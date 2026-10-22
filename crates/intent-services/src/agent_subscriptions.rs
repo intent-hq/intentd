@@ -2937,9 +2937,12 @@ mod tests {
         };
         drop(held);
         if !returned_early {
-            tokio::time::timeout(std::time::Duration::from_secs(10), drain)
-                .await
-                .unwrap();
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(std::time::Duration::from_secs(10)),
+                drain,
+            )
+            .await
+            .unwrap();
         }
         assert!(
             !returned_early,

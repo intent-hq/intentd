@@ -180,9 +180,12 @@ where
         .await
         .expect("send rpc frame");
     loop {
-        let next = timeout(Duration::from_secs(20), ws.next())
-            .await
-            .expect("wss rpc timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(20)),
+            ws.next(),
+        )
+        .await
+        .expect("wss rpc timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -251,7 +254,8 @@ async fn await_log_lines<F>(path: &Path, what: &str, pred: F) -> Vec<Value>
 where
     F: Fn(&Value) -> bool,
 {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(30));
     loop {
         let lines: Vec<Value> = std::fs::read_to_string(path)
             .unwrap_or_default()
@@ -278,7 +282,8 @@ where
     let store = intent_store::Store::open(&data_dir.join("intentd.db"))
         .await
         .expect("open store");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(30));
     loop {
         let session = store
             .get_agent_session(&AgentId(agent_id.to_string()))
@@ -433,14 +438,17 @@ async fn resume_via_session_load_replays_interrupted_tail() {
     // `metadata.interrupted`) and captures the interrupted_agent row.
     let shutdown = uds_rpc(&socket, 3, "system.shutdown", json!({})).await;
     assert_eq!(shutdown["result"].get("ok"), Some(&json!(true)));
-    let exited = timeout(Duration::from_secs(15), async {
-        loop {
-            if let Ok(Some(_)) = daemon1.child_mut().try_wait() {
-                return;
+    let exited = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(15)),
+        async {
+            loop {
+                if let Ok(Some(_)) = daemon1.child_mut().try_wait() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    })
+        },
+    )
     .await;
     assert!(exited.is_ok(), "daemon1 did not exit after system.shutdown");
     drop(daemon1);

@@ -113,10 +113,13 @@ async fn unresolved_owner_gone_recovery_cancels_without_legacy_event_disclosure(
     })
     .await
     .unwrap();
-    let batch = tokio::time::timeout(Duration::from_secs(5), events.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    let batch = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        events.recv(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert!(
         batch.iter().all(
             |event| event.event_type == intent_core::events::CLIENT_UPDATED

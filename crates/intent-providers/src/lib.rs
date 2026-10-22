@@ -30,6 +30,9 @@ pub mod config;
 pub mod discover;
 pub mod installed_cli;
 pub mod models;
+/// Shared Codex/Claude CLI fixtures; compiled only for test builds.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 pub mod version_gate;
 
 pub use args::{
@@ -68,5 +71,7 @@ pub use version_gate::{
     PiCliGate, PiCliProbe,
 };
 
+#[cfg(test)]
+mod provider_cli_guard;
 #[cfg(test)]
 mod tests;

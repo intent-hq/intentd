@@ -258,8 +258,9 @@ pub struct ProviderConfig {
     /// session spawn, discovery `installed`, one-shot / test-prompt launches,
     /// the ACP auth fallback probe) — so users can track the adapter
     /// themselves (intent-hq/monorepo#4352). An invalid override contributes
-    /// nothing and the pinned spawn applies. Opt-in per provider: claude-code
-    /// (a self-contained adapter). pi stays pinned-npx-only — its adapter
+    /// nothing and the pinned spawn applies. Opt-in per provider; no provider
+    /// opts in today. Codex and Claude Code stay pinned to the reviewed
+    /// package plus their installed CLI. pi stays pinned-npx-only — its adapter
     /// additionally routes through the version-gated real `pi` CLI and the
     /// extension wrapper, and its auth probe runs the pinned package, so an
     /// override there would advertise `installed` for a spawn that still
@@ -280,6 +281,14 @@ pub struct ProviderConfig {
     /// Grok Build's ACP adapter does this (`/bin/bash -lc '…'` in `command`);
     /// argv-only clients (most providers) leave this false.
     pub terminal_requires_shell: bool,
+    /// When true, `initialize` requests the AIR async-tasks extension
+    /// (`clientCapabilities._meta.jetbrains.air.capabilities: ["asyncTasks"]`)
+    /// so the adapter reports background workers (PROTOCOL §5.5b). Only for
+    /// providers whose adapter is on the worker allowlist and whose ordinary
+    /// tool-call rendering does not change when the extension is requested:
+    /// codex-acp switches its whole tool-call format for any AIR client, so
+    /// codex stays off until its mapping handles that form.
+    pub requests_agent_workers: bool,
     /// When true, the provider's client silently truncates long MCP tool
     /// descriptions (claude-code cuts at ~2k chars — see
     /// <https://github.com/anthropics/claude-code/issues/53933>), so the
@@ -417,6 +426,7 @@ impl ProviderConfig {
             npx_only_honors_path_override: false,
             requires_secondary_binary: None,
             terminal_requires_shell: false,
+            requests_agent_workers: false,
             truncates_tool_descriptions: false,
             kills_child_on_interrupt: false,
             supports_test_prompt: true,
@@ -516,6 +526,9 @@ pub static ACP_PROVIDERS: &[ProviderConfig] = &[
         // (anthropics/claude-code#53933): serve the compact `workspace_api`
         // description and carry the full API reference in the system prompt.
         truncates_tool_descriptions: true,
+        // claude-agent-acp gates each AIR capability on its own flag, so
+        // requesting `asyncTasks` changes nothing but the worker reports.
+        requests_agent_workers: true,
         ..ProviderConfig::empty("claude-code", "Anthropic Claude Code", "claude-agent-acp")
     },
     ProviderConfig {

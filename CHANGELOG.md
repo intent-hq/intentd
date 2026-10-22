@@ -2,6 +2,129 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.24] - 2026-10-22
+
+### 🐛 Bug Fixes
+
+- *(test)* Wait for durable idle before restart in assistant restart e2e ([#2585](https://github.com/intent-hq/intentd/pull/2585))
+
+### 🧪 Testing
+
+- Scale fixed test deadlines of 1s or more in the remaining crates ([#2583](https://github.com/intent-hq/intentd/pull/2583))
+
+
+## [0.11.23] - 2026-10-21
+
+### 🚀 Features
+
+- *(sitter)* Check for updates through updates.intentapp.dev, once a day on stable ([#2566](https://github.com/intent-hq/intentd/pull/2566))
+- Launch Intent's bundled Codex/Claude CLI when the installed one is too old ([#2567](https://github.com/intent-hq/intentd/pull/2567))
+
+### 🐛 Bug Fixes
+
+- *(test)* Gate LogCapture helper to unix for Windows clippy ([#2579](https://github.com/intent-hq/intentd/pull/2579))
+- Clear daemon-raised provider-stall blockers after a later successful turn ([#2572](https://github.com/intent-hq/intentd/pull/2572))
+- *(agents)* Keep idle agents with running background workers alive ([#2573](https://github.com/intent-hq/intentd/pull/2573))
+- Pause worktree work for workspaces whose checkout folder is missing ([#2574](https://github.com/intent-hq/intentd/pull/2574))
+
+### 📚 Documentation
+
+- *(guide)* Describe provider background tasks in the chat card ([#2564](https://github.com/intent-hq/intentd/pull/2564))
+- *(guide)* Document double-click opening in Home ([#2561](https://github.com/intent-hq/intentd/pull/2561))
+- *(assistant-guide)* Idle agents with running background tasks stay open ([#2577](https://github.com/intent-hq/intentd/pull/2577))
+- Explain safe return from raw Markdown ([#2394](https://github.com/intent-hq/intentd/pull/2394))
+
+### 🧪 Testing
+
+- *(intent-services)* Scale fixed test deadlines with the timeout multiplier ([#2568](https://github.com/intent-hq/intentd/pull/2568))
+- Share a current Codex/Claude CLI version across test fixtures ([#2578](https://github.com/intent-hq/intentd/pull/2578))
+- *(intentd)* Scale fixed test deadlines of 1s or more with the timeout multiplier ([#2576](https://github.com/intent-hq/intentd/pull/2576))
+
+
+## [0.11.22] - 2026-10-21
+
+### 🧪 Testing
+
+- *(intent-services)* Wait for exec before judging fixture HOME ([#2563](https://github.com/intent-hq/intentd/pull/2563))
+- Point fixture-test failures at make test-select ([#2565](https://github.com/intent-hq/intentd/pull/2565))
+
+
+## [0.11.21] - 2026-10-21
+
+### 🚀 Features
+
+- Add qualified GitLab repository pages and child Git policy ([#2431](https://github.com/intent-hq/intentd/pull/2431))
+
+
+## [0.11.20] - 2026-10-21
+
+### 🚀 Features
+
+- *(scripts)* Persist script output to disk with retention GC ([#2545](https://github.com/intent-hq/intentd/pull/2545))
+- Observe and stop provider background workers (agent.workers) ([#2550](https://github.com/intent-hq/intentd/pull/2550))
+- *(agents)* Ask Assistant chats to name themselves on the first turn ([#2558](https://github.com/intent-hq/intentd/pull/2558))
+
+### 🐛 Bug Fixes
+
+- *(services)* Resolve repo-less GitHub PR reads from fetch remotes ([#2552](https://github.com/intent-hq/intentd/pull/2552))
+- Expect unused_mut on non-unix in script output store no_follow ([#2555](https://github.com/intent-hq/intentd/pull/2555))
+- *(store)* Default new repository roots to never-saved selection ([#2559](https://github.com/intent-hq/intentd/pull/2559))
+- *(git)* Stop history reads walking the whole first-parent chain ([#2560](https://github.com/intent-hq/intentd/pull/2560))
+- *(intentd)* Pace incremental vacuum by time so it never stalls the write pool ([#2549](https://github.com/intent-hq/intentd/pull/2549))
+- *(intentd)* Wait for running command scripts before a staged update restart ([#2533](https://github.com/intent-hq/intentd/pull/2533))
+- Restore the Windows build on main ([#2556](https://github.com/intent-hq/intentd/pull/2556))
+
+### 📚 Documentation
+
+- *(assistant-guide)* Describe the Codex CLI Update toast action ([#2557](https://github.com/intent-hq/intentd/pull/2557))
+
+### 🧪 Testing
+
+- *(intent-services)* Give the Claude adapter contract a CI-sized startup budget ([#2548](https://github.com/intent-hq/intentd/pull/2548))
+- Shared provider-installed helper and a no-provider-CLI test guard ([#2551](https://github.com/intent-hq/intentd/pull/2551))
+- Lint fixed test deadlines that bypass the timeout multiplier ([#2531](https://github.com/intent-hq/intentd/pull/2531))
+
+
+## [0.11.19] - 2026-10-20
+
+### 🚀 Features
+
+- *(pr)* Carry merge-queue position and time-to-merge estimate ([#2542](https://github.com/intent-hq/intentd/pull/2542))
+
+### 📚 Documentation
+
+- *(assistant-guide)* The proposal card no longer shows the agent setup ([#2538](https://github.com/intent-hq/intentd/pull/2538))
+
+
+## [0.11.18] - 2026-10-20
+
+### 🧪 Testing
+
+- *(agents)* Budget the turn-start future sizes ([#2535](https://github.com/intent-hq/intentd/pull/2535))
+
+
+## [0.11.17] - 2026-10-20
+
+### 🐛 Bug Fixes
+
+- *(pr)* Don't report a merged queue removal as mergeQueueEjection ([#2530](https://github.com/intent-hq/intentd/pull/2530))
+
+### 📚 Documentation
+
+- *(guide)* Mention Collapse tool activity under Appearance settings ([#2522](https://github.com/intent-hq/intentd/pull/2522))
+
+### ⚡ Performance
+
+- Batch note page index descriptor writes ([#2387](https://github.com/intent-hq/intentd/pull/2387))
+
+
+## [0.11.16] - 2026-10-20
+
+### 🧪 Testing
+
+- *(intent-services)* Run the pinned Claude adapter in CI against a stand-in CLI ([#2521](https://github.com/intent-hq/intentd/pull/2521))
+
+
 ## [0.11.15] - 2026-10-19
 
 ### 🐛 Bug Fixes

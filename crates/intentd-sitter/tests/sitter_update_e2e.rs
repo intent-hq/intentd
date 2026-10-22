@@ -715,6 +715,7 @@ fn update_rejects_archive_without_tailcat_and_keeps_installation() {
 #[test]
 fn exact_and_channel_repairs_keep_the_installed_version_when_channel_trails() {
     use intentd_sitter::cli::Channel;
+    use intentd_sitter::telemetry::CheckTrigger;
     use intentd_sitter::updater::{UpdateOutcome, Updater};
 
     for exact in [false, true] {
@@ -740,11 +741,11 @@ fn exact_and_channel_repairs_keep_the_installed_version_when_channel_trails() {
         } else {
             assert!(
                 updater
-                    .check_only(Channel::Stable)
+                    .check_only(Channel::Stable, CheckTrigger::Manual)
                     .unwrap()
                     .update_available
             );
-            updater.check_and_install(Channel::Stable)
+            updater.check_and_install(Channel::Stable, CheckTrigger::Manual)
         }
         .unwrap();
         assert_eq!(
@@ -855,7 +856,7 @@ fn update_signals_running_supervised_sitter_then_waits_for_it() {
     );
 
     // The trap handler appends asynchronously; poll briefly.
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(10));
     while Instant::now() < deadline
         && !fs::read_to_string(&hup_log).is_ok_and(|s| s.contains("HUP"))
     {

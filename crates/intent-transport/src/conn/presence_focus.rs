@@ -199,9 +199,12 @@ mod tests {
                 recovery: crate::conn::recovery::Output::default(),
             },
         ));
-        tokio::time::timeout(std::time::Duration::from_secs(5), api.entered.notified())
-            .await
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+            api.entered.notified(),
+        )
+        .await
+        .unwrap();
         let _ = bus.publish_transient(&intent_store::NewEvent {
             workspace_id: WorkspaceId::from("secret-old"),
             timestamp: intent_core::now_iso(),
@@ -215,10 +218,13 @@ mod tests {
         });
         // The stale read is still parked: the event must cancel it, perform a
         // fresh authorization read, clear the target and stop without release.
-        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let frame = tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+            rx.recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         let value: Value = serde_json::from_str(&frame).unwrap();
         assert_eq!(value["params"]["seq"], 0);
         assert_eq!(
@@ -284,10 +290,13 @@ mod tests {
                     recovery: crate::conn::recovery::Output::default(),
                 },
             ));
-            let first = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
-                .await
-                .unwrap()
-                .unwrap();
+            let first = tokio::time::timeout(
+                intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+                rx.recv(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
             let first: Value = serde_json::from_str(&first).unwrap();
             assert_eq!(first["params"]["seq"], 0);
             assert!(first["params"]["snapshot"].get("closed").is_none());
@@ -313,10 +322,13 @@ mod tests {
             } else {
                 bus
             };
-            let closed = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
-                .await
-                .unwrap()
-                .unwrap();
+            let closed = tokio::time::timeout(
+                intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+                rx.recv(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
             let value: Value = serde_json::from_str(&closed).unwrap();
             assert_eq!(value["params"]["seq"], 1);
             assert_eq!(

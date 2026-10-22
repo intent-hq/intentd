@@ -244,14 +244,21 @@ pub(crate) fn pull_to_json(pr: &PullRequest) -> Value {
 /// — the `github.pulls.get` shape served from the shared PR cache: the key
 /// is present exactly when the cached read reported the host's merge-queue
 /// state (`true` / `false`), and absent (never `null`) when it did not
-/// (REST-only fallback, older GHES).
+/// (REST-only fallback, older GHES). The additive `mergeQueue` entry
+/// (position, queue size, state, enqueue time, time-to-merge estimate)
+/// rides along as served: the checklist only carries one while the PR is
+/// reported queued (`pr_ops::queued_merge_queue_entry`).
 pub(crate) fn pull_to_json_with_merge_queue(
     pr: &PullRequest,
     is_in_merge_queue: Option<bool>,
+    merge_queue: Option<&intent_sourcecontrol::MergeQueueEntry>,
 ) -> Value {
     let mut v = pull_to_json(pr);
     if let (Value::Object(map), Some(queued)) = (&mut v, is_in_merge_queue) {
         map.insert("isInMergeQueue".into(), json!(queued));
+        if let Some(entry) = merge_queue {
+            map.insert("mergeQueue".into(), json!(entry));
+        }
     }
     v
 }

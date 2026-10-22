@@ -574,11 +574,14 @@ async fn recovery_uds_loss_and_fence_follow_physical_write_order() {
         .await
         .unwrap();
     });
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !path.exists() {
-            tokio::task::yield_now().await;
-        }
-    })
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            while !path.exists() {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
     .await
     .unwrap();
     let socket = tokio::net::UnixStream::connect(&path).await.unwrap();

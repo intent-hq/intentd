@@ -1186,11 +1186,14 @@ impl Socket {
     }
 }
 async fn wait_until(check: impl Fn() -> bool) {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !check() {
-            tokio::task::yield_now().await;
-        }
-    })
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            while !check() {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
     .await
     .unwrap();
 }
@@ -1666,7 +1669,7 @@ async fn native_review_concurrent_registered_roots_coordinate_complete_branch_pa
         tokio::spawn(async move { s.request(&f.services, Frame::Execute(first)).await })
     };
     tokio::time::timeout(
-        Duration::from_secs(5),
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
         f.server.control.post_entered.notified(),
     )
     .await
@@ -3960,17 +3963,20 @@ async fn diagnostic_case<F: Future<Output = ()>>(
     drop(process);
     // Original Request cancellation owners may still be unwinding their own task.
     // This wait observes diagnostics only; worker/lock assertions are separate.
-    let finished = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if companion_observation::read(&observer.lines())
-                .incomplete
-                .is_empty()
-            {
-                break;
+    let finished = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            loop {
+                if companion_observation::read(&observer.lines())
+                    .incomplete
+                    .is_empty()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
-    })
+        },
+    )
     .await;
     let report = observer.finish();
     diagnostic_checkpoint(

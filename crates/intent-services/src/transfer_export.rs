@@ -1291,10 +1291,13 @@ mod tests {
             .is_err());
         // Registry removal precedes asynchronous staging cleanup. The existing
         // terminal event is published only after that cleanup has completed.
-        let batch = tokio::time::timeout(std::time::Duration::from_secs(10), failed_events.recv())
-            .await
-            .expect("failed export cleanup completes")
-            .expect("failure subscription remains open");
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(10)),
+            failed_events.recv(),
+        )
+        .await
+        .expect("failed export cleanup completes")
+        .expect("failure subscription remains open");
         let failed = batch
             .iter()
             .find(|event| event.event_type == WORKSPACE_TRANSFER_FAILED)
@@ -1350,10 +1353,13 @@ mod tests {
             .is_err());
         // Registry removal precedes asynchronous staging cleanup. The existing
         // terminal event is published only after that cleanup has completed.
-        let batch = tokio::time::timeout(std::time::Duration::from_secs(10), failed_events.recv())
-            .await
-            .expect("failed export cleanup completes")
-            .expect("failure subscription remains open");
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(10)),
+            failed_events.recv(),
+        )
+        .await
+        .expect("failed export cleanup completes")
+        .expect("failure subscription remains open");
         let failed = batch
             .iter()
             .find(|event| event.event_type == WORKSPACE_TRANSFER_FAILED)
@@ -1390,9 +1396,12 @@ mod tests {
         };
         drop(held);
         if !returned_early {
-            tokio::time::timeout(std::time::Duration::from_secs(10), &mut shutdown)
-                .await
-                .unwrap();
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(std::time::Duration::from_secs(10)),
+                &mut shutdown,
+            )
+            .await
+            .unwrap();
         }
         assert!(
             !returned_early,
@@ -2177,10 +2186,13 @@ mod tests {
 
         // The failed event is published AFTER cleanup, so receiving it means
         // the failure path has fully settled.
-        let batch = tokio::time::timeout(std::time::Duration::from_secs(10), sub.recv())
-            .await
-            .expect("failed event delivered")
-            .expect("subscription open");
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(10)),
+            sub.recv(),
+        )
+        .await
+        .expect("failed event delivered")
+        .expect("subscription open");
         let failed = batch
             .iter()
             .find(|e| e.event_type == WORKSPACE_TRANSFER_FAILED)

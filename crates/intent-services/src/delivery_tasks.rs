@@ -293,9 +293,12 @@ mod tests {
             () = std::future::ready(()) => {}
         }
         release_child.send(()).unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            tokio::join!(drain, second);
-        })
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(10)),
+            async {
+                tokio::join!(drain, second);
+            },
+        )
         .await
         .unwrap();
         assert_eq!(
@@ -315,9 +318,12 @@ mod tests {
                 inside.drain_finite().await;
             })
             .unwrap();
-        let result = tokio::time::timeout(std::time::Duration::from_secs(10), task)
-            .await
-            .unwrap();
+        let result = tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(10)),
+            task,
+        )
+        .await
+        .unwrap();
         assert!(result.unwrap_err().is_panic());
         tasks.drain_finite().await;
         assert!(tasks.is_closed());
@@ -332,10 +338,13 @@ mod tests {
                 inside.shutdown().await;
             })
             .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(1), callback)
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(1)),
+            callback,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         tasks.shutdown().await;
         assert!(tasks.is_closed());
     }
@@ -349,10 +358,13 @@ mod tests {
                 inside.shutdown().await;
             })
             .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(1), callback)
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(1)),
+            callback,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         tasks.shutdown().await;
     }
 
@@ -365,9 +377,12 @@ mod tests {
                 inside.closed().await;
             })
             .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(1), tasks.shutdown())
-            .await
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(1)),
+            tasks.shutdown(),
+        )
+        .await
+        .unwrap();
         scheduler.await.unwrap();
     }
 

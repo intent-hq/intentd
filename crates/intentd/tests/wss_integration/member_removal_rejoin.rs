@@ -216,10 +216,13 @@ async fn postcommit_rejoin(self_revoke: bool) {
             };
             (response, command)
         });
-        tokio::time::timeout(Duration::from_secs(5), publication_reached)
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            publication_reached,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(srv
             .store
             .resolve_active_principal_credential(&sha256_hex(old_token.as_bytes()))
@@ -252,10 +255,13 @@ async fn postcommit_rejoin(self_revoke: bool) {
         });
         // The fresh challenge and real proof are in flight while the old
         // operation is durably committed but its actual publication is held.
-        tokio::time::timeout(Duration::from_secs(5), forge.user_read.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            forge.user_read.recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         drop(release_publication);
         let (removed, mut command) = removal.await.unwrap();
         assert!(removed.get("error").is_none());
@@ -267,11 +273,14 @@ async fn postcommit_rejoin(self_revoke: bool) {
         assert_eq!(fresh["result"]["principalId"], old.principal.id.0);
         assert_eq!(fresh["result"]["hostRole"], role);
         let fresh_token = fresh["result"]["token"].as_str().unwrap();
-        let frame = tokio::time::timeout(Duration::from_secs(5), old.ws.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+        let frame = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            old.ws.next(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
         let Message::Text(frame) = frame else {
             panic!("old removal control precedes close")
         };

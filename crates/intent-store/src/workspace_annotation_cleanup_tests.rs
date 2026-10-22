@@ -123,7 +123,7 @@ async fn empty_presence_uses_indexed_owner_probes_and_preserves_keeper() {
 
 #[tokio::test]
 async fn populated_presence_cancel_reopen_resumes_bounded_child_order() {
-    tokio::time::timeout(Duration::from_secs(30), async {
+    tokio::time::timeout(intentd_test_support::test_timeout(Duration::from_secs(30)), async {
         let (dir, store, doomed, keeper) = fixture().await;
         seed_lines(&store, doomed, 1_201).await;
         seed_lines(&store, keeper, 3).await;
@@ -137,7 +137,7 @@ async fn populated_presence_cancel_reopen_resumes_bounded_child_order() {
             if update.table == "note_attribution_author_piece" {
                 if let Some(blocked) = blocked.take() {
                     observed.notify_one();
-                    blocked.recv_timeout(Duration::from_secs(15)).unwrap();
+                    blocked.recv_timeout(intentd_test_support::test_timeout(Duration::from_secs(15))).unwrap();
                 }
             }
         });

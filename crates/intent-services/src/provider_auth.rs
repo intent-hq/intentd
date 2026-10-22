@@ -1453,11 +1453,16 @@ case "$*" in
   --version)
     [ "$CLAUDE_CODE_EXECUTABLE" = "$0" ] || exit 91
     printf 'version\n' >> "$HOME/cli-calls"
-    printf '2.1.0 (Claude Code)\n' ;;
+    printf '%s\n' '@CURRENT@' ;;
   *) exit 92 ;;
 esac
 "#
-                .to_owned(),
+                .replace(
+                    "@CURRENT@",
+                    &intent_providers::test_support::current_cli_version(
+                        intent_providers::installed_cli::InstalledCli::Claude,
+                    ),
+                ),
             ),
             (
                 "npx",
@@ -1506,7 +1511,7 @@ while IFS= read -r unexpected; do exit 95; done
             .stderr(Stdio::from(log));
         let mut child = intentd_test_support::GuardedChild::spawn(&mut command).unwrap();
         let status = child
-            .wait_with_timeout(Duration::from_secs(60))
+            .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(60)))
             .unwrap()
             .expect("isolated auth wiring test timed out");
         assert!(

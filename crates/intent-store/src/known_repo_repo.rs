@@ -26,6 +26,19 @@ impl Store {
         rows.iter().map(map_known_repo_row).collect()
     }
 
+    /// Check one explicitly supplied registry path without loading every row.
+    ///
+    /// This is local input validation, not filesystem or repository authority.
+    /// # Errors
+    /// Returns an error if the registry query fails.
+    pub async fn known_repo_exists(&self, path: &str) -> Result<bool> {
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM known_repo WHERE path = ?)")
+            .bind(path)
+            .fetch_one(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("known repo lookup failed: {e}")))
+    }
+
     /// Insert or update a known repo, keyed on `path` (TS `addRepo`). A new row
     /// is inserted with `added_at = last_used_at = now`. On conflict the
     /// `last_used_at` is bumped and `name`/`owner` are overwritten when a

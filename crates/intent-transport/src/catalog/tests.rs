@@ -83,6 +83,7 @@ fn extract_fastpath_methods() -> HashSet<String> {
         ("invite.rs", "host.invite."),
         ("presence.rs", "presence."),
         ("presence.rs", "note.presence."),
+        ("agent_workers.rs", "agent.workers."),
     ] {
         let source = std::fs::read_to_string(base_path.join(filename))
             .unwrap_or_else(|_| panic!("Failed to read {filename} at test time"));
@@ -197,7 +198,10 @@ fn extract_fastpath_methods() -> HashSet<String> {
 // Generic event recovery adds the events.fence fast path.
 // Correlated discussion controls: +2 router methods.
 // Persisted guest roles: +1 owner-only role assignment method.
-const EXPECTED_TOTAL_METHODS: usize = 448;
+// Startup status (14.1): +1 fast-path method.
+// Scoped repository pages and child Git policy (15.1): +8 router methods.
+// Provider worker observations (§5.5b, `agentWorkers: 1`): +2 router, +1 fast path.
+const EXPECTED_TOTAL_METHODS: usize = 459;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// Protocol 12.0 removes five router methods, three fast paths and two aliases.
@@ -208,16 +212,19 @@ const EXPECTED_TOTAL_METHODS: usize = 448;
 /// Named provider profiles (§5.54) add the four `providers.profiles.*` methods.
 /// Correlated discussion controls add `discussion.stopAgent` and `discussion.retryAgent`.
 /// Persisted guest roles add `workspace.members.setRole`.
-const EXPECTED_ROUTER_METHODS: usize = 391;
+/// Scoped repository pages and child Git policy add eight router methods.
+/// Provider worker observations (§5.5b) add `agent.workers.list` / `.stop`.
+const EXPECTED_ROUTER_METHODS: usize = 401;
 
 /// Golden count: fast-path methods (intercepted before router).
-const EXPECTED_FASTPATH_METHODS: usize = 57;
+/// `agent.workers.subscribe` (§5.5b) holds per-connection subscription state.
+const EXPECTED_FASTPATH_METHODS: usize = 58;
 
 /// Golden count: method aliases.
 const EXPECTED_ALIASES: usize = 0;
 
 /// Golden count: server→client notifications.
-const EXPECTED_NOTIFICATIONS: usize = 6;
+const EXPECTED_NOTIFICATIONS: usize = 7;
 
 /// Golden count: client-served reverse RPCs.
 const EXPECTED_REVERSE_METHODS: usize = 5;
@@ -574,6 +581,9 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "agent.summary",
     "agent.unsubscribe",
     "agent.update",
+    "agent.workers.list",
+    "agent.workers.stop",
+    "agent.workers.subscribe",
     "browser.closeTab",
     "browser.exec",
     "browser.listTabs",
@@ -864,11 +874,19 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "sourceControl.checkout.warm",
     "sourceControl.connect",
     "sourceControl.getUser",
+    "sourceControl.gitlab.childGit.get",
+    "sourceControl.gitlab.childGit.set",
     "sourceControl.identityProof.create",
     "sourceControl.identityProof.delete",
     "sourceControl.read.capture",
+    "sourceControl.read.captureScoped",
     "sourceControl.read.detail",
+    "sourceControl.read.detailScoped",
+    "sourceControl.read.discussions",
+    "sourceControl.read.list",
     "sourceControl.read.release",
+    "sourceControl.read.releaseScoped",
+    "sourceControl.read.resolveKnownRepository",
     "sourceControl.revoke",
     "specialist.create",
     "specialist.delete",
@@ -1399,8 +1417,11 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "sourceControl.cancelAuth",
     "sourceControl.connect",
     "sourceControl.getUser",
+    "sourceControl.gitlab.childGit.get",
+    "sourceControl.gitlab.childGit.set",
     "sourceControl.identityProof.create",
     "sourceControl.identityProof.delete",
+    "sourceControl.read.resolveKnownRepository",
     "sourceControl.revoke",
     "specialist.create",
     "specialist.delete",
@@ -2063,6 +2084,13 @@ mod unbound_owner_only_methods {
             ("sourceControl.cancelAuth", json!({ "provider": "github" })),
             ("sourceControl.connect", json!({ "provider": "github" })),
             ("sourceControl.getUser", json!({ "provider": "github" })),
+            ("sourceControl.gitlab.childGit.get", json!({})),
+            (
+                "sourceControl.gitlab.childGit.set",
+                json!({"binding":{"instanceBaseUrl":"https://forge.test/install",
+                    "connection":{"connectionId":"original","accountId":"account",
+                        "connectionGeneration":"1"},"revision":"1"},"enabled":false}),
+            ),
             (
                 "sourceControl.identityProof.create",
                 json!({ "provider": "github", "nonce": "n", "hostLabel": "h" }),
@@ -2070,6 +2098,10 @@ mod unbound_owner_only_methods {
             (
                 "sourceControl.identityProof.delete",
                 json!({ "provider": "github", "proofId": "g" }),
+            ),
+            (
+                "sourceControl.read.resolveKnownRepository",
+                json!({ "context": { "kind": "host" }, "readLifetimeId": "original", "path": dir }),
             ),
             ("sourceControl.revoke", json!({ "provider": "github" })),
             ("specialist.create", json!({ "id": "s", "spec": {} })),
@@ -2592,8 +2624,11 @@ fn member_methods_and_administrator_remainder_are_classified() {
         "sourceControl.cancelAuth",
         "sourceControl.connect",
         "sourceControl.getUser",
+        "sourceControl.gitlab.childGit.get",
+        "sourceControl.gitlab.childGit.set",
         "sourceControl.identityProof.create",
         "sourceControl.identityProof.delete",
+        "sourceControl.read.resolveKnownRepository",
         "sourceControl.revoke",
         "specialist.create",
         "specialist.delete",

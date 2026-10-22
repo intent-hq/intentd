@@ -549,7 +549,7 @@ mod tests {
         .unwrap();
         let traffic = Traffic::default();
         let result = tokio::time::timeout(
-            Duration::from_secs(5),
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
             with_traffic(traffic.clone(), async {
                 transport
                     .client(false, None)
@@ -605,7 +605,7 @@ mod tests {
         .await;
         // Consumption happens after both task-local scopes have exited.
         let error = tokio::time::timeout(
-            Duration::from_secs(5),
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
             transport.client(false, None).body_to_string(response),
         )
         .await

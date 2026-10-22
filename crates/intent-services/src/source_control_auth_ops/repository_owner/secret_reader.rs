@@ -14,7 +14,8 @@ use sha2::{Digest, Sha256};
 use super::{GitlabCredentialGate, RepositoryOwner};
 use crate::repository_credentials::authority::CredentialFuture;
 use crate::repository_credentials::read::{
-    RepositoryReadScope, RepositoryResponseAttribution, RepositoryResponseDisposition,
+    RepositoryCollectionTarget, RepositoryReadScope, RepositoryResponseAttribution,
+    RepositoryResponseDisposition,
 };
 use crate::repository_credentials::{
     RepositoryConnectionBinding, RepositoryCredentialAdmission, RepositoryCredentialError as Error,
@@ -824,6 +825,20 @@ impl RepositorySettledConnection {
             crate::repository_credentials::RepositoryDispatchStamp,
         ) -> Result<T>,
     ) -> Result<T> {
+        self.with_child_current(expected, projects, dispatch, None, action)
+    }
+
+    pub(crate) fn with_child_current<T>(
+        &self,
+        expected: Option<&RepositorySecretRequest>,
+        projects: &[&str],
+        dispatch: bool,
+        child_revision: Option<u64>,
+        action: impl FnOnce(
+            &RepositorySecretRequest,
+            crate::repository_credentials::RepositoryDispatchStamp,
+        ) -> Result<T>,
+    ) -> Result<T> {
         let settings = self.owner.settings.get().ok_or(Error::Unverified)?;
         let config = settings.config.lock().map_err(|_| Error::Indeterminate)?;
         let descriptor = self
@@ -831,46 +846,111 @@ impl RepositorySettledConnection {
             .descriptor
             .lock()
             .map_err(|_| Error::Indeterminate)?;
-        self.owner.directory.with_checkout_metadata(
+        let validate = |actual: &GitlabDescriptor, selected: &RepositorySecretRequest, stamp| {
+            let proof = self
+                .owner
+                .evidence
+                .published
+                .lock()
+                .map_err(|_| Error::Indeterminate)?;
+            self.check_checkout_proof(
+                &config,
+                descriptor.as_ref(),
+                actual,
+                selected,
+                proof.as_deref(),
+            )?;
+            let denials = self
+                .owner
+                .evidence
+                .checkout_denials
+                .lock()
+                .map_err(|_| Error::Indeterminate)?;
+            if projects.iter().any(|p| denials.get(*p) == Some(selected)) {
+                return Err(Error::AuthorityDenied);
+            }
+            action(selected, stamp)
+        };
+        match child_revision {
+            None => self.owner.directory.with_checkout_metadata(
+                &self.selected.binding,
+                expected,
+                dispatch,
+                validate,
+            ),
+            Some(revision) => self.owner.directory.with_checkout_child_metadata(
+                &self.selected.binding,
+                expected,
+                dispatch,
+                Some(revision),
+                validate,
+            ),
+        }
+    }
+
+    fn check_checkout_proof(
+        &self,
+        config: &intent_core::settings_file::GitlabSettings,
+        descriptor: Option<&GitlabDescriptor>,
+        actual: &GitlabDescriptor,
+        selected: &RepositorySecretRequest,
+        proof: Option<&AttestedSource>,
+    ) -> Result<()> {
+        let settings = self.owner.settings.get().ok_or(Error::Unverified)?;
+        if settings.source.is_none()
+            || settings.store.is_none()
+            || selected.source != RepositoryCredentialSource::GitlabSecretSlot
+        {
+            return Err(Error::Unverified);
+        }
+        let proof = proof.ok_or(Error::Unverified)?;
+        if proof.request != *selected {
+            return Err(Error::SecretMismatch);
+        }
+        if descriptor != Some(actual)
+            || proof.descriptor != *actual
+            || super::adoption::approved_descriptor(config, &settings.fixtures).as_ref()
+                != Some(actual)
+            || self.descriptor != *actual
+            || self.selected.source != selected.source
+        {
+            return Err(Error::BoundaryMismatch);
+        }
+        Ok(())
+    }
+
+    /// Keep the original source proof and disabled/enabled child metadata under
+    /// the same ranked locks until a single synchronous output transfer finishes.
+    pub(crate) fn with_child_policy_status<T>(
+        &self,
+        expected: Option<(bool, u64)>,
+        action: impl FnOnce(bool, u64) -> Result<T>,
+    ) -> Result<T> {
+        let settings = self.owner.settings.get().ok_or(Error::Unverified)?;
+        let config = settings.config.lock().map_err(|_| Error::Indeterminate)?;
+        let descriptor = self
+            .owner
+            .descriptor
+            .lock()
+            .map_err(|_| Error::Indeterminate)?;
+        self.owner.directory.with_child_policy_metadata(
             &self.selected.binding,
             expected,
-            dispatch,
-            |actual, selected, stamp| {
+            |actual, selected, enabled, revision| {
                 let proof = self
                     .owner
                     .evidence
                     .published
                     .lock()
                     .map_err(|_| Error::Indeterminate)?;
-                if settings.source.is_none()
-                    || settings.store.is_none()
-                    || selected.source != RepositoryCredentialSource::GitlabSecretSlot
-                {
-                    return Err(Error::Unverified);
-                }
-                let proof = proof.as_ref().ok_or(Error::Unverified)?;
-                if proof.request != *selected {
-                    return Err(Error::SecretMismatch);
-                }
-                if descriptor.as_ref() != Some(actual)
-                    || proof.descriptor != *actual
-                    || super::adoption::approved_descriptor(&config, &settings.fixtures).as_ref()
-                        != Some(actual)
-                    || self.descriptor != *actual
-                    || self.selected.source != selected.source
-                {
-                    return Err(Error::BoundaryMismatch);
-                }
-                let denials = self
-                    .owner
-                    .evidence
-                    .checkout_denials
-                    .lock()
-                    .map_err(|_| Error::Indeterminate)?;
-                if projects.iter().any(|p| denials.get(*p) == Some(selected)) {
-                    return Err(Error::AuthorityDenied);
-                }
-                action(selected, stamp)
+                self.check_checkout_proof(
+                    &config,
+                    descriptor.as_ref(),
+                    actual,
+                    selected,
+                    proof.as_deref(),
+                )?;
+                action(enabled, revision)
             },
         )
     }
@@ -1301,6 +1381,42 @@ impl RepositoryReadEligibility {
             .map_err(|_| Error::Indeterminate)?;
         self.scope
             .with_response(attribution, target, &mut |disposition, selected| {
+                let proof = self
+                    .owner
+                    .evidence
+                    .published
+                    .lock()
+                    .map_err(|_| Error::Indeterminate)?;
+                if let Some(selected) = selected {
+                    self.check_source(
+                        settings,
+                        &config,
+                        descriptor.as_ref(),
+                        proof.as_deref(),
+                        selected,
+                    )?;
+                }
+                // Rejection's accepted event survives its own directory disconnect.
+                // NoDenial likewise says nothing about successful payload eligibility.
+                apply(disposition)
+            })
+    }
+
+    pub(crate) fn with_collection_response(
+        &self,
+        attribution: &RepositoryResponseAttribution,
+        target: &RepositoryCollectionTarget,
+        apply: &mut (dyn FnMut(RepositoryResponseDisposition) -> Result<()> + Send),
+    ) -> Result<()> {
+        let settings = self.owner.settings.get().ok_or(Error::Unverified)?;
+        let config = settings.config.lock().map_err(|_| Error::Indeterminate)?;
+        let descriptor = self
+            .owner
+            .descriptor
+            .lock()
+            .map_err(|_| Error::Indeterminate)?;
+        self.scope
+            .with_collection_response(attribution, target, &mut |disposition, selected| {
                 let proof = self
                     .owner
                     .evidence

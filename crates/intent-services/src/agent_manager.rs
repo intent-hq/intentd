@@ -893,6 +893,22 @@ pub(crate) const REASON_MEMORY_BUDGET: &str = "memory-budget";
 /// only evicts.
 pub(crate) const REASON_IDLE_TTL: &str = "idle-ttl";
 
+/// Whether an idle agent still has a running provider worker (PROTOCOL
+/// §5.5b — a `run_in_background` dev server, say) on a continuous connection.
+/// Killing such an agent's process kills the worker with it, so the TTL sweep
+/// skips it and the pressure-driven paths (slot cap, memory budget) evict it
+/// only after every idle agent without one. Called under the registry lock:
+/// it must not take any lock that can be held while acquiring that lock.
+pub(crate) type KeepAliveFn = Arc<dyn Fn(&AgentId) -> bool + Send + Sync>;
+
+/// Safety bound on the TTL keep-alive for an agent with running workers.
+/// §5.5b keeps a row `running` until its end report arrives or the
+/// connection ends, so a lost end report could otherwise pin an idle agent
+/// forever on a host with no slot or memory pressure. Past
+/// `idleReapMinutes + WORKER_KEEPALIVE_CAP` of idle time the sweep reaps it
+/// like any other — long enough to keep an overnight dev server running.
+pub(crate) const WORKER_KEEPALIVE_CAP: Duration = Duration::from_secs(24 * 60 * 60);
+
 struct ProcessEntry {
     last_active_ms: u64,
     is_active: bool,
@@ -968,17 +984,31 @@ fn settle_stale_waiter(rx: Option<tokio::sync::oneshot::Receiver<()>>) -> bool {
 /// parked here; its waiter then wakes via `deregister`, re-classifies as
 /// unregistered, admits, and respawns through the spawn gate (queued, never
 /// refused, message intact — the warm session is lost, not the turn).
-fn lru_idle_ordered(inner: &RegistryInner, exclude: Option<&AgentId>) -> Vec<(AgentId, KillFn)> {
-    let mut candidates: Vec<(AgentId, u64, KillFn)> = inner
+///
+/// Agents the keep-alive predicate pins (running provider workers) sort after
+/// every unpinned candidate: pressure relief may still evict them, but last.
+fn lru_idle_ordered(
+    inner: &RegistryInner,
+    exclude: Option<&AgentId>,
+    keep_alive: Option<&KeepAliveFn>,
+) -> Vec<(AgentId, KillFn)> {
+    let mut candidates: Vec<(AgentId, bool, u64, KillFn)> = inner
         .entries
         .iter()
         .filter(|(id, e)| !e.is_active && exclude.is_none_or(|x| *id != x))
-        .map(|(id, e)| (id.clone(), e.last_active_ms, e.kill.clone()))
+        .map(|(id, e)| {
+            (
+                id.clone(),
+                keep_alive.is_some_and(|f| f(id)),
+                e.last_active_ms,
+                e.kill.clone(),
+            )
+        })
         .collect();
-    candidates.sort_by_key(|(_, ms, _)| *ms);
+    candidates.sort_by_key(|(_, pinned, ms, _)| (*pinned, *ms));
     candidates
         .into_iter()
-        .map(|(id, _, kill)| (id, kill))
+        .map(|(id, _, _, kill)| (id, kill))
         .collect()
 }
 
@@ -1001,13 +1031,42 @@ impl<R: Fn(&AgentId)> Drop for ClaimGuard<'_, R> {
     }
 }
 
-/// Idle entries whose `last_active_ms` is at/older than `cutoff_ms`, ordered
+/// Whether the TTL sweep may reap this idle entry: it is idle past
+/// `cutoff_ms` and either has no running worker or has been idle past
+/// `pinned_cutoff_ms` (the [`WORKER_KEEPALIVE_CAP`] safety bound).
+fn ttl_reapable(
+    id: &AgentId,
+    e: &ProcessEntry,
+    cutoff_ms: u64,
+    pinned_cutoff_ms: u64,
+    keep_alive: Option<&KeepAliveFn>,
+) -> bool {
+    if e.is_active || e.last_active_ms > cutoff_ms {
+        return false;
+    }
+    if e.last_active_ms <= pinned_cutoff_ms || !keep_alive.is_some_and(|f| f(id)) {
+        return true;
+    }
+    tracing::trace!(
+        agent = %id,
+        idle_ms = now_ms().saturating_sub(e.last_active_ms),
+        "process registry: idle process kept (running provider worker)"
+    );
+    false
+}
+
+/// Idle entries the TTL sweep may reap ([`ttl_reapable`]), ordered
 /// least-recently-used first (the TTL idle-reap candidate list).
-fn idle_older_than(inner: &RegistryInner, cutoff_ms: u64) -> Vec<(AgentId, KillFn)> {
+fn idle_older_than(
+    inner: &RegistryInner,
+    cutoff_ms: u64,
+    pinned_cutoff_ms: u64,
+    keep_alive: Option<&KeepAliveFn>,
+) -> Vec<(AgentId, KillFn)> {
     let mut candidates: Vec<(AgentId, u64, KillFn)> = inner
         .entries
         .iter()
-        .filter(|(_, e)| !e.is_active && e.last_active_ms <= cutoff_ms)
+        .filter(|(id, e)| ttl_reapable(id, e, cutoff_ms, pinned_cutoff_ms, keep_alive))
         .map(|(id, e)| (id.clone(), e.last_active_ms, e.kill.clone()))
         .collect();
     candidates.sort_by_key(|(_, ms, _)| *ms);
@@ -1020,28 +1079,32 @@ fn idle_older_than(inner: &RegistryInner, cutoff_ms: u64) -> Vec<(AgentId, KillF
 /// Idle entries ordered for the budget drain (monorepo#2063 level 2): largest
 /// attributed subtree first (Phase A attribution), ties and unattributed
 /// entries (charged 0 by the sort) falling back to least-recently-used first —
-/// so with no attribution at all the order degrades to plain LRU.
+/// so with no attribution at all the order degrades to plain LRU. Agents the
+/// keep-alive predicate pins (running provider workers) sort after every
+/// unpinned candidate, whatever their size.
 fn idle_largest_first(
     inner: &RegistryInner,
     samples: &HashMap<AgentId, u64>,
+    keep_alive: Option<&KeepAliveFn>,
 ) -> Vec<(AgentId, KillFn)> {
-    let mut candidates: Vec<(AgentId, u64, u64, KillFn)> = inner
+    let mut candidates: Vec<(AgentId, bool, u64, u64, KillFn)> = inner
         .entries
         .iter()
         .filter(|(_, e)| !e.is_active)
         .map(|(id, e)| {
             (
                 id.clone(),
+                keep_alive.is_some_and(|f| f(id)),
                 samples.get(id).copied().unwrap_or(0),
                 e.last_active_ms,
                 e.kill.clone(),
             )
         })
         .collect();
-    candidates.sort_by(|a, b| b.1.cmp(&a.1).then(a.2.cmp(&b.2)));
+    candidates.sort_by(|a, b| a.1.cmp(&b.1).then(b.2.cmp(&a.2)).then(a.3.cmp(&b.3)));
     candidates
         .into_iter()
-        .map(|(id, _, _, kill)| (id, kill))
+        .map(|(id, _, _, _, kill)| (id, kill))
         .collect()
 }
 
@@ -1365,6 +1428,10 @@ pub struct ProcessRegistry {
     /// Optional callback for lifecycle events (queue/resume/evict). Wired by the
     /// manager to publish events + log; the registry stays testable without it.
     event_fn: Option<ProcessEventFn>,
+    /// Optional "has a running provider worker" predicate ([`KeepAliveFn`]),
+    /// wired by the manager to the §5.5b worker projections. Not installed
+    /// leaves every eviction path byte-for-byte the pre-keep-alive behaviour.
+    keep_alive: Option<KeepAliveFn>,
     event_tasks: crate::delivery_tasks::DeliveryTasks,
     /// Optional aggregate memory budget, installed once by the composition root
     /// when `agents.memoryBudgetMb` resolves to a positive budget (auto, the
@@ -1426,6 +1493,7 @@ impl ProcessRegistry {
             cap: cap.max(1),
             inner: Mutex::new(RegistryInner::default()),
             event_fn: None,
+            keep_alive: None,
             event_tasks: crate::delivery_tasks::DeliveryTasks::default(),
             memory: std::sync::OnceLock::new(),
         }
@@ -1546,6 +1614,13 @@ impl ProcessRegistry {
     /// `(agent_id, event_type, used, cap, reason)` — see [`ProcessEventFn`].
     pub(crate) fn with_event_fn(mut self, f: ProcessEventFn) -> Self {
         self.event_fn = Some(f);
+        self
+    }
+
+    /// Attach the running-worker keep-alive predicate ([`KeepAliveFn`]).
+    /// Chainable builder, like [`Self::with_event_fn`].
+    pub(crate) fn with_keep_alive_fn(mut self, f: KeepAliveFn) -> Self {
+        self.keep_alive = Some(f);
         self
     }
 
@@ -1823,7 +1898,7 @@ impl ProcessRegistry {
                     self.budget_adjust(&mut inner, 1);
                     Action::Slot
                 } else if let Some(candidates) = (!forced_wait)
-                    .then(|| lru_idle_ordered(&inner, None))
+                    .then(|| lru_idle_ordered(&inner, None, self.keep_alive.as_ref()))
                     .filter(|c| !c.is_empty())
                 {
                     Action::Evict(candidates, reason)
@@ -2012,7 +2087,7 @@ impl ProcessRegistry {
                     let candidates = if forced_wait {
                         Vec::new()
                     } else {
-                        lru_idle_ordered(&inner, Some(agent_id))
+                        lru_idle_ordered(&inner, Some(agent_id), self.keep_alive.as_ref())
                     };
                     if candidates.is_empty() {
                         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -2167,7 +2242,7 @@ impl ProcessRegistry {
         let max = max.unwrap_or(usize::MAX);
         let candidates = {
             let inner = self.inner.lock().unwrap();
-            lru_idle_ordered(&inner, None)
+            lru_idle_ordered(&inner, None, self.keep_alive.as_ref())
         };
         let mut evicted = 0;
         for (id, kill) in candidates {
@@ -2227,9 +2302,12 @@ impl ProcessRegistry {
         R: Fn(&AgentId),
     {
         let cutoff = now_ms().saturating_sub(u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX));
+        let pinned_cutoff = cutoff
+            .saturating_sub(u64::try_from(WORKER_KEEPALIVE_CAP.as_millis()).unwrap_or(u64::MAX));
+        let keep_alive = self.keep_alive.as_ref();
         let candidates = {
             let inner = self.inner.lock().unwrap();
-            idle_older_than(&inner, cutoff)
+            idle_older_than(&inner, cutoff, pinned_cutoff, keep_alive)
         };
         let mut evicted = 0;
         for (id, kill) in candidates {
@@ -2239,14 +2317,15 @@ impl ProcessRegistry {
             // Re-validate under the registry lock: the candidate snapshot is
             // stale by the time earlier kills in this sweep have awaited, so
             // the entry may have run a whole turn (fresh `last_active_ms`),
-            // be actively streaming again, or be gone. With the claim held
-            // nothing can start new work on it after this check.
+            // be actively streaming again, have started a worker, or be gone.
+            // With the claim held nothing can start new work on it after this
+            // check.
             let still_stale = {
                 let inner = self.inner.lock().unwrap();
                 inner
                     .entries
                     .get(&id)
-                    .is_some_and(|e| !e.is_active && e.last_active_ms <= cutoff)
+                    .is_some_and(|e| ttl_reapable(&id, e, cutoff, pinned_cutoff, keep_alive))
             };
             if !still_stale {
                 release(&id);
@@ -2323,7 +2402,10 @@ impl ProcessRegistry {
                 .get()
                 .map(|b| b.probe.agent_samples())
                 .unwrap_or_default();
-            (idle_largest_first(&inner, &samples), samples)
+            (
+                idle_largest_first(&inner, &samples, self.keep_alive.as_ref()),
+                samples,
+            )
         };
         let mut evicted = 0;
         for (id, kill) in candidates {
@@ -3009,9 +3091,18 @@ impl AgentManager {
             })
         });
 
+        // Keep idle agents with running provider workers (§5.5b) out of the
+        // TTL sweep and last in pressure eviction.
+        let workers = services.agent_workers.clone();
+        let keep_alive: KeepAliveFn = Arc::new(move |id| workers.has_running_workers(id));
+
         Self {
             services,
-            registry: Arc::new(ProcessRegistry::new(cap).with_event_fn(event_fn)),
+            registry: Arc::new(
+                ProcessRegistry::new(cap)
+                    .with_event_fn(event_fn)
+                    .with_keep_alive_fn(keep_alive),
+            ),
             handles: Arc::new(Mutex::new(HashMap::new())),
             sink,
             permissions: Arc::new(PermissionRegistry::new()),
@@ -3447,6 +3538,9 @@ impl AgentManager {
             })
             .with_original_services(original_services, session.clone())
         };
+        // Prompt envelopes use the original physical confirmation even when a
+        // provider has no callback-registration or session-MCP capability.
+        repository_origin.configure_prompt_source(server_blueprint.clone());
         let mut server = server_blueprint.server();
         if let Some(context) = repository_origin.pending_callback() {
             server = server.with_request_context(Arc::new(context));
@@ -3665,7 +3759,11 @@ impl AgentManager {
 
         let (req_tx, mut req_rx) = mpsc::unbounded_channel::<IncomingRequest>();
         let (note_tx, note_rx) = mpsc::unbounded_channel::<IncomingNotification>();
+        // §5.5b: worker reports bypass the turn router (and the idle wake
+        // listener) into this outer connection's own generation.
+        let (worker_tx, worker_rx) = mpsc::unbounded_channel::<intent_acp::workers::WorkerFrame>();
         let hooks = ConnectionHooks {
+            workers: Some(worker_tx),
             auth_required_stdout_marker: (opts.provider.id == "antigravity")
                 .then_some(crate::antigravity::AUTH_REQUIRED_MARKER),
             requests: Some(req_tx),
@@ -3710,7 +3808,7 @@ impl AgentManager {
         {
             // A named profile resolves before account lookup; the spawn layer
             // applies the same overlay to the prepared command.
-            let context = crate::installed_cli::InstalledContext::discover_for(
+            let mut context = crate::installed_cli::InstalledContext::discover_for(
                 cli,
                 spawn_opts.profile_env.cloned().map(Arc::new),
             )
@@ -3721,16 +3819,17 @@ impl AgentManager {
                 let prepared = Arc::new(prepared);
                 let dependency =
                     crate::codex_diagnostics::process::ProbeDependency::hold(prepared.clone());
-                let (_, version) = context
-                    .observe_with_dependency(&prepared.command, Some(dependency))
-                    .await
-                    .map_err(Error::InvalidInput)?;
+                // A confirmed-old installed CLI switches the context to
+                // Intent's bundled copy; the launch is re-applied below.
                 context
-                    .validate_launch_version(&version)
-                    .map_err(Error::InvalidInput)?;
-                Arc::try_unwrap(prepared).map_err(|_| {
+                    .select_launch(&prepared.command, Some(dependency))
+                    .await
+                    .map_err(|error| Error::InvalidInput(error.to_string()))?;
+                let mut prepared = Arc::try_unwrap(prepared).map_err(|_| {
                     Error::Internal("installed CLI cleanup still owns the launch directory".into())
-                })
+                })?;
+                context.apply_selection(&mut prepared.command);
+                Ok::<_, Error>(prepared)
             })
             .await
             .map_err(|_| Error::Internal("installed CLI preparation task failed".into()))??;
@@ -3745,6 +3844,7 @@ impl AgentManager {
         // (a respawn installed a newer child with its own watcher).
         let child_pid = child.id();
         let connection = Arc::new(connection);
+        let worker_connection = Arc::downgrade(&connection);
 
         let terminal_host: Arc<dyn intent_acp::TerminalHost> =
             Arc::new(crate::PtyTerminalHost::with_shell_mode(
@@ -3849,6 +3949,7 @@ impl AgentManager {
         // the install is refused here (fresh child killed below); handle
         // installed first → `stop_many`'s detach finds it and kills it with
         // the batch. Either interleaving leaves no orphaned process.
+        let mut worker_rx = Some(worker_rx);
         let fenced = {
             let closed = self.admission_closed.lock().unwrap();
             let retired = self.retired.lock().unwrap();
@@ -3868,6 +3969,21 @@ impl AgentManager {
                             Arc::downgrade(&repository_origin),
                         ),
                     );
+                    // §5.5b: the worker generation starts atomically with the
+                    // install, under the same locks a teardown fence takes, so
+                    // a concurrent stop/detach either never sees this handle
+                    // or releases this generation after it exists. Reports
+                    // buffer in the channel until the drain starts.
+                    if let Some(frames) = worker_rx.take() {
+                        self.begin_worker_generation(
+                            &workspace_id,
+                            &agent_id,
+                            opts.profile_env
+                                .map_or(opts.provider.id, intent_acp::ProfileEnv::provider_ref),
+                            worker_connection.clone(),
+                            frames,
+                        );
+                    }
                     None
                 } else {
                     Some(handle)
@@ -4120,6 +4236,69 @@ impl AgentManager {
         cwd: PathBuf,
         provider: &ProviderConfig,
     ) -> Result<StartedSession> {
+        // Boxed: keeps the caller's session-open future frame unchanged.
+        let started = Box::pin(self.start_session_opened(agent_id, cwd, provider)).await?;
+        let workers = self.services.agent_workers();
+        if let Some(generation) = started
+            .turn
+            .connection
+            .as_ref()
+            .and_then(|conn| workers.generation_for(agent_id, conn))
+        {
+            if let Some(snapshot) = workers.bind_session(agent_id, &generation, &started.session_id)
+            {
+                self.services.publish_workers_snapshot(snapshot);
+            }
+        }
+        Ok(started)
+    }
+
+    /// Start a §5.5b worker generation for a freshly spawned outer connection
+    /// and drain its diverted worker reports until the reader closes, which
+    /// marks the generation disconnected.
+    fn begin_worker_generation(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        provider: &str,
+        connection: std::sync::Weak<Connection>,
+        mut frames: mpsc::UnboundedReceiver<intent_acp::workers::WorkerFrame>,
+    ) {
+        let generation = Uuid::new_v4().to_string();
+        let snapshot = self.services.agent_workers().begin(
+            crate::agent_workers::Scope {
+                workspace_id: workspace_id.clone(),
+                agent_id: agent_id.clone(),
+                provider: provider.to_owned(),
+                acp_session_id: None,
+                connection_generation: Some(generation.clone()),
+            },
+            &crate::agent_workers::AdapterIdentity::default(),
+            false,
+            connection,
+        );
+        self.services.publish_workers_snapshot(snapshot);
+        let services = self.services.clone();
+        let agent = agent_id.clone();
+        intent_core::spawn_daemon(async move {
+            while let Some(frame) = frames.recv().await {
+                if let Some(snapshot) = services.agent_workers().ingest(&agent, &generation, &frame)
+                {
+                    services.publish_workers_snapshot(snapshot);
+                }
+            }
+            if let Some(snapshot) = services.agent_workers().disconnect(&agent, &generation) {
+                services.publish_workers_snapshot(snapshot);
+            }
+        });
+    }
+
+    async fn start_session_opened(
+        &self,
+        agent_id: &AgentId,
+        cwd: PathBuf,
+        provider: &ProviderConfig,
+    ) -> Result<StartedSession> {
         let (
             conn,
             runtime,
@@ -4187,6 +4366,22 @@ impl AgentManager {
             negotiated.map_err(|e| Error::Internal(format!("handshake failed: {e}")))?;
         let callbacks = negotiated.callbacks;
         let handshake = negotiated.ordinary;
+        {
+            let workers = self.services.agent_workers();
+            if let Some(generation) = workers.generation_for(agent_id, &conn) {
+                let info = serde_json::to_value(&handshake.initialize.agent_info).ok();
+                let identity =
+                    crate::agent_workers::AdapterIdentity::from_initialize(info.as_ref());
+                if let Some(snapshot) = workers.negotiate(
+                    agent_id,
+                    &generation,
+                    &identity,
+                    provider.requests_agent_workers,
+                ) {
+                    self.services.publish_workers_snapshot(snapshot);
+                }
+            }
+        }
 
         // Per the ACP schema, http/sse `McpServer` entries are only valid when
         // the agent advertised `mcpCapabilities.http`/`sse` in `initialize` —
@@ -5292,12 +5487,16 @@ impl AgentManager {
     /// * Fires only on the agent's **first** turn — detected by the absence of
     ///   any prior `assistant` message in the persisted transcript.
     /// * Agent naming fires only for generated generic/specialist placeholders
-    ///   whose name was not explicitly set. Intentional task names are retained.
+    ///   whose name was not explicitly set — plus, in the Assistant (chief)
+    ///   workspace, the chat placeholders ([`is_assistant_chat_placeholder_name`]),
+    ///   so Assistant chats name themselves like workspace agents. Intentional
+    ///   task names are retained.
     ///   It uses the provider-correct workspace API MCP tool to call
     ///   `ws.workspace.setAgentName`.
     /// * Workspace naming fires only when the workspace lookup succeeds AND
     ///   the current title is empty/whitespace or still shaped like an
-    ///   auto-generated slug ([`intent_core::slug::is_workspace_slug`]).
+    ///   auto-generated slug ([`intent_core::slug::is_workspace_slug`]), and
+    ///   never for the virtual Assistant workspace.
     /// * Workspace naming names the concrete daemon tool the session's
     ///   provider surfaces (see [`workspace_naming_tool_reference`]).
     async fn build_first_turn_naming_instruction(
@@ -5321,15 +5520,20 @@ impl AgentManager {
             if s.name_explicitly_set {
                 return false;
             }
+            if workspace_id.is_chief() && is_assistant_chat_placeholder_name(&s.name) {
+                return true;
+            }
             let specialist_name = self
                 .services
                 .session_specialist_display_name(s, workspace_path.as_deref());
             is_generated_agent_name(&s.name, specialist_name.as_deref())
         });
-        let needs_workspace_title = workspace.as_ref().is_some_and(|workspace| {
-            let title = workspace.title.trim();
-            title.is_empty() || is_workspace_slug(title)
-        });
+        // The Assistant workspace is virtual and has no user-facing title.
+        let needs_workspace_title = !workspace_id.is_chief()
+            && workspace.as_ref().is_some_and(|workspace| {
+                let title = workspace.title.trim();
+                title.is_empty() || is_workspace_slug(title)
+            });
         if !needs_agent_name && !needs_workspace_title {
             return None;
         }
@@ -6047,6 +6251,11 @@ impl AgentManager {
             if !repository_origin::is_current(&self.handles, agent_id, original) {
                 return (false, None);
             }
+        }
+        // §5.5b: the provider tree (and every worker in it) goes with the
+        // handle, so its worker generation is released, not left unknown.
+        if let Some(snapshot) = self.services.agent_workers().release(agent_id) {
+            self.services.publish_workers_snapshot(snapshot);
         }
         // Pin the live-turn slot BEFORE aborting the worker (the abort drops
         // LiveTurnGuard; the pin keeps the slot published until the flush
@@ -12324,9 +12533,12 @@ mod shutdown_writer_tests {
             () = std::future::ready(()) => {}
         }
         release.send(()).unwrap();
-        tokio::time::timeout(Duration::from_secs(10), shutdown)
-            .await
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            shutdown,
+        )
+        .await
+        .unwrap();
         let workspace = manager
             .services
             .store
@@ -12907,6 +13119,20 @@ pub(crate) fn is_generated_agent_name(name: &str, specialist_name: Option<&str>)
         || specialist_name.is_some_and(matches_base)
 }
 
+/// Whether `name` is a creation placeholder an Assistant (chief) chat carries
+/// before it is named: blank, the desktop "New chat" placeholder, or a legacy
+/// placeholder an older client may still create. Exact matches only — the
+/// cloudlands-fe display helper `isPlaceholderChiefThreadName` also treats a
+/// "New thread …" prefix as a placeholder, but only fresh chats reach the
+/// first-turn check, and a prefix would also catch intentional task names.
+/// Only consulted for chief-workspace sessions.
+pub(crate) fn is_assistant_chat_placeholder_name(name: &str) -> bool {
+    matches!(
+        name.trim(),
+        "" | "New chat" | "New chat with Assistant" | "New chat with Intent" | "Chief of Staff"
+    )
+}
+
 /// Provider-correct spelling of the workspace API MCP tool used for agent
 /// self-naming.
 pub(crate) fn agent_naming_tool_reference(provider_id: &str) -> &'static str {
@@ -13135,10 +13361,10 @@ fn resolve_spawn(
     // npx-only providers (claude-code, codex, pi) are spawned via
     // `npx -y <pinned package>`; auto-discovery (managed bin / PATH scan) is
     // skipped entirely. For providers that opt in
-    // (`npx_only_honors_path_override`; claude-code) a valid `providers.paths`
+    // (`npx_only_honors_path_override`; none today) a valid `providers.paths`
     // override (absolute, executable) is the one exception: it is exec'd
-    // directly in place of the pinned npx spawn (monorepo#4352); an invalid
-    // override — or any override for codex/pi — is ignored.
+    // directly in place of the pinned npx spawn (monorepo#4352); otherwise
+    // any override is ignored. Tests use `test_support::provider_installed`.
     if provider.npx_only_package.is_some() {
         let explicit_path = read_provider_path_setting(settings, &provider_id);
         if let Some(binary) =
@@ -13167,12 +13393,15 @@ fn resolve_spawn(
         } else {
             intent_providers::find_npx()
         };
-        // Test-only: the `agent_ops::TEST_RUNNABLE_PATH` marker stands in for
-        // a host npx so pure resolution tests do not depend on Node/npx.
+        // Test-only: a provider marked by `test_support::provider_installed`
+        // gets a placeholder npx, so pure resolution tests do not depend on
+        // the host's Node/npx.
         #[cfg(test)]
         let npx = npx.or_else(|| {
-            (read_provider_path_setting(settings, provider.id).as_deref()
-                == Some(crate::agent_ops::TEST_RUNNABLE_PATH))
+            crate::test_support::provider_installed::is_marked(
+                &settings.providers.paths,
+                provider.id,
+            )
             .then(|| std::path::PathBuf::from("npx"))
         });
         let (npx_binary, npx_package) = resolve_npx_only(&provider, npx)?;
@@ -16859,7 +17088,7 @@ mod npx_launch_dir_lifetime_tests {
         *svc.secrets.writer_drain_pending.lock().unwrap() = Some(tx);
         let owner = mgr.clone();
         let mut shutdown = intent_core::spawn_daemon(async move { owner.shutdown().await });
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(intentd_test_support::test_timeout(Duration::from_secs(5)), async {
             tokio::select! {
                 result = pending => assert_eq!(result.unwrap(), "process-registry"),
                 result = &mut shutdown => { result.unwrap(); panic!("shutdown omitted removed physical cleanup"); }
@@ -16867,32 +17096,35 @@ mod npx_launch_dir_lifetime_tests {
         }).await.unwrap();
         assert!(pid_alive(tree.grandchild));
         release.send(()).unwrap();
-        tokio::time::timeout(Duration::from_secs(10), async {
-            shutdown.await.unwrap();
-            // These are synchronous shutdown postconditions: orphan-PID
-            // polling below must not hide delayed resource/registry cleanup.
-            assert!(!pid_alive(leader.cast_signed()));
-            assert!(
-                !pid_alive(tree.grandchild),
-                "grandchild {} alive after shutdown; launch_dir_exists={}",
-                tree.grandchild,
-                tree.launch_path.exists()
-            );
-            assert!(!tree.launch_path.exists());
-            // An aborted acquire skips its existing post-kill deregistration.
-            // Preserve that stale in-memory slot: late ID-only removal could
-            // erase a replacement runtime. The watcher deregisters first.
-            assert_eq!(mgr.registry.is_registered(&agent_id), !unexpected);
-            // Live descendants must be gone before shutdown returns. A dead
-            // orphan may still retain its PID until init reaps it; observe
-            // that retirement within the SAME total shutdown budget. Use
-            // signal 0 because pid_alive deliberately treats zombies as dead.
-            while nix::sys::signal::kill(nix::unistd::Pid::from_raw(tree.grandchild), None)
-                != Err(nix::errno::Errno::ESRCH)
-            {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                shutdown.await.unwrap();
+                // These are synchronous shutdown postconditions: orphan-PID
+                // polling below must not hide delayed resource/registry cleanup.
+                assert!(!pid_alive(leader.cast_signed()));
+                assert!(
+                    !pid_alive(tree.grandchild),
+                    "grandchild {} alive after shutdown; launch_dir_exists={}",
+                    tree.grandchild,
+                    tree.launch_path.exists()
+                );
+                assert!(!tree.launch_path.exists());
+                // An aborted acquire skips its existing post-kill deregistration.
+                // Preserve that stale in-memory slot: late ID-only removal could
+                // erase a replacement runtime. The watcher deregisters first.
+                assert_eq!(mgr.registry.is_registered(&agent_id), !unexpected);
+                // Live descendants must be gone before shutdown returns. A dead
+                // orphan may still retain its PID until init reaps it; observe
+                // that retirement within the SAME total shutdown budget. Use
+                // signal 0 because pid_alive deliberately treats zombies as dead.
+                while nix::sys::signal::kill(nix::unistd::Pid::from_raw(tree.grandchild), None)
+                    != Err(nix::errno::Errno::ESRCH)
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            },
+        )
         .await
         .unwrap();
         assert!(!pid_alive(tree.grandchild));
@@ -17054,7 +17286,8 @@ mod npx_launch_dir_lifetime_tests {
         let _ends =
             install_fake_handle_with_launch_dir(&mgr, &agent_id, Some(child), Some(launch_dir));
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline =
+            std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(10));
         while !marker.exists() {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -17194,7 +17427,8 @@ mod npx_launch_dir_lifetime_tests {
     }
 
     async fn wait_for_file(path: &Path, what: &str) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_secs(10));
         while !path.exists() {
             assert!(
                 tokio::time::Instant::now() < deadline,
@@ -17207,7 +17441,8 @@ mod npx_launch_dir_lifetime_tests {
 
     async fn read_grandchild_pid(pidfile: &Path) -> i32 {
         wait_for_file(pidfile, "grandchild pidfile").await;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_secs(10));
         loop {
             if let Ok(pid) = std::fs::read_to_string(pidfile)
                 .unwrap_or_default()
@@ -17275,7 +17510,8 @@ mod npx_launch_dir_lifetime_tests {
     /// The launch dir must exist for as long as the discoverable tree is
     /// live, and be gone once the bounded kill has swept it.
     async fn assert_dir_outlives_tree(tree: &Tree, what: &str) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_secs(10));
         while pid_alive(tree.grandchild) {
             assert!(
                 tree.launch_path.is_dir(),
@@ -18020,6 +18256,114 @@ mod role_reminder_tests {
         );
         assert!(!later.contains("ws.workspace.setAgentName"));
         assert!(later.ends_with("later"));
+    }
+
+    /// Seed an Assistant (chief) chat session alongside the default fixture.
+    async fn insert_assistant_chat(
+        mgr: &AgentManager,
+        name: &str,
+        explicitly_set: bool,
+    ) -> AgentId {
+        let agent_id = AgentId::from("assistant-chat-1");
+        let mut chat = session(&agent_id, &WorkspaceId::chief(), Some("chief-of-staff"));
+        chat.name = name.to_string();
+        chat.name_explicitly_set = explicitly_set;
+        mgr.services
+            .store
+            .insert_agent_session(&chat)
+            .await
+            .expect("insert assistant chat");
+        agent_id
+    }
+
+    #[tokio::test]
+    async fn assistant_chat_placeholder_names_receive_agent_naming_instruction() {
+        for name in [
+            "New chat",
+            "  New chat  ",
+            "",
+            "New chat with Assistant",
+            "New chat with Intent",
+            "Chief of Staff",
+        ] {
+            let (mgr, _agent, _db) = manager_with(None, None).await;
+            let agent_id = insert_assistant_chat(&mgr, name, false).await;
+            let instruction = mgr
+                .build_first_turn_naming_instruction(&agent_id, &WorkspaceId::chief())
+                .await
+                .unwrap_or_else(|| panic!("Assistant placeholder {name:?} needs a name"));
+            assert!(
+                instruction.contains("ws.workspace.setAgentName"),
+                "{name:?}: {instruction}"
+            );
+            assert!(
+                !instruction.contains("This workspace needs a title"),
+                "the Assistant workspace is never retitled: {instruction}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn assistant_chat_naming_instruction_is_first_turn_only() {
+        let (mgr, _agent, _db) = manager_with(None, None).await;
+        let agent_id = insert_assistant_chat(&mgr, "New chat", false).await;
+        let chief = WorkspaceId::chief();
+        let first = prompt_text(
+            &mgr.build_turn_prompt(&agent_id, &chief, "first", &TurnOptions::default())
+                .await
+                .unwrap(),
+        );
+        assert!(first.contains("ws.workspace.setAgentName"));
+        mgr.services
+            .store
+            .append_agent_message(
+                &agent_id,
+                "assistant",
+                &serde_json::json!([{ "type": "text", "text": "ready" }]),
+                &now_iso(),
+            )
+            .await
+            .expect("assistant message");
+        let later = prompt_text(
+            &mgr.build_turn_prompt(&agent_id, &chief, "later", &TurnOptions::default())
+                .await
+                .unwrap(),
+        );
+        assert!(!later.contains("ws.workspace.setAgentName"));
+    }
+
+    #[tokio::test]
+    async fn named_assistant_chats_do_not_receive_agent_naming_instruction() {
+        for (name, explicitly_set) in [
+            ("New chat", true),
+            ("Quarterly planning", true),
+            ("Quarterly planning", false),
+            ("New chats digest", false),
+            ("New thread pool for workers", false),
+        ] {
+            let (mgr, _agent, _db) = manager_with(None, None).await;
+            let agent_id = insert_assistant_chat(&mgr, name, explicitly_set).await;
+            assert!(
+                mgr.build_first_turn_naming_instruction(&agent_id, &WorkspaceId::chief())
+                    .await
+                    .is_none(),
+                "preserve Assistant chat name {name:?} (explicit: {explicitly_set})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn assistant_placeholder_names_stay_intentional_in_regular_workspaces() {
+        for name in ["New chat", "Chief of Staff", "New thread 1"] {
+            let (mgr, agent_id, _db) = manager_with(None, None).await;
+            configure_agent_name(&mgr, &agent_id, name, false, None).await;
+            assert!(
+                mgr.build_first_turn_naming_instruction(&agent_id, &WorkspaceId::from("ws-1"))
+                    .await
+                    .is_none(),
+                "workspace agent named {name:?} keeps its name"
+            );
+        }
     }
 
     /// `stop()` clears `recreated`/`prepend_pending` (stale-flag hygiene) but
@@ -19057,7 +19401,7 @@ mod role_reminder_tests {
                 calls
             });
             let outcome = tokio::time::timeout(
-                Duration::from_secs(2),
+                intentd_test_support::test_timeout(Duration::from_secs(2)),
                 mgr.maybe_apply_session_model(
                     &connection,
                     &agent_id,
@@ -19563,7 +19907,8 @@ mod dead_child_respawn_tests {
         // The child exits on its own; once `try_wait` observes that, the
         // mapping must be gone. Poll up to a deadline — the exit is quick
         // but not synchronous with the spawn returning.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline =
+            std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(5));
         while !mgr.agent_root_pids().is_empty() {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -22128,11 +22473,14 @@ mod cancel_and_settle_tests {
 
         // The cancel frame reached the agent side of the pipe.
         let mut lines = BufReader::new(c2a_agent).lines();
-        let line = tokio::time::timeout(Duration::from_secs(2), lines.next_line())
-            .await
-            .expect("frame arrives")
-            .expect("read ok")
-            .expect("one frame");
+        let line = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            lines.next_line(),
+        )
+        .await
+        .expect("frame arrives")
+        .expect("read ok")
+        .expect("one frame");
         let frame: serde_json::Value = serde_json::from_str(&line).expect("valid JSON-RPC frame");
         assert_eq!(frame["method"], "session/cancel");
         assert_eq!(frame["params"]["sessionId"], "acp-1");
@@ -23751,6 +24099,10 @@ mod legacy_identity_tests;
 #[cfg(all(test, unix))]
 #[path = "agent_manager/fast_mode_tests.rs"]
 mod fast_mode_tests;
+
+#[cfg(test)]
+#[path = "agent_manager/future_size_tests.rs"]
+mod future_size_tests;
 
 /// Persistent launches under a named profile (PROTOCOL §5.54): the frozen
 /// command carries the profile over inherited and captured values, never over

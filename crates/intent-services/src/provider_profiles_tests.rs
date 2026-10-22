@@ -120,10 +120,13 @@ fn data_code(err: &Error) -> String {
 
 async fn recv_profiles_event(sub: &mut Subscription) -> Value {
     loop {
-        let batch = tokio::time::timeout(Duration::from_secs(5), sub.recv())
-            .await
-            .expect("event delivered")
-            .expect("subscription open");
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            sub.recv(),
+        )
+        .await
+        .expect("event delivered")
+        .expect("subscription open");
         for event in batch {
             let ev = serde_json::to_value(&event).unwrap();
             if ev["type"] == intent_core::events::PROVIDERS_PROFILES_CHANGED {

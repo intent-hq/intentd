@@ -28,10 +28,13 @@ fn mock_fe_replies_with(
     reply: Value,
 ) -> tokio::task::JoinHandle<Value> {
     tokio::spawn(async move {
-        let frame = tokio::time::timeout(Duration::from_secs(2), out_rx.recv())
-            .await
-            .expect("daemon did not forward a reverse RPC within 2s")
-            .expect("daemon forwarded a reverse RPC");
+        let frame = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            out_rx.recv(),
+        )
+        .await
+        .expect("daemon did not forward a reverse RPC within 2s")
+        .expect("daemon forwarded a reverse RPC");
         let req: Value = serde_json::from_str(&frame).expect("valid JSON frame");
         let id = req["id"]
             .as_str()

@@ -177,7 +177,8 @@ pub struct SystemStatus {
 
 /// The idle-triggered update check state for `system.status`: the daemon
 /// asks its supervising sitter for an idle-mode update check (SIGUSR2) while
-/// no turn is in flight, and exits for a staged update only once idle.
+/// no turn is in flight and no command script runs, and exits for a staged
+/// update only once idle (the script wait is bounded).
 /// Timestamps are RFC 3339 UTC strings, `None` (null on the wire) when unset.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IdleUpdateCheckStatus {
@@ -193,8 +194,15 @@ pub struct IdleUpdateCheckStatus {
     /// the requester is disabled.
     pub next_eligible_at: Option<String>,
     /// The sitter staged a newer version: the daemon exits for the restart
-    /// at the next moment no turn is in flight.
+    /// at the next moment no turn is in flight and no command script runs.
     pub restart_pending: bool,
+    /// Command-mode script runs in flight right now. They count as busy for
+    /// the handshake: no idle request is sent and a staged restart waits for
+    /// them (bounded; see `restart_deferred_until`). Services never count.
+    pub running_scripts: usize,
+    /// While a staged restart is pending and held by running command
+    /// scripts: when the daemon stops waiting for them and restarts anyway.
+    pub restart_deferred_until: Option<String>,
 }
 
 /// Live file-watch coverage for `system.status` (intent-hq/intent#3708):
@@ -315,6 +323,8 @@ pub(crate) enum SystemMethod {
         pid: Option<u64>,
         protocol: Option<String>,
         host: Option<String>,
+        path: Option<String>,
+        username: Option<String>,
     },
 }
 
@@ -375,6 +385,8 @@ pub(crate) fn classify(value: &Value) -> Option<SystemRequest> {
                 pid,
                 protocol: text("protocol"),
                 host: text("host"),
+                path: text("path"),
+                username: text("username"),
             }
         }
         _ => return None,
@@ -383,6 +395,73 @@ pub(crate) fn classify(value: &Value) -> Option<SystemRequest> {
         method,
         id_present: id_member.is_some(),
         id_echo: id_member.cloned().unwrap_or(Value::Null),
+    })
+}
+
+/// The existing GitHub branch keeps its exact resolver and scope. Other HTTPS
+/// helpers may use only an explicit path through the original local owner.
+pub(crate) fn gitlab_credential_query(
+    req: &SystemRequest,
+) -> Option<intent_core::gitlab_child_git::GitlabChildGitCredentialQuery> {
+    let SystemMethod::GitCredential {
+        pid,
+        protocol,
+        host,
+        path,
+        username,
+    } = &req.method
+    else {
+        return None;
+    };
+    if git_credential_scope_ok(protocol.as_deref(), host.as_deref()) {
+        return None;
+    }
+    let protocol = protocol.as_ref()?;
+    let host = host.as_ref()?;
+    let path = path.as_ref()?;
+    if !protocol.eq_ignore_ascii_case("https")
+        || host.len() > 2048
+        || path.len() > 4096
+        || username.as_ref().is_some_and(|s| s.len() > 256)
+    {
+        return None;
+    }
+    Some(
+        intent_core::gitlab_child_git::GitlabChildGitCredentialQuery {
+            pid: *pid,
+            protocol: protocol.clone(),
+            host: host.clone(),
+            path: path.clone(),
+            username: username.clone(),
+        },
+    )
+}
+
+/// Only called for actual UDS admission; the Services owner independently
+/// checks the captured local origin. The result uses ordinary private egress.
+pub(crate) async fn prepare_gitlab_credential(
+    req: SystemRequest,
+    query: intent_core::gitlab_child_git::GitlabChildGitCredentialQuery,
+    api: &dyn intent_core::WorkspaceApi,
+) -> Option<crate::router::PreparedReply> {
+    use intent_core::repository_request::RepositoryReadReplyKind;
+    let result = api.gitlab_child_git_credential(query).await;
+    if !req.id_present {
+        return None;
+    }
+    let (frame, kind) = match result {
+        Ok(result) => (
+            success_frame(&req.id_echo, &serde_json::json!(result)),
+            RepositoryReadReplyKind::Result,
+        ),
+        Err(error) => (
+            crate::router::delivery_error(&req.id_echo, error),
+            RepositoryReadReplyKind::ServiceError,
+        ),
+    };
+    Some(crate::router::PreparedReply {
+        frame,
+        service: Some((kind, req.id_echo)),
     })
 }
 
@@ -431,6 +510,8 @@ pub(crate) fn status_json(status: &SystemStatus, is_local: bool) -> Value {
             "lastRequestedAt": status.idle_update_check.last_requested_at,
             "nextEligibleAt": status.idle_update_check.next_eligible_at,
             "restartPending": status.idle_update_check.restart_pending,
+            "runningScripts": status.idle_update_check.running_scripts,
+            "restartDeferredUntil": status.idle_update_check.restart_deferred_until,
         },
         "host": {
             "os": status.os,
@@ -635,6 +716,7 @@ pub(crate) async fn handle(
             pid,
             protocol,
             host,
+            ..
         } => {
             // Defense in depth (monorepo#884): the daemon re-checks the
             // helper's scope gate, so an arbitrary local UDS caller cannot

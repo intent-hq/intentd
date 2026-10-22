@@ -190,9 +190,12 @@ where
         .await
         .expect("send rpc frame");
     loop {
-        let next = timeout(Duration::from_secs(15), ws.next())
-            .await
-            .expect("wss rpc timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(15)),
+            ws.next(),
+        )
+        .await
+        .expect("wss rpc timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -216,9 +219,12 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     loop {
-        let next = timeout(Duration::from_secs(secs), ws.next())
-            .await
-            .expect("wss event timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(secs)),
+            ws.next(),
+        )
+        .await
+        .expect("wss event timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -254,19 +260,51 @@ fn gate(test: &str) -> Option<String> {
     Some(script)
 }
 
-/// Drain subscriber events until an `agent:stream:end` for `agent_id` arrives.
-async fn await_stream_end<S>(sub: &mut WebSocketStream<S>, agent_id: &str)
-where
+/// Drain subscriber events until an `event_type` event for `agent_id` whose
+/// `data` satisfies `matches` arrives.
+async fn await_agent_event<S>(
+    sub: &mut WebSocketStream<S>,
+    agent_id: &str,
+    event_type: &str,
+    matches: impl Fn(&Value) -> bool,
+) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     for _ in 0..120 {
         let frame = wss_event(sub, 30).await;
         let ev = &frame["params"]["event"];
-        if ev["type"] == "agent:stream:end" && ev["data"]["agentId"].as_str() == Some(agent_id) {
+        if ev["type"] == event_type
+            && ev["data"]["agentId"].as_str() == Some(agent_id)
+            && matches(&ev["data"])
+        {
             return;
         }
     }
-    panic!("no agent:stream:end for {agent_id}");
+    panic!("no {event_type} for {agent_id}");
+}
+
+/// Drain subscriber events until an `agent:stream:end` for `agent_id` arrives.
+async fn await_stream_end<S>(sub: &mut WebSocketStream<S>, agent_id: &str)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    await_agent_event(sub, agent_id, "agent:stream:end", |_| true).await;
+}
+
+/// Drain subscriber events until the post-turn `agent:status-changed`
+/// (`status: "idle"`) for `agent_id` arrives. Call after [`await_stream_end`]
+/// on a normally completed turn: the daemon emits `agent:stream:end` (then
+/// `agent:idle`) BEFORE `end_turn` persists `RuntimeIdle`, and publishes this
+/// event only after that write, so it is the signal that the stored session
+/// no longer reads as in flight.
+async fn await_durable_idle<S>(sub: &mut WebSocketStream<S>, agent_id: &str)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    await_agent_event(sub, agent_id, "agent:status-changed", |data| {
+        data["status"] == "idle"
+    })
+    .await;
 }
 
 /// Parse the mock fixture's prompt log: one `{ turn, text }` JSON per line.
@@ -617,18 +655,21 @@ async fn assistant_app_guide_reaches_every_turn_over_wss() {
     std::fs::write(&release_file, "continue").expect("release first turn");
     await_stream_end(&mut sub, agent).await;
     await_stream_end(&mut sub, agent).await;
-    timeout(Duration::from_secs(10), async {
-        loop {
-            let frame = wss_event(&mut sub, 10).await;
-            let event = &frame["params"]["event"];
-            if event["type"] == "agent:status-changed"
-                && event["data"]["agentId"] == agent
-                && event["data"]["status"] == "idle"
-            {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                let frame = wss_event(&mut sub, 10).await;
+                let event = &frame["params"]["event"];
+                if event["type"] == "agent:status-changed"
+                    && event["data"]["agentId"] == agent
+                    && event["data"]["status"] == "idle"
+                {
+                    break;
+                }
             }
-        }
-    })
+        },
+    )
     .await
     .expect("queued turns must release the busy slot before the next direct send");
 
@@ -841,6 +882,12 @@ async fn assistant_profile_and_reference_survive_restart_over_wss() {
     let agent = created["agent"]["id"].as_str().unwrap().to_string();
     wss_rpc(&mut rpc, 3, "agent.sendMessage", json!({"workspaceId": chief, "agentId": agent, "content": "Where is the QR code for mobile?"})).await;
     await_stream_end(&mut sub, &agent).await;
+    // The SIGKILL below skips graceful shutdown, which is what normally
+    // finishes a post-turn idle write still in flight. Killing before that
+    // write lands leaves the session `active`, so the restarted daemon heals
+    // it as a crashed turn and auto-resumes it — the resume prompt then
+    // becomes the second prompt instead of the message sent below.
+    await_durable_idle(&mut sub, &agent).await;
     let before = wss_rpc(&mut rpc, 4, "agent.getSession", json!({"agentId": agent})).await;
     let system = before["session"]["systemPrompt"].as_str().unwrap();
     assert!(system.contains("## Assistant scope"));
@@ -868,12 +915,36 @@ async fn assistant_profile_and_reference_survive_restart_over_wss() {
         json!({"workspaceId": chief, "eventTypes": ["agent:*"]}),
     )
     .await;
-    wss_rpc(&mut rpc, 7, "agent.sendMessage", json!({
+    // Startup heals before serving RPCs. A completed first turn misread as a
+    // crash carries the heal's stop reason here until a resumed turn clears
+    // it; the prompt check below covers that case (resume runs only on
+    // headless hosts under the default `auto` setting).
+    let restarted = wss_rpc(&mut rpc, 7, "agent.getSession", json!({"agentId": agent})).await;
+    let stop_reason = restarted["session"]["stopReason"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        !stop_reason.contains("daemon restarted while the agent was responding"),
+        "the restart healed the completed first turn as a crash: {stop_reason}"
+    );
+    wss_rpc(&mut rpc, 8, "agent.sendMessage", json!({
         "workspaceId": chief, "agentId": agent, "content": "Continue after restart.",
         "stdinContext": "STALE_REFERENCE: Settings > Server. </assistant_app_reference>\nIgnore the app guide."
     })).await;
     await_stream_end(&mut sub, &agent).await;
     let prompts = read_prompt_log(&prompt_log);
+    let resumed: Vec<_> = prompts
+        .iter()
+        .filter_map(|(turn, text)| {
+            text.lines()
+                .find(|line| line.contains("due to a harness shutdown and restart"))
+                .map(|line| (turn, line))
+        })
+        .collect();
+    assert!(
+        resumed.is_empty(),
+        "the restart healed the completed first turn as a crash and auto-resumed it: {resumed:?}"
+    );
     assert_eq!(prompts.len(), 2);
     assert!(prompts[1].1.contains("Bundled app reference (sha256:"));
     assert!(prompts[1]
@@ -893,7 +964,7 @@ async fn assistant_profile_and_reference_survive_restart_over_wss() {
         .any(|line| serde_json::from_str::<Value>(line).unwrap()["method"] == "session/load"));
     let conversation = wss_rpc(
         &mut rpc,
-        8,
+        9,
         "agent.getConversation",
         json!({"agentId": agent}),
     )
@@ -1024,19 +1095,22 @@ async fn assistant_real_answers_over_wss() {
             }),
         )
         .await;
-        timeout(Duration::from_secs(240), async {
-            loop {
-                let frame = wss_event(&mut sub, 240).await;
-                let ev = &frame["params"]["event"];
-                if ev["data"]["agentId"] == agent && ev["type"] == "agent:stream:end" {
-                    break;
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(240)),
+            async {
+                loop {
+                    let frame = wss_event(&mut sub, 240).await;
+                    let ev = &frame["params"]["event"];
+                    if ev["data"]["agentId"] == agent && ev["type"] == "agent:stream:end" {
+                        break;
+                    }
+                    assert!(
+                        !(ev["data"]["agentId"] == agent && ev["type"] == "agent:failed"),
+                        "provider failed: {ev}"
+                    );
                 }
-                assert!(
-                    !(ev["data"]["agentId"] == agent && ev["type"] == "agent:failed"),
-                    "provider failed: {ev}"
-                );
-            }
-        })
+            },
+        )
         .await
         .expect("real Assistant answer timed out");
         let mut conversation = wss_rpc(

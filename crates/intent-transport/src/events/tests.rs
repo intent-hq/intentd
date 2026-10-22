@@ -753,10 +753,13 @@ mod collaborator_fan_out {
         for _ in 0..2048 {
             let _ = h.bus.publish_transient(&event("note:updated", "foreign"));
         }
-        let frame = tokio::time::timeout(Duration::from_secs(2), h.rx.bulk.recv())
-            .await
-            .expect("loss must wake a quiet filtered stream")
-            .unwrap();
+        let frame = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            h.rx.bulk.recv(),
+        )
+        .await
+        .expect("loss must wake a quiet filtered stream")
+        .unwrap();
         let value: Value = serde_json::from_str(&frame).unwrap();
         assert_eq!(
             value,

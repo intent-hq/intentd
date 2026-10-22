@@ -1181,15 +1181,6 @@ pub(crate) fn resolve_disabled_provider_rehome(
     Some(DisabledProviderRehome { provider, model })
 }
 
-/// Test-only `providers.paths` value marking a base provider installed for
-/// [`ensure_provider_available`]. Codex and Claude Code are npx-only and ignore
-/// path overrides, so without it their availability follows the host's
-/// Node/npx. Being settings data, it reaches every call site (including the
-/// `spawn_blocking` delegate resolver) per `Services` instance, without
-/// mutating process-global `PATH`. The disabled and auth gates still run.
-#[cfg(test)]
-pub(crate) const TEST_RUNNABLE_PATH: &str = "intentd-test:runnable";
-
 /// Reject a known provider id that is disabled in settings, whose cached
 /// auth verdict is hard-false, or that the daemon's own provider discovery
 /// reports as unrunnable (not installed, or gated off by a missing env
@@ -1201,9 +1192,11 @@ pub(crate) const TEST_RUNNABLE_PATH: &str = "intentd-test:runnable";
 /// with its own distinct message. Mirrors `resolve_spawn`'s override-aware resolution
 /// (monorepo#1065) via [`intent_providers::provider_availability_for`], keyed
 /// by the same `providers.paths` settings, and aligns "installed" with what
-/// the spawn path can actually run: a provider whose only runnable path is
-/// its npx fallback (`fallback_npx_package`, e.g. codex) counts as runnable
-/// when npx resolves — exactly like `resolve_spawn`'s fallback tier.
+/// the spawn path can actually run. npx-only providers (Codex, Claude Code,
+/// Pi) are installed only when npx resolves and, for Codex and Claude Code,
+/// the real `codex` / `claude` CLI resolves too (`requires_secondary_binary`);
+/// a `providers.paths` override changes neither. Tests mark a provider
+/// installed with `test_support::provider_installed`, never with an override.
 pub(crate) fn ensure_provider_available(
     method: &str,
     provider_id: &str,
@@ -1215,19 +1208,19 @@ pub(crate) fn ensure_provider_available(
         provider_id,
         crate::provider_auth::cached_auth_verdict(provider_id),
     )?;
-    #[cfg(test)]
-    if providers
-        .paths
-        .get(intent_providers::base_provider_id(provider_id))
-        .is_some_and(|path| path == TEST_RUNNABLE_PATH)
-    {
-        return Ok(());
-    }
     // A profile shares its base provider's installation and paths.
     let availability = intent_providers::provider_availability_for(
         intent_providers::base_provider_id(provider_id),
         &|key| providers.paths.get(key).cloned(),
     );
+    // Test-only: a provider marked by `test_support::provider_installed`
+    // counts as installed; feature gating still applies.
+    #[cfg(test)]
+    let availability = availability.map(|mut availability| {
+        availability.installed |=
+            crate::test_support::provider_installed::is_marked(&providers.paths, provider_id);
+        availability
+    });
     ensure_provider_runnable(method, provider_id, availability, &|| {
         intent_providers::find_npx().is_some()
     })
@@ -10319,53 +10312,152 @@ impl Services {
             let Some(blocker_reason) = session.attention_request_reason.as_deref() else {
                 return Ok(result(false));
             };
-            let gate = self.attention_mutation_gates.for_agent(&caller);
-            let _guard = gate.lock().await;
             let saved_at = session.attention_request_timestamp.as_deref();
-            if !self.store.clear_blocker_request_if_matches(
-                &workspace_id, &caller, blocker_reason, saved_at, &now_iso(),
-            ).await? {
-                return Ok(result(false));
-            }
-            // Retire this blocker and older blocker raises only. Discussions
-            // and replacement generations remain independently actionable.
-            if let Ok(mut map) = self.deferred_attention.lock() {
-                if let Some(entries) = map.get_mut(&caller) {
-                    // The generation CAS succeeded while holding the raise
-                    // gate: every parked blocker precedes or is this request.
-                    // A newer raise cannot park until this guard is released.
-                    entries.retain(|entry| entry.meta_kind != "blocker-report");
-                    if entries.is_empty() { map.remove(&caller); }
+            let resolved = self
+                .clear_observed_blocker(&workspace_id, &caller, &session, blocker_reason, saved_at)
+                .await?;
+            Ok(result(resolved))
+        })
+        .await
+    }
+
+    /// Clear the blocker generation `(blocker_reason, saved_at)` observed on
+    /// `session` — the shared clearing path behind `ws.agent.resolveBlocker`
+    /// and the daemon's provider-stall auto-clear (intent-hq/intent#7182).
+    /// A replacement request (a newer blocker or a discussion) survives the
+    /// conditional write. On success: retires parked blocker surfacings,
+    /// emits `agent:updated` with `attentionRequestCleared: true`, resumes a
+    /// still-`blocked` linked task the agent is assigned to (terminal
+    /// statuses untouched), and recomputes the workspace displayStatus.
+    /// Returns whether the blocker was cleared.
+    async fn clear_observed_blocker(
+        &self,
+        workspace_id: &WorkspaceId,
+        caller: &AgentId,
+        session: &AgentSession,
+        blocker_reason: &str,
+        saved_at: Option<&str>,
+    ) -> Result<bool> {
+        let workspace_id = workspace_id.clone();
+        let caller = caller.clone();
+        let gate = self.attention_mutation_gates.for_agent(&caller);
+        let _guard = gate.lock().await;
+        if !self
+            .store
+            .clear_blocker_request_if_matches(
+                &workspace_id,
+                &caller,
+                blocker_reason,
+                saved_at,
+                &now_iso(),
+            )
+            .await?
+        {
+            return Ok(false);
+        }
+        // Retire this blocker and older blocker raises only. Discussions
+        // and replacement generations remain independently actionable.
+        if let Ok(mut map) = self.deferred_attention.lock() {
+            if let Some(entries) = map.get_mut(&caller) {
+                // The generation CAS succeeded while holding the raise
+                // gate: every parked blocker precedes or is this request.
+                // A newer raise cannot park until this guard is released.
+                entries.retain(|entry| entry.meta_kind != "blocker-report");
+                if entries.is_empty() {
+                    map.remove(&caller);
                 }
             }
-            self.publish_agent_mutation_event(
-                &workspace_id, &caller, intent_core::events::AGENT_UPDATED,
-                json!({ "agentId": caller.0, "attentionRequestCleared": true }),
-            ).await;
-            // Read the current task, then condition its write on both that
-            // revision and the session link in one SQLite statement. A note
-            // transition or a session-only relink wins before the write.
-            let current = self.store.get_agent_session_summary(&caller).await?;
-            if current.task_note_id == session.task_note_id {
-                if let Some(note_id) = &session.task_note_id {
-                    if let Ok(note) = crate::fetch_note(&self.store, &workspace_id, note_id).await {
-                        if note.metadata.task.as_ref().is_some_and(|task| {
-                            task.status == intent_core::TaskStatus::Blocked
-                                && task.assigned_agent_ids.contains(&caller)
-                        }) {
-                            if let Err(e) = self.set_task_note_status_guarded(
-                                &workspace_id, note_id, intent_core::TaskStatus::InProgress,
-                                Some(note.rev), Some(caller.clone()), Some(caller.clone()),
-                            ).await {
-                                tracing::warn!(error = %e, note = %note_id, "blocker recovery task transition skipped");
-                            }
+        }
+        self.publish_agent_mutation_event(
+            &workspace_id,
+            &caller,
+            intent_core::events::AGENT_UPDATED,
+            json!({ "agentId": caller.0, "attentionRequestCleared": true }),
+        )
+        .await;
+        // Read the current task, then condition its write on both that
+        // revision and the session link in one SQLite statement. A note
+        // transition or a session-only relink wins before the write.
+        let current = self.store.get_agent_session_summary(&caller).await?;
+        if current.task_note_id == session.task_note_id {
+            if let Some(note_id) = &session.task_note_id {
+                if let Ok(note) = crate::fetch_note(&self.store, &workspace_id, note_id).await {
+                    if note.metadata.task.as_ref().is_some_and(|task| {
+                        task.status == intent_core::TaskStatus::Blocked
+                            && task.assigned_agent_ids.contains(&caller)
+                    }) {
+                        if let Err(e) = self
+                            .set_task_note_status_guarded(
+                                &workspace_id,
+                                note_id,
+                                intent_core::TaskStatus::InProgress,
+                                Some(note.rev),
+                                Some(caller.clone()),
+                                Some(caller.clone()),
+                            )
+                            .await
+                        {
+                            tracing::warn!(error = %e, note = %note_id, "blocker recovery task transition skipped");
                         }
                     }
                 }
             }
-            self.maybe_emit_display_status_changed(&workspace_id).await;
-            Ok(result(true))
-        }).await
+        }
+        self.maybe_emit_display_status_changed(&workspace_id).await;
+        Ok(true)
+    }
+
+    /// Successful-turn hook (intent-hq/intent#7182): when the agent's
+    /// pending request is a daemon-raised provider-stall blocker — recognised
+    /// by its persisted reason, which starts with a daemon-reserved prefix
+    /// ([`crate::agent_session::is_daemon_stall_blocker_reason`]) — clear
+    /// that exact `(reason, savedAt)` generation through the
+    /// `resolveBlocker` path. Recognition reads the persisted row, so it
+    /// survives a daemon restart. Agent-raised blockers (whose reasons can
+    /// never carry the reserved prefixes) and discussions are untouched, and
+    /// the generation CAS leaves any newer request pending. Best-effort:
+    /// errors log and the turn proceeds.
+    pub(crate) async fn clear_daemon_stall_blocker_after_success(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+    ) {
+        let outcome = async {
+            let session = self.load_session_internal(agent_id).await?;
+            if session.workspace_id != *workspace_id
+                || session.attention_request_kind.as_deref() != Some("blocker")
+            {
+                return Ok(false);
+            }
+            let Some(reason) = session
+                .attention_request_reason
+                .as_deref()
+                .filter(|reason| crate::agent_session::is_daemon_stall_blocker_reason(reason))
+            else {
+                return Ok(false);
+            };
+            let _mutation = self.workspace_mutations.enter(workspace_id)?;
+            self.clear_observed_blocker(
+                workspace_id,
+                agent_id,
+                &session,
+                reason,
+                session.attention_request_timestamp.as_deref(),
+            )
+            .await
+        };
+        match crate::workspace_mutations::boxed(outcome).await {
+            Ok(true) => tracing::info!(
+                agent = %agent_id,
+                "provider-stall blocker cleared after a successful turn (intent#7182)"
+            ),
+            Ok(false) => {}
+            Err(e) => tracing::warn!(
+                agent = %agent_id,
+                error = %e,
+                "failed to clear provider-stall blocker after a successful turn (intent#7182)"
+            ),
+        }
     }
 
     /// Shared services op behind `ws.agent.requestDiscussion` /

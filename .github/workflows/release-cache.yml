@@ -33,6 +33,10 @@ concurrency:
 jobs:
   runner-route:
     uses: ./.github/workflows/runner-route.yml
+    with:
+      # Each heavy Linux sitter leg reads its own slot (see runner-route.yml).
+      slot_jobs: >-
+        [{"key":"sitter","label":"gh-linux-16x","rust":true,"minutes":20,"legs":["x86_64-unknown-linux-musl","aarch64-unknown-linux-musl"]}]
     permissions:
       contents: read
       actions: read
@@ -238,7 +242,7 @@ jobs:
         - target: x86_64-pc-windows-msvc
           os: gh-windows-16x
     needs: [runner-route]
-    runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')[matrix.os] || matrix.os }}
+    runs-on: ${{ contains(matrix.os, 'gh-linux') && fromJSON(needs.runner-route.outputs.slots || '{}')[format('sitter-{0}', matrix.target)] || fromJSON(needs.runner-route.outputs.runners || '{}')[matrix.os] || matrix.os }}
     timeout-minutes: 30
     env:
       TARGET: ${{ matrix.target }}

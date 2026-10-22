@@ -9,13 +9,35 @@ Run: python3 -I -B scripts/test-release-scripts-local.py   (needs PyYAML)
 import os
 from pathlib import Path
 import shutil
+import site
 import subprocess
 import sys
 import tempfile
 import textwrap
 import unittest
+import unittest.mock
 
 LOADER_PATH = ('LD_LIBRARY_PATH', 'DYLD_LIBRARY_PATH', 'DYLD_FALLBACK_LIBRARY_PATH')
+# Where the caller's PyYAML may live besides the system site.
+IMPORT_PATH = ('PYTHONPATH',)
+
+
+def child_env(bin_dir, home, **extra_env):
+    """Environment for a child runner: stub-only PATH, fixture HOME.
+
+    The loader path is forwarded so a toolcache python3 still starts
+    (intentd#2490). The fixture HOME would move Python's user site, so the
+    caller's user base is pinned and PYTHONPATH forwarded: a PyYAML installed
+    with `pip install --user` (or reached through PYTHONPATH) must stay
+    importable for the runner. `extra_env` overrides any of these.
+    """
+    environ = {key: os.environ[key] for key in LOADER_PATH + IMPORT_PATH if key in os.environ}
+    environ.update(PATH=str(bin_dir), HOME=str(home))
+    user_base = os.environ.get('PYTHONUSERBASE') or site.getuserbase()
+    if user_base:
+        environ['PYTHONUSERBASE'] = user_base
+    environ.update(extra_env)
+    return environ
 RUNNER = Path(__file__).resolve().with_name('release-scripts-local.py')
 
 CI = '''\
@@ -63,8 +85,6 @@ class RunnerTests(unittest.TestCase):
         self.bin.mkdir()
         for tool in ('bash', 'python3'):
             (self.bin / tool).symlink_to(shutil.which(tool) or sys.executable)
-        self.preload = self.temp / 'preload'
-        self.preload.write_text('')
         self.write('dist-workspace.toml', '[dist]\ncargo-dist-version = "0.32.0"\n')
         self.write('scripts/setup-sccache.py', 'VERSION = "0.17.0"\n')
         self.write('.github/workflows/ci.yml', CI)
@@ -89,15 +109,40 @@ class RunnerTests(unittest.TestCase):
         target.write_text(f'#!/usr/bin/env bash\necho "{version}"\n')
         target.chmod(0o755)
 
+    RUNNER_FLAGS = ('-B',)  # No -I/-s: they drop the user site the runner may need for PyYAML.
+
     def run_runner(self, *args, **extra_env):
-        # A minimal PATH isolates the stub tools; the loader path is forwarded so a
-        # toolcache python3 still starts (intentd#2490).
-        environ = {key: os.environ[key] for key in LOADER_PATH if key in os.environ}
-        environ.update(PATH=str(self.bin), HOME=str(self.temp),
-                       RELEASE_SCRIPTS_LOCAL_PRELOAD_FILE=str(self.preload), **extra_env)
-        # No -I: a user-site PyYAML must stay importable for the runner.
-        return subprocess.run([sys.executable, '-B', str(RUNNER), '--root', str(self.root), *args],
-                              env=environ, capture_output=True, text=True, timeout=60)
+        return subprocess.run([sys.executable, *self.RUNNER_FLAGS, str(RUNNER), '--root', str(self.root), *args],
+                              env=child_env(self.bin, self.temp, **extra_env),
+                              capture_output=True, text=True, timeout=60)
+
+    USER_SITE_PROBE = ('import site, sys; print(bool(site.ENABLE_USER_SITE), '
+                       'site.getusersitepackages() in sys.path, site.getusersitepackages())')
+
+    def probe_user_site(self, flags, env):
+        probe = subprocess.run([sys.executable, *flags, '-c', self.USER_SITE_PROBE],
+                               env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(probe.returncode, 0, probe.stderr)
+        enabled, on_path, path = probe.stdout.split(maxsplit=2)
+        return enabled, on_path, path.strip()
+
+    def test_child_runner_sees_the_same_user_site_as_a_plain_run(self):
+        # Reference: this interpreter run plainly in the caller's environment, as
+        # `make test-release-scripts` runs the runner. A virtual environment
+        # disables the user site there too, so only a difference is a failure.
+        plain_env = dict(os.environ)
+        plain_env.pop('PYTHONNOUSERSITE', None)
+        expected = self.probe_user_site((), plain_env)
+        actual = self.probe_user_site(self.RUNNER_FLAGS, child_env(self.bin, self.temp))
+        self.assertEqual(actual, expected, 'the fixture env changes where the runner finds user-site packages')
+
+    def test_child_env_forwards_import_path_and_accepts_overrides(self):
+        with unittest.mock.patch.dict(os.environ, {'PYTHONPATH': '/fixture/py', 'LD_LIBRARY_PATH': '/fixture/lib'}):
+            environ = child_env(self.bin, self.temp, PYTHONUSERBASE='/override', HOME='/h')
+        self.assertEqual(environ['PYTHONPATH'], '/fixture/py')
+        self.assertEqual(environ['LD_LIBRARY_PATH'], '/fixture/lib')
+        self.assertEqual(environ['PYTHONUSERBASE'], '/override')
+        self.assertEqual(environ['HOME'], '/h')
 
     def test_runs_every_test_line_in_ci_order_and_fails_on_a_real_failure(self):
         result = self.run_runner()
@@ -136,15 +181,14 @@ class RunnerTests(unittest.TestCase):
         result = self.run_runner('--list')
         self.assertIn('SKIP test-dist.sh: needs dist 0.32.0 (found 0.31.0)', result.stdout)
 
-    def test_host_rules_skip_old_sccache_and_a_global_preload(self):
+    def test_host_rules_skip_old_sccache(self):
         self.tool('sccache', 'sccache 0.7.7')
-        self.preload.write_text('/run/some/launcher.preload.so\n')
         result = self.run_runner()
         self.assertEqual(result.returncode, 1)
         self.assertIn('SKIP test-release-cache-smoke.py: needs sccache >= 0.17.0 (found 0.7.7)', result.stdout)
-        self.assertIn('SKIP test-changed-tests-stdin.py: needs a host without a global library preload', result.stdout)
         self.assertNotIn('ran test-release-cache-smoke.py', result.stdout)
-        self.assertIn('2 skipped', result.stdout)
+        self.assertIn('ran test-changed-tests-stdin.py', result.stdout)
+        self.assertIn('1 skipped', result.stdout)
 
     def test_sccache_bin_overrides_path_and_newer_sccache_runs(self):
         newer = self.temp / 'sccache-new'
@@ -154,17 +198,19 @@ class RunnerTests(unittest.TestCase):
         result = self.run_runner('--list', SCCACHE_BIN=str(newer))
         self.assertIn('RUN  test-release-cache-smoke.py', result.stdout)
 
-    def test_ld_preload_skips_the_stdin_suite(self):
+    def test_a_library_preload_does_not_skip_the_stdin_suite(self):
+        # The stdin suite checks only the files it creates, so a host preload
+        # that writes into TMPDIR (intentd#2516) is no reason to skip it.
         result = self.run_runner('--list', LD_PRELOAD='/nonexistent.so')
-        self.assertIn('SKIP test-changed-tests-stdin.py: needs a host without a global library preload, '
-                      'which writes files into TMPDIR (LD_PRELOAD is set)', result.stdout)
+        self.assertIn('RUN  test-changed-tests-stdin.py', result.stdout)
+        self.assertNotIn('SKIP test-changed-tests-stdin.py', result.stdout)
 
     def test_a_host_rule_for_a_removed_suite_is_a_setup_error(self):
-        self.write('.github/workflows/ci.yml', CI.replace('./scripts/test-changed-tests-stdin.py', ''))
+        self.write('.github/workflows/ci.yml', CI.replace('./scripts/test-release-cache-smoke.py', ''))
         result = self.run_runner('--list')
         self.assertEqual(result.returncode, 2)
         self.assertIn('HOST_RULES names suites no longer in job', result.stderr)
-        self.assertIn('test-changed-tests-stdin.py', result.stderr)
+        self.assertIn('test-release-cache-smoke.py', result.stderr)
 
     def ci_with(self, step):
         self.write('.github/workflows/ci.yml', CI + textwrap.indent(textwrap.dedent(step), '      '))
@@ -181,6 +227,31 @@ class RunnerTests(unittest.TestCase):
             ''')
         result = self.run_runner()
         self.assertIn('ran test-env.sh FOO=one BAR=two PWD=sub', result.stdout)
+
+    def git(self, *args):
+        # The caller's git config must not reach the fixture: a global ignore of
+        # __pycache__ would hide the very file the test looks for.
+        env = {key: value for key, value in os.environ.items()
+               if not key.startswith('GIT_') and key != 'XDG_CONFIG_HOME'}
+        env.update(HOME=str(self.temp), GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull)
+        config = ['-c', 'user.name=t', '-c', 'user.email=t@t', '-c', f'core.excludesFile={os.devnull}',
+                  '-c', 'commit.gpgsign=false']
+        return subprocess.run(['git', '-C', str(self.root), *config, *args],
+                              env=env, capture_output=True, text=True, check=True).stdout
+
+    def test_suites_leave_no_untracked_files(self):
+        # A suite that imports a sibling module would leave scripts/__pycache__
+        # behind, dirtying the caller's worktree (nothing git-ignores it there).
+        self.write('scripts/helper_module.py', 'VALUE = 1\n')
+        self.write('scripts/test-imports.py', 'import helper_module\nprint("ran test-imports.py", helper_module.VALUE)\n')
+        self.ci_with('- run: python3 scripts/test-imports.py\n')
+        self.git('init', '-q')
+        self.git('add', '-A')
+        self.git('commit', '-q', '-m', 'fixture')
+        result = self.run_runner()
+        self.assertIn('ran test-imports.py 1', result.stdout)
+        self.assertEqual(self.git('status', '--porcelain', '--untracked-files=all'), '',
+                         'a suite left files behind in the worktree')
 
     def test_steps_needing_ci_context_are_skipped(self):
         for step, reason in [

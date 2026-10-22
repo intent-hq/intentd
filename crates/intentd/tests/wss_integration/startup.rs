@@ -19,37 +19,45 @@ async fn barrier(listener: &UnixListener, stage: u8) -> UnixStream {
 }
 
 async fn call(ws: &mut Ws, method: &str, params: Value) -> Value {
-    timeout(Duration::from_secs(3), async {
-        ws.send(Message::Text(
-            json!({"jsonrpc":"2.0","id":41,"method":method,"params":params})
-                .to_string()
-                .into(),
-        ))
-        .await
-        .unwrap();
-        loop {
-            match ws.next().await {
-                Some(Ok(Message::Text(text))) => return serde_json::from_str(&text).unwrap(),
-                Some(Ok(Message::Ping(data))) => ws.send(Message::Pong(data)).await.unwrap(),
-                other => panic!("RPC response expected: {other:?}"),
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(3)),
+        async {
+            ws.send(Message::Text(
+                json!({"jsonrpc":"2.0","id":41,"method":method,"params":params})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => return serde_json::from_str(&text).unwrap(),
+                    Some(Ok(Message::Ping(data))) => ws.send(Message::Pong(data)).await.unwrap(),
+                    other => panic!("RPC response expected: {other:?}"),
+                }
             }
-        }
-    })
+        },
+    )
     .await
     .expect("startup RPC responds while preparation is blocked")
 }
 
 async fn uds_call(path: &Path, method: &str) -> Value {
-    timeout(Duration::from_secs(3), async {
-        let mut stream = UnixStream::connect(path).await.unwrap();
-        stream
-            .write_all(format!("{}\n", json!({"jsonrpc":"2.0","id":42,"method":method})).as_bytes())
-            .await
-            .unwrap();
-        let mut line = String::new();
-        BufReader::new(stream).read_line(&mut line).await.unwrap();
-        serde_json::from_str(&line).unwrap()
-    })
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(3)),
+        async {
+            let mut stream = UnixStream::connect(path).await.unwrap();
+            stream
+                .write_all(
+                    format!("{}\n", json!({"jsonrpc":"2.0","id":42,"method":method})).as_bytes(),
+                )
+                .await
+                .unwrap();
+            let mut line = String::new();
+            BufReader::new(stream).read_line(&mut line).await.unwrap();
+            serde_json::from_str(&line).unwrap()
+        },
+    )
     .await
     .expect("UDS status responds during preparation")
 }
@@ -349,11 +357,14 @@ async fn protected_preparation_and_fresh_handoff_preserve_lazy_backlog() {
     .await
     .expect("ready handoff");
     assert_eq!(
-        timeout(Duration::from_secs(3), old_uds.read_u8())
-            .await
-            .unwrap()
-            .unwrap_err()
-            .kind(),
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(3)),
+            old_uds.read_u8()
+        )
+        .await
+        .unwrap()
+        .unwrap_err()
+        .kind(),
         std::io::ErrorKind::UnexpectedEof
     );
     let mut ready = connect_ws(proxy_port, cfg.clone()).await;
@@ -492,16 +503,19 @@ async fn protected_preparation_and_fresh_handoff_preserve_lazy_backlog() {
         &format!("wss://localhost:{port}/ws?token=valid-guest-token"),
     )
     .await;
-    let prepared = timeout(Duration::from_secs(15), async {
-        loop {
-            let response = call(&mut guest, "note.get", page.clone()).await;
-            if response["error"]["data"]["code"] != "note-index-preparing" {
-                break response;
+    let prepared = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(15)),
+        async {
+            loop {
+                let response = call(&mut guest, "note.get", page.clone()).await;
+                if response["error"]["data"]["code"] != "note-index-preparing" {
+                    break response;
+                }
+                // timing-guard: retry only the explicit read-preparation response.
+                tokio::time::sleep(Duration::from_millis(25)).await;
             }
-            // timing-guard: retry only the explicit read-preparation response.
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    })
+        },
+    )
     .await
     .unwrap();
     assert_eq!(prepared["result"]["kind"], "noteSourcePage", "{prepared}");
@@ -535,7 +549,7 @@ async fn protected_preparation_and_fresh_handoff_preserve_lazy_backlog() {
     db.close().await;
     child.signal(nix::sys::signal::Signal::SIGTERM).unwrap();
     assert!(child
-        .wait_with_timeout(Duration::from_secs(20))
+        .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(20)))
         .unwrap()
         .unwrap()
         .success());
@@ -566,7 +580,7 @@ async fn failed_preparation_and_shutdown_preserve_backlog_and_reset_attempt() {
         }
         assert_eq!(
             child
-                .wait_with_timeout(Duration::from_secs(20))
+                .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(20)))
                 .unwrap()
                 .unwrap()
                 .success(),
@@ -642,7 +656,7 @@ async fn queue_restore_failure_never_activates_operational_work() {
     let (mut child, _) = launch(dir.path(), &gate_path);
     barrier(&indexing, b'p').await.write_u8(b'c').await.unwrap();
     assert!(!child
-        .wait_with_timeout(Duration::from_secs(20))
+        .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(20)))
         .unwrap()
         .unwrap()
         .success());
@@ -720,7 +734,7 @@ async fn service_startup_exit(invalidate_policy: bool) {
     }
     assert_eq!(
         child
-            .wait_with_timeout(Duration::from_secs(20))
+            .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(20)))
             .unwrap()
             .unwrap()
             .success(),
@@ -826,18 +840,21 @@ async fn bootstrap_disable_failure_and_owner_token_rotation() {
     .await;
     assert!(health.ends_with("{\"status\":\"failed\"}"));
     tokens.store_token(&"cd".repeat(32)).await.unwrap();
-    timeout(Duration::from_secs(3), async {
-        loop {
-            match ws.next().await {
-                Some(Ok(Message::Close(Some(close)))) => {
-                    assert_eq!(close.reason, "Credential changed; reconnect");
-                    break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(3)),
+        async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Close(Some(close)))) => {
+                        assert_eq!(close.reason, "Credential changed; reconnect");
+                        break;
+                    }
+                    Some(Ok(Message::Ping(data))) => ws.send(Message::Pong(data)).await.unwrap(),
+                    other => panic!("rotation closes restricted owner seat: {other:?}"),
                 }
-                Some(Ok(Message::Ping(data))) => ws.send(Message::Pong(data)).await.unwrap(),
-                other => panic!("rotation closes restricted owner seat: {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await
     .unwrap();
     let rejected = https_request(port, cfg, &upgrade_req("/ws", None, Some(TOKEN))).await;
@@ -934,9 +951,10 @@ async fn cli_startup_liveness_uses_server_identity_and_rejects_invalid_probes() 
             .args(["call", method, "--params", params])
             .env("INTENTD_DATA_DIR", dir.path())
             .kill_on_drop(true);
-        let ((), output) = timeout(Duration::from_secs(5), async {
-            tokio::join!(server, command.output())
-        })
+        let ((), output) = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            async { tokio::join!(server, command.output()) },
+        )
         .await
         .unwrap();
         let output = output.unwrap();
@@ -995,7 +1013,7 @@ async fn sigusr2_during_preparation_is_retained_until_ready_and_stop_wins() {
                 }
             }
             let exit = child
-                .wait_with_timeout(Duration::from_secs(20))
+                .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(20)))
                 .unwrap()
                 .expect("bounded exit");
             assert_eq!(

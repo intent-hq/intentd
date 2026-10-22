@@ -2185,20 +2185,23 @@ mod tests {
         /// through the same `try_wait` probe `ensure_endpoint` uses to
         /// notice a dead child.
         async fn wait_for_child_exit(mgr: &UnslothServerManager) {
-            tokio::time::timeout(Duration::from_secs(30), async {
-                loop {
-                    let alive = mgr
-                        .state
-                        .lock()
-                        .await
-                        .as_mut()
-                        .is_some_and(ManagedServer::is_alive);
-                    if !alive {
-                        return;
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(30)),
+                async {
+                    loop {
+                        let alive = mgr
+                            .state
+                            .lock()
+                            .await
+                            .as_mut()
+                            .is_some_and(ManagedServer::is_alive);
+                        if !alive {
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
                     }
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-            })
+                },
+            )
             .await
             .expect("stub child exits after release");
         }
@@ -2210,7 +2213,8 @@ mod tests {
         async fn reap_stub_child(pid: u32) {
             use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
             let pid = nix::unistd::Pid::from_raw(pid.cast_signed());
-            let deadline = Instant::now() + Duration::from_secs(30);
+            let deadline =
+                Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(30));
             loop {
                 match waitpid(pid, Some(WaitPidFlag::WNOHANG)) {
                     Ok(WaitStatus::Exited(..) | WaitStatus::Signaled(..)) => return,
@@ -2708,10 +2712,12 @@ mod tests {
             config.hf_files_timeout = Duration::from_millis(200);
             let mgr = UnslothServerManager::with_config(config);
             let started = std::time::Instant::now();
-            let quant =
-                tokio::time::timeout(Duration::from_secs(5), mgr.resolve_quant_variant(REPO))
-                    .await
-                    .expect("resolution must not hang past the timeout budget");
+            let quant = tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                mgr.resolve_quant_variant(REPO),
+            )
+            .await
+            .expect("resolution must not hang past the timeout budget");
             assert_eq!(quant, "UD-Q4_K_XL");
             assert!(
                 started.elapsed() < Duration::from_secs(2),
@@ -2843,7 +2849,8 @@ mod tests {
         /// is a hang guard for a startup that never registers, sized to
         /// expire before nextest's kill window, not a latency bound.
         async fn wait_for_identity_registered(mgr: &UnslothServerManager) {
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+            let deadline = tokio::time::Instant::now()
+                + intentd_test_support::test_timeout(Duration::from_secs(60));
             while lock_ignore_poison(&mgr.identity).is_none() {
                 assert!(
                     tokio::time::Instant::now() < deadline,
@@ -2887,10 +2894,13 @@ mod tests {
             // would otherwise sit behind the long startup window), but it
             // is far too loose to measure latency — the ordering assertions
             // below carry the contract.
-            let status = tokio::time::timeout(Duration::from_secs(60), mgr.status_snapshot())
-                .await
-                .expect("status_snapshot must not block behind the startup's state lock")
-                .expect("server tracked as running mid-startup");
+            let status = tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(60)),
+                mgr.status_snapshot(),
+            )
+            .await
+            .expect("status_snapshot must not block behind the startup's state lock")
+            .expect("server tracked as running mid-startup");
             assert!(
                 !startup.is_finished(),
                 "startup must still be in flight when the snapshot returns"
@@ -2928,7 +2938,8 @@ mod tests {
             // have progressed that far yet, making `stop()` report `false`
             // (monorepo#972). Reads only the lock-free identity mirror — the
             // in-flight startup holds `state`'s lock for its whole window.
-            let registered = tokio::time::Instant::now() + Duration::from_secs(30);
+            let registered = tokio::time::Instant::now()
+                + intentd_test_support::test_timeout(Duration::from_secs(30));
             while lock_ignore_poison(&mgr.identity).is_none() {
                 assert!(
                     tokio::time::Instant::now() < registered,

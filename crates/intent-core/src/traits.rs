@@ -134,6 +134,28 @@ pub trait WorkspaceApi: Send + Sync {
         None
     }
 
+    /// Owner-only policy on the original native application connection.
+    fn gitlab_child_git_policy_get(
+        &self,
+        _query: crate::gitlab_child_git::GitlabChildGitPolicyQuery,
+    ) -> BoxFuture<'_, Result<crate::gitlab_child_git::GitlabChildGitPolicy>> {
+        Box::pin(async { Err(Error::Forbidden("Child Git policy unavailable".into())) })
+    }
+    fn gitlab_child_git_policy_set(
+        &self,
+        _query: crate::gitlab_child_git::GitlabChildGitPolicySet,
+    ) -> BoxFuture<'_, Result<crate::gitlab_child_git::GitlabChildGitPolicy>> {
+        Box::pin(async { Err(Error::Forbidden("Child Git policy unavailable".into())) })
+    }
+    /// Transport-private helper branch. Implementations require actual local
+    /// owner admission and retain credential proof through final socket output.
+    fn gitlab_child_git_credential(
+        &self,
+        _query: crate::gitlab_child_git::GitlabChildGitCredentialQuery,
+    ) -> BoxFuture<'_, Result<crate::gitlab_child_git::GitlabChildGitCredentialResult>> {
+        Box::pin(async { Err(Error::Forbidden("Child Git credential unavailable".into())) })
+    }
+
     /// Acquire read-only repository context under the original native connection.
     /// Explicit original-socket resource reads; older implementations refuse.
     fn repository_resource_capture(
@@ -162,6 +184,68 @@ pub trait WorkspaceApi: Send + Sync {
     ) -> BoxFuture<'_, Result<crate::repository_request::RepositoryContextReleased>> {
         Box::pin(async {
             Err(crate::Error::Forbidden(
+                "Repository resource reads unavailable".into(),
+            ))
+        })
+    }
+
+    fn repository_resource_resolve_known(
+        &self,
+        _query: crate::repository_resource_pages::RepositoryKnownQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_resource_pages::RepositoryKnownSelection>> {
+        Box::pin(async {
+            Err(crate::Error::Forbidden(
+                "Repository resource read unavailable".into(),
+            ))
+        })
+    }
+
+    fn repository_resource_capture_scoped(
+        &self,
+        _query: crate::repository_resource_pages::RepositoryScopedCaptureQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_resource_pages::RepositoryScopedCapture>> {
+        Box::pin(async {
+            Err(Error::Forbidden(
+                "Repository resource reads unavailable".into(),
+            ))
+        })
+    }
+    fn repository_resource_detail_scoped(
+        &self,
+        _query: crate::repository_resource_pages::RepositoryScopedDetailQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_resource_pages::RepositoryScopedDetail>> {
+        Box::pin(async {
+            Err(Error::Forbidden(
+                "Repository resource reads unavailable".into(),
+            ))
+        })
+    }
+    fn repository_resource_release_scoped(
+        &self,
+        _query: crate::repository_resource_pages::RepositoryScopedBoundQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_request::RepositoryContextReleased>> {
+        Box::pin(async {
+            Err(Error::Forbidden(
+                "Repository resource reads unavailable".into(),
+            ))
+        })
+    }
+    fn repository_resource_list(
+        &self,
+        _query: crate::repository_resource_pages::RepositoryResourceListQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_resource_pages::RepositoryResourceList>> {
+        Box::pin(async {
+            Err(Error::Forbidden(
+                "Repository resource reads unavailable".into(),
+            ))
+        })
+    }
+    fn repository_resource_discussions(
+        &self,
+        _query: crate::repository_resource_pages::RepositoryDiscussionsQuery,
+    ) -> BoxFuture<'_, Result<crate::repository_resource_pages::RepositoryDiscussions>> {
+        Box::pin(async {
+            Err(Error::Forbidden(
                 "Repository resource reads unavailable".into(),
             ))
         })
@@ -2542,6 +2626,30 @@ pub trait WorkspaceApi: Send + Sync {
                 "WorkspaceApi::agent_get_queue not implemented".to_string(),
             ))
         })
+    }
+
+    /// `agent.workers.list` (PROTOCOL §5.5b): the agent's complete
+    /// `WorkerSnapshot` — a memory-only read, never a provider call.
+    fn agent_workers_list(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id);
+        Box::pin(async { Err(Error::Unsupported("agent.workers.list".into())) })
+    }
+
+    /// `agent.workers.stop` (PROTOCOL §5.5b): ask the provider to stop one
+    /// worker of `connection_generation`; `{ asyncTaskId, stopped }`.
+    fn agent_workers_stop(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        connection_generation: String,
+        async_task_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id, connection_generation, async_task_id);
+        Box::pin(async { Err(Error::Unsupported("agent.workers.stop".into())) })
     }
 
     /// `agent.stop`: cancel an in-flight stream; `{ success: true }` (PROTOCOL §5.5).

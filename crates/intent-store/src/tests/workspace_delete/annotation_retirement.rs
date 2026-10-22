@@ -8,7 +8,7 @@ use std::time::Duration;
 
 #[tokio::test]
 async fn workspace_annotation_retirement_rejects_reads_and_regeneration_after_cancellation() {
-    tokio::time::timeout(Duration::from_secs(30), async {
+    tokio::time::timeout(intentd_test_support::test_timeout(Duration::from_secs(30)), async {
         let temporary = TempDb::new();
         let store = Store::open(&temporary.path).await.unwrap();
         let doomed = seed_workspace(&store, "doomed").await;
@@ -51,7 +51,7 @@ async fn workspace_annotation_retirement_rejects_reads_and_regeneration_after_ca
             if update.table == "note_comment_detail_piece" {
                 if let Some(blocked) = blocked.take() {
                     observed.notify_one();
-                    blocked.recv_timeout(Duration::from_secs(15)).unwrap();
+                    blocked.recv_timeout(intentd_test_support::test_timeout(Duration::from_secs(15))).unwrap();
                 }
             }
         });

@@ -207,7 +207,8 @@ async fn rpc(ws: &mut Ws, id: i64, method: &str, params: Value) -> Value {
     ws.send(Message::Text(msg.to_string().into()))
         .await
         .expect("send rpc");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(15));
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         match timeout(remaining, ws.next()).await.expect("rpc timeout") {
@@ -234,7 +235,8 @@ async fn ok(ws: &mut Ws, id: i64, method: &str, params: Value) -> Value {
 }
 
 async fn next_event(ws: &mut Ws, event_type: &str) -> Value {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(15));
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         match timeout(remaining, ws.next())
@@ -648,13 +650,6 @@ async fn provider_profile_selection_surfaces_over_wss() {
 
     // An agent on the profile: no activation state while nothing runs, and
     // after removal its next turn needs an explicit replacement.
-    ok(
-        &mut ws,
-        7,
-        "settings.update",
-        json!({ "changes": [{ "path": "providers.paths", "value": { "codex": "/bin/sh" } }] }),
-    )
-    .await;
     let workspace = ok(
         &mut ws,
         8,

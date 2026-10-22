@@ -1,4 +1,5 @@
-//! Optional delivery on one confirmed physical owner and its original Query.
+//! Optional prompt delivery on one confirmed physical owner; private callbacks
+//! additionally retain and acknowledge their original Query.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -67,6 +68,38 @@ impl ServerBlueprint {
 
     pub(in crate::agent_manager) fn server(&self) -> WorkspaceMcpServer {
         (self.build)()
+    }
+
+    /// Standard ACP confirms an original physical owner without registering a
+    /// private callback. Only new 3.2 sessions opt into this prompt envelope;
+    /// it never upgrades the initial MCP endpoint or acknowledges a Query.
+    pub(super) fn bind_prompt_context(
+        &self,
+        connection: &Arc<Connection>,
+        physical: &crate::repository_admission::lifecycle::physical_owner::RepositoryPhysicalOwner,
+        workspace: &intent_core::WorkspaceId,
+        agent: &intent_core::AgentId,
+    ) -> Option<Arc<LiveContext>> {
+        let (services, session) = self.original.as_ref()?;
+        if session.harness_version != "3.2"
+            || session.retired_at.is_some()
+            || &session.workspace_id != workspace
+            || &session.id != agent
+        {
+            return None;
+        }
+        Some(Arc::new(LiveContext {
+            connection: Arc::downgrade(connection),
+            session_id: physical.confirmed_session_id().into(),
+            owner: RepositoryContextOwner::bind(
+                services.clone(),
+                self.read_owner.clone(),
+                physical,
+            ),
+            requires_callback_ack: false,
+            acknowledged: AtomicBool::new(false),
+            retired: AtomicBool::new(false),
+        }))
     }
 
     fn confirmed_server(
@@ -158,6 +191,7 @@ impl EndpointBlueprint {
                 }),
                 physical,
             ),
+            requires_callback_ack: true,
             acknowledged: AtomicBool::new(false),
             retired: AtomicBool::new(false),
         }))
@@ -180,13 +214,16 @@ pub(super) struct LiveContext {
     connection: Weak<Connection>,
     session_id: String,
     owner: AdmissionResult<Arc<RepositoryContextOwner>>,
+    requires_callback_ack: bool,
     acknowledged: AtomicBool,
     retired: AtomicBool,
 }
 
 impl LiveContext {
     fn capture(&self) -> AdmissionResult<RepositoryPromptContext> {
-        if !self.acknowledged.load(Ordering::SeqCst) || self.retired.load(Ordering::SeqCst) {
+        if (self.requires_callback_ack && !self.acknowledged.load(Ordering::SeqCst))
+            || self.retired.load(Ordering::SeqCst)
+        {
             return Err(AdmissionError::Unavailable);
         }
         self.owner
@@ -195,7 +232,23 @@ impl LiveContext {
             .capture_manager_prompt()
     }
 
-    fn invalidate_and_drain(&self) {
+    pub(super) fn capture_prompt(
+        self: &Arc<Self>,
+        connection: &Arc<Connection>,
+    ) -> Option<RepositoryPromptInput> {
+        if !Weak::ptr_eq(&self.connection, &Arc::downgrade(connection))
+            || (self.requires_callback_ack && !self.acknowledged.load(Ordering::SeqCst))
+            || self.retired.load(Ordering::SeqCst)
+        {
+            return None;
+        }
+        Some(RepositoryPromptInput {
+            binding: self.clone(),
+            captured: Some(self.capture()),
+        })
+    }
+
+    pub(super) fn invalidate_and_drain(&self) {
         if let Ok(owner) = &self.owner {
             owner.invalidate();
             if let Ok(runtime) = tokio::runtime::Handle::try_current() {
@@ -209,7 +262,7 @@ impl LiveContext {
         }
     }
 
-    fn retire(&self) {
+    pub(super) fn retire(&self) {
         if !self.retired.swap(true, Ordering::SeqCst) {
             self.invalidate_and_drain();
         }
@@ -312,16 +365,7 @@ impl Endpoint {
         connection: &Arc<Connection>,
     ) -> Option<RepositoryPromptInput> {
         let live = self.live.as_ref()?;
-        if !Weak::ptr_eq(&live.connection, &Arc::downgrade(connection))
-            || !live.acknowledged.load(Ordering::SeqCst)
-            || live.retired.load(Ordering::SeqCst)
-        {
-            return None;
-        }
-        Some(RepositoryPromptInput {
-            binding: live.clone(),
-            captured: Some(live.capture()),
-        })
+        live.capture_prompt(connection)
     }
 
     pub(super) fn interrupt_context(&self) {
@@ -481,10 +525,20 @@ impl Drop for ConfirmedCallbackAttempt {
     }
 }
 
+/// Both variants retain the original confirmation. A standard prompt capture
+/// is made before metadata awaits, independently of callback registration.
+pub(in crate::agent_manager) enum SessionDelivery {
+    Callback(Box<ConfirmedCallbackAttempt>),
+    Prompt(RepositoryPromptInput),
+}
+
 pub(in crate::agent_manager) async fn deliver_captured(
-    delivery: Option<ConfirmedCallbackAttempt>,
+    delivery: Option<SessionDelivery>,
 ) -> Option<RepositoryPromptInput> {
-    let mut delivery = delivery?;
+    let mut delivery = match delivery? {
+        SessionDelivery::Callback(delivery) => delivery,
+        SessionDelivery::Prompt(captured) => return Some(captured),
+    };
     // Keep the completed ordinary session result independent of registration.
     let _ = delivery.deliver().await;
     if !delivery.retained {
@@ -497,9 +551,12 @@ pub(in crate::agent_manager) async fn deliver_captured(
 }
 
 #[cfg(test)]
-async fn deliver_optional(delivery: Option<ConfirmedCallbackAttempt>) {
+async fn deliver_optional(delivery: Option<SessionDelivery>) {
     let _ = deliver_captured(delivery).await;
 }
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, unix))]
+mod prompt_envelope_tests;

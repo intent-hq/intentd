@@ -71,9 +71,10 @@ async fn congested_terminal_forwarder_preserves_cursor_ranges_and_exit_order() {
         }
         frames
     };
-    let ((), frames) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        tokio::join!(forwarder, reader)
-    })
+    let ((), frames) = tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(10)),
+        async { tokio::join!(forwarder, reader) },
+    )
     .await
     .expect("forwarder drains without blocking");
     assert_eq!(

@@ -56,12 +56,20 @@ pub struct SitterState {
     pub channel: Channel,
     /// Currently installed daemon version (`versions/<version>/`), if any.
     pub current_version: Option<String>,
-    /// When the last update check ran (RFC 3339).
+    /// When the last successful automatic update check ran (RFC 3339).
+    /// Failed and manual checks leave it alone. On the stable channel a
+    /// value on today's UTC date means the daily check is done.
     #[serde(default, with = "time::serde::rfc3339::option")]
     pub last_check_at: Option<OffsetDateTime>,
-    /// When the next periodic update check is due (RFC 3339).
+    /// When the next scheduled check (alpha/beta) or local tick (stable)
+    /// fires (RFC 3339).
     #[serde(default, with = "time::serde::rfc3339::option")]
     pub next_check_at: Option<OffsetDateTime>,
+    /// UTC day (`YYYY-MM-DD`) of the last update check that reached the
+    /// update-check endpoint; drives its first-check-of-the-day flag. A
+    /// date only, never an identifier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_check_day: Option<String>,
 }
 
 impl Default for SitterState {
@@ -72,6 +80,7 @@ impl Default for SitterState {
             current_version: None,
             last_check_at: None,
             next_check_at: None,
+            last_check_day: None,
         }
     }
 }
@@ -133,6 +142,7 @@ mod tests {
             current_version: Some("1.2.3".to_string()),
             last_check_at: Some(datetime!(2026-07-23 01:02:03 UTC)),
             next_check_at: Some(datetime!(2026-07-23 18:00:00 UTC)),
+            last_check_day: Some("2026-07-23".to_string()),
         };
         save(&path, &state).unwrap();
         assert_eq!(load(&path), state);
@@ -167,6 +177,20 @@ mod tests {
         };
         save(&path, &state).unwrap();
         assert_eq!(load(&path), SitterState::default());
+    }
+
+    #[test]
+    fn state_without_last_check_day_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        fs::write(
+            &path,
+            r#"{"schema":1,"channel":"beta","current_version":"1.0.0"}"#,
+        )
+        .unwrap();
+        let state = load(&path);
+        assert_eq!(state.current_version.as_deref(), Some("1.0.0"));
+        assert_eq!(state.last_check_day, None);
     }
 
     #[test]

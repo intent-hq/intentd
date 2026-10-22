@@ -87,7 +87,7 @@ async fn assert_deferred_before_delivery(
     child: &AgentId,
     park: &crate::CompletionClassifyPark,
 ) {
-    timeout(Duration::from_secs(2), async {
+    timeout(intentd_test_support::test_timeout(Duration::from_secs(2)), async {
         tokio::select! {
             () = svc.redeliver_completion_after_queue_mutation(child) => {},
             () = park.entered.notified() => panic!("pending notification admitted synthetic completion"),
@@ -161,17 +161,20 @@ async fn restore_pending_query(svc: &Services) {
 }
 
 async fn wait_for_completion(svc: &Services, parent: &AgentId, child: &AgentId) {
-    timeout(Duration::from_secs(10), async {
-        loop {
-            if parent_message_count(svc, parent).await == 1
-                && svc.find_watches_for_child(child).is_empty()
-                && svc.pending_completion_retries.lock().unwrap().is_empty()
-            {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                if parent_message_count(svc, parent).await == 1
+                    && svc.find_watches_for_child(child).is_empty()
+                    && svc.pending_completion_retries.lock().unwrap().is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("completion and retry ownership settle");
     assert!(!svc.has_interim_skipped_idle(child));
@@ -197,9 +200,12 @@ async fn pending_query_error_recovers_without_pending_row_or_another_event() {
     let parent = watch_child(&svc, &ws, &child).await;
     break_pending_query(&svc).await;
     let event = completion_event(&ws, AGENT_IDLE, &child, json!({"agentId":child.0}));
-    timeout(Duration::from_secs(2), svc.handle_completion_event(&event))
-        .await
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        svc.handle_completion_event(&event),
+    )
+    .await
+    .unwrap();
     assert!(svc.has_interim_skipped_idle(&child));
     assert_eq!(parent_message_count(&svc, &parent).await, 0);
     for _ in 0..8 {
@@ -213,14 +219,17 @@ async fn pending_query_error_recovers_without_pending_row_or_another_event() {
     // Let the worker itself encounter the fault before fixing it, so the
     // generation and backoff loop, not just its initial timer, are covered.
     let generation = svc.pending_completion_retries.lock().unwrap()[&child];
-    timeout(Duration::from_secs(5), async {
-        loop {
-            if svc.pending_completion_retries.lock().unwrap()[&child] > generation {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            loop {
+                if svc.pending_completion_retries.lock().unwrap()[&child] > generation {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("worker retries the unreadable outbox");
     restore_pending_query(&svc).await;
@@ -246,17 +255,23 @@ async fn pending_notifications_allow_other_dispatches_and_settle_exactly_once() 
         &child,
         json!({"agentId":child.0,"completionReport":"done"}),
     );
-    timeout(Duration::from_secs(2), svc.handle_completion_event(&event))
-        .await
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        svc.handle_completion_event(&event),
+    )
+    .await
+    .unwrap();
     assert!(svc.has_interim_skipped_idle(&child));
     assert_eq!(parent_message_count(&svc, &parent).await, 0);
     // Same sequential dispatch shape used by notification maintenance: the
     // first owner's remaining pending row must not block unrelated owners.
-    timeout(Duration::from_secs(2), async {
-        deliver_pending_notification(&svc, &first).await;
-        deliver_pending_notification(&svc, &unrelated).await;
-    })
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        async {
+            deliver_pending_notification(&svc, &first).await;
+            deliver_pending_notification(&svc, &unrelated).await;
+        },
+    )
     .await
     .expect("maintenance can advance to the next owner");
     assert!(!svc
@@ -294,21 +309,30 @@ async fn pending_notification_settling_before_marker_is_retried() {
     let parked = svc.clone().with_completion_classify_park(park.clone());
     let event = completion_event(&ws, AGENT_IDLE, &child, json!({"agentId":child.0}));
     let delivery = tokio::spawn(async move { parked.handle_completion_event(&event).await });
-    timeout(Duration::from_secs(2), park.entered.notified())
-        .await
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        park.entered.notified(),
+    )
+    .await
+    .unwrap();
     assert!(!svc.has_interim_skipped_idle(&child));
     deliver_pending_notification(&svc, &row).await;
     assert_eq!(parent_message_count(&svc, &parent).await, 0);
     park.release.notify_one();
-    timeout(Duration::from_secs(2), delivery)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        delivery,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     // The deferred retry observes settlement after the marker exists.
-    timeout(Duration::from_secs(5), park.entered.notified())
-        .await
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        park.entered.notified(),
+    )
+    .await
+    .unwrap();
     park.release.notify_one();
     wait_for_completion(&svc, &parent, &child).await;
     svc.shutdown_agent_deliveries().await;
@@ -367,7 +391,7 @@ async fn pending_advisory_provenance_clears_when_notification_settles() {
     let svc = svc.with_completion_classify_park(park.clone());
     let delivery = svc.redeliver_completion_after_queue_mutation(&child);
     tokio::pin!(delivery);
-    timeout(Duration::from_secs(2), async {
+    timeout(intentd_test_support::test_timeout(Duration::from_secs(2)), async {
         tokio::select! {
             () = &mut delivery => panic!("owed advisory must enter delivery"),
             () = park.entered.notified() => {},

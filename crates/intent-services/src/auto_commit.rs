@@ -9,7 +9,9 @@
 //! changes, a merge is pending (scoped commits are refused mid-merge,
 //! monorepo#4223), the session opted out via `skip_auto_commit`, or the
 //! `agent:idle` finish reason is non-normal (`error`/`cancelled`/
-//! `provider_stopped`/`refusal`).
+//! `provider_stopped`/`refusal`). A checkout folder that is missing on disk
+//! skips the commit with one transition warning instead of one per idle
+//! (intent-hq/intent#7183, [`crate::worktree_presence`]).
 //!
 //! Commit-message generation is bounded by [`GENERATION_TIMEOUT_MS`] and,
 //! after a timeout, skipped for the workspace for [`GENERATION_COOLDOWN_MS`]
@@ -283,6 +285,9 @@ impl Services {
         // only thing blocking auto-commit for them.
         let worktree_path = match self.store().get_workspace(&session.workspace_id).await {
             Ok(ws) => {
+                if ws.checkout_mode.is_some() {
+                    self.worktree_presence.mark_git(&ws.id);
+                }
                 if let Some(p) = ws.effective_path().map(PathBuf::from) {
                     p
                 } else {
@@ -304,6 +309,17 @@ impl Services {
                 return;
             }
         };
+
+        // A checkout deleted or unmounted outside Intent (intent-hq/intent#7183):
+        // skip before generation and `git_agent_commit`. The presence map logs
+        // one warning on the transition, so repeated wakes into such a
+        // workspace stay quiet, and the first idle after it reappears resumes.
+        if !self
+            .worktree_presence
+            .observe(&session.workspace_id, &worktree_path)
+        {
+            return;
+        }
 
         let linked_note_id = session.task_note_id.clone();
         // Attempt LLM generation; fall back to deterministic subject on any failure.

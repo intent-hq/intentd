@@ -15,19 +15,22 @@ async fn through_marker(
     ))
     .await
     .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        let mut received = Vec::new();
-        loop {
-            for event in events.recv().await.expect("subscription open") {
-                if event.event_type == WORKSPACE_UPDATED
-                    && event.data["changes"]["title"] == "presence notification barrier"
-                {
-                    return received;
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            let mut received = Vec::new();
+            loop {
+                for event in events.recv().await.expect("subscription open") {
+                    if event.event_type == WORKSPACE_UPDATED
+                        && event.data["changes"]["title"] == "presence notification barrier"
+                    {
+                        return received;
+                    }
+                    received.push(event);
                 }
-                received.push(event);
             }
-        }
-    })
+        },
+    )
     .await
     .expect("event delivery barrier")
 }
