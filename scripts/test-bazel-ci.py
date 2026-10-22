@@ -75,8 +75,7 @@ class CheckAndFix(unittest.TestCase):
         self.assertIn(drift.FIX_COMMAND, err)
 
     def test_stale_generated_files_fail_before_bazel(self):
-        with mock.patch.object(drift, "generated_drift_is_release_only", return_value=False):
-            code, calls, err = self.run_main([], [1])
+        code, calls, err = self.run_main([], [1])
         self.assertEqual(code, 1)
         self.assertEqual(len(calls), 1)
         self.assertIn("bazel-gen.py --check", err)
@@ -168,8 +167,9 @@ class ReleaseTolerance(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             tmp = self.git_repo(Path(raw))
             edit(tmp)
-            with mock.patch.object(drift, "ROOT", tmp), mock.patch.object(drift, "LOCK", tmp / "MODULE.bazel.lock"):
-                return drift.lock_drift_is_release_only()
+            with mock.patch.object(drift, "ROOT", tmp), mock.patch.object(drift, "LOCK", tmp / "MODULE.bazel.lock"), \
+                    mock.patch.object(drift, "run", return_value=0), contextlib.redirect_stdout(io.StringIO()):
+                return drift.lock_drift_is_release_only("bazel")
 
     def test_lock_behind_a_release_passes(self):
         def bump(tmp):
@@ -190,19 +190,79 @@ class ReleaseTolerance(unittest.TestCase):
         ok, _ = self.lock_verdict(lambda tmp: None)
         self.assertFalse(ok)
 
+    def check_with_bazel(self, edit, stale_against_recorded_inputs):
+        """Run check() on the fixture; `mod deps` fails, as frozen resolution does behind a bump.
+
+        The second `mod deps` is the configuration check: it runs with the Cargo inputs the
+        lock recorded put back, and returns `stale_against_recorded_inputs` (1 when
+        MODULE.bazel or a crate annotation changed too).
+        """
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = self.git_repo(Path(raw))
+            edit(tmp)
+            current = {p: (tmp / p).read_text() for p in ("Cargo.lock", "crates/a/Cargo.toml")}
+            on_disk_during_recheck = []
+
+            def fake_run(cmd):
+                if cmd[1:2] != ["mod"]:
+                    return 0
+                if not on_disk_during_recheck and len(fake_run.mod_calls) == 0:
+                    fake_run.mod_calls.append(cmd)
+                    return 1
+                fake_run.mod_calls.append(cmd)
+                on_disk_during_recheck.append({p: (tmp / p).read_text() for p in current})
+                return stale_against_recorded_inputs
+            fake_run.mod_calls = []
+
+            with mock.patch.object(drift, "ROOT", tmp), mock.patch.object(drift, "LOCK", tmp / "MODULE.bazel.lock"), \
+                    mock.patch.object(drift, "run", fake_run), mock.patch.object(drift, "check_lock_paths", return_value=[]), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                problems, notes = drift.check("bazel")
+            after = {p: (tmp / p).read_text() for p in current}
+        return problems, notes, fake_run.mod_calls, on_disk_during_recheck, current, after
+
+    def bump_release(self, tmp):
+        for name in ("Cargo.lock", "crates/a/Cargo.toml"):
+            (tmp / name).write_text(release((tmp / name).read_text()))
+
+    def test_release_bump_with_a_configuration_change_fails(self):
+        # A crate annotation (bazel/crates.MODULE.bazel) or MODULE.bazel change makes the lock
+        # stale even against the Cargo inputs it recorded; a version bump must not hide it.
+        problems, notes, mod_calls, during, current, after = self.check_with_bazel(self.bump_release, 1)
+        self.assertEqual(len(mod_calls), 2, "the guard must re-check the lock against its recorded Cargo inputs")
+        self.assertIn("--lockfile_mode=error", mod_calls[1])
+        self.assertEqual(during, [{"Cargo.lock": LOCKFILE, "crates/a/Cargo.toml": MANIFEST}])
+        self.assertEqual(after, current, "the working tree must be restored")
+        self.assertEqual(notes, [])
+        self.assertEqual(len(problems), 1)
+        self.assertIn("MODULE.bazel.lock is out of date", problems[0])
+        self.assertIn("configuration", problems[0])
+
+    def test_release_bump_alone_passes_the_configuration_check(self):
+        problems, notes, mod_calls, during, current, after = self.check_with_bazel(self.bump_release, 0)
+        self.assertEqual(problems, [])
+        self.assertEqual(len(notes), 1)
+        self.assertEqual(len(mod_calls), 2)
+        self.assertEqual(after, current)
+
     def test_release_drift_passes_check_with_a_note(self):
-        with mock.patch.object(drift, "run", side_effect=[1, 1]), \
-                mock.patch.object(drift, "generated_drift_is_release_only", return_value=True), \
+        with mock.patch.object(drift, "run", side_effect=[0, 1]), \
                 mock.patch.object(drift, "lock_drift_is_release_only", return_value=(True, "versions")), \
                 mock.patch.object(drift, "check_lock_paths", return_value=[]), \
                 contextlib.redirect_stdout(io.StringIO()):
             problems, notes = drift.check("bazel")
         self.assertEqual(problems, [])
-        self.assertEqual(len(notes), 2)
+        self.assertEqual(len(notes), 1)
 
-    def test_generated_version_lines_only(self):
-        self.assertEqual(drift.VERSION_LINE.sub("", '    edition = "2021",\n    version = "0.11.25",\n'),
-                         '    edition = "2021",\n')
+    def test_stale_generated_files_are_never_tolerated(self):
+        # Generated files carry no versions, so even a release bump leaves them current.
+        with mock.patch.object(drift, "run", side_effect=[1, 1]), \
+                mock.patch.object(drift, "lock_drift_is_release_only", return_value=(True, "versions")), \
+                mock.patch.object(drift, "check_lock_paths", return_value=[]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            problems, _ = drift.check("bazel")
+        self.assertEqual(len(problems), 1)
+        self.assertIn("bazel-gen.py --check", problems[0])
 
 
 class StarlarkFailure(Exception):
@@ -219,6 +279,67 @@ def evaluate_starlark(path: Path, env: dict) -> dict:
     scope = {"fail": lambda msg: (_ for _ in ()).throw(StarlarkFailure(msg)), **env}
     exec(compile(source, str(path), "exec"), scope)  # noqa: S102 - trusted repository file
     return scope
+
+
+def cargo_versions_bzl() -> dict:
+    """bazel/cargo_versions.bzl evaluated in Python, with the Bazel builtins stubbed."""
+    stub = lambda *a, **k: None  # noqa: E731
+    attr = type("attr", (), {"label": staticmethod(stub), "string": staticmethod(stub),
+                             "string_dict": staticmethod(stub)})
+    return evaluate_starlark(ROOT / "bazel/cargo_versions.bzl", {
+        "attr": attr, "tag_class": stub, "module_extension": stub, "repository_rule": stub, "Label": str,
+    })
+
+
+CARGO_VERSIONS_TAG = re.compile(r'cargo_versions\.crate\(\s*name = "([^"]+)",\s*manifest = "//([^:"]*):Cargo\.toml",\s*\)')
+
+
+def starlark_cargo_versions(root: Path) -> dict:
+    """What @cargo_versions computes for the workspace at `root`: the crates the generated
+    MODULE file registers, each versioned from its Cargo.toml as the extension reads it."""
+    bzl = cargo_versions_bzl()
+    module = (root / "bazel/generated.MODULE.bazel").read_text()
+    workspace = lambda: (root / "Cargo.toml").read_text()  # noqa: E731
+    return {name: bzl["package_version"]((root / pkg / "Cargo.toml").read_text(), workspace, name)
+            for name, pkg in CARGO_VERSIONS_TAG.findall(module)}
+
+
+class CargoVersionParsing(unittest.TestCase):
+    """bazel/cargo_versions.bzl's manifest reader, evaluated in Python."""
+
+    def version(self, manifest, workspace=""):
+        return cargo_versions_bzl()["package_version"](manifest, lambda: workspace, "a")
+
+    def test_reads_the_package_version_only(self):
+        self.assertEqual(self.version(MANIFEST), "0.11.25")
+        self.assertEqual(self.version('[dependencies]\nx = { version = "9" }\n[package]\nname = "a"\n'
+                                      'version = "1.2.3" # bumped by release-plz\n'), "1.2.3")
+
+    def test_inherits_the_workspace_version(self):
+        self.assertEqual(self.version('[package]\nversion.workspace = true\n',
+                                      '[workspace]\n[workspace.package]\nversion = "4.5.6"\n'), "4.5.6")
+        self.assertEqual(self.version('[package]\nversion = { workspace = true }\n',
+                                      '[workspace.package]\nversion = "4.5.7"\n'), "4.5.7")
+
+    def test_missing_version_fails_loudly(self):
+        with self.assertRaisesRegex(StarlarkFailure, "no \\[package\\] version"):
+            self.version('[package]\nname = "a"\n')
+
+    def test_every_workspace_crate_is_registered(self):
+        versions = starlark_cargo_versions(ROOT)
+        crates = {tomllib_name(p) for p in ROOT.glob("crates/*/Cargo.toml")}
+        self.assertEqual(set(versions), crates)
+        self.assertEqual(versions["intentd"], tomllib_version(ROOT / "crates/intentd/Cargo.toml"))
+
+
+def tomllib_name(path: Path) -> str:
+    import tomllib
+    return tomllib.loads(path.read_text())["package"]["name"]
+
+
+def tomllib_version(path: Path) -> str:
+    import tomllib
+    return tomllib.loads(path.read_text())["package"]["version"]
 
 
 class Package:
@@ -250,9 +371,11 @@ class Package:
                                   {"native": native, "rust_test": self.recorder("rust_test")})
         return scope["rust_integration_tests"]
 
-    def evaluate_build(self):
+    def evaluate_build(self, cargo_versions=None):
         """Evaluate the package's generated BUILD.bazel; returns {target: (kind, attrs)}."""
         env = {
+            "CARGO_VERSIONS": cargo_versions if cargo_versions is not None
+            else starlark_cargo_versions(self.directory.parents[1]),
             "glob": self.glob,
             "package": lambda **_: None,
             "rust_integration_tests": self.macro(),
@@ -424,6 +547,19 @@ class GeneratorDiscovery(unittest.TestCase):
     def test_feature_change_fails(self):
         self.crate("a", lib="pub mod m1;\npub mod m2;\n", extra='\n[features]\ndefault = ["x"]\nx = []\n')
         self.assertIn("crates/a/BUILD.bazel", self.stale())
+
+    def test_release_bump_needs_no_regeneration_and_builds_the_new_version(self):
+        # release-plz bumps [package] versions without touching Bazel files; the Bazel
+        # targets must still carry the new version (CARGO_PKG_VERSION, `--version`).
+        manifest = self.tmp / "crates/a/Cargo.toml"
+        manifest.write_text(manifest.read_text().replace('version = "0.1.0"', 'version = "0.2.0"'))
+        self.cargo("generate-lockfile", "--offline")
+        self.assertEqual(self.stale(), [])
+        self.assertEqual(self.check()[0], 0)
+        self.assertEqual(starlark_cargo_versions(self.tmp), {"a": "0.2.0"})
+        rules = Package(self.tmp / "crates/a").evaluate_build()
+        self.assertEqual(rules["a"][1]["version"], "0.2.0")
+        self.assertEqual(rules["a_dev"][1]["version"], "0.2.0")
 
     def test_drift_guard_prints_the_same_fix(self):
         self.assertEqual(drift.FIX_COMMAND, gen.FIX_COMMAND)

@@ -56,3 +56,88 @@ crate.from_cargo(
     ],
 )
 use_repo(crate, "crates", "crates_dev")
+
+# Workspace-crate versions, read from these manifests whenever they change
+# (bazel/cargo_versions.bzl), so release bumps need no Bazel action.
+cargo_versions = use_extension("//bazel:cargo_versions.bzl", "cargo_versions")
+cargo_versions.crate(
+    name = "intent-acp",
+    manifest = "//crates/intent-acp:Cargo.toml",
+)
+cargo_versions.crate(
+    name = "intent-context",
+    manifest = "//crates/intent-context:Cargo.toml",
+)
+cargo_versions.crate(
+    name = "intent-core",
+    manifest = "//crates/intent-core:Cargo.toml",
+)
+cargo_versions.crate(
+    name = "intent-git",
+    manifest = "//crates/intent-git:Cargo.toml",
+)
+cargo_versions.crate(
+    name = "intent-js",
+    manifest = "//crates/intent-js:Cargo.toml",
+)
+cargo_versions.crate(
+    name = "intent-linear",
+    manifest = "//crates/intent-linear:Cargo.toml",
+)
+cargo_versions.crate(
+    name = "intent-nodes",
+    manifest = "//crates/intent-nodes:Cargo.toml",
+)
+cargo_versions.crate(
+    name = "intent-providers",
+    manifest = "//crates/intent-providers:Cargo.toml",
+)
+cargo_versions.crate(
+    name = "intent-pty",
+    manifest = "//crates/intent-pty:Cargo.toml",
+)
+cargo_versions.crate(
+    name = "intent-search",
+    manifest = "//crates/intent-search:Cargo.toml",
+)
+cargo_versions.crate(
+    name = "intent-sentry",
+    manifest = "//crates/intent-sentry:Cargo.toml",
+)
+cargo_versions.crate(
+    name = "intent-services",
+    manifest = "//crates/intent-services:Cargo.toml",
+)
+cargo_versions.crate(
+    name = "intent-sourcecontrol",
+    manifest = "//crates/intent-sourcecontrol:Cargo.toml",
+)
+cargo_versions.crate(
+    name = "intent-store",
+    manifest = "//crates/intent-store:Cargo.toml",
+)
+cargo_versions.crate(
+    name = "intent-test-macros",
+    manifest = "//crates/intent-test-macros:Cargo.toml",
+)
+cargo_versions.crate(
+    name = "intent-transport",
+    manifest = "//crates/intent-transport:Cargo.toml",
+)
+cargo_versions.crate(
+    name = "intent-voice",
+    manifest = "//crates/intent-voice:Cargo.toml",
+)
+cargo_versions.crate(
+    name = "intentd",
+    manifest = "//crates/intentd:Cargo.toml",
+)
+cargo_versions.crate(
+    name = "intentd-sitter",
+    manifest = "//crates/intentd-sitter:Cargo.toml",
+)
+cargo_versions.crate(
+    name = "intentd-test-support",
+    manifest = "//crates/intentd-test-support:Cargo.toml",
+)
+use_repo(cargo_versions, "cargo_versions")

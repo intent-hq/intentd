@@ -726,7 +726,9 @@ def render_build(ws: Workspace, package: dict, nextest: NextestPolicy) -> str:
     # git checkout), so a new commit does not invalidate every cached test.
     env_files = override.get("rustc_env_files", [])
     lint_config = ":cargo_lints" if has_lints(package) else None
-    common = {"edition": package["edition"], "version": package["version"]}
+    # The version comes from Cargo.toml at load time (bazel/cargo_versions.bzl),
+    # so a release bump needs no regeneration.
+    common = {"edition": package["edition"], "version": Raw("CRATE_VERSION")}
     # Test-graph actions run outside the sandbox (TEST_GRAPH_TAGS), so rules_rust's
     # CARGO_MANIFEST_DIR is the real execroot, whose top-level entries link to
     # the source tree. Tests embed it with env!() and hand paths below it to
@@ -1081,6 +1083,7 @@ def render_build(ws: Workspace, package: dict, nextest: NextestPolicy) -> str:
     # --- assemble ---
     out = [HEADER]
     out.append('load("@bazel_skylib//rules:copy_file.bzl", "copy_file")\n' if "copy_file" in used else "")
+    out.append('load("@cargo_versions//:versions.bzl", "CARGO_VERSIONS")\n')
     out.append('load("@crates//:defs.bzl", "aliases", "all_crate_deps")\n')
     out.append('load("@crates_dev//:defs.bzl", dev_aliases = "aliases", dev_crate_deps = "all_crate_deps")\n')
     cargo_rules = sorted({"cargo_build_script"} & used | ({"extract_cargo_lints"} if lint_config else set()))
@@ -1093,6 +1096,8 @@ def render_build(ws: Workspace, package: dict, nextest: NextestPolicy) -> str:
     rust_rules = sorted(used & {"rust_binary", "rust_library", "rust_proc_macro", "rust_test"})
     out.append('load("@rules_rust//rust:defs.bzl", ' + ", ".join(f'"{r}"' for r in rust_rules) + ")\n\n")
     out.append('package(default_visibility = ["//visibility:public"])\n\n')
+    out.append("# The crate's current Cargo.toml version, read when Bazel loads the build.\n")
+    out.append(f'CRATE_VERSION = CARGO_VERSIONS["{name}"]\n\n')
     out.append(
         "COMPILE_DATA = glob(\n    [\"**\"],\n    exclude = "
         + starlark_list(COMPILE_DATA_EXCLUDES, "    ")
@@ -1156,6 +1161,10 @@ def render_module(ws: Workspace) -> str:
         f"//{ws.package_dir(p).as_posix()}:Cargo.toml" for p in ws.packages
     )
     manifest_lines = "".join(f'        "{m}",\n' for m in manifests)
+    version_tags = "".join(
+        f'cargo_versions.crate(\n    name = "{p["name"]}",\n    manifest = "//{ws.package_dir(p).as_posix()}:Cargo.toml",\n)\n'
+        for p in sorted(ws.packages, key=lambda p: p["name"])
+    )
     return f'''{HEADER}
 # Rust toolchain, pinned to rust-toolchain.toml's channel.
 rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
@@ -1191,6 +1200,11 @@ crate.from_cargo(
 {manifest_lines}    ],
 )
 use_repo(crate, "crates", "crates_dev")
+
+# Workspace-crate versions, read from these manifests whenever they change
+# (bazel/cargo_versions.bzl), so release bumps need no Bazel action.
+cargo_versions = use_extension("//bazel:cargo_versions.bzl", "cargo_versions")
+{version_tags}use_repo(cargo_versions, "cargo_versions")
 '''
 
 

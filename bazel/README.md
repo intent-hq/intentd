@@ -196,14 +196,22 @@ matches `MODULE.bazel` or the Cargo manifests and `Cargo.lock`
 A third-party bump in `Cargo.lock` therefore needs only `--fix` and a commit of
 the refreshed lock.
 
-**Release bumps pass.** When the only difference is workspace-crate versions
-(each crate's `version`, path dependencies' `version`, and source-less
-`Cargo.lock` packages), the guard prints a "tolerated" note and exits 0, so a
-release-plz PR and the PRs after it stay green with no Bazel action. It
-compares today's Cargo files against the ones recorded in the lock, recovered
-from the commit that last changed `MODULE.bazel.lock` (CI checks out full
-history for this). Third-party versions, features, path changes or a new crate
-still fail. `--fix` at any time refreshes everything. Set `BAZEL` to pick the launcher (default `bazelisk`, then
+**Release bumps pass.** The generated BUILD files carry no crate versions:
+each loads `CARGO_VERSIONS` from `@cargo_versions`, which
+`bazel/cargo_versions.bzl` reads from the current `Cargo.toml` files when Bazel
+loads the build. Bazel watches those manifests, so after a bump the binaries
+report the new `CARGO_PKG_VERSION` (`--version`) with no regeneration. The
+extension is reproducible, so the lock does not record it. When the only lock
+difference is workspace-crate versions (each crate's `version`, path
+dependencies' `version`, and source-less `Cargo.lock` packages), the guard
+prints a "tolerated" note and exits 0, so a release-plz PR and the PRs after it
+stay green with no Bazel action. It compares today's Cargo files against the
+ones recorded in the lock, recovered from the commit that last changed
+`MODULE.bazel.lock` (CI checks out full history for this), then reruns
+`mod deps --lockfile_mode=error` with those recorded files temporarily put
+back: if the lock is still stale, `MODULE.bazel` or a crate annotation changed
+alongside the bump, and the guard fails. Third-party versions, features, path
+changes, annotations or a new crate still fail. `--fix` at any time refreshes everything. Set `BAZEL` to pick the launcher (default `bazelisk`, then
 `bazel`). Its unit tests are `python3 -B scripts/test-bazel-ci.py`.
 
 ## CI

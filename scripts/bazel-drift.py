@@ -14,9 +14,13 @@ change:
     checkout that wrote it.
 
 Release bumps need no Bazel action. release-plz changes only the versions of
-workspace crates; when that is the whole difference (in the generated files,
-or between the Cargo inputs the lock recorded and today's), the check passes.
-Any third-party, feature, path or crate-set change still fails.
+workspace crates. The generated files carry no versions (Bazel reads them from
+Cargo.toml at load time, see bazel/cargo_versions.bzl), so they stay current.
+The lock is tolerated behind a bump when the Cargo inputs it recorded differ
+from today's only in those versions, and when the lock is still current with
+those recorded inputs put back, so MODULE.bazel and crate annotations have not
+changed either. Any third-party, feature, path, crate-set, annotation or other
+configuration change still fails.
 
     python3 scripts/bazel-drift.py         # check; exit 1 and print the fix
     python3 scripts/bazel-drift.py --fix   # regenerate, refresh the lock, recheck
@@ -29,8 +33,8 @@ needs the git history (fetch-depth: 0).
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
-import importlib.util
 import json
 import os
 import re
@@ -46,8 +50,6 @@ FIX_COMMAND = "python3 scripts/bazel-drift.py --fix"
 # Paths that only exist on the machine that wrote the lock.
 HOST_PATH = re.compile(r'(?<![\w.-])/(?:home|Users|root|tmp|private|var/folders)/[^"\s\\]*')
 BAZEL_FLAGS = ["--curses=no", "--color=no"]
-# A crate's own version line in a generated BUILD file.
-VERSION_LINE = re.compile(r'^\s*version = "[^"]*",\n', re.M)
 CRATE_EXTENSION = "@@rules_rust+//crate_universe:extensions.bzl%crate"
 DEP_TABLES = ("dependencies", "dev-dependencies", "build-dependencies")
 
@@ -152,8 +154,27 @@ def git_show(rev: str, path: str) -> str | None:
     return out.stdout if out.returncode == 0 else None
 
 
-def lock_drift_is_release_only() -> tuple[bool, str]:
-    """Whether every Cargo input that changed since the lock was written changed only versions."""
+@contextlib.contextmanager
+def recorded_cargo_inputs(originals: dict[str, bytes]):
+    """Temporarily put back the Cargo files the lock recorded; restore the tree afterwards."""
+    current = {path: (ROOT / path).read_bytes() for path in originals}
+    try:
+        for path, content in originals.items():
+            (ROOT / path).write_bytes(content)
+        yield
+    finally:
+        for path, content in current.items():
+            (ROOT / path).write_bytes(content)
+
+
+def lock_drift_is_release_only(launcher: str) -> tuple[bool, str]:
+    """Whether the lock is behind a release bump and nothing else.
+
+    Every Cargo input that changed since the lock was written must differ only in
+    workspace-crate versions, and the lock must still be current once those inputs
+    are put back: that second check catches MODULE.bazel and crate annotation
+    (bazel/crates.MODULE.bazel) changes made alongside the bump.
+    """
     rev = subprocess.run(["git", "log", "-1", "--format=%H", "--", LOCK.name],
                          cwd=ROOT, capture_output=True, text=True).stdout.strip()
     if not rev:
@@ -161,7 +182,7 @@ def lock_drift_is_release_only() -> tuple[bool, str]:
     recorded = recorded_crate_inputs(LOCK.read_text(encoding="utf-8"))
     if not recorded:
         return False, "the lock records no crate_universe inputs"
-    changed = []
+    changed: dict[str, bytes] = {}
     for path, digest in sorted(recorded.items()):
         current = ROOT / path
         if current.exists() and hashlib.sha256(current.read_bytes()).hexdigest() == digest:
@@ -171,35 +192,16 @@ def lock_drift_is_release_only() -> tuple[bool, str]:
             return False, f"cannot recover the {path} the lock recorded"
         if not current.exists() or not release_only_change(path, old, current.read_text(encoding="utf-8")):
             return False, f"{path} changed beyond workspace-crate versions"
-        changed.append(path)
+        changed[path] = old.encode()
     if not changed:
         return False, "the recorded Cargo inputs are unchanged, so MODULE.bazel or the lock itself drifted"
+    print("bazel-drift: rechecking the lock against the Cargo inputs it recorded", flush=True)
+    with recorded_cargo_inputs(changed):
+        current_without_bump = run([launcher, "mod", "deps", "--lockfile_mode=error", *BAZEL_FLAGS]) == 0
+    if not current_without_bump:
+        return False, ("MODULE.bazel or crate_universe configuration (such as a crate annotation) "
+                       "changed as well as workspace-crate versions")
     return True, f"only workspace-crate versions changed in {len(changed)} Cargo file(s)"
-
-
-def load_generator():
-    spec = importlib.util.spec_from_file_location("bazel_gen", ROOT / "scripts/bazel-gen.py")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def generated_drift_is_release_only() -> bool:
-    """Whether the stale generated files differ from the generator's output only in version lines."""
-    try:
-        expected = load_generator().generated_files()
-    except (SystemExit, Exception):  # noqa: BLE001 - any generator failure means real drift
-        return False
-    stale = False
-    for path, content in expected.items():
-        current = path.read_text(encoding="utf-8") if path.exists() else None
-        if current == content:
-            continue
-        if current is None or VERSION_LINE.sub("", current) != VERSION_LINE.sub("", content):
-            return False
-        stale = True
-    orphans = {p for p in ROOT.glob("crates/*/BUILD.bazel")} - set(expected)
-    return stale and not orphans
 
 
 # --- check / fix --------------------------------------------------------------
@@ -209,15 +211,12 @@ def check(launcher: str) -> tuple[list[str], list[str]]:
     """Return (problems, notes)."""
     problems, notes = [], []
     if run([sys.executable, "scripts/bazel-gen.py", "--check"]) != 0:
-        if generated_drift_is_release_only():
-            notes.append("generated files differ only in workspace-crate versions (release bump)")
-        else:
-            problems.append("generated BUILD or MODULE files are stale (scripts/bazel-gen.py --check)")
+        problems.append("generated BUILD or MODULE files are stale (scripts/bazel-gen.py --check)")
     problems += check_lock_paths()
     # `mod deps` evaluates the module extensions, so crate_universe's recorded
     # Cargo.toml/Cargo.lock digests are compared against the working tree.
     if not problems and run([launcher, "mod", "deps", "--lockfile_mode=error", *BAZEL_FLAGS]) != 0:
-        release_only, why = lock_drift_is_release_only()
+        release_only, why = lock_drift_is_release_only(launcher)
         if release_only:
             notes.append(f"{LOCK.name} is behind a release bump: {why}")
         else:
