@@ -556,8 +556,46 @@ impl Updater {
         channel: Channel,
         trigger: CheckTrigger,
     ) -> Result<ChannelManifest, UpdateError> {
-        let now = time::OffsetDateTime::now_utc();
+        self.with_activity(time::OffsetDateTime::now_utc, |flags| {
+            Self::send_endpoint_check(endpoint, channel, trigger, flags)
+        })
+    }
+
+    /// One read → send → record activity transaction under
+    /// [`state::activity_lock`]: concurrent checks (e.g. startup plus
+    /// `intentd update`) observe each other's recorded success instead of
+    /// both sending the first-of-period and install flags. The clock is
+    /// read once the lock is held, and that request time — not completion
+    /// time — is recorded, so a check straddling midnight counts toward
+    /// the period it reported. The request is bounded by the endpoint
+    /// timeout; a lock that cannot be taken degrades to an unserialized
+    /// check rather than blocking updates.
+    fn with_activity<T>(
+        &self,
+        clock: impl FnOnce() -> time::OffsetDateTime,
+        send: impl FnOnce(activity::Activity) -> Result<T, UpdateError>,
+    ) -> Result<T, UpdateError> {
+        let _transaction = state::activity_lock(&self.paths.state_path)
+            .map_err(|e| eprintln!("intentd-sitter: failed to lock activity state: {e}"))
+            .ok();
+        let now = clock();
         let flags = activity::activity(&self.resolve_first_seen(now), now);
+        let result = send(flags)?;
+        if flags.needs_record() {
+            self.update_state(|state| {
+                activity::record_success(state, now);
+                true
+            });
+        }
+        Ok(result)
+    }
+
+    fn send_endpoint_check(
+        endpoint: &UpdateEndpoint,
+        channel: Channel,
+        trigger: CheckTrigger,
+        flags: activity::Activity,
+    ) -> Result<ChannelManifest, UpdateError> {
         let url = telemetry::update_check_url(
             &endpoint.base_url,
             channel,
@@ -598,14 +636,7 @@ impl Updater {
                 status,
             });
         }
-        let manifest = manifest::parse(&resp.bytes().map_err(network)?)?;
-        if flags.needs_record() {
-            self.update_state(|state| {
-                activity::record_success(state, now);
-                true
-            });
-        }
-        Ok(manifest)
+        Ok(manifest::parse(&resp.bytes().map_err(network)?)?)
     }
 
     /// Record the first-seen date on the first endpoint check (before the
@@ -1009,6 +1040,126 @@ fn dir_has_entries(dir: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whether another process (here: another open file description)
+    /// could take the activity transaction lock right now.
+    #[cfg(unix)]
+    fn activity_lock_is_free(paths: &SitterPaths) -> bool {
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(paths.state_path.with_file_name("activity.lock"))
+            .unwrap();
+        nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock).is_ok()
+    }
+
+    /// Regression: concurrent update checks (startup plus `intentd
+    /// update`) both read unset week/month dates and sent `i=1&w=1&m=1`,
+    /// counting one install twice. The flags must be read, sent and
+    /// recorded under one cross-process lock, with the clock read after
+    /// it is acquired.
+    #[cfg(unix)]
+    #[test]
+    fn activity_flags_are_read_sent_and_recorded_under_the_transaction_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = SitterPaths::from_data_dir(dir.path());
+        let updater = Updater::with_base_url(paths.clone(), "http://127.0.0.1:1").unwrap();
+        let now = time::macros::datetime!(2026-05-20 12:00 UTC);
+        let first = updater
+            .with_activity(
+                || {
+                    assert!(!activity_lock_is_free(&paths), "clock read before locking");
+                    now
+                },
+                |flags| {
+                    assert!(!activity_lock_is_free(&paths), "request sent unlocked");
+                    Ok(flags)
+                },
+            )
+            .unwrap();
+        assert!(activity_lock_is_free(&paths), "lock leaked past the check");
+        assert!(first.install && first.first_of_week && first.first_of_month);
+        // A check queued behind the first observes its recorded success.
+        let second = updater.with_activity(|| now, Ok).unwrap();
+        assert!(!second.needs_record(), "second check recounted: {second:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_checks_wait_for_the_in_flight_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = SitterPaths::from_data_dir(dir.path());
+        let now = time::macros::datetime!(2026-05-20 12:00 UTC);
+        let (in_flight_tx, in_flight_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let first = {
+            let paths = paths.clone();
+            std::thread::spawn(move || {
+                let updater = Updater::with_base_url(paths, "http://127.0.0.1:1").unwrap();
+                updater
+                    .with_activity(
+                        || now,
+                        |flags| {
+                            in_flight_tx.send(()).unwrap();
+                            release_rx.recv().unwrap();
+                            Ok(flags)
+                        },
+                    )
+                    .unwrap()
+            })
+        };
+        in_flight_rx.recv().unwrap();
+        let second = {
+            let paths = paths.clone();
+            std::thread::spawn(move || {
+                let updater = Updater::with_base_url(paths, "http://127.0.0.1:1").unwrap();
+                updater.with_activity(|| now, Ok).unwrap()
+            })
+        };
+        // Deterministic: while the first request is in flight its
+        // transaction lock is held, so the second check cannot have read
+        // the (still unrecorded) flags yet.
+        assert!(!activity_lock_is_free(&paths));
+        release_tx.send(()).unwrap();
+        let first = first.join().unwrap();
+        let second = second.join().unwrap();
+        assert!(first.install && first.first_of_week && first.first_of_month);
+        assert!(!second.needs_record(), "second check recounted: {second:?}");
+    }
+
+    /// A check sent just before midnight that completes after it records
+    /// the day/week/month it reported (request time), and the next
+    /// period's first check still carries its flags.
+    #[test]
+    fn check_straddling_midnight_records_the_request_period() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = SitterPaths::from_data_dir(dir.path());
+        let updater = Updater::with_base_url(paths.clone(), "http://127.0.0.1:1").unwrap();
+        // Sunday 2026-05-31: the last day of ISO week 22 and of May.
+        let request = time::macros::datetime!(2026-05-31 23:59:59 UTC);
+        let next_period = time::macros::datetime!(2026-06-01 00:00:01 UTC);
+        let mut clock_reads = 0;
+        updater
+            .with_activity(
+                || {
+                    clock_reads += 1;
+                    request
+                },
+                // The response lands after midnight; the transaction must
+                // not re-read the clock to record it.
+                Ok,
+            )
+            .unwrap();
+        assert_eq!(clock_reads, 1);
+        let state = state::load(&paths.state_path);
+        assert_eq!(state.last_check_day.as_deref(), Some("2026-05-31"));
+        assert_eq!(state.last_week.as_deref(), Some("2026-W22"));
+        assert_eq!(state.last_month.as_deref(), Some("2026-05"));
+        let next = updater.with_activity(|| next_period, Ok).unwrap();
+        assert!(next.first_of_day && next.first_of_week && next.first_of_month);
+        assert!(!next.install);
+    }
 
     #[test]
     fn install_version_preserves_binary_and_payload_contents() {

@@ -21,14 +21,29 @@ pub const STATE_SCHEMA_VERSION: u32 = 1;
 /// # Errors
 /// Returns an I/O error if the lock cannot be created or acquired.
 pub fn lock(path: &Path) -> io::Result<StateLock> {
-    if let Some(parent) = path.parent() {
+    lock_file(&path.with_extension("lock"))
+}
+
+/// Serialize the update-check endpoint transaction (read activity flags →
+/// send → record success) across updater processes, so concurrent checks
+/// never both send the first-of-period or install flags. Lock order: take
+/// this before [`lock`], never while holding it.
+///
+/// # Errors
+/// Returns an I/O error if the lock cannot be created or acquired.
+pub fn activity_lock(state_path: &Path) -> io::Result<StateLock> {
+    lock_file(&state_path.with_file_name("activity.lock"))
+}
+
+fn lock_file(lock_path: &Path) -> io::Result<StateLock> {
+    if let Some(parent) = lock_path.parent() {
         fs::create_dir_all(parent)?;
     }
     let file = fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(path.with_extension("lock"))?;
+        .open(lock_path)?;
     #[cfg(unix)]
     {
         nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusive)
