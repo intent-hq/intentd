@@ -45,7 +45,7 @@ impl Drop for Dropped {
 
 async fn run(code: &str, host: GuardedHostFn) -> Result<Value, JsError> {
     tokio::time::timeout(
-        Duration::from_secs(10),
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
         eval_guarded(code, &EvalOptions::default(), Some(host)),
     )
     .await
@@ -53,10 +53,13 @@ async fn run(code: &str, host: GuardedHostFn) -> Result<Value, JsError> {
 }
 
 async fn next<T>(rx: &mut mpsc::UnboundedReceiver<T>) -> T {
-    tokio::time::timeout(Duration::from_secs(10), rx.recv())
-        .await
-        .expect("test watchdog: expected transition")
-        .expect("fixture sender exists")
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        rx.recv(),
+    )
+    .await
+    .expect("test watchdog: expected transition")
+    .expect("fixture sender exists")
 }
 
 const CATCH: &str = "try { return await host(null); } catch (e) { return e.message; }";
@@ -455,7 +458,7 @@ async fn timeout_drops_pending_host_and_admission_without_retry() {
             ..EvalOptions::default()
         };
         let result = tokio::time::timeout(
-            Duration::from_secs(10),
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
             eval_guarded("return await host(null);", &opts, Some(host)),
         )
         .await

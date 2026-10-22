@@ -56,14 +56,14 @@ async fn attribution_recovers_after_write_pool_timeout() {
     let result = tokio::select! {
         result = &mut write => { drop(held); result }
         () = async {
-            tokio::time::timeout(Duration::from_secs(15), async {
+            tokio::time::timeout(intentd_test_support::test_timeout(Duration::from_secs(15)), async {
                 while observed.load(Ordering::SeqCst) == 0 {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             }).await.expect("upsert must observe an actual pool timeout");
         } => {
             drop(held);
-            tokio::time::timeout(Duration::from_secs(15), &mut write).await.expect("bounded recovery")
+            tokio::time::timeout(intentd_test_support::test_timeout(Duration::from_secs(15)), &mut write).await.expect("bounded recovery")
         }
     };
     result.expect("attribution upsert must recover without another edit");
@@ -93,7 +93,7 @@ async fn attribution_does_not_retry_a_closed_pool() {
         attributions: BTreeMap::default(),
     };
     let error = tokio::time::timeout(
-        Duration::from_secs(1),
+        intentd_test_support::test_timeout(Duration::from_secs(1)),
         store.upsert_note_line_attribution(&data),
     )
     .await
@@ -113,14 +113,14 @@ async fn after_attribution_pool_timeout<T>(
     let result = tokio::select! {
         result = &mut write => { drop(held); result }
         () = async {
-            tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::time::timeout(intentd_test_support::test_timeout(Duration::from_secs(10)), async {
                 while observed.load(Ordering::SeqCst) == 0 {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             }).await.expect("observe this operation's actual pool timeout");
         } => {
             drop(held);
-            tokio::time::timeout(Duration::from_secs(10), &mut write).await.expect("recovery deadline")
+            tokio::time::timeout(intentd_test_support::test_timeout(Duration::from_secs(10)), &mut write).await.expect("recovery deadline")
         }
     };
     let value = result.expect("normalized attribution must retry transient pool contention");
@@ -213,7 +213,7 @@ async fn attribution_ticket_and_atomic_publication_recover_after_pool_timeouts()
     // A committed/superseded ticket is a permanent stale result, not a retry.
     assert!(matches!(
         tokio::time::timeout(
-            Duration::from_secs(1),
+            intentd_test_support::test_timeout(Duration::from_secs(1)),
             store.publish_note_attribution(&job, &note.content, &data)
         )
         .await

@@ -331,14 +331,17 @@ mod tests {
         // The worker thread drops the last strong reference when SQLite closes the
         // connection. Arc reports no strong owners just before that thread runs
         // the destructor that unlocks the file, so wait on the OS lease itself.
-        let reacquired = tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                if let Ok(owner) = crate::daemon_ownership::DaemonOwnership::acquire(&lock) {
-                    break owner;
+        let reacquired = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                loop {
+                    if let Ok(owner) = crate::daemon_ownership::DaemonOwnership::acquire(&lock) {
+                        break owner;
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        })
+            },
+        )
         .await
         .expect("initialization worker must eventually release the lease");
         assert!(weak_owner.upgrade().is_none());

@@ -690,7 +690,7 @@ mod tests {
         assert!(matches!(&err, Error::Api(msg) if msg.contains("timed out")));
 
         entered_rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(intentd_test_support::test_timeout(Duration::from_secs(5)))
             .expect("write entered");
         assert!(
             !released.load(std::sync::atomic::Ordering::SeqCst),
@@ -699,9 +699,10 @@ mod tests {
 
         release_tx.send(()).expect("release the writer");
         returned_rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(intentd_test_support::test_timeout(Duration::from_secs(5)))
             .expect("write returned");
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline =
+            std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(5));
         while !released.load(std::sync::atomic::Ordering::SeqCst) {
             assert!(
                 std::time::Instant::now() < deadline,

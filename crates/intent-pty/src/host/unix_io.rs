@@ -226,7 +226,7 @@ mod tests {
             tx.send(writer.write_all(b"blocked")).unwrap();
         });
         stop.store(true, Ordering::Release);
-        let result = rx.recv_timeout(Duration::from_secs(5));
+        let result = rx.recv_timeout(intentd_test_support::test_timeout(Duration::from_secs(5)));
         drop(peer);
         thread.join().unwrap();
         assert_eq!(

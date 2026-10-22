@@ -60,7 +60,8 @@ impl RepositoryLifecycleObserver for Probe {
         let hold = self.hold.lock().unwrap().take();
         if let Some((entered, rx)) = hold {
             entered.notify_one();
-            rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            rx.recv_timeout(intentd_test_support::test_timeout(Duration::from_secs(10)))
+                .unwrap();
         }
         if self.reject.load(Ordering::SeqCst) {
             return Err(Error::Internal("fixture begin refusal".into()));
@@ -163,11 +164,14 @@ async fn held_observer_releases_writer_serialization_and_second_comparison_detec
     let writer = store.clone();
     let task =
         tokio::spawn(async move { writer.write_repository_selection(&before, change()).await });
-    tokio::time::timeout(Duration::from_secs(5), entered.notified())
-        .await
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        entered.notified(),
+    )
+    .await
+    .unwrap();
     let current = tokio::time::timeout(
-        Duration::from_secs(5),
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
         store.repository_selection_snapshot(&root),
     )
     .await
@@ -309,16 +313,20 @@ async fn cancelled_commit(installed: bool) {
         .set_commit_hook(move || {
             if let Some(rx) = rx.take() {
                 notify.notify_one();
-                rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                rx.recv_timeout(intentd_test_support::test_timeout(Duration::from_secs(10)))
+                    .unwrap();
             }
             true
         });
     drop(connection);
     let task =
         tokio::spawn(async move { store.write_repository_selection(&before, change()).await });
-    tokio::time::timeout(Duration::from_secs(5), entered.notified())
-        .await
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        entered.notified(),
+    )
+    .await
+    .unwrap();
     task.abort();
     assert!(matches!(task.await,Err(e) if e.is_cancelled()));
     release.send(()).unwrap();

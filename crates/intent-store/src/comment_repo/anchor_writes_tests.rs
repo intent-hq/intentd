@@ -219,12 +219,15 @@ async fn dropping_changed_writer_before_finalization_rolls_back_then_retry_commi
     x.content = "Changed inside cancelled writer".into();
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
     let mut pending = Box::pin(AFTER_MUTATION.scope(sender, update(&store, &ws, &x)));
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        tokio::select! {
-            reached = receiver.recv() => assert_eq!(reached, Some(())),
-            result = &mut pending => panic!("writer escaped mutation barrier: {result:?}"),
-        }
-    })
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+        async {
+            tokio::select! {
+                reached = receiver.recv() => assert_eq!(reached, Some(())),
+                result = &mut pending => panic!("writer escaped mutation barrier: {result:?}"),
+            }
+        },
+    )
     .await
     .unwrap();
     drop(pending);
