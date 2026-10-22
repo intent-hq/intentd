@@ -211,6 +211,21 @@ pub(crate) async fn try_dispatch(
     if let Some(rest) = method.strip_prefix("help.") {
         return help::dispatch(workspace_id, features, is_sub_agent, rest, args).map(Some);
     }
+    // Retired workspaces are read-only (PROTOCOL §5.1): an agent or hook
+    // still running there (the agent that retired its own workspace, mid
+    // turn) must not write notes, tasks or files into it. Its folder is
+    // gone, so every other ws.* call is refused until the workspace is
+    // revived.
+    if !workspace_id.is_chief() {
+        if let Ok(Some(retired)) = api
+            .retired_workspace_for(Some(workspace_id.clone()), None)
+            .await
+        {
+            return Err(map_err(intent_core::Error::WorkspaceRetired {
+                workspace_id: retired.as_str().to_string(),
+            }));
+        }
+    }
     if let Some(rest) = method.strip_prefix("workspace.") {
         return workspace::dispatch(api, workspace_id, caller_agent_id, rest, args)
             .await
@@ -600,5 +615,70 @@ mod prelude_tests {
             );
             assert!(js.contains("create:"), "create installer must survive");
         }
+    }
+}
+
+#[cfg(test)]
+mod retired_workspace_tests {
+    use super::*;
+    use intent_core::BoxFuture;
+    use serde_json::json;
+
+    /// `ws-retired` is retired; every other workspace is live. Note writes
+    /// succeed on a live workspace so the refusal is the gate's, not the
+    /// binding's.
+    struct RetiredApi;
+
+    impl WorkspaceApi for RetiredApi {
+        fn retired_workspace_for(
+            &self,
+            workspace_id: Option<WorkspaceId>,
+            _agent_id: Option<AgentId>,
+        ) -> BoxFuture<'_, intent_core::Result<Option<WorkspaceId>>> {
+            Box::pin(async move { Ok(workspace_id.filter(|w| w.as_str() == "ws-retired")) })
+        }
+    }
+
+    /// Every ws.* call from a retired workspace (other than help) is refused
+    /// with `workspace-retired` before it reaches a binding — so an agent
+    /// still mid-turn there cannot write notes, tasks or files.
+    #[tokio::test]
+    async fn bindings_refuse_calls_from_a_retired_workspace() {
+        let api: Arc<dyn WorkspaceApi> = Arc::new(RetiredApi);
+        let features = AgentFeaturesSettings::default();
+        let call = |ws: &'static str, method: &'static str| {
+            let api = api.clone();
+            let features = features.clone();
+            async move {
+                try_dispatch(
+                    &api,
+                    &WorkspaceId::from(ws),
+                    None,
+                    None,
+                    &features,
+                    false,
+                    EvalBudget::starting_now(Duration::from_secs(30)),
+                    method,
+                    &json!({ "title": "t", "content": "c" }),
+                )
+                .await
+            }
+        };
+        for method in [
+            "note.create",
+            "task.updateStatus",
+            "file.write",
+            "git.commit",
+        ] {
+            let err = call("ws-retired", method).await.unwrap_err();
+            assert!(err.contains("retired"), "{method}: {err}");
+        }
+        // A live workspace reaches the binding (which then fails on the
+        // fake API for its own reasons, never with the retired refusal).
+        let live = call("ws-live", "note.create").await;
+        assert!(
+            live.as_ref().err().is_none_or(|e| !e.contains("retired")),
+            "{live:?}"
+        );
     }
 }

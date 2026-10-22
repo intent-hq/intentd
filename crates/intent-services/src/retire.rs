@@ -55,6 +55,7 @@ impl Services {
         let current = self.store.get_workspace(&id).await?;
         if !current.is_retired() {
             retire_supported(&current)?;
+            self.require_owned_worktree(&current)?;
             // A workspace inside its delete grace window is on its way out:
             // retiring it would race the committed delete.
             if self
@@ -137,6 +138,12 @@ impl Services {
                 drop(manager.stop_many(&ids).await);
             }
         }
+        // Kill the workspace's terminals: their shells run inside the folder
+        // being removed, and a terminal addressed only by `terminalId` would
+        // otherwise keep writing into a retired workspace.
+        for terminal in self.pty.list_scope(id.as_str()) {
+            self.pty.kill(terminal).await;
+        }
         if let Some(worktree) = git_ops::worktree_path(&ws) {
             self.git_status_cache.evict(&worktree);
         }
@@ -145,6 +152,47 @@ impl Services {
         ws.activity = self.workspace_activity(&ws.id);
         self.attach_workspace_membership(&mut ws).await;
         Ok(ws)
+    }
+
+    /// Ownership proof before anything is deleted (the `workspace.delete`
+    /// root-anchored rule): the checkout's parent directory is named after
+    /// the workspace id AND sits under a root the daemon provisions into
+    /// (the boot workspaces root or the configured
+    /// `workspace.worktreesLocation`). A persisted path that fails it is a
+    /// folder the daemon cannot prove it created, so retire is refused with
+    /// `retire-unsupported` and nothing changes. A present folder must also
+    /// be a linked worktree registered in the source repository.
+    fn require_owned_worktree(&self, ws: &Workspace) -> Result<()> {
+        let workspaces_root = self
+            .workspaces_root
+            .clone()
+            .unwrap_or_else(default_workspaces_root);
+        let worktrees_location = self.configured_worktrees_location();
+        let owned = ws.worktree_path.as_deref().is_some_and(|wt| {
+            crate::checkout_parent_is_workspace_dir(wt, &ws.id)
+                && (std::path::Path::new(wt).starts_with(&workspaces_root)
+                    || worktrees_location
+                        .as_deref()
+                        .is_some_and(|loc| std::path::Path::new(wt).starts_with(loc)))
+        });
+        // …and the folder must be a linked worktree registered in its source
+        // repository (a folder that is already gone has nothing to delete).
+        let registered = owned
+            && ws.worktree_path.as_deref().is_some_and(|wt| {
+                let wt = std::path::Path::new(wt);
+                !wt.exists()
+                    || ws.repository_path.as_deref().is_some_and(|repo| {
+                        intent_git::worktree::is_registered_worktree(std::path::Path::new(repo), wt)
+                    })
+            });
+        if registered {
+            Ok(())
+        } else {
+            Err(Error::RetireUnsupported {
+                workspace_id: ws.id.as_str().to_string(),
+                checkout_mode: ws.checkout_mode,
+            })
+        }
     }
 
     /// Remove a retired workspace's worktree from disk: under the per-repo

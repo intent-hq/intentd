@@ -401,12 +401,23 @@ async fn retire_refuses_non_worktree_checkouts() {
     remote.is_remote = true;
     let mut bare = base("bare");
     bare.worktree_path = None;
+    // A worktree-mode row whose persisted path the daemon cannot prove it
+    // created (outside every workspaces root): never deleted.
+    let mut foreign = base("foreign");
+    foreign.worktree_path = Some(
+        f.repo
+            .join("ws-foreign")
+            .join("repo")
+            .to_string_lossy()
+            .to_string(),
+    );
     let cases = [
         (cow, Some(intent_core::CheckoutMode::Cow)),
         (direct, Some(intent_core::CheckoutMode::Direct)),
         (skip, None),
         (remote, None),
         (bare, None),
+        (foreign, Some(intent_core::CheckoutMode::Worktree)),
     ];
     for (ws, mode) in cases {
         f.store.insert_workspace(&ws).await.expect("insert");
@@ -425,4 +436,49 @@ async fn retire_refuses_non_worktree_checkouts() {
         assert_eq!(row.status, WorkspaceStatus::Active, "{} untouched", ws.id.0);
         assert!(!row.archived, "{} not archived", ws.id.0);
     }
+}
+
+/// Retire kills the workspace's terminals: their shells ran in the deleted
+/// folder, and a write addressed only by `terminalId` must have nothing left
+/// to reach.
+#[intent_test_macros::daemon_test]
+async fn retire_kills_workspace_terminals() {
+    let f = fixture().await;
+    let ws = create_workspace(&f).await;
+    f.svc
+        .terminal_create(ws.id.clone(), 80, 24, None, None, None)
+        .await
+        .expect("terminal");
+    assert_eq!(f.svc.pty.list_scope(ws.id.as_str()).len(), 1);
+    f.svc
+        .retire_workspace(ws.id.clone(), None)
+        .await
+        .expect("retire");
+    assert!(
+        f.svc.pty.list_scope(ws.id.as_str()).is_empty(),
+        "terminals killed on retire"
+    );
+}
+
+/// A daemon-root path that exists but is not a linked worktree registered
+/// in the source repository is never deleted: retire is refused and the
+/// folder survives untouched.
+#[intent_test_macros::daemon_test]
+async fn retire_refuses_unregistered_folder_and_keeps_it() {
+    let f = fixture().await;
+    let id = WorkspaceId::from("ws-unregistered");
+    let folder = f.root.join(id.as_str()).join("repo");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("keep.txt"), "user data").unwrap();
+    let mut ws = super::workspace(&id);
+    ws.repository_path = Some(f.repo.to_string_lossy().to_string());
+    ws.worktree_path = Some(folder.to_string_lossy().to_string());
+    ws.checkout_mode = Some(intent_core::CheckoutMode::Worktree);
+    f.store.insert_workspace(&ws).await.expect("insert");
+
+    let err = f.svc.retire_workspace(id.clone(), None).await.unwrap_err();
+    assert!(matches!(err, Error::RetireUnsupported { .. }), "{err:?}");
+    assert!(folder.join("keep.txt").is_file(), "folder untouched");
+    let row = f.store.get_workspace(&id).await.unwrap();
+    assert_eq!(row.status, WorkspaceStatus::Active);
 }

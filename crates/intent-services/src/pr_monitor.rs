@@ -14573,8 +14573,9 @@ mod tests {
         let mut row = svc.store().get_workspace(&ws).await.unwrap();
         row.repository_path = Some(scratch.path().join("repo").to_string_lossy().into_owned());
         row.worktree_path = Some(
-            scratch
-                .path()
+            svc.workspaces_root
+                .clone()
+                .expect("test workspaces root")
                 .join(ws.as_str())
                 .join("wt")
                 .to_string_lossy()

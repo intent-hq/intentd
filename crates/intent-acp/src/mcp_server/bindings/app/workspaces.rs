@@ -993,9 +993,9 @@ async fn archive(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, Str
 
     assert_mutable_workspace_id(id)?;
 
-    // Validate workspace exists
+    // Validate workspace exists (id validation, not a listing: retired ids stay deletable)
     let workspaces = api
-        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .list_workspaces(intent_core::WorkspaceListFilter::ALL)
         .await
         .map_err(map_err)?;
     let workspace = workspaces
@@ -1041,9 +1041,9 @@ async fn delete(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, Stri
 
     assert_mutable_workspace_id(id)?;
 
-    // Validate workspace exists
+    // Validate workspace exists (id validation, not a listing: retired ids stay deletable)
     let workspaces = api
-        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .list_workspaces(intent_core::WorkspaceListFilter::ALL)
         .await
         .map_err(map_err)?;
     let workspace = workspaces
@@ -1101,9 +1101,9 @@ async fn bulk_archive(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value
         }
     }
 
-    // Validate all workspaces exist
+    // Validate all workspaces exist (id validation, not a listing: retired ids stay deletable)
     let workspaces = api
-        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .list_workspaces(intent_core::WorkspaceListFilter::ALL)
         .await
         .map_err(map_err)?;
     let mut bulk_items = Vec::new();
@@ -1167,9 +1167,9 @@ async fn bulk_delete(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value,
         }
     }
 
-    // Validate all workspaces exist
+    // Validate all workspaces exist (id validation, not a listing: retired ids stay deletable)
     let workspaces = api
-        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .list_workspaces(intent_core::WorkspaceListFilter::ALL)
         .await
         .map_err(map_err)?;
     let mut bulk_items = Vec::new();
@@ -1346,6 +1346,37 @@ mod tests {
             pending_delete_at: None,
             membership: None,
         }
+    }
+
+    /// `app.workspaces.delete` / `bulkDelete` validate ids against every
+    /// row, retired included: a retired workspace stays deletable (its id is
+    /// not reported as not found just because lists hide it).
+    #[tokio::test]
+    async fn delete_accepts_retired_workspace_ids() {
+        let fake = Arc::new(FakeApi::default());
+        let mut retired = make_workspace("ws-retired", "Retired");
+        retired.status = WorkspaceStatus::Retired;
+        retired.archived = true;
+        fake.workspaces.lock().unwrap().push(retired);
+        let api: Arc<dyn WorkspaceApi> = fake;
+        let chief = WorkspaceId::chief();
+        let one = dispatch(&api, &chief, None, "delete", &json!({ "id": "ws-retired" })).await;
+        assert!(
+            one.as_ref().err().is_none_or(|e| !e.contains("not found")),
+            "{one:?}"
+        );
+        let bulk = dispatch(
+            &api,
+            &chief,
+            None,
+            "bulkDelete",
+            &json!({ "ids": ["ws-retired"] }),
+        )
+        .await;
+        assert!(
+            bulk.as_ref().err().is_none_or(|e| !e.contains("not found")),
+            "{bulk:?}"
+        );
     }
 
     /// `app.workspaces.list` (the ws.app.* MCP binding) hides retired

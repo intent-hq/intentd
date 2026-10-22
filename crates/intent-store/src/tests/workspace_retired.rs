@@ -131,3 +131,23 @@ async fn retired_row_survives_unarchive_and_full_row_update() {
     assert_eq!(row.status, WorkspaceStatus::Retired);
     assert!(row.retired_at.is_some());
 }
+
+/// The archive flip reads the status inside its IMMEDIATE transaction: a
+/// retired row is refused with `WorkspaceRetired` and never flipped back to
+/// Archived (closes the archive-vs-retire race).
+#[tokio::test]
+async fn archive_flip_refuses_a_retired_row() {
+    let (_tmp, store, _active, _archived, retired) = seeded().await;
+    let err = store
+        .archive_workspace_detaching_guests(&retired, &now_iso())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, Error::WorkspaceRetired { workspace_id } if *workspace_id == retired.0),
+        "{err:?}"
+    );
+    assert_eq!(
+        store.get_workspace(&retired).await.unwrap().status,
+        WorkspaceStatus::Retired
+    );
+}
