@@ -1,0 +1,22 @@
+exports_files([
+    "workspace_status.sh",
+])
+
+# rustc env file carrying the stamped build commit into intent-transport, in
+# place of its git-calling build.rs. Unstamped builds (--nostamp) get an empty
+# file, so `option_env!("INTENTD_EMBEDDED_BUILD_COMMIT")` is None, the same as a
+# Cargo build outside a git checkout.
+genrule(
+    name = "build_commit_env",
+    outs = ["build_commit.env"],
+    cmd = """
+if [ -f bazel-out/stable-status.txt ]; then
+  sed -n 's/^STABLE_INTENTD_BUILD_COMMIT \\([0-9a-fA-F]*\\)$$/INTENTD_EMBEDDED_BUILD_COMMIT=\\1/p' \
+    bazel-out/stable-status.txt > $@
+else
+  : > $@
+fi
+""",
+    stamp = -1,
+    visibility = ["//visibility:public"],
+)

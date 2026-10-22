@@ -1,0 +1,17 @@
+# Bazel build for intentd, alongside Cargo. See bazel/README.md.
+
+exports_files([
+    "Cargo.lock",
+    "Cargo.toml",
+    "rust-toolchain.toml",
+])
+
+alias(
+    name = "intentd",
+    actual = "//crates/intentd",
+)
+
+alias(
+    name = "intentd-sitter",
+    actual = "//crates/intentd-sitter",
+)

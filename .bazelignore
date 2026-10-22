@@ -1,0 +1,6 @@
+# Cargo output.
+target
+# Vendored crate consumed through crate_universe as a Cargo [patch] path
+# dependency. crate_universe renders a BUILD.bazel into this directory while it
+# resolves the workspace; ignoring it keeps it out of the main repo's packages.
+vendor/pprof

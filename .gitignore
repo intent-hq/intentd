@@ -6,3 +6,5 @@ coverage-summary.txt
 /packaging/libexec/tailcat.exe
 /bazel-*
 /user.bazelrc
+/vendor/pprof/BUILD.bazel
+/MODULE.bazel.lock

@@ -1,0 +1,18 @@
+"""Hand-maintained crate_universe annotations for third-party crates.
+
+Keep this list short: each entry is a place where Bazel needs help that Cargo
+does not. Record why next to every annotation.
+"""
+
+crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
+
+# Cargo's resolver 2 builds rquickjs-core twice: for the target (std, futures,
+# parallel) and for the rquickjs-macro proc-macro host (loader + relative-path).
+# crate_universe merges both into one feature set, so rquickjs-core gets `std`
+# and `loader` together. That combination compiles its file resolver, which
+# needs relative-path's `std` feature (rquickjs-core's weak
+# `relative-path?/std`), but Cargo.lock's resolution only enables `alloc`.
+crate.annotation(
+    crate = "relative-path",
+    crate_features = ["std"],
+)
