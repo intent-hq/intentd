@@ -652,9 +652,10 @@ class RunnerAvailabilityTests(unittest.TestCase):
                         self.assertEqual(json.loads(outputs["macos_labels"]), ["self-hosted", "macOS", "ARM64"])
                     logged = "merge queue keeps heavy" in run_heavy(self.workflow, result["outputs"], event)[1]
                     self.assertEqual(logged, event == "merge_group")
-        # coverage-all raises the inotify limit with sudo, so it keeps the hosted override.
-        self.assertEqual(self.workflow["jobs"]["coverage-all"]["runs-on"], "${{ fromJSON(needs.route.outputs.linux_labels) }}")
-        for job_id, label in {"check": "gh-linux-8x", "coverage-changed": "gh-linux-16x", "coverage-e2e": "gh-linux-16x"}.items():
+        # The coverage suites need more inotify instances than a slot host allows.
+        for job_id in ("coverage-e2e", "coverage-all"):
+            self.assertEqual(self.workflow["jobs"][job_id]["runs-on"], "${{ fromJSON(needs.route.outputs.linux_labels) }}")
+        for job_id, label in {"check": "gh-linux-8x", "coverage-changed": "gh-linux-16x"}.items():
             with self.subTest(job=job_id):
                 self.assertEqual(self.workflow["jobs"][job_id]["runs-on"],
                                  "${{ fromJSON(needs.route.outputs.slots || '{}')['%s'] || fromJSON('[\"%s\"]') }}" % (job_id, label))
