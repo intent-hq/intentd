@@ -223,3 +223,17 @@ fn the_state_round_trips_through_session_metadata() {
     let cleared = json!({ PROVIDER_RETURN_METADATA_KEY: null });
     assert_eq!(read_state_from(Some(&cleared)), None, "null is on home");
 }
+
+#[test]
+fn a_failed_return_with_nothing_left_still_moves_the_timer() {
+    let now = utc(NOW);
+    let mut state = on_switch(None, "claude-code", "claude-code@pb1", None, now);
+    state.returning = Some(ReturnMode::Rotation);
+    let failed = on_failed_return(state.clone(), None, now);
+    assert_eq!(failed.backoff_step, 1);
+    assert_eq!(failed.return_after, "2026-10-22T11:00:00Z");
+    assert_eq!(failed.returning, None);
+    assert_eq!(failed.away_on, state.away_on, "where it is stays unchanged");
+    let reported = on_failed_return(state, Some(utc("2026-10-22T10:20:00Z")), now);
+    assert_eq!(reported.return_after, "2026-10-22T10:20:00Z");
+}

@@ -144,7 +144,6 @@ impl Services {
         } else {
             chains.insert(agent_id.clone(), QuotaFailoverChain::default());
             self.quota_failover_replays.lock().unwrap().remove(agent_id);
-            self.cancel_provider_return_announcement(agent_id);
         }
     }
 
@@ -333,10 +332,39 @@ impl Services {
             }
             target
         };
+        let now = chrono::Utc::now();
+        let reported = crate::provider_return::parse_reset_time(error_text, now);
         let Some(target) = target else {
+            // Nothing left to try. When this was home rejecting a return
+            // before any output, it still counts as a failed return: the
+            // timer moves to the reported reset or the next backoff step.
+            // Guarded on the identity read above, so a concurrent manual
+            // choice (which clears the state) is never undone.
+            if let Some(state) = return_state.filter(|s| s.home == from_selection) {
+                let failed = crate::provider_return::on_failed_return(state, reported, now);
+                self.persist_provider_return_state_if_identity(
+                    workspace_id,
+                    agent_id,
+                    &from,
+                    session.model.as_deref(),
+                    &failed,
+                )
+                .await;
+            }
             return false;
         };
         let model = session.model.clone().filter(|m| !m.is_empty());
+        let next_state = crate::provider_return::on_switch(
+            return_state,
+            &from_selection,
+            &target,
+            reported,
+            now,
+        );
+        let next_state_json = json!(next_state).to_string();
+        // The move and its return bookkeeping land in one statement, so a
+        // concurrent `agent.setModel` (which clears the state) either wins
+        // the compare-and-set or comes after — never in between.
         let landed = match self
             .store
             .failover_agent_session_provider(
@@ -345,6 +373,10 @@ impl Services {
                 &from,
                 session.model.as_deref(),
                 &target,
+                Some((
+                    crate::provider_return::PROVIDER_RETURN_METADATA_KEY,
+                    &next_state_json,
+                )),
                 &now_iso(),
             )
             .await
@@ -370,18 +402,14 @@ impl Services {
             .unwrap()
             .insert(agent_id.clone());
         // Leaving the configuration this message started on: a timed return
-        // home that has not produced output yet is not announced.
+        // home that has not produced output yet is not announced. A rotation
+        // that reaches home is a return attempt of its own: home's first
+        // output accepts it (no `provider_returned` row — the failover row
+        // below announces the move).
         self.cancel_provider_return_announcement(agent_id);
-        let now = chrono::Utc::now();
-        let next_state = crate::provider_return::on_switch(
-            return_state,
-            &from_selection,
-            &target,
-            crate::provider_return::parse_reset_time(error_text, now),
-            now,
-        );
-        self.persist_provider_return_state(workspace_id, agent_id, Some(&next_state))
-            .await;
+        if next_state.returning.is_some() {
+            self.arm_provider_return_announcement(agent_id);
+        }
         self.invalidate_agent_list_cache(workspace_id);
         self.publish_agent_mutation_event(
             workspace_id,

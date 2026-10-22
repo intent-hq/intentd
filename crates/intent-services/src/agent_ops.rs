@@ -6492,6 +6492,9 @@ impl Services {
         crate::principal_ops::MessageAuthorResolver::new(self, &session.workspace_id)
             .attach_typed(&mut session.messages)
             .await;
+        // Daemon-internal bookkeeping stays in storage only (PROTOCOL §5.54:
+        // the home/return state is never exposed to clients).
+        crate::provider_return::strip_internal_metadata(&mut session);
         Ok(session)
     }
 

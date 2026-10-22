@@ -13774,6 +13774,10 @@ async fn run_message_worker(
     // the references already tried for it stay excluded; every other loop
     // pass starts a new message with a fresh chain.
     let mut keep_failover_chain = false;
+    // Set when the next loop pass continues the same logical turn rather
+    // than starting a new one (an idle-timeout warning turn, a truncation
+    // nudge, a stale or requeued redelivery): no timed return home there.
+    let mut continuation_turn = false;
     'outer: loop {
         if let Some(owner) = options.monitor_turn.take() {
             if let Some(turn) = owner.take() {
@@ -13853,10 +13857,16 @@ async fn run_message_worker(
             return;
         }
         let redrive = std::mem::take(&mut keep_failover_chain);
+        let continuation = std::mem::take(&mut continuation_turn);
         mgr.services.arm_quota_failover(&agent_id, redrive);
-        // Timed return to the home provider (PROTOCOL §5.54): only at the
-        // start of a user message, never on a redrive of the same message.
-        if !redrive && options.origin.is_user() {
+        // Timed return to the home provider (PROTOCOL §5.54): at the start of
+        // every new turn, whatever its origin (user, agent-to-agent,
+        // delegation, wake) — never on a redrive, retry or replay of the
+        // same turn, and never mid-turn.
+        if !redrive && !continuation {
+            // A new turn: an earlier turn's unaccepted return attempt is
+            // over. A continuation of the same turn keeps it pending.
+            mgr.services.cancel_provider_return_announcement(&agent_id);
             mgr.services
                 .begin_provider_return(&workspace_id, &agent_id)
                 .await;
@@ -14037,6 +14047,7 @@ async fn run_message_worker(
                             )
                             .await;
                             content = nudge;
+                            continuation_turn = true;
                             options = TurnOptions {
                                 turn_id: Some(nudge_turn_id),
                                 message_metadata: Some(nudge_metadata),
@@ -14240,6 +14251,7 @@ async fn run_message_worker(
                                     }
                                 }
                                 content = warning;
+                                continuation_turn = true;
                                 options = TurnOptions {
                                     turn_id: Some(warning_turn_id),
                                     // The same delivery remains owned until its continuation ends.
@@ -14654,6 +14666,9 @@ async fn run_message_worker(
             // A terminal-failure requeue whose user row already reached the
             // transcript before its failed turn began must not duplicate the
             // row on retry; otherwise persist now and remember the outcome.
+            // A stale or already-persisted (requeued) entry replays an
+            // earlier turn rather than starting a new one.
+            continuation_turn = stale || next.persisted;
             user_persisted = if next.monitor_turn.is_some() || next.persisted {
                 true
             } else {
@@ -14861,6 +14876,9 @@ async fn run_message_worker(
                 .await;
             let next_image_blocks = next.image_blocks.clone();
             let next_file_blocks = next.file_blocks.clone();
+            // A stale or already-persisted (requeued) entry replays an
+            // earlier turn rather than starting a new one.
+            continuation_turn = stale || next.persisted;
             user_persisted = if next.monitor_turn.is_some() || next.persisted {
                 true
             } else {

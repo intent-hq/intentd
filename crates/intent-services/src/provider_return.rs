@@ -101,6 +101,14 @@ pub(crate) fn read_state(session: &AgentSession) -> Option<ProviderReturnState> 
     read_state_from(session.metadata.as_ref())
 }
 
+/// Remove the return state from a session about to leave the daemon
+/// (`agent.getSession`): it is internal bookkeeping, kept in storage only.
+pub(crate) fn strip_internal_metadata(session: &mut AgentSession) {
+    if let Some(Value::Object(metadata)) = session.metadata.as_mut() {
+        metadata.remove(PROVIDER_RETURN_METADATA_KEY);
+    }
+}
+
 /// [`read_state`] on a raw session `metadata` value.
 pub(crate) fn read_state_from(metadata: Option<&Value>) -> Option<ProviderReturnState> {
     metadata?
@@ -150,14 +158,27 @@ pub(crate) fn on_switch(
         state.away_on = from;
         state.returning = Some(ReturnMode::Rotation);
     } else if from == state.home {
-        state.backoff_step = state.backoff_step.saturating_add(1);
-        state.return_after = rfc3339(reported.unwrap_or(now + backoff_delay(state.backoff_step)));
+        state = on_failed_return(state, reported, now);
         state.away_on = to;
-        state.returning = None;
     } else {
         state.away_on = to;
         state.returning = None;
     }
+    state
+}
+
+/// Home rejected a return before producing any output: one more failed
+/// return. The next return-after is the reported reset (when usable), else
+/// the next backoff step.
+pub(crate) fn on_failed_return(
+    mut state: ProviderReturnState,
+    reported: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> ProviderReturnState {
+    let reported = reported.filter(|t| *t > now && *t <= now + MAX_REPORTED_HORIZON);
+    state.backoff_step = state.backoff_step.saturating_add(1);
+    state.return_after = rfc3339(reported.unwrap_or(now + backoff_delay(state.backoff_step)));
+    state.returning = None;
     state
 }
 
@@ -314,6 +335,48 @@ impl Services {
         }
     }
 
+    /// Persist `state` only while the session still carries the provider
+    /// and model it was derived from (see
+    /// `Store::set_agent_session_metadata_key_json_if_identity`), so stale
+    /// bookkeeping never lands after a concurrent manual choice.
+    pub(crate) async fn persist_provider_return_state_if_identity(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        expected_provider: &str,
+        expected_model: Option<&str>,
+        state: &ProviderReturnState,
+    ) -> bool {
+        match self
+            .store
+            .set_agent_session_metadata_key_json_if_identity(
+                workspace_id,
+                agent_id,
+                expected_provider,
+                expected_model,
+                PROVIDER_RETURN_METADATA_KEY,
+                &json!(state).to_string(),
+                &now_iso(),
+            )
+            .await
+        {
+            Ok(landed) => landed,
+            Err(e) => {
+                tracing::warn!(agent = %agent_id, error = %e, "persisting the provider return state failed");
+                false
+            }
+        }
+    }
+
+    /// Arm the first-output acceptance of a return attempt (see
+    /// [`Self::announce_provider_return_if_pending`]).
+    pub(crate) fn arm_provider_return_announcement(&self, agent_id: &AgentId) {
+        self.provider_return_announcements
+            .lock()
+            .unwrap()
+            .insert(agent_id.clone());
+    }
+
     /// A manual model/provider choice makes it the new home: drop any
     /// return state. A no-op write when there is none.
     pub(crate) async fn clear_provider_return_state(
@@ -349,6 +412,29 @@ impl Services {
         let Some(mut state) = read_state(&session) else {
             return;
         };
+        // Already on home while the state still says away (home took the
+        // turn through the rotation, or after a failed return with nothing
+        // left to try): this turn is a return attempt too, due or not. Its
+        // first output accepts it and clears the state; the move home was
+        // already announced, so no `provider_returned` row.
+        if let Some(current) = session.provider.as_deref().filter(|p| !p.trim().is_empty()) {
+            if provider_profiles::canonical_selection(current) == state.home {
+                state.returning = Some(ReturnMode::Rotation);
+                if self
+                    .persist_provider_return_state_if_identity(
+                        workspace_id,
+                        agent_id,
+                        current,
+                        session.model.as_deref(),
+                        &state,
+                    )
+                    .await
+                {
+                    self.arm_provider_return_announcement(agent_id);
+                }
+                return;
+            }
+        }
         if !return_due(&state, Utc::now()) {
             return;
         }
@@ -370,23 +456,24 @@ impl Services {
             return;
         };
         let current_selection = provider_profiles::canonical_selection(&current);
-        if current_selection != state.home {
-            let landed = self
-                .store
-                .failover_agent_session_provider(
-                    workspace_id,
-                    agent_id,
-                    &current,
-                    session.model.as_deref(),
-                    &state.home,
-                    &now_iso(),
-                )
-                .await
-                .unwrap_or(false);
-            if !landed {
-                return;
-            }
-            state.away_on = current_selection;
+        state.away_on = current_selection;
+        state.returning = Some(ReturnMode::Timer);
+        // The move home and its bookkeeping are one statement (see
+        // `try_quota_failover`): a concurrent manual choice wins.
+        let landed = self
+            .store
+            .failover_agent_session_provider(
+                workspace_id,
+                agent_id,
+                &current,
+                session.model.as_deref(),
+                &state.home,
+                Some((PROVIDER_RETURN_METADATA_KEY, &json!(state).to_string())),
+                &now_iso(),
+            )
+            .await
+            .unwrap_or(false);
+        if landed {
             self.invalidate_agent_list_cache(workspace_id);
             self.publish_agent_mutation_event(
                 workspace_id,
@@ -399,15 +486,11 @@ impl Services {
                 }),
             )
             .await;
-            tracing::info!(agent = %agent_id, home = %state.home, "quota reset time passed; starting this message on the home provider");
+            tracing::info!(agent = %agent_id, home = %state.home, "quota reset time passed; starting this turn on the home provider");
         }
-        state.returning = Some(ReturnMode::Timer);
-        self.persist_provider_return_state(workspace_id, agent_id, Some(&state))
-            .await;
-        self.provider_return_announcements
-            .lock()
-            .unwrap()
-            .insert(agent_id.clone());
+        if landed {
+            self.arm_provider_return_announcement(agent_id);
+        }
     }
 
     /// Drop the pending announcement (a new message, a teardown, or home
@@ -420,10 +503,13 @@ impl Services {
             .remove(agent_id);
     }
 
-    /// Home produced its first output on a timed return: write the one
-    /// `provider_returned` row now, ahead of that output (the turn's
-    /// assistant row is persisted after it). A no-op unless a return is
-    /// pending for this message.
+    /// Home produced its first output on a return attempt: home accepted
+    /// it. The conversation is back home — the timer and backoff are
+    /// cleared (a later quota failure is a fresh departure) — and a timed
+    /// return writes its one `provider_returned` row now, ahead of that
+    /// output (the turn's assistant row is persisted after it). A return
+    /// through the rotation was announced by its failover row. A no-op
+    /// unless a return attempt is pending for this turn.
     pub(crate) async fn announce_provider_return_if_pending(
         &self,
         workspace_id: &WorkspaceId,
@@ -447,48 +533,32 @@ impl Services {
             .provider
             .as_deref()
             .is_some_and(|p| provider_profiles::canonical_selection(p) == state.home);
-        if state.returning != Some(ReturnMode::Timer) || !on_home {
+        let Some(mode) = state.returning.filter(|_| on_home) else {
             return;
+        };
+        self.persist_provider_return_state(workspace_id, agent_id, None)
+            .await;
+        if mode == ReturnMode::Timer {
+            self.persist_provider_returned_notice(
+                workspace_id,
+                agent_id,
+                &state.away_on,
+                &state.home,
+                session.model.as_deref().filter(|m| !m.is_empty()),
+            )
+            .await;
         }
-        self.persist_provider_returned_notice(
-            workspace_id,
-            agent_id,
-            &state.away_on,
-            &state.home,
-            session.model.as_deref().filter(|m| !m.is_empty()),
-        )
-        .await;
     }
 
-    /// After a turn completes: a conversation going back home is home, and
-    /// the state is cleared. A timed return whose turn produced no output at
-    /// all is announced now; a return through the rotation was already
-    /// announced by its failover row.
+    /// After a turn completes on a return attempt that produced no output
+    /// at all, home still accepted it: same as
+    /// [`Self::announce_provider_return_if_pending`].
     pub(crate) async fn complete_provider_return(
         &self,
         workspace_id: &WorkspaceId,
         agent_id: &AgentId,
     ) {
         self.announce_provider_return_if_pending(workspace_id, agent_id)
-            .await;
-        let Ok(session) = self.store.get_agent_session(agent_id).await else {
-            return;
-        };
-        let Some(state) = read_state(&session) else {
-            return;
-        };
-        let Some(mode) = state.returning else {
-            return;
-        };
-        let on_home = session
-            .provider
-            .as_deref()
-            .is_some_and(|p| provider_profiles::canonical_selection(p) == state.home);
-        if !on_home {
-            return;
-        }
-        tracing::debug!(agent = %agent_id, ?mode, "back on the home provider");
-        self.persist_provider_return_state(workspace_id, agent_id, None)
             .await;
     }
 

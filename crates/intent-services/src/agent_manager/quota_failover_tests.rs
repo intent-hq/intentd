@@ -37,12 +37,17 @@ impl Fixture {
     /// A `claude-code` Default agent (model `opus`) with the given mock
     /// behavior and a fresh attempt counter.
     async fn new(behavior: Value) -> Self {
-        Self::build(behavior, Some("opus"), None).await
+        Self::build(behavior, Some("opus"), None, None).await
     }
 
     /// A Default agent with the given stored model (`None` = provider
     /// default) and an optional session-open result (`MOCK_AGENT_SESSION_RESULT`).
-    async fn build(behavior: Value, model: Option<&str>, session_result: Option<Value>) -> Self {
+    async fn build(
+        behavior: Value,
+        model: Option<&str>,
+        session_result: Option<Value>,
+        idle_timeout_ms: Option<&str>,
+    ) -> Self {
         let script = mock_agent_script();
         let session_result = session_result.map(|v| v.to_string());
         let scratch = crate::test_support::test_tempdir("quota-failover-");
@@ -56,6 +61,7 @@ impl Fixture {
             ("MOCK_AGENT_ATTEMPT_FILE", attempts.to_str()),
             ("MOCK_AGENT_STANDS_IN_FOR", Some("claude-code")),
             ("MOCK_AGENT_SESSION_RESULT", session_result.as_deref()),
+            ("INTENTD_PROMPT_IDLE_TIMEOUT_MS", idle_timeout_ms),
             ("INTENTD_SPAWN_RETRY_BACKOFF_MS", Some("10,20")),
         ]);
         let db = crate::test_support::test_tempdir("quota-failover-db-");
@@ -956,6 +962,7 @@ async fn a_provider_default_agent_with_a_session_open_fill_still_fails_over() {
              "currentValue": "mock-current",
              "options": [{"value": "mock-current", "name": "Mock Current"}]}
         ]})),
+        None,
     )
     .await;
     let first = fx.profile("First", true).await;
@@ -1175,6 +1182,17 @@ async fn leaving_home_records_the_return_state_durably() {
     let reopened = Store::open(&fx.db.path().join("store.db")).await.unwrap();
     let persisted = reopened.get_agent_session(&fx.agent).await.unwrap();
     assert_eq!(crate::provider_return::read_state(&persisted), Some(state));
+    let full = fx
+        .mgr
+        .services
+        .agent_get_session_op(fx.agent.clone())
+        .await
+        .unwrap();
+    let full_wire = serde_json::to_value(&full).unwrap().to_string();
+    assert!(
+        !full_wire.contains("providerReturn"),
+        "agent.getSession never exposes the internal state: {full_wire}"
+    );
     let lite = fx
         .mgr
         .services
@@ -1327,10 +1345,9 @@ async fn a_rejected_return_fails_over_and_backs_off() {
     );
 }
 
-/// Before the return-after time, and for automatic (non-user) messages, the
-/// conversation stays on the backup.
+/// Before the return-after time the conversation stays on the backup.
 #[intent_test_macros::daemon_test]
-async fn no_return_before_the_time_or_on_an_automatic_message() {
+async fn no_return_before_the_time() {
     let fx = Fixture::new(json!({ "response": "answered" })).await;
     let first = fx.profile("First", true).await;
     let future = chrono::Utc::now() + chrono::Duration::hours(2);
@@ -1339,17 +1356,121 @@ async fn no_return_before_the_time_or_on_an_automatic_message() {
     fx.send_as_user("not yet").await;
     assert_eq!(fx.row().await.provider.as_deref(), Some(first.as_str()));
     assert_eq!(fx.return_state().await.map(|s| s.backoff_step), Some(0));
+    assert!(notices(&fx.messages().await, "provider_returned").is_empty());
+}
 
+/// The timed return applies to every new turn whatever its origin: an
+/// agent-to-agent / wake (automatic-origin) message after the return-after
+/// time starts on home too — quota is account-level and much work runs in
+/// delegated agents.
+#[intent_test_macros::daemon_test]
+async fn an_agent_origin_message_after_the_time_returns_home() {
+    let fx = Fixture::new(json!({ "response": "answered on home" })).await;
+    let first = fx.profile("First", true).await;
     let past = chrono::Utc::now() - chrono::Duration::minutes(1);
     fx.away(&first, state_json("claude-code", &first, past, 0))
         .await;
-    fx.send("automatic wake").await;
+
+    let events = fx.send("message from the parent agent").await;
+
+    assert!(of_type(&events, "agent:failed").is_empty(), "{events:#?}");
+    assert_eq!(fx.row().await.provider.as_deref(), Some("claude-code"));
+    assert_eq!(fx.return_state().await, None);
+    assert_eq!(notices(&fx.messages().await, "provider_returned").len(), 1);
+}
+
+/// An internal redrive of the same turn never starts a timed return, even
+/// once the return-after time has passed: here the backup's prompt is held
+/// (receipt gate) while the timer becomes due, then hits its quota; the
+/// failover hop redrives the same message on the next backup in the
+/// rotation, not on home, and no `provider_returned` row is written.
+#[intent_test_macros::daemon_test]
+async fn an_internal_redrive_after_the_time_does_not_return_home() {
+    let scratch = crate::test_support::test_tempdir("quota-failover-redrive-");
+    let entered = scratch.path().join("entered");
+    let release = scratch.path().join("release");
+    let fx = Fixture::new(json!({
+        "promptRpcError": quota_error(),
+        "promptRpcErrorAttempts": 1,
+        "promptReceiptGate": {
+            "suffix": "please answer",
+            "enteredFile": entered.to_str().unwrap(),
+            "releaseFile": release.to_str().unwrap(),
+        },
+        "response": "answered on the second backup",
+    }))
+    .await;
+    let first = fx.profile("First", true).await;
+    let second = fx.profile("Second", true).await;
+    let future = chrono::Utc::now() + chrono::Duration::hours(2);
+    fx.away(&first, state_json("claude-code", &first, future, 0))
+        .await;
+
+    let mut sub = fx.bus.subscribe(SubscriptionFilter::default());
+    fx.mgr
+        .send_message(
+            fx.agent.clone(),
+            fx.ws.clone(),
+            "please answer".to_string(),
+            None,
+            super::TurnOptions {
+                origin: intent_core::MessageOrigin::User,
+                ..super::TurnOptions::default()
+            },
+        )
+        .await
+        .expect("send_message spawns the worker inline");
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(20)),
+        async {
+            while !entered.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        },
+    )
+    .await
+    .expect("the prompt reaches the backup");
+    // The return-after time passes while the turn is in flight.
+    let past = chrono::Utc::now() - chrono::Duration::minutes(1);
+    fx.mgr
+        .services
+        .store
+        .set_agent_session_metadata_key_json(
+            &fx.ws,
+            &fx.agent,
+            crate::provider_return::PROVIDER_RETURN_METADATA_KEY,
+            &state_json("claude-code", &first, past, 0).to_string(),
+            &now_iso(),
+        )
+        .await
+        .unwrap();
+    std::fs::write(&release, "go").unwrap();
+    timeout_settled(&fx.mgr, &fx.agent).await;
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) =
+        // fixed-deadline: allow — quiet-window drain after the worker settled
+        tokio::time::timeout(Duration::from_millis(300), sub.recv()).await
+    {
+        events.extend(batch);
+    }
+
+    assert!(of_type(&events, "agent:failed").is_empty(), "{events:#?}");
     assert_eq!(
         fx.row().await.provider.as_deref(),
-        Some(first.as_str()),
-        "only a user message starts a return"
+        Some(second.as_str()),
+        "the redrive follows the rotation, not the timer"
     );
-    assert!(notices(&fx.messages().await, "provider_returned").is_empty());
+    let messages = fx.messages().await;
+    assert!(
+        notices(&messages, "provider_returned").is_empty(),
+        "{messages:#?}"
+    );
+    let failover = notices(&messages, "provider_failover");
+    assert_eq!(failover.len(), 1, "{messages:#?}");
+    assert_eq!(
+        failover[0].metadata.as_ref().unwrap()["toProvider"],
+        json!(second)
+    );
 }
 
 /// The rotation itself can reach home (after the backups): that switch is a
@@ -1415,12 +1536,13 @@ async fn a_manual_selection_clears_the_return_state() {
     );
 }
 
-/// Home accepts the timed return and starts answering, then runs out
-/// mid-turn: the `provider_returned` row (written at home's first output)
-/// stays, the move on is a `provider_failover` row after it, and the timer
-/// backs off.
+/// Home accepts the timed return as soon as it produces output: the
+/// `provider_returned` row is written then and the timer and backoff are
+/// cleared. Running out later in that turn is a fresh departure — a
+/// `provider_failover` row after the notice, the 5-hour fallback (no
+/// reported reset) and backoff step 0.
 #[intent_test_macros::daemon_test]
-async fn home_running_out_after_its_first_output_keeps_the_return_notice() {
+async fn home_running_out_after_its_first_output_is_a_fresh_departure() {
     let fx = Fixture::new(json!({
         "promptRpcError": quota_error(),
         "promptRpcErrorAttempts": 1,
@@ -1430,15 +1552,26 @@ async fn home_running_out_after_its_first_output_keeps_the_return_notice() {
     .await;
     let first = fx.profile("First", true).await;
     let past = chrono::Utc::now() - chrono::Duration::minutes(1);
-    fx.away(&first, state_json("claude-code", &first, past, 0))
+    fx.away(&first, state_json("claude-code", &first, past, 3))
         .await;
+    let before = chrono::Utc::now();
 
     let events = fx.send_as_user("hello again").await;
 
     assert!(of_type(&events, "agent:failed").is_empty(), "{events:#?}");
     assert_eq!(fx.row().await.provider.as_deref(), Some(first.as_str()));
-    let state = fx.return_state().await.expect("still away");
-    assert_eq!(state.backoff_step, 1);
+    let state = fx.return_state().await.expect("away again");
+    assert_eq!(state.home, "claude-code");
+    assert_eq!(
+        state.backoff_step, 0,
+        "a fresh departure, not a failed return"
+    );
+    assert_eq!(state.returning, None);
+    assert!(
+        near(&state.return_after, before + chrono::Duration::hours(5)),
+        "{}",
+        state.return_after
+    );
     let messages = fx.messages().await;
     let types: Vec<&str> = messages
         .iter()
@@ -1450,6 +1583,183 @@ async fn home_running_out_after_its_first_output_keeps_the_return_notice() {
         vec!["provider_returned", "provider_failover"],
         "{messages:#?}"
     );
+}
+
+/// Accepted at first output, so a later non-quota failure in that turn
+/// leaves the conversation home (state cleared, notice kept) and surfaces
+/// today's failure.
+#[intent_test_macros::daemon_test]
+async fn home_failing_for_another_reason_after_output_stays_home() {
+    let fx = Fixture::new(json!({
+        "promptRpcError": { "code": -32603, "message": "Internal error", "data": "boom" },
+        "streamBeforeErrorText": "home started answering",
+        "response": "unreached",
+    }))
+    .await;
+    let first = fx.profile("First", true).await;
+    let past = chrono::Utc::now() - chrono::Duration::minutes(1);
+    fx.away(&first, state_json("claude-code", &first, past, 2))
+        .await;
+
+    let events = fx.send_as_user("hello again").await;
+
+    assert_eq!(of_type(&events, "agent:failed").len(), 1, "{events:#?}");
+    assert_eq!(fx.row().await.provider.as_deref(), Some("claude-code"));
+    assert_eq!(fx.return_state().await, None, "home accepted the return");
+    assert_eq!(notices(&fx.messages().await, "provider_returned").len(), 1);
+}
+
+/// Home rejecting a return with nothing else left to try (no backup flags
+/// any more) still counts as a failed return: the turn fails as today and
+/// the timer moves to the next backoff step instead of staying due.
+#[intent_test_macros::daemon_test]
+async fn an_exhausted_failed_return_still_backs_off() {
+    let fx = Fixture::new(json!({
+        "promptRpcError": quota_error(),
+        "promptRpcErrorAttempts": 2,
+        "response": "unreached",
+    }))
+    .await;
+    let first = fx.profile("First", true).await;
+    let future = chrono::Utc::now() + chrono::Duration::hours(2);
+    fx.away(&first, state_json("claude-code", &first, future, 0))
+        .await;
+    let profile_id = first.split('@').nth(1).unwrap().to_owned();
+    fx.mgr
+        .services
+        .provider_profiles_update_impl(profile_id, json!({ "backup": false }))
+        .await
+        .expect("clear the backup flag");
+    let before = chrono::Utc::now();
+
+    // First runs out → the rotation reaches home → home runs out before any
+    // output → nothing left.
+    let events = fx.send("please answer").await;
+
+    let failed = of_type(&events, "agent:failed");
+    assert_eq!(failed.len(), 1, "{events:#?}");
+    assert_eq!(failed[0].data["errorCode"], json!("quota-exceeded"));
+    let state = fx.return_state().await.expect("still away from home");
+    assert_eq!(state.backoff_step, 1);
+    assert_eq!(state.returning, None);
+    assert!(
+        near(&state.return_after, before + chrono::Duration::hours(1)),
+        "{}",
+        state.return_after
+    );
+    assert!(notices(&fx.messages().await, "provider_returned").is_empty());
+
+    // The agent is on home now. The next new turn, before the backoff
+    // deadline, is accepted by home (its quota is back): the stale state is
+    // cleared, so a later departure starts fresh (step 0, see `on_switch`).
+    assert_eq!(fx.row().await.provider.as_deref(), Some("claude-code"));
+    let events = fx.send("a later message").await;
+    assert!(of_type(&events, "agent:failed").is_empty(), "{events:#?}");
+    assert_eq!(fx.row().await.provider.as_deref(), Some("claude-code"));
+    assert_eq!(
+        fx.return_state().await,
+        None,
+        "home accepted: state cleared"
+    );
+    assert!(
+        notices(&fx.messages().await, "provider_returned").is_empty(),
+        "already home: no return notice"
+    );
+}
+
+/// An idle-timeout warning turn continues the same turn: even once the
+/// return time has passed it never starts a timed return, while the next
+/// genuinely new turn (any origin) does.
+#[intent_test_macros::daemon_test]
+async fn an_idle_timeout_warning_turn_never_returns_home() {
+    let scratch = crate::test_support::test_tempdir("quota-failover-idle-");
+    let entered = scratch.path().join("entered");
+    let release = scratch.path().join("release");
+    let fx = Fixture::build(
+        json!({
+            "promptReceiptGate": {
+                "suffix": "park-me and go silent",
+                "enteredFile": entered.to_str().unwrap(),
+                "releaseFile": release.to_str().unwrap(),
+            },
+            // Only the original prompt parks; a later turn's replayed
+            // history mentions it but ends with its own message.
+            "parkIfPromptEndsWith": "park-me and go silent",
+            "rules": [
+                { "ifPromptContains": "[SYSTEM WARNING]", "response": "continued after warning" },
+            ],
+            "response": "answered",
+        }),
+        Some("opus"),
+        None,
+        Some("100"),
+    )
+    .await;
+    let first = fx.profile("First", true).await;
+    let future = chrono::Utc::now() + chrono::Duration::hours(2);
+    fx.away(&first, state_json("claude-code", &first, future, 0))
+        .await;
+
+    fx.mgr
+        .send_message(
+            fx.agent.clone(),
+            fx.ws.clone(),
+            "park-me and go silent".to_string(),
+            None,
+            super::TurnOptions {
+                origin: intent_core::MessageOrigin::User,
+                ..super::TurnOptions::default()
+            },
+        )
+        .await
+        .expect("send_message spawns the worker inline");
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(20)),
+        async {
+            while !entered.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        },
+    )
+    .await
+    .expect("the prompt reaches the backup");
+    let past = chrono::Utc::now() - chrono::Duration::minutes(1);
+    fx.mgr
+        .services
+        .store
+        .set_agent_session_metadata_key_json(
+            &fx.ws,
+            &fx.agent,
+            crate::provider_return::PROVIDER_RETURN_METADATA_KEY,
+            &state_json("claude-code", &first, past, 0).to_string(),
+            &now_iso(),
+        )
+        .await
+        .unwrap();
+    std::fs::write(&release, "go").unwrap();
+    timeout_settled(&fx.mgr, &fx.agent).await;
+
+    let messages = fx.messages().await;
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.role == "user" && m.content.to_string().contains("[SYSTEM WARNING]")),
+        "the idle-timeout warning turn ran: {messages:#?}"
+    );
+    assert_eq!(
+        fx.row().await.provider.as_deref(),
+        Some(first.as_str()),
+        "the warning turn continues on the backup"
+    );
+    assert!(
+        notices(&messages, "provider_returned").is_empty(),
+        "{messages:#?}"
+    );
+
+    // The next new turn starts on home.
+    fx.send("a new message").await;
+    assert_eq!(fx.row().await.provider.as_deref(), Some("claude-code"));
+    assert_eq!(notices(&fx.messages().await, "provider_returned").len(), 1);
 }
 
 /// Home stays a candidate while the conversation is away, even once no
