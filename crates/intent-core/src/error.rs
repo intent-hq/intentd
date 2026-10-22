@@ -8,12 +8,6 @@
 /// Domain error type for intentd.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// Bounded cancellable deletion control failure.
-    #[error("{}", .0.wire_code())]
-    NoteDelete(crate::note_delete::NoteDeleteError),
-    /// Bounded note page failure; never carries source content.
-    #[error("{}", .0.wire_code())]
-    NotePage(crate::note_page::NotePageError),
     /// Safe member recovery for a classified execution authorization error.
     /// The source preserves the owner's established error contract internally.
     #[error("{}", authorization.message())]
@@ -69,6 +63,18 @@ pub enum Error {
     /// stop matching on prose (monorepo#761).
     #[error("invalid params: cannot resolve base ref '{base_ref}'")]
     BaseRefUnresolvable { base_ref: String },
+
+    /// A guarded whole-content note write (`note.setContent` / the content
+    /// arm of `note.update` carrying `baseContentBytes`) whose base size does
+    /// not match the base the daemon resolved, or whose base is unknown
+    /// (`resolved_base_bytes: None`). Nothing is written. Surfaces as
+    /// `-32602` with `error.data = { code: "content-base-mismatch",
+    /// baseContentBytes, resolvedBaseBytes }` (protocol "Truncated note reads").
+    #[error("Content base does not match the stored note; re-read the full note and retry.")]
+    ContentBaseMismatch {
+        base_content_bytes: u64,
+        resolved_base_bytes: Option<u64>,
+    },
 
     /// A named provider profile request failed (PROTOCOL §5.54). `data`
     /// carries the machine-readable discriminator (`data.code`, e.g.
@@ -545,7 +551,6 @@ impl Error {
     #[must_use]
     pub fn code(&self) -> i32 {
         match self {
-            Error::NoteDelete(kind) => kind.rpc_code(),
             Error::ExecutionAuthorization { source, .. } => match source.as_ref() {
                 Error::CloneFailed { .. } | Error::SourceControlUnauthorized { .. } => source.code(),
                 _ => -32603,
@@ -558,9 +563,6 @@ impl Error {
                     -32602
                 }
             }
-            Error::NotePage(crate::note_page::NotePageError::Preparing | crate::note_page::NotePageError::ResourceLimit) => -32006,
-            Error::NotePage(crate::note_page::NotePageError::Stale)
-            | Error::Conflict { .. } => -32005,
             Error::IdentityMismatch
             | Error::IdentityInUse
             | Error::HostMembershipRequired
@@ -568,8 +570,8 @@ impl Error {
             | Error::NotFound(_)
             | Error::InvalidInput(_)
             | Error::BaseRefUnresolvable { .. }
-            | Error::NotAFile { .. }
-            | Error::NotePage(_) => -32602,
+            | Error::ContentBaseMismatch { .. }
+            | Error::NotAFile { .. } => -32602,
             Error::CloneFailed { category, .. } => match category {
                 CloneErrorCategory::PathInvalid | CloneErrorCategory::DestinationExistsNonEmpty => {
                     -32602
@@ -596,6 +598,7 @@ impl Error {
             | Error::IdentityUnverifiable { .. }
             // Unsupported: map to internal error for now
             | Error::Unsupported(_) => -32603,
+            Error::Conflict { .. } => -32005,
             Error::Forbidden(_) => -32003,
             Error::Invite(kind) => kind.code(),
         }

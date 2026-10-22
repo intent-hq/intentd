@@ -2,6 +2,45 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.30] - 2026-10-22
+
+### 🚀 Features
+
+- Add workspace discussions, agent messaging and guest roles ([#2432](https://github.com/intent-hq/intentd/pull/2432))
+
+
+## [0.11.29] - 2026-10-22
+
+### 🐛 Bug Fixes
+
+- Treat Claude Code weekly/session limit errors as quota ([#7615](https://github.com/intent-hq/intentd/pull/7615)) ([#2607](https://github.com/intent-hq/intentd/pull/2607))
+
+### 📚 Documentation
+
+- *(browser)* Document background hosting and snapshot mount-on-demand ([#2541](https://github.com/intent-hq/intentd/pull/2541))
+
+
+## [0.11.28] - 2026-10-22
+
+### 🚀 Features
+
+- Serve large notes truncated on request ([#2592](https://github.com/intent-hq/intentd/pull/2592))
+
+
+## [0.11.27] - 2026-10-22
+
+### 🚀 Features
+
+- Provider profile order, backup flag and automatic quota failover ([#2581](https://github.com/intent-hq/intentd/pull/2581))
+
+
+## [0.11.26] - 2026-10-22
+
+### 🔧 Refactor
+
+- Remove the unused note paging system ([#2588](https://github.com/intent-hq/intentd/pull/2588))
+
+
 ## [0.11.25] - 2026-10-22
 
 ### 🐛 Bug Fixes

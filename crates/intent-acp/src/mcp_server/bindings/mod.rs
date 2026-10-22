@@ -23,6 +23,7 @@ pub(crate) mod app;
 pub(crate) mod browser;
 pub(crate) mod comment;
 pub(crate) mod cross_workspace;
+pub(crate) mod discussion;
 pub(crate) mod event;
 pub(crate) mod file;
 pub(crate) mod git;
@@ -86,6 +87,7 @@ pub fn prelude_for_bridge(features: &AgentFeaturesSettings, is_sub_agent: bool) 
         note::PRELUDE,
         task::PRELUDE,
         comment::PRELUDE,
+        discussion::PRELUDE,
         primitive::PRELUDE,
         cross_workspace::PRELUDE,
         pr.as_str(),
@@ -223,6 +225,11 @@ pub(crate) async fn try_dispatch(
     }
     if let Some(rest) = method.strip_prefix("task.") {
         return task::dispatch(api, workspace_id, caller_agent_id, rest, args)
+            .await
+            .map(Some);
+    }
+    if let Some(rest) = method.strip_prefix("discussion.") {
+        return discussion::dispatch(api, workspace_id, caller_agent_id, rest, args)
             .await
             .map(Some);
     }

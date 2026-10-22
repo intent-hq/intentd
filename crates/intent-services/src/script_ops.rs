@@ -332,6 +332,8 @@ pub(crate) struct SupervisePark {
 /// grouped so the manager constructor stays within arity limits.
 #[derive(Clone, Default)]
 pub(crate) struct ScriptParks {
+    /// Signals that a request passed the public gate and is waiting for admission.
+    pub(crate) admission_wait: Option<Arc<tokio::sync::Notify>>,
     /// Parks a first-use list before its atomic bootstrap claim.
     pub(crate) bootstrap_persist: Option<Arc<SupervisePark>>,
     pub(crate) monitor_clock: Option<Arc<std::sync::atomic::AtomicI64>>,
@@ -515,6 +517,54 @@ impl ScriptManager {
             .expect("script owner must settle before service writer admission closes")
     }
 
+    fn spawn_admission<T: Send + 'static>(
+        &self,
+        future: impl std::future::Future<Output = T> + Send + 'static,
+    ) -> tokio::task::JoinHandle<T> {
+        self.tasks
+            .spawn_draining_with_current_caller(future)
+            .expect("script admission must settle before service writer admission closes")
+    }
+
+    /// The caller holds the definition lock, so a private replacement cannot
+    /// slip between this fresh grant check and admission of its command.
+    async fn require_admission(&self, ws: &WorkspaceId, id: &str) -> Result<()> {
+        if let Some(services) = &self.owner_services {
+            services
+                .require_saved_script_operator(ws, id, "script operation")
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Full-authority runtime reads keep their existing nonblocking behavior.
+    /// Restricted guest reads fence replacement while capturing their response.
+    pub(crate) async fn scoped_read_guard(
+        &self,
+        ws: &WorkspaceId,
+        id: &str,
+    ) -> Result<Option<tokio::sync::OwnedMutexGuard<()>>> {
+        let Some(services) = &self.owner_services else {
+            return Ok(None);
+        };
+        if !services
+            .require_workspace_operator(ws, "script read")
+            .await?
+        {
+            return Ok(None);
+        }
+        self.signal_admission_wait();
+        let guard = self.locks.definition_lock(id).lock_owned().await;
+        self.require_admission(ws, id).await?;
+        Ok(Some(guard))
+    }
+
+    fn signal_admission_wait(&self) {
+        if let Some(entered) = &self.parks.admission_wait {
+            entered.notify_one();
+        }
+    }
+
     pub(crate) fn with_settings(mut self, settings: Option<Arc<crate::SettingsRegistry>>) -> Self {
         self.settings = settings;
         self
@@ -595,30 +645,29 @@ impl ScriptManager {
         };
         // Creation defaults do not reclassify stored definitions. Startup
         // hydration is best-effort, so a registry miss must consult SQLite.
-        let purpose = if let Some(purpose) = params.purpose {
-            purpose
-        } else {
-            let registered = self
-                .scripts
-                .lock()
-                .unwrap()
-                .get(&(workspace_id.clone(), id.clone()))
-                .map(|old| old.def.purpose);
-            match registered {
-                Some(purpose) => purpose,
-                None => self
-                    .store
-                    .get_script_in_workspace(&workspace_id, &id)
-                    .await?
-                    .map_or(
-                        match params.mode {
-                            ScriptMode::Command => intent_core::ScriptPurpose::OneOff,
-                            ScriptMode::Service => intent_core::ScriptPurpose::Saved,
-                        },
-                        |old| old.purpose,
-                    ),
-            }
+        let registered = self
+            .scripts
+            .lock()
+            .unwrap()
+            .get(&(workspace_id.clone(), id.clone()))
+            .map(|old| old.def.purpose);
+        let previous_purpose = match registered {
+            Some(purpose) => Some(purpose),
+            None => self
+                .store
+                .get_script_in_workspace(&workspace_id, &id)
+                .await?
+                .map(|old| old.purpose),
         };
+        let purpose = params
+            .purpose
+            .or(previous_purpose)
+            .unwrap_or(match params.mode {
+                ScriptMode::Command => intent_core::ScriptPurpose::OneOff,
+                ScriptMode::Service => intent_core::ScriptPurpose::Saved,
+            });
+        let retire_saved = previous_purpose == Some(intent_core::ScriptPurpose::Saved)
+            && purpose == intent_core::ScriptPurpose::OneOff;
         if purpose == intent_core::ScriptPurpose::OneOff
             && (params.mode != ScriptMode::Command || params.auto_start == Some(true))
         {
@@ -717,6 +766,10 @@ impl ScriptManager {
                 pending_result: None,
             },
         );
+        if retire_saved {
+            self.emit_saved_retirement_locked(&workspace_id, &def.id)
+                .await;
+        }
         self.emit_changed_locked(&workspace_id, &def.id, change)
             .await;
         Ok(serde_json::to_value(def).unwrap_or_else(|_| json!({})))
@@ -955,6 +1008,10 @@ impl ScriptManager {
         let publication = self.locks.publication_lock(script_id);
         let publishing = publication.lock().await;
         let old = self.scripts.lock().unwrap().remove(&key);
+        let retire_saved = old
+            .as_ref()
+            .is_some_and(|old| old.def.purpose == intent_core::ScriptPurpose::Saved)
+            && def.purpose == intent_core::ScriptPurpose::OneOff;
         let change = if old.is_some() { "updated" } else { "created" };
         drop(publishing);
         if let Some(mut old) = old {
@@ -993,6 +1050,10 @@ impl ScriptManager {
                 pending_result: None,
             },
         );
+        if retire_saved {
+            self.emit_saved_retirement_locked(workspace_id, script_id)
+                .await;
+        }
         self.emit_changed_locked(workspace_id, script_id, change)
             .await;
         Ok(())
@@ -1004,6 +1065,13 @@ impl ScriptManager {
     pub(crate) async fn list(&self, workspace_id: &WorkspaceId) -> Result<Value> {
         self.list_filtered(workspace_id, intent_core::ScriptArchiveFilter::Active)
             .await
+    }
+
+    async fn saved_only(&self, ws: &WorkspaceId) -> Result<bool> {
+        match &self.owner_services {
+            Some(services) => services.require_workspace_operator(ws, "script.list").await,
+            None => Ok(false),
+        }
     }
 
     pub(crate) async fn summary_page(
@@ -1018,10 +1086,13 @@ impl ScriptManager {
         ))?;
         self.list_filtered_inner(ws, intent_core::ScriptArchiveFilter::Active, false)
             .await?;
-        let mut page = self
-            .store
-            .script_summary_page(ws, None, false, options)
-            .await?;
+        let mut page = if self.saved_only(ws).await? {
+            self.store.saved_script_summary_page(ws, options).await?
+        } else {
+            self.store
+                .script_summary_page(ws, None, false, options)
+                .await?
+        };
         let registry = self.scripts.lock().unwrap();
         if let Some(rows) = page["scripts"].as_array_mut() {
             for row in rows {
@@ -1075,7 +1146,11 @@ impl ScriptManager {
                 "only active script lists are supported".into(),
             ));
         }
-        let selected = |m: &ManagedScript| m.def.archived_at.is_none();
+        let saved_only = self.saved_only(workspace_id).await?;
+        let selected = |m: &ManagedScript| {
+            m.def.archived_at.is_none()
+                && (!saved_only || m.def.purpose == intent_core::ScriptPurpose::Saved)
+        };
         // Filter the existing registry before serializing full definitions.
         // Nonempty registries need no initialization read, even if filtered empty.
         {
@@ -1139,6 +1214,18 @@ impl ScriptManager {
                     return Ok(json!({ "scripts": [] }));
                 }
 
+                // Importing repository commands creates executable definitions.
+                // A scoped guest may operate saved definitions, never bootstrap
+                // new commands through the ostensibly read-only list endpoint.
+                if let Some(services) = &self.owner_services {
+                    if services
+                        .require_workspace_manager(workspace_id, "script bootstrap")
+                        .await
+                        .is_err()
+                    {
+                        return Ok(json!({ "scripts": [] }));
+                    }
+                }
                 // Now safe to bootstrap
                 if let Ok(ws) = self.store.get_workspace(workspace_id).await {
                     if let Some(repo_path) = ws
@@ -1357,7 +1444,7 @@ impl ScriptManager {
             script_event(
                 workspace_id,
                 SCRIPT_CHANGED,
-                json!({ "scriptId": script_id, "action": "removed" }),
+                json!({ "scriptId": script_id, "action": "removed", "purpose": managed.def.purpose }),
             ),
         )
         .await;
@@ -1561,7 +1648,7 @@ impl ScriptManager {
         let mgr = self.clone();
         let ws = workspace_id.clone();
         let id = script_id.to_owned();
-        self.spawn_owned(async move { mgr.start_owned(&ws, &id, restoring).await })
+        self.spawn_admission(async move { mgr.start_owned(&ws, &id, restoring).await })
             .await
             .map_err(|e| Error::Internal(format!("script start admission failed: {e}")))?
     }
@@ -1572,8 +1659,10 @@ impl ScriptManager {
         script_id: &str,
         restoring: bool,
     ) -> Result<Value> {
+        self.signal_admission_wait();
         let lock = self.locks.definition_lock(script_id);
         let _guard = lock.lock().await;
+        self.require_admission(workspace_id, script_id).await?;
         if self.is_live(workspace_id, script_id)? {
             return Ok(self.start_reply(workspace_id, script_id));
         }
@@ -1662,9 +1751,11 @@ impl ScriptManager {
         let mgr = self.clone();
         let ws = workspace_id.clone();
         let id = script_id.to_owned();
-        self.spawn_owned(async move {
+        self.spawn_admission(async move {
+            mgr.signal_admission_wait();
             let lock = mgr.locks.definition_lock(&id);
             let _guard = lock.lock().await;
+            mgr.require_admission(&ws, &id).await?;
             mgr.ensure_known_locked(&ws, &id).await?;
             mgr.stop_inner(&ws, &id, true).await
         })
@@ -1923,14 +2014,16 @@ impl ScriptManager {
         let mgr = self.clone();
         let ws = workspace_id.clone();
         let id = script_id.to_owned();
-        self.spawn_owned(async move { mgr.restart_owned(&ws, &id).await })
+        self.spawn_admission(async move { mgr.restart_owned(&ws, &id).await })
             .await
             .map_err(|e| Error::Internal(format!("script restart failed: {e}")))?
     }
 
     async fn restart_owned(&self, workspace_id: &WorkspaceId, script_id: &str) -> Result<Value> {
+        self.signal_admission_wait();
         let lock = self.locks.definition_lock(script_id);
         let _guard = lock.lock().await;
+        self.require_admission(workspace_id, script_id).await?;
         self.ensure_known_locked(workspace_id, script_id).await?;
         // Admission survives teardown, but its predecessor cannot report an
         // outcome for the successor token while shutdown is draining it.
@@ -1976,8 +2069,10 @@ impl ScriptManager {
                 json!({"output": "", "warning": "Script is already running; wait for it to finish or use script.stop."}),
             );
         }
+        self.signal_admission_wait();
         let lock = self.locks.definition_lock(script_id);
         let admission = lock.lock_owned().await;
+        self.require_admission(workspace_id, script_id).await?;
         if self.is_live(workspace_id, script_id)? {
             return Ok(
                 json!({"output": "", "warning": "Script is already running; wait for it to finish or use script.stop."}),
@@ -1987,7 +2082,7 @@ impl ScriptManager {
         let ws = workspace_id.clone();
         let id = script_id.to_owned();
         let admission = self
-            .spawn_owned(async move {
+            .spawn_admission(async move {
                 mgr.finish_previous_locked(&ws, &id).await;
                 // Publish restoration before reserving running in memory: a
                 // cancelled pre-spawn reservation is intentionally silent.
@@ -2057,7 +2152,7 @@ impl ScriptManager {
         let ws = workspace_id.clone();
         let id = script_id.to_owned();
         let (ready, receive) = tokio::sync::oneshot::channel();
-        self.spawn_owned(async move {
+        self.spawn_admission(async move {
             let _admission = admission;
             let result = match mgr.prepare_launch(&ws, &id).await {
                 Ok(()) => Ok(reservation),
@@ -2809,6 +2904,20 @@ impl ScriptManager {
         if let Some(state) = state {
             self.emit_state_locked(ws, id, &state).await;
         }
+    }
+
+    /// Retire the prior saved projection before publishing a private replacement.
+    /// Dedicated action lets guests clear caches without resetting owner buffers.
+    async fn emit_saved_retirement_locked(&self, ws: &WorkspaceId, id: &str) {
+        publish_event(
+            self.bus.as_ref(),
+            script_event(
+                ws,
+                SCRIPT_CHANGED,
+                json!({"workspaceId":ws,"scriptId":id,"action":"guest-access-revoked"}),
+            ),
+        )
+        .await;
     }
 
     /// Caller holds the publication lock, and definition writers also hold
@@ -3915,6 +4024,156 @@ mod tests {
             .collect();
         actions.sort_unstable();
         assert_eq!(actions, vec!["created", "removed", "updated"]);
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn guest_roles_queued_script_operations_recheck_role_and_purpose_under_lock() {
+        use intent_core::{Caller, HostRole, Principal, PrincipalId, WorkspaceRole};
+        let h = harness().await;
+        let guest = Principal {
+            id: PrincipalId::new(),
+            identity: None,
+            github_user_id: None,
+            login: Some("manager".into()),
+            display_name: None,
+            avatar_url: None,
+            is_primary: false,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+        };
+        h.services.store().upsert_principal(&guest).await.unwrap();
+        h.services
+            .store()
+            .add_workspace_member(&h.ws, &guest.id, WorkspaceRole::Manager)
+            .await
+            .unwrap();
+        for downgrade in [false, true] {
+            for operation in ["start", "stop", "restart", "run", "get", "output", "status"] {
+                h.services
+                    .store()
+                    .set_workspace_member_role(&h.ws, &guest.id, WorkspaceRole::Manager)
+                    .await
+                    .unwrap();
+                let id = create_simple(&h, "saved", "true", ScriptMode::Command).await;
+                let entered = Arc::new(tokio::sync::Notify::new());
+                let mut services = h.services.clone();
+                services.script_parks.admission_wait = Some(entered.clone());
+                let manager = services.script_manager();
+                let lock = manager.locks.definition_lock(&id);
+                let guard = lock.lock().await;
+                let ws = h.ws.clone();
+                let target = id.clone();
+                let caller = Caller::Wire {
+                    principal_id: guest.id.clone(),
+                    host_role: HostRole::Guest,
+                };
+                let pending = tokio::spawn(intent_core::with_caller(caller, async move {
+                    match operation {
+                        "start" => services.script_start(ws, target).await,
+                        "stop" => services.script_stop(ws, target).await,
+                        "restart" => services.script_restart(ws, target).await,
+                        "run" => services.script_run(ws, target, None, Some(1)).await,
+                        "get" => services.script_get(ws, target).await,
+                        "output" => services.script_output(ws, target, None, None, None).await,
+                        "status" => services.script_status(ws, target).await,
+                        _ => unreachable!(),
+                    }
+                }));
+                tokio::time::timeout(LIVENESS, entered.notified())
+                    .await
+                    .expect("request reached admission lock");
+                assert!(!pending.is_finished());
+                if downgrade {
+                    h.services
+                        .store()
+                        .set_workspace_member_role(&h.ws, &guest.id, WorkspaceRole::Collaborator)
+                        .await
+                        .unwrap();
+                } else {
+                    // Commit the replacement while holding the same writer lock
+                    // as create_with_scope, after the request's public gate passed.
+                    let mut replacement = h
+                        .services
+                        .store()
+                        .get_script_in_workspace(&h.ws, &id)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    replacement.purpose = intent_core::ScriptPurpose::OneOff;
+                    replacement.command = "private-command-must-not-execute".into();
+                    h.services
+                        .store()
+                        .upsert_script(&replacement)
+                        .await
+                        .unwrap();
+                    manager
+                        .scripts
+                        .lock()
+                        .unwrap()
+                        .get_mut(&(h.ws.clone(), id.clone()))
+                        .unwrap()
+                        .def = replacement;
+                }
+                drop(guard);
+                let result = tokio::time::timeout(LIVENESS, pending)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    matches!(result, Err(Error::Forbidden(_))),
+                    "{operation}, downgrade={downgrade}: {result:?}"
+                );
+                assert!(h
+                    .services
+                    .store()
+                    .latest_script_run(&h.ws, &id)
+                    .await
+                    .unwrap()
+                    .is_none());
+                let registry = manager.scripts.lock().unwrap();
+                let entry = registry.get(&(h.ws.clone(), id)).unwrap();
+                assert_eq!(entry.state.status, ScriptStatus::Idle);
+                assert!(!entry.stopped_by_user);
+                assert!(
+                    entry.pty_id.is_none() && entry.run_id.is_none() && entry.supervisor.is_none()
+                );
+            }
+        }
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn guest_roles_saved_to_one_off_retires_only_the_old_projection() {
+        let h = harness().await;
+        let mut sub = subscribe(&h);
+        let id = create_simple(&h, "saved", "true", ScriptMode::Command).await;
+        await_script_change(&mut sub, "created").await;
+        create(
+            &h,
+            ScriptCreateParams {
+                script_id: Some(id.clone()),
+                name: "private".into(),
+                command: "private-command".into(),
+                mode: ScriptMode::Command,
+                purpose: Some(intent_core::ScriptPurpose::OneOff),
+                ..Default::default()
+            },
+        )
+        .await;
+        let removed = await_script_change(&mut sub, "guest-access-revoked").await;
+        assert_eq!(
+            removed["data"],
+            json!({"workspaceId":h.ws,"scriptId":id,"action":"guest-access-revoked"})
+        );
+        let updated = await_script_change(&mut sub, "updated").await;
+        assert_eq!(updated["data"]["script"]["purpose"], "oneOff");
+        assert_eq!(updated["data"]["script"]["command"], "private-command");
+        assert!(h
+            .services
+            .store()
+            .get_script_in_workspace(&h.ws, &id)
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[intent_test_macros::daemon_test]

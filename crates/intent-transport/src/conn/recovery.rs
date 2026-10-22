@@ -1,7 +1,7 @@
 //! Negotiated generic recovery: ordered controls and physical writer receipts.
 use super::{
     conflate, events, json, spawn_forwarder, Arc, ConflationBuffer, ConnSubs, Delivery, Enqueue,
-    Event, EventItem, Future, HashMap, HashSet, OutboundSender, Subscription, Value,
+    Event, EventItem, Future, HashMap, HashSet, OutboundSender, Subscription, Value, WorkspaceApi,
 };
 use futures::FutureExt as _;
 use std::sync::Mutex;
@@ -320,6 +320,7 @@ async fn guarded<T>(
 }
 
 struct Forwarder {
+    api: Arc<dyn WorkspaceApi>,
     gate: Option<events::MembershipGate>,
     membership: Option<Subscription>,
     scope: Option<String>,
@@ -400,6 +401,32 @@ impl Forwarder {
                     }
                     continue;
                 }
+            };
+            // Discussion and typing projections re-read participant access after
+            // capacity is available. Never enqueue the unprojected bus payload,
+            // including for administrators, errors, or membership invalidation.
+            let item = match &item {
+                EventItem::Latest(event)
+                    if event.event_type.starts_with("discussion:")
+                        || event.event_type == intent_core::events::PRESENCE_CHANGED =>
+                {
+                    match guarded(
+                        self.api.discussion_project_event(event.clone()),
+                        &mut self.membership,
+                    )
+                    .await
+                    {
+                        Guarded::Ready(Ok(Some(projected))) => EventItem::Latest(projected),
+                        Guarded::Ready(Ok(None) | Err(_)) => return true,
+                        Guarded::Membership(delivery) => {
+                            if !self.membership(delivery) {
+                                return false;
+                            }
+                            continue;
+                        }
+                    }
+                }
+                _ => item,
             };
             // Re-authorize buffered frames AFTER acquiring output capacity.
             match self.allowed(item.event()).await {
@@ -495,6 +522,7 @@ impl Forwarder {
     reason = "connection admission passes the independent subscription policy and lifetime"
 )]
 pub(super) async fn forward(
+    api: Arc<dyn WorkspaceApi>,
     mut subscription: Subscription,
     membership: Option<(events::MembershipGate, Subscription)>,
     scope: Option<String>,
@@ -514,6 +542,7 @@ pub(super) async fn forward(
     let (gate, membership) = membership.map_or((None, None), |(g, s)| (Some(g), Some(s)));
     let output = out.recovery.clone();
     let mut f = Forwarder {
+        api,
         gate,
         membership,
         scope,

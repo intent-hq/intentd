@@ -22,7 +22,6 @@ use tokio::sync::{mpsc, OwnedSemaphorePermit};
 use tokio::task::JoinHandle;
 use tracing::Instrument;
 
-mod page_state;
 mod presence_focus;
 pub(crate) mod recovery;
 
@@ -568,24 +567,6 @@ async fn process_captured_frame(
                 };
                 return out_tx.send_priority(frame).await.is_ok();
             }
-        }
-        // Admit opt-in state subscriptions before classifiers clone params/id.
-        if matches!(
-            value["method"].as_str(),
-            Some("note.subscribe" | "comment.subscribe")
-        ) && value["params"]["projection"] == "pageState"
-            && (raw.len() > 65_536 || !page_state::valid_id(value.get("id")))
-        {
-            let id = value.get("id").filter(|id| page_state::valid_id(Some(id)));
-            return send_fast_path_error(
-                events::IdInfo {
-                    present: value.get("id").is_some(),
-                    echo: id.cloned().unwrap_or(Value::Null),
-                },
-                "Invalid pageState subscription",
-                out_tx,
-            )
-            .await;
         }
         // A reply to a daemon-initiated reverse request (FE-served intents such
         // as `host.openExternal`, §12.4) — route it to the awaiting caller and
@@ -1584,6 +1565,7 @@ pub(crate) async fn handle_fast_path(
                     fences.push(membership.fence_handle());
                 }
                 let handle = spawn_forwarder(recovery::forward(
+                    Arc::clone(api),
                     subscription,
                     gate.map(|gate| (gate, membership_events.expect("paired with gate"))),
                     scoped_workspace,
@@ -1649,38 +1631,6 @@ pub(crate) async fn handle_sub_fast_path(
     out_tx: &OutboundSender,
     subs: &mut ConnSubs,
 ) -> bool {
-    let sub = match sub {
-        SubFastPath::Subscribe {
-            id,
-            channel,
-            params,
-        } if matches!(channel, Channel::Note | Channel::Comment) => {
-            let kind = if channel == Channel::Note {
-                crate::annotation_subscription::PageStateChannel::Note
-            } else {
-                crate::annotation_subscription::PageStateChannel::Comment
-            };
-            let value = Value::Object(params);
-            match crate::annotation_subscription::parse_page_state_subscription(kind, &value) {
-                Ok(Some(request)) => {
-                    return page_state::subscribe(id, channel, request, api, bus, out_tx, subs)
-                        .await
-                }
-                Ok(None) => {
-                    let Value::Object(params) = value else {
-                        unreachable!()
-                    };
-                    SubFastPath::Subscribe {
-                        id,
-                        channel,
-                        params,
-                    }
-                }
-                Err(message) => return send_fast_path_error(id, &message, out_tx).await,
-            }
-        }
-        other => other,
-    };
     match sub {
         SubFastPath::Subscribe {
             id,
@@ -1697,6 +1647,7 @@ pub(crate) async fn handle_sub_fast_path(
                     workspace_id,
                     replace_group,
                     projection,
+                    max_content_bytes,
                 } = p;
                 // Time the request-to-snapshot interval (intent-hq/intent#3707):
                 // the fast-path never enters the `rpc_dispatch` span, so this
@@ -1740,6 +1691,7 @@ pub(crate) async fn handle_sub_fast_path(
                     api.clone(),
                     WorkspaceId::from(workspace_id),
                     projection,
+                    max_content_bytes,
                     subscription,
                     membership,
                     subscription_id.clone(),
@@ -2156,6 +2108,7 @@ async fn forward_note_subscription(
     api: Arc<dyn WorkspaceApi>,
     workspace_id: WorkspaceId,
     projection: Option<intent_core::NoteListProjection>,
+    max_content_bytes: Option<usize>,
     mut subscription: Subscription,
     mut membership: Option<ChannelMembership>,
     subscription_id: String,
@@ -2170,7 +2123,15 @@ async fn forward_note_subscription(
                     .map(intent_core::note_list_slim_row)
                     .collect(),
             ),
-            None => serde_json::to_value(notes).unwrap_or_else(|_| Value::Array(Vec::new())),
+            None => match max_content_bytes {
+                Some(limit) => Value::Array(
+                    notes
+                        .into_iter()
+                        .map(|note| intent_core::note_bounded_row(note, limit))
+                        .collect(),
+                ),
+                None => serde_json::to_value(notes).unwrap_or_else(|_| Value::Array(Vec::new())),
+            },
         },
         Err(_) => Value::Array(Vec::new()),
     };
@@ -2182,8 +2143,14 @@ async fn forward_note_subscription(
     let mut seq: u64 = 1;
     while let Some(batch) = recv_visible(&mut subscription, &mut membership).await {
         for event in batch {
-            if let Some(delta) =
-                subscriptions::note_delta(api.as_ref(), &workspace_id, &event, projection).await
+            if let Some(delta) = subscriptions::note_delta(
+                api.as_ref(),
+                &workspace_id,
+                &event,
+                projection,
+                max_content_bytes,
+            )
+            .await
             {
                 let frame = subscriptions::build_delta_push(&subscription_id, seq, &delta);
                 if out_tx.send_bulk(frame).await.is_err() {

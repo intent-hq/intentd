@@ -1794,7 +1794,9 @@ impl QueuedMessage {
     }
 
     fn can_merge_pending(&self, incoming: &Self) -> bool {
-        !self.persisted
+        !crate::discussion_activity::is_discussion(self.message_metadata.as_ref())
+            && !crate::discussion_activity::is_discussion(incoming.message_metadata.as_ref())
+            && !self.persisted
             && !incoming.persisted
             && !self.has_attachments()
             && !incoming.has_attachments()
@@ -5829,6 +5831,10 @@ impl Services {
         {
             tracing::warn!(agent = %agent_id, error = %e, "clear resolved display model failed");
         }
+        // A manual choice is the new home provider: any pending return to
+        // the old one (PROTOCOL §5.54 backup failover) is dropped.
+        self.clear_provider_return_state(&workspace_id, &agent_id)
+            .await;
         self.publish_agent_mutation_event(
             &workspace_id,
             &agent_id,
@@ -6488,6 +6494,9 @@ impl Services {
         crate::principal_ops::MessageAuthorResolver::new(self, &session.workspace_id)
             .attach_typed(&mut session.messages)
             .await;
+        // Daemon-internal bookkeeping stays in storage only (PROTOCOL §5.54:
+        // the home/return state is never exposed to clients).
+        crate::provider_return::strip_internal_metadata(&mut session);
         Ok(session)
     }
 
@@ -7841,6 +7850,12 @@ impl Services {
             if let Some(gate) = gate.as_ref() {
                 gate.check(&queue[position])?;
             }
+            if crate::discussion_activity::is_discussion(queue[position].message_metadata.as_ref())
+            {
+                return Err(Error::InvalidParams(
+                    "discussion requests are immutable; use discussion.stopAgent to cancel".into(),
+                ));
+            }
             let was = queue[position].editing;
             let edit_id = if was {
                 queue[position]
@@ -8036,6 +8051,13 @@ impl Services {
                     gate.check(entry)?;
                 }
             }
+            if entry.is_some_and(|entry| {
+                crate::discussion_activity::is_discussion(entry.message_metadata.as_ref())
+            }) {
+                return Err(Error::InvalidParams(
+                    "use discussion.stopAgent to cancel a discussion request".into(),
+                ));
+            }
             entry
                 .and_then(|entry| {
                     crate::script_monitor::monitor_id(entry.message_metadata.as_ref())
@@ -8111,6 +8133,12 @@ impl Services {
                 return Err(Error::InvalidParams(format!(
                     "queued message {message_id} belongs to another sender (or the user) and cannot be removed"
                 )));
+            }
+            if crate::discussion_activity::is_discussion(queue[position].message_metadata.as_ref())
+            {
+                return Err(Error::InvalidParams(
+                    "use discussion.stopAgent to cancel a discussion request".into(),
+                ));
             }
             queue.remove(position);
         }
@@ -16603,7 +16631,8 @@ impl Services {
         // Preserve each script wake's durable identity and lifecycle fence through worker admission.
         if queue.iter().any(|m| {
             m.ready_to_send()
-                && (m.monitor_turn.is_some()
+                && (crate::discussion_activity::is_discussion(m.message_metadata.as_ref())
+                    || m.monitor_turn.is_some()
                     || crate::script_monitor::monitor_id(m.message_metadata.as_ref()).is_some())
         }) {
             return None;
@@ -16998,16 +17027,27 @@ impl Services {
 
     /// Drop all queued messages for an agent (used by `agent.editAndRegenerate`,
     /// which supersedes the queue with the regenerated message). Returns `true`
-    /// iff the queue previously held at least one message — the caller uses this
-    /// to decide whether to publish `agent:queue:updated`.
+    /// iff an entry was removed. Correlated discussion requests are retained;
+    /// only their own Stop control cancels them. The caller uses the result to
+    /// decide whether to publish `agent:queue:updated`.
     pub(crate) fn clear_queue(&self, agent_id: &AgentId) -> bool {
         let mut guard = self
             .agent_queues
             .lock()
             .expect("agent queue registry poisoned");
-        let had = guard.get(agent_id).is_some_and(|q| !q.is_empty());
-        guard.remove(agent_id);
-        had
+        let Some(queue) = guard.get_mut(agent_id) else {
+            return false;
+        };
+        let previous = queue.len();
+        // Regenerating an unrelated chat turn does not cancel discussion requests.
+        queue.retain(|entry| {
+            crate::discussion_activity::is_discussion(entry.message_metadata.as_ref())
+        });
+        let changed = queue.len() != previous;
+        if queue.is_empty() {
+            guard.remove(agent_id);
+        }
+        changed
     }
 
     /// Snapshot the current queue contents as wire-shape `QueuedMessage` JSON
@@ -17179,7 +17219,11 @@ impl Services {
                 let idx = queue
                     .iter()
                     .position(|m| m.matches_submission(message_id))?;
-                if queue[idx].monitor_turn.is_some() {
+                if queue[idx].monitor_turn.is_some()
+                    || crate::discussion_activity::is_discussion(
+                        queue[idx].message_metadata.as_ref(),
+                    )
+                {
                     refused = Some(Error::Forbidden(
                         "monitor updates require their original delivery route".into(),
                     ));
@@ -17260,6 +17304,7 @@ impl Services {
                 gate.check(entry)?;
             }
             if !entry.ready_to_send()
+                || crate::discussion_activity::is_discussion(entry.message_metadata.as_ref())
                 || entry.monitor_turn.is_some()
                 || crate::script_monitor::monitor_id(entry.message_metadata.as_ref()).is_some()
             {
@@ -17506,6 +17551,7 @@ impl Services {
     ///
     /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub async fn rehydrate_agent_queues(&self) -> Result<usize> {
+        self.store.recover_discussion_activity().await?;
         let rows = self.store.load_all_agent_queues().await?;
         let max_order = rows
             .iter()
@@ -17604,6 +17650,7 @@ impl Services {
         for (agent_id, message_id, hold_until) in held {
             self.arm_hold_release_timer(&agent_id, &message_id, &hold_until);
         }
+        count += self.dispatch_discussion_deliveries(None, false).await?;
         Ok(count)
     }
 

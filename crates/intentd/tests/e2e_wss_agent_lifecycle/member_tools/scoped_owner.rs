@@ -196,7 +196,15 @@ async fn permission_recovery(routed: bool) {
     let refused =
         wss_rpc_envelope(&mut ordinary, 2, "agent.respondPermission", answer.clone()).await;
     assert_eq!(refused["error"]["code"], -32003, "{refused}");
-    let refused = wss_rpc_envelope(&mut guest, 6, "script.list", json!({"workspaceId":ws})).await;
+    let scripts = wss_rpc(&mut guest, 6, "script.list", json!({"workspaceId":ws})).await;
+    assert_eq!(scripts["scripts"], json!([]), "{scripts}");
+    let refused = wss_rpc_envelope(
+        &mut guest,
+        16,
+        "script.create",
+        json!({"workspaceId":ws,"name":"Forbidden script","command":"true","mode":"command"}),
+    )
+    .await;
     assert_eq!(refused["error"]["code"], -32003, "{refused}");
 
     store
@@ -206,6 +214,8 @@ async fn permission_recovery(routed: bool) {
     let row = wss_rpc(&mut guest, 7, "workspace.get", json!({"workspaceId":ws})).await;
     assert_eq!(row["workspace"]["canManage"], false);
     assert_eq!(row["workspace"]["myRole"], "collaborator");
+    let refused = wss_rpc_envelope(&mut guest, 17, "script.list", json!({"workspaceId":ws})).await;
+    assert_eq!(refused["error"]["code"], -32003, "{refused}");
     assert_eq!(
         wss_rpc(&mut guest, 8, "agent.pendingPermissions", json!({})).await["requests"],
         json!([])

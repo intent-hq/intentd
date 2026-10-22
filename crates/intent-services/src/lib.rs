@@ -88,6 +88,9 @@ mod delete_grace;
 mod delivery_tasks;
 mod device_ops;
 mod discovery_cache;
+mod discussion_activity;
+mod discussion_delivery;
+mod discussion_ops;
 mod disk_usage;
 mod drafts;
 mod enhance_ops;
@@ -103,7 +106,6 @@ pub mod host_exec;
 pub mod host_exec_stream;
 mod host_execution;
 mod installed_cli;
-mod note_delete;
 mod workspace_mutations;
 
 mod github_ops;
@@ -208,10 +210,8 @@ mod member_removal;
 mod model_catalog;
 mod model_preference;
 mod nested_repos;
-mod note_annotation;
 mod note_merge;
 pub mod note_ops;
-mod note_page_state;
 mod npx_cli;
 #[expect(
     dead_code,
@@ -236,7 +236,9 @@ mod provider_images;
 pub mod provider_models;
 mod provider_preparation;
 mod provider_profiles;
+mod provider_return;
 pub mod provider_test_prompt;
+mod quota_failover;
 mod rate_limit;
 pub mod repo_config;
 pub mod retention;
@@ -270,6 +272,8 @@ mod transfer_roundtrip;
 #[cfg(all(test, unix))]
 mod transfer_selection_contract;
 mod transfer_submodules;
+#[cfg(test)]
+mod truncated_read_guard_tests;
 mod unsloth_server;
 mod voice_ops;
 mod workspace_aggregates;
@@ -349,8 +353,8 @@ pub use agent_subscriptions::StartupCompletionRecovery;
 // (created by the composition root; intent-hq/intent#4953), and the
 // bus/refresher surface leave the crate.
 pub use events::{
-    Delivery, EventBus, FenceHandle, GitStatusRefresher, InvalidationSubscription, SharedWatchHub,
-    Subscription, SubscriptionFilter, WatchHealth, WatchHealthSnapshot, WatcherRegistry,
+    Delivery, EventBus, FenceHandle, GitStatusRefresher, SharedWatchHub, Subscription,
+    SubscriptionFilter, WatchHealth, WatchHealthSnapshot, WatcherRegistry,
 };
 pub use intent_acp::{PermissionOutcome, PermissionPolicy, PermissionRequestData};
 pub use pr_ops::PrRefreshOutcome;
@@ -717,7 +721,6 @@ pub struct Services {
     primary_auth_admitted: bool,
     terminal_tasks: Arc<delivery_tasks::DeliveryTasks>,
     pending_delete_tasks: Arc<delivery_tasks::DeliveryTasks>,
-    note_deletions: Arc<note_delete::Registry>,
     host_exec_runtime: Arc<host_exec::HostExecRuntime>,
     provider_preparation: Arc<provider_preparation::Preparation>,
     /// Child agent ids with an active terminal-delivery retry task, mapped
@@ -1090,6 +1093,17 @@ pub struct Services {
     /// Shared across clones so consecutive turns of one agent accumulate the
     /// same stall-episode streak.
     truncation_redrives: agent_session::TruncationRedrives,
+    /// Per-agent quota failover chain of the user turn in flight
+    /// (PROTOCOL §5.54 Backup failover): see
+    /// [`quota_failover::QuotaFailoverChains`]. Shared across clones so the
+    /// turn worker's arm and the failure seam's switch observe the same chain.
+    quota_failover_chains: quota_failover::QuotaFailoverChains,
+    /// Continue-the-cut-short-turn replay marks (PROTOCOL §5.54): see
+    /// [`quota_failover::QuotaFailoverReplays`].
+    quota_failover_replays: quota_failover::QuotaFailoverReplays,
+    /// Pending `provider_returned` announcements (PROTOCOL §5.54): see
+    /// [`provider_return::ProviderReturnAnnouncements`].
+    provider_return_announcements: provider_return::ProviderReturnAnnouncements,
     /// One-shot truncation auto-redrive handoff flags
     /// (intent-hq/monorepo#2863): see
     /// [`agent_session::PendingTruncationRedrives`]. Shared across clones so
@@ -1267,6 +1281,7 @@ pub struct Services {
     /// connections (multiplayer w4).
     principal_revocations: invite_ops::PrincipalRevocations,
     human_instruction_authority: Arc<tokio::sync::RwLock<()>>,
+    discussion_control_gates: Arc<agent_ops::AgentRetirementGates>,
     #[cfg(test)]
     invite_create_commit_pause: Arc<member_removal::MutationBarrier>,
     #[cfg(test)]
@@ -1694,7 +1709,6 @@ impl Services {
             primary_auth_admitted: false,
             terminal_tasks: Arc::new(delivery_tasks::DeliveryTasks::default()),
             pending_delete_tasks,
-            note_deletions: Arc::default(),
             host_exec_runtime: Arc::default(),
             provider_preparation: Arc::default(),
             completion_delivery_retries: Arc::new(Mutex::new(HashMap::new())),
@@ -1764,6 +1778,9 @@ impl Services {
             turn_bookkeeping: Arc::new(Mutex::new(HashMap::new())),
             last_turn_silent_tails: Arc::new(Mutex::new(HashMap::new())),
             truncation_redrives: Arc::new(Mutex::new(HashMap::new())),
+            quota_failover_chains: Arc::new(Mutex::new(HashMap::new())),
+            quota_failover_replays: Arc::new(Mutex::new(HashSet::new())),
+            provider_return_announcements: Arc::new(Mutex::new(HashSet::new())),
             pending_truncation_redrive: Arc::new(Mutex::new(HashSet::new())),
             test_busy: Arc::new(Mutex::new(HashSet::new())),
             deferred_attention: Arc::new(Mutex::new(HashMap::new())),
@@ -1799,6 +1816,7 @@ impl Services {
             invite_nonces: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             invite_nonce_permits: invite_ops::new_nonce_permits(),
             human_instruction_authority: Arc::new(tokio::sync::RwLock::new(())),
+            discussion_control_gates: Arc::default(),
             #[cfg(test)]
             invite_create_commit_pause: Arc::new(member_removal::MutationBarrier::default()),
             #[cfg(test)]
@@ -6989,8 +7007,6 @@ impl Services {
         // and PtyHost::kill_all has refused/reaped every late PTY spawn.
         // Pending undo waits are discarded on restart by their wire contract;
         // a timer that already claimed its delete finishes the cascade.
-        self.note_deletions.close();
-        self.note_deletions.tasks.shutdown().await;
         self.pending_delete_tasks.shutdown().await;
         // Device-flow cancellation is cooperative: remove the generation and
         // join any in-flight token write/reconciliation instead of aborting it.
@@ -11130,6 +11146,27 @@ fn check_set_content_reduction(
     Ok(())
 }
 
+/// Truncated-read write guard: compare the writer's `baseContentBytes` with
+/// the UTF-8 size of the base `merge` resolved — the stored `current`
+/// content on the exact path, the retained snapshot on the merge path. The
+/// last-writer-wins path has no known base, so a guarded write is refused
+/// there rather than overwriting text the writer never saw.
+fn check_content_base(expected: u64, merge: &SetContentMerge, current: &str) -> Result<()> {
+    let resolved = match merge.outcome {
+        "exact" => Some(current.len()),
+        "merged" => merge.base.as_deref().map(str::len),
+        _ => None,
+    }
+    .map(|len| u64::try_from(len).unwrap_or(u64::MAX));
+    if resolved == Some(expected) {
+        return Ok(());
+    }
+    Err(Error::ContentBaseMismatch {
+        base_content_bytes: expected,
+        resolved_base_bytes: resolved,
+    })
+}
+
 /// How [`persist_merged_content`] turns one attempt's merged text into the
 /// text it persists.
 #[derive(Clone, Copy)]
@@ -11175,6 +11212,16 @@ struct ContentWrite<'a> {
     author: &'a NoteVersionAuthor,
     /// Method label for the merge trace.
     op: &'static str,
+    /// The writer's `baseContentBytes` (truncated-read write guard): when
+    /// `Some`, every attempt refuses the write with
+    /// [`Error::ContentBaseMismatch`] unless it equals the UTF-8 size of the
+    /// base that attempt resolves (the stored content on the exact path, the
+    /// merge snapshot on the stale path; an unknown base always refuses, so
+    /// a guarded write never degrades to last-writer-wins). Without
+    /// `expected_version` a retry after a lost rev gate is refused too: the
+    /// concurrent text was never the writer's base. `None` (surgical ops,
+    /// agents, MCP) is unguarded.
+    base_content_bytes: Option<u64>,
 }
 
 /// Read-merge-persist loop every client content write runs through
@@ -11211,6 +11258,7 @@ async fn persist_merged_content(
         policy,
         author,
         op,
+        base_content_bytes,
     } = write;
     let normalized;
     let merge_input = match policy {
@@ -11229,6 +11277,16 @@ async fn persist_merged_content(
         };
         let old_content = note.content.clone();
         let current_rev = note.rev;
+        if let (Some(expected), None, true) = (base_content_bytes, expected_version, attempt > 1) {
+            // A guarded write without `expectedVersion` checked its base
+            // against the row the previous attempt read; a write that landed
+            // since is text the writer never saw, so it is refused rather
+            // than retried over (the caller holds no rev to merge from).
+            return Err(Error::ContentBaseMismatch {
+                base_content_bytes: expected,
+                resolved_base_bytes: Some(u64::try_from(old_content.len()).unwrap_or(u64::MAX)),
+            });
+        }
         let merge = merge_set_content(
             store,
             workspace_id,
@@ -11238,6 +11296,9 @@ async fn persist_merged_content(
             expected_version,
         )
         .await?;
+        if let Some(expected) = base_content_bytes {
+            check_content_base(expected, &merge, &old_content)?;
+        }
         if let ContentWritePolicy::SetContent {
             confirm_replacement,
         } = policy
@@ -11266,8 +11327,9 @@ async fn persist_merged_content(
         note.content = content.clone();
         let now = now_iso();
         note.updated_at = now.clone();
-        match plan.persist(store, &note, Some(current_rev), author).await {
+        match persist_note_content(store, &note, Some(current_rev), author).await {
             Ok(rev) => {
+                plan.apply_orphaned(store, workspace_id).await?;
                 return Ok(MergedContentWrite {
                     note,
                     old_content,
@@ -11292,8 +11354,11 @@ async fn persist_merged_content(
 /// Returns a [`ReanchorPlan`]: the possibly-rewritten markdown plus the set
 /// of comments whose `is_orphaned` flag needs to be flipped to `true`.
 /// Already-orphaned comments are left as-is. The plan does **no** store
-/// writes. Callers commit source, its version, orphan flags and anchor readiness
-/// together through the versioned writer; a failure leaves every row unchanged.
+/// writes — callers first persist the note-content change via an atomic
+/// versioned write (`persist_note_content` / the `*_with_version` store
+/// helpers) and then call [`ReanchorPlan::apply_orphaned`] so a failed note write
+/// cannot leave comment rows flagged orphaned while the persisted markdown
+/// still contains the original anchors.
 ///
 /// The lookup is scoped to `workspace_id` because `note_id` (e.g. the
 /// well-known `spec` id) is not globally unique — see
@@ -11371,6 +11436,7 @@ async fn reanchor_note_comments(
     current = note_ops::scrub_phantom_anchor_markers(&current, &live_ids);
     Ok(ReanchorPlan {
         content: current,
+        note_id: note_id.clone(),
         orphaned,
     })
 }
@@ -11386,30 +11452,34 @@ fn live_comment_ids(comments: &[Comment]) -> HashSet<String> {
 }
 
 /// Result of [`reanchor_note_comments`]: the rewritten note markdown and the
-/// set of comment rows whose `is_orphaned` flag needs to flip to `true`.
+/// ids of root comments whose `is_orphaned` flag needs to flip to `true`.
 struct ReanchorPlan {
     content: String,
+    note_id: NoteId,
+    /// Ids of root comments to flag orphaned (never whole cached rows).
     orphaned: Vec<String>,
 }
 
 impl ReanchorPlan {
-    async fn persist(
-        &self,
-        store: &Store,
-        note: &Note,
-        expected_version: Option<i64>,
-        author: &NoteVersionAuthor,
-    ) -> Result<i64> {
-        store
-            .update_note_with_version_and_orphans(
-                note,
-                expected_version,
-                author,
-                &note.updated_at,
-                &self.orphaned,
-            )
-            .await
-            .map(|(revision, _)| revision)
+    /// Persist the queued orphan flips. Callers **must** run this only after
+    /// the note-content write has succeeded so a note-write failure cannot
+    /// leave comment rows marked orphaned while the persisted markdown still
+    /// contains the original anchors. If a comment update fails after the
+    /// note has been written the anchors on disk are still a valid pointer
+    /// (either intact or scrubbed) and the next mutation's reanchor pass
+    /// will finish the job.
+    ///
+    /// Each flip is a targeted update of the orphan flag and its timestamp,
+    /// never a write-back of the comment row read before the note write: a
+    /// thread resolved in between must stay resolved (intentd#2592 review).
+    async fn apply_orphaned(self, store: &Store, workspace_id: &WorkspaceId) -> Result<()> {
+        let now = now_iso();
+        for id in self.orphaned {
+            store
+                .mark_comment_orphaned(workspace_id, &self.note_id, &id, &now)
+                .await?;
+        }
+        Ok(())
     }
 }
 
@@ -11534,25 +11604,14 @@ impl Services {
     /// Run `attribute_lines` over the note's current content + full version
     /// history, persist the result, and emit `line-attribution:updated` as a
     /// broadcast-only (transient, never persisted) event to live subscribers.
-    /// A generation ticket binds the computation to its original source and
-    /// prevents an older or superseded job from publishing over newer state.
-    /// Indexed attribution and the compatible legacy snapshot commit together.
+    /// The write is idempotent (upsert), so a race between two computes leaves
+    /// the store consistent with the *latest* one to complete.
     async fn compute_and_persist_line_attribution(
         &self,
         workspace_id: &WorkspaceId,
         note_id: &NoteId,
     ) -> Result<LineAttributionData> {
         let note = fetch_note(&self.store, workspace_id, note_id).await?;
-        let job = self
-            .store
-            .begin_note_attribution(workspace_id, note_id, note.rev)
-            .await?;
-        // Publish the committed pending invalidation without fabricating an
-        // empty legacy attribution result. Existing note listeners can re-read.
-        publish_event_transient(
-            self.event_bus.as_ref(),
-            &note_change_event(workspace_id, note_id, &note.title, NOTE_UPDATED, "update"),
-        );
         let summaries = self.store.list_note_versions(workspace_id, note_id).await?;
         let mut versions: Vec<NoteVersion> = Vec::with_capacity(summaries.len());
         for summary in &summaries {
@@ -11591,9 +11650,7 @@ impl Services {
             computed_at: now_iso(),
             attributions: map,
         };
-        self.store
-            .publish_note_attribution(&job, &note.content, &data)
-            .await?;
+        self.store.upsert_note_line_attribution(&data).await?;
         publish_event_transient(
             self.event_bus.as_ref(),
             &line_attribution_updated_event(&data),
@@ -12245,6 +12302,7 @@ async fn append_primitive(
             policy: ContentWritePolicy::Surgical,
             author: &author,
             op: "primitive.append",
+            base_content_bytes: None,
         },
     )
     .await?;
@@ -16884,13 +16942,12 @@ impl Services {
             note.updated_at = now_iso();
             let children: Vec<Note> = created.iter().map(|(child, _)| child.clone()).collect();
             match store
-                .update_note_with_version_and_children_and_orphans(
+                .update_note_with_version_and_children(
                     &note,
                     Some(read_rev),
                     &children,
                     &author,
                     &note.updated_at,
-                    &plan.orphaned,
                 )
                 .await
             {
@@ -16904,6 +16961,7 @@ impl Services {
                         created = created.len(),
                         "task blocks converted"
                     );
+                    plan.apply_orphaned(store, &workspace_id).await?;
                     break (note, parsed, warnings, created, block_note_ids);
                 }
                 Err(Error::Conflict { .. }) if attempt < SET_CONTENT_MAX_ATTEMPTS => {}
@@ -18963,6 +19021,12 @@ impl WorkspaceApi for Services {
             // (§5.1); it is included as true/false when the probe ran and
             // omitted when it could not run (presence-detected by clients).
             let mut caps = serde_json::Map::new();
+            caps.insert("discussionConversations".into(), serde_json::json!(1));
+            caps.insert("discussionMessageActions".into(), serde_json::json!(1));
+            caps.insert("discussionReactions".into(), serde_json::json!(1));
+            caps.insert("workspaceGuestRoles".into(), serde_json::json!(1));
+            caps.insert("discussionAgentMessaging".into(), serde_json::json!(1));
+            caps.insert("discussionAgentActivity".into(), serde_json::json!(1));
             if let Some(cow_supported) = self.compute_cow_supported().await {
                 caps.insert("cowSupported".to_string(), serde_json::json!(cow_supported));
             }
@@ -19015,6 +19079,13 @@ impl WorkspaceApi for Services {
         profile_id: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(self.provider_profiles_delete_impl(profile_id))
+    }
+
+    fn provider_profiles_reorder(
+        &self,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.provider_profiles_reorder_impl(params))
     }
 
     fn provider_profiles_auth_status(
@@ -20896,7 +20967,7 @@ impl WorkspaceApi for Services {
     fn script_list(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
         Box::pin(async move {
-            self.require_workspace_manager(&workspace_id, "script.list")
+            self.require_workspace_operator(&workspace_id, "script.list")
                 .await?;
             mgr.list(&workspace_id).await
         })
@@ -20909,7 +20980,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
         Box::pin(async move {
-            self.require_workspace_manager(&workspace_id, "script.list")
+            self.require_workspace_operator(&workspace_id, "script.list")
                 .await?;
             mgr.list_filtered(&workspace_id, archive).await
         })
@@ -20921,7 +20992,7 @@ impl WorkspaceApi for Services {
         options: serde_json::Value,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            self.require_workspace_manager(&workspace_id, "script.list")
+            self.require_workspace_operator(&workspace_id, "script.list")
                 .await?;
             let options = intent_core::script_lists::ScriptListOptions::parse(&options, false)?;
             if options.summary {
@@ -20939,9 +21010,11 @@ impl WorkspaceApi for Services {
         script_id: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            self.require_workspace_manager(&workspace_id, "script.get")
+            self.require_saved_script_operator(&workspace_id, &script_id, "script.get")
                 .await?;
-            self.script_manager().get(&workspace_id, &script_id).await
+            let mgr = self.script_manager();
+            let _read = mgr.scoped_read_guard(&workspace_id, &script_id).await?;
+            mgr.get(&workspace_id, &script_id).await
         })
     }
     fn script_monitor_list_view(
@@ -21109,7 +21182,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
         Box::pin(async move {
-            self.require_workspace_manager(&workspace_id, "script.start")
+            self.require_saved_script_operator(&workspace_id, &script_id, "script.start")
                 .await?;
             mgr.start(&workspace_id, &script_id).await
         })
@@ -21122,7 +21195,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
         Box::pin(async move {
-            self.require_workspace_manager(&workspace_id, "script.stop")
+            self.require_saved_script_operator(&workspace_id, &script_id, "script.stop")
                 .await?;
             mgr.stop(&workspace_id, &script_id).await
         })
@@ -21135,7 +21208,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
         Box::pin(async move {
-            self.require_workspace_manager(&workspace_id, "script.restart")
+            self.require_saved_script_operator(&workspace_id, &script_id, "script.restart")
                 .await?;
             mgr.restart(&workspace_id, &script_id).await
         })
@@ -21151,9 +21224,10 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
         Box::pin(async move {
-            self.require_workspace_manager(&workspace_id, "script.output")
+            self.require_saved_script_operator(&workspace_id, &script_id, "script.output")
                 .await?;
             mgr.ensure_known(&workspace_id, &script_id).await?;
+            let _read = mgr.scoped_read_guard(&workspace_id, &script_id).await?;
             mgr.output(
                 &workspace_id,
                 &script_id,
@@ -21172,9 +21246,10 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
         Box::pin(async move {
-            self.require_workspace_manager(&workspace_id, "script.status")
+            self.require_saved_script_operator(&workspace_id, &script_id, "script.status")
                 .await?;
             mgr.ensure_known(&workspace_id, &script_id).await?;
+            let _read = mgr.scoped_read_guard(&workspace_id, &script_id).await?;
             mgr.status(&workspace_id, &script_id)
         })
     }
@@ -21188,10 +21263,15 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
         Box::pin(async move {
-            self.require_workspace_manager(&workspace_id, "script.run")
+            self.require_saved_script_operator(&workspace_id, &script_id, "script.run")
                 .await?;
-            mgr.run(&workspace_id, &script_id, max_lines, timeout_seconds)
-                .await
+            let result = mgr
+                .run(&workspace_id, &script_id, max_lines, timeout_seconds)
+                .await?;
+            // A command may finish after the owner downgraded this open socket.
+            self.require_saved_script_operator(&workspace_id, &script_id, "script.run")
+                .await?;
+            Ok(result)
         })
     }
 
@@ -25819,60 +25899,6 @@ impl WorkspaceApi for Services {
         })
     }
 
-    fn note_paging_backend_id(&self) -> Option<String> {
-        Some(self.store.note_paging_backend_id().to_owned())
-    }
-
-    fn get_note_page(
-        &self,
-        workspace_id: WorkspaceId,
-        note_id: NoteId,
-        request: intent_core::note_page::NotePageRequest,
-        rpc_id: serde_json::Value,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move {
-            self.require_member(&workspace_id).await?;
-            let principal = match intent_core::current_caller() {
-                Some(intent_core::Caller::Wire { principal_id, .. }) => {
-                    format!("principal:{}", principal_id.0)
-                }
-                Some(intent_core::Caller::Agent { agent_id }) => format!("agent:{}", agent_id.0),
-                Some(intent_core::Caller::Daemon) => "daemon".into(),
-                None => return Err(Error::Forbidden("Caller required".into())),
-            };
-            let result = self
-                .store
-                .read_note_page(&workspace_id.0, &note_id.0, &principal, request, &rpc_id)
-                .await;
-            #[cfg(test)]
-            note_annotation::tests::pause_after_read(
-                &workspace_id,
-                note_annotation::tests::read_outcome(&result),
-            )
-            .await;
-            self.require_member(&workspace_id).await?;
-            result
-        })
-    }
-
-    fn get_note_annotation_page(
-        &self,
-        method: intent_core::note_annotation::AnnotationMethod,
-        request: intent_core::note_annotation::AnnotationReadRequest,
-        rpc_id: serde_json::Value,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(self.read_annotation_page(method, request, rpc_id))
-    }
-
-    fn get_note_page_state(
-        &self,
-        workspace_id: WorkspaceId,
-        note_id: NoteId,
-        incarnation: Option<String>,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(self.read_page_state(workspace_id, note_id, incarnation))
-    }
-
     fn get_note(&self, workspace_id: WorkspaceId, note_id: NoteId) -> BoxFuture<'_, Result<Note>> {
         let store = self.store.clone();
         Box::pin(async move {
@@ -25997,10 +26023,30 @@ impl WorkspaceApi for Services {
             if let Some(content) = input.content.as_deref() {
                 note_ops::reject_numbered_read_presentation(content)?;
             }
-            let expected_version = input.expected_version;
+            let caller_expected_version = input.expected_version;
+            let mut expected_version = caller_expected_version;
             let mut note = fetch_note(&store, &workspace_id, &note_id).await?;
             // content present → raw full set; otherwise title/tags metadata.
             let content_changed = input.content.is_some();
+            if let (true, Some(base)) = (content_changed, input.base_content_bytes) {
+                // Truncated-read write guard, after the strict
+                // `expectedVersion` check (a stale value is `-32005` first).
+                // The persist below is then gated on the rev just checked, so
+                // a write landing in between cannot be overwritten unseen.
+                if expected_version.is_some_and(|v| v != note.rev) {
+                    let current = serde_json::to_value(&note)
+                        .map_err(|e| Error::Internal(format!("encode current note failed: {e}")))?;
+                    return Err(Error::Conflict { current });
+                }
+                let stored = u64::try_from(note.content.len()).unwrap_or(u64::MAX);
+                if stored != base {
+                    return Err(Error::ContentBaseMismatch {
+                        base_content_bytes: base,
+                        resolved_base_bytes: Some(stored),
+                    });
+                }
+                expected_version = Some(note.rev);
+            }
             let mut reanchor_plan: Option<ReanchorPlan> = None;
             if let Some(content) = input.content {
                 // Plain versioned write: a stale `expectedVersion` surfaces
@@ -26026,9 +26072,29 @@ impl WorkspaceApi for Services {
             if content_changed {
                 // FE-only `note.update`: no caller-agent context on this arm
                 // (transport router path), so the version author is the user.
-                if let Some(plan) = &reanchor_plan {
-                    plan.persist(&store, &note, expected_version, &user_version_author())
-                        .await?;
+                match persist_note_content(&store, &note, expected_version, &user_version_author())
+                    .await
+                {
+                    // A guarded write the caller sent without
+                    // `expectedVersion` lost the rev gate pinned above: a
+                    // concurrent writer changed the note after the size
+                    // check, which the contract reports as a base mismatch.
+                    Err(Error::Conflict { current }) if caller_expected_version.is_none() => {
+                        if let Some(base) = input.base_content_bytes {
+                            let resolved = current
+                                .get("content")
+                                .and_then(serde_json::Value::as_str)
+                                .map(|c| u64::try_from(c.len()).unwrap_or(u64::MAX));
+                            return Err(Error::ContentBaseMismatch {
+                                base_content_bytes: base,
+                                resolved_base_bytes: resolved,
+                            });
+                        }
+                        return Err(Error::Conflict { current });
+                    }
+                    other => {
+                        other?;
+                    }
                 }
             } else {
                 // Metadata-scoped: leaves the stored content untouched even
@@ -26042,6 +26108,9 @@ impl WorkspaceApi for Services {
             // concurrent write landed — rather than the pre-write copy
             // (intent-hq/intent#5589).
             note = fetch_note(&store, &workspace_id, &note_id).await?;
+            if let Some(plan) = reanchor_plan {
+                plan.apply_orphaned(&store, &workspace_id).await?;
+            }
             if content_changed {
                 services.schedule_line_attribution_recompute(
                     &note.workspace_id.clone(),
@@ -26120,6 +26189,7 @@ impl WorkspaceApi for Services {
                     policy: ContentWritePolicy::Surgical,
                     author: &author,
                     op: "note.add",
+                    base_content_bytes: None,
                 },
             )
             .await?;
@@ -26210,6 +26280,7 @@ impl WorkspaceApi for Services {
                     policy: ContentWritePolicy::Surgical,
                     author: &author,
                     op: "note.edit",
+                    base_content_bytes: None,
                 },
             )
             .await?;
@@ -26298,6 +26369,7 @@ impl WorkspaceApi for Services {
                     policy: ContentWritePolicy::Surgical,
                     author: &author,
                     op: "note.editLines",
+                    base_content_bytes: None,
                 },
             )
             .await?;
@@ -26359,6 +26431,27 @@ impl WorkspaceApi for Services {
         expected_version: Option<i64>,
         caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<NoteSetContentResult>> {
+        self.set_note_content_guarded(
+            workspace_id,
+            note_id,
+            content,
+            confirm_replacement,
+            expected_version,
+            None,
+            caller_agent_id,
+        )
+    }
+
+    fn set_note_content_guarded(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        content: String,
+        confirm_replacement: bool,
+        expected_version: Option<i64>,
+        base_content_bytes: Option<u64>,
+        caller_agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<NoteSetContentResult>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         let services = self.clone();
@@ -26388,6 +26481,7 @@ impl WorkspaceApi for Services {
                     },
                     author: &author,
                     op: "note.setContent",
+                    base_content_bytes,
                 },
             )
             .await?;
@@ -26515,31 +26609,6 @@ impl WorkspaceApi for Services {
                 rev: Some(note.rev),
             })
         })
-    }
-
-    fn supports_note_delete_grace(&self) -> bool {
-        true
-    }
-
-    fn schedule_note_delete(
-        &self,
-        request: intent_core::note_delete::NoteDeleteSchedule,
-    ) -> BoxFuture<'_, Result<intent_core::note_delete::NoteDeleteOperationResponse>> {
-        Box::pin(self.grace_schedule(request))
-    }
-
-    fn cancel_note_delete(
-        &self,
-        request: intent_core::note_delete::NoteDeleteCancel,
-    ) -> BoxFuture<'_, Result<intent_core::note_delete::NoteDeleteOperationResponse>> {
-        Box::pin(self.grace_cancel(request))
-    }
-
-    fn note_delete_status(
-        &self,
-        request: intent_core::note_delete::NoteDeleteStatus,
-    ) -> BoxFuture<'_, Result<intent_core::note_delete::NoteDeleteStatusResponse>> {
-        Box::pin(self.grace_status(request))
     }
 
     fn delete_note(
@@ -26947,6 +27016,7 @@ impl WorkspaceApi for Services {
                     policy: ContentWritePolicy::Surgical,
                     author: &author,
                     op: "task.updateStatus",
+                    base_content_bytes: None,
                 },
             )
             .await?;
@@ -27138,6 +27208,7 @@ impl WorkspaceApi for Services {
                             policy: ContentWritePolicy::Surgical,
                             author: &author,
                             op: "task.update",
+                            base_content_bytes: None,
                         },
                     )
                     .await?;
@@ -27148,8 +27219,9 @@ impl WorkspaceApi for Services {
                         .await?;
                 note.content = std::mem::take(&mut plan.content);
                 note.updated_at = now_iso();
-                match plan.persist(&store, &note, Some(read_rev), &author).await {
+                match persist_note_content(&store, &note, Some(read_rev), &author).await {
                     Ok(_) => {
+                        plan.apply_orphaned(&store, &workspace_id).await?;
                         break (note, update, redirect, true);
                     }
                     Err(Error::Conflict { .. }) if attempt < SET_CONTENT_MAX_ATTEMPTS => {
@@ -31129,8 +31201,28 @@ impl WorkspaceApi for Services {
             // background flag); lifecycle, session, model, prompt, task and
             // attachment fields are the owner's.
             if !capability::collaborator_editable_agent_update(&changes) {
-                self.require_agent_owner(&agent_id, "agent.update (protected fields)")
+                let model_preferences = changes.as_object().is_some_and(|fields| {
+                    fields.keys().all(|key| {
+                        [
+                            "name",
+                            "nameExplicitlySet",
+                            "isBackground",
+                            "reasoningEffort",
+                        ]
+                        .contains(&key.as_str())
+                    })
+                });
+                if model_preferences {
+                    let workspace_id = self.agent_workspace(&agent_id).await?;
+                    self.require_workspace_operator(
+                        &workspace_id,
+                        "agent.update (model preferences)",
+                    )
                     .await?;
+                } else {
+                    self.require_agent_owner(&agent_id, "agent.update (protected fields)")
+                        .await?;
+                }
             }
             self.agent_update_op(agent_id, changes).await
         })
@@ -31274,7 +31366,34 @@ impl WorkspaceApi for Services {
         extra: intent_core::AgentCreateExtra,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         self.execution_call(async move {
-            self.require_member(&workspace_id).await?;
+            let manager = self
+                .require_workspace_operator(&workspace_id, "agent.create")
+                .await?;
+            if manager
+                && (parent_agent_id.is_some()
+                    || extra.workspace_path.is_some()
+                    || extra.workspace_context.is_some()
+                    || extra.agent_type.is_some()
+                    || extra.metadata.as_ref().is_some_and(|m| {
+                        !m.as_object().is_some_and(|o| {
+                            o.keys().all(|k| {
+                                [
+                                    "initialMessage",
+                                    "contextReferences",
+                                    "contextRefs",
+                                    "imageBlocks",
+                                    "fileBlocks",
+                                    "isBackground",
+                                ]
+                                .contains(&k.as_str())
+                            })
+                        })
+                    }))
+            {
+                return Err(Error::Forbidden(
+                    "agent.create protected configuration requires the workspace owner".into(),
+                ));
+            }
             if let Some(model) = model.as_deref() {
                 reject_compound_model("model", model)?;
             }
@@ -34570,6 +34689,93 @@ impl WorkspaceApi for Services {
 
     // `workspace.members.*` (multiplayer w3) — see `capability`.
 
+    fn discussion_list(
+        &self,
+        workspace_id: WorkspaceId,
+        conversation_id: String,
+        before_sequence: Option<i64>,
+        after_sequence: Option<i64>,
+        limit: u32,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.discussion_history_op(
+                &workspace_id,
+                &conversation_id,
+                before_sequence,
+                after_sequence,
+                limit,
+            )
+            .await
+        })
+    }
+    fn discussion_send(
+        &self,
+        workspace_id: WorkspaceId,
+        message_id: String,
+        body: String,
+        target: intent_core::discussion::DiscussionTarget,
+    ) -> BoxFuture<'_, Result<intent_core::discussion::DiscussionSendResult>> {
+        Box::pin(async move {
+            self.discussion_send_to_op(&workspace_id, &message_id, &body, &target)
+                .await
+        })
+    }
+    fn discussion_control_agent(
+        &self,
+        request: intent_core::discussion::DiscussionAgentControl,
+        retry: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.discussion_control_op(request, retry))
+    }
+    fn discussion_react(
+        &self,
+        workspace_id: WorkspaceId,
+        conversation_id: String,
+        message_id: String,
+        reaction: String,
+        active: bool,
+    ) -> BoxFuture<'_, Result<intent_core::discussion::DiscussionReactionState>> {
+        Box::pin(async move {
+            self.discussion_react_op(
+                &workspace_id,
+                &conversation_id,
+                &message_id,
+                &reaction,
+                active,
+            )
+            .await
+        })
+    }
+    fn discussion_conversations(
+        &self,
+        workspace_id: WorkspaceId,
+        before_id: Option<String>,
+        limit: u32,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.discussion_conversations_op(&workspace_id, before_id.as_deref(), limit)
+                .await
+        })
+    }
+    fn discussion_recipients(
+        &self,
+        workspace_id: WorkspaceId,
+        query: String,
+        after_id: Option<String>,
+        limit: u32,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.discussion_recipients_op(&workspace_id, &query, after_id.as_deref(), limit)
+                .await
+        })
+    }
+    fn discussion_project_event(
+        &self,
+        event: intent_core::Event,
+    ) -> BoxFuture<'_, Result<Option<intent_core::Event>>> {
+        Box::pin(async move { self.discussion_project_event_op(event).await })
+    }
+
     fn workspace_members_list(
         &self,
         workspace_id: WorkspaceId,
@@ -34584,6 +34790,18 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             self.workspace_members_add_op(&workspace_id, &principal_id)
+                .await
+        })
+    }
+
+    fn workspace_members_set_role(
+        &self,
+        workspace_id: WorkspaceId,
+        principal_id: intent_core::PrincipalId,
+        role: intent_core::WorkspaceRole,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.workspace_members_set_role_op(&workspace_id, &principal_id, role)
                 .await
         })
     }

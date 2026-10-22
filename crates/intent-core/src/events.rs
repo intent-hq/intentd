@@ -211,12 +211,17 @@ pub const GIT_ROOT_REGISTERED: &str = "gitRoot:registered";
 pub const GIT_ROOT_UPDATED: &str = "gitRoot:updated";
 pub const GIT_ROOT_UNREGISTERED: &str = "gitRoot:unregistered";
 
+/// Versioned activity of an explicitly addressed discussion invocation.
+pub const DISCUSSION_ACTIVITY: &str = "discussion:activity";
+/// A newly persisted discussion message.
+pub const DISCUSSION_MESSAGE: &str = "discussion:message";
+/// Transient committed reaction metadata; never a new message.
+pub const DISCUSSION_REACTION: &str = "discussion:reaction";
+
 // Note events.
 pub const NOTE_CREATED: &str = "note:created";
 pub const NOTE_UPDATED: &str = "note:updated";
 pub const NOTE_DELETED: &str = "note:deleted";
-/// Bounded grace deletion registry invalidation, scoped to its workspace.
-pub const NOTE_DELETE_OPERATION: &str = "note:delete-operation";
 
 // Line-attribution events (new in intentd; PROTOCOL §5.2.1). Emitted after the
 // daemon recomputes per-line attributions for a note (post-mutation,
@@ -639,10 +644,12 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     GIT_ROOT_REGISTERED,
     GIT_ROOT_UPDATED,
     GIT_ROOT_UNREGISTERED,
+    DISCUSSION_MESSAGE,
+    DISCUSSION_ACTIVITY,
+    DISCUSSION_REACTION,
     NOTE_CREATED,
     NOTE_UPDATED,
     NOTE_DELETED,
-    NOTE_DELETE_OPERATION,
     LINE_ATTRIBUTION_UPDATED,
     TASK_CREATED,
     TASK_UPDATED,
@@ -914,6 +921,9 @@ pub const COLLABORATOR_EVENT_TYPES: &[(&str, &str)] = &[
     (COMMENT_ADDED, "Comment: a comment landed on a note."),
     (COMMENT_DELETED, "Comment: a comment was deleted from a note."),
     (COMMENT_RESOLVED, "Comment: a thread was resolved."),
+    (DISCUSSION_ACTIVITY, "Discussion: versioned activity for one explicitly addressed invocation."),
+    (DISCUSSION_MESSAGE, "Human discussion: authenticated member message in the workspace."),
+    (DISCUSSION_REACTION, "Human discussion: participant-visible reaction metadata update."),
     (DRAFT_CHANGED, "Draft: a client's composer draft exists or was cleared; { workspaceId, agentId, clientId, hasDraft } — never the text."),
     (FILE_CHANGED, "File: a watched file changed; payload paths are workspace-relative (`events::watcher::relative_path`), never absolute."),
     (FILE_CREATED, "File: a watched file was created; workspace-relative path."),
@@ -932,7 +942,6 @@ pub const COLLABORATOR_EVENT_TYPES: &[(&str, &str)] = &[
     (HOOK_SCHEDULED, "Hook lifecycle: a hook was registered; hook id, name and schedule."),
     (LINE_ATTRIBUTION_UPDATED, "Note: per-line authorship of a note changed."),
     (NOTE_CREATED, "Note: a note was created."),
-    (NOTE_DELETE_OPERATION, "Note: a cancellable deletion changed state."),
     (NOTE_DELETED, "Note: a note was deleted."),
     (NOTE_PRESENCE, "Presence: a member joined / moved its caret in / left a note the guest is a member of; principal profile fields and a caret position (rev/anchor/head) only. Transient."),
     (NOTE_UPDATED, "Note: note content or metadata changed."),

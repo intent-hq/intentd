@@ -92,8 +92,15 @@ async fn scoped_owner_projection_over_wss_tracks_workspace_snapshots_and_role_lo
     assert_eq!(delta["kind"], "delta");
     assert_owner(&delta["delta"]["updated"][0]);
 
+    let scripts = guest
+        .call("script.list", json!({"workspaceId":owned}))
+        .await;
+    assert_eq!(scripts["result"]["scripts"], json!([]), "{scripts}");
     for (method, params) in [
-        ("script.list", json!({"workspaceId":owned})),
+        (
+            "script.create",
+            json!({"workspaceId":owned,"name":"Forbidden script","command":"true","mode":"command"}),
+        ),
         ("workspace.create", json!({"title":"Forbidden creation"})),
         ("settings.list", json!({})),
     ] {
@@ -121,6 +128,10 @@ async fn scoped_owner_projection_over_wss_tracks_workspace_snapshots_and_role_lo
     let delta = workspace_push(&mut subscriber).await;
     assert_eq!(delta["delta"]["updated"][0]["canManage"], false);
     assert_eq!(delta["delta"]["updated"][0]["myRole"], "collaborator");
+    let refused = guest
+        .call("script.list", json!({"workspaceId":owned}))
+        .await;
+    assert_eq!(refused["error"]["code"], -32003, "{refused}");
     let refused = guest
         .call(
             "workspace.update",

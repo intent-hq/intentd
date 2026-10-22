@@ -61,8 +61,11 @@ pub(crate) const AGENT_SUBSCRIBABLE_CATEGORY_WILDCARDS: &[&str] = &[
 /// `prMonitor:refreshed` re-read hint (merge-queue movement must never wake
 /// an agent; agents read the queue entry on request). The prefix rule also
 /// covers the `agent:*` pattern itself.
+/// Human-only `discussion:` events are never admitted or delivered to
+/// agent-owned event subscriptions, including restored subscriptions.
 pub(crate) fn is_agent_restricted_event_type(event_type: &str) -> bool {
     event_type.starts_with("agent:")
+        || event_type.starts_with("discussion:")
         || event_type == "chat:stream:delta"
         || event_type == PRESENCE_CHANGED
         || event_type == NOTE_PRESENCE
@@ -347,6 +350,10 @@ mod tests {
             "chat:stream:delta",
             "presence:changed",
             "note:presence",
+            "discussion:message",
+            "discussion:*",
+            "discussion:reaction",
+            "discussion:future-type",
             "prMonitor:refreshed",
         ] {
             assert!(is_agent_restricted_event_type(t), "{t} must be restricted");
@@ -397,6 +404,39 @@ mod tests {
         assert!(event_matches(
             &fe,
             &event("agent:message", Some("a"), ActorType::Agent)
+        ));
+    }
+
+    #[test]
+    fn discussion_events_never_match_agent_filters_including_legacy_rows() {
+        for patterns in [
+            vec![],
+            vec!["discussion:*".into()],
+            vec!["discussion:message".into()],
+        ] {
+            let filter = SubscriptionFilter {
+                event_types: patterns,
+                exclude_agent_events: true,
+                ..Default::default()
+            };
+            for kind in [
+                "discussion:message",
+                "discussion:reaction",
+                "discussion:future-type",
+            ] {
+                assert!(!event_matches(
+                    &filter,
+                    &event(kind, Some("human"), ActorType::User)
+                ));
+            }
+        }
+        let human = SubscriptionFilter {
+            event_types: vec!["discussion:*".into()],
+            ..Default::default()
+        };
+        assert!(event_matches(
+            &human,
+            &event("discussion:message", Some("human"), ActorType::User)
         ));
     }
 

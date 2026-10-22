@@ -1152,46 +1152,6 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// Fetch one note by id, scoped to the workspace (PROTOCOL §5.2).
-    /// Persistent backend identity only when bounded note reads and annotations are available.
-    fn note_paging_backend_id(&self) -> Option<String> {
-        None
-    }
-
-    /// Read bounded indexed source/context/metadata at one live revision.
-    fn get_note_page(
-        &self,
-        workspace_id: WorkspaceId,
-        note_id: NoteId,
-        request: crate::note_page::NotePageRequest,
-        rpc_id: serde_json::Value,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, note_id, request, rpc_id);
-        Box::pin(async { Err(crate::Error::Unsupported("note pages".into())) })
-    }
-
-    /// Read an opt-in annotation page under current scope and authorization.
-    fn get_note_annotation_page(
-        &self,
-        method: crate::note_annotation::AnnotationMethod,
-        request: crate::note_annotation::AnnotationReadRequest,
-        rpc_id: serde_json::Value,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (method, request, rpc_id);
-        Box::pin(async { Err(crate::Error::Unsupported("annotation pages".into())) })
-    }
-
-    /// Read one bounded persisted subscription tuple under current authorization.
-    /// An incarnation pins a running subscription to its deletion tombstone.
-    fn get_note_page_state(
-        &self,
-        workspace_id: WorkspaceId,
-        note_id: NoteId,
-        incarnation: Option<String>,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = (workspace_id, note_id, incarnation);
-        Box::pin(async { Err(crate::Error::Unsupported("note page state".into())) })
-    }
-
     fn get_note(&self, workspace_id: WorkspaceId, note_id: NoteId) -> BoxFuture<'_, Result<Note>> {
         let _ = (workspace_id, note_id);
         Box::pin(async {
@@ -1357,6 +1317,46 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// [`WorkspaceApi::set_note_content`] with the truncated-read write guard:
+    /// `base_content_bytes` is the UTF-8 size of the writer's base text.
+    /// When `Some`, the write is refused with `Error::ContentBaseMismatch`
+    /// (no write) unless it equals the size of the base the daemon resolves
+    /// — the stored content when `expected_version` is absent or current,
+    /// the merge snapshot when it is stale; an unrecoverable snapshot is an
+    /// unknown base and always refuses (never last-writer-wins). The check
+    /// runs on every read-merge-persist attempt, after the above-current
+    /// `expected_version` `Conflict` and before the merge result is
+    /// persisted; without `expected_version`, losing the rev gate to a
+    /// concurrent writer is a refusal, not a retry. `None` behaves exactly
+    /// like `set_note_content`.
+    #[expect(clippy::too_many_arguments)]
+    fn set_note_content_guarded(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        content: String,
+        confirm_replacement: bool,
+        expected_version: Option<i64>,
+        base_content_bytes: Option<u64>,
+        caller_agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<NoteSetContentResult>> {
+        if base_content_bytes.is_none() {
+            return self.set_note_content(
+                workspace_id,
+                note_id,
+                content,
+                confirm_replacement,
+                expected_version,
+                caller_agent_id,
+            );
+        }
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::set_note_content_guarded not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `note.updateMetadata`: title/tags (spec title is skipped) (PROTOCOL §5.2).
     /// `expected_version` gates the write on the current `rev` when `Some` (§5.6).
     ///
@@ -1385,38 +1385,6 @@ pub trait WorkspaceApi: Send + Sync {
                 "WorkspaceApi::update_note_metadata not implemented".to_string(),
             ))
         })
-    }
-
-    /// Whether this implementation provides the complete grace deletion contract.
-    fn supports_note_delete_grace(&self) -> bool {
-        false
-    }
-
-    /// Bounded grace deletion control; legacy immediate deletion is unchanged.
-    fn schedule_note_delete(
-        &self,
-        request: crate::note_delete::NoteDeleteSchedule,
-    ) -> BoxFuture<'_, Result<crate::note_delete::NoteDeleteOperationResponse>> {
-        let _ = request;
-        Box::pin(async { Err(Error::Unsupported("note deletion grace".into())) })
-    }
-
-    /// Bounded grace deletion control; legacy immediate deletion is unchanged.
-    fn cancel_note_delete(
-        &self,
-        request: crate::note_delete::NoteDeleteCancel,
-    ) -> BoxFuture<'_, Result<crate::note_delete::NoteDeleteOperationResponse>> {
-        let _ = request;
-        Box::pin(async { Err(Error::Unsupported("note deletion grace".into())) })
-    }
-
-    /// Bounded grace deletion control; legacy immediate deletion is unchanged.
-    fn note_delete_status(
-        &self,
-        request: crate::note_delete::NoteDeleteStatus,
-    ) -> BoxFuture<'_, Result<crate::note_delete::NoteDeleteStatusResponse>> {
-        let _ = request;
-        Box::pin(async { Err(Error::Unsupported("note deletion grace".into())) })
     }
 
     /// `note.delete`: remove a note (PROTOCOL §5.2). `expected_version` gates the
@@ -5366,6 +5334,94 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// Human-only conversation history with participant authorization.
+    fn discussion_list(
+        &self,
+        workspace_id: WorkspaceId,
+        conversation_id: String,
+        before_sequence: Option<i64>,
+        after_sequence: Option<i64>,
+        limit: u32,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (
+            workspace_id,
+            conversation_id,
+            before_sequence,
+            after_sequence,
+            limit,
+        );
+        Box::pin(async { Err(Error::Internal("discussion.list not implemented".into())) })
+    }
+    /// Atomic first send or participant-authorized append with exact retry semantics.
+    fn discussion_send(
+        &self,
+        workspace_id: WorkspaceId,
+        message_id: String,
+        body: String,
+        target: crate::discussion::DiscussionTarget,
+    ) -> BoxFuture<'_, Result<crate::discussion::DiscussionSendResult>> {
+        let _ = (workspace_id, message_id, body, target);
+        Box::pin(async { Err(Error::Internal("discussion.send not implemented".into())) })
+    }
+    /// Human-only compare-and-swap control of an explicitly addressed invocation.
+    fn discussion_control_agent(
+        &self,
+        request: crate::discussion::DiscussionAgentControl,
+        retry: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (request, retry);
+        Box::pin(async { Err(Error::Internal("discussion control not implemented".into())) })
+    }
+    /// Set one human's desired reaction state; retries are no-ops.
+    fn discussion_react(
+        &self,
+        workspace_id: WorkspaceId,
+        conversation_id: String,
+        message_id: String,
+        reaction: String,
+        active: bool,
+    ) -> BoxFuture<'_, Result<crate::discussion::DiscussionReactionState>> {
+        let _ = (workspace_id, conversation_id, message_id, reaction, active);
+        Box::pin(async { Err(Error::Internal("discussion.react not implemented".into())) })
+    }
+    /// Bounded participant-only discovery.
+    fn discussion_conversations(
+        &self,
+        workspace_id: WorkspaceId,
+        before_id: Option<String>,
+        limit: u32,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, before_id, limit);
+        Box::pin(async {
+            Err(Error::Internal(
+                "discussion.conversations not implemented".into(),
+            ))
+        })
+    }
+    /// Bounded offline-capable effective member picker.
+    fn discussion_recipients(
+        &self,
+        workspace_id: WorkspaceId,
+        query: String,
+        after_id: Option<String>,
+        limit: u32,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, query, after_id, limit);
+        Box::pin(async {
+            Err(Error::Internal(
+                "discussion.recipients not implemented".into(),
+            ))
+        })
+    }
+    /// Delivery-time participant projection, including owners. Fail closed by default.
+    fn discussion_project_event(
+        &self,
+        event: crate::Event,
+    ) -> BoxFuture<'_, Result<Option<crate::Event>>> {
+        let _ = event;
+        Box::pin(async { Ok(None) })
+    }
+
     /// `workspace.members.list` (multiplayer w3): the members of a workspace
     /// → `{ members: [{ principalId, login?, displayName?, avatarUrl?, role,
     /// addedAt }], guestCount, guestLimit }`, owners first. `guestCount` is
@@ -5401,6 +5457,22 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::workspace_members_add not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Owner-only direct guest role change. Owner and inherited host roles
+    /// are immutable here. Emits workspace:updated only when changed.
+    fn workspace_members_set_role(
+        &self,
+        workspace_id: WorkspaceId,
+        principal_id: PrincipalId,
+        role: crate::WorkspaceRole,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, principal_id, role);
+        Box::pin(async {
+            Err(Error::Internal(
+                "workspace_members_set_role not implemented".into(),
             ))
         })
     }
@@ -5483,8 +5555,8 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `presence.update({ focus: [{ workspaceId, agentId?, noteId? }],
-    /// typing?: { agentId } })`: replace the connection's focus set (sent
-    /// whole) and typing target → `{ ok: true, typingSource }`, where
+    /// typing?: { agentId } | null, discussionTyping?: { workspaceId } | null })`:
+    /// replace the connection's focus set (sent whole) and typing targets → `{ ok: true, typingSource }`, where
     /// `typingSource` is the connection's own opaque, daemon-minted typing
     /// source handle (the `source` its typing entry carries in
     /// `presence:changed`, so the client can suppress only itself). Every
@@ -5495,7 +5567,9 @@ pub trait WorkspaceApi: Send + Sync {
     /// unchanged. Requires
     /// a hello'd connection; every focused workspace and the typing agent's
     /// workspace must be a member workspace (`NotFound` otherwise). Publishes
-    /// `presence:changed` to each workspace whose aggregate changed.
+    /// `presence:changed` to each workspace whose aggregate changed. Discussion
+    /// typing requires a human member in its target workspace, shares the
+    /// connection source with a separate counter, and clears when omitted or null.
     fn presence_update(
         &self,
         connection_id: String,
@@ -5514,7 +5588,9 @@ pub trait WorkspaceApi: Send + Sync {
     /// with the same member rows the event carries — for a client that
     /// attached its event subscription after its hello (or a second
     /// connection of an already-online principal, whose hello publishes
-    /// nothing). Member+; a non-member sees `NotFound`.
+    /// nothing). Member+; a non-member sees `NotFound`. Human rows include
+    /// `discussionTyping: [{ source, since, pulse }]` (empty when idle);
+    /// agent/daemon snapshots omit that field.
     fn presence_snapshot(
         &self,
         workspace_id: WorkspaceId,
@@ -6539,7 +6615,7 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `providers.profiles.create` (PROTOCOL §5.54): `params` carries
-    /// `baseProviderId`, `name` and optional `env`; returns
+    /// `baseProviderId`, `name` and optional `env` / `backup`; returns
     /// `{ profile, revision }` and emits `providers:profiles-changed`.
     fn provider_profiles_create(
         &self,
@@ -6553,8 +6629,8 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `providers.profiles.update` (PROTOCOL §5.54): optional `name` and
-    /// complete `env` list; returns `{ profile, revision, activation }`.
+    /// `providers.profiles.update` (PROTOCOL §5.54): optional `name`,
+    /// `backup` and complete `env` list; returns `{ profile, revision, activation }`.
     fn provider_profiles_update(
         &self,
         profile_id: String,
@@ -6578,6 +6654,22 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::provider_profiles_delete not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `providers.profiles.reorder` (PROTOCOL §5.54): `params` carries
+    /// `baseProviderId` and `profileIds` (every saved profile of that base,
+    /// once); returns `{ profiles, revision }` and emits
+    /// `providers:profiles-changed` (`change: "reordered"`).
+    fn provider_profiles_reorder(
+        &self,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = params;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::provider_profiles_reorder not implemented".to_string(),
             ))
         })
     }

@@ -16,6 +16,7 @@ use intent_store::Store;
 use crate::{repository_backfill_probe_count, BackfillCandidate, Services};
 
 mod line_attribution_retry;
+mod orphan_flag_race;
 mod skill_list;
 mod task_list_latency;
 mod task_push;
@@ -7890,6 +7891,7 @@ async fn update_note_full_content_with_task_block_auto_converts() {
                 title: None,
                 tags: None,
                 expected_version: None,
+                base_content_bytes: None,
             },
         )
         .await

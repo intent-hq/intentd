@@ -15823,6 +15823,12 @@ async fn principal_stamp_overwrites_client_value_on_every_user_origin_entry_poin
     // agent.create: the wire stores `initialMessage` on the session and
     // appends NO transcript row — the kickoff arrives through
     // `agent.sendMessage` (stamped above), so no unstamped row can exist.
+    // Only the creation arm needs Manager access; the messaging arms above
+    // deliberately exercise the ordinary Participant role.
+    svc.store()
+        .set_workspace_member_role(&ws, &alice, intent_core::WorkspaceRole::Manager)
+        .await
+        .expect("promote creator to Manager");
     let created = with_caller(wire(&alice), async {
         svc.agent_create(
             ws.clone(),
@@ -19881,6 +19887,79 @@ async fn event_subscription_excludes_self_and_unsubscribe_stops_delivery() {
         session.messages.is_empty(),
         "unsubscribed subscriptions must not deliver"
     );
+}
+
+#[intent_test_macros::daemon_test]
+async fn discussion_rehydrated_agent_subscription_excludes_human_events() {
+    let (_tmp, svc, ws, bus) = setup_with_bus().await;
+    let subscriber = create_agent(&svc, &ws, "Watcher").await;
+    // An old row can name human discussions even though new admissions reject
+    // them. Exercise the actual startup rehydration and wake-delivery path.
+    let id = "legacy-discussion-subscription";
+    svc.store
+        .upsert_event_subscription(&intent_store::PersistedEventSubscription {
+            id: id.into(),
+            workspace_id: ws.clone(),
+            subscriber_agent_id: subscriber.clone(),
+            event_types: vec!["discussion:*".into(), "file:*".into()],
+            exclude_self: true,
+            batch_window_ms: 1,
+            created_at: now_iso(),
+        })
+        .await
+        .unwrap();
+    let subscribers = bus.subscriber_count();
+    assert_eq!(svc.heal_event_subscriptions_on_startup().await.unwrap(), 1);
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            while bus.subscriber_count() <= subscribers {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
+    .await
+    .expect("rehydrated subscription attached");
+    for (kind, data) in [
+        ("discussion:message", json!({"body":"human-secret"})),
+        ("file:changed", json!({"path":"sentinel.rs"})),
+    ] {
+        let _ = bus.publish_transient(&NewEvent {
+            workspace_id: ws.clone(),
+            timestamp: now_iso(),
+            event_type: kind.into(),
+            actor: EventActor {
+                actor_type: ActorType::User,
+                id: Some("human".into()),
+                ..Default::default()
+            },
+            session_id: None,
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            data,
+        });
+    }
+    let messages = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            loop {
+                let session = svc.store.get_agent_session(&subscriber).await.unwrap();
+                if !session.messages.is_empty() {
+                    break session.messages;
+                }
+                tokio::task::yield_now().await;
+            }
+        },
+    )
+    .await
+    .expect("allowed sentinel delivered");
+    let text = serde_json::to_string(&messages).unwrap();
+    assert!(text.contains("file:changed"));
+    assert!(!text.contains("human-secret"));
+    assert!(!text.contains("discussion:message"));
+    assert_eq!(messages.len(), 1);
+    svc.remove_event_subscription(id).await;
 }
 
 /// monorepo#937: agent-owned subscriptions persist and rehydrate on startup;
@@ -49118,8 +49197,19 @@ async fn script_monitor_waiting_advisory_and_after_all_retire_on_silent_cancel()
         .unwrap()
         .unwrap();
         // Cancellation and commit_monitor's spawned redelivery race for the
-        // same claim. Await durable retirement by the winner, preserving the
-        // exact final assertions for both individual and after_all watches.
+        // same claim. The winner commits durable retirement before removing
+        // the in-memory watch, so observing the database alone is not a fence
+        // for both states. Await memory cleanup and then durable retirement.
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            async {
+                while !svc.find_watches_for_child(&child).is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            },
+        )
+        .await
+        .expect("cancellation redelivery retires the in-memory watch");
         wait_for_persisted_watches(&svc, 0).await;
         assert!(svc.find_watches_for_child(&child).is_empty());
         assert_eq!(parent_message_count(&svc, &parent).await, 2);

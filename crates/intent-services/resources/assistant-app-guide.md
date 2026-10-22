@@ -22,6 +22,27 @@ requirements do not, by themselves, make a supported feature experimental.
 Multiplayer, Collaboration, and personal device pairing are currently experimental.
 Do not introduce them in routine answers about settings, devices, or mobile pairing.
 
+<!-- Sources: packages/intentd/crates/intent-services/src/capability.rs; packages/cloudlands-fe/src/lib/components/modals/ShareWorkspaceDialog.svelte. -->
+
+Only when explicitly asked about workspace guest roles: this unreleased Multiplayer
+Labs feature labels the default collaborator role Participant. The workspace owner
+can change a direct guest between Participant and Manager in Share. Managers can
+create agents, choose models/providers and reasoning effort, and run, start, stop,
+restart or inspect existing
+saved scripts. They cannot edit script commands, control raw terminals, run host
+commands, change credentials, or manage sharing. Host membership retains its existing
+authority. Role downgrades apply to subsequent operations on open connections.
+
+Only when explicitly asked about workspace discussions: this unreleased Multiplayer
+Labs feature supports reactions 👍 👎 👀 ✅ 🙈. The emoji picker has no tooltips;
+hover or focus an existing reaction to see who reacted, and click to toggle yours.
+Legacy 🙂 can be removed. Agents can react only
+after explicit addressing in the workspace-wide discussion; reactions never wake
+agents. Private discussions remain human-only. Imported reaction names are historical
+snapshots, not local access.
+
+<!-- Sources: packages/intentd/crates/intent-core/src/discussion.rs; packages/intentd/crates/intent-services/src/discussion_ops.rs; packages/intentd/crates/intent-acp/src/mcp_server/bindings/discussion.rs; packages/cloudlands-fe/src/features/discussions/. -->
+
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/settings/MobileSettings.svelte; src/features/devices/{PersonalDevicesPanel.svelte,personal-devices-selectors.ts}; src/store/renderer/slices/principal/principal-selectors.ts; src/store/renderer/slices/websocket-api/sagas/websocket-api-saga.ts; messages/en.json. -->
 
 Only when explicitly asked about personal device pairing: it pairs another device
@@ -137,7 +158,7 @@ recover a chat after deletion has completed.
 
 ## Choose a model or change agent behavior
 
-<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/initializer/InitialAgentPicker.svelte; packages/cloudlands-fe/src/lib/components/settings/{SettingsSidebarNav,ProviderSelector,ProviderProfiles,ProviderProfileDialog}.svelte; packages/cloudlands-fe/src/lib/components/chat/input/ModelPicker.svelte; packages/cloudlands-fe/src/shared/app-ui-targets.ts; packages/intentd/crates/intent-services/src/{provider_profiles,profile_activation}.rs. -->
+<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/initializer/InitialAgentPicker.svelte; packages/cloudlands-fe/src/lib/components/settings/{SettingsSidebarNav,ProviderSelector,ProviderProfiles,ProviderProfileDialog}.svelte; packages/cloudlands-fe/src/lib/components/chat/input/ModelPicker.svelte; packages/cloudlands-fe/src/shared/app-ui-targets.ts; packages/intentd/crates/intent-services/src/{provider_profiles,profile_activation,quota_failover,provider_return}.rs; packages/cloudlands-fe/src/lib/components/chat/ProviderFailoverNotice.svelte. -->
 
 For the default model, open **Settings → Providers → Default model**
 (`/settings?tab=providers#utility-default-model`). For new work, choose a model in
@@ -171,6 +192,18 @@ mode** (Claude Code) or **Service Tier** (Codex) in its ⋯ menu; it starts off 
 never follows the Default setting. Delegated agents follow their
 explicit, specialist, or default selection, never the parent's profile.
 
+**Backup profiles.** Drag a profile in **Settings → Providers**, or focus its
+handle and use the Up and Down arrow keys, to set its order. Turn on **Use as backup
+provider** in the profile dialog; backup profiles show a **Backup** badge. When a
+conversation's current Codex or Claude Code configuration runs out of quota, the turn
+continues on the next backup of the same provider in saved order, with the same
+model, and a chat notice shows the switch; the conversation then stays there. After
+the quota reset time (or 5 hours when none is reported), the next turn goes back to
+the configuration it used before its first automatic switch, with a "back on …"
+notice; if that one is still out of quota, Intent tries again later with growing
+waits. Choosing a model or profile yourself makes that the new starting point. When
+every option is out of quota, the usual quota message appears.
+
 Switching a conversation to another profile, even with the same model, applies on
 the next message: a turn in progress finishes first, then a fresh provider session
 starts with the conversation history. Editing a profile's environment never
@@ -182,7 +215,8 @@ intentd on the provider host; reconnecting alone does not apply the edit. Remove
 profile from the same view, after changing any default, specialist, or quick-action
 setting that selects it. Conversations keep their history, and their next message
 asks for another model (**Choose another model to continue**), as does a profile
-whose provider is disabled. Intent never switches them to another account.
+whose provider is disabled. Intent does not move them to another account; only the
+quota backup switching above changes a conversation's profile automatically.
 
 Settings sections and controls can depend on platform, daemon capabilities, or
 access. A supported route does not grant permissions or prove that a control is
@@ -652,6 +686,11 @@ Use its **Add context** action to create a note. In layouts showing the Notes-pa
 button, its visible label is **Attach more context**; **New note** is the tooltip.
 Notes hold shared context, decisions, and deliverables for that workspace.
 
+With a supporting daemon, the desktop app shows a note over 500 KB truncated and
+render-only, with a banner, so the user cannot edit it there. Agents still read
+and write the full content; make large-note edits with note tools rather than
+asking the user to edit them in the app.
+
 <!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/initializer/{IssueSuggestions,GitLabContextSuggestions}.svelte; src/lib/components/workspace/sidebar/context-picker/ContextPickerModal.svelte. -->
 
 When testing experimental GitLab context suggestions, choose **GL Issues** or
@@ -661,11 +700,6 @@ selected projects; **Use link** accepts an explicit project URL where offered.
 partial results remain explicit. Selecting an item attaches its qualified context;
 it does not automatically check out the MR's source branch. Availability depends
 on the current connection, repository access and supported daemon.
-
-When a supported note deletion offers **Undo**, it cancels a pending deletion during
-the displayed grace period (normally 15 seconds). It does not restore an already
-deleted note. If the result is uncertain, check the note’s current status before trying again. If the
-connected backend does not support cancellable deletion, the note is kept.
 
 In test builds that include **Back to rendered view**, use **Edit Raw Markdown**
 in a note's **…** menu to edit Markdown directly; large notes otherwise stay
