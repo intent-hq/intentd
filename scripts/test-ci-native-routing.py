@@ -460,6 +460,8 @@ process.env.WINDOWS_RUNNER_DISABLED = fixture.windowsDisabled || '';
 process.env.MACOS_RUNNER_DISABLED = fixture.macosDisabled || '';
 process.env.LINUX_RUNNER_DISABLED = fixture.linuxDisabled || '';
 process.env.SLOT_JOBS = fixture.slotJobs || '';
+// Most cases check the GitHub fallback; the WarpBuild cases turn WarpBuild on.
+process.env.WARPBUILD_DISABLED = fixture.warpbuildDisabled ?? 'true';
 const AsyncFunction = Object.getPrototypeOf(async function() {}).constructor;
 new AsyncFunction('github', 'core', 'context', script)(github, core, context)
   .then(() => process.stdout.write(JSON.stringify({ outputs, calls, logs })))
@@ -637,7 +639,8 @@ class RunnerAvailabilityTests(unittest.TestCase):
                     # The one free heavy slot goes to `check` on a PR; the queue lists no heavy job.
                     self.assertEqual(slots["check"], CACHE if event == "pull_request" and idle else ["gh-linux-8x"])
                     self.assertEqual(slots["coverage-changed"], ["gh-linux-16x"])
-                    self.assertEqual(slots["release-scripts"], SMALL if idle else ["ubuntu-24.04"])
+                    # Free standard labels never take a self-hosted slot, even an idle one.
+                    self.assertEqual(slots["release-scripts"], ["ubuntu-24.04"])
                     # Unlisted heavy jobs only get a slot that is still free after the listed ones.
                     unlisted = hosted or event == "pull_request"
                     self.assertEqual(json.loads(outputs["linux_labels"]),
@@ -645,7 +648,6 @@ class RunnerAvailabilityTests(unittest.TestCase):
                     self.assertEqual(json.loads(outputs["check_labels"]),
                                      ["gh-linux-8x"] if unlisted else CACHE)
                     self.assertEqual(outputs["linux_burst"], str(unlisted).lower())
-                    # The fixture's one fast slot went to release-scripts, so unlisted light jobs go hosted.
                     self.assertEqual(json.loads(outputs["runners"])["ubuntu-24.04"], ["ubuntu-24.04"])
                     if idle:
                         self.assertEqual(json.loads(outputs["windows_labels"]), ["self-hosted", "Windows", "X64"])
@@ -669,18 +671,63 @@ class RunnerAvailabilityTests(unittest.TestCase):
             with self.subTest(job=job_id):
                 self.assertIn("needs.route.outputs.slots", self.workflow["jobs"][job_id]["runs-on"])
 
-    def test_merge_queue_fits_fast_jobs_and_pi_legs_to_free_slots(self):
-        # Three free fast slots and four listed fast jobs: release-scripts (longest) and both
-        # Linux pi-session-paths legs get them; deb-packaging and unlisted jobs go hosted.
+    def test_free_label_jobs_stay_on_github_with_idle_small_slots(self):
+        # Standard GitHub runners are free for this public repository, so the fast
+        # jobs and both Linux pi-session-paths legs keep their GitHub label.
         result = run_route(self.workflow, org=[small_slot()] * 3, eventName="merge_group")
         slots = json.loads(result["outputs"]["slots"])
-        on_pool = sorted(k for k, v in slots.items() if v == SMALL)
-        self.assertEqual(on_pool, ["pi-session-paths-22", "pi-session-paths-24", "release-scripts"])
-        self.assertEqual(slots["deb-packaging"], ["ubuntu-24.04"])
+        self.assertNotIn(SMALL, slots.values())
+        for key in ("release-scripts", "deb-packaging", "pi-session-paths-22", "pi-session-paths-24"):
+            self.assertEqual(slots[key], ["ubuntu-24.04"])
         self.assertEqual(json.loads(result["outputs"]["runners"])["ubuntu-24.04"], ["ubuntu-24.04"])
         runs_on = self.workflow["jobs"]["pi-session-paths"]["runs-on"]
         self.assertIn("format('pi-session-paths-{0}', matrix.node)", runs_on)
         self.assertTrue(runs_on.startswith("${{ matrix.os == 'ubuntu-24.04' && fromJSON(needs.route.outputs.slots"))
+
+    def test_bursts_go_to_warpbuild(self):
+        same_repo = {"pull_request": {"head": {"repo": {"full_name": "intent-hq/intentd"}}}}
+        warp = {"linux_labels": ["warp-ubuntu-2404-x64-16x"], "check_labels": ["warp-ubuntu-2404-x64-8x"],
+                "windows_labels": ["warp-windows-2022-x64-16x"], "macos_labels": ["warp-macos-26-arm64-6x"]}
+        for event in ("pull_request", "push", "merge_group"):
+            with self.subTest(event=event):
+                result = run_route(self.workflow, org=[], eventName=event, warpbuildDisabled="",
+                                   payload=same_repo if event == "pull_request" else {})
+                outputs = route_outputs(self.workflow, result["outputs"], event)
+                for key, labels in warp.items():
+                    self.assertEqual(json.loads(outputs[key]), labels, key)
+                slots = json.loads(outputs["slots"])
+                self.assertEqual(slots["check"], ["warp-ubuntu-2404-x64-8x"])
+                self.assertEqual(slots["coverage-changed"], ["warp-ubuntu-2404-x64-16x"])
+                self.assertEqual(slots["release-scripts"], ["ubuntu-24.04"])
+                cloud = json.loads(outputs["cloud"])
+                self.assertEqual(cloud["gh-linux-16x"], ["warp-ubuntu-2404-x64-16x"])
+                self.assertEqual(cloud["ubuntu-24.04"], ["ubuntu-24.04"])
+        # The merge queue keeps heavy Rust jobs off idle slots and on WarpBuild.
+        idle = [slot(), slot(), runner("Windows", "X64"), runner()]
+        result = run_route(self.workflow, org=idle, eventName="merge_group", warpbuildDisabled="")
+        outputs, logs = run_heavy(self.workflow, result["outputs"], "merge_group")
+        self.assertEqual(json.loads(outputs["linux_labels"]), ["warp-ubuntu-2404-x64-16x"])
+        self.assertEqual(json.loads(outputs["check_labels"]), ["warp-ubuntu-2404-x64-8x"])
+        self.assertEqual(outputs["linux_burst"], "true")
+        self.assertIn("merge queue keeps heavy Rust jobs off the intent-cache slots", logs)
+        # Idle native runners still win over WarpBuild.
+        outputs = route_outputs(self.workflow, result["outputs"], "merge_group")
+        self.assertEqual(json.loads(outputs["windows_labels"]), ["self-hosted", "Windows", "X64"])
+        self.assertEqual(json.loads(outputs["macos_labels"]), ["self-hosted", "macOS", "ARM64"])
+        # An empty or unreadable cloud map falls back to the GitHub labels.
+        for cloud in ("", "not json", "{}"):
+            with self.subTest(cloud=cloud):
+                outputs, _ = run_heavy(self.workflow, {**result["outputs"], "cloud": cloud}, "merge_group")
+                self.assertEqual(json.loads(outputs["linux_labels"]), ["gh-linux-16x"])
+                self.assertEqual(json.loads(outputs["check_labels"]), ["gh-linux-8x"])
+
+    def test_release_linux_legs_take_the_burst_runner(self):
+        for name, job, key in (("release-cache.yml", "daemon", "matrix.runner"),
+                               ("release-sitter.yml", "build", "matrix.os"),
+                               ("v-release.yml", "build-local-artifacts", "matrix.runner")):
+            with self.subTest(workflow=name):
+                runs_on = yaml.safe_load((ROOT / ".github/workflows" / name).read_text())["jobs"][job]["runs-on"]
+                self.assertIn("(fromJSON(needs.runner-route.outputs.cloud || '{}')[%s] || %s)" % (key, key), runs_on)
 
     def test_pr_fits_heavy_rust_jobs_to_free_slots(self):
         same_repo = {"pull_request": {"head": {"repo": {"full_name": "intent-hq/intentd"}}}}

@@ -157,7 +157,7 @@ jobs:
       matrix: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix }}
     # LOCAL CUSTOMIZATION: only the isolated Intel Mac leg may fail.
     continue-on-error: ${{ matrix.optional }}
-    runs-on: ${{ (contains(matrix.runner, 'ubuntu') || contains(matrix.runner, 'linux')) && matrix.runner || fromJSON(needs.runner-route.outputs.runners || '{}')[matrix.runner] || matrix.runner }}
+    runs-on: ${{ (contains(matrix.runner, 'ubuntu') || contains(matrix.runner, 'linux')) && (fromJSON(needs.runner-route.outputs.cloud || '{}')[matrix.runner] || matrix.runner) || fromJSON(needs.runner-route.outputs.runners || '{}')[matrix.runner] || matrix.runner }}
     container: ${{ matrix.container && matrix.container.image || null }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
