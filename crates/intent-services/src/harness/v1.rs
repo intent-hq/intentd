@@ -1134,12 +1134,18 @@ impl Harness for V1 {
         }
         // Keyed on the event identity (`at`), not the queued flag: an
         // enter→eject pair that nets out on `isInMergeQueue` still yields
-        // this reportable line.
+        // this reportable line. An ejection that predates the PR's current
+        // queue entry is history, not news (intent-hq/intent#7523): it stays
+        // in the snapshot but is never reported.
         let ejection_at = |r: &crate::pr_ops::MergeRequirements| {
             r.merge_queue_ejection.as_ref().map(|e| e.at.clone())
         };
         if ejection_at(o) != ejection_at(n) {
-            if let Some(e) = &n.merge_queue_ejection {
+            if let Some(e) = n
+                .merge_queue_ejection
+                .as_ref()
+                .filter(|e| !e.superseded_by_queue_entry(n))
+            {
                 changes.push(match &e.reason {
                     Some(reason) => format!(
                         "removed from the merge queue ({})",
