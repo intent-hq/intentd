@@ -95,6 +95,54 @@ fn not_found(message: impl Into<String>) -> RpcErr {
 
 /// Map a domain [`Error`] to its JSON-RPC representation (§9). Internal errors
 /// surface as `-32603 "Internal error"` carrying the original cause in `data`.
+/// An integral JSON number at or above `min`, accepting integral floats
+/// (`10.0`) like the reference `Number.isInteger`; anything else is `None`.
+fn json_integer_at_least(value: &Value, min: u64) -> Option<u64> {
+    let n = value.as_u64().or_else(|| {
+        let f = value.as_f64()?;
+        // Integral, non-negative and below 2^53 → exact in u64.
+        #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let n =
+            (f.fract() == 0.0 && (0.0..9_007_199_254_740_992.0).contains(&f)).then_some(f as u64);
+        n
+    })?;
+    (n >= min).then_some(n)
+}
+
+/// `maxContentBytes` on `note.get` / `note.subscribe` (truncated note reads):
+/// absent or `null` → `None` (the unbounded read, byte-identical); a positive
+/// integer → the UTF-8 byte limit; anything else → the documented `-32602`.
+pub(crate) fn max_content_bytes_param(
+    params: &Map<String, Value>,
+) -> std::result::Result<Option<usize>, &'static str> {
+    match params.get("maxContentBytes") {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => json_integer_at_least(v, 1)
+            .map(|n| Some(usize::try_from(n).unwrap_or(usize::MAX)))
+            .ok_or("maxContentBytes must be a positive integer"),
+    }
+}
+
+fn parse_max_content_bytes(
+    params: &Map<String, Value>,
+) -> std::result::Result<Option<usize>, RpcErr> {
+    max_content_bytes_param(params).map_err(invalid_params)
+}
+
+/// `baseContentBytes` on whole-content note writes (truncated-read write
+/// guard): absent or `null` → unguarded; a non-negative integer → the
+/// writer's base size; anything else → the documented `-32602`.
+fn parse_base_content_bytes(
+    params: &Map<String, Value>,
+) -> std::result::Result<Option<u64>, RpcErr> {
+    match params.get("baseContentBytes") {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => json_integer_at_least(v, 0)
+            .map(Some)
+            .ok_or_else(|| invalid_params("baseContentBytes must be a non-negative integer")),
+    }
+}
+
 fn domain_to_rpc(e: Error) -> RpcErr {
     match e {
         Error::ExecutionAuthorization {
@@ -139,6 +187,21 @@ fn domain_to_rpc(e: Error) -> RpcErr {
             code: e.code(),
             message: e.to_string(),
             data: Some(json!({ "code": "base-ref-unresolvable", "baseRef": base_ref })),
+        },
+        // Guarded whole-content note write whose base size did not match the
+        // resolved base (or the base is unknown): -32602 with the documented
+        // machine-readable data, no write ("Truncated note reads").
+        ref e @ Error::ContentBaseMismatch {
+            base_content_bytes,
+            resolved_base_bytes,
+        } => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({
+                "code": "content-base-mismatch",
+                "baseContentBytes": base_content_bytes,
+                "resolvedBaseBytes": resolved_base_bytes,
+            })),
         },
         // Provider profile failure (§5.54): -32602 (or -32603 for an
         // unreadable profile file) with the service-built `data` verbatim —
@@ -1288,8 +1351,14 @@ async fn dispatch(
         "note.get" => {
             let ws = require_ws_note(params)?;
             let note_id = require_note_id(params)?;
+            let max_content_bytes = parse_max_content_bytes(params)?;
             match api.get_note(ws, note_id).await {
-                Ok(note) => Ok(json!({ "note": note })),
+                Ok(note) => match max_content_bytes {
+                    Some(limit) => {
+                        Ok(json!({ "note": intent_core::note_bounded_row(note, limit) }))
+                    }
+                    None => Ok(json!({ "note": note })),
+                },
                 Err(Error::NotFound(_)) => Err(not_found("Note not found")),
                 Err(e) => Err(domain_to_rpc(e)),
             }
@@ -1323,6 +1392,7 @@ async fn dispatch(
                 title: opt_str(params, "title"),
                 tags: opt_tags(params, "tags"),
                 expected_version: opt_int(params, "expectedVersion"),
+                base_content_bytes: parse_base_content_bytes(params)?,
             };
             let note = api
                 .update_note(ws, note_id, input)
@@ -1384,8 +1454,17 @@ async fn dispatch(
             let content = require_str_param(params, "content")?;
             let confirm = parse_confirm(params);
             let expected_version = opt_int(params, "expectedVersion");
+            let base_content_bytes = parse_base_content_bytes(params)?;
             let result = api
-                .set_note_content(ws, note_id, content, confirm, expected_version, None)
+                .set_note_content_guarded(
+                    ws,
+                    note_id,
+                    content,
+                    confirm,
+                    expected_version,
+                    base_content_bytes,
+                    None,
+                )
                 .await
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
