@@ -32,7 +32,7 @@ extract_cargo_lints(
 
 filegroup(
     name = "test_data_files",
-    srcs = glob(["**"], exclude = ["**/*.rs", "target/**"], allow_empty = True),
+    srcs = glob(["**"], exclude = ["**/*.rs", "BUILD.bazel", "target/**"], allow_empty = True),
 )
 
 filegroup(
@@ -71,7 +71,6 @@ rust_library(
     crate_features = [],
     lint_config = ":cargo_lints",
     proc_macro_deps = dev_crate_deps(proc_macro = True),
-    rustc_env_files = ["//bazel:build_commit_env"],
     tags = [
         "no-sandbox",
         "test-graph",

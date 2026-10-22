@@ -32,7 +32,7 @@ extract_cargo_lints(
 
 filegroup(
     name = "test_data_files",
-    srcs = glob(["**"], exclude = ["**/*.rs", "target/**"], allow_empty = True),
+    srcs = glob(["**"], exclude = ["**/*.rs", "BUILD.bazel", "target/**"], allow_empty = True),
 )
 
 filegroup(

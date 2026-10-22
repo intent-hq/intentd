@@ -82,6 +82,8 @@ COMPILE_DATA_EXCLUDES = [
 # Workspace files outside crates/ that tests read at run time (source lints read
 # .github/workflows, script tests read scripts/, nextest tests read .config/).
 ROOT_TEST_DATA = [".config/**", ".github/**", "packaging/**", "scripts/**"]
+# BUILD files are left out of test data, so regenerating them does not
+# invalidate cached test results.
 ROOT_TEST_DATA_FILES = [
     "Cargo.lock",
     "Cargo.toml",
@@ -583,6 +585,8 @@ def render_build(ws: Workspace, package: dict, nextest: NextestPolicy) -> str:
     tests = [t for t in targets if "test" in t["kind"]]
     build_rs = next((t for t in targets if "custom-build" in t["kind"]), None)
     build_mode = override.get("build_script", "cargo") if build_rs else None
+    # Production only: the test graph is unstamped (like a Cargo build outside a
+    # git checkout), so a new commit does not invalidate every cached test.
     env_files = override.get("rustc_env_files", [])
     lint_config = ":cargo_lints" if has_lints(package) else None
     common = {"edition": package["edition"], "version": package["version"]}
@@ -599,7 +603,7 @@ def render_build(ws: Workspace, package: dict, nextest: NextestPolicy) -> str:
         rules.append(Rule("extract_cargo_lints", name="cargo_lints", manifest="Cargo.toml", workspace="//:Cargo.toml"))
 
     rules.append(Rule("filegroup", name="test_data_files", srcs=Raw(
-        'glob(["**"], exclude = ["**/*.rs", "target/**"], allow_empty = True)')))
+        'glob(["**"], exclude = ["**/*.rs", "BUILD.bazel", "target/**"], allow_empty = True)')))
     rules.append(Rule("filegroup", name="rust_source_files", srcs=Raw(
         'glob(["**/*.rs"], exclude = ["target/**"], allow_empty = True)')))
 
@@ -662,7 +666,7 @@ def render_build(ws: Workspace, package: dict, nextest: NextestPolicy) -> str:
                 lint_config=lint_config,
                 proc_macro_deps=concat(crate_deps(g, proc_macro=True), normal_macros),
                 rustc_env=test_env or None if dev else None,
-                rustc_env_files=env_files or None,
+                rustc_env_files=(env_files or None) if not dev else None,
                 tags=TEST_GRAPH_TAGS if dev else None,
                 deps=concat(crate_deps(g, normal=True), normal_deps + build_dep),
             ))
@@ -683,7 +687,7 @@ def render_build(ws: Workspace, package: dict, nextest: NextestPolicy) -> str:
                 lint_config=lint_config,
                 proc_macro_deps=concat(crate_deps(g, proc_macro=True), normal_macros),
                 rustc_env=test_env or None if dev else None,
-                rustc_env_files=env_files or None,
+                rustc_env_files=(env_files or None) if not dev else None,
                 tags=TEST_GRAPH_TAGS if dev else None,
                 deps=concat(crate_deps(g, normal=True), sorted(set(extra))),
             ))
@@ -845,7 +849,7 @@ def render_build(ws: Workspace, package: dict, nextest: NextestPolicy) -> str:
                 "aliases": Raw("dev_aliases(normal_dev = True, proc_macro_dev = True)"),
                 "proc_macro_deps": concat("dev_crate_deps(proc_macro = True, proc_macro_dev = True)", dev_macros),
                 "rustc_env": test_env or None,
-                "rustc_env_files": env_files or None,
+                "rustc_env_files": None,
                 "deps": concat("dev_crate_deps(normal = True, normal_dev = True)", sorted(set(extra))),
             },
             None,
