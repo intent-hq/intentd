@@ -199,9 +199,12 @@ where
         .await
         .expect("send rpc frame");
     loop {
-        let next = timeout(Duration::from_secs(15), ws.next())
-            .await
-            .expect("wss rpc timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(15)),
+            ws.next(),
+        )
+        .await
+        .expect("wss rpc timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -556,7 +559,8 @@ async fn last_activity_propagates_over_wss_on_agent_turn() {
     // pattern as the burst test), keeping the latest lastActivity. Once quiet
     // no bump is pending, so the workspace.get below must observe exactly
     // this value and the byte-equality assertion is deterministic (#1004).
-    let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let drain_deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(30));
     while let Some(evt) = try_next_event(
         &mut sub,
         &["workspace:updated"],
@@ -708,7 +712,8 @@ async fn last_activity_persisted_for_workspace_subscribe_snapshot() {
         .as_str()
         .expect("lastActivity string")
         .to_string();
-    let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let drain_deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(30));
     while let Some(evt) = try_next_event(
         &mut sub,
         &["workspace:updated"],
@@ -908,7 +913,8 @@ async fn burst_debounce_case(script: &str, behavior: Value, release_file: Option
     // window, so nothing from the warm-up leaks into the burst count. An
     // outer deadline hard-bounds the drain even if some event source kept
     // emitting less than one quiet window apart.
-    let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let drain_deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(30));
     while try_next_event(
         &mut sub,
         &["workspace:updated"],
@@ -1008,7 +1014,8 @@ async fn burst_debounce_case(script: &str, behavior: Value, release_file: Option
     // Collect workspace:updated events until the subscription has been quiet
     // for well over one debounce window (covers the trailing debounce fire).
     // Same outer deadline pattern as the warm-up drain above.
-    let collect_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let collect_deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(30));
     let mut last_activity_events = Vec::new();
     while let Some(evt) = try_next_event(
         &mut sub,

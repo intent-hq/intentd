@@ -206,11 +206,14 @@ async fn wss_rpc(
     ws.send(Message::Text(msg.to_string().into()))
         .await
         .expect("send rpc");
-    let resp = timeout(Duration::from_secs(10), ws.next())
-        .await
-        .expect("timeout")
-        .expect("stream next")
-        .expect("ws message");
+    let resp = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        ws.next(),
+    )
+    .await
+    .expect("timeout")
+    .expect("stream next")
+    .expect("ws message");
     let txt = resp.into_text().expect("message text");
     let val: Value = serde_json::from_str(&txt).expect("parse response");
     val["result"].clone()

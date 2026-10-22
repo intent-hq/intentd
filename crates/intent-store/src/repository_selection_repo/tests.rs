@@ -697,7 +697,7 @@ impl crate::RepositoryLifecycleObserver for SelectionDrain {
             let waited = signal
                 .wait_timeout_while(
                     ready.lock().unwrap(),
-                    std::time::Duration::from_secs(5),
+                    intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
                     |ready| !*ready,
                 )
                 .unwrap();
@@ -746,9 +746,12 @@ async fn admitted_selection_final_transaction_rechecks_authority_after_real_drai
             || panic!("changed authority reached UPDATE"),
         ))
     });
-    tokio::time::timeout(std::time::Duration::from_secs(5), drain.entered.notified())
-        .await
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+        drain.entered.notified(),
+    )
+    .await
+    .unwrap();
     f.store
         .revoke_principal_credential("drain-fixture")
         .await
@@ -871,9 +874,12 @@ async fn selection_waits_for_original_completion(cancel: bool) {
         () = tokio::time::sleep(std::time::Duration::from_secs(5)) => panic!("selection did not start original retirement"),
     }
     assert!(!observer.settled.load(std::sync::atomic::Ordering::SeqCst));
-    let stored = tokio::time::timeout(std::time::Duration::from_secs(5), f.read())
-        .await
-        .expect("selection join retained Store serialization");
+    let stored = tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+        f.read(),
+    )
+    .await
+    .expect("selection join retained Store serialization");
     assert_eq!(
         saved(&stored),
         &SavedReviewSelection::ExplicitRemote {
@@ -883,11 +889,14 @@ async fn selection_waits_for_original_completion(cancel: bool) {
     if cancel {
         drop(write);
         observer.released.notify_one();
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while !observer.settled.load(std::sync::atomic::Ordering::SeqCst) {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+            async {
+                while !observer.settled.load(std::sync::atomic::Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+            },
+        )
         .await
         .expect("cancelled selection waiter abandoned completion");
     } else {

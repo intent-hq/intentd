@@ -277,16 +277,19 @@ async fn await_owner_identity(owner: &mut Ws) {
 /// For the steps whose assertions are about the request itself, not the
 /// throttle.
 async fn admitted_rpc(ws: &mut Ws, id: i64, method: &str, params: Value) -> Value {
-    timeout(Duration::from_secs(90), async {
-        loop {
-            let v = wss_rpc(ws, id, method, params.clone()).await;
-            if v["error"]["data"]["code"] != json!("invite-flow-busy") {
-                return v;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(90)),
+        async {
+            loop {
+                let v = wss_rpc(ws, id, method, params.clone()).await;
+                if v["error"]["data"]["code"] != json!("invite-flow-busy") {
+                    return v;
+                }
+                // timing-guard: poll interval (the start throttle refills one token per 5 s)
+                tokio::time::sleep(Duration::from_millis(500)).await;
             }
-            // timing-guard: poll interval (the start throttle refills one token per 5 s)
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
-    })
+        },
+    )
     .await
     .unwrap_or_else(|_| panic!("{method} (id {id}) was never admitted by the start throttle"))
 }
@@ -329,7 +332,8 @@ async fn prove(
 
 /// Wait for a `github:auth-changed` event carrying `status`.
 async fn await_auth_changed(ws: &mut Ws, status: &str) -> Value {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(30));
     loop {
         let remaining = deadline
             .checked_duration_since(tokio::time::Instant::now())
@@ -368,10 +372,13 @@ async fn upgrade_status_line(port: u16, cfg: Arc<ClientConfig>, token: &str) -> 
     let mut buf = Vec::new();
     let mut tmp = [0u8; 1024];
     loop {
-        let n = timeout(Duration::from_secs(10), tls.read(&mut tmp))
-            .await
-            .expect("upgrade response timed out")
-            .expect("read upgrade response");
+        let n = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            tls.read(&mut tmp),
+        )
+        .await
+        .expect("upgrade response timed out")
+        .expect("read upgrade response");
         if n == 0 {
             break;
         }
@@ -1403,18 +1410,21 @@ async fn invite_link_identity_join_and_removal_over_wss() {
         json!({ "revoked": true, "credentials": 2, "workspaces": 2, "hostMembershipRemoved": false }),
         "{v}"
     );
-    let closed = timeout(Duration::from_secs(15), async {
-        loop {
-            match guest.next().await {
-                Some(Ok(Message::Close(frame))) => return frame.map(|f| f.code),
-                Some(Ok(Message::Ping(p))) => {
-                    let _ = guest.send(Message::Pong(p)).await;
+    let closed = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(15)),
+        async {
+            loop {
+                match guest.next().await {
+                    Some(Ok(Message::Close(frame))) => return frame.map(|f| f.code),
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = guest.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(_)) => {}
+                    None | Some(Err(_)) => return None,
                 }
-                Some(Ok(_)) => {}
-                None | Some(Err(_)) => return None,
             }
-        }
-    })
+        },
+    )
     .await
     .expect("daemon closed the revoked connection");
     assert_eq!(
@@ -1939,25 +1949,28 @@ async fn members_list_attaches_the_owner_identity_over_wss() {
         .expect("owner principal id")
         .to_string();
 
-    let attached = timeout(Duration::from_secs(30), async {
-        let mut id = 3;
-        loop {
-            let v = wss_rpc(
-                &mut owner,
-                id,
-                "workspace.members.list",
-                json!({ "workspaceId": ws_id }),
-            )
-            .await;
-            assert!(v.get("error").is_none(), "workspace.members.list: {v}");
-            if v["result"]["members"][0]["login"] == json!("owner") {
-                break v;
+    let attached = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async {
+            let mut id = 3;
+            loop {
+                let v = wss_rpc(
+                    &mut owner,
+                    id,
+                    "workspace.members.list",
+                    json!({ "workspaceId": ws_id }),
+                )
+                .await;
+                assert!(v.get("error").is_none(), "workspace.members.list: {v}");
+                if v["result"]["members"][0]["login"] == json!("owner") {
+                    break v;
+                }
+                id += 1;
+                // timing-guard: poll interval (the identity is attached off the read path)
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            id += 1;
-            // timing-guard: poll interval (the identity is attached off the read path)
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("members.list attached the owner identity");
     let member = &attached["result"]["members"][0];

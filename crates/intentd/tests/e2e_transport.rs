@@ -256,19 +256,22 @@ async fn http_status(port: u16, cfg: Arc<ClientConfig>, request: &str) -> u16 {
     tls.flush().await.expect("flush");
     let mut buf = Vec::new();
     let mut byte = [0u8; 1];
-    let _ = timeout(Duration::from_secs(3), async {
-        loop {
-            match tls.read(&mut byte).await {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {
-                    buf.push(byte[0]);
-                    if buf.ends_with(b"\r\n") {
-                        break;
+    let _ = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(3)),
+        async {
+            loop {
+                match tls.read(&mut byte).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        buf.push(byte[0]);
+                        if buf.ends_with(b"\r\n") {
+                            break;
+                        }
                     }
                 }
             }
-        }
-    })
+        },
+    )
     .await;
     String::from_utf8_lossy(&buf)
         .split_whitespace()
@@ -402,14 +405,17 @@ async fn e2e_transport_full() {
     // --- graceful `intentd stop`: clean socket + pidfile, then clean restart ---
     let stop_dir = data_dir.clone();
     let stop = tokio::task::spawn_blocking(move || run_cli(&stop_dir, &["stop"]));
-    let reaped = timeout(Duration::from_secs(15), async {
-        loop {
-            if matches!(daemon.child.try_wait(), Ok(Some(_))) {
-                return true;
+    let reaped = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(15)),
+        async {
+            loop {
+                if matches!(daemon.child.try_wait(), Ok(Some(_))) {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
+        },
+    )
     .await
     .unwrap_or(false);
     assert!(reaped, "daemon did not exit after stop");
@@ -621,15 +627,18 @@ async fn e2e_idle_session_reaping() {
 
     // The idle agent must be reaped by the TTL sweep — the live registry count
     // returns to zero with no explicit `agent.stop`.
-    let reaped = timeout(Duration::from_secs(15), async {
-        loop {
-            let st = uds_rpc(&socket, 4, "system.status", json!({})).await;
-            if st["result"]["agents"].as_u64() == Some(0) {
-                return true;
+    let reaped = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(15)),
+        async {
+            loop {
+                let st = uds_rpc(&socket, 4, "system.status", json!({})).await;
+                if st["result"]["agents"].as_u64() == Some(0) {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    })
+        },
+    )
     .await
     .unwrap_or(false);
     assert!(reaped, "idle agent was not reaped by the TTL sweep");

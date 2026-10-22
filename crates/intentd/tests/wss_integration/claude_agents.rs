@@ -732,7 +732,8 @@ async fn claude_agents_custom_config_root_discovers_and_watches_agents_and_skill
     // WSS readiness does not await catalog priming or deferred OS enrollment.
     // This exact root is registered after the initial specialist fingerprint.
     // Keep readiness plus the actual edit/event within the original 20s bound.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(20));
     let watched_root = target.join("agents").canonicalize().unwrap();
     let watched_root = watched_root.to_str().unwrap();
     tokio::time::timeout_at(deadline, async {

@@ -2,19 +2,22 @@
 use super::*;
 
 async fn event(client: &mut Client, subscription: &Value, kind: &str) -> Value {
-    timeout(Duration::from_secs(90), async {
-        loop {
-            if let Some(index) = client.notices.iter().position(|v| {
-                v["method"] == "events.event"
-                    && &v["params"]["subscriptionId"] == subscription
-                    && v["params"]["event"]["type"] == kind
-            }) {
-                return client.notices.remove(index);
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(90)),
+        async {
+            loop {
+                if let Some(index) = client.notices.iter().position(|v| {
+                    v["method"] == "events.event"
+                        && &v["params"]["subscriptionId"] == subscription
+                        && v["params"]["event"]["type"] == kind
+                }) {
+                    return client.notices.remove(index);
+                }
+                let next = client.next().await;
+                client.notices.push(next);
             }
-            let next = client.next().await;
-            client.notices.push(next);
-        }
-    })
+        },
+    )
     .await
     .unwrap_or_else(|_| panic!("missing qualified event {kind}"))
 }
@@ -25,23 +28,26 @@ async fn idle_model(
     model: &Path,
     count: usize,
 ) -> Value {
-    timeout(Duration::from_secs(90), async {
-        loop {
-            if let Ok(bytes) = std::fs::read(model) {
-                if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
-                    if value.as_array().unwrap().len() >= count
-                        && store.get_agent_session(agent).await.unwrap().status
-                            == intent_core::AgentStatus::RuntimeIdle
-                    {
-                        assert_eq!(value.as_array().unwrap().len(), count);
-                        return value;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(90)),
+        async {
+            loop {
+                if let Ok(bytes) = std::fs::read(model) {
+                    if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
+                        if value.as_array().unwrap().len() >= count
+                            && store.get_agent_session(agent).await.unwrap().status
+                                == intent_core::AgentStatus::RuntimeIdle
+                        {
+                            assert_eq!(value.as_array().unwrap().len(), count);
+                            return value;
+                        }
                     }
                 }
+                // timing-guard: wait for actual model request and daemon idle state
+                tokio::time::sleep(Duration::from_millis(25)).await;
             }
-            // timing-guard: wait for actual model request and daemon idle state
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("native model turn did not complete")
 }
@@ -253,30 +259,36 @@ async fn pending_recovery_case(transferred: bool) {
         .unwrap();
     }
     *account.draft.lock().unwrap() = true;
-    let mut pending = timeout(Duration::from_secs(45), async {
-        loop {
-            let row = store.get_pr_monitor(&id).await.unwrap();
-            if !row.pending_changes.is_empty() {
-                break row;
+    let mut pending = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(45)),
+        async {
+            loop {
+                let row = store.get_pr_monitor(&id).await.unwrap();
+                if !row.pending_changes.is_empty() {
+                    break row;
+                }
+                // timing-guard: observe original timer poll before its debounce delivery
+                tokio::time::sleep(Duration::from_millis(25)).await;
             }
-            // timing-guard: observe original timer poll before its debounce delivery
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    })
+        },
+    )
     .await
     .unwrap();
     let observed_transfer = if transferred {
-        let observed = timeout(Duration::from_secs(45), async {
-            loop {
-                if let Ok(bytes) = std::fs::read(native.join("held-monitor-request.json")) {
-                    if let Ok(request) = serde_json::from_slice::<Value>(&bytes) {
-                        break request;
+        let observed = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(45)),
+            async {
+                loop {
+                    if let Ok(bytes) = std::fs::read(native.join("held-monitor-request.json")) {
+                        if let Ok(request) = serde_json::from_slice::<Value>(&bytes) {
+                            break request;
+                        }
                     }
+                    // timing-guard: wait for model receipt while its native response remains held
+                    tokio::time::sleep(Duration::from_millis(25)).await;
                 }
-                // timing-guard: wait for model receipt while its native response remains held
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-        })
+            },
+        )
         .await
         .expect("original private input did not reach held model response");
         assert!(observed

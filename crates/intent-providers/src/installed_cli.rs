@@ -33,6 +33,15 @@ impl InstalledCli {
         }
     }
 
+    /// The provider id this CLI runs (inverse of [`Self::for_provider`]).
+    #[must_use]
+    pub fn provider_id(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude-code",
+        }
+    }
+
     #[must_use]
     pub fn command(self) -> &'static str {
         match self {

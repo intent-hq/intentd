@@ -156,9 +156,12 @@ async fn wss_rpc(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value 
         .await
         .expect("send rpc frame");
     loop {
-        let next = timeout(Duration::from_secs(30), ws.next())
-            .await
-            .expect("wss rpc timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(30)),
+            ws.next(),
+        )
+        .await
+        .expect("wss rpc timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");

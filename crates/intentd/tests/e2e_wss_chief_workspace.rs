@@ -291,9 +291,12 @@ where
         .await
         .expect("send rpc frame");
     loop {
-        let next = timeout(Duration::from_secs(15), ws.next())
-            .await
-            .expect("wss rpc timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(15)),
+            ws.next(),
+        )
+        .await
+        .expect("wss rpc timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -314,23 +317,26 @@ async fn chief_collection_push<S>(ws: &mut WebSocketStream<S>) -> Value
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    timeout(Duration::from_secs(15), async {
-        loop {
-            match ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let v: Value = serde_json::from_str(&text).unwrap();
-                    if v["method"] == "subscription.push" {
-                        return v["params"].clone();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(15)),
+        async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).unwrap();
+                        if v["method"] == "subscription.push" {
+                            return v["params"].clone();
+                        }
                     }
+                    Some(Ok(Message::Ping(p))) => {
+                        ws.send(Message::Pong(p)).await.unwrap();
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected collection push, got {other:?}"),
                 }
-                Some(Ok(Message::Ping(p))) => {
-                    ws.send(Message::Pong(p)).await.unwrap();
-                }
-                Some(Ok(_)) => {}
-                other => panic!("expected collection push, got {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await
     .expect("collection push timed out")
 }
@@ -1371,22 +1377,25 @@ async fn assert_transfer_proposal_readonly_over_wss(omit_tool_output: bool) {
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
-        timeout(Duration::from_secs(10), async {
-            loop {
-                match ws.next().await {
-                    Some(Ok(Message::Text(text))) => {
-                        let frame: Value = serde_json::from_str(&text).unwrap();
-                        if frame["method"] == "subscription.push" {
-                            return frame["params"].clone();
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                loop {
+                    match ws.next().await {
+                        Some(Ok(Message::Text(text))) => {
+                            let frame: Value = serde_json::from_str(&text).unwrap();
+                            if frame["method"] == "subscription.push" {
+                                return frame["params"].clone();
+                            }
+                            assert!(frame.get("error").is_none(), "{frame}");
                         }
-                        assert!(frame.get("error").is_none(), "{frame}");
+                        Some(Ok(Message::Ping(p))) => ws.send(Message::Pong(p)).await.unwrap(),
+                        Some(Ok(_)) => {}
+                        other => panic!("unexpected chat frame: {other:?}"),
                     }
-                    Some(Ok(Message::Ping(p))) => ws.send(Message::Pong(p)).await.unwrap(),
-                    Some(Ok(_)) => {}
-                    other => panic!("unexpected chat frame: {other:?}"),
                 }
-            }
-        })
+            },
+        )
         .await
         .expect("chat subscription timed out")
     }
@@ -1542,43 +1551,49 @@ async fn assert_transfer_proposal_readonly_over_wss(omit_tool_output: bool) {
         }),
     )
     .await;
-    timeout(Duration::from_secs(20), async {
-        loop {
-            let active = wss_rpc_envelope(&mut rpc, 6, "agent.listActive", json!({})).await;
-            if active["result"]["streams"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|s| s["agentId"] == source_agent)
-            {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(20)),
+        async {
+            loop {
+                let active = wss_rpc_envelope(&mut rpc, 6, "agent.listActive", json!({})).await;
+                if active["result"]["streams"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|s| s["agentId"] == source_agent)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
-    })
+        },
+    )
     .await
     .expect("source agent running");
     // This fixture supplies an existing worktree without a branch parameter.
     // Creation seeds a generated branch; the watcher started at setup completion
     // reconciles it to HEAD after its first debounced refresh. Capture the
     // baseline only after that initialization, before requesting any proposals.
-    let before = timeout(Duration::from_secs(20), async {
-        loop {
-            let current = wss_rpc_envelope(
-                &mut rpc,
-                7,
-                "workspace.get",
-                json!({"workspaceId": workspace_id}),
-            )
-            .await;
-            assert!(current.get("error").is_none(), "{current}");
-            if current["result"]["workspace"]["branch"] == branch_before.trim() {
-                break current;
+    let before = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(20)),
+        async {
+            loop {
+                let current = wss_rpc_envelope(
+                    &mut rpc,
+                    7,
+                    "workspace.get",
+                    json!({"workspaceId": workspace_id}),
+                )
+                .await;
+                assert!(current.get("error").is_none(), "{current}");
+                if current["result"]["workspace"]["branch"] == branch_before.trim() {
+                    break current;
+                }
+                // timing-guard: poll metadata reconciliation within the enclosing timeout.
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            // timing-guard: poll metadata reconciliation within the enclosing timeout.
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("source workspace branch metadata reconciled to Git HEAD");
     let sent = wss_rpc_envelope(
@@ -1678,23 +1693,26 @@ async fn assert_transfer_proposal_readonly_over_wss(omit_tool_output: bool) {
         }),
     )
     .await;
-    let live_block = timeout(Duration::from_secs(10), async {
-        loop {
-            let push = chat_push(&mut chat).await;
-            if let Some(entity) = push["delta"]["added"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .find(|e| e["block"]["type"] == "resource")
-            {
-                assert_ne!(
-                    entity["streamingComplete"], true,
-                    "card must arrive before terminal reconciliation"
-                );
-                return entity["block"].clone();
+    let live_block = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                let push = chat_push(&mut chat).await;
+                if let Some(entity) = push["delta"]["added"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|e| e["block"]["type"] == "resource")
+                {
+                    assert_ne!(
+                        entity["streamingComplete"], true,
+                        "card must arrive before terminal reconciliation"
+                    );
+                    return entity["block"].clone();
+                }
             }
-        }
-    })
+        },
+    )
     .await
     .expect("live proposal after JavaScript error");
     let (after_exception, failed_blocks) = poll_conversation(

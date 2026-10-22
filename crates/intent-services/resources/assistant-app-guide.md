@@ -19,8 +19,7 @@ answer honestly, label its experimental status, and explain known limits. Do not
 that it exists or present it as ready for general use. Ordinary setup or permission
 requirements do not, by themselves, make a supported feature experimental.
 
-Multiplayer, Collaboration, personal device pairing, and provider profiles are
-currently experimental.
+Multiplayer, Collaboration, and personal device pairing are currently experimental.
 Do not introduce them in routine answers about settings, devices, or mobile pairing.
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/settings/MobileSettings.svelte; src/features/devices/{PersonalDevicesPanel.svelte,personal-devices-selectors.ts}; src/store/renderer/slices/principal/principal-selectors.ts; src/store/renderer/slices/websocket-api/sagas/websocket-api-saga.ts; messages/en.json. -->
@@ -152,15 +151,11 @@ existing specialist to edit its behavior. Global defaults and a specialist's
 instructions are different scopes. Some agent feature changes apply only to newly
 created sessions; do not promise they alter running conversations.
 
-**Provider profiles (experimental; Codex and Claude Code only).** Describe them
-only when the user asks. To turn them on, use the command menu action **Enable
-experimental provider profiles** (**Disable experimental provider profiles** turns
-them off), or, if asked, propose `labs.providerProfiles` with `ws.app.settings.propose`.
-A profile runs the installed
+**Provider profiles (Codex and Claude Code only).** A profile runs the installed
 CLI with its own environment variables, for example a work and a personal account
-or a different endpoint. In **Settings → Providers**, open Codex or Claude Code and
-choose **Add profile**: enter a name and environment variables (literal values,
-**Empty value**, or **Unset**; no shell expansion). Use `CODEX_HOME` or
+or a different endpoint. In **Settings → Providers**, open the ⋯ menu on Codex or
+Claude Code and choose **Add profile**: enter a name and environment variables
+(literal values, **Empty value**, or **Unset**; no shell expansion). Use `CODEX_HOME` or
 `CLAUDE_CONFIG_DIR` to choose an account; there only, a leading `~` or `~/` means
 the provider host user's home folder (`~user` stays literal). The user signs in or
 prepares that account outside Intent. Credentials inherited from the environment can still
@@ -668,6 +663,16 @@ When a supported note deletion offers **Undo**, it cancels a pending deletion du
 the displayed grace period (normally 15 seconds). It does not restore an already
 deleted note. If the result is uncertain, check the note’s current status before trying again. If the
 connected backend does not support cancellable deletion, the note is kept.
+
+In test builds that include **Back to rendered view**, use **Edit Raw Markdown**
+in a note's **…** menu to edit Markdown directly; large notes otherwise stay
+read-only. **Back to rendered view** flushes pending edits and waits for the save acknowledgement before
+leaving the editor. Returning does not undo saved changes. If saving fails or
+conflicts, the draft and editor stay open: use **Retry save** after addressing the
+error, then return. A rendered-note loading error is separate from a save failure;
+returning to rendered view does not guarantee that loading error is resolved.
+
+<!-- Sources: packages/cloudlands-fe/src/features/layout/tab-types/NoteTabType.svelte; packages/cloudlands-fe/src/lib/components/workspace/NoteWithComments.svelte; packages/cloudlands-fe/messages/en.json. Test-build behavior pending its frontend release. -->
 
 Open a task note and inspect its status and assigned agent first. Select the
 assigned agent to continue existing work. To start an agent for the task, use the

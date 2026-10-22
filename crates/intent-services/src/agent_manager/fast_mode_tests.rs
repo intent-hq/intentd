@@ -39,9 +39,7 @@ async fn fixture_with(
     let dir = test_tempdir("fast-mode-runtime-");
     let cli_env = crate::test_support::installed_cli_env(
         dir.path(),
-        intent_providers::installed_cli::InstalledCli::for_provider(provider)
-            .unwrap()
-            .command(),
+        intent_providers::installed_cli::InstalledCli::for_provider(provider).unwrap(),
     );
     let script = dir.path().join("adapter.mjs");
     std::fs::write(&script, format!("#!/usr/bin/env node\nconst provider = {provider:?}; const failOff = {fail_off}; const logPath = {};\n{FIXTURE}", json!(dir.path().join("calls.jsonl")))).unwrap();

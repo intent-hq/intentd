@@ -19,7 +19,8 @@ async fn monitor_native_daemon_frontend_handoff() {
     }
     let mut agent: Option<intent_core::AgentId> = None;
     let mut sequence = 0;
-    let expires = tokio::time::Instant::now() + Duration::from_secs(3600);
+    let expires =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(3600));
     loop {
         let socket = h.dir.path().join("intentd.sock");
         let status = common::await_wss_status(&socket).await;
@@ -68,22 +69,25 @@ async fn monitor_native_daemon_frontend_handoff() {
                 let id =
                     intent_core::AgentId::from(success(&created)["agent"]["id"].as_str().unwrap());
                 success(&ordinary.rpc("agent.sendMessage", json!({"workspaceId":h.workspace,"agentId":id,"content":"Register the original frontend review monitor"})).await);
-                timeout(Duration::from_secs(60), async {
-                    loop {
-                        if store.get_agent_session(&id).await.unwrap().status
-                            == intent_core::AgentStatus::RuntimeIdle
-                            && !store
-                                .list_active_pr_monitors_by_agent(&id)
-                                .await
-                                .unwrap()
-                                .is_empty()
-                        {
-                            break;
+                timeout(
+                    intentd_test_support::test_timeout(Duration::from_secs(60)),
+                    async {
+                        loop {
+                            if store.get_agent_session(&id).await.unwrap().status
+                                == intent_core::AgentStatus::RuntimeIdle
+                                && !store
+                                    .list_active_pr_monitors_by_agent(&id)
+                                    .await
+                                    .unwrap()
+                                    .is_empty()
+                            {
+                                break;
+                            }
+                            // timing-guard: wait for actual original callback registration
+                            tokio::time::sleep(Duration::from_millis(25)).await;
                         }
-                        // timing-guard: wait for actual original callback registration
-                        tokio::time::sleep(Duration::from_millis(25)).await;
-                    }
-                })
+                    },
+                )
                 .await
                 .unwrap();
                 agent = Some(id);
@@ -117,16 +121,19 @@ async fn monitor_native_daemon_frontend_handoff() {
     }
     let mut shutdown = h.uds().await;
     success(&shutdown.rpc("system.shutdown", json!({})).await);
-    timeout(Duration::from_secs(30), async {
-        loop {
-            if let Some(status) = h.child.try_wait().unwrap() {
-                assert!(status.success());
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async {
+            loop {
+                if let Some(status) = h.child.try_wait().unwrap() {
+                    assert!(status.success());
+                    break;
+                }
+                // timing-guard: preserve native join until the owned daemon shutdown completes
+                tokio::time::sleep(Duration::from_millis(25)).await;
             }
-            // timing-guard: preserve native join until the owned daemon shutdown completes
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    })
+        },
+    )
     .await
     .unwrap();
     std::fs::write(output.join("stopped.json"), b"{\"stopped\":true}\n").unwrap();

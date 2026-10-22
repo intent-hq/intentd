@@ -207,7 +207,8 @@ where
     ws.send(Message::Text(frame.to_string().into()))
         .await
         .expect("send rpc frame");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(30));
     loop {
         let next = tokio::time::timeout_at(deadline, ws.next())
             .await

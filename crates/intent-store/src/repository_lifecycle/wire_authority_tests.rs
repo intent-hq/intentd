@@ -839,7 +839,9 @@ async fn canceled_actual_credential_worker_survives_last_store_without_unblockin
                     if let Some(blocked) = blocked.take() {
                         notify.notify_one();
                         blocked
-                            .recv_timeout(std::time::Duration::from_secs(20))
+                            .recv_timeout(intentd_test_support::test_timeout(
+                                std::time::Duration::from_secs(20),
+                            ))
                             .unwrap();
                     }
                 }
@@ -898,7 +900,9 @@ async fn independent_writer_classifies_noop_only_after_original_settles() {
                 if let Some(blocked) = blocked.take() {
                     notify.notify_one();
                     blocked
-                        .recv_timeout(std::time::Duration::from_secs(20))
+                        .recv_timeout(intentd_test_support::test_timeout(
+                            std::time::Duration::from_secs(20),
+                        ))
                         .unwrap();
                 }
             }
@@ -1067,18 +1071,21 @@ async fn principal_completion_releases_writer(revoke: bool, cancelled: bool) {
         result = &mut operation => panic!("principal completed before retained settlement: {result:?}"),
         () = tokio::time::sleep(Duration::from_secs(5)) => panic!("principal did not reach settlement"),
     }
-    timeout(Duration::from_secs(5), async {
-        let mut writer = store.write_pool().acquire().await.unwrap();
-        sqlx::query("BEGIN IMMEDIATE")
-            .execute(&mut *writer)
-            .await
-            .unwrap();
-        sqlx::query("UPDATE principal SET updated_at=updated_at WHERE 0")
-            .execute(&mut *writer)
-            .await
-            .unwrap();
-        sqlx::query("ROLLBACK").execute(&mut *writer).await.unwrap();
-    })
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            let mut writer = store.write_pool().acquire().await.unwrap();
+            sqlx::query("BEGIN IMMEDIATE")
+                .execute(&mut *writer)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE principal SET updated_at=updated_at WHERE 0")
+                .execute(&mut *writer)
+                .await
+                .unwrap();
+            sqlx::query("ROLLBACK").execute(&mut *writer).await.unwrap();
+        },
+    )
     .await
     .expect("principal retirement retained the single-writer pool");
     if revoke {
@@ -1107,11 +1114,14 @@ async fn principal_completion_releases_writer(revoke: bool, cancelled: bool) {
         observer.release.notify_one();
         operation.await.unwrap();
     }
-    timeout(Duration::from_secs(5), async {
-        while !observer.settled.load(Ordering::SeqCst) {
-            tokio::task::yield_now().await;
-        }
-    })
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            while !observer.settled.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
     .await
     .expect("original completion was lost with its caller");
 }

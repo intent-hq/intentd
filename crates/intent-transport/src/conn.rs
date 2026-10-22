@@ -3113,9 +3113,12 @@ mod tests {
             )
             .await
         );
-        tokio::time::timeout(Duration::from_secs(10), writer.entered.notified())
-            .await
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            writer.entered.notified(),
+        )
+        .await
+        .unwrap();
         limiter.begin_shutdown();
         assert!(
             !process_frame(
@@ -3142,9 +3145,12 @@ mod tests {
             () = std::future::ready(()) => {}
         }
         writer.release.notify_one();
-        tokio::time::timeout(Duration::from_secs(10), drained)
-            .await
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            drained,
+        )
+        .await
+        .unwrap();
         assert_eq!(writer.calls.load(Ordering::SeqCst), 1);
         assert_eq!(
             store.get_setting("test.admitted").await.unwrap().as_deref(),
@@ -3228,7 +3234,8 @@ mod tests {
             }));
         }
         // Both permits come free while the writer is still stalled.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now()
+            + intentd_test_support::test_timeout(std::time::Duration::from_secs(5));
         while limiter.available_permits() != Some(2) {
             assert!(
                 std::time::Instant::now() < deadline,

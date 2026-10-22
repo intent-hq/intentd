@@ -4157,7 +4157,7 @@ async fn incremental_vacuum_chunk_reports_freed_and_remaining() {
     // than `try_acquire`; a held connection would block for the full 10 s
     // acquire timeout.
     let reacquired = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(2)),
         store.write_pool().acquire(),
     )
     .await;

@@ -233,9 +233,12 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     loop {
-        let next = timeout(Duration::from_secs(15), ws.next())
-            .await
-            .expect("wss rpc timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(15)),
+            ws.next(),
+        )
+        .await
+        .expect("wss rpc timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -439,7 +442,8 @@ exit 0
             attempt += 1;
             std::fs::write(worktree.join(control), format!("attempt-{attempt}"))
                 .expect("write control");
-            next_write = tokio::time::Instant::now() + Duration::from_secs(1);
+            next_write = tokio::time::Instant::now()
+                + intentd_test_support::test_timeout(Duration::from_secs(1));
         }
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         assert!(!remaining.is_zero(), "control file event never arrived");

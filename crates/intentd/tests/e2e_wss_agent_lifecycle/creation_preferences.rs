@@ -13,11 +13,14 @@ where
     .await
     .unwrap();
     loop {
-        match timeout(Duration::from_secs(15), ws.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap()
+        match timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(15)),
+            ws.next(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
         {
             Message::Text(text) => {
                 let value: Value = serde_json::from_str(&text).unwrap();
@@ -270,18 +273,21 @@ async fn creation_preferences_workspace_initial_agent_ui_shape_over_wss() {
                 .await;
                 assert_eq!(sent["success"], true);
             }
-            timeout(Duration::from_secs(30), async {
-                loop {
-                    let frame = wss_event(&mut sub, 30).await;
-                    let event = &frame["params"]["event"];
-                    if event["type"] == "agent:status-changed"
-                        && event["data"]["agentId"] == agent_id
-                        && event["data"]["status"] == "idle"
-                    {
-                        break;
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(30)),
+                async {
+                    loop {
+                        let frame = wss_event(&mut sub, 30).await;
+                        let event = &frame["params"]["event"];
+                        if event["type"] == "agent:status-changed"
+                            && event["data"]["agentId"] == agent_id
+                            && event["data"]["status"] == "idle"
+                        {
+                            break;
+                        }
                     }
-                }
-            })
+                },
+            )
             .await
             .expect("initial agent turn settled");
             let log = std::fs::read_to_string(&prompt_log).expect("provider prompt log");
@@ -432,18 +438,21 @@ async fn creation_preferences_welcome_instructions_reach_first_turn_over_wss() {
         )
         .await;
         assert_eq!(sent["success"], true);
-        timeout(Duration::from_secs(30), async {
-            loop {
-                let frame = wss_event(&mut sub, 30).await;
-                let event = &frame["params"]["event"];
-                if event["type"] == "agent:status-changed"
-                    && event["data"]["agentId"] == *id
-                    && event["data"]["status"] == "idle"
-                {
-                    break;
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(30)),
+            async {
+                loop {
+                    let frame = wss_event(&mut sub, 30).await;
+                    let event = &frame["params"]["event"];
+                    if event["type"] == "agent:status-changed"
+                        && event["data"]["agentId"] == *id
+                        && event["data"]["status"] == "idle"
+                    {
+                        break;
+                    }
                 }
-            }
-        })
+            },
+        )
         .await
         .expect("welcome first turn settled");
         let log = std::fs::read_to_string(&prompt_log).unwrap();

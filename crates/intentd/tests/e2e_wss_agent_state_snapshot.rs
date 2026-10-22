@@ -197,11 +197,14 @@ async fn wss_rpc(ws: &mut Ws, id: i64, method: &str, params: Value) -> Value {
         .await
         .expect("send");
     loop {
-        let msg = timeout(Duration::from_secs(10), ws.next())
-            .await
-            .expect("ws rpc timeout")
-            .expect("ws closed")
-            .expect("ws error");
+        let msg = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            ws.next(),
+        )
+        .await
+        .expect("ws rpc timeout")
+        .expect("ws closed")
+        .expect("ws error");
         if let Message::Text(text) = msg {
             let v: Value = serde_json::from_str(&text).expect("invalid json");
             if v["id"] == id {
@@ -323,10 +326,13 @@ struct BridgeClient {
 
 impl BridgeClient {
     async fn connect(addr: &str) -> Self {
-        let stream = timeout(Duration::from_secs(10), TcpStream::connect(addr))
-            .await
-            .expect("bridge connect timeout")
-            .expect("bridge connect");
+        let stream = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            TcpStream::connect(addr),
+        )
+        .await
+        .expect("bridge connect timeout")
+        .expect("bridge connect");
         let (r, w) = stream.into_split();
         let mut c = BridgeClient {
             reader: BufReader::new(r),
@@ -352,10 +358,13 @@ impl BridgeClient {
         let mut buf = String::new();
         loop {
             buf.clear();
-            let n = timeout(Duration::from_secs(30), self.reader.read_line(&mut buf))
-                .await
-                .expect("bridge read timeout")
-                .expect("bridge read");
+            let n = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(30)),
+                self.reader.read_line(&mut buf),
+            )
+            .await
+            .expect("bridge read timeout")
+            .expect("bridge read");
             assert!(n > 0, "bridge closed while waiting for response");
             let v: Value = match serde_json::from_str(buf.trim()) {
                 Ok(v) => v,
@@ -900,7 +909,8 @@ async fn snapshot_running_sub_agents_excludes_idle_children_over_wss() {
     assert_eq!(sent["result"]["success"], true, "sendMessage ok: {sent}");
 
     // In flight: the parent's snapshot must count exactly the running child.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(60));
     loop {
         let (err, text) = bridge.call_js("return await ws.agent.snapshot()").await;
         assert!(!err, "snapshot poll (in flight): {text}");
@@ -918,7 +928,8 @@ async fn snapshot_running_sub_agents_excludes_idle_children_over_wss() {
     // Settled: once the child's turn ends it persists idle and must drop out
     // of the count. Pre-fix this poll never converged — the idle child is
     // non-terminal, so the unsettled blocklist kept reporting it as running.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(60));
     loop {
         let (err, text) = bridge.call_js("return await ws.agent.snapshot()").await;
         assert!(!err, "snapshot poll (settled): {text}");

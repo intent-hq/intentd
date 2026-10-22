@@ -140,10 +140,13 @@ async fn personal_pairing_inflight_revalidation_orders_real_revocation_and_remov
             let result = person.call("pairing.getSelfInfo", json!({})).await;
             (result, person)
         });
-        tokio::time::timeout(Duration::from_secs(5), arrived)
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            arrived,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         // The first credential check succeeded. Commit actual invalidation
         // before permitting the route/profile/final-check portion to complete.
         if remove {
@@ -200,21 +203,24 @@ fn assert_pairing(response: &Value, token: &str, person: &intent_core::Principal
 }
 
 async fn assert_closed(ws: &mut common::TlsWs) {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match ws.next().await {
-                Some(Ok(Message::Close(Some(frame)))) => {
-                    assert_eq!(
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Close(Some(frame)))) => {
+                        assert_eq!(
                         frame.code,
                         tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy
                     );
-                    return;
+                        return;
+                    }
+                    Some(Ok(Message::Ping(bytes))) => ws.send(Message::Pong(bytes)).await.unwrap(),
+                    _ => panic!("revoked socket must close without another payload"),
                 }
-                Some(Ok(Message::Ping(bytes))) => ws.send(Message::Pong(bytes)).await.unwrap(),
-                _ => panic!("revoked socket must close without another payload"),
             }
-        }
-    })
+        },
+    )
     .await
     .expect("live credential invalidation closes the socket");
 }
@@ -696,17 +702,20 @@ async fn removal_tunnel(srv: &Server, token: &str) -> common::TlsWs {
     common::wss_connect_with_retry(srv.port, srv.cfg.clone(), &url).await
 }
 async fn removal_frame(ws: &mut common::TlsWs) -> intent_transport::tunnel::Frame {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match ws.next().await {
-                Some(Ok(Message::Binary(b))) => {
-                    return intent_transport::tunnel::Frame::decode(&b).unwrap()
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Binary(b))) => {
+                        return intent_transport::tunnel::Frame::decode(&b).unwrap()
+                    }
+                    Some(Ok(Message::Ping(b))) => ws.send(Message::Pong(b)).await.unwrap(),
+                    _ => panic!("expected binary tunnel response"),
                 }
-                Some(Ok(Message::Ping(b))) => ws.send(Message::Pong(b)).await.unwrap(),
-                _ => panic!("expected binary tunnel response"),
             }
-        }
-    })
+        },
+    )
     .await
     .unwrap()
 }
@@ -724,10 +733,13 @@ async fn removal_roundtrip(ws: &mut common::TlsWs, peer: &mut TcpStream) {
     )
     .await;
     let mut bytes = [0; 5];
-    tokio::time::timeout(Duration::from_secs(5), peer.read_exact(&mut bytes))
-        .await
-        .unwrap()
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        peer.read_exact(&mut bytes),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!(&bytes, b"hello");
     peer.write_all(b"reply").await.unwrap();
     assert_eq!(
@@ -808,11 +820,14 @@ async fn member_removal_idle_active_tunnels_and_final_control() {
     );
     // A subscribed removed person receives the real durable control event,
     // despite revocation having priority over ordinary bulk traffic.
-    let notification = tokio::time::timeout(Duration::from_secs(5), idle.ws.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    let notification = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        idle.ws.next(),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
     let Message::Text(frame) = notification else {
         panic!("removal control must precede close")
     };
@@ -829,10 +844,13 @@ async fn member_removal_idle_active_tunnels_and_final_control() {
     assert_closed(&mut idle_tunnel).await;
     assert_closed(&mut active_tunnel).await;
     assert_eq!(
-        tokio::time::timeout(Duration::from_secs(5), peer.read(&mut two))
-            .await
-            .unwrap()
-            .unwrap(),
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            peer.read(&mut two)
+        )
+        .await
+        .unwrap()
+        .unwrap(),
         0
     );
     for old in [token, second_token] {
@@ -954,10 +972,13 @@ async fn member_removal_connection_admission_both_linearizations_cannot_reopen_a
             let url = format!("wss://localhost:{}{path}?token={token}", srv.port);
             let connect =
                 tokio::spawn(async move { tokio_tungstenite::client_async(url, tls).await });
-            tokio::time::timeout(Duration::from_secs(5), reached)
-                .await
-                .unwrap()
-                .unwrap();
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                reached,
+            )
+            .await
+            .unwrap()
+            .unwrap();
             assert_eq!(
                 admin
                     .call(
@@ -1025,10 +1046,13 @@ async fn member_removal_invalidates_inflight_personal_pairing_through_real_owner
         let response = person.call("pairing.getSelfInfo", json!({})).await;
         (person, response)
     });
-    tokio::time::timeout(Duration::from_secs(5), reached)
-        .await
-        .unwrap()
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        reached,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!(
         admin
             .call("host.members.remove", json!({"principalId":id}))

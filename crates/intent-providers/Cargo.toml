@@ -1,14 +1,21 @@
 [package]
 name = "intent-providers"
-version = "0.11.22"
+version = "0.11.24"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 license.workspace = true
 description = "Provider registry, launch arg/env assembly, model-tier and capability tables"
 
+[features]
+# Shared Codex/Claude CLI test fixtures (`test_support`). Enable only from
+# `[dev-dependencies]`: Cargo then turns it on for builds that also compile
+# test targets (`cargo test`, `--all-targets`), never for release/packaging
+# builds of the daemon.
+test-support = []
+
 [dependencies]
-intent-core = { path = "../intent-core", version = "0.11.22" }
+intent-core = { path = "../intent-core", version = "0.11.24" }
 serde_json = { workspace = true }
 node-semver = "2.2.0"
 tracing.workspace = true
@@ -16,6 +23,8 @@ tracing.workspace = true
 [dev-dependencies]
 ctor = "1.0.10"
 tempfile = "3"
+# Source-lint scaffolding for `tests/cli_fixture_version_lint.rs`.
+intentd-test-support = { path = "../intentd-test-support" }
 
 [lints]
 workspace = true

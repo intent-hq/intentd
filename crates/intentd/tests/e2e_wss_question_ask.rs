@@ -209,9 +209,12 @@ where
         .await
         .expect("send rpc frame");
     loop {
-        let next = timeout(Duration::from_secs(15), ws.next())
-            .await
-            .expect("wss rpc timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(15)),
+            ws.next(),
+        )
+        .await
+        .expect("wss rpc timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -1475,10 +1478,13 @@ struct BridgeClient {
 impl BridgeClient {
     async fn connect(addr: &str) -> Self {
         use tokio::io::BufReader;
-        let stream = timeout(Duration::from_secs(10), TcpStream::connect(addr))
-            .await
-            .expect("bridge connect timeout")
-            .expect("bridge connect");
+        let stream = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            TcpStream::connect(addr),
+        )
+        .await
+        .expect("bridge connect timeout")
+        .expect("bridge connect");
         let (r, w) = stream.into_split();
         let mut c = BridgeClient {
             reader: BufReader::new(r),
@@ -1505,10 +1511,13 @@ impl BridgeClient {
         let mut buf = String::new();
         loop {
             buf.clear();
-            let n = timeout(Duration::from_secs(30), self.reader.read_line(&mut buf))
-                .await
-                .expect("bridge read timeout")
-                .expect("bridge read");
+            let n = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(30)),
+                self.reader.read_line(&mut buf),
+            )
+            .await
+            .expect("bridge read timeout")
+            .expect("bridge read");
             assert!(n > 0, "bridge closed while waiting for response");
             let v: Value = match serde_json::from_str(buf.trim()) {
                 Ok(v) => v,

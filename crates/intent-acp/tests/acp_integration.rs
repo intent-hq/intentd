@@ -522,10 +522,13 @@ fn text_block(text: &str) -> ContentBlock {
 
 /// Receive the next streamed notification (with a generous timeout).
 async fn recv_note(rx: &mut mpsc::UnboundedReceiver<IncomingNotification>) -> IncomingNotification {
-    tokio::time::timeout(Duration::from_secs(5), rx.recv())
-        .await
-        .expect("notification timed out")
-        .expect("notification stream closed")
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        rx.recv(),
+    )
+    .await
+    .expect("notification timed out")
+    .expect("notification stream closed")
 }
 
 /// Assert a notification is an agent message chunk and return its text.
@@ -872,7 +875,8 @@ impl TerminalHost for PtyTermHost {
             // command waits out the full 5s deadline. Revisit (e.g. an
             // explicit reader-drained signal from the PTY host) before
             // reusing this host for other commands.
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            let deadline = tokio::time::Instant::now()
+                + intentd_test_support::test_timeout(Duration::from_secs(5));
             let mut last = pty.scrollback(id).unwrap_or_default();
             loop {
                 tokio::time::sleep(Duration::from_millis(20)).await;

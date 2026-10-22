@@ -58,17 +58,20 @@ async fn wss_task_list_latency_baseline() {
                 .send(Message::Text(request.clone().into()))
                 .await
                 .unwrap();
-            let text = tokio::time::timeout(Duration::from_secs(30), async {
-                loop {
-                    match socket.next().await {
-                        Some(Ok(Message::Text(text))) => break text,
-                        Some(Ok(Message::Ping(payload))) => {
-                            socket.send(Message::Pong(payload)).await.unwrap();
+            let text = tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(30)),
+                async {
+                    loop {
+                        match socket.next().await {
+                            Some(Ok(Message::Text(text))) => break text,
+                            Some(Ok(Message::Ping(payload))) => {
+                                socket.send(Message::Pong(payload)).await.unwrap();
+                            }
+                            other => panic!("expected task.list response, got {other:?}"),
                         }
-                        other => panic!("expected task.list response, got {other:?}"),
                     }
-                }
-            })
+                },
+            )
             .await
             .expect("task.list response deadline");
             let roundtrip_us = start.elapsed().as_micros();

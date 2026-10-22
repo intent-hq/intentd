@@ -178,9 +178,12 @@ where
         .await
         .expect("send rpc frame");
     loop {
-        let next = timeout(Duration::from_secs(15), ws.next())
-            .await
-            .expect("wss rpc timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(15)),
+            ws.next(),
+        )
+        .await
+        .expect("wss rpc timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -470,9 +473,12 @@ where
         .await
         .expect("send rpc frame");
     loop {
-        let next = timeout(Duration::from_secs(15), ws.next())
-            .await
-            .expect("wss rpc timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(15)),
+            ws.next(),
+        )
+        .await
+        .expect("wss rpc timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -711,11 +717,14 @@ async fn git_clone_missing_params_rejected_over_wss() {
         .await
         .unwrap();
     let err = loop {
-        let next = timeout(Duration::from_secs(15), ws.next())
-            .await
-            .expect("timed out")
-            .unwrap()
-            .unwrap();
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(15)),
+            ws.next(),
+        )
+        .await
+        .expect("timed out")
+        .unwrap()
+        .unwrap();
         if let Message::Text(t) = next {
             let v: Value = serde_json::from_str(&t).unwrap();
             if v["id"] == json!(5) {

@@ -1380,9 +1380,14 @@ async fn agent_commit_captures_polling_caller_before_owned_handoff() {
 }
 
 /// Captured `(level, message)` pairs for the missing-checkout tests.
+///
+/// Unix-only like its only caller: on Windows it would be dead code and
+/// fail `cargo clippy -D warnings`.
+#[cfg(unix)]
 #[derive(Clone, Default)]
 struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>);
 
+#[cfg(unix)]
 impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LogCapture {
     fn on_event(
         &self,
@@ -1406,6 +1411,7 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LogCapture {
     }
 }
 
+#[cfg(unix)]
 impl LogCapture {
     fn count(&self, level: tracing::Level, needle: &str) -> usize {
         self.0

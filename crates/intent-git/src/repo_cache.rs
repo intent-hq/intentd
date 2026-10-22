@@ -2753,13 +2753,19 @@ mod tests {
                 Some(callback),
             )
         });
-        tokio::time::timeout(Duration::from_secs(10), entered_rx)
-            .await
-            .unwrap()
-            .unwrap();
-        let returned_while_callback_held = tokio::time::timeout(Duration::from_secs(10), &mut job)
-            .await
-            .is_ok();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            entered_rx,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let returned_while_callback_held = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            &mut job,
+        )
+        .await
+        .is_ok();
         release_tx.send(()).unwrap();
         finished_rx.await.unwrap();
         if !returned_while_callback_held {
