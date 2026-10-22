@@ -49,7 +49,7 @@ rust_binary(
     aliases = aliases(package_name = "bazel/prod-workspace/crates/intentd"),
     compile_data = COMPILE_DATA,
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     proc_macro_deps = all_crate_deps(package_name = "bazel/prod-workspace/crates/intentd", proc_macro = True),
@@ -73,7 +73,7 @@ rust_binary(
     aliases = dev_aliases(),
     compile_data = COMPILE_DATA,
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     proc_macro_deps = dev_crate_deps(proc_macro = True),
@@ -131,7 +131,7 @@ rust_test(
     compile_data = ["//:workspace_test_data"],
     data = ["//:workspace_test_data"],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -172,7 +172,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -213,7 +213,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -254,7 +254,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -295,7 +295,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -336,7 +336,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -377,7 +377,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -418,7 +418,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -459,7 +459,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -500,7 +500,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -541,7 +541,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -582,7 +582,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -623,7 +623,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -664,7 +664,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -705,7 +705,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -746,7 +746,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -787,7 +787,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -828,7 +828,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -869,7 +869,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -910,7 +910,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -951,7 +951,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -992,7 +992,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -1033,7 +1033,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -1074,7 +1074,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -1116,7 +1116,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -1158,7 +1158,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -1199,7 +1199,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -1240,7 +1240,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -1282,7 +1282,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -1323,7 +1323,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -1364,7 +1364,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -1405,7 +1405,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -1446,7 +1446,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -1487,7 +1487,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -1528,7 +1528,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -1569,7 +1569,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -1610,7 +1610,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -1651,7 +1651,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -1692,7 +1692,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -1733,7 +1733,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -1774,7 +1774,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -1815,7 +1815,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -1856,7 +1856,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -1897,7 +1897,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -1938,7 +1938,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -1979,7 +1979,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -2020,7 +2020,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -2061,7 +2061,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -2102,7 +2102,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -2143,7 +2143,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -2184,7 +2184,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -2225,7 +2225,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -2266,7 +2266,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -2307,7 +2307,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -2348,7 +2348,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -2389,7 +2389,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -2430,7 +2430,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -2471,7 +2471,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -2512,7 +2512,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -2553,7 +2553,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -2594,7 +2594,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -2635,7 +2635,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -2676,7 +2676,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -2717,7 +2717,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -2758,7 +2758,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -2799,7 +2799,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -2840,7 +2840,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -2881,7 +2881,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -2922,7 +2922,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -2963,7 +2963,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -3004,7 +3004,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -3045,7 +3045,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -3087,7 +3087,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -3128,7 +3128,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -3169,7 +3169,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -3210,7 +3210,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -3251,7 +3251,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -3292,7 +3292,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -3333,7 +3333,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -3374,7 +3374,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -3415,7 +3415,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -3456,7 +3456,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -3497,7 +3497,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -3538,7 +3538,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -3579,7 +3579,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -3620,7 +3620,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -3661,7 +3661,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -3702,7 +3702,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -3743,7 +3743,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -3784,7 +3784,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -3825,7 +3825,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -3867,7 +3867,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -3909,7 +3909,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -3950,7 +3950,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -3991,7 +3991,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -4032,7 +4032,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -4073,7 +4073,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -4114,7 +4114,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -4156,7 +4156,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -4197,7 +4197,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -4238,7 +4238,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -4279,7 +4279,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -4320,7 +4320,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -4362,7 +4362,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -4404,7 +4404,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -4445,7 +4445,48 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
+    crate_features = [],
+    lint_config = ":cargo_lints",
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
+)
+
+rust_test(
+    name = "e2e_wss_note_truncated_read",
+    srcs = ["tests/e2e_wss_note_truncated_read.rs"] + TEST_SUPPORT_SRCS,
+    crate_root = "tests/e2e_wss_note_truncated_read.rs",
+    aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
+    proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
+    rustc_env = {
+        "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+    },
+    deps = dev_crate_deps(normal = True, normal_dev = True) + [
+        "//crates/intent-acp:intent_acp_dev",
+        "//crates/intent-context:intent_context_dev",
+        "//crates/intent-core:intent_core_dev",
+        "//crates/intent-git:intent_git_dev",
+        "//crates/intent-linear:intent_linear_dev",
+        "//crates/intent-providers:intent_providers_dev",
+        "//crates/intent-sentry:intent_sentry_dev",
+        "//crates/intent-services:intent_services_dev",
+        "//crates/intent-sourcecontrol:intent_sourcecontrol_dev",
+        "//crates/intent-store:intent_store_dev",
+        "//crates/intent-transport:intent_transport_dev",
+        "//crates/intent-voice:intent_voice_dev",
+        "//crates/intentd-sitter:intentd_sitter_dev",
+        "//crates/intentd-test-support:intentd_test_support_dev",
+    ],
+    compile_data = ["//:workspace_test_data"],
+    data = [
+        "//:workspace_test_data",
+        "//:workspace_rust_sources",
+        ":intentd_test_bin",
+    ],
+    edition = "2021",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -4486,7 +4527,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -4527,7 +4568,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -4568,7 +4609,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -4609,7 +4650,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -4650,7 +4691,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -4692,7 +4733,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -4733,7 +4774,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -4774,7 +4815,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -4815,7 +4856,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -4856,7 +4897,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -4897,7 +4938,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -4938,7 +4979,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -4979,7 +5020,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -5020,7 +5061,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -5061,7 +5102,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -5102,7 +5143,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -5143,7 +5184,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -5185,7 +5226,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -5226,7 +5267,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -5267,7 +5308,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -5308,7 +5349,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -5349,7 +5390,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -5390,7 +5431,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -5431,7 +5472,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     args = ["--list"],
@@ -5501,7 +5542,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -5542,7 +5583,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -5583,7 +5624,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -5624,7 +5665,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -5665,7 +5706,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -5707,7 +5748,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -5748,7 +5789,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -5789,7 +5830,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -5830,7 +5871,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -5871,7 +5912,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -5912,7 +5953,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -5953,7 +5994,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -5994,7 +6035,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -6035,7 +6076,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -6076,7 +6117,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -6117,7 +6158,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -6158,7 +6199,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -6199,7 +6240,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -6240,7 +6281,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -6281,7 +6322,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -6322,7 +6363,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -6363,7 +6404,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -6404,7 +6445,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -6445,7 +6486,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -6486,7 +6527,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -6527,7 +6568,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -6568,7 +6609,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -6609,7 +6650,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -6650,7 +6691,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -6691,7 +6732,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -6732,7 +6773,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -6773,7 +6814,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -6814,7 +6855,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -6855,7 +6896,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -6896,7 +6937,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -6937,7 +6978,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -6978,7 +7019,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -7019,7 +7060,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -7060,7 +7101,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -7101,7 +7142,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -7142,7 +7183,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -7183,7 +7224,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -7224,7 +7265,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -7265,7 +7306,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -7306,7 +7347,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -7347,7 +7388,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -7388,7 +7429,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -7429,7 +7470,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -7470,7 +7511,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -7511,7 +7552,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -7552,7 +7593,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -7593,7 +7634,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -7634,7 +7675,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -7675,7 +7716,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -7716,7 +7757,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -7757,7 +7798,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -7798,7 +7839,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -7839,7 +7880,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -7880,7 +7921,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -7921,7 +7962,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -7962,7 +8003,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -8003,7 +8044,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -8044,7 +8085,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -8085,7 +8126,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -8126,7 +8167,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -8167,7 +8208,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -8208,7 +8249,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -8249,7 +8290,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -8290,7 +8331,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -8331,7 +8372,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -8372,7 +8413,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -8413,7 +8454,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -8454,7 +8495,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -8495,7 +8536,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -8536,7 +8577,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -8577,7 +8618,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -8618,7 +8659,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -8659,7 +8700,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -8700,7 +8741,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -8741,7 +8782,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -8782,7 +8823,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
@@ -8823,7 +8864,7 @@ rust_test(
         ":intentd_test_bin",
     ],
     edition = "2021",
-    version = "0.11.27",
+    version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     tags = [
