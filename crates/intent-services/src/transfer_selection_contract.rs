@@ -154,7 +154,11 @@ async fn migrated_template(dir: &Path) -> PathBuf {
     store.close().await;
     let mut wal = path.clone().into_os_string();
     wal.push("-wal");
-    let wal_len = std::fs::metadata(&wal).map_or(0, |meta| meta.len());
+    let wal_len = match std::fs::metadata(&wal) {
+        Ok(meta) => meta.len(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => panic!("cannot inspect template WAL: {error}"),
+    };
     assert_eq!(
         wal_len, 0,
         "template WAL was not checkpointed into the main file"
@@ -521,21 +525,27 @@ fn validator_rejects_corrupt_physical_inputs_despite_valid_lexical_sibling() {
 /// every row of every table (`quote()` keeps BLOBs exact), sorted.
 ///
 /// `Store::open` seeds each new database with a random identity: the local
-/// owner principal (UUID, also the seeded workspace's owner) and the note-page
-/// backend's database-local id and key, stamped with the creation time. Copies
-/// of one template share those values, while two fresh databases never do.
-/// So UUIDs, 32-hex ids, BLOB literals and UTC timestamps are masked. Row
-/// counts, every other value and the schema still have to match exactly. The
-/// migration ledger's install times and durations are left out.
+/// owner principal (id and creation time, which the seeded `__chief__`
+/// workspace, its membership and authority rows reference) and the note-page
+/// backend's database-local id and key. Copies of one template share those
+/// values; two fresh databases never do. Exactly those values are masked,
+/// wherever they appear, so every other value must still match. A new random
+/// seed fails this comparison until it is listed here. The migration ledger's
+/// install times and durations are left out.
 async fn database_snapshot(store: &Store) -> Value {
     use sqlx::Row as _;
-    let per_database = regex::Regex::new(concat!(
-        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
-        r"|'[0-9a-f]{32}'|X'[0-9A-F]*'",
-        r"|\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z",
-    ))
-    .unwrap();
     let pool = store.write_pool();
+    let mut identity: Vec<String> = Vec::new();
+    for query in [
+        "SELECT quote(id), quote(created_at), quote(updated_at) FROM principal",
+        "SELECT quote(backend_id), quote(token_key), NULL FROM note_page_backend",
+    ] {
+        let rows: Vec<(String, String, Option<String>)> =
+            sqlx::query_as(query).fetch_all(pool).await.unwrap();
+        for (first, second, third) in rows {
+            identity.extend([Some(first), Some(second), third].into_iter().flatten());
+        }
+    }
     let mut snapshot = serde_json::Map::new();
     for pragma in ["auto_vacuum", "journal_mode"] {
         let row = sqlx::query(&format!("PRAGMA {pragma}"))
@@ -579,7 +589,11 @@ async fn database_snapshot(store: &Store) -> Value {
         .unwrap();
         let mut rows: Vec<String> = rows
             .iter()
-            .map(|row| per_database.replace_all(row, "<per-database>").into_owned())
+            .map(|row| {
+                identity.iter().fold(row.clone(), |row, value| {
+                    row.replace(value, "<per-database>")
+                })
+            })
             .collect();
         rows.sort();
         snapshot.insert(format!("rows:{table}"), json!(rows));
@@ -594,32 +608,18 @@ async fn template_copy_matches_a_fresh_destination() {
     let copy_dir = test_tempdir("transfer-selection-copy-");
     let copied = fresh_destination(&template, copy_dir.path());
 
-    // The copy records every migration before any Store opens it, so the
-    // per-case Store::open does no schema work (the point of the template).
-    let mut raw = <sqlx::SqliteConnection as sqlx::Connection>::connect_with(
-        &sqlx::sqlite::SqliteConnectOptions::new().filename(&copied),
-    )
-    .await
-    .unwrap();
-    let applied: Vec<i64> =
-        sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
-            .fetch_all(&mut raw)
-            .await
-            .unwrap();
-    sqlx::Connection::close(raw).await.unwrap();
+    // The copy records every migration, complete and unmodified, before any
+    // Store opens it, so the per-case Store::open does no schema work.
+    let ledger = intent_store::DiagnosticStore::open(&copied).await.unwrap();
+    let status = ledger.migration_status().await.unwrap();
+    ledger.close().await;
+    assert!(status.is_current(), "template copy has pending migrations");
 
     let fresh_dir = test_tempdir("transfer-selection-fresh-");
     let fresh = Store::open(&fresh_dir.path().join("store.db"))
         .await
         .unwrap();
     let reused = Store::open(&copied).await.unwrap();
-    let status = fresh.migration_status().await.unwrap();
-    assert!(status.is_current(), "fresh destination is not migrated");
-    assert_eq!(
-        applied, status.expected,
-        "template copy has pending migrations"
-    );
-    assert!(reused.migration_status().await.unwrap().is_current());
     assert_eq!(
         database_snapshot(&reused).await,
         database_snapshot(&fresh).await,
