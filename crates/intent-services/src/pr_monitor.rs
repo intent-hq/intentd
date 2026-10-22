@@ -6515,11 +6515,11 @@ mod tests {
         // A re-push that also never started CI is a new head: its first
         // sighting never flags (its commit time can predate the push)...
         let next_head = "9d1f000000000000000000000000000000000000";
-        let next_read = zero_run_read(next_head, "2026-10-21T03:00:00Z");
-        let next_seen = next_read.materialize_at(Some(&first), no_ci_now());
+        let repushed = zero_run_read(next_head, "2026-10-21T03:00:00Z");
+        let next_seen = repushed.materialize_at(Some(&first), no_ci_now());
         assert_eq!(next_seen.requirements.checks_not_started, None);
         // ...and the next poll of that head wakes again, once.
-        let next = next_read.materialize_at(Some(&next_seen), no_ci_now());
+        let next = repushed.materialize_at(Some(&next_seen), no_ci_now());
         assert_eq!(
             next.requirements
                 .checks_not_started
