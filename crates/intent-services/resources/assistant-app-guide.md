@@ -137,7 +137,7 @@ recover a chat after deletion has completed.
 
 ## Choose a model or change agent behavior
 
-<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/initializer/InitialAgentPicker.svelte; packages/cloudlands-fe/src/lib/components/settings/{SettingsSidebarNav,ProviderSelector,ProviderProfiles,ProviderProfileDialog}.svelte; packages/cloudlands-fe/src/lib/components/chat/input/ModelPicker.svelte; packages/cloudlands-fe/src/store/renderer/slices/user-preferences/user-preferences-slice.ts; packages/cloudlands-fe/src/shared/app-ui-targets.ts; packages/intentd/crates/intent-services/src/{provider_profiles,profile_activation}.rs. -->
+<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/initializer/InitialAgentPicker.svelte; packages/cloudlands-fe/src/lib/components/settings/{SettingsSidebarNav,ProviderSelector,ProviderProfiles,ProviderProfileDialog}.svelte; packages/cloudlands-fe/src/lib/components/chat/input/ModelPicker.svelte; packages/cloudlands-fe/src/store/renderer/slices/user-preferences/user-preferences-slice.ts; packages/cloudlands-fe/src/shared/app-ui-targets.ts; packages/intentd/crates/intent-services/src/{provider_profiles,profile_activation,quota_failover,provider_return}.rs. -->
 
 For the default model, open **Settings → Providers → Default model**
 (`/settings?tab=providers#utility-default-model`). For new work, choose a model in
@@ -175,6 +175,21 @@ mode** (Claude Code) or **Service Tier** (Codex) in its ⋯ menu; it starts off 
 never follows the Default setting. Delegated agents follow their
 explicit, specialist, or default selection, never the parent's profile.
 
+**Backup profiles.** These controls require matching app and daemon support.
+Older apps may support provider profiles without profile ordering or backup
+controls; check availability before directing users to them. In supporting apps,
+drag a profile in **Settings → Providers**, or focus its handle and use the Up and
+Down arrow keys, to set its order. Turn on **Use as backup
+provider** in the profile dialog; backup profiles show a **Backup** badge. When a
+conversation's current Codex or Claude Code configuration runs out of quota, the turn
+continues on the next backup of the same provider in saved order, with the same
+model, and a chat notice shows the switch; the conversation then stays there. After
+the quota reset time (or 5 hours when none is reported), the next turn goes back to
+the configuration it used before its first automatic switch, with a "back on …"
+notice; if that one is still out of quota, Intent tries again later with growing
+waits. Choosing a model or profile yourself makes that the new starting point. When
+every option is out of quota, the usual quota message appears.
+
 Switching a conversation to another profile, even with the same model, applies on
 the next message: a turn in progress finishes first, then a fresh provider session
 starts with the conversation history. Editing a profile's environment never
@@ -186,7 +201,8 @@ intentd on the provider host; reconnecting alone does not apply the edit. Remove
 profile from the same view, after changing any default, specialist, or quick-action
 setting that selects it. Conversations keep their history, and their next message
 asks for another model (**Choose another model to continue**), as does a profile
-whose provider is disabled. Intent never switches them to another account.
+whose provider is disabled. Intent does not move them to another account; only the
+quota backup switching above changes a conversation's profile automatically.
 
 Settings sections and controls can depend on platform, daemon capabilities, or
 access. A supported route does not grant permissions or prove that a control is

@@ -233,7 +233,9 @@ mod provider_images;
 pub mod provider_models;
 mod provider_preparation;
 mod provider_profiles;
+mod provider_return;
 pub mod provider_test_prompt;
+mod quota_failover;
 mod rate_limit;
 pub mod repo_config;
 pub mod retention;
@@ -1089,6 +1091,17 @@ pub struct Services {
     /// Shared across clones so consecutive turns of one agent accumulate the
     /// same stall-episode streak.
     truncation_redrives: agent_session::TruncationRedrives,
+    /// Per-agent quota failover chain of the user turn in flight
+    /// (PROTOCOL §5.54 Backup failover): see
+    /// [`quota_failover::QuotaFailoverChains`]. Shared across clones so the
+    /// turn worker's arm and the failure seam's switch observe the same chain.
+    quota_failover_chains: quota_failover::QuotaFailoverChains,
+    /// Continue-the-cut-short-turn replay marks (PROTOCOL §5.54): see
+    /// [`quota_failover::QuotaFailoverReplays`].
+    quota_failover_replays: quota_failover::QuotaFailoverReplays,
+    /// Pending `provider_returned` announcements (PROTOCOL §5.54): see
+    /// [`provider_return::ProviderReturnAnnouncements`].
+    provider_return_announcements: provider_return::ProviderReturnAnnouncements,
     /// One-shot truncation auto-redrive handoff flags
     /// (intent-hq/monorepo#2863): see
     /// [`agent_session::PendingTruncationRedrives`]. Shared across clones so
@@ -1764,6 +1777,9 @@ impl Services {
             turn_bookkeeping: Arc::new(Mutex::new(HashMap::new())),
             last_turn_silent_tails: Arc::new(Mutex::new(HashMap::new())),
             truncation_redrives: Arc::new(Mutex::new(HashMap::new())),
+            quota_failover_chains: Arc::new(Mutex::new(HashMap::new())),
+            quota_failover_replays: Arc::new(Mutex::new(HashSet::new())),
+            provider_return_announcements: Arc::new(Mutex::new(HashSet::new())),
             pending_truncation_redrive: Arc::new(Mutex::new(HashSet::new())),
             test_busy: Arc::new(Mutex::new(HashSet::new())),
             deferred_attention: Arc::new(Mutex::new(HashMap::new())),
@@ -19051,6 +19067,13 @@ impl WorkspaceApi for Services {
         profile_id: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(self.provider_profiles_delete_impl(profile_id))
+    }
+
+    fn provider_profiles_reorder(
+        &self,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.provider_profiles_reorder_impl(params))
     }
 
     fn provider_profiles_auth_status(
