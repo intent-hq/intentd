@@ -1,0 +1,15 @@
+# Bazel settings for the intentd workspace. See bazel/README.md.
+
+common --enable_bzlmod
+common --lockfile_mode=update
+
+# Embed the build commit (bazel/workspace_status.sh) the way Cargo's
+# intent-transport build script does.
+build --workspace_status_command=bazel/workspace_status.sh
+build --stamp
+
+# Keep host environment out of action keys.
+build --incompatible_strict_action_env
+
+# Local overrides (cache paths, jobs) stay out of the repo.
+try-import %workspace%/user.bazelrc

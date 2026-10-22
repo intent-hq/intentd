@@ -4,3 +4,5 @@ lcov.info
 coverage-summary.txt
 /packaging/libexec/tailcat
 /packaging/libexec/tailcat.exe
+/bazel-*
+/user.bazelrc

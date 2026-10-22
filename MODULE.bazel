@@ -1,0 +1,22 @@
+"""Bazel build for intentd, maintained alongside Cargo.
+
+Cargo stays the source of truth: third-party crates come from Cargo.toml and
+Cargo.lock through crate_universe, and the Rust toolchain version comes from
+rust-toolchain.toml. The parts derived from those files live in
+bazel/generated.MODULE.bazel, which scripts/bazel-gen.py writes; see
+bazel/README.md for the workflow.
+"""
+
+module(name = "intentd")
+
+bazel_dep(name = "rules_rust", version = "0.74.0")
+bazel_dep(name = "bazel_skylib", version = "1.9.2")
+bazel_dep(name = "platforms", version = "1.1.0")
+bazel_dep(name = "rules_cc", version = "0.2.26")
+
+# Toolchain pin and crate_universe manifests, generated from Cargo metadata and
+# rust-toolchain.toml (`python3 scripts/bazel-gen.py`).
+include("//bazel:generated.MODULE.bazel")
+
+# Hand-maintained crate_universe annotations for third-party crates.
+include("//bazel:crates.MODULE.bazel")
