@@ -32785,17 +32785,21 @@ impl WorkspaceApi for Services {
             &request,
         );
         self.execution_call(async move {
-            match captured?
-                .read(self)
-                .await
-                .map_err(|_| repository_read_source::refused())?
-            {
+            let refused = |refusal| {
+                repository_read_source::refused_at(
+                    "pr.snapshot",
+                    &workspace_id,
+                    request.pr_number,
+                    refusal,
+                )
+            };
+            match captured?.read_staged(self).await.map_err(refused)? {
                 repository_read_source::ReadOutcome::Unsupported => Err(Error::Unsupported(
                     "Addressed review monitoring unavailable".into(),
                 )),
                 repository_read_source::ReadOutcome::Github(repo) => {
                     self.pr_state(
-                        workspace_id,
+                        workspace_id.clone(),
                         request.pr_number,
                         Some(format!("{}/{}", repo.owner, repo.name)),
                     )
@@ -32806,7 +32810,13 @@ impl WorkspaceApi for Services {
                         pr_monitor::qualified_cache::CacheError::Provider(error) => {
                             pr_ops::map_sc_err(error)
                         }
-                        _ => repository_read_source::refused(),
+                        cause => repository_read_source::refused_with(
+                            "pr.snapshot",
+                            &workspace_id,
+                            request.pr_number,
+                            repository_read_source::RefusalStage::CacheRead,
+                            &cause,
+                        ),
                     })?;
                     pr_ops::qualified_review_snapshot(&target, &read.value)
                 }
@@ -32836,11 +32846,25 @@ impl WorkspaceApi for Services {
                     intent_sourcecontrol::RepoRef::new(owner, repo)
                 }
                 None => match captured
-                    .ok_or_else(repository_read_source::refused)?
-                    .read(self)
+                    .ok_or_else(|| {
+                        repository_read_source::refused_with(
+                            "pr.snapshot",
+                            &workspace_id,
+                            pr_number,
+                            repository_read_source::RefusalStage::Capture,
+                            repository_read_source::RefusalReason::Detail("MissingCapture"),
+                        )
+                    })?
+                    .read_staged(self)
                     .await
-                    .map_err(|_| repository_read_source::refused())?
-                {
+                    .map_err(|refusal| {
+                        repository_read_source::refused_at(
+                            "pr.snapshot",
+                            &workspace_id,
+                            pr_number,
+                            refusal,
+                        )
+                    })? {
                     repository_read_source::ReadOutcome::Unsupported => {
                         return Err(Error::Unsupported(
                             "Addressed review monitoring unavailable".into(),
@@ -32852,7 +32876,13 @@ impl WorkspaceApi for Services {
                             pr_monitor::qualified_cache::CacheError::Provider(error) => {
                                 pr_ops::map_sc_err(error)
                             }
-                            _ => repository_read_source::refused(),
+                            cause => repository_read_source::refused_with(
+                                "pr.snapshot",
+                                &workspace_id,
+                                pr_number,
+                                repository_read_source::RefusalStage::CacheRead,
+                                &cause,
+                            ),
                         })?;
                         return pr_ops::qualified_review_snapshot(&target, &read.value);
                     }
