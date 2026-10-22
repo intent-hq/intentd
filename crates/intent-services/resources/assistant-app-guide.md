@@ -654,7 +654,8 @@ Hover over an icon for its section name; scroll the row horizontally when space
 is tight. **Agents** opens by default; your selected section is remembered.
 When collapsed, the sidebar leaves a slim vertical icon rail. Hover over or focus
 a section tab to reveal just its content panel beside it, aligned with the tab
-when space allows. Moving the pointer between tabs smoothly switches the preview
+when space allows. The panel fits its contents; longer sections scroll within the
+available space. Moving the pointer between tabs smoothly switches the preview
 without changing your remembered section; click a tab to keep that selection. The rail's
 sidebar toggle pins it open; the expanded sidebar's toggle collapses it.
 **Toggle Sidebar** still uses
