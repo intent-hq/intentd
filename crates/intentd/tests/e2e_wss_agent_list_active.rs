@@ -191,6 +191,7 @@ async fn seed_workspace(data_dir: &Path) -> String {
         context_links: None,
         archived: false,
         archived_at: None,
+        retired_at: None,
         task_stats: None,
         agent_summary: None,
         diff_summary: None,

@@ -1,0 +1,281 @@
+//! `workspace.retire` (PROTOCOL §5.1): the Retired lifecycle state.
+//!
+//! Retiring deletes a workspace's checkout folder on disk to free space while
+//! keeping every DB row (agents, conversations, notes, assets, tasks), so the
+//! workspace stays viewable read-only. The flow reuses the two existing
+//! teardown halves:
+//!
+//! - the `workspace.archive` active-work teardown (interrupt turns, cancel
+//!   hooks / PR monitors / script monitors, detach guests) — run first when
+//!   the workspace is still Active;
+//! - the `workspace.delete` filesystem removal (worktree registration prune,
+//!   rename to a trash path, parallel recursive removal) — minus the branch
+//!   delete (the git branch is kept) and minus every row delete.
+//!
+//! Disk-backed mutations on a retired workspace are refused with
+//! [`Error::WorkspaceRetired`] ([`Services::refuse_if_retired`]).
+
+use std::path::PathBuf;
+
+use intent_core::{AgentId, Error, Result, Workspace, WorkspaceId, WorkspaceStatus};
+
+use crate::{
+    cleanup_detached_worktree, cleanup_workspace_worktree_locked, default_workspaces_root, git_ops,
+    now_iso, publish_event, workspace_dir_candidates, workspace_updated_event, Services,
+};
+
+impl Services {
+    /// Refuse a call that needs the workspace's folder on disk when the
+    /// workspace is retired: `Err(Error::WorkspaceRetired)`. Any other
+    /// state — and a missing workspace or read failure, which the caller's
+    /// own lookup reports with its usual error — passes.
+    pub(crate) async fn refuse_if_retired(&self, workspace_id: &WorkspaceId) -> Result<()> {
+        if workspace_id.is_chief() {
+            return Ok(());
+        }
+        match self.store.get_workspace(workspace_id).await {
+            Ok(ws) if ws.is_retired() => Err(retired_error(workspace_id)),
+            _ => Ok(()),
+        }
+    }
+
+    /// `workspace.retire` body (see [`intent_core::WorkspaceApi::retire_workspace`]).
+    pub(crate) async fn retire_workspace_op(
+        &self,
+        id: WorkspaceId,
+        caller_agent_id: Option<AgentId>,
+    ) -> Result<Workspace> {
+        self.require_workspace_manager(&id, "workspace.retire")
+            .await?;
+        if id.is_chief() {
+            return Err(Error::InvalidParams(
+                "cannot retire the chief workspace".to_string(),
+            ));
+        }
+        let current = self.store.get_workspace(&id).await?;
+        if !current.is_retired() {
+            retire_supported(&current)?;
+            // A workspace inside its delete grace window is on its way out:
+            // retiring it would race the committed delete.
+            if self
+                .pending_workspace_deletes
+                .deadline(&crate::delete_grace::PendingDeleteSubject::Workspace(
+                    id.clone(),
+                ))?
+                .is_some()
+            {
+                return Err(Error::InvalidParams(format!(
+                    "workspace {id} has a pending delete; cancel it before retiring"
+                )));
+            }
+        }
+        if current.is_retired() {
+            // Idempotent: the folder is already gone.
+            let mut ws = current;
+            ws.activity = self.workspace_activity(&ws.id);
+            self.attach_workspace_membership(&mut ws).await;
+            return Ok(ws);
+        }
+        // Active → run the full archive teardown first (interrupt turns,
+        // cancel hooks / PR monitors / script monitors, detach guests) and
+        // its `workspace:updated` archived delta. An already-archived
+        // workspace went through it when it was archived.
+        if !current.archived {
+            intent_core::WorkspaceApi::archive_workspace(self, id.clone(), caller_agent_id.clone())
+                .await?;
+        }
+        // Stop every running script and refuse new launches until the folder
+        // is gone, so nothing writes into the checkout being removed. After
+        // the flip below, `script.start` is refused by the retired guard.
+        let _scripts_closed = self.script_manager().close_workspace(&id).await;
+        let retired_at = now_iso();
+        let ws = {
+            // Same fence as archive ↔ unarchive: the flip and its delta are
+            // ordered against a concurrent unarchive.
+            let _fence = self.archive_fence.acquire(&id).await;
+            let flipped = self
+                .store
+                .retire_workspace_if_archived(&id, &retired_at)
+                .await?;
+            let ws = self.store.get_workspace(&id).await?;
+            if !flipped && !ws.is_retired() {
+                // A concurrent unarchive won the race: the workspace is live
+                // again, so its folder must not be deleted.
+                return Err(Error::InvalidInput(format!(
+                    "workspace {id} was unarchived while it was being retired"
+                )));
+            }
+            if flipped {
+                publish_event(
+                    self.event_bus.as_ref(),
+                    workspace_updated_event(
+                        &id,
+                        &serde_json::json!({
+                            "status": WorkspaceStatus::Retired,
+                            "retiredAt": ws.retired_at,
+                            "archived": true,
+                            "archivedAt": ws.archived_at,
+                        }),
+                    ),
+                )
+                .await;
+            }
+            ws
+        };
+        // Stop the agents' provider processes (rows, transcripts and queues
+        // are kept — `agent.stop` semantics): their working directory is
+        // about to disappear. The initiating agent is excluded for the same
+        // reason as the archive interrupt sweep: it is blocked on this call.
+        if let Some(manager) = self.agent_manager() {
+            let sessions = self.store.list_agent_session_summaries(&id).await?;
+            let ids: Vec<AgentId> = sessions
+                .into_iter()
+                .map(|s| s.id)
+                .filter(|a| Some(a) != caller_agent_id.as_ref())
+                .collect();
+            if !ids.is_empty() {
+                drop(manager.stop_many(&ids).await);
+            }
+        }
+        if let Some(worktree) = git_ops::worktree_path(&ws) {
+            self.git_status_cache.evict(&worktree);
+        }
+        self.remove_retired_checkout(&ws).await;
+        let mut ws = ws;
+        ws.activity = self.workspace_activity(&ws.id);
+        self.attach_workspace_membership(&mut ws).await;
+        Ok(ws)
+    }
+
+    /// Remove a retired workspace's worktree from disk: under the per-repo
+    /// worktree lock, prune the git worktree registration and rename the
+    /// checkout to a trash path (so it is gone from its path when this
+    /// returns), keeping the branch; then, on a detached task, recursively
+    /// remove the trash and sweep the daemon-owned `<parent>/<id>/`
+    /// directory (the same candidates `workspace.delete` sweeps).
+    /// Best-effort: failures are logged and the workspace stays retired.
+    async fn remove_retired_checkout(&self, ws: &Workspace) {
+        let workspaces_root = self
+            .workspaces_root
+            .clone()
+            .unwrap_or_else(default_workspaces_root);
+        let worktrees_location = self.configured_worktrees_location();
+        // [`retire_supported`] admitted only a daemon-owned git worktree
+        // (`checkoutMode` worktree, not skipIsolation / remote), so both
+        // paths are present.
+        let worktree_path = ws.worktree_path.clone().filter(|p| !p.is_empty());
+        let repo_dir = ws
+            .repository_path
+            .as_deref()
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from);
+        let mut trash: Option<PathBuf> = None;
+        if let (Some(repo_dir), Some(wt)) = (repo_dir, worktree_path.as_deref().map(PathBuf::from))
+        {
+            let branch = ws.branch.clone();
+            let repo = repo_dir.clone();
+            trash = self
+                .worktree_locks
+                .with_lock(&repo_dir, move || async move {
+                    // `branch_auto_generated = false`: the branch is kept on
+                    // retire (only a delete removes it).
+                    let task = tokio::task::spawn_blocking(move || {
+                        cleanup_workspace_worktree_locked(&repo, &wt, &branch, false)
+                    })
+                    .await;
+                    match task {
+                        Ok((trash, _)) => trash,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "workspace.retire: worktree detach task failed");
+                            None
+                        }
+                    }
+                })
+                .await;
+        }
+        let dirs = workspace_dir_candidates(
+            &ws.id,
+            worktree_path.as_deref(),
+            &workspaces_root,
+            worktrees_location.as_deref(),
+        );
+        let id = ws.id.clone();
+        let removal = async move {
+            if let Some(trash) = trash {
+                let _ =
+                    tokio::task::spawn_blocking(move || cleanup_detached_worktree(&trash)).await;
+            }
+            for dir in dirs {
+                let result = tokio::task::spawn_blocking(move || {
+                    intent_git::fs_remove::remove_dir_all_parallel(&dir)
+                })
+                .await;
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => tracing::warn!(
+                        workspace = %id.as_str(),
+                        error = %e,
+                        "workspace.retire: failed to remove workspace directory"
+                    ),
+                    Err(e) => tracing::warn!(
+                        workspace = %id.as_str(),
+                        error = %e,
+                        "workspace.retire: workspace-dir removal task failed"
+                    ),
+                }
+            }
+        };
+        if self.store_tasks.spawn_draining(removal).is_none() {
+            tracing::warn!(
+                workspace = %ws.id.as_str(),
+                "workspace.retire: daemon writer admission closed; folder sweep skipped"
+            );
+        }
+    }
+}
+
+/// Retire is only for daemon-owned git worktrees: `cow` / `direct`
+/// checkouts (the folder IS the repository — deleting it loses the branch),
+/// `skipIsolation` workspaces (the folder is the user's repository), remote
+/// workspaces and checkout-less rows are refused with
+/// [`Error::RetireUnsupported`] before anything changes.
+pub(crate) fn retire_supported(ws: &Workspace) -> Result<()> {
+    let refuse = |reason: &str, checkout_mode: Option<String>| {
+        Err(Error::RetireUnsupported {
+            workspace_id: ws.id.as_str().to_string(),
+            reason: reason.to_string(),
+            checkout_mode,
+        })
+    };
+    if ws.is_remote {
+        return refuse("remote workspaces have no local folder to delete", None);
+    }
+    match ws.checkout_mode {
+        Some(mode @ (intent_core::CheckoutMode::Cow | intent_core::CheckoutMode::Direct)) => {
+            let wire = serde_json::to_value(mode)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string));
+            return refuse(
+                "the checkout folder is the repository itself, so deleting it would lose the branch",
+                wire,
+            );
+        }
+        Some(intent_core::CheckoutMode::Worktree) | None => {}
+    }
+    if ws.skip_worktree {
+        return refuse("the workspace folder is the user's own repository", None);
+    }
+    if ws.worktree_path.as_deref().is_none_or(str::is_empty)
+        || ws.repository_path.as_deref().is_none_or(str::is_empty)
+    {
+        return refuse("the workspace has no git worktree checkout", None);
+    }
+    Ok(())
+}
+
+/// The [`Error::WorkspaceRetired`] refusal for `workspace_id`.
+pub(crate) fn retired_error(workspace_id: &WorkspaceId) -> Error {
+    Error::WorkspaceRetired {
+        workspace_id: workspace_id.as_str().to_string(),
+    }
+}

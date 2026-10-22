@@ -821,6 +821,7 @@ pub const EVENT_DISCRIMINATORS: &[EventDiscriminator] = &[
             "repositoryName",
             "repositoryOwner",
             "repositoryPath",
+            "retiredAt",
             "scope",
             "setupScript",
             "skipIsolation",

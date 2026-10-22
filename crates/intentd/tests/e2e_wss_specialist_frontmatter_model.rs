@@ -363,7 +363,11 @@ async fn specialist_provider_and_frontmatter_model_resolved_over_wss() {
         .await
         .expect("read store");
     let sessions_before = store.list_all_agent_sessions().await.unwrap().len();
-    let workspaces_before = store.list_workspaces(true).await.unwrap().len();
+    let workspaces_before = store
+        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await
+        .unwrap()
+        .len();
     let notes_before = store.list_all_notes().await.unwrap().len();
     let query = intent_store::EventQuery {
         event_types: vec!["agent:created".into(), "workspace:created".into()],
@@ -404,7 +408,11 @@ async fn specialist_provider_and_frontmatter_model_resolved_over_wss() {
         sessions_before
     );
     assert_eq!(
-        store.list_workspaces(true).await.unwrap().len(),
+        store
+            .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .unwrap()
+            .len(),
         workspaces_before
     );
     assert_eq!(store.list_all_notes().await.unwrap().len(), notes_before);
@@ -1297,6 +1305,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         context_links: None,
         archived: false,
         archived_at: None,
+        retired_at: None,
         task_stats: None,
         agent_summary: None,
         diff_summary: None,

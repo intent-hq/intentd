@@ -766,7 +766,12 @@ async fn moved_branch_create_controls(
     assert_ne!(moved, selected);
     git(&bare, &["update-ref", reference, &moved, selected]);
 
-    let before = h.store.list_workspaces(true).await.unwrap().len();
+    let before = h
+        .store
+        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await
+        .unwrap()
+        .len();
     let mut direct = selection.clone();
     direct["mode"] = json!("direct");
     let refused = client
@@ -780,11 +785,16 @@ async fn moved_branch_create_controls(
         json!({"jsonrpc":"2.0","id":client.id,"error":{"code":-32003,"message":"Forbidden","data":{"code":"forbidden","detail":"Repository checkout unavailable"}}}),
         "assert the final protected wire envelope, not the upstream native error"
     );
-    let after_refusal = h.store.list_workspaces(true).await.unwrap().len();
+    let after_refusal = h
+        .store
+        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await
+        .unwrap()
+        .len();
     assert_eq!(after_refusal, before);
     let published_before = h
         .store
-        .list_workspaces(true)
+        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
         .await
         .unwrap()
         .into_iter()
@@ -818,7 +828,12 @@ async fn moved_branch_create_controls(
         .unwrap()
         .len();
     assert_eq!(requests_after, requests_before);
-    let after_cached = h.store.list_workspaces(true).await.unwrap().len();
+    let after_cached = h
+        .store
+        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await
+        .unwrap()
+        .len();
     assert_eq!(after_cached, before + 1);
     assert_eq!(git(&bare, &["rev-parse", reference]), moved);
     eprintln!(
@@ -928,7 +943,12 @@ async fn late_completion_controls(
     let denied = client.rpc("sourceControl.checkout.branches", q).await;
     assert_eq!(success(&denied)["status"], "unavailable");
     assert!(success(&denied).get("value").is_none());
-    let before = h.store.list_workspaces(true).await.unwrap().len();
+    let before = h
+        .store
+        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await
+        .unwrap()
+        .len();
     let mut forbidden_selection = project_query(&replacement);
     forbidden_selection["branch"] = json!("late/cache-update");
     forbidden_selection["commitSha"] = json!(late_sha);
@@ -940,7 +960,14 @@ async fn late_completion_controls(
         )
         .await;
     assert!(denied.get("error").is_some());
-    assert_eq!(h.store.list_workspaces(true).await.unwrap().len(), before);
+    assert_eq!(
+        h.store
+            .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .unwrap()
+            .len(),
+        before
+    );
     std::fs::write(root.join("upload-release"), []).unwrap();
     let result = tokio::time::timeout(ACQUIRE, warm).await.unwrap().unwrap();
     assert!(result.get("error").is_some() || result["result"]["status"] == "unavailable");

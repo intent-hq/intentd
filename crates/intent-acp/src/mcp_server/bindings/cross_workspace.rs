@@ -17,7 +17,7 @@ use super::{map_err, req_str};
 pub(crate) const PRELUDE: &str = r"
     globalThis.ws = globalThis.ws || {};
     ws.crossWorkspace = {
-        listSiblings: () => host({ method: 'crossWorkspace.listSiblings', args: {} }),
+        listSiblings: (options) => host({ method: 'crossWorkspace.listSiblings', args: options || {} }),
         readNote: (targetWorkspaceId, noteId) =>
             host({ method: 'crossWorkspace.readNote', args: { targetWorkspaceId, noteId } }),
         listNotes: (targetWorkspaceId) =>
@@ -32,15 +32,24 @@ pub(crate) async fn dispatch(
     args: &Value,
 ) -> Result<Value, String> {
     match method {
-        "listSiblings" => list_siblings(api, ws).await,
+        "listSiblings" => list_siblings(api, ws, args).await,
         "readNote" => read_note(api, ws, args).await,
         "listNotes" => list_notes(api, ws, args).await,
         other => Err(format!("host: unknown method `crossWorkspace.{other}`")),
     }
 }
 
-async fn list_siblings(api: &Arc<dyn WorkspaceApi>, ws: &WorkspaceId) -> Result<Value, String> {
-    api.cross_workspace_list_siblings(ws.clone())
+/// Retired siblings are opt-in: `ws.crossWorkspace.listSiblings({ includeRetired: true })`.
+async fn list_siblings(
+    api: &Arc<dyn WorkspaceApi>,
+    ws: &WorkspaceId,
+    args: &Value,
+) -> Result<Value, String> {
+    let include_retired = args
+        .get("includeRetired")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    api.cross_workspace_list_siblings(ws.clone(), include_retired)
         .await
         .map_err(map_err)
 }

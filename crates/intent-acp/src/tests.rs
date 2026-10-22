@@ -6839,6 +6839,7 @@ mod _dead_workspace_metadata_tool_tests {
                 pull_requests: None,
                 archived: false,
                 archived_at: None,
+                retired_at: None,
                 task_stats: None,
                 agent_summary: None,
                 diff_summary: None,
@@ -7138,6 +7139,7 @@ mod workspace_api_tool_tests {
                 context_links: None,
                 archived: false,
                 archived_at: None,
+                retired_at: None,
                 task_stats: None,
                 agent_summary: None,
                 diff_summary: None,
@@ -10044,7 +10046,11 @@ mod wsapi6_bindings_tests {
             })
         }
 
-        fn cross_workspace_list_siblings(&self, _ws: WorkspaceId) -> BoxFuture<'_, Result<Value>> {
+        fn cross_workspace_list_siblings(
+            &self,
+            _ws: WorkspaceId,
+            _include_retired: bool,
+        ) -> BoxFuture<'_, Result<Value>> {
             *self.cross_list_siblings_calls.lock().unwrap() += 1;
             Box::pin(async {
                 Ok(json!([
@@ -13830,6 +13836,7 @@ mod workspace_api_output_limit_tests {
                     context_links: None,
                     archived: false,
                     archived_at: None,
+                    retired_at: None,
                     task_stats: None,
                     agent_summary: None,
                     diff_summary: None,
@@ -14158,6 +14165,7 @@ mod workspace_apply_proposal_tests {
             context_links: None,
             archived: false,
             archived_at: None,
+            retired_at: None,
             task_stats: None,
             agent_summary: None,
             diff_summary: None,

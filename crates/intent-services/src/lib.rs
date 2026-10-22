@@ -59,6 +59,7 @@ mod agent_ops;
 mod agent_session;
 mod agent_subscriptions;
 mod agent_workers;
+mod retire;
 /// The §5.5b wire-ID rule, shared by the transport's request validation.
 pub use intent_acp::workers::is_wire_id;
 pub mod antigravity;
@@ -3769,7 +3770,11 @@ impl Services {
     /// candidate read and every git/filesystem probe stay off startup and RPC
     /// critical paths.
     pub async fn prewarm_repository_metadata(&self) {
-        match self.store.list_workspaces(false).await {
+        match self
+            .store
+            .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+            .await
+        {
             Ok(workspaces) => self.spawn_repository_owner_backfill(&workspaces),
             Err(error) => tracing::warn!(
                 %error,
@@ -6391,7 +6396,11 @@ impl Services {
     }
 
     async fn refresh_all_workspace_prs_owned(&self, tick: u64) {
-        let workspaces = match self.store.list_workspaces(false).await {
+        let workspaces = match self
+            .store
+            .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+            .await
+        {
             Ok(list) => list,
             Err(e) => {
                 tracing::warn!(error = %e, "pr refresh: listing workspaces failed");
@@ -6845,7 +6854,11 @@ impl Services {
     /// sweep never monopolizes `SQLite` pool slots (intent-hq/monorepo#703).
     /// Errors are logged per workspace and never abort the sweep.
     async fn scan_all_token_usage(&self) {
-        let workspaces = match self.store.list_workspaces(false).await {
+        let workspaces = match self
+            .store
+            .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+            .await
+        {
             Ok(list) => list,
             Err(e) => {
                 tracing::warn!(error = %e, "token usage scan: listing workspaces failed");
@@ -13863,7 +13876,9 @@ mod orphan_trash_sweep_tests {
 /// (intent-hq/monorepo#2227). Best-effort: callers ignore the result so a
 /// sync failure never blocks/fails the `repo.list` response.
 async fn sync_repos_from_workspaces(store: &Store, workspaces_roots: &[PathBuf]) -> Result<()> {
-    let workspaces = store.list_workspaces(true).await?;
+    let workspaces = store
+        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await?;
     for ws in &workspaces {
         let Some(repo_path) = ws.repository_path.as_deref() else {
             continue;
@@ -15776,7 +15791,10 @@ pub(crate) fn publish_event_transient(bus: Option<&EventBus>, event: &NewEvent) 
 /// an archived workspace's worktree still resolves.
 async fn find_workspace_by_worktree_path(store: &Store, repo_path: &str) -> Option<Workspace> {
     let canon_target = std::fs::canonicalize(repo_path).ok()?;
-    let workspaces = store.list_workspaces(true).await.ok()?;
+    let workspaces = store
+        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await
+        .ok()?;
     workspaces.into_iter().find(|ws| {
         ws.worktree_path
             .as_deref()
@@ -20048,6 +20066,7 @@ impl WorkspaceApi for Services {
             // Management admission also permits deletion retries for missing
             // workspaces; a member must not spawn an unmanageable terminal there.
             self.require_member(&workspace_id).await?;
+            self.refuse_if_retired(&workspace_id).await?;
             terminal_ops::create_owned(
                 &self.terminal_tasks,
                 pty,
@@ -20205,6 +20224,7 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             let _mutation = self.workspace_mutations.enter(&workspace_id)?;
             self.require_member(&workspace_id).await?;
+            self.refuse_if_retired(&workspace_id).await?;
             let root =
                 file_ops::resolve_root(&store, &workspace_id, caller_agent_id.as_ref()).await;
             let result = file_ops::write(&root, &path, &content)?;
@@ -20256,6 +20276,7 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             let _mutation = self.workspace_mutations.enter(&workspace_id)?;
             self.require_member(&workspace_id).await?;
+            self.refuse_if_retired(&workspace_id).await?;
             let root =
                 file_ops::resolve_root(&store, &workspace_id, caller_agent_id.as_ref()).await;
             let result = file_ops::delete(&root, &path)?;
@@ -20278,6 +20299,7 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
+            self.refuse_if_retired(&workspace_id).await?;
             let root =
                 file_ops::resolve_root(&store, &workspace_id, caller_agent_id.as_ref()).await;
             file_ops::mkdir(&root, &path)
@@ -20295,6 +20317,7 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             let _mutation = self.workspace_mutations.enter(&workspace_id)?;
             self.require_member(&workspace_id).await?;
+            self.refuse_if_retired(&workspace_id).await?;
             let root =
                 file_ops::resolve_root(&store, &workspace_id, caller_agent_id.as_ref()).await;
             let result = file_ops::rename(&root, &old_path, &new_path)?;
@@ -20423,6 +20446,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
+            self.refuse_if_retired(&workspace_id).await?;
             let idempotency_key = attachment_upload::validate_idempotency_key(idempotency_key)?;
             let decoded;
             let source = match (&data, &source_path) {
@@ -20505,6 +20529,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
+            self.refuse_if_retired(&workspace_id).await?;
             self.file_attachment_upload_begin_op(
                 workspace_id,
                 file_name,
@@ -20784,6 +20809,7 @@ impl WorkspaceApi for Services {
     fn cross_workspace_list_siblings(
         &self,
         workspace_id: WorkspaceId,
+        include_retired: bool,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
@@ -20800,7 +20826,9 @@ impl WorkspaceApi for Services {
                     "Current workspace is not associated with a repository".to_string(),
                 ));
             }
-            let mut all = store.list_workspaces(true).await?;
+            let mut all = store
+                .list_workspaces(intent_core::WorkspaceListFilter::new(true, include_retired))
+                .await?;
             self.retain_member_workspaces(&mut all).await?;
             let siblings: Vec<serde_json::Value> = all
                 .into_iter()
@@ -21100,6 +21128,7 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             self.require_workspace_manager(&workspace_id, "script.start")
                 .await?;
+            self.refuse_if_retired(&workspace_id).await?;
             mgr.start(&workspace_id, &script_id).await
         })
     }
@@ -21126,6 +21155,7 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             self.require_workspace_manager(&workspace_id, "script.restart")
                 .await?;
+            self.refuse_if_retired(&workspace_id).await?;
             mgr.restart(&workspace_id, &script_id).await
         })
     }
@@ -21179,16 +21209,23 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             self.require_workspace_manager(&workspace_id, "script.run")
                 .await?;
+            self.refuse_if_retired(&workspace_id).await?;
             mgr.run(&workspace_id, &script_id, max_lines, timeout_seconds)
                 .await
         })
     }
 
-    fn list_workspaces(&self, include_archived: bool) -> BoxFuture<'_, Result<Vec<Workspace>>> {
+    fn list_workspaces(
+        &self,
+        filter: intent_core::WorkspaceListFilter,
+    ) -> BoxFuture<'_, Result<Vec<Workspace>>> {
         let store = self.store.clone();
         let this = self.clone();
+        // Retired rows stay `archived = 1`, so the archived-scoped aggregate
+        // reads below must cover them whenever the list includes them.
+        let include_archived = filter.include_archived || filter.include_retired;
         Box::pin(async move {
-            let mut list = store.list_workspaces(include_archived).await?;
+            let mut list = store.list_workspaces(filter).await?;
             // Membership filter (multiplayer w3) before any enrichment, so a
             // collaborator's rows never cost more than what it can see.
             this.retain_member_workspaces(&mut list).await?;
@@ -21239,10 +21276,11 @@ impl WorkspaceApi for Services {
 
     fn list_workspaces_lite(
         &self,
-        include_archived: bool,
+        filter: intent_core::WorkspaceListFilter,
     ) -> BoxFuture<'_, Result<Vec<Workspace>>> {
         let store = self.store.clone();
         let this = self.clone();
+        let include_archived = filter.include_archived || filter.include_retired;
         Box::pin(async move {
             // Store rows + live activity + cheap status aggregates only. No
             // notes/sessions enrichment so workspace.subscribe seq-0 stays
@@ -21253,7 +21291,7 @@ impl WorkspaceApi for Services {
             // `taskStats` (counting query, no note-body hydration),
             // `displayStatus` (same derivation as the enriched path), and
             // `cowSupported` (lifetime-cached probe, effectively free).
-            let mut list = store.list_workspaces(include_archived).await?;
+            let mut list = store.list_workspaces(filter).await?;
             this.retain_member_workspaces(&mut list).await?;
             let workspace_ids: Vec<_> = list.iter().map(|ws| ws.id.clone()).collect();
             let snapshot = this
@@ -21282,12 +21320,16 @@ impl WorkspaceApi for Services {
     fn find_workspaces_by_pull_request(
         &self,
         url: String,
+        include_retired: bool,
     ) -> BoxFuture<'_, Result<Vec<intent_core::PullRequestWorkspace>>> {
         let this = self.clone();
         Box::pin(async move {
             let key = intent_core::pull_request_key(&url)
                 .ok_or_else(|| Error::InvalidParams("url is not a pull-request URL".to_string()))?;
-            let mut rows = this.store.list_pull_request_workspaces(&key).await?;
+            let mut rows = this
+                .store
+                .list_pull_request_workspaces(&key, include_retired)
+                .await?;
             // Same membership narrowing as `workspace.list` (§5.48).
             if let Some(visible) = this.visible_workspace_ids().await? {
                 rows.retain(|row| visible.contains(&row.id));
@@ -22505,6 +22547,7 @@ impl WorkspaceApi for Services {
                         context_links: input.context_links.filter(|l| !l.is_empty()),
                         archived: false,
                         archived_at: None,
+                        retired_at: None,
                         // Card aggregates are computed on the list/get emit path only.
                         task_stats: None,
                         agent_summary: None,
@@ -24163,6 +24206,11 @@ impl WorkspaceApi for Services {
                 return Ok(chief_workspace());
             }
             let mut ws = store.get_workspace(&id).await?;
+            // A retired workspace is already past archived; re-archiving
+            // would flip its status back to Archived without a folder.
+            if ws.is_retired() {
+                return Err(retire::retired_error(&id));
+            }
             // Archive ↔ unarchive fence (see `ArchiveFence`): held from
             // before the commit until the detached guests' queued messages
             // are dropped and their removal deltas are out (the guard moves
@@ -24373,6 +24421,26 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn retired_workspace_for(
+        &self,
+        workspace_id: Option<WorkspaceId>,
+        agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<Option<WorkspaceId>>> {
+        Box::pin(async move {
+            self.store
+                .retired_workspace_for(workspace_id.as_ref(), agent_id.as_ref())
+                .await
+        })
+    }
+
+    fn retire_workspace(
+        &self,
+        id: WorkspaceId,
+        caller_agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<Workspace>> {
+        Box::pin(self.retire_workspace_op(id, caller_agent_id))
+    }
+
     fn unarchive_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
         let this = self.clone();
         // Manual unarchive (`workspace.unarchive` / `workspace.restore`):
@@ -24503,6 +24571,7 @@ impl WorkspaceApi for Services {
                 context_links: None,
                 archived: false,
                 archived_at: None,
+                retired_at: None,
                 task_stats: None,
                 agent_summary: None,
                 diff_summary: None,
@@ -29152,6 +29221,7 @@ impl WorkspaceApi for Services {
         let status_cache = self.git_status_invalidator();
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
+            self.refuse_if_retired(&workspace_id).await?;
             // Reject `.`/`*`/`--all` and parse first (TS `ws.git.stage` order).
             let path_list = git_ops::parse_stage_paths(&paths)?;
             // All stage failures surface as `-32603` (TS wraps the whole path in
@@ -29180,6 +29250,7 @@ impl WorkspaceApi for Services {
         let status_cache = self.git_status_invalidator();
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
+            self.refuse_if_retired(&workspace_id).await?;
             // Same `.`/`*`/`--all` rejection + CSV/array parse as `git.stage`.
             let path_list = git_ops::parse_stage_paths(&paths)?;
             // Mirror `git.stage`: every failure surfaces as `-32603`, so a
@@ -29207,6 +29278,7 @@ impl WorkspaceApi for Services {
         let status_cache = self.git_status_invalidator();
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
+            self.refuse_if_retired(&workspace_id).await?;
             // Discard-specific parser: `.`/`*`/`--all` rejected in BOTH the
             // top-level string and every array element (closes the array-form
             // bypass that would otherwise let `["*"]` / `["--all"]` devolve
@@ -29245,6 +29317,7 @@ impl WorkspaceApi for Services {
         let status_cache = self.git_status_invalidator();
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
+            self.refuse_if_retired(&workspace_id).await?;
             // Wire policy mirrors `git.stage`: every failure surfaces as
             // `-32603`. A missing workspace/worktree stays `Internal`.
             let ws = store
@@ -29288,6 +29361,7 @@ impl WorkspaceApi for Services {
         let status_cache = self.git_status_invalidator();
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
+            self.refuse_if_retired(&workspace_id).await?;
             let ws = store
                 .get_workspace(&workspace_id)
                 .await
@@ -29330,6 +29404,7 @@ impl WorkspaceApi for Services {
         let status_cache = self.git_status_invalidator();
         self.execution_call(async move {
             self.require_member(&workspace_id).await?;
+            self.refuse_if_retired(&workspace_id).await?;
             let ws = store
                 .get_workspace(&workspace_id)
                 .await
@@ -29419,6 +29494,7 @@ impl WorkspaceApi for Services {
         let status_cache = self.git_status_invalidator();
         self.execution_call(async move {
             self.require_member(&workspace_id).await?;
+            self.refuse_if_retired(&workspace_id).await?;
             let ws = store
                 .get_workspace(&workspace_id)
                 .await
@@ -29485,6 +29561,7 @@ impl WorkspaceApi for Services {
         let status_cache = self.git_status_invalidator();
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
+            self.refuse_if_retired(&workspace_id).await?;
             if branch_name.trim().is_empty() {
                 return Err(Error::InvalidParams("branchName is required".to_string()));
             }
@@ -29533,6 +29610,7 @@ impl WorkspaceApi for Services {
         let status_cache = self.git_status_invalidator();
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
+            self.refuse_if_retired(&workspace_id).await?;
             if branch_name.trim().is_empty() {
                 return Err(Error::InvalidParams("branchName is required".to_string()));
             }
@@ -29577,6 +29655,7 @@ impl WorkspaceApi for Services {
         let status_cache = self.git_status_invalidator();
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
+            self.refuse_if_retired(&workspace_id).await?;
             if old_branch_name.trim().is_empty() {
                 return Err(Error::InvalidParams(
                     "oldBranchName cannot be empty".to_string(),
@@ -29640,6 +29719,7 @@ impl WorkspaceApi for Services {
         let locks = self.worktree_locks.clone();
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
+            self.refuse_if_retired(&workspace_id).await?;
             // Unknown workspace → surface as `-32603`; a bare `NotFound` here
             // would be misleading given the FE's `Result` shape.
             let ws = store
@@ -30045,6 +30125,7 @@ impl WorkspaceApi for Services {
         let this = self.clone();
         let tasks = self.store_tasks.clone();
         Box::pin(async move {
+            self.refuse_if_retired(&workspace_id).await?;
             let caller = intent_core::current_caller();
             let wire = intent_core::caller::current_wire_credential();
             if let Some(agent) = agent_id.as_ref() {
@@ -35415,6 +35496,7 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
+            self.refuse_if_retired(&workspace_id).await?;
             let path_list = file_tracking_ops::parse_paths(&paths)?;
             let ws = store
                 .get_workspace(&workspace_id)
@@ -35444,6 +35526,7 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
+            self.refuse_if_retired(&workspace_id).await?;
             let path_list = file_tracking_ops::parse_paths(&paths)?;
             let ws = store
                 .get_workspace(&workspace_id)
@@ -36294,6 +36377,12 @@ impl Services {
                 .await?
         };
         let mut ws = store.get_workspace(&id).await?;
+        // A retired workspace is never flipped back by unarchive (the store
+        // flip skips it): its folder is gone, so report it instead of
+        // pretending the workspace is live.
+        if ws.is_retired() {
+            return Err(retire::retired_error(&id));
+        }
         // The losing racer on the auto path stops here: the winner (a
         // concurrent turn start or a manual unarchive) already kicked the
         // parked drains and emitted its delta, so re-running the tail would

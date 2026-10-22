@@ -1208,7 +1208,10 @@ mod tests {
             ),
             (
                 "workspace.list",
-                f.services.list_workspaces(true).await.map(drop),
+                f.services
+                    .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+                    .await
+                    .map(drop),
             ),
             (
                 "workspace.delete",
@@ -1459,7 +1462,10 @@ mod tests {
         let services = f.services.clone();
         let (tx, rx) = tokio::sync::oneshot::channel();
         drop(tokio::spawn(async move {
-            let outcome = services.list_workspaces(true).await.map(|w| w.len());
+            let outcome = services
+                .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+                .await
+                .map(|w| w.len());
             let _ = tx.send(format!("{outcome:?}"));
         }));
         let outcome = rx.await.expect("detached task reported");
@@ -1537,7 +1543,11 @@ mod tests {
         let f = fixture(&tmp).await;
         for role in ROLES {
             let listed: HashSet<WorkspaceId> = f
-                .run(role, f.services.list_workspaces(true))
+                .run(
+                    role,
+                    f.services
+                        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED),
+                )
                 .await
                 .expect("workspace.list")
                 .into_iter()
@@ -1592,7 +1602,7 @@ mod tests {
                 .run(
                     role,
                     f.services
-                        .find_workspaces_by_pull_request(format!("{PR}/files")),
+                        .find_workspaces_by_pull_request(format!("{PR}/files"), false),
                 )
                 .await
                 .expect("workspace.findByPullRequest")
@@ -1611,8 +1621,10 @@ mod tests {
             let bad = f
                 .run(
                     role,
-                    f.services
-                        .find_workspaces_by_pull_request("https://github.com/o/r/issues/7".into()),
+                    f.services.find_workspaces_by_pull_request(
+                        "https://github.com/o/r/issues/7".into(),
+                        false,
+                    ),
                 )
                 .await;
             assert!(

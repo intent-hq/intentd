@@ -86,9 +86,18 @@ async fn list(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, String
     let include_deleted = filter_obj
         .and_then(|f| opt_bool(f, "includeDeleted"))
         .unwrap_or(false);
+    // Retired workspaces are opt-in only (PROTOCOL §5.1): listed only with
+    // an explicit `filter.includeRetired: true`, never via a status filter
+    // alone.
+    let include_retired = filter_obj
+        .and_then(|f| opt_bool(f, "includeRetired"))
+        .unwrap_or(false);
 
     // Fetch all workspaces (include archived so we can apply status filter)
-    let workspaces = api.list_workspaces(true).await.map_err(map_err)?;
+    let workspaces = api
+        .list_workspaces(intent_core::WorkspaceListFilter::new(true, include_retired))
+        .await
+        .map_err(map_err)?;
 
     // Filter and summarize
     let mut results = Vec::new();
@@ -760,7 +769,10 @@ async fn lookup_known_repo_local_path(
     github_url: &str,
 ) -> Option<String> {
     let wanted = GitRemoteUrl::parse(github_url)?.github_repo()?;
-    let workspaces = api.list_workspaces(true).await.ok()?;
+    let workspaces = api
+        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await
+        .ok()?;
 
     let mut strict = Vec::new();
     let mut name_only = Vec::new();
@@ -982,7 +994,10 @@ async fn archive(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, Str
     assert_mutable_workspace_id(id)?;
 
     // Validate workspace exists
-    let workspaces = api.list_workspaces(true).await.map_err(map_err)?;
+    let workspaces = api
+        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await
+        .map_err(map_err)?;
     let workspace = workspaces
         .iter()
         .find(|w| w.id.as_str() == id)
@@ -1027,7 +1042,10 @@ async fn delete(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, Stri
     assert_mutable_workspace_id(id)?;
 
     // Validate workspace exists
-    let workspaces = api.list_workspaces(true).await.map_err(map_err)?;
+    let workspaces = api
+        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await
+        .map_err(map_err)?;
     let workspace = workspaces
         .iter()
         .find(|w| w.id.as_str() == id)
@@ -1084,7 +1102,10 @@ async fn bulk_archive(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value
     }
 
     // Validate all workspaces exist
-    let workspaces = api.list_workspaces(true).await.map_err(map_err)?;
+    let workspaces = api
+        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await
+        .map_err(map_err)?;
     let mut bulk_items = Vec::new();
 
     for id_val in ids {
@@ -1147,7 +1168,10 @@ async fn bulk_delete(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value,
     }
 
     // Validate all workspaces exist
-    let workspaces = api.list_workspaces(true).await.map_err(map_err)?;
+    let workspaces = api
+        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await
+        .map_err(map_err)?;
     let mut bulk_items = Vec::new();
 
     for id_val in ids {
@@ -1217,9 +1241,16 @@ mod tests {
     impl WorkspaceApi for FakeApi {
         fn list_workspaces(
             &self,
-            _include_archived: bool,
+            filter: intent_core::WorkspaceListFilter,
         ) -> BoxFuture<'_, Result<Vec<Workspace>>> {
-            let workspaces = self.workspaces.lock().unwrap().clone();
+            let workspaces: Vec<Workspace> = self
+                .workspaces
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|w| filter.admits(w))
+                .cloned()
+                .collect();
             Box::pin(async move { Ok(workspaces) })
         }
 
@@ -1300,6 +1331,7 @@ mod tests {
             context_links: None,
             archived: false,
             archived_at: None,
+            retired_at: None,
             task_stats: None,
             agent_summary: None,
             diff_summary: None,
@@ -1314,6 +1346,56 @@ mod tests {
             pending_delete_at: None,
             membership: None,
         }
+    }
+
+    /// `app.workspaces.list` (the ws.app.* MCP binding) hides retired
+    /// workspaces unless `filter.includeRetired: true` — even a
+    /// `status: "retired"` filter alone does not surface them.
+    #[tokio::test]
+    async fn list_hides_retired_unless_include_retired() {
+        let fake = Arc::new(FakeApi::default());
+        let live = make_workspace("ws-live", "Live");
+        let mut retired = make_workspace("ws-retired", "Retired");
+        retired.status = WorkspaceStatus::Retired;
+        retired.archived = true;
+        retired.retired_at = Some("2026-10-22T00:00:00Z".to_string());
+        fake.workspaces.lock().unwrap().extend([live, retired]);
+        let api: Arc<dyn WorkspaceApi> = fake;
+        let chief = WorkspaceId::chief();
+        let ids = |v: Value| -> Vec<String> {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .map(|w| w["id"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        let default = dispatch(&api, &chief, None, "list", &json!({}))
+            .await
+            .unwrap();
+        assert_eq!(ids(default), vec!["ws-live"]);
+        let by_status = dispatch(
+            &api,
+            &chief,
+            None,
+            "list",
+            &json!({ "filter": { "status": "retired" } }),
+        )
+        .await
+        .unwrap();
+        assert!(ids(by_status).is_empty());
+        let opted_in = dispatch(
+            &api,
+            &chief,
+            None,
+            "list",
+            &json!({ "filter": { "includeRetired": true } }),
+        )
+        .await
+        .unwrap();
+        let mut got = ids(opted_in);
+        got.sort();
+        assert_eq!(got, vec!["ws-live", "ws-retired"]);
     }
 
     #[tokio::test]

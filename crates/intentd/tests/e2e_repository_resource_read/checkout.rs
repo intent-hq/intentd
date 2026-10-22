@@ -150,7 +150,14 @@ async fn checkout_default_provider_self_heal_keeps_original_pages_but_gitlab_set
                     ["projectPath"],
                 PROJECT
             );
-            assert_eq!(h.store.list_workspaces(true).await.unwrap().len(), 0);
+            assert_eq!(
+                h.store
+                    .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+                    .await
+                    .unwrap()
+                    .len(),
+                0
+            );
             owner.close().await;
             client.close().await;
             h.finish().await;
@@ -281,7 +288,11 @@ async fn checkout_pagination_reaches_beyond_retained_history_without_losing_curr
 async fn checkout_preworkspace_real_owner_and_member_page_two_restore_and_cursor_isolation() {
     let h = Harness::with_workspace(false).await;
     assert_eq!(
-        h.store.list_workspaces(true).await.unwrap().len(),
+        h.store
+            .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .unwrap()
+            .len(),
         0,
         "browsing requires no workspace"
     );

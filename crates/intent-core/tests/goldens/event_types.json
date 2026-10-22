@@ -201,6 +201,7 @@
         "repositoryName",
         "repositoryOwner",
         "repositoryPath",
+        "retiredAt",
         "scope",
         "setupScript",
         "skipIsolation",

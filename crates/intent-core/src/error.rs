@@ -32,6 +32,27 @@ pub enum Error {
     #[error("not found: {0}")]
     NotFound(String),
 
+    /// The workspace is retired (§5.1 `workspace.retire`): its checkout
+    /// folder was deleted, so a call that needs disk state (file write,
+    /// script start, terminal, git ops, commit) is refused. Surfaces as
+    /// `-32602` with machine-readable
+    /// `error.data = { code: "workspace-retired", workspaceId }`.
+    #[error("workspace {workspace_id} is retired; its folder on disk was deleted")]
+    WorkspaceRetired { workspace_id: String },
+
+    /// `workspace.retire` on a workspace whose folder is not a daemon-owned
+    /// git worktree (§5.1): a `cow` / `direct` checkout (the folder IS the
+    /// repository, so deleting it loses the branch), a `skipIsolation`
+    /// workspace (the folder is the user's repository) or a remote
+    /// workspace. Nothing is changed. Surfaces as `-32602` with
+    /// `error.data = { code: "retire-unsupported", checkoutMode? }`.
+    #[error("workspace {workspace_id} cannot be retired: {reason}")]
+    RetireUnsupported {
+        workspace_id: String,
+        reason: String,
+        checkout_mode: Option<String>,
+    },
+
     /// libgit2 classified an authentication failure. Legacy wire rendering
     /// matches Internal; shared execution may attach safe recovery.
     #[error("internal error: {0}")]
@@ -556,6 +577,8 @@ impl Error {
             | Error::HostMembershipRequired
             | Error::InvalidParams(_)
             | Error::NotFound(_)
+            | Error::WorkspaceRetired { .. }
+            | Error::RetireUnsupported { .. }
             | Error::InvalidInput(_)
             | Error::BaseRefUnresolvable { .. }
             | Error::NotAFile { .. } => -32602,
