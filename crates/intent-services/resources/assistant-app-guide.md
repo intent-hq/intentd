@@ -106,7 +106,9 @@ suggest an Apple Silicon build for an Intel Mac.
 Update checks go through `updates.intentapp.dev`, which counts them (platform,
 version, channel, install source, check trigger, country; no IDs, IPs not stored)
 and redirects to the GitHub release; if it is unreachable, updates come straight
-from GitHub. The desktop app's switch is **Settings → General → Updates → Share
+from GitHub. Each check also says whether it is this install's first check of the
+UTC day, week, or month, or its first check ever, plus a coarse install-age bucket;
+only those dates are stored locally. The desktop app's switch is **Settings → General → Updates → Share
 anonymous update statistics** (on by default). For standalone intentd, set `DO_NOT_TRACK=1`,
 `INTENTD_DISABLE_TELEMETRY=1`, or `telemetry = false` in
 `<data-dir>/sitter/config.toml`.
@@ -117,7 +119,7 @@ first hour after midnight UTC) and restarts into an update once no agent turn is
 running, forcing the restart only after 24 hours. Alpha and beta still check
 hourly when idle. `intentd update` always checks immediately.
 
-<!-- Sources: packages/intentd/crates/intentd-sitter/src/{telemetry.rs,updater.rs,config.rs,supervisor.rs}; packages/cloudlands-fe/src/features/auto-update/main/auto-update.service.ts. -->
+<!-- Sources: packages/intentd/crates/intentd-sitter/src/{telemetry.rs,activity.rs,updater.rs,config.rs,supervisor.rs}; packages/cloudlands-fe/src/features/auto-update/main/auto-update.service.ts. -->
 
 ## Manage Assistant chats
 
