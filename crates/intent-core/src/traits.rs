@@ -6467,7 +6467,7 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `providers.profiles.create` (PROTOCOL §5.54): `params` carries
-    /// `baseProviderId`, `name` and optional `env`; returns
+    /// `baseProviderId`, `name` and optional `env` / `backup`; returns
     /// `{ profile, revision }` and emits `providers:profiles-changed`.
     fn provider_profiles_create(
         &self,
@@ -6481,8 +6481,8 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// `providers.profiles.update` (PROTOCOL §5.54): optional `name` and
-    /// complete `env` list; returns `{ profile, revision, activation }`.
+    /// `providers.profiles.update` (PROTOCOL §5.54): optional `name`,
+    /// `backup` and complete `env` list; returns `{ profile, revision, activation }`.
     fn provider_profiles_update(
         &self,
         profile_id: String,
@@ -6506,6 +6506,22 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::provider_profiles_delete not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `providers.profiles.reorder` (PROTOCOL §5.54): `params` carries
+    /// `baseProviderId` and `profileIds` (every saved profile of that base,
+    /// once); returns `{ profiles, revision }` and emits
+    /// `providers:profiles-changed` (`change: "reordered"`).
+    fn provider_profiles_reorder(
+        &self,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = params;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::provider_profiles_reorder not implemented".to_string(),
             ))
         })
     }

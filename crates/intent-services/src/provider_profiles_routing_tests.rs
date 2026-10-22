@@ -197,7 +197,10 @@ async fn catalog_offers_profiles_and_rename_changes_only_the_label() {
     for p in profiles {
         let mut keys: Vec<&String> = p.as_object().unwrap().keys().collect();
         keys.sort();
-        assert_eq!(keys, ["baseProviderId", "id", "name", "providerRef"]);
+        assert_eq!(
+            keys,
+            ["backup", "baseProviderId", "id", "name", "providerRef"]
+        );
     }
     let rendered = catalog.to_string();
     assert!(!rendered.contains("PROFILE_ROUTING_TOKEN"), "{rendered}");
