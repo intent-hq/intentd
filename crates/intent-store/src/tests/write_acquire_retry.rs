@@ -38,9 +38,6 @@ async fn short_acquire_store(tmp: &TempDb) -> Store {
     Store {
         task_event_baselines: Arc::default(),
         task_events_enabled: Arc::default(),
-        note_pages: Arc::default(),
-        note_index_jobs: Arc::default(),
-        note_index_owner: Arc::default(),
         _daemon_owner: None,
         write_pool: write_pool.into(),
         read_pool: crate::connect_read(&tmp.path)

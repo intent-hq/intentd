@@ -659,11 +659,6 @@ partial results remain explicit. Selecting an item attaches its qualified contex
 it does not automatically check out the MR's source branch. Availability depends
 on the current connection, repository access and supported daemon.
 
-When a supported note deletion offers **Undo**, it cancels a pending deletion during
-the displayed grace period (normally 15 seconds). It does not restore an already
-deleted note. If the result is uncertain, check the note’s current status before trying again. If the
-connected backend does not support cancellable deletion, the note is kept.
-
 In test builds that include **Back to rendered view**, use **Edit Raw Markdown**
 in a note's **…** menu to edit Markdown directly; large notes otherwise stay
 read-only. **Back to rendered view** flushes pending edits and waits for the save acknowledgement before
