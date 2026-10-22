@@ -64,10 +64,10 @@ def coverage_budget_violations(workflow):
             errors.append(f"coverage-changed: {name} must retain its {limit}m phase bound")
     combined = workflow["jobs"]["coverage-all"]
     steps = [step for step in combined["steps"] if step.get("name") == "Run combined coverage"]
-    if type(combined.get("timeout-minutes")) is not int or combined["timeout-minutes"] != 45:
-        errors.append("coverage-all must reserve 2m outside its 43m combined phase")
-    if len(steps) != 1 or type(steps[0].get("timeout-minutes")) is not int or steps[0]["timeout-minutes"] != 43:
-        errors.append("coverage-all must retain its 43m compile/test/report bound")
+    if type(combined.get("timeout-minutes")) is not int or combined["timeout-minutes"] != 70:
+        errors.append("coverage-all must reserve 2m outside its 68m combined phase")
+    if len(steps) != 1 or type(steps[0].get("timeout-minutes")) is not int or steps[0]["timeout-minutes"] != 68:
+        errors.append("coverage-all must retain its 68m compile/test/report bound")
     return errors
 
 
@@ -375,7 +375,8 @@ class CiPolicyTests(unittest.TestCase):
                 self.assertIn(f"NEXTEST_TEST_THREADS={expected} (nproc={cpus}, cap 16)", result.stdout)
 
     def test_full_coverage_budget_includes_report_generation(self):
-        self.assertEqual(self.workflow["jobs"]["coverage-all"]["timeout-minutes"], 45)
+        # 68m phase plus 2m: an 8-CPU heavy slot (xl busy) runs about twice as long as gh-linux-16x.
+        self.assertEqual(self.workflow["jobs"]["coverage-all"]["timeout-minutes"], 70)
 
     def test_coverage_profile_pool_rejects_unbounded_or_unverified_collection(self):
         self.assertEqual(profile_pool_violations(self.workflow), [])
