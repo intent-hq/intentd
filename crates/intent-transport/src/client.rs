@@ -281,15 +281,7 @@ pub(crate) async fn handle(
         };
     }
     *client_id = Some(resolved.clone());
-    let mut server = connection_server_json(is_local, version);
-    if api.supports_note_delete_grace() {
-        server["capabilities"]["noteDeleteGrace"] = json!(1);
-    }
-    if let Some(backend_id) = api.note_paging_backend_id() {
-        server["capabilities"]["notePagingRead"] = json!(1);
-        server["capabilities"]["notePagingBackendId"] = json!(backend_id);
-        server["capabilities"]["noteAnnotations"] = json!(1);
-    }
+    let server = connection_server_json(is_local, version);
     HelloOutcome {
         frame: frame(
             req.id_present,

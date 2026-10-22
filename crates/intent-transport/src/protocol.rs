@@ -747,6 +747,8 @@ use std::time::{Duration, Instant};
 // 14.1 adds owner-only startup readiness and indexing observations.
 // 15.0 removes system.importLegacy, the legacy import CLI commands and first-boot import.
 // 15.1 adds scoped repository pages and owner-bound GitLab child Git policy methods.
+// The 13.9/13.10 note paging, annotation and cancellable deletion surface was
+// later removed without a version bump: no client ever adopted it.
 pub const PROTOCOL_VERSION: &str = "15.1";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
