@@ -526,11 +526,10 @@ fn validator_rejects_corrupt_physical_inputs_despite_valid_lexical_sibling() {
 ///
 /// `Store::open` seeds each new database with a random identity: the local
 /// owner principal (id and creation time, which the seeded `__chief__`
-/// workspace, its membership and authority rows reference), the time that
-/// membership was added, and the note-page backend's database-local id and
-/// key. Copies of one template share those values; two fresh databases never
-/// do. Exactly those values are masked, wherever they appear, so every other
-/// value must still match. A new random seed fails this comparison until it
+/// workspace, its membership and authority rows reference) and the time that
+/// membership was added. Copies of one template share those values; two fresh
+/// databases never do. Exactly those values are masked, wherever they appear,
+/// so every other value must still match. A new random seed fails this comparison until it
 /// is listed here. The migration ledger's install times and durations are
 /// left out.
 async fn database_snapshot(store: &Store) -> Value {
@@ -539,7 +538,6 @@ async fn database_snapshot(store: &Store) -> Value {
     let mut identity: Vec<String> = Vec::new();
     for query in [
         "SELECT quote(id), quote(created_at), quote(updated_at) FROM principal",
-        "SELECT quote(backend_id), quote(token_key), NULL FROM note_page_backend",
         // Seeded by a separate statement, so `now` can be a millisecond later.
         "SELECT quote(added_at), NULL, NULL FROM workspace_member \
          WHERE workspace_id = '__chief__'",
