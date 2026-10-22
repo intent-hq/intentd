@@ -41,7 +41,15 @@ after explicit addressing in the workspace-wide discussion; reactions never wake
 agents. Private discussions remain human-only. Imported reaction names are historical
 snapshots, not local access.
 
-<!-- Sources: packages/intentd/crates/intent-core/src/discussion.rs; packages/intentd/crates/intent-services/src/discussion_ops.rs; packages/intentd/crates/intent-acp/src/mcp_server/bindings/discussion.rs; packages/cloudlands-fe/src/features/discussions/. -->
+An agent author's name or avatar opens that agent beside the discussion. If the
+agent is unavailable, the app reports that it cannot open the reference. Sending
+in an existing discussion preserves its message row while confirmation arrives; failed messages can be
+retried without consuming a newer draft. Discussion composers currently support
+text and references, not image pasting or file attachments. The discussion and
+agent-chat @ menus have different recipient and delivery rules. Sending a message
+with a selected agent in a workspace-wide discussion explicitly addresses that agent.
+
+<!-- Sources: packages/intentd/crates/intent-core/src/discussion.rs; packages/intentd/crates/intent-services/src/discussion_ops.rs; packages/intentd/crates/intent-acp/src/mcp_server/bindings/discussion.rs; packages/cloudlands-fe/src/features/discussions/components/{DiscussionThread,DiscussionMessageView,DiscussionMentionPicker}.svelte; packages/cloudlands-fe/src/features/discussions/discussion-reference-navigation.ts. -->
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/settings/MobileSettings.svelte; src/features/devices/{PersonalDevicesPanel.svelte,personal-devices-selectors.ts}; src/store/renderer/slices/principal/principal-selectors.ts; src/store/renderer/slices/websocket-api/sagas/websocket-api-saga.ts; messages/en.json. -->
 
