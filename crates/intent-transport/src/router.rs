@@ -93,8 +93,6 @@ fn not_found(message: impl Into<String>) -> RpcErr {
     }
 }
 
-/// Map a domain [`Error`] to its JSON-RPC representation (§9). Internal errors
-/// surface as `-32603 "Internal error"` carrying the original cause in `data`.
 /// An integral JSON number at or above `min`, accepting integral floats
 /// (`10.0`) like the reference `Number.isInteger`; anything else is `None`.
 fn json_integer_at_least(value: &Value, min: u64) -> Option<u64> {
@@ -143,6 +141,8 @@ fn parse_base_content_bytes(
     }
 }
 
+/// Map a domain [`Error`] to its JSON-RPC representation (§9). Internal errors
+/// surface as `-32603 "Internal error"` carrying the original cause in `data`.
 fn domain_to_rpc(e: Error) -> RpcErr {
     match e {
         Error::ExecutionAuthorization {
