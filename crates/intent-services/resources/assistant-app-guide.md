@@ -652,6 +652,11 @@ Use its **Add context** action to create a note. In layouts showing the Notes-pa
 button, its visible label is **Attach more context**; **New note** is the tooltip.
 Notes hold shared context, decisions, and deliverables for that workspace.
 
+With a supporting daemon, the desktop app shows a note over 500 KB truncated and
+render-only, with a banner, so the user cannot edit it there. Agents still read
+and write the full content; make large-note edits with note tools rather than
+asking the user to edit them in the app.
+
 <!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/initializer/{IssueSuggestions,GitLabContextSuggestions}.svelte; src/lib/components/workspace/sidebar/context-picker/ContextPickerModal.svelte. -->
 
 When testing experimental GitLab context suggestions, choose **GL Issues** or
