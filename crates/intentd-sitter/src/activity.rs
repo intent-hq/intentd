@@ -76,6 +76,10 @@ impl fmt::Display for AgeBucket {
 }
 
 /// Flags sent with one endpoint check.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent wire flags, one per query param"
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Activity {
     /// `d`: first successful check of the UTC day.
