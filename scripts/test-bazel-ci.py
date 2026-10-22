@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
-"""Unit tests for the Bazel CI helpers: scripts/bazel-drift.py and
-bazel/remote-cache-credentials.sh (no Bazel needed)."""
+"""Unit tests for the Bazel CI helpers: scripts/bazel-drift.py,
+scripts/bazel-gen.py's test discovery, bazel/rust_integration_tests.bzl and
+bazel/remote-cache-credentials.sh (no Bazel needed; the generator tests need
+cargo)."""
 
 from __future__ import annotations
 
@@ -10,6 +12,8 @@ import importlib.util
 import io
 import json
 import os
+import re
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -20,6 +24,9 @@ ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location("bazel_drift", ROOT / "scripts/bazel-drift.py")
 drift = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(drift)
+GEN_SPEC = importlib.util.spec_from_file_location("bazel_gen", ROOT / "scripts/bazel-gen.py")
+gen = importlib.util.module_from_spec(GEN_SPEC)
+GEN_SPEC.loader.exec_module(gen)
 
 
 class HostPaths(unittest.TestCase):
@@ -196,6 +203,230 @@ class ReleaseTolerance(unittest.TestCase):
     def test_generated_version_lines_only(self):
         self.assertEqual(drift.VERSION_LINE.sub("", '    edition = "2021",\n    version = "0.11.25",\n'),
                          '    edition = "2021",\n')
+
+
+class StarlarkFailure(Exception):
+    pass
+
+
+def evaluate_starlark(path: Path, env: dict) -> dict:
+    """Run a .bzl or BUILD file as Python, with `load` lines dropped.
+
+    The files here use only the Python-compatible subset of Starlark, so this
+    exercises the real macro and generated BUILD files without Bazel.
+    """
+    source = re.sub(r"^load\(.*\)$", "", path.read_text(), flags=re.M)
+    scope = {"fail": lambda msg: (_ for _ in ()).throw(StarlarkFailure(msg)), **env}
+    exec(compile(source, str(path), "exec"), scope)  # noqa: S102 - trusted repository file
+    return scope
+
+
+class Package:
+    """A fake Bazel package: glob() over a directory, rules recorded by kind."""
+
+    def __init__(self, directory: Path):
+        self.directory = directory
+        self.rules: dict[str, tuple[str, dict]] = {}
+
+    def glob(self, include, exclude=(), allow_empty=False):
+        found = set()
+        for pattern in include:
+            found |= {p.relative_to(self.directory).as_posix()
+                      for p in self.directory.glob(pattern) if p.is_file()}
+        for pattern in exclude:
+            found -= {p.relative_to(self.directory).as_posix() for p in self.directory.glob(pattern)}
+        return sorted(found)
+
+    def recorder(self, kind):
+        def rule(name=None, **attrs):
+            if name in self.rules:
+                raise StarlarkFailure(f"duplicate target {name}")
+            self.rules[name] = (kind, attrs)
+        return rule
+
+    def macro(self):
+        native = type("native", (), {"glob": staticmethod(self.glob)})
+        scope = evaluate_starlark(ROOT / "bazel/rust_integration_tests.bzl",
+                                  {"native": native, "rust_test": self.recorder("rust_test")})
+        return scope["rust_integration_tests"]
+
+    def evaluate_build(self):
+        """Evaluate the package's generated BUILD.bazel; returns {target: (kind, attrs)}."""
+        env = {
+            "glob": self.glob,
+            "package": lambda **_: None,
+            "rust_integration_tests": self.macro(),
+            "aliases": lambda *a, **k: {},
+            "all_crate_deps": lambda *a, **k: [],
+            "dev_aliases": lambda *a, **k: {},
+            "dev_crate_deps": lambda *a, **k: [],
+        }
+        for kind in ("rust_library", "rust_proc_macro", "rust_binary", "rust_test", "filegroup", "copy_file",
+                     "cargo_build_script", "extract_cargo_lints", "shared_binary_test"):
+            env[kind] = self.recorder(kind)
+        evaluate_starlark(self.directory / "BUILD.bazel", env)
+        return self.rules
+
+
+class IntegrationTestMacro(unittest.TestCase):
+    """bazel/rust_integration_tests.bzl, evaluated in Python."""
+
+    def declare(self, files, **kwargs):
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            for name in files:
+                (tmp / name).parent.mkdir(parents=True, exist_ok=True)
+                (tmp / name).write_text("")
+            package = Package(tmp)
+            package.macro()(**kwargs)
+            return package.rules
+
+    def test_one_target_per_cargo_test_root(self):
+        rules = self.declare(["tests/a.rs", "tests/b/main.rs", "tests/b/util.rs", "tests/common/mod.rs",
+                              "tests/fixtures/x.json", "src/lib.rs"])
+        self.assertEqual(sorted(rules), ["a", "b"])
+        _, a = rules["a"]
+        self.assertEqual(a["crate_root"], "tests/a.rs")
+        self.assertEqual(a["srcs"], ["tests/a.rs", "tests/b/main.rs", "tests/b/util.rs", "tests/common/mod.rs"])
+        _, b = rules["b"]
+        self.assertEqual(b["crate_root"], "tests/b/main.rs")
+        self.assertNotIn("tests/a.rs", b["srcs"])
+        self.assertEqual(gen.integration_test_roots(Path("/nonexistent")), [])
+
+    def test_defaults_and_overrides(self):
+        rules = self.declare(
+            ["tests/plain.rs", "tests/source_lint.rs", "tests/special.rs", "tests/split.rs"],
+            overrides={"special": {"manual": "why", "exclusive": True, "timeout": "long",
+                                   "cargo": True, "workspace_sources": True}},
+            exclude=["split"], data=[":bin_test_bin"], rustc_env={"X": "1"}, tags=["test-graph"],
+        )
+        self.assertEqual(sorted(rules), ["plain", "source_lint", "special"])
+        plain = rules["plain"][1]
+        self.assertEqual(plain["data"], ["//:workspace_test_data", ":bin_test_bin"])
+        self.assertEqual(plain["tags"], ["test-graph"])
+        self.assertIsNone(plain["timeout"])
+        self.assertEqual(rules["source_lint"][1]["data"],
+                         ["//:workspace_test_data", "//:workspace_rust_sources", ":bin_test_bin"])
+        special = rules["special"][1]
+        self.assertEqual(special["tags"], ["exclusive", "manual", "test-graph"])
+        self.assertEqual(special["timeout"], "long")
+        self.assertEqual(list(special["rustc_env"]), ["CARGO", "X"])
+        self.assertIn("@rules_rust//rust/toolchain:current_cargo_files", special["data"])
+
+    def test_crate_wide_workspace_sources(self):
+        rules = self.declare(["tests/plain.rs"], workspace_sources=True)
+        self.assertIn("//:workspace_rust_sources", rules["plain"][1]["data"])
+
+    def test_stale_or_misspelled_overrides_fail(self):
+        with self.assertRaisesRegex(StarlarkFailure, "override for gone"):
+            self.declare(["tests/a.rs"], overrides={"gone": {"manual": "x"}})
+        with self.assertRaisesRegex(StarlarkFailure, "unknown override key"):
+            self.declare(["tests/a.rs"], overrides={"a": {"manul": "x"}})
+
+    def test_name_rule_matches_the_generator(self):
+        for name in ("tmp_hygiene_lint", "e2e_wss_lint_x", "lint", "plain"):
+            native = type("native", (), {"glob": staticmethod(lambda *a, **k: [])})
+            scope = evaluate_starlark(ROOT / "bazel/rust_integration_tests.bzl",
+                                      {"native": native, "rust_test": None})
+            self.assertEqual(scope["reads_workspace_sources"](name), gen.reads_workspace_sources_by_name(name))
+
+
+@unittest.skipUnless(shutil.which("cargo"), "needs cargo")
+class GeneratorDiscovery(unittest.TestCase):
+    """What changes the generated files (and so fails the drift guard), on a scratch workspace."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="bazel-gen-test-"))
+        self.addCleanup(shutil.rmtree, self.tmp)
+        shutil.copy(ROOT / "rust-toolchain.toml", self.tmp / "rust-toolchain.toml")
+        (self.tmp / "Cargo.toml").write_text('[workspace]\nresolver = "2"\nmembers = ["crates/*"]\n')
+        self.crate("a", lib="pub mod m1;\npub mod m2;\n")
+        self.write("crates/a/src/m1.rs", "pub fn one() {}\n")
+        self.write("crates/a/src/m2.rs", "pub fn two() {}\n")
+        self.write("crates/a/tests/existing.rs", "#[test]\nfn t() {}\n")
+        for name, value in (("ROOT", self.tmp), ("MODULE_SHARDS", {"a": [["m1"], ["m2"]]})):
+            patcher = mock.patch.object(gen, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.cargo("generate-lockfile", "--offline")
+        self.write_generated()
+
+    def write(self, rel, text):
+        (self.tmp / rel).parent.mkdir(parents=True, exist_ok=True)
+        (self.tmp / rel).write_text(text)
+
+    def crate(self, name, lib="", extra=""):
+        self.write(f"crates/{name}/Cargo.toml",
+                   f'[package]\nname = "{name}"\nversion = "0.1.0"\nedition = "2021"\n{extra}')
+        self.write(f"crates/{name}/src/lib.rs", lib)
+
+    def cargo(self, *args):
+        subprocess.run(["cargo", *args], cwd=self.tmp, check=True, capture_output=True)
+
+    def write_generated(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(gen.main([]), 0)
+
+    def stale(self):
+        return sorted(str(p.relative_to(self.tmp)) for p, c in gen.generated_files().items()
+                      if not p.exists() or p.read_text() != c)
+
+    def check(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            code = gen.main(["--check"])
+        return code, err.getvalue()
+
+    def test_new_integration_tests_need_no_regeneration(self):
+        self.write("crates/a/tests/new_test.rs", "#[test]\nfn t() {}\n")
+        self.write("crates/a/tests/dir_test/main.rs", "mod util;\n")
+        self.write("crates/a/tests/dir_test/util.rs", "")
+        self.write("crates/a/tests/new_lint.rs", "// walks the workspace: source_lint\n")
+        self.assertEqual(self.stale(), [])
+        self.assertEqual(self.check()[0], 0)
+        rules = Package(self.tmp / "crates/a").evaluate_build()
+        for name, root in (("new_test", "tests/new_test.rs"), ("dir_test", "tests/dir_test/main.rs"),
+                           ("existing", "tests/existing.rs")):
+            kind, attrs = rules[name]
+            self.assertEqual((kind, attrs["crate_root"]), ("rust_test", root))
+        self.assertIn("//:workspace_rust_sources", rules["new_lint"][1]["data"])
+
+    def test_first_test_in_a_crate_needs_no_regeneration(self):
+        self.crate("b")
+        self.cargo("generate-lockfile", "--offline")
+        self.write_generated()
+        self.write("crates/b/tests/first.rs", "#[test]\nfn t() {}\n")
+        self.assertEqual(self.stale(), [])
+        self.assertIn("first", Package(self.tmp / "crates/b").evaluate_build())
+
+    def test_unit_test_growth_and_new_modules_keep_shards(self):
+        self.write("crates/a/src/m1.rs", "pub fn one() {}\n" + "// grown\n" * 2000)
+        self.write("crates/a/src/lib.rs", "pub mod m1;\npub mod m2;\npub mod m3;\n")
+        self.write("crates/a/src/m3.rs", "")
+        self.assertEqual(self.stale(), [])
+
+    def test_test_needing_policy_fails_with_the_fix(self):
+        self.write("crates/a/tests/reader.rs", 'const _: &str = "workspace_root(";\n')
+        self.assertEqual(self.stale(), ["crates/a/BUILD.bazel"])
+        self.assertIn('"reader": {"workspace_sources": True}', gen.generated_files()[self.tmp / "crates/a/BUILD.bazel"])
+        code, err = self.check()
+        self.assertEqual(code, 1)
+        self.assertIn(gen.FIX_COMMAND, err)
+
+    def test_new_crate_fails_and_names_it(self):
+        self.crate("c")
+        self.cargo("generate-lockfile", "--offline")
+        code, err = self.check()
+        self.assertEqual(code, 1)
+        self.assertIn("crates/c/BUILD.bazel (missing: new crate c)", err)
+        self.assertIn(f"Run: {gen.FIX_COMMAND}", err)
+
+    def test_feature_change_fails(self):
+        self.crate("a", lib="pub mod m1;\npub mod m2;\n", extra='\n[features]\ndefault = ["x"]\nx = []\n')
+        self.assertIn("crates/a/BUILD.bazel", self.stale())
+
+    def test_drift_guard_prints_the_same_fix(self):
+        self.assertEqual(drift.FIX_COMMAND, gen.FIX_COMMAND)
 
 
 class RemoteCacheCredentials(unittest.TestCase):
