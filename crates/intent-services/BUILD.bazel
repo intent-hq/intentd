@@ -148,7 +148,7 @@ rust_test(
     ],
 )
 
-# manual: timed out at 900 s on a host at load 60-87; not yet shown passing
+# manual: holds pr_monitor, whose tests (qwen_regression::*, a_stale_backlog_drains_within_the_quota_share) fail nondeterministically, a different set each run, in one shared libtest process; needs a process-per-test runner
 shared_binary_test(
     name = "lib_test_shard1",
     binary = ":lib_test_binary",
@@ -319,7 +319,7 @@ shared_binary_test(
     ],
 )
 
-# manual: pr_monitor tests fail nondeterministically (a different set each run) when they share one libtest process; needs a process-per-test runner
+# manual: no failure recorded for these modules; kept manual because the shard 2 that ran held pr_monitor (now shard 1); not yet run with this module set
 shared_binary_test(
     name = "lib_test_shard2",
     binary = ":lib_test_binary",
@@ -609,7 +609,7 @@ shared_binary_test(
     ],
 )
 
-# manual: timed out at 900 s on a host at load 60-87; not yet shown passing
+# manual: no failure recorded for these modules; kept manual because the shard 4 that ran timed out at 900 s (only 2 of today's 23 modules were in it); not yet run with this module set
 shared_binary_test(
     name = "lib_test_shard4",
     binary = ":lib_test_binary",
@@ -1147,7 +1147,7 @@ shared_binary_test(
     ],
 )
 
-# manual: agent_ops tests fail nondeterministically (a different set each run) when they share one libtest process; needs a process-per-test runner
+# manual: agent_ops tests (pre_publish_group_record_*, pr_monitor_waiting_idle_*, principal_stamp_*, progressive_history_*) fail nondeterministically, a different set each run, in one shared libtest process; needs a process-per-test runner
 shared_binary_test(
     name = "lib_test_shard8",
     binary = ":lib_test_binary",

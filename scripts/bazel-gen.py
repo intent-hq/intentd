@@ -287,21 +287,30 @@ MODULE_SHARDS: dict[str, list[list[str]]] = {
     ],
 }
 
-# Shards tagged manual, keyed by (package, shard number): ones that did not
-# finish within Bazel's `long` timeout (900 s) on the loaded evaluation host
-# (load average up to 87 on 32 cores), and ones whose tests fail
-# nondeterministically in a shared libtest process. They keep an `eternal`
-# timeout and stay runnable explicitly.
+# Shards tagged manual, keyed by (package, shard number), with what is known
+# about the modules MODULE_SHARDS puts in each. They keep an `eternal` timeout
+# and stay runnable explicitly. The evidence comes from runs on the loaded
+# evaluation host (load average up to 87 on 32 cores) under an earlier
+# size-balanced assignment; shards 1, 2 and 4 have not yet run with exactly
+# today's module sets.
 MANUAL_SHARDS: dict[tuple[str, int], str] = {
-    ("intent-services", 1): "timed out at 900 s on a host at load 60-87; not yet shown passing",
-    ("intent-services", 4): "timed out at 900 s on a host at load 60-87; not yet shown passing",
+    ("intent-services", 1): (
+        "holds pr_monitor, whose tests (qwen_regression::*, a_stale_backlog_drains_within_the_quota_share) "
+        "fail nondeterministically, a different set each run, in one shared libtest process; "
+        "needs a process-per-test runner"
+    ),
     ("intent-services", 2): (
-        "pr_monitor tests fail nondeterministically (a different set each run) when they "
-        "share one libtest process; needs a process-per-test runner"
+        "no failure recorded for these modules; kept manual because the shard 2 that ran held "
+        "pr_monitor (now shard 1); not yet run with this module set"
+    ),
+    ("intent-services", 4): (
+        "no failure recorded for these modules; kept manual because the shard 4 that ran timed out "
+        "at 900 s (only 2 of today's 23 modules were in it); not yet run with this module set"
     ),
     ("intent-services", 8): (
-        "agent_ops tests fail nondeterministically (a different set each run) when they "
-        "share one libtest process; needs a process-per-test runner"
+        "agent_ops tests (pre_publish_group_record_*, pr_monitor_waiting_idle_*, principal_stamp_*, "
+        "progressive_history_*) fail nondeterministically, a different set each run, in one shared "
+        "libtest process; needs a process-per-test runner"
     ),
 }
 
