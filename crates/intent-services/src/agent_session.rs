@@ -4877,7 +4877,16 @@ impl Services {
         let quota_failover = prompt_quota_failure
             && prompt_actionable_error.is_none()
             && self
-                .try_quota_failover(workspace_id, agent_id, prompt_quota_provider.as_deref())
+                .try_quota_failover(
+                    workspace_id,
+                    agent_id,
+                    prompt_quota_provider.as_deref(),
+                    &result
+                        .as_ref()
+                        .err()
+                        .map(ToString::to_string)
+                        .unwrap_or_default(),
+                )
                 .await;
         if let Err(e) = &result {
             if !pre_output_transport_failure && !prompt_idle_timeout && !quota_failover {
@@ -6281,6 +6290,15 @@ impl Services {
         else {
             return false;
         };
+        // A timed return home is announced at home's first output, ahead of
+        // it (PROTOCOL §5.54 backup failover).
+        if matches!(
+            mapped,
+            MappedUpdate::Chunk { .. } | MappedUpdate::ToolCall(_)
+        ) {
+            self.announce_provider_return_if_pending(workspace_id, agent_id)
+                .await;
+        }
         let message_id = transcript.message_id.clone();
         match mapped {
             MappedUpdate::Chunk {

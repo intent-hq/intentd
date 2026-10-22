@@ -236,6 +236,7 @@ mod provider_images;
 pub mod provider_models;
 mod provider_preparation;
 mod provider_profiles;
+mod provider_return;
 pub mod provider_test_prompt;
 mod quota_failover;
 mod rate_limit;
@@ -1099,6 +1100,9 @@ pub struct Services {
     /// Continue-the-cut-short-turn replay marks (PROTOCOL §5.54): see
     /// [`quota_failover::QuotaFailoverReplays`].
     quota_failover_replays: quota_failover::QuotaFailoverReplays,
+    /// Pending `provider_returned` announcements (PROTOCOL §5.54): see
+    /// [`provider_return::ProviderReturnAnnouncements`].
+    provider_return_announcements: provider_return::ProviderReturnAnnouncements,
     /// One-shot truncation auto-redrive handoff flags
     /// (intent-hq/monorepo#2863): see
     /// [`agent_session::PendingTruncationRedrives`]. Shared across clones so
@@ -1775,6 +1779,7 @@ impl Services {
             truncation_redrives: Arc::new(Mutex::new(HashMap::new())),
             quota_failover_chains: Arc::new(Mutex::new(HashMap::new())),
             quota_failover_replays: Arc::new(Mutex::new(HashSet::new())),
+            provider_return_announcements: Arc::new(Mutex::new(HashSet::new())),
             pending_truncation_redrive: Arc::new(Mutex::new(HashSet::new())),
             test_busy: Arc::new(Mutex::new(HashSet::new())),
             deferred_attention: Arc::new(Mutex::new(HashMap::new())),

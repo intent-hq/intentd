@@ -452,3 +452,123 @@ fn an_escape_heavy_partial_response_stays_within_the_byte_budget() {
         "the start of the partial text is kept"
     );
 }
+
+#[test]
+fn the_rotation_includes_home_after_the_backups_and_wraps_around() {
+    let profiles = saved();
+    // Away on pb1 with home Default: pb2, then home.
+    assert_eq!(
+        next_candidate("claude-code@pb1", Some("claude-code"), &[], &profiles, None).as_deref(),
+        Some("claude-code@pb2")
+    );
+    assert_eq!(
+        next_candidate(
+            "claude-code@pb2",
+            Some("claude-code"),
+            &tried(&["claude-code@pb1"]),
+            &profiles,
+            None
+        )
+        .as_deref(),
+        Some("claude-code"),
+        "home comes after the last backup"
+    );
+    // On home (a timed return rejected): wrap to the first backup.
+    assert_eq!(
+        next_candidate("claude-code", Some("claude-code"), &[], &profiles, None).as_deref(),
+        Some("claude-code@pb1")
+    );
+    // Away on pb2 with home pwork (not a backup): home, then wrap to pb1.
+    assert_eq!(
+        next_candidate(
+            "claude-code@pb2",
+            Some("claude-code@pwork"),
+            &[],
+            &profiles,
+            None
+        )
+        .as_deref(),
+        Some("claude-code@pwork")
+    );
+    assert_eq!(
+        next_candidate(
+            "claude-code@pb2",
+            Some("claude-code@pwork"),
+            &tried(&["claude-code@pwork"]),
+            &profiles,
+            None
+        )
+        .as_deref(),
+        Some("claude-code@pb1"),
+        "wraps around to backups before the current one"
+    );
+}
+
+#[test]
+fn the_rotation_with_home_is_bounded_per_message() {
+    let profiles = saved();
+    let mut chain = tried(&["claude-code@pb2"]);
+    let mut current = "claude-code@pb2".to_owned();
+    let mut walked = Vec::new();
+    while let Some(next) = next_candidate(&current, Some("claude-code"), &chain, &profiles, None) {
+        chain.push(next.clone());
+        walked.push(next.clone());
+        current = next;
+        assert!(walked.len() <= 3, "the rotation must not loop: {walked:?}");
+    }
+    assert_eq!(walked, tried(&["claude-code", "claude-code@pb1"]));
+}
+
+#[test]
+fn a_removed_profile_home_or_another_base_home_is_skipped() {
+    let profiles = saved();
+    assert_eq!(
+        next_candidate(
+            "claude-code@pb2",
+            Some("claude-code@pgone"),
+            &tried(&["claude-code@pb1"]),
+            &profiles,
+            None
+        ),
+        None
+    );
+    assert_eq!(
+        next_candidate(
+            "claude-code@pb2",
+            Some("codex"),
+            &tried(&["claude-code@pb1"]),
+            &profiles,
+            None
+        ),
+        None
+    );
+}
+
+#[test]
+fn home_is_the_only_candidate_when_no_backups_are_flagged() {
+    let unflagged = vec![
+        profile("claude-code", "pb1", false),
+        profile("claude-code", "pwork", false),
+    ];
+    assert_eq!(
+        next_candidate(
+            "claude-code@pb1",
+            Some("claude-code"),
+            &[],
+            &unflagged,
+            None
+        )
+        .as_deref(),
+        Some("claude-code"),
+        "away: home is still a candidate"
+    );
+    assert_eq!(
+        next_candidate("claude-code", Some("claude-code"), &[], &unflagged, None),
+        None,
+        "at home with no backups: terminal as today"
+    );
+    assert_eq!(
+        next_candidate("claude-code", None, &[], &unflagged, None),
+        None
+    );
+}

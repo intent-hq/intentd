@@ -10689,6 +10689,14 @@ impl AgentManager {
         if selection(from_provider) == selection(to_provider) {
             return false;
         }
+        // A timed return home: its `provider_returned` row is the notice.
+        if self
+            .services
+            .is_announced_provider_return(agent_id, from_provider, to_provider)
+            .await
+        {
+            return true;
+        }
         let same_base = canonical(from_provider) == canonical(to_provider);
         let latest = match self
             .services
@@ -13844,8 +13852,15 @@ async fn run_message_worker(
                 .await;
             return;
         }
-        mgr.services
-            .arm_quota_failover(&agent_id, std::mem::take(&mut keep_failover_chain));
+        let redrive = std::mem::take(&mut keep_failover_chain);
+        mgr.services.arm_quota_failover(&agent_id, redrive);
+        // Timed return to the home provider (PROTOCOL §5.54): only at the
+        // start of a user message, never on a redrive of the same message.
+        if !redrive && options.origin.is_user() {
+            mgr.services
+                .begin_provider_return(&workspace_id, &agent_id)
+                .await;
+        }
         // Keep the large session-start future off the worker's inline state;
         // it is still polled and cancelled by this same worker.
         match Box::pin(retry_spawn_owned(&mgr, &agent_id, &workspace_id)).await {
@@ -13981,6 +13996,11 @@ async fn run_message_worker(
                         // streak (monorepo#840): the session is provably not
                         // poisoned.
                         mgr.services.clear_failure_streak(&agent_id);
+                        // A turn that went back to the home provider and
+                        // completed there is home (PROTOCOL §5.54).
+                        mgr.services
+                            .complete_provider_return(&workspace_id, &agent_id)
+                            .await;
                         // A completed turn also resets the consecutive
                         // idle-timeout streak (warn-and-continue).
                         consecutive_idle_timeouts = 0;
@@ -14443,7 +14463,12 @@ async fn run_message_worker(
                 if intent_acp::message_is_quota_exceeded(&e.to_string())
                     && mgr
                         .services
-                        .try_quota_failover(&workspace_id, &agent_id, attempted.as_deref())
+                        .try_quota_failover(
+                            &workspace_id,
+                            &agent_id,
+                            attempted.as_deref(),
+                            &e.to_string(),
+                        )
                         .await
                 {
                     mgr.spawn_attempt_provider.lock().unwrap().remove(&agent_id);

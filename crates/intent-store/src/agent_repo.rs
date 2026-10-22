@@ -2689,7 +2689,7 @@ impl Store {
             "SELECT metadata FROM agent_message \
              WHERE agent_id=? AND role='system' \
                AND json_extract(metadata, '$.type') \
-                   IN ('model_changed', 'provider_rehomed', 'provider_failover') \
+                   IN ('model_changed', 'provider_rehomed', 'provider_failover', 'provider_returned') \
              ORDER BY seq DESC LIMIT ?",
         )
         .bind(&agent_id.0)
@@ -2706,8 +2706,8 @@ impl Store {
 
     /// Metadata of the agent's newest `role: "system"` transcript row that
     /// records a spawn-identity change — a `model_changed`, a
-    /// `provider_rehomed` or a `provider_failover` notice — or `None` when
-    /// the transcript carries none of them. The model-change notice path reads it to tell a re-home's
+    /// `provider_rehomed`, a `provider_failover` or a `provider_returned`
+    /// notice — or `None` when the transcript carries none of them. The model-change notice path reads it to tell a re-home's
     /// deferred last-turn commit (the newest such row is the
     /// `provider_rehomed` notice for this very provider hop) from an
     /// ordinary switch, durably across spawn retries, later turns and
@@ -2726,7 +2726,7 @@ impl Store {
             "SELECT metadata FROM agent_message \
              WHERE agent_id=? AND role='system' \
                AND json_extract(metadata, '$.type') \
-                   IN ('model_changed', 'provider_rehomed', 'provider_failover') \
+                   IN ('model_changed', 'provider_rehomed', 'provider_failover', 'provider_returned') \
              ORDER BY seq DESC LIMIT 1",
         )
         .bind(&agent_id.0)

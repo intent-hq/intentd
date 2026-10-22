@@ -71,15 +71,31 @@ pub(crate) fn is_quota_failover_error(err: &intent_core::Error) -> bool {
 }
 
 /// The next backup for an agent whose `current` selection just failed for
-/// quota: the first profile, in saved order, with `backup: true` whose base
-/// provider is `current`'s base, that is neither `current` nor already in
-/// `tried`. `None` when the base provider is disabled or no candidate is
-/// left. `current` may be the base's Default configuration (a bare id) or a
-/// profile reference; failover never crosses base providers. Profiles that
-/// no longer exist are not in `profiles`, so they are skipped by
-/// construction.
+/// quota, with no home to return to: [`next_candidate`] without a home.
+#[cfg(test)]
 pub(crate) fn next_backup(
     current: &str,
+    tried: &[String],
+    profiles: &[ProfileMeta],
+    enabled: Option<&BTreeMap<String, bool>>,
+) -> Option<String> {
+    next_candidate(current, None, tried, profiles, enabled)
+}
+
+/// The next configuration to try for an agent whose `current` selection just
+/// failed for quota. The rotation is the `backup: true` profiles of
+/// `current`'s base provider in saved order, then the conversation's `home`
+/// (when it is away and home is not itself a backup), taken in a cycle
+/// starting after `current` and skipping `current` and every reference in
+/// `tried`. `None` when the base provider is disabled or nothing is left.
+/// `current` and `home` may be the base's Default configuration (a bare id)
+/// or a profile reference; the rotation never crosses base providers.
+/// Profiles that no longer exist are not in `profiles`, so a backup is
+/// skipped by construction; a profile home that no longer exists is skipped
+/// too.
+pub(crate) fn next_candidate(
+    current: &str,
+    home: Option<&str>,
     tried: &[String],
     profiles: &[ProfileMeta],
     enabled: Option<&BTreeMap<String, bool>>,
@@ -93,11 +109,27 @@ pub(crate) fn next_backup(
     if crate::agent_ops::provider_is_disabled(&base, enabled) {
         return None;
     }
-    profiles
+    let mut rotation: Vec<String> = profiles
         .iter()
         .filter(|p| p.backup && p.base_provider == base)
         .map(ProfileMeta::provider_ref)
-        .find(|candidate| *candidate != current && !tried.contains(candidate))
+        .collect();
+    if let Some(home) = home.map(provider_profiles::canonical_selection) {
+        let home_base = intent_providers::base_provider_id(&home).to_owned();
+        let home_exists = !provider_profiles::is_qualified_ref(&home)
+            || profiles.iter().any(|p| p.provider_ref() == home);
+        if home_base == base && home_exists && !rotation.contains(&home) {
+            rotation.push(home);
+        }
+    }
+    let start = rotation
+        .iter()
+        .position(|candidate| *candidate == current)
+        .map_or(0, |index| index + 1);
+    (0..rotation.len())
+        .map(|offset| &rotation[(start + offset) % rotation.len()])
+        .find(|candidate| **candidate != current && !tried.contains(candidate))
+        .cloned()
 }
 
 impl Services {
@@ -112,6 +144,7 @@ impl Services {
         } else {
             chains.insert(agent_id.clone(), QuotaFailoverChain::default());
             self.quota_failover_replays.lock().unwrap().remove(agent_id);
+            self.cancel_provider_return_announcement(agent_id);
         }
     }
 
@@ -179,6 +212,7 @@ impl Services {
     pub(crate) fn disarm_quota_failover(&self, agent_id: &AgentId) {
         self.quota_failover_chains.lock().unwrap().remove(agent_id);
         self.quota_failover_replays.lock().unwrap().remove(agent_id);
+        self.cancel_provider_return_announcement(agent_id);
     }
 
     /// Whether the agent's current message is a turn a quota failover cut
@@ -215,8 +249,10 @@ impl Services {
             return false;
         };
         let settings = self.effective_settings();
-        next_backup(
+        let home = crate::provider_return::read_state(&session).map(|s| s.home);
+        next_candidate(
             &from,
+            home.as_deref(),
             &tried,
             &profiles,
             settings.providers.enabled.as_ref(),
@@ -224,8 +260,10 @@ impl Services {
         .is_some()
     }
 
-    /// After a quota failure, switch the agent onto its next backup profile.
-    /// `failed_provider` is the configuration the failed attempt actually ran
+    /// After a quota failure, switch the agent onto the next configuration of
+    /// its rotation ([`next_candidate`]). `error_text` is the rendered quota
+    /// error, read for a reported reset time (the return-home timer, see
+    /// [`crate::provider_return`]). `failed_provider` is the configuration the failed attempt actually ran
     /// on (the committed turn identity, or the spawn attempt's record). When
     /// the session already names another configuration — the user switched
     /// while the attempt was in flight — nothing fails over: the user's
@@ -244,6 +282,7 @@ impl Services {
         workspace_id: &WorkspaceId,
         agent_id: &AgentId,
         failed_provider: Option<&str>,
+        error_text: &str,
     ) -> bool {
         let session = match self.store.get_agent_session(agent_id).await {
             Ok(session) => session,
@@ -271,6 +310,8 @@ impl Services {
         };
         let settings = self.effective_settings();
         let from_selection = provider_profiles::canonical_selection(&from);
+        let return_state = crate::provider_return::read_state(&session);
+        let home = return_state.as_ref().map(|s| s.home.clone());
         let target = {
             let mut chains = self.quota_failover_chains.lock().unwrap();
             let Some(chain) = chains.get_mut(agent_id) else {
@@ -280,8 +321,9 @@ impl Services {
             if !tried.contains(&from_selection) {
                 tried.push(from_selection.clone());
             }
-            let target = next_backup(
+            let target = next_candidate(
                 &from_selection,
+                home.as_deref(),
                 tried,
                 &profiles,
                 settings.providers.enabled.as_ref(),
@@ -327,6 +369,19 @@ impl Services {
             .lock()
             .unwrap()
             .insert(agent_id.clone());
+        // Leaving the configuration this message started on: a timed return
+        // home that has not produced output yet is not announced.
+        self.cancel_provider_return_announcement(agent_id);
+        let now = chrono::Utc::now();
+        let next_state = crate::provider_return::on_switch(
+            return_state,
+            &from_selection,
+            &target,
+            crate::provider_return::parse_reset_time(error_text, now),
+            now,
+        );
+        self.persist_provider_return_state(workspace_id, agent_id, Some(&next_state))
+            .await;
         self.invalidate_agent_list_cache(workspace_id);
         self.publish_agent_mutation_event(
             workspace_id,
