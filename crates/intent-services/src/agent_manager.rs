@@ -24256,7 +24256,8 @@ mod legacy_identity_tests;
 #[path = "agent_manager/fast_mode_tests.rs"]
 mod fast_mode_tests;
 
-#[cfg(test)]
+// Unix-only like its shared mock-agent helpers (`dead_child_respawn_tests`).
+#[cfg(all(test, unix))]
 #[path = "agent_manager/quota_failover_tests.rs"]
 mod quota_failover_tests;
 
