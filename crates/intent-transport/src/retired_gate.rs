@@ -519,6 +519,9 @@ mod tests {
             "workspace.update",
             "file.write",
             "git.agentCommit",
+            "script.start",
+            "script.run",
+            "terminal.create",
         ] {
             let err = check(&RetiredApi, method, &retired).await.unwrap_err();
             assert!(

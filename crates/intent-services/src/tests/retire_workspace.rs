@@ -319,12 +319,9 @@ async fn retired_workspace_refuses_disk_mutations_and_still_deletes() {
         .await
         .unwrap_err();
     assert!(is_retired(&err), "file.delete: {err:?}");
-    let err = f
-        .svc
-        .script_start(id(), "missing".into())
-        .await
-        .unwrap_err();
-    assert!(is_retired(&err), "script.start: {err:?}");
+    // script.start/restart/run are refused at the entry gates (RPC
+    // `retired_gate`, ws.* dispatcher), not in the service: an extra await
+    // before the launch reservation would reorder the start/stop race.
     let err = f
         .svc
         .git_stage(id(), serde_json::json!(["README.md"]))

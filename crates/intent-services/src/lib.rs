@@ -21128,7 +21128,6 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             self.require_workspace_manager(&workspace_id, "script.start")
                 .await?;
-            self.refuse_if_retired(&workspace_id).await?;
             mgr.start(&workspace_id, &script_id).await
         })
     }
@@ -21155,7 +21154,6 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             self.require_workspace_manager(&workspace_id, "script.restart")
                 .await?;
-            self.refuse_if_retired(&workspace_id).await?;
             mgr.restart(&workspace_id, &script_id).await
         })
     }
@@ -21209,7 +21207,6 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             self.require_workspace_manager(&workspace_id, "script.run")
                 .await?;
-            self.refuse_if_retired(&workspace_id).await?;
             mgr.run(&workspace_id, &script_id, max_lines, timeout_seconds)
                 .await
         })
