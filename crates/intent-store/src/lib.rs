@@ -11,6 +11,7 @@ use sqlx::sqlite::{SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode, Sq
 use sqlx::{Row, SqlitePool};
 
 pub use intent_core::{Error, Result};
+
 mod advisory_wake_delivery_repo;
 mod agent_flipped_completion_repo;
 mod agent_queue_repo;
@@ -44,14 +45,8 @@ mod message_payload;
 mod message_thumbnails;
 mod metrics_repo;
 mod node_repo;
-pub mod note_annotation_repo;
-pub mod note_delete_repo;
-mod note_index_budget;
-mod note_index_job;
 mod note_line_attribution_repo;
-mod note_page_html;
-mod note_page_index;
-mod note_page_repo;
+pub mod note_paging_cleanup;
 mod note_repo;
 mod note_search_repo;
 mod note_version_repo;
@@ -79,7 +74,6 @@ mod transfer_authorship;
 mod transfer_repo;
 mod usage_rate_repo;
 mod usage_stats_repo;
-mod workspace_annotation_cleanup;
 mod workspace_context_repo;
 mod workspace_git_root_repo;
 mod workspace_mcp_repo;
@@ -405,11 +399,8 @@ pub struct Store {
     /// Process-local `displayed` overlay of the browser tab registry; see
     /// `browser_tab_repo::DisplayedOverlay`.
     browser_tab_displayed: browser_tab_repo::DisplayedOverlay,
-    note_pages: std::sync::Arc<note_page_repo::Runtime>,
     task_event_baselines: std::sync::Arc<TaskEventBaselines>,
     task_events_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    note_index_jobs: std::sync::Arc<note_index_job::Coordinator>,
-    note_index_owner: std::sync::Arc<note_index_job::Owner>,
     #[cfg(test)]
     export_author_barrier: std::sync::Arc<
         std::sync::Mutex<Option<std::sync::Arc<transfer_authorship::ExportAuthorBarrier>>>,
@@ -474,22 +465,13 @@ impl Store {
             )),
             _ => Error::Internal(format!("migrations failed: {e}")),
         })?;
-        let write_pool = StorePool::new(write_pool, owner.is_some());
-        let read_pool = StorePool::new(read_pool, owner.is_some());
-        // Profiles/readiness are checked only for a demanded note. Opening the
-        // database must never hydrate or convert the stale note backlog.
-        let note_pages = std::sync::Arc::new(note_page_repo::Runtime::open(&write_pool).await?);
-        let note_index_jobs = note_index_job::domain_for(db_path)?;
         lifecycle.settle_after_retirement().await?;
         Ok(Self {
             repository_lifecycle,
-            note_pages,
             task_event_baselines: std::sync::Arc::default(),
             task_events_enabled: std::sync::Arc::default(),
-            note_index_jobs,
-            note_index_owner: std::sync::Arc::default(),
-            write_pool,
-            read_pool,
+            write_pool: StorePool::new(write_pool, owner.is_some()),
+            read_pool: StorePool::new(read_pool, owner.is_some()),
             _daemon_owner: owner,
             browser_tab_displayed: browser_tab_repo::DisplayedOverlay::default(),
             #[cfg(test)]
@@ -764,7 +746,6 @@ impl Store {
     /// This ensures WAL changes are visible to subsequent daemon instances
     /// (regression: persisted settings must survive app relaunches in sidecar mode).
     pub async fn close(&self) {
-        self.note_index_jobs.close(&self.note_index_owner).await;
         let started = std::time::Instant::now();
         self.log_close_phase("wal_checkpoint", "started", 0);
         // Best-effort WAL checkpoint before closing the pools (via write pool).

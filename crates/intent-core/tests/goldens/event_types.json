@@ -102,7 +102,6 @@
     "mcp.servers:status-changed",
     "mcp:notification",
     "note:created",
-    "note:delete-operation",
     "note:deleted",
     "note:presence",
     "note:updated",

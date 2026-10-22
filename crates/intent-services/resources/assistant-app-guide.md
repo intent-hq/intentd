@@ -348,10 +348,13 @@ confirm independently, for example by checking whether the dev server still
 responds. Such a row has no Stop and clears the next time the agent starts.
 Codex and other providers do not report background tasks.
 
-<!-- Sources: packages/intentd/crates/intent-services/src/{provider_images,agent_session,agent_ops}.rs. -->
+<!-- Sources: packages/intentd/crates/intent-services/src/{provider_images,agent_manager,agent_session,agent_ops}.rs. -->
 
-Images sent to agents may be resized or re-encoded for provider delivery; original
-attachments and their displayed previews are unchanged. If an image cannot be read
+PNG, JPEG, GIF, and WebP attachments may be resized or re-encoded for provider
+delivery; original attachments and their displayed previews are unchanged. SVG and
+other image formats are sent as files the agent can retrieve and read, rather than
+as vision input. To have the agent inspect their appearance, export a PNG or JPEG.
+If a supported image cannot be read
 or the images together exceed the delivery budget, the turn fails rather than
 silently omitting an image. Re-export an unreadable image as PNG/JPEG, or send fewer
 images cropped to the relevant detail. A provider request-size error can also come
@@ -679,11 +682,6 @@ selected projects; **Use link** accepts an explicit project URL where offered.
 partial results remain explicit. Selecting an item attaches its qualified context;
 it does not automatically check out the MR's source branch. Availability depends
 on the current connection, repository access and supported daemon.
-
-When a supported note deletion offers **Undo**, it cancels a pending deletion during
-the displayed grace period (normally 15 seconds). It does not restore an already
-deleted note. If the result is uncertain, check the note’s current status before trying again. If the
-connected backend does not support cancellable deletion, the note is kept.
 
 In test builds that include **Back to rendered view**, use **Edit Raw Markdown**
 in a note's **…** menu to edit Markdown directly; large notes otherwise stay

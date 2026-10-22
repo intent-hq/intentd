@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.25] - 2026-10-22
+
+### 🐛 Bug Fixes
+
+- Log why repo-less PR reads are refused ([#2590](https://github.com/intent-hq/intentd/pull/2590))
+- Deliver unsupported image attachments as retrievable files ([#2582](https://github.com/intent-hq/intentd/pull/2582))
+
+### 📚 Documentation
+
+- *(assistant-guide)* Describe provider profiles as a supported feature ([#2587](https://github.com/intent-hq/intentd/pull/2587))
+
+### 🧪 Testing
+
+- Bootstrap the transfer import contract DB once per worker ([#2589](https://github.com/intent-hq/intentd/pull/2589))
+
+
 ## [0.11.24] - 2026-10-22
 
 ### 🐛 Bug Fixes

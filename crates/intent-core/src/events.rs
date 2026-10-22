@@ -222,8 +222,6 @@ pub const DISCUSSION_REACTION: &str = "discussion:reaction";
 pub const NOTE_CREATED: &str = "note:created";
 pub const NOTE_UPDATED: &str = "note:updated";
 pub const NOTE_DELETED: &str = "note:deleted";
-/// Bounded grace deletion registry invalidation, scoped to its workspace.
-pub const NOTE_DELETE_OPERATION: &str = "note:delete-operation";
 
 // Line-attribution events (new in intentd; PROTOCOL §5.2.1). Emitted after the
 // daemon recomputes per-line attributions for a note (post-mutation,
@@ -652,7 +650,6 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     NOTE_CREATED,
     NOTE_UPDATED,
     NOTE_DELETED,
-    NOTE_DELETE_OPERATION,
     LINE_ATTRIBUTION_UPDATED,
     TASK_CREATED,
     TASK_UPDATED,
@@ -945,7 +942,6 @@ pub const COLLABORATOR_EVENT_TYPES: &[(&str, &str)] = &[
     (HOOK_SCHEDULED, "Hook lifecycle: a hook was registered; hook id, name and schedule."),
     (LINE_ATTRIBUTION_UPDATED, "Note: per-line authorship of a note changed."),
     (NOTE_CREATED, "Note: a note was created."),
-    (NOTE_DELETE_OPERATION, "Note: a cancellable deletion changed state."),
     (NOTE_DELETED, "Note: a note was deleted."),
     (NOTE_PRESENCE, "Presence: a member joined / moved its caret in / left a note the guest is a member of; principal profile fields and a caret position (rev/anchor/head) only. Transient."),
     (NOTE_UPDATED, "Note: note content or metadata changed."),
