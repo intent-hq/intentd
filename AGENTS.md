@@ -78,6 +78,7 @@ only on `intent-services`, never on `intent-store`.
 | CI release / workflow scripts (`scripts/test-*` in ci.yml's `release-scripts` job) | `make test-release-scripts` (from `packages/intentd`; `make -C packages/intentd test-release-scripts` at the monorepo root) runs every test that job runs, in CI order, and skips suites that need CI-only tooling (release-plz, sccache, cargo-dist) with "SKIP <suite>: needs <X>" — a skipped suite is unverified, so install the tool when your change touches it; run it before pushing a change to `.github/workflows/*.yml` or `scripts/` (CI Gate's job list is pinned by `test-retire-obsolete-merge-runs-workflow.py`, intentd#2499) |
 | a fake Codex/Claude CLI in a test | `intent_providers::test_support::current_cli_version` / `current_cli_script` (enable the intent-providers `test-support` feature from `[dev-dependencies]`); keep a literal version only for tests about that exact version, marked for `cli_fixture_version_lint` |
 | a test that needs a provider "installed", or passes locally but fails on CI with "not installed" | `crates/intent-services/src/test_support/provider_installed.rs` (mark a provider installed; Codex and Claude Code ignore `providers.paths` overrides, so `/bin/sh` overrides do nothing); `scripts/test-without-provider-clis.sh <command>` runs tests with every provider CLI hidden, the way CI's runners lack them (Linux, needs `bwrap`; CI's `check` job asserts its runners have none) |
+| Bazel build (parallel to Cargo; Cargo stays the source of truth) | `bazel/README.md`; `python3 scripts/bazel-drift.py --fix` after any `Cargo.toml` / `Cargo.lock` / `rust-toolchain.toml` change (regenerates `crates/*/BUILD.bazel` via `scripts/bazel-gen.py` and refreshes `MODULE.bazel.lock`); `.github/workflows/bazel.yml` is the informational CI job |
 | RPC performance / cost rules | "Performance — the RPC cost contract" below; durable principles in `../../docs/ARCHITECTURE.md` |
 
 ## Performance — the RPC cost contract
@@ -273,6 +274,19 @@ down (the lint fails until a fixed file's entry is removed or lowered).
 | `transfer_version_source_lint` | `CARGO_PKG_VERSION` within 20 lines of the transfer manifest's `creating_intentd_version` / `creatingIntentdVersion` field outside `crates/intent-core/src/transfer.rs` — crate versions can drift in a release, so export, the import check and test manifests must all use `intent_core::transfer::CREATING_INTENTD_VERSION` | none |
 | `workflow_grep_quiet_lint` | a `\| grep -q` / `-Eq` / `--quiet` / `--silent` pipeline in `.github/workflows/*.yml` — under `bash -eo pipefail` a large matched input makes the producer die of SIGPIPE and the step report "no match" (cloudlands-fe#2709); use a here-string for variable input, `\| grep -E pat >/dev/null` for a real producer, or `grep -q pat file` | none |
 | `cli_fixture_version_lint` | a hand-written Codex/Claude `--version` output (`codex-cli X`, `X (Claude Code)`, `claude X`, `fixture-cli X`, …) in a string literal of any `crates/**/*.rs` file or in a `.mjs`/`.cjs`/`.js`/`.py`/`.sh` fixture script — old or new, it breaks once an adapter bump moves the minimum (intentd#2567); print `intent_providers::test_support::current_cli_version` or use `current_cli_script`; a marker that covers no version is stale | `// cli-fixture-version: allow — <reason>` (`#` in shell/Python) on the line above, or above a multi-line literal's opening line |
+
+### Bazel (parallel build, informational)
+
+Bazel mirrors the Cargo workspace; it is not a gate and never replaces the Cargo gates
+above. **Cargo stays the source of truth.** When you change a `Cargo.toml`, `Cargo.lock`
+or `rust-toolchain.toml`, run `python3 scripts/bazel-drift.py --fix` and commit the
+regenerated `crates/*/BUILD.bazel`, `bazel/generated.MODULE.bazel` and
+`MODULE.bazel.lock`; never edit those by hand. The `Bazel` workflow's `drift` job fails
+otherwise and prints that command. To build or test with Bazel locally (bazelisk, plus
+`libssl-dev` / `zlib1g-dev` / `pkg-config`): `bazel build //...`, `bazel test //...`. In
+saved `ws.script` runs add `--config=ci` (plain progress output, frozen lock, uncached test
+results); `bazel` exits 3 for failing tests, 1 for build errors and 4 when no tests
+matched. See `bazel/README.md`.
 
 See the [root `AGENTS.md`](../../AGENTS.md) for the full submodule-PR → monorepo-bump
 workflow and conventional-commit / breadcrumb conventions.

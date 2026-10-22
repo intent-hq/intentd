@@ -26,7 +26,7 @@ Install [bazelisk](https://github.com/bazelbuild/bazelisk) as `bazel`; it reads
 records the `bazel_dep` registry hashes and crate_universe's resolution of
 `Cargo.toml` + `Cargo.lock`, so a checkout with an up-to-date lock skips the
 roughly one-minute Cargo resolution. Refresh it after any Cargo manifest or
-lockfile change with `scripts/bazel-drift.sh --fix` (see "Drift guard" below).
+lockfile change with `python3 scripts/bazel-drift.py --fix` (see "Drift guard" below).
 CI builds with `--lockfile_mode=error`, so a stale lock fails the job.
 
 crate_universe would record the `[patch]` path crate (`vendor/pprof`) by its
@@ -79,6 +79,61 @@ Hand decisions that Cargo metadata cannot express live in two places only:
   first-party features (`intent-providers/test-support`,
   `intent-services/repository-test-fixtures`) need feature-enabled library
   variants, because Bazel has no Cargo-style feature unification.
-- **CI drift guard**: run `python3 scripts/bazel-gen.py --check`.
-- **Remote cache**: put `--remote_cache` settings behind a named config in
-  `.bazelrc`, and keep per-user settings in the git-ignored `user.bazelrc`.
+
+## Drift guard
+
+```sh
+python3 scripts/bazel-drift.py          # exit 1, with the fix command, on drift
+python3 scripts/bazel-drift.py --fix    # regenerate, refresh MODULE.bazel.lock, recheck
+```
+
+The check fails when a generated file is stale (`bazel-gen.py --check`), when
+`MODULE.bazel.lock` records a host-absolute path, or when the lock no longer
+matches `MODULE.bazel` or the Cargo manifests and `Cargo.lock`
+(`bazel mod deps --lockfile_mode=error`; crate_universe records their digests).
+A third-party bump in `Cargo.lock` therefore needs only `--fix` and a commit of
+the refreshed lock. Set `BAZEL` to pick the launcher (default `bazelisk`, then
+`bazel`). Its unit tests are `python3 -B scripts/test-bazel-ci.py`.
+
+## CI
+
+`.github/workflows/bazel.yml` is informational (not a required check, not in
+the merge queue) and runs on pull requests and `main` pushes that touch Rust or
+Bazel inputs:
+
+- `drift`: the drift guard above, on a small runner.
+- `bazel`: `bazel build //...`, `bazel test --build_tests_only //...`, then
+  `bazel build --config=<name> //...` for each lint config (`clippy`,
+  `rustfmt`) that `.bazelrc` defines. Every command uses `--config=ci`: plain
+  logs, a frozen lock and `--nocache_test_results`, because tests still read
+  undeclared host inputs. Drop that flag once test inputs are audited.
+
+The job installs `libssl-dev`, `zlib1g-dev` and `pkg-config` when missing,
+since openssl-sys and libz-sys link the system libraries on linux-gnu. The
+repository cache and disk cache travel through the GitHub Actions cache:
+pull requests only restore them, and `main` pushes save them. The disk cache
+key includes a fingerprint of the OS release, C compiler and OpenSSL/zlib
+versions, so non-hermetic native actions are never reused on a machine with
+different system libraries.
+
+## Remote cache
+
+`--config=remote-cache` reads from a self-hosted HTTP cache (bazel-remote
+behind the cache host's token gate, per the CI research). It never uploads
+(`--remote_upload_local_results=false`); `--config=remote-cache-write` adds
+uploads for trusted `main` runs. The endpoint and token come from the
+environment:
+
+```sh
+export BAZEL_REMOTE_CACHE_URL=https://cache.example/bazel   # endpoint
+export BAZEL_REMOTE_CACHE_TOKEN=...                          # read-only token
+bazel build --config=remote-cache --remote_cache="$BAZEL_REMOTE_CACHE_URL" //...
+```
+
+`bazel/remote-cache-credentials.sh` is the credential helper. It sends the
+token as a Bearer header only to `BAZEL_REMOTE_CACHE_URL`'s host. Put the two
+flags in the git-ignored `user.bazelrc` to make them permanent. In CI, set the
+`BAZEL_REMOTE_CACHE_URL` variable and the `BAZEL_REMOTE_CACHE_RO_TOKEN` /
+`BAZEL_REMOTE_CACHE_RW_TOKEN` secrets; the workflow then enables the cache with
+no code change. Pull requests always get the read-only token and config, and
+the cache server must reject writes from that token as well.

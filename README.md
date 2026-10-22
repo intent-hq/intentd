@@ -880,6 +880,27 @@ cargo build --workspace
 cargo test --workspace
 ```
 
+### Bazel (parallel build)
+
+Bazel builds, tests and lints the same workspace alongside Cargo. **Cargo stays the
+source of truth**: releases, the required CI gates and day-to-day development use Cargo,
+and the Bazel files are derived from `Cargo.toml`, `Cargo.lock` and `rust-toolchain.toml`.
+Install [bazelisk](https://github.com/bazelbuild/bazelisk) as `bazel` (it reads
+`.bazelversion`); the linux-gnu build links the system OpenSSL and zlib, so install
+`libssl-dev`, `zlib1g-dev` and `pkg-config`.
+
+```bash
+bazel build //...                       # every crate and both binaries
+bazel test //...                        # Bazel test targets
+python3 scripts/bazel-drift.py          # fails when Bazel drifted from Cargo
+python3 scripts/bazel-drift.py --fix    # after a Cargo.toml / Cargo.lock / toolchain change
+```
+
+`--fix` regenerates `crates/*/BUILD.bazel` and `bazel/generated.MODULE.bazel`
+(`scripts/bazel-gen.py`) and refreshes `MODULE.bazel.lock`; commit the result. The
+informational `Bazel` workflow (`.github/workflows/bazel.yml`) runs the same check plus the
+build, tests and lint configs. Details: [`bazel/README.md`](bazel/README.md).
+
 **Conventional commits** are required (`feat`, `fix`, `chore`, `docs`, `refactor`, `test`,
 `ci`, `perf`); PR titles are validated in CI and changelogs are generated with `git-cliff`.
 
