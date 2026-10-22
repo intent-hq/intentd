@@ -572,6 +572,23 @@ def module_shards(pkg_root: Path, crate_root: str, count: int) -> list[list[str]
     return [sorted(members) for _, members in buckets if members]
 
 
+SRC_GLOB = 'glob(["src/**/*.rs"], exclude = INCLUDED_SRCS)'
+_INCLUDE_RE = re.compile(r'\binclude!\s*\(\s*"([^"]+\.rs)"\s*\)')
+
+
+def included_fragments(pkg_root: Path) -> list[str]:
+    """Package-relative .rs files under src/ that are only reached via include!()."""
+    found = set()
+    for path in sorted((pkg_root / "src").rglob("*.rs")):
+        for rel in _INCLUDE_RE.findall(path.read_text(errors="replace")):
+            target = (path.parent / rel).resolve()
+            try:
+                found.add(target.relative_to(pkg_root.resolve()).as_posix())
+            except ValueError:
+                continue
+    return sorted(f for f in found if f.startswith("src/") and (pkg_root / f).is_file())
+
+
 def render_build(ws: Workspace, package: dict, nextest: NextestPolicy) -> str:
     name = package["name"]
     pkg_dir = ws.package_dir(package).as_posix()
@@ -594,7 +611,11 @@ def render_build(ws: Workspace, package: dict, nextest: NextestPolicy) -> str:
     # CARGO_MANIFEST_DIR is the real execroot, whose top-level entries link to
     # the source tree. Tests embed it with env!() and hand paths below it to
     # child processes, as under Cargo, so it must outlive the compile action.
-    test_env: dict[str, str] = {}
+    # Cargo passes the crate's rust-version to rustc and clippy; clippy uses it
+    # as the MSRV, which keeps lints for newer std APIs quiet. rules_rust does
+    # not set it.
+    pkg_env = {"CARGO_PKG_RUST_VERSION": package["rust_version"]} if package.get("rust_version") else {}
+    test_env: dict[str, str] = dict(pkg_env)
 
     rules: list[Rule] = []
     used = {"rust_test"} if (tests or bins or lib) else set()
@@ -640,7 +661,7 @@ def render_build(ws: Workspace, package: dict, nextest: NextestPolicy) -> str:
                 name=f"build_script{g['suffix']}",
                 srcs=[relative_src(package, build_rs)],
                 aliases=Raw(f"{g['aliases']}({g['pkg']}build = True)"),
-                compile_data=Raw("COMPILE_DATA"),
+                compile_data=Raw("COMPILE_DATA + INCLUDED_SRCS"),
                 data=Raw("COMPILE_DATA"),
                 **common,
                 crate_features=g["features"],
@@ -657,15 +678,15 @@ def render_build(ws: Workspace, package: dict, nextest: NextestPolicy) -> str:
                 # Unsandboxed, a pipelined full compile rewrites the read-only
                 # .rmeta its metadata action already produced.
                 disable_pipelining=True if dev and not is_proc_macro else None,
-                srcs=Raw('glob(["src/**/*.rs"])'),
+                srcs=Raw(SRC_GLOB),
                 crate_root=relative_src(package, lib),
                 aliases=Raw(f"{g['aliases']}({g['pkg'].rstrip(', ')})"),
-                compile_data=Raw("COMPILE_DATA"),
+                compile_data=Raw("COMPILE_DATA + INCLUDED_SRCS"),
                 **common,
                 crate_features=g["features"],
                 lint_config=lint_config,
                 proc_macro_deps=concat(crate_deps(g, proc_macro=True), normal_macros),
-                rustc_env=test_env or None if dev else None,
+                rustc_env=(test_env if dev else pkg_env) or None,
                 rustc_env_files=(env_files or None) if not dev else None,
                 tags=TEST_GRAPH_TAGS if dev else None,
                 deps=concat(crate_deps(g, normal=True), normal_deps + build_dep),
@@ -678,15 +699,15 @@ def render_build(ws: Workspace, package: dict, nextest: NextestPolicy) -> str:
             rules.append(Rule(
                 "rust_binary",
                 name=bin_target["name"] + g["suffix"],
-                srcs=Raw('glob(["src/**/*.rs"])'),
+                srcs=Raw(SRC_GLOB),
                 crate_root=relative_src(package, bin_target),
                 aliases=Raw(f"{g['aliases']}({g['pkg'].rstrip(', ')})"),
-                compile_data=Raw("COMPILE_DATA"),
+                compile_data=Raw("COMPILE_DATA + INCLUDED_SRCS"),
                 **common,
                 crate_features=g["features"],
                 lint_config=lint_config,
                 proc_macro_deps=concat(crate_deps(g, proc_macro=True), normal_macros),
-                rustc_env=test_env or None if dev else None,
+                rustc_env=(test_env if dev else pkg_env) or None,
                 rustc_env_files=(env_files or None) if not dev else None,
                 tags=TEST_GRAPH_TAGS if dev else None,
                 deps=concat(crate_deps(g, normal=True), sorted(set(extra))),
@@ -844,7 +865,7 @@ def render_build(ws: Workspace, package: dict, nextest: NextestPolicy) -> str:
             f"{name}::bin/{bin_target['name']}",
             crate_sources(pkg_root, "src/**/*.rs"),
             {
-                "srcs": Raw('glob(["src/**/*.rs"])'),
+                "srcs": Raw(SRC_GLOB),
                 "crate_root": relative_src(package, bin_target),
                 "aliases": Raw("dev_aliases(normal_dev = True, proc_macro_dev = True)"),
                 "proc_macro_deps": concat("dev_crate_deps(proc_macro = True, proc_macro_dev = True)", dev_macros),
@@ -907,6 +928,12 @@ def render_build(ws: Workspace, package: dict, nextest: NextestPolicy) -> str:
         + starlark_list(COMPILE_DATA_EXCLUDES, "    ")
         + ",\n    allow_empty = True,\n)\n\n"
     )
+    included = included_fragments(pkg_root)
+    out.append(
+        "# Rust files pulled in with include!() rather than declared as modules. They\n"
+        "# are compile data, not srcs, so the rustfmt aspect skips them as cargo fmt does.\n"
+    )
+    out.append(f"INCLUDED_SRCS = {starlark_list(included, '')}\n\n")
     out.append("# Shared modules of the integration tests (tests/<dir>/**), compiled into each.\n")
     out.append('TEST_SUPPORT_SRCS = glob(["tests/*/**/*.rs"], allow_empty = True)\n\n')
     out.append("\n".join(rule.render() for rule in rules))

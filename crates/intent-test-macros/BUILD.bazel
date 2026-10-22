@@ -20,6 +20,10 @@ COMPILE_DATA = glob(
     allow_empty = True,
 )
 
+# Rust files pulled in with include!() rather than declared as modules. They
+# are compile data, not srcs, so the rustfmt aspect skips them as cargo fmt does.
+INCLUDED_SRCS = []
+
 # Shared modules of the integration tests (tests/<dir>/**), compiled into each.
 TEST_SUPPORT_SRCS = glob(["tests/*/**/*.rs"], allow_empty = True)
 
@@ -35,28 +39,34 @@ filegroup(
 
 rust_proc_macro(
     name = "intent_test_macros",
-    srcs = glob(["src/**/*.rs"]),
+    srcs = glob(["src/**/*.rs"], exclude = INCLUDED_SRCS),
     crate_root = "src/lib.rs",
     aliases = aliases(package_name = "bazel/prod-workspace/crates/intent-test-macros"),
-    compile_data = COMPILE_DATA,
+    compile_data = COMPILE_DATA + INCLUDED_SRCS,
     edition = "2021",
     version = "0.9.55",
     crate_features = [],
     proc_macro_deps = all_crate_deps(package_name = "bazel/prod-workspace/crates/intent-test-macros", proc_macro = True),
+    rustc_env = {
+        "CARGO_PKG_RUST_VERSION": "1.88",
+    },
     deps = all_crate_deps(package_name = "bazel/prod-workspace/crates/intent-test-macros", normal = True),
 )
 
 rust_proc_macro(
     name = "intent_test_macros_dev",
     crate_name = "intent_test_macros",
-    srcs = glob(["src/**/*.rs"]),
+    srcs = glob(["src/**/*.rs"], exclude = INCLUDED_SRCS),
     crate_root = "src/lib.rs",
     aliases = dev_aliases(),
-    compile_data = COMPILE_DATA,
+    compile_data = COMPILE_DATA + INCLUDED_SRCS,
     edition = "2021",
     version = "0.9.55",
     crate_features = [],
     proc_macro_deps = dev_crate_deps(proc_macro = True),
+    rustc_env = {
+        "CARGO_PKG_RUST_VERSION": "1.88",
+    },
     tags = [
         "no-sandbox",
         "test-graph",
@@ -70,6 +80,9 @@ rust_test(
     crate = ":intent_test_macros_dev",
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro_dev = True),
+    rustc_env = {
+        "CARGO_PKG_RUST_VERSION": "1.88",
+    },
     deps = dev_crate_deps(normal_dev = True) + ["//crates/intent-core:intent_core_dev"],
     compile_data = ["//:workspace_test_data"],
     data = ["//:workspace_test_data"],
@@ -88,6 +101,9 @@ rust_test(
     crate_root = "tests/daemon_test.rs",
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + [":intent_test_macros_dev"],
+    rustc_env = {
+        "CARGO_PKG_RUST_VERSION": "1.88",
+    },
     deps = dev_crate_deps(normal = True, normal_dev = True) + ["//crates/intent-core:intent_core_dev"],
     compile_data = ["//:workspace_test_data"],
     data = ["//:workspace_test_data"],

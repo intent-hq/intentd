@@ -23,6 +23,10 @@ COMPILE_DATA = glob(
     allow_empty = True,
 )
 
+# Rust files pulled in with include!() rather than declared as modules. They
+# are compile data, not srcs, so the rustfmt aspect skips them as cargo fmt does.
+INCLUDED_SRCS = []
+
 # Shared modules of the integration tests (tests/<dir>/**), compiled into each.
 TEST_SUPPORT_SRCS = glob(["tests/*/**/*.rs"], allow_empty = True)
 
@@ -44,15 +48,18 @@ filegroup(
 
 rust_binary(
     name = "intentd",
-    srcs = glob(["src/**/*.rs"]),
+    srcs = glob(["src/**/*.rs"], exclude = INCLUDED_SRCS),
     crate_root = "src/main.rs",
     aliases = aliases(package_name = "bazel/prod-workspace/crates/intentd"),
-    compile_data = COMPILE_DATA,
+    compile_data = COMPILE_DATA + INCLUDED_SRCS,
     edition = "2021",
     version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     proc_macro_deps = all_crate_deps(package_name = "bazel/prod-workspace/crates/intentd", proc_macro = True),
+    rustc_env = {
+        "CARGO_PKG_RUST_VERSION": "1.88",
+    },
     deps = all_crate_deps(package_name = "bazel/prod-workspace/crates/intentd", normal = True) + [
         "//crates/intent-acp:intent_acp",
         "//crates/intent-context:intent_context",
@@ -68,15 +75,18 @@ rust_binary(
 
 rust_binary(
     name = "intentd_dev",
-    srcs = glob(["src/**/*.rs"]),
+    srcs = glob(["src/**/*.rs"], exclude = INCLUDED_SRCS),
     crate_root = "src/main.rs",
     aliases = dev_aliases(),
-    compile_data = COMPILE_DATA,
+    compile_data = COMPILE_DATA + INCLUDED_SRCS,
     edition = "2021",
     version = "0.11.28",
     crate_features = [],
     lint_config = ":cargo_lints",
     proc_macro_deps = dev_crate_deps(proc_macro = True),
+    rustc_env = {
+        "CARGO_PKG_RUST_VERSION": "1.88",
+    },
     tags = [
         "no-sandbox",
         "test-graph",
@@ -108,10 +118,13 @@ copy_file(
 rust_test(
     name = "bin_intentd_test",
     timeout = "long",
-    srcs = glob(["src/**/*.rs"]),
+    srcs = glob(["src/**/*.rs"], exclude = INCLUDED_SRCS),
     crate_root = "src/main.rs",
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
+    rustc_env = {
+        "CARGO_PKG_RUST_VERSION": "1.88",
+    },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
         "//crates/intent-context:intent_context_dev",
@@ -148,6 +161,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -189,6 +203,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -230,6 +245,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -271,6 +287,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -312,6 +329,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -353,6 +371,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -394,6 +413,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -435,6 +455,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -476,6 +497,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -517,6 +539,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -558,6 +581,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -599,6 +623,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -640,6 +665,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -681,6 +707,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -722,6 +749,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -763,6 +791,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -804,6 +833,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -845,6 +875,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -886,6 +917,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -927,6 +959,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -968,6 +1001,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -1009,6 +1043,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -1050,6 +1085,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -1092,6 +1128,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -1134,6 +1171,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -1175,6 +1213,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -1216,6 +1255,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -1258,6 +1298,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -1299,6 +1340,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -1340,6 +1382,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -1381,6 +1424,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -1422,6 +1466,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -1463,6 +1508,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -1504,6 +1550,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -1545,6 +1592,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -1586,6 +1634,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -1627,6 +1676,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -1668,6 +1718,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -1709,6 +1760,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -1750,6 +1802,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -1791,6 +1844,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -1832,6 +1886,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -1873,6 +1928,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -1914,6 +1970,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -1955,6 +2012,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -1996,6 +2054,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -2037,6 +2096,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -2078,6 +2138,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -2119,6 +2180,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -2160,6 +2222,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -2201,6 +2264,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -2242,6 +2306,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -2283,6 +2348,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -2324,6 +2390,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -2365,6 +2432,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -2406,6 +2474,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -2447,6 +2516,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -2488,6 +2558,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -2529,6 +2600,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -2570,6 +2642,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -2611,6 +2684,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -2652,6 +2726,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -2693,6 +2768,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -2734,6 +2810,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -2775,6 +2852,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -2816,6 +2894,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -2857,6 +2936,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -2898,6 +2978,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -2939,6 +3020,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -2980,6 +3062,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -3021,6 +3104,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -3063,6 +3147,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -3104,6 +3189,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -3145,6 +3231,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -3186,6 +3273,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -3227,6 +3315,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -3268,6 +3357,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -3309,6 +3399,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -3350,6 +3441,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -3391,6 +3483,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -3432,6 +3525,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -3473,6 +3567,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -3514,6 +3609,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -3555,6 +3651,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -3596,6 +3693,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -3637,6 +3735,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -3678,6 +3777,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -3719,6 +3819,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -3760,6 +3861,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -3801,6 +3903,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -3843,6 +3946,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -3885,6 +3989,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -3926,6 +4031,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -3967,6 +4073,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -4008,6 +4115,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -4049,6 +4157,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -4090,6 +4199,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -4132,6 +4242,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -4173,6 +4284,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -4214,6 +4326,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -4255,6 +4368,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -4296,6 +4410,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -4338,6 +4453,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -4380,6 +4496,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -4421,6 +4538,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -4462,6 +4580,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -4503,6 +4622,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -4544,6 +4664,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -4585,6 +4706,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -4626,6 +4748,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -4667,6 +4790,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -4709,6 +4833,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -4750,6 +4875,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -4791,6 +4917,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -4832,6 +4959,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -4873,6 +5001,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -4914,6 +5043,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -4955,6 +5085,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -4996,6 +5127,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -5037,6 +5169,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -5078,6 +5211,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -5119,6 +5253,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -5160,6 +5295,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -5202,6 +5338,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -5243,6 +5380,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -5284,6 +5422,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -5325,6 +5464,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -5366,6 +5506,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -5407,6 +5548,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -5448,6 +5590,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -5518,6 +5661,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -5559,6 +5703,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -5600,6 +5745,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -5641,6 +5787,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -5682,6 +5829,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -5724,6 +5872,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -5765,6 +5914,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -5806,6 +5956,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -5847,6 +5998,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -5888,6 +6040,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -5929,6 +6082,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -5970,6 +6124,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -6011,6 +6166,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -6052,6 +6208,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -6093,6 +6250,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -6134,6 +6292,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -6175,6 +6334,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -6216,6 +6376,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -6257,6 +6418,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -6298,6 +6460,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -6339,6 +6502,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -6380,6 +6544,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -6421,6 +6586,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -6462,6 +6628,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -6503,6 +6670,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -6544,6 +6712,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -6585,6 +6754,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -6626,6 +6796,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -6667,6 +6838,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -6708,6 +6880,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -6749,6 +6922,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -6790,6 +6964,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -6831,6 +7006,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -6872,6 +7048,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -6913,6 +7090,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -6954,6 +7132,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -6995,6 +7174,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -7036,6 +7216,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -7077,6 +7258,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -7118,6 +7300,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -7159,6 +7342,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -7200,6 +7384,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -7241,6 +7426,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -7282,6 +7468,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -7323,6 +7510,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -7364,6 +7552,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -7405,6 +7594,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -7446,6 +7636,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -7487,6 +7678,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -7528,6 +7720,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -7569,6 +7762,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -7610,6 +7804,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -7651,6 +7846,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -7692,6 +7888,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -7733,6 +7930,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -7774,6 +7972,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -7815,6 +8014,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -7856,6 +8056,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -7897,6 +8098,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -7938,6 +8140,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -7979,6 +8182,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -8020,6 +8224,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -8061,6 +8266,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -8102,6 +8308,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -8143,6 +8350,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -8184,6 +8392,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -8225,6 +8434,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -8266,6 +8476,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -8307,6 +8518,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -8348,6 +8560,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -8389,6 +8602,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -8430,6 +8644,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -8471,6 +8686,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -8512,6 +8728,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -8553,6 +8770,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -8594,6 +8812,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -8635,6 +8854,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -8676,6 +8896,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -8717,6 +8938,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -8758,6 +8980,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -8799,6 +9022,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
@@ -8840,6 +9064,7 @@ rust_test(
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
     rustc_env = {
         "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
+        "CARGO_PKG_RUST_VERSION": "1.88",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intent-acp:intent_acp_dev",
