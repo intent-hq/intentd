@@ -292,8 +292,8 @@ async fn list(
 }
 
 /// Disk-backed mutations on a retired workspace are refused with
-/// `workspace-retired`, as are archive and unarchive; `workspace.delete`
-/// still works.
+/// `workspace-retired`, as is archive; `workspace.delete` still works.
+/// (Unarchive revives instead — see the revive tests below.)
 #[intent_test_macros::daemon_test]
 async fn retired_workspace_refuses_disk_mutations_and_still_deletes() {
     let f = fixture().await;
@@ -342,8 +342,6 @@ async fn retired_workspace_refuses_disk_mutations_and_still_deletes() {
     assert!(is_retired(&err), "terminal.create: {err:?}");
     let err = f.svc.archive_workspace(id(), None).await.unwrap_err();
     assert!(is_retired(&err), "workspace.archive: {err:?}");
-    let err = f.svc.unarchive_workspace(id()).await.unwrap_err();
-    assert!(is_retired(&err), "workspace.unarchive: {err:?}");
     assert_eq!(
         f.store.get_workspace(&ws.id).await.unwrap().status,
         WorkspaceStatus::Retired,
@@ -478,4 +476,332 @@ async fn retire_refuses_unregistered_folder_and_keeps_it() {
     assert!(folder.join("keep.txt").is_file(), "folder untouched");
     let row = f.store.get_workspace(&id).await.unwrap();
     assert_eq!(row.status, WorkspaceStatus::Active);
+}
+
+// ---------------------------------------------------------------------------
+// Revive (PROTOCOL §5.1 "Revive"): a retired workspace comes back as a fresh
+// blank checkout of the default branch on a NEW branch, at the same path.
+// ---------------------------------------------------------------------------
+
+fn subscribe_updates(f: &Fixture, ws: &WorkspaceId) -> crate::Subscription {
+    f.bus.subscribe(crate::SubscriptionFilter {
+        event_types: vec!["workspace:updated".to_string()],
+        workspace_id: Some(ws.0.clone()),
+        ..Default::default()
+    })
+}
+
+/// Collect the `changes` of every `workspace:updated` delta that arrives
+/// within a short quiet window.
+async fn drain_changes(sub: &mut crate::Subscription) -> Vec<serde_json::Value> {
+    let mut changes = Vec::new();
+    while let Ok(Some(batch)) = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(500)),
+        sub.recv(),
+    )
+    .await
+    {
+        for ev in batch {
+            changes.push(serde_json::to_value(&ev).unwrap()["data"]["changes"].clone());
+        }
+    }
+    changes
+}
+
+fn head_branch(worktree: &std::path::Path) -> String {
+    let repo = git2::Repository::open(worktree).expect("open revived checkout");
+    let head = repo.head().expect("head");
+    head.shorthand().expect("branch name").to_string()
+}
+
+/// Retire `ws` after leaving an untracked file in its checkout, so a revive
+/// can prove nothing on disk came back.
+async fn retire_with_scratch(f: &Fixture, ws: &intent_core::Workspace) -> std::path::PathBuf {
+    let wt = std::path::PathBuf::from(ws.worktree_path.clone().unwrap());
+    std::fs::write(wt.join("scratch.txt"), "uncommitted work").unwrap();
+    f.svc
+        .retire_workspace(ws.id.clone(), None)
+        .await
+        .expect("retire");
+    assert!(!wt.exists());
+    wt
+}
+
+/// `workspace.unarchive` on a retired workspace is the manual revive: a fresh
+/// blank checkout at the same path on a new branch cut from the default
+/// branch (the old branch is kept), the row flips back to Active with
+/// `archivedAt` / `retiredAt` cleared, and ONE delta carries
+/// `revived: { reason: "manual" }` plus the new `branch` — never
+/// `autoUnarchive`. Rows are kept and no agent transcript notice is written.
+#[intent_test_macros::daemon_test]
+async fn manual_unarchive_revives_retired_workspace_as_fresh_checkout() {
+    let f = fixture().await;
+    let ws = create_workspace(&f).await;
+    let notes_before = f.store.list_notes(&ws.id).await.unwrap().len();
+    let wt = retire_with_scratch(&f, &ws).await;
+    let mut sub = subscribe_updates(&f, &ws.id);
+
+    let revived = f
+        .svc
+        .unarchive_workspace(ws.id.clone())
+        .await
+        .expect("unarchive revives");
+    assert_eq!(revived.status, WorkspaceStatus::Active);
+    assert!(!revived.archived);
+    assert!(revived.archived_at.is_none());
+    assert!(revived.retired_at.is_none());
+    assert_ne!(revived.branch, ws.branch, "revive uses a new branch");
+    assert_eq!(
+        revived.worktree_path, ws.worktree_path,
+        "revive provisions at the same path"
+    );
+
+    assert!(
+        wt.join("README.md").is_file(),
+        "fresh checkout of the default branch"
+    );
+    assert!(
+        !wt.join("scratch.txt").exists(),
+        "nothing from the old folder comes back"
+    );
+    assert_eq!(head_branch(&wt), revived.branch);
+    let repo = git2::Repository::open(&f.repo).unwrap();
+    assert!(
+        repo.find_branch(&ws.branch, git2::BranchType::Local)
+            .is_ok(),
+        "the old branch is left untouched"
+    );
+    assert!(
+        intent_git::worktree::is_registered_worktree(&f.repo, &wt),
+        "the new checkout is a registered linked worktree"
+    );
+
+    let changes = drain_changes(&mut sub).await;
+    assert_eq!(changes.len(), 1, "exactly one delta: {changes:?}");
+    assert_eq!(
+        changes[0],
+        serde_json::json!({
+            "archived": false,
+            "status": "Active",
+            "archivedAt": null,
+            "retiredAt": null,
+            "branch": revived.branch,
+            "baseCommitSha": revived.base_commit_sha,
+            "revived": { "reason": "manual" },
+        })
+    );
+
+    let row = f.store.get_workspace(&ws.id).await.unwrap();
+    assert_eq!(row.status, WorkspaceStatus::Active);
+    assert_eq!(row.branch, revived.branch);
+    assert!(row.retired_at.is_none());
+    assert_eq!(
+        f.store.list_notes(&ws.id).await.unwrap().len(),
+        notes_before,
+        "notes kept"
+    );
+    let agent = intent_core::AgentId::from(format!("agent-{}", ws.id.0));
+    assert!(
+        f.store
+            .get_agent_messages(&agent, None)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a manual revive writes no agent transcript notice"
+    );
+
+    // Writable again: the retired read-only gate no longer applies.
+    f.svc
+        .file_write(ws.id.clone(), "new.txt".into(), "x".into(), None)
+        .await
+        .expect("revived workspace accepts writes");
+}
+
+/// `workspace.restore` is the same manual revive.
+#[intent_test_macros::daemon_test]
+async fn restore_revives_retired_workspace() {
+    let f = fixture().await;
+    let ws = create_workspace(&f).await;
+    let wt = retire_with_scratch(&f, &ws).await;
+    let revived = f
+        .svc
+        .restore_workspace(ws.id.clone())
+        .await
+        .expect("restore revives");
+    assert_eq!(revived.status, WorkspaceStatus::Active);
+    assert!(revived.retired_at.is_none());
+    assert!(wt.join("README.md").is_file());
+    assert!(!wt.join("scratch.txt").exists());
+}
+
+/// A revive racing the retire's background folder sweep must keep the new
+/// checkout: the sweep of the old `<root>/<id>/` directory never deletes a
+/// folder provisioned by a revive.
+#[intent_test_macros::daemon_test]
+async fn revive_right_after_retire_survives_the_folder_sweep() {
+    let f = fixture().await;
+    let ws = create_workspace(&f).await;
+    let wt = std::path::PathBuf::from(ws.worktree_path.clone().unwrap());
+    f.svc
+        .retire_workspace(ws.id.clone(), None)
+        .await
+        .expect("retire");
+    f.svc
+        .unarchive_workspace(ws.id.clone())
+        .await
+        .expect("revive");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        wt.join("README.md").is_file(),
+        "the revived checkout survives the retire sweep"
+    );
+}
+
+/// The turn-start trigger revives a retired workspace and reports it as a
+/// revive (not a plain unarchive), with a delta stamped
+/// `revived: { reason: "agent_activity", agentId, agentName }`.
+#[intent_test_macros::daemon_test]
+async fn turn_start_revives_retired_workspace() {
+    let f = fixture().await;
+    let ws = create_workspace(&f).await;
+    let wt = retire_with_scratch(&f, &ws).await;
+    let agent = intent_core::AgentId::from(format!("agent-{}", ws.id.0));
+    let mut sub = subscribe_updates(&f, &ws.id);
+
+    let outcome = f.svc.auto_unarchive_on_turn_start(&ws.id, &agent).await;
+    let Some(crate::UnarchiveOutcome::Revived {
+        previous_branch,
+        branch,
+    }) = outcome
+    else {
+        panic!("expected a revive, got {outcome:?}");
+    };
+    assert_eq!(previous_branch, ws.branch);
+    assert_ne!(branch, ws.branch);
+    assert!(wt.join("README.md").is_file());
+    assert!(!wt.join("scratch.txt").exists());
+
+    let changes = drain_changes(&mut sub).await;
+    assert_eq!(changes.len(), 1, "{changes:?}");
+    assert_eq!(
+        changes[0]["revived"],
+        serde_json::json!({
+            "reason": "agent_activity",
+            "agentId": agent.0,
+            "agentName": format!("test-{}", agent.0),
+        })
+    );
+    assert!(changes[0].get("autoUnarchive").is_none(), "{changes:?}");
+    assert_eq!(changes[0]["branch"], serde_json::json!(branch));
+    let row = f.store.get_workspace(&ws.id).await.unwrap();
+    assert_eq!(row.status, WorkspaceStatus::Active);
+
+    // A second turn start is a no-op: the workspace is Active now.
+    assert!(f
+        .svc
+        .auto_unarchive_on_turn_start(&ws.id, &agent)
+        .await
+        .is_none());
+}
+
+async fn begin_upload(f: &Fixture, ws: &WorkspaceId, payload: &[u8]) -> String {
+    use base64::Engine as _;
+    let r = f
+        .svc
+        .file_attachment_upload_begin(
+            ws.clone(),
+            "report.bin".to_string(),
+            payload.len() as u64,
+            crate::attachment_upload::sha256_hex(payload),
+            None,
+            None,
+        )
+        .await
+        .expect("begin");
+    let upload = r["uploadId"].as_str().expect("uploadId").to_string();
+    f.svc
+        .file_attachment_upload_chunk(
+            upload.clone(),
+            0,
+            base64::engine::general_purpose::STANDARD.encode(payload),
+        )
+        .await
+        .expect("chunk before retire");
+    upload
+}
+
+/// An upload begun before the workspace became retired cannot keep writing:
+/// `chunk` and `commit` resolve the upload's workspace and are refused with
+/// `workspace-retired` (the RPC gate cannot see an `uploadId`-only call).
+#[intent_test_macros::daemon_test]
+async fn upload_continuations_refused_once_workspace_is_retired() {
+    use base64::Engine as _;
+    let f = fixture().await;
+    let ws = create_workspace(&f).await;
+    let upload = begin_upload(&f, &ws.id, b"payload").await;
+    // The row flip alone (the window before retire's upload sweep).
+    f.store
+        .archive_workspace_detaching_guests(&ws.id, &intent_core::now_iso())
+        .await
+        .unwrap();
+    assert!(f
+        .store
+        .retire_workspace_if_archived(&ws.id, &intent_core::now_iso())
+        .await
+        .unwrap());
+    let is_retired = |e: &Error| matches!(e, Error::WorkspaceRetired { workspace_id } if *workspace_id == ws.id.0);
+
+    let err = f
+        .svc
+        .file_attachment_upload_chunk(
+            upload.clone(),
+            0,
+            base64::engine::general_purpose::STANDARD.encode(b"payload"),
+        )
+        .await
+        .unwrap_err();
+    assert!(is_retired(&err), "chunk: {err:?}");
+    let err = f
+        .svc
+        .file_attachment_upload_commit(upload.clone())
+        .await
+        .unwrap_err();
+    assert!(is_retired(&err), "commit: {err:?}");
+    assert!(
+        f.store.list_attachments(&ws.id).await.unwrap().is_empty(),
+        "nothing placed"
+    );
+}
+
+/// `workspace.retire` aborts the workspace's in-flight uploads: their
+/// sessions are dropped and staging deleted, so a late chunk / commit has
+/// nothing to write into.
+#[intent_test_macros::daemon_test]
+async fn retire_aborts_in_flight_uploads() {
+    let f = fixture().await;
+    let ws = create_workspace(&f).await;
+    let upload = begin_upload(&f, &ws.id, b"payload").await;
+    let staging = f
+        .svc
+        .attachment_uploads
+        .lock()
+        .unwrap()
+        .get(&upload)
+        .map(|s| s.staging_dir.clone())
+        .expect("session");
+    assert!(staging.is_dir());
+    f.svc
+        .retire_workspace(ws.id.clone(), None)
+        .await
+        .expect("retire");
+    assert!(
+        !f.svc
+            .attachment_uploads
+            .lock()
+            .unwrap()
+            .contains_key(&upload),
+        "session dropped on retire"
+    );
+    assert!(!staging.exists(), "staging deleted on retire");
+    assert!(f.svc.file_attachment_upload_commit(upload).await.is_err());
 }

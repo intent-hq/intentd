@@ -1461,6 +1461,57 @@ impl Store {
         Ok(false)
     }
 
+    /// Scoped, conditional revive flip (PROTOCOL §5.1 "Revive"): flip a
+    /// `Retired` row back to `Active` — clear `archived`, `archived_at` and
+    /// `retired_at` — and record the fresh checkout's `branch` and
+    /// `base_commit_sha`, ONLY when the row is currently retired. Every other
+    /// column is untouched. Returns whether this call performed the flip;
+    /// `NotFound` when the workspace does not exist. Same archive-binding
+    /// lifecycle bracket as [`Self::unarchive_workspace_if_archived`] (a
+    /// retired row is always archived).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
+    pub async fn revive_workspace_if_retired(
+        &self,
+        id: &WorkspaceId,
+        branch: &str,
+        base_commit_sha: Option<&str>,
+        updated_at: &str,
+    ) -> Result<bool> {
+        let retired = enum_to_db(&WorkspaceStatus::Retired)?;
+        let mut lifecycle = self.repository_lifecycle_write().await?;
+        let status: Option<String> = sqlx::query_scalar("SELECT status FROM workspace WHERE id=?")
+            .bind(&id.0)
+            .fetch_optional(self.read_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("read retired binding failed: {e}")))?;
+        let Some(status) = status else {
+            return Err(Error::NotFound(format!("workspace {id}")));
+        };
+        if status != retired {
+            lifecycle.settle_after_retirement().await?;
+            return Ok(false);
+        }
+        lifecycle.begin(&[crate::RepositoryLifecycleKey::Workspace(id.clone())])?;
+        let res = sqlx::query(
+            "UPDATE workspace SET status=?, archived=0, archived_at=NULL, retired_at=NULL, \
+             branch=?, base_commit_sha=?, updated_at=? WHERE id=? AND status=?",
+        )
+        .bind(enum_to_db(&WorkspaceStatus::Active)?)
+        .bind(branch)
+        .bind(base_commit_sha)
+        .bind(updated_at)
+        .bind(&id.0)
+        .bind(&retired)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("conditional revive failed: {e}")))?;
+        lifecycle.settle_after_retirement().await?;
+        Ok(res.rows_affected() > 0)
+    }
+
     /// Ordinary workspace keys for inherited host access, without hydrating
     /// rows or issuing a role lookup per workspace. Includes archived rows.
     ///

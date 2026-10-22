@@ -13560,7 +13560,11 @@ mod change_event_parity {
             .services
             .auto_unarchive_on_turn_start(&h.ws, &agent_id)
             .await;
-        assert!(flipped, "a persisted flip reports true");
+        assert_eq!(
+            flipped,
+            Some(crate::UnarchiveOutcome::Unarchived),
+            "a persisted flip reports Unarchived"
+        );
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &h.ws.0, "workspace:updated");
         assert_eq!(
@@ -13602,7 +13606,7 @@ mod change_event_parity {
             .services
             .auto_unarchive_on_turn_start(&h.ws, &agent_id)
             .await;
-        assert!(!flipped, "no flip on an active workspace");
+        assert!(flipped.is_none(), "no flip on an active workspace");
         let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
         assert!(
             quiet.is_err(),
@@ -13627,7 +13631,7 @@ mod change_event_parity {
             .services
             .auto_unarchive_on_turn_start(&missing, &agent_id)
             .await;
-        assert!(!flipped, "a failed read reports no flip");
+        assert!(flipped.is_none(), "a failed read reports no flip");
         let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
         assert!(
             quiet.is_err(),
@@ -13660,7 +13664,10 @@ mod change_event_parity {
             .unarchive_workspace_inner(h.ws.clone(), Some(stamp))
             .await
             .expect("losing racer still succeeds");
-        assert!(!flipped, "the losing racer must not claim the flip");
+        assert!(
+            flipped.is_none(),
+            "the losing racer must not claim the flip"
+        );
         assert!(!ws.archived, "the returned row reflects the Active state");
         let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
         assert!(
@@ -13711,7 +13718,10 @@ mod change_event_parity {
             .services
             .auto_unarchive_on_turn_start(&h.ws, &agent_id)
             .await;
-        assert!(flipped, "the flip persists despite the missing session row");
+        assert!(
+            flipped.is_some(),
+            "the flip persists despite the missing session row"
+        );
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &h.ws.0, "workspace:updated");
         assert_eq!(

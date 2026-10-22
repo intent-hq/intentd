@@ -172,6 +172,24 @@ pub(crate) const AUTO_UNARCHIVE_NOTICE_TEXT: &str =
 pub(crate) const AUTO_UNARCHIVE_PROMPT_NOTICE: &str =
     "[SYSTEM NOTICE] This workspace was archived; it has been automatically unarchived because this message was sent.";
 
+/// Transcript text of the `workspace_revived` system row persisted when a turn
+/// start revives a RETIRED workspace (PROTOCOL §5.1 "Revive").
+pub(crate) const WORKSPACE_REVIVED_NOTICE_TEXT: &str =
+    "Workspace was retired and has been revived as a fresh, blank checkout because a message was sent to this agent. Files, uncommitted changes, and local git state from before were lost; conversations and notes were kept.";
+
+/// Trailing prompt block injected into the SAME turn that revived a retired
+/// workspace: all prior on-disk state is gone. Names the kept old branch (its
+/// committed work is still in the repository) and the fresh branch.
+pub(crate) fn workspace_revived_prompt_notice(previous_branch: &str, branch: &str) -> String {
+    format!(
+        "[SYSTEM NOTICE] This workspace was retired and its folder was deleted. All files, \
+         uncommitted changes, and local git state from before are gone; you are now in a fresh, \
+         blank checkout of the repository's default branch on the new branch `{branch}`. \
+         Commits on the previous branch `{previous_branch}` are kept in the repository. \
+         Conversation history and notes were kept."
+    )
+}
+
 /// Queued-message size (chars) above which a turn failing with a
 /// context-size error (HTTP 413, [`crate::is_context_size_error`]) is
 /// treated as the MESSAGE being too large rather than the accumulated
@@ -3005,7 +3023,9 @@ pub struct AgentManager {
     /// turns. A claim that never builds a prompt (harness wake turns) has the
     /// stale flag cleared by [`AgentManager::release_slot_sync`] when the
     /// slot is released. In-memory only, same gap as `recreated`.
-    auto_unarchived: Arc<Mutex<HashSet<AgentId>>>,
+    /// The value is the prompt block to inject (the auto-unarchive or the
+    /// workspace-revived notice).
+    auto_unarchived: Arc<Mutex<HashMap<AgentId, String>>>,
     /// Slot holders that published the terminal `agent:idle` of a completed
     /// turn and have dequeued no new work since. `agent:idle` precedes the
     /// worker's post-turn tail and its `end_turn`, so busy-slot membership
@@ -3143,7 +3163,7 @@ impl AgentManager {
             retired: Arc::new(Mutex::new(HashSet::new())),
             unsloth: Arc::new(crate::unsloth_server::UnslothServerManager::default()),
             tree_probe: std::sync::OnceLock::new(),
-            auto_unarchived: Arc::new(Mutex::new(HashSet::new())),
+            auto_unarchived: Arc::new(Mutex::new(HashMap::new())),
             settled_turns: Mutex::new(HashSet::new()),
             pending_idle_writes: Mutex::new(HashMap::new()),
             next_idle_write: AtomicU64::new(0),
@@ -5879,8 +5899,9 @@ impl AgentManager {
         // here so only the triggering turn carries it — the persisted
         // `auto_unarchived` system row stays excluded from history replay
         // like every system row.
-        if self.auto_unarchived.lock().unwrap().remove(agent_id) {
-            blocks.extend(text_prompt(AUTO_UNARCHIVE_PROMPT_NOTICE));
+        let notice = self.auto_unarchived.lock().unwrap().remove(agent_id);
+        if let Some(notice) = notice {
+            blocks.extend(text_prompt(&notice));
         }
         Ok(blocks)
     }
@@ -7356,20 +7377,49 @@ impl AgentManager {
             // triggers this. Suppressed (`auto_unarchive = false`) only by
             // the worker's raced re-claim, whose own post-claim archived
             // re-check parks instead of un-archiving (monorepo#2513).
-            if auto_unarchive
-                && self
-                    .services
+            let outcome = if auto_unarchive {
+                self.services
                     .auto_unarchive_on_turn_start(workspace_id, agent_id)
                     .await
-            {
-                // The flip actually persisted: record the `auto_unarchived`
-                // system transcript row and arm the one-shot prompt-notice
-                // flag so THIS turn's outbound prompt tells the model the
-                // workspace was auto-unarchived. Both best-effort — never
-                // block the turn.
-                self.persist_auto_unarchive_notice(agent_id, workspace_id)
+            } else {
+                None
+            };
+            // The flip actually persisted: record the system transcript row
+            // (`auto_unarchived`, or `workspace_revived` for a retired
+            // workspace) and arm the one-shot prompt-notice flag so THIS
+            // turn's outbound prompt tells the model. Both best-effort —
+            // never block the turn.
+            match outcome {
+                Some(crate::UnarchiveOutcome::Unarchived) => {
+                    self.persist_auto_unarchive_notice(
+                        agent_id,
+                        workspace_id,
+                        AUTO_UNARCHIVE_NOTICE_TEXT,
+                        "auto_unarchived",
+                    )
                     .await;
-                self.arm_auto_unarchive_flag_if_slot_held(agent_id);
+                    self.arm_auto_unarchive_flag_if_slot_held(
+                        agent_id,
+                        AUTO_UNARCHIVE_PROMPT_NOTICE.to_string(),
+                    );
+                }
+                Some(crate::UnarchiveOutcome::Revived {
+                    previous_branch,
+                    branch,
+                }) => {
+                    self.persist_auto_unarchive_notice(
+                        agent_id,
+                        workspace_id,
+                        WORKSPACE_REVIVED_NOTICE_TEXT,
+                        "workspace_revived",
+                    )
+                    .await;
+                    self.arm_auto_unarchive_flag_if_slot_held(
+                        agent_id,
+                        workspace_revived_prompt_notice(&previous_branch, &branch),
+                    );
+                }
+                None => {}
             }
             // Pre-upgrade pending-questions marker (PROTOCOL §5.5): a session
             // whose marker key was never written derives pendingness from the
@@ -7623,13 +7673,13 @@ impl AgentManager {
     /// `busy` while inserting closes the window: either this claim still owns
     /// the slot (insert precedes the release's clear) or the slot is gone
     /// (insert is skipped entirely).
-    fn arm_auto_unarchive_flag_if_slot_held(&self, agent_id: &AgentId) {
+    fn arm_auto_unarchive_flag_if_slot_held(&self, agent_id: &AgentId, notice: String) {
         let busy = self.busy.lock().unwrap();
         if busy.contains(agent_id) {
             self.auto_unarchived
                 .lock()
                 .unwrap()
-                .insert(agent_id.clone());
+                .insert(agent_id.clone(), notice);
         }
     }
 
@@ -10749,16 +10799,24 @@ impl AgentManager {
     /// confirmed flip, never on the suppressed re-claim or an unarchive
     /// failure). The row is `role: "system"` — excluded from supervisor-XML
     /// history replay like the model-change notice — with metadata
-    /// `{ type: "auto_unarchived", reason: "agent_activity" }`. Emits
+    /// `{ type: <kind>, reason: "agent_activity" }` — `kind` is
+    /// `auto_unarchived`, or `workspace_revived` when the turn start revived
+    /// a retired workspace (PROTOCOL §5.1 "Revive"). Emits
     /// `agent:message` so clients update live. Entirely best-effort: an
     /// append/publish failure is logged and the turn proceeds.
-    async fn persist_auto_unarchive_notice(&self, agent_id: &AgentId, workspace_id: &WorkspaceId) {
+    async fn persist_auto_unarchive_notice(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        text: &str,
+        kind: &str,
+    ) {
         let content = json!([{
             "type": "text",
-            "text": AUTO_UNARCHIVE_NOTICE_TEXT,
+            "text": text,
         }]);
         let metadata = json!({
-            "type": "auto_unarchived",
+            "type": kind,
             "reason": "agent_activity",
         });
         match self

@@ -14,6 +14,11 @@
 //!
 //! Disk-backed mutations on a retired workspace are refused with
 //! [`Error::WorkspaceRetired`] ([`Services::refuse_if_retired`]).
+//!
+//! Revive ([`Services::revive_retired_checkout`]) brings a retired workspace
+//! back as a fresh blank checkout of the repository default branch, on a new
+//! branch, at the same path. It is reached through `workspace.unarchive` /
+//! `workspace.restore` and the turn-start auto-unarchive.
 
 use std::path::PathBuf;
 
@@ -23,6 +28,27 @@ use crate::{
     cleanup_detached_worktree, cleanup_workspace_worktree_locked, default_workspaces_root, git_ops,
     now_iso, publish_event, workspace_dir_candidates, workspace_updated_event, Services,
 };
+
+/// What an unarchive call did (`workspace.unarchive` / `workspace.restore` /
+/// the turn-start auto-unarchive).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UnarchiveOutcome {
+    /// An Archived workspace flipped back to Active; its folder was intact.
+    Unarchived,
+    /// A Retired workspace was revived as a fresh blank checkout on `branch`;
+    /// `previous_branch` (kept in the repository) is where its old work lives.
+    Revived {
+        previous_branch: String,
+        branch: String,
+    },
+}
+
+/// The fresh checkout a revive provisioned and persisted.
+pub(crate) struct RevivedCheckout {
+    pub(crate) previous_branch: String,
+    pub(crate) branch: String,
+    pub(crate) base_commit_sha: String,
+}
 
 impl Services {
     /// Refuse a call that needs the workspace's folder on disk when the
@@ -123,6 +149,10 @@ impl Services {
             }
             ws
         };
+        // In-flight attachment uploads would otherwise keep staging chunks
+        // and could commit into the deleted folder. After the flip, so a
+        // `begin` racing this sweep is refused by the retired gate instead.
+        self.abort_workspace_attachment_uploads(&id).await;
         // Stop the agents' provider processes (rows, transcripts and queues
         // are kept — `agent.stop` semantics): their working directory is
         // about to disappear. The initiating agent is excluded for the same
@@ -152,6 +182,112 @@ impl Services {
         ws.activity = self.workspace_activity(&ws.id);
         self.attach_workspace_membership(&mut ws).await;
         Ok(ws)
+    }
+
+    /// Revive a retired workspace's checkout (PROTOCOL §5.1 "Revive"):
+    /// provision a fresh linked worktree at the persisted `worktreePath` from
+    /// the repository default branch on a NEW branch (the old branch, kept by
+    /// retire, gets a `-N` suffix so it is never reused or touched), then flip
+    /// the row Retired → Active with the new `branch` / `baseCommitSha`.
+    ///
+    /// The caller holds the workspace's archive fence: the retire folder
+    /// sweep takes the same fence, so it can never delete the new checkout.
+    /// A leftover folder at the path (a revive that won the race against the
+    /// retire sweep) is detached and trashed first. Returns `None` when the
+    /// row is no longer retired (nothing provisioned). On a failed row flip
+    /// the new worktree and branch are removed again (best-effort).
+    pub(crate) async fn revive_retired_checkout(
+        &self,
+        ws: &Workspace,
+    ) -> Result<Option<RevivedCheckout>> {
+        retire_supported(ws)?;
+        let (Some(repo), Some(wt)) = (
+            ws.repository_path.as_deref().map(PathBuf::from),
+            ws.worktree_path.as_deref().map(PathBuf::from),
+        ) else {
+            return Err(retired_error(&ws.id));
+        };
+        let previous_branch = ws.branch.clone();
+        let name = ws.id.0.clone();
+        let (branch, sha, trash) = {
+            let repo = repo.clone();
+            let wt = wt.clone();
+            let previous = previous_branch.clone();
+            self.worktree_locks
+                .with_lock(&repo.clone(), move || async move {
+                    tokio::task::spawn_blocking(move || -> Result<_> {
+                        let trash = if wt.exists() {
+                            intent_git::worktree::detach_worktree(&repo, &wt)?
+                        } else {
+                            None
+                        };
+                        let base = intent_git::branches::repo_default_branch(&repo)?;
+                        let desired = if previous.is_empty() {
+                            "revived".to_string()
+                        } else {
+                            previous
+                        };
+                        let branch =
+                            intent_git::branches::ensure_unique_branch_name(&repo, &desired)?;
+                        let sha = intent_git::worktree::provision_worktree(
+                            &repo,
+                            &name,
+                            &wt,
+                            &branch,
+                            Some(&base),
+                            "origin",
+                        )?;
+                        Ok((branch, sha, trash))
+                    })
+                    .await
+                    .map_err(|e| Error::Internal(format!("revive provisioning task failed: {e}")))?
+                })
+                .await?
+        };
+        if let Some(trash) = trash {
+            let removal = async move {
+                let _ =
+                    tokio::task::spawn_blocking(move || cleanup_detached_worktree(&trash)).await;
+            };
+            drop(self.store_tasks.spawn_draining(removal));
+        }
+        let flipped = self
+            .store
+            .revive_workspace_if_retired(&ws.id, &branch, Some(&sha), &now_iso())
+            .await;
+        if !matches!(flipped, Ok(true)) {
+            // Roll back the checkout this call provisioned: the row is not
+            // (or no longer) retired, or the write failed.
+            let (repo, wt, branch) = (repo.clone(), wt.clone(), branch.clone());
+            self.worktree_locks
+                .with_lock(&repo.clone(), move || async move {
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let (trash, _) =
+                            cleanup_workspace_worktree_locked(&repo, &wt, &branch, true);
+                        if let Some(trash) = trash {
+                            cleanup_detached_worktree(&trash);
+                        }
+                    })
+                    .await;
+                })
+                .await;
+            return flipped.map(|_| None);
+        }
+        // The new branch is daemon-generated: `workspace.delete` may remove
+        // it (best-effort, like workspace.create's flag write).
+        if let Err(e) = self
+            .store
+            .set_workspace_branch_auto_generated(&ws.id, true)
+            .await
+        {
+            tracing::warn!(workspace = %ws.id.as_str(), error = %e, "revive: branch flag write failed");
+        }
+        self.git_status_cache.evict(&wt);
+        Ok(Some(RevivedCheckout {
+            previous_branch,
+            branch,
+            base_commit_sha: sha,
+        }))
     }
 
     /// Ownership proof before anything is deleted (the `workspace.delete`
@@ -203,6 +339,19 @@ impl Services {
     /// directory (the same candidates `workspace.delete` sweeps).
     /// Best-effort: failures are logged and the workspace stays retired.
     async fn remove_retired_checkout(&self, ws: &Workspace) {
+        // Held until the folder sweep below finishes: a revive takes the same
+        // fence before provisioning at the same path, so the sweep can never
+        // delete a revived checkout. A revive that won the race already
+        // replaced the folder — nothing left to remove.
+        let fence = self.archive_fence.acquire(&ws.id).await;
+        if !self
+            .store
+            .get_workspace(&ws.id)
+            .await
+            .is_ok_and(|row| row.is_retired())
+        {
+            return;
+        }
         let workspaces_root = self
             .workspaces_root
             .clone()
@@ -249,6 +398,7 @@ impl Services {
         );
         let id = ws.id.clone();
         let removal = async move {
+            let _fence = fence;
             if let Some(trash) = trash {
                 let _ =
                     tokio::task::spawn_blocking(move || cleanup_detached_worktree(&trash)).await;

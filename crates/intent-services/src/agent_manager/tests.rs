@@ -3576,6 +3576,162 @@ async fn winning_try_begin_auto_unarchives_the_workspace() {
     mgr.end_turn(&id).await;
 }
 
+/// A git repo with one commit on `main` plus the kept branch `feat-old`, and
+/// a retired worktree workspace row pointing at a (deleted) checkout path.
+fn init_revive_repo(dir: &std::path::Path) {
+    let repo = git2::Repository::init(dir).expect("init repo");
+    {
+        let mut cfg = repo.config().unwrap();
+        cfg.set_str("user.name", "Tester").unwrap();
+        cfg.set_str("user.email", "t@e.dev").unwrap();
+    }
+    std::fs::write(dir.join("README.md"), "init\n").unwrap();
+    let mut index = repo.index().unwrap();
+    index
+        .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+        .unwrap();
+    index.write().unwrap();
+    let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+    let sig = git2::Signature::now("Tester", "t@e.dev").unwrap();
+    let commit = repo
+        .commit(Some("HEAD"), &sig, &sig, "chore: init", &tree, &[])
+        .unwrap();
+    let commit = repo.find_commit(commit).unwrap();
+    repo.branch("feat-old", &commit, false).unwrap();
+}
+
+/// A winning `try_begin` in a RETIRED workspace revives it: a fresh blank
+/// checkout is provisioned at the same path on a new branch, the row flips
+/// to Active, ONE `workspace_revived` system row lands in the transcript,
+/// and THIS turn's prompt — and only this turn's — carries the notice that
+/// all prior on-disk state is gone.
+#[tokio::test]
+async fn winning_try_begin_revives_a_retired_workspace() {
+    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let ws = WorkspaceId::from("ws-revive");
+    let id = AgentId::from("a-revive");
+    seed_agent(&mgr, &ws, &id).await;
+    let repo_dir = test_tempdir("intentd-revive-repo-");
+    init_revive_repo(repo_dir.path());
+    let root = test_tempdir("intentd-revive-root-");
+    let wt = root.path().join(ws.as_str()).join("repo");
+    let mut row = mgr.services.store.get_workspace(&ws).await.unwrap();
+    row.repository_path = Some(repo_dir.path().to_string_lossy().into_owned());
+    row.worktree_path = Some(wt.to_string_lossy().into_owned());
+    row.checkout_mode = Some(intent_core::CheckoutMode::Worktree);
+    mgr.services
+        .store
+        .update_workspace_with_branch(&row, Some("feat-old"))
+        .await
+        .unwrap();
+    assert_eq!(
+        mgr.services.store.get_workspace(&ws).await.unwrap().branch,
+        "feat-old"
+    );
+    mgr.services
+        .store
+        .archive_workspace_detaching_guests(&ws, &now_iso())
+        .await
+        .expect("archive row");
+    assert!(mgr
+        .services
+        .store
+        .retire_workspace_if_archived(&ws, &now_iso())
+        .await
+        .expect("retire row"));
+    assert!(!wt.exists());
+
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    assert!(
+        mgr.try_begin(&id, &ws).await,
+        "the claim wins despite the retired workspace"
+    );
+
+    let after = mgr.services.store.get_workspace(&ws).await.unwrap();
+    assert_eq!(after.status, WorkspaceStatus::Active, "revived to Active");
+    assert!(!after.archived);
+    assert!(after.retired_at.is_none());
+    assert_ne!(after.branch, "feat-old", "revive uses a new branch");
+    assert!(wt.join("README.md").is_file(), "fresh checkout provisioned");
+
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        events.extend(batch);
+    }
+    let delta = events
+        .iter()
+        .find(|e| e.event_type == "workspace:updated")
+        .expect("revive published workspace:updated");
+    assert_eq!(
+        delta.data["changes"]["revived"],
+        json!({ "reason": "agent_activity", "agentId": id.0, "agentName": "Builder" })
+    );
+    assert!(delta.data["changes"].get("autoUnarchive").is_none());
+
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .unwrap();
+    assert_eq!(messages.len(), 1, "exactly one notice row");
+    let notice = &messages[0];
+    assert_eq!(notice.role, "system");
+    assert_eq!(
+        notice.content,
+        json!([{ "type": "text", "text": super::WORKSPACE_REVIVED_NOTICE_TEXT }])
+    );
+    assert_eq!(
+        notice.metadata,
+        Some(json!({ "type": "workspace_revived", "reason": "agent_activity" }))
+    );
+
+    let prompt = mgr
+        .build_turn_prompt(&id, &ws, "hello", &super::TurnOptions::default())
+        .await
+        .unwrap();
+    let last = serde_json::to_value(prompt.last().expect("non-empty prompt")).unwrap();
+    let text = last["text"].as_str().expect("text block");
+    assert!(
+        text.starts_with("[SYSTEM NOTICE] This workspace was retired"),
+        "{text}"
+    );
+    assert!(text.contains("are gone"), "{text}");
+    assert!(
+        text.contains("feat-old"),
+        "names the kept old branch: {text}"
+    );
+    assert!(text.contains(&after.branch), "names the new branch: {text}");
+    assert!(
+        !text.contains("automatically unarchived"),
+        "a revive is not reported as a plain unarchive: {text}"
+    );
+    mgr.end_turn(&id).await;
+
+    assert!(mgr.try_begin(&id, &ws).await, "second claim wins");
+    let next = mgr
+        .build_turn_prompt(&id, &ws, "hello", &super::TurnOptions::default())
+        .await
+        .unwrap();
+    assert!(
+        !serde_json::to_string(&next)
+            .unwrap()
+            .contains("was retired"),
+        "the notice must not replay on later turns"
+    );
+    mgr.end_turn(&id).await;
+    assert_eq!(
+        mgr.services
+            .store
+            .get_agent_messages(&id, None)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "no second notice row"
+    );
+}
+
 /// A claim in a NON-archived workspace persists no `auto_unarchived` notice
 /// and injects nothing into the turn's prompt.
 #[tokio::test]
@@ -3704,22 +3860,22 @@ async fn auto_unarchive_flag_arm_skipped_when_slot_released() {
 
     // Slot held: the arm lands.
     assert!(mgr.try_begin(&id, &ws).await);
-    mgr.arm_auto_unarchive_flag_if_slot_held(&id);
+    mgr.arm_auto_unarchive_flag_if_slot_held(&id, super::AUTO_UNARCHIVE_PROMPT_NOTICE.to_string());
     assert!(
-        mgr.auto_unarchived.lock().unwrap().contains(&id),
+        mgr.auto_unarchived.lock().unwrap().contains_key(&id),
         "the arm lands while the claim holds the slot"
     );
     mgr.end_turn(&id).await;
     assert!(
-        !mgr.auto_unarchived.lock().unwrap().contains(&id),
+        !mgr.auto_unarchived.lock().unwrap().contains_key(&id),
         "the release clears the armed flag"
     );
 
     // The race: the slot was released (concurrent stop/teardown) before the
     // arm ran — the late arm must be skipped, not inserted after the clear.
-    mgr.arm_auto_unarchive_flag_if_slot_held(&id);
+    mgr.arm_auto_unarchive_flag_if_slot_held(&id, super::AUTO_UNARCHIVE_PROMPT_NOTICE.to_string());
     assert!(
-        !mgr.auto_unarchived.lock().unwrap().contains(&id),
+        !mgr.auto_unarchived.lock().unwrap().contains_key(&id),
         "a late arm after the slot release must be skipped"
     );
 

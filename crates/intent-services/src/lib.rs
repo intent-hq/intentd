@@ -62,6 +62,7 @@ mod agent_workers;
 mod retire;
 /// The §5.5b wire-ID rule, shared by the transport's request validation.
 pub use intent_acp::workers::is_wire_id;
+pub(crate) use retire::UnarchiveOutcome;
 pub mod antigravity;
 pub mod antigravity_install;
 pub mod antigravity_setup;
@@ -20550,6 +20551,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             self.require_upload_member(&upload_id).await?;
+            self.refuse_upload_if_retired(&upload_id).await?;
             self.file_attachment_upload_chunk_op(upload_id, seq, data)
                 .await
         })
@@ -20561,6 +20563,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             self.require_upload_member(&upload_id).await?;
+            self.refuse_upload_if_retired(&upload_id).await?;
             self.file_attachment_upload_commit_op(upload_id).await
         })
     }
@@ -36332,11 +36335,17 @@ impl Services {
     /// `changes` as `autoUnarchive: { reason, agentId, agentName }`; manual
     /// callers pass `None` and the field is absent (PROTOCOL §6.5).
     ///
-    /// Returns the workspace plus whether THIS call performed the
-    /// Archived → Active flip: the row write is conditional
+    /// A Retired workspace is revived instead
+    /// ([`Services::revive_retired_checkout`]): its delta carries
+    /// `retiredAt: null`, the new `branch` / `baseCommitSha` and
+    /// `revived: { reason }` (the turn-start stamp, else `"manual"`) in
+    /// place of `autoUnarchive`.
+    ///
+    /// Returns the workspace plus the [`UnarchiveOutcome`] when THIS call
+    /// performed the flip (`None` otherwise): the row write is conditional
     /// (`unarchive_workspace_if_archived`, `WHERE archived = 1`), so
     /// concurrent unarchivers serialize at the statement and exactly one
-    /// caller reports `true`. A declined flip (already Active) still
+    /// caller reports an outcome. A declined flip (already Active) still
     /// succeeds for the manual RPCs (idempotent unarchive, delta still
     /// emitted) but skips the emit entirely on the auto path — the losing
     /// racer must not re-announce a flip it did not perform (the winner's
@@ -36350,12 +36359,12 @@ impl Services {
         &self,
         id: WorkspaceId,
         auto_unarchive: Option<serde_json::Value>,
-    ) -> Result<(Workspace, bool)> {
+    ) -> Result<(Workspace, Option<UnarchiveOutcome>)> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         let manager = self.agent_manager();
         if id.is_chief() {
-            return Ok((chief_workspace(), false));
+            return Ok((chief_workspace(), None));
         }
         // Conditional flip: writes only when the row is currently archived,
         // so two racing unarchivers (concurrent turn starts, or a manual
@@ -36367,19 +36376,35 @@ impl Services {
         // it unlocks — lands strictly after the archive tail's drop, never
         // inside it. Held only across the flip: the drain kicks below can
         // re-enter the turn-start auto-unarchive, which takes this fence.
-        let flipped = {
+        //
+        // A RETIRED workspace is revived instead (PROTOCOL §5.1 "Revive"):
+        // a fresh blank checkout on a new branch, provisioned under the same
+        // fence so the retire folder sweep can never delete it.
+        let (flipped, revived) = {
             let _fence = self.archive_fence.acquire(&id).await;
-            store
-                .unarchive_workspace_if_archived(&id, &now_iso())
-                .await?
+            let current = store.get_workspace(&id).await?;
+            if current.is_retired() {
+                let revived = self.revive_retired_checkout(&current).await?;
+                (revived.is_some(), revived)
+            } else {
+                let flipped = store
+                    .unarchive_workspace_if_archived(&id, &now_iso())
+                    .await?;
+                (flipped, None)
+            }
         };
         let mut ws = store.get_workspace(&id).await?;
-        // A retired workspace is never flipped back by unarchive (the store
-        // flip skips it): its folder is gone, so report it instead of
-        // pretending the workspace is live.
         if ws.is_retired() {
             return Err(retire::retired_error(&id));
         }
+        let outcome = match &revived {
+            Some(r) => Some(UnarchiveOutcome::Revived {
+                previous_branch: r.previous_branch.clone(),
+                branch: r.branch.clone(),
+            }),
+            None if flipped => Some(UnarchiveOutcome::Unarchived),
+            None => None,
+        };
         // The losing racer on the auto path stops here: the winner (a
         // concurrent turn start or a manual unarchive) already kicked the
         // parked drains and emitted its delta, so re-running the tail would
@@ -36388,7 +36413,7 @@ impl Services {
         // (unarchiving an Active workspace still re-derives and re-emits).
         if auto_unarchive.is_some() && !flipped {
             ws.activity = self.workspace_activity(&ws.id);
-            return Ok((ws, false));
+            return Ok((ws, None));
         }
         // Re-engage queues parked by the archived gates
         // (`try_drain_queue` / `deliver_wake_message`): nothing kicks a
@@ -36439,11 +36464,21 @@ impl Services {
             "status": ws.status,
             "archivedAt": serde_json::Value::Null,
         });
-        if let Some(stamp) = auto_unarchive {
+        if let Some(revived) = &revived {
+            // Revive delta (§6.5): `retiredAt` cleared, the fresh checkout's
+            // `branch` / `baseCommitSha`, and `revived: { reason }` — the
+            // turn-start stamp's agent fields carried over, never
+            // `autoUnarchive`.
+            changes["retiredAt"] = serde_json::Value::Null;
+            changes["branch"] = serde_json::json!(revived.branch);
+            changes["baseCommitSha"] = serde_json::json!(revived.base_commit_sha);
+            changes["revived"] =
+                auto_unarchive.unwrap_or_else(|| serde_json::json!({ "reason": "manual" }));
+        } else if let Some(stamp) = auto_unarchive {
             changes["autoUnarchive"] = stamp;
         }
         publish_event(bus.as_ref(), workspace_updated_event(&ws.id, &changes)).await;
-        Ok((ws, flipped))
+        Ok((ws, outcome))
     }
 
     /// Best-effort auto-unarchive at the turn-start choke point
@@ -36469,12 +36504,13 @@ impl Services {
     /// better than a lost turn, and the archived drain gates keep parking
     /// follow-on wakes until a later trigger succeeds.
     ///
-    /// Returns `true` only when THIS call actually flipped the workspace
-    /// from Archived to Active (the conditional write affected the row);
-    /// `false` on the chief skip, a non-archived workspace, a read failure,
-    /// a lost flip race, or an unarchive failure — the caller uses the flip
-    /// to persist the `auto_unarchived` transcript notice and inject the
-    /// triggering turn's prompt block.
+    /// Returns the [`UnarchiveOutcome`] only when THIS call actually flipped
+    /// the workspace — `Unarchived` for Archived → Active, `Revived` when a
+    /// Retired workspace was re-provisioned as a fresh blank checkout
+    /// (PROTOCOL §5.1 "Revive"); `None` on the chief skip, a non-archived
+    /// workspace, a read failure, a lost flip race, or an unarchive/revive
+    /// failure — the caller uses it to persist the matching transcript
+    /// notice and inject the triggering turn's prompt block.
     ///
     /// Returns a [`BoxFuture`] (rather than `async fn`) to break the async
     /// type cycle: this helper is awaited inside `try_begin`, and the
@@ -36485,14 +36521,14 @@ impl Services {
         &'a self,
         workspace_id: &'a WorkspaceId,
         agent_id: &'a AgentId,
-    ) -> BoxFuture<'a, bool> {
+    ) -> BoxFuture<'a, Option<UnarchiveOutcome>> {
         Box::pin(async move {
             if workspace_id.is_chief() {
-                return false;
+                return None;
             }
             match self.store.get_workspace(workspace_id).await {
                 Ok(ws) if ws.archived => {}
-                Ok(_) => return false,
+                Ok(_) => return None,
                 Err(e) => {
                     tracing::warn!(
                         workspace = %workspace_id.as_str(),
@@ -36500,7 +36536,7 @@ impl Services {
                         error = %e,
                         "auto-unarchive: workspace read failed; turn proceeds in archived workspace"
                     );
-                    return false;
+                    return None;
                 }
             }
             // Name lookup is display-only: a lookup failure (or a session
@@ -36521,15 +36557,16 @@ impl Services {
                 .unarchive_workspace_inner(workspace_id.clone(), Some(stamp))
                 .await
             {
-                Ok((_, flipped)) => {
-                    if flipped {
+                Ok((_, outcome)) => {
+                    if outcome.is_some() {
                         tracing::info!(
                             workspace = %workspace_id.as_str(),
                             agent = %agent_id,
+                            outcome = ?outcome,
                             "auto-unarchived workspace on agent turn start"
                         );
                     }
-                    flipped
+                    outcome
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -36538,7 +36575,7 @@ impl Services {
                         error = %e,
                         "auto-unarchive failed; turn proceeds in archived workspace"
                     );
-                    false
+                    None
                 }
             }
         })

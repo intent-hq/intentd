@@ -151,3 +151,45 @@ async fn archive_flip_refuses_a_retired_row() {
         WorkspaceStatus::Retired
     );
 }
+
+/// The revive flip (PROTOCOL §5.1 "Revive") turns ONLY a retired row back to
+/// Active — clearing `archived`, `archivedAt` and `retiredAt` and recording
+/// the new branch / base commit — declines an archived or active row, and
+/// reports a missing row.
+#[tokio::test]
+async fn revive_flip_is_scoped_and_conditional() {
+    let (_tmp, store, active, archived, retired) = seeded().await;
+
+    assert!(store
+        .revive_workspace_if_retired(&retired, "feature/test-2", Some("abc123"), &now_iso())
+        .await
+        .expect("revive"));
+    let row = store.get_workspace(&retired).await.unwrap();
+    assert_eq!(row.status, WorkspaceStatus::Active);
+    assert!(!row.archived);
+    assert!(row.archived_at.is_none());
+    assert!(row.retired_at.is_none());
+    assert_eq!(row.branch, "feature/test-2");
+    assert_eq!(row.base_commit_sha.as_deref(), Some("abc123"));
+
+    assert!(!store
+        .revive_workspace_if_retired(&retired, "x", None, &now_iso())
+        .await
+        .expect("second revive declines"));
+    for id in [&active, &archived] {
+        let before = store.get_workspace(id).await.unwrap();
+        assert!(!store
+            .revive_workspace_if_retired(id, "x", None, &now_iso())
+            .await
+            .expect("non-retired declines"));
+        let after = store.get_workspace(id).await.unwrap();
+        assert_eq!(before.archived, after.archived);
+        assert_eq!(before.branch, after.branch);
+    }
+    assert!(matches!(
+        store
+            .revive_workspace_if_retired(&WorkspaceId::new(), "x", None, &now_iso())
+            .await,
+        Err(Error::NotFound(_))
+    ));
+}
