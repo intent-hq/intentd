@@ -26,14 +26,16 @@ try-import %workspace%/user.bazelrc
 # CI and remote cache. Keep this section last; see bazel/README.md.
 # ---------------------------------------------------------------------------
 
-# --config=ci: plain logs, a frozen MODULE.bazel.lock, and test results that
-# are never served from a cache. Tests still read undeclared host inputs, so a
-# cached pass would not mean what a Cargo pass means; drop
-# --nocache_test_results once test inputs are audited.
+# --config=ci: plain logs and test results that are never served from a cache.
+# Tests still read undeclared host inputs, so a cached pass would not mean what
+# a Cargo pass means; drop --nocache_test_results once test inputs are audited.
+# The lock stays in the default `update` mode: after a release bump CI
+# re-resolves from Cargo.lock (the pinned source of truth) and never commits
+# or uploads the refreshed lock. The drift job (scripts/bazel-drift.py) is
+# what enforces the lock.
 common:ci --curses=no
 common:ci --color=no
 common:ci --show_progress_rate_limit=30
-common:ci --lockfile_mode=error
 build:ci --verbose_failures
 test:ci --test_output=errors
 test:ci --nocache_test_results

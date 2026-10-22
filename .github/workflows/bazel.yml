@@ -64,7 +64,9 @@ jobs:
 
   # Fails when Cargo.toml, Cargo.lock or rust-toolchain.toml changed without
   # the matching generated BUILD files or MODULE.bazel.lock refresh, and
-  # prints the fix command (`python3 scripts/bazel-drift.py --fix`).
+  # prints the fix command (`python3 scripts/bazel-drift.py --fix`). A
+  # release-plz bump (workspace-crate versions only) passes: releases need no
+  # Bazel action.
   drift:
     needs: [runner-route]
     runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
@@ -73,6 +75,8 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+          # Release-bump tolerance reads the commit that last changed MODULE.bazel.lock.
+          fetch-depth: 0
       - uses: actions/setup-python@v6
         with:
           python-version: '3.11'
