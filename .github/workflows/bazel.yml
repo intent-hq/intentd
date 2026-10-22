@@ -1,0 +1,230 @@
+# Parallel Bazel build of the Cargo workspace (see bazel/README.md).
+# Informational: not a required check and not part of the merge queue. Cargo
+# (ci.yml) stays the gate; this workflow keeps the Bazel build from rotting.
+name: Bazel
+on:
+  pull_request:
+    paths:
+      - 'crates/**'
+      - 'vendor/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.cargo/**'
+      - 'BUILD.bazel'
+      - 'MODULE.bazel'
+      - 'MODULE.bazel.lock'
+      - '.bazelrc'
+      - '.bazelversion'
+      - '.bazelignore'
+      - 'bazel/**'
+      - 'scripts/bazel-*.py'
+      - 'scripts/test-bazel-ci.py'
+      - '.github/workflows/bazel.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'crates/**'
+      - 'vendor/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.cargo/**'
+      - 'BUILD.bazel'
+      - 'MODULE.bazel'
+      - 'MODULE.bazel.lock'
+      - '.bazelrc'
+      - '.bazelversion'
+      - '.bazelignore'
+      - 'bazel/**'
+      - 'scripts/bazel-*.py'
+      - 'scripts/test-bazel-ci.py'
+      - '.github/workflows/bazel.yml'
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+env:
+  BAZELISK_VERSION: v1.30.0
+  BAZELISK_SHA256: a248ae2b2b62b5baebb748f6fba7203bff1a27e5d01b55399a8406744cb539e8
+jobs:
+  runner-route:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    uses: ./.github/workflows/runner-route.yml
+    with:
+      slot_jobs: >-
+        [{"key":"bazel","label":"gh-linux-8x","rust":true,"minutes":45}]
+    permissions:
+      contents: read
+      actions: read
+    secrets:
+      CI_QUEUE_READ_TOKEN: ${{ secrets.CI_QUEUE_READ_TOKEN }}
+
+  # Fails when Cargo.toml, Cargo.lock or rust-toolchain.toml changed without
+  # the matching generated BUILD files or MODULE.bazel.lock refresh, and
+  # prints the fix command (`python3 scripts/bazel-drift.py --fix`).
+  drift:
+    needs: [runner-route]
+    runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - name: Resolve Rust toolchain
+        id: rust
+        run: echo "channel=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')" >> "$GITHUB_OUTPUT"
+      # scripts/bazel-gen.py reads `cargo metadata --no-deps`.
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
+        with:
+          toolchain: ${{ steps.rust.outputs.channel }}
+      - name: Install bazelisk
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl --proto '=https' --tlsv1.2 -fsSL --retry 3 -o "$RUNNER_TEMP/bin/bazel" \
+            "https://github.com/bazelbuild/bazelisk/releases/download/${BAZELISK_VERSION}/bazelisk-linux-amd64"
+          echo "${BAZELISK_SHA256}  $RUNNER_TEMP/bin/bazel" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/bin/bazel"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Test the Bazel CI helpers
+        run: python3 -B scripts/test-bazel-ci.py
+      - name: Check Cargo and Bazel are in sync
+        env:
+          BAZEL: bazel
+        run: python3 scripts/bazel-drift.py
+
+  bazel:
+    needs: [runner-route]
+    runs-on: ${{ fromJSON(needs.runner-route.outputs.slots || '{}')['bazel'] || fromJSON('["gh-linux-8x"]') }}
+    timeout-minutes: 90
+    env:
+      # The self-hosted remote cache is off until BAZEL_REMOTE_CACHE_URL is set
+      # (repository or org variable). Pull requests only ever get the
+      # read-only token; see the "Configure Bazel" step.
+      BAZEL_REMOTE_CACHE_URL: ${{ vars.BAZEL_REMOTE_CACHE_URL }}
+      BAZEL_REMOTE_CACHE_TOKEN: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && secrets.BAZEL_REMOTE_CACHE_RW_TOKEN || secrets.BAZEL_REMOTE_CACHE_RO_TOKEN }}
+      REMOTE_CACHE_WRITE: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && secrets.BAZEL_REMOTE_CACHE_RW_TOKEN != '' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      # openssl-sys and libz-sys link the system libraries on linux-gnu, so the
+      # build needs their development packages (intent-cache images ship them).
+      - name: Provide OpenSSL and zlib development packages
+        run: |
+          if ! pkg-config --exists openssl zlib; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends pkg-config libssl-dev zlib1g-dev
+          fi
+          pkg-config --modversion openssl zlib
+      - name: Install bazelisk
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl --proto '=https' --tlsv1.2 -fsSL --retry 3 -o "$RUNNER_TEMP/bin/bazel" \
+            "https://github.com/bazelbuild/bazelisk/releases/download/${BAZELISK_VERSION}/bazelisk-linux-amd64"
+          echo "${BAZELISK_SHA256}  $RUNNER_TEMP/bin/bazel" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/bin/bazel"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      # Native actions (C build scripts, linking against system OpenSSL/zlib)
+      # are not hermetic, so the action cache is keyed by this host fingerprint
+      # and never shared between machines with different system libraries.
+      - name: Fingerprint host toolchain
+        id: host
+        run: |
+          {
+            . /etc/os-release && echo "$ID $VERSION_ID"
+            uname -m
+            cc --version | head -n1
+            pkg-config --modversion openssl zlib
+          } | tee /dev/stderr | sha256sum | cut -c1-16 | sed 's/^/fp=/' >> "$GITHUB_OUTPUT"
+      # GitHub Actions caches: pull requests restore only; main saves below.
+      - name: Restore repository cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/bazel-ci/repo
+          key: bazel-repo-v1-${{ hashFiles('MODULE.bazel.lock', '.bazelversion') }}
+          restore-keys: bazel-repo-v1-
+      - name: Restore disk cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/bazel-ci/disk
+          key: bazel-disk-v1-${{ runner.os }}-${{ steps.host.outputs.fp }}-${{ github.sha }}
+          restore-keys: bazel-disk-v1-${{ runner.os }}-${{ steps.host.outputs.fp }}-
+      - name: Configure Bazel
+        run: |
+          REPO_CACHE="$HOME/.cache/bazel-ci/repo"
+          DISK_CACHE="$HOME/.cache/bazel-ci/disk"
+          echo "DISK_CACHE=$DISK_CACHE" >> "$GITHUB_ENV"
+          mkdir -p "$REPO_CACHE" "$DISK_CACHE"
+          {
+            echo "common --config=ci"
+            echo "common --repository_cache=$REPO_CACHE"
+            echo "common --disk_cache=$DISK_CACHE"
+            if [ -n "$BAZEL_REMOTE_CACHE_URL" ]; then
+              echo "common --remote_cache=$BAZEL_REMOTE_CACHE_URL"
+              if [ "$REMOTE_CACHE_WRITE" = true ]; then
+                echo "common --config=remote-cache-write"
+              else
+                echo "common --config=remote-cache"
+              fi
+            fi
+          } > user.bazelrc
+          cat user.bazelrc
+          touch "$RUNNER_TEMP/bazel-start"
+      - name: Build
+        run: bazel build //...
+      - name: Test
+        run: |
+          set +e
+          bazel test --build_tests_only //...
+          rc=$?
+          # Exit 4: no test targets yet (tests are generated as they land).
+          if [ "$rc" -eq 4 ]; then echo "::notice::No Bazel test targets yet"; rc=0; fi
+          exit "$rc"
+      - name: Lint
+        run: |
+          ran=0
+          for config in clippy rustfmt; do
+            if grep -Eq "^(build|common):${config}[[:space:]]" .bazelrc; then
+              echo "::group::--config=${config}"
+              bazel build --config="${config}" //...
+              echo "::endgroup::"
+              ran=$((ran + 1))
+            else
+              echo "::notice::.bazelrc defines no ${config} config yet; skipping"
+            fi
+          done
+          echo "ran ${ran} lint config(s)"
+      - name: Upload test logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: bazel-testlogs
+          path: bazel-testlogs/**/test.log
+          if-no-files-found: ignore
+          retention-days: 7
+      # Keep only entries this run read or wrote, so the saved disk cache stays
+      # one build's working set instead of growing with every main push.
+      - name: Prune disk cache
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          bazel shutdown
+          find "$DISK_CACHE" -type f ! -newer "$RUNNER_TEMP/bazel-start" -delete
+          du -sh "$HOME/.cache/bazel-ci/"*
+      - name: Save repository cache
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/bazel-ci/repo
+          key: bazel-repo-v1-${{ hashFiles('MODULE.bazel.lock', '.bazelversion') }}
+      - name: Save disk cache
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/bazel-ci/disk
+          key: bazel-disk-v1-${{ runner.os }}-${{ steps.host.outputs.fp }}-${{ github.sha }}

@@ -21,3 +21,35 @@ build --incompatible_strict_action_env
 
 # Local overrides (cache paths, jobs) stay out of the repo.
 try-import %workspace%/user.bazelrc
+
+# ---------------------------------------------------------------------------
+# CI and remote cache. Keep this section last; see bazel/README.md.
+# ---------------------------------------------------------------------------
+
+# --config=ci: plain logs, a frozen MODULE.bazel.lock, and test results that
+# are never served from a cache. Tests still read undeclared host inputs, so a
+# cached pass would not mean what a Cargo pass means; drop
+# --nocache_test_results once test inputs are audited.
+common:ci --curses=no
+common:ci --color=no
+common:ci --show_progress_rate_limit=30
+common:ci --lockfile_mode=error
+build:ci --verbose_failures
+test:ci --test_output=errors
+test:ci --nocache_test_results
+
+# --config=remote-cache: read from the self-hosted HTTP cache. Pass the
+# endpoint with --remote_cache=$BAZEL_REMOTE_CACHE_URL (CI writes it to
+# user.bazelrc); the credential helper sends BAZEL_REMOTE_CACHE_TOKEN as a
+# Bearer token, and only to that endpoint's host. Read-only by default, so
+# pull requests and dev hosts can never write.
+common:remote-cache --credential_helper=%workspace%/bazel/remote-cache-credentials.sh
+common:remote-cache --remote_upload_local_results=false
+common:remote-cache --remote_local_fallback
+common:remote-cache --remote_timeout=60s
+
+# --config=remote-cache-write: trusted main-branch runs only, with a
+# read-write token. The cache server must also reject writes from read-only
+# tokens.
+common:remote-cache-write --config=remote-cache
+common:remote-cache-write --remote_upload_local_results=true
