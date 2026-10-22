@@ -3738,12 +3738,15 @@ impl Services {
             // persisting it in the baseline keeps the decision once a later
             // poll loses the queue state (degraded probe, queue exit,
             // terminal wake).
-            if let Some(ejection) = fresh.requirements.merge_queue_ejection.as_ref() {
-                if ejection.superseded_by_queue_entry(&fresh.requirements)
-                    && s.requirements.merge_queue_ejection.as_ref() != Some(ejection)
-                {
-                    s.requirements.merge_queue_ejection = Some(ejection.clone());
-                }
+            if fresh
+                .requirements
+                .merge_queue_ejection
+                .as_ref()
+                .is_some_and(|e| e.superseded_by_queue_entry(&fresh.requirements))
+            {
+                s.requirements
+                    .merge_queue_ejection
+                    .clone_from(&fresh.requirements.merge_queue_ejection);
             }
         };
         if let Some(prev) = previous.as_mut() {
