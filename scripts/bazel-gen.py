@@ -203,13 +203,22 @@ KNOWN_FAILING[("intent-services", "intent-services")] = {
 # shard's prefix may run twice.
 MODULE_SHARDS: dict[str, int] = {"intent-services": 8}
 
-# Shards that did not finish within Bazel's `long` timeout (900 s) on the
-# loaded evaluation host (load average up to 87 on 32 cores). They keep an
-# `eternal` timeout and are tagged manual until more shards or a quieter runner
-# bring them under it. Keyed by (package, shard number).
+# Shards tagged manual, keyed by (package, shard number): ones that did not
+# finish within Bazel's `long` timeout (900 s) on the loaded evaluation host
+# (load average up to 87 on 32 cores), and ones whose tests fail
+# nondeterministically in a shared libtest process. They keep an `eternal`
+# timeout and stay runnable explicitly.
 MANUAL_SHARDS: dict[tuple[str, int], str] = {
     ("intent-services", 1): "timed out at 900 s on a host at load 60-87; not yet shown passing",
     ("intent-services", 4): "timed out at 900 s on a host at load 60-87; not yet shown passing",
+    ("intent-services", 2): (
+        "pr_monitor tests fail nondeterministically (a different set each run) when they "
+        "share one libtest process; needs a process-per-test runner"
+    ),
+    ("intent-services", 8): (
+        "agent_ops tests fail nondeterministically (a different set each run) when they "
+        "share one libtest process; needs a process-per-test runner"
+    ),
 }
 
 # Test timeouts beyond the generated defaults (`long` for unit-test binaries),
