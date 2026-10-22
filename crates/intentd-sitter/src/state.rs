@@ -21,29 +21,7 @@ pub const STATE_SCHEMA_VERSION: u32 = 1;
 /// # Errors
 /// Returns an I/O error if the lock cannot be created or acquired.
 pub fn lock(path: &Path) -> io::Result<StateLock> {
-    lock_file(&path.with_extension("lock"))
-}
-
-/// Serialize the update-check endpoint transaction (read activity flags →
-/// send → record success) across updater processes, so concurrent checks
-/// never both send the first-of-period or install flags. Lock order: take
-/// this before [`lock`], never while holding it.
-///
-/// # Errors
-/// Returns an I/O error if the lock cannot be created or acquired.
-pub fn activity_lock(state_path: &Path) -> io::Result<StateLock> {
-    lock_file(&state_path.with_file_name("activity.lock"))
-}
-
-fn lock_file(lock_path: &Path) -> io::Result<StateLock> {
-    if let Some(parent) = lock_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let file = fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(lock_path)?;
+    let file = open_lock_file(&path.with_extension("lock"))?;
     #[cfg(unix)]
     {
         nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusive)
@@ -52,6 +30,132 @@ fn lock_file(lock_path: &Path) -> io::Result<StateLock> {
     #[cfg(not(unix))]
     {
         Ok(file)
+    }
+}
+
+/// Serialize the update-check endpoint transaction (read activity flags →
+/// send → record success) across updater processes on every platform, so
+/// concurrent checks never both send the first-of-period or install flags.
+/// Lock order: take this before [`lock`], never while holding it.
+///
+/// # Errors
+/// Returns an I/O error if the lock cannot be created or acquired.
+pub fn activity_lock(state_path: &Path) -> io::Result<ActivityLock> {
+    ActivityLock::acquire(&state_path.with_file_name("activity.lock"), true)
+        .and_then(|lock| lock.ok_or_else(|| io::Error::from(io::ErrorKind::WouldBlock)))
+}
+
+/// Non-blocking [`activity_lock`]: `None` while another holder has it.
+///
+/// # Errors
+/// Returns an I/O error if the lock file cannot be opened or locked.
+#[cfg(test)]
+pub(crate) fn try_activity_lock(state_path: &Path) -> io::Result<Option<ActivityLock>> {
+    ActivityLock::acquire(&state_path.with_file_name("activity.lock"), false)
+}
+
+fn open_lock_file(lock_path: &Path) -> io::Result<fs::File> {
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(lock_path)
+}
+
+/// RAII exclusive lock on `activity.lock`, held per open file
+/// (description/handle), so it excludes other processes and other opens
+/// in this process alike. Released on drop.
+#[derive(Debug)]
+pub struct ActivityLock {
+    #[cfg(unix)]
+    _lock: nix::fcntl::Flock<fs::File>,
+    #[cfg(windows)]
+    file: fs::File,
+    #[cfg(not(any(unix, windows)))]
+    _file: fs::File,
+}
+
+impl ActivityLock {
+    /// `Ok(None)` only when `blocking` is false and the lock is held.
+    fn acquire(lock_path: &Path, blocking: bool) -> io::Result<Option<Self>> {
+        let file = open_lock_file(lock_path)?;
+        #[cfg(unix)]
+        {
+            use nix::fcntl::{Flock, FlockArg};
+            let arg = if blocking {
+                FlockArg::LockExclusive
+            } else {
+                FlockArg::LockExclusiveNonblock
+            };
+            match Flock::lock(file, arg) {
+                Ok(lock) => Ok(Some(Self { _lock: lock })),
+                Err((_, nix::errno::Errno::EWOULDBLOCK)) if !blocking => Ok(None),
+                Err((_, error)) => Err(io::Error::from(error)),
+            }
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION;
+            use windows_sys::Win32::Storage::FileSystem::{
+                LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+            };
+            let flags = if blocking {
+                LOCKFILE_EXCLUSIVE_LOCK
+            } else {
+                LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY
+            };
+            let mut overlapped = windows_sys::Win32::System::IO::OVERLAPPED::default();
+            // SAFETY: the handle is owned by `file`, which outlives the call;
+            // `overlapped` is a valid zeroed OVERLAPPED (offset 0) and the
+            // handle is synchronous, so the call completes before returning.
+            let ok = unsafe {
+                LockFileEx(
+                    file.as_raw_handle(),
+                    flags,
+                    0,
+                    u32::MAX,
+                    u32::MAX,
+                    &raw mut overlapped,
+                )
+            };
+            if ok != 0 {
+                return Ok(Some(Self { file }));
+            }
+            let error = io::Error::last_os_error();
+            if !blocking && error.raw_os_error() == i32::try_from(ERROR_LOCK_VIOLATION).ok() {
+                return Ok(None);
+            }
+            Err(error)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = blocking;
+            Ok(Some(Self { _file: file }))
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ActivityLock {
+    fn drop(&mut self) {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::UnlockFileEx;
+        let mut overlapped = windows_sys::Win32::System::IO::OVERLAPPED::default();
+        // SAFETY: unlocks the range locked in `acquire` on the still-open
+        // handle; closing the handle afterwards would also release it.
+        unsafe {
+            UnlockFileEx(
+                self.file.as_raw_handle(),
+                0,
+                u32::MAX,
+                u32::MAX,
+                &raw mut overlapped,
+            );
+        }
     }
 }
 

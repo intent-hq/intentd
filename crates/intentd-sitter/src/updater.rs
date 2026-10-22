@@ -1041,17 +1041,12 @@ fn dir_has_entries(dir: &Path) -> bool {
 mod tests {
     use super::*;
 
-    /// Whether another process (here: another open file description)
-    /// could take the activity transaction lock right now.
-    #[cfg(unix)]
+    /// Whether another process (here: another open file
+    /// description/handle) could take the activity transaction lock now.
     fn activity_lock_is_free(paths: &SitterPaths) -> bool {
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(paths.state_path.with_file_name("activity.lock"))
-            .unwrap();
-        nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock).is_ok()
+        state::try_activity_lock(&paths.state_path)
+            .unwrap()
+            .is_some()
     }
 
     /// Regression: concurrent update checks (startup plus `intentd
@@ -1059,7 +1054,6 @@ mod tests {
     /// counting one install twice. The flags must be read, sent and
     /// recorded under one cross-process lock, with the clock read after
     /// it is acquired.
-    #[cfg(unix)]
     #[test]
     fn activity_flags_are_read_sent_and_recorded_under_the_transaction_lock() {
         let dir = tempfile::tempdir().unwrap();
@@ -1085,7 +1079,6 @@ mod tests {
         assert!(!second.needs_record(), "second check recounted: {second:?}");
     }
 
-    #[cfg(unix)]
     #[test]
     fn concurrent_checks_wait_for_the_in_flight_transaction() {
         let dir = tempfile::tempdir().unwrap();
