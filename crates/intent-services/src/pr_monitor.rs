@@ -3731,6 +3731,20 @@ impl Services {
                     .clone_from(&fresh.requirements.merge_queue_ejection);
                 s.ejection_tracked = true;
             }
+            // An ejection that predates the PR's current queue entry is
+            // history, not news (intent-hq/intent#7523: first observed
+            // after the re-queue, it was reported while the queue was about
+            // to land the PR). Adopt it silently, like the backfill above;
+            // persisting it in the baseline keeps the decision once a later
+            // poll loses the queue state (degraded probe, queue exit,
+            // terminal wake).
+            if let Some(ejection) = fresh.requirements.merge_queue_ejection.as_ref() {
+                if ejection.superseded_by_queue_entry(&fresh.requirements)
+                    && s.requirements.merge_queue_ejection.as_ref() != Some(ejection)
+                {
+                    s.requirements.merge_queue_ejection = Some(ejection.clone());
+                }
+            }
         };
         if let Some(prev) = previous.as_mut() {
             backfill(prev);
@@ -6312,21 +6326,20 @@ mod tests {
         );
     }
 
-    /// An ejection older than the PR's current queue entry is stale history
-    /// (intent-hq/intent#7523): first observed after the re-queue, it yields
-    /// no line. Without a comparable entry time — not queued, no entry, no
-    /// `enqueuedAt`, unparseable, or an entry that predates the ejection —
-    /// the ejection is still reported.
+    /// An ejection older than the PR's current queue entry is superseded
+    /// (intent-hq/intent#7523), including across RFC 3339 offsets. Without a
+    /// strictly later, comparable entry time — not queued, no entry, no
+    /// `enqueuedAt`, unparseable, or an entry at or before the ejection —
+    /// it is not, so the monitor still reports it.
     #[test]
-    fn diff_ignores_an_ejection_older_than_the_current_queue_entry() {
-        const EJECTED: &str = "removed from the merge queue (failed checks)";
-        let base = snapshot(|_| {});
+    fn an_ejection_is_superseded_only_by_a_later_queue_entry() {
+        let ejection = pr_ops::MergeQueueEjection {
+            at: "2026-10-21T13:18:28Z".into(),
+            reason: Some("failed_checks".into()),
+        };
         let with = |queued: Option<bool>, enqueued_at: Option<&str>, entry: bool| {
             snapshot(|s| {
-                s.requirements.merge_queue_ejection = Some(pr_ops::MergeQueueEjection {
-                    at: "2026-10-21T13:18:28Z".into(),
-                    reason: Some("failed_checks".into()),
-                });
+                s.requirements.merge_queue_ejection = Some(ejection.clone());
                 s.requirements.is_in_merge_queue = queued;
                 s.requirements.merge_queue = entry.then(|| intent_sourcecontrol::MergeQueueEntry {
                     position: 1,
@@ -6336,18 +6349,25 @@ mod tests {
                     estimated_time_to_merge: None,
                 });
             })
+            .requirements
         };
 
-        let requeued = with(Some(true), Some("2026-10-21T13:21:58Z"), true);
-        assert_eq!(
-            diff_snapshots(&base, &requeued),
-            vec!["entered the merge queue"]
-        );
-        // An equivalent instant in another offset still compares as later.
-        let offset = with(Some(true), Some("2026-10-21T15:21:58+02:00"), true);
-        assert!(!diff_snapshots(&base, &offset).iter().any(|c| c == EJECTED));
-
-        for (label, fresh) in [
+        for (label, requirements) in [
+            (
+                "re-queued",
+                with(Some(true), Some("2026-10-21T13:21:58Z"), true),
+            ),
+            (
+                "re-queued, other offset",
+                with(Some(true), Some("2026-10-21T15:21:58+02:00"), true),
+            ),
+        ] {
+            assert!(
+                ejection.superseded_by_queue_entry(&requirements),
+                "{label}: superseded"
+            );
+        }
+        for (label, requirements) in [
             (
                 "entry predates ejection",
                 with(Some(true), Some("2026-10-21T13:00:00Z"), true),
@@ -6365,8 +6385,8 @@ mod tests {
             ("not queued", with(None, Some("2026-10-21T13:21:58Z"), true)),
         ] {
             assert!(
-                diff_snapshots(&base, &fresh).iter().any(|c| c == EJECTED),
-                "{label}: the ejection is still reported"
+                !ejection.superseded_by_queue_entry(&requirements),
+                "{label}: still applies"
             );
         }
     }
@@ -13283,8 +13303,9 @@ mod tests {
 
     /// intent-hq/intent#7523 regression: the PR was ejected (13:18:28Z) and
     /// re-queued (13:21:58Z) before the monitor first observed the ejection.
-    /// The stale event predates the current queue entry, so it is kept as
-    /// history but never reported; a later ejection is still news.
+    /// The stale event predates the current queue entry, so it is adopted as
+    /// history and never reported — not even once a later poll loses the
+    /// queue state — while a later ejection is still news.
     #[tokio::test]
     async fn an_ejection_older_than_the_current_queue_entry_is_not_reported() {
         let (_db, _root, svc, forge, ws, owner) = setup().await;
@@ -13336,6 +13357,40 @@ mod tests {
             Some(stale.at.as_str()),
             "the stale event stays in the snapshot as history"
         );
+
+        // The decision persists once the queue state is lost before the
+        // wake: a degraded probe (the event is held, the queue state is
+        // not), then the PR leaving the queue with the stale event still
+        // the latest.
+        let assert_no_stale_line = |row: &PrMonitor, when: &str| {
+            assert!(
+                !row.pending_changes
+                    .iter()
+                    .any(|c| c.starts_with("removed from the merge queue")),
+                "{when}: the superseded ejection stays unreported: {:?}",
+                row.pending_changes
+            );
+        };
+        forge.edit(|s| s.fail_merge_requirements = true);
+        svc.poll_pr_monitors().await;
+        let row = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        assert_no_stale_line(&row, "degraded probe");
+        forge.edit(|s| {
+            s.fail_merge_requirements = false;
+            s.in_merge_queue = None;
+            s.merge_queue_entry = None;
+        });
+        svc.poll_pr_monitors().await;
+        let row = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        assert_no_stale_line(&row, "left the queue");
 
         // The queue ejects the PR again: a NEW event, after the entry, is
         // reported.
