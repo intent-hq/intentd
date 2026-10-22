@@ -5831,6 +5831,10 @@ impl Services {
         {
             tracing::warn!(agent = %agent_id, error = %e, "clear resolved display model failed");
         }
+        // A manual choice is the new home provider: any pending return to
+        // the old one (PROTOCOL §5.54 backup failover) is dropped.
+        self.clear_provider_return_state(&workspace_id, &agent_id)
+            .await;
         self.publish_agent_mutation_event(
             &workspace_id,
             &agent_id,
@@ -6490,6 +6494,9 @@ impl Services {
         crate::principal_ops::MessageAuthorResolver::new(self, &session.workspace_id)
             .attach_typed(&mut session.messages)
             .await;
+        // Daemon-internal bookkeeping stays in storage only (PROTOCOL §5.54:
+        // the home/return state is never exposed to clients).
+        crate::provider_return::strip_internal_metadata(&mut session);
         Ok(session)
     }
 

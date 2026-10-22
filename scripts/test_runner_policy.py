@@ -96,6 +96,20 @@ def slot_violations(text):
             errors.append(f"{entry['key']}: {entry.get('label')} is not an intent-cache pool label")
     for job, body in jobs(text).items():
         runner = re.search(r'^    runs-on: (.+)$', body, re.M)
+        # A matrix row may read its own slot in its `os` value (runs-on: matrix.os).
+        rows = re.findall(r'^ +(?:- )?os: (\$\{\{ .*outputs\.slots.*)$', body, re.M) if runner and runner[1] == '${{ matrix.os }}' else []
+        for row in rows:
+            read = SLOT_READ.search(row)
+            entry = by_key.get(read and read[1])
+            if not entry:
+                errors.append(f'{job}: reads an unlisted slot')
+                continue
+            used.add(entry['key'])
+            if entry['label'] != read[3]:
+                errors.append(f"{job}: fallback {read[3]} differs from listed {entry['label']}")
+            only = re.search(r"^    if: github\.event_name == '(\w+)'$", body, re.M)
+            if only and entry.get('events') != [only[1]]:
+                errors.append(f'{job}: runs only on {only[1]} but lists events {entry.get("events")}')
         if not runner or 'outputs.slots' not in runner[1]:
             continue
         read = SLOT_READ.search(runner[1])
@@ -193,11 +207,35 @@ class RunnerPolicy(unittest.TestCase):
         self.assertEqual(len(slot_violations(listing.format('gh-linux-8x', ',"events":["merge_group"]') + job)), 1)
         self.assertEqual(len(slot_violations(listing.format('windows-2025', ',"events":["merge_group"]') + job)), 2)
         self.assertEqual(slot_violations('jobs:\n' + job), ['a: reads an unlisted slot'])
+        row = "  b:\n    strategy:\n      matrix:\n        include:\n          - os: ${{ fromJSON(needs.route.outputs.slots || '{}')['b-linux'] || fromJSON('[\"gh-linux-16x\"]') }}\n    runs-on: ${{ matrix.os }}\n"
+        rows = '    with:\n      slot_jobs: >-\n        [{{"key":"b-linux","label":"{}"}}]\njobs:\n'
+        self.assertEqual(slot_violations(rows.format('gh-linux-16x') + row), [])
+        self.assertEqual(slot_violations(rows.format('gh-linux-8x') + row), ['b: fallback gh-linux-16x differs from listed gh-linux-8x'])
+        self.assertEqual(slot_violations('jobs:\n' + row), ['b: reads an unlisted slot'])
+        # A queue-only matrix row must list only that event, or it holds a slot on other events.
+        queued = row.replace('    strategy:', "    if: github.event_name == 'merge_group'\n    strategy:", 1)
+        events = '    with:\n      slot_jobs: >-\n        [{{"key":"b-linux","label":"gh-linux-16x"{}}}]\njobs:\n'
+        self.assertEqual(slot_violations(events.format(',"events":["merge_group"]') + queued), [])
+        self.assertEqual(slot_violations(events.format('') + queued), ['b: runs only on merge_group but lists events None'])
 
     def test_all_workloads_are_routed(self):
         for path in (ROOT / '.github/workflows').glob('*.yml'):
             with self.subTest(workflow=path.name):
                 self.assertEqual(violations(path.read_text(), path.name), [])
+
+    def test_queue_heavy_jobs_take_their_own_slots(self):
+        # The Linux daemon-lifecycle leg runs only in the merge queue; it is
+        # listed for merge_group so a free xl or heavy slot can take it, instead
+        # of the `heavy` step's always-hosted mapping. The coverage jobs stay
+        # hosted until the slot hosts raise their shared inotify limit.
+        ci = (ROOT / '.github/workflows/ci.yml').read_text()
+        listed = {entry['key']: entry for entry in slot_list(ci)}
+        self.assertNotIn('coverage-e2e', listed)
+        self.assertEqual(listed['daemon-lifecycle-linux'], {'key': 'daemon-lifecycle-linux', 'label': 'gh-linux-16x', 'rust': True, 'minutes': 4, 'events': ['merge_group']})
+        body = jobs(ci)
+        self.assertIn('outputs.linux_labels', body['coverage-e2e'])
+        self.assertIn("os: ${{ fromJSON(needs.route.outputs.slots || '{}')['daemon-lifecycle-linux'] || fromJSON('[\"gh-linux-16x\"]') }}", body['daemon-lifecycle'])
+        self.assertIn('outputs.linux_labels', body['coverage-all'])
 
     def test_routed_linux_jobs_run_unprivileged(self):
         # A routed Linux job may land on an intent-cache slot, which has no sudo or Docker.
