@@ -39,6 +39,12 @@ pub const NOTE_PAGING_CLEANUP_MIN_PAUSE: Duration = Duration::from_millis(50);
 /// Interval between progress log lines.
 pub const NOTE_PAGING_CLEANUP_PROGRESS_EVERY: Duration = Duration::from_secs(30);
 
+/// First retry delay after a failed step; doubles per consecutive failure.
+pub const NOTE_PAGING_CLEANUP_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+
+/// Cap on the retry delay after consecutive failed steps.
+pub const NOTE_PAGING_CLEANUP_MAX_BACKOFF: Duration = Duration::from_secs(300);
+
 /// One step of the cleanup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetiredNotePagingStep {
@@ -71,6 +77,10 @@ pub struct NotePagingCleanupPolicy {
     pub min_pause: Duration,
     /// Progress log interval ([`NOTE_PAGING_CLEANUP_PROGRESS_EVERY`]).
     pub progress_every: Duration,
+    /// First retry delay ([`NOTE_PAGING_CLEANUP_INITIAL_BACKOFF`]).
+    pub initial_backoff: Duration,
+    /// Retry delay cap ([`NOTE_PAGING_CLEANUP_MAX_BACKOFF`]).
+    pub max_backoff: Duration,
 }
 
 impl Default for NotePagingCleanupPolicy {
@@ -81,6 +91,8 @@ impl Default for NotePagingCleanupPolicy {
             hold_budget: NOTE_PAGING_CLEANUP_HOLD_BUDGET,
             min_pause: NOTE_PAGING_CLEANUP_MIN_PAUSE,
             progress_every: NOTE_PAGING_CLEANUP_PROGRESS_EVERY,
+            initial_backoff: NOTE_PAGING_CLEANUP_INITIAL_BACKOFF,
+            max_backoff: NOTE_PAGING_CLEANUP_MAX_BACKOFF,
         }
     }
 }
@@ -94,6 +106,8 @@ pub struct NotePagingCleanupOutcome {
     pub tables_dropped: u32,
     /// Longest single step.
     pub max_step: Duration,
+    /// Failed steps that were retried.
+    pub failed_steps: u32,
     /// True when both tables are gone.
     pub finished: bool,
 }
@@ -144,8 +158,12 @@ impl Store {
     /// both are gone. Between batches the write connection goes back to the
     /// (FIFO-fair) pool and the cleanup pauses, so queued writes run first. A
     /// batch slower than `policy.hold_budget` halves the next one. Logs start,
-    /// periodic progress and completion at info; a failure is logged at warn
-    /// and ends this run (the next daemon start resumes it).
+    /// periodic progress and completion at info. A failed step is logged at
+    /// warn with its attempt count and retried after a capped exponential
+    /// backoff (`policy.initial_backoff` doubling to `policy.max_backoff`), so
+    /// a transient failure such as a write-pool acquire timeout does not leave
+    /// the tables until the next restart. Every wait is a cancellable sleep:
+    /// aborting the task at shutdown stops it between statements.
     pub async fn run_retired_note_paging_cleanup(
         &self,
         policy: NotePagingCleanupPolicy,
@@ -155,18 +173,28 @@ impl Store {
         let mut batch = policy.batch_rows.max(1);
         let mut outcome = NotePagingCleanupOutcome::default();
         let mut announced = false;
+        let mut consecutive_failures = 0u32;
         loop {
             let step_started = Instant::now();
             let step = match self.retired_note_paging_step(batch).await {
-                Ok(step) => step,
+                Ok(step) => {
+                    consecutive_failures = 0;
+                    step
+                }
                 Err(e) => {
+                    consecutive_failures += 1;
+                    outcome.failed_steps += 1;
+                    let backoff = retry_backoff(&policy, consecutive_failures);
                     tracing::warn!(
                         error = %e,
+                        attempt = consecutive_failures,
+                        retry_in_ms = backoff.as_millis(),
                         rows_removed = outcome.rows_removed,
                         elapsed_ms = started.elapsed().as_millis(),
-                        "retired note paging cleanup failed; it resumes on the next start"
+                        "retired note paging cleanup step failed; retrying"
                     );
-                    return outcome;
+                    tokio::time::sleep(backoff).await;
+                    continue;
                 }
             };
             let elapsed = step_started.elapsed();
@@ -215,5 +243,83 @@ impl Store {
             }
             tokio::time::sleep(elapsed.max(policy.min_pause)).await;
         }
+    }
+}
+
+/// Delay before retrying after `failures` consecutive failed steps: the
+/// initial backoff doubled per extra failure, capped at the maximum.
+fn retry_backoff(policy: &NotePagingCleanupPolicy, failures: u32) -> Duration {
+    let doublings = failures.saturating_sub(1).min(31);
+    policy
+        .initial_backoff
+        .saturating_mul(1u32 << doublings)
+        .min(policy.max_backoff)
+}
+
+/// True when `error` reports a table the post-startup cleanup already dropped.
+fn is_missing_table(error: &sqlx::Error) -> bool {
+    error.to_string().contains("no such table")
+}
+
+impl Store {
+    /// Delete one workspace's retired page-index rows in bounded batches
+    /// before its notes are deleted, so a note batch never cascades
+    /// note → `note_page_head` → `note_page_entry` over millions of rows in one
+    /// statement. Each batch is its own autocommit statement of at most
+    /// [`NOTE_PAGING_CLEANUP_BATCH_ROWS`] rows. A table the post-startup
+    /// cleanup has already dropped (before or between batches) is skipped.
+    ///
+    /// # Errors
+    /// Returns `Error::Internal` if a batch fails for any other reason.
+    pub(crate) async fn delete_workspace_retired_note_paging(
+        &self,
+        workspace_id: &str,
+    ) -> Result<()> {
+        self.delete_workspace_retired_note_paging_in_batches(
+            workspace_id,
+            NOTE_PAGING_CLEANUP_BATCH_ROWS,
+        )
+        .await
+        .map(drop)
+    }
+
+    /// [`Self::delete_workspace_retired_note_paging`] with an explicit batch
+    /// size. Returns the rows each DELETE statement removed, in order.
+    pub(crate) async fn delete_workspace_retired_note_paging_in_batches(
+        &self,
+        workspace_id: &str,
+        batch_rows: u32,
+    ) -> Result<Vec<u64>> {
+        let batch = i64::from(batch_rows.max(1));
+        let mut statements = Vec::new();
+        for table in RETIRED_NOTE_PAGING_TABLES {
+            // `table` is one of two constants, never caller input.
+            let sql = format!(
+                "DELETE FROM {table} WHERE rowid IN \
+                 (SELECT rowid FROM {table} WHERE workspace_id = ? LIMIT ?)"
+            );
+            loop {
+                let removed = match sqlx::query(&sql)
+                    .bind(workspace_id)
+                    .bind(batch)
+                    .execute(self.write_pool())
+                    .await
+                {
+                    Ok(done) => done.rows_affected(),
+                    Err(e) if is_missing_table(&e) => break,
+                    Err(e) => {
+                        return Err(Error::Internal(format!(
+                            "delete workspace retired {table} rows: {e}"
+                        )))
+                    }
+                };
+                statements.push(removed);
+                if removed < batch.unsigned_abs() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        }
+        Ok(statements)
     }
 }

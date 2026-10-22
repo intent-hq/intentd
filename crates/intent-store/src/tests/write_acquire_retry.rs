@@ -203,3 +203,59 @@ async fn note_write_gives_up_within_budget_under_continuous_saturation() {
     );
     assert_eq!(stored.rev, 0);
 }
+
+/// intentd#2588 review: a failed retired-note-paging cleanup step (here a
+/// write-pool acquire timeout) is retried with backoff instead of ending the
+/// cleanup until the next daemon restart.
+#[tokio::test]
+async fn retired_note_paging_cleanup_retries_a_failed_step() {
+    use crate::note_paging_cleanup::NotePagingCleanupPolicy;
+    let tmp = TempDb::new();
+    let store = short_acquire_store(&tmp).await;
+    sqlx::raw_sql(
+        r"
+        INSERT INTO workspace(id,title,branch,created_at,updated_at) VALUES ('ws','W','main','c','u');
+        INSERT INTO note(id,workspace_id,title,content,rev,created_at,updated_at)
+          VALUES ('n','ws','Spec','body',1,'c','u');
+        INSERT INTO note_page_head(workspace_id,note_id,instance_id,current_rev,generation)
+          VALUES ('ws','n','instance',1,'generation');
+        WITH RECURSIVE seq(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM seq WHERE i+1 < 50)
+        INSERT INTO note_page_entry(workspace_id,note_id,collection,position,value)
+          SELECT 'ws','n','blocks',i,'entry' FROM seq;
+        ",
+    )
+    .execute(store.write_pool())
+    .await
+    .expect("seed retired index");
+
+    // Hold the only writer past one acquire timeout so the first step fails.
+    let held = store
+        .write_pool()
+        .acquire()
+        .await
+        .expect("hold write connection");
+    let cleaner = store.clone();
+    let cleanup = tokio::spawn(async move {
+        cleaner
+            .run_retired_note_paging_cleanup(NotePagingCleanupPolicy {
+                min_pause: Duration::ZERO,
+                initial_backoff: Duration::from_millis(10),
+                max_backoff: Duration::from_millis(50),
+                ..NotePagingCleanupPolicy::default()
+            })
+            .await
+    });
+    tokio::time::sleep(ACQUIRE_TIMEOUT * 2 + Duration::from_millis(500)).await;
+    drop(held);
+    let outcome = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        cleanup,
+    )
+    .await
+    .expect("cleanup finishes after the writer is released")
+    .expect("cleanup task");
+    assert!(outcome.finished, "{outcome:?}");
+    assert!(outcome.failed_steps >= 1, "{outcome:?}");
+    assert_eq!(outcome.rows_removed, 51);
+    assert_eq!(outcome.tables_dropped, 2);
+}

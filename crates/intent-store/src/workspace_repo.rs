@@ -1050,6 +1050,10 @@ impl Store {
             DELETE_CASCADE_BATCH,
         )
         .await?;
+        // Retired note paging rows (intent-hq/intent#7515) can greatly
+        // outnumber notes until the post-startup cleanup drops their tables.
+        // Remove them in bounded batches so no note batch cascades into them.
+        self.delete_workspace_retired_note_paging(&id.0).await?;
         // Partial indexes contain only remaining parent links and note-bound
         // comments, so batches do not rescan processed notes or no-note rows.
         // Preserve comments with no note (no cascade before).

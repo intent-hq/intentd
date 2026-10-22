@@ -376,3 +376,103 @@ async fn unrelated_writes_complete_promptly_while_the_cleanup_runs() {
         "{outcome:?}"
     );
 }
+
+async fn retired_rows(store: &Store, workspace: &str) -> (i64, i64) {
+    let entries = sqlx::query_scalar("SELECT count(*) FROM note_page_entry WHERE workspace_id=?")
+        .bind(workspace)
+        .fetch_one(store.read_pool())
+        .await
+        .unwrap();
+    let heads = sqlx::query_scalar("SELECT count(*) FROM note_page_head WHERE workspace_id=?")
+        .bind(workspace)
+        .fetch_one(store.read_pool())
+        .await
+        .unwrap();
+    (entries, heads)
+}
+
+async fn seed_other_workspace_index(store: &Store) {
+    sqlx::raw_sql(
+        r"
+        INSERT INTO workspace(id,title,branch,created_at,updated_at) VALUES ('keep','K','main','c','u');
+        INSERT INTO note(id,workspace_id,title,content,rev,created_at,updated_at)
+          VALUES ('k','keep','Kept','kept body',1,'c','u');
+        INSERT INTO note_page_head(workspace_id,note_id,instance_id,current_rev,generation)
+          VALUES ('keep','k','instance',1,'generation');
+        WITH RECURSIVE seq(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM seq WHERE i+1 < 10)
+        INSERT INTO note_page_entry(workspace_id,note_id,collection,position,value)
+          SELECT 'keep','k','blocks',i,'kept entry' FROM seq;
+        ",
+    )
+    .execute(store.write_pool())
+    .await
+    .unwrap();
+}
+
+/// intentd#2588 review: a workspace's retired page rows are removed in
+/// statements of at most one batch each (entries before heads), scoped to
+/// that workspace, before its notes are deleted.
+#[tokio::test]
+async fn workspace_retired_page_sweep_is_bounded_per_statement() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.unwrap();
+    seed_retired_index(&store, 350).await;
+    seed_other_workspace_index(&store).await;
+    let statements = store
+        .delete_workspace_retired_note_paging_in_batches("ws", 100)
+        .await
+        .unwrap();
+    assert_eq!(statements, [100, 100, 100, 50, 1]);
+    assert_eq!(retired_rows(&store, "ws").await, (0, 0));
+    assert_eq!(retired_rows(&store, "keep").await, (10, 1));
+}
+
+/// intentd#2588 review: `delete_workspace` with leftover page-index rows
+/// (more than two production batches) completes and leaves no orphans,
+/// while another workspace's rows stay for the background cleanup.
+#[tokio::test]
+async fn workspace_delete_leaves_no_retired_page_orphans() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.unwrap();
+    let rows = crate::note_paging_cleanup::NOTE_PAGING_CLEANUP_BATCH_ROWS * 2 + 2_000;
+    seed_retired_index(&store, rows).await;
+    seed_other_workspace_index(&store).await;
+    store
+        .delete_workspace(&WorkspaceId::from("ws"))
+        .await
+        .unwrap();
+    assert_eq!(retired_rows(&store, "ws").await, (0, 0));
+    assert_eq!(retired_rows(&store, "keep").await, (10, 1));
+    let notes: i64 = sqlx::query_scalar("SELECT count(*) FROM note WHERE workspace_id='ws'")
+        .fetch_one(store.read_pool())
+        .await
+        .unwrap();
+    assert_eq!(notes, 0);
+}
+
+/// The sweep tolerates the post-startup cleanup having dropped the tables.
+#[tokio::test]
+async fn workspace_delete_after_the_retired_tables_are_gone() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.unwrap();
+    seed_retired_index(&store, 10).await;
+    let outcome = store.run_retired_note_paging_cleanup(fast_cleanup()).await;
+    assert!(outcome.finished, "{outcome:?}");
+    assert_eq!(
+        store
+            .delete_workspace_retired_note_paging_in_batches("ws", 100)
+            .await
+            .unwrap(),
+        Vec::<u64>::new(),
+        "missing tables are skipped"
+    );
+    store
+        .delete_workspace(&WorkspaceId::from("ws"))
+        .await
+        .unwrap();
+    let notes: i64 = sqlx::query_scalar("SELECT count(*) FROM note WHERE workspace_id='ws'")
+        .fetch_one(store.read_pool())
+        .await
+        .unwrap();
+    assert_eq!(notes, 0);
+}
