@@ -526,12 +526,13 @@ fn validator_rejects_corrupt_physical_inputs_despite_valid_lexical_sibling() {
 ///
 /// `Store::open` seeds each new database with a random identity: the local
 /// owner principal (id and creation time, which the seeded `__chief__`
-/// workspace, its membership and authority rows reference) and the note-page
-/// backend's database-local id and key. Copies of one template share those
-/// values; two fresh databases never do. Exactly those values are masked,
-/// wherever they appear, so every other value must still match. A new random
-/// seed fails this comparison until it is listed here. The migration ledger's
-/// install times and durations are left out.
+/// workspace, its membership and authority rows reference), the time that
+/// membership was added, and the note-page backend's database-local id and
+/// key. Copies of one template share those values; two fresh databases never
+/// do. Exactly those values are masked, wherever they appear, so every other
+/// value must still match. A new random seed fails this comparison until it
+/// is listed here. The migration ledger's install times and durations are
+/// left out.
 async fn database_snapshot(store: &Store) -> Value {
     use sqlx::Row as _;
     let pool = store.write_pool();
@@ -539,11 +540,14 @@ async fn database_snapshot(store: &Store) -> Value {
     for query in [
         "SELECT quote(id), quote(created_at), quote(updated_at) FROM principal",
         "SELECT quote(backend_id), quote(token_key), NULL FROM note_page_backend",
+        // Seeded by a separate statement, so `now` can be a millisecond later.
+        "SELECT quote(added_at), NULL, NULL FROM workspace_member \
+         WHERE workspace_id = '__chief__'",
     ] {
-        let rows: Vec<(String, String, Option<String>)> =
+        let rows: Vec<(Option<String>, Option<String>, Option<String>)> =
             sqlx::query_as(query).fetch_all(pool).await.unwrap();
         for (first, second, third) in rows {
-            identity.extend([Some(first), Some(second), third].into_iter().flatten());
+            identity.extend([first, second, third].into_iter().flatten());
         }
     }
     let mut snapshot = serde_json::Map::new();
