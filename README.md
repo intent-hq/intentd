@@ -897,7 +897,8 @@ python3 scripts/bazel-drift.py --fix    # after a Cargo.toml / Cargo.lock / tool
 ```
 
 `--fix` regenerates `crates/*/BUILD.bazel` and `bazel/generated.MODULE.bazel`
-(`scripts/bazel-gen.py`) and refreshes `MODULE.bazel.lock`; commit the result. The
+(`scripts/bazel-gen.py`) and refreshes `MODULE.bazel.lock`; commit the result. Releases
+need no Bazel action: a bump of only workspace-crate versions passes the check. The
 informational `Bazel` workflow (`.github/workflows/bazel.yml`) runs the same check plus the
 build, tests and lint configs. Details: [`bazel/README.md`](bazel/README.md).
 

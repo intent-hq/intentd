@@ -27,7 +27,9 @@ records the `bazel_dep` registry hashes and crate_universe's resolution of
 `Cargo.toml` + `Cargo.lock`, so a checkout with an up-to-date lock skips the
 roughly one-minute Cargo resolution. Refresh it after any Cargo manifest or
 lockfile change with `python3 scripts/bazel-drift.py --fix` (see "Drift guard" below).
-CI builds with `--lockfile_mode=error`, so a stale lock fails the job.
+The `drift` CI job fails on a stale lock. **Releases need no Bazel action**: a
+release-plz bump that changes only workspace-crate versions is tolerated (see
+"Drift guard").
 
 crate_universe would record the `[patch]` path crate (`vendor/pprof`) by its
 absolute host path, which made the lock checkout-specific.
@@ -92,7 +94,16 @@ The check fails when a generated file is stale (`bazel-gen.py --check`), when
 matches `MODULE.bazel` or the Cargo manifests and `Cargo.lock`
 (`bazel mod deps --lockfile_mode=error`; crate_universe records their digests).
 A third-party bump in `Cargo.lock` therefore needs only `--fix` and a commit of
-the refreshed lock. Set `BAZEL` to pick the launcher (default `bazelisk`, then
+the refreshed lock.
+
+**Release bumps pass.** When the only difference is workspace-crate versions
+(each crate's `version`, path dependencies' `version`, and source-less
+`Cargo.lock` packages), the guard prints a "tolerated" note and exits 0, so a
+release-plz PR and the PRs after it stay green with no Bazel action. It
+compares today's Cargo files against the ones recorded in the lock, recovered
+from the commit that last changed `MODULE.bazel.lock` (CI checks out full
+history for this). Third-party versions, features, path changes or a new crate
+still fail. `--fix` at any time refreshes everything. Set `BAZEL` to pick the launcher (default `bazelisk`, then
 `bazel`). Its unit tests are `python3 -B scripts/test-bazel-ci.py`.
 
 ## CI
@@ -105,8 +116,11 @@ Bazel inputs:
 - `bazel`: `bazel build //...`, `bazel test --build_tests_only //...`, then
   `bazel build --config=<name> //...` for each lint config (`clippy`,
   `rustfmt`) that `.bazelrc` defines. Every command uses `--config=ci`: plain
-  logs, a frozen lock and `--nocache_test_results`, because tests still read
-  undeclared host inputs. Drop that flag once test inputs are audited.
+  logs and `--nocache_test_results`, because tests still read undeclared host
+  inputs (drop that flag once they are audited). The lock stays in `update`
+  mode, so after a release bump the job re-resolves from `Cargo.lock`; the
+  refreshed lock is never committed or uploaded, and the `drift` job is what
+  enforces it.
 
 The job installs `libssl-dev`, `zlib1g-dev` and `pkg-config` when missing,
 since openssl-sys and libz-sys link the system libraries on linux-gnu. The
