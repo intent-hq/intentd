@@ -49197,8 +49197,19 @@ async fn script_monitor_waiting_advisory_and_after_all_retire_on_silent_cancel()
         .unwrap()
         .unwrap();
         // Cancellation and commit_monitor's spawned redelivery race for the
-        // same claim. Await durable retirement by the winner, preserving the
-        // exact final assertions for both individual and after_all watches.
+        // same claim. The winner commits durable retirement before removing
+        // the in-memory watch, so observing the database alone is not a fence
+        // for both states. Await memory cleanup and then durable retirement.
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            async {
+                while !svc.find_watches_for_child(&child).is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            },
+        )
+        .await
+        .expect("cancellation redelivery retires the in-memory watch");
         wait_for_persisted_watches(&svc, 0).await;
         assert!(svc.find_watches_for_child(&child).is_empty());
         assert_eq!(parent_message_count(&svc, &parent).await, 2);
