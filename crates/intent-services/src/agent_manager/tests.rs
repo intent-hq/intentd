@@ -3655,7 +3655,12 @@ async fn winning_try_begin_revives_a_retired_workspace() {
     assert!(wt.join("README.md").is_file(), "fresh checkout provisioned");
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let delta = events
