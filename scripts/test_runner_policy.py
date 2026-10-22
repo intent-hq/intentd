@@ -96,6 +96,17 @@ def slot_violations(text):
             errors.append(f"{entry['key']}: {entry.get('label')} is not an intent-cache pool label")
     for job, body in jobs(text).items():
         runner = re.search(r'^    runs-on: (.+)$', body, re.M)
+        # A matrix row may read its own slot in its `os` value (runs-on: matrix.os).
+        rows = re.findall(r'^ +(?:- )?os: (\$\{\{ .*outputs\.slots.*)$', body, re.M) if runner and runner[1] == '${{ matrix.os }}' else []
+        for row in rows:
+            read = SLOT_READ.search(row)
+            entry = by_key.get(read and read[1])
+            if not entry:
+                errors.append(f'{job}: reads an unlisted slot')
+                continue
+            used.add(entry['key'])
+            if entry['label'] != read[3]:
+                errors.append(f"{job}: fallback {read[3]} differs from listed {entry['label']}")
         if not runner or 'outputs.slots' not in runner[1]:
             continue
         read = SLOT_READ.search(runner[1])
@@ -120,7 +131,7 @@ def slot_violations(text):
 
 POOL_OF = {'gh-linux-8x': 'heavy', 'gh-linux-16x': 'heavy', 'ubuntu-22.04': 'small', 'ubuntu-24.04': 'small'}
 # Merge-queue-only heavy jobs that ci.yml's route `heavy` step always sends hosted.
-QUEUE_HOSTED = {('ci.yml', 'coverage-e2e'), ('ci.yml', 'coverage-all')}
+QUEUE_HOSTED = {('ci.yml', 'coverage-all')}
 
 def pool_reads(body):
     """(pool, several legs?) for a job reading a pool-level mapping, else None."""
@@ -193,11 +204,29 @@ class RunnerPolicy(unittest.TestCase):
         self.assertEqual(len(slot_violations(listing.format('gh-linux-8x', ',"events":["merge_group"]') + job)), 1)
         self.assertEqual(len(slot_violations(listing.format('windows-2025', ',"events":["merge_group"]') + job)), 2)
         self.assertEqual(slot_violations('jobs:\n' + job), ['a: reads an unlisted slot'])
+        row = "  b:\n    strategy:\n      matrix:\n        include:\n          - os: ${{ fromJSON(needs.route.outputs.slots || '{}')['b-linux'] || fromJSON('[\"gh-linux-16x\"]') }}\n    runs-on: ${{ matrix.os }}\n"
+        rows = '    with:\n      slot_jobs: >-\n        [{{"key":"b-linux","label":"{}"}}]\njobs:\n'
+        self.assertEqual(slot_violations(rows.format('gh-linux-16x') + row), [])
+        self.assertEqual(slot_violations(rows.format('gh-linux-8x') + row), ['b: fallback gh-linux-16x differs from listed gh-linux-8x'])
+        self.assertEqual(slot_violations('jobs:\n' + row), ['b: reads an unlisted slot'])
 
     def test_all_workloads_are_routed(self):
         for path in (ROOT / '.github/workflows').glob('*.yml'):
             with self.subTest(workflow=path.name):
                 self.assertEqual(violations(path.read_text(), path.name), [])
+
+    def test_queue_heavy_jobs_take_their_own_slots(self):
+        # coverage-e2e and the Linux daemon-lifecycle leg run only in the merge
+        # queue; they are listed for merge_group so a free xl or heavy slot can
+        # take them, instead of the `heavy` step's always-hosted mapping.
+        ci = (ROOT / '.github/workflows/ci.yml').read_text()
+        listed = {entry['key']: entry for entry in slot_list(ci)}
+        self.assertEqual(listed['coverage-e2e'], {'key': 'coverage-e2e', 'label': 'gh-linux-16x', 'rust': True, 'minutes': 11, 'events': ['merge_group']})
+        self.assertEqual(listed['daemon-lifecycle-linux'], {'key': 'daemon-lifecycle-linux', 'label': 'gh-linux-16x', 'rust': True, 'minutes': 4, 'events': ['merge_group']})
+        body = jobs(ci)
+        self.assertIn("runs-on: ${{ fromJSON(needs.route.outputs.slots || '{}')['coverage-e2e'] || fromJSON('[\"gh-linux-16x\"]') }}", body['coverage-e2e'])
+        self.assertIn("os: ${{ fromJSON(needs.route.outputs.slots || '{}')['daemon-lifecycle-linux'] || fromJSON('[\"gh-linux-16x\"]') }}", body['daemon-lifecycle'])
+        self.assertIn('outputs.linux_labels', body['coverage-all'])
 
     def test_routed_linux_jobs_run_unprivileged(self):
         # A routed Linux job may land on an intent-cache slot, which has no sudo or Docker.

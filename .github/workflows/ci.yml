@@ -87,9 +87,11 @@ jobs:
           XL_THRESHOLD: ${{ env.LINUX_XL_BURST_THRESHOLD }}
           SMALL_THRESHOLD: ${{ env.LINUX_SMALL_BURST_THRESHOLD }}
           # Pooled jobs that start together once routing finishes; each reads
-          # outputs.slots[key] (see runner-route.yml for the fields). The
-          # heavy Rust jobs list pull_request only: the merge queue keeps them
-          # on GitHub-hosted larger runners (see the `heavy` step below).
+          # outputs.slots[key] (see runner-route.yml for the fields). check
+          # and coverage-changed list pull_request only: the merge queue keeps
+          # them on GitHub-hosted larger runners (see the `heavy` step below).
+          # coverage-e2e and the Linux daemon-lifecycle leg run only in the
+          # queue and take a free xl or heavy slot there; the rest go hosted.
           # Minutes are typical PR / merge-queue durations. release-fast-path
           # (release branches only) and the gate keep the `runners` mapping.
           SLOT_JOBS: >-
@@ -101,7 +103,9 @@ jobs:
             {"key":"pr-title","label":"ubuntu-24.04","events":["pull_request"]},
             {"key":"conflict-markers","label":"ubuntu-24.04","events":["pull_request"]},
             {"key":"deb-packaging","label":"ubuntu-24.04","events":["merge_group","push"]},
-            {"key":"pi-session-paths","label":"ubuntu-24.04","minutes":1,"legs":[22,24],"events":["merge_group","push"]}
+            {"key":"pi-session-paths","label":"ubuntu-24.04","minutes":1,"legs":[22,24],"events":["merge_group","push"]},
+            {"key":"coverage-e2e","label":"gh-linux-16x","rust":true,"minutes":11,"events":["merge_group"]},
+            {"key":"daemon-lifecycle-linux","label":"gh-linux-16x","rust":true,"minutes":4,"events":["merge_group"]}
             ]
           LINUX_RUNNER_DISABLED: ${{ vars.CI_LINUX_RUNNER_DISABLED }}
           WINDOWS_RUNNER_DISABLED: ${{ vars.CI_WINDOWS_RUNNER_DISABLED }}
@@ -242,13 +246,16 @@ jobs:
             core.setOutput('windows_labels', JSON.stringify(mapping['gh-windows-16x']));
             core.setOutput('macos_labels', JSON.stringify(mapping['macos-26-xlarge']));
             for (const key of ['windows', 'macos']) core.setOutput(`${key}_burst`, String(burst[key]));
-      # The heavy Rust jobs (check and coverage-changed through `slots`, which
-      # list pull_request only; the other coverage-* jobs and daemon-lifecycle
-      # through linux_labels) all stay hosted in the merge queue. In the merge
-      # queue they stay on GitHub-hosted larger runners: one queue run starts ~4 of them at once,
-      # sized for 16 CPUs, and the route decision is made before any of them
-      # is queued, so all would land on the two 8-CPU intent-cache slots and
-      # run one after another past the queue's time budget. PR and push
+      # check and coverage-changed (through `slots`, which list pull_request
+      # only) and coverage-all (through linux_labels) stay hosted in the merge
+      # queue. coverage-all raises the inotify instance limit with sudo, which
+      # the intent-cache containers lack (their hosts share a 128-instance
+      # limit across all slots). coverage-e2e and the Linux daemon-lifecycle
+      # leg read their own `slots` entries, so only as many take a slot as
+      # are free. Before slot fitting existed, one queue run started ~4 heavy jobs at once,
+      # sized for 16 CPUs, and the shared mapping sent all of them to the
+      # same two 8-CPU intent-cache slots, one after another, past the
+      # queue's time budget. PR and push
       # runs, and the light jobs routed through `runners`, keep the probe's
       # choice. This override stays out of the probe script above, which is
       # kept identical to runner-route.yml across intent, intentd and
@@ -1144,7 +1151,7 @@ jobs:
     # the repo's own ruleset, so no same-repo fork guard applies.
     needs: route
     if: ${{ !cancelled() && github.event_name == 'merge_group' && needs.route.result == 'success' }}
-    runs-on: ${{ fromJSON(needs.route.outputs.linux_labels) }}
+    runs-on: ${{ fromJSON(needs.route.outputs.slots || '{}')['coverage-e2e'] || fromJSON('["gh-linux-16x"]') }}
     timeout-minutes: 30
     env:
       CARGO_PROFILE_DEV_DEBUG: 0
@@ -2106,8 +2113,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # The Linux leg takes its own slot (listed in the route job's
+          # SLOT_JOBS); macOS keeps the shared mapping.
           - platform: linux
-            os: ${{ fromJSON(needs.route.outputs.linux_labels || '["gh-linux-16x"]') }}
+            os: ${{ fromJSON(needs.route.outputs.slots || '{}')['daemon-lifecycle-linux'] || fromJSON('["gh-linux-16x"]') }}
           - platform: macos
             os: ${{ fromJSON(needs.route.outputs.macos_labels || '["macos-26-xlarge"]') }}
     runs-on: ${{ matrix.os }}
