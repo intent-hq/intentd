@@ -4,3 +4,6 @@ target
 # dependency. crate_universe renders a BUILD.bazel into this directory while it
 # resolves the workspace; ignoring it keeps it out of the main repo's packages.
 vendor/pprof
+# crate_universe's production hub reaches vendor/ through this link (see
+# scripts/bazel-gen.py PROD_WORKSPACE_LINKS); keep it out of the package graph.
+bazel/prod-workspace/vendor
