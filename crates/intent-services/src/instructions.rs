@@ -495,8 +495,8 @@ mod tests {
         defaults()
     }
 
-    /// The latest common body includes v2.10 app file-link guidance.
-    const COMMON_LATEST: &str = V2_10.common;
+    /// The current common body includes development-only inline visual guidance.
+    const COMMON_LATEST: &str = V3_3.common;
     /// The latest set's workspace body. Harness v2.2 rewrites the workspace
     /// status-message guidance to one short plain sentence.
     const WORKSPACE_LATEST: &str = V2_2.workspace;
