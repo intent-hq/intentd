@@ -49,7 +49,16 @@ text and references, not image pasting or file attachments. The discussion and
 agent-chat @ menus have different recipient and delivery rules. Sending a message
 with a selected agent in a workspace-wide discussion explicitly addresses that agent.
 
-<!-- Sources: packages/intentd/crates/intent-core/src/discussion.rs; packages/intentd/crates/intent-services/src/discussion_ops.rs; packages/intentd/crates/intent-acp/src/mcp_server/bindings/discussion.rs; packages/cloudlands-fe/src/features/discussions/components/{DiscussionThread,DiscussionMessageView,DiscussionMentionPicker}.svelte; packages/cloudlands-fe/src/features/discussions/discussion-reference-navigation.ts. -->
+With person-mention support from the connected daemon, selecting a person in the
+discussion's @ menu records who is mentioned. Sending can alert that person when
+the discussion is off screen and notifications are enabled. Plain text that looks
+like an @ mention does not identify a recipient. Notification actions open the
+relevant discussion subject to current access. Unread counts appear in discussion
+navigation and inactive tabs. They reflect messages observed by this client and
+clear as focused discussion content is read; they are not durable cross-device
+read receipts. These additions remain part of unreleased Multiplayer Labs.
+
+<!-- Sources: packages/intentd/crates/intent-core/src/discussion.rs; packages/intentd/crates/intent-services/src/discussion_ops.rs; packages/intentd/crates/intent-acp/src/mcp_server/bindings/discussion.rs; packages/cloudlands-fe/src/features/discussions/components/{DiscussionThread,DiscussionMessageView,DiscussionMentionPicker,DiscussionUnreadBadge}.svelte; packages/cloudlands-fe/src/features/discussions/discussion-reference-navigation.ts; packages/cloudlands-fe/src/store/renderer/slices/notifications/sagas/notifications-saga.ts; packages/cloudlands-fe/src/store/renderer/slices/workspace-discussion/workspace-discussion-selectors.ts. -->
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/settings/MobileSettings.svelte; src/features/devices/{PersonalDevicesPanel.svelte,personal-devices-selectors.ts}; src/store/renderer/slices/principal/principal-selectors.ts; src/store/renderer/slices/websocket-api/sagas/websocket-api-saga.ts; messages/en.json. -->
 
