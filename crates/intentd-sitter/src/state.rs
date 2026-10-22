@@ -70,6 +70,22 @@ pub struct SitterState {
     /// date only, never an identifier.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_check_day: Option<String>,
+    /// ISO week (`YYYY-Www`, UTC) of the last successful endpoint check;
+    /// drives `w`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_week: Option<String>,
+    /// UTC month (`YYYY-MM`) of the last successful endpoint check; drives
+    /// `m`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_month: Option<String>,
+    /// UTC day (`YYYY-MM-DD`) this install was first seen, for the `a` age
+    /// bucket. `None` with [`Self::first_seen_estimated`] means unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_seen_day: Option<String>,
+    /// Whether `first_seen_day` was estimated for an install that predates
+    /// it (such installs never send `i=1`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub first_seen_estimated: bool,
 }
 
 impl Default for SitterState {
@@ -81,6 +97,10 @@ impl Default for SitterState {
             last_check_at: None,
             next_check_at: None,
             last_check_day: None,
+            last_week: None,
+            last_month: None,
+            first_seen_day: None,
+            first_seen_estimated: false,
         }
     }
 }
@@ -143,6 +163,10 @@ mod tests {
             last_check_at: Some(datetime!(2026-07-23 01:02:03 UTC)),
             next_check_at: Some(datetime!(2026-07-23 18:00:00 UTC)),
             last_check_day: Some("2026-07-23".to_string()),
+            last_week: Some("2026-W30".to_string()),
+            last_month: Some("2026-07".to_string()),
+            first_seen_day: Some("2026-01-02".to_string()),
+            first_seen_estimated: true,
         };
         save(&path, &state).unwrap();
         assert_eq!(load(&path), state);
@@ -191,6 +215,38 @@ mod tests {
         let state = load(&path);
         assert_eq!(state.current_version.as_deref(), Some("1.0.0"));
         assert_eq!(state.last_check_day, None);
+    }
+
+    #[test]
+    fn state_without_activity_fields_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        fs::write(
+            &path,
+            r#"{"schema":1,"channel":"stable","current_version":"0.11.23","last_check_at":"2026-10-21T08:00:00Z","next_check_at":null,"last_check_day":"2026-10-21"}"#,
+        )
+        .unwrap();
+        let state = load(&path);
+        assert_eq!(state.current_version.as_deref(), Some("0.11.23"));
+        assert_eq!(state.last_check_day.as_deref(), Some("2026-10-21"));
+        assert_eq!(state.last_week, None);
+        assert_eq!(state.last_month, None);
+        assert_eq!(state.first_seen_day, None);
+        assert!(!state.first_seen_estimated);
+    }
+
+    #[test]
+    fn unset_activity_fields_are_not_written() {
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&SitterState::default()).unwrap()).unwrap();
+        for key in [
+            "last_week",
+            "last_month",
+            "first_seen_day",
+            "first_seen_estimated",
+        ] {
+            assert!(json.get(key).is_none(), "{key}");
+        }
     }
 
     #[test]

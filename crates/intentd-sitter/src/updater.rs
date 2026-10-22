@@ -23,10 +23,11 @@ use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
+use crate::activity;
 use crate::cli::Channel;
 use crate::manifest::{self, ChannelManifest, ManifestError, PlatformEntry, TARGET_TRIPLE};
 use crate::paths::{SitterPaths, DAEMON_BIN_NAME};
-use crate::state;
+use crate::state::{self, SitterState};
 use crate::telemetry::{self, CheckParams, CheckTrigger, UpdateEndpoint};
 
 /// TCP connect timeout for all requests (fail fast when offline).
@@ -547,7 +548,8 @@ impl Updater {
 
     /// One manifest fetch through the update-check endpoint, with the
     /// redirect allowlist ([`telemetry::check_redirect`]) on a dedicated
-    /// client. Records today's UTC date once a first-of-day check succeeds.
+    /// client. Advances the stored day/week/month once the check succeeds
+    /// ([`activity`]).
     fn fetch_via_endpoint(
         &self,
         endpoint: &UpdateEndpoint,
@@ -555,8 +557,7 @@ impl Updater {
         trigger: CheckTrigger,
     ) -> Result<ChannelManifest, UpdateError> {
         let now = time::OffsetDateTime::now_utc();
-        let last_day = state::load(&self.paths.state_path).last_check_day;
-        let first_of_day = telemetry::is_first_check_of_day(last_day.as_deref(), now);
+        let flags = activity::activity(&self.resolve_first_seen(now), now);
         let url = telemetry::update_check_url(
             &endpoint.base_url,
             channel,
@@ -565,7 +566,7 @@ impl Updater {
                 version: telemetry::SITTER_VERSION,
                 source: endpoint.install_source,
                 trigger,
-                first_of_day,
+                activity: flags,
             },
         )
         .map_err(|e| UpdateError::InvalidEndpoint(format!("{}: {e}", endpoint.base_url)))?;
@@ -598,22 +599,43 @@ impl Updater {
             });
         }
         let manifest = manifest::parse(&resp.bytes().map_err(network)?)?;
-        if first_of_day {
-            self.record_check_day(&telemetry::utc_day(now));
+        if flags.needs_record() {
+            self.update_state(|state| {
+                activity::record_success(state, now);
+                true
+            });
         }
         Ok(manifest)
     }
 
-    /// Best-effort: persist `last_check_day` under the state lock.
-    fn record_check_day(&self, day: &str) {
-        let Ok(_lock) = state::lock(&self.paths.state_path) else {
-            return;
+    /// Record the first-seen date on the first endpoint check (before the
+    /// request, so a failed first check still counts as fresh next time)
+    /// and return the state the flags are computed from.
+    fn resolve_first_seen(&self, now: time::OffsetDateTime) -> SitterState {
+        let prior = |state: &SitterState| {
+            activity::state_shows_prior_install(state) || dir_has_entries(&self.paths.versions_dir)
         };
+        self.update_state(|state| {
+            let has_prior_install = prior(state);
+            activity::resolve_first_seen(state, now, has_prior_install, || {
+                activity::estimate_first_seen(&self.paths.sitter_dir)
+            })
+        })
+        .unwrap_or_else(|| state::load(&self.paths.state_path))
+    }
+
+    /// Best-effort read-modify-write of `state.json` under the state lock;
+    /// `apply` returns whether it changed anything worth saving. Returns
+    /// the resulting state, or `None` when the lock cannot be taken.
+    fn update_state(&self, apply: impl FnOnce(&mut SitterState) -> bool) -> Option<SitterState> {
+        let _lock = state::lock(&self.paths.state_path).ok()?;
         let mut state = state::load(&self.paths.state_path);
-        state.last_check_day = Some(day.to_string());
-        if let Err(e) = state::save(&self.paths.state_path, &state) {
-            eprintln!("intentd-sitter: failed to persist state.json: {e}");
+        if apply(&mut state) {
+            if let Err(e) = state::save(&self.paths.state_path, &state) {
+                eprintln!("intentd-sitter: failed to persist state.json: {e}");
+            }
         }
+        Some(state)
     }
 
     fn fetch(&self, url: &str, timeout: Duration) -> Result<Vec<u8>, UpdateError> {
@@ -977,6 +999,11 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
         #[cfg(not(unix))]
         Err(_) => Ok(()),
     }
+}
+
+/// Whether `dir` exists and has at least one entry.
+fn dir_has_entries(dir: &Path) -> bool {
+    fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_some())
 }
 
 #[cfg(test)]
