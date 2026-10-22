@@ -240,35 +240,25 @@ impl Services {
 /// workspaces and checkout-less rows are refused with
 /// [`Error::RetireUnsupported`] before anything changes.
 pub(crate) fn retire_supported(ws: &Workspace) -> Result<()> {
-    let refuse = |reason: &str, checkout_mode: Option<String>| {
+    let refuse = |checkout_mode: Option<intent_core::CheckoutMode>| {
         Err(Error::RetireUnsupported {
             workspace_id: ws.id.as_str().to_string(),
-            reason: reason.to_string(),
             checkout_mode,
         })
     };
     if ws.is_remote {
-        return refuse("remote workspaces have no local folder to delete", None);
+        return refuse(None);
     }
-    match ws.checkout_mode {
-        Some(mode @ (intent_core::CheckoutMode::Cow | intent_core::CheckoutMode::Direct)) => {
-            let wire = serde_json::to_value(mode)
-                .ok()
-                .and_then(|v| v.as_str().map(str::to_string));
-            return refuse(
-                "the checkout folder is the repository itself, so deleting it would lose the branch",
-                wire,
-            );
-        }
-        Some(intent_core::CheckoutMode::Worktree) | None => {}
+    if let Some(mode @ (intent_core::CheckoutMode::Cow | intent_core::CheckoutMode::Direct)) =
+        ws.checkout_mode
+    {
+        return refuse(Some(mode));
     }
-    if ws.skip_worktree {
-        return refuse("the workspace folder is the user's own repository", None);
-    }
-    if ws.worktree_path.as_deref().is_none_or(str::is_empty)
+    if ws.skip_worktree
+        || ws.worktree_path.as_deref().is_none_or(str::is_empty)
         || ws.repository_path.as_deref().is_none_or(str::is_empty)
     {
-        return refuse("the workspace has no git worktree checkout", None);
+        return refuse(None);
     }
     Ok(())
 }

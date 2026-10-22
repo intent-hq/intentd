@@ -158,8 +158,7 @@ async fn retire_archived_workspace_removes_folder_and_keeps_rows_and_branch() {
     assert!(
         registered.iter().all(|name| {
             repo.find_worktree(name)
-                .map(|w| w.path() != wt.as_path())
-                .unwrap_or(true)
+                .map_or(true, |w| w.path() != wt.as_path())
         }),
         "worktree registration pruned: {registered:?}"
     );
@@ -403,8 +402,8 @@ async fn retire_refuses_non_worktree_checkouts() {
     let mut bare = base("bare");
     bare.worktree_path = None;
     let cases = [
-        (cow, Some("cow")),
-        (direct, Some("direct")),
+        (cow, Some(intent_core::CheckoutMode::Cow)),
+        (direct, Some(intent_core::CheckoutMode::Direct)),
         (skip, None),
         (remote, None),
         (bare, None),
@@ -418,7 +417,7 @@ async fn retire_refuses_non_worktree_checkouts() {
             .unwrap_err();
         match &err {
             Error::RetireUnsupported { checkout_mode, .. } => {
-                assert_eq!(checkout_mode.as_deref(), mode, "{}", ws.id.0);
+                assert_eq!(*checkout_mode, mode, "{}", ws.id.0);
             }
             other => panic!("{}: expected RetireUnsupported, got {other:?}", ws.id.0),
         }

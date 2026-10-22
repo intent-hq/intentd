@@ -3507,8 +3507,7 @@ fn workspace_retired_error_maps_to_machine_readable_code() {
 
     let rpc = super::domain_to_rpc(Error::RetireUnsupported {
         workspace_id: "ws-1".to_string(),
-        reason: "cow".to_string(),
-        checkout_mode: Some("cow".to_string()),
+        checkout_mode: Some(intent_core::CheckoutMode::Cow),
     });
     assert_eq!(rpc.code, -32602);
     assert_eq!(
@@ -3517,7 +3516,6 @@ fn workspace_retired_error_maps_to_machine_readable_code() {
     );
     let rpc = super::domain_to_rpc(Error::RetireUnsupported {
         workspace_id: "ws-1".to_string(),
-        reason: "remote".to_string(),
         checkout_mode: None,
     });
     assert_eq!(

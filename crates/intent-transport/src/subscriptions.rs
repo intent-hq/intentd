@@ -280,8 +280,8 @@ pub(crate) fn parse_note_subscribe_params(
 }
 
 /// Validate `workspace.subscribe` params. The channel is global, so only the
-/// optional `replaceGroup` is read (§6.2).
-#[expect(clippy::unnecessary_wraps)] // params parser; keeps the uniform Result shape of its siblings
+/// optional `replaceGroup` and `includeRetired` (strict boolean; a
+/// non-boolean is `-32602`) are read (§6.2).
 pub(crate) fn parse_workspace_subscribe_params(
     params: &Map<String, Value>,
 ) -> Result<WorkspaceSubscribeParams, String> {

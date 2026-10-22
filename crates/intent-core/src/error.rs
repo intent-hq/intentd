@@ -43,14 +43,14 @@ pub enum Error {
     /// `workspace.retire` on a workspace whose folder is not a daemon-owned
     /// git worktree (§5.1): a `cow` / `direct` checkout (the folder IS the
     /// repository, so deleting it loses the branch), a `skipIsolation`
-    /// workspace (the folder is the user's repository) or a remote
-    /// workspace. Nothing is changed. Surfaces as `-32602` with
-    /// `error.data = { code: "retire-unsupported", checkoutMode? }`.
-    #[error("workspace {workspace_id} cannot be retired: {reason}")]
+    /// workspace (the folder is the user's repository), a remote workspace,
+    /// or one without a checkout. Nothing is changed. Surfaces as `-32602`
+    /// with `error.data = { code: "retire-unsupported", checkoutMode? }`.
+    /// Kept small (no owned reason string) so [`Error`] does not grow.
+    #[error("workspace {workspace_id} cannot be retired: only git worktree workspaces can retire")]
     RetireUnsupported {
         workspace_id: String,
-        reason: String,
-        checkout_mode: Option<String>,
+        checkout_mode: Option<crate::model::CheckoutMode>,
     },
 
     /// libgit2 classified an authentication failure. Legacy wire rendering

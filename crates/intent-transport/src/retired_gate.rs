@@ -162,7 +162,7 @@ pub(crate) const RETIRED_GATED_METHODS: &[&str] = &[
 /// revive triggers (`workspace.unarchive`, `workspace.restore`, a user
 /// message via `agent.sendMessage`), the idempotent `workspace.retire`, and
 /// per-viewer bookkeeping that changes no workspace content.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) const RETIRED_EXEMPT_METHODS: &[&str] = &[
     "agent.markSeen",
     "agent.sendMessage",
@@ -177,7 +177,7 @@ pub(crate) const RETIRED_EXEMPT_METHODS: &[&str] = &[
 
 /// Reads and daemon-global methods (no workspace content to protect): never
 /// gated. Listed so the classification golden test covers every method.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) const RETIRED_UNGATED_METHODS: &[&str] = &[
     "accept-changes.getStatus",
     "agent.completeOnce",
@@ -505,14 +505,14 @@ mod tests {
         }
     }
 
-    fn params(v: Value) -> Map<String, Value> {
+    fn params(v: &Value) -> Map<String, Value> {
         v.as_object().unwrap().clone()
     }
 
     #[tokio::test]
     async fn gated_writes_are_refused_on_retired_workspaces_only() {
-        let retired = params(serde_json::json!({ "workspaceId": "ws-retired" }));
-        let live = params(serde_json::json!({ "workspaceId": "ws-live" }));
+        let retired = params(&serde_json::json!({ "workspaceId": "ws-retired" }));
+        let live = params(&serde_json::json!({ "workspaceId": "ws-live" }));
         for method in [
             "note.create",
             "task.update",
@@ -528,7 +528,7 @@ mod tests {
             check(&RetiredApi, method, &live).await.expect(method);
         }
         // Agent-scoped writes resolve the agent's workspace.
-        let by_agent = params(serde_json::json!({ "agentId": "agent-retired" }));
+        let by_agent = params(&serde_json::json!({ "agentId": "agent-retired" }));
         assert!(check(&RetiredApi, "agent.rename", &by_agent).await.is_err());
         // Reads and the documented exceptions pass.
         for method in [
