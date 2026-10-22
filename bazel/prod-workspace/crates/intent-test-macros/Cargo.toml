@@ -4,7 +4,6 @@
 
 [package]
 name = "intent-test-macros"
-version = "0.9.55"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true

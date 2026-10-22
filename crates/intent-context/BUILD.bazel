@@ -3,6 +3,7 @@
 load("@crates//:defs.bzl", "aliases", "all_crate_deps")
 load("@crates_dev//:defs.bzl", dev_aliases = "aliases", dev_crate_deps = "all_crate_deps")
 load("@rules_rust//cargo:defs.bzl", "extract_cargo_lints")
+load("//bazel:shared_binary_test.bzl", "shared_binary_test")
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 
 package(default_visibility = ["//visibility:public"])
@@ -75,8 +76,7 @@ rust_library(
 )
 
 rust_test(
-    name = "lib_test",
-    timeout = "long",
+    name = "lib_test_binary",
     crate = ":intent_context_dev",
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro_dev = True),
@@ -87,6 +87,17 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    args = ["--list"],
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
+)
+
+shared_binary_test(
+    name = "lib_test",
+    binary = ":lib_test_binary",
+    timeout = "long",
     args = [
         "--skip",
         "availability_available_via_fake_binary",
@@ -99,19 +110,10 @@ rust_test(
     ],
 )
 
-rust_test(
+shared_binary_test(
     name = "lib_test_serial",
+    binary = ":lib_test_binary",
     timeout = "long",
-    crate = ":intent_context_dev",
-    aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
-    proc_macro_deps = dev_crate_deps(proc_macro_dev = True),
-    deps = dev_crate_deps(normal_dev = True),
-    compile_data = ["//:workspace_test_data"],
-    data = ["//:workspace_test_data"],
-    edition = "2021",
-    version = "0.11.27",
-    crate_features = [],
-    lint_config = ":cargo_lints",
     args = [
         "availability_available_via_fake_binary",
         "run_auggie",

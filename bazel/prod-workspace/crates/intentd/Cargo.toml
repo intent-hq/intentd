@@ -4,7 +4,6 @@
 
 [package]
 name = "intentd"
-version = "0.11.27"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -21,7 +20,7 @@ description = "Intent backend daemon — local-first JSON-RPC daemon for the Int
 # unchanged, so they leave the intentd group alone. Neither crate is
 # published, so the wide range only affects release planning; the path still
 # selects the in-tree sitter. scripts/test-version-group.py enforces this.
-intentd-sitter = { path = "../intentd-sitter", version = "0" }
+intentd-sitter = { path = "../intentd-sitter" }
 clap = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
@@ -33,16 +32,16 @@ tracing-appender = { workspace = true }
 directories = { workspace = true }
 sqlx = { workspace = true }
 
-intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.11.27", optional = true }
-intent-core = { path = "../intent-core", version = "0.11.27" }
-intent-store = { path = "../intent-store", version = "0.11.27" }
-intent-services = { path = "../intent-services", version = "0.11.27" }
-intent-acp = { path = "../intent-acp", version = "0.11.27" }
-intent-providers = { path = "../intent-providers", version = "0.11.27" }
-intent-git = { path = "../intent-git", version = "0.11.27" }
-intent-context = { path = "../intent-context", version = "0.11.27" }
-intent-transport = { path = "../intent-transport", version = "0.11.27" }
-intent-js = { path = "../intent-js", version = "0.11.27", optional = true }
+intent-sourcecontrol = { path = "../intent-sourcecontrol", optional = true }
+intent-core = { path = "../intent-core" }
+intent-store = { path = "../intent-store" }
+intent-services = { path = "../intent-services" }
+intent-acp = { path = "../intent-acp" }
+intent-providers = { path = "../intent-providers" }
+intent-git = { path = "../intent-git" }
+intent-context = { path = "../intent-context" }
+intent-transport = { path = "../intent-transport" }
+intent-js = { path = "../intent-js", optional = true }
 qrcode = "0.14.1"
 image = { version = "0.25.6", default-features = false, features = ["png"] }
 sysinfo = { version = "0.39.6", default-features = false, features = ["system", "disk"] }

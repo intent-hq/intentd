@@ -3,6 +3,7 @@
 load("@crates//:defs.bzl", "aliases", "all_crate_deps")
 load("@crates_dev//:defs.bzl", dev_aliases = "aliases", dev_crate_deps = "all_crate_deps")
 load("@rules_rust//cargo:defs.bzl", "extract_cargo_lints")
+load("//bazel:shared_binary_test.bzl", "shared_binary_test")
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 
 package(default_visibility = ["//visibility:public"])
@@ -85,8 +86,7 @@ rust_library(
 )
 
 rust_test(
-    name = "lib_test",
-    timeout = "long",
+    name = "lib_test_binary",
     crate = ":intent_acp_dev",
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro_dev = True),
@@ -104,6 +104,17 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    args = ["--list"],
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
+)
+
+shared_binary_test(
+    name = "lib_test",
+    binary = ":lib_test_binary",
+    timeout = "long",
     args = [
         "--skip",
         "callback_registration::tests::",
@@ -115,26 +126,10 @@ rust_test(
 )
 
 # manual: needs INTENT_ACP_CALLBACK_ADAPTER_FIXTURE from the client environment
-rust_test(
+shared_binary_test(
     name = "lib_test_fixture",
+    binary = ":lib_test_binary",
     timeout = "long",
-    crate = ":intent_acp_dev",
-    aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
-    proc_macro_deps = dev_crate_deps(proc_macro_dev = True),
-    deps = dev_crate_deps(normal_dev = True) + [
-        "//crates/intent-pty:intent_pty_dev",
-        "//crates/intent-services:intent_services_dev",
-        "//crates/intentd-test-support:intentd_test_support_dev",
-    ],
-    compile_data = ["//:workspace_test_data"],
-    data = [
-        "//:workspace_test_data",
-        "//:workspace_rust_sources",
-    ],
-    edition = "2021",
-    version = "0.11.27",
-    crate_features = [],
-    lint_config = ":cargo_lints",
     args = ["callback_registration::tests::"],
     env_inherit = ["INTENT_ACP_CALLBACK_ADAPTER_FIXTURE"],
     tags = [

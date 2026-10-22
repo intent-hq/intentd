@@ -4,7 +4,6 @@
 
 [package]
 name = "intent-voice"
-version = "0.4.1"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -12,7 +11,7 @@ license.workspace = true
 description = "VoiceEngine + providers for the voice.* surface (speech-to-text over reqwest)"
 
 [dependencies]
-intent-core = { path = "../intent-core", version = "0.11.27" }
+intent-core = { path = "../intent-core" }
 reqwest = { workspace = true, features = ["multipart"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -183,6 +183,16 @@ KNOWN_FAILING[("intent-services", "intent-services")] = {
         "tests::pr::discovery_http::shared_discovery_explicit_admission_rechecks_guards_between_pages": SHARED_PROCESS,
         "tests::pr::discovery_http::shared_discovery_audited_distribution_http_before_after_counts": SHARED_PROCESS,
         "tests::workspace_delete::transcript_append_cannot_refill_completed_sweep": SHARED_PROCESS,
+        "pr_discovery::tests::shared_discovery_cache_is_bounded_and_in_flight_slots_are_not_evicted": SHARED_PROCESS,
+        "pr_monitor::tests::qwen_regression::qwen_old_snapshot_rest_failure_and_recovery_each_deliver_once": SHARED_PROCESS,
+        "pr_monitor::tests::qwen_regression::qwen_older_snapshot_preserves_unknown_status_provenance_until_full_read": SHARED_PROCESS,
+        "pr_monitor::tests::qwen_regression::qwen_preserves_pending_failure_through_degradation_and_reregistration": SHARED_PROCESS,
+        "pr_monitor::tests::qwen_regression::qwen_recovery_after_delivered_push_reports_new_head_completion_once": SHARED_PROCESS,
+        "pr_monitor::tests::qwen_regression::qwen_recovery_after_delivered_push_reports_new_head_failure_once": SHARED_PROCESS,
+        "pr_monitor::tests::qwen_regression::qwen_silent_discovery_and_learning_preserve_mixed_pending_changes": SHARED_PROCESS,
+        "pr_monitor::tests::qwen_regression::qwen_silent_discovery_failure_before_learning_preserves_pending_changes": SHARED_PROCESS,
+        "pr_monitor::tests::qwen_regression::qwen_silent_discovery_removal_before_learning_preserves_pending_changes": SHARED_PROCESS,
+        "pr_monitor::tests::qwen_regression::qwen_silent_discovery_repairs_missing_emitted_evidence_from_last_poll": SHARED_PROCESS,
 }
 
 # Unit-test binaries split into several Bazel targets by top-level module, so
@@ -712,16 +722,26 @@ def render_build(ws: Workspace, package: dict, nextest: NextestPolicy) -> str:
             serial = []
         base_tags = TEST_GRAPH_TAGS + (["manual"] if manual_reason else [])
 
-        def emit(suffix: str, args: list[str], tags: list[str], extra: dict) -> None:
+        default_timeout = TEST_TIMEOUTS.get(
+            (name, binary_id.split("::", 1)[-1]),
+            # Bazel times out a whole test binary (nextest kills single tests at
+            # 180 s). Unit-test binaries hold thousands of tests.
+            "long" if "::" not in binary_id or "::bin/" in binary_id else None,
+        )
+        known = KNOWN_FAILING.get((name, binary_id.split("::", 1)[-1]), {})
+        shards = module_shards(pkg_root, relative_src(package, lib), MODULE_SHARDS[name]) \
+            if binary_id == name and name in MODULE_SHARDS and lib is not None else []
+        # A binary split into several targets is compiled once, as
+        # `<target>_binary`; the split targets run it through shared_binary_test. The
+        # binary target itself only lists its tests, so it stays a normal
+        # target that the clippy and rustfmt aspects reach.
+        split = bool(shards or serial or known or fixture_patterns)
+
+        def compile_rule(rule_name: str, args: list[str], tags: list[str], timeout: str | None, extra: dict) -> None:
             rules.append(Rule(
                 "rust_test",
-                name=target_name + suffix,
-                # Bazel times out a whole test binary (nextest kills single tests
-                # at 180 s). Unit-test binaries hold thousands of tests.
-                timeout=extra.pop("timeout", None) or TEST_TIMEOUTS.get(
-                    (name, binary_id.split("::", 1)[-1]),
-                    "long" if "::" not in binary_id or "::bin/" in binary_id else None,
-                ),
+                name=rule_name,
+                timeout=timeout,
                 **attrs,
                 compile_data=Raw('["//:workspace_test_data"]'),
                 data=data,
@@ -733,14 +753,30 @@ def render_build(ws: Workspace, package: dict, nextest: NextestPolicy) -> str:
                 tags=sorted(set(base_tags + tags)) or None,
             ))
 
-        known = KNOWN_FAILING.get((name, binary_id.split("::", 1)[-1]), {})
+        if split:
+            used.add("shared_binary_test")
+            compile_rule(f"{target_name}_binary", ["--list"], [], None, {})
+
+        def emit(suffix: str, args: list[str], tags: list[str], extra: dict) -> None:
+            timeout = extra.pop("timeout", None) or default_timeout
+            if not split:
+                compile_rule(target_name + suffix, args, tags, timeout, extra)
+                return
+            rules.append(Rule(
+                "shared_binary_test",
+                name=target_name + suffix,
+                binary=f":{target_name}_binary",
+                timeout=timeout,
+                args=args or None,
+                **extra,
+                tags=sorted(set(base_tags + tags)) or None,
+            ))
+
         skips = [a for p in fixture_patterns + serial for a in ("--skip", p)]
         skips += [a for t in sorted(known) for a in ("--skip", t)]
         exclusive = ["exclusive"] if binary_id in nextest.exclusive_binaries else []
         if manual_reason:
             rules.append(Comment(f"manual: {manual_reason}"))
-        shards = module_shards(pkg_root, relative_src(package, lib), MODULE_SHARDS[name]) \
-            if binary_id == name and name in MODULE_SHARDS and lib is not None else []
         if shards:
             prefixes = [f"{m}::" for bucket in shards for m in bucket]
             for index, bucket in enumerate(shards, 1):
@@ -848,6 +884,8 @@ def render_build(ws: Workspace, package: dict, nextest: NextestPolicy) -> str:
     cargo_rules = sorted({"cargo_build_script"} & used | ({"extract_cargo_lints"} if lint_config else set()))
     if cargo_rules:
         out.append('load("@rules_rust//cargo:defs.bzl", ' + ", ".join(f'"{r}"' for r in cargo_rules) + ")\n")
+    if "shared_binary_test" in used:
+        out.append('load("//bazel:shared_binary_test.bzl", "shared_binary_test")\n')
     rust_rules = sorted(used & {"rust_binary", "rust_library", "rust_proc_macro", "rust_test"})
     out.append('load("@rules_rust//rust:defs.bzl", ' + ", ".join(f'"{r}"' for r in rust_rules) + ")\n\n")
     out.append('package(default_visibility = ["//visibility:public"])\n\n')
@@ -978,6 +1016,28 @@ def strip_manifest(text: str, package_extra: str = "") -> str:
     return "\n".join(out).rstrip("\n") + "\n"
 
 
+def drop_member_versions(text: str) -> str:
+    """Remove workspace-crate versions from a production manifest copy.
+
+    release-plz bumps every workspace crate's version on each release. Feature
+    resolution does not depend on them, so the copies omit the package version
+    (Cargo then uses 0.0.0) and the `version` of path dependencies; the
+    generated manifests and pruned lock stay unchanged across releases.
+    """
+    out = []
+    section = ""
+    for line in text.splitlines():
+        match = _HEADER_RE.match(line)
+        if match:
+            section = match.group(1).strip()
+        if section == "package" and re.match(r"^version(\.workspace)?\s*=", line):
+            continue
+        if re.search(r'\bpath\s*=\s*"', line):
+            line = re.sub(r',?\s*\bversion\s*=\s*"[^"]*"', "", line)
+        out.append(line)
+    return "\n".join(out) + "\n"
+
+
 def prod_workspace_files(ws: Workspace) -> dict[Path, str]:
     root = strip_manifest((ROOT / "Cargo.toml").read_text())
     root = re.sub(r'^exclude\s*=.*\n', "", root, flags=re.M)
@@ -1002,7 +1062,7 @@ def prod_workspace_files(ws: Workspace) -> dict[Path, str]:
                 sections.append(f'[lib]\nname = "{target["name"]}"\npath = "{src}"\nproc-macro = true\n')
             elif "bin" in target["kind"]:
                 sections.append(f'[[bin]]\nname = "{target["name"]}"\npath = "{src}"\n')
-        body = strip_manifest(Path(package["manifest_path"]).read_text(), build)
+        body = drop_member_versions(strip_manifest(Path(package["manifest_path"]).read_text(), build))
         files[ROOT / PROD_WORKSPACE / pkg_dir / "Cargo.toml"] = (
             TOML_HEADER + "\n" + body + "\n" + "\n".join(sections)
         )

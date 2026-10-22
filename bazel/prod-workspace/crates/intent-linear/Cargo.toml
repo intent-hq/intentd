@@ -4,7 +4,6 @@
 
 [package]
 name = "intent-linear"
-version = "0.11.27"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -12,7 +11,7 @@ license.workspace = true
 description = "LinearEngine + DTOs for the linear.* surface (typed GraphQL over reqwest)"
 
 [dependencies]
-intent-core = { path = "../intent-core", version = "0.11.27" }
+intent-core = { path = "../intent-core" }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

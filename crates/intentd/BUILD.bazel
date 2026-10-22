@@ -4,6 +4,7 @@ load("@bazel_skylib//rules:copy_file.bzl", "copy_file")
 load("@crates//:defs.bzl", "aliases", "all_crate_deps")
 load("@crates_dev//:defs.bzl", dev_aliases = "aliases", dev_crate_deps = "all_crate_deps")
 load("@rules_rust//cargo:defs.bzl", "extract_cargo_lints")
+load("//bazel:shared_binary_test.bzl", "shared_binary_test")
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_test")
 
 package(default_visibility = ["//visibility:public"])
@@ -5399,7 +5400,7 @@ rust_test(
 )
 
 rust_test(
-    name = "e2e_wss_script_persistence",
+    name = "e2e_wss_script_persistence_binary",
     srcs = ["tests/e2e_wss_script_persistence.rs"] + TEST_SUPPORT_SRCS,
     crate_root = "tests/e2e_wss_script_persistence.rs",
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
@@ -5433,6 +5434,16 @@ rust_test(
     version = "0.11.27",
     crate_features = [],
     lint_config = ":cargo_lints",
+    args = ["--list"],
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
+)
+
+shared_binary_test(
+    name = "e2e_wss_script_persistence",
+    binary = ":e2e_wss_script_persistence_binary",
     args = [
         "--skip",
         "out_of_band_kill_reaches_exited_over_wss",
@@ -5444,41 +5455,9 @@ rust_test(
 )
 
 # manual: out_of_band_kill_reaches_exited_over_wss: the out-of-band kill is observed late with the other 18 tests sharing the process, so the retired one-off is still listed
-rust_test(
+shared_binary_test(
     name = "e2e_wss_script_persistence_known_failing",
-    srcs = ["tests/e2e_wss_script_persistence.rs"] + TEST_SUPPORT_SRCS,
-    crate_root = "tests/e2e_wss_script_persistence.rs",
-    aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
-    proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
-    rustc_env = {
-        "CARGO_BIN_EXE_intentd": "$(execpath :intentd_test_bin)",
-    },
-    deps = dev_crate_deps(normal = True, normal_dev = True) + [
-        "//crates/intent-acp:intent_acp_dev",
-        "//crates/intent-context:intent_context_dev",
-        "//crates/intent-core:intent_core_dev",
-        "//crates/intent-git:intent_git_dev",
-        "//crates/intent-linear:intent_linear_dev",
-        "//crates/intent-providers:intent_providers_dev",
-        "//crates/intent-sentry:intent_sentry_dev",
-        "//crates/intent-services:intent_services_dev",
-        "//crates/intent-sourcecontrol:intent_sourcecontrol_dev",
-        "//crates/intent-store:intent_store_dev",
-        "//crates/intent-transport:intent_transport_dev",
-        "//crates/intent-voice:intent_voice_dev",
-        "//crates/intentd-sitter:intentd_sitter_dev",
-        "//crates/intentd-test-support:intentd_test_support_dev",
-    ],
-    compile_data = ["//:workspace_test_data"],
-    data = [
-        "//:workspace_test_data",
-        "//:workspace_rust_sources",
-        ":intentd_test_bin",
-    ],
-    edition = "2021",
-    version = "0.11.27",
-    crate_features = [],
-    lint_config = ":cargo_lints",
+    binary = ":e2e_wss_script_persistence_binary",
     args = [
         "out_of_band_kill_reaches_exited_over_wss",
         "--exact",

@@ -4,6 +4,7 @@ load("@bazel_skylib//rules:copy_file.bzl", "copy_file")
 load("@crates//:defs.bzl", "aliases", "all_crate_deps")
 load("@crates_dev//:defs.bzl", dev_aliases = "aliases", dev_crate_deps = "all_crate_deps")
 load("@rules_rust//cargo:defs.bzl", "cargo_build_script", "extract_cargo_lints")
+load("//bazel:shared_binary_test.bzl", "shared_binary_test")
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 
 package(default_visibility = ["//visibility:public"])
@@ -362,7 +363,7 @@ rust_test(
 )
 
 rust_test(
-    name = "supervisor_e2e",
+    name = "supervisor_e2e_binary",
     srcs = ["tests/supervisor_e2e.rs"] + TEST_SUPPORT_SRCS,
     crate_root = "tests/supervisor_e2e.rs",
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
@@ -383,6 +384,16 @@ rust_test(
     version = "0.1.31",
     crate_features = [],
     lint_config = ":cargo_lints",
+    args = ["--list"],
+    tags = [
+        "no-sandbox",
+        "test-graph",
+    ],
+)
+
+shared_binary_test(
+    name = "supervisor_e2e",
+    binary = ":supervisor_e2e_binary",
     args = [
         "--skip",
         "panic_mid_test_leaves_no_sitter_or_daemon_behind",
@@ -394,28 +405,9 @@ rust_test(
 )
 
 # manual: panic_mid_test_leaves_no_sitter_or_daemon_behind: after the injected panic the sitter and fake daemon outlive the 5 s cleanup wait; under nextest the panicking process exits and takes them with it
-rust_test(
+shared_binary_test(
     name = "supervisor_e2e_known_failing",
-    srcs = ["tests/supervisor_e2e.rs"] + TEST_SUPPORT_SRCS,
-    crate_root = "tests/supervisor_e2e.rs",
-    aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
-    proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True),
-    rustc_env = {
-        "CARGO_BIN_EXE_intentd-sitter": "$(execpath :intentd-sitter_test_bin)",
-    },
-    deps = dev_crate_deps(normal = True, normal_dev = True) + [
-        "//crates/intentd-test-support:intentd_test_support_dev",
-        ":intentd_sitter_dev",
-    ],
-    compile_data = ["//:workspace_test_data"],
-    data = [
-        "//:workspace_test_data",
-        ":intentd-sitter_test_bin",
-    ],
-    edition = "2021",
-    version = "0.1.31",
-    crate_features = [],
-    lint_config = ":cargo_lints",
+    binary = ":supervisor_e2e_binary",
     args = [
         "panic_mid_test_leaves_no_sitter_or_daemon_behind",
         "--exact",
