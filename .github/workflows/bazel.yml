@@ -113,15 +113,22 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      # openssl-sys and libz-sys link the system libraries on linux-gnu, so the
-      # build needs their development packages (intent-cache images ship them).
+      # openssl-sys links the system OpenSSL on linux-gnu, so the build needs its
+      # development package. libz-sys uses the system zlib when present and
+      # otherwise builds its bundled copy. Hosted runners install what is
+      # missing; intent-cache slots (no sudo) ship libssl-dev and pkg-config.
       - name: Provide OpenSSL and zlib development packages
         run: |
-          if ! pkg-config --exists openssl zlib; then
+          if ! pkg-config --exists openssl zlib && command -v sudo >/dev/null 2>&1; then
             sudo apt-get update
             sudo apt-get install -y --no-install-recommends pkg-config libssl-dev zlib1g-dev
           fi
-          pkg-config --modversion openssl zlib
+          if ! pkg-config --exists openssl; then
+            echo "::error::OpenSSL development files (libssl-dev, pkg-config) are missing and this runner cannot install them"
+            exit 1
+          fi
+          echo "openssl $(pkg-config --modversion openssl)"
+          echo "zlib $(pkg-config --modversion zlib 2>/dev/null || echo 'not installed: libz-sys builds its bundled copy')"
       - name: Install bazelisk
         run: |
           mkdir -p "$RUNNER_TEMP/bin"
@@ -140,7 +147,8 @@ jobs:
             . /etc/os-release && echo "$ID $VERSION_ID"
             uname -m
             cc --version | head -n1
-            pkg-config --modversion openssl zlib
+            pkg-config --modversion openssl
+            pkg-config --modversion zlib 2>/dev/null || echo bundled-zlib
           } | tee /dev/stderr | sha256sum | cut -c1-16 | sed 's/^/fp=/' >> "$GITHUB_OUTPUT"
       # GitHub Actions caches: pull requests restore only; main saves below.
       - name: Restore repository cache
