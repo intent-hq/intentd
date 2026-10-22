@@ -923,7 +923,7 @@ let SESSION_ID = `config-session-${process.pid}`;
             (state.endpoint.is_none(), state.prompt_context.clone())
         };
         assert!(endpoint_absent);
-        if matches!(stored.harness_version.as_str(), "3.2" | "3.3") {
+        if matches!(stored.harness_version.as_str(), "3.2" | "3.3" | "3.4") {
             let context = context.expect("initialized original prompt owner");
             assert!(!context.acknowledged.load(Ordering::SeqCst));
             assert!(!context.requires_callback_ack);

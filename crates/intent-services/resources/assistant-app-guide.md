@@ -50,9 +50,19 @@ The preview shows a skeleton while its content streams or the sandbox starts.
 Scrolling continues through chat when the visual has no more content to scroll.
 Use this for exploring comparisons or changing inputs. Keep simple explanations
 in text and shareable charts in saved files. Visuals use app semantic CSS variables
-for both themes and cannot use external libraries, network access, app APIs,
+for both themes and cannot use external libraries, network access, arbitrary app APIs,
 navigation, forms, popups, or embedded frames. **Source** shows the code;
-**Reload** starts the visual again and resets its local inputs.
+**Reload** starts it again with its last published configuration restored.
+
+With the persistent-visual development extension, authored code publishes bounded
+JSON state plus named inputs and derived results through `window.intentVisual`.
+The host toolbar can **Save scenario** (up to six), compare, restore or remove
+scenarios. **Use this configuration** appends selected inputs/results to the
+editable composer draft without sending it. **Export** saves JSON and editable
+source to fixed workspace paths; the visual cannot choose paths or send messages.
+This extension does not promise arbitrary SVG/PNG export. A labeled file input
+can read an explicitly user-picked local CSV, JSON or image with the browser File
+API; it cannot read arbitrary paths or fetch data automatically.
 
 The development preview supplies app typography, compact controls and optional
 drawing styles from the diagrams: neutral surfaces and thin lines that stay thin
@@ -62,7 +72,7 @@ can override the defaults. Figures share the surrounding content gutter; keep
 headings, chart labels, controls and results on common edges, with row values
 aligned at the right.
 
-<!-- Sources: packages/cloudlands-fe/src/features/inline-html/{InlineHtmlPreview.svelte,inline-html-document.ts,inline-html-styles.ts}; packages/cloudlands-fe/src/lib/styles/tokens.css; packages/intentd/crates/intent-services/resources/agent-instructions/v3.3/common.md. -->
+<!-- Sources: packages/cloudlands-fe/src/features/inline-html/{InlineHtmlPreview.svelte,inline-html-document.ts,inline-html-styles.ts}; packages/cloudlands-fe/src/lib/styles/tokens.css; packages/intentd/crates/intent-services/resources/agent-instructions/v3.4/common.md. -->
 
 ## Finding things
 

@@ -66,7 +66,7 @@ pub(crate) fn render(
     input: GuidanceContext<'_>,
 ) -> Option<RepositoryGuidance> {
     let session = session.filter(|s| eligible_harness_version(Some(&s.harness_version)))?;
-    let policy = if matches!(session.harness_version.as_str(), "3.2" | "3.3") {
+    let policy = if matches!(session.harness_version.as_str(), "3.2" | "3.3" | "3.4") {
         MONITOR_POLICY
     } else {
         POLICY
