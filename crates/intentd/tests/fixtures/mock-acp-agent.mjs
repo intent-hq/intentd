@@ -565,7 +565,17 @@ async function handlePrompt(id, params) {
     typeof behavior.promptRpcErrorAttempts === 'number' && behavior.promptRpcErrorAttempts > 0
       ? behavior.promptRpcErrorAttempts
       : 0;
-  const attempt = exitGate > 0 || rpcGate > 0 ? getAndIncrementAttempt() : 0;
+  // `exitDuringPromptOnAttempt` exits on exactly that attempt only (e.g. a
+  // transport failure on a later spawn after an earlier attempt failed).
+  const exitOn =
+    typeof behavior.exitDuringPromptOnAttempt === 'number' && behavior.exitDuringPromptOnAttempt > 0
+      ? behavior.exitDuringPromptOnAttempt
+      : 0;
+  const attempt = exitGate > 0 || rpcGate > 0 || exitOn > 0 ? getAndIncrementAttempt() : 0;
+  if (exitOn > 0 && attempt === exitOn) {
+    log(`exiting during prompt (attempt ${attempt} = exitDuringPromptOnAttempt)`);
+    process.exit(1);
+  }
   if (exitGate > 0 && attempt <= exitGate) {
     // Pipe-holding descendant (monorepo#3592): on the LAST gated attempt (the
     // one the daemon classifies as a terminal failure), leave a same-group
@@ -600,6 +610,30 @@ async function handlePrompt(id, params) {
             sessionUpdate: 'agent_message_chunk',
             content: { type: 'text', text: behavior.streamBeforeErrorText },
           },
+        });
+      }
+      // `toolCallBeforeError` (a command string) runs one completed tool
+      // call before the failure, modelling partial work a mid-turn failure
+      // leaves behind (quota failover must replay it to the next provider).
+      if (typeof behavior.toolCallBeforeError === 'string' && behavior.toolCallBeforeError.length > 0) {
+        const toolCallId = `pre-error-tool-${promptCount}`;
+        note('session/update', {
+          sessionId: SESSION_ID,
+          update: {
+            sessionUpdate: 'tool_call', toolCallId, title: 'Bash', kind: 'execute',
+            status: 'in_progress', rawInput: { command: behavior.toolCallBeforeError },
+          },
+        });
+        // `toolCallBeforeErrorNoOutput` completes the call with no rawOutput
+        // (a tool that printed nothing).
+        note('session/update', {
+          sessionId: SESSION_ID,
+          update: behavior.toolCallBeforeErrorNoOutput
+            ? { sessionUpdate: 'tool_call_update', toolCallId, status: 'completed' }
+            : {
+                sessionUpdate: 'tool_call_update', toolCallId, status: 'completed',
+                rawOutput: `ran: ${behavior.toolCallBeforeError}`,
+              },
         });
       }
       log(`failing session/prompt with JSON-RPC error ${behavior.promptRpcError.code}`);
@@ -1178,9 +1212,18 @@ async function dispatch(msg) {
       // upstream body lives in `data`), modelling a provider whose allowance
       // is already spent when the daemon opens the session — before any
       // prompt — so spawn-path failure attribution can be pinned.
+      // `sessionNewRpcErrorAttempts` gates the rejection to the first N
+      // session/new calls (counter in MOCK_AGENT_ATTEMPT_FILE, persisted
+      // across spawns), so a later spawn — e.g. on a backup profile — opens.
       if (behavior.sessionNewRpcError) {
-        log(`failing session/new with JSON-RPC error ${behavior.sessionNewRpcError.code}`);
-        return send({ jsonrpc: '2.0', id: msg.id, error: behavior.sessionNewRpcError });
+        const gate =
+          typeof behavior.sessionNewRpcErrorAttempts === 'number' && behavior.sessionNewRpcErrorAttempts > 0
+            ? behavior.sessionNewRpcErrorAttempts
+            : 0;
+        if (gate === 0 || getAndIncrementAttempt() <= gate) {
+          log(`failing session/new with JSON-RPC error ${behavior.sessionNewRpcError.code}`);
+          return send({ jsonrpc: '2.0', id: msg.id, error: behavior.sessionNewRpcError });
+        }
       }
       // Stash the session-setup-delivered MCP servers (STAB-156) so
       // `callWorkspaceTool` can reach the bridge without an `--mcp-config`.

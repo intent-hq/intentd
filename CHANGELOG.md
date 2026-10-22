@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.27] - 2026-10-22
+
+### 🚀 Features
+
+- Provider profile order, backup flag and automatic quota failover ([#2581](https://github.com/intent-hq/intentd/pull/2581))
+
+
+## [0.11.26] - 2026-10-22
+
+### 🔧 Refactor
+
+- Remove the unused note paging system ([#2588](https://github.com/intent-hq/intentd/pull/2588))
+
+
 ## [0.11.25] - 2026-10-22
 
 ### 🐛 Bug Fixes
