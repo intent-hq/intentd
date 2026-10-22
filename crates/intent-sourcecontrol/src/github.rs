@@ -1102,6 +1102,7 @@ query GetMergeRequirements($owner: String!, $repo: String!, $prNumber: Int!, $ch
         nodes {
           commit {
             oid
+            committedDate
             statusCheckRollup {
               contexts(first: 100, after: $checksCursor) {
                 pageInfo { hasNextPage endCursor }
@@ -1239,6 +1240,7 @@ query GetPrObservation($owner: String!, $repo: String!, $prNumber: Int!, $checks
         nodes {
           commit {
             oid
+            committedDate
             statusCheckRollup {
               contexts(first: 100, after: $checksCursor) {
                 pageInfo { hasNextPage endCursor }
@@ -1396,6 +1398,7 @@ fn parse_merge_requirement_signals(data: &Value) -> MergeRequirementSignals {
             .and_then(|p| p.get("headRefOid"))
             .and_then(Value::as_str)
             .map(String::from),
+        head_committed_at: parse_head_committed_at(data),
         branch_rules: None,
         // Absent on hosts that do not report it: degrades to `None`.
         is_in_merge_queue: pr
@@ -1543,6 +1546,27 @@ fn parse_merge_queue_removal(pr: Option<&Value>) -> Option<MergeQueueRemoval> {
 
 /// The GraphQL pointer to the PR's status-check rollup contexts (the last
 /// commit on the PR is its head).
+/// The PR's last commit in the merge-requirements-shaped GraphQL payload.
+const HEAD_COMMIT_POINTER: &str = "/repository/pullRequest/commits/nodes/0/commit";
+
+/// The head commit's `committedDate`, only when the commit node IS the PR's
+/// head (`oid == headRefOid`): a commit time read off any other commit would
+/// start the never-started-CI clock for the wrong head.
+fn parse_head_committed_at(data: &Value) -> Option<String> {
+    let head = data
+        .pointer("/repository/pullRequest/headRefOid")
+        .and_then(Value::as_str)?;
+    let commit = data.pointer(HEAD_COMMIT_POINTER)?;
+    if commit.get("oid").and_then(Value::as_str) != Some(head) {
+        return None;
+    }
+    commit
+        .get("committedDate")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+}
+
 const ROLLUP_CONTEXTS_POINTER: &str =
     "/repository/pullRequest/commits/nodes/0/commit/statusCheckRollup/contexts/nodes";
 
@@ -3443,6 +3467,7 @@ mod tests {
             }],
             checks_head_sha: None,
             checks_known: true,
+            head_committed_at: None,
             branch_rules: Some(BranchRules {
                 required_approving_review_count: Some(1),
                 required_conversation_resolution: Some(true),
@@ -3534,6 +3559,51 @@ mod tests {
                 .map(|e| e.position),
             Some(2)
         );
+    }
+
+    #[test]
+    fn parses_head_committed_at_only_for_the_head_commit() {
+        let head = "8c0e5137c0000000000000000000000000000000";
+        let data = |oid: &str, date: Value| {
+            json!({ "repository": { "pullRequest": {
+                "headRefOid": head,
+                "commits": { "nodes": [ { "commit": {
+                    "oid": oid,
+                    "committedDate": date,
+                    "statusCheckRollup": null
+                } } ] }
+            } } })
+        };
+        // The intentd#2531 head: its commit time anchors the stall clock.
+        assert_eq!(
+            parse_merge_requirement_signals(&data(head, json!("2026-10-20T23:12:00Z")))
+                .head_committed_at
+                .as_deref(),
+            Some("2026-10-20T23:12:00Z")
+        );
+        // A commit node that is not the head, a null or empty date, or no
+        // commit node at all: unknown, never a stale anchor.
+        for (oid, date) in [
+            (
+                "ffffffffffffffffffffffffffffffffffffffff",
+                json!("2026-10-20T23:12:00Z"),
+            ),
+            (head, Value::Null),
+            (head, json!("")),
+        ] {
+            assert_eq!(
+                parse_merge_requirement_signals(&data(oid, date)).head_committed_at,
+                None
+            );
+        }
+        let no_commits = json!({ "repository": { "pullRequest": { "headRefOid": head } } });
+        assert_eq!(
+            parse_merge_requirement_signals(&no_commits).head_committed_at,
+            None
+        );
+        // Both folded queries select it.
+        assert!(MERGE_REQUIREMENTS_QUERY.contains("committedDate"));
+        assert!(PR_OBSERVATION_QUERY.contains("committedDate"));
     }
 
     #[test]

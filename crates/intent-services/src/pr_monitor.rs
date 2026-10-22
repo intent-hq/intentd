@@ -534,6 +534,10 @@ pub struct SharedPrSnapshot {
     /// ([`pr_ops::MergeRequirementsRead::merge_queue_reported`]) — what
     /// `github.pulls.get` carries as `isInMergeQueue` (`None` → key absent).
     pub(crate) merge_queue_reported: Option<bool>,
+    /// The read's inputs to the never-started-CI flag, re-derived against
+    /// the clock every time the snapshot is materialized or served
+    /// ([`Self::requirements_at`]).
+    pub(crate) checks_start: pr_ops::ChecksStartEvidence,
 }
 
 impl SharedPrSnapshot {
@@ -544,6 +548,29 @@ impl SharedPrSnapshot {
     /// rather than silently dropping it from the pending set (the event is
     /// monotonic — always reaches the wake — per intent-hq/monorepo#3479).
     pub(crate) fn materialize(&self, previous: Option<&PrMonitorSnapshot>) -> PrMonitorSnapshot {
+        self.materialize_at(previous, time::OffsetDateTime::now_utc())
+    }
+
+    /// The checklist as served at `now` (`ws.pr.snapshot`): the cached
+    /// requirements with the never-started-CI flag derived against the
+    /// clock, so a cached read still crosses the threshold.
+    pub(crate) fn requirements_at(&self, now: time::OffsetDateTime) -> MergeRequirements {
+        let mut requirements = self.requirements.clone();
+        requirements.checks_not_started = pr_ops::checks_not_started(
+            &requirements,
+            self.check_runs_known,
+            &self.checks_start,
+            now,
+        );
+        requirements
+    }
+
+    /// [`Self::materialize`] against an explicit clock.
+    pub(crate) fn materialize_at(
+        &self,
+        previous: Option<&PrMonitorSnapshot>,
+        now: time::OffsetDateTime,
+    ) -> PrMonitorSnapshot {
         let mut requirements = self.requirements.clone();
         let mut checks_unobserved = !self.check_runs_known;
         let same_head = previous.filter(|p| {
@@ -609,6 +636,11 @@ impl SharedPrSnapshot {
             // a probe actually answers.
             previous.is_some_and(|p| p.ejection_tracked)
         };
+        // Derived after the same-head carry-forward above so an unobserved
+        // read never flags, and against `now` so a cached read still crosses
+        // the threshold.
+        requirements.checks_not_started =
+            pr_ops::checks_not_started(&requirements, !checks_unobserved, &self.checks_start, now);
         PrMonitorSnapshot {
             title: self.title.clone(),
             url: self.url.clone(),
@@ -1018,6 +1050,7 @@ async fn shared_snapshot_from_observation(
         check_runs_known: read.check_runs_known,
         status_checks: read.status_checks,
         merge_queue_reported: read.merge_queue_reported,
+        checks_start: read.checks_start,
     };
     Ok((observation.pr, snapshot))
 }
@@ -1301,6 +1334,7 @@ async fn finish_shared_snapshot(
         check_runs_known: read.check_runs_known,
         status_checks: read.status_checks,
         merge_queue_reported: read.merge_queue_reported,
+        checks_start: read.checks_start,
     };
     Ok((pr, snapshot))
 }
@@ -1858,6 +1892,10 @@ fn pr_monitor_wire(m: &PrMonitor, paused_until: Option<&str>) -> Value {
         // Same presence rule: only when the host reported an ejection event.
         if let Some(ejection) = &r.merge_queue_ejection {
             last["mergeQueueEjection"] = serde_json::to_value(ejection).expect("serialize");
+        }
+        // Same presence rule: only while CI never started on the head.
+        if let Some(stall) = &r.checks_not_started {
+            last["checksNotStarted"] = serde_json::to_value(stall).expect("serialize");
         }
         obj.insert("lastSnapshot".to_string(), last);
     }
@@ -5008,6 +5046,7 @@ mod tests {
                 checks: self.checks.clone(),
                 checks_head_sha: None,
                 checks_known: true,
+                head_committed_at: None,
                 branch_rules: None,
                 is_in_merge_queue: self.in_merge_queue,
                 merge_queue_removal: self.merge_queue_removal.clone(),
@@ -5823,6 +5862,7 @@ mod tests {
                 merge_blocked_reason: None,
                 rules_known: true,
                 is_in_merge_queue: None,
+                checks_not_started: None,
                 merge_queue_ejection: None,
                 merge_queue: None,
             },
@@ -6347,7 +6387,192 @@ mod tests {
             check_runs_known: true,
             status_checks: s.status_checks.clone(),
             merge_queue_reported: s.requirements.is_in_merge_queue,
+            checks_start: pr_ops::ChecksStartEvidence::default(),
         }
+    }
+
+    // ── checksNotStarted: CI never started on the head (intentd#2531) ──
+
+    const NO_CI_HEAD: &str = "8c0e5137c0000000000000000000000000000000";
+
+    fn no_ci_now() -> time::OffsetDateTime {
+        intent_core::parse_iso("2026-10-21T04:00:00Z").unwrap()
+    }
+
+    /// A fresh read of `head` committed at `committed_at`, carrying zero
+    /// check runs on a base branch that requires checks.
+    fn zero_run_read(head: &str, committed_at: &str) -> SharedPrSnapshot {
+        let s = snapshot(|s| {
+            s.head_sha = Some(head.into());
+            s.requirements.checks = pr_ops::MergeRequirementsChecks::from_items(vec![], true);
+        });
+        let mut shared = shared_from(&s, true);
+        shared.checks_start = pr_ops::ChecksStartEvidence {
+            head_sha: Some(head.into()),
+            head_committed_at: Some(committed_at.into()),
+            checks_required: true,
+        };
+        shared
+    }
+
+    fn no_ci_lines(old: &PrMonitorSnapshot, new: &PrMonitorSnapshot) -> Vec<String> {
+        diff_snapshots(old, new)
+            .into_iter()
+            .filter(|l| l.starts_with("no checks reported for head"))
+            .collect()
+    }
+
+    #[test]
+    fn zero_run_head_past_threshold_surfaces_stalled_state_and_wakes_once() {
+        let read = zero_run_read(NO_CI_HEAD, "2026-10-20T23:12:00Z");
+        // The baseline: the same head, observed before the threshold passed.
+        let before = read.materialize_at(
+            None,
+            intent_core::parse_iso("2026-10-20T23:13:00Z").unwrap(),
+        );
+        assert_eq!(before.requirements.checks_not_started, None);
+
+        let now = read.materialize_at(Some(&before), no_ci_now());
+        let stall = now
+            .requirements
+            .checks_not_started
+            .clone()
+            .expect("flagged");
+        assert_eq!(stall.head_sha, NO_CI_HEAD);
+        assert_eq!(stall.head_committed_at, "2026-10-20T23:12:00Z");
+        assert_eq!(stall.threshold_minutes, 15);
+        assert_eq!(
+            no_ci_lines(&before, &now),
+            vec![
+                "no checks reported for head 8c0e5137 after 15+ min — CI may never have \
+                 started; push again (e.g. an empty commit) or rebase to trigger it"
+            ]
+        );
+        // Once delivered (the baseline now carries the flag), later polls of
+        // the same stalled head stay quiet: one wake per head.
+        let later = read.materialize_at(Some(&now), no_ci_now() + time::Duration::hours(5));
+        assert!(later.requirements.checks_not_started.is_some());
+        assert!(diff_snapshots(&now, &later).is_empty());
+        // The wake's checklist carries the recovery hint while it holds.
+        let checklist = render_checklist(&now);
+        assert!(
+            checklist.contains(
+                "checks never started on head 8c0e5137 (none reported 15+ min after its \
+                 commit) — push again or rebase to trigger CI"
+            ),
+            "{checklist}"
+        );
+        assert!(!render_checklist(&before).contains("checks never started"));
+    }
+
+    #[test]
+    fn head_with_check_runs_never_reports_stalled_ci() {
+        let mut read = zero_run_read(NO_CI_HEAD, "2026-10-20T23:12:00Z");
+        read.requirements = snapshot(|_| {}).requirements;
+        assert_eq!(read.requirements.checks.total, 1, "fixture carries a run");
+        let baseline = read.materialize_at(None, no_ci_now());
+        let later = read.materialize_at(Some(&baseline), no_ci_now() + time::Duration::hours(5));
+        assert_eq!(later.requirements.checks_not_started, None);
+        assert!(no_ci_lines(&baseline, &later).is_empty());
+        assert_eq!(read.requirements_at(no_ci_now()).checks_not_started, None);
+    }
+
+    #[test]
+    fn freshly_pushed_head_inside_threshold_is_not_stalled_until_it_passes() {
+        // Pushed ten minutes ago: inside the threshold.
+        let read = zero_run_read(NO_CI_HEAD, "2026-10-21T03:50:00Z");
+        let fresh = read.materialize_at(None, no_ci_now());
+        assert_eq!(fresh.requirements.checks_not_started, None);
+        assert_eq!(read.requirements_at(no_ci_now()).checks_not_started, None);
+        // The SAME cached read polled after the threshold flags it: the
+        // verdict is derived against the clock, not frozen at fetch time.
+        let later_at = no_ci_now() + time::Duration::minutes(6);
+        let later = read.materialize_at(Some(&fresh), later_at);
+        assert!(later.requirements.checks_not_started.is_some());
+        assert_eq!(no_ci_lines(&fresh, &later).len(), 1);
+        assert!(read.requirements_at(later_at).checks_not_started.is_some());
+    }
+
+    #[test]
+    fn stalled_ci_on_a_new_head_wakes_again_and_unobserved_checks_never_flag() {
+        let first =
+            zero_run_read(NO_CI_HEAD, "2026-10-20T23:12:00Z").materialize_at(None, no_ci_now());
+        assert!(first.requirements.checks_not_started.is_some());
+        // A re-push that also never started CI is a new head: new wake.
+        let next_head = "9d1f000000000000000000000000000000000000";
+        let next = zero_run_read(next_head, "2026-10-21T03:00:00Z")
+            .materialize_at(Some(&first), no_ci_now());
+        assert_eq!(
+            next.requirements
+                .checks_not_started
+                .as_ref()
+                .map(|s| s.head_sha.as_str()),
+            Some(next_head)
+        );
+        assert_eq!(no_ci_lines(&first, &next).len(), 1);
+
+        // A read whose check runs did not answer is unknown, not zero —
+        // even on a brand-new head with nothing to carry forward.
+        let mut degraded = zero_run_read(NO_CI_HEAD, "2026-10-20T23:12:00Z");
+        degraded.check_runs_known = false;
+        assert_eq!(
+            degraded
+                .materialize_at(None, no_ci_now())
+                .requirements
+                .checks_not_started,
+            None
+        );
+        assert_eq!(
+            degraded.requirements_at(no_ci_now()).checks_not_started,
+            None
+        );
+    }
+
+    #[test]
+    fn stalled_ci_projects_into_last_snapshot_and_old_baselines_stay_quiet() {
+        let s = zero_run_read(NO_CI_HEAD, "2026-10-20T23:12:00Z").materialize_at(None, no_ci_now());
+        let ts = "2026-01-01T00:00:00Z".to_string();
+        let mut m = PrMonitor {
+            monitor_id: PrMonitorId::new(),
+            workspace_id: WorkspaceId::from("ws-1"),
+            agent_id: AgentId::from("agent-1"),
+            repo_owner: "o".into(),
+            repo_name: "r".into(),
+            pr_number: 42,
+            state: PrMonitorState::Active,
+            last_snapshot: Some(serde_json::to_string(&s).unwrap()),
+            baseline_snapshot: None,
+            pending_changes: Vec::new(),
+            pending_since: None,
+            last_change_at: None,
+            last_polled_at: None,
+            last_error: None,
+            created_at: ts.clone(),
+            updated_at: ts,
+        };
+        assert_eq!(
+            pr_monitor_wire(&m, None)["lastSnapshot"]["checksNotStarted"],
+            json!({
+                "headSha": NO_CI_HEAD,
+                "headCommittedAt": "2026-10-20T23:12:00Z",
+                "thresholdMinutes": 15,
+            })
+        );
+        // Absent → key omitted, never null.
+        let quiet = snapshot(|_| {});
+        m.last_snapshot = Some(serde_json::to_string(&quiet).unwrap());
+        assert!(pr_monitor_wire(&m, None)["lastSnapshot"]
+            .get("checksNotStarted")
+            .is_none());
+        // A baseline persisted before the field existed parses and diffs
+        // silently against a fresh snapshot without the flag.
+        let mut wire = serde_json::to_value(&quiet).unwrap();
+        wire["requirements"]
+            .as_object_mut()
+            .unwrap()
+            .remove("checksNotStarted");
+        let old: PrMonitorSnapshot = serde_json::from_value(wire).unwrap();
+        assert!(diff_snapshots(&old, &quiet).is_empty());
     }
 
     /// A degraded merge-requirements probe (`ejection_known == false`) must

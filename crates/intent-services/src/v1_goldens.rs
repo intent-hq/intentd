@@ -790,6 +790,7 @@ fn merge_requirements(
         is_in_merge_queue: None,
         merge_queue_ejection: None,
         merge_queue: None,
+        checks_not_started: None,
     }
 }
 
