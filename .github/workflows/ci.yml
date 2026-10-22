@@ -1331,6 +1331,10 @@ jobs:
     # Include LLVM report generation after the full suite on shared runners.
     timeout-minutes: 45
     env:
+      # WarpBuild runners preset NODE_OPTIONS (GitHub-hosted runners do not), and
+      # the ACP callback fixture refuses any NODE_OPTIONS injection; clear it so
+      # the job behaves the same on every runner it bursts to.
+      NODE_OPTIONS: ''
       # Merge each binary's executions into eight locked raw profiles instead
       # of retaining a multi-megabyte profile for every nextest process.
       LLVM_PROFILE_FILE_NAME: "intent-%8m.profraw"
@@ -1458,6 +1462,10 @@ jobs:
     # Shared-runner coverage can exceed 30 minutes while still making progress.
     timeout-minutes: 60
     env:
+      # WarpBuild runners preset NODE_OPTIONS (GitHub-hosted runners do not), and
+      # the ACP callback fixture refuses any NODE_OPTIONS injection; clear it so
+      # the job behaves the same on every runner it bursts to.
+      NODE_OPTIONS: ''
       # Share the full-coverage pool: nextest launches one process per test.
       # Bound retained raw profiles per binary without dropping execution counts.
       LLVM_PROFILE_FILE_NAME: "intent-%8m.profraw"
