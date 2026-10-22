@@ -228,7 +228,11 @@ Bazel inputs:
   `bazel build --config=<name> //...` for each lint config (`clippy`,
   `rustfmt`) that `.bazelrc` defines. Every command uses `--config=ci`: plain
   logs and `--nocache_test_results`, because tests still read undeclared host
-  inputs (drop that flag once they are audited). The lock stays in `update`
+  inputs (drop that flag once they are audited). `--config=ci` also caps test concurrency at
+  `--local_test_jobs=4`: each libtest binary already uses every CPU, and Bazel
+  has no equivalent of nextest's thread cap or serial groups across binaries, so
+  an uncapped run overloads the 8-CPU runner and timing-sensitive tests fail. This is a
+  known limitation until the process-per-test phase. The lock stays in `update`
   mode, so after a release bump the job re-resolves from `Cargo.lock`; the
   refreshed lock is never committed or uploaded, and the `drift` job is what
   enforces it.

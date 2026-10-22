@@ -65,6 +65,12 @@ common:ci --show_progress_rate_limit=30
 build:ci --verbose_failures
 test:ci --test_output=errors
 test:ci --nocache_test_results
+# Run at most 4 test binaries at once on CI's 8-CPU runners. Each libtest
+# binary already runs its tests on every CPU, and Bazel applies none of
+# nextest's thread cap or serial groups across binaries, so a full parallel
+# run overloads the runner and trips timing-sensitive tests. Known limitation
+# until the process-per-test phase.
+test:ci --local_test_jobs=4
 
 # --config=remote-cache: read from the self-hosted HTTP cache. Pass the
 # endpoint with --remote_cache=$BAZEL_REMOTE_CACHE_URL (CI writes it to
