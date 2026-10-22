@@ -19,6 +19,26 @@ build --host_compilation_mode=fastbuild
 # Keep host environment out of action keys.
 build --incompatible_strict_action_env
 
+# ---------------------------------------------------------------------------
+# Tests and lints. Generated targets: scripts/bazel-gen.py; see bazel/README.md.
+# ---------------------------------------------------------------------------
+
+# nextest parity (.config/nextest.toml): `retries = 1` is one extra attempt.
+# nextest's 180 s per-test kill has no Bazel equivalent (Bazel times out whole
+# test binaries); the default per-size timeouts apply instead.
+test --flaky_test_attempts=2
+test --test_output=errors
+
+# --config=clippy: `cargo clippy --workspace --all-targets -- -D warnings`.
+# [workspace.lints] reaches clippy through each crate's `cargo_lints` target.
+build:clippy --aspects=@rules_rust//rust:defs.bzl%rust_clippy_aspect
+build:clippy --output_groups=+clippy_checks
+build:clippy --@rules_rust//rust/settings:clippy_flag=-Dwarnings
+
+# --config=rustfmt: `cargo fmt --check`.
+build:rustfmt --aspects=@rules_rust//rust:defs.bzl%rustfmt_aspect
+build:rustfmt --output_groups=+rustfmt_checks
+
 # Local overrides (cache paths, jobs) stay out of the repo.
 try-import %workspace%/user.bazelrc
 

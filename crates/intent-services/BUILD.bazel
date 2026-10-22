@@ -76,7 +76,7 @@ rust_library(
     aliases = dev_aliases(),
     compile_data = COMPILE_DATA,
     edition = "2021",
-    version = "0.11.25",
+    version = "0.11.27",
     crate_features = ["repository-test-fixtures"],
     lint_config = ":cargo_lints",
     proc_macro_deps = dev_crate_deps(proc_macro = True),
@@ -116,7 +116,7 @@ rust_test(
         "//:workspace_rust_sources",
     ],
     edition = "2021",
-    version = "0.11.25",
+    version = "0.11.27",
     crate_features = ["repository-test-fixtures"],
     lint_config = ":cargo_lints",
     args = [
@@ -172,7 +172,7 @@ rust_test(
         "//:workspace_rust_sources",
     ],
     edition = "2021",
-    version = "0.11.25",
+    version = "0.11.27",
     crate_features = ["repository-test-fixtures"],
     lint_config = ":cargo_lints",
     args = [
@@ -212,7 +212,7 @@ rust_test(
         "//:workspace_rust_sources",
     ],
     edition = "2021",
-    version = "0.11.25",
+    version = "0.11.27",
     crate_features = ["repository-test-fixtures"],
     lint_config = ":cargo_lints",
     args = [
@@ -258,7 +258,7 @@ rust_test(
     compile_data = ["//:workspace_test_data"],
     data = ["//:workspace_test_data"],
     edition = "2021",
-    version = "0.11.25",
+    version = "0.11.27",
     crate_features = ["repository-test-fixtures"],
     lint_config = ":cargo_lints",
 )
@@ -295,7 +295,7 @@ rust_test(
         "//:workspace_rust_sources",
     ],
     edition = "2021",
-    version = "0.11.25",
+    version = "0.11.27",
     crate_features = ["repository-test-fixtures"],
     lint_config = ":cargo_lints",
 )
@@ -332,7 +332,7 @@ rust_test(
         "//:workspace_rust_sources",
     ],
     edition = "2021",
-    version = "0.11.25",
+    version = "0.11.27",
     crate_features = ["repository-test-fixtures"],
     lint_config = ":cargo_lints",
 )
@@ -369,7 +369,7 @@ rust_test(
         "//:workspace_rust_sources",
     ],
     edition = "2021",
-    version = "0.11.25",
+    version = "0.11.27",
     crate_features = ["repository-test-fixtures"],
     lint_config = ":cargo_lints",
 )

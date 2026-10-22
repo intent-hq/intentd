@@ -2169,7 +2169,7 @@ dependencies = [
 
 [[package]]
 name = "intent-acp"
-version = "0.11.25"
+version = "0.11.27"
 dependencies = [
  "agent-client-protocol",
  "intent-core",
@@ -2191,7 +2191,7 @@ dependencies = [
 
 [[package]]
 name = "intent-context"
-version = "0.11.25"
+version = "0.11.27"
 dependencies = [
  "async-trait",
  "directories",
@@ -2202,7 +2202,7 @@ dependencies = [
 
 [[package]]
 name = "intent-core"
-version = "0.11.25"
+version = "0.11.27"
 dependencies = [
  "async-trait",
  "directories",
@@ -2221,7 +2221,7 @@ dependencies = [
 
 [[package]]
 name = "intent-git"
-version = "0.11.25"
+version = "0.11.27"
 dependencies = [
  "git2",
  "intent-core",
@@ -2237,7 +2237,7 @@ dependencies = [
 
 [[package]]
 name = "intent-js"
-version = "0.11.25"
+version = "0.11.27"
 dependencies = [
  "rquickjs",
  "serde_json",
@@ -2247,7 +2247,7 @@ dependencies = [
 
 [[package]]
 name = "intent-linear"
-version = "0.11.25"
+version = "0.11.27"
 dependencies = [
  "async-trait",
  "intent-core",
@@ -2261,14 +2261,14 @@ dependencies = [
 
 [[package]]
 name = "intent-nodes"
-version = "0.11.25"
+version = "0.11.27"
 dependencies = [
  "intent-core",
 ]
 
 [[package]]
 name = "intent-providers"
-version = "0.11.25"
+version = "0.11.27"
 dependencies = [
  "intent-core",
  "node-semver",
@@ -2278,7 +2278,7 @@ dependencies = [
 
 [[package]]
 name = "intent-pty"
-version = "0.11.25"
+version = "0.11.27"
 dependencies = [
  "intent-core",
  "nix 0.31.3",
@@ -2290,7 +2290,7 @@ dependencies = [
 
 [[package]]
 name = "intent-search"
-version = "0.11.25"
+version = "0.11.27"
 dependencies = [
  "globset",
  "grep",
@@ -2302,7 +2302,7 @@ dependencies = [
 
 [[package]]
 name = "intent-sentry"
-version = "0.11.25"
+version = "0.11.27"
 dependencies = [
  "async-trait",
  "intent-core",
@@ -2316,7 +2316,7 @@ dependencies = [
 
 [[package]]
 name = "intent-services"
-version = "0.11.25"
+version = "0.11.27"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -2361,7 +2361,7 @@ dependencies = [
 
 [[package]]
 name = "intent-sourcecontrol"
-version = "0.11.25"
+version = "0.11.27"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -2385,7 +2385,7 @@ dependencies = [
 
 [[package]]
 name = "intent-store"
-version = "0.11.25"
+version = "0.11.27"
 dependencies = [
  "async-stream",
  "base64 0.23.1",
@@ -2410,7 +2410,7 @@ version = "0.9.55"
 
 [[package]]
 name = "intent-transport"
-version = "0.11.25"
+version = "0.11.27"
 dependencies = [
  "base64 0.23.1",
  "futures",
@@ -2457,7 +2457,7 @@ dependencies = [
 
 [[package]]
 name = "intentd"
-version = "0.11.25"
+version = "0.11.27"
 dependencies = [
  "anyhow",
  "clap",

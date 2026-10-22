@@ -5,7 +5,7 @@
 [package]
 build = "build.rs"
 name = "intent-transport"
-version = "0.11.25"
+version = "0.11.27"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -18,8 +18,8 @@ default = []
 repository-test-fixtures = []
 
 [dependencies]
-intent-core = { path = "../intent-core", version = "0.11.25" }
-intent-services = { path = "../intent-services", version = "0.11.25" }
+intent-core = { path = "../intent-core", version = "0.11.27" }
+intent-services = { path = "../intent-services", version = "0.11.27" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
