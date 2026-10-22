@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import platform
+import shlex
 import shutil
 import signal
 import stat
@@ -226,7 +227,21 @@ def configuration(path):
 
 def platform_check():
     require(sys.platform == "linux" and platform.machine().lower() in ("x86_64", "amd64"), "fixture requires Linux x64")
-    require(not os.environ.get("NODE_OPTIONS"), "NODE_OPTIONS injection is not supported")
+    require(not os.environ.get("NODE_OPTIONS"), NODE_OPTIONS_REFUSAL)
+
+
+NODE_OPTIONS_REFUSAL = "NODE_OPTIONS injection is not supported"
+
+
+def node_options_rerun(argv):
+    """The same invocation with only NODE_OPTIONS cleared (the refusal stays).
+
+    Hosts with a monitoring tracer inject NODE_OPTIONS into every shell; name
+    the exact working command so the first retry succeeds. The value itself is
+    not echoed: it may carry host paths or tokens.
+    """
+    return shlex.join(["env", "-u", "NODE_OPTIONS", sys.executable, "-I", "-B", "-S",
+                       str(Path(argv[0]).resolve()), *argv[1:]])
 
 
 def environment(work):
@@ -442,7 +457,11 @@ def main():
         print(root, flush=True)
     except (InvalidFixture, OSError, ValueError, KeyError, tarfile.TarError,
             subprocess.TimeoutExpired, KeyboardInterrupt) as error:
-        print(f"callback fixture: {error}", file=sys.stderr)
+        message = f"callback fixture: {error}"
+        if str(error) == NODE_OPTIONS_REFUSAL and os.environ.get("NODE_OPTIONS"):
+            message += ("; NODE_OPTIONS is set in this shell (often a host preload such as a"
+                        f" monitoring tracer). Re-run without it: {node_options_rerun(sys.argv)}")
+        print(message, file=sys.stderr)
         return 1
     return 0
 

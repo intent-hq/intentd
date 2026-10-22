@@ -47,11 +47,16 @@ pub(crate) mod review;
 
 #[path = "native_checkout.rs"]
 pub(crate) mod checkout;
+#[path = "native_child_git.rs"]
+pub(crate) mod child_git;
 #[path = "native_resource_read.rs"]
 pub(crate) mod resource;
 
 #[path = "native_selection.rs"]
 pub(crate) mod selection;
+
+#[path = "native_wire/monitor.rs"]
+pub(crate) mod monitor;
 
 const LEASE_LIMIT: usize = 64;
 const ROOT_LIMIT: usize = 128;
@@ -125,8 +130,10 @@ pub(crate) fn connection(
         parent: RepositoryRetirement::default(),
         review: review::ConnectionState::default(),
         resource: resource::ConnectionState::default(),
+        child_git: child_git::ConnectionState::default(),
         checkout: checkout::ConnectionState::default(),
         selection: selection::ConnectionState::default(),
+        monitor: monitor::ConnectionState::default(),
         state: Mutex::new(ConnectionState::default()),
         notify: Notify::new(),
         permits: Arc::new(Semaphore::new(LEASE_LIMIT)),
@@ -146,8 +153,10 @@ struct Connection {
     parent: RepositoryRetirement,
     review: review::ConnectionState,
     resource: resource::ConnectionState,
+    child_git: child_git::ConnectionState,
     checkout: checkout::ConnectionState,
     selection: selection::ConnectionState,
+    monitor: monitor::ConnectionState,
     state: Mutex<ConnectionState>,
     notify: Notify,
     permits: Arc<Semaphore>,
@@ -243,6 +252,7 @@ impl Connection {
         self.resource.close();
         self.checkout.close();
         self.selection.close();
+        self.monitor.close();
         self.origin.retire();
         for lease in leases {
             lease.lifetime.retirement().end_scope();
@@ -292,10 +302,7 @@ impl Connection {
     }
 }
 impl Connection {
-    fn capture_native(
-        &self,
-        query: Option<&RepositoryContextQuery>,
-    ) -> Arc<dyn RepositoryReadRequestScope> {
+    fn capture_native(&self, query: Option<&RepositoryContextQuery>) -> Arc<Request> {
         let captured = (|| {
             self.entered()?;
             if NATIVE_REQUEST.try_with(|_| ()).is_ok() {
@@ -343,6 +350,7 @@ impl Connection {
             read_lane: Mutex::new(None),
             subscriptions: Mutex::new(subscriptions),
             queued_query: query.cloned(),
+            monitor_receipt: self.monitor.capture(),
         });
         if query.is_some() {
             let weak = Arc::downgrade(&request);
@@ -366,6 +374,23 @@ impl Connection {
     }
 }
 impl RepositoryReadConnection for Connection {
+    fn capture_child_git(
+        &self,
+        frame: &intent_core::gitlab_child_git::GitlabChildGitFrame,
+    ) -> Option<Arc<dyn RepositoryReadRequestScope>> {
+        Some(child_git::capture_frame(self, frame.clone()))
+    }
+    fn capture_monitor_events(
+        &self,
+    ) -> Option<Arc<dyn intent_core::repository_request::RepositoryMonitorEventRecipient>> {
+        monitor::capture_events(self)
+    }
+    fn review_monitoring_hello(
+        &self,
+        support: intent_core::review_monitor::ReviewMonitorRecipientSupport,
+    ) -> Option<Arc<dyn intent_core::repository_request::ReviewMonitorHello>> {
+        monitor::hello(self, support)
+    }
     fn capture_checkout(
         &self,
         frame: &intent_core::repository_checkout::CheckoutFrame,
@@ -406,6 +431,11 @@ impl RepositoryReadConnection for Connection {
         &self,
     ) -> Option<Box<dyn intent_core::repository_request::RepositorySelectionRetirements>> {
         selection::take_retirements(self)
+    }
+    fn capture_monitor_history(
+        &self,
+    ) -> Option<Arc<dyn intent_core::repository_request::RepositoryMonitorHistoryRecipient>> {
+        monitor::capture_history(self)
     }
     fn capture(&self) -> Arc<dyn RepositoryReadRequestScope> {
         self.capture_native(None)
@@ -494,6 +524,7 @@ impl RepositoryReadRetirements for Receiver {
                                 };
                                 for id in ids { c.retire_id(&id); }
                             }
+                            Some(crate::Delivery::Monitor(_) | crate::Delivery::HistoryChanged | crate::Delivery::Fence(_)) => {},
                             Some(crate::Delivery::Lagged(_)) | None => c.close(),
                         }
                     },
@@ -520,10 +551,12 @@ struct Request {
     read_lane: Mutex<Option<tokio::sync::OwnedMutexGuard<()>>>,
     subscriptions: Mutex<Vec<RepositorySubscription>>,
     queued_query: Option<RepositoryContextQuery>,
+    monitor_receipt: Option<Arc<monitor::Receipt>>,
 }
 #[derive(Clone)]
 enum RequestState {
     Ordinary,
+    Monitor(Arc<monitor::Projection>),
     Pending,
     Public,
     Capture(Arc<Lease>),
@@ -609,6 +642,17 @@ impl Drop for Request {
     }
 }
 impl RepositoryReadRequestScope for Request {
+    fn bind_private_output(
+        &self,
+        frame: &str,
+    ) -> Result<Option<Arc<dyn intent_core::repository_request::RepositoryPrivateOutput>>> {
+        let state = self.state.lock().map_err(|_| unavailable())?;
+        Ok(match &*state {
+            RequestState::Monitor(recipient) => Some(recipient.output(frame)),
+            _ => None,
+        })
+    }
+
     fn scope<'a>(&'a self, body: BoxFuture<'a, ()>) -> BoxFuture<'a, ()> {
         let owner = self.weak.upgrade().expect("owned request scope");
         Box::pin(NATIVE_REQUEST.scope(owner, body))
@@ -626,6 +670,10 @@ impl RepositoryReadRequestScope for Request {
             let state = self.state.lock().map_err(|_| unavailable())?.clone();
             match state {
                 RequestState::Ordinary | RequestState::Public => transfer(),
+                RequestState::Monitor(recipient) => {
+                    entered.map_err(|_| unavailable())?;
+                    recipient.with_current(transfer)
+                }
                 RequestState::Pending | RequestState::Reading(_) => Err(unavailable()),
                 RequestState::Capture(lease) => {
                     entered.map_err(|_| unavailable())?;

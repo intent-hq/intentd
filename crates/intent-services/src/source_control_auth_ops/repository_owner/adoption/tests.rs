@@ -972,9 +972,12 @@ async fn abandoned_settings_write_retains_original_gate_and_leaves_unknown_settl
             .update_secrets(&changes)
             .await
     });
-    tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
-        .await
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+        entered.notified(),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         f.directory.binding().unwrap_err(),
         RepositoryCredentialError::Mutating
@@ -984,7 +987,7 @@ async fn abandoned_settings_write_retains_original_gate_and_leaves_unknown_settl
     assert!(f.services.gitlab_credential_gate.mutex.try_lock().is_err());
     drop(pause);
     let _finished = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
         f.services.gitlab_credential_gate.lock(),
     )
     .await
@@ -1072,7 +1075,7 @@ async fn attached_same_account_refresh_preserves_real_ticket_quota_and_rejects_o
         .directory
         .record_backoff(
             ticket.dispatch_stamp(),
-            Instant::now() + Duration::from_secs(3600)
+            Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(3600))
         )
         .unwrap());
     assert!(f

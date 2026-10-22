@@ -56,7 +56,7 @@ async fn hot_loop_is_killed_by_timeout() {
     // Test-level fail-safe: if the interrupt handler regresses, the test must
     // fail fast rather than hang CI on the very mechanism under test.
     let err = tokio::time::timeout(
-        Duration::from_secs(10),
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
         eval("while (true) {}", &short_opts(150), None),
     )
     .await
@@ -86,7 +86,7 @@ async fn pending_promise_is_killed_by_timeout() {
     // Test-level fail-safe: if the outer timeout regresses, the 30 s host
     // sleep must not hang CI on the very mechanism under test.
     let err = tokio::time::timeout(
-        Duration::from_secs(10),
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
         eval("return await host(null);", &short_opts(150), Some(host)),
     )
     .await
@@ -136,7 +136,7 @@ async fn memory_hog_is_killed_by_default_limit() {
     // Test-level fail-safe: if the memory cap regresses, the hog loop would
     // otherwise run until the 30 s wall clock — fail fast instead.
     let err = tokio::time::timeout(
-        Duration::from_secs(10),
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
         eval(
             "let s = 'x'; while (true) { s += s; } return s.length;",
             &EvalOptions::default(),

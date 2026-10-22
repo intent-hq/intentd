@@ -469,9 +469,10 @@ async fn delete_workspace_drains_orphan_metadata_in_bounded_batches() {
             }
         }
     };
-    tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        tokio::join!(deletion, observer)
-    })
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(30)),
+        async { tokio::join!(deletion, observer) },
+    )
     .await
     .unwrap();
     assert_foreign_keys(&store).await;
@@ -637,7 +638,7 @@ async fn workspace_recovery_cancellation_keeps_sessions_and_can_retry() {
             tx.commit().await.unwrap();
         }
     };
-    let held = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+    let held = tokio::time::timeout(intentd_test_support::test_timeout(std::time::Duration::from_secs(30)), async {
         tokio::select! {
             held = observe => held,
             result = &mut deleting => panic!("deletion finished before cancellation: {result:?}"),

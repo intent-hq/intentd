@@ -9,9 +9,12 @@
 //!
 //! `serve` lifecycle:
 //!
-//! 1. startup update check (fail-fast): on success run the manifest version;
-//!    on failure fall back to `state.current_version`; nothing installed AND
-//!    check failed → exit non-zero with a clear message
+//! 1. startup update check (fail-fast, `k=startup`): on success run the
+//!    manifest version; on failure fall back to `state.current_version`;
+//!    nothing installed AND check failed → exit non-zero with a clear
+//!    message. On the stable channel it runs only when a daily check is due
+//!    (item 11); otherwise the installed version starts with no request
+//!    (with nothing installed the check runs anyway)
 //! 2. spawn `versions/<current>/intentd` with all forwarded args verbatim,
 //!    inheriting stdio and environment. The sitter injects two env
 //!    variables: respawning a version different from the one that just ran
@@ -21,16 +24,23 @@
 //!    of which set it); and serve mode on unix sets [`IDLE_RESTART_ENV`]`=1`
 //!    to advertise the idle-restart handshake (item 10), clearing it on
 //!    one-shot spawns and elsewhere
-//! 3. after every check, pick the next check uniformly at random in
-//!    [`SupervisorConfig::check_min`], [`SupervisorConfig::check_max`]) and
-//!    persist it to `state.json`
-//! 4. update found mid-run: download/verify/install first, then stop the
+//! 3. after every check, pick the next scheduled check and persist it to
+//!    `state.json`: on alpha/beta uniformly at random in
+//!    [`SupervisorConfig::check_min`], [`SupervisorConfig::check_max`])
+//!    (12–24 h), on stable the next local tick in
+//!    [`SupervisorConfig::tick_min`], [`SupervisorConfig::tick_max`])
+//!    (about hourly; item 11). A successful automatic check (startup,
+//!    scheduled, failed-start, or idle) also records `last_check_at`;
+//!    failed and manual checks do not
+//! 4. update found mid-run by the alpha/beta periodic check (`k=daily`): download/verify/install first, then stop the
 //!    child gracefully (SIGTERM on Unix, local shutdown RPC on Windows,
 //!    followed by a bounded kill fallback) and respawn the new version with the same args. A version
 //!    that is already installed and named by `state.json` but is not the
 //!    one running — staged by a SIGUSR2 check (item 10) the daemon has not
 //!    yet restarted into, or by a concurrent updater — counts as an update
-//!    found: the periodic check forces the same graceful stop + respawn
+//!    found: the periodic check forces the same graceful stop + respawn.
+//!    Stable takes a found version through the idle handshake instead
+//!    (item 11)
 //! 5. unexpected child exit (non-zero or signal) → respawn the same version
 //!    with exponential backoff — but not forever:
 //!    [`SupervisorConfig::give_up_after_failures`] consecutive failed
@@ -48,7 +58,7 @@
 //!    (`status`, `stop`, `doctor`, `call`, …) legitimately exit non-zero, so
 //!    they run exactly once and their exit status passes through
 //! 6. every failed start (crash or spawn error) also forces an off-schedule
-//!    channel re-check before the respawn/give-up decision, persisting the
+//!    channel re-check (`k=startup`, on every channel, due or not) before the respawn/give-up decision, persisting the
 //!    check schedule as usual: a crash loop is the strongest signal that
 //!    the pinned version is broken, so a fixed build published on the
 //!    channel is installed and respawned instead of the sitter respawning
@@ -70,7 +80,8 @@
 //!    version from `state.json`, and resets the backoff. Serve mode
 //!    advertises itself for this via `<data_dir>/sitter/sitter.pid`,
 //!    written before the supervision loop and removed on exit
-//! 9. SIGUSR1 (unix only) runs the update check immediately — the same
+//! 9. SIGUSR1 (unix only) runs a manual update check (`k=manual`)
+//!    immediately on every channel — the same
 //!    path as the periodic check, rescheduling it — and, when a newer
 //!    version installs (or a concurrently installed one is found), stops
 //!    the child gracefully and respawns it on the new version (an
@@ -79,19 +90,21 @@
 //!    failed check, which is logged and non-fatal) leaves the daemon
 //!    running. A SIGUSR1 during a crash-backoff sleep cuts the wait
 //!    short, checks, and respawns
-//! 10. SIGUSR2 (unix only) is the idle-mode variant of item 9: the same
-//!     immediate check, but when a different version installs (or is found
+//! 10. SIGUSR2 (unix only) is the idle-mode variant of item 9 (`k=idle`):
+//!     the same immediate check — on stable only when a daily check is due
+//!     (item 11) — but when a different version installs (or is found
 //!     staged) the child is not stopped — it is sent SIGUSR2 ("staged; exit
 //!     when idle") and supervision continues. The daemon exits with
-//!     [`RESTART_FOR_UPDATE_EXIT_CODE`] once idle; that exit is neither a
-//!     crash nor a clean exit: the sitter re-resolves the version from
+//!     [`RESTART_FOR_UPDATE_EXIT_CODE`] once idle (no turn in flight and no
+//!     command script running, the script wait capped at 90 minutes); that
+//!     exit is neither a crash nor a clean exit: the sitter re-resolves the version from
 //!     `state.json`, resets the backoff and failure counter, and respawns
 //!     immediately (setting [`UPDATE_RESTART_ENV`] when the version
 //!     differs) — the SIGHUP path without the stop. Serve mode advertises
 //!     the handshake by setting [`IDLE_RESTART_ENV`]`=1` on the child; the
 //!     daemon only sends SIGUSR2 to a sitter that did. The daemon sends one
-//!     once no agent turn has been in flight for `updates.idleGraceSeconds`
-//!     (default 120 s), at most every `updates.idleCheckIntervalMinutes`
+//!     once no agent turn and no command-mode script run has been in flight
+//!     for `updates.idleGraceSeconds` (default 120 s), at most every `updates.idleCheckIntervalMinutes`
 //!     (default 60), so an idle daemon picks up a publish within about that
 //!     interval instead of waiting for item 3's 12–24 h schedule — which
 //!     stays the forced fallback: a daemon that never gets idle is caught by
@@ -100,12 +113,29 @@
 //!     no restart) and leaves only the periodic path. A SIGUSR1 arriving
 //!     while the idle-mode check is in flight escalates it to item 9's
 //!     immediate restart; a SIGUSR2 never downgrades a SIGUSR1 check
+//! 11. the stable channel makes at most one successful automatic check per
+//!     UTC day ([`daily_check_due`]: no `last_check_at` on today's UTC
+//!     date). Instead of item 3's 12–24 h timer, a cheap local tick (about
+//!     hourly, jittered) makes a network check (`k=daily`) only when one is
+//!     due, so rollover checks spread across the first hour of the UTC day;
+//!     a failed check is not recorded, so the next tick retries. A found
+//!     version is staged and the child is sent SIGUSR2 (item 10's
+//!     hand-off, restart when idle); if it is still not running
+//!     [`SupervisorConfig::staged_restart_after`] (24 h) later, a tick
+//!     forces item 4's graceful stop + respawn. Off unix (no handshake) a
+//!     found version restarts the child at once, as in item 4. A SIGUSR2
+//!     when no check is due makes no request but still hands an
+//!     already-staged version to the child. Manual checks (item 9,
+//!     `intentd update`) always run and never count as the day's check.
+//!     The rule follows the effective channel, re-resolved at every tick
+//!     and request, so `intentd sitter channel` switches cadence on a
+//!     running service
 //!
 //! When the startup channel came from `config.toml` or the stable default
 //! (not the `--sitter-channel` flag or `INTENTD_CHANNEL` env), every update
 //! check re-resolves the channel from `config.toml` first, so
 //! `intentd sitter channel <value>` takes effect on a running service at its
-//! next periodic check. Flag/env selections stay pinned for the process
+//! next scheduled check or tick. Flag/env selections stay pinned for the process
 //! lifetime.
 //!
 //! The updater API is blocking, so checks run on the blocking thread pool
@@ -126,6 +156,7 @@ use crate::cli::Channel;
 use crate::config::{self, ChannelOrigin, ResolvedChannel};
 use crate::paths::SitterPaths;
 use crate::state;
+use crate::telemetry::{CheckTrigger, UpdateEndpoint};
 use crate::updater::{UpdateError, UpdateOutcome, Updater};
 
 /// Env override for the channel-manifest base URL — exactly one base, no
@@ -168,6 +199,8 @@ pub const BACKOFF_INITIAL_ENV: &str = "INTENTD_SITTER_BACKOFF_INITIAL_MS";
 pub const BACKOFF_CAP_ENV: &str = "INTENTD_SITTER_BACKOFF_CAP_MS";
 pub const BACKOFF_RESET_ENV: &str = "INTENTD_SITTER_BACKOFF_RESET_MS";
 pub const KILL_TIMEOUT_ENV: &str = "INTENTD_SITTER_KILL_TIMEOUT_MS";
+/// Test-only override for [`SupervisorConfig::staged_restart_after`].
+pub const STAGED_RESTART_AFTER_ENV: &str = "INTENTD_SITTER_STAGED_RESTART_MS";
 
 /// Test-only env override (a count, not milliseconds) for
 /// [`SupervisorConfig::give_up_after_failures`]. Production never sets it.
@@ -183,6 +216,14 @@ pub struct SupervisorConfig {
     pub check_min: Duration,
     /// Upper bound (exclusive) of the randomized update-check interval.
     pub check_max: Duration,
+    /// Lower bound (inclusive) of the stable channel's local tick, which
+    /// makes a network check only when one is due (see [`daily_check_due`]).
+    pub tick_min: Duration,
+    /// Upper bound (exclusive) of the stable channel's local tick.
+    pub tick_max: Duration,
+    /// On stable, how long a version staged for an idle restart may wait
+    /// before the tick forces the restart.
+    pub staged_restart_after: Duration,
     /// First respawn delay after an unexpected child exit.
     pub backoff_initial: Duration,
     /// Maximum respawn delay (doubling stops here).
@@ -202,6 +243,9 @@ impl Default for SupervisorConfig {
         Self {
             check_min: Duration::from_secs(12 * 60 * 60),
             check_max: Duration::from_secs(24 * 60 * 60),
+            tick_min: Duration::from_secs(50 * 60),
+            tick_max: Duration::from_secs(70 * 60),
+            staged_restart_after: Duration::from_secs(24 * 60 * 60),
             backoff_initial: Duration::from_secs(1),
             backoff_cap: Duration::from_secs(60),
             backoff_reset_after: Duration::from_secs(5 * 60),
@@ -238,11 +282,18 @@ impl SupervisorConfig {
                 .and_then(|v| v.parse::<u64>().ok())
                 .map(Duration::from_millis)
         };
+        // One override drives both cadences, so a test runs either channel
+        // at millisecond scale.
         if let Some(v) = ms(CHECK_MIN_ENV) {
             config.check_min = v;
+            config.tick_min = v;
         }
         if let Some(v) = ms(CHECK_MAX_ENV) {
             config.check_max = v;
+            config.tick_max = v;
+        }
+        if let Some(v) = ms(STAGED_RESTART_AFTER_ENV) {
+            config.staged_restart_after = v;
         }
         if let Some(v) = ms(BACKOFF_INITIAL_ENV) {
             config.backoff_initial = v;
@@ -274,6 +325,45 @@ pub fn next_check_delay(min: Duration, max: Duration, random: u64) -> Duration {
     }
     let offset = u128::from(random) % span;
     min + Duration::from_nanos(u64::try_from(offset).unwrap_or(u64::MAX))
+}
+
+/// How a channel's automatic update checks are paced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cadence {
+    /// Stable: at most one successful automatic check per UTC day, polled
+    /// by a cheap local tick; a found version restarts the daemon when idle.
+    Daily,
+    /// Alpha/beta: a check every 12–24 h that force-restarts onto a found
+    /// version, plus a check on every idle request.
+    Periodic,
+}
+
+/// The cadence for `channel`: only stable checks once a day.
+#[must_use]
+pub fn cadence_for(channel: Channel) -> Cadence {
+    match channel {
+        Channel::Stable => Cadence::Daily,
+        Channel::Beta | Channel::Alpha => Cadence::Periodic,
+    }
+}
+
+/// Whether a daily (stable) check is due at `now`: no successful automatic
+/// check is recorded for the current UTC date.
+#[must_use]
+pub fn daily_check_due(last_success: Option<OffsetDateTime>, now: OffsetDateTime) -> bool {
+    last_success.is_none_or(|at| {
+        at.to_offset(time::UtcOffset::UTC).date() != now.to_offset(time::UtcOffset::UTC).date()
+    })
+}
+
+/// How a stable daily check takes a found version, for log lines: the
+/// idle-restart handshake on unix, an immediate restart elsewhere.
+fn daily_restart_note() -> &'static str {
+    if cfg!(unix) {
+        "asking daemon to restart when idle"
+    } else {
+        "restarting daemon"
+    }
 }
 
 /// A random `u64` from the standard library's randomly-keyed `SipHash`
@@ -438,9 +528,10 @@ pub fn run(
     passthrough: Vec<OsString>,
     config: SupervisorConfig,
     base_urls: Vec<String>,
+    endpoint: Option<UpdateEndpoint>,
 ) -> i32 {
     let updater = match Updater::with_base_urls(paths.clone(), base_urls) {
-        Ok(updater) => Arc::new(updater),
+        Ok(updater) => Arc::new(updater.with_update_endpoint(endpoint)),
         Err(e) => {
             eprintln!("intentd-sitter: {e}");
             return 1;
@@ -541,67 +632,84 @@ impl Supervisor {
         }
 
         let (mut current_version, mut next_check_at) = if supervised {
-            // Startup check: always runs, regardless of the persisted schedule.
-            // Signal handlers are already installed for PID discovery. Keep
-            // consuming them while network I/O is in flight, so service stop
-            // never waits for a manifest/download timeout or spawns a child.
-            let check = self.check();
-            tokio::pin!(check);
-            let startup = loop {
-                tokio::select! {
-                    biased;
-                    event = signals.recv() => match event {
-                        SignalEvent::Shutdown(signal) => { return signals.finish_stop(128 + signal); },
-                        // No child exists yet; startup already checks for an
-                        // update and will spawn the selected version once.
-                        SignalEvent::Restart => {
-                            eprintln!("intentd-sitter: restart requested during startup");
+            let channel = self.effective_channel();
+            // Stable checks at most once per UTC day: with today's check
+            // already recorded, start the installed version without one.
+            if let Some(version) = self
+                .installed_version()
+                .filter(|_| cadence_for(channel) == Cadence::Daily && !self.daily_check_is_due())
+            {
+                eprintln!(
+                    "intentd-sitter: already checked for updates today; starting installed intentd {version}"
+                );
+                (version, self.finish_check(channel, false))
+            } else {
+                // Startup check: runs whenever one is due (always on alpha/beta).
+                // Signal handlers are already installed for PID discovery. Keep
+                // consuming them while network I/O is in flight, so service stop
+                // never waits for a manifest/download timeout or spawns a child.
+                let check = self.check(channel, CheckTrigger::Startup);
+                tokio::pin!(check);
+                let startup = loop {
+                    tokio::select! {
+                        biased;
+                        event = signals.recv() => match event {
+                            SignalEvent::Shutdown(signal) => { return signals.finish_stop(128 + signal); },
+                            // No child exists yet; startup already checks for an
+                            // update and will spawn the selected version once.
+                            SignalEvent::Restart => {
+                                eprintln!("intentd-sitter: restart requested during startup");
+                            }
+                            #[cfg(unix)]
+                            SignalEvent::CheckNow | SignalEvent::CheckNowIdle => {
+                                eprintln!("intentd-sitter: {} received; startup check is already running", event.name());
+                            }
+                        },
+                        () = tokio::time::sleep_until(startup_deadline), if starting => {
+                            eprintln!("intentd-sitter: startup update check timed out");
+                            return 1;
                         }
-                        #[cfg(unix)]
-                        SignalEvent::CheckNow | SignalEvent::CheckNowIdle => {
-                            eprintln!("intentd-sitter: {} received; startup check is already running", event.name());
-                        }
-                    },
-                    () = tokio::time::sleep_until(startup_deadline), if starting => {
-                        eprintln!("intentd-sitter: startup update check timed out");
-                        return 1;
+                        outcome = &mut check => break outcome,
                     }
-                    outcome = &mut check => break outcome,
-                }
-            };
-            let next_check_at = self.schedule_next_check();
-            let version = match startup {
-                Ok(UpdateOutcome::Installed { version, previous }) => {
-                    match previous {
-                        Some(previous) => {
-                            eprintln!("intentd-sitter: updated intentd {previous} -> {version}");
+                };
+                let next_check_at = self.finish_check(channel, startup.is_ok());
+                let version = match startup {
+                    Ok(UpdateOutcome::Installed { version, previous }) => {
+                        match previous {
+                            Some(previous) => {
+                                eprintln!(
+                                    "intentd-sitter: updated intentd {previous} -> {version}"
+                                );
+                            }
+                            None => eprintln!("intentd-sitter: installed intentd {version}"),
                         }
-                        None => eprintln!("intentd-sitter: installed intentd {version}"),
-                    }
-                    version
-                }
-                Ok(UpdateOutcome::AlreadyCurrent { version }) => version,
-                Err(e) => {
-                    eprintln!("intentd-sitter: update check failed: {e}");
-                    let state = state::load(&self.paths.state_path);
-                    if let Some(version) = state
-                        .current_version
-                        .filter(|v| self.paths.daemon_binary(v).exists())
-                    {
-                        eprintln!("intentd-sitter: falling back to installed intentd {version}");
                         version
-                    } else {
-                        eprintln!(
-                            "intentd-sitter: no intentd daemon is installed for channel {} \
+                    }
+                    Ok(UpdateOutcome::AlreadyCurrent { version }) => version,
+                    Err(e) => {
+                        eprintln!("intentd-sitter: update check failed: {e}");
+                        let state = state::load(&self.paths.state_path);
+                        if let Some(version) = state
+                            .current_version
+                            .filter(|v| self.paths.daemon_binary(v).exists())
+                        {
+                            eprintln!(
+                                "intentd-sitter: falling back to installed intentd {version}"
+                            );
+                            version
+                        } else {
+                            eprintln!(
+                                "intentd-sitter: no intentd daemon is installed for channel {} \
                              and the update check failed; cannot start (check network access \
                              and retry)",
-                            self.channel.channel
-                        );
-                        return 1;
+                                self.channel.channel
+                            );
+                            return 1;
+                        }
                     }
-                }
-            };
-            (version, next_check_at)
+                };
+                (version, next_check_at)
+            }
         } else {
             // One-shot: resolve the installed version with no updater
             // activity (no manifest fetch, no state.json write, no prune).
@@ -649,6 +757,10 @@ impl Supervisor {
         // `agents.resumeInterruptedOnStart=off`, agents interrupted by the
         // update then stay unresumed (a crash respawn is a plain restart).
         let mut last_ran_version: Option<String> = None;
+        // Stable only: when a version was first handed to the running child
+        // for an idle restart, so the tick can force it once
+        // `staged_restart_after` passes. Set to `None` on every spawn.
+        let mut staged_at: Option<Instant>;
 
         loop {
             let binary = self.paths.daemon_binary(&current_version);
@@ -739,6 +851,7 @@ impl Supervisor {
                         BackoffOutcome::CheckNowRequested => {
                             match self
                                 .check_now(
+                                    self.effective_channel(),
                                     &current_version,
                                     RestartStyle::Now,
                                     &mut signals,
@@ -775,7 +888,7 @@ impl Supervisor {
                     signals.restart_during_readiness = false;
                 }
                 if !self
-                    .await_initial_readiness(&binary, &mut child, &mut signals)
+                    .await_initial_readiness(&binary, &current_version, &mut child, &mut signals)
                     .await
                 {
                     let exit = if self.graceful_stop(&mut child).await {
@@ -799,6 +912,7 @@ impl Supervisor {
                 starting = false;
             }
             last_ran_version = Some(current_version.clone());
+            staged_at = None;
             let spawned_at = Instant::now();
 
             // Supervise this child until it exits or the sitter stops it.
@@ -891,7 +1005,7 @@ impl Supervisor {
                             #[cfg(unix)]
                             BackoffOutcome::CheckNowRequested => {
                                 match self
-                                    .check_now(&current_version, RestartStyle::Now, &mut signals, &mut next_check_at)
+                                    .check_now(self.effective_channel(), &current_version, RestartStyle::Now, &mut signals, &mut next_check_at)
                                     .await
                                 {
                                     CheckNowOutcome::Shutdown(signal) => { return signals.finish_stop(128 + signal); },
@@ -909,13 +1023,88 @@ impl Supervisor {
                         break; // respawn (possibly a new version after SIGHUP)
                     }
                     () = tokio::time::sleep_until(next_check_at), if supervised => {
-                        match self.check().await {
+                        let channel = self.effective_channel();
+                        if cadence_for(channel) == Cadence::Daily {
+                            // Stable: a cheap local tick. Check only when no
+                            // successful check is recorded today; a found
+                            // version restarts the daemon when idle.
+                            let mut found = None;
+                            let mut succeeded = false;
+                            if self.daily_check_is_due() {
+                                match self.check(channel, CheckTrigger::Daily).await {
+                                    Ok(UpdateOutcome::Installed { version, previous }) => {
+                                        succeeded = true;
+                                        eprintln!(
+                                            "intentd-sitter: installed intentd {version} (was {}); {}",
+                                            previous.as_deref().unwrap_or("none"),
+                                            daily_restart_note()
+                                        );
+                                        found = Some(version);
+                                    }
+                                    Ok(UpdateOutcome::AlreadyCurrent { version })
+                                        if version != current_version
+                                            && self.paths.daemon_binary(&version).exists() =>
+                                    {
+                                        succeeded = true;
+                                        eprintln!(
+                                            "intentd-sitter: found staged intentd {version} (was {current_version}); {}",
+                                            daily_restart_note()
+                                        );
+                                        found = Some(version);
+                                    }
+                                    Ok(UpdateOutcome::AlreadyCurrent { .. }) => succeeded = true,
+                                    Err(e) => eprintln!(
+                                        "intentd-sitter: update check failed: {e}; will retry at the next tick"
+                                    ),
+                                }
+                            }
+                            next_check_at = self.finish_check(channel, succeeded);
+                            if let Some(version) = found {
+                                // The idle-restart handshake is unix-only;
+                                // elsewhere restart at once, as before.
+                                #[cfg(unix)]
+                                {
+                                    let _ = version;
+                                    forward_signal(&child, nix::sys::signal::Signal::SIGUSR2 as i32);
+                                    staged_at.get_or_insert_with(Instant::now);
+                                }
+                                #[cfg(not(unix))]
+                                {
+                                    self.graceful_stop(&mut child).await;
+                                    current_version = version;
+                                    backoff = self.config.backoff_initial;
+                                    failures = 0;
+                                    break; // respawn the new version
+                                }
+                            }
+                            // Fallback: a staged version the daemon has not
+                            // restarted into within the window is forced.
+                            if staged_at.is_some_and(|at| at.elapsed() >= self.config.staged_restart_after) {
+                                if let Some(version) = self.staged_version(&current_version) {
+                                    eprintln!(
+                                        "intentd-sitter: staged intentd {version} was not taken within {:?}; restarting daemon",
+                                        self.config.staged_restart_after
+                                    );
+                                    self.graceful_stop(&mut child).await;
+                                    current_version = version;
+                                    backoff = self.config.backoff_initial;
+                                    failures = 0;
+                                    break; // respawn the staged version
+                                }
+                                staged_at = None;
+                            }
+                            continue;
+                        }
+                        // Alpha/beta: the 12–24 h periodic check, which
+                        // force-restarts onto whatever it finds.
+                        let outcome = self.check(channel, CheckTrigger::Daily).await;
+                        next_check_at = self.finish_check(channel, outcome.is_ok());
+                        match outcome {
                             Ok(UpdateOutcome::Installed { version, previous }) => {
                                 eprintln!(
                                     "intentd-sitter: installed intentd {version} (was {}); restarting daemon",
                                     previous.as_deref().unwrap_or("none")
                                 );
-                                next_check_at = self.schedule_next_check();
                                 self.graceful_stop(&mut child).await;
                                 current_version = version;
                                 backoff = self.config.backoff_initial;
@@ -934,7 +1123,6 @@ impl Supervisor {
                                 eprintln!(
                                     "intentd-sitter: found staged intentd {version} (was {current_version}); restarting daemon"
                                 );
-                                next_check_at = self.schedule_next_check();
                                 self.graceful_stop(&mut child).await;
                                 current_version = version;
                                 backoff = self.config.backoff_initial;
@@ -946,7 +1134,6 @@ impl Supervisor {
                                 "intentd-sitter: update check failed: {e}; will retry at the next scheduled check"
                             ),
                         }
-                        next_check_at = self.schedule_next_check();
                     }
                     event = signals.recv() => {
                         let signal = match event {
@@ -985,7 +1172,7 @@ impl Supervisor {
                                 }
                                 eprintln!("intentd-sitter: SIGUSR1 received; checking for updates now");
                                 match self
-                                    .check_now(&current_version, RestartStyle::Now, &mut signals, &mut next_check_at)
+                                    .check_now(self.effective_channel(), &current_version, RestartStyle::Now, &mut signals, &mut next_check_at)
                                     .await
                                 {
                                     CheckNowOutcome::Respawn { version, .. } => {
@@ -1023,13 +1210,35 @@ impl Supervisor {
                                     eprintln!("intentd-sitter: ignoring SIGUSR2 (one-shot invocation)");
                                     continue;
                                 }
+                                let channel = self.effective_channel();
+                                // Stable, already checked today: no network
+                                // check, but still hand over a staged version.
+                                if cadence_for(channel) == Cadence::Daily && !self.daily_check_is_due() {
+                                    // The channel may have just switched to
+                                    // stable: keep the tick no further off.
+                                    next_check_at = next_check_at.min(Instant::now() + self.tick_delay());
+                                    if let Some(version) = self.staged_version(&current_version) {
+                                        eprintln!(
+                                            "intentd-sitter: SIGUSR2 received; already checked for updates today; \
+                                             asking daemon to restart into staged intentd {version} when idle"
+                                        );
+                                        forward_signal(&child, nix::sys::signal::Signal::SIGUSR2 as i32);
+                                        staged_at.get_or_insert_with(Instant::now);
+                                    } else {
+                                        eprintln!(
+                                            "intentd-sitter: SIGUSR2 received; already checked for updates today; nothing staged"
+                                        );
+                                    }
+                                    continue; // daemon untouched
+                                }
                                 eprintln!("intentd-sitter: SIGUSR2 received; checking for updates now (restart when idle)");
                                 match self
-                                    .check_now(&current_version, RestartStyle::WhenIdle, &mut signals, &mut next_check_at)
+                                    .check_now(channel, &current_version, RestartStyle::WhenIdle, &mut signals, &mut next_check_at)
                                     .await
                                 {
                                     CheckNowOutcome::Respawn { style: RestartStyle::WhenIdle, .. } => {
                                         forward_signal(&child, nix::sys::signal::Signal::SIGUSR2 as i32);
+                                        staged_at.get_or_insert_with(Instant::now);
                                         continue; // keep supervising until it exits
                                     }
                                     CheckNowOutcome::Respawn { version, style: RestartStyle::Now } => {
@@ -1087,28 +1296,75 @@ impl Supervisor {
         }
     }
 
+    /// The channel for the next check: re-resolved from `config.toml`
+    /// unless flag/env pinned it (see [`effective_channel`]).
+    fn effective_channel(&self) -> Channel {
+        effective_channel(self.channel, &self.paths.config_path)
+    }
+
     /// One blocking update check on the blocking pool (the updater's HTTP
-    /// client is blocking; never run it on the async runtime). Re-resolves
-    /// the channel from `config.toml` first unless flag/env pinned it.
-    async fn check(&self) -> Result<UpdateOutcome, UpdateError> {
+    /// client is blocking; never run it on the async runtime).
+    async fn check(
+        &self,
+        channel: Channel,
+        trigger: CheckTrigger,
+    ) -> Result<UpdateOutcome, UpdateError> {
         let updater = Arc::clone(&self.updater);
-        let channel = effective_channel(self.channel, &self.paths.config_path);
-        tokio::task::spawn_blocking(move || updater.check_and_install(channel))
+        tokio::task::spawn_blocking(move || updater.check_and_install(channel, trigger))
             .await
             .map_err(|e| UpdateError::Io(io::Error::other(e)))?
     }
 
-    /// Pick the next check time in [`check_min`, `check_max`) and persist it
-    /// (with `last_check_at = now`) so restarts don't reset the clock.
-    fn schedule_next_check(&self) -> Instant {
-        let delay = next_check_delay(self.config.check_min, self.config.check_max, random_u64());
+    /// The next stable tick delay, in [`tick_min`, `tick_max`).
+    fn tick_delay(&self) -> Duration {
+        next_check_delay(self.config.tick_min, self.config.tick_max, random_u64())
+    }
+
+    /// Whether a stable daily check is due now ([`daily_check_due`] against
+    /// the recorded `last_check_at`).
+    fn daily_check_is_due(&self) -> bool {
+        daily_check_due(
+            state::load(&self.paths.state_path).last_check_at,
+            OffsetDateTime::now_utc(),
+        )
+    }
+
+    /// The installed `state.json` version, if its binary exists.
+    fn installed_version(&self) -> Option<String> {
+        state::load(&self.paths.state_path)
+            .current_version
+            .filter(|v| self.paths.daemon_binary(v).exists())
+    }
+
+    /// An installed `state.json` version other than the running one: staged
+    /// for a restart the daemon has not made yet.
+    fn staged_version(&self, running: &str) -> Option<String> {
+        self.installed_version().filter(|v| v != running)
+    }
+
+    /// After a check (or a skipped one): pick the next check time for
+    /// `channel`'s cadence — the stable tick in [`tick_min`, `tick_max`),
+    /// otherwise [`check_min`, `check_max`) — and persist it, so restarts
+    /// don't reset the clock. `record_success` (a successful automatic
+    /// check) also sets `last_check_at = now`, which is what makes the
+    /// stable daily check not due until the UTC day rolls over; failed and
+    /// manual checks leave it alone.
+    fn finish_check(&self, channel: Channel, record_success: bool) -> Instant {
+        let delay = match cadence_for(channel) {
+            Cadence::Daily => self.tick_delay(),
+            Cadence::Periodic => {
+                next_check_delay(self.config.check_min, self.config.check_max, random_u64())
+            }
+        };
         let now = OffsetDateTime::now_utc();
         let Ok(_lock) = state::lock(&self.paths.state_path) else {
             eprintln!("intentd-sitter: failed to lock update state; not persisting schedule");
             return Instant::now() + delay;
         };
         let mut state = state::load(&self.paths.state_path);
-        state.last_check_at = Some(now);
+        if record_success {
+            state.last_check_at = Some(now);
+        }
         state.next_check_at = Some(now + delay);
         if let Err(e) = state::save(&self.paths.state_path, &state) {
             eprintln!("intentd-sitter: failed to persist state.json: {e}");
@@ -1156,7 +1412,8 @@ impl Supervisor {
         signals: &mut Signals,
         next_check_at: &mut Instant,
     ) -> FailedStartCheck {
-        let check = self.check();
+        let channel = self.effective_channel();
+        let check = self.check(channel, CheckTrigger::Startup);
         tokio::pin!(check);
         #[cfg_attr(
             windows,
@@ -1189,7 +1446,7 @@ impl Supervisor {
                 },
             }
         };
-        *next_check_at = self.schedule_next_check();
+        *next_check_at = self.finish_check(channel, outcome.is_ok());
         match outcome {
             Ok(UpdateOutcome::Installed { version, previous }) => {
                 eprintln!(
@@ -1237,12 +1494,20 @@ impl Supervisor {
     #[cfg(unix)]
     async fn check_now(
         &self,
+        channel: Channel,
         current_version: &str,
         mut style: RestartStyle,
         signals: &mut Signals,
         next_check_at: &mut Instant,
     ) -> CheckNowOutcome {
-        let check = self.check();
+        let trigger = match style {
+            RestartStyle::Now => CheckTrigger::Manual,
+            RestartStyle::WhenIdle => CheckTrigger::Idle,
+        };
+        // Only the idle request is automatic; a manual check never counts
+        // as the day's check.
+        let automatic = trigger == CheckTrigger::Idle;
+        let check = self.check(channel, trigger);
         tokio::pin!(check);
         let outcome = loop {
             tokio::select! {
@@ -1281,7 +1546,7 @@ impl Supervisor {
                 },
             }
         };
-        *next_check_at = self.schedule_next_check();
+        *next_check_at = self.finish_check(channel, automatic && outcome.is_ok());
         match outcome {
             Ok(UpdateOutcome::Installed { version, previous }) => {
                 eprintln!(
@@ -1384,12 +1649,14 @@ impl Supervisor {
     async fn await_initial_readiness(
         &self,
         binary: &Path,
+        version: &str,
         child: &mut tokio::process::Child,
         signals: &mut Signals,
     ) -> bool {
-        let deadline = Instant::now() + crate::readiness::timeout_from_env();
+        use crate::readiness::{versions_match, ProbeStatus, StartupBudget};
+        let mut budget = StartupBudget::new(crate::readiness::timeout_from_env());
         loop {
-            let probe = crate::readiness::probe_daemon_version_async(binary);
+            let probe = crate::readiness::probe_status_async(binary);
             tokio::select! {
                 biased;
                 status = child.wait() => {
@@ -1406,12 +1673,17 @@ impl Supervisor {
                         return false;
                     }
                 }
-                () = tokio::time::sleep_until(deadline) => {
+                () = tokio::time::sleep_until(budget.deadline.into()) => {
                     eprintln!("intentd-sitter: startup readiness timed out");
                     return false;
                 }
                 result = probe => {
-                    if result.is_some() {
+                    budget.observe(&result);
+                    if result == ProbeStatus::Failed {
+                        eprintln!("intentd-sitter: daemon startup failed");
+                        return false;
+                    }
+                    if matches!(result, ProbeStatus::Ready(actual) if versions_match(&actual, version)) {
                         if !matches!(child.try_wait(), Ok(None)) {
                             return false;
                         }
@@ -1790,6 +2062,60 @@ mod tests {
         assert_eq!(config.backoff_reset_after, Duration::from_secs(5 * 60));
         assert_eq!(config.give_up_after_failures, 10);
         assert_eq!(config.kill_timeout, Duration::from_secs(30));
+        // Stable's local tick: about hourly, with jitter either side.
+        assert_eq!(config.tick_min, Duration::from_secs(50 * 60));
+        assert_eq!(config.tick_max, Duration::from_secs(70 * 60));
+        assert_eq!(config.staged_restart_after, 24 * HOUR);
+    }
+
+    #[test]
+    fn check_interval_overrides_also_drive_the_stable_tick() {
+        let config = SupervisorConfig::from_lookup(|name| match name {
+            CHECK_MIN_ENV => Some("100".to_string()),
+            CHECK_MAX_ENV => Some("200".to_string()),
+            STAGED_RESTART_AFTER_ENV => Some("750".to_string()),
+            _ => None,
+        });
+        assert_eq!(config.tick_min, Duration::from_millis(100));
+        assert_eq!(config.tick_max, Duration::from_millis(200));
+        assert_eq!(config.check_min, Duration::from_millis(100));
+        assert_eq!(config.check_max, Duration::from_millis(200));
+        assert_eq!(config.staged_restart_after, Duration::from_millis(750));
+    }
+
+    #[test]
+    fn only_the_stable_channel_checks_daily() {
+        assert_eq!(cadence_for(Channel::Stable), Cadence::Daily);
+        assert_eq!(cadence_for(Channel::Beta), Cadence::Periodic);
+        assert_eq!(cadence_for(Channel::Alpha), Cadence::Periodic);
+    }
+
+    #[test]
+    fn daily_check_is_due_once_per_utc_day() {
+        use time::macros::datetime;
+        // Never checked: due.
+        assert!(daily_check_due(None, datetime!(2026-10-21 12:00 UTC)));
+        // Checked earlier the same UTC day: not due, up to the last second.
+        let checked = Some(datetime!(2026-10-21 00:00:01 UTC));
+        assert!(!daily_check_due(checked, datetime!(2026-10-21 12:00 UTC)));
+        assert!(!daily_check_due(
+            checked,
+            datetime!(2026-10-21 23:59:59 UTC)
+        ));
+        // The UTC day rolls over: due again, however recent the last check.
+        let late = Some(datetime!(2026-10-21 23:59:59 UTC));
+        assert!(daily_check_due(late, datetime!(2026-10-22 00:00:00 UTC)));
+        // UTC, not the local offset: 20:00 at -05:00 is already the 22nd UTC.
+        assert!(daily_check_due(checked, datetime!(2026-10-21 20:00 -05:00)));
+        assert!(!daily_check_due(
+            Some(datetime!(2026-10-21 23:30 +02:00)),
+            datetime!(2026-10-21 22:00 UTC)
+        ));
+        // A clock that went backwards to an earlier day: due (a different day).
+        assert!(daily_check_due(
+            Some(datetime!(2026-10-22 08:00 UTC)),
+            datetime!(2026-10-21 08:00 UTC)
+        ));
     }
 
     #[test]

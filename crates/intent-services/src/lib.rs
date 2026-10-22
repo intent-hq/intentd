@@ -58,6 +58,9 @@ mod agent_manager;
 mod agent_ops;
 mod agent_session;
 mod agent_subscriptions;
+mod agent_workers;
+/// The §5.5b wire-ID rule, shared by the transport's request validation.
+pub use intent_acp::workers::is_wire_id;
 pub mod antigravity;
 pub mod antigravity_install;
 pub mod antigravity_setup;
@@ -67,7 +70,10 @@ mod auggie_cli;
 mod auto_commit;
 pub mod browser_ops;
 mod browser_tabs;
+mod bundled_cli;
 mod capability;
+#[cfg(all(test, unix))]
+mod claude_adapter_contract;
 mod clone_ops;
 pub mod codex_diagnostics;
 mod codex_session_title;
@@ -97,7 +103,6 @@ pub mod host_exec;
 pub mod host_exec_stream;
 mod host_execution;
 mod installed_cli;
-mod note_delete;
 mod workspace_mutations;
 
 mod github_ops;
@@ -157,14 +162,11 @@ mod repository_context_live;
 )]
 mod repository_context_output;
 mod repository_context_reader;
-#[expect(
-    dead_code,
-    unused_imports,
-    reason = "Settings and child-policy writer integration remains inactive"
-)]
 #[cfg_attr(
     not(test),
     expect(
+        dead_code,
+        unused_imports,
         clippy::wildcard_imports,
         reason = "Preserve private writer imports while native and child-policy integration is pending"
     )
@@ -203,11 +205,10 @@ mod line_attribution;
 mod linear_ops;
 mod member_removal;
 mod model_catalog;
+mod model_preference;
 mod nested_repos;
-mod note_annotation;
 mod note_merge;
 pub mod note_ops;
-mod note_page_state;
 mod npx_cli;
 #[expect(
     dead_code,
@@ -224,13 +225,17 @@ mod pr_ops;
 pub mod presence;
 mod primitive_ops;
 mod principal_ops;
+mod profile_activation;
 pub mod provider_auth;
 pub(crate) mod provider_catalog;
 pub mod provider_cli;
 mod provider_images;
 pub mod provider_models;
 mod provider_preparation;
+mod provider_profiles;
+mod provider_return;
 pub mod provider_test_prompt;
+mod quota_failover;
 mod rate_limit;
 pub mod repo_config;
 pub mod retention;
@@ -238,6 +243,10 @@ mod rtk;
 mod sandbox_ops;
 mod script_monitor;
 mod script_ops;
+mod script_output_cleanup;
+mod script_output_store;
+pub mod worktree_presence;
+pub use script_ops::CommandScriptActivity;
 mod search_ops;
 mod sentry_ops;
 mod settings;
@@ -260,6 +269,8 @@ mod transfer_roundtrip;
 #[cfg(all(test, unix))]
 mod transfer_selection_contract;
 mod transfer_submodules;
+#[cfg(test)]
+mod truncated_read_guard_tests;
 mod unsloth_server;
 mod voice_ops;
 mod workspace_aggregates;
@@ -339,7 +350,7 @@ pub use agent_subscriptions::StartupCompletionRecovery;
 // (created by the composition root; intent-hq/intent#4953), and the
 // bus/refresher surface leave the crate.
 pub use events::{
-    Delivery, EventBus, GitStatusRefresher, InvalidationSubscription, SharedWatchHub, Subscription,
+    Delivery, EventBus, FenceHandle, GitStatusRefresher, SharedWatchHub, Subscription,
     SubscriptionFilter, WatchHealth, WatchHealthSnapshot, WatcherRegistry,
 };
 pub use intent_acp::{PermissionOutcome, PermissionPolicy, PermissionRequestData};
@@ -534,6 +545,8 @@ pub struct Services {
     /// `None` until wired by the composition root; when unset, mutations persist
     /// as before but emit no events (keeps read-only/test wiring unchanged).
     event_bus: Option<EventBus>,
+    /// Provider worker observations per live agent generation (§5.5b).
+    agent_workers: Arc<agent_workers::AgentWorkers>,
     /// Per-agent in-memory send queues backing `agent.queueMessage` /
     /// `agent.getQueue` (and the `agent.sendMessage` auto-queue fallback). The
     /// live-stream coupling (flipping `queued` while a turn is mid-flight) lands
@@ -663,6 +676,11 @@ pub struct Services {
     /// generation up front and commits the fallback subject. In-memory only,
     /// shared across clones like the other registries.
     auto_commit_cooldowns: Arc<Mutex<HashMap<WorkspaceId, std::time::Instant>>>,
+    /// Workspaces last observed with a missing checkout folder
+    /// (intent-hq/intent#7183). Gates auto-commit and the tracked-changes
+    /// sweep and is shared with the watcher registry's presence probe.
+    /// In-memory only, shared across clones.
+    worktree_presence: worktree_presence::WorktreePresence,
     /// Per-workspace setup-stage state (§6.5 lifecycle) backing
     /// [`WorkspaceApi::workspace_setup_status`]: written at every
     /// `workspace:setup:started` / `workspace:setup:completed` publish site
@@ -700,7 +718,6 @@ pub struct Services {
     primary_auth_admitted: bool,
     terminal_tasks: Arc<delivery_tasks::DeliveryTasks>,
     pending_delete_tasks: Arc<delivery_tasks::DeliveryTasks>,
-    note_deletions: Arc<note_delete::Registry>,
     host_exec_runtime: Arc<host_exec::HostExecRuntime>,
     provider_preparation: Arc<provider_preparation::Preparation>,
     /// Child agent ids with an active terminal-delivery retry task, mapped
@@ -900,6 +917,10 @@ pub struct Services {
     /// Shared across clones and manager views: bootstrap serializes per
     /// workspace; definition replacement serializes per durable script id.
     script_locks: script_ops::ScriptLocks,
+    /// On-disk per-run script output logs (`<data_dir>/script-output`). The
+    /// composition root points it at the daemon data dir; until then it uses a
+    /// per-instance temp dir so unconfigured instances never share logs.
+    script_output: script_output_store::ScriptOutputStore,
     /// The `script.*` too-fast-exit floor in milliseconds
     /// ([`script_ops::TOO_FAST_MS`] in production). Tests raise it via the
     /// `#[cfg(test)]`-only `with_script_too_fast_ms` seam so the no-restart
@@ -1020,6 +1041,13 @@ pub struct Services {
     /// finishes before acquiring this gate to commit the ordinary subset.
     settings_revision_gate: Arc<tokio::sync::RwLock<()>>,
     settings_secret_gates: Arc<settings::SecretSettingsGates>,
+    /// Named provider profile metadata (`<data_dir>/provider-profiles.json`),
+    /// mutation lock and revision watermark (PROTOCOL §5.54). In-memory until
+    /// the composition root calls [`Services::with_provider_profiles_dir`].
+    provider_profiles: Arc<provider_profiles::ProviderProfileStore>,
+    /// Live profile processes and the settings fingerprint each started
+    /// with (PROTOCOL §5.54 activation); in-memory, per daemon process.
+    profile_activation: Arc<profile_activation::ProfileActivation>,
     /// Override for the **user** specialists directory (§18.2). `None` resolves
     /// to `~/.intent/specialists/`; tests inject a temp dir for hermetic
     /// 3-tier coverage.
@@ -1062,6 +1090,17 @@ pub struct Services {
     /// Shared across clones so consecutive turns of one agent accumulate the
     /// same stall-episode streak.
     truncation_redrives: agent_session::TruncationRedrives,
+    /// Per-agent quota failover chain of the user turn in flight
+    /// (PROTOCOL §5.54 Backup failover): see
+    /// [`quota_failover::QuotaFailoverChains`]. Shared across clones so the
+    /// turn worker's arm and the failure seam's switch observe the same chain.
+    quota_failover_chains: quota_failover::QuotaFailoverChains,
+    /// Continue-the-cut-short-turn replay marks (PROTOCOL §5.54): see
+    /// [`quota_failover::QuotaFailoverReplays`].
+    quota_failover_replays: quota_failover::QuotaFailoverReplays,
+    /// Pending `provider_returned` announcements (PROTOCOL §5.54): see
+    /// [`provider_return::ProviderReturnAnnouncements`].
+    provider_return_announcements: provider_return::ProviderReturnAnnouncements,
     /// One-shot truncation auto-redrive handoff flags
     /// (intent-hq/monorepo#2863): see
     /// [`agent_session::PendingTruncationRedrives`]. Shared across clones so
@@ -1210,6 +1249,7 @@ pub struct Services {
     repository_wire_owner: Arc<OnceLock<Weak<Services>>>,
     repository_review_capacity: Arc<repository_native_wire::review::Capacity>,
     repository_resource_capacity: Arc<repository_native_wire::resource::Capacity>,
+    repository_child_git_capacity: Arc<repository_native_wire::child_git::Capacity>,
     repository_checkout_capacity: Arc<repository_native_wire::checkout::Capacity>,
     repository_selection_capacity: Arc<repository_native_wire::selection::Capacity>,
     /// Original invalidation owner for this Services instance. Clones share it;
@@ -1434,6 +1474,26 @@ pub struct Services {
     /// Serialize quota admission through persistence per owner, including
     /// adoption; unrelated owners never wait on each other's forge reads.
     pr_monitor_registration: Arc<KeyedInflight<AgentId>>,
+    /// Original qualified registration lifetimes, never rebuilt from stored IDs.
+    review_monitor_authorities: Arc<
+        Mutex<HashMap<intent_core::PrMonitorId, Arc<repository_read_source::MonitorAuthority>>>,
+    >,
+    /// GitLab's configured connection has an independent, non-overlapping poll lane.
+    review_monitor_poll_lane: Arc<tokio::sync::Mutex<()>>,
+    /// Bounded controls consumed by the existing monitor loop, never a wake queue.
+    review_monitor_controls: Arc<
+        Mutex<Option<tokio::sync::mpsc::Sender<repository_native_wire::monitor::flush::Command>>>,
+    >,
+    /// Current original deliveries; never reconstructed from persisted wake metadata.
+    review_monitor_deliveries: repository_read_source::MonitorDeliveries,
+    /// Explicit fixture receipt for tests that exercise the real session launcher.
+    /// Captured once by the original read owner; absent from production builds.
+    #[cfg(test)]
+    test_review_monitoring_recipient: bool,
+    #[cfg(test)]
+    test_review_monitor_write_ready: Arc<Mutex<Option<Arc<tokio::sync::Notify>>>>,
+    #[cfg(test)]
+    test_export_monitor_preflight: Arc<Mutex<Option<transfer_export::MonitorExportBarrier>>>,
     /// Upper bound on one shared forge fetch within a PR-monitor sweep (60 s
     /// in production) — defense in depth above the client-level network
     /// timeouts, so a hung connection can never wedge the sweep loop. Tests
@@ -1610,6 +1670,7 @@ impl Services {
             assets_root: None,
             event_subscriptions: Arc::new(Mutex::new(HashMap::new())),
             event_bus: None,
+            agent_workers: Arc::new(agent_workers::AgentWorkers::default()),
             agent_queues: Arc::new(Mutex::new(HashMap::new())),
             queue_submission_order: Arc::new(AtomicU64::new(0)),
             draining_queue_entries: Arc::new(Mutex::new(HashMap::new())),
@@ -1631,6 +1692,7 @@ impl Services {
             auto_commit_timeout_ms: None,
             auto_commit_cooldown_ms: None,
             auto_commit_cooldowns: Arc::new(Mutex::new(HashMap::new())),
+            worktree_presence: worktree_presence::WorktreePresence::default(),
             workspace_setup_states: WorkspaceSetupStates::default(),
             agent_subscriptions: Arc::new(Mutex::new(
                 agent_subscriptions::SubscriptionRegistry::default(),
@@ -1643,7 +1705,6 @@ impl Services {
             primary_auth_admitted: false,
             terminal_tasks: Arc::new(delivery_tasks::DeliveryTasks::default()),
             pending_delete_tasks,
-            note_deletions: Arc::default(),
             host_exec_runtime: Arc::default(),
             provider_preparation: Arc::default(),
             completion_delivery_retries: Arc::new(Mutex::new(HashMap::new())),
@@ -1673,6 +1734,10 @@ impl Services {
             daemon_boot_id,
             scripts: Arc::new(Mutex::new(HashMap::new())),
             script_locks: script_ops::ScriptLocks::new(),
+            script_output: script_output_store::ScriptOutputStore::new(
+                &std::env::temp_dir().join(format!("intentd-{}", uuid::Uuid::new_v4())),
+                intent_core::config::DEFAULT_SCRIPT_OUTPUT_MAX_BYTES_PER_RUN,
+            ),
             script_too_fast_ms: script_ops::TOO_FAST_MS,
             script_parks: script_ops::ScriptParks::default(),
             completion_classify_park: None,
@@ -1698,6 +1763,8 @@ impl Services {
             settings_revision: Arc::new(AtomicU64::new(0)),
             settings_revision_gate: Arc::new(tokio::sync::RwLock::new(())),
             settings_secret_gates: Arc::new(settings::SecretSettingsGates::default()),
+            provider_profiles: Arc::new(provider_profiles::ProviderProfileStore::in_memory()),
+            profile_activation: Arc::default(),
             specialists_user_dir: None,
             specialists_bundled_dir: None,
             mcp_hub,
@@ -1707,6 +1774,9 @@ impl Services {
             turn_bookkeeping: Arc::new(Mutex::new(HashMap::new())),
             last_turn_silent_tails: Arc::new(Mutex::new(HashMap::new())),
             truncation_redrives: Arc::new(Mutex::new(HashMap::new())),
+            quota_failover_chains: Arc::new(Mutex::new(HashMap::new())),
+            quota_failover_replays: Arc::new(Mutex::new(HashSet::new())),
+            provider_return_announcements: Arc::new(Mutex::new(HashSet::new())),
             pending_truncation_redrive: Arc::new(Mutex::new(HashSet::new())),
             test_busy: Arc::new(Mutex::new(HashSet::new())),
             deferred_attention: Arc::new(Mutex::new(HashMap::new())),
@@ -1732,6 +1802,7 @@ impl Services {
             repository_lifecycle_registry: Arc::default(),
             repository_wire_owner: Arc::default(),
             repository_resource_capacity: Arc::default(),
+            repository_child_git_capacity: Arc::default(),
             repository_checkout_capacity: Arc::default(),
             repository_review_capacity: Arc::default(),
             repository_selection_capacity: Arc::default(),
@@ -1798,6 +1869,16 @@ impl Services {
             pr_monitor_debounce_seconds: None,
             pr_monitors_max_per_agent: None,
             pr_monitor_registration: Arc::default(),
+            review_monitor_authorities: Arc::default(),
+            review_monitor_poll_lane: Arc::default(),
+            review_monitor_controls: Arc::default(),
+            review_monitor_deliveries: Arc::default(),
+            #[cfg(test)]
+            test_review_monitoring_recipient: false,
+            #[cfg(test)]
+            test_review_monitor_write_ready: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            test_export_monitor_preflight: Arc::default(),
             pr_monitor_fetch_timeout: pr_monitor::PR_MONITOR_FETCH_TIMEOUT,
             pr_refresh_fetch_timeout: PR_REFRESH_FETCH_TIMEOUT,
             sweep_rate_limit: Arc::new(rate_limit::RateLimitGate::default()),
@@ -2468,6 +2549,7 @@ impl Services {
             self.script_parks.clone(),
         )
         .with_settings(self.settings_registry.clone())
+        .with_output_store(self.script_output.clone())
         .with_tasks(self.store_tasks.clone())
         .with_owner_services(self.clone())
     }
@@ -2490,6 +2572,28 @@ impl Services {
         park: Arc<script_ops::SupervisePark>,
     ) -> Self {
         self.script_parks.supervise = Some(park);
+        self
+    }
+
+    /// Test seam: park every script launch before its PTY spawns and its
+    /// output log opens (including service auto-restarts).
+    #[cfg(test)]
+    pub(crate) fn with_script_before_spawn_park(
+        mut self,
+        park: Arc<script_ops::SupervisePark>,
+    ) -> Self {
+        self.script_parks.before_spawn = Some(park);
+        self
+    }
+
+    /// Test seam: park workspace deletion after its scripts stop, before the
+    /// script output folder is deleted.
+    #[cfg(test)]
+    pub(crate) fn with_script_workspace_closed_park(
+        mut self,
+        park: Arc<script_ops::SupervisePark>,
+    ) -> Self {
+        self.script_parks.workspace_closed = Some(park);
         self
     }
 
@@ -2770,6 +2874,14 @@ impl Services {
         self
     }
 
+    /// The shared missing-checkout map (intent-hq/intent#7183), handed to the
+    /// composition root so the watcher registry's presence probe and the
+    /// auto-commit / sweep gates agree on one transition log.
+    #[must_use]
+    pub fn worktree_presence(&self) -> worktree_presence::WorktreePresence {
+        self.worktree_presence.clone()
+    }
+
     /// The shared event-invalidated working-tree status cache (monorepo#1648),
     /// handed to the composition root so the [`GitStatusRefresher`]'s
     /// watcher-driven recompute repopulates the same entries the read path
@@ -2900,6 +3012,18 @@ impl Services {
         self.script_manager().recover_monitors().await?;
         self.start_script_monitor_maintenance();
         self.script_manager().hydrate().await
+    }
+
+    /// Command-mode script runs in flight right now (admitted and not yet
+    /// durably settled, or with a live process) plus when the last one
+    /// settled. The idle update handshake counts these as busy so a staged
+    /// self-update does not kill a long check mid-run. Service-mode scripts
+    /// never count: they run indefinitely and an auto-start service is
+    /// restored after a restart. One registry lock, no I/O — cheap enough
+    /// for `system.status` and a 1 s poll.
+    #[must_use]
+    pub fn command_script_activity(&self) -> CommandScriptActivity {
+        script_ops::command_activity(&self.scripts, &self.script_locks)
     }
 
     /// Clean daemon shutdown (monorepo#1526): flag every managed script with
@@ -4673,6 +4797,33 @@ impl Services {
         self
     }
 
+    /// Store script output logs under `<data_dir>/script-output` (one file
+    /// per run). Composition-root only — call before the surface is shared.
+    #[must_use]
+    pub fn with_script_output_dir(mut self, data_dir: &Path) -> Self {
+        self.script_output = script_output_store::ScriptOutputStore::new(
+            data_dir,
+            intent_core::config::DEFAULT_SCRIPT_OUTPUT_MAX_BYTES_PER_RUN,
+        );
+        self
+    }
+
+    /// The on-disk script output store.
+    pub(crate) fn script_output_store(&self) -> &script_output_store::ScriptOutputStore {
+        &self.script_output
+    }
+
+    /// Load named provider profile metadata from
+    /// `<data_dir>/provider-profiles.json` (PROTOCOL §5.54). A malformed file
+    /// is left untouched and `providers.profiles.*` report it unreadable.
+    /// Composition-root only — call before the surface is shared/cloned,
+    /// then run [`Services::sweep_provider_profile_secrets`] once.
+    #[must_use]
+    pub fn with_provider_profiles_dir(mut self, data_dir: &Path) -> Self {
+        self.provider_profiles = Arc::new(provider_profiles::ProviderProfileStore::load(data_dir));
+        self
+    }
+
     /// Persist the per-provider `models.list` cache (PROTOCOL §5.30) under
     /// `dir` (the daemon data dir), reloading any current-version snapshot.
     /// Composition-root only — call before the surface is shared/cloned.
@@ -4970,7 +5121,9 @@ impl Services {
     ///    against its detected repo ([`Services::refresh_git_root_pr`]).
     ///
     /// Fail-soft per root: every per-root error is logged and never aborts
-    /// the sweep, so a bad root never fails the workspace refresh. Each
+    /// the sweep, so a bad root never fails the workspace refresh. A
+    /// request-budget deferral is not a per-root failure: it is counted and
+    /// logged once per repository (intent-hq/intent#7264). Each
     /// per-root forge refresh is bounded by [`PR_REFRESH_FETCH_TIMEOUT`]
     /// like the workspace refresh itself.
     ///
@@ -4978,12 +5131,17 @@ impl Services {
     /// 1–3 are pure git/store work and still run (so submodule detection,
     /// pruning, and the commit-sha backfill don't require forge
     /// credentials); only the per-root PR refresh (step 4) is skipped.
-    async fn sweep_workspace_git_roots(
+    ///
+    /// Request-budget deferrals are counted into the caller's per-sweep
+    /// `deferrals`, which [`pr_discovery::DeferralTally::log`] reports once
+    /// per repository after the whole sweep.
+    async fn sweep_workspace_git_roots_tallied(
         &self,
         ws: &Workspace,
         sc: Option<&Arc<dyn intent_sourcecontrol::SourceControl>>,
         interval_secs: u64,
         local_maintenance: bool,
+        deferrals: &mut pr_discovery::DeferralTally,
     ) {
         if ws.is_remote || ws.archived {
             return;
@@ -5161,6 +5319,7 @@ impl Services {
                 continue;
             };
             let root_id = root.id.clone();
+            let root_repo = root.repo();
             let refreshed = pr_discovery::automatically_refresh(
                 interval_secs,
                 self.refresh_git_root_pr(root, sc),
@@ -5174,6 +5333,16 @@ impl Services {
                     )
                     .await;
                 }
+                // The repository's shared slot hands the same deferral to
+                // every root: summarized once per repository per sweep.
+                Err(e) if pr_discovery::is_budget_deferral(&e) => {
+                    tracing::debug!(
+                        workspace = %ws.id.as_str(),
+                        git_root = %root_id.as_str(),
+                        "git root sweep: root refresh deferred by request budget"
+                    );
+                    deferrals.root(root_repo);
+                }
                 Err(e) => {
                     tracing::warn!(
                         workspace = %ws.id.as_str(),
@@ -5185,6 +5354,28 @@ impl Services {
                 Ok(_) => {}
             }
         }
+    }
+
+    /// One workspace's git-root sweep with its own deferral summary — the
+    /// test entry point for [`Self::sweep_workspace_git_roots_tallied`].
+    #[cfg(test)]
+    async fn sweep_workspace_git_roots(
+        &self,
+        ws: &Workspace,
+        sc: Option<&Arc<dyn intent_sourcecontrol::SourceControl>>,
+        interval_secs: u64,
+        local_maintenance: bool,
+    ) {
+        let mut deferrals = pr_discovery::DeferralTally::default();
+        self.sweep_workspace_git_roots_tallied(
+            ws,
+            sc,
+            interval_secs,
+            local_maintenance,
+            &mut deferrals,
+        )
+        .await;
+        deferrals.log(&self.pr_discovery);
     }
 
     /// True while the global sweep rate-limit pause window is active
@@ -5558,6 +5749,13 @@ impl Services {
                             discovery_rate_limited = Some(detail);
                             None
                         }
+                        Err(e) if pr_discovery::is_budget_deferral_sc(&e) => {
+                            tracing::debug!(
+                                git_root = %root.id.as_str(),
+                                "git root refresh: relink discovery deferred by request budget, persisting status only"
+                            );
+                            None
+                        }
                         Err(e) => {
                             tracing::warn!(
                                 git_root = %root.id.as_str(),
@@ -5872,6 +6070,13 @@ impl Services {
                     // workspaces (monorepo#2961).
                     Err(intent_sourcecontrol::Error::RateLimited(detail)) => {
                         discovery_rate_limited = Some(detail);
+                        None
+                    }
+                    Err(e) if pr_discovery::is_budget_deferral_sc(&e) => {
+                        tracing::debug!(
+                            workspace_id = %ws.id.as_str(),
+                            "pr refresh: relink discovery deferred by request budget, persisting status only"
+                        );
                         None
                     }
                     Err(e) => {
@@ -6252,6 +6457,7 @@ impl Services {
             )
             .await;
         }
+        let mut deferrals = pr_discovery::DeferralTally::default();
         for ws in workspaces {
             if self.settings_tasks.is_closed() {
                 break;
@@ -6289,6 +6495,13 @@ impl Services {
                         )
                         .await;
                     }
+                    Err(e) if pr_discovery::is_budget_deferral(&e) => {
+                        tracing::debug!(
+                            workspace = %ws_id.as_str(),
+                            "pr refresh: workspace refresh deferred by request budget"
+                        );
+                        deferrals.workspace(ws.repo());
+                    }
                     Err(e) => {
                         tracing::warn!(
                             workspace = %ws_id.as_str(),
@@ -6302,17 +6515,19 @@ impl Services {
             // After the workspace's own refresh, sweep its tracked git roots
             // (submodule auto-detect, auto-prune, per-root PR refresh;
             // monorepo#2053). Fail-soft internally, per-root timeouts inside.
-            self.sweep_workspace_git_roots(
+            self.sweep_workspace_git_roots_tallied(
                 &ws,
                 sc.as_ref(),
                 interval,
                 pr_ops::local_root_maintenance_due(&ws, tick, time::OffsetDateTime::now_utc()),
+                &mut deferrals,
             )
             .await;
             // Release the SQLite pool slot between workspaces so queued
             // interactive acquires win it (intent-hq/monorepo#703).
             tokio::time::sleep(SWEEP_INTER_WORKSPACE_PAUSE).await;
         }
+        deferrals.log(&self.pr_discovery);
     }
 
     /// Spawn the background PR refresh loop (§7.6): every `interval` (60 s at
@@ -6458,129 +6673,172 @@ impl Services {
             .map_err(|error| Error::Internal(format!("token usage worker failed: {error}")))?
     }
 
+    /// Refresh the materialized `agentNames` (§5.23) after an agent rename.
+    /// A rename changes no `agent_message` rows, so neither the end-of-turn
+    /// update nor the watermark-gated reconciliation scan would pick it up.
+    /// Only recomputes when the stored snapshot already names a usage bucket
+    /// for this agent, so renaming a usage-less agent never materializes a
+    /// snapshot. Best-effort: the rename itself already landed.
+    pub(crate) async fn refresh_token_usage_after_rename(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+    ) {
+        let has_bucket = match self.store.get_workspace(workspace_id).await {
+            Ok(workspace) => workspace
+                .token_usage
+                .is_some_and(|usage| usage.by_agent_id.contains_key(&agent_id.0)),
+            Err(e) => {
+                tracing::warn!(workspace = %workspace_id.as_str(), error = %e, "read token usage before rename refresh failed");
+                return;
+            }
+        };
+        if !has_bucket {
+            return;
+        }
+        if let Err(e) = self
+            .recompute_workspace_token_usage(workspace_id, false)
+            .await
+        {
+            tracing::warn!(
+                workspace = %workspace_id.as_str(),
+                error = %e,
+                "recompute workspace token usage after rename failed"
+            );
+        }
+    }
+
     async fn recompute_workspace_token_usage_owned(
         &self,
         workspace_id: &WorkspaceId,
         guard_zero_regression: bool,
     ) -> Result<bool> {
-        let written =
-            self.store
-                .update_workspace_token_usage(workspace_id, |usage_data, current| {
-                    // Tally usage without hydrating full message logs (finding F2;
-                    // snapshot/baseline-backed sessions arrive with empty contents).
-                    let mut tallies = Vec::new();
-                    let mut cross_rows = Vec::new();
-                    for (agent_id, model, snapshot, baseline, contents, cells) in usage_data {
-                        let reported =
-                            intent_core::token_usage_reported(baseline.as_ref(), snapshot.as_ref());
-                        let mut contributed = false;
-                        let has_materialized_totals = cells.iter().any(|cell| {
-                            cell.reported_totals != intent_core::TokenUsageTotals::default()
-                        });
-                        for cell in cells {
-                            let totals = if reported {
-                                cell.reported_totals.clone()
-                            } else {
-                                let mut totals = token_usage::agent_token_tally(
-                                    agent_id,
-                                    Some(&cell.model),
-                                    None,
-                                    None,
-                                    &cell.message_usage,
-                                )
-                                .totals;
-                                totals.cost.clone_from(&cell.reported_totals.cost);
-                                totals
-                            };
-                            if totals != intent_core::TokenUsageTotals::default()
-                                || cell.human_messages != 0
-                                || cell.agent_messages != 0
-                            {
-                                contributed = true;
-                                let model = if cell.model.is_empty() {
-                                    token_usage::UNKNOWN_MODEL.to_string()
-                                } else {
-                                    cell.model.clone()
-                                };
-                                tallies.push(token_usage::AgentTokenTally {
-                                    agent_id: agent_id.clone(),
-                                    model: model.clone(),
-                                    totals: totals.clone(),
-                                });
-                                cross_rows.push(intent_core::TokenUsageCrossFilterRow {
-                                    agent_id: agent_id.clone(),
-                                    model,
-                                    totals,
-                                    human_messages: cell.human_messages,
-                                    agent_messages: cell.agent_messages,
-                                });
-                            }
-                        }
-                        let fallback = token_usage::agent_token_tally(
-                            agent_id,
-                            model.as_deref(),
-                            baseline.as_ref(),
-                            snapshot.as_ref(),
-                            contents,
-                        );
-                        if reported
-                            && !has_materialized_totals
-                            && fallback.totals != intent_core::TokenUsageTotals::default()
-                        {
-                            if let Some(row) = cross_rows.iter_mut().rev().find(|row| {
-                                row.agent_id == *agent_id && row.model == fallback.model
-                            }) {
-                                row.totals = fallback.totals.clone();
-                            } else {
-                                cross_rows.push(intent_core::TokenUsageCrossFilterRow {
-                                    agent_id: agent_id.clone(),
-                                    model: fallback.model.clone(),
-                                    totals: fallback.totals.clone(),
-                                    human_messages: 0,
-                                    agent_messages: 0,
-                                });
-                            }
-                            tallies.push(fallback.clone());
-                            contributed = true;
-                        }
-                        if !contributed {
-                            tallies.push(fallback);
-                        }
-                    }
-                    cross_rows.sort_by(|a, b| {
-                        a.agent_id
-                            .cmp(&b.agent_id)
-                            .then_with(|| a.model.cmp(&b.model))
+        let written = self
+            .store
+            .update_workspace_token_usage(workspace_id, |usage_data, current| {
+                // Tally usage without hydrating full message logs (finding F2;
+                // snapshot/baseline-backed sessions arrive with empty contents).
+                let mut tallies = Vec::new();
+                let mut cross_rows = Vec::new();
+                for (agent_id, model, snapshot, baseline, contents, cells, _name) in usage_data {
+                    let reported =
+                        intent_core::token_usage_reported(baseline.as_ref(), snapshot.as_ref());
+                    let mut contributed = false;
+                    let has_materialized_totals = cells.iter().any(|cell| {
+                        cell.reported_totals != intent_core::TokenUsageTotals::default()
                     });
-                    let mut usage = token_usage::aggregate_token_usage(&tallies);
-                    usage.by_agent_model = Some(cross_rows);
-                    usage.last_scan_at = Some(now_iso());
-
-                    if guard_zero_regression
-                        && !usage_data.is_empty()
-                        && usage.totals == intent_core::TokenUsageTotals::default()
-                        && current.is_some_and(|prev| {
-                            prev.totals != intent_core::TokenUsageTotals::default()
-                        })
-                    {
-                        // Reconciliation guard: never clobber a fresher live snapshot
-                        // with an all-zero tally while session rows exist (the racing-
-                        // sweep case). An empty workspace (all sessions deleted) has no
-                        // turn to race, so the zero recount above writes through.
-                        return None;
-                    }
-                    let changed = match current {
-                        Some(prev) => {
-                            prev.by_agent_id != usage.by_agent_id
-                                || prev.by_model != usage.by_model
-                                || prev.by_agent_model != usage.by_agent_model
-                                || prev.totals != usage.totals
+                    for cell in cells {
+                        let totals = if reported {
+                            cell.reported_totals.clone()
+                        } else {
+                            let mut totals = token_usage::agent_token_tally(
+                                agent_id,
+                                Some(&cell.model),
+                                None,
+                                None,
+                                &cell.message_usage,
+                            )
+                            .totals;
+                            totals.cost.clone_from(&cell.reported_totals.cost);
+                            totals
+                        };
+                        if totals != intent_core::TokenUsageTotals::default()
+                            || cell.human_messages != 0
+                            || cell.agent_messages != 0
+                        {
+                            contributed = true;
+                            let model = if cell.model.is_empty() {
+                                token_usage::UNKNOWN_MODEL.to_string()
+                            } else {
+                                cell.model.clone()
+                            };
+                            tallies.push(token_usage::AgentTokenTally {
+                                agent_id: agent_id.clone(),
+                                model: model.clone(),
+                                totals: totals.clone(),
+                            });
+                            cross_rows.push(intent_core::TokenUsageCrossFilterRow {
+                                agent_id: agent_id.clone(),
+                                model,
+                                totals,
+                                human_messages: cell.human_messages,
+                                agent_messages: cell.agent_messages,
+                            });
                         }
-                        None => true,
-                    };
-                    changed.then_some(usage)
-                })
-                .await?;
+                    }
+                    let fallback = token_usage::agent_token_tally(
+                        agent_id,
+                        model.as_deref(),
+                        baseline.as_ref(),
+                        snapshot.as_ref(),
+                        contents,
+                    );
+                    if reported
+                        && !has_materialized_totals
+                        && fallback.totals != intent_core::TokenUsageTotals::default()
+                    {
+                        if let Some(row) = cross_rows
+                            .iter_mut()
+                            .rev()
+                            .find(|row| row.agent_id == *agent_id && row.model == fallback.model)
+                        {
+                            row.totals = fallback.totals.clone();
+                        } else {
+                            cross_rows.push(intent_core::TokenUsageCrossFilterRow {
+                                agent_id: agent_id.clone(),
+                                model: fallback.model.clone(),
+                                totals: fallback.totals.clone(),
+                                human_messages: 0,
+                                agent_messages: 0,
+                            });
+                        }
+                        tallies.push(fallback.clone());
+                        contributed = true;
+                    }
+                    if !contributed {
+                        tallies.push(fallback);
+                    }
+                }
+                cross_rows.sort_by(|a, b| {
+                    a.agent_id
+                        .cmp(&b.agent_id)
+                        .then_with(|| a.model.cmp(&b.model))
+                });
+                let mut usage = token_usage::aggregate_token_usage(&tallies);
+                usage.by_agent_model = Some(cross_rows);
+                usage.agent_names = token_usage::agent_names(
+                    &usage.by_agent_id,
+                    usage_data
+                        .iter()
+                        .map(|row| (row.0.as_str(), row.6.as_str())),
+                );
+                usage.last_scan_at = Some(now_iso());
+
+                if guard_zero_regression
+                    && !usage_data.is_empty()
+                    && usage.totals == intent_core::TokenUsageTotals::default()
+                    && current
+                        .is_some_and(|prev| prev.totals != intent_core::TokenUsageTotals::default())
+                {
+                    // Reconciliation guard: never clobber a fresher live snapshot
+                    // with an all-zero tally while session rows exist (the racing-
+                    // sweep case). An empty workspace (all sessions deleted) has no
+                    // turn to race, so the zero recount above writes through.
+                    return None;
+                }
+                let changed = match current {
+                    Some(prev) => {
+                        prev.by_agent_id != usage.by_agent_id
+                            || prev.by_model != usage.by_model
+                            || prev.by_agent_model != usage.by_agent_model
+                            || prev.totals != usage.totals
+                            || prev.agent_names != usage.agent_names
+                    }
+                    None => true,
+                };
+                changed.then_some(usage)
+            })
+            .await?;
         let Some(usage) = written else {
             return Ok(false);
         };
@@ -6744,8 +7002,6 @@ impl Services {
         // and PtyHost::kill_all has refused/reaped every late PTY spawn.
         // Pending undo waits are discarded on restart by their wire contract;
         // a timer that already claimed its delete finishes the cascade.
-        self.note_deletions.close();
-        self.note_deletions.tasks.shutdown().await;
         self.pending_delete_tasks.shutdown().await;
         // Device-flow cancellation is cooperative: remove the generation and
         // join any in-flight token write/reconciliation instead of aborting it.
@@ -7386,20 +7642,23 @@ impl Services {
     /// (`after_all`) watches count too: a coordinator idling while its delegation
     /// group is open is genuinely waiting on its children.
     ///
-    /// 2-cycle deadlock guard: a mutual watch pair (A⇄B) in which BOTH sides
-    /// are idle would defer forever — each waits on the other, neither ever
-    /// fires. An outgoing watch on a target that watches this agent back AND is
-    /// itself idle (not busy, empty ready-to-send queue) is therefore NOT
-    /// counted as a waiting reason, so the deadlocked pair delivers as before
-    /// (both watchers fire). A mutual pair whose counterpart is still busy is a
-    /// genuine wait (the busy side will complete and wake this one), so it
-    /// still defers. The guard fails open in one asymmetric case: a
-    /// counterpart that is idle but itself hook-waiting or agent-waiting on a
-    /// third agent is not actually deadlocked (it will run again when its own
-    /// wait resolves), yet the edge is still declassified and this agent's
-    /// watchers fire early. That is the safe direction (an early wake, not a
-    /// stall) — the same class of accepted imprecision as deeper cycles
-    /// (A→B→C→A), which the guard does not detect either.
+    /// Idle-cycle deadlock guard: a closed watch cycle whose members are ALL
+    /// idle would defer forever — each waits on the next, none ever fires.
+    /// The mutual pair (A⇄B) is the 2-member case; deeper cycles
+    /// (A→B→C→A) deadlock the same way (issue intent-hq/intent#7205: idle
+    /// agents left "waiting" indefinitely on persisted cycles). An outgoing
+    /// watch on a target from which a chain of watches leads back to this
+    /// agent, with the target and every intermediate agent idle (not busy,
+    /// empty ready-to-send queue), is therefore NOT counted as a waiting
+    /// reason, so the last idle in the cycle delivers and the cycle unwinds
+    /// one wake per edge. A cycle with a busy (or queued) member is a genuine
+    /// wait (that member will complete and wake its watcher), so it still
+    /// defers, as does an acyclic chain. The guard fails open in one
+    /// asymmetric case: a cycle member that is idle but hook-waiting or
+    /// agent-waiting on an agent OUTSIDE the cycle is not actually
+    /// deadlocked (it will run again when its own wait resolves), yet the
+    /// edge is still declassified and this agent's watchers fire early. That
+    /// is the safe direction (an early wake, not a stall).
     ///
     /// `report_delivered` watches are excluded (issue
     /// intent-hq/monorepo#1643): such a watch has already delivered its
@@ -7425,12 +7684,18 @@ impl Services {
             .into_iter()
             .map(|w| w.child_agent_id)
             .collect();
-        let incoming: Vec<AgentId> = self
-            .find_watches_for_child(agent_id)
-            .into_iter()
-            .map(|w| w.parent_agent_id)
+        if outgoing.is_empty() {
+            return false;
+        }
+        let edges: Vec<(AgentId, AgentId)> = self
+            .agent_subscriptions
+            .lock()
+            .expect("agent subscription registry poisoned")
+            .subscriptions
+            .iter()
+            .map(|w| (w.parent_agent_id.clone(), w.child_agent_id.clone()))
             .collect();
-        self.classify_agent_waiting(agent_id, &outgoing, &incoming)
+        self.classify_agent_waiting(agent_id, &outgoing, &edges)
     }
 
     /// Durable variant of [`Services::agent_is_waiting_on_agents`]: falls
@@ -7464,38 +7729,66 @@ impl Services {
         if outgoing.is_empty() {
             return false;
         }
-        let incoming: Vec<AgentId> = rows
+        let edges: Vec<(AgentId, AgentId)> = rows
             .iter()
-            .filter(|r| &r.child_agent_id == agent_id)
-            .map(|r| r.parent_agent_id.clone())
+            .map(|r| (r.parent_agent_id.clone(), r.child_agent_id.clone()))
             .collect();
-        self.classify_agent_waiting(agent_id, &outgoing, &incoming)
+        self.classify_agent_waiting(agent_id, &outgoing, &edges)
     }
 
     /// Core of the agent-waiting classification, shared between the live
     /// in-memory predicate above and the persisted-row fallback used by group
     /// rehydration (which runs before the watch registry is loaded at
-    /// startup). `outgoing` is the agent's outgoing watch targets and
-    /// `incoming` the parents watching it; busy/queue state is probed live in
-    /// both cases (the 2-cycle guard).
+    /// startup). `outgoing` is the agent's waiting (non-`report_delivered`)
+    /// watch targets and `edges` every `(parent, child)` watch edge in the
+    /// graph; busy/queue state is probed live in both cases (the idle-cycle
+    /// guard).
     pub(crate) fn classify_agent_waiting(
         &self,
         agent_id: &AgentId,
         outgoing: &[AgentId],
-        incoming: &[AgentId],
+        edges: &[(AgentId, AgentId)],
     ) -> bool {
         outgoing.iter().any(|target| {
             if target == agent_id {
                 // Defensive: a self-watch is never a waiting reason.
                 return false;
             }
-            let mutual_idle = incoming.contains(target)
-                && !self.agent_is_busy(target.clone())
-                && !self.has_ready_to_send(target);
-            // Count this edge as a waiting reason unless it is a deadlocked
-            // mutual-idle 2-cycle.
-            !mutual_idle
+            // Count this edge as a waiting reason unless it closes a
+            // deadlocked all-idle cycle back to `agent_id`.
+            !self.idle_watch_path_leads_back(agent_id, target, edges)
         })
+    }
+
+    /// Whether a chain of watch `edges` leads from `target` back to
+    /// `agent_id` through agents that are all idle (not busy, empty
+    /// ready-to-send queue), `target` included — i.e. the outgoing edge
+    /// `agent_id → target` closes an all-idle cycle no member can break.
+    fn idle_watch_path_leads_back(
+        &self,
+        agent_id: &AgentId,
+        target: &AgentId,
+        edges: &[(AgentId, AgentId)],
+    ) -> bool {
+        let mut seen: HashSet<&AgentId> = HashSet::new();
+        let mut stack: Vec<&AgentId> = vec![target];
+        while let Some(node) = stack.pop() {
+            if node == agent_id || !seen.insert(node) {
+                continue;
+            }
+            if self.agent_is_busy(node.clone()) || self.has_ready_to_send(node) {
+                continue;
+            }
+            for (parent, child) in edges {
+                if parent == node {
+                    if child == agent_id {
+                        return true;
+                    }
+                    stack.push(child);
+                }
+            }
+        }
+        false
     }
 
     /// monorepo#1280: re-run completion-watch delivery for `child_id` after a
@@ -8162,7 +8455,7 @@ impl Services {
     /// agent-waiting idle defers WATCH delivery exactly like a hook-waiting
     /// one (ungrouped watches neither deliver nor retire; grouped memberships
     /// skip the settlement record), classified LIVE at delivery time via
-    /// [`Services::agent_is_waiting_on_agents`] (which bakes in the 2-cycle
+    /// [`Services::agent_is_waiting_on_agents`] (which bakes in the idle-cycle
     /// deadlock guard). Like hook-waiting (monorepo#1483), agent-waiting does
     /// NOT defer the child's OWN `after_all` group seal — an `after_all`
     /// coordinator always holds grouped outgoing watches on its own children,
@@ -8284,22 +8577,21 @@ impl Services {
         // own poll loop will wake the agent when it changes or settles.
         // Probed live, same as the hook probe, and independently of
         // `hook_waiting` so the GROUPED branch below can defer on either.
-        let active_pr_monitors: Vec<serde_json::Value> =
-            if event.event_type == AGENT_IDLE && !completion_reported {
-                self.active_pr_monitors_for_agent(child_id)
-                    .await
-                    .iter()
-                    .map(crate::pr_monitor::waiting_on_pr_monitors_entry)
-                    .collect()
-            } else {
-                Vec::new()
-            };
-        let pr_monitor_waiting = !active_pr_monitors.is_empty();
+        let pr_monitor_waiting = if event.event_type == AGENT_IDLE && !completion_reported {
+            !self.active_pr_monitors_for_agent(child_id).await.is_empty()
+        } else {
+            false
+        };
+        let active_pr_monitors = if pr_monitor_waiting {
+            self.legacy_pr_monitor_wait_entries(child_id).await
+        } else {
+            Vec::new()
+        };
         // Idle-visibility deferral (issue intent-hq/monorepo#1468): an
         // `agent:idle` for a child that itself holds live outgoing completion
         // watches on other, unsettled agents is not its real completion — it
         // will run again when a watched target completes. Classified LIVE at
-        // delivery time (like the hook probe) and with the 2-cycle deadlock
+        // delivery time (like the hook probe) and with the idle-cycle deadlock
         // guard baked into the predicate. This defers WATCH delivery only; it
         // must NOT defer the child's own after_all group seal (see the
         // `interim_idle` vs. `seal_interim` split below): a coordinator that
@@ -8648,7 +8940,7 @@ impl Services {
                 // Unlike the queue-interim case below, grouped watches DO
                 // defer here: a hook-waiting child is bounded by the hook TTL
                 // (§5.40) and an agent-waiting child is bounded by its watched
-                // target's completion (plus the 2-cycle guard), so the group
+                // target's completion (plus the idle-cycle guard), so the group
                 // cannot hang forever. NB this defers this child's record in
                 // ITS parent's group; the child's OWN after_all group seal is
                 // gated separately on `seal_interim` (which excludes
@@ -10849,6 +11141,27 @@ fn check_set_content_reduction(
     Ok(())
 }
 
+/// Truncated-read write guard: compare the writer's `baseContentBytes` with
+/// the UTF-8 size of the base `merge` resolved — the stored `current`
+/// content on the exact path, the retained snapshot on the merge path. The
+/// last-writer-wins path has no known base, so a guarded write is refused
+/// there rather than overwriting text the writer never saw.
+fn check_content_base(expected: u64, merge: &SetContentMerge, current: &str) -> Result<()> {
+    let resolved = match merge.outcome {
+        "exact" => Some(current.len()),
+        "merged" => merge.base.as_deref().map(str::len),
+        _ => None,
+    }
+    .map(|len| u64::try_from(len).unwrap_or(u64::MAX));
+    if resolved == Some(expected) {
+        return Ok(());
+    }
+    Err(Error::ContentBaseMismatch {
+        base_content_bytes: expected,
+        resolved_base_bytes: resolved,
+    })
+}
+
 /// How [`persist_merged_content`] turns one attempt's merged text into the
 /// text it persists.
 #[derive(Clone, Copy)]
@@ -10894,6 +11207,16 @@ struct ContentWrite<'a> {
     author: &'a NoteVersionAuthor,
     /// Method label for the merge trace.
     op: &'static str,
+    /// The writer's `baseContentBytes` (truncated-read write guard): when
+    /// `Some`, every attempt refuses the write with
+    /// [`Error::ContentBaseMismatch`] unless it equals the UTF-8 size of the
+    /// base that attempt resolves (the stored content on the exact path, the
+    /// merge snapshot on the stale path; an unknown base always refuses, so
+    /// a guarded write never degrades to last-writer-wins). Without
+    /// `expected_version` a retry after a lost rev gate is refused too: the
+    /// concurrent text was never the writer's base. `None` (surgical ops,
+    /// agents, MCP) is unguarded.
+    base_content_bytes: Option<u64>,
 }
 
 /// Read-merge-persist loop every client content write runs through
@@ -10930,6 +11253,7 @@ async fn persist_merged_content(
         policy,
         author,
         op,
+        base_content_bytes,
     } = write;
     let normalized;
     let merge_input = match policy {
@@ -10948,6 +11272,16 @@ async fn persist_merged_content(
         };
         let old_content = note.content.clone();
         let current_rev = note.rev;
+        if let (Some(expected), None, true) = (base_content_bytes, expected_version, attempt > 1) {
+            // A guarded write without `expectedVersion` checked its base
+            // against the row the previous attempt read; a write that landed
+            // since is text the writer never saw, so it is refused rather
+            // than retried over (the caller holds no rev to merge from).
+            return Err(Error::ContentBaseMismatch {
+                base_content_bytes: expected,
+                resolved_base_bytes: Some(u64::try_from(old_content.len()).unwrap_or(u64::MAX)),
+            });
+        }
         let merge = merge_set_content(
             store,
             workspace_id,
@@ -10957,6 +11291,9 @@ async fn persist_merged_content(
             expected_version,
         )
         .await?;
+        if let Some(expected) = base_content_bytes {
+            check_content_base(expected, &merge, &old_content)?;
+        }
         if let ContentWritePolicy::SetContent {
             confirm_replacement,
         } = policy
@@ -10985,8 +11322,9 @@ async fn persist_merged_content(
         note.content = content.clone();
         let now = now_iso();
         note.updated_at = now.clone();
-        match plan.persist(store, &note, Some(current_rev), author).await {
+        match persist_note_content(store, &note, Some(current_rev), author).await {
             Ok(rev) => {
+                plan.apply_orphaned(store, workspace_id).await?;
                 return Ok(MergedContentWrite {
                     note,
                     old_content,
@@ -11011,8 +11349,11 @@ async fn persist_merged_content(
 /// Returns a [`ReanchorPlan`]: the possibly-rewritten markdown plus the set
 /// of comments whose `is_orphaned` flag needs to be flipped to `true`.
 /// Already-orphaned comments are left as-is. The plan does **no** store
-/// writes. Callers commit source, its version, orphan flags and anchor readiness
-/// together through the versioned writer; a failure leaves every row unchanged.
+/// writes — callers first persist the note-content change via an atomic
+/// versioned write (`persist_note_content` / the `*_with_version` store
+/// helpers) and then call [`ReanchorPlan::apply_orphaned`] so a failed note write
+/// cannot leave comment rows flagged orphaned while the persisted markdown
+/// still contains the original anchors.
 ///
 /// The lookup is scoped to `workspace_id` because `note_id` (e.g. the
 /// well-known `spec` id) is not globally unique — see
@@ -11090,6 +11431,7 @@ async fn reanchor_note_comments(
     current = note_ops::scrub_phantom_anchor_markers(&current, &live_ids);
     Ok(ReanchorPlan {
         content: current,
+        note_id: note_id.clone(),
         orphaned,
     })
 }
@@ -11105,30 +11447,34 @@ fn live_comment_ids(comments: &[Comment]) -> HashSet<String> {
 }
 
 /// Result of [`reanchor_note_comments`]: the rewritten note markdown and the
-/// set of comment rows whose `is_orphaned` flag needs to flip to `true`.
+/// ids of root comments whose `is_orphaned` flag needs to flip to `true`.
 struct ReanchorPlan {
     content: String,
+    note_id: NoteId,
+    /// Ids of root comments to flag orphaned (never whole cached rows).
     orphaned: Vec<String>,
 }
 
 impl ReanchorPlan {
-    async fn persist(
-        &self,
-        store: &Store,
-        note: &Note,
-        expected_version: Option<i64>,
-        author: &NoteVersionAuthor,
-    ) -> Result<i64> {
-        store
-            .update_note_with_version_and_orphans(
-                note,
-                expected_version,
-                author,
-                &note.updated_at,
-                &self.orphaned,
-            )
-            .await
-            .map(|(revision, _)| revision)
+    /// Persist the queued orphan flips. Callers **must** run this only after
+    /// the note-content write has succeeded so a note-write failure cannot
+    /// leave comment rows marked orphaned while the persisted markdown still
+    /// contains the original anchors. If a comment update fails after the
+    /// note has been written the anchors on disk are still a valid pointer
+    /// (either intact or scrubbed) and the next mutation's reanchor pass
+    /// will finish the job.
+    ///
+    /// Each flip is a targeted update of the orphan flag and its timestamp,
+    /// never a write-back of the comment row read before the note write: a
+    /// thread resolved in between must stay resolved (intentd#2592 review).
+    async fn apply_orphaned(self, store: &Store, workspace_id: &WorkspaceId) -> Result<()> {
+        let now = now_iso();
+        for id in self.orphaned {
+            store
+                .mark_comment_orphaned(workspace_id, &self.note_id, &id, &now)
+                .await?;
+        }
+        Ok(())
     }
 }
 
@@ -11253,25 +11599,14 @@ impl Services {
     /// Run `attribute_lines` over the note's current content + full version
     /// history, persist the result, and emit `line-attribution:updated` as a
     /// broadcast-only (transient, never persisted) event to live subscribers.
-    /// A generation ticket binds the computation to its original source and
-    /// prevents an older or superseded job from publishing over newer state.
-    /// Indexed attribution and the compatible legacy snapshot commit together.
+    /// The write is idempotent (upsert), so a race between two computes leaves
+    /// the store consistent with the *latest* one to complete.
     async fn compute_and_persist_line_attribution(
         &self,
         workspace_id: &WorkspaceId,
         note_id: &NoteId,
     ) -> Result<LineAttributionData> {
         let note = fetch_note(&self.store, workspace_id, note_id).await?;
-        let job = self
-            .store
-            .begin_note_attribution(workspace_id, note_id, note.rev)
-            .await?;
-        // Publish the committed pending invalidation without fabricating an
-        // empty legacy attribution result. Existing note listeners can re-read.
-        publish_event_transient(
-            self.event_bus.as_ref(),
-            &note_change_event(workspace_id, note_id, &note.title, NOTE_UPDATED, "update"),
-        );
         let summaries = self.store.list_note_versions(workspace_id, note_id).await?;
         let mut versions: Vec<NoteVersion> = Vec::with_capacity(summaries.len());
         for summary in &summaries {
@@ -11310,9 +11645,7 @@ impl Services {
             computed_at: now_iso(),
             attributions: map,
         };
-        self.store
-            .publish_note_attribution(&job, &note.content, &data)
-            .await?;
+        self.store.upsert_note_line_attribution(&data).await?;
         publish_event_transient(
             self.event_bus.as_ref(),
             &line_attribution_updated_event(&data),
@@ -11964,6 +12297,7 @@ async fn append_primitive(
             policy: ContentWritePolicy::Surgical,
             author: &author,
             op: "primitive.append",
+            base_content_bytes: None,
         },
     )
     .await?;
@@ -14313,6 +14647,22 @@ fn comment_resolved_event(
 /// (§6.5). Self-sufficient payload `{ workspaceId, workspace }` (§6.7) so a
 /// client can render the new workspace without a follow-up read.
 fn workspace_created_event(ws: &Workspace) -> NewEvent {
+    workspace_created_event_with_origin(ws, None)
+}
+
+/// [`workspace_created_event`] plus the optional `data.origin` provenance
+/// (§6.5, [`WorkspaceCreate::origin`]); `None` keeps the plain payload.
+fn workspace_created_event_with_origin(
+    ws: &Workspace,
+    origin: Option<&intent_core::WorkspaceCreateOrigin>,
+) -> NewEvent {
+    let mut data = serde_json::json!({
+        "workspaceId": ws.id.as_str(),
+        "workspace": ws,
+    });
+    if let Some(origin) = origin {
+        data["origin"] = serde_json::json!(origin);
+    }
     NewEvent {
         workspace_id: ws.id.clone(),
         timestamp: now_iso(),
@@ -14322,10 +14672,7 @@ fn workspace_created_event(ws: &Workspace) -> NewEvent {
         correlation_id: None,
         parent_event_id: None,
         metadata: None,
-        data: serde_json::json!({
-            "workspaceId": ws.id.as_str(),
-            "workspace": ws,
-        }),
+        data,
     }
 }
 
@@ -15420,6 +15767,60 @@ pub(crate) async fn publish_event(bus: Option<&EventBus>, event: NewEvent) {
     };
     if let Err(e) = bus.publish(&event).await {
         tracing::warn!(error = %e, "failed to publish change event");
+    }
+}
+
+impl Services {
+    /// §5.5b ownership: the agent must exist in `workspace_id` and the caller
+    /// must be able to read it; an absent agent, an agent of another workspace
+    /// and an unauthorized caller are the same `not-found`. Returns the
+    /// agent's configured provider for a no-session snapshot.
+    async fn authorize_agent_workers(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+    ) -> Result<String> {
+        let not_found = || Error::NotFound(format!("agent {agent_id}"));
+        let session = self
+            .store
+            .get_agent_session_summary(agent_id)
+            .await
+            .map_err(|_| not_found())?;
+        if session.workspace_id != *workspace_id {
+            return Err(not_found());
+        }
+        self.require_member(workspace_id)
+            .await
+            .map_err(|e| match e {
+                Error::Forbidden(_) => not_found(),
+                other => other,
+            })?;
+        Ok(session.provider.unwrap_or_default())
+    }
+
+    /// The §5.5b worker projections.
+    pub(crate) fn agent_workers(&self) -> &agent_workers::AgentWorkers {
+        &self.agent_workers
+    }
+
+    /// Broadcast a changed `WorkerSnapshot` as the transient
+    /// `agent:workers-changed` event (§5.5b): never persisted, never a wake.
+    pub(crate) fn publish_workers_snapshot(&self, snapshot: serde_json::Value) {
+        let Some(workspace_id) = snapshot["workspaceId"].as_str().map(WorkspaceId::from) else {
+            return;
+        };
+        let event = NewEvent {
+            workspace_id,
+            timestamp: now_iso(),
+            event_type: intent_core::events::AGENT_WORKERS_CHANGED.to_string(),
+            actor: intent_core::EventActor::default(),
+            session_id: None,
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            data: snapshot,
+        };
+        let _ = publish_event_transient(self.event_bus.as_ref(), &event);
     }
 }
 
@@ -16536,13 +16937,12 @@ impl Services {
             note.updated_at = now_iso();
             let children: Vec<Note> = created.iter().map(|(child, _)| child.clone()).collect();
             match store
-                .update_note_with_version_and_children_and_orphans(
+                .update_note_with_version_and_children(
                     &note,
                     Some(read_rev),
                     &children,
                     &author,
                     &note.updated_at,
-                    &plan.orphaned,
                 )
                 .await
             {
@@ -16556,6 +16956,7 @@ impl Services {
                         created = created.len(),
                         "task blocks converted"
                     );
+                    plan.apply_orphaned(store, &workspace_id).await?;
                     break (note, parsed, warnings, created, block_note_ids);
                 }
                 Err(Error::Conflict { .. }) if attempt < SET_CONTENT_MAX_ATTEMPTS => {}
@@ -17240,6 +17641,13 @@ impl Services {
         expected: Arc<SettingsSnapshot>,
         mut admission: PreparedReloadAdmission,
     ) -> Result<SettingsChanged> {
+        type Completion = (
+            PreparedReloadAdmission,
+            Option<Arc<source_control_auth_ops::repository_owner::RepositorySettingsWrite>>,
+            Result<SettingsChanged>,
+            Option<source_control_auth_ops::repository_owner::GitlabCredentialGuard>,
+            tokio::sync::OwnedRwLockWriteGuard<()>,
+        );
         let registry = self
             .settings_registry
             .as_deref()
@@ -17252,7 +17660,78 @@ impl Services {
         } else {
             None
         };
-        let revision_guard = admission.wait(self.settings_revision_gate.write()).await?;
+        let revision_guard = admission
+            .wait(self.settings_revision_gate.clone().write_owned())
+            .await?;
+        let (sender, receiver) = tokio::sync::oneshot::channel::<Completion>();
+        let services = self.clone();
+        // Pre-publication waits remain on the original watcher. Register the
+        // finite completion owner before committing, then hand it the SAME
+        // admitted write and guards without an intervening await.
+        let task =
+            self.store_tasks
+                .spawn_draining_with_current_caller(async move {
+                    let (admission, write, result, credential_guard, revision_guard) = receiver
+                        .await
+                        .map_err(|_| Error::Internal("settings reload was not published".into()))?;
+                    admission
+                        .finish(async {
+                            if let Some(write) = write
+                                .as_ref()
+                                .filter(|write| write.native_retirement_pending())
+                            {
+                                let completed = write
+                                    .completed_source(services.gitlab_secret_store.clone())
+                                    .await;
+                                drop(revision_guard);
+                                write.release_native_wait_lease();
+                                drop(credential_guard);
+                                if let Err(error) = write.join_native_retirement().await {
+                                    // The adopted external file remains authoritative. Keep
+                                    // any original publication error; never invent rollback.
+                                    return result.and(Err(error));
+                                }
+                                let credential_guard = services.gitlab_credential_gate.lock().await;
+                                write.restore_native_wait_lease(&credential_guard);
+                                if let Err(error) = write
+                                    .check_completed_source(
+                                        completed,
+                                        services.gitlab_secret_store.clone(),
+                                    )
+                                    .await
+                                {
+                                    return result.and(Err(error));
+                                }
+                                services
+                                    .settle_gitlab_repository_settings(
+                                        Some(write),
+                                        result.is_ok(),
+                                        false,
+                                    )
+                                    .await;
+                                if let Ok(notice) = &result {
+                                    let _revision = services.settings_revision_gate.write().await;
+                                    services.apply_external_settings_change(notice).await;
+                                }
+                                result
+                            } else {
+                                if let Ok(notice) = &result {
+                                    services.apply_external_settings_change(notice).await;
+                                }
+                                drop(revision_guard);
+                                services
+                                    .settle_gitlab_repository_settings(
+                                        write.as_deref(),
+                                        result.is_ok(),
+                                        false,
+                                    )
+                                    .await;
+                                result
+                            }
+                        })
+                        .await
+                })
+                .ok_or_else(|| Error::Internal("daemon is shutting down".into()))?;
         let (write, result) = admission.publish(|| {
             let write = if self.gitlab_credential_gate.has_settings_boundary() {
                 credential_guard
@@ -17271,17 +17750,18 @@ impl Services {
             let result = registry.publish_repository_reload(candidate, write.as_deref());
             Ok((write, result))
         })?;
-        admission
-            .finish(async {
-                if let Ok(notice) = &result {
-                    self.apply_external_settings_change(notice).await;
-                }
-                drop(revision_guard);
-                self.settle_gitlab_repository_settings(write.as_deref(), result.is_ok(), false)
-                    .await;
-                result
-            })
-            .await
+        sender
+            .send((admission, write, result, credential_guard, revision_guard))
+            .map_err(|_| {
+                Error::Internal(
+                    "settings reload completion owner unavailable; state may be unknown".into(),
+                )
+            })?;
+        task.await.map_err(|error| {
+            Error::Internal(format!(
+                "settings reload completion failed: {error}; state may be unknown"
+            ))
+        })?
     }
 
     /// Apply an **externally driven** settings change (config.toml
@@ -17628,6 +18108,10 @@ impl Services {
             services
                 .cancel_script_monitors(&id, None, "workspace-deleted")
                 .await?;
+            // Refuse new script launches, auto-restarts and output logs, and
+            // stop the running scripts, so nothing writes a log after the
+            // output folder is deleted below. Held until this delete returns.
+            let _scripts_closed = services.script_manager().close_workspace(&id).await;
             // Terminate live agent sessions BEFORE the store cascade drops
             // their rows. A same-slug recreate hitting `agent.list` after the
             // delete would otherwise surface ghost sessions whose workers are
@@ -17894,6 +18378,9 @@ impl Services {
                 }
                 Err(e) => return Err(e),
             }
+            // The row is gone and its scripts are stopped: delete its on-disk
+            // script output (best-effort; the startup orphan sweep retries).
+            services.delete_workspace_script_output(&id).await;
             // Cancel any pending debounced lastActivity derivation
             // (monorepo#3623): the timer must not outlive the workspace —
             // it would fire against the deleted row and log a spurious
@@ -18195,7 +18682,9 @@ impl Services {
                 // Cancellation or a late blocking worker drops the claims as unknown.
                 if known_completion {
                     for claim in deletion_claims {
-                        claim.settle_confirmed();
+                        if claim.settle_confirmed().await.is_err() {
+                            tracing::warn!("background cleanup: original retirement completion unavailable");
+                        }
                     }
                 }
                 #[cfg(all(test, unix))]
@@ -18214,6 +18703,24 @@ impl Services {
 }
 
 impl WorkspaceApi for Services {
+    fn gitlab_child_git_policy_get(
+        &self,
+        query: intent_core::gitlab_child_git::GitlabChildGitPolicyQuery,
+    ) -> BoxFuture<'_, Result<intent_core::gitlab_child_git::GitlabChildGitPolicy>> {
+        repository_native_wire::child_git::policy_get(self, query)
+    }
+    fn gitlab_child_git_policy_set(
+        &self,
+        query: intent_core::gitlab_child_git::GitlabChildGitPolicySet,
+    ) -> BoxFuture<'_, Result<intent_core::gitlab_child_git::GitlabChildGitPolicy>> {
+        repository_native_wire::child_git::policy_set(self, query)
+    }
+    fn gitlab_child_git_credential(
+        &self,
+        query: intent_core::gitlab_child_git::GitlabChildGitCredentialQuery,
+    ) -> BoxFuture<'_, Result<intent_core::gitlab_child_git::GitlabChildGitCredentialResult>> {
+        repository_native_wire::child_git::credential(self, query)
+    }
     fn prepare_provider_adapters(&self, provider_ids: Vec<String>) {
         self.provider_preparation
             .enqueue(provider_ids, self.effective_settings());
@@ -18395,6 +18902,48 @@ impl WorkspaceApi for Services {
         repository_native_wire::resource::release(self, query)
     }
 
+    fn repository_resource_resolve_known(
+        &self,
+        query: intent_core::repository_resource_pages::RepositoryKnownQuery,
+    ) -> BoxFuture<'_, Result<intent_core::repository_resource_pages::RepositoryKnownSelection>>
+    {
+        repository_native_wire::resource::known::resolve(self, query)
+    }
+
+    fn repository_resource_capture_scoped(
+        &self,
+        query: intent_core::repository_resource_pages::RepositoryScopedCaptureQuery,
+    ) -> BoxFuture<'_, Result<intent_core::repository_resource_pages::RepositoryScopedCapture>>
+    {
+        repository_native_wire::resource::scoped::capture(self, query)
+    }
+    fn repository_resource_detail_scoped(
+        &self,
+        query: intent_core::repository_resource_pages::RepositoryScopedDetailQuery,
+    ) -> BoxFuture<'_, Result<intent_core::repository_resource_pages::RepositoryScopedDetail>> {
+        repository_native_wire::resource::scoped::detail(self, query)
+    }
+    fn repository_resource_release_scoped(
+        &self,
+        query: intent_core::repository_resource_pages::RepositoryScopedBoundQuery,
+    ) -> BoxFuture<'_, Result<intent_core::repository_request::RepositoryContextReleased>> {
+        repository_native_wire::resource::scoped::release(self, query)
+    }
+
+    fn repository_resource_list(
+        &self,
+        query: intent_core::repository_resource_pages::RepositoryResourceListQuery,
+    ) -> BoxFuture<'_, Result<intent_core::repository_resource_pages::RepositoryResourceList>> {
+        repository_native_wire::resource::pages::list(self, query)
+    }
+
+    fn repository_resource_discussions(
+        &self,
+        query: intent_core::repository_resource_pages::RepositoryDiscussionsQuery,
+    ) -> BoxFuture<'_, Result<intent_core::repository_resource_pages::RepositoryDiscussions>> {
+        repository_native_wire::resource::pages::discussions(self, query)
+    }
+
     fn repository_context_capture(
         &self,
         query: intent_core::repository_request::RepositoryContextQuery,
@@ -18443,7 +18992,7 @@ impl WorkspaceApi for Services {
         &self,
         changes: serde_json::Value,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(self.owned_settings_mutation(changes, None))
+        Box::pin(self.settings_update_checking_profiles(changes))
     }
 
     fn settings_reset(&self, path: String) -> BoxFuture<'_, Result<serde_json::Value>> {
@@ -18483,7 +19032,70 @@ impl WorkspaceApi for Services {
     }
 
     fn providers_catalog(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move { Ok(provider_catalog::build_providers_catalog()) })
+        Box::pin(async move {
+            // Saved profile summaries ride alongside the per-type rows
+            // (PROTOCOL §5.54); `providers` stays one row per provider type.
+            let mut catalog = provider_catalog::build_providers_catalog();
+            catalog["profiles"] = serde_json::Value::Array(self.provider_profile_summaries());
+            Ok(catalog)
+        })
+    }
+
+    fn provider_profiles_list(
+        &self,
+        base_provider_id: Option<String>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.provider_profiles_list_impl(base_provider_id))
+    }
+
+    fn provider_profiles_create(
+        &self,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.provider_profiles_create_impl(params))
+    }
+
+    fn provider_profiles_update(
+        &self,
+        profile_id: String,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.provider_profiles_update_impl(profile_id, params))
+    }
+
+    fn provider_profiles_delete(
+        &self,
+        profile_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.provider_profiles_delete_impl(profile_id))
+    }
+
+    fn provider_profiles_reorder(
+        &self,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.provider_profiles_reorder_impl(params))
+    }
+
+    fn provider_profiles_auth_status(
+        &self,
+        provider_ref: Option<String>,
+        force: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.provider_profiles_auth_status_impl(provider_ref, force))
+    }
+
+    fn provider_profiles_test_prompt(
+        &self,
+        provider_ref: String,
+        model: Option<String>,
+        node_max_old_space_mb: Option<u32>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.provider_profiles_test_prompt_impl(
+            provider_ref,
+            model,
+            node_max_old_space_mb,
+        ))
     }
 
     fn host_execution_context(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
@@ -20609,6 +21221,7 @@ impl WorkspaceApi for Services {
                 paginate.unwrap_or(false),
                 page_token.as_ref(),
             )
+            .await
         })
     }
 
@@ -20734,6 +21347,23 @@ impl WorkspaceApi for Services {
             }
             this.attach_workspace_memberships(&mut list).await;
             Ok(list)
+        })
+    }
+
+    fn find_workspaces_by_pull_request(
+        &self,
+        url: String,
+    ) -> BoxFuture<'_, Result<Vec<intent_core::PullRequestWorkspace>>> {
+        let this = self.clone();
+        Box::pin(async move {
+            let key = intent_core::pull_request_key(&url)
+                .ok_or_else(|| Error::InvalidParams("url is not a pull-request URL".to_string()))?;
+            let mut rows = this.store.list_pull_request_workspaces(&key).await?;
+            // Same membership narrowing as `workspace.list` (§5.48).
+            if let Some(visible) = this.visible_workspace_ids().await? {
+                rows.retain(|row| visible.contains(&row.id));
+            }
+            Ok(rows)
         })
     }
 
@@ -20988,6 +21618,7 @@ impl WorkspaceApi for Services {
                     let store = op_store;
                     let now = now_iso();
                     let mut input = input;
+                    let create_origin = input.origin.take();
                     // Request-shape `-32602`s run here, BEFORE any state
                     // change (row / metadata file / event / spec note /
                     // initial agent): compound `initialAgent.model` and
@@ -21148,6 +21779,7 @@ impl WorkspaceApi for Services {
                                     false,
                                     extra,
                                     spec_wp,
+                                    crate::agent_ops::CreateModelSource::Caller,
                                 )
                                 .await?;
                             Some((plan, prompt, image_blocks))
@@ -22768,7 +23400,11 @@ impl WorkspaceApi for Services {
                     // Inside the idempotency scope: a replayed create returns
                     // the stored result without re-running the op, so the
                     // event fires at most once per logical create (§6.5).
-                    publish_event(bus.as_ref(), workspace_created_event(&ws)).await;
+                    publish_event(
+                        bus.as_ref(),
+                        workspace_created_event_with_origin(&ws, create_origin.as_ref()),
+                    )
+                    .await;
                     // Seed the well-known `spec` note (reference parity with
                     // `notes.service.ts ensureSpecExists`). Idempotent under
                     // the replay guard: on retry the stored result comes back
@@ -25243,51 +25879,6 @@ impl WorkspaceApi for Services {
         })
     }
 
-    fn note_paging_backend_id(&self) -> Option<String> {
-        Some(self.store.note_paging_backend_id().to_owned())
-    }
-
-    fn get_note_page(
-        &self,
-        workspace_id: WorkspaceId,
-        note_id: NoteId,
-        request: intent_core::note_page::NotePageRequest,
-        rpc_id: serde_json::Value,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move {
-            self.require_member(&workspace_id).await?;
-            let principal = match intent_core::current_caller() {
-                Some(intent_core::Caller::Wire { principal_id, .. }) => {
-                    format!("principal:{}", principal_id.0)
-                }
-                Some(intent_core::Caller::Agent { agent_id }) => format!("agent:{}", agent_id.0),
-                Some(intent_core::Caller::Daemon) => "daemon".into(),
-                None => return Err(Error::Forbidden("Caller required".into())),
-            };
-            self.store
-                .read_note_page(&workspace_id.0, &note_id.0, &principal, request, &rpc_id)
-                .await
-        })
-    }
-
-    fn get_note_annotation_page(
-        &self,
-        method: intent_core::note_annotation::AnnotationMethod,
-        request: intent_core::note_annotation::AnnotationReadRequest,
-        rpc_id: serde_json::Value,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(self.read_annotation_page(method, request, rpc_id))
-    }
-
-    fn get_note_page_state(
-        &self,
-        workspace_id: WorkspaceId,
-        note_id: NoteId,
-        incarnation: Option<String>,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(self.read_page_state(workspace_id, note_id, incarnation))
-    }
-
     fn get_note(&self, workspace_id: WorkspaceId, note_id: NoteId) -> BoxFuture<'_, Result<Note>> {
         let store = self.store.clone();
         Box::pin(async move {
@@ -25412,10 +26003,30 @@ impl WorkspaceApi for Services {
             if let Some(content) = input.content.as_deref() {
                 note_ops::reject_numbered_read_presentation(content)?;
             }
-            let expected_version = input.expected_version;
+            let caller_expected_version = input.expected_version;
+            let mut expected_version = caller_expected_version;
             let mut note = fetch_note(&store, &workspace_id, &note_id).await?;
             // content present → raw full set; otherwise title/tags metadata.
             let content_changed = input.content.is_some();
+            if let (true, Some(base)) = (content_changed, input.base_content_bytes) {
+                // Truncated-read write guard, after the strict
+                // `expectedVersion` check (a stale value is `-32005` first).
+                // The persist below is then gated on the rev just checked, so
+                // a write landing in between cannot be overwritten unseen.
+                if expected_version.is_some_and(|v| v != note.rev) {
+                    let current = serde_json::to_value(&note)
+                        .map_err(|e| Error::Internal(format!("encode current note failed: {e}")))?;
+                    return Err(Error::Conflict { current });
+                }
+                let stored = u64::try_from(note.content.len()).unwrap_or(u64::MAX);
+                if stored != base {
+                    return Err(Error::ContentBaseMismatch {
+                        base_content_bytes: base,
+                        resolved_base_bytes: Some(stored),
+                    });
+                }
+                expected_version = Some(note.rev);
+            }
             let mut reanchor_plan: Option<ReanchorPlan> = None;
             if let Some(content) = input.content {
                 // Plain versioned write: a stale `expectedVersion` surfaces
@@ -25441,9 +26052,29 @@ impl WorkspaceApi for Services {
             if content_changed {
                 // FE-only `note.update`: no caller-agent context on this arm
                 // (transport router path), so the version author is the user.
-                if let Some(plan) = &reanchor_plan {
-                    plan.persist(&store, &note, expected_version, &user_version_author())
-                        .await?;
+                match persist_note_content(&store, &note, expected_version, &user_version_author())
+                    .await
+                {
+                    // A guarded write the caller sent without
+                    // `expectedVersion` lost the rev gate pinned above: a
+                    // concurrent writer changed the note after the size
+                    // check, which the contract reports as a base mismatch.
+                    Err(Error::Conflict { current }) if caller_expected_version.is_none() => {
+                        if let Some(base) = input.base_content_bytes {
+                            let resolved = current
+                                .get("content")
+                                .and_then(serde_json::Value::as_str)
+                                .map(|c| u64::try_from(c.len()).unwrap_or(u64::MAX));
+                            return Err(Error::ContentBaseMismatch {
+                                base_content_bytes: base,
+                                resolved_base_bytes: resolved,
+                            });
+                        }
+                        return Err(Error::Conflict { current });
+                    }
+                    other => {
+                        other?;
+                    }
                 }
             } else {
                 // Metadata-scoped: leaves the stored content untouched even
@@ -25457,6 +26088,9 @@ impl WorkspaceApi for Services {
             // concurrent write landed — rather than the pre-write copy
             // (intent-hq/intent#5589).
             note = fetch_note(&store, &workspace_id, &note_id).await?;
+            if let Some(plan) = reanchor_plan {
+                plan.apply_orphaned(&store, &workspace_id).await?;
+            }
             if content_changed {
                 services.schedule_line_attribution_recompute(
                     &note.workspace_id.clone(),
@@ -25535,6 +26169,7 @@ impl WorkspaceApi for Services {
                     policy: ContentWritePolicy::Surgical,
                     author: &author,
                     op: "note.add",
+                    base_content_bytes: None,
                 },
             )
             .await?;
@@ -25625,6 +26260,7 @@ impl WorkspaceApi for Services {
                     policy: ContentWritePolicy::Surgical,
                     author: &author,
                     op: "note.edit",
+                    base_content_bytes: None,
                 },
             )
             .await?;
@@ -25713,6 +26349,7 @@ impl WorkspaceApi for Services {
                     policy: ContentWritePolicy::Surgical,
                     author: &author,
                     op: "note.editLines",
+                    base_content_bytes: None,
                 },
             )
             .await?;
@@ -25774,6 +26411,27 @@ impl WorkspaceApi for Services {
         expected_version: Option<i64>,
         caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<NoteSetContentResult>> {
+        self.set_note_content_guarded(
+            workspace_id,
+            note_id,
+            content,
+            confirm_replacement,
+            expected_version,
+            None,
+            caller_agent_id,
+        )
+    }
+
+    fn set_note_content_guarded(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        content: String,
+        confirm_replacement: bool,
+        expected_version: Option<i64>,
+        base_content_bytes: Option<u64>,
+        caller_agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<NoteSetContentResult>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         let services = self.clone();
@@ -25803,6 +26461,7 @@ impl WorkspaceApi for Services {
                     },
                     author: &author,
                     op: "note.setContent",
+                    base_content_bytes,
                 },
             )
             .await?;
@@ -25930,31 +26589,6 @@ impl WorkspaceApi for Services {
                 rev: Some(note.rev),
             })
         })
-    }
-
-    fn supports_note_delete_grace(&self) -> bool {
-        true
-    }
-
-    fn schedule_note_delete(
-        &self,
-        request: intent_core::note_delete::NoteDeleteSchedule,
-    ) -> BoxFuture<'_, Result<intent_core::note_delete::NoteDeleteOperationResponse>> {
-        Box::pin(self.grace_schedule(request))
-    }
-
-    fn cancel_note_delete(
-        &self,
-        request: intent_core::note_delete::NoteDeleteCancel,
-    ) -> BoxFuture<'_, Result<intent_core::note_delete::NoteDeleteOperationResponse>> {
-        Box::pin(self.grace_cancel(request))
-    }
-
-    fn note_delete_status(
-        &self,
-        request: intent_core::note_delete::NoteDeleteStatus,
-    ) -> BoxFuture<'_, Result<intent_core::note_delete::NoteDeleteStatusResponse>> {
-        Box::pin(self.grace_status(request))
     }
 
     fn delete_note(
@@ -26362,6 +26996,7 @@ impl WorkspaceApi for Services {
                     policy: ContentWritePolicy::Surgical,
                     author: &author,
                     op: "task.updateStatus",
+                    base_content_bytes: None,
                 },
             )
             .await?;
@@ -26553,6 +27188,7 @@ impl WorkspaceApi for Services {
                             policy: ContentWritePolicy::Surgical,
                             author: &author,
                             op: "task.update",
+                            base_content_bytes: None,
                         },
                     )
                     .await?;
@@ -26563,8 +27199,9 @@ impl WorkspaceApi for Services {
                         .await?;
                 note.content = std::mem::take(&mut plan.content);
                 note.updated_at = now_iso();
-                match plan.persist(&store, &note, Some(read_rev), &author).await {
+                match persist_note_content(&store, &note, Some(read_rev), &author).await {
                     Ok(_) => {
+                        plan.apply_orphaned(&store, &workspace_id).await?;
                         break (note, update, redirect, true);
                     }
                     Err(Error::Conflict { .. }) if attempt < SET_CONTENT_MAX_ATTEMPTS => {
@@ -30811,6 +31448,10 @@ impl WorkspaceApi for Services {
             // (monorepo#3338) — rejected before any state change.
             self.validate_image_block_refs("agent.sendMessage", image_blocks.as_ref())
                 .await?;
+            // A named profile that was removed or whose provider is disabled
+            // refuses the turn here, structured, before anything persists
+            // (PROTOCOL §5.54), rather than as a prose spawn failure later.
+            self.ensure_turn_provider_selectable(&agent_id).await?;
             // When the runtime manager is attached, drive a real spawn/turn loop;
             // otherwise fall back to the store-only persist (read-only wiring).
             // `priority: "interrupt"` preempts the in-flight turn keep-alive
@@ -31137,6 +31778,88 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             self.require_agent_member(&agent_id).await?;
             self.agent_get_queue_op(agent_id, workspace_id).await
+        })
+    }
+
+    fn agent_workers_list(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            let provider = self
+                .authorize_agent_workers(&workspace_id, &agent_id)
+                .await?;
+            Ok(self.agent_workers.snapshot(&agent_id).unwrap_or_else(|| {
+                agent_workers::Projection::no_session(workspace_id, agent_id, provider)
+                    .snapshot(agent_workers::now_ms())
+            }))
+        })
+    }
+
+    fn agent_workers_stop(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        connection_generation: String,
+        async_task_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            for (name, value) in [
+                ("connectionGeneration", &connection_generation),
+                ("asyncTaskId", &async_task_id),
+            ] {
+                if !intent_acp::workers::is_wire_id(value) {
+                    return Err(Error::InvalidParams(format!(
+                        "{name} must be a nonempty string of at most 256 bytes without control characters"
+                    )));
+                }
+            }
+            self.authorize_agent_workers(&workspace_id, &agent_id)
+                .await?;
+            // Same authority as `agent.stop`; read access alone never stops.
+            self.require_agent_member(&agent_id).await?;
+            let not_found = || Error::NotFound(format!("worker {async_task_id}"));
+            let declined = serde_json::json!({ "asyncTaskId": async_task_id, "stopped": false });
+            let target = self
+                .agent_workers
+                .stop_target(&agent_id, &connection_generation, &async_task_id)
+                .ok_or_else(not_found)?;
+            let (connection, session_id, fence) = match target {
+                agent_workers::StopTarget::Decline => return Ok(declined),
+                agent_workers::StopTarget::ConnectionGone => {
+                    return Err(Error::ProviderRequest(
+                        "the provider connection ended before the stop was sent".into(),
+                    ))
+                }
+                agent_workers::StopTarget::Forward {
+                    connection,
+                    session_id,
+                    fence,
+                } => (connection, session_id, fence),
+            };
+            // Last check before the write: the deciding generation must still
+            // be this agent's current one. A retired generation's connection is
+            // its own provider process's pipe, so a request already admitted
+            // can never reach a newer process (§5.5b).
+            if self
+                .agent_workers
+                .generation_for(&agent_id, &connection)
+                .as_deref()
+                != Some(connection_generation.as_str())
+            {
+                return Err(Error::ProviderRequest(
+                    "the worker's provider connection was replaced before the stop was sent".into(),
+                ));
+            }
+            let answer =
+                intent_acp::workers::request_stop(&connection, &session_id, &async_task_id, fence)
+                    .await
+                    .map_err(|e| Error::ProviderRequest(e.to_string()))?;
+            Ok(serde_json::json!({
+                "asyncTaskId": async_task_id,
+                "stopped": answer.get("stopped") == Some(&serde_json::Value::Bool(true)),
+            }))
         })
     }
 
@@ -31515,6 +32238,15 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
+            // The daemon's provider-stall blocker prefixes are reserved so an
+            // agent-raised request is never mistaken for one and auto-cleared
+            // by a later successful turn (intent-hq/intent#7182).
+            if crate::agent_session::is_daemon_stall_blocker_reason(reason.trim()) {
+                return Err(Error::InvalidParams(
+                    "reason uses a prefix reserved for daemon-raised provider-stall blockers"
+                        .to_string(),
+                ));
+            }
             self.agent_request_attention_op(workspace_id, kind, reason, caller_agent_id)
                 .await
         })
@@ -32094,6 +32826,56 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn pr_state_addressed(
+        &self,
+        workspace_id: WorkspaceId,
+        request: intent_core::review_monitor::ReviewMonitorRequest,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let captured = repository_read_source::CapturedReview::capture_addressed(
+            self,
+            workspace_id.clone(),
+            &request,
+        );
+        self.execution_call(async move {
+            let refused = |refusal| {
+                repository_read_source::refused_at(
+                    "pr.snapshot",
+                    &workspace_id,
+                    request.pr_number,
+                    refusal,
+                )
+            };
+            match captured?.read_staged(self).await.map_err(refused)? {
+                repository_read_source::ReadOutcome::Unsupported => Err(Error::Unsupported(
+                    "Addressed review monitoring unavailable".into(),
+                )),
+                repository_read_source::ReadOutcome::Github(repo) => {
+                    self.pr_state(
+                        workspace_id.clone(),
+                        request.pr_number,
+                        Some(format!("{}/{}", repo.owner, repo.name)),
+                    )
+                    .await
+                }
+                repository_read_source::ReadOutcome::Managed { target, result } => {
+                    let read = (*result).map_err(|failure| match failure.cause {
+                        pr_monitor::qualified_cache::CacheError::Provider(error) => {
+                            pr_ops::map_sc_err(error)
+                        }
+                        cause => repository_read_source::refused_with(
+                            "pr.snapshot",
+                            &workspace_id,
+                            request.pr_number,
+                            repository_read_source::RefusalStage::CacheRead,
+                            &cause,
+                        ),
+                    })?;
+                    pr_ops::qualified_review_snapshot(&target, &read.value)
+                }
+            }
+        })
+    }
+
     fn pr_state(
         &self,
         workspace_id: WorkspaceId,
@@ -32116,18 +32898,43 @@ impl WorkspaceApi for Services {
                     intent_sourcecontrol::RepoRef::new(owner, repo)
                 }
                 None => match captured
-                    .ok_or_else(repository_read_source::refused)?
-                    .read(self)
+                    .ok_or_else(|| {
+                        repository_read_source::refused_with(
+                            "pr.snapshot",
+                            &workspace_id,
+                            pr_number,
+                            repository_read_source::RefusalStage::Capture,
+                            repository_read_source::RefusalReason::Detail("MissingCapture"),
+                        )
+                    })?
+                    .read_staged(self)
                     .await
-                    .map_err(|_| repository_read_source::refused())?
-                {
+                    .map_err(|refusal| {
+                        repository_read_source::refused_at(
+                            "pr.snapshot",
+                            &workspace_id,
+                            pr_number,
+                            refusal,
+                        )
+                    })? {
+                    repository_read_source::ReadOutcome::Unsupported => {
+                        return Err(Error::Unsupported(
+                            "Addressed review monitoring unavailable".into(),
+                        ));
+                    }
                     repository_read_source::ReadOutcome::Github(repo) => repo,
                     repository_read_source::ReadOutcome::Managed { target, result } => {
                         let read = (*result).map_err(|failure| match failure.cause {
                             pr_monitor::qualified_cache::CacheError::Provider(error) => {
                                 pr_ops::map_sc_err(error)
                             }
-                            _ => repository_read_source::refused(),
+                            cause => repository_read_source::refused_with(
+                                "pr.snapshot",
+                                &workspace_id,
+                                pr_number,
+                                repository_read_source::RefusalStage::CacheRead,
+                                &cause,
+                            ),
                         })?;
                         return pr_ops::qualified_review_snapshot(&target, &read.value);
                     }
@@ -32296,6 +33103,7 @@ impl WorkspaceApi for Services {
                 "pull": github_ops::pull_to_json_with_merge_queue(
                     &entry.pr,
                     entry.snapshot.merge_queue_reported,
+                    entry.snapshot.requirements.merge_queue.as_ref(),
                 ),
             }))
         })
@@ -34618,11 +35426,16 @@ impl WorkspaceApi for Services {
             let walked = tokio::task::spawn_blocking(move || -> Result<_> {
                 // Resolve the workspace boundary (merge-base preferred, baseCommitSha fallback)
                 let boundary_started = std::time::Instant::now();
-                let boundary_sha = intent_git::history::resolve_workspace_boundary(
-                    &worktree,
-                    base_ref.as_deref(),
-                    base_commit_sha.as_deref(),
-                )?;
+                let snapshot = accept_changes::history_refresh_snapshot(&worktree, &ws);
+                let boundary_sha = if let Some(snapshot) = &snapshot {
+                    snapshot.history.boundary.map(|oid| oid.to_string())
+                } else {
+                    intent_git::history::resolve_workspace_boundary(
+                        &worktree,
+                        base_ref.as_deref(),
+                        base_commit_sha.as_deref(),
+                    )?
+                };
                 let boundary_ms =
                     u64::try_from(boundary_started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
@@ -34637,21 +35450,41 @@ impl WorkspaceApi for Services {
                 // Metadata-only walk (`include_files = false`): the list
                 // payload skips the O(commits) per-commit tree diff; the FE
                 // fetches per-file data on demand via `git.commitDetails`.
-                let commits = intent_git::history::history_bounded(
-                    &worktree,
-                    boundary_sha.as_deref(),
-                    fetch,
-                    include_older,
-                    false,
-                )?;
+                // Never label a live-ref walk with a separately observed token:
+                // refs can move A -> B -> A between push and response.
+                let commits = if let Some(snapshot) = &snapshot {
+                    intent_git::history::history_bounded_snapshot(
+                        &worktree,
+                        &snapshot.history,
+                        fetch,
+                        include_older,
+                        false,
+                    )?
+                } else {
+                    intent_git::history::history_bounded(
+                        &worktree,
+                        boundary_sha.as_deref(),
+                        fetch,
+                        include_older,
+                        false,
+                    )?
+                };
+                let history_identity = snapshot.map(|snapshot| snapshot.identity);
                 let walk_ms = u64::try_from(walk_started.elapsed().as_millis()).unwrap_or(u64::MAX);
-                Ok(Some((boundary_sha, boundary_ms, commits, walk_ms)))
+                Ok(Some((
+                    boundary_sha,
+                    boundary_ms,
+                    commits,
+                    walk_ms,
+                    history_identity,
+                )))
             })
             .await
             .map_err(|e| {
                 Error::Internal(format!("file-tracking.loadCommits task failed: {e}"))
             })??;
-            let Some((boundary_sha, boundary_ms, commits, walk_ms)) = walked else {
+            let Some((boundary_sha, boundary_ms, commits, walk_ms, history_identity)) = walked
+            else {
                 return Ok(empty);
             };
             let has_more = commits.len() > page_end;
@@ -34681,11 +35514,15 @@ impl WorkspaceApi for Services {
                 Some(sha) => serde_json::Value::String(sha),
                 None => serde_json::Value::Null,
             };
-            Ok(serde_json::json!({
+            let mut result = serde_json::json!({
                 "commits": values,
                 "nextToken": next_token,
                 "boundarySha": boundary_value
-            }))
+            });
+            if let Some(identity) = history_identity {
+                result["historyIdentity"] = serde_json::Value::String(identity);
+            }
+            Ok(result)
         })
     }
 
@@ -35322,7 +36159,51 @@ impl WorkspaceApi for Services {
         })
     }
 
-    /// `ws.pr.monitor`: register (idempotently) a centralized PR monitor.
+    fn pr_monitor_start_addressed(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        request: intent_core::review_monitor::ReviewMonitorRequest,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let captured = repository_read_source::CapturedReview::capture_addressed(
+            self,
+            workspace_id.clone(),
+            &request,
+        );
+        let retained = repository_read_source::capture_monitor_owner(self);
+        self.execution_call(async move {
+            self.require_agent_member(&agent_id).await?;
+            self.review_monitor_start_op(
+                &workspace_id,
+                &agent_id,
+                request.pr_number,
+                captured?,
+                retained,
+            )
+            .await
+        })
+    }
+
+    fn pr_monitor_stop_addressed(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        request: intent_core::review_monitor::ReviewMonitorRequest,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let captured = repository_read_source::CapturedReview::capture_addressed(
+            self,
+            workspace_id.clone(),
+            &request,
+        );
+        self.execution_call(async move {
+            self.require_agent_member(&agent_id).await?;
+            self.review_monitor_stop_op(&workspace_id, &agent_id, request.pr_number, captured?)
+                .await
+        })
+    }
+
+    /// Explicit legacy GitHub calls retain their original producer. Omission
+    /// resolves the selected original root before choosing a provider.
     fn pr_monitor_start(
         &self,
         workspace_id: WorkspaceId,
@@ -35330,14 +36211,28 @@ impl WorkspaceApi for Services {
         pr_number: u64,
         repo: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move {
+        let captured = repo.is_none().then(|| {
+            repository_read_source::CapturedReview::capture(self, workspace_id.clone(), pr_number)
+        });
+        let retained = repository_read_source::capture_monitor_owner(self);
+        self.execution_call(async move {
             self.require_agent_member(&agent_id).await?;
-            self.pr_monitor_start_op(&workspace_id, &agent_id, pr_number, repo)
+            if let Some(captured) = captured {
+                self.review_monitor_start_op(
+                    &workspace_id,
+                    &agent_id,
+                    pr_number,
+                    captured,
+                    retained,
+                )
                 .await
+            } else {
+                self.pr_monitor_start_op(&workspace_id, &agent_id, pr_number, repo)
+                    .await
+            }
         })
     }
 
-    /// `ws.pr.unmonitor`: cancel the caller's own monitor on a PR.
     fn pr_monitor_stop(
         &self,
         workspace_id: WorkspaceId,
@@ -35345,10 +36240,18 @@ impl WorkspaceApi for Services {
         pr_number: u64,
         repo: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move {
+        let captured = repo.is_none().then(|| {
+            repository_read_source::CapturedReview::capture(self, workspace_id.clone(), pr_number)
+        });
+        self.execution_call(async move {
             self.require_agent_member(&agent_id).await?;
-            self.pr_monitor_stop_op(&workspace_id, &agent_id, pr_number, repo)
-                .await
+            if let Some(captured) = captured {
+                self.review_monitor_stop_op(&workspace_id, &agent_id, pr_number, captured)
+                    .await
+            } else {
+                self.pr_monitor_stop_op(&workspace_id, &agent_id, pr_number, repo)
+                    .await
+            }
         })
     }
 
@@ -35362,6 +36265,12 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             // See `hook_list`: gate the workspace, not the optional filter.
             self.require_member(&workspace_id).await?;
+            if let Some(value) =
+                repository_native_wire::monitor::list(self, &workspace_id, agent_id.as_ref())
+                    .await?
+            {
+                return Ok(value);
+            }
             self.pr_monitor_list_op(&workspace_id, agent_id.as_ref())
                 .await
         })
@@ -35376,6 +36285,11 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             self.require_workspace_manager(&workspace_id, "prMonitor.cancel")
                 .await?;
+            if let Some(value) =
+                repository_native_wire::monitor::cancel(self, &workspace_id, &monitor_id).await?
+            {
+                return Ok(value);
+            }
             self.pr_monitor_cancel_by_id_op(&workspace_id, &monitor_id)
                 .await
         })
@@ -37110,11 +38024,13 @@ impl Services {
         Ok(())
     }
 
-    /// Recompute the workspace metrics and broadcast `changes:metrics-changed` +
-    /// `changes:git-status` after a mutating accept-changes step.
-    async fn ac_emit_after_mutation(&self, workspace_id: &WorkspaceId, worktree: &Path) {
+    /// Recompute the workspace's durable line-change aggregates from its
+    /// `tracked_changes` rows and broadcast them as `changes:metrics-changed`
+    /// (§5.20, §6.5). Best-effort: a recompute failure is logged and the
+    /// stored aggregates are published as they are.
+    pub(crate) async fn recompute_and_publish_metrics(&self, workspace_id: &WorkspaceId) {
         if let Err(e) = crate::metrics::recompute(&self.store, workspace_id).await {
-            tracing::warn!(error = %e, "accept-changes: metrics recompute failed");
+            tracing::warn!(error = %e, "metrics: recompute failed");
         }
         let metrics = match self.store.get_workspace_metrics(workspace_id).await {
             Ok(Some(ws)) => {
@@ -37132,6 +38048,12 @@ impl Services {
             changes_metrics_changed_event(workspace_id, &metrics),
         )
         .await;
+    }
+
+    /// Recompute the workspace metrics and broadcast `changes:metrics-changed` +
+    /// `changes:git-status` after a mutating accept-changes step.
+    async fn ac_emit_after_mutation(&self, workspace_id: &WorkspaceId, worktree: &Path) {
+        self.recompute_and_publish_metrics(workspace_id).await;
 
         if let Ok(ws) = self.store.get_workspace(workspace_id).await {
             // The step just mutated the worktree, so the cached scan is the
@@ -37284,6 +38206,7 @@ struct AcExtras {
 /// best-effort diff stats + blob SHAs via [`crate::diffs::compute_and_store`],
 /// then the metrics / usage-stats recomputes. The status is inferred from the
 /// diff's blob SHAs when available, falling back to `fallback_status`.
+/// Untracked git-ignored paths are not recorded (intent-hq/intent#7266).
 /// Best-effort throughout — a tracking miss never fails the mutation.
 async fn record_agent_file_mutation(
     store: &Store,
@@ -37322,6 +38245,11 @@ async fn record_agent_file_mutation(
             return;
         }
     };
+    // A git-ignored untracked path can never be committed, so a row for it
+    // would sit in `unstaged` forever (intent-hq/intent#7266).
+    if crate::file_tracking::is_ignored_write(&worktree, &rel_path).await {
+        return;
+    }
     // Diff compute is best-effort: a missing repo / clean worktree still
     // records the attribution row (with zero stats) so provenance is kept.
     let summary =
@@ -37457,6 +38385,7 @@ pub mod diffs;
 pub(crate) mod file_tracking;
 mod file_tracking_ops;
 pub mod metrics;
+mod tracked_changes_sweep;
 
 // Integrations & Ops modules (§19).
 pub mod token_usage;
@@ -38323,12 +39252,22 @@ pub(crate) mod setup_runner {
     }
 }
 
+// Retained by the settings supervisor before any effect; caller cancellation
+// cannot abandon the original write or its deferred publication.
+#[derive(Default)]
+struct SettingsNativeCompletion {
+    write: Option<Arc<source_control_auth_ops::repository_owner::RepositorySettingsWrite>>,
+    settlement: Option<(bool, bool)>,
+    event: Option<(Vec<serde_json::Value>, u64)>,
+}
+
 impl Services {
     async fn settings_update_owned(
         &self,
         changes: serde_json::Value,
         is_tcp: bool,
         credential_guard: Option<&source_control_auth_ops::repository_owner::GitlabCredentialGuard>,
+        native: &std::sync::Mutex<SettingsNativeCompletion>,
     ) -> Result<serde_json::Value> {
         /// Which store a captured old value belongs to, so the rollback
         /// path restores it through the same seam that persisted it.
@@ -38389,6 +39328,7 @@ impl Services {
         self.settings_service().validate_update(&changes)?;
         let repository_write =
             self.prepare_gitlab_repository_settings(&changes, credential_guard)?;
+        native.lock().unwrap().write.clone_from(&repository_write);
         let settings = self
             .settings_service()
             .with_repository_write(repository_write.clone());
@@ -38397,7 +39337,8 @@ impl Services {
             let secrets = match settings.update_secrets(&changes).await {
                 Ok(secrets) => secrets,
                 Err(error) => {
-                    self.settle_gitlab_repository_settings(
+                    self.settle_settings_before_native_completion(
+                        native,
                         repository_write.as_deref(),
                         false,
                         false,
@@ -38691,12 +39632,12 @@ impl Services {
                     }
                     self.include_ws_port_assignment(port_was_unassigned, &mut applied);
                     let revision = self.settings_revision.fetch_add(1, Ordering::SeqCst) + 1;
-                    publish_event(
-                        self.event_bus.as_ref(),
-                        settings_changed_event(&applied, revision),
-                    )
-                    .await;
-                    self.on_settings_applied(&applied);
+                    if repository_write.as_deref().is_some_and(source_control_auth_ops::repository_owner::RepositorySettingsWrite::native_retirement_pending) {
+                        native.lock().unwrap().event = Some((applied.clone(), revision));
+                    } else {
+                        publish_event(self.event_bus.as_ref(), settings_changed_event(&applied, revision)).await;
+                        self.on_settings_applied(&applied);
+                    }
                     return Ok(serde_json::json!({ "applied": applied, "revision": revision }));
                 }
                 Ok(serde_json::json!({
@@ -38710,7 +39651,8 @@ impl Services {
         drop(revision_guard);
         if let Err(error) = result {
             let rollback_incomplete = !secrets_compensated && secrets.rollback(&self.secrets).await;
-            self.settle_gitlab_repository_settings(
+            self.settle_settings_before_native_completion(
+                native,
                 repository_write.as_deref(),
                 compensation_complete && !rollback_incomplete,
                 true,
@@ -38723,8 +39665,13 @@ impl Services {
             }
             return Err(error);
         }
-        self.settle_gitlab_repository_settings(repository_write.as_deref(), true, false)
-            .await;
+        self.settle_settings_before_native_completion(
+            native,
+            repository_write.as_deref(),
+            true,
+            false,
+        )
+        .await;
         result
     }
 
@@ -38732,6 +39679,7 @@ impl Services {
         &self,
         path: String,
         credential_guard: Option<&source_control_auth_ops::repository_owner::GitlabCredentialGuard>,
+        native: &std::sync::Mutex<SettingsNativeCompletion>,
     ) -> Result<serde_json::Value> {
         Self::require_administrator("settings.reset")?;
         // Same serialization and lock order as `settings.update`
@@ -38745,6 +39693,7 @@ impl Services {
             Some(self.settings_revision_gate.write().await)
         };
         let repository_write = self.prepare_gitlab_repository_reset(&path, credential_guard)?;
+        native.lock().unwrap().write.clone_from(&repository_write);
         let reset = self
             .settings_service()
             .with_repository_write(repository_write.clone())
@@ -38754,8 +39703,13 @@ impl Services {
             Ok(result) => result,
             Err(error) => {
                 drop(revision_guard);
-                self.settle_gitlab_repository_settings(repository_write.as_deref(), false, false)
-                    .await;
+                self.settle_settings_before_native_completion(
+                    native,
+                    repository_write.as_deref(),
+                    false,
+                    false,
+                )
+                .await;
                 return Err(error);
             }
         };
@@ -38764,22 +39718,49 @@ impl Services {
         }
         let revision = if changed {
             let revision = self.settings_revision.fetch_add(1, Ordering::SeqCst) + 1;
-            publish_event(
-                self.event_bus.as_ref(),
-                settings_changed_event(std::slice::from_ref(&result), revision),
-            )
-            .await;
-            self.on_settings_applied(std::slice::from_ref(&result));
+            if repository_write
+                .as_deref()
+                .is_some_and(source_control_auth_ops::repository_owner::RepositorySettingsWrite::native_retirement_pending)
+            {
+                native.lock().unwrap().event = Some((vec![result.clone()], revision));
+            } else {
+                publish_event(
+                    self.event_bus.as_ref(),
+                    settings_changed_event(std::slice::from_ref(&result), revision),
+                )
+                .await;
+                self.on_settings_applied(std::slice::from_ref(&result));
+            }
             revision
         } else {
             self.settings_revision.load(Ordering::SeqCst)
         };
         drop(revision_guard);
-        self.settle_gitlab_repository_settings(repository_write.as_deref(), true, false)
-            .await;
+        self.settle_settings_before_native_completion(
+            native,
+            repository_write.as_deref(),
+            true,
+            false,
+        )
+        .await;
         let mut result = result;
         result["revision"] = serde_json::json!(revision);
         Ok(result)
+    }
+
+    async fn settle_settings_before_native_completion(
+        &self,
+        native: &std::sync::Mutex<SettingsNativeCompletion>,
+        write: Option<&source_control_auth_ops::repository_owner::RepositorySettingsWrite>,
+        settled: bool,
+        compensated: bool,
+    ) {
+        if write.is_some_and(source_control_auth_ops::repository_owner::RepositorySettingsWrite::native_retirement_pending) {
+            native.lock().unwrap().settlement = Some((settled, compensated));
+        } else {
+            self.settle_gitlab_repository_settings(write, settled, compensated)
+                .await;
+        }
     }
 
     async fn owned_settings_mutation(
@@ -38806,31 +39787,96 @@ impl Services {
             operation.primary_auth_admitted = true;
             let primary = reset.as_deref().is_some_and(|path| path.starts_with("sourceControl.gitlab."))
                 || Self::repository_settings_relevant(&changes);
-            let credential_guard = if primary {
+            let mut credential_guard = if primary {
                 Some(Arc::new(operation.gitlab_credential_gate.lock().await))
             } else { None };
-            let paths: Vec<&str> = match &reset {
-                Some(path) => vec![path.as_str()],
-                None => changes.as_array().into_iter().flatten().filter_map(|entry| entry.get("path").and_then(serde_json::Value::as_str)).collect(),
+            let paths: Vec<String> = match &reset {
+                Some(path) => vec![path.clone()],
+                None => changes.as_array().into_iter().flatten().filter_map(|entry| entry.get("path").and_then(serde_json::Value::as_str).map(str::to_owned)).collect(),
             };
-            let _account_guards = operation.settings_secret_gates.write(&paths).await;
+            let path_refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+            let mut account_guards = Some(operation.settings_secret_gates.write(&path_refs).await);
+            let native = Arc::new(std::sync::Mutex::new(SettingsNativeCompletion::default()));
+            let worker_native = native.clone();
             // The supervisor, not the fallible algorithm, owns these guards.
             // A panic becomes an unknown failure, then actual writes still
             // settle before another same-account operation can proceed.
             let worker = operation.clone();
             let worker_credential = credential_guard.clone();
-            let result = intent_core::spawn_daemon(intent_core::with_caller(caller,
-                intent_core::caller::with_wire_credential(credential, async move {
+            let mut result = intent_core::spawn_daemon(intent_core::with_caller(caller.clone(),
+                intent_core::caller::with_wire_credential(credential.clone(), async move {
                     match reset {
-                        Some(path) => worker.settings_reset_owned(path, worker_credential.as_deref()).await,
-                        None => worker.settings_update_owned(changes, is_tcp, worker_credential.as_deref()).await,
+                        Some(path) => worker.settings_reset_owned(path, worker_credential.as_deref(), &worker_native).await,
+                        None => worker.settings_update_owned(changes, is_tcp, worker_credential.as_deref(), &worker_native).await,
                     }
                 })
             )).await.unwrap_or_else(|error| Err(Error::Internal(format!("settings operation failed: {error}; state may be unknown — reconcile before retrying"))));
+            intent_core::with_caller(caller, intent_core::caller::with_wire_credential(credential, async {
+            let (original, deferred) = {
+                let state = native.lock().unwrap();
+                (state.write.clone(), state.settlement.is_some() || state.event.is_some())
+            };
+            if let Some(write) = original.filter(|write| deferred || write.native_retirement_pending()) {
+                // Complete actual persistence first, then release every physical
+                // guard. The original logical mutation stays retained in native.
+                operation.secrets.finish_operation().await;
+                let completed = write.completed_source(operation.gitlab_secret_store.clone()).await;
+                write.release_native_wait_lease();
+                drop(account_guards.take());
+                drop(credential_guard.take());
+                if let Err(error) = write.join_native_retirement().await {
+                    if result.is_ok() { result = Err(error); }
+                } else {
+                        credential_guard = Some(Arc::new(operation.gitlab_credential_gate.lock().await));
+                        account_guards = Some(operation.settings_secret_gates.write(&path_refs).await);
+                        write.restore_native_wait_lease(credential_guard.as_deref().unwrap());
+                        let current = write.check_completed_source(completed, operation.gitlab_secret_store.clone()).await;
+                        if current.is_ok() {
+                            let (settled, compensated) = native.lock().unwrap().settlement.unwrap_or((false, false));
+                            operation.settle_gitlab_repository_settings(Some(&write), settled, compensated).await;
+                        } else if result.is_ok() {
+                            result = current.map(|()| serde_json::Value::Null);
+                        }
+                        let event = native.lock().unwrap().event.take();
+                        if let (Ok(response), Some((applied, _persisted_revision))) = (&mut result, event) {
+                            let _revision = operation.settings_revision_gate.write().await;
+                            // A later update may have superseded overlapping keys
+                            // while native retirement was held. Project the current
+                            // wire values for this batch's paths under the revision
+                            // gate, without reapplying its persisted values.
+                            let current = async {
+                                let settings = operation.settings_service();
+                                let mut current = Vec::with_capacity(applied.len());
+                                for entry in &applied {
+                                    let path = entry["path"].as_str().ok_or_else(|| Error::Internal("settings completion path unavailable".into()))?;
+                                    current.push(settings.completion_value(path).await?);
+                                }
+                                Ok::<_, Error>(current)
+                            }.await;
+                            match current {
+                                Ok(applied) => {
+                                    let revision = operation.settings_revision.fetch_add(1, Ordering::SeqCst) + 1;
+                                    if response.get("applied").is_some() {
+                                        response["applied"] = serde_json::json!(applied);
+                                    } else if let Some(reset) = applied.first() {
+                                        *response = reset.clone();
+                                    }
+                                    response["revision"] = serde_json::json!(revision);
+                                    publish_event(operation.event_bus.as_ref(), settings_changed_event(&applied, revision)).await;
+                                    operation.on_settings_applied(&applied);
+                                }
+                                Err(error) => result = Err(error),
+                            }
+                        }
+                }
+            }
+            })).await;
             let _ = response.send(result);
             // Caller caps and unknown-state response are preserved. This tail
             // never resumes skipped work or blindly restores after that error.
             operation.secrets.finish_operation().await;
+            drop(account_guards);
+            drop(credential_guard);
         }).is_none() {
             return Err(Error::Internal("daemon is shutting down".into()));
         }

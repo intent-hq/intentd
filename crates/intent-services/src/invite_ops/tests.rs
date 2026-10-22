@@ -1850,10 +1850,13 @@ async fn accept_joins_a_returning_guest_with_its_credential() {
     );
     assert!(f.services.invite_nonces.lock().await.is_empty());
 
-    let batch = tokio::time::timeout(Duration::from_secs(5), events.recv())
-        .await
-        .expect("event in time")
-        .expect("event batch");
+    let batch = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        events.recv(),
+    )
+    .await
+    .expect("event in time")
+    .expect("event batch");
     let ev = batch
         .iter()
         .find(|e| e.data["changes"]["addedPrincipalId"] == json!(guest.0))
@@ -1885,10 +1888,13 @@ async fn accept_joins_a_returning_guest_with_its_credential() {
     );
     // …and it is not announced as a membership change: only the invite's
     // last-redemption stamp moved, so the event says `invites` alone.
-    let batch = tokio::time::timeout(Duration::from_secs(5), events.recv())
-        .await
-        .expect("event in time")
-        .expect("event batch");
+    let batch = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        events.recv(),
+    )
+    .await
+    .expect("event in time")
+    .expect("event batch");
     let ev = batch
         .iter()
         .find(|e| e.event_type == "workspace:updated" && e.data["workspaceId"] == json!(ws2.0))
@@ -2426,10 +2432,13 @@ async fn prove_joins_on_a_matching_gist_and_consumes_the_nonce() {
         .expect("row");
     assert_eq!(invite.redeemed_by_principal_id, Some(guest.clone()));
 
-    let batch = tokio::time::timeout(Duration::from_secs(5), events.recv())
-        .await
-        .expect("event in time")
-        .expect("event batch");
+    let batch = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        events.recv(),
+    )
+    .await
+    .expect("event in time")
+    .expect("event batch");
     assert!(
         batch
             .iter()

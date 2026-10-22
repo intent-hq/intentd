@@ -1186,6 +1186,7 @@ async fn antigravity_inflight_and_negative_results_cannot_cross_executables() {
 fn installed_selection(key: &str) -> super::InstalledSelection {
     super::InstalledSelection {
         observed: tokio::time::Instant::now(),
+        profile_key: None,
         key: key.into(),
         command: Err("must not start a CLI on a cached read".into()),
     }
@@ -1428,8 +1429,14 @@ fn installed_cli_credential_file_rotation_rejects_last_good_account() {
         );
         std::fs::write(bin.join("node"), launcher).unwrap();
         std::fs::set_permissions(bin.join("node"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let claude = format!(
+            "#!/bin/sh\nprintf '%s\\n' '{}'\n",
+            intent_providers::test_support::current_cli_version(
+                intent_providers::installed_cli::InstalledCli::Claude
+            )
+        );
         for (name, script) in [
-            ("claude", "#!/bin/sh\nprintf '2.0.0 (Claude Code)\\n'\n"),
+            ("claude", claude.as_str()),
             (
                 "npx",
                 r"#!/usr/bin/env node
@@ -1469,4 +1476,87 @@ require('readline').createInterface({input:process.stdin}).on('line',line=>{
             String::from_utf8_lossy(&output.stderr)
         );
     }
+}
+
+fn profile_env(reference: &str, fingerprint: &str) -> Arc<intent_acp::ProfileEnv> {
+    Arc::new(intent_acp::ProfileEnv::new(
+        reference,
+        fingerprint,
+        Vec::new(),
+    ))
+}
+
+fn profile_selection(key: &str, profile: &intent_acp::ProfileEnv) -> super::InstalledSelection {
+    super::InstalledSelection {
+        profile_key: Some(profile.cache_key()),
+        ..installed_selection(key)
+    }
+}
+
+#[tokio::test]
+async fn profile_catalogs_never_cross_references_or_the_default() {
+    let cache = Arc::new(ModelCatalogCache::new(None));
+    let work = profile_env("codex@work", "f1");
+    let personal = profile_env("codex@personal", "f1");
+    for (reference, profile, model) in [
+        ("codex@work", &work, "work-model"),
+        ("codex@personal", &personal, "personal-model"),
+    ] {
+        let key = format!("installed-test:{reference}");
+        cache
+            .installed
+            .lock()
+            .unwrap()
+            .insert(reference.into(), profile_selection(&key, profile));
+        cache.test_store(
+            reference,
+            &key,
+            vec![serde_json::json!({ "id": model })],
+            ModelCatalogCache::now_ms(),
+        );
+    }
+    let resolved = cache
+        .resolve_installed_for("codex@work", Some(work.clone()), false)
+        .await;
+    assert_eq!(resolved.models.unwrap()[0]["id"], "work-model");
+    let resolved = cache
+        .resolve_installed_for("codex@personal", Some(personal.clone()), false)
+        .await;
+    assert_eq!(resolved.models.unwrap()[0]["id"], "personal-model");
+    // The Default configuration has its own (here empty) slot.
+    cache.installed.lock().unwrap().insert(
+        "codex".into(),
+        installed_selection("installed-test:default"),
+    );
+    let resolved = cache.resolve_installed("codex", false).await;
+    assert!(resolved.models.is_none());
+}
+
+#[test]
+fn installed_selection_is_reused_only_for_the_same_profile_settings() {
+    let now = tokio::time::Instant::now();
+    let earlier = now.checked_sub(std::time::Duration::from_secs(1)).unwrap();
+    let work = profile_env("codex@work", "f1");
+    let edited = profile_env("codex@work", "f2");
+    let prior = profile_selection("installed-test:work", &work);
+    let current = Some(work.cache_key());
+    assert!(super::reusable_selection(
+        &prior,
+        earlier,
+        false,
+        current.as_deref()
+    ));
+    assert!(!super::reusable_selection(
+        &prior,
+        earlier,
+        false,
+        Some(edited.cache_key()).as_deref()
+    ));
+    assert!(!super::reusable_selection(&prior, earlier, false, None));
+    assert!(!super::reusable_selection(
+        &installed_selection("installed-test:default"),
+        earlier,
+        false,
+        current.as_deref()
+    ));
 }

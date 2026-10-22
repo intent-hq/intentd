@@ -588,7 +588,11 @@ async fn run_hook_script(
     // with a `console.*` shim whose capped line buffer rides back as
     // `__logs`. A user-code throw is caught in-envelope (`__k: 'e'`) so its
     // logs survive; only a timeout/engine failure loses them.
-    let prelude = intent_acp::bindings_prelude_for_bridge(agent_features, is_sub_agent);
+    let prelude = intent_acp::bindings_prelude_for_workspace(
+        agent_features,
+        is_sub_agent,
+        &hook.workspace_id,
+    );
     let code = &hook.code;
     let max_lines = HOOK_LOG_MAX_LINES;
     let max_bytes = HOOK_LOG_MAX_BYTES;
@@ -2791,7 +2795,9 @@ mod tests {
                 .stdout(log.try_clone().unwrap())
                 .stderr(log);
             let mut child = intentd_test_support::GuardedChild::spawn(&mut command).unwrap();
-            let status = child.wait_with_timeout(Duration::from_secs(30)).unwrap();
+            let status = child
+                .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(30)))
+                .unwrap();
             assert!(
                 status.is_some_and(|s| s.success()),
                 "{mode} worker failed ({status:?}): {}",
@@ -2997,9 +3003,12 @@ mod tests {
         let mut shutdown = tokio::spawn(async move {
             shutdown_svc.shutdown_agent_deliveries().await;
         });
-        let timely = tokio::time::timeout(Duration::from_secs(1), &mut shutdown)
-            .await
-            .is_ok();
+        let timely = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(1)),
+            &mut shutdown,
+        )
+        .await
+        .is_ok();
         if !timely {
             tokio::time::timeout(POLL_DEADLINE, shutdown)
                 .await
@@ -3041,19 +3050,22 @@ mod tests {
         });
         // Poll independent work on the SAME task while the nested evaluation
         // is suspended. A process-wide or thread-local depth leaks here.
-        tokio::time::timeout(Duration::from_secs(10), async {
-            tokio::select! {
-                result = &mut pending => panic!("pending validation completed: {result:?}"),
-                () = async {
-                    loop {
-                        if svc.store.get_workspace(&ws).await.unwrap().status_message.as_deref()
-                            == Some("validation entered") { break; }
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                    }
-                    svc.hook_schedule_op(&ws, &other, &ordinary_nested).await.unwrap();
-                } => {}
-            }
-        })
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                tokio::select! {
+                    result = &mut pending => panic!("pending validation completed: {result:?}"),
+                    () = async {
+                        loop {
+                            if svc.store.get_workspace(&ws).await.unwrap().status_message.as_deref()
+                                == Some("validation entered") { break; }
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                        svc.hook_schedule_op(&ws, &other, &ordinary_nested).await.unwrap();
+                    } => {}
+                }
+            },
+        )
         .await
         .unwrap();
         drop(pending);
@@ -4385,9 +4397,12 @@ mod tests {
         let mut shutdown = tokio::spawn(async move {
             shutdown_mgr.shutdown().await;
         });
-        let timely = tokio::time::timeout(Duration::from_secs(2), &mut shutdown)
-            .await
-            .is_ok();
+        let timely = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            &mut shutdown,
+        )
+        .await
+        .is_ok();
         // Always release the fixture before asserting the expected baseline failure.
         park.release.notify_one();
         if !timely {
@@ -6657,7 +6672,8 @@ mod tests {
         owner: &AgentId,
         want: usize,
     ) -> Vec<intent_core::AgentMessage> {
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let deadline =
+            std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(30));
         loop {
             let messages = svc
                 .store()

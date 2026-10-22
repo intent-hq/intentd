@@ -138,10 +138,26 @@ struct Fixture {
 }
 
 async fn boot() -> Fixture {
+    boot_with_bulk_gate(None).await
+}
+
+async fn boot_with_bulk_gate(
+    recovery_bulk_gate: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Fixture {
+    boot_with_limits(recovery_bulk_gate, None).await
+}
+
+async fn boot_with_limits(
+    recovery_bulk_gate: Option<tokio::sync::watch::Receiver<bool>>,
+    raw_capacity: Option<usize>,
+) -> Fixture {
     let tmp = common::test_tempdir("intentd-conflate-");
     let dir = tmp.path().to_path_buf();
     let store = Store::open(&dir.join("intentd.db")).await.expect("store");
-    let bus = EventBus::new(store.clone());
+    let bus = raw_capacity.map_or_else(
+        || EventBus::new(store.clone()),
+        |capacity| EventBus::with_broadcast_capacity(store.clone(), capacity),
+    );
     let workspaces_root = dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_root).expect("mkdir hermetic root");
     let services = Services::new(store)
@@ -155,6 +171,7 @@ async fn boot() -> Fixture {
     let opts = WsOptions {
         base_port: 0,
         bind_addresses: vec![Ipv4Addr::LOCALHOST.into()],
+        recovery_bulk_gate,
         ..Default::default()
     };
     let ws = WsApiServer::new(api, bus.clone(), &tls, &token_store, opts, None).expect("server");
@@ -265,33 +282,36 @@ async fn stalled_subscriber_receives_burst_losslessly_with_exit_after_data() {
     let mut received: Vec<u8> = Vec::with_capacity(expected.len());
     let mut data_frames = 0usize;
     let mut saw_exit = false;
-    timeout(Duration::from_secs(30), async {
-        while !saw_exit {
-            match ws.next().await.unwrap().unwrap() {
-                Message::Text(text) => {
-                    let v: Value = serde_json::from_str(&text).unwrap();
-                    if v["method"] != json!("events.event")
-                        || v["params"]["subscriptionId"] != json!(sub_id)
-                    {
-                        continue;
-                    }
-                    let event = &v["params"]["event"];
-                    match event["type"].as_str() {
-                        Some("terminal:data") => {
-                            assert!(!saw_exit, "no data may follow the exit barrier");
-                            let chunk = event["data"]["chunk"].as_str().expect("chunk");
-                            received.extend_from_slice(&BASE64.decode(chunk).unwrap());
-                            data_frames += 1;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async {
+            while !saw_exit {
+                match ws.next().await.unwrap().unwrap() {
+                    Message::Text(text) => {
+                        let v: Value = serde_json::from_str(&text).unwrap();
+                        if v["method"] != json!("events.event")
+                            || v["params"]["subscriptionId"] != json!(sub_id)
+                        {
+                            continue;
                         }
-                        Some("terminal:exit") => saw_exit = true,
-                        other => panic!("unexpected event type {other:?}"),
+                        let event = &v["params"]["event"];
+                        match event["type"].as_str() {
+                            Some("terminal:data") => {
+                                assert!(!saw_exit, "no data may follow the exit barrier");
+                                let chunk = event["data"]["chunk"].as_str().expect("chunk");
+                                received.extend_from_slice(&BASE64.decode(chunk).unwrap());
+                                data_frames += 1;
+                            }
+                            Some("terminal:exit") => saw_exit = true,
+                            other => panic!("unexpected event type {other:?}"),
+                        }
                     }
+                    Message::Close(_) => panic!("connection closed mid-stream"),
+                    _ => {}
                 }
-                Message::Close(_) => panic!("connection closed mid-stream"),
-                _ => {}
             }
-        }
-    })
+        },
+    )
     .await
     .expect("burst + exit not fully received in time");
 
@@ -303,4 +323,236 @@ async fn stalled_subscriber_receives_burst_losslessly_with_exit_after_data() {
     );
     assert_eq!(received, expected, "byte content and order are exact");
     assert!(saw_exit, "terminal:exit arrives after all data");
+}
+
+/// Current-thread publication deterministically overruns raw receivers before
+/// any worker can consume; filtered foreign tails must still announce loss.
+#[intent_test_macros::daemon_test]
+async fn recovery_wss_loss_and_quiet_fence() {
+    let f = boot_with_limits(None, Some(1)).await;
+    let mut ws = connect(f.port, f.cfg.clone()).await;
+    let ack = wss_rpc(
+        &mut ws,
+        60,
+        "events.subscribe",
+        recovery_corpus()["wire"]["scopedRequest"]["params"].clone(),
+    )
+    .await;
+    assert_eq!(ack["lossRecovery"], 1);
+    let sid = ack["subscriptionId"].as_str().unwrap();
+    let _ = f.bus.publish_transient(&terminal_event(
+        "ws-a",
+        "file:changed",
+        json!({"path":"lost"}),
+    ));
+    let _ = f
+        .bus
+        .publish_transient(&terminal_event("foreign", "note:updated", json!({})));
+    ws.send(Message::Text(
+        json!({"jsonrpc":"2.0","id":62,"method":"events.fence",
+        "params":{"subscriptionIds":[sid]}})
+        .to_string()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    let frames = timeout(common::rpc_read_timeout(), async {
+        let mut frames = Vec::new();
+        loop {
+            if let Message::Text(text) = ws.next().await.unwrap().unwrap() {
+                let value: Value = serde_json::from_str(&text).unwrap();
+                let done = value["id"] == 62;
+                frames.push(value);
+                if done {
+                    return frames;
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let corpus = recovery_corpus();
+    let mut lost = corpus["admission"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "scoped")
+        .unwrap()["frame"]
+        .clone();
+    lost["params"]["subscriptionId"] = json!(sid);
+    let mut fence = corpus["wire"]["fenceReply"].clone();
+    fence["result"]["subscriptionIds"] = json!([sid]);
+    assert_eq!(frames, vec![lost, fence]);
+}
+
+fn recovery_corpus() -> Value {
+    serde_json::from_str(include_str!(
+        "../../intent-transport/src/events/fixtures/event-stream-recovery.json"
+    ))
+    .unwrap()
+}
+
+#[intent_test_macros::daemon_test]
+async fn recovery_wss_fence_keeps_input_and_priority_writer_live_when_bulk_is_full() {
+    let (release, gate) = tokio::sync::watch::channel(false);
+    let f = boot_with_bulk_gate(Some(gate)).await;
+    let mut ws = connect(f.port, f.cfg.clone()).await;
+    let ack = wss_rpc(
+        &mut ws,
+        60,
+        "events.subscribe",
+        json!({"eventTypes":["note:*"],"lossRecovery":1}),
+    )
+    .await;
+    let sid = ack["subscriptionId"].clone();
+    for i in 0..3 {
+        f.bus
+            .publish(&terminal_event("ws-a", "note:updated", json!({"order":i})))
+            .await
+            .unwrap();
+    }
+    ws.send(Message::Text(
+        json!({"jsonrpc":"2.0","id":62,"method":"events.fence","params":{"subscriptionIds":[sid]}})
+            .to_string()
+            .into(),
+    ))
+    .await
+    .unwrap();
+    // This priority RPC can finish only if the WSS loop returned from fence
+    // admission. Its result cannot depend on releasing the blocked bulk lane.
+    let ack2 = wss_rpc(
+        &mut ws,
+        63,
+        "events.subscribe",
+        json!({"eventTypes":["file:*"]}),
+    )
+    .await;
+    assert!(ack2["subscriptionId"].is_string());
+    release.send_replace(true);
+    let frames = timeout(common::rpc_read_timeout(), async {
+        let mut frames = Vec::new();
+        loop {
+            if let Message::Text(text) = ws.next().await.unwrap().unwrap() {
+                let value: Value = serde_json::from_str(&text).unwrap();
+                let done = value["id"] == 62;
+                frames.push(value);
+                if done {
+                    return frames;
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(frames.len(), 4);
+    for (i, frame) in frames[..3].iter().enumerate() {
+        assert_eq!(frame["params"]["event"]["data"]["order"], i);
+    }
+    let mut expected = recovery_corpus()["wire"]["fenceReply"].clone();
+    expected["result"]["subscriptionIds"] = json!([sid]);
+    assert_eq!(frames[3], expected);
+}
+
+#[intent_test_macros::daemon_test]
+async fn recovery_wss_replacement_cancels_fence_while_bulk_is_full() {
+    let (release, gate) = tokio::sync::watch::channel(false);
+    let f = boot_with_bulk_gate(Some(gate)).await;
+    let mut ws = connect(f.port, f.cfg.clone()).await;
+    let params = json!({"eventTypes":["note:*"],"replaceGroup":"notes","lossRecovery":1});
+    let old = wss_rpc(&mut ws, 60, "events.subscribe", params.clone()).await;
+    for i in 0..3 {
+        f.bus
+            .publish(&terminal_event("ws-a", "note:updated", json!({"order":i})))
+            .await
+            .unwrap();
+    }
+    for request in [
+        json!({"jsonrpc":"2.0","id":62,"method":"events.fence","params":{"subscriptionIds":[old["subscriptionId"]]}}),
+        json!({"jsonrpc":"2.0","id":63,"method":"events.subscribe","params":params}),
+    ] {
+        ws.send(Message::Text(request.to_string().into()))
+            .await
+            .unwrap();
+    }
+    let replacement = timeout(common::rpc_read_timeout(), async {
+        let mut replacement = None;
+        let mut failed = false;
+        loop {
+            if let Message::Text(text) = ws.next().await.unwrap().unwrap() {
+                let reply: Value = serde_json::from_str(&text).unwrap();
+                match reply["id"].as_u64() {
+                    Some(62) => {
+                        assert_eq!(reply["error"]["code"], -32602);
+                        assert_eq!(
+                            reply["error"]["message"],
+                            "Invalid recovery subscription set"
+                        );
+                        failed = true;
+                    }
+                    Some(63) => replacement = Some(reply["result"]["subscriptionId"].clone()),
+                    _ => panic!("bulk gate leaked a frame: {reply}"),
+                }
+                if let Some(id) = replacement.as_ref().filter(|_| failed) {
+                    return id.clone();
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_ne!(replacement, old["subscriptionId"]);
+    release.send_replace(true);
+    ws.send(Message::Text(json!({"jsonrpc":"2.0","id":64,"method":"events.fence","params":{"subscriptionIds":[replacement]}}).to_string().into())).await.unwrap();
+    timeout(common::rpc_read_timeout(), async {
+        loop {
+            if let Message::Text(text) = ws.next().await.unwrap().unwrap() {
+                let reply: Value = serde_json::from_str(&text).unwrap();
+                assert_ne!(reply["id"], 62, "retired fence must never succeed later");
+                if reply["id"] == 64 {
+                    assert_eq!(reply["result"], json!({"subscriptionIds":[replacement]}));
+                    return;
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[intent_test_macros::daemon_test]
+async fn recovery_wss_stalled_bulk_deadline_closes_socket_and_discards_queued_marker() {
+    let (release, gate) = tokio::sync::watch::channel(false);
+    let f = boot_with_bulk_gate(Some(gate)).await;
+    let mut ws = connect(f.port, f.cfg.clone()).await;
+    wss_rpc(
+        &mut ws,
+        60,
+        "events.subscribe",
+        recovery_corpus()["wire"]["scopedRequest"]["params"].clone(),
+    )
+    .await;
+    for _ in 0..2048 {
+        let _ = f
+            .bus
+            .publish_transient(&terminal_event("foreign", "note:updated", json!({})));
+    }
+    // The normal reader sees no marker while the bulk writer is held. Its
+    // deadline must drop the socket out of band, without needing to open it.
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(8)),
+        async {
+            loop {
+                match ws.next().await {
+                    None | Some(Err(_) | Ok(Message::Close(_))) => break,
+                    Some(Ok(Message::Text(text))) => {
+                        panic!("queued frame escaped cancellation: {text}")
+                    }
+                    Some(Ok(_)) => {}
+                }
+            }
+        },
+    )
+    .await
+    .expect("loss deadline must close the physical socket");
+    release.send_replace(true);
 }

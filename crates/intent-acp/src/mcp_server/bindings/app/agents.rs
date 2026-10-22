@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use intent_core::{AgentId, AgentStatus, WorkspaceApi, WorkspaceId};
+use intent_core::{AgentId, AgentLite, AgentStatus, Workspace, WorkspaceApi, WorkspaceId};
 use serde_json::{json, Value};
 
 use crate::mcp_server::bindings::{map_err, opt_bool, opt_i64, opt_str, strip_agent_hidden_fields};
@@ -146,8 +146,7 @@ async fn list(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, String
     // Extract optional filters
     let filter_workspace_id = opt_str(args, "workspaceId").map(WorkspaceId::from);
     let include_completed = opt_bool(args, "includeCompleted").unwrap_or(false);
-    let cursor = normalize_offset(opt_i64(args, "cursor"))?;
-    let limit = normalize_limit(opt_i64(args, "limit"), DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT)?;
+    let (cursor, limit) = list_bounds(args)?;
 
     // Fetch all workspaces (include archived to apply status filtering)
     let workspaces = if let Some(ws_id) = filter_workspace_id {
@@ -199,6 +198,23 @@ async fn list(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, String
         }
     }
 
+    Ok(page_threads(threads, cursor, limit, "threads"))
+}
+
+pub(super) fn list_bounds(args: &Value) -> Result<(i64, i64), String> {
+    Ok((
+        normalize_offset(opt_i64(args, "cursor"))?,
+        normalize_limit(opt_i64(args, "limit"), DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT)?,
+    ))
+}
+
+/// Shared recent-first pagination for workspace agents and Assistant chats.
+pub(super) fn page_threads(
+    mut threads: Vec<Value>,
+    cursor: i64,
+    limit: i64,
+    rows_key: &str,
+) -> Value {
     // Sort by last activity timestamp, newest first
     threads.sort_by(|a, b| {
         let ts_a = thread_timestamp(a);
@@ -216,7 +232,7 @@ async fn list(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, String
     let returned = page.len();
 
     let mut result = json!({
-        "threads": page,
+        rows_key: page,
         "total": total,
         "returned": returned,
     });
@@ -228,7 +244,7 @@ async fn list(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, String
             json!(cursor + i64::try_from(returned).expect("value fits in i64")),
         );
     }
-    Ok(result)
+    result
 }
 
 async fn read_conversation(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, String> {
@@ -243,12 +259,6 @@ async fn read_conversation(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<
         return Err(format!("Workspace not found: {workspace_id_str}"));
     }
 
-    // Bounds handling options
-    let last_n = opt_i64(args, "lastN");
-    let start_turn = opt_i64(args, "startTurn");
-    let end_turn = opt_i64(args, "endTurn");
-    let include_tool_calls = opt_bool(args, "includeToolCalls").unwrap_or(false);
-
     // Validate workspace exists
     let workspace = api
         .get_workspace(workspace_id.clone())
@@ -257,9 +267,26 @@ async fn read_conversation(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<
 
     // Fetch agent metadata
     let agent = api
-        .agent_get(agent_id.clone(), Some(workspace_id.clone()))
+        .agent_get(agent_id, Some(workspace_id))
         .await
         .map_err(map_err)?;
+
+    read_conversation_for_agent(api, &workspace, &agent, args).await
+}
+
+/// Read an already-resolved target; each namespace validates its own scope first.
+pub(super) async fn read_conversation_for_agent(
+    api: &Arc<dyn WorkspaceApi>,
+    workspace: &Workspace,
+    agent: &AgentLite,
+    args: &Value,
+) -> Result<Value, String> {
+    let workspace_id = &workspace.id;
+    let agent_id = &agent.id;
+    let last_n = opt_i64(args, "lastN");
+    let start_turn = opt_i64(args, "startTurn");
+    let end_turn = opt_i64(args, "endTurn");
+    let include_tool_calls = opt_bool(args, "includeToolCalls").unwrap_or(false);
 
     // The conversation is read under the slim projection (§5.5): bounded
     // tool/image block bodies, like every other consumer since v8.0. The
@@ -800,6 +827,9 @@ mod tests {
 
     fn make_agent(id: &str, name: &str, status: AgentStatus, ws_id: &WorkspaceId) -> AgentLite {
         AgentLite {
+            digest_truncated: false,
+            last_agent_response_truncated: false,
+            last_user_message_truncated: false,
             harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
             harness_features: None,
             id: AgentId::from_string(id),
@@ -844,9 +874,13 @@ mod tests {
             stop_reason_timestamp: None,
             session_corrupted: false,
             pending_delete_at: None,
+            using_earlier_profile_settings: false,
+            provider_replacement_required: None,
             retired_at: None,
             notifications_muted: false,
             metadata: AgentMetadata {
+                attention_request_reason_truncated: false,
+                completion_report_truncated: false,
                 is_background: false,
                 specialist: None,
                 created_by_agent_id: None,

@@ -6,9 +6,9 @@ use base64::Engine as _;
 use intent_sourcecontrol::{
     error::{ProviderFailure, ProviderFailureKind},
     ConfirmedReviewState, Error, GitLabSourceControl, GitlabDescriptor, GitlabInstance,
-    GitlabRequestCredentials, IssueQuery, NewPullRequest, PageParams, PrQuery,
-    ProviderAvailability, RepoRef, ReviewBranchIdentity, ReviewCreateOutcome, ReviewDetails,
-    SourceControl,
+    GitlabRequestCredentials, IssueQuery, NewPullRequest, PageParams, PrInvolvement, PrQuery,
+    PrState, ProviderAvailability, RepoRef, ReviewBranchIdentity, ReviewCreateOutcome,
+    ReviewDetails, SourceControl,
 };
 use secrecy::SecretString;
 use serde_json::{json, Value};
@@ -422,13 +422,58 @@ fn observation_reply(r: &Request) -> Reply {
     }
     if r.path.ends_with("/merge_requests/7") {
         let mut v = mr();
-        v["head_pipeline"] = json!({"id":19,"project_id":91,"sha":"synthetic","status":"running"});
+        v["head_pipeline"] = json!({"id":19,"project_id":91,"sha":"remote-A","status":"running"});
         return reply(200, v);
     }
     let mut p = project();
     p["only_allow_merge_if_pipeline_succeeds"] = json!(true);
     p["only_allow_merge_if_all_discussions_are_resolved"] = json!(true);
     reply(200, p)
+}
+
+#[tokio::test]
+async fn observation_never_attributes_an_old_pipeline_to_the_current_mr_head() {
+    for pipeline_sha in [Some("old-head"), Some("merged-result"), None, Some("")] {
+        let fixture = Fixture::new(move |request| {
+            if request.path.ends_with("/merge_requests/7") {
+                let mut body = mr();
+                body["head_pipeline"] =
+                    json!({"id":19,"project_id":73,"sha":pipeline_sha,"status":"success"});
+                return reply(200, body);
+            }
+            if request.path.contains("/pipelines/") {
+                return reply(200, json!([]));
+            }
+            observation_reply(request)
+        })
+        .await;
+        let observed = fixture.provider().observe_review(&repo(), 7).await.unwrap();
+        assert!(
+            !observed.signals.checks_known,
+            "pipeline {pipeline_sha:?} cannot establish current-head success"
+        );
+        assert_eq!(observed.availability.checks, ProviderAvailability::Unknown);
+        assert_ne!(
+            observed.signals.checks_head_sha.as_deref(),
+            Some("remote-A")
+        );
+        assert_eq!(
+            observed.signals.checks_head_sha.as_deref(),
+            pipeline_sha.filter(|sha| !sha.is_empty())
+        );
+        assert!(
+            !fixture
+                .provider()
+                .mergeability(&repo(), 7)
+                .await
+                .unwrap()
+                .required_checks_passed
+        );
+        assert!(fixture
+            .requests()
+            .iter()
+            .all(|request| !request.path.contains("/pipelines/")));
+    }
 }
 
 #[tokio::test]
@@ -776,6 +821,98 @@ async fn review_lists_reject_foreign_logical_urls() {
 }
 
 #[tokio::test]
+async fn closed_review_list_includes_merged_and_unmerged_closed() {
+    let f = Fixture::new(|request| {
+        let state = |name, number| {
+            let mut value = mr();
+            value["state"] = json!(name);
+            value["iid"] = json!(number);
+            value["web_url"] = json!(format!(
+                "{INSTANCE}/Team/Sub/Project/-/merge_requests/{number}"
+            ));
+            value
+        };
+        // Respect the actual server state filter: `closed` excludes merged MRs.
+        let items = if request.path.contains("state=closed") {
+            vec![state("closed", 8)]
+        } else {
+            vec![state("opened", 7), state("closed", 8), state("merged", 9)]
+        };
+        reply(200, json!(items))
+    })
+    .await;
+    let page = f
+        .provider()
+        .list_prs(
+            &repo(),
+            PrQuery {
+                state: Some(PrState::Closed),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        page.items
+            .iter()
+            .map(|item| item.number)
+            .collect::<Vec<_>>(),
+        vec![8, 9]
+    );
+    assert_eq!(page.items[0].state, PrState::Closed);
+    assert_eq!(page.items[1].state, PrState::Merged);
+    assert_eq!(f.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn closed_review_list_keeps_an_empty_page_continuation() {
+    let f = Fixture::new(|request| {
+        let query = reqwest::Url::parse(&format!("http://fixture{}", request.path)).unwrap();
+        let page = query.query_pairs().find(|(key, _)| key == "page");
+        if page.is_some_and(|(_, value)| value == "2") {
+            let mut value = mr();
+            value["state"] = json!("merged");
+            let mut response = reply(200, json!([value]));
+            response.headers.push(("x-next-page".into(), String::new()));
+            response
+        } else if request.path.contains("state=closed") {
+            reply(200, json!([]))
+        } else {
+            let mut response = reply(200, json!([mr()]));
+            response.headers.push(("x-next-page".into(), "2".into()));
+            response
+        }
+    })
+    .await;
+    let provider = f.provider();
+    let query = PrQuery {
+        state: Some(PrState::Closed),
+        limit: Some(1),
+        ..Default::default()
+    };
+    let first = provider.list_prs(&repo(), query.clone()).await.unwrap();
+    assert!(first.items.is_empty());
+    assert!(
+        first.next_cursor.is_some(),
+        "an empty filtered page is not exhaustion"
+    );
+    let second = provider
+        .list_prs(
+            &repo(),
+            PrQuery {
+                cursor: first.next_cursor,
+                ..query
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.items.len(), 1);
+    assert_eq!(second.items[0].state, PrState::Merged);
+    assert!(second.next_cursor.is_none());
+    assert_eq!(f.requests().len(), 2);
+}
+
+#[tokio::test]
 async fn retiring_the_injected_scope_between_branch_reads_prevents_create() {
     let retired = Arc::new(Mutex::new(None::<Arc<Credentials>>));
     let seen = retired.clone();
@@ -863,7 +1000,7 @@ async fn ci_policy_distinguishes_skipped_optional_and_missing_pipelines() {
             if r.path.ends_with("/merge_requests/7") {
                 let mut v = mr();
                 if let Some(status) = pipeline_status {
-                    v["head_pipeline"] = json!({"id":19,"status":status});
+                    v["head_pipeline"] = json!({"id":19,"sha":"remote-A","status":status});
                 }
                 return reply(200, v);
             }
@@ -960,6 +1097,286 @@ async fn discussion_comments_keep_reply_and_instance_qualified_thread_identity()
         identity,
         json!([INSTANCE, "Team/Sub/Project", 7, "discussion-1"])
     );
+}
+
+#[tokio::test]
+async fn remaining_read_self_filters_are_exact_project_scopes_and_involves_is_unsupported() {
+    let f = Fixture::new(|r| {
+        assert!(r
+            .path
+            .contains("/projects/Team%2FSub%2FProject/merge_requests?"));
+        reply(200, json!([mr()]))
+    })
+    .await;
+    let sc = f.provider();
+    for (involvement, scope) in [
+        (PrInvolvement::Created, "created_by_me"),
+        (PrInvolvement::Assigned, "assigned_to_me"),
+        (PrInvolvement::ReviewRequested, "reviews_for_me"),
+    ] {
+        sc.list_prs(
+            &repo(),
+            PrQuery {
+                involvement: Some(involvement),
+                search: Some("needle/one".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let requests = f.requests();
+        let path = &requests.last().unwrap().path;
+        assert!(path.contains(&format!("scope={scope}")));
+        assert!(path.contains("search=needle%2Fone"));
+    }
+    assert!(matches!(
+        sc.list_prs(
+            &repo(),
+            PrQuery {
+                involvement: Some(PrInvolvement::Involves),
+                ..Default::default()
+            }
+        )
+        .await,
+        Err(Error::Unsupported(_))
+    ));
+    assert_eq!(
+        f.requests().len(),
+        3,
+        "no /user or approximate participant fan-out"
+    );
+}
+
+#[tokio::test]
+async fn remaining_read_project_cursor_cannot_cross_connection_query_or_project_order() {
+    let f = Fixture::new(|_| reply(200, json!([]))).await;
+    let sc = f.provider().with_pagination_scope("original".into());
+    let query = PrQuery {
+        extra_repos: vec![RepoRef {
+            owner: "Team".into(),
+            name: "Second".into(),
+        }],
+        search: Some("needle".into()),
+        ..Default::default()
+    };
+    let first = sc.list_prs(&repo(), query.clone()).await.unwrap();
+    assert!(first.items.is_empty());
+    let cursor = first
+        .next_cursor
+        .expect("continue through empty first project");
+    let continuation = PrQuery {
+        cursor: Some(cursor),
+        ..query
+    };
+    let other = f.provider().with_pagination_scope("replacement".into());
+    assert!(matches!(
+        other.list_prs(&repo(), continuation.clone()).await,
+        Err(Error::Config(_))
+    ));
+    assert!(matches!(
+        sc.list_prs(
+            &repo(),
+            PrQuery {
+                search: Some("changed".into()),
+                ..continuation.clone()
+            }
+        )
+        .await,
+        Err(Error::Config(_))
+    ));
+    assert!(matches!(
+        sc.list_prs(
+            &repo(),
+            PrQuery {
+                extra_repos: vec![RepoRef {
+                    owner: "Other".into(),
+                    name: "Second".into()
+                }],
+                ..continuation.clone()
+            }
+        )
+        .await,
+        Err(Error::Config(_))
+    ));
+    assert_eq!(f.requests().len(), 1);
+    let second = sc.list_prs(&repo(), continuation).await.unwrap();
+    assert!(second.next_cursor.is_none());
+    assert!(f.requests()[1]
+        .path
+        .contains("/projects/Team%2FSecond/merge_requests"));
+}
+
+fn complete_note(id: u64, kind: Value, resolvable: bool, resolved: Value) -> Value {
+    let mut note = json!({"id":id,"body":"same body","author":{"username":"alice"},"created_at":"now","system":false,"resolvable":resolvable});
+    note["type"] = kind;
+    note["resolved"] = resolved;
+    note
+}
+
+#[tokio::test]
+async fn remaining_read_discussions_include_each_kind_with_canonical_identity_and_resolution() {
+    let f = Fixture::new(|r| {
+        assert!(r.path.contains("/merge_requests/7/discussions?"));
+        let mut diff = complete_note(4, json!("DiffNote"), true, json!(false));
+        diff["position"] = json!({"new_path":"src/a.rs","new_line":9,"head_sha":"a".repeat(40)});
+        reply(200, json!([
+            {"id":"standalone","individual_note":true,"notes":[complete_note(1, Value::Null, false, json!(false))]},
+            {"id":"general","individual_note":false,"notes":[complete_note(2,json!("DiscussionNote"),false,Value::Null),complete_note(3,json!("DiscussionNote"),false,Value::Null)]},
+            {"id":"diff","individual_note":false,"notes":[diff,complete_note(5,json!("DiffNote"),false,Value::Null)]},
+            {"id":"resolved","individual_note":false,"notes":[complete_note(6,json!("DiscussionNote"),true,json!(true))]},
+            {"id":"unknown","individual_note":false,"notes":[complete_note(7,json!("DiscussionNote"),true,Value::Null)]}
+        ]))
+    }).await;
+    let page = f
+        .provider()
+        .list_discussions(&repo(), 7, PageParams::first(20))
+        .await
+        .unwrap();
+    assert_eq!(page.items.len(), 5);
+    assert_eq!(page.items.iter().map(|d| d.notes.len()).sum::<usize>(), 7);
+    let standalone = &page.items[0];
+    assert!(standalone.individual_note);
+    assert!(!standalone.notes[0].resolvable);
+    assert_eq!(standalone.notes[0].resolved, None);
+    assert_eq!(standalone.notes[0].path, None);
+    assert_eq!(standalone.notes[0].position_head_sha, None);
+    let general = &page.items[1];
+    assert_eq!(
+        general.notes[1].in_reply_to_id.as_ref(),
+        Some(&general.notes[0].id)
+    );
+    assert_ne!(
+        general.notes[0].id, standalone.notes[0].id,
+        "identical bodies are distinct notes"
+    );
+    let diff = &page.items[2];
+    assert_eq!(diff.notes[0].path.as_deref(), Some("src/a.rs"));
+    assert_eq!(diff.notes[0].line, Some(9));
+    assert_eq!(
+        diff.notes[0].position_head_sha.as_deref(),
+        Some("a".repeat(40).as_str())
+    );
+    assert_eq!(diff.notes[0].resolved, Some(false));
+    assert_eq!(
+        diff.notes[1].in_reply_to_id.as_ref(),
+        Some(&diff.notes[0].id)
+    );
+    assert_eq!(
+        diff.notes[1].path, None,
+        "a reply does not invent its own diff anchor"
+    );
+    assert_eq!(diff.notes[1].position_head_sha, None);
+    assert_eq!(page.items[3].notes[0].resolved, Some(true));
+    assert_eq!(page.items[4].notes[0].resolved, None);
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(general.id.strip_prefix("gitlab:").unwrap())
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&raw).unwrap(),
+        json!([INSTANCE, "Team/Sub/Project", 7, "general"])
+    );
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(general.notes[0].id.strip_prefix("gitlab-note:").unwrap())
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&raw).unwrap(),
+        json!([INSTANCE, "Team/Sub/Project", 7, 2])
+    );
+    assert_eq!(
+        f.requests().len(),
+        1,
+        "no separate notes or legacy comments fetch"
+    );
+}
+
+#[tokio::test]
+async fn remaining_read_discussions_refuse_ambiguous_identity_and_resolvability() {
+    for mode in 0..4 {
+        let f = Fixture::new(move |_| {
+            let mut note = complete_note(1, Value::Null, false, Value::Null);
+            if mode == 0 {
+                note.as_object_mut().unwrap().remove("resolvable");
+            }
+            let mut thread = json!({"id":"one","individual_note":false,"notes":[note.clone()]});
+            if mode == 1 {
+                thread["notes"] = json!([note.clone(), note]);
+            }
+            if mode == 2 {
+                thread.as_object_mut().unwrap().remove("individual_note");
+            }
+            reply(
+                200,
+                if mode == 3 {
+                    json!([thread.clone(), thread])
+                } else {
+                    json!([thread])
+                },
+            )
+        })
+        .await;
+        assert!(matches!(
+            f.provider()
+                .list_discussions(&repo(), 7, PageParams::first(20))
+                .await,
+            Err(Error::Decode(_))
+        ));
+        assert_eq!(f.requests().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn remaining_read_discussion_empty_page_continues_and_failure_retains_quota() {
+    let f = Fixture::new(|r| {
+        if r.path.contains("page=2&") {
+            let mut response = reply(429, json!({"message":"slow down"}));
+            response.headers.push(("retry-after".into(), "60".into()));
+            return response;
+        }
+        let mut note = complete_note(1, Value::Null, false, Value::Null);
+        note["system"] = json!(true);
+        let mut response = reply(
+            200,
+            json!([{"id":"system","individual_note":true,"notes":[note]}]),
+        );
+        response.headers.push(("x-next-page".into(), "2".into()));
+        response
+    })
+    .await;
+    let sc = f.provider();
+    let first = sc
+        .list_discussions(&repo(), 7, PageParams::first(20))
+        .await
+        .unwrap();
+    assert!(first.items.is_empty());
+    let cursor = first
+        .next_cursor
+        .expect("system-only page still has continuation");
+    assert!(matches!(
+        sc.list_discussions(
+            &repo(),
+            8,
+            PageParams {
+                limit: 20,
+                cursor: Some(cursor.clone())
+            }
+        )
+        .await,
+        Err(Error::Config(_))
+    ));
+    assert!(matches!(
+        sc.list_discussions(
+            &repo(),
+            7,
+            PageParams {
+                limit: 20,
+                cursor: Some(cursor)
+            }
+        )
+        .await,
+        Err(Error::RateLimited(_))
+    ));
+    assert_eq!(sc.rate_limit_status().await.unwrap().remaining, Some(0));
+    assert_eq!(f.requests().len(), 2);
 }
 
 #[tokio::test]
@@ -2078,5 +2495,115 @@ async fn checkout_branch_rejects_corrupt_or_oversized_missing_responses() {
                 .unwrap_err(),
             Error::Provider(_)
         ));
+    }
+}
+
+#[tokio::test]
+async fn remaining_issue_filters_use_exact_current_user_scope_and_isolated_empty_continuation() {
+    use intent_sourcecontrol::{IssueInvolvement, IssueQuery};
+    let f = Fixture::new(|request| {
+        let mut result = reply(200, json!([]));
+        result.headers.push((
+            "x-next-page".into(),
+            if request.path.contains("page=1&") {
+                "2"
+            } else {
+                ""
+            }
+            .into(),
+        ));
+        result
+    })
+    .await;
+    let provider = f
+        .provider()
+        .with_pagination_scope("original-account".into());
+    for (filter, scope) in [
+        (IssueInvolvement::Created, "created_by_me"),
+        (IssueInvolvement::Assigned, "assigned_to_me"),
+    ] {
+        let query = IssueQuery {
+            state: Some("closed".into()),
+            search: Some("needle/one".into()),
+            limit: Some(2),
+            ..IssueQuery::default()
+        };
+        let first = provider
+            .list_issues_filtered(&repo(), query.clone(), filter)
+            .await
+            .unwrap();
+        assert!(first.items.is_empty());
+        let cursor = first.next_cursor.unwrap();
+        let continuation = IssueQuery {
+            cursor: Some(cursor),
+            ..query
+        };
+        let before = f.requests().len();
+        let other = if filter == IssueInvolvement::Created {
+            IssueInvolvement::Assigned
+        } else {
+            IssueInvolvement::Created
+        };
+        assert!(matches!(
+            provider
+                .list_issues_filtered(&repo(), continuation.clone(), other)
+                .await,
+            Err(Error::Config(_))
+        ));
+        assert!(matches!(
+            f.provider()
+                .with_pagination_scope("replacement".into())
+                .list_issues_filtered(&repo(), continuation.clone(), filter)
+                .await,
+            Err(Error::Config(_))
+        ));
+        assert_eq!(f.requests().len(), before);
+        let last = provider
+            .list_issues_filtered(&repo(), continuation, filter)
+            .await
+            .unwrap();
+        assert!(last.next_cursor.is_none());
+        let requests = f.requests();
+        assert!(requests[before - 1].path.contains(&format!(
+            "scope={scope}&state=closed&search=needle%2Fone&page=1&per_page=2"
+        )));
+        assert!(requests[before].path.contains("page=2&per_page=2"));
+    }
+    assert_eq!(
+        f.requests().len(),
+        4,
+        "no user-identity or participant probe"
+    );
+}
+
+#[tokio::test]
+async fn complete_discussion_failures_use_optional_scope_without_losing_auth_or_quota() {
+    for (status, kind) in [
+        (403, ProviderFailureKind::OptionalRestricted),
+        (404, ProviderFailureKind::OptionalUnavailable),
+        (405, ProviderFailureKind::OptionalUnavailable),
+        (501, ProviderFailureKind::OptionalUnavailable),
+        (401, ProviderFailureKind::CredentialRejected),
+    ] {
+        let f = Fixture::new(move |_| {
+            let mut response = reply(status, json!({"message":"unavailable"}));
+            response
+                .headers
+                .push(("ratelimit-remaining".into(), "23".into()));
+            response
+        })
+        .await;
+        let provider = f.provider();
+        let result = provider
+            .list_discussions(&repo(), 7, PageParams::first(20))
+            .await;
+        assert!(
+            matches!(result, Err(Error::Provider(ProviderFailure { kind:k, status:Some(s) })) if k == kind && s == status)
+        );
+        assert_eq!(
+            provider.rate_limit_status().await.unwrap().remaining,
+            Some(23)
+        );
+        assert_eq!(f.requests().len(), 1);
     }
 }

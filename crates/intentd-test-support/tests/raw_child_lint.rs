@@ -113,7 +113,6 @@ const BASELINE: &[&str] = &[
     "crates/intentd/tests/e2e_wss_host.rs",
     "crates/intentd/tests/e2e_wss_host_credential_env.rs",
     "crates/intentd/tests/e2e_wss_last_activity.rs",
-    "crates/intentd/tests/e2e_wss_legacy_import.rs",
     "crates/intentd/tests/e2e_wss_mcp_oauth_refresh.rs",
     "crates/intentd/tests/e2e_wss_mcp_servers.rs",
     "crates/intentd/tests/e2e_wss_pending_questions.rs",
@@ -154,7 +153,6 @@ const BASELINE: &[&str] = &[
     "crates/intentd/tests/uds_agent_runtime.rs",
     "crates/intentd/tests/uds_control.rs",
     "crates/intentd/tests/uds_git_credentials.rs",
-    "crates/intentd/tests/uds_legacy_import.rs",
     "crates/intentd/tests/uds_rpc_profile_warn.rs",
 ];
 

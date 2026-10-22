@@ -14,7 +14,8 @@ use sha2::{Digest, Sha256};
 use super::{GitlabCredentialGate, RepositoryOwner};
 use crate::repository_credentials::authority::CredentialFuture;
 use crate::repository_credentials::read::{
-    RepositoryReadScope, RepositoryResponseAttribution, RepositoryResponseDisposition,
+    RepositoryCollectionTarget, RepositoryReadScope, RepositoryResponseAttribution,
+    RepositoryResponseDisposition,
 };
 use crate::repository_credentials::{
     RepositoryConnectionBinding, RepositoryCredentialAdmission, RepositoryCredentialError as Error,
@@ -34,6 +35,8 @@ struct AttestedSource {
 pub(super) struct SourceEvidence {
     nonce: uuid::Uuid,
     published: Mutex<Option<Arc<AttestedSource>>>,
+    pub(super) native_contexts:
+        crate::repository_admission::lifecycle::native_allocation::NativeContextRetirements,
     checkout_denials: Mutex<std::collections::HashMap<String, RepositorySecretRequest>>,
     #[cfg(test)]
     read_probe: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
@@ -44,6 +47,7 @@ impl SourceEvidence {
         Self {
             nonce: uuid::Uuid::new_v4(),
             published: Mutex::new(None),
+            native_contexts: crate::repository_admission::lifecycle::native_allocation::NativeContextRetirements::default(),
             checkout_denials: Mutex::new(std::collections::HashMap::new()),
             #[cfg(test)]
             read_probe: Mutex::new(None),
@@ -73,7 +77,9 @@ impl SourceEvidence {
     }
 
     pub(super) fn invalidate(&self) -> Result<()> {
-        *self.published.lock().map_err(|_| Error::Indeterminate)? = None;
+        let mut current = self.published.lock().map_err(|_| Error::Indeterminate)?;
+        self.native_contexts.retire();
+        *current = None;
         Ok(())
     }
 
@@ -83,6 +89,7 @@ impl SourceEvidence {
             .as_ref()
             .is_some_and(|current| Arc::ptr_eq(current, original))
         {
+            self.native_contexts.retire();
             *current = None;
         }
         Ok(())
@@ -406,11 +413,15 @@ impl RepositoryOwner {
         if request.source != RepositoryCredentialSource::GitlabSecretSlot {
             return Err(Error::Unverified);
         }
-        *self
+        let mut published = self
             .evidence
             .published
             .lock()
-            .map_err(|_| Error::Indeterminate)? = Some(Arc::new(AttestedSource {
+            .map_err(|_| Error::Indeterminate)?;
+        if !self.evidence.native_contexts.settled() {
+            return Err(Error::Indeterminate);
+        }
+        *published = Some(Arc::new(AttestedSource {
             request,
             descriptor: descriptor.clone(),
             fingerprint,
@@ -814,6 +825,20 @@ impl RepositorySettledConnection {
             crate::repository_credentials::RepositoryDispatchStamp,
         ) -> Result<T>,
     ) -> Result<T> {
+        self.with_child_current(expected, projects, dispatch, None, action)
+    }
+
+    pub(crate) fn with_child_current<T>(
+        &self,
+        expected: Option<&RepositorySecretRequest>,
+        projects: &[&str],
+        dispatch: bool,
+        child_revision: Option<u64>,
+        action: impl FnOnce(
+            &RepositorySecretRequest,
+            crate::repository_credentials::RepositoryDispatchStamp,
+        ) -> Result<T>,
+    ) -> Result<T> {
         let settings = self.owner.settings.get().ok_or(Error::Unverified)?;
         let config = settings.config.lock().map_err(|_| Error::Indeterminate)?;
         let descriptor = self
@@ -821,46 +846,111 @@ impl RepositorySettledConnection {
             .descriptor
             .lock()
             .map_err(|_| Error::Indeterminate)?;
-        self.owner.directory.with_checkout_metadata(
+        let validate = |actual: &GitlabDescriptor, selected: &RepositorySecretRequest, stamp| {
+            let proof = self
+                .owner
+                .evidence
+                .published
+                .lock()
+                .map_err(|_| Error::Indeterminate)?;
+            self.check_checkout_proof(
+                &config,
+                descriptor.as_ref(),
+                actual,
+                selected,
+                proof.as_deref(),
+            )?;
+            let denials = self
+                .owner
+                .evidence
+                .checkout_denials
+                .lock()
+                .map_err(|_| Error::Indeterminate)?;
+            if projects.iter().any(|p| denials.get(*p) == Some(selected)) {
+                return Err(Error::AuthorityDenied);
+            }
+            action(selected, stamp)
+        };
+        match child_revision {
+            None => self.owner.directory.with_checkout_metadata(
+                &self.selected.binding,
+                expected,
+                dispatch,
+                validate,
+            ),
+            Some(revision) => self.owner.directory.with_checkout_child_metadata(
+                &self.selected.binding,
+                expected,
+                dispatch,
+                Some(revision),
+                validate,
+            ),
+        }
+    }
+
+    fn check_checkout_proof(
+        &self,
+        config: &intent_core::settings_file::GitlabSettings,
+        descriptor: Option<&GitlabDescriptor>,
+        actual: &GitlabDescriptor,
+        selected: &RepositorySecretRequest,
+        proof: Option<&AttestedSource>,
+    ) -> Result<()> {
+        let settings = self.owner.settings.get().ok_or(Error::Unverified)?;
+        if settings.source.is_none()
+            || settings.store.is_none()
+            || selected.source != RepositoryCredentialSource::GitlabSecretSlot
+        {
+            return Err(Error::Unverified);
+        }
+        let proof = proof.ok_or(Error::Unverified)?;
+        if proof.request != *selected {
+            return Err(Error::SecretMismatch);
+        }
+        if descriptor != Some(actual)
+            || proof.descriptor != *actual
+            || super::adoption::approved_descriptor(config, &settings.fixtures).as_ref()
+                != Some(actual)
+            || self.descriptor != *actual
+            || self.selected.source != selected.source
+        {
+            return Err(Error::BoundaryMismatch);
+        }
+        Ok(())
+    }
+
+    /// Keep the original source proof and disabled/enabled child metadata under
+    /// the same ranked locks until a single synchronous output transfer finishes.
+    pub(crate) fn with_child_policy_status<T>(
+        &self,
+        expected: Option<(bool, u64)>,
+        action: impl FnOnce(bool, u64) -> Result<T>,
+    ) -> Result<T> {
+        let settings = self.owner.settings.get().ok_or(Error::Unverified)?;
+        let config = settings.config.lock().map_err(|_| Error::Indeterminate)?;
+        let descriptor = self
+            .owner
+            .descriptor
+            .lock()
+            .map_err(|_| Error::Indeterminate)?;
+        self.owner.directory.with_child_policy_metadata(
             &self.selected.binding,
             expected,
-            dispatch,
-            |actual, selected, stamp| {
+            |actual, selected, enabled, revision| {
                 let proof = self
                     .owner
                     .evidence
                     .published
                     .lock()
                     .map_err(|_| Error::Indeterminate)?;
-                if settings.source.is_none()
-                    || settings.store.is_none()
-                    || selected.source != RepositoryCredentialSource::GitlabSecretSlot
-                {
-                    return Err(Error::Unverified);
-                }
-                let proof = proof.as_ref().ok_or(Error::Unverified)?;
-                if proof.request != *selected {
-                    return Err(Error::SecretMismatch);
-                }
-                if descriptor.as_ref() != Some(actual)
-                    || proof.descriptor != *actual
-                    || super::adoption::approved_descriptor(&config, &settings.fixtures).as_ref()
-                        != Some(actual)
-                    || self.descriptor != *actual
-                    || self.selected.source != selected.source
-                {
-                    return Err(Error::BoundaryMismatch);
-                }
-                let denials = self
-                    .owner
-                    .evidence
-                    .checkout_denials
-                    .lock()
-                    .map_err(|_| Error::Indeterminate)?;
-                if projects.iter().any(|p| denials.get(*p) == Some(selected)) {
-                    return Err(Error::AuthorityDenied);
-                }
-                action(selected, stamp)
+                self.check_checkout_proof(
+                    &config,
+                    descriptor.as_ref(),
+                    actual,
+                    selected,
+                    proof.as_deref(),
+                )?;
+                action(enabled, revision)
             },
         )
     }
@@ -975,14 +1065,104 @@ pub(crate) struct RepositoryReadEligibility {
     scope: RepositoryReadScope,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "qualified cache consumption remains separately owned"
-    )
-)]
+impl crate::repository_admission::read_request::MonitorCommitAuthority
+    for RepositoryReadEligibility
+{
+    fn commit_prepared(
+        &self,
+        write: intent_store::PreparedMonitorWrite,
+    ) -> crate::repository_admission::AdmissionResult<intent_core::Result<bool>> {
+        self.commit_monitor_write(write)
+            .map_err(|_| crate::repository_admission::AdmissionError::Retired)
+    }
+
+    fn commit_message(
+        &self,
+        write: intent_store::PreparedMonitorMessage,
+    ) -> crate::repository_admission::AdmissionResult<
+        intent_core::Result<Option<intent_core::AgentMessage>>,
+    > {
+        let mut write = Some(write);
+        let mut outcome = None;
+        self.with_current(&mut || {
+            outcome = Some(write.take().ok_or(Error::Indeterminate)?.commit());
+            Ok(())
+        })
+        .map_err(|_| crate::repository_admission::AdmissionError::Retired)?;
+        outcome.ok_or(crate::repository_admission::AdmissionError::Retired)
+    }
+}
+
 impl RepositoryReadEligibility {
+    /// Dedicated database-effect boundary. The Store token already owns an
+    /// IMMEDIATE transaction, so this cannot wait for pool/writer acquisition or
+    /// call provider/lifecycle code while metadata fences are held. Only the
+    /// `SQLite` worker executes the prebuilt statement and commit under these
+    /// fences; account retirement cannot finish until that commit finishes.
+    pub(crate) fn commit_monitor_write(
+        &self,
+        write: intent_store::PreparedMonitorWrite,
+    ) -> Result<intent_core::Result<bool>> {
+        let mut write = Some(write);
+        let mut outcome = None;
+        self.with_current(&mut || {
+            outcome = Some(write.take().ok_or(Error::Indeterminate)?.commit());
+            Ok(())
+        })?;
+        outcome.ok_or(Error::Indeterminate)
+    }
+
+    /// Called under the original request/recipient fence; all credential and
+    /// source proofs remain held until the exact allocation has been retained.
+    pub(crate) fn retain_native_context(
+        originals: &[&Self],
+        native: &Arc<crate::repository_admission::lifecycle::native_allocation::NativeAllocation>,
+    ) -> Result<()> {
+        Self::with_all_current_and_facts(originals, None, |_| {
+            for original in originals {
+                original
+                    .owner
+                    .directory
+                    .native_contexts
+                    .retain(native.clone())
+                    .map_err(|_| Error::Retired)?;
+                original
+                    .owner
+                    .evidence
+                    .native_contexts
+                    .retain(native.clone())
+                    .map_err(|_| Error::Retired)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Retain the new prompt's source obligation before its final transfer,
+    /// while the exact source/configuration/proof fences are still held.
+    pub(crate) fn with_native_context(
+        &self,
+        native: Option<
+            &Arc<crate::repository_admission::lifecycle::native_allocation::NativeAllocation>,
+        >,
+        transfer: &mut (dyn FnMut() -> Result<()> + Send),
+    ) -> Result<()> {
+        self.with_current(&mut || {
+            if let Some(native) = native {
+                self.owner
+                    .directory
+                    .native_contexts
+                    .retain(native.clone())
+                    .map_err(|_| Error::Retired)?;
+                self.owner
+                    .evidence
+                    .native_contexts
+                    .retain(native.clone())
+                    .map_err(|_| Error::Retired)?;
+            }
+            transfer()
+        })
+    }
+
     pub(crate) fn check(&self) -> Result<()> {
         self.with_current(&mut || Ok(()))
     }
@@ -1155,6 +1335,8 @@ impl RepositoryReadEligibility {
 
     /// Lock order: settings config -> descriptor -> directory -> source proof.
     /// Only a prebuilt, synchronous metadata/ownership action may run here.
+    /// The typed `commit_monitor_write` entry is the sole database exception: it
+    /// reserves its writer before this fence, never acquires one inside it.
     pub(crate) fn with_current(
         &self,
         action: &mut (dyn FnMut() -> Result<()> + Send),
@@ -1199,6 +1381,42 @@ impl RepositoryReadEligibility {
             .map_err(|_| Error::Indeterminate)?;
         self.scope
             .with_response(attribution, target, &mut |disposition, selected| {
+                let proof = self
+                    .owner
+                    .evidence
+                    .published
+                    .lock()
+                    .map_err(|_| Error::Indeterminate)?;
+                if let Some(selected) = selected {
+                    self.check_source(
+                        settings,
+                        &config,
+                        descriptor.as_ref(),
+                        proof.as_deref(),
+                        selected,
+                    )?;
+                }
+                // Rejection's accepted event survives its own directory disconnect.
+                // NoDenial likewise says nothing about successful payload eligibility.
+                apply(disposition)
+            })
+    }
+
+    pub(crate) fn with_collection_response(
+        &self,
+        attribution: &RepositoryResponseAttribution,
+        target: &RepositoryCollectionTarget,
+        apply: &mut (dyn FnMut(RepositoryResponseDisposition) -> Result<()> + Send),
+    ) -> Result<()> {
+        let settings = self.owner.settings.get().ok_or(Error::Unverified)?;
+        let config = settings.config.lock().map_err(|_| Error::Indeterminate)?;
+        let descriptor = self
+            .owner
+            .descriptor
+            .lock()
+            .map_err(|_| Error::Indeterminate)?;
+        self.scope
+            .with_collection_response(attribution, target, &mut |disposition, selected| {
                 let proof = self
                     .owner
                     .evidence

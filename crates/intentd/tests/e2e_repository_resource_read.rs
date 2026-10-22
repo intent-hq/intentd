@@ -105,7 +105,7 @@ impl Server {
                             let pause={let mut p=state.pause.lock().unwrap();if p.as_deref()==Some(route){p.take();true}else{false}};
                             if pause {state.entered.notify_one();state.release.notified().await;}
                             let body=reply.1.to_string();
-                            let next=state.next_pages.lock().unwrap().get(&path).map(|n|format!("X-Next-Page: {n}\r\n")).unwrap_or_default();
+                            let next={let pages=state.next_pages.lock().unwrap();pages.get(&path).or_else(||pages.get(route)).map(|n|format!("X-Next-Page: {n}\r\n")).unwrap_or_default()};
                             let head=format!("HTTP/1.1 {} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{next}RateLimit-Remaining: 17\r\nRateLimit-Limit: 100\r\nRateLimit-Reset: 1900000000\r\nConnection: close\r\n\r\n",reply.0,body.len());
                             let _=stream.write_all(format!("{head}{body}").as_bytes()).await;
                         });
@@ -298,13 +298,28 @@ impl Harness {
         Self::from_server(existing, Server::new().await).await
     }
     async fn from_server(existing: bool, server: Server) -> Self {
+        Self::with_control(existing, server, None).await
+    }
+    async fn with_control(
+        existing: bool,
+        server: Server,
+        control: Option<Arc<dyn intent_transport::SystemControl>>,
+    ) -> Self {
         let fixtures = vec![server.descriptor.clone()];
-        Self::with_fixtures(existing, server, fixtures).await
+        Self::with_fixtures_and_control(existing, server, fixtures, control).await
     }
     async fn with_fixtures(
         existing: bool,
         server: Server,
         fixtures: Vec<GitlabDescriptor>,
+    ) -> Self {
+        Self::with_fixtures_and_control(existing, server, fixtures, None).await
+    }
+    async fn with_fixtures_and_control(
+        existing: bool,
+        server: Server,
+        fixtures: Vec<GitlabDescriptor>,
+        control: Option<Arc<dyn intent_transport::SystemControl>>,
     ) -> Self {
         let dir = common::test_tempdir("itd-resource-wire-");
         let store = Store::open(&dir.path().join("intentd.db")).await.unwrap();
@@ -431,7 +446,7 @@ impl Harness {
                     bind_addresses: vec![std::net::Ipv4Addr::LOCALHOST.into()],
                     ..Default::default()
                 },
-                None,
+                control.clone(),
             )
             .unwrap(),
         );
@@ -439,7 +454,7 @@ impl Harness {
         let socket = dir.path().join("intentd.sock");
         let (shutdown, stopped) = tokio::sync::oneshot::channel();
         let listener = tokio::spawn(async move {
-            intent_transport::serve_uds(api, bus, &socket, None, async move {
+            intent_transport::serve_uds(api, bus, &socket, control, async move {
                 let _ = stopped.await;
             })
             .await
@@ -773,3 +788,6 @@ async fn repository_resource_real_failure_classes_keep_original_wire_evidence() 
 
 #[path = "e2e_repository_resource_read/checkout.rs"]
 mod checkout;
+
+#[path = "e2e_repository_resource_read/pages.rs"]
+mod pages;

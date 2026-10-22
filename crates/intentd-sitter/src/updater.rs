@@ -27,6 +27,7 @@ use crate::cli::Channel;
 use crate::manifest::{self, ChannelManifest, ManifestError, PlatformEntry, TARGET_TRIPLE};
 use crate::paths::{SitterPaths, DAEMON_BIN_NAME};
 use crate::state;
+use crate::telemetry::{self, CheckParams, CheckTrigger, UpdateEndpoint};
 
 /// TCP connect timeout for all requests (fail fast when offline).
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -103,6 +104,10 @@ pub enum UpdateError {
     NoBaseUrls,
     #[error("invalid exact update: {0}")]
     ExactVersion(String),
+    #[error("update endpoint {url} was not redirected to an official GitHub manifest (ended at {final_url})")]
+    UnverifiedSource { url: String, final_url: String },
+    #[error("invalid update endpoint URL {0}")]
+    InvalidEndpoint(String),
 }
 
 /// The update engine. Holds the resolved sitter paths and an HTTP client
@@ -113,6 +118,9 @@ pub struct Updater {
     /// constructors). The manifest fetch tries each in order.
     base_urls: Vec<String>,
     client: reqwest::blocking::Client,
+    /// Update-check endpoint tried before `base_urls` unless telemetry is
+    /// opted out at check time. `None` with an explicit base override.
+    endpoint: Option<UpdateEndpoint>,
 }
 
 impl Updater {
@@ -245,13 +253,23 @@ impl Updater {
         }
         let client = reqwest::blocking::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
+            .user_agent(telemetry::user_agent())
             .build()
             .map_err(UpdateError::Client)?;
         Ok(Self {
             paths,
             base_urls,
             client,
+            endpoint: None,
         })
+    }
+
+    /// Fetch manifests through `endpoint` first (unless opted out when a
+    /// check runs), falling back to the base URLs on any failure.
+    #[must_use]
+    pub fn with_update_endpoint(mut self, endpoint: Option<UpdateEndpoint>) -> Self {
+        self.endpoint = endpoint;
+        self
     }
 
     /// Run one update check for `channel`: fetch the manifest and, when it
@@ -261,8 +279,12 @@ impl Updater {
     /// # Errors
     ///
     /// Returns an [`UpdateError`] when the manifest cannot be fetched or parsed, or the download/verify/install sequence fails.
-    pub fn check_and_install(&self, channel: Channel) -> Result<UpdateOutcome, UpdateError> {
-        self.install_from_manifest(channel, false)
+    pub fn check_and_install(
+        &self,
+        channel: Channel,
+        trigger: CheckTrigger,
+    ) -> Result<UpdateOutcome, UpdateError> {
+        self.install_from_manifest(channel, trigger, false)
     }
 
     /// Fetch the channel manifest and install its version unconditionally,
@@ -275,8 +297,12 @@ impl Updater {
     /// # Errors
     ///
     /// Returns an [`UpdateError`] when the manifest cannot be fetched or parsed, or the download/verify/install sequence fails.
-    pub fn force_install(&self, channel: Channel) -> Result<UpdateOutcome, UpdateError> {
-        self.install_from_manifest(channel, true)
+    pub fn force_install(
+        &self,
+        channel: Channel,
+        trigger: CheckTrigger,
+    ) -> Result<UpdateOutcome, UpdateError> {
+        self.install_from_manifest(channel, trigger, true)
     }
 
     /// Dry-run: fetch the channel manifest and report installed vs latest
@@ -287,8 +313,12 @@ impl Updater {
     /// # Errors
     ///
     /// Returns an [`UpdateError`] when the manifest cannot be fetched or parsed, or its version string is invalid.
-    pub fn check_only(&self, channel: Channel) -> Result<UpdateCheck, UpdateError> {
-        let manifest = self.fetch_manifest(channel)?;
+    pub fn check_only(
+        &self,
+        channel: Channel,
+        trigger: CheckTrigger,
+    ) -> Result<UpdateCheck, UpdateError> {
+        let manifest = self.fetch_manifest(channel, trigger)?;
         semver::Version::parse(&manifest.version).map_err(|source| {
             UpdateError::InvalidManifestVersion {
                 version: manifest.version.clone(),
@@ -317,9 +347,10 @@ impl Updater {
     fn install_from_manifest(
         &self,
         channel: Channel,
+        trigger: CheckTrigger,
         force: bool,
     ) -> Result<UpdateOutcome, UpdateError> {
-        let manifest = self.fetch_manifest(channel)?;
+        let manifest = self.fetch_manifest(channel, trigger)?;
         // The manifest version becomes a directory name under `versions/` and
         // the persisted `current_version`; reject anything that is not valid
         // semver before it touches the filesystem (also covers the fresh
@@ -471,7 +502,25 @@ impl Updater {
     /// URL in order. Any failure — network error, HTTP status, unparseable
     /// body — advances to the next base; when every base fails, the last
     /// error is returned.
-    fn fetch_manifest(&self, channel: Channel) -> Result<ChannelManifest, UpdateError> {
+    fn fetch_manifest(
+        &self,
+        channel: Channel,
+        trigger: CheckTrigger,
+    ) -> Result<ChannelManifest, UpdateError> {
+        // An opt-out (re-read on every check) goes straight to GitHub.
+        let endpoint = self.endpoint.as_ref().filter(|_| {
+            !telemetry::opted_out(|name| std::env::var_os(name), &self.paths.config_path)
+        });
+        if let Some(endpoint) = endpoint {
+            match self.fetch_via_endpoint(endpoint, channel, trigger) {
+                Ok(manifest) => return Ok(manifest),
+                Err(e) => eprintln!(
+                    "intentd-sitter: update check via {} failed ({e}); \
+                     falling back to GitHub",
+                    endpoint.base_url
+                ),
+            }
+        }
         let mut last_err = None;
         for (i, base_url) in self.base_urls.iter().enumerate() {
             let url = manifest::manifest_url(base_url, channel);
@@ -494,6 +543,77 @@ impl Updater {
             }
         }
         Err(last_err.unwrap_or(UpdateError::NoBaseUrls))
+    }
+
+    /// One manifest fetch through the update-check endpoint, with the
+    /// redirect allowlist ([`telemetry::check_redirect`]) on a dedicated
+    /// client. Records today's UTC date once a first-of-day check succeeds.
+    fn fetch_via_endpoint(
+        &self,
+        endpoint: &UpdateEndpoint,
+        channel: Channel,
+        trigger: CheckTrigger,
+    ) -> Result<ChannelManifest, UpdateError> {
+        let now = time::OffsetDateTime::now_utc();
+        let last_day = state::load(&self.paths.state_path).last_check_day;
+        let first_of_day = telemetry::is_first_check_of_day(last_day.as_deref(), now);
+        let url = telemetry::update_check_url(
+            &endpoint.base_url,
+            channel,
+            &CheckParams {
+                platform: TARGET_TRIPLE,
+                version: telemetry::SITTER_VERSION,
+                source: endpoint.install_source,
+                trigger,
+                first_of_day,
+            },
+        )
+        .map_err(|e| UpdateError::InvalidEndpoint(format!("{}: {e}", endpoint.base_url)))?;
+        let client = reqwest::blocking::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .user_agent(telemetry::user_agent())
+            .redirect(telemetry::redirect_policy(channel))
+            .build()
+            .map_err(UpdateError::Client)?;
+        let network = |source| UpdateError::Network {
+            url: url.to_string(),
+            source,
+        };
+        let resp = client
+            .get(url.clone())
+            .timeout(endpoint.timeout)
+            .send()
+            .map_err(network)?;
+        if !telemetry::is_allowed_final_url(resp.url(), channel) {
+            return Err(UpdateError::UnverifiedSource {
+                url: url.to_string(),
+                final_url: resp.url().to_string(),
+            });
+        }
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(UpdateError::HttpStatus {
+                url: resp.url().to_string(),
+                status,
+            });
+        }
+        let manifest = manifest::parse(&resp.bytes().map_err(network)?)?;
+        if first_of_day {
+            self.record_check_day(&telemetry::utc_day(now));
+        }
+        Ok(manifest)
+    }
+
+    /// Best-effort: persist `last_check_day` under the state lock.
+    fn record_check_day(&self, day: &str) {
+        let Ok(_lock) = state::lock(&self.paths.state_path) else {
+            return;
+        };
+        let mut state = state::load(&self.paths.state_path);
+        state.last_check_day = Some(day.to_string());
+        if let Err(e) = state::save(&self.paths.state_path, &state) {
+            eprintln!("intentd-sitter: failed to persist state.json: {e}");
+        }
     }
 
     fn fetch(&self, url: &str, timeout: Duration) -> Result<Vec<u8>, UpdateError> {

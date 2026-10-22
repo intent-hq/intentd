@@ -26,26 +26,29 @@ impl NoteObserver {
             .await
             .unwrap();
         let mut pending = VecDeque::new();
-        let subscription = timeout(Duration::from_secs(10), async {
-            loop {
-                match socket.next().await {
-                    Some(Ok(Message::Text(text))) => {
-                        let frame: Value = serde_json::from_str(&text).unwrap();
-                        if frame["id"] == 897 {
-                            return result(&frame, 897)["subscriptionId"]
-                                .as_str()
-                                .unwrap()
-                                .to_owned();
+        let subscription = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                loop {
+                    match socket.next().await {
+                        Some(Ok(Message::Text(text))) => {
+                            let frame: Value = serde_json::from_str(&text).unwrap();
+                            if frame["id"] == 897 {
+                                return result(&frame, 897)["subscriptionId"]
+                                    .as_str()
+                                    .unwrap()
+                                    .to_owned();
+                            }
+                            pending.push_back(frame);
                         }
-                        pending.push_back(frame);
+                        Some(Ok(Message::Ping(payload))) => {
+                            socket.send(Message::Pong(payload)).await.unwrap();
+                        }
+                        other => panic!("note observer subscribe: {other:?}"),
                     }
-                    Some(Ok(Message::Ping(payload))) => {
-                        socket.send(Message::Pong(payload)).await.unwrap();
-                    }
-                    other => panic!("note observer subscribe: {other:?}"),
                 }
-            }
-        })
+            },
+        )
         .await
         .expect("note observer subscribe deadline");
         Self {
@@ -56,25 +59,28 @@ impl NoteObserver {
     }
 
     async fn next_push(&mut self) -> Value {
-        timeout(Duration::from_secs(10), async {
-            loop {
-                let frame = if let Some(frame) = self.pending.pop_front() {
-                    frame
-                } else {
-                    match self.socket.next().await {
-                        Some(Ok(Message::Text(text))) => serde_json::from_str(&text).unwrap(),
-                        Some(Ok(Message::Ping(payload))) => {
-                            self.socket.send(Message::Pong(payload)).await.unwrap();
-                            continue;
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                loop {
+                    let frame = if let Some(frame) = self.pending.pop_front() {
+                        frame
+                    } else {
+                        match self.socket.next().await {
+                            Some(Ok(Message::Text(text))) => serde_json::from_str(&text).unwrap(),
+                            Some(Ok(Message::Ping(payload))) => {
+                                self.socket.send(Message::Pong(payload)).await.unwrap();
+                                continue;
+                            }
+                            other => panic!("note observer push: {other:?}"),
                         }
-                        other => panic!("note observer push: {other:?}"),
-                    }
-                };
-                assert_eq!(frame["method"], "subscription.push", "{frame}");
-                assert_eq!(frame["params"]["subscriptionId"], self.subscription);
-                return frame["params"].clone();
-            }
-        })
+                    };
+                    assert_eq!(frame["method"], "subscription.push", "{frame}");
+                    assert_eq!(frame["params"]["subscriptionId"], self.subscription);
+                    return frame["params"].clone();
+                }
+            },
+        )
         .await
         .expect("note observer push deadline")
     }
@@ -119,30 +125,33 @@ async fn events_through_marker(
         .await,
         880,
     );
-    timeout(Duration::from_secs(10), async {
-        let mut events = Vec::new();
-        loop {
-            match subscriber.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let frame: Value = serde_json::from_str(&text).unwrap();
-                    if frame["method"] != "events.event" {
-                        continue;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            let mut events = Vec::new();
+            loop {
+                match subscriber.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let frame: Value = serde_json::from_str(&text).unwrap();
+                        if frame["method"] != "events.event" {
+                            continue;
+                        }
+                        let event = frame["params"]["event"].clone();
+                        if event["type"] == "workspace:updated"
+                            && event["data"]["changes"]["title"] == title
+                        {
+                            return events;
+                        }
+                        events.push(event);
                     }
-                    let event = frame["params"]["event"].clone();
-                    if event["type"] == "workspace:updated"
-                        && event["data"]["changes"]["title"] == title
-                    {
-                        return events;
+                    Some(Ok(Message::Ping(payload))) => {
+                        subscriber.send(Message::Pong(payload)).await.unwrap();
                     }
-                    events.push(event);
+                    other => panic!("event delivery before marker: {other:?}"),
                 }
-                Some(Ok(Message::Ping(payload))) => {
-                    subscriber.send(Message::Pong(payload)).await.unwrap();
-                }
-                other => panic!("event delivery before marker: {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await
     .expect("workspace event barrier")
 }
@@ -183,15 +192,19 @@ async fn offline_addition_notifies_guest(cached: bool) {
     }
     let retained = store.list_workspace_members(&wid).await.unwrap();
     let mut guest_rpc = connect_ws(host.port, host.cfg.clone(), &remaining_token).await;
-    result(
+    let hello = result(
         &wss_rpc(
             &mut guest_rpc,
             883,
             "client.hello",
-            json!({"clientId":"remaining-guest"}),
+            json!({"clientId":"remaining-guest","capabilities":{"workspaceMembershipEvents":false}}),
         )
         .await,
         883,
+    );
+    assert_eq!(
+        hello["server"]["capabilities"]["workspaceMembershipEvents"],
+        1
     );
     let mut subscriber = connect_ws(host.port, host.cfg.clone(), &remaining_token).await;
     result(
@@ -228,19 +241,22 @@ async fn offline_addition_notifies_guest(cached: bool) {
         );
         promoted.close(None).await.unwrap();
         // Observe the actual last-connection close, not an assumed delay.
-        timeout(Duration::from_secs(10), async {
-            loop {
-                let event = next_event(&mut subscriber, "presence:changed", 10).await;
-                if event["data"]["members"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .all(|row| row["principalId"] != person.id.0)
-                {
-                    break;
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                loop {
+                    let event = next_event(&mut subscriber, "presence:changed", 10).await;
+                    if event["data"]["members"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .all(|row| row["principalId"] != person.id.0)
+                    {
+                        break;
+                    }
                 }
-            }
-        })
+            },
+        )
         .await
         .expect("promoted guest is now offline");
         Some((lease, subscription))
@@ -354,6 +370,18 @@ async fn offline_addition_notifies_guest(cached: bool) {
     );
     let events = events_through_marker(&mut owner, &mut subscriber, &workspace, "Added").await;
     assert_scoped(&events, &workspace);
+    let invalidations: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            event["type"] == "workspace:updated" && event["data"]["changes"]["members"] == true
+        })
+        .collect();
+    assert_eq!(
+        invalidations.len(),
+        1,
+        "offline promotion must invalidate membership: {events:?}"
+    );
+    assert_eq!(invalidations[0]["data"]["workspaceId"], workspace);
     let presence: Vec<_> = events
         .iter()
         .filter(|event| event["type"] == "presence:changed")
@@ -419,7 +447,10 @@ async fn offline_addition_notifies_guest(cached: bool) {
     );
     let noop = events_through_marker(&mut owner, &mut subscriber, &workspace, "Unchanged").await;
     assert_scoped(&noop, &workspace);
-    assert!(noop.iter().all(|event| event["type"] != "presence:changed"));
+    assert!(noop
+        .iter()
+        .all(|event| event["type"] != "presence:changed"
+            && event["data"]["changes"]["members"] != true));
 
     if let Some((mut lease, subscription)) = cached_lease {
         result(
@@ -433,17 +464,20 @@ async fn offline_addition_notifies_guest(cached: bool) {
             899,
         );
         let observer = note_observer.as_mut().unwrap();
-        let left = timeout(Duration::from_secs(10), async {
-            loop {
-                let push = observer.next_push().await;
-                if push["kind"] == "delta"
-                    && push["delta"]["kind"] == "left"
-                    && push["delta"]["viewer"]["principalId"] == person.id.0
-                {
-                    return push;
+        let left = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                loop {
+                    let push = observer.next_push().await;
+                    if push["kind"] == "delta"
+                        && push["delta"]["kind"] == "left"
+                        && push["delta"]["viewer"]["principalId"] == person.id.0
+                    {
+                        return push;
+                    }
                 }
-            }
-        })
+            },
+        )
         .await
         .expect("target lease left on the dedicated note channel");
         assert_eq!(left["delta"]["viewer"]["hostRole"], "member");
@@ -475,6 +509,12 @@ async fn offline_addition_notifies_guest(cached: bool) {
     );
     let removed = events_through_marker(&mut owner, &mut subscriber, &workspace, "Removed").await;
     assert_scoped(&removed, &workspace);
+    assert!(removed
+        .iter()
+        .any(|event| event["type"] == "workspace:updated"
+            && event["data"]["changes"]["members"] == true
+            && event["data"]["changes"]["removedPrincipalId"] == person.id.0
+            && event["data"]["changes"]["memberCount"] == 2));
     assert!(removed
         .iter()
         .any(|event| event["type"] == "presence:changed"));

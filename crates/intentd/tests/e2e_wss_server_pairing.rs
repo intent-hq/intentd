@@ -114,7 +114,7 @@ esac
 async fn await_uds(socket: &Path) -> bool {
     tokio::time::timeout(common::daemon_startup_timeout(), async {
         loop {
-            if socket.exists() {
+            if common::daemon_is_ready(socket).await {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -595,31 +595,102 @@ async fn server_rotate_token_over_wss_rejects() {
 }
 
 #[tokio::test]
-async fn system_import_legacy_over_wss_rejects() {
-    let data_dir_guard = temp_data_dir();
-    let data_dir = data_dir_guard.path().to_path_buf();
+async fn retired_legacy_import_is_missing_over_wss_and_uds() {
+    let data_dir = temp_data_dir();
     let daemon = Daemon {
-        child: spawn_serve(&data_dir),
+        child: spawn_serve(data_dir.path()),
     };
-    let (port, fp) = boot(&data_dir).await;
+    let (port, fp) = boot(data_dir.path()).await;
     let frame = json!({
         "jsonrpc": "2.0", "id": 1, "method": "system.importLegacy",
         "params": { "force": false }
     })
     .to_string();
-    let response = wss_call(port, client_config(&fp), &frame).await;
+    let remote = wss_call(port, client_config(&fp), &frame).await;
+    let local = uds_rpc(
+        &data_dir.path().join("intentd.sock"),
+        1,
+        "system.importLegacy",
+        json!({}),
+    )
+    .await;
+    for response in [remote, local] {
+        assert_eq!(response["jsonrpc"], "2.0", "{response}");
+        assert_eq!(response["id"], 1, "{response}");
+        assert_eq!(response["error"]["code"], -32601, "{response}");
+        assert!(response.get("result").is_none(), "{response}");
+    }
+    drop(daemon);
+}
 
-    assert_eq!(response["jsonrpc"], "2.0", "{response}");
-    assert_eq!(response["id"], 1, "{response}");
-    assert_eq!(response["error"]["code"], -32001, "{response}");
-    assert!(response["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("UDS only"));
-    daemon
+#[tokio::test]
+async fn fresh_daemon_does_not_import_legacy_workspaces() {
+    let data_dir = temp_data_dir();
+    let legacy_root = data_dir.path().join("legacy");
+    let metadata = legacy_root.join("legacy-fixture/.workspace");
+    std::fs::create_dir_all(&metadata).unwrap();
+    let manifest = json!({
+        "id": "legacy-fixture", "title": "Legacy workspace", "status": "Active",
+        "createdAt": "2025-05-01T00:00:00Z", "updatedAt": "2025-05-02T00:00:00Z"
+    })
+    .to_string();
+    std::fs::write(metadata.join("workspace.json"), &manifest).unwrap();
+    common::enable_ws_api(data_dir.path());
+    let root = legacy_root.to_str().unwrap();
+    let mut daemon = Daemon {
+        child: spawn_serve_inner(data_dir.path(), &[("INTENTD_LEGACY_IMPORT_ROOTS", root)]),
+    };
+    let (port, fp) = boot(data_dir.path()).await;
+    let response = wss_call(
+        port,
+        client_config(&fp),
+        &json!({
+            "jsonrpc": "2.0", "id": 2, "method": "workspace.list", "params": {}
+        })
+        .to_string(),
+    )
+    .await;
+    assert!(response.get("error").is_none(), "{response}");
+    assert!(
+        !response.to_string().contains("legacy-fixture"),
+        "{response}"
+    );
+    let shutdown = uds_rpc(
+        &data_dir.path().join("intentd.sock"),
+        3,
+        "system.shutdown",
+        json!({}),
+    )
+    .await;
+    assert!(shutdown.get("error").is_none(), "{shutdown}");
+    let status = daemon
         .child
-        .signal_group(nix::sys::signal::Signal::SIGKILL)
-        .ok();
+        .wait_with_timeout(common::daemon_startup_timeout())
+        .unwrap()
+        .expect("daemon did not stop");
+    assert!(status.success(), "{status}");
+    // Check after graceful shutdown so a delayed first-boot task cannot escape the assertion.
+    let store = intent_store::Store::open(&data_dir.path().join("intentd.db"))
+        .await
+        .unwrap();
+    assert!(store.list_workspaces(true).await.unwrap().is_empty());
+    store.close().await;
+    assert_eq!(
+        std::fs::read_to_string(metadata.join("workspace.json")).unwrap(),
+        manifest
+    );
+}
+
+#[test]
+fn retired_legacy_import_commands_are_rejected() {
+    for command in ["import", "import-legacy"] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_intentd"))
+            .args([command, "--help"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("unrecognized subcommand"));
+    }
 }
 
 #[tokio::test]
@@ -683,15 +754,18 @@ async fn system_shutdown_over_wss_rejects_and_daemon_survives() {
     ws.send(Message::Text(notification.into()))
         .await
         .expect("send");
-    let unexpected = timeout(Duration::from_secs(2), async {
-        loop {
-            match ws.next().await {
-                Some(Ok(Message::Text(text))) => return Some(text),
-                Some(Ok(_)) => {}
-                _ => return None,
+    let unexpected = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => return Some(text),
+                    Some(Ok(_)) => {}
+                    _ => return None,
+                }
             }
-        }
-    })
+        },
+    )
     .await;
     assert!(
         !matches!(&unexpected, Ok(Some(_))),

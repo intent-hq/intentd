@@ -77,6 +77,7 @@ fn meta() -> Meta {
 fn query(conn: &Arc<Connection>) -> CallbackQuery {
     CallbackClient {
         connection: Arc::clone(conn),
+        monitoring: None,
     }
     .capture("session".into(), Some(&meta()))
     .unwrap()
@@ -182,6 +183,7 @@ async fn original_new_and_load_each_run_once_and_bad_receipts_preserve_response(
             let (conn, mut peer) = pair(8192);
             let client = CallbackClient {
                 connection: Arc::clone(&conn),
+                monitoring: None,
             };
             let expected = receipt == json!({"version":1,"queryReceipt":RECEIPT});
             let run = tokio::spawn(async move {
@@ -226,6 +228,7 @@ async fn original_errors_remain_errors_without_registration() {
     let (conn, mut peer) = pair(8192);
     let client = CallbackClient {
         connection: Arc::clone(&conn),
+        monitoring: None,
     };
     let task = tokio::spawn(async move { client.new_session("/fixture", vec![], None).await });
     let request = peer.read().await;
@@ -500,6 +503,26 @@ async fn queued_rpc_error_disconnect_and_foreign_reply_remain_uncertain() {
     }
 }
 
+/// The frozen da577fff callback adapter. Only the monorepo gate runner
+/// (`make test`, `make test-select`) sets the variable, from its verified
+/// offline cache; raw `cargo nextest` leaves it unset.
+fn callback_adapter_fixture() -> std::path::PathBuf {
+    const HINT: &str = "run these tests with make test-select E='<nextest filterset>' (or make \
+        test), which set it from the verified offline cache; raw cargo nextest does not. Setup: \
+        the monorepo's CONTRIBUTING.md#linux-x64-callback-gates";
+    let value = std::env::var_os("INTENT_ACP_CALLBACK_ADAPTER_FIXTURE")
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| {
+            panic!("INTENT_ACP_CALLBACK_ADAPTER_FIXTURE (the frozen da577fff adapter fixture) is unset: {HINT}")
+        });
+    std::fs::canonicalize(&value).unwrap_or_else(|error| {
+        panic!(
+            "INTENT_ACP_CALLBACK_ADAPTER_FIXTURE={} is not a usable fixture ({error}): {HINT}",
+            std::path::Path::new(&value).display()
+        )
+    })
+}
+
 struct NodePeer {
     // Kill the scripted adapter before deleting its allowed scratch directories.
     child: tokio::process::Child,
@@ -509,9 +532,7 @@ struct NodePeer {
 
 impl NodePeer {
     fn start() -> Self {
-        let adapter = std::env::var("INTENT_ACP_CALLBACK_ADAPTER_FIXTURE")
-            .expect("set INTENT_ACP_CALLBACK_ADAPTER_FIXTURE to the frozen da577fff local fixture");
-        let adapter = std::fs::canonicalize(adapter).unwrap();
+        let adapter = callback_adapter_fixture();
         let dependencies = std::fs::canonicalize(adapter.join("node_modules")).unwrap();
         let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/claude_callback_peer.mjs");
@@ -814,4 +835,848 @@ async fn actual_adapter_replacement_rejects_old_query_and_disabled_never_registe
             .any(|v| v["request"]["subtype"] == "mcp_set_servers"));
     }
     f.finish().await;
+}
+
+async fn monitor_client(
+    conn: &Arc<Connection>,
+    peer: &mut Peer,
+    advertised: Value,
+) -> Arc<CallbackClient> {
+    let c = conn.clone();
+    let run = tokio::spawn(async move {
+        crate::handshake::handshake_with_review_monitoring(
+            c,
+            &config(),
+            CallbackOffer::V1,
+            crate::review_monitoring::ReviewMonitoringOffer::V1,
+        )
+        .await
+        .unwrap()
+    });
+    let request = peer.read().await;
+    assert_eq!(
+        request["params"]["clientCapabilities"]["_meta"]["reviewMonitoring"],
+        1
+    );
+    assert_eq!(
+        request["params"]["clientCapabilities"]["_meta"][META_KEY],
+        json!({"version":1})
+    );
+    peer.reply(
+        &request,
+        json!({"protocolVersion":1,"agentCapabilities":{},"authMethods":[],
+        "_meta":{META_KEY:capability(),"reviewMonitoring":advertised,"ordinary":"retained"}}),
+    )
+    .await;
+    let response = run.await.unwrap();
+    assert_eq!(
+        response.ordinary.initialize.meta.unwrap()["ordinary"],
+        "retained"
+    );
+    Arc::new(response.callbacks.unwrap())
+}
+
+fn monitor_meta() -> Meta {
+    let mut meta = Meta::new();
+    crate::review_monitoring::ReviewMonitoringContext::new("original-owner".into())
+        .unwrap()
+        .insert_into(&mut meta);
+    meta
+}
+
+async fn monitor_session(
+    client: &Arc<CallbackClient>,
+    peer: &mut Peer,
+    session: &str,
+    advertised: Value,
+) -> CallbackQuery {
+    let client = client.clone();
+    let run = tokio::spawn(async move {
+        client
+            .new_session("/fixture", vec![], Some(monitor_meta()))
+            .await
+            .unwrap()
+    });
+    let request = peer.read().await;
+    peer.reply(&request,json!({"sessionId":session,"_meta":{META_KEY:{"version":1,"queryReceipt":RECEIPT},
+        "reviewMonitoring":advertised,"reviewMonitoringContext":request["params"]["_meta"]["reviewMonitoringContext"]}})).await;
+    run.await.unwrap().query.unwrap()
+}
+
+async fn monitor_ack(
+    query: CallbackQuery,
+    peer: &mut Peer,
+) -> crate::review_monitoring::ReviewMonitoringReceipt {
+    let evidence = query.pending_review_monitoring().unwrap();
+    assert!(
+        evidence.acknowledged().is_none(),
+        "a captured pre-ACK request has no recipient receipt"
+    );
+    let run = tokio::spawn(async move { query.registration(server(true)).run(pending()).await });
+    let request = peer.read().await;
+    peer.reply(&request, success(&request)).await;
+    assert!(matches!(
+        run.await.unwrap(),
+        CallbackDeliveryOutcome::Remote(_)
+    ));
+    evidence
+        .acknowledged()
+        .expect("actual correlated ACK enables original session receipt")
+}
+
+#[tokio::test]
+async fn monitor_receipt_intersects_initialize_session_and_actual_ack() {
+    for version in [
+        Value::Null,
+        json!(0),
+        json!(-1),
+        json!(true),
+        json!("1"),
+        json!(1.5),
+        json!(1),
+        json!(9),
+    ] {
+        for initialize in [false, true] {
+            let (conn, mut peer) = pair(8192);
+            let client = monitor_client(
+                &conn,
+                &mut peer,
+                if initialize {
+                    version.clone()
+                } else {
+                    json!(1)
+                },
+            )
+            .await;
+            let query = monitor_session(
+                &client,
+                &mut peer,
+                "original",
+                if initialize {
+                    json!(1)
+                } else {
+                    version.clone()
+                },
+            )
+            .await;
+            let supported = version.as_u64().is_some_and(|v| v >= 1);
+            assert_eq!(query.pending_review_monitoring().is_some(), supported);
+            if supported {
+                let receipt = monitor_ack(query, &mut peer).await;
+                assert!(receipt.is_current());
+                assert_eq!(receipt.with_current(|| 42), Some(42));
+                receipt.retire();
+                assert_eq!(receipt.with_current(|| 42), None);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn monitor_receipt_reinitialize_and_late_ack_never_revive_generation() {
+    let (conn, mut peer) = pair(8192);
+    let client = monitor_client(&conn, &mut peer, json!(1)).await;
+    let query = monitor_session(&client, &mut peer, "original", json!(1)).await;
+    let retained = query.pending_review_monitoring().unwrap();
+    let ack = tokio::spawn(async move { query.registration(server(true)).run(pending()).await });
+    let registration = peer.read().await;
+    let c = conn.clone();
+    let reinitialize = tokio::spawn(async move { crate::handshake::initialize(&c).await });
+    let request = peer.read().await;
+    assert!(request["params"]["clientCapabilities"]["_meta"]["reviewMonitoring"].is_null());
+    peer.reply(&registration, success(&registration)).await;
+    let _ = ack.await.unwrap();
+    assert!(
+        retained.acknowledged().is_none(),
+        "late ACK cannot resurrect old generation"
+    );
+    peer.reply(
+        &request,
+        json!({"protocolVersion":1,"agentCapabilities":{},"authMethods":[]}),
+    )
+    .await;
+    reinitialize.await.unwrap().unwrap();
+    let stale = monitor_session(&client, &mut peer, "original", json!(1)).await;
+    assert!(stale.pending_review_monitoring().is_none());
+}
+
+#[tokio::test]
+async fn monitor_receipt_same_id_load_retires_before_reply_and_ignores_stale_completion() {
+    let (conn, mut peer) = pair(8192);
+    let client = monitor_client(&conn, &mut peer, json!(1)).await;
+    let query = monitor_session(&client, &mut peer, "original", json!(1)).await;
+    let old = monitor_ack(query, &mut peer).await;
+    let c = client.clone();
+    let first = tokio::spawn(async move {
+        c.load_session("original", "/fixture", vec![], Some(monitor_meta()))
+            .await
+    });
+    let first_request = peer.read().await;
+    assert!(!old.is_current());
+    let c = client.clone();
+    let second = tokio::spawn(async move {
+        c.load_session("original", "/fixture", vec![], Some(monitor_meta()))
+            .await
+    });
+    let second_request = peer.read().await;
+    let response = |request: &Value| json!({"_meta":{META_KEY:{"version":1,"queryReceipt":RECEIPT},"reviewMonitoring":1,"reviewMonitoringContext":request["params"]["_meta"]["reviewMonitoringContext"]}});
+    peer.reply(&second_request, response(&second_request)).await;
+    let query = second.await.unwrap().unwrap().query.unwrap();
+    let fresh = monitor_ack(query, &mut peer).await;
+    peer.reply(&first_request, response(&first_request)).await;
+    assert!(first
+        .await
+        .unwrap()
+        .unwrap()
+        .query
+        .unwrap()
+        .pending_review_monitoring()
+        .is_none());
+    assert!(fresh.is_current());
+    drop(peer);
+    timeout(WAIT, async {
+        while fresh.is_current() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!old.is_current());
+}
+
+#[tokio::test]
+async fn monitor_receipt_requires_exact_original_startup_context_echo() {
+    let original =
+        json!({"version":1,"ownerKey":"original-owner","loadAttemptId":"original-attempt"});
+    for sent in [Value::Null, original.clone()] {
+        for echoed in [
+            Value::Null,
+            json!({"version":1,"ownerKey":"foreign-owner","loadAttemptId":"original-attempt"}),
+            json!({"version":1,"ownerKey":"original-owner","loadAttemptId":"replacement-attempt"}),
+            json!({"version":1,"ownerKey":"original-owner","loadAttemptId":"original-attempt","extra":true}),
+            original.clone(),
+        ] {
+            let (conn, mut peer) = pair(8192);
+            let client = monitor_client(&conn, &mut peer, json!(1)).await;
+            let c = client.clone();
+            let meta = serde_json::from_value(json!({"reviewMonitoringContext":sent})).unwrap();
+            let run = tokio::spawn(async move {
+                c.new_session("/fixture", vec![], Some(meta)).await.unwrap()
+            });
+            let request = peer.read().await;
+            peer.reply(&request,json!({"sessionId":"original","_meta":{META_KEY:{"version":1,"queryReceipt":RECEIPT},"reviewMonitoring":1,"reviewMonitoringContext":echoed}})).await;
+            let query = run.await.unwrap().query.unwrap();
+            assert_eq!(
+                query.pending_review_monitoring().is_some(),
+                sent == original && echoed == original,
+                "sent={sent}, echoed={echoed}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn monitor_startup_attempt_cannot_be_reused_for_same_id_replacement() {
+    let (conn, mut peer) = pair(8192);
+    let client = monitor_client(&conn, &mut peer, json!(1)).await;
+    let meta = Some(monitor_meta());
+    let mut original = None;
+    for first in [true, false] {
+        let c = client.clone();
+        let m = meta.clone();
+        let run = tokio::spawn(async move {
+            c.load_session("original", "/fixture", vec![], m)
+                .await
+                .unwrap()
+        });
+        let request = peer.read().await;
+        if let Some(old) = &original {
+            assert!(!crate::review_monitoring::ReviewMonitoringReceipt::is_current(old));
+        }
+        peer.reply(&request,json!({"_meta":{META_KEY:{"version":1,"queryReceipt":RECEIPT},"reviewMonitoring":1,"reviewMonitoringContext":request["params"]["_meta"]["reviewMonitoringContext"]}})).await;
+        let query = run.await.unwrap().query.unwrap();
+        if first {
+            original = Some(monitor_ack(query, &mut peer).await);
+        } else {
+            assert!(query.pending_review_monitoring().is_none());
+        }
+    }
+}
+
+fn prepared_history() -> Value {
+    json!({"preparationId":"prepared-original","snapshotDigest":"a".repeat(64),"monitorMessages":[{"messageId":"original-message","storeEnvelopeDigest":"b".repeat(64),"acpPayloadDigest":"c".repeat(64)}]})
+}
+
+#[tokio::test]
+async fn monitor_prepared_history_consumes_exact_original_snapshot_with_context_echo() {
+    let (conn, mut peer) = pair(8192);
+    let client = monitor_client(&conn, &mut peer, json!(1)).await;
+    let context =
+        crate::review_monitoring::ReviewMonitoringContext::new("original-owner".into()).unwrap();
+    let c = client.clone();
+    let selected = context.clone();
+    let prepare = tokio::spawn(async move { c.prepare_review_history("original", selected).await });
+    let request = peer.read().await;
+    assert_eq!(request["method"], "_intent/session/prepare_review_history");
+    assert_eq!(request["params"]["ownerKey"], "original-owner");
+    assert!(request["params"].get("account").is_none());
+    let attempt = request["params"]["loadAttemptId"].clone();
+    peer.reply(&request, prepared_history()).await;
+    let prepared = prepare.await.unwrap().unwrap();
+    assert_eq!(prepared.messages().len(), 1);
+    assert_eq!(prepared.messages()[0].message_id, "original-message");
+    let target = prepared.load_target("/fixture", vec![], None).unwrap();
+    let c = client.clone();
+    let load = tokio::spawn(async move {
+        prepared
+            .load(
+                &c,
+                "/fixture",
+                vec![],
+                None,
+                Box::new(TestBoundHistoryAdmission(target)),
+            )
+            .await
+    });
+    let request = peer.read().await;
+    assert_eq!(request["method"], "session/load");
+    assert_eq!(request["params"]["sessionId"], "original");
+    assert_eq!(
+        request["params"]["_meta"]["reviewMonitoringHistory"],
+        json!({"version":1,"preparationId":"prepared-original","snapshotDigest":"a".repeat(64),"loadAttemptId":attempt})
+    );
+    assert_eq!(
+        request["params"]["_meta"]["reviewMonitoringContext"],
+        serde_json::to_value(context).unwrap()
+    );
+    peer.reply(&request,json!({"_meta":{META_KEY:{"version":1,"queryReceipt":RECEIPT},"reviewMonitoring":1,"reviewMonitoringContext":request["params"]["_meta"]["reviewMonitoringContext"]}})).await;
+    let query = load.await.unwrap().unwrap().query.unwrap();
+    assert!(query
+        .pending_review_monitoring()
+        .unwrap()
+        .acknowledged()
+        .is_none());
+    assert!(monitor_ack(query, &mut peer).await.is_current());
+}
+
+#[tokio::test]
+async fn monitor_prepared_history_rejects_malformed_lineage_and_retired_original() {
+    let (conn, mut peer) = pair(8192);
+    let client = monitor_client(&conn, &mut peer, json!(1)).await;
+    for mutation in ["missing", "duplicate", "digest", "binding"] {
+        let c = client.clone();
+        let prepare = tokio::spawn(async move {
+            c.prepare_review_history(
+                "original",
+                crate::review_monitoring::ReviewMonitoringContext::new("owner".into()).unwrap(),
+            )
+            .await
+        });
+        let request = peer.read().await;
+        let mut response = prepared_history();
+        match mutation {
+            "missing" => {
+                response.as_object_mut().unwrap().remove("monitorMessages");
+            }
+            "duplicate" => {
+                let duplicate = response["monitorMessages"][0].clone();
+                response["monitorMessages"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(duplicate);
+            }
+            "digest" => {
+                response["monitorMessages"][0]["storeEnvelopeDigest"] = json!("not-a-digest");
+            }
+            "binding" => {
+                response["monitorMessages"][0]["privateBinding"] = json!({"account":"secret"});
+            }
+            _ => unreachable!(),
+        }
+        peer.reply(&request, response).await;
+        assert!(prepare.await.unwrap().is_err(), "{mutation}");
+    }
+    let c = client.clone();
+    let prepare = tokio::spawn(async move {
+        c.prepare_review_history(
+            "original",
+            crate::review_monitoring::ReviewMonitoringContext::new("owner".into()).unwrap(),
+        )
+        .await
+    });
+    let request = peer.read().await;
+    peer.reply(&request, prepared_history()).await;
+    let prepared = prepare.await.unwrap().unwrap();
+    let c = conn.clone();
+    let reinitialize = tokio::spawn(async move { crate::handshake::initialize(&c).await });
+    let request = peer.read().await;
+    assert!(prepared
+        .load(
+            &client,
+            "/fixture",
+            vec![],
+            None,
+            Box::new(TestHistoryAdmission)
+        )
+        .await
+        .is_err());
+    peer.reply(
+        &request,
+        json!({"protocolVersion":1,"agentCapabilities":{},"authMethods":[]}),
+    )
+    .await;
+    reinitialize.await.unwrap().unwrap();
+    // A later peer reply or ordinary successful initialize cannot reattach the
+    // consuming preparation to a fresh generation, and no load was queued.
+    assert!(timeout(Duration::from_millis(20), peer.read())
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn monitor_recipient_binding_requires_exact_connection_and_original_session() {
+    let (connection, mut peer) = pair(8192);
+    let client = monitor_client(&connection, &mut peer, json!(1)).await;
+    let query = monitor_session(&client, &mut peer, "original", json!(1)).await;
+    let pending = query.pending_review_monitoring().unwrap();
+    let (other, _other_peer) = pair(8192);
+    assert!(pending.is_for(&connection, "original"));
+    assert!(!pending.is_for(&other, "original"));
+    assert!(!pending.is_for(&connection, "replacement"));
+    assert!(pending.acknowledged().is_none());
+    let receipt = monitor_ack(query, &mut peer).await;
+    assert!(pending.is_for(&connection, "original"));
+    assert!(receipt.is_current());
+    let replacement = monitor_session(&client, &mut peer, "original", json!(1)).await;
+    assert!(!pending.is_for(&connection, "original"));
+    assert!(!receipt.is_current());
+    let current = replacement.pending_review_monitoring().unwrap();
+    assert!(current.is_for(&connection, "original"));
+    assert!(current.acknowledged().is_none());
+}
+
+struct TestHistoryAdmission;
+impl crate::review_monitoring::history::ReviewHistoryLoadAdmission for TestHistoryAdmission {
+    fn admit(
+        &self,
+        boundary: &crate::review_monitoring::history::ReviewHistoryLoadBoundary,
+        packet: crate::review_monitoring::history::PreparedReviewHistoryLoad<'_>,
+    ) -> crate::error::AcpResult<crate::review_monitoring::history::ReviewHistoryLoadReceipt> {
+        packet.transfer(boundary)
+    }
+}
+
+struct TestBoundHistoryAdmission(crate::review_monitoring::history::ReviewHistoryLoadTarget);
+impl crate::review_monitoring::history::ReviewHistoryLoadAdmission for TestBoundHistoryAdmission {
+    fn admit(
+        &self,
+        boundary: &crate::review_monitoring::history::ReviewHistoryLoadBoundary,
+        packet: crate::review_monitoring::history::PreparedReviewHistoryLoad<'_>,
+    ) -> crate::error::AcpResult<crate::review_monitoring::history::ReviewHistoryLoadReceipt> {
+        if !self.0.matches(boundary) {
+            return Err(crate::error::AcpError::Protocol(
+                "foreign prepared load".into(),
+            ));
+        }
+        packet.transfer(boundary)
+    }
+}
+
+#[tokio::test]
+async fn monitor_prepared_history_bound_target_refuses_changed_cwd_and_metadata() {
+    for changed in ["cwd", "metadata"] {
+        let (conn, mut peer) = pair(8192);
+        let client = monitor_client(&conn, &mut peer, json!(1)).await;
+        let context =
+            crate::review_monitoring::ReviewMonitoringContext::new("original-owner".into())
+                .unwrap();
+        let c = client.clone();
+        let prepare =
+            tokio::spawn(async move { c.prepare_review_history("original", context).await });
+        let request = peer.read().await;
+        peer.reply(&request, prepared_history()).await;
+        let prepared = prepare.await.unwrap().unwrap();
+        let target = prepared.load_target("/fixture", vec![], None).unwrap();
+        let cwd = if changed == "cwd" {
+            "/replacement"
+        } else {
+            "/fixture"
+        };
+        let meta = (changed == "metadata")
+            .then(|| serde_json::from_value(json!({"systemPrompt":"replacement"})).unwrap());
+        assert!(prepared
+            .load(
+                &client,
+                cwd,
+                vec![],
+                meta,
+                Box::new(TestBoundHistoryAdmission(target))
+            )
+            .await
+            .is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), peer.read())
+                .await
+                .is_err(),
+            "changed load or fallback reached the peer"
+        );
+    }
+}
+
+#[tokio::test]
+async fn monitor_context_retirement_closes_before_poll_and_requires_exact_remote_join() {
+    for joined in [true, false] {
+        let (connection, mut peer) = pair(8192);
+        let client = monitor_client(&connection, &mut peer, json!(1)).await;
+        let original = monitor_session(&client, &mut peer, "original", json!(1)).await;
+        let receipt = monitor_ack(original, &mut peer).await;
+        let context = receipt.context().clone();
+        let sibling = monitor_session(&client, &mut peer, "sibling", json!(1)).await;
+        let sibling = monitor_ack(sibling, &mut peer).await;
+        let retirement = client
+            .begin_review_context_retirement("original", &context)
+            .unwrap();
+        assert!(
+            !receipt.is_current(),
+            "local eligibility survived until the join future was polled"
+        );
+        assert!(sibling.is_current());
+        assert!(
+            timeout(Duration::from_millis(20), peer.read())
+                .await
+                .is_err(),
+            "begin performed asynchronous I/O"
+        );
+        let join = tokio::spawn(retirement.join());
+        let request = peer.read().await;
+        assert_eq!(request["method"], "_intent/session/retire_review_context");
+        assert_eq!(
+            request["params"],
+            json!({"sessionId":"original","loadAttemptId":serde_json::to_value(&context).unwrap()["loadAttemptId"]})
+        );
+        assert!(
+            !join.is_finished(),
+            "local closure fabricated remote completion"
+        );
+        peer.reply(&request, json!({"retired":joined})).await;
+        assert_eq!(join.await.unwrap().is_ok(), joined);
+        assert!(sibling.is_current());
+        assert!(!receipt.is_current());
+    }
+}
+
+#[tokio::test]
+async fn monitor_context_retirement_keeps_original_attempt_after_same_id_replacement() {
+    let (connection, mut peer) = pair(8192);
+    let client = monitor_client(&connection, &mut peer, json!(1)).await;
+    let query = monitor_session(&client, &mut peer, "original", json!(1)).await;
+    let original = monitor_ack(query, &mut peer).await;
+    let context = original.context().clone();
+    let retirement = client
+        .begin_review_context_retirement("original", &context)
+        .unwrap();
+    let query = monitor_session(&client, &mut peer, "original", json!(1)).await;
+    let replacement = monitor_ack(query, &mut peer).await;
+    assert_ne!(
+        serde_json::to_value(replacement.context()).unwrap()["loadAttemptId"],
+        serde_json::to_value(&context).unwrap()["loadAttemptId"]
+    );
+    let join = tokio::spawn(retirement.join());
+    let request = peer.read().await;
+    assert_eq!(
+        request["params"]["loadAttemptId"],
+        serde_json::to_value(&context).unwrap()["loadAttemptId"]
+    );
+    assert!(replacement.is_current());
+    peer.reply(&request, json!({"retired":true})).await;
+    join.await.unwrap().unwrap();
+    assert!(
+        replacement.is_current(),
+        "old retirement targeted same-ID replacement"
+    );
+    assert!(!original.is_current());
+}
+
+#[tokio::test]
+async fn monitor_context_retirement_before_capture_cannot_revive_original_load() {
+    let (connection, mut peer) = pair(8192);
+    let client = monitor_client(&connection, &mut peer, json!(1)).await;
+    let context =
+        crate::review_monitoring::ReviewMonitoringContext::new("original-owner".into()).unwrap();
+    let mut meta = agent_client_protocol::schema::v1::Meta::new();
+    context.insert_into(&mut meta);
+    let c = client.clone();
+    let load = tokio::spawn(async move {
+        c.load_session("original", "/fixture", vec![], Some(meta))
+            .await
+    });
+    let request = peer.read().await;
+    let retirement = client
+        .begin_review_context_retirement("original", &context)
+        .unwrap();
+    peer.reply(&request, json!({"_meta":{META_KEY:{"version":1,"queryReceipt":RECEIPT},"reviewMonitoring":1,"reviewMonitoringContext":request["params"]["_meta"]["reviewMonitoringContext"]}})).await;
+    let query = load.await.unwrap().unwrap().query.unwrap();
+    assert!(
+        query.pending_review_monitoring().is_none(),
+        "late load response revived a retired original attempt"
+    );
+    let replacement = monitor_session(&client, &mut peer, "original", json!(1)).await;
+    let replacement = monitor_ack(replacement, &mut peer).await;
+    let join = tokio::spawn(retirement.join());
+    let request = peer.read().await;
+    peer.reply(&request, json!({"retired":true})).await;
+    join.await.unwrap().unwrap();
+    assert!(replacement.is_current());
+}
+
+#[tokio::test]
+async fn monitor_context_retirement_before_prepared_queue_refuses_private_load() {
+    let (connection, mut peer) = pair(8192);
+    let client = monitor_client(&connection, &mut peer, json!(1)).await;
+    let context =
+        crate::review_monitoring::ReviewMonitoringContext::new("original-owner".into()).unwrap();
+    let c = client.clone();
+    let selected = context.clone();
+    let prepare = tokio::spawn(async move { c.prepare_review_history("original", selected).await });
+    let request = peer.read().await;
+    peer.reply(&request, prepared_history()).await;
+    let prepared = prepare.await.unwrap().unwrap();
+    let target = prepared.load_target("/fixture", vec![], None).unwrap();
+    let retirement = client
+        .begin_review_context_retirement("original", &context)
+        .unwrap();
+    let c = client.clone();
+    let load = tokio::spawn(async move {
+        prepared
+            .load(
+                &c,
+                "/fixture",
+                vec![],
+                None,
+                Box::new(TestBoundHistoryAdmission(target)),
+            )
+            .await
+    });
+    let queued = tokio::select! {
+        response = load => { assert!(response.unwrap().is_err()); false },
+        request = peer.read() => {
+            peer.reply(&request, json!({})).await;
+            true
+        },
+    };
+    assert!(!queued, "retired prepared history reached the peer");
+    let join = tokio::spawn(retirement.join());
+    let request = peer.read().await;
+    peer.reply(&request, json!({"retired":true})).await;
+    join.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn monitor_context_retirement_at_final_admission_refuses_reserved_history_slot() {
+    struct RetireAtAdmission {
+        client: Arc<CallbackClient>,
+        context: crate::review_monitoring::ReviewMonitoringContext,
+        retirement: Arc<
+            std::sync::Mutex<Option<crate::review_monitoring::history::ReviewContextRetirement>>,
+        >,
+    }
+    impl crate::review_monitoring::history::ReviewHistoryLoadAdmission for RetireAtAdmission {
+        fn admit(
+            &self,
+            boundary: &crate::review_monitoring::history::ReviewHistoryLoadBoundary,
+            packet: crate::review_monitoring::history::PreparedReviewHistoryLoad<'_>,
+        ) -> crate::error::AcpResult<crate::review_monitoring::history::ReviewHistoryLoadReceipt>
+        {
+            *self.retirement.lock().unwrap() = Some(
+                self.client
+                    .begin_review_context_retirement("original", &self.context)?,
+            );
+            packet.transfer(boundary)
+        }
+    }
+    let (connection, mut peer) = pair(8192);
+    let client = monitor_client(&connection, &mut peer, json!(1)).await;
+    let context =
+        crate::review_monitoring::ReviewMonitoringContext::new("original-owner".into()).unwrap();
+    let c = client.clone();
+    let selected = context.clone();
+    let prepare = tokio::spawn(async move { c.prepare_review_history("original", selected).await });
+    let request = peer.read().await;
+    peer.reply(&request, prepared_history()).await;
+    let prepared = prepare.await.unwrap().unwrap();
+    let retirement = Arc::new(std::sync::Mutex::new(None));
+    let admission = RetireAtAdmission {
+        client: client.clone(),
+        context,
+        retirement: retirement.clone(),
+    };
+    let load = prepared.load(&client, "/fixture", vec![], None, Box::new(admission));
+    let mut load = Box::pin(load);
+    tokio::select! {
+        response = &mut load => assert!(response.is_err()),
+        _ = peer.read() => panic!("retired history crossed its final reserved queue boundary"),
+    }
+    let operation = retirement.lock().unwrap().take().unwrap();
+    let join = tokio::spawn(operation.join());
+    let request = peer.read().await;
+    peer.reply(&request, json!({"retired":true})).await;
+    join.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn monitor_context_retirement_reused_old_attempt_preserves_replacement() {
+    let (connection, mut peer) = pair(8192);
+    let client = monitor_client(&connection, &mut peer, json!(1)).await;
+    let original = monitor_session(&client, &mut peer, "original", json!(1)).await;
+    let original = monitor_ack(original, &mut peer).await;
+    let context = original.context().clone();
+    let retirement = client
+        .begin_review_context_retirement("original", &context)
+        .unwrap();
+    let replacement = monitor_session(&client, &mut peer, "original", json!(1)).await;
+    let replacement = monitor_ack(replacement, &mut peer).await;
+    let mut meta = agent_client_protocol::schema::v1::Meta::new();
+    context.insert_into(&mut meta);
+    let c = client.clone();
+    let stale = tokio::spawn(async move {
+        c.load_session("original", "/fixture", vec![], Some(meta))
+            .await
+    });
+    let request = peer.read().await;
+    let current_before_response = replacement.is_current();
+    peer.reply(&request, json!({"_meta":{META_KEY:{"version":1,"queryReceipt":RECEIPT},"reviewMonitoring":1,"reviewMonitoringContext":request["params"]["_meta"]["reviewMonitoringContext"]}})).await;
+    assert!(stale
+        .await
+        .unwrap()
+        .unwrap()
+        .query
+        .unwrap()
+        .pending_review_monitoring()
+        .is_none());
+    assert!(
+        current_before_response,
+        "retired old attempt invalidated the replacement before capture"
+    );
+    assert!(replacement.is_current());
+    let join = tokio::spawn(retirement.join());
+    let request = peer.read().await;
+    peer.reply(&request, json!({"retired":true})).await;
+    join.await.unwrap().unwrap();
+    assert!(replacement.is_current());
+}
+
+#[tokio::test]
+async fn monitor_context_retirement_join_survives_waiter_drop_and_is_shared() {
+    for joined in [true, false] {
+        let (connection, mut peer) = pair(8192);
+        let client = monitor_client(&connection, &mut peer, json!(1)).await;
+        let query = monitor_session(&client, &mut peer, "original", json!(1)).await;
+        let receipt = monitor_ack(query, &mut peer).await;
+        let context = receipt.context().clone();
+        let original = client
+            .begin_review_context_retirement("original", &context)
+            .unwrap();
+        let waiter = tokio::spawn(original.join());
+        let request = peer.read().await;
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        let repeated = client
+            .begin_review_context_retirement("original", &context)
+            .unwrap();
+        let repeated = tokio::spawn(repeated.join());
+        let duplicate = timeout(Duration::from_millis(20), peer.read()).await;
+        assert!(
+            duplicate.is_err(),
+            "a second waiter started a new native retirement request"
+        );
+        assert!(
+            !repeated.is_finished(),
+            "local closure substituted for the held remote join"
+        );
+        peer.reply(&request, json!({"retired":joined})).await;
+        assert_eq!(
+            timeout(WAIT, repeated).await.unwrap().unwrap().is_ok(),
+            joined
+        );
+        let again = client
+            .begin_review_context_retirement("original", &context)
+            .unwrap();
+        assert_eq!(timeout(WAIT, again.join()).await.unwrap().is_ok(), joined);
+        assert!(
+            timeout(Duration::from_millis(20), peer.read())
+                .await
+                .is_err(),
+            "terminal join result triggered an implicit retry"
+        );
+        assert!(!receipt.is_current());
+    }
+}
+
+#[tokio::test]
+async fn monitor_context_retirement_drop_before_wait_retains_original_join() {
+    let (connection, mut peer) = pair(8192);
+    let client = monitor_client(&connection, &mut peer, json!(1)).await;
+    let query = monitor_session(&client, &mut peer, "original", json!(1)).await;
+    let receipt = monitor_ack(query, &mut peer).await;
+    let context = receipt.context().clone();
+    drop(
+        client
+            .begin_review_context_retirement("original", &context)
+            .unwrap(),
+    );
+    let request = timeout(Duration::from_millis(100), peer.read())
+        .await
+        .expect("dropping the caller lost its exact remote retirement obligation");
+    peer.reply(&request, json!({"retired":true})).await;
+    assert!(timeout(
+        WAIT,
+        client
+            .begin_review_context_retirement("original", &context)
+            .unwrap()
+            .join()
+    )
+    .await
+    .unwrap()
+    .is_ok());
+    assert!(timeout(Duration::from_millis(20), peer.read())
+        .await
+        .is_err());
+    assert!(!receipt.is_current());
+}
+
+/// PROTOCOL §5.5b: a provider that requests workers sends the AIR
+/// async-tasks extension merged beside the callback offer; one that does not
+/// sends no `jetbrains` key at all (codex-acp would switch formats on it).
+#[tokio::test]
+async fn initialize_requests_async_tasks_only_for_opted_in_providers() {
+    for (requests, expected) in [
+        (
+            true,
+            json!({ "air": { "version": 1, "capabilities": ["asyncTasks"] } }),
+        ),
+        (false, Value::Null),
+    ] {
+        let (conn, mut peer) = pair(64 * 1024);
+        let mut provider = config();
+        provider.requests_agent_workers = requests;
+        let run = tokio::spawn(async move {
+            handshake_with_callbacks(conn, &provider, CallbackOffer::V1)
+                .await
+                .unwrap()
+        });
+        let request = peer.read().await;
+        let meta = &request["params"]["clientCapabilities"]["_meta"];
+        assert_eq!(meta["jetbrains"], expected, "requests={requests}");
+        assert_eq!(
+            meta[META_KEY],
+            json!({ "version": 1 }),
+            "callback offer kept"
+        );
+        peer.reply(
+            &request,
+            json!({ "protocolVersion": 1, "agentCapabilities": {}, "authMethods": [] }),
+        )
+        .await;
+        run.await.unwrap();
+    }
 }

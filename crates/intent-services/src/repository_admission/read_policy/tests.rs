@@ -23,9 +23,12 @@ impl Hold {
         self.release.acquire().await.unwrap().forget();
     }
     async fn reached(&self) {
-        tokio::time::timeout(Duration::from_secs(10), self.entered.notified())
-            .await
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            self.entered.notified(),
+        )
+        .await
+        .unwrap();
     }
 }
 
@@ -213,7 +216,7 @@ async fn actual_tcp_response_runs_the_same_real_aggregate_after_host_transfer() 
     gate.release.add_permits(1);
     let mut reply = String::new();
     tokio::time::timeout(
-        Duration::from_secs(10),
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
         BufReader::new(socket).read_line(&mut reply),
     )
     .await
@@ -256,7 +259,7 @@ async fn artifact_start_admits_one_original_job_before_io_and_response_revalidat
         let folder = f.git.dir.path().join("tool-outputs");
         assert!(!folder.exists(), "no private I/O inside admission");
         tokio::time::timeout(
-            Duration::from_secs(2),
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
             f.auth
                 .service
                 .worktree_locks
@@ -302,7 +305,7 @@ async fn run_quota(
 ) -> serde_json::Value {
     let started = std::time::Instant::now();
     let result = tokio::time::timeout(
-        Duration::from_secs(30),
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
         server.handle_message(&crate::repository_read_source::tests::call(code)),
     )
     .await;
@@ -406,7 +409,7 @@ async fn source_changes_after_host_disclosure_reject_constant_output_without_reb
             _ => f.owner.retirement().retire(),
         }
         if let Some(pending) = pending {
-            pending.settle_confirmed();
+            pending.settle_confirmed().await.unwrap();
         }
         gate.release.add_permits(1);
         let reply = task.await.unwrap();
@@ -497,18 +500,21 @@ async fn original_claimed_workspace_timer_cannot_be_canceled_or_deliver_old_read
             .schedule_workspace_delete(f.git.workspace.id.clone(), 0)
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while f
-                .auth
-                .service
-                .pending_workspace_deletes
-                .deadline(&PendingDeleteSubject::Workspace(f.git.workspace.id.clone()))
-                .unwrap()
-                .is_some()
-            {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                while f
+                    .auth
+                    .service
+                    .pending_workspace_deletes
+                    .deadline(&PendingDeleteSubject::Workspace(f.git.workspace.id.clone()))
+                    .unwrap()
+                    .is_some()
+                {
+                    tokio::task::yield_now().await;
+                }
+            },
+        )
         .await
         .unwrap();
         assert!(!f
@@ -525,18 +531,21 @@ async fn original_claimed_workspace_timer_cannot_be_canceled_or_deliver_old_read
         .unwrap()
         .to_string()
         .contains("Private result delivery refused"));
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while f
-            .auth
-            .service
-            .store
-            .get_workspace(&f.git.workspace.id)
-            .await
-            .is_ok()
-        {
-            tokio::task::yield_now().await;
-        }
-    })
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            while f
+                .auth
+                .service
+                .store
+                .get_workspace(&f.git.workspace.id)
+                .await
+                .is_ok()
+            {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
     .await
     .unwrap();
 }
@@ -636,7 +645,7 @@ async fn original_artifact_cancellation_and_failed_io_do_not_become_replacement_
             assert!(!folder.exists());
         }
         tokio::time::timeout(
-            Duration::from_secs(2),
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
             f.auth
                 .service
                 .worktree_locks

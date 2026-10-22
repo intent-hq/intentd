@@ -247,6 +247,7 @@ const COLLABORATOR_REFUSED_EVENT_TYPES: &[&str] = &[
     "mcp.servers:status-changed",
     "mcp:notification",
     "principal:identity-changed",
+    "providers:profiles-changed",
     "script:changed",
     "script:output",
     "script:state",
@@ -441,6 +442,7 @@ fn member_event_administrator_remainder_is_frozen() {
         "mcp.servers:status-changed",
         "mcp:notification",
         "principal:identity-changed",
+        "providers:profiles-changed",
         "settings:changed",
         "sourceControl:auth-changed",
     ];

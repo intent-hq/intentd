@@ -56,7 +56,9 @@ tokio::task_local! {
     /// (UDS sets `false`, WSS sets `true`) before spawning the request handler.
     /// Queried by `ServerControl::is_tcp_connection()` to enforce safety guards.
     static IS_TCP: RefCell<bool>;
+    static MONITOR_HISTORY: Arc<dyn intent_core::repository_request::RepositoryMonitorHistoryRecipient>;
     static READ_CONNECTION: Option<Arc<dyn RepositoryReadConnection>>;
+    static CHILD_GIT_FRAME: Option<intent_core::gitlab_child_git::GitlabChildGitFrame>;
     static CHECKOUT_FRAME: Option<intent_core::repository_checkout::CheckoutFrame>;
     static RESOURCE_FRAME: Option<intent_core::repository_request::RepositoryResourceFrame>;
     static REVIEW_FRAME: Option<intent_core::repository_request::NativeReviewFrame>;
@@ -68,6 +70,29 @@ tokio::task_local! {
 /// frame future. The synchronous carrier captures it before any slot wait.
 pub(crate) fn with_repository_frame<T>(raw: &str, construct: impl FnOnce() -> T) -> T {
     use intent_core::repository_request::{RepositoryContextBoundQuery, RepositoryContextQuery};
+    let child_git = serde_json::from_str::<serde_json::Value>(raw)
+        .ok()
+        .and_then(|value| {
+            use intent_core::gitlab_child_git::GitlabChildGitFrame as Frame;
+            let method = value.get("method")?.as_str()?;
+            match method {
+                "sourceControl.gitlab.childGit.get" => {
+                    serde_json::from_value(value.get("params")?.clone())
+                        .ok()
+                        .map(Frame::Get)
+                }
+                "sourceControl.gitlab.childGit.set" => {
+                    serde_json::from_value(value.get("params")?.clone())
+                        .ok()
+                        .map(Frame::Set)
+                }
+                "system.gitCredential" => crate::control::classify(&value)
+                    .as_ref()
+                    .and_then(crate::control::gitlab_credential_query)
+                    .map(Frame::Credential),
+                _ => None,
+            }
+        });
     let query = serde_json::from_str::<serde_json::Value>(raw)
         .ok()
         .and_then(|value| {
@@ -138,6 +163,22 @@ pub(crate) fn with_repository_frame<T>(raw: &str, construct: impl FnOnce() -> T)
             use intent_core::repository_request::RepositoryResourceFrame as Frame;
             let params = value.get("params")?.clone();
             match value.get("method")?.as_str()? {
+                "sourceControl.read.resolveKnownRepository" => {
+                    serde_json::from_value(params).ok().map(Frame::ResolveKnown)
+                }
+                "sourceControl.read.captureScoped" => serde_json::from_value(params)
+                    .ok()
+                    .map(Frame::CaptureScoped),
+                "sourceControl.read.detailScoped" => {
+                    serde_json::from_value(params).ok().map(Frame::DetailScoped)
+                }
+                "sourceControl.read.releaseScoped" => serde_json::from_value(params)
+                    .ok()
+                    .map(Frame::ReleaseScoped),
+                "sourceControl.read.list" => serde_json::from_value(params).ok().map(Frame::List),
+                "sourceControl.read.discussions" => {
+                    serde_json::from_value(params).ok().map(Frame::Discussions)
+                }
                 "sourceControl.read.capture" => {
                     serde_json::from_value(params).ok().map(Frame::Capture)
                 }
@@ -196,11 +237,13 @@ pub(crate) fn with_repository_frame<T>(raw: &str, construct: impl FnOnce() -> T)
                 _ => None,
             }
         });
-    CHECKOUT_FRAME.sync_scope(checkout, || {
-        RESOURCE_FRAME.sync_scope(resource, || {
-            REVIEW_FRAME.sync_scope(review, || {
-                SELECTION_FRAME
-                    .sync_scope(selection, || REPOSITORY_FRAME.sync_scope(query, construct))
+    CHILD_GIT_FRAME.sync_scope(child_git, || {
+        CHECKOUT_FRAME.sync_scope(checkout, || {
+            RESOURCE_FRAME.sync_scope(resource, || {
+                REVIEW_FRAME.sync_scope(review, || {
+                    SELECTION_FRAME
+                        .sync_scope(selection, || REPOSITORY_FRAME.sync_scope(query, construct))
+                })
             })
         })
     })
@@ -212,6 +255,63 @@ pub(crate) fn with_repository_frame<T>(raw: &str, construct: impl FnOnce() -> T)
 #[derive(Clone)]
 pub(crate) struct ReadConnectionGuard(Option<Arc<dyn RepositoryReadConnection>>);
 
+pub(crate) fn review_monitoring_hello(
+    support: intent_core::review_monitor::ReviewMonitorRecipientSupport,
+) -> Option<Arc<dyn intent_core::repository_request::ReviewMonitorHello>> {
+    READ_CONNECTION
+        .try_with(|connection| connection.as_ref()?.review_monitoring_hello(support))
+        .ok()
+        .flatten()
+}
+
+pub(crate) fn capture_monitor_events(
+) -> Option<Arc<dyn intent_core::repository_request::RepositoryMonitorEventRecipient>> {
+    READ_CONNECTION
+        .try_with(|connection| connection.as_ref()?.capture_monitor_events())
+        .ok()
+        .flatten()
+}
+
+/// Capture the acknowledged physical recipient before spawning the forwarder.
+pub(crate) fn capture_monitor_history(
+) -> Option<Arc<dyn intent_core::repository_request::RepositoryMonitorHistoryRecipient>> {
+    READ_CONNECTION
+        .try_with(|connection| connection.as_ref()?.capture_monitor_history())
+        .ok()
+        .flatten()
+}
+
+pub(crate) async fn with_monitor_history(
+    owner: Option<Arc<dyn intent_core::repository_request::RepositoryMonitorHistoryRecipient>>,
+    body: impl Future<Output = ()> + Send,
+) {
+    struct Retire(Arc<dyn intent_core::repository_request::RepositoryMonitorHistoryRecipient>);
+    impl Drop for Retire {
+        fn drop(&mut self) {
+            self.0.retire();
+        }
+    }
+    let Some(owner) = owner else {
+        return body.await;
+    };
+    // Natural forwarder exit and cancellation have the same retirement rule.
+    let _retire = Retire(owner.clone());
+    owner
+        .scope(Box::pin(MONITOR_HISTORY.scope(owner.clone(), body)))
+        .await;
+}
+
+pub(crate) fn chat_frame(frame: String) -> crate::OutboundFrame {
+    match MONITOR_HISTORY.try_with(Clone::clone) {
+        Ok(owner) => crate::OutboundFrame::private(owner.bind_output(frame)),
+        Err(_) => frame.into(),
+    }
+}
+
+pub(crate) fn begin_chat_history_generation() {
+    let _ = MONITOR_HISTORY.try_with(|owner| owner.begin_generation());
+}
+
 impl ReadConnectionGuard {
     pub(crate) fn bind(api: &dyn intent_core::WorkspaceApi, entry: RepositoryWireEntry) -> Self {
         Self(api.repository_read_connection(entry))
@@ -220,7 +320,7 @@ impl ReadConnectionGuard {
     /// Consume the original owner's bounded control feed on this socket only.
     pub(crate) fn forward_retirements(
         &self,
-        output: tokio::sync::mpsc::Sender<String>,
+        output: tokio::sync::mpsc::Sender<crate::OutboundFrame>,
     ) -> RetirementForwarder {
         let resource_output = output.clone();
         let review_output = output.clone();
@@ -233,7 +333,7 @@ impl ReadConnectionGuard {
                         "jsonrpc": "2.0", "method": "workspace.repositoryContext.retired", "params": notice,
                     }).to_string();
                     // Receiver loss closes this original feed and all its leases.
-                    if !matches!(tokio::time::timeout(std::time::Duration::from_secs(5), output.send(frame)).await, Ok(Ok(()))) || terminal { break; }
+                    if !matches!(tokio::time::timeout(std::time::Duration::from_secs(5), output.send(frame.into())).await, Ok(Ok(()))) || terminal { break; }
                 }
             })
         });
@@ -242,7 +342,7 @@ impl ReadConnectionGuard {
                 while let Some(notice) = receiver.next().await {
                     let terminal = notice.terminal;
                     let frame = serde_json::json!({"jsonrpc":"2.0","method":"workspace.repositorySelection.retired","params":notice}).to_string();
-                    if !matches!(tokio::time::timeout(std::time::Duration::from_secs(5), selection_output.send(frame)).await, Ok(Ok(()))) || terminal { break; }
+                    if !matches!(tokio::time::timeout(std::time::Duration::from_secs(5), selection_output.send(frame.into())).await, Ok(Ok(()))) || terminal { break; }
                 }
             })
         });
@@ -251,16 +351,19 @@ impl ReadConnectionGuard {
                 while let Some(notice) = receiver.next().await {
                     let terminal = notice.terminal;
                     let frame = serde_json::json!({"jsonrpc":"2.0","method":"accept-changes.retired","params":notice}).to_string();
-                    if !matches!(tokio::time::timeout(std::time::Duration::from_secs(5), review_output.send(frame)).await, Ok(Ok(()))) || terminal { break; }
+                    if !matches!(tokio::time::timeout(std::time::Duration::from_secs(5), review_output.send(frame.into())).await, Ok(Ok(()))) || terminal { break; }
                 }
             })
         });
         let resource = self.0.as_ref().and_then(|owner| owner.take_resource_retirements()).map(|mut receiver| {
             tokio::spawn(async move {
-                while let Some(notice) = receiver.next().await {
-                    let terminal = notice.terminal;
-                    let frame = serde_json::json!({"jsonrpc":"2.0","method":"sourceControl.read.retired","params":notice}).to_string();
-                    if !matches!(tokio::time::timeout(std::time::Duration::from_secs(5), resource_output.send(frame)).await, Ok(Ok(()))) || terminal { break; }
+                while let Some(event) = receiver.next_event().await {
+                    use intent_core::repository_resource_pages::RepositoryResourceEvent;
+                    let (terminal, frame) = match event {
+                        RepositoryResourceEvent::Retired(notice) => (notice.terminal, serde_json::json!({"jsonrpc":"2.0","method":"sourceControl.read.retired","params":notice}).to_string()),
+                        RepositoryResourceEvent::Invalidated(notice) => (false, serde_json::json!({"jsonrpc":"2.0","method":"sourceControl.read.invalidated","params":notice}).to_string()),
+                    };
+                    if !matches!(tokio::time::timeout(std::time::Duration::from_secs(5), resource_output.send(frame.into())).await, Ok(Ok(()))) || terminal { break; }
                 }
             })
         });
@@ -401,6 +504,11 @@ impl CapturedFrame {
             completion: READ_CONNECTION
                 .try_with(|owner| {
                     owner.as_ref().and_then(|owner| {
+                        if let Some(frame) = CHILD_GIT_FRAME.try_with(Clone::clone).ok().flatten() {
+                            return owner
+                                .capture_child_git(&frame)
+                                .map(|scope| Arc::new(RequestCompletion(scope)));
+                        }
                         if let Some(frame) = CHECKOUT_FRAME.try_with(Clone::clone).ok().flatten() {
                             return owner
                                 .capture_checkout(&frame)

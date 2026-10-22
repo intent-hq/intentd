@@ -715,6 +715,7 @@ fn update_rejects_archive_without_tailcat_and_keeps_installation() {
 #[test]
 fn exact_and_channel_repairs_keep_the_installed_version_when_channel_trails() {
     use intentd_sitter::cli::Channel;
+    use intentd_sitter::telemetry::CheckTrigger;
     use intentd_sitter::updater::{UpdateOutcome, Updater};
 
     for exact in [false, true] {
@@ -740,11 +741,11 @@ fn exact_and_channel_repairs_keep_the_installed_version_when_channel_trails() {
         } else {
             assert!(
                 updater
-                    .check_only(Channel::Stable)
+                    .check_only(Channel::Stable, CheckTrigger::Manual)
                     .unwrap()
                     .update_available
             );
-            updater.check_and_install(Channel::Stable)
+            updater.check_and_install(Channel::Stable, CheckTrigger::Manual)
         }
         .unwrap();
         assert_eq!(
@@ -855,7 +856,7 @@ fn update_signals_running_supervised_sitter_then_waits_for_it() {
     );
 
     // The trap handler appends asynchronously; poll briefly.
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(10));
     while Instant::now() < deadline
         && !fs::read_to_string(&hup_log).is_ok_and(|s| s.contains("HUP"))
     {
@@ -1071,5 +1072,48 @@ fn double_dash_forwards_update_to_the_daemon() {
         state::load(&paths.state_path).current_version.as_deref(),
         Some("0.1.0"),
         "the forwarded form must not update anything"
+    );
+}
+
+#[test]
+fn update_waits_for_cli_starting_before_target_ready() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = SitterPaths::from_data_dir(dir.path());
+    preinstall(&paths, "0.1.0");
+    let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
+    let (base_url, _) = serve_recording(Arc::clone(&routes));
+    publish_stable(
+        &routes,
+        &base_url,
+        "0.2.0",
+        br#"#!/bin/sh
+count=0
+if [ -f "$INTENTD_DATA_DIR/probes" ]; then count=$(cat "$INTENTD_DATA_DIR/probes"); fi
+count=$((count + 1))
+echo "$count" > "$INTENTD_DATA_DIR/probes"
+if [ "$count" -lt 7 ]; then
+  echo '{"version":"0.2.0","ready":false,"startup":{"startupStatus":1,"attemptId":"boot-update","phase":"indexing","elapsedMs":10,"phaseElapsedMs":10,"progressAgeMs":10,"retryAfterMs":1000}}'
+else
+  echo '{"version":"0.2.0"}'
+fi
+"#,
+    );
+    let hup_log = dir.path().join("hup.log");
+    let mut sitter = spawn_fake_sitter(&paths, &hup_log);
+    let output = run_sitter_with_readiness_timeout(dir.path(), &base_url, 2000, &["update"]);
+    let _ = sitter.kill();
+    let _ = sitter.wait();
+    assert!(
+        output.status.success(),
+        "{}; count={:?}",
+        stderr_of(&output),
+        fs::read_to_string(dir.path().join("probes"))
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("probes"))
+            .unwrap()
+            .trim(),
+        "7",
+        "ready:false with a matching version must renew the budget without reporting ready"
     );
 }

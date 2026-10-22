@@ -34,11 +34,12 @@
 //! Each version also owns a [`Doctrine`] — its bundled instruction/specialist
 //! markdown set under `resources/agent-instructions/<ver>/` and
 //! `resources/specialists/<ver>/` — and the [`REGISTRY`] maps the stamped
-//! session `harnessVersion` (`"1.0"` through `"3.2"`) to the pair, so a session
+//! session `harnessVersion` (`"1.0"` through `"3.3"`) to the pair, so a session
 //! keeps assembling the exact doctrine
 //! it was created with even after the binary ships a newer set. All past
 //! versions stay bundled.
 
+pub(crate) mod review_wake;
 pub(crate) mod v1;
 pub(crate) mod v1_1;
 pub(crate) mod v2;
@@ -53,7 +54,7 @@ pub(crate) mod v2_7;
 pub(crate) mod v2_8;
 pub(crate) mod v2_9;
 pub(crate) mod v3_1;
-pub(crate) mod v3_2;
+pub(crate) mod v3_3;
 
 // Context rendering is admitted separately from the versioned text bundle.
 #[cfg_attr(not(test), expect(dead_code))]
@@ -515,6 +516,17 @@ static V3_ENTRY: HarnessEntry = HarnessEntry {
     feature_labels: v1::FEATURE_LABELS,
 };
 
+/// New sessions receive monitor-address guidance through the existing optional
+/// context renderer. Ordinary doctrine, wakes and captured feature defaults stay
+/// identical to 3.1; no private runtime capability is enabled by this stamp.
+static V3_2_ENTRY: HarnessEntry = HarnessEntry {
+    version: "3.2",
+    harness: v3_1::ENTRY.harness,
+    doctrine: v3_1::ENTRY.doctrine,
+    default_features: AgentFeaturesSettings::default,
+    feature_labels: v1::FEATURE_LABELS,
+};
+
 /// Every bundled harness version, oldest first. All past versions stay
 /// bundled so an old session keeps resolving the doctrine it was created
 /// with. A version with unchanged text and doctrine may reuse their references.
@@ -534,7 +546,8 @@ static REGISTRY: &[&HarnessEntry] = &[
     &v2_10::ENTRY,
     &V3_ENTRY,
     &v3_1::ENTRY,
-    &v3_2::ENTRY,
+    &V3_2_ENTRY,
+    &v3_3::ENTRY,
 ];
 
 /// The registry row for [`LATEST_VERSION`]. A unit test pins that the row
@@ -591,7 +604,7 @@ mod tests {
     fn registry_resolves_stamped_current_version() {
         let entry = resolve_entry(intent_core::CURRENT_HARNESS_VERSION);
         assert_eq!(entry.version, intent_core::CURRENT_HARNESS_VERSION);
-        assert_eq!(entry.version, "3.2");
+        assert_eq!(entry.version, "3.3");
         let repository_guidance = resolve_entry("3.0");
         let previous = resolve_entry("2.10");
         assert_eq!(previous.version, "2.10");

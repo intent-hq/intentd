@@ -290,6 +290,46 @@ pub async fn prompt_with_guidance(
     }
 }
 
+/// Send a whole prompt only through its retained original admission. Unlike
+/// optional guidance, refusal sends no base prompt. The caller must bind the
+/// admission to the actual destination connection and session before calling.
+///
+/// # Errors
+/// Preserves ordinary prompt response/idle errors and refuses an unadmitted
+/// whole prompt without sending any replacement content.
+pub async fn prompt_with_required_admission(
+    conn: &Connection,
+    session_id: &str,
+    prompt: Vec<ContentBlock>,
+    activity: &ActivityTracker,
+    admission: Box<dyn crate::transport::AcpPromptAdmission>,
+) -> AcpResult<PromptOutcome> {
+    let request = PromptRequest::new(SessionId::new(session_id), prompt);
+    let params = admission.required_params(serde_json::to_value(&request)?)?;
+    let idle_window = prompt_idle_timeout();
+    let req_fut =
+        conn.request_required_prompt(params, admission, Duration::from_secs(24 * 60 * 60));
+    tokio::pin!(req_fut);
+    loop {
+        tokio::select! {
+            res = &mut req_fut => {
+                let response: PromptResponse = serde_json::from_value(res?)
+                    .map_err(|e| AcpError::Protocol(format!("invalid session/prompt response: {e}")))?;
+                return Ok(PromptOutcome {
+                    stop_reason: response.stop_reason,
+                    usage: response.usage,
+                    meta: response.meta,
+                });
+            }
+            () = tokio::time::sleep(Duration::from_secs(1)) => {
+                if Duration::from_millis(activity.idle_ms()) >= idle_window {
+                    return Err(AcpError::PromptIdleTimeout(idle_window));
+                }
+            }
+        }
+    }
+}
+
 /// `session/prompt` with the user content blocks → drives a turn; the agent
 /// streams `session/update`s then returns a [`PromptOutcome`] carrying the
 /// [`StopReason`] and optional end-of-turn usage snapshot (§6.5).
@@ -508,6 +548,11 @@ pub struct MappedToolCall {
     pub output: Option<Value>,
     /// `data.status`: one of started|completed|error.
     pub status: &'static str,
+    /// PROTOCOL §5.5b: a backgrounded-marker update that supplied no explicit
+    /// `status`. Its genuine fields keep their ordinary processing, but the
+    /// tool keeps the status it already has: the marker must never reopen a
+    /// completed or failed tool as `started`.
+    pub keeps_status: bool,
 }
 
 /// Map a `session/update` to a [`MappedUpdate`], or `None` when the variant has
@@ -687,6 +732,7 @@ fn map_tool_call(tool_call: &ToolCall) -> MappedToolCall {
         input,
         output: tool_call.raw_output.clone(),
         status: tool_status_word(tool_call.status),
+        keeps_status: false,
         tool_name,
         name_authoritative,
         title,
@@ -703,6 +749,11 @@ fn map_tool_call_update(update: &ToolCallUpdate) -> MappedToolCall {
         tool_kind: tool_kind_word(fields.kind.unwrap_or_default(), &tool_name),
         // A bare progress update (no status) is still mid-flight → "started".
         status: fields.status.map_or("started", tool_status_word),
+        keeps_status: fields.status.is_none()
+            && update
+                .meta
+                .as_ref()
+                .is_some_and(crate::workers::meta_is_backgrounded),
         tool_call_id: update.tool_call_id.0.to_string(),
         input,
         output: fields.raw_output.clone(),
@@ -1073,8 +1124,8 @@ mod prompt_guidance_tests {
         let (mut replies, read) = tokio::io::duplex(4096);
         let conn = Connection::new(input, read, None, ConnectionHooks::default());
         let blocks: Vec<ContentBlock> = serde_json::from_value(json!([
-            {"type":"text","text":"original user block"},
-            {"type":"image","data":PNG_1X1_BASE64,"mimeType":"image/png"}
+            {"type":"text","text":"original user block","_meta":{"fixture":"original text metadata"}},
+            {"type":"image","data":PNG_1X1_BASE64,"mimeType":"image/png","_meta":{"fixture":"original attachment metadata"}}
         ]))
         .unwrap();
         let activity = ActivityTracker::new();
@@ -1158,8 +1209,8 @@ mod prompt_guidance_tests {
         assert_eq!(
             frame["params"]["prompt"],
             json!([
-                {"type":"text","text":"original user block"},
-                {"type":"image","data":PNG_1X1_BASE64,"mimeType":"image/png"},
+                {"type":"text","text":"original user block","_meta":{"fixture":"original text metadata"}},
+                {"type":"image","data":PNG_1X1_BASE64,"mimeType":"image/png","_meta":{"fixture":"original attachment metadata"}},
                 {"type":"text","text":"optional inert text"}
             ])
         );

@@ -288,7 +288,7 @@ async fn close_and_await_deregistration(
     let _ = ws.close(None).await;
     drain_until_close(&mut ws, Duration::from_secs(2)).await;
     drop(ws);
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(2));
     while registry.len() > expected_len {
         assert!(
             Instant::now() < deadline,
@@ -364,7 +364,7 @@ async fn await_client_event(ws: &mut PlainWs, dur: Duration) -> Value {
 /// Wait (bounded, no fixed sleep) until the registry holds exactly
 /// `expected_len` entries.
 async fn await_registry_len(registry: &PrimaryReverseRegistry, expected_len: usize) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(5));
     while registry.len() != expected_len {
         assert!(
             Instant::now() < deadline,
@@ -554,11 +554,14 @@ async fn agent_screenshot_timeout_returns_before_outer_deadline() {
     assert_eq!(reverse["params"]["actions"][0]["action"], "screenshot");
     // Leave the reverse request unanswered and prove the same sticky-primary
     // path used by ws.browser.exec reports the error inside the outer budget.
-    let err = timeout(Duration::from_secs(25), call)
-        .await
-        .expect("inner screenshot timeout must settle first")
-        .expect("join")
-        .expect_err("unanswered screenshot must fail");
+    let err = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(25)),
+        call,
+    )
+    .await
+    .expect("inner screenshot timeout must settle first")
+    .expect("join")
+    .expect_err("unanswered screenshot must fail");
     let elapsed = started.elapsed();
     assert!(
         err.to_string()

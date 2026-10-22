@@ -9,6 +9,9 @@ use intent_core::{
 use serde_json::json;
 use std::future::Future;
 
+#[path = "tests/monitor.rs"]
+mod monitor;
+
 struct Fixture {
     git: GitFixture,
     services: Arc<Services>,
@@ -323,7 +326,7 @@ async fn native_wire_pending_root_change_and_private_retirement_cursor() {
         )])
         .unwrap();
     let event = tokio::time::timeout(
-        Duration::from_secs(2),
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
         s.receiver.get_mut().unwrap().as_mut().unwrap().next(),
     )
     .await
@@ -497,20 +500,23 @@ async fn native_wire_bounds_overflow_expiry_and_same_id_foreign_caller() {
     }))
     .await;
     assert!(s.read(&f, &c).await.is_ok());
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while Arc::strong_count(
-            connection
-                .state
-                .lock()
-                .unwrap()
-                .leases
-                .get(&c.lifetime_id)
-                .unwrap(),
-        ) != 1
-        {
-            tokio::task::yield_now().await;
-        }
-    })
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            while Arc::strong_count(
+                connection
+                    .state
+                    .lock()
+                    .unwrap()
+                    .leases
+                    .get(&c.lifetime_id)
+                    .unwrap(),
+            ) != 1
+            {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
     .await
     .unwrap();
     {
@@ -657,7 +663,9 @@ async fn native_wire_final_transfer_joins_writer_and_keeps_completed_effect() {
                                     entered.take().unwrap().send(()).unwrap();
                                     held.lock()
                                         .unwrap()
-                                        .recv_timeout(Duration::from_secs(5))
+                                        .recv_timeout(intentd_test_support::test_timeout(
+                                            Duration::from_secs(5),
+                                        ))
                                         .unwrap();
                                     Ok(())
                                 })
@@ -700,7 +708,7 @@ impl BlockingHold {
             .wake
             .wait_timeout_while(
                 self.released.lock().unwrap(),
-                Duration::from_secs(15),
+                intentd_test_support::test_timeout(Duration::from_secs(15)),
                 |released| !*released,
             )
             .unwrap();
@@ -738,9 +746,12 @@ async fn native_wire_cancelled_blocking_job_keeps_actual_worktree_lock_until_exi
             })
             .await;
     });
-    tokio::time::timeout(Duration::from_secs(5), hold.entered.notified())
-        .await
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        hold.entered.notified(),
+    )
+    .await
+    .unwrap();
     scope.retire();
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
@@ -752,17 +763,20 @@ async fn native_wire_cancelled_blocking_job_keeps_actual_worktree_lock_until_exi
         .await
         .is_none());
     hold.release();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let changed = connection.jobs_changed.notified();
-            tokio::pin!(changed);
-            changed.as_mut().enable();
-            if connection.active_jobs.load(Ordering::Acquire) == 0 {
-                break;
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            loop {
+                let changed = connection.jobs_changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if connection.active_jobs.load(Ordering::Acquire) == 0 {
+                    break;
+                }
+                changed.await;
             }
-            changed.await;
-        }
-    })
+        },
+    )
     .await
     .unwrap();
     assert!(f
@@ -813,18 +827,24 @@ async fn native_wire_queued_worktree_cancellation_closes_without_waiting_for_loc
             })
             .await;
     });
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while connection.active_jobs.load(Ordering::Acquire) == 0 {
-            tokio::task::yield_now().await;
-        }
-    })
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            while connection.active_jobs.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
     .await
     .unwrap();
     scope.retire();
-    tokio::time::timeout(Duration::from_secs(2), read)
-        .await
-        .unwrap()
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        read,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!(connection.active_jobs.load(Ordering::Acquire), 0);
     release.send(()).unwrap();
     holder.await.unwrap();
@@ -836,19 +856,12 @@ async fn native_wire_saved_selection_historical_and_exact_root_incarnation() {
         ReviewSelectionOutcome, ReviewSelectionRequiredReason, SavedReviewSelection,
     };
     use intent_store::{RepositorySelectionChange, RepositorySelectionWriteResult};
-    let mut f = Fixture::new().await;
-    f.services
-        .store
-        .delete_workspace(&f.git.workspace.id)
-        .await
-        .unwrap();
-    f.git.workspace.repository_owner = Some("historical".into());
-    f.git.workspace.repository_name = Some("old".into());
-    f.services
-        .store
-        .insert_workspace(&f.git.workspace)
-        .await
-        .unwrap();
+    let f = Fixture::new().await;
+    crate::repository_admission_source_tests::fixtures::Fixture::seed_unresolved_history(
+        &f.services.store,
+        &f.git.workspace.id,
+    )
+    .await;
     f.git.git(
         &f.git.path,
         &["remote", "add", "origin", "https://github.com/team/one.git"],
@@ -1372,7 +1385,7 @@ async fn native_wire_actual_event_receiver_gap_closes_only_original_feed() {
         let _ = bus.publish_transient(&event);
     }
     let notice = tokio::time::timeout(
-        Duration::from_secs(3),
+        intentd_test_support::test_timeout(Duration::from_secs(3)),
         socket.receiver.get_mut().unwrap().as_mut().unwrap().next(),
     )
     .await
@@ -1535,11 +1548,14 @@ async fn native_wire_cancelled_acquisition_closes_before_late_metadata_returns()
             })))
             .await;
     });
-    tokio::time::timeout(Duration::from_secs(3), async {
-        while connection.active_jobs.load(Ordering::Acquire) == 0 {
-            tokio::task::yield_now().await;
-        }
-    })
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(3)),
+        async {
+            while connection.active_jobs.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
     .await
     .unwrap();
     scope.retire();
@@ -1550,11 +1566,14 @@ async fn native_wire_cancelled_acquisition_closes_before_late_metadata_returns()
     assert_eq!(connection.active_jobs.load(Ordering::Acquire), 1);
     hold.release();
     writer.await.unwrap();
-    tokio::time::timeout(Duration::from_secs(3), async {
-        while connection.active_jobs.load(Ordering::Acquire) != 0 {
-            tokio::task::yield_now().await;
-        }
-    })
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(3)),
+        async {
+            while connection.active_jobs.load(Ordering::Acquire) != 0 {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
     .await
     .unwrap();
     assert!(connection.state.lock().unwrap().leases.is_empty());

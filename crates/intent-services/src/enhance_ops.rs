@@ -583,7 +583,7 @@ mod tests {
         let prompt = "x".repeat(4 * 1024 * 1024);
         let started = std::time::Instant::now();
         let result = tokio::time::timeout(
-            Duration::from_secs(10),
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
             run_auggie_print(&bin, None, None, &prompt, 200, "One-shot completion"),
         )
         .await

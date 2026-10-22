@@ -4,8 +4,9 @@
 //! Speaks the line-oriented git-credential protocol on stdin/stdout: git
 //! writes `key=value` attribute lines terminated by a blank line (or EOF), and
 //! a `get` operation answers with `username=`/`password=` lines. Only `get`
-//! for `protocol=https` + `host=github.com` is answered — everything else
-//! (including `store`/`erase`, other hosts, a daemon that is not running, the
+//! for GitHub or a path-qualified GitLab HTTPS request is forwarded; the daemon
+//! validates its original full instance and current child policy. Everything else
+//! (including `store`/`erase`, a daemon that is not running, the
 //! gate being off, or no token) prints nothing and exits 0 so git falls
 //! through to its remaining helpers/prompt rules. The credential comes from
 //! the running daemon over the UDS `system.gitCredential` control RPC
@@ -61,6 +62,8 @@ async fn credential_for(
         "pid": std::process::id(),
         "protocol": attrs.get("protocol"),
         "host": attrs.get("host"),
+        "path": attrs.get("path"),
+        "username": attrs.get("username"),
     });
     let response = tokio::time::timeout(
         rpc_timeout,
@@ -90,9 +93,9 @@ pub(crate) fn parse_attributes(reader: impl BufRead) -> BTreeMap<String, String>
     attrs
 }
 
-/// The answer gate: only a `get` operation for `protocol=https` on
-/// `host=github.com` (case-insensitive, exact host — no subdomains, no
-/// explicit port) is eligible. `store`/`erase` and anything else are no-ops.
+/// The preliminary answer gate: GitHub retains its exact host rules; other
+/// HTTPS requests require a repository path and daemon-side instance admission.
+/// `store`/`erase` and other protocols remain no-ops.
 /// A git-supplied `username` (an explicit identity in the remote URL, e.g.
 /// `https://alice@github.com/...`) must match the daemon's fixed helper
 /// identity — otherwise stay silent so the user's own credentials/prompt win.
@@ -109,7 +112,27 @@ pub(crate) fn should_answer(operation: &str, attrs: &BTreeMap<String, String>) -
     let username_ok = attrs
         .get("username")
         .is_none_or(|u| u == intent_git::auth::TOKEN_USERNAME);
-    protocol_ok && host_ok && username_ok
+    if protocol_ok && host_ok {
+        return username_ok;
+    }
+    // GitLab's identity and grant are selected only by the daemon. The helper
+    // forwards a path-bearing HTTPS request, never a token or alternate source.
+    let Some(host) = attrs.get("host") else {
+        return false;
+    };
+    let Some(path) = attrs.get("path") else {
+        return false;
+    };
+    protocol_ok
+        && !host.is_empty()
+        && !path.is_empty()
+        && !host.contains(['/', '@', '?', '#', '\\'])
+        && !path.starts_with('/')
+        && !path.contains(['?', '#', '\\'])
+        && ![host, path]
+            .iter()
+            .any(|value| value.chars().any(char::is_control))
+        && attrs.get("username").is_none_or(|user| user == "oauth2")
 }
 
 /// Pull `(username, password)` out of a `system.gitCredential` response

@@ -6,6 +6,7 @@ const readline = require('node:readline');
 const config = JSON.parse(fs.readFileSync(path.join(fixture, 'fixture.json'), 'utf8'));
 if (process.argv.includes('--version')) {
   const isolatedVersion = config.installed && process.env.CODEX_HOME === process.cwd();
+  // cli-fixture-version: allow — catalog and doctor tests assert these exact runtime versions
   console.log(role === 'acp' ? 'codex-acp 1.13.1' : isolatedVersion ? 'codex-cli 0.333.5' : 'codex-cli 0.333.4');
   process.exit(0);
 }

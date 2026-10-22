@@ -458,7 +458,7 @@ exit 97
     drop(ws);
     daemon.signal(nix::sys::signal::Signal::SIGTERM).unwrap();
     assert!(daemon
-        .wait_with_timeout(Duration::from_secs(30))
+        .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(30)))
         .unwrap()
         .expect("graceful shutdown")
         .success());

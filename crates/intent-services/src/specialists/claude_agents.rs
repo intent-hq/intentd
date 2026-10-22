@@ -18,11 +18,13 @@ pub(crate) fn user_root(intent_root: Option<&Path>) -> Option<PathBuf> {
         return Some(PathBuf::from(root).join("agents"));
     }
     let intent_root = intent_root?;
-    let parent = intent_root.parent()?;
-    if parent.file_name()? != ".intent" || intent_root.file_name()? != "specialists" {
+    // A tier relocated by `INTENTD_USER_SPECIALISTS_DIR` resolves to the real
+    // home inside `home_for_user_dir`; otherwise only `.intent/specialists`.
+    let relocated = super::user_dir_override_from_env();
+    if relocated.as_deref() != Some(intent_root) && intent_root.file_name()? != "specialists" {
         return None;
     }
-    Some(parent.parent()?.join(".claude/agents"))
+    super::home_for_user_dir(intent_root).map(|home| home.join(".claude/agents"))
 }
 
 #[derive(Default)]

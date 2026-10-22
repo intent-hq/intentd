@@ -2,7 +2,13 @@
 """Offline extraction/synchronization tests for pinned adapter requirements."""
 import json
 import unittest
-from provider_cli_metadata import package_snapshot, replace_package, read_pin
+from provider_cli_metadata import package_snapshot, replace_package, read_pin, runtime_spec
+
+
+CLAUDE = {"claude-code": {"cliPackage": "cli", "runtimePackage": "sdk",
+                          "runtimeVersionField": "cliVersion", "package": {}}}
+ADAPTER = {"name": "adapter", "version": "1.0.0", "dependencies": {"sdk": "0.3.280"}}
+SDK = {"name": "sdk", "version": "0.3.280", "cliVersion": "2.1.280", "scripts": {"x": "y"}}
 
 
 class PackageMetadataTests(unittest.TestCase):
@@ -37,6 +43,35 @@ class PackageMetadataTests(unittest.TestCase):
         self.assertEqual(read_pin('pub const PIN: &str = "adapter@2.3.4";', "PIN"), "adapter@2.3.4")
         self.assertEqual(read_pin('macro_rules! claude_agent_acp_version { () => { "0.81.1" }; }', "CLAUDE_AGENT_ACP_NPX_PACKAGE"), "@agentclientprotocol/claude-agent-acp@0.81.1")
         with self.assertRaises(ValueError): read_pin("", "PIN")
+
+
+    def test_runtime_snapshot_records_only_the_mapped_version_field(self):
+        content = json.dumps(CLAUDE)
+        self.assertEqual(runtime_spec(content, "claude-code", ADAPTER), ("sdk", "0.3.280"))
+        updated = json.loads(replace_package(content, "claude-code", ADAPTER, SDK))
+        self.assertEqual(updated["claude-code"]["runtime"],
+                         {"name": "sdk", "version": "0.3.280", "cliVersion": "2.1.280"})
+        # A snapshot is itself valid input, so automation can recompute it.
+        again = replace_package(content, "claude-code", ADAPTER, updated["claude-code"]["runtime"])
+        self.assertEqual(json.loads(again), updated)
+
+    def test_runtime_mapping_rejects_missing_mismatched_or_inexact_runtime(self):
+        content = json.dumps(CLAUDE)
+        for runtime in (None, {**SDK, "version": "0.3.279"}, {**SDK, "name": "other"},
+                        {**SDK, "cliVersion": "^2.1.0"}, {k: v for k, v in SDK.items() if k != "cliVersion"}):
+            with self.assertRaises(ValueError, msg=runtime):
+                replace_package(content, "claude-code", ADAPTER, runtime)
+        for declared in ("^0.3.280", "latest", None):
+            adapter = {**ADAPTER, "dependencies": {} if declared is None else {"sdk": declared}}
+            with self.assertRaises(ValueError, msg=declared):
+                runtime_spec(content, "claude-code", adapter)
+
+    def test_unmapped_runtime_is_neither_fetched_nor_accepted(self):
+        content = json.dumps({"codex": {"cliPackage": "cli", "package": {}}})
+        self.assertIsNone(runtime_spec(content, "codex", ADAPTER))
+        self.assertNotIn("runtime", json.loads(replace_package(content, "codex", ADAPTER))["codex"])
+        with self.assertRaises(ValueError):
+            replace_package(content, "codex", ADAPTER, SDK)
 
 
 if __name__ == "__main__": unittest.main()

@@ -90,16 +90,11 @@ fn force_hermetic_root_guard() {
 }
 
 /// Apply the timeout multiplier from the environment for coverage
-/// instrumentation. Reads `INTENTD_TEST_TIMEOUT_MULTIPLIER` (defaults to 1.0;
-/// non-finite values are ignored and values below 1.0 are clamped so budgets
-/// can only be extended; overflow saturates to `Duration::MAX`).
+/// instrumentation: delegates to [`intentd_test_support::test_timeout`]
+/// (`INTENTD_TEST_TIMEOUT_MULTIPLIER`, defaults to 1.0, never below 1.0,
+/// capped at 20x, saturating to `Duration::MAX`).
 pub fn test_timeout(base: Duration) -> Duration {
-    let multiplier = std::env::var("INTENTD_TEST_TIMEOUT_MULTIPLIER")
-        .ok()
-        .and_then(|s| s.parse::<f64>().ok())
-        .filter(|m| m.is_finite())
-        .unwrap_or(1.0);
-    Duration::try_from_secs_f64(base.as_secs_f64() * multiplier.max(1.0)).unwrap_or(Duration::MAX)
+    intentd_test_support::test_timeout(base)
 }
 
 /// Shared budget for waiting on daemon startup (UDS/socket ready): 60s base,
@@ -367,7 +362,7 @@ pub fn registry_with_default_provider(
     registry
 }
 
-/// Wait until a freshly spawned `intentd serve` child accepts connections on
+/// Wait until a freshly spawned `intentd serve` child serves application RPCs on
 /// its UDS `socket`, budgeted by [`daemon_startup_timeout`]. Fails fast —
 /// panicking with the daemon log — if the child exits before listening, so
 /// tests don't keep polling a dead daemon for the full window. Unix-only
@@ -378,7 +373,7 @@ pub async fn await_daemon_listening(child: &mut Child, socket: &Path, log_path: 
     let budget = daemon_startup_timeout();
     let deadline = tokio::time::Instant::now() + budget;
     loop {
-        if tokio::net::UnixStream::connect(socket).await.is_ok() {
+        if daemon_is_ready(socket).await {
             return;
         }
         if let Ok(Some(status)) = child.try_wait() {
@@ -399,32 +394,54 @@ pub async fn await_daemon_listening(child: &mut Child, socket: &Path, log_path: 
     }
 }
 
-/// One `system.status` round-trip over the daemon's UDS control socket. The
-/// whole connect + write + read sequence shares a single `budget` timeout so a
-/// wedged daemon cannot stall the readiness poll below beyond that bound.
-#[cfg(unix)]
+/// A listening startup socket is not application readiness. Probe only a read;
+/// never retry a test's writes or open its store while migrations are running.
+#[cfg(any(unix, windows))]
+pub async fn daemon_is_ready(socket: &Path) -> bool {
+    try_status_rpc(socket, Duration::from_secs(1))
+        .await
+        .is_ok_and(|reply| reply["result"].is_object())
+}
+
+/// One `system.status` round-trip over the daemon's local control transport
+/// (UDS on Unix, named pipe on Windows). The whole connect + write + read
+/// sequence shares a single `budget` timeout, including a busy pipe instance.
+#[cfg(any(unix, windows))]
 async fn try_status_rpc(socket: &Path, budget: Duration) -> Result<serde_json::Value, String> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     let rpc = async {
+        #[cfg(unix)]
         let stream = tokio::net::UnixStream::connect(socket)
             .await
             .map_err(|e| format!("uds connect failed: {e}"))?;
+        #[cfg(unix)]
         let (read_half, mut write_half) = stream.into_split();
+        #[cfg(windows)]
+        let (read_half, mut write_half) = {
+            let pipe = intent_transport::pipe_name_for_socket_path(socket)
+                .map_err(|e| format!("pipe name failed: {e}"))?;
+            // A busy pipe is not ready yet; the caller's bounded poll retries
+            // this read-only probe on a fresh connection, never a test write.
+            let stream = tokio::net::windows::named_pipe::ClientOptions::new()
+                .open(&pipe)
+                .map_err(|e| format!("pipe connect failed: {e}"))?;
+            tokio::io::split(stream)
+        };
         let frame = "{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"system.status\",\"params\":{}}\n";
         write_half
             .write_all(frame.as_bytes())
             .await
-            .map_err(|e| format!("uds write failed: {e}"))?;
+            .map_err(|e| format!("control write failed: {e}"))?;
         write_half
             .flush()
             .await
-            .map_err(|e| format!("uds write failed: {e}"))?;
+            .map_err(|e| format!("control write failed: {e}"))?;
         let mut buf = String::new();
         BufReader::new(read_half)
             .read_line(&mut buf)
             .await
-            .map_err(|e| format!("uds read failed: {e}"))?;
+            .map_err(|e| format!("control read failed: {e}"))?;
         serde_json::from_str(buf.trim_end()).map_err(|e| format!("invalid JSON frame: {e}"))
     };
     tokio::time::timeout(budget, rpc)
@@ -614,7 +631,11 @@ pub fn hermetic_serve_command(data_dir: &Path) -> std::process::Command {
 /// Sets no TCP-port env override, preserving explicit pins and listener restarts.
 pub fn hermetic_serve_command_fixed_port(data_dir: &Path) -> std::process::Command {
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve").env("INTENTD_DATA_DIR", data_dir);
+    // A sandbox daemon's shell may export the user-tier relocation; fixtures
+    // own their user tier through HOME.
+    cmd.arg("serve")
+        .env("INTENTD_DATA_DIR", data_dir)
+        .env_remove("INTENTD_USER_SPECIALISTS_DIR");
     hermetic_fixture_identity(&mut cmd, data_dir);
     cmd
 }
@@ -1233,11 +1254,11 @@ mod tests {
                     caught_panic();
                     ready_tx.send((original, retained, owner)).expect("ready");
                     release_rx
-                        .recv_timeout(Duration::from_secs(5))
+                        .recv_timeout(intentd_test_support::test_timeout(Duration::from_secs(5)))
                         .expect("release");
                 });
                 let (failed_original, failed_retained, failed_owner) = ready_rx
-                    .recv_timeout(Duration::from_secs(5))
+                    .recv_timeout(intentd_test_support::test_timeout(Duration::from_secs(5)))
                     .expect("retained");
                 // KEEP_TMP intentionally leaves the original occupied, so name
                 // reuse only applies to the ordinary rename-on-panic policy.

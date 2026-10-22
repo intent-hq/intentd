@@ -22,6 +22,7 @@ use crate::reverse::ReverseClientIdentity;
 
 /// A classified `client.hello` request awaiting handling by the connection task.
 pub(crate) struct ClientRequest {
+    pub connection_role: ConnectionRole,
     /// The re-presented `clientId`, when a valid string was supplied.
     pub client_id: Option<String>,
     /// A `clientId` member was present but not a string ⇒ `-32602`.
@@ -34,6 +35,15 @@ pub(crate) struct ClientRequest {
     pub host: ClientHostInfo,
     pub id_present: bool,
     pub id_echo: Value,
+}
+
+/// An attachment is admitted by the original physical connection registry,
+/// never by the ordinary profile-writing handler.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConnectionRole {
+    Ordinary,
+    ReviewMonitor,
+    Invalid,
 }
 
 /// Classify a parsed frame as a `client.hello` request, or `None` to fall
@@ -55,6 +65,11 @@ pub(crate) fn classify(value: &Value) -> Option<ClientRequest> {
         }
     }
     let params = obj.get("params").and_then(Value::as_object);
+    let connection_role = match params.and_then(|p| p.get("connectionRole")) {
+        None => ConnectionRole::Ordinary,
+        Some(Value::String(role)) if role == "review-monitor" => ConnectionRole::ReviewMonitor,
+        Some(_) => ConnectionRole::Invalid,
+    };
     let client_id_member = params.and_then(|p| p.get("clientId"));
     let (client_id, client_id_invalid) = match client_id_member {
         None | Some(Value::Null) => (None, false),
@@ -75,6 +90,7 @@ pub(crate) fn classify(value: &Value) -> Option<ClientRequest> {
         device_kind: string_param("deviceKind"),
     };
     Some(ClientRequest {
+        connection_role,
         client_id,
         client_id_invalid,
         name,
@@ -105,7 +121,7 @@ pub(crate) fn server_json(
         "osArch": format!("{os}/{arch}"),
         "version": version,
         "protocolVersion": PROTOCOL_VERSION,
-        "capabilities": { "liveState": true, "antigravitySetup": 1, "collaborationIdentity": 1, "hostMembership": 1, "invitationAccountSearch": 1, "personalPairing": 1, "authenticatedDevices": 1, "agentRetire": 1, "scriptLifecycle": 1, "scriptMonitors": 2, "scriptActiveLists": 1, "repositoryContext": 1, "repositorySelection": 1, "nativeReview": 1, "nativeReviewCompanion": 1, "repositoryResourceRead": 1, "gitlabCheckout": 1, "gitlabCheckoutRepoConfig": 1, "gitlabCheckoutOwnerAvatar": 1, "submissionCorrelation": 1 },
+        "capabilities": { "liveState": true, "eventStreamRecovery": 1, "antigravitySetup": 1, "collaborationIdentity": 1, "hostMembership": 1, "workspaceMembershipEvents": 1, "invitationAccountSearch": 1, "personalPairing": 1, "authenticatedDevices": 1, "agentRetire": 1, "scriptLifecycle": 1, "scriptMonitors": 2, "scriptActiveLists": 1, "repositoryContext": 1, "repositorySelection": 1, "nativeReview": 1, "nativeReviewCompanion": 1, "repositoryResourceRead": 1, "repositoryResourcePages": 1, "gitlabChildGitPolicy": 1, "gitlabCheckout": 1, "gitlabCheckoutRepoConfig": 1, "gitlabCheckoutOwnerAvatar": 1, "submissionCorrelation": 1, "prWorkspaceLookup": 1, "agentWorkers": 1, "noteTruncatedRead": 1 },
     });
     if let Some(build_commit) = build_commit {
         server
@@ -116,12 +132,70 @@ pub(crate) fn server_json(
     server
 }
 
+/// A deliberately compiled test host can exercise the real negotiation path.
+/// This signal supplies compatibility only, never source or recipient authority.
+fn connection_server_json(is_local: bool, version: &str) -> Value {
+    let server = server_json(
+        detect_has_display(),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        version,
+        crate::BUILD_COMMIT,
+        is_local,
+    );
+    #[cfg(feature = "repository-test-fixtures")]
+    let server = {
+        let mut server = server;
+        apply_monitor_test_support(
+            &mut server,
+            std::env::var("INTENTD_REVIEW_MONITOR_TEST_SUPPORT").as_deref() == Ok("1"),
+        );
+        server
+    };
+    server
+}
+
+#[cfg(feature = "repository-test-fixtures")]
+fn apply_monitor_test_support(server: &mut Value, enabled: bool) {
+    if enabled {
+        server["capabilities"]["reviewMonitoring"] = json!(1);
+    }
+}
+
 /// Result of [`handle`]: the response frame (`None` for a notification) and,
 /// on success, the identity the connection now carries — what the connection
 /// task binds onto its reverse-registry entry (REV-2).
 pub(crate) struct HelloOutcome {
     pub frame: Option<String>,
     pub bound: Option<ReverseClientIdentity>,
+}
+
+pub(crate) fn reject_role(req: &ClientRequest) -> Option<String> {
+    frame(
+        req.id_present,
+        &req.id_echo,
+        Err((
+            -32602,
+            "monitor attachment requires a current acknowledged source connection".into(),
+        )),
+    )
+}
+
+pub(crate) fn attachment_result(
+    req: &ClientRequest,
+    client_id: &ClientId,
+    is_local: bool,
+    version: &str,
+) -> String {
+    success_frame(
+        &req.id_echo,
+        &json!({
+            "clientId":client_id.as_str(),
+            "connectionRole":"review-monitor",
+            "protocolVersion":PROTOCOL_VERSION,
+            "server":connection_server_json(is_local, version)
+        }),
+    )
 }
 
 /// Namespace a `clientId` by the caller's principal when the request is bound
@@ -159,13 +233,28 @@ pub(crate) fn scope_to_caller(raw: ClientId) -> ClientId {
 /// into the `server` block. A non-string `clientId` is `-32602`; a persistence
 /// failure is `-32603`. Idempotent: re-sending updates name / capabilities /
 /// host identification and re-returns the same `server` block (PROTOCOL
-/// §5.17).
+/// §5.17). `version` is the daemon binary's version
+/// ([`crate::SystemControl::daemon_version`]), never this crate's own.
 pub(crate) async fn handle(
     req: ClientRequest,
     api: &dyn WorkspaceApi,
     client_id: &mut Option<ClientId>,
     is_local: bool,
+    version: &str,
 ) -> HelloOutcome {
+    if req.connection_role != ConnectionRole::Ordinary {
+        return HelloOutcome {
+            frame: frame(
+                req.id_present,
+                &req.id_echo,
+                Err((
+                    -32602,
+                    "connectionRole requires an admitted monitor attachment".into(),
+                )),
+            ),
+            bound: None,
+        };
+    }
     if req.client_id_invalid {
         return HelloOutcome {
             frame: frame(
@@ -192,22 +281,7 @@ pub(crate) async fn handle(
         };
     }
     *client_id = Some(resolved.clone());
-    let mut server = server_json(
-        detect_has_display(),
-        std::env::consts::OS,
-        std::env::consts::ARCH,
-        env!("CARGO_PKG_VERSION"),
-        crate::BUILD_COMMIT,
-        is_local,
-    );
-    if api.supports_note_delete_grace() {
-        server["capabilities"]["noteDeleteGrace"] = json!(1);
-    }
-    if let Some(backend_id) = api.note_paging_backend_id() {
-        server["capabilities"]["notePagingRead"] = json!(1);
-        server["capabilities"]["notePagingBackendId"] = json!(backend_id);
-        server["capabilities"]["noteAnnotations"] = json!(1);
-    }
+    let server = connection_server_json(is_local, version);
     HelloOutcome {
         frame: frame(
             req.id_present,

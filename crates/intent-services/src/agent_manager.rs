@@ -30,7 +30,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -105,8 +105,10 @@ impl OriginalTurn {
     }
 }
 
+mod monitor_wake;
 mod repository_origin;
 use crate::repository_admission::lifecycle::physical_owner::RepositoryCreationIntent;
+pub(crate) use monitor_wake::QueuedMonitorTurn;
 pub(crate) use repository_origin::callback_delivery::RepositoryPromptInput;
 use repository_origin::callback_delivery::{deliver_captured, EndpointBlueprint, ServerBlueprint};
 use repository_origin::RepositoryOrigin;
@@ -519,6 +521,8 @@ async fn cancel_and_settle_idle_prompt(
     reason = "Shutdown, prompt, priority and queue provenance are independent per-turn flags"
 )]
 pub struct TurnOptions {
+    /// Current original monitor owner, never rebuilt from prompt metadata.
+    pub(crate) monitor_turn: Option<Arc<QueuedMonitorTurn>>,
     pub(crate) delivery_groups: Option<Vec<crate::agent_ops::QueuedDeliveryGroup>>,
     pub(crate) prepend_delivery_groups: Option<Vec<crate::agent_ops::QueuedDeliveryGroup>>,
     /// Resume recovery must retain its pending interruption when shutdown
@@ -553,6 +557,12 @@ pub struct TurnOptions {
     /// delivered report queryable via `agent.get`. Fresh turns leave this
     /// `false` and clear as today.
     pub suppress_report_clear: bool,
+    /// `true` when this turn replays an earlier one rather than starting a
+    /// new turn: a stale (#576) redelivery or a requeued entry whose user
+    /// row already reached the transcript (a terminal-failure retry). Such a
+    /// turn never starts a timed return to the home provider (PROTOCOL
+    /// §5.54); carried through every worker spawn path.
+    pub replay: bool,
     /// The drained entry's original `queued_at`, threaded through so a
     /// terminal-failure requeue (STAB-112) re-enqueues with the ORIGINAL
     /// timestamp instead of stamping `now_iso()` — keeping the #576 staleness
@@ -679,6 +689,7 @@ fn turn_options_for_entry(entry: &QueuedMessage, stale: bool) -> TurnOptions {
         file_blocks: entry.file_blocks.clone(),
         message_metadata: entry.message_metadata.clone(),
         suppress_report_clear: stale,
+        replay: stale || entry.persisted,
         queued_at: Some(entry.queued_at.clone()),
         queued_submission_ids: entry.submission_ids(),
         recovery_sources: entry.recovery_sources.clone(),
@@ -889,6 +900,22 @@ pub(crate) const REASON_MEMORY_BUDGET: &str = "memory-budget";
 /// only evicts.
 pub(crate) const REASON_IDLE_TTL: &str = "idle-ttl";
 
+/// Whether an idle agent still has a running provider worker (PROTOCOL
+/// §5.5b — a `run_in_background` dev server, say) on a continuous connection.
+/// Killing such an agent's process kills the worker with it, so the TTL sweep
+/// skips it and the pressure-driven paths (slot cap, memory budget) evict it
+/// only after every idle agent without one. Called under the registry lock:
+/// it must not take any lock that can be held while acquiring that lock.
+pub(crate) type KeepAliveFn = Arc<dyn Fn(&AgentId) -> bool + Send + Sync>;
+
+/// Safety bound on the TTL keep-alive for an agent with running workers.
+/// §5.5b keeps a row `running` until its end report arrives or the
+/// connection ends, so a lost end report could otherwise pin an idle agent
+/// forever on a host with no slot or memory pressure. Past
+/// `idleReapMinutes + WORKER_KEEPALIVE_CAP` of idle time the sweep reaps it
+/// like any other — long enough to keep an overnight dev server running.
+pub(crate) const WORKER_KEEPALIVE_CAP: Duration = Duration::from_secs(24 * 60 * 60);
+
 struct ProcessEntry {
     last_active_ms: u64,
     is_active: bool,
@@ -964,17 +991,31 @@ fn settle_stale_waiter(rx: Option<tokio::sync::oneshot::Receiver<()>>) -> bool {
 /// parked here; its waiter then wakes via `deregister`, re-classifies as
 /// unregistered, admits, and respawns through the spawn gate (queued, never
 /// refused, message intact — the warm session is lost, not the turn).
-fn lru_idle_ordered(inner: &RegistryInner, exclude: Option<&AgentId>) -> Vec<(AgentId, KillFn)> {
-    let mut candidates: Vec<(AgentId, u64, KillFn)> = inner
+///
+/// Agents the keep-alive predicate pins (running provider workers) sort after
+/// every unpinned candidate: pressure relief may still evict them, but last.
+fn lru_idle_ordered(
+    inner: &RegistryInner,
+    exclude: Option<&AgentId>,
+    keep_alive: Option<&KeepAliveFn>,
+) -> Vec<(AgentId, KillFn)> {
+    let mut candidates: Vec<(AgentId, bool, u64, KillFn)> = inner
         .entries
         .iter()
         .filter(|(id, e)| !e.is_active && exclude.is_none_or(|x| *id != x))
-        .map(|(id, e)| (id.clone(), e.last_active_ms, e.kill.clone()))
+        .map(|(id, e)| {
+            (
+                id.clone(),
+                keep_alive.is_some_and(|f| f(id)),
+                e.last_active_ms,
+                e.kill.clone(),
+            )
+        })
         .collect();
-    candidates.sort_by_key(|(_, ms, _)| *ms);
+    candidates.sort_by_key(|(_, pinned, ms, _)| (*pinned, *ms));
     candidates
         .into_iter()
-        .map(|(id, _, kill)| (id, kill))
+        .map(|(id, _, _, kill)| (id, kill))
         .collect()
 }
 
@@ -997,13 +1038,42 @@ impl<R: Fn(&AgentId)> Drop for ClaimGuard<'_, R> {
     }
 }
 
-/// Idle entries whose `last_active_ms` is at/older than `cutoff_ms`, ordered
+/// Whether the TTL sweep may reap this idle entry: it is idle past
+/// `cutoff_ms` and either has no running worker or has been idle past
+/// `pinned_cutoff_ms` (the [`WORKER_KEEPALIVE_CAP`] safety bound).
+fn ttl_reapable(
+    id: &AgentId,
+    e: &ProcessEntry,
+    cutoff_ms: u64,
+    pinned_cutoff_ms: u64,
+    keep_alive: Option<&KeepAliveFn>,
+) -> bool {
+    if e.is_active || e.last_active_ms > cutoff_ms {
+        return false;
+    }
+    if e.last_active_ms <= pinned_cutoff_ms || !keep_alive.is_some_and(|f| f(id)) {
+        return true;
+    }
+    tracing::trace!(
+        agent = %id,
+        idle_ms = now_ms().saturating_sub(e.last_active_ms),
+        "process registry: idle process kept (running provider worker)"
+    );
+    false
+}
+
+/// Idle entries the TTL sweep may reap ([`ttl_reapable`]), ordered
 /// least-recently-used first (the TTL idle-reap candidate list).
-fn idle_older_than(inner: &RegistryInner, cutoff_ms: u64) -> Vec<(AgentId, KillFn)> {
+fn idle_older_than(
+    inner: &RegistryInner,
+    cutoff_ms: u64,
+    pinned_cutoff_ms: u64,
+    keep_alive: Option<&KeepAliveFn>,
+) -> Vec<(AgentId, KillFn)> {
     let mut candidates: Vec<(AgentId, u64, KillFn)> = inner
         .entries
         .iter()
-        .filter(|(_, e)| !e.is_active && e.last_active_ms <= cutoff_ms)
+        .filter(|(id, e)| ttl_reapable(id, e, cutoff_ms, pinned_cutoff_ms, keep_alive))
         .map(|(id, e)| (id.clone(), e.last_active_ms, e.kill.clone()))
         .collect();
     candidates.sort_by_key(|(_, ms, _)| *ms);
@@ -1016,28 +1086,32 @@ fn idle_older_than(inner: &RegistryInner, cutoff_ms: u64) -> Vec<(AgentId, KillF
 /// Idle entries ordered for the budget drain (monorepo#2063 level 2): largest
 /// attributed subtree first (Phase A attribution), ties and unattributed
 /// entries (charged 0 by the sort) falling back to least-recently-used first —
-/// so with no attribution at all the order degrades to plain LRU.
+/// so with no attribution at all the order degrades to plain LRU. Agents the
+/// keep-alive predicate pins (running provider workers) sort after every
+/// unpinned candidate, whatever their size.
 fn idle_largest_first(
     inner: &RegistryInner,
     samples: &HashMap<AgentId, u64>,
+    keep_alive: Option<&KeepAliveFn>,
 ) -> Vec<(AgentId, KillFn)> {
-    let mut candidates: Vec<(AgentId, u64, u64, KillFn)> = inner
+    let mut candidates: Vec<(AgentId, bool, u64, u64, KillFn)> = inner
         .entries
         .iter()
         .filter(|(_, e)| !e.is_active)
         .map(|(id, e)| {
             (
                 id.clone(),
+                keep_alive.is_some_and(|f| f(id)),
                 samples.get(id).copied().unwrap_or(0),
                 e.last_active_ms,
                 e.kill.clone(),
             )
         })
         .collect();
-    candidates.sort_by(|a, b| b.1.cmp(&a.1).then(a.2.cmp(&b.2)));
+    candidates.sort_by(|a, b| a.1.cmp(&b.1).then(b.2.cmp(&a.2)).then(a.3.cmp(&b.3)));
     candidates
         .into_iter()
-        .map(|(id, _, _, kill)| (id, kill))
+        .map(|(id, _, _, _, kill)| (id, kill))
         .collect()
 }
 
@@ -1135,6 +1209,11 @@ impl BusEventSink {
         let Some(worktree) = crate::git_ops::worktree_path(&ws) else {
             return;
         };
+        // A git-ignored untracked path can never be committed, so a row for
+        // it would sit in `unstaged` forever (intent-hq/intent#7266).
+        if crate::file_tracking::is_ignored_write(&worktree, &rel_path).await {
+            return;
+        }
 
         // Diff compute is best-effort: a missing repo / clean worktree still
         // records the attribution row (with zero stats) so provenance is kept.
@@ -1356,6 +1435,10 @@ pub struct ProcessRegistry {
     /// Optional callback for lifecycle events (queue/resume/evict). Wired by the
     /// manager to publish events + log; the registry stays testable without it.
     event_fn: Option<ProcessEventFn>,
+    /// Optional "has a running provider worker" predicate ([`KeepAliveFn`]),
+    /// wired by the manager to the §5.5b worker projections. Not installed
+    /// leaves every eviction path byte-for-byte the pre-keep-alive behaviour.
+    keep_alive: Option<KeepAliveFn>,
     event_tasks: crate::delivery_tasks::DeliveryTasks,
     /// Optional aggregate memory budget, installed once by the composition root
     /// when `agents.memoryBudgetMb` resolves to a positive budget (auto, the
@@ -1417,6 +1500,7 @@ impl ProcessRegistry {
             cap: cap.max(1),
             inner: Mutex::new(RegistryInner::default()),
             event_fn: None,
+            keep_alive: None,
             event_tasks: crate::delivery_tasks::DeliveryTasks::default(),
             memory: std::sync::OnceLock::new(),
         }
@@ -1537,6 +1621,13 @@ impl ProcessRegistry {
     /// `(agent_id, event_type, used, cap, reason)` — see [`ProcessEventFn`].
     pub(crate) fn with_event_fn(mut self, f: ProcessEventFn) -> Self {
         self.event_fn = Some(f);
+        self
+    }
+
+    /// Attach the running-worker keep-alive predicate ([`KeepAliveFn`]).
+    /// Chainable builder, like [`Self::with_event_fn`].
+    pub(crate) fn with_keep_alive_fn(mut self, f: KeepAliveFn) -> Self {
+        self.keep_alive = Some(f);
         self
     }
 
@@ -1814,7 +1905,7 @@ impl ProcessRegistry {
                     self.budget_adjust(&mut inner, 1);
                     Action::Slot
                 } else if let Some(candidates) = (!forced_wait)
-                    .then(|| lru_idle_ordered(&inner, None))
+                    .then(|| lru_idle_ordered(&inner, None, self.keep_alive.as_ref()))
                     .filter(|c| !c.is_empty())
                 {
                     Action::Evict(candidates, reason)
@@ -2003,7 +2094,7 @@ impl ProcessRegistry {
                     let candidates = if forced_wait {
                         Vec::new()
                     } else {
-                        lru_idle_ordered(&inner, Some(agent_id))
+                        lru_idle_ordered(&inner, Some(agent_id), self.keep_alive.as_ref())
                     };
                     if candidates.is_empty() {
                         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -2158,7 +2249,7 @@ impl ProcessRegistry {
         let max = max.unwrap_or(usize::MAX);
         let candidates = {
             let inner = self.inner.lock().unwrap();
-            lru_idle_ordered(&inner, None)
+            lru_idle_ordered(&inner, None, self.keep_alive.as_ref())
         };
         let mut evicted = 0;
         for (id, kill) in candidates {
@@ -2218,9 +2309,12 @@ impl ProcessRegistry {
         R: Fn(&AgentId),
     {
         let cutoff = now_ms().saturating_sub(u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX));
+        let pinned_cutoff = cutoff
+            .saturating_sub(u64::try_from(WORKER_KEEPALIVE_CAP.as_millis()).unwrap_or(u64::MAX));
+        let keep_alive = self.keep_alive.as_ref();
         let candidates = {
             let inner = self.inner.lock().unwrap();
-            idle_older_than(&inner, cutoff)
+            idle_older_than(&inner, cutoff, pinned_cutoff, keep_alive)
         };
         let mut evicted = 0;
         for (id, kill) in candidates {
@@ -2230,14 +2324,15 @@ impl ProcessRegistry {
             // Re-validate under the registry lock: the candidate snapshot is
             // stale by the time earlier kills in this sweep have awaited, so
             // the entry may have run a whole turn (fresh `last_active_ms`),
-            // be actively streaming again, or be gone. With the claim held
-            // nothing can start new work on it after this check.
+            // be actively streaming again, have started a worker, or be gone.
+            // With the claim held nothing can start new work on it after this
+            // check.
             let still_stale = {
                 let inner = self.inner.lock().unwrap();
                 inner
                     .entries
                     .get(&id)
-                    .is_some_and(|e| !e.is_active && e.last_active_ms <= cutoff)
+                    .is_some_and(|e| ttl_reapable(&id, e, cutoff, pinned_cutoff, keep_alive))
             };
             if !still_stale {
                 release(&id);
@@ -2314,7 +2409,10 @@ impl ProcessRegistry {
                 .get()
                 .map(|b| b.probe.agent_samples())
                 .unwrap_or_default();
-            (idle_largest_first(&inner, &samples), samples)
+            (
+                idle_largest_first(&inner, &samples, self.keep_alive.as_ref()),
+                samples,
+            )
         };
         let mut evicted = 0;
         for (id, kill) in candidates {
@@ -2563,7 +2661,19 @@ struct AgentHandle {
     /// env config) — passing servers they'd ignore is avoided for wire parity.
     session_mcp_servers: Vec<McpServer>,
     spawned_model: Option<String>,
+    /// The model the session-open fill persisted onto a session spawned
+    /// without one (`AcpSessionOpened::filled_model`): the fill's own landed
+    /// value, taken by `adopt_filled_model` on the spawn path.
+    session_open_filled_model: Option<String>,
     spawned_provider: String,
+    /// The selection identity the child was spawned under: the canonical
+    /// provider id, or the named profile reference whose overlay it carries.
+    /// A different selection never reuses this child (PROTOCOL §5.54).
+    spawned_selection: String,
+    /// Activation registration of a child started under a named profile
+    /// (the saved settings fingerprint it read at start); dropping the
+    /// handle unregisters it (PROTOCOL §5.54 activation).
+    _activation: Option<crate::profile_activation::ActivationLease>,
     /// The reasoning-effort (`thought_level`) selector the provider advertised
     /// at session open (PROTOCOL §5.5), with `current_value` tracking the value
     /// the adapter is believed to be on — updated on every successful
@@ -2584,6 +2694,16 @@ struct AgentHandle {
     /// The per-agent idle-notification listener (monorepo#855), installed by
     /// `create_agent` after the handle lands; aborted when the handle drops.
     wake_listener: Option<JoinHandle<()>>,
+}
+
+#[cfg(test)]
+impl AgentHandle {
+    /// Test seam: mark a tracked mock child as spawned for the `mock`
+    /// provider (executable `node`, selection `mock`).
+    fn align_with_mock_for_test(&mut self) {
+        "node".clone_into(&mut self.spawned_provider);
+        "mock".clone_into(&mut self.spawned_selection);
+    }
 }
 
 impl Drop for AgentHandle {
@@ -2893,6 +3013,20 @@ pub struct AgentManager {
     /// stale flag cleared by [`AgentManager::release_slot_sync`] when the
     /// slot is released. In-memory only, same gap as `recreated`.
     auto_unarchived: Arc<Mutex<HashSet<AgentId>>>,
+    /// Slot holders that published the terminal `agent:idle` of a completed
+    /// turn and have dequeued no new work since. `agent:idle` precedes the
+    /// worker's post-turn tail and its `end_turn`, so busy-slot membership
+    /// alone cannot tell graceful shutdown that the turn is still unfinished.
+    /// Set by [`AgentManager::mark_turn_settled_if_slot_held`]; cleared by
+    /// every slot claim and release and by a drain dequeue.
+    settled_turns: Mutex<HashSet<AgentId>>,
+    /// `end_turn` calls that released their slot but have not yet persisted
+    /// `RuntimeIdle`, keyed by agent with the slot workspace and a per-call
+    /// token. The release is synchronous and the write awaits, so an aborted
+    /// caller would otherwise leave the session `Active` for the next
+    /// startup heal to record as a crashed turn. Shutdown finishes them.
+    pending_idle_writes: Mutex<HashMap<AgentId, (WorkspaceId, u64)>>,
+    next_idle_write: AtomicU64,
     /// Armed by [`AgentManager::arm_send_now_handback_gate`]; see
     /// [`HandbackGate`].
     #[cfg(test)]
@@ -2963,9 +3097,18 @@ impl AgentManager {
             })
         });
 
+        // Keep idle agents with running provider workers (§5.5b) out of the
+        // TTL sweep and last in pressure eviction.
+        let workers = services.agent_workers.clone();
+        let keep_alive: KeepAliveFn = Arc::new(move |id| workers.has_running_workers(id));
+
         Self {
             services,
-            registry: Arc::new(ProcessRegistry::new(cap).with_event_fn(event_fn)),
+            registry: Arc::new(
+                ProcessRegistry::new(cap)
+                    .with_event_fn(event_fn)
+                    .with_keep_alive_fn(keep_alive),
+            ),
             handles: Arc::new(Mutex::new(HashMap::new())),
             sink,
             permissions: Arc::new(PermissionRegistry::new()),
@@ -3008,6 +3151,9 @@ impl AgentManager {
             unsloth: Arc::new(crate::unsloth_server::UnslothServerManager::default()),
             tree_probe: std::sync::OnceLock::new(),
             auto_unarchived: Arc::new(Mutex::new(HashSet::new())),
+            settled_turns: Mutex::new(HashSet::new()),
+            pending_idle_writes: Mutex::new(HashMap::new()),
+            next_idle_write: AtomicU64::new(0),
             #[cfg(test)]
             send_now_handback_gate: Mutex::new(None),
             #[cfg(test)]
@@ -3347,6 +3493,8 @@ impl AgentManager {
         // initialization confirms a distinct physical owner.
         let original_services = Arc::new(self.services.clone());
         let repository_origin = RepositoryOrigin::allocate(&original_services, &session).await;
+        #[cfg(feature = "repository-test-fixtures")]
+        repository_origin.capture_review_runtime_fixture(opts);
         let read_owner = crate::repository_admission::read_request::RepositoryReadOwner::capture(
             original_services.clone(),
         );
@@ -3395,6 +3543,9 @@ impl AgentManager {
             })
             .with_original_services(original_services, session.clone())
         };
+        // Prompt envelopes use the original physical confirmation even when a
+        // provider has no callback-registration or session-MCP capability.
+        repository_origin.configure_prompt_source(server_blueprint.clone());
         let mut server = server_blueprint.server();
         if let Some(context) = repository_origin.pending_callback() {
             server = server.with_request_context(Arc::new(context));
@@ -3613,7 +3764,11 @@ impl AgentManager {
 
         let (req_tx, mut req_rx) = mpsc::unbounded_channel::<IncomingRequest>();
         let (note_tx, note_rx) = mpsc::unbounded_channel::<IncomingNotification>();
+        // §5.5b: worker reports bypass the turn router (and the idle wake
+        // listener) into this outer connection's own generation.
+        let (worker_tx, worker_rx) = mpsc::unbounded_channel::<intent_acp::workers::WorkerFrame>();
         let hooks = ConnectionHooks {
+            workers: Some(worker_tx),
             auth_required_stdout_marker: (opts.provider.id == "antigravity")
                 .then_some(crate::antigravity::AUTH_REQUIRED_MARKER),
             requests: Some(req_tx),
@@ -3656,26 +3811,30 @@ impl AgentManager {
         let spawned = if let Some(cli) =
             intent_providers::installed_cli::InstalledCli::for_provider(spawn_opts.provider.id)
         {
-            let context = crate::installed_cli::InstalledContext::discover(cli)
-                .await
-                .map_err(Error::InvalidInput)?;
-            let mut prepared = intent_acp::spawn::prepare_provider(&spawn_opts)
-                .map_err(|e| Error::Internal(format!("prepare provider failed: {e}")))?;
-            context.apply(&mut prepared.command);
+            // A named profile resolves before account lookup; the spawn layer
+            // applies the same overlay to the prepared command.
+            let mut context = crate::installed_cli::InstalledContext::discover_for(
+                cli,
+                spawn_opts.profile_env.cloned().map(Arc::new),
+            )
+            .await
+            .map_err(Error::InvalidInput)?;
+            let prepared = prepare_installed_launch(&context, &spawn_opts)?;
             let prepared = intent_core::caller::spawn_with_current_caller(async move {
                 let prepared = Arc::new(prepared);
                 let dependency =
                     crate::codex_diagnostics::process::ProbeDependency::hold(prepared.clone());
-                let (_, version) = context
-                    .observe_with_dependency(&prepared.command, Some(dependency))
-                    .await
-                    .map_err(Error::InvalidInput)?;
+                // A confirmed-old installed CLI switches the context to
+                // Intent's bundled copy; the launch is re-applied below.
                 context
-                    .validate_launch_version(&version)
-                    .map_err(Error::InvalidInput)?;
-                Arc::try_unwrap(prepared).map_err(|_| {
+                    .select_launch(&prepared.command, Some(dependency))
+                    .await
+                    .map_err(|error| Error::InvalidInput(error.to_string()))?;
+                let mut prepared = Arc::try_unwrap(prepared).map_err(|_| {
                     Error::Internal("installed CLI cleanup still owns the launch directory".into())
-                })
+                })?;
+                context.apply_selection(&mut prepared.command);
+                Ok::<_, Error>(prepared)
             })
             .await
             .map_err(|_| Error::Internal("installed CLI preparation task failed".into()))??;
@@ -3690,6 +3849,7 @@ impl AgentManager {
         // (a respawn installed a newer child with its own watcher).
         let child_pid = child.id();
         let connection = Arc::new(connection);
+        let worker_connection = Arc::downgrade(&connection);
 
         let terminal_host: Arc<dyn intent_acp::TerminalHost> =
             Arc::new(crate::PtyTerminalHost::with_shell_mode(
@@ -3719,6 +3879,19 @@ impl AgentManager {
             }
         });
 
+        // The child read the profile's saved settings now; track it until
+        // it is torn down so earlier-settings state stays accurate.
+        let activation = match opts.profile_env {
+            // Boxed: keeps the spawn future's stack frame unchanged.
+            Some(profile) => {
+                Box::pin(
+                    self.services
+                        .register_profile_process(&workspace_id, &agent_id, profile),
+                )
+                .await
+            }
+            None => None,
+        };
         let handle = AgentHandle {
             repository_origin: repository_origin.clone(),
             execution: RuntimeHandle::local(LocalResources {
@@ -3741,9 +3914,15 @@ impl AgentManager {
             session_mcp_servers,
             spawned_model: opts.model.map(std::string::ToString::to_string),
             spawned_provider: opts.provider.command.to_string(),
+            spawned_selection: opts
+                .profile_env
+                .map_or(opts.provider.id, intent_acp::ProfileEnv::provider_ref)
+                .to_string(),
+            _activation: activation,
             thought_level: None,
             config_options: None,
             confirmed_effort: None,
+            session_open_filled_model: None,
             wake_gate: Arc::new(AtomicUsize::new(0)),
             wake_listener: None,
         };
@@ -3775,6 +3954,7 @@ impl AgentManager {
         // the install is refused here (fresh child killed below); handle
         // installed first → `stop_many`'s detach finds it and kills it with
         // the batch. Either interleaving leaves no orphaned process.
+        let mut worker_rx = Some(worker_rx);
         let fenced = {
             let closed = self.admission_closed.lock().unwrap();
             let retired = self.retired.lock().unwrap();
@@ -3794,6 +3974,21 @@ impl AgentManager {
                             Arc::downgrade(&repository_origin),
                         ),
                     );
+                    // §5.5b: the worker generation starts atomically with the
+                    // install, under the same locks a teardown fence takes, so
+                    // a concurrent stop/detach either never sees this handle
+                    // or releases this generation after it exists. Reports
+                    // buffer in the channel until the drain starts.
+                    if let Some(frames) = worker_rx.take() {
+                        self.begin_worker_generation(
+                            &workspace_id,
+                            &agent_id,
+                            opts.profile_env
+                                .map_or(opts.provider.id, intent_acp::ProfileEnv::provider_ref),
+                            worker_connection.clone(),
+                            frames,
+                        );
+                    }
                     None
                 } else {
                     Some(handle)
@@ -4046,6 +4241,69 @@ impl AgentManager {
         cwd: PathBuf,
         provider: &ProviderConfig,
     ) -> Result<StartedSession> {
+        // Boxed: keeps the caller's session-open future frame unchanged.
+        let started = Box::pin(self.start_session_opened(agent_id, cwd, provider)).await?;
+        let workers = self.services.agent_workers();
+        if let Some(generation) = started
+            .turn
+            .connection
+            .as_ref()
+            .and_then(|conn| workers.generation_for(agent_id, conn))
+        {
+            if let Some(snapshot) = workers.bind_session(agent_id, &generation, &started.session_id)
+            {
+                self.services.publish_workers_snapshot(snapshot);
+            }
+        }
+        Ok(started)
+    }
+
+    /// Start a §5.5b worker generation for a freshly spawned outer connection
+    /// and drain its diverted worker reports until the reader closes, which
+    /// marks the generation disconnected.
+    fn begin_worker_generation(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        provider: &str,
+        connection: std::sync::Weak<Connection>,
+        mut frames: mpsc::UnboundedReceiver<intent_acp::workers::WorkerFrame>,
+    ) {
+        let generation = Uuid::new_v4().to_string();
+        let snapshot = self.services.agent_workers().begin(
+            crate::agent_workers::Scope {
+                workspace_id: workspace_id.clone(),
+                agent_id: agent_id.clone(),
+                provider: provider.to_owned(),
+                acp_session_id: None,
+                connection_generation: Some(generation.clone()),
+            },
+            &crate::agent_workers::AdapterIdentity::default(),
+            false,
+            connection,
+        );
+        self.services.publish_workers_snapshot(snapshot);
+        let services = self.services.clone();
+        let agent = agent_id.clone();
+        intent_core::spawn_daemon(async move {
+            while let Some(frame) = frames.recv().await {
+                if let Some(snapshot) = services.agent_workers().ingest(&agent, &generation, &frame)
+                {
+                    services.publish_workers_snapshot(snapshot);
+                }
+            }
+            if let Some(snapshot) = services.agent_workers().disconnect(&agent, &generation) {
+                services.publish_workers_snapshot(snapshot);
+            }
+        });
+    }
+
+    async fn start_session_opened(
+        &self,
+        agent_id: &AgentId,
+        cwd: PathBuf,
+        provider: &ProviderConfig,
+    ) -> Result<StartedSession> {
         let (
             conn,
             runtime,
@@ -4094,15 +4352,41 @@ impl AgentManager {
                 "info",
             )
             .await;
-        let negotiated = handshake_with_callbacks(
-            conn.clone(),
-            provider,
-            repository_origin.callback_offer(&session_record, provider),
-        )
-        .await
-        .map_err(|e| Error::Internal(format!("handshake failed: {e}")))?;
+        let callback_offer = repository_origin.callback_offer(&session_record, provider);
+        #[cfg(feature = "repository-test-fixtures")]
+        let negotiated = if repository_origin.review_runtime_fixture() {
+            intent_acp::handshake::handshake_with_review_monitoring(
+                conn.clone(),
+                provider,
+                callback_offer,
+                intent_acp::review_monitoring::ReviewMonitoringOffer::V1,
+            )
+            .await
+        } else {
+            handshake_with_callbacks(conn.clone(), provider, callback_offer).await
+        };
+        #[cfg(not(feature = "repository-test-fixtures"))]
+        let negotiated = handshake_with_callbacks(conn.clone(), provider, callback_offer).await;
+        let negotiated =
+            negotiated.map_err(|e| Error::Internal(format!("handshake failed: {e}")))?;
         let callbacks = negotiated.callbacks;
         let handshake = negotiated.ordinary;
+        {
+            let workers = self.services.agent_workers();
+            if let Some(generation) = workers.generation_for(agent_id, &conn) {
+                let info = serde_json::to_value(&handshake.initialize.agent_info).ok();
+                let identity =
+                    crate::agent_workers::AdapterIdentity::from_initialize(info.as_ref());
+                if let Some(snapshot) = workers.negotiate(
+                    agent_id,
+                    &generation,
+                    &identity,
+                    provider.requests_agent_workers,
+                ) {
+                    self.services.publish_workers_snapshot(snapshot);
+                }
+            }
+        }
 
         // Per the ACP schema, http/sse `McpServer` entries are only valid when
         // the agent advertised `mcpCapabilities.http`/`sse` in `initialize` —
@@ -4158,6 +4442,18 @@ impl AgentManager {
         // agent (no id) opens a first session; an agent with a lost id recreates
         // (CAS-replacing exactly this id) and resends history.
         let stored_id = session_record.acp_session_id.clone();
+        // A private family may resume only through its original admission.
+        // A failed or unavailable load must not replace it with a new session.
+        // The Store also refuses malformed or missing known-private enrollment.
+        let private_history = if let Some(session_id) = &stored_id {
+            self.services
+                .store
+                .get_review_context_enrollment(&session_record.workspace_id, agent_id, session_id)
+                .await?
+                .is_some()
+        } else {
+            false
+        };
 
         // Forced recreate (`agent.editAndRegenerate`): the transcript was
         // truncated, so resuming the provider session would retain the
@@ -4263,6 +4559,12 @@ impl AgentManager {
                     },
                 });
             }
+            Ok(None) if private_history => {
+                return Err(Error::Forbidden(
+                    "Private native history requires original admission".into(),
+                ));
+            }
+            Err(error) if private_history => return Err(error),
             Ok(None) => {}
             // Auth-required resume failure (intent-hq/intent#3941): the
             // provider said it is not logged in — propagate the actionable
@@ -4611,6 +4913,9 @@ impl AgentManager {
         if let Some(handle) = self.handles.lock().unwrap().get_mut(&session_record.id) {
             handle.config_options.clone_from(&opened.config_options);
             crate::fast_mode::refresh_options(&mut handle.config_options, model_response.as_ref());
+            handle
+                .session_open_filled_model
+                .clone_from(&opened.filled_model);
         }
         let mut thought_level = opened.thought_level.clone();
         if let Some(options) = model_response
@@ -4659,6 +4964,7 @@ impl AgentManager {
         agent_id: &AgentId,
         session_id: &str,
         provider: &str,
+        selection: &str,
         original: &OriginalTurn,
     ) -> Result<()> {
         let Some((conn, mut options)) = self
@@ -4676,14 +4982,11 @@ impl AgentManager {
         else {
             return Ok(());
         };
-        let enabled = self
-            .services
-            .effective_settings()
-            .providers
-            .fast_mode
-            .get(provider)
-            .copied()
-            .unwrap_or(false);
+        // A named profile reads its own entry, never the base provider's.
+        let enabled = crate::fast_mode::preference(
+            &self.services.effective_settings().providers.fast_mode,
+            selection,
+        );
         crate::fast_mode::apply(&conn, session_id, provider, enabled, &mut options).await?;
         if let Some(handle) = self
             .handles
@@ -5189,12 +5492,16 @@ impl AgentManager {
     /// * Fires only on the agent's **first** turn — detected by the absence of
     ///   any prior `assistant` message in the persisted transcript.
     /// * Agent naming fires only for generated generic/specialist placeholders
-    ///   whose name was not explicitly set. Intentional task names are retained.
+    ///   whose name was not explicitly set — plus, in the Assistant (chief)
+    ///   workspace, the chat placeholders ([`is_assistant_chat_placeholder_name`]),
+    ///   so Assistant chats name themselves like workspace agents. Intentional
+    ///   task names are retained.
     ///   It uses the provider-correct workspace API MCP tool to call
     ///   `ws.workspace.setAgentName`.
     /// * Workspace naming fires only when the workspace lookup succeeds AND
     ///   the current title is empty/whitespace or still shaped like an
-    ///   auto-generated slug ([`intent_core::slug::is_workspace_slug`]).
+    ///   auto-generated slug ([`intent_core::slug::is_workspace_slug`]), and
+    ///   never for the virtual Assistant workspace.
     /// * Workspace naming names the concrete daemon tool the session's
     ///   provider surfaces (see [`workspace_naming_tool_reference`]).
     async fn build_first_turn_naming_instruction(
@@ -5218,22 +5525,28 @@ impl AgentManager {
             if s.name_explicitly_set {
                 return false;
             }
+            if workspace_id.is_chief() && is_assistant_chat_placeholder_name(&s.name) {
+                return true;
+            }
             let specialist_name = self
                 .services
                 .session_specialist_display_name(s, workspace_path.as_deref());
             is_generated_agent_name(&s.name, specialist_name.as_deref())
         });
-        let needs_workspace_title = workspace.as_ref().is_some_and(|workspace| {
-            let title = workspace.title.trim();
-            title.is_empty() || is_workspace_slug(title)
-        });
+        // The Assistant workspace is virtual and has no user-facing title.
+        let needs_workspace_title = !workspace_id.is_chief()
+            && workspace.as_ref().is_some_and(|workspace| {
+                let title = workspace.title.trim();
+                title.is_empty() || is_workspace_slug(title)
+            });
         if !needs_agent_name && !needs_workspace_title {
             return None;
         }
         let configured_default =
             crate::agent_session::derived_default_provider(&self.services.effective_settings());
         let provider_id = match &session {
-            Ok(s) => session_provider_id(s, configured_default.as_deref()),
+            Ok(s) => session_provider_id(s, configured_default.as_deref())
+                .map(|id| intent_providers::base_provider_id(&id).to_owned()),
             Err(e) => {
                 tracing::warn!(
                     agent = %agent_id,
@@ -5402,7 +5715,7 @@ impl AgentManager {
                 group_source_ids.push(id.to_string());
             }
         }
-        let (body, excluded_group_sources) = self
+        let (body, excluded_group_sources, continues_cut_short_turn) = self
             .build_turn_body_with_group_replay(
                 agent_id,
                 &combined,
@@ -5497,7 +5810,12 @@ impl AgentManager {
                         .as_ref()
                         .is_some_and(|source| excluded_group_sources.contains(source));
                 let in_envelope = !batch && !history_covers_prepend && i == 0;
-                if !covered && !in_envelope {
+                // A quota failover continuing a cut-short turn (PROTOCOL
+                // §5.54) already replays every request of this delivery in
+                // the turn section; re-appending their text after the
+                // continuation would invite repeated work. Attachments are
+                // not in the text replay, so they are still delivered.
+                if !covered && !in_envelope && !continues_cut_short_turn {
                     let text = if batch && !group.is_prepend {
                         message_number += 1;
                         format!("\n\nMessage #{}:\n{}", message_number, group.content)
@@ -5507,6 +5825,7 @@ impl AgentManager {
                     blocks.extend(text_prompt(&text));
                 }
                 self.append_resolved_attachments(
+                    workspace_id,
                     &mut blocks,
                     group.image_blocks.as_ref(),
                     group.file_blocks.as_ref(),
@@ -5515,12 +5834,14 @@ impl AgentManager {
             }
         } else {
             self.append_resolved_attachments(
+                workspace_id,
                 &mut blocks,
                 options.prepend_image_blocks.as_ref(),
                 options.prepend_file_blocks.as_ref(),
             )
             .await?;
             self.append_resolved_attachments(
+                workspace_id,
                 &mut blocks,
                 options.image_blocks.as_ref(),
                 options.file_blocks.as_ref(),
@@ -5579,6 +5900,7 @@ impl AgentManager {
     /// Resolve references within their message group, before emitting the next text.
     async fn append_resolved_attachments(
         &self,
+        workspace_id: &WorkspaceId,
         blocks: &mut Vec<ContentBlock>,
         images: Option<&Value>,
         files: Option<&Value>,
@@ -5587,15 +5909,118 @@ impl AgentManager {
             .services
             .resolve_image_block_refs(images.cloned())
             .await?;
+        if let Some(resolved_images) = resolved.as_ref().and_then(Value::as_array) {
+            for (index, image) in resolved_images.iter().enumerate() {
+                let Some(mime) = image.get("mimeType").and_then(Value::as_str) else {
+                    continue;
+                };
+                let mime = crate::provider_images::normalize_image_mime(mime);
+                if crate::provider_images::supports_image_mime(&mime) {
+                    let mut image = image.clone();
+                    image["mimeType"] = json!(mime);
+                    push_image_blocks(blocks, Some(&json!([image])));
+                    continue;
+                }
+                let original = images
+                    .and_then(Value::as_array)
+                    .and_then(|items| items.get(index));
+                let reference = original
+                    .and_then(|item| item.get("attachmentId"))
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.trim().is_empty());
+                let notice = if let Some(id) = reference {
+                    let record = self.services.store.get_attachment(id).await?;
+                    if record.workspace_id == *workspace_id {
+                        attachment_reference_notice(
+                            &record.file_name,
+                            Some(&mime),
+                            u64::try_from(record.size).ok(),
+                            id,
+                        )
+                    } else {
+                        // Image references are registry-wide, but getAttachment is
+                        // workspace-scoped. Give the receiver its own retrievable copy.
+                        self.preserve_image_file(
+                            workspace_id,
+                            image,
+                            &mime,
+                            Some(&record.file_name),
+                        )
+                        .await?
+                    }
+                } else {
+                    self.preserve_image_file(workspace_id, image, &mime, None)
+                        .await?
+                };
+                blocks.extend(text_prompt(&notice));
+            }
+        }
         append_attachment_blocks(
             blocks,
             &TurnOptions {
-                image_blocks: resolved,
                 file_blocks: files.cloned(),
                 ..TurnOptions::default()
             },
         );
         Ok(())
+    }
+
+    /// Keep unsupported inline or foreign-reference images accessible to the receiver.
+    /// Content-addressed placement also makes queue retries reuse the source copy.
+    async fn preserve_image_file(
+        &self,
+        workspace_id: &WorkspaceId,
+        image: &Value,
+        mime: &str,
+        file_name: Option<&str>,
+    ) -> Result<String> {
+        use crate::attachment_upload::{attachment_fingerprint, sha256_hex, KeyedPlacement};
+        use base64::Engine as _;
+        let data = image.get("data").and_then(Value::as_str).ok_or_else(|| {
+            Error::InvalidParams("Image attachment is missing its data. Reattach the file.".into())
+        })?;
+        if data.len() > 40 * 1024 * 1024 {
+            return Err(Error::InvalidParams(
+                "Image attachment exceeds 40 MiB of base64 data.".into(),
+            ));
+        }
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(data))
+            .map_err(|_| {
+                Error::InvalidParams(
+                    "Image attachment is not valid base64. Reattach the file.".into(),
+                )
+            })?;
+        let mime = mime.trim().to_ascii_lowercase();
+        let extension = intent_core::asset_extension_from_mime(&mime).unwrap_or(".bin");
+        let name = file_name.map_or_else(|| format!("image{extension}"), str::to_owned);
+        let digest = sha256_hex(&bytes);
+        let fingerprint = attachment_fingerprint(&name, bytes.len() as u64, Some(&digest));
+        let key = format!("image-file-{}", sha256_hex(fingerprint.as_bytes()));
+        let placed = self
+            .services
+            .place_attachment_registered(
+                workspace_id.clone(),
+                &name,
+                &crate::file_ops::AttachmentSource::Bytes(&bytes),
+                Some(mime.clone()),
+                Some(KeyedPlacement {
+                    key,
+                    lookup_fingerprint: Some(fingerprint),
+                    sha256: Some(digest),
+                }),
+            )
+            .await?;
+        let id = placed["attachmentId"].as_str().ok_or_else(|| {
+            Error::Internal("Image attachment placement returned no attachment ID.".into())
+        })?;
+        Ok(attachment_reference_notice(
+            &name,
+            Some(&mime),
+            Some(bytes.len() as u64),
+            id,
+        ))
     }
 
     /// Build the user-turn body: normally just `content`, but when the ACP
@@ -5622,9 +6047,27 @@ impl AgentManager {
         content: &str,
         flushed_ids: Option<&[String]>,
         group_source_ids: &[String],
-    ) -> (String, HashSet<String>) {
+    ) -> (String, HashSet<String>, bool) {
+        let failover_replay = self.services.quota_failover_replay_pending(agent_id);
         if !self.take_recreated(agent_id) {
-            return (content.to_string(), HashSet::new());
+            // A resumed native session (no replay) already holds the cut-short
+            // turn's history from the backup's earlier prompt; it still gets
+            // the continuation instead of the message again.
+            if failover_replay
+                && self
+                    .services
+                    .store
+                    .get_agent_messages(agent_id, None)
+                    .await
+                    .is_ok_and(|messages| partial_turn_follows_last_user(&messages))
+            {
+                return (
+                    crate::quota_failover::QUOTA_FAILOVER_CONTINUATION.to_string(),
+                    HashSet::new(),
+                    true,
+                );
+            }
+            return (content.to_string(), HashSet::new(), false);
         }
         // The per-block cap is read live so a `config.toml` edit applies to
         // the next replay without a daemon restart. The bounded replay read
@@ -5670,6 +6113,50 @@ impl AgentManager {
                 .iter()
                 .position(|message| queue_source(message).is_some_and(|id| ids.contains(&id)))
         });
+        // Quota failover mid-turn (PROTOCOL §5.54): when the failed attempt
+        // already persisted assistant/tool rows after the current user row,
+        // the backup continues that turn — older history, then the cut-short
+        // turn (user request + every tool call it made, never dropped for
+        // size; see `format_cut_short_turn`), then a continuation instruction
+        // instead of the re-sent message. Applies to every send shape
+        // (direct, live flush, saved groups).
+        if failover_replay && partial_turn_follows_last_user(&messages) {
+            // The current turn starts at its first user row: the flushed
+            // batch's first row, the earliest saved group source, else the
+            // newest user row. Everything before it is older history.
+            let group_start = messages.iter().position(|message| {
+                message.role == "user"
+                    && (excluded_group_sources.contains(&message.id)
+                        || queue_source(message)
+                            .is_some_and(|source| excluded_group_sources.contains(&source)))
+            });
+            let last_user = messages.iter().rposition(|message| message.role == "user");
+            let start = first_flushed
+                .into_iter()
+                .chain(group_start)
+                .chain(last_user)
+                .min()
+                .unwrap_or(0);
+            let keep = |message: &&intent_core::AgentMessage| {
+                !crate::agent_ops::is_qualified_monitor_message(message)
+            };
+            let prior: Vec<_> = messages[..start].iter().filter(keep).cloned().collect();
+            let current: Vec<_> = messages[start..].iter().filter(keep).cloned().collect();
+            let turn = crate::history_xml::format_cut_short_turn(
+                &prior,
+                &current,
+                crate::history_xml::MAX_HISTORY_CHARS,
+                tool_content_chars,
+            );
+            return (
+                format!(
+                    "{turn}\n\n{}",
+                    crate::quota_failover::QUOTA_FAILOVER_CONTINUATION
+                ),
+                excluded_group_sources,
+                true,
+            );
+        }
         let prior: &[_] = if let Some(index) = first_flushed {
             // Preserve the existing boundary for an ordinary live flush.
             &messages[..index]
@@ -5684,12 +6171,14 @@ impl AgentManager {
             }
         };
         if prior.is_empty() {
-            return (content.to_string(), excluded_group_sources);
+            return (content.to_string(), excluded_group_sources, false);
         }
         // Unlike the existing live-flush boundary, saved group sources may
         // precede unrelated conversation. Remove only matched source rows.
         let prior: Vec<_> = prior
             .iter()
+            // Ordinary history replay has no original monitor admission.
+            .filter(|message| !crate::agent_ops::is_qualified_monitor_message(message))
             .filter(|message| {
                 message.role != "user"
                     || (!excluded_group_sources.contains(&message.id)
@@ -5706,6 +6195,7 @@ impl AgentManager {
         (
             format!("{history_xml}\n\n{content}"),
             excluded_group_sources,
+            false,
         )
     }
 
@@ -5807,6 +6297,7 @@ impl AgentManager {
                     .map(|connection| crate::agent_session::LocalPromptInput {
                         connection,
                         captured,
+                        required: None,
                     }),
             )
             .await;
@@ -5941,6 +6432,11 @@ impl AgentManager {
                 return (false, None);
             }
         }
+        // §5.5b: the provider tree (and every worker in it) goes with the
+        // handle, so its worker generation is released, not left unknown.
+        if let Some(snapshot) = self.services.agent_workers().release(agent_id) {
+            self.services.publish_workers_snapshot(snapshot);
+        }
         // Pin the live-turn slot BEFORE aborting the worker (the abort drops
         // LiveTurnGuard; the pin keeps the slot published until the flush
         // below persists the row — monorepo#2056), then flush the partial
@@ -5991,6 +6487,9 @@ impl AgentManager {
         // inherit the old count and hit the cap early.
         self.services.take_truncation_redrive(agent_id);
         self.services.clear_truncation_redrives(agent_id);
+        // The aborted worker's quota failover chain (PROTOCOL §5.54) belongs
+        // to the aborted turn; the next worker re-arms its own.
+        self.services.disarm_quota_failover(agent_id);
         {
             let mut armed = self.stop_redelivery.lock().unwrap();
             match redelivery {
@@ -6271,6 +6770,7 @@ impl AgentManager {
         });
         let provider_kills_on_interrupt = session_provider
             .as_deref()
+            .map(intent_providers::base_provider_id)
             .and_then(intent_providers::find_provider)
             .is_some_and(|p| p.kills_child_on_interrupt)
             // `MOCK_AGENT_KILLS_ON_INTERRUPT=1` grants the mock provider the
@@ -6859,6 +7359,9 @@ impl AgentManager {
         // slot it kept is cleared like any other orphan.
         self.services
             .clear_live_turn_unless_flush_in_flight(agent_id);
+        // A new claim's own end supersedes any earlier release's pending
+        // idle write. (`settled_turns` cannot survive a release.)
+        self.pending_idle_writes.lock().unwrap().remove(agent_id);
         busy.insert(agent_id.clone());
         let admission = TurnAdmission(self.next_admission.fetch_add(1, AtomicOrdering::Relaxed));
         self.turn_admissions
@@ -7142,11 +7645,25 @@ impl AgentManager {
     /// `busy` guard is dropped — the registry lock is never nested under it.
     #[expect(clippy::option_option)] // outer = was-busy, inner = the removed entry
     fn release_slot_sync(&self, agent_id: &AgentId) -> Option<Option<WorkspaceId>> {
+        self.release_slot_sync_inner(agent_id, false)
+            .map(|removed| removed.map(|(workspace_id, _)| workspace_id))
+    }
+
+    /// [`Self::release_slot_sync`], optionally recording a pending
+    /// `RuntimeIdle` write under the same `busy` critical section, so no
+    /// claim can interleave between the release and the record.
+    #[expect(clippy::option_option)] // outer = was-busy, inner = the removed entry
+    fn release_slot_sync_inner(
+        &self,
+        agent_id: &AgentId,
+        record_idle_write: bool,
+    ) -> Option<Option<(WorkspaceId, Option<u64>)>> {
         let removed = {
             let mut busy = self.busy.lock().unwrap();
             if !busy.remove(agent_id) {
                 return None;
             }
+            self.settled_turns.lock().unwrap().remove(agent_id);
             self.turn_admissions.lock().unwrap().remove(agent_id);
             if busy.is_empty() {
                 *self.idle_since.lock().unwrap() = Some(Instant::now());
@@ -7156,7 +7673,18 @@ impl AgentManager {
             // failure releasing before spawn) must not leak the notice into a
             // later unrelated turn.
             self.auto_unarchived.lock().unwrap().remove(agent_id);
-            self.agent_ws.lock().unwrap().remove(agent_id)
+            let workspace_id = self.agent_ws.lock().unwrap().remove(agent_id);
+            workspace_id.map(|workspace_id| {
+                let token = record_idle_write.then(|| {
+                    let token = self.next_idle_write.fetch_add(1, AtomicOrdering::Relaxed);
+                    self.pending_idle_writes
+                        .lock()
+                        .unwrap()
+                        .insert(agent_id.clone(), (workspace_id.clone(), token));
+                    token
+                });
+                (workspace_id, token)
+            })
         };
         self.registry.wake_waiter_if_idle(agent_id);
         Some(removed)
@@ -7183,19 +7711,56 @@ impl AgentManager {
         }
     }
 
+    /// Record that the current slot holder completed its turn and published
+    /// its terminal `agent:idle`. Decided under the `busy` lock (lock order
+    /// busy → `settled_turns`, matching [`Self::claim_slot_sync`]); claims and
+    /// releases clear it under the same lock, so it never outlives the slot.
+    pub(crate) fn mark_turn_settled_if_slot_held(&self, agent_id: &AgentId) {
+        let busy = self.busy.lock().unwrap();
+        if busy.contains(agent_id) {
+            self.settled_turns.lock().unwrap().insert(agent_id.clone());
+        }
+    }
+
+    /// The slot holder dequeued new work: shutdown must again treat it as
+    /// interrupted. Synchronous, so a worker abort cannot land between
+    /// taking the work and clearing the mark.
+    fn clear_turn_settled(&self, agent_id: &AgentId) {
+        self.settled_turns.lock().unwrap().remove(agent_id);
+    }
+
+    fn turn_settled(&self, agent_id: &AgentId) -> bool {
+        self.settled_turns.lock().unwrap().contains(agent_id)
+    }
+
+    /// Retire this call's pending idle write. A later release replaces the
+    /// entry with its own token, so a stale write never retires a newer one.
+    fn finish_idle_write(&self, agent_id: &AgentId, token: u64) {
+        let mut pending = self.pending_idle_writes.lock().unwrap();
+        if pending
+            .get(agent_id)
+            .is_some_and(|(_, current)| *current == token)
+        {
+            pending.remove(agent_id);
+        }
+    }
+
     /// Release the in-flight slot, recomputing the owning workspace's derived
     /// `WorkspaceActivity` (§9.9) and emitting `workspace:activity-changed` on
     /// the `AgentRunning → Idle` edge. Also persists the `agent_session.status`
     /// transition to `RuntimeIdle` and emits `agent:status-changed` (PROTOCOL
     /// §6.5/§6.7) so a hydrated chat reflects the post-turn idle state.
     async fn end_turn(&self, agent_id: &AgentId) {
-        let Some(workspace_id) = self.release_slot_sync(agent_id) else {
+        let Some(released) = self.release_slot_sync_inner(agent_id, true) else {
             return;
         };
-        if let Some(workspace_id) = workspace_id {
+        if let Some((workspace_id, token)) = released {
             self.services.agent_activity_end(&workspace_id);
             self.persist_status(agent_id, &workspace_id, AgentStatus::RuntimeIdle, false)
                 .await;
+            if let Some(token) = token {
+                self.finish_idle_write(agent_id, token);
+            }
         }
     }
 
@@ -8411,7 +8976,7 @@ impl AgentManager {
         // (`persisted: false`) so `agent.retry` re-attempts the append,
         // instead of producing assistant output for a user row that never
         // reached the transcript.
-        let user_persisted = if next.persisted {
+        let user_persisted = if next.monitor_turn.is_some() || next.persisted {
             true
         } else {
             persist_user(
@@ -8434,12 +8999,14 @@ impl AgentManager {
         // The `prepend_*` fields restore a failed zero-output interrupt's
         // combined delivery on retry (monorepo#1014).
         let options = TurnOptions {
+            monitor_turn: next.monitor_turn.clone(),
             delivery_groups: next.delivery_groups.clone(),
             prepend_delivery_groups: next.prepend_delivery_groups.clone(),
             image_blocks: next.image_blocks.clone(),
             file_blocks: next.file_blocks.clone(),
             message_metadata: next.message_metadata.clone(),
             suppress_report_clear: stale,
+            replay: stale || next.persisted,
             queued_at: Some(next.queued_at.clone()),
             queued_submission_ids: next.submission_ids(),
             recovery_sources: next.recovery_sources.clone(),
@@ -8610,6 +9177,10 @@ impl AgentManager {
             file_blocks: entry.file_blocks.clone(),
             message_metadata: entry.message_metadata.clone(),
             suppress_report_clear: stale,
+            // Classified before any row is persisted: a stale or an
+            // already-persisted entry replays an earlier turn (no timed
+            // return home, PROTOCOL §5.54).
+            replay: stale || entry.persisted,
             queued_at: Some(entry.queued_at.clone()),
             queued_submission_ids: entry.submission_ids(),
             recovery_sources: entry.recovery_sources.clone(),
@@ -9250,7 +9821,11 @@ impl AgentManager {
         // flush rebuilds the same aggregate order as this turn (entry
         // prepends in entry order, then the stop redelivery) instead of
         // losing it with the discarded aggregate prepend.
-        let armed = self.stop_redelivery.lock().unwrap().remove(&agent_id);
+        let armed = if options.monitor_turn.is_none() {
+            self.stop_redelivery.lock().unwrap().remove(&agent_id)
+        } else {
+            None
+        };
         let consumed_redelivery = armed.is_some();
         if let Some(armed) = armed {
             if let Some(last) = options
@@ -9868,7 +10443,9 @@ impl AgentManager {
         resolved: &ResolvedSpawn,
     ) {
         let to_model = resolved.model.as_deref();
-        let to_provider = resolved.provider.id;
+        // The selection, not the base id: a profile switch is a provider
+        // change, and `last_turn_provider` names the native session's owner.
+        let to_provider = resolved.selection.as_str();
         let (from_model, from_provider) = match self
             .services
             .store
@@ -9897,9 +10474,18 @@ impl AgentManager {
                 )
                 .await;
         if changed && !announced {
-            let label = |provider: &str, model: Option<&str>| match model {
-                Some(m) => format!("{provider}:{m}"),
-                None => format!("{provider} (default model)"),
+            // A profile reads as `<base> (<profile name>)`, never as its
+            // internal reference; the metadata keeps the references.
+            let profiles = self.services.provider_profiles.profiles().ok();
+            let label = |provider: &str, model: Option<&str>| {
+                let provider = crate::provider_profiles::readable_selection(
+                    provider,
+                    profiles.as_deref().map(Vec::as_slice),
+                );
+                match model {
+                    Some(m) => format!("{provider}:{m}"),
+                    None => format!("{provider} (default model)"),
+                }
             };
             let from_label = label(
                 from_provider.as_deref().unwrap_or(""),
@@ -9954,6 +10540,76 @@ impl AgentManager {
         }
     }
 
+    /// Adopt the model the session-open fill persisted for a session spawned
+    /// without one. The value is the fill's own landed model, recorded on the
+    /// live handle (`session_open_filled_model`) — never re-read from the
+    /// row, so a racing `agent.setModel` is not mistaken for an applied
+    /// model. Only a model `resolve_spawn` itself would pass is adopted (a
+    /// provider that always spawns on its default — the E2E mock — must not
+    /// see a phantom mismatch that respawns every turn). Sets the handle's
+    /// `spawned_model` and `resolved.model`; when the last committed turn ran
+    /// the same provider on its default (`last_turn_model` NULL) the baseline
+    /// moves to the adopted id too, so the provider default → its concrete id
+    /// is not announced as a model change. Returns the landed fill (the model
+    /// now stored on the row), adopted or not. Best-effort.
+    async fn adopt_filled_model(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        session: &AgentSession,
+        workspace: Option<&intent_core::Workspace>,
+        settings: &intent_core::settings_file::SettingsFile,
+        resolved: &mut ResolvedSpawn,
+    ) -> Option<String> {
+        let filled = self
+            .handles
+            .lock()
+            .unwrap()
+            .get_mut(agent_id)
+            .and_then(|h| h.session_open_filled_model.take())?;
+        if resolved.model.is_some() {
+            return Some(filled);
+        }
+        let probe = AgentSession {
+            model: Some(filled.clone()),
+            ..session.clone()
+        };
+        let Some(model) =
+            resolve_spawn(&probe, workspace, settings, self.chief_cwd_root.as_deref())
+                .ok()
+                .and_then(|r| r.model)
+        else {
+            return Some(filled);
+        };
+        if let Some(handle) = self.handles.lock().unwrap().get_mut(agent_id) {
+            handle.spawned_model = Some(model.clone());
+        }
+        if let Ok((None, Some(prev))) = self
+            .services
+            .store
+            .get_agent_session_last_turn_model(workspace_id, agent_id)
+            .await
+        {
+            if intent_providers::provider_config(&prev).id == resolved.provider.id {
+                if let Err(e) = self
+                    .services
+                    .store
+                    .set_agent_session_last_turn_model(
+                        workspace_id,
+                        agent_id,
+                        Some(&model),
+                        resolved.provider.id,
+                    )
+                    .await
+                {
+                    tracing::warn!(agent = %agent_id, error = %e, "failed to rebase last-turn model");
+                }
+            }
+        }
+        resolved.model = Some(model);
+        Some(filled)
+    }
+
     /// Commit a confirmed effort at the successful turn boundary, never a
     /// picker update. SQL NULL is an unobserved baseline; JSON effort:null is
     /// Auto. The system row is excluded from provider history replay.
@@ -9991,10 +10647,24 @@ impl AgentManager {
             model: resolved.model.clone(),
         };
         if let Some(from) = &previous {
-            let same = match (&from.effort, &state.effort) {
-                (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
-                (None, None) => true,
-                _ => false,
+            // Compare the EFFECTIVE level: Auto resolves to the provider's
+            // default value, so Auto → that same explicit level (e.g. the
+            // session-open fill pinning the provider's current level) is not
+            // a change.
+            let effective = |e: &intent_store::AgentTurnEffort| {
+                e.effort
+                    .clone()
+                    .or_else(|| Some(e.default_value.clone()).filter(|d| !d.is_empty()))
+            };
+            let same = if from.effort.is_none() && state.effort.is_none() {
+                // Auto → Auto is never a change, whatever the default did.
+                true
+            } else {
+                match (effective(from), effective(&state)) {
+                    (Some(a), Some(b)) => a.eq_ignore_ascii_case(&b),
+                    (None, None) => true,
+                    _ => false,
+                }
             };
             if !same {
                 let content = json!([{"type":"text", "text": format!(
@@ -10040,9 +10710,81 @@ impl AgentManager {
         }
     }
 
+    /// Every session carries a concrete reasoning level: a session that ran
+    /// this turn on Auto (no stored effort) is pinned to the level the
+    /// provider confirmed for it — its explicit selection, else its known
+    /// default — never the adapter's `"default"` sentinel. Fill-only, so a
+    /// concurrent effort change wins, and it lands only while the row still
+    /// carries the provider/model this turn ran (`expected_*`), so a model
+    /// switch racing the turn never inherits the old model's level. The
+    /// store marks the level Auto-pinned (`reasoning_effort_auto`), and the
+    /// effective-level comparison keeps Auto → that same level silent on the
+    /// next turn.
+    async fn fill_confirmed_effort(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        resolved: &ResolvedSpawn,
+        expected_provider: Option<&str>,
+        expected_model: Option<&str>,
+    ) {
+        if resolved.reasoning_effort.is_some() {
+            return;
+        }
+        let applied = self
+            .handles
+            .lock()
+            .unwrap()
+            .get(agent_id)
+            .and_then(|h| h.confirmed_effort.clone());
+        let Some(level) = applied
+            .and_then(|a| a.selection.or(Some(a.default_value)))
+            .filter(|level| !level.trim().is_empty() && !level.eq_ignore_ascii_case("default"))
+        else {
+            return;
+        };
+        match self
+            .services
+            .store
+            .fill_agent_session_effort_if_identity(
+                workspace_id,
+                agent_id,
+                &level,
+                expected_provider,
+                expected_model,
+                &now_iso(),
+            )
+            .await
+        {
+            Ok(true) => {
+                tracing::info!(
+                    agent_id = %agent_id,
+                    reasoning_effort = %level,
+                    field = "reasoning_effort",
+                    "legacy session repaired"
+                );
+                self.services.invalidate_agent_list_cache(workspace_id);
+                self.services
+                    .publish_agent_mutation_event(
+                        workspace_id,
+                        agent_id,
+                        intent_core::events::AGENT_UPDATED,
+                        json!({ "agentId": agent_id.0, "reasoningEffort": level }),
+                    )
+                    .await;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(agent = %agent_id, error = %e, "fill confirmed effort failed");
+            }
+        }
+    }
+
     /// Whether a pending `model_changed` row for the provider hop
     /// `from_provider` → `to_provider` is the deferred last-turn commit of a
-    /// re-home the transcript already announces (intent-hq/intent#5737): the
+    /// re-home (intent-hq/intent#5737) or a quota failover (PROTOCOL §5.54,
+    /// a `provider_failover` row for the same selection hop) the transcript
+    /// already announces. For a re-home: the
     /// agent's newest identity-change system row
     /// ([`intent_store::Store::latest_agent_identity_notice`]) is a
     /// `provider_rehomed` notice for that same hop, both sides canonicalized
@@ -10060,9 +10802,21 @@ impl AgentManager {
         to_provider: &str,
     ) -> bool {
         let canonical = |id: &str| intent_providers::provider_config(id).id;
-        if canonical(from_provider) == canonical(to_provider) {
+        let selection = crate::provider_profiles::canonical_selection;
+        // A model-only change is never an announced switch. A hop between two
+        // configurations of one base can only be a quota failover.
+        if selection(from_provider) == selection(to_provider) {
             return false;
         }
+        // A timed return home: its `provider_returned` row is the notice.
+        if self
+            .services
+            .is_announced_provider_return(agent_id, from_provider, to_provider)
+            .await
+        {
+            return true;
+        }
+        let same_base = canonical(from_provider) == canonical(to_provider);
         let latest = match self
             .services
             .store
@@ -10078,7 +10832,32 @@ impl AgentManager {
         let Some(latest) = latest else {
             return false;
         };
-        if latest["type"].as_str() != Some("provider_rehomed") {
+        // Quota failover (PROTOCOL §5.54): the `provider_failover` rows of
+        // this turn already name the hop between selections (profiles
+        // included) — one row, or an unbroken chain when a backup's own setup
+        // also ran out before another one succeeded.
+        if latest["type"].as_str() == Some(crate::quota_failover::PROVIDER_FAILOVER_NOTICE_TYPE) {
+            return match self
+                .services
+                .store
+                .recent_agent_identity_notices(
+                    agent_id,
+                    crate::quota_failover::FAILOVER_CHAIN_READ_LIMIT,
+                )
+                .await
+            {
+                Ok(notices) => crate::quota_failover::failover_chain_announces(
+                    &notices,
+                    from_provider,
+                    to_provider,
+                ),
+                Err(e) => {
+                    tracing::warn!(agent = %agent_id, error = %e, "failed to read identity notices; keeping the model-change notice");
+                    false
+                }
+            };
+        }
+        if same_base || latest["type"].as_str() != Some("provider_rehomed") {
             return false;
         }
         let hop = |key: &str| latest[key].as_str().map(canonical);
@@ -10126,6 +10905,76 @@ impl AgentManager {
                 tracing::warn!(agent = %agent_id, error = %e, "failed to persist auto-unarchive notice");
             }
         }
+    }
+
+    /// Turn-start repair of a legacy session whose `provider` column is NULL
+    /// (written before every create pinned its provider). The provider comes
+    /// from [`crate::agent_session::legacy_session_provider`]: the provider
+    /// its last committed turn actually ran, else the settings default in
+    /// effect now (a session that never ran). Persisted through the
+    /// compare-and-set [`intent_store::Store::pin_agent_session_provider_if_null`],
+    /// so a concurrent `agent.setModel` that pinned a provider first wins and
+    /// the fresh row is used instead. The effective spawn identity of a
+    /// session that last ran on the pinned provider is unchanged, so no
+    /// respawn and no `model_changed` row follow. Emits `agent:updated` so
+    /// clients re-read the projection. With nothing to pin onto the session
+    /// is returned unchanged and `resolve_spawn` raises its own loud error.
+    async fn pin_legacy_session_provider(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        session: AgentSession,
+    ) -> Result<AgentSession> {
+        if session
+            .provider
+            .as_deref()
+            .is_some_and(|p| !p.trim().is_empty())
+        {
+            return Ok(session);
+        }
+        let provider = match crate::agent_session::legacy_session_provider(
+            &self.services,
+            workspace_id,
+            agent_id,
+        )
+        .await
+        {
+            Ok(Some(provider)) => provider,
+            Ok(None) => return Ok(session),
+            Err(e) => {
+                // Never pin on a failed read: this turn resolves as before
+                // and the next turn retries the repair.
+                tracing::warn!(agent = %agent_id, error = %e, "legacy provider repair skipped");
+                return Ok(session);
+            }
+        };
+        let landed = self
+            .services
+            .store
+            .pin_agent_session_provider_if_null(workspace_id, agent_id, &provider, &now_iso())
+            .await?;
+        if !landed {
+            return self.services.store.get_agent_session(agent_id).await;
+        }
+        tracing::info!(
+            agent_id = %agent_id,
+            provider = %provider,
+            field = "provider",
+            "legacy session repaired"
+        );
+        self.services.invalidate_agent_list_cache(workspace_id);
+        self.services
+            .publish_agent_mutation_event(
+                workspace_id,
+                agent_id,
+                intent_core::events::AGENT_UPDATED,
+                json!({ "agentId": agent_id.0, "providerId": provider }),
+            )
+            .await;
+        Ok(AgentSession {
+            provider: Some(provider),
+            ..session
+        })
     }
 
     /// Turn-start disabled-provider gate (intent-hq/intent#5737). When the
@@ -10183,6 +11032,15 @@ impl AgentManager {
         ) else {
             return Ok((session, false));
         };
+        // A named profile is never re-homed: a missing profile or a disabled
+        // base provider needs an explicit replacement before this turn, and
+        // never moves the conversation to the app default or the base's
+        // Default account (PROTOCOL §5.54). Bare selections keep the re-home.
+        if crate::provider_profiles::is_qualified_ref(&raw) {
+            self.services
+                .ensure_provider_ref_selectable_in(&raw, &settings.providers)?;
+            return Ok((session, false));
+        }
         let current = intent_providers::provider_config(&raw).id;
         if !crate::agent_ops::provider_is_disabled(current, settings.providers.enabled.as_ref()) {
             return Ok((session, false));
@@ -10387,6 +11245,15 @@ impl AgentManager {
             .await;
         let workspace = self.services.store.get_workspace(workspace_id).await.ok();
         let settings = self.services.effective_settings();
+        // Legacy provider repair: every session pins its provider at create,
+        // so a NULL column is a pre-pin row. Pin it once onto the provider its
+        // last turn ran (else the current default) BEFORE the disabled gate
+        // and `resolve_spawn`, so the session stops following
+        // `model.defaultProvider` changes from this turn on.
+        // Boxed: keeps the repair's state off `ensure_started`'s future (the
+        // deep send/interrupt paths otherwise overflow the test stack).
+        let session =
+            Box::pin(self.pin_legacy_session_provider(agent_id, workspace_id, session)).await?;
         // Disabled-provider gate (intent-hq/intent#5737): a session pinned to
         // a provider the user switched off in Settings > Agents never spawns
         // it — re-home onto the usable default (persisted before
@@ -10402,6 +11269,13 @@ impl AgentManager {
             &settings,
             self.chief_cwd_root.as_deref(),
         )?;
+        // Backup failover (PROTOCOL §5.54): the identity this attempt starts
+        // with — a failure only fails over while the session still carries it.
+        self.services.note_quota_failover_attempt(
+            agent_id,
+            &resolved.selection,
+            session.model.as_deref(),
+        );
 
         // Check if the agent's model/provider has changed (via agent.setModel).
         // If so, tear down the existing child and force a respawn with the new model.
@@ -10412,10 +11286,12 @@ impl AgentManager {
                     // Compare the session's currently-resolved model/provider against
                     // the values the child was spawned with. A mismatch means
                     // agent.setModel was called while the child was live.
-                    let model_changed =
-                        handle.spawned_model.as_deref() != resolved.model.as_deref();
-                    let provider_changed = handle.spawned_provider != resolved.provider.command;
-                    model_changed || provider_changed
+                    spawn_identity_changed(
+                        handle.spawned_model.as_deref(),
+                        &handle.spawned_provider,
+                        &handle.spawned_selection,
+                        &resolved,
+                    )
                 } else {
                     false
                 }
@@ -10466,8 +11342,22 @@ impl AgentManager {
                     }
                     self.maybe_persist_effort_change_notice(agent_id, workspace_id, &resolved)
                         .await;
-                    self.apply_fast_mode(agent_id, &acp, resolved.provider.id, &original)
-                        .await?;
+                    Box::pin(self.fill_confirmed_effort(
+                        agent_id,
+                        workspace_id,
+                        &resolved,
+                        session.provider.as_deref(),
+                        session.model.as_deref(),
+                    ))
+                    .await;
+                    self.apply_fast_mode(
+                        agent_id,
+                        &acp,
+                        resolved.provider.id,
+                        &resolved.selection,
+                        &original,
+                    )
+                    .await?;
                     return Ok(StartedSession {
                         session_id: acp,
                         turn: original,
@@ -10598,7 +11488,16 @@ impl AgentManager {
                 "no provider binary resolved; launching the bare command from the daemon PATH"
             );
         }
+        // A named profile's saved overlay, read fresh for this new process
+        // (it re-checks the profile still exists and its base is enabled).
+        // Boxed: keeps this turn-start future's stack frame unchanged.
+        let profile_env = if crate::provider_profiles::is_qualified_ref(&resolved.selection) {
+            Box::pin(self.services.resolve_selected_profile(&resolved.selection)).await?
+        } else {
+            None
+        };
         let mut opts = SpawnOptions::new(&resolved.provider);
+        opts.profile_env = profile_env.as_deref();
         opts.cwd = Some(&resolved.cwd);
         opts.model = resolved.model.as_deref();
         opts.reasoning_effort = resolved.reasoning_effort.as_deref();
@@ -10625,11 +11524,24 @@ impl AgentManager {
         // Record the identity this attempt runs under BEFORE anything below
         // can fail: a spawn or session-setup failure is attributed to the
         // provider that was actually tried, not to whatever the last committed
-        // turn ran on. Cleared on success at the end of this method.
+        // turn ran on. Cleared on success at the end of this method. The
+        // selection is recorded: a bare provider's selection is its canonical
+        // id, and a profile attempt names its reference (PROTOCOL §5.54: a
+        // quota exhaustion names the last reference tried, and failover must
+        // attribute the failure to the configuration that actually ran).
         self.spawn_attempt_provider
             .lock()
             .unwrap()
-            .insert(agent_id.clone(), resolved.provider.id.to_string());
+            .insert(agent_id.clone(), resolved.selection.clone());
+        let private_history = if let Some(session_id) = &session.acp_session_id {
+            self.services
+                .store
+                .get_review_context_enrollment(workspace_id, agent_id, session_id)
+                .await?
+                .is_some()
+        } else {
+            false
+        };
         if !self.contains(agent_id) {
             // Derive the agent type from the session's specialist `agentType`
             // frontmatter (SP-B); falls back to the default interactive type so
@@ -10659,13 +11571,21 @@ impl AgentManager {
             )
             .await?;
         }
+        let original_attempt = repository_origin::capture(&self.handles, agent_id);
         let session_result = self
             .start_session_owned(agent_id, resolved.cwd.clone(), &resolved.provider)
             .await;
         let acp_session_id = match session_result {
             Ok(id) => id,
             Err(error) => {
-                if resolved.provider.id == "antigravity" {
+                if private_history {
+                    // A refused private load has no usable session in this
+                    // child. Retire only this captured attempt so a later
+                    // original-account recovery must load on a fresh child.
+                    if let Some(original) = &original_attempt {
+                        self.kill_original_child(agent_id, original).await;
+                    }
+                } else if resolved.provider.id == "antigravity" {
                     // Never let the next turn reuse an unverified child
                     // through the fast path. Fresh candidates are not committed
                     // until confirmation; a failed load keeps its prior ID.
@@ -10674,6 +11594,26 @@ impl AgentManager {
                 return Err(error);
             }
         };
+        // A session spawned on the provider default (no stored model) had its
+        // `model` filled at session open from the provider's current option
+        // id (`fill_identity_from_session_open`). The child runs exactly that
+        // model, so adopt it as the resolved identity: the notice/commit
+        // below and the next turn's respawn comparison see the same id.
+        let filled_model = Box::pin(self.adopt_filled_model(
+            agent_id,
+            workspace_id,
+            &session,
+            workspace.as_ref(),
+            &settings,
+            &mut resolved,
+        ))
+        .await;
+        // Backup failover: a turn that started on the provider default now
+        // runs under the filled model, which the session row also carries.
+        if let (None, Some(filled)) = (session.model.as_deref(), filled_model.as_deref()) {
+            self.services
+                .note_quota_failover_filled_model(agent_id, filled);
+        }
         // Model-change transcript notice: only AFTER the child + ACP session
         // are provably up under the new identity — a failed spawn/switch must
         // not persist a notice or commit `last_turn_*` to an identity the
@@ -10686,10 +11626,21 @@ impl AgentManager {
             .await;
         self.maybe_persist_effort_change_notice(agent_id, workspace_id, &resolved)
             .await;
+        // The row now carries the session-open fill (if one landed) instead
+        // of the turn-start NULL model.
+        Box::pin(self.fill_confirmed_effort(
+            agent_id,
+            workspace_id,
+            &resolved,
+            session.provider.as_deref(),
+            filled_model.as_deref().or(session.model.as_deref()),
+        ))
+        .await;
         self.apply_fast_mode(
             agent_id,
             &acp_session_id.session_id,
             resolved.provider.id,
+            &resolved.selection,
             &acp_session_id.turn,
         )
         .await?;
@@ -10729,6 +11680,9 @@ impl AgentManager {
         stopping.extend(self.workers.lock().unwrap().keys().cloned());
         drop(stopping);
         drop(closed);
+        self.services
+            .repository_lifecycle_registry
+            .begin_native_shutdown();
         // Join original authority before cancellation can drop its producer.
         // The separate shutdown mutex makes repeated callers join this same
         // boundary; admission/map locks are free while stages finish.
@@ -10778,6 +11732,34 @@ impl AgentManager {
             let _ = worker.await;
         }
         self.services.persist_shutdown_drains().await;
+        // Finish `end_turn` writes aborted after their release: the agent is
+        // outside `in_flight`, and a persisted `Active` would make the next
+        // startup heal record its completed turn as a crash. Only a status
+        // still in flight is rewritten (a later stop, failure or delete wins),
+        // and undelivered ready input keeps the crash path's recovery.
+        let pending_idle: Vec<(AgentId, WorkspaceId)> = self
+            .pending_idle_writes
+            .lock()
+            .unwrap()
+            .drain()
+            .filter(|(id, _)| !in_flight.iter().any(|(busy, _)| busy == id))
+            .map(|(id, (workspace_id, _))| (id, workspace_id))
+            .collect();
+        for (id, workspace_id) in &pending_idle {
+            if self.services.has_ready_to_send(id) {
+                continue;
+            }
+            match self.services.store.get_agent_session_status(id).await {
+                Ok(status) if crate::is_stale_in_flight_status(status) => {
+                    self.persist_status(id, workspace_id, AgentStatus::RuntimeIdle, false)
+                        .await;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(agent_id = %id, error = %e, "graceful shutdown: could not read status for a pending idle write");
+                }
+            }
+        }
         // The lazy-spawn fence remains for this manager's lifetime. Persist the
         // captured identities, never a post-await re-read of the mutable maps.
         let now = intent_core::now_iso();
@@ -10801,11 +11783,20 @@ impl AgentManager {
             self.services
                 .flush_pinned_turn_on_interruption(id, InterruptReason::DaemonShutdown, None)
                 .await;
+            // Workers are joined, so the mark is final. A holder that already
+            // published its completed turn's `agent:idle` and admitted no new
+            // work is only finishing post-turn bookkeeping: recording it would
+            // make the next startup deliver a second continuation.
+            if self.turn_settled(id) && !self.services.has_ready_to_send(id) {
+                tracing::debug!(agent_id = %id, "graceful shutdown: turn already settled, no interrupted_agent row");
+                continue;
+            }
             // Read the current persisted status BEFORE end_turn settles it to RuntimeIdle.
             // Use get_agent_session_status (lightweight, skips message log).
             // RACE: try_begin inserts into busy BEFORE persist_status(Active) completes, so
-            // shutdown in that window may read Pending. Busy-set membership is authoritative:
-            // if the agent is in busy, it's mid-turn regardless of the persisted status.
+            // shutdown in that window may read Pending. Busy-set membership without a
+            // settled mark is authoritative: the agent is mid-turn regardless of the
+            // persisted status.
             let prev_status = match self.services.store.get_agent_session_status(id).await {
                 Ok(status) => status,
                 Err(e) => {
@@ -10864,12 +11855,34 @@ impl AgentManager {
     /// # Panics
     /// Panics if an internal mutex is poisoned.
     pub async fn shutdown(&self) {
+        if let Err(error) = self.shutdown_with_native_outcome().await {
+            tracing::error!(%error, "original native retirement unconfirmed during shutdown");
+        }
+    }
+
+    /// Preserve an uncertain original native join as a shutdown failure. Native
+    /// transports remain owned until their exact retirement outcomes settle.
+    /// # Errors
+    /// Returns an error when original native retirement is unconfirmed.
+    ///
+    /// # Panics
+    /// Panics if a manager bookkeeping mutex is poisoned.
+    pub async fn shutdown_with_native_outcome(&self) -> intent_core::Result<()> {
         self.begin_shutdown();
         let mut ids: HashSet<AgentId> = self.handles.lock().unwrap().keys().cloned().collect();
         ids.extend(self.list_busy().into_iter().map(|(id, _)| id));
         ids.extend(self.workers.lock().unwrap().keys().cloned());
         self.checkpoint_shutdown().await;
         self.services.shutdown_agent_deliveries().await;
+        self.services
+            .repository_lifecycle_registry
+            .join_native_shutdown()
+            .await
+            .map_err(|_| {
+                intent_core::Error::Internal(
+                    "original native retirement unconfirmed during shutdown".into(),
+                )
+            })?;
         // Now tear down every agent's bookkeeping (settles to RuntimeIdle) and
         // collect the detached children, then kill all process groups in
         // parallel under ONE shared grace window — total teardown stays ~one
@@ -10914,6 +11927,7 @@ impl AgentManager {
             })
         };
         finish.await;
+        Ok(())
     }
 
     /// Idle-reap hook: evict up to `max` idle agents in LRU order (count-based;
@@ -11699,9 +12713,12 @@ mod shutdown_writer_tests {
             () = std::future::ready(()) => {}
         }
         release.send(()).unwrap();
-        tokio::time::timeout(Duration::from_secs(10), shutdown)
-            .await
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            shutdown,
+        )
+        .await
+        .unwrap();
         let workspace = manager
             .services
             .store
@@ -11743,6 +12760,15 @@ fn redelivery_prepend(
     active_groups: Option<Vec<crate::agent_ops::QueuedDeliveryGroup>>,
     marker_row_id: Option<&String>,
 ) -> Option<crate::agent_ops::QueuedPrepend> {
+    // Do not turn an interrupted private envelope into an ordinary prepend,
+    // including the saved-group/marker path. Its original scoped owner retries.
+    if messages
+        .iter()
+        .rfind(|message| message.role == "user")
+        .is_some_and(crate::agent_ops::is_qualified_monitor_message)
+    {
+        return None;
+    }
     match (active_groups, marker_row_id) {
         (Some(groups), Some(marker_id)) => {
             let marker = messages.iter().find(|message| &message.id == marker_id)?;
@@ -12135,6 +13161,13 @@ fn push_file_blocks(blocks: &mut Vec<ContentBlock>, file_blocks: Option<&Value>)
 /// [`SpawnOptions`] reference during a spawn.
 struct ResolvedSpawn {
     provider: ProviderConfig,
+    /// The selection identity the session runs under
+    /// ([`crate::provider_profiles::canonical_selection`]): the canonical
+    /// provider id, or the profile reference `<base>@<profileId>` whose
+    /// overlay the spawn applies. Process reuse, the model-change notice and
+    /// native-session ownership compare this, so a switch between profiles
+    /// (or a profile and Default) always starts a fresh process.
+    selection: String,
     model: Option<String>,
     /// The session's persisted `reasoningEffort` (PROTOCOL §5.5, Option B),
     /// threaded into `SpawnOptions.reasoning_effort` so the codex spawn path
@@ -12263,6 +13296,20 @@ pub(crate) fn is_generated_agent_name(name: &str, specialist_name: Option<&str>)
         || specialist_name.is_some_and(matches_base)
 }
 
+/// Whether `name` is a creation placeholder an Assistant (chief) chat carries
+/// before it is named: blank, the desktop "New chat" placeholder, or a legacy
+/// placeholder an older client may still create. Exact matches only — the
+/// cloudlands-fe display helper `isPlaceholderChiefThreadName` also treats a
+/// "New thread …" prefix as a placeholder, but only fresh chats reach the
+/// first-turn check, and a prefix would also catch intentional task names.
+/// Only consulted for chief-workspace sessions.
+pub(crate) fn is_assistant_chat_placeholder_name(name: &str) -> bool {
+    matches!(
+        name.trim(),
+        "" | "New chat" | "New chat with Assistant" | "New chat with Intent" | "Chief of Staff"
+    )
+}
+
 /// Provider-correct spelling of the workspace API MCP tool used for agent
 /// self-naming.
 pub(crate) fn agent_naming_tool_reference(provider_id: &str) -> &'static str {
@@ -12299,6 +13346,19 @@ fn resolve_spawn(
         crate::agent_session::derived_default_provider(settings).as_deref(),
     )
     .ok_or_else(|| crate::agent_session::no_default_provider_error("agent spawn"))?;
+    let selection = crate::provider_profiles::canonical_selection(&provider_id);
+    // A profile shares its base provider's installation, paths and launch
+    // configuration; only the environment overlay differs.
+    let provider_id = intent_providers::base_provider_id(&provider_id).to_owned();
+    // Test seam: let the mock ACP agent stand in for a profile-capable base
+    // (`codex` / `claude-code`) so profile selections spawn a real child in
+    // unit tests. The selection identity is unchanged.
+    #[cfg(test)]
+    let provider_id = if std::env::var("MOCK_AGENT_STANDS_IN_FOR").is_ok_and(|b| b == provider_id) {
+        "mock".to_owned()
+    } else {
+        provider_id
+    };
     // Whitespace-bearing ids are effective-model display names persisted
     // onto `model` by the pre-monorepo#1534 D13 resolution (legacy rows,
     // e.g. `Opus 4.8`) — stats/attribution values, not spawnable model ids.
@@ -12426,6 +13486,7 @@ fn resolve_spawn(
             ..*base
         };
         return Ok(ResolvedSpawn {
+            selection: selection.clone(),
             provider,
             // Config-option E2E providers must track the selected model so
             // live switches exercise the same respawn path as real providers.
@@ -12456,14 +13517,40 @@ fn resolve_spawn(
     // Filled by `ensure_started` (unsloth spawn gate) — pure resolution here
     // never starts the managed server.
     let unsloth_endpoint = None;
+    // Disposable process-integration fixtures select an already verified
+    // bundle launcher. This is absent from packaged builds and never enables
+    // a production provider or changes the ordinary catalog's path policy.
+    #[cfg(feature = "repository-test-fixtures")]
+    if provider.id == "claude-code" {
+        if let Some(path) = std::env::var_os("INTENTD_TEST_REVIEW_LAUNCHER") {
+            let path = PathBuf::from(path);
+            if !path.is_absolute() || !path.is_file() {
+                return Err(Error::InvalidInput(
+                    "invalid private runtime fixture launcher".into(),
+                ));
+            }
+            return Ok(ResolvedSpawn {
+                selection: selection.clone(),
+                provider,
+                model,
+                reasoning_effort,
+                cwd,
+                provider_binary: Some(path),
+                extra_env,
+                npx_fallback_binary: None,
+                npx_fallback_package: None,
+                unsloth_endpoint: None,
+            });
+        }
+    }
 
     // npx-only providers (claude-code, codex, pi) are spawned via
     // `npx -y <pinned package>`; auto-discovery (managed bin / PATH scan) is
     // skipped entirely. For providers that opt in
-    // (`npx_only_honors_path_override`; claude-code) a valid `providers.paths`
+    // (`npx_only_honors_path_override`; none today) a valid `providers.paths`
     // override (absolute, executable) is the one exception: it is exec'd
-    // directly in place of the pinned npx spawn (monorepo#4352); an invalid
-    // override — or any override for codex/pi — is ignored.
+    // directly in place of the pinned npx spawn (monorepo#4352); otherwise
+    // any override is ignored. Tests use `test_support::provider_installed`.
     if provider.npx_only_package.is_some() {
         let explicit_path = read_provider_path_setting(settings, &provider_id);
         if let Some(binary) =
@@ -12475,6 +13562,7 @@ fn resolve_spawn(
                 "providers.paths override honored: spawning adapter binary in place of pinned npx"
             );
             return Ok(ResolvedSpawn {
+                selection: selection.clone(),
                 provider,
                 model,
                 reasoning_effort,
@@ -12491,8 +13579,20 @@ fn resolve_spawn(
         } else {
             intent_providers::find_npx()
         };
+        // Test-only: a provider marked by `test_support::provider_installed`
+        // gets a placeholder npx, so pure resolution tests do not depend on
+        // the host's Node/npx.
+        #[cfg(test)]
+        let npx = npx.or_else(|| {
+            crate::test_support::provider_installed::is_marked(
+                &settings.providers.paths,
+                provider.id,
+            )
+            .then(|| std::path::PathBuf::from("npx"))
+        });
         let (npx_binary, npx_package) = resolve_npx_only(&provider, npx)?;
         return Ok(ResolvedSpawn {
+            selection: selection.clone(),
             provider,
             model,
             reasoning_effort,
@@ -12532,6 +13632,7 @@ fn resolve_spawn(
 
     Ok(ResolvedSpawn {
         provider,
+        selection,
         model,
         reasoning_effort,
         cwd,
@@ -12580,6 +13681,48 @@ fn resolve_npx_only(
     Ok((npx, pkg))
 }
 
+/// Whether a live child no longer matches the session's resolved spawn
+/// identity and must be replaced before the next turn: a different model, a
+/// different provider executable, or a different selection — a switch
+/// between named profiles, or a profile and Default, is never served by the
+/// other configuration's process even when the model and executable match
+/// (PROTOCOL §5.54).
+fn spawn_identity_changed(
+    spawned_model: Option<&str>,
+    spawned_provider: &str,
+    spawned_selection: &str,
+    resolved: &ResolvedSpawn,
+) -> bool {
+    spawned_model != resolved.model.as_deref()
+        || spawned_provider != resolved.provider.command
+        || spawned_selection != resolved.selection
+}
+
+/// Test seam: the canonical selection of a handle spawned with `command`.
+#[cfg(test)]
+pub(crate) fn test_selection_for_command(command: &str) -> String {
+    intent_providers::ACP_PROVIDERS
+        .iter()
+        .rev()
+        .find(|p| p.command == command)
+        .map_or(command, |p| p.id)
+        .to_string()
+}
+
+/// Build a persistent installed-CLI launch: the spawn layer's command (provider
+/// env, Intent wiring, the profile overlay over captured credentials), frozen
+/// to the installed context, which re-asserts the selected executable and
+/// enforced policy.
+fn prepare_installed_launch(
+    context: &crate::installed_cli::InstalledContext,
+    spawn_opts: &SpawnOptions<'_>,
+) -> Result<intent_acp::spawn::PreparedProvider> {
+    let mut prepared = intent_acp::spawn::prepare_provider(spawn_opts)
+        .map_err(|e| Error::Internal(format!("prepare provider failed: {e}")))?;
+    context.apply(&mut prepared.command);
+    Ok(prepared)
+}
+
 /// Rebuild the caller's [`SpawnOptions`] for `create_agent`, injecting the
 /// generated rules/MCP config paths while preserving every other field of the
 /// incoming opts. Notably the npx fallback pair must survive: dropping it
@@ -12608,6 +13751,7 @@ fn rebuild_spawn_opts<'a>(
     spawn_opts.unsloth_endpoint = opts.unsloth_endpoint;
     spawn_opts.node_max_old_space_mb = opts.node_max_old_space_mb;
     spawn_opts.npx_launch_root = opts.npx_launch_root;
+    spawn_opts.profile_env = opts.profile_env;
     spawn_opts
 }
 
@@ -12694,7 +13838,9 @@ fn dequeue_worker_raced_tail(
 ) -> Option<(Vec<QueuedMessage>, DrainingGuard)> {
     // The head was popped before the slot reclaim, so queue selectors can no
     // longer see its monitor identity. Never attach unrelated work to its wake.
-    if crate::script_monitor::monitor_id(next.message_metadata.as_ref()).is_some() {
+    if next.monitor_turn.is_some()
+        || crate::script_monitor::monitor_id(next.message_metadata.as_ref()).is_some()
+    {
         return None;
     }
     services.dequeue_ready_batch_draining(agent_id, false, 1)
@@ -12742,7 +13888,27 @@ async fn run_message_worker(
     // [`MAX_CONSECUTIVE_IDLE_TIMEOUT_REDRIVES`] the worker injects a warning
     // turn instead of failing; past it the timeout takes the terminal path.
     let mut consecutive_idle_timeouts: u32 = 0;
+    // Backup failover (PROTOCOL §5.54): set when the attempt about to run
+    // redrives the SAME message (a quota failover or a silent redrive), so
+    // the references already tried for it stay excluded; every other loop
+    // pass starts a new message with a fresh chain.
+    let mut keep_failover_chain = false;
+    // Set when the next loop pass continues the same logical turn rather
+    // than starting a new one (an idle-timeout warning turn, a truncation
+    // nudge, a stale or requeued redelivery): no timed return home there.
+    let mut continuation_turn = false;
     'outer: loop {
+        if let Some(owner) = options.monitor_turn.take() {
+            if let Some(turn) = owner.take() {
+                // Keep the qualified turn future out of the ordinary worker frame.
+                if let Err(error) = Box::pin(turn.run(&mgr, admission)).await {
+                    tracing::debug!(agent = %agent_id, ?error, "original monitor delivery withheld");
+                }
+            }
+            mgr.finish_monitor_worker(&agent_id, &workspace_id, admission)
+                .await;
+            return;
+        }
         mgr.services
             .track_script_monitor_worker(&agent_id, options.message_metadata.as_ref());
         if mgr.services.defer_script_monitor_for_export(
@@ -12808,6 +13974,27 @@ async fn run_message_worker(
             mgr.finish_monitor_worker(&agent_id, &workspace_id, admission)
                 .await;
             return;
+        }
+        let redrive = std::mem::take(&mut keep_failover_chain);
+        let continuation = std::mem::take(&mut continuation_turn) || options.replay;
+        mgr.services.arm_quota_failover(&agent_id, redrive);
+        // Timed return to the home provider (PROTOCOL §5.54): at the start of
+        // every new turn, whatever its origin (user, agent-to-agent,
+        // delegation, wake) — never on a redrive, retry or replay of the
+        // same turn, and never mid-turn.
+        if !redrive && !continuation {
+            // A new turn: an earlier turn's unaccepted return attempt is
+            // over. A continuation of the same turn keeps it pending.
+            mgr.services.cancel_provider_return_announcement(&agent_id);
+            // Boxed: keeps the return check's state off the worker's future
+            // (the deep send/interrupt paths overflow the test stack).
+            Box::pin(mgr.services.begin_provider_return(&workspace_id, &agent_id)).await;
+        } else if !redrive {
+            // A replay or continuation never starts a timed switch, but an
+            // owed return already persisted on home (e.g. a retry resumed
+            // after a daemon restart lost the in-memory mark) is re-armed so
+            // home's first output still announces it and clears the state.
+            Box::pin(mgr.services.rearm_provider_return_if_home(&agent_id)).await;
         }
         // Keep the large session-start future off the worker's inline state;
         // it is still polled and cancelled by this same worker.
@@ -12944,6 +14131,13 @@ async fn run_message_worker(
                         // streak (monorepo#840): the session is provably not
                         // poisoned.
                         mgr.services.clear_failure_streak(&agent_id);
+                        // A turn that went back to the home provider and
+                        // completed there is home (PROTOCOL §5.54).
+                        Box::pin(
+                            mgr.services
+                                .complete_provider_return(&workspace_id, &agent_id),
+                        )
+                        .await;
                         // A completed turn also resets the consecutive
                         // idle-timeout streak (warn-and-continue).
                         consecutive_idle_timeouts = 0;
@@ -12980,6 +14174,7 @@ async fn run_message_worker(
                             )
                             .await;
                             content = nudge;
+                            continuation_turn = true;
                             options = TurnOptions {
                                 turn_id: Some(nudge_turn_id),
                                 message_metadata: Some(nudge_metadata),
@@ -13183,6 +14378,7 @@ async fn run_message_worker(
                                     }
                                 }
                                 content = warning;
+                                continuation_turn = true;
                                 options = TurnOptions {
                                     turn_id: Some(warning_turn_id),
                                     // The same delivery remains owned until its continuation ends.
@@ -13327,10 +14523,28 @@ async fn run_message_worker(
                             // Tear down the dead child and loop back through
                             // `retry_spawn` with the SAME content/options.
                             silent_redrive_used = true;
+                            keep_failover_chain = true;
                             tracing::warn!(
                                 agent = %agent_id,
                                 error = %e,
                                 "transport closed before output — redriving the prompt once on a fresh child"
+                            );
+                            mgr.kill_child_only(&agent_id).await;
+                            continue 'outer;
+                        } else if crate::quota_failover::is_quota_failover_error(&e) {
+                            // Backup failover (PROTOCOL §5.54): `run_prompt_turn`
+                            // already switched the agent onto a backup profile
+                            // and swallowed this attempt. Redrive the SAME
+                            // content/options on a fresh child of the backup —
+                            // its new identity opens a fresh native session with
+                            // Intent history replayed; the user row is not
+                            // persisted again. Bounded: the chain never retries
+                            // a reference for this message.
+                            keep_failover_chain = true;
+                            tracing::warn!(
+                                agent = %agent_id,
+                                error = %e,
+                                "provider quota exhausted — redriving the turn on a backup profile"
                             );
                             mgr.kill_child_only(&agent_id).await;
                             continue 'outer;
@@ -13372,6 +14586,39 @@ async fn run_message_worker(
                     // Cancellation is not provider failure. Leave the admitted
                     // slot for shutdown's interrupted-turn capture.
                     return;
+                }
+                // Backup failover for a rejected session setup (PROTOCOL
+                // §5.54): the spawn attempt hit its quota, so switch onto the
+                // next backup and loop back through the spawn with the same
+                // message instead of surfacing `agent:failed`. The attempt's
+                // provider record is consumed here because no terminal
+                // publisher runs for the swallowed attempt.
+                let attempted = mgr
+                    .spawn_attempt_provider
+                    .lock()
+                    .unwrap()
+                    .get(&agent_id)
+                    .cloned();
+                if intent_acp::message_is_quota_exceeded(&e.to_string())
+                    && mgr
+                        .services
+                        .try_quota_failover(
+                            &workspace_id,
+                            &agent_id,
+                            attempted.as_deref(),
+                            &e.to_string(),
+                        )
+                        .await
+                {
+                    mgr.spawn_attempt_provider.lock().unwrap().remove(&agent_id);
+                    tracing::warn!(
+                        agent = %agent_id,
+                        error = %e,
+                        "provider quota exhausted at session setup — retrying on a backup profile"
+                    );
+                    keep_failover_chain = true;
+                    mgr.kill_child_only(&agent_id).await;
+                    continue 'outer;
                 }
                 match stderr_capture_hint(&mgr, &agent_id, &e).await {
                     Some(log) => tracing::warn!(
@@ -13494,6 +14741,7 @@ async fn run_message_worker(
                 .services
                 .dequeue_ready_batch_draining(&agent_id, false, 2)
             {
+                mgr.clear_turn_settled(&agent_id);
                 match prepare_flush_turn(&mgr, &agent_id, &workspace_id, batch, draining).await {
                     FlushPrep::Turn {
                         content: c,
@@ -13515,6 +14763,7 @@ async fn run_message_worker(
             }
         }
         if let Some((mut next, draining)) = mgr.services.dequeue_message_draining(&agent_id) {
+            mgr.clear_turn_settled(&agent_id);
             // Durable shrink now; the shrunk `agent:queue:updated` is
             // published only after the user row below is persisted (§6.5
             // drain ordering).
@@ -13544,7 +14793,10 @@ async fn run_message_worker(
             // A terminal-failure requeue whose user row already reached the
             // transcript before its failed turn began must not duplicate the
             // row on retry; otherwise persist now and remember the outcome.
-            user_persisted = if next.persisted {
+            // A stale or already-persisted (requeued) entry replays an
+            // earlier turn rather than starting a new one.
+            continuation_turn = stale || next.persisted;
+            user_persisted = if next.monitor_turn.is_some() || next.persisted {
                 true
             } else {
                 persist_user(
@@ -13563,12 +14815,14 @@ async fn run_message_worker(
             let queued_submission_ids = next.submission_ids();
             content = next.content;
             options = TurnOptions {
+                monitor_turn: next.monitor_turn.clone(),
                 delivery_groups: next.delivery_groups.clone(),
                 prepend_delivery_groups: next.prepend_delivery_groups.clone(),
                 image_blocks: next_image_blocks,
                 file_blocks: next_file_blocks,
                 message_metadata: next.message_metadata.clone(),
                 suppress_report_clear: stale,
+                replay: stale || next.persisted,
                 queued_at: Some(next.queued_at.clone()),
                 queued_submission_ids,
                 recovery_sources: next.recovery_sources.clone(),
@@ -13750,7 +15004,10 @@ async fn run_message_worker(
                 .await;
             let next_image_blocks = next.image_blocks.clone();
             let next_file_blocks = next.file_blocks.clone();
-            user_persisted = if next.persisted {
+            // A stale or already-persisted (requeued) entry replays an
+            // earlier turn rather than starting a new one.
+            continuation_turn = stale || next.persisted;
+            user_persisted = if next.monitor_turn.is_some() || next.persisted {
                 true
             } else {
                 persist_user(
@@ -13769,12 +15026,14 @@ async fn run_message_worker(
             let queued_submission_ids = next.submission_ids();
             content = next.content;
             options = TurnOptions {
+                monitor_turn: next.monitor_turn.clone(),
                 delivery_groups: next.delivery_groups.clone(),
                 prepend_delivery_groups: next.prepend_delivery_groups.clone(),
                 image_blocks: next_image_blocks,
                 file_blocks: next_file_blocks,
                 message_metadata: next.message_metadata.clone(),
                 suppress_report_clear: stale,
+                replay: stale || next.persisted,
                 queued_at: Some(next.queued_at.clone()),
                 queued_submission_ids,
                 recovery_sources: next.recovery_sources.clone(),
@@ -13959,6 +15218,11 @@ async fn prepare_flush_turn(
     // stale check before the wait note, both before the row persist so the
     // persisted row and the provider prompt carry the same content.
     let mut stale_flags = Vec::with_capacity(entries.len());
+    // Replay classification, captured BEFORE the rows below are persisted
+    // (which marks every entry persisted): the batch replays an earlier
+    // turn only when every entry does (PROTOCOL §5.54 — one fresh entry
+    // makes it a new turn, which may start a timed return home).
+    let mut all_replays = true;
     for entry in &mut entries {
         let stale = mgr.annotate_stale_redrive(agent_id, entry).await;
         annotate_dequeue_wait(entry);
@@ -13966,6 +15230,7 @@ async fn prepare_flush_turn(
         // groups them; this distinguishes them).
         stamp_queued_message_id(entry);
         stale_flags.push(stale);
+        all_replays &= stale || entry.persisted;
     }
     // Batch grouping stamp — after the wait stamps (it creates `queueInfo`
     // when absent; the wait stamp never overwrites an existing one): every
@@ -14072,6 +15337,7 @@ async fn prepare_flush_turn(
         file_blocks,
         message_metadata: entries[0].message_metadata.clone(),
         suppress_report_clear: stale_flags.iter().all(|&s| s),
+        replay: all_replays,
         queued_at: Some(entries[0].queued_at.clone()),
         latest_human_submission_at: entries
             .iter()
@@ -14535,6 +15801,19 @@ fn is_retryable_spawn_error(err: &Error) -> bool {
     false
 }
 
+/// Whether assistant rows (a cut-short attempt's partial work) follow the
+/// newest user row of `messages`.
+fn partial_turn_follows_last_user(messages: &[intent_core::AgentMessage]) -> bool {
+    messages
+        .iter()
+        .rposition(|message| message.role == "user")
+        .is_some_and(|index| {
+            messages[index + 1..]
+                .iter()
+                .any(|message| message.role == "assistant")
+        })
+}
+
 /// Retry `ensure_started` up to `MAX_SPAWN_ATTEMPTS` times with jittered
 /// backoff. On each retry (after the first failure), tear down the failed
 /// child, publish an `agent:stream:status` retry hint, and spawn a fresh
@@ -14567,12 +15846,31 @@ async fn retry_spawn_owned(
     let mut last_error: Option<Error> = None;
 
     for attempt in 1..=MAX_SPAWN_ATTEMPTS {
-        match mgr.ensure_started_owned(agent_id, workspace_id).await {
+        // Boxed: the turn-start future (spawn, session open, identity
+        // repairs) is large; inlining it into the turn worker's future
+        // overflows the stack on deep send/interrupt paths.
+        match Box::pin(mgr.ensure_started_owned(agent_id, workspace_id)).await {
             Ok(session_id) => return Ok(session_id),
             Err(e) => {
                 let retryable = is_retryable_spawn_error(&e);
                 let error_msg = e.to_string();
-                let will_retry = retryable && attempt < MAX_SPAWN_ATTEMPTS;
+                // Backup failover (PROTOCOL §5.54): a quota-rejected setup
+                // with a backup candidate skips the remaining same-provider
+                // retries — a spent quota stays spent — so the worker fails
+                // over at once. Without a candidate the retries run as today.
+                let attempted = mgr
+                    .spawn_attempt_provider
+                    .lock()
+                    .unwrap()
+                    .get(agent_id)
+                    .cloned();
+                let will_retry = retryable
+                    && attempt < MAX_SPAWN_ATTEMPTS
+                    && !(intent_acp::message_is_quota_exceeded(&error_msg)
+                        && mgr
+                            .services
+                            .has_quota_failover_candidate(agent_id, attempted.as_deref())
+                            .await);
                 let captured = if will_retry {
                     stderr_capture_hint(mgr, agent_id, &e).await
                 } else {
@@ -15158,6 +16456,7 @@ async fn publish_error_status_and_requeue(
         // add earlier groups without duplicating that aggregate on retry.
         let prepend_delivery_groups = delivery_groups.as_ref().map(|_| Vec::new());
         let mut queued = crate::agent_ops::QueuedMessage {
+            monitor_turn: None,
             delivery_groups,
             prepend_delivery_groups,
             turn_id: options.turn_id.clone().unwrap_or_else(|| id.clone()),
@@ -16052,7 +17351,7 @@ mod npx_launch_dir_lifetime_tests {
         *svc.secrets.writer_drain_pending.lock().unwrap() = Some(tx);
         let owner = mgr.clone();
         let mut shutdown = intent_core::spawn_daemon(async move { owner.shutdown().await });
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(intentd_test_support::test_timeout(Duration::from_secs(5)), async {
             tokio::select! {
                 result = pending => assert_eq!(result.unwrap(), "process-registry"),
                 result = &mut shutdown => { result.unwrap(); panic!("shutdown omitted removed physical cleanup"); }
@@ -16060,32 +17359,35 @@ mod npx_launch_dir_lifetime_tests {
         }).await.unwrap();
         assert!(pid_alive(tree.grandchild));
         release.send(()).unwrap();
-        tokio::time::timeout(Duration::from_secs(10), async {
-            shutdown.await.unwrap();
-            // These are synchronous shutdown postconditions: orphan-PID
-            // polling below must not hide delayed resource/registry cleanup.
-            assert!(!pid_alive(leader.cast_signed()));
-            assert!(
-                !pid_alive(tree.grandchild),
-                "grandchild {} alive after shutdown; launch_dir_exists={}",
-                tree.grandchild,
-                tree.launch_path.exists()
-            );
-            assert!(!tree.launch_path.exists());
-            // An aborted acquire skips its existing post-kill deregistration.
-            // Preserve that stale in-memory slot: late ID-only removal could
-            // erase a replacement runtime. The watcher deregisters first.
-            assert_eq!(mgr.registry.is_registered(&agent_id), !unexpected);
-            // Live descendants must be gone before shutdown returns. A dead
-            // orphan may still retain its PID until init reaps it; observe
-            // that retirement within the SAME total shutdown budget. Use
-            // signal 0 because pid_alive deliberately treats zombies as dead.
-            while nix::sys::signal::kill(nix::unistd::Pid::from_raw(tree.grandchild), None)
-                != Err(nix::errno::Errno::ESRCH)
-            {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                shutdown.await.unwrap();
+                // These are synchronous shutdown postconditions: orphan-PID
+                // polling below must not hide delayed resource/registry cleanup.
+                assert!(!pid_alive(leader.cast_signed()));
+                assert!(
+                    !pid_alive(tree.grandchild),
+                    "grandchild {} alive after shutdown; launch_dir_exists={}",
+                    tree.grandchild,
+                    tree.launch_path.exists()
+                );
+                assert!(!tree.launch_path.exists());
+                // An aborted acquire skips its existing post-kill deregistration.
+                // Preserve that stale in-memory slot: late ID-only removal could
+                // erase a replacement runtime. The watcher deregisters first.
+                assert_eq!(mgr.registry.is_registered(&agent_id), !unexpected);
+                // Live descendants must be gone before shutdown returns. A dead
+                // orphan may still retain its PID until init reaps it; observe
+                // that retirement within the SAME total shutdown budget. Use
+                // signal 0 because pid_alive deliberately treats zombies as dead.
+                while nix::sys::signal::kill(nix::unistd::Pid::from_raw(tree.grandchild), None)
+                    != Err(nix::errno::Errno::ESRCH)
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            },
+        )
         .await
         .unwrap();
         assert!(!pid_alive(tree.grandchild));
@@ -16247,7 +17549,8 @@ mod npx_launch_dir_lifetime_tests {
         let _ends =
             install_fake_handle_with_launch_dir(&mgr, &agent_id, Some(child), Some(launch_dir));
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let deadline =
+            std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(10));
         while !marker.exists() {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -16387,7 +17690,8 @@ mod npx_launch_dir_lifetime_tests {
     }
 
     async fn wait_for_file(path: &Path, what: &str) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_secs(10));
         while !path.exists() {
             assert!(
                 tokio::time::Instant::now() < deadline,
@@ -16400,7 +17704,8 @@ mod npx_launch_dir_lifetime_tests {
 
     async fn read_grandchild_pid(pidfile: &Path) -> i32 {
         wait_for_file(pidfile, "grandchild pidfile").await;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_secs(10));
         loop {
             if let Ok(pid) = std::fs::read_to_string(pidfile)
                 .unwrap_or_default()
@@ -16468,7 +17773,8 @@ mod npx_launch_dir_lifetime_tests {
     /// The launch dir must exist for as long as the discoverable tree is
     /// live, and be gone once the bounded kill has swept it.
     async fn assert_dir_outlives_tree(tree: &Tree, what: &str) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_secs(10));
         while pid_alive(tree.grandchild) {
             assert!(
                 tree.launch_path.is_dir(),
@@ -17213,6 +18519,114 @@ mod role_reminder_tests {
         );
         assert!(!later.contains("ws.workspace.setAgentName"));
         assert!(later.ends_with("later"));
+    }
+
+    /// Seed an Assistant (chief) chat session alongside the default fixture.
+    async fn insert_assistant_chat(
+        mgr: &AgentManager,
+        name: &str,
+        explicitly_set: bool,
+    ) -> AgentId {
+        let agent_id = AgentId::from("assistant-chat-1");
+        let mut chat = session(&agent_id, &WorkspaceId::chief(), Some("chief-of-staff"));
+        chat.name = name.to_string();
+        chat.name_explicitly_set = explicitly_set;
+        mgr.services
+            .store
+            .insert_agent_session(&chat)
+            .await
+            .expect("insert assistant chat");
+        agent_id
+    }
+
+    #[tokio::test]
+    async fn assistant_chat_placeholder_names_receive_agent_naming_instruction() {
+        for name in [
+            "New chat",
+            "  New chat  ",
+            "",
+            "New chat with Assistant",
+            "New chat with Intent",
+            "Chief of Staff",
+        ] {
+            let (mgr, _agent, _db) = manager_with(None, None).await;
+            let agent_id = insert_assistant_chat(&mgr, name, false).await;
+            let instruction = mgr
+                .build_first_turn_naming_instruction(&agent_id, &WorkspaceId::chief())
+                .await
+                .unwrap_or_else(|| panic!("Assistant placeholder {name:?} needs a name"));
+            assert!(
+                instruction.contains("ws.workspace.setAgentName"),
+                "{name:?}: {instruction}"
+            );
+            assert!(
+                !instruction.contains("This workspace needs a title"),
+                "the Assistant workspace is never retitled: {instruction}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn assistant_chat_naming_instruction_is_first_turn_only() {
+        let (mgr, _agent, _db) = manager_with(None, None).await;
+        let agent_id = insert_assistant_chat(&mgr, "New chat", false).await;
+        let chief = WorkspaceId::chief();
+        let first = prompt_text(
+            &mgr.build_turn_prompt(&agent_id, &chief, "first", &TurnOptions::default())
+                .await
+                .unwrap(),
+        );
+        assert!(first.contains("ws.workspace.setAgentName"));
+        mgr.services
+            .store
+            .append_agent_message(
+                &agent_id,
+                "assistant",
+                &serde_json::json!([{ "type": "text", "text": "ready" }]),
+                &now_iso(),
+            )
+            .await
+            .expect("assistant message");
+        let later = prompt_text(
+            &mgr.build_turn_prompt(&agent_id, &chief, "later", &TurnOptions::default())
+                .await
+                .unwrap(),
+        );
+        assert!(!later.contains("ws.workspace.setAgentName"));
+    }
+
+    #[tokio::test]
+    async fn named_assistant_chats_do_not_receive_agent_naming_instruction() {
+        for (name, explicitly_set) in [
+            ("New chat", true),
+            ("Quarterly planning", true),
+            ("Quarterly planning", false),
+            ("New chats digest", false),
+            ("New thread pool for workers", false),
+        ] {
+            let (mgr, _agent, _db) = manager_with(None, None).await;
+            let agent_id = insert_assistant_chat(&mgr, name, explicitly_set).await;
+            assert!(
+                mgr.build_first_turn_naming_instruction(&agent_id, &WorkspaceId::chief())
+                    .await
+                    .is_none(),
+                "preserve Assistant chat name {name:?} (explicit: {explicitly_set})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn assistant_placeholder_names_stay_intentional_in_regular_workspaces() {
+        for name in ["New chat", "Chief of Staff", "New thread 1"] {
+            let (mgr, agent_id, _db) = manager_with(None, None).await;
+            configure_agent_name(&mgr, &agent_id, name, false, None).await;
+            assert!(
+                mgr.build_first_turn_naming_instruction(&agent_id, &WorkspaceId::from("ws-1"))
+                    .await
+                    .is_none(),
+                "workspace agent named {name:?} keeps its name"
+            );
+        }
     }
 
     /// `stop()` clears `recreated`/`prepend_pending` (stale-flag hygiene) but
@@ -18250,7 +19664,7 @@ mod role_reminder_tests {
                 calls
             });
             let outcome = tokio::time::timeout(
-                Duration::from_secs(2),
+                intentd_test_support::test_timeout(Duration::from_secs(2)),
                 mgr.maybe_apply_session_model(
                     &connection,
                     &agent_id,
@@ -18602,9 +20016,12 @@ mod dead_child_respawn_tests {
             session_mcp_servers: Vec::new(),
             spawned_model: None,
             spawned_provider: "node".to_string(),
+            spawned_selection: crate::agent_manager::test_selection_for_command("node"),
+            _activation: None,
             thought_level: None,
             config_options: None,
             confirmed_effort: None,
+            session_open_filled_model: None,
             wake_gate: Arc::new(AtomicUsize::new(0)),
             wake_listener: None,
         }
@@ -18753,7 +20170,8 @@ mod dead_child_respawn_tests {
         // The child exits on its own; once `try_wait` observes that, the
         // mapping must be gone. Poll up to a deadline — the exit is quick
         // but not synchronous with the spawn returning.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline =
+            std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(5));
         while !mgr.agent_root_pids().is_empty() {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -18793,7 +20211,8 @@ mod disabled_provider_rehome_tests {
 
     /// Manager over a temp store with a settings registry wired and NO
     /// seeded session — each test seeds its own row.
-    async fn registry_manager() -> (AgentManager, EventBus, tempfile::TempDir, tempfile::TempDir) {
+    pub(super) async fn registry_manager(
+    ) -> (AgentManager, EventBus, tempfile::TempDir, tempfile::TempDir) {
         let db_dir = crate::tests::test_tempdir("intentd-rehome-");
         let path = db_dir.path().join("store.db");
         let store = Store::open(&path).await.expect("open store");
@@ -18819,7 +20238,7 @@ mod disabled_provider_rehome_tests {
         )
     }
 
-    fn set(mgr: &AgentManager, path: &str, value: Value) {
+    pub(super) fn set(mgr: &AgentManager, path: &str, value: Value) {
         mgr.services
             .settings_registry()
             .expect("registry wired")
@@ -20124,6 +21543,7 @@ mod thought_level_tests {
                 modes: None,
                 thought_level: Some(option("medium")),
                 config_options: None,
+                filled_model: None,
             };
             mgr.services
                 .persist_session_effort_levels(
@@ -20173,6 +21593,7 @@ mod thought_level_tests {
                 modes: None,
                 thought_level: Some(option("medium")),
                 config_options: None,
+                filled_model: None,
             };
             mgr.services
                 .persist_session_effort_levels(
@@ -21315,11 +22736,14 @@ mod cancel_and_settle_tests {
 
         // The cancel frame reached the agent side of the pipe.
         let mut lines = BufReader::new(c2a_agent).lines();
-        let line = tokio::time::timeout(Duration::from_secs(2), lines.next_line())
-            .await
-            .expect("frame arrives")
-            .expect("read ok")
-            .expect("one frame");
+        let line = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            lines.next_line(),
+        )
+        .await
+        .expect("frame arrives")
+        .expect("read ok")
+        .expect("one frame");
         let frame: serde_json::Value = serde_json::from_str(&line).expect("valid JSON-RPC frame");
         assert_eq!(frame["method"], "session/cancel");
         assert_eq!(frame["params"]["sessionId"], "acp-1");
@@ -22037,6 +23461,7 @@ mod agent_retry_tests {
             intent_core::MessageOrigin::Automatic,
         );
         let requeued = crate::agent_ops::QueuedMessage {
+            monitor_turn: None,
             requeued_after_failure: true,
             ..mgr
                 .services
@@ -22114,6 +23539,7 @@ mod agent_retry_tests {
         mgr.services.requeue_front(
             &agent_id,
             crate::agent_ops::QueuedMessage {
+                monitor_turn: None,
                 requeued_after_failure: true,
                 ..delivered
             },
@@ -22302,6 +23728,7 @@ mod agent_retry_tests {
         mgr.services.requeue_front(
             &agent_id,
             crate::agent_ops::QueuedMessage {
+                monitor_turn: None,
                 requeued_after_failure: true,
                 ..delivered
             },
@@ -22367,6 +23794,7 @@ mod agent_retry_tests {
         mgr.services.requeue_front(
             &agent_id,
             crate::agent_ops::QueuedMessage {
+                monitor_turn: None,
                 requeued_after_failure: true,
                 ..delivered
             },
@@ -22928,5 +24356,203 @@ mod agent_retry_tests {
 mod effort_notice_tests;
 
 #[cfg(all(test, unix))]
+#[path = "agent_manager/legacy_identity_tests.rs"]
+mod legacy_identity_tests;
+
+#[cfg(all(test, unix))]
 #[path = "agent_manager/fast_mode_tests.rs"]
 mod fast_mode_tests;
+
+// Unix-only like its shared mock-agent helpers (`dead_child_respawn_tests`).
+#[cfg(all(test, unix))]
+#[path = "agent_manager/quota_failover_tests.rs"]
+mod quota_failover_tests;
+
+#[cfg(test)]
+#[path = "agent_manager/future_size_tests.rs"]
+mod future_size_tests;
+
+/// Persistent launches under a named profile (PROTOCOL §5.54): the frozen
+/// command carries the profile over inherited and captured values, never over
+/// Intent's wiring, executable selection or enforced policy.
+#[cfg(all(test, unix))]
+mod profile_launch_tests {
+    use super::*;
+    use intent_providers::installed_cli::InstalledCli;
+    use std::ffi::OsString;
+
+    fn env(command: &tokio::process::Command, key: &str) -> Option<OsString> {
+        command
+            .as_std()
+            .get_envs()
+            .find(|(k, _)| *k == key)
+            .and_then(|(_, v)| v.map(OsString::from))
+    }
+
+    #[test]
+    fn persistent_launch_applies_profile_but_never_over_intent_wiring() {
+        for (base, cli, account_var) in [
+            ("codex", InstalledCli::Codex, "CODEX_HOME"),
+            ("claude-code", InstalledCli::Claude, "CLAUDE_CONFIG_DIR"),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let work = root.path().join("work");
+            let profile = intent_acp::ProfileEnv::new(
+                format!("{base}@work"),
+                "f1",
+                vec![
+                    ("PROFILE_LAUNCH_TOKEN".into(), Some("work".into())),
+                    (
+                        account_var.into(),
+                        Some(work.to_string_lossy().into_owned()),
+                    ),
+                    ("LOGNAME".into(), None),
+                    ("INTENT_TEST_WIRING".into(), Some("profile".into())),
+                ],
+            );
+            let context = crate::installed_cli::test_context_in(cli, &root.path().join("runtime"))
+                .with_profile(Some(Arc::new(profile.clone())));
+            let provider = intent_providers::find_provider(base).unwrap();
+            let npx = root.path().join("npx");
+            let mut opts = SpawnOptions::new(provider);
+            opts.npx_fallback_binary = Some(&npx);
+            opts.npx_fallback_package = provider.npx_only_package;
+            opts.npx_launch_root = Some(root.path());
+            opts.profile_env = Some(&profile);
+            opts.extra_env
+                .insert("INTENT_TEST_WIRING".into(), "intent".into());
+            let prepared = prepare_installed_launch(&context, &opts).unwrap();
+            let command = &prepared.command;
+            assert_eq!(
+                env(command, "PROFILE_LAUNCH_TOKEN"),
+                Some("work".into()),
+                "{base}"
+            );
+            assert_eq!(
+                env(command, account_var),
+                Some(work.into_os_string()),
+                "{base}"
+            );
+            assert!(env(command, "LOGNAME").is_none(), "{base}");
+            assert_eq!(
+                env(command, "INTENT_TEST_WIRING"),
+                Some("intent".into()),
+                "{base}"
+            );
+            assert_eq!(
+                env(command, cli.path_env()),
+                Some(context.runtime.path().as_os_str().to_owned()),
+                "{base}"
+            );
+            if cli == InstalledCli::Codex {
+                assert_eq!(
+                    env(command, "CODEX_CONFIG"),
+                    Some(intent_providers::CODEX_SUBAGENT_POLICY_CONFIG.into())
+                );
+            }
+            assert!(std::env::var_os("PROFILE_LAUNCH_TOKEN").is_none());
+        }
+    }
+
+    #[test]
+    fn rebuilt_spawn_options_keep_the_profile() {
+        let provider = intent_providers::find_provider("codex").unwrap();
+        let profile = intent_acp::ProfileEnv::new("codex@work", "f1", Vec::new());
+        let mut opts = SpawnOptions::new(provider);
+        opts.profile_env = Some(&profile);
+        let rebuilt = rebuild_spawn_opts(&opts, None, None, None);
+        assert_eq!(rebuilt.profile_env, Some(&profile));
+    }
+}
+
+/// Every key a profile may save reaches the persistent launch and the probe
+/// paths unchanged, even when Intent injects its own git wiring.
+#[cfg(all(test, unix))]
+mod profile_reach_tests {
+    use super::*;
+    use intent_providers::installed_cli::InstalledCli;
+    use std::ffi::OsString;
+
+    fn env(command: &tokio::process::Command, key: &str) -> Option<OsString> {
+        command
+            .as_std()
+            .get_envs()
+            .find(|(k, _)| *k == key)
+            .and_then(|(_, v)| v.map(OsString::from))
+    }
+
+    const CANDIDATES: &[&str] = &[
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "CODEX_ACCESS_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_BASE_URL",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "AWS_PROFILE",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "GIT_SSH_COMMAND",
+        "GIT_TERMINAL_PROMPT",
+        "INITIAL_AGENT_MODE",
+        "CORP_GATEWAY_TOKEN",
+        "LANG",
+    ];
+
+    #[test]
+    fn every_non_reserved_profile_key_reaches_launch_and_probes_unchanged() {
+        let repo = tempfile::tempdir().unwrap();
+        let git = git2::Repository::init(repo.path()).unwrap();
+        let mut config = git.config().unwrap();
+        config.set_str("user.name", "Intent Wiring").unwrap();
+        config
+            .set_str("user.email", "wiring@example.invalid")
+            .unwrap();
+        for (base, cli) in [
+            ("codex", InstalledCli::Codex),
+            ("claude-code", InstalledCli::Claude),
+        ] {
+            let allowed: Vec<&str> = CANDIDATES
+                .iter()
+                .copied()
+                .filter(|k| crate::provider_profiles::reserved_key_reason(k, base).is_none())
+                .collect();
+            assert_eq!(
+                allowed.contains(&"INITIAL_AGENT_MODE"),
+                base == "claude-code"
+            );
+            let value = |k: &str| format!("profile-{k}");
+            let profile = intent_acp::ProfileEnv::new(
+                format!("{base}@work"),
+                "f1",
+                allowed
+                    .iter()
+                    .map(|k| ((*k).to_owned(), Some(value(k))))
+                    .collect(),
+            );
+            let root = tempfile::tempdir().unwrap();
+            let context = crate::installed_cli::test_context_in(cli, &root.path().join("runtime"))
+                .with_profile(Some(Arc::new(profile.clone())));
+            let provider = intent_providers::find_provider(base).unwrap();
+            let npx = root.path().join("npx");
+            let mut opts = SpawnOptions::new(provider);
+            opts.npx_fallback_binary = Some(&npx);
+            opts.npx_fallback_package = provider.npx_only_package;
+            opts.npx_launch_root = Some(root.path());
+            opts.cwd = Some(repo.path());
+            opts.profile_env = Some(&profile);
+            inject_git_identity_env(&mut opts.extra_env, Some(repo.path()));
+            inject_git_credential_env(&mut opts.extra_env, Some(repo.path()), true);
+            let prepared = prepare_installed_launch(&context, &opts).unwrap();
+            let mut auth_probe = tokio::process::Command::new(context.runtime.path());
+            context.apply(&mut auth_probe);
+            let mut model_probe = tokio::process::Command::new("unused");
+            context.apply_isolated(&mut model_probe);
+            for key in &allowed {
+                let expected = Some(OsString::from(value(key)));
+                assert_eq!(env(&prepared.command, key), expected, "{base} launch {key}");
+                assert_eq!(env(&auth_probe, key), expected, "{base} auth {key}");
+                assert_eq!(env(&model_probe, key), expected, "{base} model {key}");
+            }
+        }
+    }
+}

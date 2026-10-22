@@ -94,6 +94,31 @@ pub const TOOL_PAYLOAD_RETENTION_DAYS_MAX: u32 = 3650;
 /// out and preserve all events.
 pub const DEFAULT_STREAM_RETENTION_HOURS: u32 = 72;
 
+/// Default age in hours (`scripts.outputRetentionHours`) after which on-disk
+/// script run logs are deleted by the output sweep (one week). `0` disables
+/// the age sweep: logs are kept until their script or workspace is deleted.
+/// Read live at each sweep — no restart required.
+pub const DEFAULT_SCRIPT_OUTPUT_RETENTION_HOURS: u32 = 168;
+
+/// Upper bound accepted for `scripts.outputRetentionHours` (ten years).
+pub const SCRIPT_OUTPUT_RETENTION_HOURS_MAX: u32 = 87_600;
+
+/// Env override for `scripts.outputRetentionHours`; read live by
+/// [`script_output_retention_hours`] so it wins over the file value.
+pub const SCRIPT_OUTPUT_RETENTION_HOURS_ENV: &str = "INTENTD_SCRIPT_OUTPUT_RETENTION_HOURS";
+
+/// Default per-run size cap in bytes for an on-disk script log
+/// (`scripts.outputMaxBytesPerRun`, 50 MiB). Past the cap the newest bytes are
+/// kept and the oldest dropped. Read live at each run start.
+pub const DEFAULT_SCRIPT_OUTPUT_MAX_BYTES_PER_RUN: u64 = 52_428_800;
+
+/// Lower bound accepted for `scripts.outputMaxBytesPerRun` (64 KiB). There is
+/// no `0`/unlimited value: the cap is the disk-growth guard.
+pub const SCRIPT_OUTPUT_MAX_BYTES_PER_RUN_MIN: u64 = 65_536;
+
+/// Upper bound accepted for `scripts.outputMaxBytesPerRun` (1 GiB).
+pub const SCRIPT_OUTPUT_MAX_BYTES_PER_RUN_MAX: u64 = 1_073_741_824;
+
 /// Default max characters of one `workspace_api` tool result before the
 /// output is redirected to a file (`workspaceApi.maxOutputChars`); `0` means
 /// unlimited (never redirect).
@@ -348,6 +373,25 @@ impl Config {
             wake_resume_threshold_seconds,
         })
     }
+}
+
+/// Effective `scripts.outputRetentionHours` for one sweep: the
+/// [`SCRIPT_OUTPUT_RETENTION_HOURS_ENV`] override when it parses to an
+/// in-range value, otherwise the live settings snapshot's value. `0` means
+/// the age sweep is disabled. Call it at each sweep with the current
+/// snapshot so config edits apply without a restart.
+#[must_use]
+pub fn script_output_retention_hours(settings: &SettingsFile) -> u32 {
+    env_u32(SCRIPT_OUTPUT_RETENTION_HOURS_ENV)
+        .filter(|h| *h <= SCRIPT_OUTPUT_RETENTION_HOURS_MAX)
+        .unwrap_or(settings.scripts.output_retention_hours)
+}
+
+/// Effective `scripts.outputMaxBytesPerRun` for one run, read from the live
+/// settings snapshot at run start (no restart required).
+#[must_use]
+pub fn script_output_max_bytes_per_run(settings: &SettingsFile) -> u64 {
+    settings.scripts.output_max_bytes_per_run
 }
 
 /// Read a `u32` env override; unset or unparseable values yield `None` so the

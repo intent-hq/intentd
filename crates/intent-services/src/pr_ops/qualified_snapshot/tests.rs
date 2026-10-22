@@ -455,7 +455,7 @@ fn observed_conflicts_behind_and_draft_use_the_existing_reason_words() {
     o.details.confirmed_draft = Some(true);
     assert_eq!(
         project(&o)["mergeBlockedReason"],
-        "draft PRs cannot be merged"
+        "draft MRs cannot be merged"
     );
 }
 
@@ -477,6 +477,30 @@ fn queue_ejection_fields_and_deadline_are_only_present_when_observed() {
     assert_eq!(
         v["requirements"]["mergeQueueEjection"],
         json!({"at":"2026-09-28T00:00:00Z"})
+    );
+}
+
+/// Regression (cloudlands-fe#3524): the qualified snapshot shares the
+/// checklist's ejection rule — a `merged` removal is never an ejection.
+#[test]
+fn queue_removal_reason_merged_is_not_an_ejection() {
+    let mut o = observation();
+    for reason in ["merged", "MERGED"] {
+        o.signals.merge_queue_removal = Some(MergeQueueRemoval {
+            at: "2026-10-19T17:57:04Z".into(),
+            reason: Some(reason.into()),
+        });
+        assert!(project(&o)["requirements"]
+            .get("mergeQueueEjection")
+            .is_none());
+    }
+    o.signals.merge_queue_removal = Some(MergeQueueRemoval {
+        at: "2026-10-19T17:57:04Z".into(),
+        reason: Some("failed_checks".into()),
+    });
+    assert_eq!(
+        project(&o)["requirements"]["mergeQueueEjection"],
+        json!({"at":"2026-10-19T17:57:04Z","reason":"failed_checks"})
     );
 }
 

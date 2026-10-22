@@ -170,11 +170,11 @@
       *) echo "no tailcat mapping for target '${{ join(matrix.targets, ' ') }}'" >&2; exit 1 ;;
     esac
     ls -l "$dest"
-# Main builds populate these bounded compiler entries. Tags only restore;
-# an evicted or incompatible archive leaves the normal cold build intact.
-- name: Restore release compiler cache
-  uses: ./.github/actions/release-rust-cache
-  with:
-    flavor: daemon-dist
-    target: ${{ join(matrix.targets, ' ') }}
-    runner: ${{ matrix.runner }}
+# Main and release builds share compiler entries through the self-hosted sccache.
+- name: Configure the self-hosted compiler cache
+  shell: bash
+  env:
+    INTENT_SCCACHE_ENDPOINT: ${{ vars.INTENT_SCCACHE_ENDPOINT }}
+    INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
+    INTENT_SCCACHE_MODE: ${{ vars.INTENT_SCCACHE_MODE }}
+  run: python3 scripts/setup-sccache.py

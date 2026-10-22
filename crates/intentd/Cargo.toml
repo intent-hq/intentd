@@ -1,6 +1,6 @@
 [package]
 name = "intentd"
-version = "0.10.43"
+version = "0.11.29"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -9,14 +9,19 @@ homepage.workspace = true
 description = "Intent backend daemon — local-first JSON-RPC daemon for the Intent domain model"
 
 [dependencies]
-intentd-sitter = { path = "../intentd-sitter", version = "0.1.25" }
+# Keep this requirement major-only ("0", not "0.1.N"). release-plz 0.3.162
+# bumps a dependent package's patch version, outside its version_group,
+# whenever a dependency release rewrites the requirement: an exact pin made
+# each sitter-only release bump intentd alone and split it from its library
+# crates (intent-hq/intentd#2461). Sitter patch and minor releases leave "0"
+# unchanged, so they leave the intentd group alone. Neither crate is
+# published, so the wide range only affects release planning; the path still
+# selects the in-tree sitter. scripts/test-version-group.py enforces this.
+intentd-sitter = { path = "../intentd-sitter", version = "0" }
 clap = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-# Legacy note frontmatter (`.workspace/notes/*.md`) parsing; already in the
-# workspace dependency tree via intent-services.
-serde_yaml = "0.9"
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -24,16 +29,16 @@ tracing-appender = { workspace = true }
 directories = { workspace = true }
 sqlx = { workspace = true }
 
-intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.10.43", optional = true }
-intent-core = { path = "../intent-core", version = "0.10.43" }
-intent-store = { path = "../intent-store", version = "0.10.43" }
-intent-services = { path = "../intent-services", version = "0.10.43" }
-intent-acp = { path = "../intent-acp", version = "0.10.43" }
-intent-providers = { path = "../intent-providers", version = "0.10.43" }
-intent-git = { path = "../intent-git", version = "0.10.43" }
-intent-context = { path = "../intent-context", version = "0.10.43" }
-intent-transport = { path = "../intent-transport", version = "0.10.43" }
-intent-js = { path = "../intent-js", version = "0.10.43", optional = true }
+intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.11.29", optional = true }
+intent-core = { path = "../intent-core", version = "0.11.29" }
+intent-store = { path = "../intent-store", version = "0.11.29" }
+intent-services = { path = "../intent-services", version = "0.11.29" }
+intent-acp = { path = "../intent-acp", version = "0.11.29" }
+intent-providers = { path = "../intent-providers", version = "0.11.29" }
+intent-git = { path = "../intent-git", version = "0.11.29" }
+intent-context = { path = "../intent-context", version = "0.11.29" }
+intent-transport = { path = "../intent-transport", version = "0.11.29" }
+intent-js = { path = "../intent-js", version = "0.11.29", optional = true }
 qrcode = "0.14.1"
 image = { version = "0.25.6", default-features = false, features = ["png"] }
 sysinfo = { version = "0.39.6", default-features = false, features = ["system", "disk"] }
@@ -45,7 +50,7 @@ default = []
 js-engine = ["dep:intent-js"]
 # Explicit cold loopback descriptors for the real GitLab auth socket tests.
 # Packaging and ordinary daemon builds must leave this feature disabled.
-repository-test-fixtures = ["intent-services/repository-test-fixtures", "dep:intent-sourcecontrol"]
+repository-test-fixtures = ["intent-services/repository-test-fixtures", "intent-transport/repository-test-fixtures", "dep:intent-sourcecontrol"]
 
 [[test]]
 name = "e2e_wss_gitlab_auth"
@@ -55,17 +60,17 @@ required-features = ["repository-test-fixtures"]
 # Portable source-lint utilities and Unix process guards; never a runtime dependency.
 intentd-test-support = { path = "../intentd-test-support" }
 uuid = { workspace = true }
-intent-services = { path = "../intent-services", version = "0.10.43", features = ["repository-test-fixtures"] }
-intent-acp = { path = "../intent-acp", version = "0.10.43" }
-intent-providers = { path = "../intent-providers", version = "0.10.43" }
-intent-core = { path = "../intent-core", version = "0.10.43" }
-intent-store = { path = "../intent-store", version = "0.10.43" }
+intent-services = { path = "../intent-services", version = "0.11.29", features = ["repository-test-fixtures"] }
+intent-acp = { path = "../intent-acp", version = "0.11.29" }
+intent-providers = { path = "../intent-providers", version = "0.11.29", features = ["test-support"] }
+intent-core = { path = "../intent-core", version = "0.11.29" }
+intent-store = { path = "../intent-store", version = "0.11.29" }
 # `uds_linear.rs` injects a stub `LinearEngine` so the `linear.*` e2e slice
 # never touches the network (no `LINEAR_API_KEY`, no GraphQL call).
-intent-linear = { path = "../intent-linear", version = "0.10.43" }
+intent-linear = { path = "../intent-linear", version = "0.11.29" }
 # `uds_sentry.rs` injects a stub `SentryEngine` so the `sentry.*` e2e slice
 # never touches the network (no token, no REST call).
-intent-sentry = { path = "../intent-sentry", version = "0.10.43" }
+intent-sentry = { path = "../intent-sentry", version = "0.11.29" }
 # `e2e_wss_voice_transcribe.rs` injects a stub `VoiceEngine` so the
 # `voice.transcribe` e2e slice never touches the network (no key, no HTTP).
 intent-voice = { path = "../intent-voice", version = "0.4.1" }
@@ -87,7 +92,7 @@ chrono = "0.4"
 ctor = "1.0.10"
 tempfile = "3"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
-intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.10.43" }
+intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.11.29" }
 # `e2e_pty_job_control.rs` boots the daemon inside a real PTY session as a
 # member of a background process group (intent-hq/intent#4231 hazard class).
 portable-pty = { workspace = true }

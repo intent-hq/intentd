@@ -78,7 +78,12 @@ fn in_subprocess(test: &str, version: &str) -> bool {
     // the pinned adapter itself is mocked. It may only be version-probed.
     executable(
         &bin.join("codex"),
-        "#!/bin/sh\n[ \"$#\" = 1 ] && [ \"$1\" = --version ] && [ \"$CODEX_PATH\" = \"$0\" ] || exit 91\nprintf 'codex-cli 1.2.3\\n'\n",
+        &format!(
+            "#!/bin/sh\n[ \"$#\" = 1 ] && [ \"$1\" = --version ] && [ \"$CODEX_PATH\" = \"$0\" ] || exit 91\nprintf '%s\\n' '{}'\n",
+            intent_providers::test_support::current_cli_version(
+                intent_providers::installed_cli::InstalledCli::Codex
+            )
+        ),
     );
     let forbidden = "#!/bin/sh\nprintf 'native\\n' >> \"$INTENT_TEST_NPX_ROOT/native\"\nexit 99\n";
     executable(&bin.join("codex-acp"), forbidden);
@@ -116,7 +121,7 @@ esac
         .stderr(Stdio::from(log));
     let mut child = GuardedChild::spawn(&mut cmd).expect("start isolated service test");
     let status = child
-        .wait_with_timeout(Duration::from_secs(120))
+        .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(120)))
         .expect("wait for isolated service test")
         .expect("isolated service test timed out");
     assert!(

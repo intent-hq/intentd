@@ -213,7 +213,10 @@ pub(crate) async fn fetch_claude_code_models() -> ProviderModelsFetch {
 }
 
 /// Resolve the installed runtime once, then use that launch for the catalog.
-pub(crate) async fn installed_model_command(provider_id: &str) -> Result<AcpProbeCommand, String> {
+pub(crate) async fn installed_model_command(
+    provider_id: &str,
+    profile: Option<std::sync::Arc<intent_acp::ProfileEnv>>,
+) -> Result<AcpProbeCommand, String> {
     let provider = intent_providers::find_provider(provider_id).ok_or("unknown provider")?;
     let codex = provider_id == "codex";
     let npx = tokio::task::spawn_blocking(move || {
@@ -228,11 +231,11 @@ pub(crate) async fn installed_model_command(provider_id: &str) -> Result<AcpProb
     let cmd = crate::complete_ops::one_shot_launch(provider, None, npx, None)
         .ok_or_else(|| crate::complete_ops::missing_one_shot_adapter_message(provider_id))?;
     cmd.check_npx_version().await.map_err(|e| e.to_string())?;
-    cmd.prepare_installed_catalog().await
+    cmd.with_profile(profile).prepare_installed_catalog().await
 }
 
 async fn fetch_installed_models(provider_id: &str) -> ProviderModelsFetch {
-    match installed_model_command(provider_id).await {
+    match installed_model_command(provider_id, None).await {
         Ok(cmd) => fetch_installed_models_at(provider_id, cmd).await,
         Err(reason) => ProviderModelsFetch::unavailable(provider_id, reason),
     }
@@ -491,13 +494,16 @@ pub(crate) async fn probe_pi_auth() -> Option<bool> {
 /// being installed. The probe runs the pinned adapter with that canonical CLI,
 /// matching session launches. The legacy `adapter_override` argument is ignored;
 /// it cannot replace the reviewed package or satisfy the installed-CLI gate.
-pub(crate) async fn probe_claude_code_auth(adapter_override: Option<PathBuf>) -> Option<bool> {
+pub(crate) async fn probe_claude_code_auth(
+    adapter_override: Option<PathBuf>,
+    profile: Option<std::sync::Arc<intent_acp::ProfileEnv>>,
+) -> Option<bool> {
     let provider = intent_providers::find_provider("claude-code")?;
     let _ = intent_providers::discover::resolve_npx_only_override(
         provider,
         adapter_override.as_deref().and_then(Path::to_str),
     );
-    let cmd = installed_model_command("claude-code").await.ok()?;
+    let cmd = installed_model_command("claude-code", profile).await.ok()?;
     let outcome = run_acp_probe(cmd, |v| parse::parse_acp_models(v, "claude-code")).await;
     claude_code_acp_auth_verdict(outcome)
 }

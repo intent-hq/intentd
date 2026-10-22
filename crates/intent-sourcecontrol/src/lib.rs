@@ -44,16 +44,17 @@ pub use gitlab_token::GitlabTokenSource;
 pub use instance::{GitlabDescriptor, GitlabInstance};
 pub use model::{
     AuthStatus, Branch, BranchRules, CheckRun, CheckState, Comment, CommentAnchor, Issue,
-    IssueQuery, MergeMethod, MergeOptions, MergeOutcome, MergeQueueRemoval,
-    MergeRequirementSignals, Mergeability, NewPullRequest, Page, PageParams, PrAncestry,
-    PrAncestryIdentity, PrInvolvement, PrObservation, PrPatch, PrQuery, PrState, PullRequest,
-    PullRequestFile, PullRequestFilesPage, PullRequestReview, RateLimitStatus, Repo, RepoRef,
-    Review, ReviewComment, ReviewDecision, ReviewThread, ReviewThreadComment, ReviewThreadTally,
-    ReviewVerdict, RollupCheck, RollupCheckKind, ScCapabilities, UserIdentity,
+    IssueInvolvement, IssueQuery, MergeMethod, MergeOptions, MergeOutcome, MergeQueueEntry,
+    MergeQueueRemoval, MergeRequirementSignals, Mergeability, NewPullRequest, Page, PageParams,
+    PrAncestry, PrAncestryIdentity, PrInvolvement, PrObservation, PrPatch, PrQuery, PrState,
+    PullRequest, PullRequestFile, PullRequestFilesPage, PullRequestReview, RateLimitStatus, Repo,
+    RepoRef, Review, ReviewComment, ReviewDecision, ReviewThread, ReviewThreadComment,
+    ReviewThreadTally, ReviewVerdict, RollupCheck, RollupCheckKind, ScCapabilities, UserIdentity,
 };
 pub use model::{
-    ConfirmedReviewState, ProviderAvailability, ReviewAvailability, ReviewBranchIdentity,
-    ReviewCreateOutcome, ReviewCreateResult, ReviewDetails, ReviewObservation,
+    ConfirmedReviewState, DiscussionNote, ProviderAvailability, ReviewAvailability,
+    ReviewBranchIdentity, ReviewCreateOutcome, ReviewCreateResult, ReviewDetails, ReviewDiscussion,
+    ReviewObservation,
 };
 pub use registry::{GithubSettings, GitlabSettings, SourceControlRegistry, SourceControlSettings};
 /// Re-exported so callers can hand [`gitlab_auth::persist_gitlab_token`] a
@@ -202,6 +203,49 @@ pub trait SourceControl: Send + Sync {
     /// List pull requests matching `query`, one §5.5 page at a time (the page
     /// cursor / size travel in `query`). Backs `github.pulls.list/search`.
     async fn list_prs(&self, repo: &RepoRef, query: PrQuery) -> Result<Page<PullRequest>>;
+
+    /// Complete conversations, including standalone/general/non-resolvable notes.
+    /// This read does not replace the separate readiness-thread projection.
+    async fn list_discussions(
+        &self,
+        _repo: &RepoRef,
+        _number: u64,
+        _page: PageParams,
+    ) -> Result<Page<ReviewDiscussion>> {
+        Err(Error::Unsupported("complete review discussions".into()))
+    }
+
+    /// Open PRs whose head branch is `head_ref`, from any head repository
+    /// (forks included), in one bounded read. More matches than one page is
+    /// an error rather than a truncated answer. The default suits forges
+    /// whose `head` filter is the bare source branch (GitLab).
+    async fn list_open_prs_by_head(
+        &self,
+        repo: &RepoRef,
+        head_ref: &str,
+    ) -> Result<Vec<PullRequest>> {
+        let page = self
+            .list_prs(
+                repo,
+                PrQuery {
+                    state: Some(PrState::Open),
+                    head: Some(head_ref.to_string()),
+                    limit: Some(100),
+                    ..PrQuery::default()
+                },
+            )
+            .await?;
+        if page.next_cursor.is_some() {
+            return Err(Error::Api(
+                "more than one page of open PRs for one head".into(),
+            ));
+        }
+        Ok(page
+            .items
+            .into_iter()
+            .filter(|pr| pr.state == PrState::Open && pr.source_branch == head_ref)
+            .collect())
+    }
 
     /// Search PRs across token-visible repositories owned by an organization or user.
     /// Providers must opt in; never silently substitute a repository listing.

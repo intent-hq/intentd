@@ -286,8 +286,17 @@ fn channel_event_types_are_all_collaborator_visible() {
             // internally and re-reads caller-scoped rows; it never forwards
             // the event payload (including the unrelated principal id).
             .filter(|t| {
+                // Workspace consumes these as invalidations only. The
+                // member-execution filter admits git-root events, and the
+                // delta re-reads an authorized row without their host paths.
                 !(channel == Channel::Workspace
-                    && t.as_str() == intent_core::events::HOST_MEMBERS_CHANGED)
+                    && matches!(
+                        t.as_str(),
+                        intent_core::events::HOST_MEMBERS_CHANGED
+                            | intent_core::events::GIT_ROOT_REGISTERED
+                            | intent_core::events::GIT_ROOT_UPDATED
+                            | intent_core::events::GIT_ROOT_UNREGISTERED
+                    ))
             })
             .filter(|t| !intent_core::events::is_collaborator_event_type(t))
             .collect();
@@ -798,6 +807,28 @@ fn note_subscribe_params_projection_mirrors_note_list() {
         assert!(err.contains("projection"), "{err}");
     }
 
+    // `maxContentBytes` (truncated note reads): absent / null → unbounded;
+    // a positive integer is the limit; the protocol's invalid vectors are a
+    // -32602 before the ack.
+    for (raw, want) in [
+        (r#"{"workspaceId":"w"}"#, None),
+        (r#"{"workspaceId":"w","maxContentBytes":null}"#, None),
+        (
+            r#"{"workspaceId":"w","maxContentBytes":512000}"#,
+            Some(512_000),
+        ),
+        (r#"{"workspaceId":"w","maxContentBytes":7.0}"#, Some(7)),
+    ] {
+        let v = parse(raw);
+        let p = parse_note_subscribe_params(v.as_object().unwrap()).unwrap();
+        assert_eq!(p.max_content_bytes, want, "{raw}");
+    }
+    for bad in ["0", "-1", "1.5", "\"10\"", "true"] {
+        let v = parse(&format!(r#"{{"workspaceId":"w","maxContentBytes":{bad}}}"#));
+        let err = parse_note_subscribe_params(v.as_object().unwrap()).unwrap_err();
+        assert_eq!(err, "maxContentBytes must be a positive integer", "{bad}");
+    }
+
     // The shared parser (task/agent channels) keeps treating the key as an
     // ignored unknown param — no new validation on those channels.
     let v = parse(r#"{"workspaceId":"w","projection":"bogus"}"#);
@@ -874,7 +905,7 @@ fn channel_event_types_full_matrix() {
     ] {
         assert!(ws.iter().any(|s| s == t), "workspace missing {t}");
     }
-    assert_eq!(ws.len(), 14);
+    assert_eq!(ws.len(), 21);
     // Comment channel — creation and deletion refresh the affected thread.
     assert_eq!(
         channel_event_types(Channel::Comment),
@@ -2588,6 +2619,7 @@ mod task_delta_re_read {
                 &ws(),
                 &note_event(event_type, "n-1"),
                 Some(NoteListProjection::Slim),
+                None,
             )
             .await
             .expect("delta");
@@ -2596,12 +2628,56 @@ mod task_delta_re_read {
             assert_eq!(row["contentPreview"].as_str().map(str::len), Some(500));
             assert_eq!(row["contentLength"].as_i64(), Some(1000));
         }
-        let delta = note_delta(&api, &ws(), &note_event(NOTE_UPDATED, "n-1"), None)
+        let delta = note_delta(&api, &ws(), &note_event(NOTE_UPDATED, "n-1"), None, None)
             .await
             .expect("delta");
         let row = &delta["updated"][0];
         assert_eq!(row["content"].as_str().map(str::len), Some(1000));
         assert!(row.get("contentPreview").is_none(), "full row: {row}");
+    }
+
+    #[tokio::test]
+    async fn note_delta_max_content_bytes_truncates_like_note_get() {
+        // Truncated note reads: `added`/`updated` re-reads of a large note
+        // carry the cut prefix plus the markers, the same row `note.get`
+        // serves; a note under the limit arrives full without markers, and
+        // slim rows ignore the limit.
+        let mut note = note_with(None);
+        note.content = "line one\nline two\nline three\n".to_string();
+        let full_bytes = note.content.len();
+        let api = StaticNoteApi::new(Some(note.clone()));
+        for (event_type, key) in [(NOTE_CREATED, "added"), (NOTE_UPDATED, "updated")] {
+            let delta = note_delta(&api, &ws(), &note_event(event_type, "n-1"), None, Some(20))
+                .await
+                .expect("delta");
+            let row = &delta[key][0];
+            assert_eq!(row["content"], "line one\nline two\n");
+            assert_eq!(row["contentTruncated"], true);
+            assert_eq!(row["contentBytes"], full_bytes);
+            assert_eq!(row, &intent_core::note_bounded_row(note.clone(), 20));
+        }
+        let delta = note_delta(
+            &api,
+            &ws(),
+            &note_event(NOTE_UPDATED, "n-1"),
+            None,
+            Some(1_000),
+        )
+        .await
+        .expect("delta");
+        assert_eq!(delta["updated"][0], serde_json::to_value(&note).unwrap());
+        let delta = note_delta(
+            &api,
+            &ws(),
+            &note_event(NOTE_UPDATED, "n-1"),
+            Some(NoteListProjection::Slim),
+            Some(5),
+        )
+        .await
+        .expect("delta");
+        let row = &delta["updated"][0];
+        assert!(row.get("content").is_none() && row.get("contentTruncated").is_none());
+        assert_eq!(row["contentLength"].as_u64(), Some(full_bytes as u64));
     }
 
     #[tokio::test]
@@ -3004,6 +3080,41 @@ mod workspace_delta_list_projection {
                 ..Default::default()
             },
             data: json!({ "workspaceId": "w" }),
+        }
+    }
+
+    #[tokio::test]
+    async fn external_pr_changes_refresh_home_rows_without_a_status_transition() {
+        use intent_core::events::{
+            GIT_ROOT_REGISTERED, GIT_ROOT_UNREGISTERED, GIT_ROOT_UPDATED, PR_MONITOR_CANCELLED,
+            PR_MONITOR_CHANGED, PR_MONITOR_COMPLETED, PR_MONITOR_REGISTERED,
+        };
+        for event_type in [
+            GIT_ROOT_REGISTERED,
+            GIT_ROOT_UPDATED,
+            GIT_ROOT_UNREGISTERED,
+            PR_MONITOR_REGISTERED,
+            PR_MONITOR_CHANGED,
+            PR_MONITOR_COMPLETED,
+            PR_MONITOR_CANCELLED,
+        ] {
+            assert!(
+                channel_event_types(Channel::Workspace)
+                    .iter()
+                    .any(|t| t == event_type),
+                "Home must subscribe to {event_type}"
+            );
+            let delta = workspace_delta(&DetailWorkspaceApi, &workspace_event(event_type), None)
+                .await
+                .expect("external PR changes refresh the background list row");
+            assert_eq!(delta["updated"][0]["id"], "w");
+            assert_eq!(
+                delta["updated"][0]["pullRequests"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                WORKSPACE_LIST_PR_CAP
+            );
         }
     }
 
@@ -5897,6 +6008,38 @@ mod channel_membership {
 
     fn workspace_subscribe() -> Value {
         json!({"jsonrpc":"2.0","id":1,"method":"workspace.subscribe","params":{}})
+    }
+
+    #[tokio::test]
+    async fn workspace_git_root_events_refresh_only_authorized_rows_without_host_paths() {
+        let (_, caller) = guest();
+        let mut h = subscribe(caller, &["ws-1"], workspace_subscribe()).await;
+        for kind in [
+            intent_core::events::GIT_ROOT_REGISTERED,
+            intent_core::events::GIT_ROOT_UPDATED,
+            intent_core::events::GIT_ROOT_UNREGISTERED,
+        ] {
+            for ws in ["ws-2", "ws-1"] {
+                h.bus
+                    .publish(&event(
+                        kind,
+                        ws,
+                        None,
+                        json!({
+                            "workspaceId": ws,
+                            "gitRoot": {"path": "/private/host/repository"}
+                        }),
+                    ))
+                    .await
+                    .unwrap();
+            }
+            let updates = deltas(&mut h.rx).await;
+            assert_eq!(updates.len(), 1, "only the authorized workspace updates");
+            assert_eq!(updates[0]["updated"][0]["id"], "ws-1");
+            assert!(!updates[0].to_string().contains("/private/host/repository"));
+            assert!(updates[0]["updated"][0].get("gitRoot").is_none());
+        }
+        drop(h.subs);
     }
 
     /// The global `workspace` channel under a guest: a `workspace:deleted`

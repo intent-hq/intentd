@@ -43,7 +43,10 @@ impl Fixture {
             Arc::new(crate::SettingsRegistry::load(dir.path().join("config.toml")).unwrap());
         registry
             .apply(&[
-                ("sourceControl.gitlab.host".into(), json!("gitlab.test")),
+                (
+                    "sourceControl.gitlab.host".into(),
+                    json!(server.host.host()),
+                ),
                 (
                     "sourceControl.gitlab.instanceBaseUrl".into(),
                     json!(server.descriptor.instance().as_str()),
@@ -514,9 +517,12 @@ impl PausedRead {
         }
     }
     pub(crate) async fn entered(&self) {
-        tokio::time::timeout(Duration::from_secs(5), self.entered.notified())
-            .await
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            self.entered.notified(),
+        )
+        .await
+        .unwrap();
     }
     pub(crate) fn resume(&mut self) {
         if let Some(release) = self.release.take() {
@@ -562,7 +568,7 @@ async fn reader_waits_for_original_gate_and_detached_file_read_keeps_its_lease()
     );
     paused.resume();
     let guard = tokio::time::timeout(
-        Duration::from_secs(5),
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
         f.service.gitlab_credential_gate.lock(),
     )
     .await
@@ -650,9 +656,12 @@ async fn reader_post_load_authority_denial_or_real_replacement_prevents_http() {
         .unwrap();
         let provider = callback.into_provider().unwrap();
         let read = tokio::spawn(async move { provider.get_repo("group", "project").await });
-        tokio::time::timeout(Duration::from_secs(5), authority.entered.notified())
-            .await
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            authority.entered.notified(),
+        )
+        .await
+        .unwrap();
         if replace {
             f.service
                 .gitlab_connect_pat(server.host.clone(), "pat-second".into())
@@ -963,10 +972,13 @@ async fn original_auth_probe_receipt_rejects_late_200_and_401_for_same_token_suc
         assert_ne!(old_selected.binding.scope, successor.binding.scope);
         let bytes = std::fs::read(f.service.gitlab_secret_store.path()).unwrap();
         server.control.release.notify_one();
-        let result = tokio::time::timeout(Duration::from_secs(5), old)
-            .await
-            .unwrap()
-            .unwrap();
+        let result = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            old,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         eprintln!("late auth response status={status} retry={retry}: {result:?}");
         assert_eq!(result.unwrap(), json!({"user":null}));
         assert_eq!(

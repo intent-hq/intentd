@@ -91,23 +91,7 @@ impl Store {
         author: &NoteVersionAuthor,
         date: &str,
     ) -> Result<(i64, i64)> {
-        self.update_note_with_version_and_orphans(note, expected_version, author, date, &[])
-            .await
-    }
-
-    /// Persist repaired source and orphan flags before publishing anchor readiness.
-    ///
-    /// # Errors
-    /// Returns the corresponding versioned-write error, or rejects an orphan root
-    /// that no longer belongs to this note. Every failure rolls back the writer.
-    pub async fn update_note_with_version_and_orphans(
-        &self,
-        note: &Note,
-        expected_version: Option<i64>,
-        author: &NoteVersionAuthor,
-        date: &str,
-        orphaned: &[String],
-    ) -> Result<(i64, i64)> {
+        self.prepare_task_events(&note.workspace_id).await;
         let mut conn = crate::note_write_connection::NoteWriteConnection::begin(self).await?;
 
         let result = async {
@@ -122,14 +106,6 @@ impl Store {
                 return Ok(None);
             };
             let v = insert_note_version(&mut conn, note, author, date, rev).await?;
-            mark_orphans(&mut conn, note, orphaned, date).await?;
-            crate::note_annotation_repo::rebuild_note_anchors(
-                &mut conn,
-                &note.workspace_id,
-                &note.id,
-                Some(&note.content),
-            )
-            .await?;
             Ok(Some((rev, v)))
         }
         .await;
@@ -163,31 +139,7 @@ impl Store {
         author: &NoteVersionAuthor,
         date: &str,
     ) -> Result<(i64, i64)> {
-        self.update_note_with_version_and_children_and_orphans(
-            note,
-            expected_version,
-            children,
-            author,
-            date,
-            &[],
-        )
-        .await
-    }
-
-    /// Persist repaired source and orphan flags before publishing anchor readiness.
-    ///
-    /// # Errors
-    /// Returns the corresponding versioned-write error, or rejects an orphan root
-    /// that no longer belongs to this note. Every failure rolls back the writer.
-    pub async fn update_note_with_version_and_children_and_orphans(
-        &self,
-        note: &Note,
-        expected_version: Option<i64>,
-        children: &[Note],
-        author: &NoteVersionAuthor,
-        date: &str,
-        orphaned: &[String],
-    ) -> Result<(i64, i64)> {
+        self.prepare_task_events(&note.workspace_id).await;
         let mut conn = crate::note_write_connection::NoteWriteConnection::begin(self).await?;
 
         // The gated parent UPDATE runs first so a miss leaves the body with
@@ -204,24 +156,9 @@ impl Store {
                 return Ok(None);
             };
             let v = insert_note_version(&mut conn, note, author, date, rev).await?;
-            mark_orphans(&mut conn, note, orphaned, date).await?;
-            crate::note_annotation_repo::rebuild_note_anchors(
-                &mut conn,
-                &note.workspace_id,
-                &note.id,
-                Some(&note.content),
-            )
-            .await?;
             for child in children {
                 crate::note_repo::exec_insert_note(&mut conn, child).await?;
                 insert_note_version(&mut conn, child, author, &child.updated_at, child.rev).await?;
-                crate::note_annotation_repo::rebuild_note_anchors(
-                    &mut conn,
-                    &child.workspace_id,
-                    &child.id,
-                    Some(&child.content),
-                )
-                .await?;
             }
             Ok(Some((rev, v)))
         }
@@ -254,19 +191,12 @@ impl Store {
         author: &NoteVersionAuthor,
         date: &str,
     ) -> Result<i64> {
+        self.prepare_task_events(&note.workspace_id).await;
         let mut conn = crate::note_write_connection::NoteWriteConnection::begin(self).await?;
 
         let result = async {
             crate::note_repo::exec_insert_note(&mut conn, note).await?;
-            let version = insert_note_version(&mut conn, note, author, date, note.rev).await?;
-            crate::note_annotation_repo::rebuild_note_anchors(
-                &mut conn,
-                &note.workspace_id,
-                &note.id,
-                Some(&note.content),
-            )
-            .await?;
-            Ok(version)
+            insert_note_version(&mut conn, note, author, date, note.rev).await
         }
         .await;
 
@@ -450,24 +380,4 @@ fn map_version_row(row: &SqliteRow) -> Result<NoteVersion> {
         title: col(row, "title")?,
         content: col(row, "content")?,
     })
-}
-
-/// Only update orphan state and time: concurrent metadata and immutable author
-/// fields are not overwritten by the service's earlier recovery snapshot.
-async fn mark_orphans(
-    conn: &mut sqlx::SqliteConnection,
-    note: &Note,
-    ids: &[String],
-    date: &str,
-) -> Result<()> {
-    for id in ids {
-        let changed = sqlx::query("UPDATE comment SET extra_json=json_set(COALESCE(extra_json,'{}'),'$.isOrphaned',json('true')),updated_at=? WHERE id=? AND workspace_id=? AND note_id=? AND parent_id IS NULL")
-            .bind(date).bind(id).bind(note.workspace_id.as_str()).bind(note.id.as_str())
-            .execute(&mut *conn).await
-            .map_err(|e| Error::Internal(format!("mark note comment orphaned: {e}")))?;
-        if changed.rows_affected() != 1 {
-            return Err(Error::NotFound(format!("comment {id} in note {}", note.id)));
-        }
-    }
-    Ok(())
 }

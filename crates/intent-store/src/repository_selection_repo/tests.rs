@@ -697,7 +697,7 @@ impl crate::RepositoryLifecycleObserver for SelectionDrain {
             let waited = signal
                 .wait_timeout_while(
                     ready.lock().unwrap(),
-                    std::time::Duration::from_secs(5),
+                    intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
                     |ready| !*ready,
                 )
                 .unwrap();
@@ -746,9 +746,12 @@ async fn admitted_selection_final_transaction_rechecks_authority_after_real_drai
             || panic!("changed authority reached UPDATE"),
         ))
     });
-    tokio::time::timeout(std::time::Duration::from_secs(5), drain.entered.notified())
-        .await
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+        drain.entered.notified(),
+    )
+    .await
+    .unwrap();
     f.store
         .revoke_principal_credential("drain-fixture")
         .await
@@ -813,4 +816,253 @@ async fn admitted_selection_commit_survives_settlement_failure_and_abort_stays_u
     assert_eq!(outcome.persistence, RepositorySelectionPersistence::Unknown);
     assert!(outcome.result.is_err());
     assert!(before.matches(&f.read().await));
+}
+
+struct AsyncSelectionSettlement {
+    entered: Arc<tokio::sync::Notify>,
+    released: Arc<tokio::sync::Notify>,
+    settled: Arc<std::sync::atomic::AtomicBool>,
+}
+impl crate::RepositoryLifecycleObserver for AsyncSelectionSettlement {
+    fn begin_mutation(
+        &self,
+        _: &[crate::RepositoryLifecycleKey],
+    ) -> Result<Box<dyn crate::RepositoryLifecycleMutationTicket>> {
+        Ok(Box::new(Self {
+            entered: self.entered.clone(),
+            released: self.released.clone(),
+            settled: self.settled.clone(),
+        }))
+    }
+}
+impl crate::RepositoryLifecycleMutationTicket for AsyncSelectionSettlement {
+    fn settle_confirmed(self: Box<Self>) {
+        self.settled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    fn settle_after_retirement(
+        self: Box<Self>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>> {
+        Box::pin(async move {
+            self.entered.notify_one();
+            self.released.notified().await;
+            self.settle_confirmed();
+            Ok(())
+        })
+    }
+}
+
+async fn selection_waits_for_original_completion(cancel: bool) {
+    let f = Fixture::new().await;
+    let original = f.read().await;
+    let observer = Arc::new(AsyncSelectionSettlement {
+        entered: Arc::new(tokio::sync::Notify::new()),
+        released: Arc::new(tokio::sync::Notify::new()),
+        settled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    });
+    f.store
+        .install_repository_lifecycle_observer(observer.clone())
+        .await
+        .unwrap();
+    let mut write = Box::pin(
+        f.store
+            .write_repository_selection(&original, remote("selected")),
+    );
+    tokio::select! {
+        () = observer.entered.notified() => {},
+        _ = &mut write => panic!("selection completed before original retirement"),
+        () = tokio::time::sleep(std::time::Duration::from_secs(5)) => panic!("selection did not start original retirement"),
+    }
+    assert!(!observer.settled.load(std::sync::atomic::Ordering::SeqCst));
+    let stored = tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+        f.read(),
+    )
+    .await
+    .expect("selection join retained Store serialization");
+    assert_eq!(
+        saved(&stored),
+        &SavedReviewSelection::ExplicitRemote {
+            remote_name: "selected".into()
+        }
+    );
+    if cancel {
+        drop(write);
+        observer.released.notify_one();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+            async {
+                while !observer.settled.load(std::sync::atomic::Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+            },
+        )
+        .await
+        .expect("cancelled selection waiter abandoned completion");
+    } else {
+        observer.released.notify_one();
+        let outcome = write.await;
+        assert!(matches!(
+            outcome.persistence,
+            RepositorySelectionPersistence::Committed { .. }
+        ));
+        assert!(matches!(
+            outcome.result,
+            Ok(RepositorySelectionWriteResult::Applied(_))
+        ));
+        assert!(observer.settled.load(std::sync::atomic::Ordering::SeqCst));
+    }
+}
+
+#[tokio::test]
+async fn selection_commit_waits_outside_locks_for_original_completion() {
+    selection_waits_for_original_completion(false).await;
+}
+#[tokio::test]
+async fn selection_commit_completion_survives_cancelled_waiter() {
+    selection_waits_for_original_completion(true).await;
+}
+
+/// intent-hq/intent#7449: owner/name metadata is not a saved choice, so a new,
+/// rebound, moved or same-ID recreated root without a saved choice stays
+/// `NeverSaved`.
+#[tokio::test]
+async fn metadata_never_manufactures_unresolved_history_for_new_roots() {
+    let f = Fixture::new().await;
+    let id = WorkspaceId::from("github-workspace");
+    let row: Workspace = serde_json::from_value(serde_json::json!({
+        "id":id,"title":"GitHub","branch":"main","status":"Active","activity":"idle","attention":"none",
+        "createdAt":"same-time","updatedAt":"same-time","tags":[],"skipWorktree":false,"isRemote":false,"archived":false,
+        "repositoryPath":"/github","repositoryOwner":"octo","repositoryName":"project"
+    })).unwrap();
+    f.store.insert_workspace(&row).await.unwrap();
+    let primary = RepositoryRootId {
+        workspace_id: id.clone(),
+        kind: RepositoryRootKind::Primary,
+    };
+    let never = |s: RepositorySelectionSnapshot| {
+        assert_eq!(s.selection(), Some(&RepositoryStoredSelection::NeverSaved));
+    };
+    never(
+        f.store
+            .repository_selection_snapshot(&primary)
+            .await
+            .unwrap(),
+    );
+    sqlx::query("UPDATE workspace SET repository_path='/rebound' WHERE id=?")
+        .bind(id.as_str())
+        .execute(f.store.write_pool())
+        .await
+        .unwrap();
+    never(
+        f.store
+            .repository_selection_snapshot(&primary)
+            .await
+            .unwrap(),
+    );
+    f.store.delete_workspace(&id).await.unwrap();
+    f.store.insert_workspace(&row).await.unwrap();
+    never(
+        f.store
+            .repository_selection_snapshot(&primary)
+            .await
+            .unwrap(),
+    );
+    // Insert triggers give every workspace dependants, so FKs refuse an id
+    // move; exercise the move trigger on one connection with FKs off.
+    let mut conn = f.store.write_pool().acquire().await.unwrap();
+    sqlx::raw_sql(
+        "PRAGMA foreign_keys=OFF; \
+         INSERT INTO workspace(id,title,branch,created_at,updated_at,repository_path,repository_owner,repository_name) \
+         VALUES('github-move','Move','main','same-time','same-time','/move','octo','project'); \
+         UPDATE workspace SET id='github-moved' WHERE id='github-move'; \
+         PRAGMA foreign_keys=ON;",
+    )
+    .execute(&mut *conn)
+    .await
+    .unwrap();
+    drop(conn);
+    never(
+        f.store
+            .repository_selection_snapshot(&RepositoryRootId {
+                workspace_id: WorkspaceId::from("github-moved"),
+                kind: RepositoryRootKind::Primary,
+            })
+            .await
+            .unwrap(),
+    );
+
+    let root: WorkspaceGitRoot = serde_json::from_value(serde_json::json!({
+        "id":"github-root","workspaceId":f.root.workspace_id,"path":"/github-root","source":"agent",
+        "repoOwner":"octo","repoName":"submodule","registeredCommitSha":"abc123",
+        "registeredByAgentIds":[],"createdAt":"same-time","updatedAt":"same-time"
+    }))
+    .unwrap();
+    f.store.upsert_workspace_git_root(&root).await.unwrap();
+    let registered = RepositoryRootId {
+        workspace_id: f.root.workspace_id.clone(),
+        kind: RepositoryRootKind::Registered {
+            git_root_id: root.id.clone(),
+        },
+    };
+    never(
+        f.store
+            .repository_selection_snapshot(&registered)
+            .await
+            .unwrap(),
+    );
+    f.store.delete_workspace_git_root(&root.id).await.unwrap();
+    f.store.upsert_workspace_git_root(&root).await.unwrap();
+    never(
+        f.store
+            .repository_selection_snapshot(&registered)
+            .await
+            .unwrap(),
+    );
+    sqlx::query("UPDATE workspace_git_root SET path='/github-root-moved' WHERE id='github-root'")
+        .execute(f.store.write_pool())
+        .await
+        .unwrap();
+    never(
+        f.store
+            .repository_selection_snapshot(&registered)
+            .await
+            .unwrap(),
+    );
+    sqlx::query("UPDATE workspace_git_root SET workspace_id='github-moved' WHERE id='github-root'")
+        .execute(f.store.write_pool())
+        .await
+        .unwrap();
+    never(
+        f.store
+            .repository_selection_snapshot(&RepositoryRootId {
+                workspace_id: WorkspaceId::from("github-moved"),
+                kind: RepositoryRootKind::Registered {
+                    git_root_id: root.id.clone(),
+                },
+            })
+            .await
+            .unwrap(),
+    );
+    // Every key all eight triggers touched, tombstones included.
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM repository_selection_state WHERE choice_mode='unresolved' OR historical_source IS NOT NULL",
+    )
+    .fetch_one(f.store.read_pool())
+    .await
+    .unwrap();
+    assert_eq!(rows, 0);
+}
+
+/// A choice the user saved still cannot silently carry over to a recreated root.
+#[tokio::test]
+async fn saved_choice_still_becomes_unresolved_after_same_id_recreation() {
+    let f = Fixture::new().await;
+    f.set("upstream").await;
+    f.store
+        .delete_workspace(&f.root.workspace_id)
+        .await
+        .unwrap();
+    workspace(&f.store, &f.root.workspace_id, Some("octo")).await;
+    unresolved(&f.read().await);
 }

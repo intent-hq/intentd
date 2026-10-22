@@ -74,6 +74,7 @@ fn extract_fastpath_methods() -> HashSet<String> {
         ("browser.rs", "browser."),
         ("host.rs", "host."),
         ("control.rs", "system."),
+        ("startup.rs", "system."),
         ("pairing.rs", "pairing."),
         ("server.rs", "server."),
         ("provider_setup.rs", "providers.setup."),
@@ -82,6 +83,7 @@ fn extract_fastpath_methods() -> HashSet<String> {
         ("invite.rs", "host.invite."),
         ("presence.rs", "presence."),
         ("presence.rs", "note.presence."),
+        ("agent_workers.rs", "agent.workers."),
     ] {
         let source = std::fs::read_to_string(base_path.join(filename))
             .unwrap_or_else(|_| panic!("Failed to read {filename} at test time"));
@@ -190,23 +192,37 @@ fn extract_fastpath_methods() -> HashSet<String> {
 // GitLab pre-workspace checkout (13.5): +6 router methods.
 // Provider adapter preparation (13.6): +1 fast-path method.
 // Cancellable note deletion (13.10): +3 router methods.
-const EXPECTED_TOTAL_METHODS: usize = 434;
+// Legacy workspace import removal (15.0): -1 fast-path method.
+// PR workspace lookup (`prWorkspaceLookup: 1`): +1 router method.
+// Named provider profiles (§5.54): +4 router methods.
+// Provider profile order (§5.54 `providers.profiles.reorder`): +1 router method.
+// Startup status (14.1): +1 fast-path method.
+// Scoped repository pages and child Git policy (15.1): +8 router methods.
+// Provider worker observations (§5.5b, `agentWorkers: 1`): +2 router, +1 fast path.
+// Note paging removal: -3 router methods (cancellable note deletion).
+const EXPECTED_TOTAL_METHODS: usize = 449;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// Protocol 12.0 removes five router methods, three fast paths and two aliases.
 /// Protocol 12.1 adds the three script-monitor controls.
 /// The subsequent git.commit removal removes one more router method.
 /// Protocol 13.10 adds three cancellable note deletion controls.
-const EXPECTED_ROUTER_METHODS: usize = 378;
+/// `workspace.findByPullRequest` (`prWorkspaceLookup: 1`) adds one more.
+/// Named provider profiles (§5.54) add the four `providers.profiles.*` methods,
+/// then `providers.profiles.reorder`.
+/// Provider worker observations (§5.5b) add `agent.workers.list` / `.stop`.
+/// Removing note paging drops the three cancellable note deletion controls.
+const EXPECTED_ROUTER_METHODS: usize = 391;
 
 /// Golden count: fast-path methods (intercepted before router).
-const EXPECTED_FASTPATH_METHODS: usize = 56;
+/// `agent.workers.subscribe` (§5.5b) holds per-connection subscription state.
+const EXPECTED_FASTPATH_METHODS: usize = 58;
 
 /// Golden count: method aliases.
 const EXPECTED_ALIASES: usize = 0;
 
 /// Golden count: server→client notifications.
-const EXPECTED_NOTIFICATIONS: usize = 5;
+const EXPECTED_NOTIFICATIONS: usize = 7;
 
 /// Golden count: client-served reverse RPCs.
 const EXPECTED_REVERSE_METHODS: usize = 5;
@@ -562,6 +578,9 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "agent.summary",
     "agent.unsubscribe",
     "agent.update",
+    "agent.workers.list",
+    "agent.workers.stop",
+    "agent.workers.subscribe",
     "browser.closeTab",
     "browser.exec",
     "browser.listTabs",
@@ -587,6 +606,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "event.agentActivity",
     "event.query",
     "event.workspaceSummary",
+    "events.fence",
     "events.subscribe",
     "events.unsubscribe",
     "file-tracking.getAgentLocks",
@@ -740,9 +760,6 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "note.add",
     "note.create",
     "note.delete",
-    "note.deleteCancel",
-    "note.deleteSchedule",
-    "note.deleteStatus",
     "note.edit",
     "note.editLines",
     "note.get",
@@ -775,6 +792,11 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "principal.me",
     "principal.revokeSelf",
     "providers.catalog",
+    "providers.profiles.create",
+    "providers.profiles.delete",
+    "providers.profiles.list",
+    "providers.profiles.reorder",
+    "providers.profiles.update",
     "providers.setup.cancel",
     "providers.setup.login",
     "providers.setup.start",
@@ -840,11 +862,19 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "sourceControl.checkout.warm",
     "sourceControl.connect",
     "sourceControl.getUser",
+    "sourceControl.gitlab.childGit.get",
+    "sourceControl.gitlab.childGit.set",
     "sourceControl.identityProof.create",
     "sourceControl.identityProof.delete",
     "sourceControl.read.capture",
+    "sourceControl.read.captureScoped",
     "sourceControl.read.detail",
+    "sourceControl.read.detailScoped",
+    "sourceControl.read.discussions",
+    "sourceControl.read.list",
     "sourceControl.read.release",
+    "sourceControl.read.releaseScoped",
+    "sourceControl.read.resolveKnownRepository",
     "sourceControl.revoke",
     "specialist.create",
     "specialist.delete",
@@ -855,9 +885,9 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "stats.getUsage",
     "system.capabilities",
     "system.gitCredential",
-    "system.importLegacy",
     "system.requestUpdate",
     "system.shutdown",
+    "system.startupStatus",
     "system.status",
     "task.assignAgent",
     "task.convertBlocks",
@@ -897,6 +927,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "workspace.export.finalize",
     "workspace.export.read",
     "workspace.export.start",
+    "workspace.findByPullRequest",
     "workspace.findRepositories",
     "workspace.generateSetupScript",
     "workspace.get",
@@ -1332,6 +1363,11 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "prMonitor.cancel",
     "prMonitor.flush",
     "principal.list",
+    "providers.profiles.create",
+    "providers.profiles.delete",
+    "providers.profiles.list",
+    "providers.profiles.reorder",
+    "providers.profiles.update",
     "providers.setup.cancel",
     "providers.setup.login",
     "providers.setup.start",
@@ -1379,16 +1415,19 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "sourceControl.cancelAuth",
     "sourceControl.connect",
     "sourceControl.getUser",
+    "sourceControl.gitlab.childGit.get",
+    "sourceControl.gitlab.childGit.set",
     "sourceControl.identityProof.create",
     "sourceControl.identityProof.delete",
+    "sourceControl.read.resolveKnownRepository",
     "sourceControl.revoke",
     "specialist.create",
     "specialist.delete",
     "specialist.edit",
     "system.gitCredential",
-    "system.importLegacy",
     "system.requestUpdate",
     "system.shutdown",
+    "system.startupStatus",
     "terminal.create",
     "terminal.getBuffer",
     "terminal.kill",
@@ -1578,6 +1617,7 @@ fn collaborator_lookup_canonicalises_aliases_and_denies_by_default() {
     assert!(collaborator_may_call("git.commits"));
     for allowed in [
         "client.hello",
+        "events.fence",
         "events.subscribe",
         "chat.subscribe",
         "workspace.subscribe",
@@ -2016,6 +2056,20 @@ mod unbound_owner_only_methods {
                 "scriptMonitor.cancelRun",
                 json!({ "workspaceId": ws, "monitorId": "m1" }),
             ),
+            (
+                "providers.profiles.create",
+                json!({ "baseProviderId": "codex", "name": "n" }),
+            ),
+            ("providers.profiles.delete", json!({ "profileId": "p1" })),
+            ("providers.profiles.list", json!({})),
+            (
+                "providers.profiles.reorder",
+                json!({ "baseProviderId": "codex", "profileIds": [] }),
+            ),
+            (
+                "providers.profiles.update",
+                json!({ "profileId": "p1", "name": "n" }),
+            ),
             ("sentry.assignIssue", json!({ "id": "i" })),
             ("sentry.authStatus", json!({})),
             ("sentry.getIssue", json!({ "id": "i" })),
@@ -2044,6 +2098,13 @@ mod unbound_owner_only_methods {
             ("sourceControl.cancelAuth", json!({ "provider": "github" })),
             ("sourceControl.connect", json!({ "provider": "github" })),
             ("sourceControl.getUser", json!({ "provider": "github" })),
+            ("sourceControl.gitlab.childGit.get", json!({})),
+            (
+                "sourceControl.gitlab.childGit.set",
+                json!({"binding":{"instanceBaseUrl":"https://forge.test/install",
+                    "connection":{"connectionId":"original","accountId":"account",
+                        "connectionGeneration":"1"},"revision":"1"},"enabled":false}),
+            ),
             (
                 "sourceControl.identityProof.create",
                 json!({ "provider": "github", "nonce": "n", "hostLabel": "h" }),
@@ -2051,6 +2112,10 @@ mod unbound_owner_only_methods {
             (
                 "sourceControl.identityProof.delete",
                 json!({ "provider": "github", "proofId": "g" }),
+            ),
+            (
+                "sourceControl.read.resolveKnownRepository",
+                json!({ "context": { "kind": "host" }, "readLifetimeId": "original", "path": dir }),
             ),
             ("sourceControl.revoke", json!({ "provider": "github" })),
             ("specialist.create", json!({ "id": "s", "spec": {} })),
@@ -2552,6 +2617,11 @@ fn member_methods_and_administrator_remainder_are_classified() {
         "mcp.servers.update",
         "mcp.testConnection",
         "pairing.getInfo",
+        "providers.profiles.create",
+        "providers.profiles.delete",
+        "providers.profiles.list",
+        "providers.profiles.reorder",
+        "providers.profiles.update",
         "providers.setup.cancel",
         "providers.setup.login",
         "providers.setup.start",
@@ -2569,16 +2639,19 @@ fn member_methods_and_administrator_remainder_are_classified() {
         "sourceControl.cancelAuth",
         "sourceControl.connect",
         "sourceControl.getUser",
+        "sourceControl.gitlab.childGit.get",
+        "sourceControl.gitlab.childGit.set",
         "sourceControl.identityProof.create",
         "sourceControl.identityProof.delete",
+        "sourceControl.read.resolveKnownRepository",
         "sourceControl.revoke",
         "specialist.create",
         "specialist.delete",
         "specialist.edit",
         "system.gitCredential",
-        "system.importLegacy",
         "system.requestUpdate",
         "system.shutdown",
+        "system.startupStatus",
         "unsloth.status",
         "unsloth.stop",
     ];

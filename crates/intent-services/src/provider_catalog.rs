@@ -68,6 +68,10 @@ fn provider_row(p: &intent_providers::ProviderConfig, env_has: &dyn Fn(&str) -> 
     row.insert("command".into(), json!(p.command));
     row.insert("canBeDisabled".into(), json!(p.can_be_disabled));
     row.insert("supportsTestPrompt".into(), json!(p.supports_test_prompt));
+    row.insert(
+        "supportsProfiles".into(),
+        json!(intent_providers::PROFILE_BASE_PROVIDERS.contains(&p.id)),
+    );
     if let Some(hint) = p.login_command_hint {
         row.insert("loginCommandHint".into(), json!(hint));
     }
@@ -152,6 +156,26 @@ mod tests {
         assert!(
             v.get("defaultProviderId").is_none(),
             "catalog must not carry defaultProviderId"
+        );
+    }
+
+    /// Only the profile bases advertise `supportsProfiles: true`; every row
+    /// carries the boolean, and rows stay one per provider type, so
+    /// onboarding (which reads `providers`) never sees a profile row.
+    #[test]
+    fn supports_profiles_only_on_codex_and_claude_code() {
+        let v = catalog(&|_| false);
+        for provider in intent_providers::ACP_PROVIDERS {
+            assert_eq!(
+                row(&v, provider.id)["supportsProfiles"],
+                matches!(provider.id, "codex" | "claude-code"),
+                "{}",
+                provider.id
+            );
+        }
+        assert!(
+            v.get("profiles").is_none(),
+            "the static builder adds no profiles"
         );
     }
 

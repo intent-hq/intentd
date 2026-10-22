@@ -1073,11 +1073,14 @@ async fn member_execution_enablement_events_follow_committed_changes_and_reset()
         )
         .await
         .unwrap();
-        let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
-            .await
-            .unwrap()
-            .unwrap()
-            .remove(0);
+        let event = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            events.recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .remove(0);
         assert_eq!(event.data["enabledProviderIds"], expected);
         assert_eq!(
             event.data["repositoryConnections"],
@@ -1129,11 +1132,14 @@ async fn member_execution_enablement_events_follow_committed_changes_and_reset()
     )
     .await
     .unwrap();
-    let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
-        .await
-        .unwrap()
-        .unwrap()
-        .remove(0);
+    let event = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        events.recv(),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .remove(0);
     assert_eq!(event.data["enabledProviderIds"], json!(all));
     // Resetting an already absent map and an empty update are true no-ops.
     let noop = with_caller(
@@ -1438,11 +1444,14 @@ async fn member_execution_context_event_is_durable_and_survives_store_reopen() {
     )
     .await
     .unwrap();
-    let live = tokio::time::timeout(Duration::from_secs(5), events.recv())
-        .await
-        .unwrap()
-        .unwrap()
-        .remove(0);
+    let live = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        events.recv(),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .remove(0);
     worker.abort();
     let _ = worker.await;
     assert_eq!(live.data, expected);
@@ -1537,10 +1546,13 @@ async fn member_execution_context_events_cover_policy_setup_and_unchanged_config
     )
     .await
     .unwrap();
-    let batch = tokio::time::timeout(Duration::from_secs(5), events.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    let batch = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        events.recv(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!(
         batch[0].data,
         json!(before),
@@ -1554,10 +1566,13 @@ async fn member_execution_context_events_cover_policy_setup_and_unchanged_config
     )
     .await
     .unwrap();
-    let batch = tokio::time::timeout(Duration::from_secs(5), events.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    let batch = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        events.recv(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!(
         batch.last().unwrap().data["gitCredentialPolicy"]["managedHelperEnabled"],
         false
@@ -1570,10 +1585,13 @@ async fn member_execution_context_events_cover_policy_setup_and_unchanged_config
     )
     .await
     .unwrap();
-    let batch = tokio::time::timeout(Duration::from_secs(5), events.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    let batch = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        events.recv(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert!(!batch[0].data.to_string().contains("no-leak"));
     worker.abort();
     let _ = worker.await;
@@ -1585,7 +1603,7 @@ async fn member_import_handles_remain_owned_by_the_authenticated_initiator() {
     let tmp = TempDb::new();
     let (svc, _, member) = fixture(&tmp).await;
     let manifest = json!({"formatVersion":intent_core::transfer::TRANSFER_FORMAT_VERSION,
-        "creatingIntentdVersion":env!("CARGO_PKG_VERSION"),"workspaceId":"member-import",
+        "creatingIntentdVersion":intent_core::transfer::CREATING_INTENTD_VERSION,"workspaceId":"member-import",
         "createdAt":now_iso(),"tables":[],"assets":[],"attachments":[],
         "git":{"hasRepository":false,"dirtyFiles":[],"sandboxBranches":[]}});
     let started = with_caller(
@@ -1799,7 +1817,7 @@ async fn assert_member_pr_authorization_entry(flush: bool) {
             let agent = AgentId::from(agent["agent"]["id"].as_str().unwrap());
             let value = with_caller(
                 owner_caller.clone(),
-                svc.pr_monitor_start(ws.clone(), agent, 42, None),
+                svc.pr_monitor_start(ws.clone(), agent, 42, Some("o/r".into())),
             )
             .await
             .unwrap();
@@ -1927,7 +1945,11 @@ async fn member_pr_status_rejection_publishes_durable_safe_context() {
     let _error = with_caller(caller(&member), svc.pr_status(ws))
         .await
         .unwrap_err();
-    let received = tokio::time::timeout(Duration::from_secs(2), events.recv()).await;
+    let received = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        events.recv(),
+    )
+    .await;
     worker.abort();
     let _ = worker.await;
     let batch = received

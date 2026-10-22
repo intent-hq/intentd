@@ -1010,7 +1010,9 @@ exit 91
         .stderr(log);
     let mut child = GuardedChild::spawn(&mut command).unwrap();
     drop(env_lock);
-    let status = child.wait_with_timeout(Duration::from_secs(120)).unwrap();
+    let status = child
+        .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(120)))
+        .unwrap();
     drop(child); // Kill/reap a timed-out worker before inspecting or removing its files.
     let worker_log = std::fs::read_to_string(&log_path).unwrap();
     let shell_receipt = std::fs::read_to_string(root.path().join("shell-captured"));

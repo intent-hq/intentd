@@ -52,7 +52,7 @@ impl ReadBarrier {
                         let (_released, timeout) = cv
                             .wait_timeout_while(
                                 lock.lock().unwrap(),
-                                Duration::from_secs(15),
+                                intentd_test_support::test_timeout(Duration::from_secs(15)),
                                 |v| !*v,
                             )
                             .unwrap();
@@ -93,7 +93,11 @@ impl ReadBarrier {
                     reached.notify_one();
                     let (lock, cv) = &*release;
                     let (_released, timeout) = cv
-                        .wait_timeout_while(lock.lock().unwrap(), Duration::from_secs(15), |v| !*v)
+                        .wait_timeout_while(
+                            lock.lock().unwrap(),
+                            intentd_test_support::test_timeout(Duration::from_secs(15)),
+                            |v| !*v,
+                        )
                         .unwrap();
                     assert!(
                         !timeout.timed_out(),
@@ -219,9 +223,12 @@ async fn imported_owner_case(change: Change, runtime: bool) {
             json!({"workspaceId":ws,"agentId":agent,"messageId":"imported-fence"}),
         )
         .await;
-    tokio::time::timeout(Duration::from_secs(10), barrier.reached.notified())
-        .await
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        barrier.reached.notified(),
+    )
+    .await
+    .unwrap();
     let count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM agent_queue WHERE id='imported-fence'")
             .fetch_one(if after_pop {
@@ -239,10 +246,13 @@ async fn imported_owner_case(change: Change, runtime: bool) {
     match change {
         Change::Unchanged => {}
         Change::Rotate | Change::RotateAfterPop => {
-            tokio::time::timeout(Duration::from_secs(5), tokens.store_token(&fresh_token))
-                .await
-                .expect("credential lease released at pop, before persistence")
-                .unwrap();
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                tokens.store_token(&fresh_token),
+            )
+            .await
+            .expect("credential lease released at pop, before persistence")
+            .unwrap();
         }
         Change::Remove => tokens.store_token("").await.unwrap(),
         Change::RevokePersonal => {
