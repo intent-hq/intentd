@@ -22,13 +22,18 @@ Install [bazelisk](https://github.com/bazelbuild/bazelisk) as `bazel`; it reads
 | Workspace members, first-party deps, default features, build scripts, bins | `cargo metadata` | generated `crates/*/BUILD.bazel` |
 | Build commit (`system.info`, hello handshake, startup banner) | `git rev-parse HEAD` or `INTENTD_BUILD_COMMIT` | `bazel/workspace_status.sh` → `//bazel:build_commit_env` |
 
-`Cargo.lock` is the only lock. There is no crate_universe lockfile, and
-`MODULE.bazel.lock` is git-ignored: crate_universe records the absolute path
-of the `[patch]` path crate (`vendor/pprof`) in both, which makes them
-host-specific. `bazel_dep` versions are exact pins in `MODULE.bazel`. Each
-fresh checkout resolves the Cargo workspace once (about a minute). After that,
-the local `MODULE.bazel.lock` caches the result until a Cargo manifest or
-lockfile changes.
+`Cargo.lock` is the dependency lock. `MODULE.bazel.lock` is committed: it
+records the `bazel_dep` registry hashes and crate_universe's resolution of
+`Cargo.toml` + `Cargo.lock`, so a checkout with an up-to-date lock skips the
+roughly one-minute Cargo resolution. Refresh it after any Cargo manifest or
+lockfile change with `scripts/bazel-drift.sh --fix` (see "Drift guard" below).
+CI builds with `--lockfile_mode=error`, so a stale lock fails the job.
+
+crate_universe would record the `[patch]` path crate (`vendor/pprof`) by its
+absolute host path, which made the lock checkout-specific.
+`bazel/rules_rust_relative_path_crates.patch`, applied to rules_rust through
+`single_version_override` in `MODULE.bazel`, stores it relative to the
+workspace root instead. Drop the patch once rules_rust does this upstream.
 
 crate_universe also writes a `BUILD.bazel` into `vendor/pprof` while it
 resolves. That file is git-ignored, and `.bazelignore` keeps the directory out

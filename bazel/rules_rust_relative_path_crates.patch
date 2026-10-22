@@ -1,0 +1,46 @@
+# Make crate_universe record in-workspace [patch] path crates (vendor/pprof)
+# relative to the workspace root, so MODULE.bazel.lock is portable across
+# checkouts. Applied to rules_rust through single_version_override in
+# MODULE.bazel. Drop it once rules_rust stores such paths relative upstream.
+diff -ru a/crate_universe/extensions.bzl b/crate_universe/extensions.bzl
+--- a/crate_universe/extensions.bzl	2026-10-22 10:11:58.146965417 +0000
++++ b/crate_universe/extensions.bzl	2026-10-22 10:12:04.803869479 +0000
+@@ -724,6 +724,11 @@
+             crates_dir.get_child(hub_package).get_child("BUILD.bazel"),
+         )
+ 
++    # intentd patch: record in-workspace path crates relative to the workspace
++    # root so MODULE.bazel.lock carries no host-absolute paths.
++    workspace_prefix = str(nonhermetic_root_bazel_workspace_dir) + "/"
++    hub_contents = {k: v.replace(workspace_prefix, "") for k, v in hub_contents.items()}
++
+     crates_vendor_remote_repository(
+         name = cfg.name,
+         contents = hub_contents,
+@@ -795,8 +800,8 @@
+                 kwargs["generator"] = "@cargo_bazel_bootstrap//:cargo-bazel"
+             local_crate_mirror(
+                 name = crate_repo_name,
+-                options_json = json.encode(options),
+-                path = repo["Path"]["path"],
++                options_json = json.encode(options).replace(workspace_prefix, ""),
++                path = repo["Path"]["path"].removeprefix(workspace_prefix),
+                 **kwargs
+             )
+         else:
+diff -ru a/crate_universe/private/local_crate_mirror.bzl b/crate_universe/private/local_crate_mirror.bzl
+--- a/crate_universe/private/local_crate_mirror.bzl	2026-10-22 10:11:58.148965388 +0000
++++ b/crate_universe/private/local_crate_mirror.bzl	2026-10-22 10:12:04.803869479 +0000
+@@ -6,7 +6,11 @@
+ load("//rust/platform:triple.bzl", "get_host_triple")
+ 
+ def _local_crate_mirror_impl(repository_ctx):
+-    path = repository_ctx.path(repository_ctx.attr.path)
++    # intentd patch: a relative path is relative to the main workspace root.
++    if repository_ctx.attr.path.startswith("/"):
++        path = repository_ctx.path(repository_ctx.attr.path)
++    else:
++        path = repository_ctx.workspace_root.get_child(repository_ctx.attr.path)
+ 
+     host_triple = get_host_triple(repository_ctx)
+ 

@@ -7,4 +7,3 @@ coverage-summary.txt
 /bazel-*
 /user.bazelrc
 /vendor/pprof/BUILD.bazel
-/MODULE.bazel.lock

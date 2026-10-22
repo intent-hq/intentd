@@ -10,6 +10,16 @@ bazel/README.md for the workflow.
 module(name = "intentd")
 
 bazel_dep(name = "rules_rust", version = "0.74.0")
+
+# crate_universe records the [patch] path crate vendor/pprof by absolute host
+# path, which would make MODULE.bazel.lock checkout-specific. This Starlark-only
+# patch stores in-workspace path crates relative to the workspace root instead.
+single_version_override(
+    module_name = "rules_rust",
+    patch_strip = 1,
+    patches = ["//bazel:rules_rust_relative_path_crates.patch"],
+    version = "0.74.0",
+)
 bazel_dep(name = "bazel_skylib", version = "1.9.2")
 bazel_dep(name = "platforms", version = "1.1.0")
 bazel_dep(name = "rules_cc", version = "0.2.26")
