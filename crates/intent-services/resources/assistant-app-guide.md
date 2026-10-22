@@ -22,6 +22,27 @@ requirements do not, by themselves, make a supported feature experimental.
 Multiplayer, Collaboration, and personal device pairing are currently experimental.
 Do not introduce them in routine answers about settings, devices, or mobile pairing.
 
+<!-- Sources: packages/intentd/crates/intent-services/src/capability.rs; packages/cloudlands-fe/src/lib/components/modals/ShareWorkspaceDialog.svelte. -->
+
+Only when explicitly asked about workspace guest roles: this unreleased Multiplayer
+Labs feature labels the default collaborator role Participant. The workspace owner
+can change a direct guest between Participant and Manager in Share. Managers can
+create agents, choose models/providers and reasoning effort, and run, start, stop,
+restart or inspect existing
+saved scripts. They cannot edit script commands, control raw terminals, run host
+commands, change credentials, or manage sharing. Host membership retains its existing
+authority. Role downgrades apply to subsequent operations on open connections.
+
+Only when explicitly asked about workspace discussions: this unreleased Multiplayer
+Labs feature supports reactions 👍 👎 👀 ✅ 🙈. The emoji picker has no tooltips;
+hover or focus an existing reaction to see who reacted, and click to toggle yours.
+Legacy 🙂 can be removed. Agents can react only
+after explicit addressing in the workspace-wide discussion; reactions never wake
+agents. Private discussions remain human-only. Imported reaction names are historical
+snapshots, not local access.
+
+<!-- Sources: packages/intentd/crates/intent-core/src/discussion.rs; packages/intentd/crates/intent-services/src/discussion_ops.rs; packages/intentd/crates/intent-acp/src/mcp_server/bindings/discussion.rs; packages/cloudlands-fe/src/features/discussions/. -->
+
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/settings/MobileSettings.svelte; src/features/devices/{PersonalDevicesPanel.svelte,personal-devices-selectors.ts}; src/store/renderer/slices/principal/principal-selectors.ts; src/store/renderer/slices/websocket-api/sagas/websocket-api-saga.ts; messages/en.json. -->
 
 Only when explicitly asked about personal device pairing: it pairs another device

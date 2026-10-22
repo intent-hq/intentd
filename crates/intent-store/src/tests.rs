@@ -11163,6 +11163,9 @@ async fn gitlab_upgrade_from_populated_main_preserves_shipped_data_and_checksums
     }
 }
 
+#[path = "discussion_tests.rs"]
+mod discussion;
+
 /// 0162 backfills legacy rows' NULL / blank provider, model and reasoning
 /// effort from the identity their last turn ran under — fill-only, skipping
 /// rows without evidence, legacy provider aliases, malformed JSON, the
@@ -11549,4 +11552,128 @@ async fn never_saved_default_upgrade_repairs_only_metadata_history() {
     assert_eq!(replay.rows_affected(), 0, "replaying the repair is a no-op");
     store.read_pool().close().await;
     store.write_pool().close().await;
+}
+
+#[tokio::test]
+async fn guest_roles_upgrade_preserves_grants_counts_and_authority_triggers() {
+    let tmp = TempDb::new();
+    let pool = crate::connect_write(&tmp.path).await.unwrap();
+    let prefix = sqlx::migrate::Migrator {
+        migrations: std::borrow::Cow::Owned(
+            crate::MIGRATOR
+                .iter()
+                .filter(|m| m.version < 171)
+                .cloned()
+                .collect(),
+        ),
+        ..sqlx::migrate::Migrator::DEFAULT
+    };
+    prefix.run(&pool).await.unwrap();
+    sqlx::raw_sql("INSERT INTO principal(id,created_at,updated_at) VALUES('role-guest','original','original');
+        INSERT INTO workspace(id,title,branch,created_at,updated_at,repository_path,repository_owner,repository_name)
+        VALUES('role-workspace','Roles','main','original','original','/owned/repository','Owner','Project');
+        INSERT INTO workspace_member VALUES('role-workspace','role-guest','collaborator','original');")
+        .execute(&pool).await.unwrap();
+    let revision: i64 = sqlx::query_scalar("SELECT revision FROM repository_authority_revision WHERE kind='workspace_member' AND subject_id='role-workspace' AND member_id='role-guest'").fetch_one(&pool).await.unwrap();
+    pool.close().await;
+    let store = Store::open(&tmp.path).await.unwrap();
+    let ws = WorkspaceId::from("role-workspace");
+    let guest = PrincipalId::from("role-guest");
+    let owner = store.get_primary_principal().await.unwrap();
+    assert_eq!(
+        store.get_workspace_member_role(&ws, &guest).await.unwrap(),
+        Some(WorkspaceRole::Collaborator)
+    );
+    assert_eq!(
+        store.count_workspace_guests(&ws).await.unwrap().committed(),
+        1
+    );
+    assert!(store
+        .set_workspace_guest_role(&ws, &guest, WorkspaceRole::Manager, Some(&owner.id))
+        .await
+        .unwrap());
+    assert!(!store
+        .set_workspace_guest_role(&ws, &guest, WorkspaceRole::Manager, Some(&owner.id))
+        .await
+        .unwrap());
+    assert_eq!(
+        store.count_workspace_guests(&ws).await.unwrap().committed(),
+        1
+    );
+    let now: i64 = sqlx::query_scalar("SELECT revision FROM repository_authority_revision WHERE kind='workspace_member' AND subject_id='role-workspace' AND member_id='role-guest'").fetch_one(store.read_pool()).await.unwrap();
+    assert_eq!(
+        now,
+        revision + 1,
+        "only the meaningful role change advances authority"
+    );
+    assert!(matches!(
+        store
+            .set_workspace_guest_role(&ws, &owner.id, WorkspaceRole::Manager, Some(&owner.id))
+            .await,
+        Err(Error::InvalidParams(_))
+    ));
+    assert!(matches!(
+        store
+            .set_workspace_guest_role(&ws, &guest, WorkspaceRole::Collaborator, Some(&guest))
+            .await,
+        Err(Error::Forbidden(_))
+    ));
+    sqlx::query("INSERT INTO host_member(principal_id,added_at) VALUES(?,?)")
+        .bind(guest.as_str())
+        .bind(now_iso())
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        store.count_workspace_guests(&ws).await.unwrap().committed(),
+        0
+    );
+    assert!(matches!(
+        store
+            .set_workspace_guest_role(&ws, &guest, WorkspaceRole::Collaborator, Some(&owner.id))
+            .await,
+        Err(Error::HostMembershipRequired)
+    ));
+    sqlx::query("DELETE FROM host_member WHERE principal_id=?")
+        .bind(guest.as_str())
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        store.count_workspace_guests(&ws).await.unwrap().committed(),
+        1
+    );
+    store.close().await;
+    let store = Store::open(&tmp.path).await.unwrap();
+    let row = store
+        .list_workspace_members(&ws)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|m| m.principal_id == guest)
+        .unwrap();
+    assert_eq!(row.role, WorkspaceRole::Manager);
+    assert_eq!(row.added_at, "original");
+    let revoked = store.revoke_principal_access(&guest).await.unwrap();
+    assert_eq!(revoked.workspaces, vec![ws.clone()]);
+    assert_eq!(
+        store.get_workspace_member_role(&ws, &guest).await.unwrap(),
+        None
+    );
+    assert_eq!(
+        store.count_workspace_guests(&ws).await.unwrap().committed(),
+        0
+    );
+    let next = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&next, "owner trigger", false))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_workspace_member_role(&next, &owner.id)
+            .await
+            .unwrap(),
+        Some(WorkspaceRole::Owner)
+    );
 }

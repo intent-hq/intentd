@@ -149,6 +149,48 @@ impl MembershipGate {
                     .await
                     .is_ok_and(|ws| ws.membership.is_some_and(|m| m.can_manage));
         }
+        if matches!(
+            event.event_type.as_str(),
+            intent_core::events::SCRIPT_CHANGED
+                | intent_core::events::SCRIPT_OUTPUT
+                | intent_core::events::SCRIPT_STATE
+        ) {
+            // Role and purpose are checked for every delivery, never cached.
+            if role.is_none() || workspace_id.is_empty() {
+                return false;
+            }
+            let Ok(ws) = self
+                .api
+                .get_workspace(WorkspaceId::from(workspace_id))
+                .await
+            else {
+                return false;
+            };
+            let Some(membership) = ws.membership else {
+                return false;
+            };
+            if membership.can_manage {
+                return true;
+            }
+            if membership.my_role != Some(intent_core::WorkspaceRole::Manager) {
+                return false;
+            }
+            if event.event_type == intent_core::events::SCRIPT_CHANGED {
+                // Definitions accompany changes, including removal after the
+                // persisted row is gone. The event is server-authored.
+                return event.data["action"] == "guest-access-revoked"
+                    || event.data["script"]["purpose"] == "saved"
+                    || (event.data["action"] == "removed" && event.data["purpose"] == "saved");
+            }
+            let Some(id) = event.data["scriptId"].as_str() else {
+                return false;
+            };
+            return self
+                .api
+                .script_get(WorkspaceId::from(workspace_id), id.to_owned())
+                .await
+                .is_ok_and(|script| script["purpose"] == "saved");
+        }
         if intent_core::events::is_member_execution_event_type(&event.event_type) {
             // Execution/context events never use the cached visibility verdict.
             // Revocation takes effect before a socket is physically closed.

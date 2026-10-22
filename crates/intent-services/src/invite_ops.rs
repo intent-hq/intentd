@@ -650,7 +650,7 @@ impl Services {
             Some(WorkspaceRole::Owner) => Err(Error::InvalidParams(format!(
                 "the owner of workspace {workspace_id} cannot leave it"
             ))),
-            Some(WorkspaceRole::Collaborator) => {
+            Some(WorkspaceRole::Collaborator | WorkspaceRole::Manager) => {
                 let left = self
                     .store
                     .remove_workspace_guest(workspace_id, &principal_id)

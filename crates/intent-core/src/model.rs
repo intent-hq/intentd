@@ -5915,7 +5915,10 @@ impl Principal {
 #[serde(rename_all = "lowercase")]
 pub enum WorkspaceRole {
     Owner,
+    /// Participant in the UI; retain the original wire/database word.
     Collaborator,
+    /// A guest allowed to create agents and operate saved scripts, not an owner.
+    Manager,
 }
 
 impl WorkspaceRole {
@@ -5925,6 +5928,7 @@ impl WorkspaceRole {
         match self {
             WorkspaceRole::Owner => "owner",
             WorkspaceRole::Collaborator => "collaborator",
+            WorkspaceRole::Manager => "manager",
         }
     }
 }
