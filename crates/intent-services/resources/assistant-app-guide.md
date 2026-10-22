@@ -649,8 +649,9 @@ client without the user's instruction.
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/{WorkspaceLayout,MultiSelectTabbedSidebar,NoteMetadataBar}.svelte; src/lib/components/workspace/sidebar/{SidebarSectionTabs,WorkspaceSidebarRail,WorkspaceProgressCard,AddContextSection,ContextPanel,NotesPanel}.svelte; src/lib/utils/shortcut-bindings.ts; messages/en.json. -->
 
-Use the horizontal icon tabs above the expanded sidebar's flat panel to switch
-sections. **Agents** opens by default; your selected section is remembered.
+Use the icon tabs above the expanded sidebar's flat panel to switch sections.
+Hover over an icon for its section name; scroll the row horizontally when space
+is tight. **Agents** opens by default; your selected section is remembered.
 When collapsed, the sidebar leaves a slim vertical icon rail. Hover over or focus
 the rail to reveal a floating sidebar without moving your content. Use the visible
 sidebar toggle to pin it open or collapse it. **Toggle Sidebar** still uses
