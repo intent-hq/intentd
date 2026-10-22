@@ -820,6 +820,21 @@ async function handlePrompt(id, params) {
     : active.toolCall
       ? [active.toolCall]
       : [];
+  if (typeof active.attachmentRetrievalLog === 'string') {
+    const blocks = Array.isArray(params?.prompt) ? params.prompt : [];
+    const notice = blocks.find((block) => block?.text?.startsWith('[Attachment:'));
+    const attachmentId = notice?.text?.match(/attachmentId: ([^.]+)\./)?.[1];
+    if (!attachmentId) throw new Error('missing attachment notice');
+    const retrieval = await callWorkspaceTool({
+      name: 'workspace_api',
+      arguments: {
+        code: `return await ws.file.getAttachment(${JSON.stringify(attachmentId)})`,
+        summary: 'Retrieve delivered source attachment',
+      },
+    });
+    fs.appendFileSync(active.attachmentRetrievalLog,
+      JSON.stringify({ attachmentId, result: retrieval }) + '\n');
+  }
   const toolResults = [];
   for (const toolCall of toolCalls) {
     try {
