@@ -310,6 +310,18 @@ class RunnerPolicy(unittest.TestCase):
                 self.assertEqual(violations(f'jobs:\n  {job}:\n    runs-on: {label}\n', filename), [job])
             self.assertEqual(violations(f'jobs:\n  {job}:\n    runs-on: ubuntu-latest\n', filename), [])
 
+    def test_callback_fixture_jobs_clear_node_options(self):
+        # WarpBuild runners preset NODE_OPTIONS and the fixture provisioner refuses it,
+        # which ejected merge-queue PRs once coverage jobs burst there (intentd#2595).
+        import yaml
+        doc = yaml.safe_load((ROOT / '.github/workflows/ci.yml').read_text())
+        builders = [name for name, job in doc['jobs'].items()
+                    if any('scripts/prepare-acp-callback-fixture.py' in (step.get('run') or '') for step in job.get('steps', []))]
+        self.assertTrue(builders)
+        for name in builders:
+            with self.subTest(job=name):
+                self.assertEqual(doc['jobs'][name].get('env', {}).get('NODE_OPTIONS'), '')
+
     def test_routing_behavior(self):
         subprocess.run(['node', '--test', str(ROOT / 'scripts/runner-policy.test.cjs')], check=True)
 
