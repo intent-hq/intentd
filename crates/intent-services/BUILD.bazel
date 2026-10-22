@@ -104,6 +104,7 @@ rust_library(
 
 rust_test(
     name = "lib_test",
+    timeout = "long",
     crate = ":intent_services_dev",
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
@@ -161,6 +162,7 @@ rust_test(
 
 rust_test(
     name = "lib_test_serial",
+    timeout = "long",
     crate = ":intent_services_dev",
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],
@@ -202,6 +204,7 @@ rust_test(
 # manual: needs INTENT_ACP_CALLBACK_ADAPTER_FIXTURE, TRANSFER_SELECTION_FIXTURE_ROOT from the client environment
 rust_test(
     name = "lib_test_fixture",
+    timeout = "long",
     crate = ":intent_services_dev",
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro_dev = True) + ["//crates/intent-test-macros:intent_test_macros_dev"],

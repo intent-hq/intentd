@@ -66,6 +66,7 @@ rust_proc_macro(
 
 rust_test(
     name = "lib_test",
+    timeout = "long",
     crate = ":intent_test_macros_dev",
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro_dev = True),

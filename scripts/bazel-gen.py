@@ -96,12 +96,10 @@ ROOT_TEST_DATA_FILES = [
 # time (the source lints walk the workspace), so it gets every crate's .rs files
 # as data. Other tests get only non-Rust files: their own crate's sources are
 # already inputs of the test binary.
-# The real execroot, substituted by rules_rust's process wrapper (`$$` escapes
-# Make-variable expansion). Generated files (the test binaries, the
-# toolchain's cargo) live below it.
-EXEC_ROOT = "$${exec_root}"
 # Test-graph targets (`_dev` libraries, test binaries) compile and run outside
-# the sandbox; see test_env in render_build.
+# the sandbox; see test_env in render_build. rules_rust expands `$(execpath)`
+# in rustc_env to an absolute ${pwd}-based path, which outside the sandbox is
+# the real execroot, so CARGO_BIN_EXE_* and CARGO stay valid at run time.
 TEST_GRAPH_TAGS = ["no-sandbox", "test-graph"]
 CARGO_FILES = "@rules_rust//rust/toolchain:current_cargo_files"
 
@@ -608,7 +606,7 @@ def render_build(ws: Workspace, package: dict, nextest: NextestPolicy) -> str:
             # Cargo sets CARGO for every compile; tests that run `cargo
             # metadata` get the toolchain's cargo.
             data.append(CARGO_FILES)
-            attrs["rustc_env"] = (attrs.get("rustc_env") or {}) | {"CARGO": f"{EXEC_ROOT}/$(execpath {CARGO_FILES})"}
+            attrs["rustc_env"] = (attrs.get("rustc_env") or {}) | {"CARGO": f"$(execpath {CARGO_FILES})"}
         fixtures = FIXTURE_TESTS.get(name, []) if binary_id == name else []
         fixture_patterns = sorted({p for p, _ in fixtures})
         serial = [
@@ -623,6 +621,9 @@ def render_build(ws: Workspace, package: dict, nextest: NextestPolicy) -> str:
             rules.append(Rule(
                 "rust_test",
                 name=target_name + suffix,
+                # Bazel times out a whole test binary (nextest kills single tests
+                # at 180 s). Unit-test binaries hold thousands of tests.
+                timeout="long" if "::" not in binary_id or "::bin/" in binary_id else None,
                 **attrs,
                 compile_data=Raw('["//:workspace_test_data"]'),
                 data=data,
@@ -686,7 +687,7 @@ def render_build(ws: Workspace, package: dict, nextest: NextestPolicy) -> str:
         )
 
     bin_env = {
-        f"CARGO_BIN_EXE_{b['name']}": f"{EXEC_ROOT}/$(execpath :{b['name']}_test_bin)" for b in bins
+        f"CARGO_BIN_EXE_{b['name']}": f"$(execpath :{b['name']}_test_bin)" for b in bins
     }
     for test in sorted(tests, key=lambda t: t["name"]):
         root = relative_src(package, test)

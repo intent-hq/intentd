@@ -152,6 +152,7 @@ copy_file(
 
 rust_test(
     name = "lib_test",
+    timeout = "long",
     crate = ":intentd_sitter_dev",
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro_dev = True),
@@ -170,6 +171,7 @@ rust_test(
 
 rust_test(
     name = "bin_intentd-sitter_test",
+    timeout = "long",
     srcs = glob(["src/**/*.rs"]),
     crate_root = "src/main.rs",
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
@@ -198,7 +200,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True),
     rustc_env = {
-        "CARGO_BIN_EXE_intentd-sitter": "$${exec_root}/$(execpath :intentd-sitter_test_bin)",
+        "CARGO_BIN_EXE_intentd-sitter": "$(execpath :intentd-sitter_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intentd-test-support:intentd_test_support_dev",
@@ -226,7 +228,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True),
     rustc_env = {
-        "CARGO_BIN_EXE_intentd-sitter": "$${exec_root}/$(execpath :intentd-sitter_test_bin)",
+        "CARGO_BIN_EXE_intentd-sitter": "$(execpath :intentd-sitter_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intentd-test-support:intentd_test_support_dev",
@@ -254,7 +256,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True),
     rustc_env = {
-        "CARGO_BIN_EXE_intentd-sitter": "$${exec_root}/$(execpath :intentd-sitter_test_bin)",
+        "CARGO_BIN_EXE_intentd-sitter": "$(execpath :intentd-sitter_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intentd-test-support:intentd_test_support_dev",
@@ -282,7 +284,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True),
     rustc_env = {
-        "CARGO_BIN_EXE_intentd-sitter": "$${exec_root}/$(execpath :intentd-sitter_test_bin)",
+        "CARGO_BIN_EXE_intentd-sitter": "$(execpath :intentd-sitter_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intentd-test-support:intentd_test_support_dev",
@@ -310,7 +312,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True),
     rustc_env = {
-        "CARGO_BIN_EXE_intentd-sitter": "$${exec_root}/$(execpath :intentd-sitter_test_bin)",
+        "CARGO_BIN_EXE_intentd-sitter": "$(execpath :intentd-sitter_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intentd-test-support:intentd_test_support_dev",
@@ -338,7 +340,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True),
     rustc_env = {
-        "CARGO_BIN_EXE_intentd-sitter": "$${exec_root}/$(execpath :intentd-sitter_test_bin)",
+        "CARGO_BIN_EXE_intentd-sitter": "$(execpath :intentd-sitter_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intentd-test-support:intentd_test_support_dev",
@@ -366,7 +368,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True),
     rustc_env = {
-        "CARGO_BIN_EXE_intentd-sitter": "$${exec_root}/$(execpath :intentd-sitter_test_bin)",
+        "CARGO_BIN_EXE_intentd-sitter": "$(execpath :intentd-sitter_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intentd-test-support:intentd_test_support_dev",
@@ -394,7 +396,7 @@ rust_test(
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro = True, proc_macro_dev = True),
     rustc_env = {
-        "CARGO_BIN_EXE_intentd-sitter": "$${exec_root}/$(execpath :intentd-sitter_test_bin)",
+        "CARGO_BIN_EXE_intentd-sitter": "$(execpath :intentd-sitter_test_bin)",
     },
     deps = dev_crate_deps(normal = True, normal_dev = True) + [
         "//crates/intentd-test-support:intentd_test_support_dev",

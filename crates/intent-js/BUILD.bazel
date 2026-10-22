@@ -76,6 +76,7 @@ rust_library(
 
 rust_test(
     name = "lib_test",
+    timeout = "long",
     crate = ":intent_js_dev",
     aliases = dev_aliases(normal_dev = True, proc_macro_dev = True),
     proc_macro_deps = dev_crate_deps(proc_macro_dev = True),
