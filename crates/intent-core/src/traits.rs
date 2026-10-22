@@ -5334,6 +5334,94 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// Human-only conversation history with participant authorization.
+    fn discussion_list(
+        &self,
+        workspace_id: WorkspaceId,
+        conversation_id: String,
+        before_sequence: Option<i64>,
+        after_sequence: Option<i64>,
+        limit: u32,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (
+            workspace_id,
+            conversation_id,
+            before_sequence,
+            after_sequence,
+            limit,
+        );
+        Box::pin(async { Err(Error::Internal("discussion.list not implemented".into())) })
+    }
+    /// Atomic first send or participant-authorized append with exact retry semantics.
+    fn discussion_send(
+        &self,
+        workspace_id: WorkspaceId,
+        message_id: String,
+        body: String,
+        target: crate::discussion::DiscussionTarget,
+    ) -> BoxFuture<'_, Result<crate::discussion::DiscussionSendResult>> {
+        let _ = (workspace_id, message_id, body, target);
+        Box::pin(async { Err(Error::Internal("discussion.send not implemented".into())) })
+    }
+    /// Human-only compare-and-swap control of an explicitly addressed invocation.
+    fn discussion_control_agent(
+        &self,
+        request: crate::discussion::DiscussionAgentControl,
+        retry: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (request, retry);
+        Box::pin(async { Err(Error::Internal("discussion control not implemented".into())) })
+    }
+    /// Set one human's desired reaction state; retries are no-ops.
+    fn discussion_react(
+        &self,
+        workspace_id: WorkspaceId,
+        conversation_id: String,
+        message_id: String,
+        reaction: String,
+        active: bool,
+    ) -> BoxFuture<'_, Result<crate::discussion::DiscussionReactionState>> {
+        let _ = (workspace_id, conversation_id, message_id, reaction, active);
+        Box::pin(async { Err(Error::Internal("discussion.react not implemented".into())) })
+    }
+    /// Bounded participant-only discovery.
+    fn discussion_conversations(
+        &self,
+        workspace_id: WorkspaceId,
+        before_id: Option<String>,
+        limit: u32,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, before_id, limit);
+        Box::pin(async {
+            Err(Error::Internal(
+                "discussion.conversations not implemented".into(),
+            ))
+        })
+    }
+    /// Bounded offline-capable effective member picker.
+    fn discussion_recipients(
+        &self,
+        workspace_id: WorkspaceId,
+        query: String,
+        after_id: Option<String>,
+        limit: u32,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, query, after_id, limit);
+        Box::pin(async {
+            Err(Error::Internal(
+                "discussion.recipients not implemented".into(),
+            ))
+        })
+    }
+    /// Delivery-time participant projection, including owners. Fail closed by default.
+    fn discussion_project_event(
+        &self,
+        event: crate::Event,
+    ) -> BoxFuture<'_, Result<Option<crate::Event>>> {
+        let _ = event;
+        Box::pin(async { Ok(None) })
+    }
+
     /// `workspace.members.list` (multiplayer w3): the members of a workspace
     /// → `{ members: [{ principalId, login?, displayName?, avatarUrl?, role,
     /// addedAt }], guestCount, guestLimit }`, owners first. `guestCount` is
@@ -5369,6 +5457,22 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::workspace_members_add not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Owner-only direct guest role change. Owner and inherited host roles
+    /// are immutable here. Emits workspace:updated only when changed.
+    fn workspace_members_set_role(
+        &self,
+        workspace_id: WorkspaceId,
+        principal_id: PrincipalId,
+        role: crate::WorkspaceRole,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, principal_id, role);
+        Box::pin(async {
+            Err(Error::Internal(
+                "workspace_members_set_role not implemented".into(),
             ))
         })
     }
@@ -5451,8 +5555,8 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `presence.update({ focus: [{ workspaceId, agentId?, noteId? }],
-    /// typing?: { agentId } })`: replace the connection's focus set (sent
-    /// whole) and typing target → `{ ok: true, typingSource }`, where
+    /// typing?: { agentId } | null, discussionTyping?: { workspaceId } | null })`:
+    /// replace the connection's focus set (sent whole) and typing targets → `{ ok: true, typingSource }`, where
     /// `typingSource` is the connection's own opaque, daemon-minted typing
     /// source handle (the `source` its typing entry carries in
     /// `presence:changed`, so the client can suppress only itself). Every
@@ -5463,7 +5567,9 @@ pub trait WorkspaceApi: Send + Sync {
     /// unchanged. Requires
     /// a hello'd connection; every focused workspace and the typing agent's
     /// workspace must be a member workspace (`NotFound` otherwise). Publishes
-    /// `presence:changed` to each workspace whose aggregate changed.
+    /// `presence:changed` to each workspace whose aggregate changed. Discussion
+    /// typing requires a human member in its target workspace, shares the
+    /// connection source with a separate counter, and clears when omitted or null.
     fn presence_update(
         &self,
         connection_id: String,
@@ -5482,7 +5588,9 @@ pub trait WorkspaceApi: Send + Sync {
     /// with the same member rows the event carries — for a client that
     /// attached its event subscription after its hello (or a second
     /// connection of an already-online principal, whose hello publishes
-    /// nothing). Member+; a non-member sees `NotFound`.
+    /// nothing). Member+; a non-member sees `NotFound`. Human rows include
+    /// `discussionTyping: [{ source, since, pulse }]` (empty when idle);
+    /// agent/daemon snapshots omit that field.
     fn presence_snapshot(
         &self,
         workspace_id: WorkspaceId,

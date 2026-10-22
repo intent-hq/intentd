@@ -1817,6 +1817,145 @@ async fn permission_delivery_rechecks_guest_management_without_visibility_cache(
     .await;
 }
 
+#[tokio::test]
+async fn guest_roles_script_delivery_rechecks_downgrade_without_visibility_cache() {
+    use intent_core::{BoxFuture, HostRole, Workspace, WorkspaceMembership, WorkspaceRole};
+    use std::sync::atomic::AtomicBool;
+
+    struct PermissionApi {
+        manages: AtomicBool,
+        manager: AtomicBool,
+        role: std::sync::Mutex<Option<HostRole>>,
+    }
+    impl WorkspaceApi for PermissionApi {
+        fn principal_host_role(
+            &self,
+            _: PrincipalId,
+        ) -> BoxFuture<'_, intent_core::Result<HostRole>> {
+            let role = *self.role.lock().unwrap();
+            Box::pin(
+                async move { role.ok_or_else(|| intent_core::Error::NotFound("revoked".into())) },
+            )
+        }
+        fn script_get(
+            &self,
+            _: WorkspaceId,
+            id: String,
+        ) -> BoxFuture<'_, intent_core::Result<Value>> {
+            Box::pin(async move {
+                Ok(json!({"purpose": if id == "saved" { "saved" } else { "oneOff" }}))
+            })
+        }
+        fn get_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, intent_core::Result<Workspace>> {
+            let manages = self.manages.load(Ordering::SeqCst);
+            let scoped_operator = self.manager.load(Ordering::SeqCst);
+            Box::pin(async move {
+                if id.as_str() != "owned" {
+                    return Err(intent_core::Error::NotFound("hidden".into()));
+                }
+                Ok(Workspace {
+                    id,
+                    membership: Some(WorkspaceMembership {
+                        can_manage: manages,
+                        owner_principal_id: None,
+                        my_role: Some(if manages {
+                            WorkspaceRole::Owner
+                        } else if scoped_operator {
+                            WorkspaceRole::Manager
+                        } else {
+                            WorkspaceRole::Collaborator
+                        }),
+                        member_count: 1,
+                        open_invite_count: 0,
+                    }),
+                    ..intent_core::chief_workspace()
+                })
+            })
+        }
+    }
+    let api = Arc::new(PermissionApi {
+        manages: AtomicBool::new(false),
+        manager: AtomicBool::new(true),
+        role: std::sync::Mutex::new(Some(HostRole::Guest)),
+    });
+    let dyn_api: Arc<dyn WorkspaceApi> = api.clone();
+    let caller = Caller::Wire {
+        principal_id: PrincipalId::new(),
+        host_role: HostRole::Guest,
+    };
+    crate::context::with_request_context(true, Some(caller), async {
+        let mut gate = MembershipGate::for_current_caller(&dyn_api).unwrap();
+        let mut ev = Event {
+            id: "permission-event".into(),
+            workspace_id: WorkspaceId::from("owned"),
+            timestamp: intent_core::now_iso(),
+            event_type: intent_core::events::AGENT_PERMISSION_REQUEST.into(),
+            actor: EventActor::default(),
+            session_id: None,
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            data: json!({"requestId":"secret", "workspaceId":"owned", "canManage":true}),
+        };
+        assert!(
+            !gate.allows(&ev).await,
+            "Managers do not inherit permission approval"
+        );
+        for ty in [
+            intent_core::events::SCRIPT_CHANGED,
+            intent_core::events::SCRIPT_OUTPUT,
+            intent_core::events::SCRIPT_STATE,
+        ] {
+            ev.event_type = ty.into();
+            ev.data = json!({"scriptId":"one-off","script":{"purpose":"oneOff"}});
+            assert!(!gate.allows(&ev).await, "one-off script events are private");
+            ev.data = json!({"scriptId":"saved","script":{"purpose":"saved"}});
+            assert!(gate.allows(&ev).await);
+            api.manager.store(false, Ordering::SeqCst);
+            assert!(
+                !gate.allows(&ev).await,
+                "downgrade without an event invalidation must revoke output"
+            );
+            api.manager.store(true, Ordering::SeqCst);
+            assert!(gate.allows(&ev).await);
+            ev.workspace_id = WorkspaceId::from("unrelated");
+            assert!(!gate.allows(&ev).await);
+            ev.workspace_id = WorkspaceId::from("owned");
+        }
+        ev.event_type = intent_core::events::SCRIPT_CHANGED.into();
+        ev.data = json!({"scriptId":"removed", "action":"removed", "purpose":"oneOff"});
+        assert!(!gate.allows(&ev).await);
+        ev.data["purpose"] = json!("saved");
+        assert!(
+            gate.allows(&ev).await,
+            "saved removal invalidates cached rows"
+        );
+        api.manager.store(false, Ordering::SeqCst);
+        assert!(!gate.allows(&ev).await);
+        api.manager.store(true, Ordering::SeqCst);
+        ev.data = json!({"scriptId":"formerly-saved", "action":"guest-access-revoked"});
+        assert!(
+            gate.allows(&ev).await,
+            "only the invalidation is delivered after reclassification"
+        );
+        api.manager.store(false, Ordering::SeqCst);
+        assert!(!gate.allows(&ev).await);
+        api.manager.store(true, Ordering::SeqCst);
+        for ty in [
+            intent_core::events::TERMINAL_DATA,
+            intent_core::events::HOST_EXEC_STDOUT,
+            intent_core::events::AGENT_PERMISSION_REQUEST,
+        ] {
+            ev.event_type = ty.into();
+            assert!(!gate.allows(&ev).await);
+        }
+        ev.event_type = intent_core::events::SCRIPT_OUTPUT.into();
+        *api.role.lock().unwrap() = None;
+        assert!(!gate.allows(&ev).await, "revoked principal fails closed");
+    })
+    .await;
+}
+
 /// Frozen monorepo contract: 531eb9ee2f231f383fcd192f7c33b022bb795ead.
 /// Keep this byte-for-byte corpus shared with the frontend consumer.
 #[test]

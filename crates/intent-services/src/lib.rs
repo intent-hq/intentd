@@ -88,6 +88,9 @@ mod delete_grace;
 mod delivery_tasks;
 mod device_ops;
 mod discovery_cache;
+mod discussion_activity;
+mod discussion_delivery;
+mod discussion_ops;
 mod disk_usage;
 mod drafts;
 mod enhance_ops;
@@ -1278,6 +1281,7 @@ pub struct Services {
     /// connections (multiplayer w4).
     principal_revocations: invite_ops::PrincipalRevocations,
     human_instruction_authority: Arc<tokio::sync::RwLock<()>>,
+    discussion_control_gates: Arc<agent_ops::AgentRetirementGates>,
     #[cfg(test)]
     invite_create_commit_pause: Arc<member_removal::MutationBarrier>,
     #[cfg(test)]
@@ -1812,6 +1816,7 @@ impl Services {
             invite_nonces: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             invite_nonce_permits: invite_ops::new_nonce_permits(),
             human_instruction_authority: Arc::new(tokio::sync::RwLock::new(())),
+            discussion_control_gates: Arc::default(),
             #[cfg(test)]
             invite_create_commit_pause: Arc::new(member_removal::MutationBarrier::default()),
             #[cfg(test)]
@@ -19016,6 +19021,12 @@ impl WorkspaceApi for Services {
             // (§5.1); it is included as true/false when the probe ran and
             // omitted when it could not run (presence-detected by clients).
             let mut caps = serde_json::Map::new();
+            caps.insert("discussionConversations".into(), serde_json::json!(1));
+            caps.insert("discussionMessageActions".into(), serde_json::json!(1));
+            caps.insert("discussionReactions".into(), serde_json::json!(1));
+            caps.insert("workspaceGuestRoles".into(), serde_json::json!(1));
+            caps.insert("discussionAgentMessaging".into(), serde_json::json!(1));
+            caps.insert("discussionAgentActivity".into(), serde_json::json!(1));
             if let Some(cow_supported) = self.compute_cow_supported().await {
                 caps.insert("cowSupported".to_string(), serde_json::json!(cow_supported));
             }
@@ -20956,7 +20967,7 @@ impl WorkspaceApi for Services {
     fn script_list(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
         Box::pin(async move {
-            self.require_workspace_manager(&workspace_id, "script.list")
+            self.require_workspace_operator(&workspace_id, "script.list")
                 .await?;
             mgr.list(&workspace_id).await
         })
@@ -20969,7 +20980,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
         Box::pin(async move {
-            self.require_workspace_manager(&workspace_id, "script.list")
+            self.require_workspace_operator(&workspace_id, "script.list")
                 .await?;
             mgr.list_filtered(&workspace_id, archive).await
         })
@@ -20981,7 +20992,7 @@ impl WorkspaceApi for Services {
         options: serde_json::Value,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            self.require_workspace_manager(&workspace_id, "script.list")
+            self.require_workspace_operator(&workspace_id, "script.list")
                 .await?;
             let options = intent_core::script_lists::ScriptListOptions::parse(&options, false)?;
             if options.summary {
@@ -20999,9 +21010,11 @@ impl WorkspaceApi for Services {
         script_id: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            self.require_workspace_manager(&workspace_id, "script.get")
+            self.require_saved_script_operator(&workspace_id, &script_id, "script.get")
                 .await?;
-            self.script_manager().get(&workspace_id, &script_id).await
+            let mgr = self.script_manager();
+            let _read = mgr.scoped_read_guard(&workspace_id, &script_id).await?;
+            mgr.get(&workspace_id, &script_id).await
         })
     }
     fn script_monitor_list_view(
@@ -21169,7 +21182,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
         Box::pin(async move {
-            self.require_workspace_manager(&workspace_id, "script.start")
+            self.require_saved_script_operator(&workspace_id, &script_id, "script.start")
                 .await?;
             mgr.start(&workspace_id, &script_id).await
         })
@@ -21182,7 +21195,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
         Box::pin(async move {
-            self.require_workspace_manager(&workspace_id, "script.stop")
+            self.require_saved_script_operator(&workspace_id, &script_id, "script.stop")
                 .await?;
             mgr.stop(&workspace_id, &script_id).await
         })
@@ -21195,7 +21208,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
         Box::pin(async move {
-            self.require_workspace_manager(&workspace_id, "script.restart")
+            self.require_saved_script_operator(&workspace_id, &script_id, "script.restart")
                 .await?;
             mgr.restart(&workspace_id, &script_id).await
         })
@@ -21211,9 +21224,10 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
         Box::pin(async move {
-            self.require_workspace_manager(&workspace_id, "script.output")
+            self.require_saved_script_operator(&workspace_id, &script_id, "script.output")
                 .await?;
             mgr.ensure_known(&workspace_id, &script_id).await?;
+            let _read = mgr.scoped_read_guard(&workspace_id, &script_id).await?;
             mgr.output(
                 &workspace_id,
                 &script_id,
@@ -21232,9 +21246,10 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
         Box::pin(async move {
-            self.require_workspace_manager(&workspace_id, "script.status")
+            self.require_saved_script_operator(&workspace_id, &script_id, "script.status")
                 .await?;
             mgr.ensure_known(&workspace_id, &script_id).await?;
+            let _read = mgr.scoped_read_guard(&workspace_id, &script_id).await?;
             mgr.status(&workspace_id, &script_id)
         })
     }
@@ -21248,10 +21263,15 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
         Box::pin(async move {
-            self.require_workspace_manager(&workspace_id, "script.run")
+            self.require_saved_script_operator(&workspace_id, &script_id, "script.run")
                 .await?;
-            mgr.run(&workspace_id, &script_id, max_lines, timeout_seconds)
-                .await
+            let result = mgr
+                .run(&workspace_id, &script_id, max_lines, timeout_seconds)
+                .await?;
+            // A command may finish after the owner downgraded this open socket.
+            self.require_saved_script_operator(&workspace_id, &script_id, "script.run")
+                .await?;
+            Ok(result)
         })
     }
 
@@ -31181,8 +31201,28 @@ impl WorkspaceApi for Services {
             // background flag); lifecycle, session, model, prompt, task and
             // attachment fields are the owner's.
             if !capability::collaborator_editable_agent_update(&changes) {
-                self.require_agent_owner(&agent_id, "agent.update (protected fields)")
+                let model_preferences = changes.as_object().is_some_and(|fields| {
+                    fields.keys().all(|key| {
+                        [
+                            "name",
+                            "nameExplicitlySet",
+                            "isBackground",
+                            "reasoningEffort",
+                        ]
+                        .contains(&key.as_str())
+                    })
+                });
+                if model_preferences {
+                    let workspace_id = self.agent_workspace(&agent_id).await?;
+                    self.require_workspace_operator(
+                        &workspace_id,
+                        "agent.update (model preferences)",
+                    )
                     .await?;
+                } else {
+                    self.require_agent_owner(&agent_id, "agent.update (protected fields)")
+                        .await?;
+                }
             }
             self.agent_update_op(agent_id, changes).await
         })
@@ -31326,7 +31366,34 @@ impl WorkspaceApi for Services {
         extra: intent_core::AgentCreateExtra,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         self.execution_call(async move {
-            self.require_member(&workspace_id).await?;
+            let manager = self
+                .require_workspace_operator(&workspace_id, "agent.create")
+                .await?;
+            if manager
+                && (parent_agent_id.is_some()
+                    || extra.workspace_path.is_some()
+                    || extra.workspace_context.is_some()
+                    || extra.agent_type.is_some()
+                    || extra.metadata.as_ref().is_some_and(|m| {
+                        !m.as_object().is_some_and(|o| {
+                            o.keys().all(|k| {
+                                [
+                                    "initialMessage",
+                                    "contextReferences",
+                                    "contextRefs",
+                                    "imageBlocks",
+                                    "fileBlocks",
+                                    "isBackground",
+                                ]
+                                .contains(&k.as_str())
+                            })
+                        })
+                    }))
+            {
+                return Err(Error::Forbidden(
+                    "agent.create protected configuration requires the workspace owner".into(),
+                ));
+            }
             if let Some(model) = model.as_deref() {
                 reject_compound_model("model", model)?;
             }
@@ -34622,6 +34689,93 @@ impl WorkspaceApi for Services {
 
     // `workspace.members.*` (multiplayer w3) — see `capability`.
 
+    fn discussion_list(
+        &self,
+        workspace_id: WorkspaceId,
+        conversation_id: String,
+        before_sequence: Option<i64>,
+        after_sequence: Option<i64>,
+        limit: u32,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.discussion_history_op(
+                &workspace_id,
+                &conversation_id,
+                before_sequence,
+                after_sequence,
+                limit,
+            )
+            .await
+        })
+    }
+    fn discussion_send(
+        &self,
+        workspace_id: WorkspaceId,
+        message_id: String,
+        body: String,
+        target: intent_core::discussion::DiscussionTarget,
+    ) -> BoxFuture<'_, Result<intent_core::discussion::DiscussionSendResult>> {
+        Box::pin(async move {
+            self.discussion_send_to_op(&workspace_id, &message_id, &body, &target)
+                .await
+        })
+    }
+    fn discussion_control_agent(
+        &self,
+        request: intent_core::discussion::DiscussionAgentControl,
+        retry: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.discussion_control_op(request, retry))
+    }
+    fn discussion_react(
+        &self,
+        workspace_id: WorkspaceId,
+        conversation_id: String,
+        message_id: String,
+        reaction: String,
+        active: bool,
+    ) -> BoxFuture<'_, Result<intent_core::discussion::DiscussionReactionState>> {
+        Box::pin(async move {
+            self.discussion_react_op(
+                &workspace_id,
+                &conversation_id,
+                &message_id,
+                &reaction,
+                active,
+            )
+            .await
+        })
+    }
+    fn discussion_conversations(
+        &self,
+        workspace_id: WorkspaceId,
+        before_id: Option<String>,
+        limit: u32,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.discussion_conversations_op(&workspace_id, before_id.as_deref(), limit)
+                .await
+        })
+    }
+    fn discussion_recipients(
+        &self,
+        workspace_id: WorkspaceId,
+        query: String,
+        after_id: Option<String>,
+        limit: u32,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.discussion_recipients_op(&workspace_id, &query, after_id.as_deref(), limit)
+                .await
+        })
+    }
+    fn discussion_project_event(
+        &self,
+        event: intent_core::Event,
+    ) -> BoxFuture<'_, Result<Option<intent_core::Event>>> {
+        Box::pin(async move { self.discussion_project_event_op(event).await })
+    }
+
     fn workspace_members_list(
         &self,
         workspace_id: WorkspaceId,
@@ -34636,6 +34790,18 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             self.workspace_members_add_op(&workspace_id, &principal_id)
+                .await
+        })
+    }
+
+    fn workspace_members_set_role(
+        &self,
+        workspace_id: WorkspaceId,
+        principal_id: intent_core::PrincipalId,
+        role: intent_core::WorkspaceRole,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.workspace_members_set_role_op(&workspace_id, &principal_id, role)
                 .await
         })
     }
