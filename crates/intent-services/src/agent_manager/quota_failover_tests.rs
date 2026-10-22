@@ -523,42 +523,81 @@ async fn non_quota_failures_never_fail_over() {
     assert!(notices(&fx.messages().await, "provider_failover").is_empty());
 }
 
-/// Claude Code's own limit errors fail over (intent-hq/intent#7615). These
-/// are the exact payloads claude-agent-acp returned for a spent weekly limit
-/// and a spent monthly spend cap: the wording sits in `message` and `data`
-/// only carries `{"errorKind":"rate_limit"}` — no 429, no `rate_limit_error`.
+/// Claude Code's own limit errors fail over (intent-hq/intent#7615): the
+/// exact payloads claude-agent-acp returned, with the wording in `message`
+/// and only `{"errorKind":"rate_limit"}` in `data` — no 429, no
+/// `rate_limit_error`. A Default agent switches to its backup profile.
+async fn assert_claude_limit_fails_over(message: &str) {
+    let fx = Fixture::new(json!({
+        "promptRpcError": {
+            "code": -32603,
+            "message": message,
+            "data": { "errorKind": "rate_limit" },
+        },
+        "promptRpcErrorAttempts": 1,
+        "response": "answered on the backup",
+    }))
+    .await;
+    let first = fx.profile("First", true).await;
+
+    let events = fx.send("please answer").await;
+
+    assert!(of_type(&events, "agent:failed").is_empty(), "{events:#?}");
+    let row = fx.row().await;
+    assert_eq!(row.provider.as_deref(), Some(first.as_str()), "{message}");
+    assert_eq!(row.status, AgentStatus::RuntimeIdle);
+    assert_eq!(
+        notices(&fx.messages().await, "provider_failover").len(),
+        1,
+        "{message}"
+    );
+}
+
 #[intent_test_macros::daemon_test]
-async fn claude_code_weekly_and_spend_limit_errors_fail_over_to_the_backup() {
-    for message in [
+async fn claude_code_weekly_limit_error_fails_over_to_the_backup() {
+    assert_claude_limit_fails_over(
         "Internal error: You've hit your weekly limit · resets Oct 27, 11am (UTC)",
+    )
+    .await;
+}
+
+#[intent_test_macros::daemon_test]
+async fn claude_code_monthly_spend_limit_error_fails_over_to_the_backup() {
+    assert_claude_limit_fails_over(
         "Internal error: You've hit your monthly spend limit · raise it at \
          https://claude.ai/settings/usage?from=cc_cli_limit_message · your weekly limit \
          resets Oct 27, 11am (UTC)",
-    ] {
-        let fx = Fixture::new(json!({
-            "promptRpcError": {
-                "code": -32603,
-                "message": message,
-                "data": { "errorKind": "rate_limit" },
-            },
-            "promptRpcErrorAttempts": 1,
-            "response": "answered on the backup",
-        }))
-        .await;
-        let first = fx.profile("First", true).await;
+    )
+    .await;
+}
 
-        let events = fx.send("please answer").await;
+/// A limit that is not the account's allowance (here the context window,
+/// phrased like Claude Code's limit messages) never switches the account,
+/// even with a backup saved.
+#[intent_test_macros::daemon_test]
+async fn a_context_length_limit_never_fails_over() {
+    let fx = Fixture::new(json!({
+        "promptRpcError": {
+            "code": -32603,
+            "message": "Internal error: You've reached your maximum context length",
+            "data": { "errorKind": "invalid_request" },
+        },
+        "response": "unreached",
+    }))
+    .await;
+    let _first = fx.profile("First", true).await;
 
-        assert!(of_type(&events, "agent:failed").is_empty(), "{events:#?}");
-        let row = fx.row().await;
-        assert_eq!(row.provider.as_deref(), Some(first.as_str()), "{message}");
-        assert_eq!(row.status, AgentStatus::RuntimeIdle);
-        assert_eq!(
-            notices(&fx.messages().await, "provider_failover").len(),
-            1,
-            "{message}"
-        );
-    }
+    let events = fx.send("please answer").await;
+
+    let failed = of_type(&events, "agent:failed");
+    assert_eq!(failed.len(), 1, "{events:#?}");
+    assert!(
+        failed[0].data.get("errorCode").is_none(),
+        "{:?}",
+        failed[0].data
+    );
+    assert_eq!(fx.row().await.provider.as_deref(), Some("claude-code"));
+    assert!(notices(&fx.messages().await, "provider_failover").is_empty());
 }
 
 /// A quota rejection at session setup (`session/new`, the spawn-attempt

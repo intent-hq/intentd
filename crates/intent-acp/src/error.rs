@@ -275,30 +275,33 @@ const QUOTA_MESSAGE_MARKERS: &[&str] = &[
     // stamps its JSON-RPC `data` with `{"errorKind":"rate_limit"}` for every
     // Claude Code plan limit (and maps `billing_error` to quota_exhausted);
     // codex-acp nests `codexErrorInfo` `usageLimitExceeded` /
-    // `rateLimitExceeded`. Bare `rate_limit` also covers `rate_limit_error`.
-    "rate_limit",
+    // `rateLimitExceeded`. Keyed on `errorkind` rather than a bare
+    // `rate_limit`, which also names config fields and unrelated settings.
+    "\"errorkind\":\"rate_limit\"",
+    "\"errorkind\": \"rate_limit\"",
     "\"errorkind\":\"billing_error\"",
     "\"errorkind\": \"billing_error\"",
     "usagelimitexceeded",
     "ratelimitexceeded",
-    // Claude Code's plan-limit wordings: the SDK's
-    // `USAGE_LIMIT_ERROR_PREFIXES` (straight and typographic apostrophes)
-    // and the per-window names it fills in after them.
-    "you've hit your",
-    "you\u{2019}ve hit your",
-    "you've reached your",
-    "you\u{2019}ve reached your",
-    "out of usage",
-    "out of extra usage",
-    "usage credits",
-    "doesn't include usage",
-    "doesn't include extra usage",
-    "usage allocation has been disabled",
+    // Claude Code's account-usage wordings. A false positive here silently
+    // switches the user's account, so the SDK's bare
+    // `USAGE_LIMIT_ERROR_PREFIXES` ("You've hit your", "You've reached your")
+    // are deliberately absent — the SDK only trusts them on its synthetic
+    // limit message, and elsewhere they also open context-length, max-turns,
+    // attachment and MCP/tool session-limit errors. Generic windows are
+    // pinned to the CLI's " · resets" suffix; the rest name the plan
+    // allowance explicitly.
+    "limit \u{b7} resets",
     "weekly limit",
-    "session limit",
     "spend limit",
     "5-hour limit",
     "opus limit",
+    "is out of usage \u{b7}",
+    "out of usage credits",
+    "out of extra usage",
+    "doesn't include usage credits",
+    "doesn't include extra usage",
+    "usage allocation has been disabled",
 ];
 
 /// LOCAL-resource exhaustion phrasings that must never read as a PROVIDER
@@ -751,63 +754,110 @@ mod classifier_tests {
         monthly spend limit · raise it at https://claude.ai/settings/usage?from=cc_cli_limit_message \
         · your weekly limit resets Oct 27, 11am (UTC): {\"errorKind\":\"rate_limit\"}";
 
-    #[test]
-    fn classifies_claude_code_weekly_and_spend_limit_errors_as_quota() {
-        for msg in [CLAUDE_WEEKLY_LIMIT, CLAUDE_SPEND_LIMIT] {
-            assert!(message_is_quota_exceeded(msg), "expected quota: {msg:?}");
-        }
-        // The structured shape the adapter actually sends renders to the
-        // same text and classifies through the variant entry point too.
+    /// Asserts `message` (as the adapter sends it, `data` =
+    /// `{"errorKind":"rate_limit"}`) classifies as quota through both entry
+    /// points and stays terminal for the transient classifiers.
+    fn assert_claude_limit_is_quota(message: &str, rendered: &str) {
+        assert!(
+            message_is_quota_exceeded(rendered),
+            "expected quota: {rendered:?}"
+        );
         let err = AcpError::Rpc(JsonRpcError {
             code: -32603,
-            message: "Internal error: You've hit your weekly limit · resets Oct 27, 11am (UTC)"
-                .to_string(),
+            message: message.to_string(),
             data: Some(serde_json::json!({ "errorKind": "rate_limit" })),
         });
-        assert_eq!(err.to_string(), CLAUDE_WEEKLY_LIMIT);
-        assert!(is_quota_exceeded(&err));
-        // And it stays terminal for the transient classifiers.
+        assert_eq!(err.to_string(), rendered);
+        assert!(is_quota_exceeded(&err), "expected quota: {err}");
         assert!(!is_transient_upstream_disconnect(&err));
         assert!(!is_transient_provider_fetch_failure(&err));
     }
 
-    /// Each limit signal on its own: the adapter's `errorKind` (compact and
-    /// spaced JSON, and bare), Claude Code's usage-limit wordings (the
-    /// SDK's `USAGE_LIMIT_ERROR_PREFIXES` and the per-window names), and
-    /// codex-acp's `codexErrorInfo` limit kinds.
+    #[test]
+    fn classifies_claude_code_weekly_limit_error_as_quota() {
+        assert_claude_limit_is_quota(
+            "Internal error: You've hit your weekly limit · resets Oct 27, 11am (UTC)",
+            CLAUDE_WEEKLY_LIMIT,
+        );
+    }
+
+    #[test]
+    fn classifies_claude_code_monthly_spend_limit_error_as_quota() {
+        assert_claude_limit_is_quota(
+            "Internal error: You've hit your monthly spend limit · raise it at \
+             https://claude.ai/settings/usage?from=cc_cli_limit_message · your weekly limit \
+             resets Oct 27, 11am (UTC)",
+            CLAUDE_SPEND_LIMIT,
+        );
+    }
+
+    /// Each account-limit signal on its own: the adapters' structured kinds
+    /// (claude-agent-acp `errorKind`, compact and spaced; codex-acp
+    /// `codexErrorInfo`) and Claude Code's account-usage wordings. Collects
+    /// every miss so one red run names them all.
     #[test]
     fn classifies_provider_limit_wordings_as_quota() {
-        for msg in [
+        let missed: Vec<&str> = [
             "JSON-RPC error -32603: Internal error: {\"errorKind\":\"rate_limit\"}",
             "JSON-RPC error -32603: Internal error: {\"errorKind\": \"rate_limit\"}",
-            "JSON-RPC error -32603: Internal error: errorKind=rate_limit",
             "JSON-RPC error -32603: Internal error: {\"errorKind\":\"billing_error\"}",
             "JSON-RPC error -32603: Internal error: {\"errorKind\": \"billing_error\"}",
+            "JSON-RPC error -32603: Internal error: {\"message\":\"limit\",\"codexErrorInfo\":\"usageLimitExceeded\"}",
+            "JSON-RPC error -32603: Internal error: {\"codexErrorInfo\":\"rateLimitExceeded\"}",
+            "Internal error: You've hit your limit · resets 3pm (UTC)",
             "Internal error: You've hit your session limit · resets 4pm",
             "Internal error: You\u{2019}ve hit your weekly limit",
             "Internal error: You've reached your Opus limit",
-            "Internal error: 5-hour limit reached ∙ resets 3pm",
-            "Internal error: Opus limit reached",
+            "Internal error: 5-hour limit reached · resets 3pm",
             "Internal error: Claude usage limit reached. Your limit will reset at 5pm",
             "Internal error: You're out of usage credits",
             "Internal error: Your org is out of usage · add funds to continue",
             "Internal error: Your seat type doesn't include usage credits",
             "Internal error: Your usage allocation has been disabled by your admin",
             "Internal error: You're out of extra usage",
-            "Internal error: Fable 5 requires usage credits",
-            "JSON-RPC error -32603: Internal error: {\"message\":\"limit\",\"codexErrorInfo\":\"usageLimitExceeded\"}",
-            "JSON-RPC error -32603: Internal error: {\"codexErrorInfo\":\"rateLimitExceeded\"}",
-        ] {
-            assert!(message_is_quota_exceeded(msg), "expected quota: {msg:?}");
-        }
+        ]
+        .into_iter()
+        .filter(|msg| !message_is_quota_exceeded(msg))
+        .collect();
+        assert!(missed.is_empty(), "expected quota: {missed:#?}");
+    }
+
+    /// Limits that are NOT the account's allowance must never fail over: a
+    /// false positive silently switches the user's account.
+    #[test]
+    fn non_account_limits_are_not_quota() {
+        let misread: Vec<&str> = [
+            "Internal error: You've reached your maximum context length",
+            "Internal error: prompt is too long: 210000 tokens > 200000 maximum",
+            "Internal error: You've reached your max turns",
+            "Internal error: You've hit your maximum number of turns",
+            "MCP tool failed: session limit reached",
+            "MCP tool failed: session limit exceeded",
+            "Internal error: You've reached your attachment size limit",
+            "Internal error: You've reached your attachment limit (20 files)",
+            "Internal error: file exceeds the 30 MB upload size limit",
+            "Internal error: You've hit your maximum login attempts",
+            "Internal error: Invalid API key · Please run /login",
+            "JSON-RPC error -32603: Internal error: {\"errorKind\":\"authentication_failed\"}",
+            "config parse error: unknown field rate_limit",
+            "Internal error: You've hit your maximum number of attachments",
+            "Internal error: This model requires usage credits",
+            "Internal error: model requires usage credits",
+            "config parse error: unknown field `rate_limit`, expected one of `model`",
+        ]
+        .into_iter()
+        .filter(|msg| message_is_quota_exceeded(msg))
+        .collect();
+        assert!(misread.is_empty(), "expected non-quota: {misread:#?}");
     }
 
     /// The new limit markers never outrank the local-resource denylist.
     #[test]
     fn local_disk_quota_still_wins_over_limit_wordings() {
         for msg in [
-            "spawn failed: Disk quota exceeded (os error 69); errorKind: rate_limit",
+            "spawn failed: Disk quota exceeded (os error 69); {\"errorKind\":\"rate_limit\"}",
             "persist failed: EDQUOT while writing; You've hit your weekly limit",
+            "persist failed: quota exceeded while writing transcript",
         ] {
             assert!(
                 !message_is_quota_exceeded(msg),
