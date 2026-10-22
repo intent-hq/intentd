@@ -137,7 +137,7 @@ recover a chat after deletion has completed.
 
 ## Choose a model or change agent behavior
 
-<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/initializer/InitialAgentPicker.svelte; packages/cloudlands-fe/src/lib/components/settings/{SettingsSidebarNav,ProviderSelector,ProviderProfiles,ProviderProfileDialog}.svelte; packages/cloudlands-fe/src/lib/components/chat/input/ModelPicker.svelte; packages/cloudlands-fe/src/shared/app-ui-targets.ts; packages/intentd/crates/intent-services/src/{provider_profiles,profile_activation}.rs. -->
+<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/initializer/InitialAgentPicker.svelte; packages/cloudlands-fe/src/lib/components/settings/{SettingsSidebarNav,ProviderSelector,ProviderProfiles,ProviderProfileDialog}.svelte; packages/cloudlands-fe/src/lib/components/chat/input/ModelPicker.svelte; packages/cloudlands-fe/src/store/renderer/slices/user-preferences/user-preferences-slice.ts; packages/cloudlands-fe/src/shared/app-ui-targets.ts; packages/intentd/crates/intent-services/src/{provider_profiles,profile_activation}.rs. -->
 
 For the default model, open **Settings → Providers → Default model**
 (`/settings?tab=providers#utility-default-model`). For new work, choose a model in
@@ -151,7 +151,11 @@ existing specialist to edit its behavior. Global defaults and a specialist's
 instructions are different scopes. Some agent feature changes apply only to newly
 created sessions; do not promise they alter running conversations.
 
-**Provider profiles (Codex and Claude Code only).** A profile runs the installed
+**Provider profiles (Codex and Claude Code only).** Availability depends on the app
+version. In apps where profiles remain in Labs, discuss them only when asked and
+label them experimental; use **Enable experimental provider profiles** in the
+command menu first. **Disable experimental provider profiles** hides profile
+management again. A profile runs the installed
 CLI with its own environment variables, for example a work and a personal account
 or a different endpoint. In **Settings → Providers**, open the ⋯ menu on Codex or
 Claude Code and choose **Add profile**: enter a name and environment variables
