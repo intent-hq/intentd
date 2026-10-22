@@ -1096,7 +1096,9 @@ impl Harness for V1 {
                 let short: String = stall.head_sha.chars().take(8).collect();
                 changes.push(format!(
                     "no checks reported for head {short} after {}+ min — CI may never have \
-                     started; push again (e.g. an empty commit) or rebase to trigger it",
+                     started; push again (e.g. an empty commit) or rebase to trigger it \
+                     (expected only if the required checks are path-filtered or run only in \
+                     the merge queue)",
                     stall.threshold_minutes
                 ));
             }

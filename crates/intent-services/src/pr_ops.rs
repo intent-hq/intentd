@@ -1282,9 +1282,10 @@ impl ChecksStartEvidence {
     }
 }
 
-/// Whether CI never started on the PR head: the PR is open (or draft) with
-/// no merge conflicts (GitHub starts no `pull_request` workflow on a
-/// conflicting head), its checks were observed and number zero, the base
+/// Whether CI never started on the PR head: the PR is open and ready (a
+/// draft may legitimately run nothing until `ready_for_review`) with no
+/// merge conflicts (GitHub starts no `pull_request` workflow on a
+/// conflicting head), its checks were freshly observed and number zero, the base
 /// branch requires status checks, and [`CHECKS_NOT_STARTED_AFTER`] has
 /// passed since the head's commit time. Every unknown input — no commit
 /// time, unreadable rules, unobserved checks — yields `None`: absence means
@@ -1295,11 +1296,10 @@ pub(crate) fn checks_not_started(
     evidence: &ChecksStartEvidence,
     now: OffsetDateTime,
 ) -> Option<ChecksNotStarted> {
-    if !matches!(requirements.state.as_str(), "open" | "draft")
+    if requirements.state != "open"
         || requirements.has_conflicts
         || !checks_observed
         || requirements.checks.total != 0
-        || !requirements.checks.items.is_empty()
         || !evidence.checks_required
     {
         return None;
@@ -3650,10 +3650,10 @@ mod tests {
             done.state = state.into();
             assert_eq!(flag(&done, true, &evidence), None, "{state}");
         }
-        // Draft PRs still expect CI.
+        // Drafts: workflows may only trigger on `ready_for_review`.
         let mut draft = base.clone();
         draft.state = "draft".into();
-        assert!(flag(&draft, true, &evidence).is_some());
+        assert_eq!(flag(&draft, true, &evidence), None);
         // No required checks on the base (or unreadable rules): a repo
         // without required CI never flags.
         let no_ci = ChecksStartEvidence {

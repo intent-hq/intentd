@@ -636,11 +636,22 @@ impl SharedPrSnapshot {
             // a probe actually answers.
             previous.is_some_and(|p| p.ejection_tracked)
         };
-        // Derived after the same-head carry-forward above so an unobserved
-        // read never flags, and against `now` so a cached read still crosses
-        // the threshold.
-        requirements.checks_not_started =
-            pr_ops::checks_not_started(&requirements, !checks_unobserved, &self.checks_start, now);
+        // Only THIS read's own answered check runs count as observed — a
+        // carried-forward empty list may be stale (CI may have started since)
+        // — and only a head an earlier poll already saw may flag: the head's
+        // commit time can predate its push, so the first sighting of a head
+        // must not read "never started" before the forge registered its runs.
+        // Derived against `now` so a cached read still crosses the threshold.
+        requirements.checks_not_started = if same_head.is_some() {
+            pr_ops::checks_not_started(
+                &requirements,
+                self.check_runs_known && !checks_unobserved,
+                &self.checks_start,
+                now,
+            )
+        } else {
+            None
+        };
         PrMonitorSnapshot {
             title: self.title.clone(),
             url: self.url.clone(),
@@ -6445,7 +6456,9 @@ mod tests {
             no_ci_lines(&before, &now),
             vec![
                 "no checks reported for head 8c0e5137 after 15+ min — CI may never have \
-                 started; push again (e.g. an empty commit) or rebase to trigger it"
+                 started; push again (e.g. an empty commit) or rebase to trigger it \
+                 (expected only if the required checks are path-filtered or run only in \
+                 the merge queue)"
             ]
         );
         // Once delivered (the baseline now carries the flag), later polls of
@@ -6495,13 +6508,18 @@ mod tests {
 
     #[test]
     fn stalled_ci_on_a_new_head_wakes_again_and_unobserved_checks_never_flag() {
-        let first =
-            zero_run_read(NO_CI_HEAD, "2026-10-20T23:12:00Z").materialize_at(None, no_ci_now());
+        let read = zero_run_read(NO_CI_HEAD, "2026-10-20T23:12:00Z");
+        let seen = read.materialize_at(None, no_ci_now());
+        let first = read.materialize_at(Some(&seen), no_ci_now());
         assert!(first.requirements.checks_not_started.is_some());
-        // A re-push that also never started CI is a new head: new wake.
+        // A re-push that also never started CI is a new head: its first
+        // sighting never flags (its commit time can predate the push)...
         let next_head = "9d1f000000000000000000000000000000000000";
-        let next = zero_run_read(next_head, "2026-10-21T03:00:00Z")
-            .materialize_at(Some(&first), no_ci_now());
+        let next_read = zero_run_read(next_head, "2026-10-21T03:00:00Z");
+        let next_seen = next_read.materialize_at(Some(&first), no_ci_now());
+        assert_eq!(next_seen.requirements.checks_not_started, None);
+        // ...and the next poll of that head wakes again, once.
+        let next = next_read.materialize_at(Some(&next_seen), no_ci_now());
         assert_eq!(
             next.requirements
                 .checks_not_started
@@ -6511,17 +6529,18 @@ mod tests {
         );
         assert_eq!(no_ci_lines(&first, &next).len(), 1);
 
-        // A read whose check runs did not answer is unknown, not zero —
-        // even on a brand-new head with nothing to carry forward.
-        let mut degraded = zero_run_read(NO_CI_HEAD, "2026-10-20T23:12:00Z");
+        // A read whose check runs did not answer is unknown, not zero: the
+        // same-head carry-forward of an earlier empty list is stale evidence
+        // (CI may have started since) and never flags, matching the
+        // `ws.pr.snapshot` view of the same cached read.
+        let mut degraded = read.clone();
         degraded.check_runs_known = false;
-        assert_eq!(
-            degraded
-                .materialize_at(None, no_ci_now())
-                .requirements
-                .checks_not_started,
-            None
+        let carried = degraded.materialize_at(Some(&seen), no_ci_now());
+        assert!(
+            !carried.checks_unobserved,
+            "carry-forward keeps the old list"
         );
+        assert_eq!(carried.requirements.checks_not_started, None);
         assert_eq!(
             degraded.requirements_at(no_ci_now()).checks_not_started,
             None
@@ -6529,8 +6548,23 @@ mod tests {
     }
 
     #[test]
+    fn an_old_commit_pushed_just_now_is_not_flagged_on_first_sighting() {
+        // Committed an hour before it was pushed: on the first poll that
+        // sees the head GitHub may not have registered its runs yet.
+        let read = zero_run_read(NO_CI_HEAD, "2026-10-21T03:00:00Z");
+        let previous_head = snapshot(|_| {});
+        let first = read.materialize_at(Some(&previous_head), no_ci_now());
+        assert_eq!(first.requirements.checks_not_started, None);
+        assert!(no_ci_lines(&previous_head, &first).is_empty());
+        let registration = read.materialize_at(None, no_ci_now());
+        assert_eq!(registration.requirements.checks_not_started, None);
+    }
+
+    #[test]
     fn stalled_ci_projects_into_last_snapshot_and_old_baselines_stay_quiet() {
-        let s = zero_run_read(NO_CI_HEAD, "2026-10-20T23:12:00Z").materialize_at(None, no_ci_now());
+        let read = zero_run_read(NO_CI_HEAD, "2026-10-20T23:12:00Z");
+        let s = read.materialize_at(Some(&read.materialize_at(None, no_ci_now())), no_ci_now());
+        assert!(s.requirements.checks_not_started.is_some());
         let ts = "2026-01-01T00:00:00Z".to_string();
         let mut m = PrMonitor {
             monitor_id: PrMonitorId::new(),

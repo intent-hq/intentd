@@ -1544,8 +1544,6 @@ fn parse_merge_queue_removal(pr: Option<&Value>) -> Option<MergeQueueRemoval> {
     })
 }
 
-/// The GraphQL pointer to the PR's status-check rollup contexts (the last
-/// commit on the PR is its head).
 /// The PR's last commit in the merge-requirements-shaped GraphQL payload.
 const HEAD_COMMIT_POINTER: &str = "/repository/pullRequest/commits/nodes/0/commit";
 
@@ -1567,6 +1565,8 @@ fn parse_head_committed_at(data: &Value) -> Option<String> {
         .map(String::from)
 }
 
+/// The GraphQL pointer to the PR's status-check rollup contexts (the last
+/// commit on the PR is its head).
 const ROLLUP_CONTEXTS_POINTER: &str =
     "/repository/pullRequest/commits/nodes/0/commit/statusCheckRollup/contexts/nodes";
 
