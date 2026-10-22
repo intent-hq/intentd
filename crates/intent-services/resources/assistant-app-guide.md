@@ -653,8 +653,11 @@ Use the icon tabs above the expanded sidebar's content panel to switch sections.
 Hover over an icon for its section name; scroll the row horizontally when space
 is tight. **Agents** opens by default; your selected section is remembered.
 When collapsed, the sidebar leaves a slim vertical icon rail. Hover over or focus
-the rail to reveal a floating sidebar without moving your content. Use the visible
-sidebar toggle to pin it open or collapse it. **Toggle Sidebar** still uses
+a section tab to reveal just its content panel beside it, aligned with the tab
+when space allows. Moving the pointer between tabs smoothly switches the preview
+without changing your remembered section; click a tab to keep that selection. The rail's
+sidebar toggle pins it open; the expanded sidebar's toggle collapses it.
+**Toggle Sidebar** still uses
 **⌘B** on macOS or **Ctrl+B** on Windows/Linux by default.
 
 In the workspace sidebar, open **Context** to find the **Spec** and other notes.
