@@ -15823,6 +15823,12 @@ async fn principal_stamp_overwrites_client_value_on_every_user_origin_entry_poin
     // agent.create: the wire stores `initialMessage` on the session and
     // appends NO transcript row — the kickoff arrives through
     // `agent.sendMessage` (stamped above), so no unstamped row can exist.
+    // Only the creation arm needs Manager access; the messaging arms above
+    // deliberately exercise the ordinary Participant role.
+    svc.store()
+        .set_workspace_member_role(&ws, &alice, intent_core::WorkspaceRole::Manager)
+        .await
+        .expect("promote creator to Manager");
     let created = with_caller(wire(&alice), async {
         svc.agent_create(
             ws.clone(),
