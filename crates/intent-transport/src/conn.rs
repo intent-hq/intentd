@@ -1647,6 +1647,7 @@ pub(crate) async fn handle_sub_fast_path(
                     workspace_id,
                     replace_group,
                     projection,
+                    max_content_bytes,
                 } = p;
                 // Time the request-to-snapshot interval (intent-hq/intent#3707):
                 // the fast-path never enters the `rpc_dispatch` span, so this
@@ -1690,6 +1691,7 @@ pub(crate) async fn handle_sub_fast_path(
                     api.clone(),
                     WorkspaceId::from(workspace_id),
                     projection,
+                    max_content_bytes,
                     subscription,
                     membership,
                     subscription_id.clone(),
@@ -2106,6 +2108,7 @@ async fn forward_note_subscription(
     api: Arc<dyn WorkspaceApi>,
     workspace_id: WorkspaceId,
     projection: Option<intent_core::NoteListProjection>,
+    max_content_bytes: Option<usize>,
     mut subscription: Subscription,
     mut membership: Option<ChannelMembership>,
     subscription_id: String,
@@ -2120,7 +2123,15 @@ async fn forward_note_subscription(
                     .map(intent_core::note_list_slim_row)
                     .collect(),
             ),
-            None => serde_json::to_value(notes).unwrap_or_else(|_| Value::Array(Vec::new())),
+            None => match max_content_bytes {
+                Some(limit) => Value::Array(
+                    notes
+                        .into_iter()
+                        .map(|note| intent_core::note_bounded_row(note, limit))
+                        .collect(),
+                ),
+                None => serde_json::to_value(notes).unwrap_or_else(|_| Value::Array(Vec::new())),
+            },
         },
         Err(_) => Value::Array(Vec::new()),
     };
@@ -2132,8 +2143,14 @@ async fn forward_note_subscription(
     let mut seq: u64 = 1;
     while let Some(batch) = recv_visible(&mut subscription, &mut membership).await {
         for event in batch {
-            if let Some(delta) =
-                subscriptions::note_delta(api.as_ref(), &workspace_id, &event, projection).await
+            if let Some(delta) = subscriptions::note_delta(
+                api.as_ref(),
+                &workspace_id,
+                &event,
+                projection,
+                max_content_bytes,
+            )
+            .await
             {
                 let frame = subscriptions::build_delta_push(&subscription_id, seq, &delta);
                 if out_tx.send_bulk(frame).await.is_err() {
