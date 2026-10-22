@@ -2,34 +2,6 @@
 # Checked by `cargo test -p intent-core --test fixed_deadline_lint`. Entries only ratchet
 # down: wrap a budget in `intentd_test_support::test_timeout(..)` (or mark a deliberate
 # short window with `// fixed-deadline: allow — <reason>`) and lower or remove its line.
-crates/intent-services/src/agent_manager.rs 1
-crates/intent-services/src/agent_manager/repository_origin/callback_delivery/tests.rs 1
-crates/intent-services/src/agent_manager/repository_origin/tests.rs 2
-crates/intent-services/src/agent_manager/tests.rs 68
-crates/intent-services/src/agent_ops/tests.rs 23
-crates/intent-services/src/agent_ops/tests_creation_preferences.rs 1
-crates/intent-services/src/agent_session/review_startup_tests.rs 13
-crates/intent-services/src/agent_session/tests.rs 28
-crates/intent-services/src/antigravity_install/tests.rs 1
-crates/intent-services/src/antigravity_setup/tests.rs 1
-crates/intent-services/src/browser_tabs/tests.rs 1
-crates/intent-services/src/capability.rs 2
-crates/intent-services/src/capability/host_role_tests.rs 3
-crates/intent-services/src/codex_diagnostics/process/windows.rs 2
-crates/intent-services/src/events/bus_tests.rs 2
-crates/intent-services/src/mcp_servers.rs 2
-crates/intent-services/src/one_shot_acp/tests.rs 1
-crates/intent-services/src/presence/tests.rs 3
-crates/intent-services/src/repository_admission/lifecycle/physical_owner/tests.rs 4
-crates/intent-services/src/repository_admission/read_request/tests.rs 1
-crates/intent-services/src/repository_admission/read_source/tests.rs 1
-crates/intent-services/src/repository_admission/request_context/tests.rs 1
-crates/intent-services/src/repository_admission/source_tests/reader.rs 1
-crates/intent-services/src/repository_context_output/tests.rs 1
-crates/intent-services/src/script_ops.rs 4
-crates/intent-services/src/source_control_auth_ops/repository_owner_tests.rs 2
-crates/intent-services/src/tests.rs 51
-crates/intent-services/src/workspace_status.rs 1
 crates/intentd/tests/e2e_agent_features_gating.rs 1
 crates/intentd/tests/e2e_native_review_wire.rs 1
 crates/intentd/tests/e2e_wss_agent_config_option.rs 1

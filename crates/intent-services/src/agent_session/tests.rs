@@ -1473,9 +1473,12 @@ async fn structured_notices_survive_resume_replay_drain() {
     drop(tx);
     drain.await;
     assert!(rx.try_recv().is_err());
-    assert!(timeout(Duration::from_millis(50), sub.recv())
-        .await
-        .is_err());
+    assert!(timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(50)),
+        sub.recv()
+    )
+    .await
+    .is_err());
     assert!(bus
         .store()
         .get_agent_messages(&agent_id, None)
@@ -1534,9 +1537,12 @@ async fn resume_replay_burst_is_dropped_then_real_turn_streams() {
 
     // Dropping the replay produced no events and no transcript message.
     assert!(
-        timeout(Duration::from_millis(100), sub.recv())
-            .await
-            .is_err(),
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(100)),
+            sub.recv()
+        )
+        .await
+        .is_err(),
         "no events published for the dropped replay burst"
     );
     assert!(
@@ -2571,9 +2577,12 @@ async fn structured_notices_do_not_count_as_output_or_block_silent_redrive() {
     assert!(transcript.blocks.is_empty());
     assert!(transcript.text_block_strings().is_empty());
     assert!(
-        timeout(Duration::from_millis(50), sub.recv())
-            .await
-            .is_err(),
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(50)),
+            sub.recv()
+        )
+        .await
+        .is_err(),
         "no chat or activity events"
     );
 }
@@ -3237,9 +3246,12 @@ async fn assert_only_marker_event(sub: &mut crate::events::Subscription, expecte
         .collect();
     assert_eq!(markers, vec![expected]);
     assert!(
-        timeout(Duration::from_millis(300), sub.recv())
-            .await
-            .is_err(),
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            sub.recv()
+        )
+        .await
+        .is_err(),
         "stale marker mutation must not emit a later event"
     );
 }
@@ -3432,9 +3444,12 @@ async fn delayed_question_set_cannot_resurrect_answered_marker() {
     );
     assert!(!services.questions_pending(&agent_id).await);
     assert!(
-        timeout(Duration::from_millis(300), sub.recv())
-            .await
-            .is_err(),
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            sub.recv()
+        )
+        .await
+        .is_err(),
         "a rejected delayed set must not emit a marker event"
     );
 }
@@ -3494,6 +3509,7 @@ async fn append_message_op_answer_row_retires_needs_attention() {
         "a plain user row must not resolve the pending Q&A"
     );
     assert!(
+        // fixed-deadline: allow — stays under the 3s WORKSPACE_IDLE_DEBOUNCE_MS idle demotion, which legitimately changes displayStatus
         timeout(Duration::from_millis(300), sub.recv())
             .await
             .is_err(),
@@ -3660,6 +3676,7 @@ async fn append_message_op_without_derivation_change_emits_nothing() {
         .expect("appendMessage succeeds");
 
     assert!(
+        // fixed-deadline: allow — stays under the 3s WORKSPACE_IDLE_DEBOUNCE_MS idle demotion, which legitimately changes displayStatus
         timeout(Duration::from_millis(750), sub.recv())
             .await
             .is_err(),
@@ -4248,7 +4265,12 @@ async fn pre_output_transport_death_marks_error_and_suppresses_terminal_events()
     // Only the pre-first-token status hint reached the bus — no agent:failed,
     // no agent:stream:end (the worker owns the terminal decision).
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
@@ -4311,7 +4333,12 @@ async fn post_output_transport_death_keeps_terminal_events() {
     );
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
@@ -4871,7 +4898,12 @@ async fn provider_request_size_failure_surfaces_actionable_history_guidance() {
         assert_eq!(stored.status, AgentStatus::Error);
         assert_eq!(stored.stop_reason.as_deref(), Some(message.as_str()));
         let mut events = Vec::new();
-        while let Ok(Some(batch)) = timeout(Duration::from_millis(100), sub.recv()).await {
+        while let Ok(Some(batch)) = timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(100)),
+            sub.recv(),
+        )
+        .await
+        {
             events.extend(batch);
         }
         let failures: Vec<_> = events
@@ -5948,7 +5980,12 @@ async fn assert_suspend_interrupt_enrolled(error_message: &str) {
     );
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     assert!(
@@ -6062,7 +6099,12 @@ async fn assert_awake_transient_failure(error_message: &str) {
     );
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     assert!(
@@ -6131,7 +6173,12 @@ async fn assert_suspend_rejects_terminal_failure(error_message: &str) {
     );
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     assert!(
@@ -6386,7 +6433,12 @@ async fn idle_timeout_silent_turn_suppresses_agent_failed() {
     );
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
@@ -6461,7 +6513,12 @@ async fn idle_timeout_after_output_flushes_partial_and_marks_streamed() {
     );
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
@@ -6762,7 +6819,12 @@ async fn mid_turn_stall_emits_stalled_then_resumed_and_rearms() {
     .expect("worker task")
     .expect("stalls never fail the turn");
     assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
 
@@ -6956,7 +7018,12 @@ async fn buffered_update_drained_after_stall_still_emits_resumed() {
     .expect("turn settles")
     .expect("worker task")
     .expect_err("abandoned retry surfaces the attempt's error");
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
 
@@ -6996,7 +7063,12 @@ async fn sub_threshold_turn_emits_no_stall_status() {
         .expect("turn ok");
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let phases: Vec<&str> = events
@@ -7186,7 +7258,12 @@ async fn tool_call_in_flight_suppresses_stall_until_closed() {
     .expect("worker task")
     .expect("stalls never fail the turn");
     assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
 
@@ -7255,7 +7332,12 @@ async fn unclosed_tool_call_below_ceiling_emits_no_stalled() {
     .expect("worker task")
     .expect("suppression never fails the turn");
     assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
 
@@ -7336,7 +7418,12 @@ async fn unclosed_tool_call_past_ceiling_emits_stalled() {
     .expect("worker task")
     .expect("the ceiling advisory never fails the turn");
     assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let phases: Vec<&str> = events
@@ -7751,7 +7838,12 @@ async fn streaming_tool_call_past_open_tool_terminal_threshold_is_not_terminated
     .expect("worker task")
     .expect("a streaming tool call is never failed as a provider stall");
     assert_eq!(serde_json::to_value(stop).unwrap(), json!("end_turn"));
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let phases: Vec<&str> = events
@@ -8594,7 +8686,12 @@ async fn prompt_turn_failure_stamps_turn_id_on_agent_failed() {
         .expect_err("transport death fails the turn");
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let failed = events
@@ -8641,7 +8738,12 @@ async fn prompt_turn_failure_omits_turn_id_when_absent() {
         .expect_err("transport death fails the turn");
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let failed = events
@@ -10366,7 +10468,12 @@ async fn activity_throttle_window_is_shared_between_chunk_and_tool_arms() {
         .await;
 
     let mut events: Vec<Event> = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let activities: Vec<&Event> = events
@@ -10509,7 +10616,12 @@ async fn thought_deltas_carry_thinking_block_type_and_skip_live_previews() {
     }
 
     let mut events: Vec<Event> = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let deltas: Vec<&Event> = events
@@ -10746,7 +10858,12 @@ async fn group_opening_text_block_precedes_its_tool_blocks_in_snapshot_and_persi
     // with the snapshot positions: the group-opening chunks all name `m1:0`,
     // and every tool event names a strictly later index.
     let mut events: Vec<Event> = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let group_deltas: Vec<&Event> = events
@@ -10999,7 +11116,12 @@ fn tool_done_note(id: &str) -> IncomingNotification {
 
 async fn drain_tool_call_events(sub: &mut crate::Subscription) -> Vec<Event> {
     let mut events: Vec<Event> = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     events.retain(|e| e.event_type == "agent:tool:call");
