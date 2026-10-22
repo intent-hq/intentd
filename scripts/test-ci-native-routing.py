@@ -511,6 +511,9 @@ def matrix_labels(value, outputs):
     """Evaluate only the actual matrix's output-or-JSON-fallback expression."""
     if isinstance(value, list):
         return value
+    slot = re.fullmatch(r"\$\{\{ fromJSON\(needs\.route\.outputs\.slots \|\| '\{\}'\)\['([\w-]+)'\] \|\| fromJSON\('([^']+)'\) \}\}", value)
+    if slot:
+        return json.loads(outputs.get("slots", "") or "{}").get(slot[1]) or json.loads(slot[2])
     match = re.fullmatch(r"\$\{\{ fromJSON\(needs\.route\.outputs\.(\w+) \|\| '([^']+)'\) \}\}", value)
     if not match:
         raise ValueError(f"unsupported runner expression: {value}")
@@ -651,19 +654,19 @@ class RunnerAvailabilityTests(unittest.TestCase):
                         self.assertEqual(json.loads(outputs["macos_labels"]), ["self-hosted", "macOS", "ARM64"])
                     logged = "merge queue keeps heavy" in run_heavy(self.workflow, result["outputs"], event)[1]
                     self.assertEqual(logged, event == "merge_group")
-        heavy = {"coverage-e2e": "linux_labels", "coverage-all": "linux_labels"}
-        for job_id, output in heavy.items():
-            with self.subTest(job=job_id):
-                self.assertEqual(self.workflow["jobs"][job_id]["runs-on"],
-                                 "${{ fromJSON(needs.route.outputs.%s) }}" % output)
+        # The coverage suites need more inotify instances than a slot host allows.
+        for job_id in ("coverage-e2e", "coverage-all"):
+            self.assertEqual(self.workflow["jobs"][job_id]["runs-on"], "${{ fromJSON(needs.route.outputs.linux_labels) }}")
         for job_id, label in {"check": "gh-linux-8x", "coverage-changed": "gh-linux-16x"}.items():
             with self.subTest(job=job_id):
                 self.assertEqual(self.workflow["jobs"][job_id]["runs-on"],
                                  "${{ fromJSON(needs.route.outputs.slots || '{}')['%s'] || fromJSON('[\"%s\"]') }}" % (job_id, label))
         lifecycle = self.workflow["jobs"]["daemon-lifecycle"]["strategy"]["matrix"]["include"]
         linux = next(row for row in lifecycle if row["platform"] == "linux")
-        self.assertEqual(matrix_labels(linux["os"], {"linux_labels": '["gh-linux-16x"]'}), ["gh-linux-16x"])
-        self.assertIn("needs.route.outputs.linux_labels", linux["os"])
+        # The Linux leg reads its own slot: hosted unless the probe granted one.
+        self.assertEqual(matrix_labels(linux["os"], {"slots": '{"daemon-lifecycle-linux":["gh-linux-16x"]}'}), ["gh-linux-16x"])
+        self.assertEqual(matrix_labels(linux["os"], {"slots": json.dumps({"daemon-lifecycle-linux": CACHE})}), CACHE)
+        self.assertNotIn("linux_labels", linux["os"])
         for job_id in ("release-scripts", "deb-packaging"):
             with self.subTest(job=job_id):
                 self.assertIn("needs.route.outputs.slots", self.workflow["jobs"][job_id]["runs-on"])

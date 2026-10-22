@@ -198,7 +198,8 @@ fn extract_fastpath_methods() -> HashSet<String> {
 // Startup status (14.1): +1 fast-path method.
 // Scoped repository pages and child Git policy (15.1): +8 router methods.
 // Provider worker observations (§5.5b, `agentWorkers: 1`): +2 router, +1 fast path.
-const EXPECTED_TOTAL_METHODS: usize = 451;
+// Note paging removal: -3 router methods (cancellable note deletion).
+const EXPECTED_TOTAL_METHODS: usize = 448;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// Protocol 12.0 removes five router methods, three fast paths and two aliases.
@@ -208,7 +209,8 @@ const EXPECTED_TOTAL_METHODS: usize = 451;
 /// `workspace.findByPullRequest` (`prWorkspaceLookup: 1`) adds one more.
 /// Named provider profiles (§5.54) add the four `providers.profiles.*` methods.
 /// Provider worker observations (§5.5b) add `agent.workers.list` / `.stop`.
-const EXPECTED_ROUTER_METHODS: usize = 393;
+/// Removing note paging drops the three cancellable note deletion controls.
+const EXPECTED_ROUTER_METHODS: usize = 390;
 
 /// Golden count: fast-path methods (intercepted before router).
 /// `agent.workers.subscribe` (§5.5b) holds per-connection subscription state.
@@ -756,9 +758,6 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "note.add",
     "note.create",
     "note.delete",
-    "note.deleteCancel",
-    "note.deleteSchedule",
-    "note.deleteStatus",
     "note.edit",
     "note.editLines",
     "note.get",

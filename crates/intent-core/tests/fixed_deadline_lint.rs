@@ -657,7 +657,7 @@ fn fixed_test_deadlines_use_the_timeout_multiplier() {
         parse_baseline(&baseline_text).unwrap_or_else(|e| panic!("{BASELINE_FILE}: {e}"));
     let Tree { deadlines, whole } = scan_tree(&root);
     for known in [
-        "crates/intent-store/src/tests/note_pages.rs",
+        "crates/intent-store/src/tests/write_acquire_retry.rs",
         "crates/intent-services/src/test_support.rs",
         "crates/intentd/tests/common/mod.rs",
     ] {

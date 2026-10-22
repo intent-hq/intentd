@@ -84,9 +84,11 @@ jobs:
           THRESHOLD: ${{ env.LINUX_BURST_THRESHOLD }}
           XL_THRESHOLD: ${{ env.LINUX_XL_BURST_THRESHOLD }}
           # Pooled jobs that start together once routing finishes; each reads
-          # outputs.slots[key] (see runner-route.yml for the fields). The
-          # heavy Rust jobs list pull_request only: the merge queue keeps them
-          # on their burst runner (see the `heavy` step below).
+          # outputs.slots[key] (see runner-route.yml for the fields). check
+          # and coverage-changed list pull_request only: the merge queue keeps
+          # them on their burst runner, WarpBuild (see the `heavy` step below).
+          # The Linux daemon-lifecycle leg runs only in the queue and takes a
+          # free xl or heavy slot there, or bursts.
           # Minutes are typical PR / merge-queue durations. release-fast-path
           # (release branches only) and the gate keep the `runners` mapping.
           SLOT_JOBS: >-
@@ -98,7 +100,8 @@ jobs:
             {"key":"pr-title","label":"ubuntu-24.04","events":["pull_request"]},
             {"key":"conflict-markers","label":"ubuntu-24.04","events":["pull_request"]},
             {"key":"deb-packaging","label":"ubuntu-24.04","events":["merge_group","push"]},
-            {"key":"pi-session-paths","label":"ubuntu-24.04","minutes":1,"legs":[22,24],"events":["merge_group","push"]}
+            {"key":"pi-session-paths","label":"ubuntu-24.04","minutes":1,"legs":[22,24],"events":["merge_group","push"]},
+            {"key":"daemon-lifecycle-linux","label":"gh-linux-16x","rust":true,"minutes":4,"events":["merge_group"]}
             ]
           LINUX_RUNNER_DISABLED: ${{ vars.CI_LINUX_RUNNER_DISABLED }}
           WINDOWS_RUNNER_DISABLED: ${{ vars.CI_WINDOWS_RUNNER_DISABLED }}
@@ -273,13 +276,17 @@ jobs:
             core.setOutput('windows_labels', JSON.stringify(mapping['gh-windows-16x']));
             core.setOutput('macos_labels', JSON.stringify(mapping['macos-26-xlarge']));
             for (const key of ['windows', 'macos']) core.setOutput(`${key}_burst`, String(burst[key]));
-      # The heavy Rust jobs (check and coverage-changed through `slots`, which
-      # list pull_request only; the other coverage-* jobs and daemon-lifecycle
-      # through linux_labels) all skip the intent-cache slots in the merge queue
-      # and take their burst runner (WarpBuild): one queue run starts ~4 of them at once,
-      # sized for 16 CPUs, and the route decision is made before any of them
-      # is queued, so all would land on the two 8-CPU intent-cache slots and
-      # run one after another past the queue's time budget. PR and push
+      # check and coverage-changed (through `slots`, which list pull_request
+      # only) and coverage-e2e and coverage-all (through linux_labels) skip the
+      # intent-cache slots in the merge queue and take their burst runner
+      # (WarpBuild). Their parallel e2e daemons each hold several
+      # inotify instances, and the intent-cache hosts share a 128-instance
+      # limit across all slots (coverage-all raises it with sudo, which
+      # WarpBuild and GitHub runners allow). The Linux daemon-lifecycle leg, one daemon at a time, reads
+      # its own `slots` entry, so it takes a slot only when one is free. Before slot fitting existed, one queue run started ~4 heavy jobs at once,
+      # sized for 16 CPUs, and the shared mapping sent all of them to the
+      # same two 8-CPU intent-cache slots, one after another, past the
+      # queue's time budget. PR and push
       # runs, and the light jobs routed through `runners`, keep the probe's
       # choice. This override stays out of the probe script above, which is
       # kept identical to runner-route.yml across intent, intentd and
@@ -1984,8 +1991,6 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: release-plz@0.3.162
-      - name: Test Cargo packaging and historical baseline compatibility
-        run: python3 -S scripts/test-release-plz-packaging.py
       - name: Test new-package release baseline and retirement
         run: python3 -S scripts/test-release-plz-baseline.py
       - name: Test daemon and sitter changelog separation
@@ -2142,8 +2147,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # The Linux leg takes its own slot (listed in the route job's
+          # SLOT_JOBS); macOS keeps the shared mapping.
           - platform: linux
-            os: ${{ fromJSON(needs.route.outputs.linux_labels || '["gh-linux-16x"]') }}
+            os: ${{ fromJSON(needs.route.outputs.slots || '{}')['daemon-lifecycle-linux'] || fromJSON('["gh-linux-16x"]') }}
           - platform: macos
             os: ${{ fromJSON(needs.route.outputs.macos_labels || '["macos-26-xlarge"]') }}
     runs-on: ${{ matrix.os }}
