@@ -1854,46 +1854,7 @@ async fn automatic_discovery_saturation(poll_seconds: u64) {
     assert_eq!(idle_requests % 10, 0, "every admitted listing completes");
 }
 
-/// Thread-local capture of every WARN-or-louder event as `message field=value`.
-#[derive(Clone, Default)]
-struct Warnings(Arc<Mutex<Vec<String>>>);
-
-impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Warnings {
-    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
-        struct Visitor(String);
-        impl tracing::field::Visit for Visitor {
-            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-                use std::fmt::Write as _;
-                let _ = write!(self.0, "{}={value:?} ", field.name());
-            }
-        }
-        if *event.metadata().level() > tracing::Level::WARN {
-            return;
-        }
-        let mut visitor = Visitor(String::new());
-        event.record(&mut visitor);
-        self.0.lock().unwrap().push(visitor.0);
-    }
-}
-
-impl Warnings {
-    fn install(&self) -> tracing::subscriber::DefaultGuard {
-        use tracing_subscriber::layer::SubscriberExt as _;
-        crate::test_tracing::set_capture_default(
-            tracing_subscriber::Registry::default().with(self.clone()),
-        )
-    }
-
-    fn containing(&self, needle: &str) -> Vec<String> {
-        self.0
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|line| line.contains(needle))
-            .cloned()
-            .collect()
-    }
-}
+use crate::test_tracing::Warnings;
 
 /// intent-hq/intent#7264: one budget deferral is cached in the repository's
 /// shared listing slot, so every root of that repository receives it. One
@@ -2063,7 +2024,7 @@ async fn non_deferral_root_failures_still_warn_per_root() {
         warnings.containing("root refresh failed").len(),
         2,
         "{:?}",
-        warnings.0.lock().unwrap()
+        warnings.all()
     );
     assert_eq!(warnings.containing("workspace refresh failed").len(), 1);
     assert!(warnings.containing("deferred by request budget").is_empty());
