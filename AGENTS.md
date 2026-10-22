@@ -282,7 +282,8 @@ above. **Cargo stays the source of truth.** When you change a `Cargo.toml`, `Car
 or `rust-toolchain.toml`, run `python3 scripts/bazel-drift.py --fix` and commit the
 regenerated `crates/*/BUILD.bazel`, `bazel/generated.MODULE.bazel` and
 `MODULE.bazel.lock`; never edit those by hand. The `Bazel` workflow's `drift` job fails
-otherwise and prints that command. Releases need no Bazel action: a bump of only
+otherwise and prints that command. New test files and unit tests normally need no Bazel
+action; `bazel/README.md` → Tests lists the exceptions. Releases need no Bazel action: a bump of only
 workspace-crate versions passes the check. To build or test with Bazel locally (bazelisk, plus
 `libssl-dev` / `zlib1g-dev` / `pkg-config`): `bazel build //...`, `bazel test //...`. In
 saved `ws.script` runs add `--config=ci` (plain progress output, uncached test

@@ -43,44 +43,143 @@ of the main repo's packages.
 
 ## Generated files
 
-`scripts/bazel-gen.py` writes `crates/*/BUILD.bazel` and
-`bazel/generated.MODULE.bazel` from `cargo metadata` and
-`rust-toolchain.toml`. Do not edit them by hand.
+`scripts/bazel-gen.py` writes `crates/*/BUILD.bazel`, the root `BUILD.bazel`,
+`bazel/generated.MODULE.bazel` and `bazel/prod-workspace/**` from
+`cargo metadata`, `rust-toolchain.toml` and `.config/nextest.toml`. Do not
+edit them by hand.
 
 ```sh
-python3 scripts/bazel-gen.py          # regenerate after a Cargo.toml change
+python3 scripts/bazel-drift.py --fix  # regenerate and refresh MODULE.bazel.lock
 python3 scripts/bazel-gen.py --check  # exit 1 when a generated file is stale
 ```
 
-Rerun the generator when you add or remove a crate, a first-party (path)
-dependency, a feature, a binary or a `build.rs`, or when you bump
-`rust-toolchain.toml`. Third-party dependency changes need no Bazel edit.
+Regenerate when you add or remove a crate, a first-party (path) dependency, a
+feature, a binary, a `build.rs` or a `[[test]]` entry, or when you bump
+`rust-toolchain.toml` or edit `.config/nextest.toml`. **A new test file needs
+no Bazel action** (see "Tests"). Third-party dependency changes need only the
+lock refresh that `--fix` does.
 
 Each generated package has:
 
 - `rust_library` / `rust_proc_macro` named after the crate (`intent_core`),
   and `rust_binary` targets named after the Cargo bins (`intentd`,
   `intentd-sitter`), so outputs keep Cargo's file names.
+- `<crate>_dev` twins of the library and binaries for the test graph (see
+  "Tests").
 - `COMPILE_DATA`: every non-`.rs` file in the package outside `tests/`,
   `benches/` and `examples/`, so `include_str!`, `include_bytes!` and
   `sqlx::migrate!()` inputs need no listing.
 - `cargo_build_script` for a `build.rs`, unless `OVERRIDES` in the generator
   replaces it.
+- one `rust_integration_tests(...)` call, plus explicit test rules for the
+  unit tests and for split integration tests.
 
 Hand decisions that Cargo metadata cannot express live in two places only:
 
-- `OVERRIDES` in `scripts/bazel-gen.py` (per first-party crate).
+- the tables at the top of `scripts/bazel-gen.py`: `OVERRIDES` (per crate),
+  `MANUAL_TESTS`, `KNOWN_FAILING`, `MODULE_SHARDS`, `MANUAL_SHARDS`,
+  `TEST_TIMEOUTS` and `FIXTURE_TESTS` (tests).
 - `bazel/crates.MODULE.bazel` (crate_universe annotations for third-party
   crates).
 
-## Extending
+## Tests
 
-- **Tests and lints**: add them in the generator (`rust_test` per lib, bin and
-  `tests/*.rs`, using `all_crate_deps(normal_dev = True)` and
-  `proc_macro_dev = True`) rather than in the generated files. Test-only
-  first-party features (`intent-providers/test-support`,
-  `intent-services/repository-test-fixtures`) need feature-enabled library
-  variants, because Bazel has no Cargo-style feature unification.
+```sh
+bazel test //...                                   # every non-manual test target
+bazel test //crates/intent-core/...                # one crate
+bazel test //crates/intentd:e2e_wss_git_reads      # one integration test file
+bazel test //crates/intent-core:lib_test --test_arg=ids::  # libtest filter
+bazel query 'attr(tags, manual, tests(//...))'     # list the manual targets
+```
+
+Targets per crate, all built against the test graph (`@crates_dev` and the
+`_dev` libraries, so dev-only features never reach production targets):
+
+| Cargo / nextest | Bazel target |
+|---|---|
+| lib unit tests | `lib_test` |
+| bin unit tests (`bin/<name>`) | `bin_<name>_test` |
+| `tests/<name>.rs`, `tests/<name>/main.rs` | `<name>` |
+
+`.bazelrc` maps nextest's `retries = 1` to `--flaky_test_attempts=2`.
+Bazel times out whole test binaries (unit-test binaries get `long`, 900 s)
+rather than single tests. nextest overrides that reserve every test thread
+become the `exclusive` tag; tests in a nextest test-group or listed by test
+name run in a `<target>_serial` companion with `--test-threads=1`.
+
+### Adding a test
+
+Add the file; nothing else. `bazel/rust_integration_tests.bzl` globs
+`tests/*.rs` and `tests/*/main.rs` at load time, like Cargo's autodiscovery,
+and gives each test the crate's dependencies, test binaries
+(`CARGO_BIN_EXE_*`), environment and tags. `tests/<dir>/**` modules are
+compiled into every test of the crate. A crate's first test file also needs
+nothing, since every crate has the call, and a new unit test normally needs
+nothing either.
+
+The drift guard fails on a new test only when it needs a policy the defaults
+do not give it. Run `python3 scripts/bazel-drift.py --fix` and commit the
+regenerated BUILD file when you:
+
+- add a test that reads other crates' Rust sources at run time and is not
+  named `*_lint` (the generator detects `source_lint`, `workspace_root(` or a
+  `../…rs` path in the sources; `*_lint` tests get the sources by name), or
+  uses `env!("CARGO")`. The same holds for the first unit test of a crate
+  that does so, since `lib_test` covers all of `src/`;
+- name a new test in `.config/nextest.toml` or one of the generator's tables;
+- add a crate, or a `[[test]]` entry in a `Cargo.toml`.
+
+The per-test table in each `rust_integration_tests(overrides = ...)` call
+holds those deviations (`manual` with its reason, `exclusive`, `timeout`,
+`workspace_sources`, `cargo`). The macro fails loading when an override names
+a test file that no longer exists, so stale entries do not linger.
+
+### Manual targets
+
+`bazel test //...` skips targets tagged `manual`; run them by label. Every
+one has its reason next to it in the generated BUILD file and in the
+generator's tables. They are:
+
+- tests Bazel cannot run as an action (trybuild in `store_pool_api` runs
+  Cargo itself) or whose `required-features` are off in
+  `cargo test --workspace`;
+- intent-services unit-test shards that time out or fail nondeterministically
+  in one shared libtest process (`MANUAL_SHARDS`);
+- `*_fixture` companions: unit tests needing a fixture prepared outside the
+  repository (`FIXTURE_TESTS`). They inherit `INTENT_ACP_CALLBACK_ADAPTER_FIXTURE`
+  / `TRANSFER_SELECTION_FIXTURE_ROOT` from your environment, as the monorepo
+  `make test` sets them;
+- `*_known_failing` companions (below).
+
+### Known-failing companions
+
+The suite is written for nextest's process-per-test model; libtest runs a
+whole binary in one process, so some tests that share process-global state or
+tight wall-clock budgets fail under Bazel and pass under nextest. Each is
+listed by name, with a reason, in `KNOWN_FAILING`. The main target skips it
+(`--skip`), and a manual `<target>_known_failing` companion runs exactly those
+tests (`--exact`), so they stay visible:
+
+```sh
+bazel test //crates/intentd:e2e_wss_script_persistence_known_failing
+```
+
+Remove a test from the table once it passes under Bazel.
+
+When one binary backs several targets (shards, `_serial`, `_known_failing`,
+`_fixture`), it is compiled once as `<target>_binary` and the others run it
+through `bazel/shared_binary_test.bzl`.
+
+### intent-services shards
+
+Its unit-test binary (~7,600 tests) is split by top-level module into
+`lib_test_shard1`…`8`, plus `lib_test_shard_rest` for every module no shard
+names. The assignment is the fixed `MODULE_SHARDS` table, not computed from
+file sizes, so editing or adding unit tests never changes the BUILD file; a
+new module runs in `_shard_rest`. To rebalance, paste the output of
+`python3 scripts/bazel-gen.py --suggest-shards intent-services` into the
+table, check the `MANUAL_SHARDS` reasons still match their modules, and
+regenerate.
 
 ## Drift guard
 
@@ -89,7 +188,8 @@ python3 scripts/bazel-drift.py          # exit 1, with the fix command, on drift
 python3 scripts/bazel-drift.py --fix    # regenerate, refresh MODULE.bazel.lock, recheck
 ```
 
-The check fails when a generated file is stale (`bazel-gen.py --check`), when
+The check fails when a generated file is stale (`bazel-gen.py --check`, which
+lists each file and marks a missing crate BUILD file as a new crate), when
 `MODULE.bazel.lock` records a host-absolute path, or when the lock no longer
 matches `MODULE.bazel` or the Cargo manifests and `Cargo.lock`
 (`bazel mod deps --lockfile_mode=error`; crate_universe records their digests).
