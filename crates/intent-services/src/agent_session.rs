@@ -6296,8 +6296,7 @@ impl Services {
             mapped,
             MappedUpdate::Chunk { .. } | MappedUpdate::ToolCall(_)
         ) {
-            self.announce_provider_return_if_pending(workspace_id, agent_id)
-                .await;
+            Box::pin(self.announce_provider_return_if_pending(workspace_id, agent_id)).await;
         }
         let message_id = transcript.message_id.clone();
         match mapped {

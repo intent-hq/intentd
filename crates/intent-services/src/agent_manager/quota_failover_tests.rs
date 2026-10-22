@@ -1899,3 +1899,181 @@ async fn a_replayed_queue_entry_drained_into_a_fresh_worker_does_not_return_home
     );
     assert!(notices(&fx.messages().await, "provider_returned").is_empty());
 }
+
+/// Queue `texts` as ready entries; those flagged `true` become replays (a
+/// requeued entry whose user row is already in the transcript).
+async fn queue_entries(fx: &Fixture, entries: &[(&str, bool)]) -> Vec<String> {
+    for (text, _) in entries {
+        fx.mgr.services.enqueue_message(
+            &fx.agent,
+            (*text).to_string(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            intent_core::MessageOrigin::Automatic,
+        );
+    }
+    let mut popped = Vec::new();
+    while let Some(entry) = fx.mgr.services.dequeue_message(&fx.agent) {
+        popped.push(entry);
+    }
+    for (entry, (_, replay)) in popped.iter_mut().zip(entries) {
+        if *replay {
+            fx.mgr
+                .services
+                .store
+                .append_agent_message_with_metadata(
+                    &fx.agent,
+                    "user",
+                    &json!([{ "type": "text", "text": entry.content }]),
+                    None,
+                    &now_iso(),
+                )
+                .await
+                .unwrap();
+            entry.persisted = true;
+        }
+    }
+    let ids = popped.iter().map(|e| e.id.clone()).collect();
+    fx.mgr.services.requeue_front_batch(&fx.agent, popped);
+    ids
+}
+
+/// A batch flush (two or more ready entries drained into one turn of a
+/// fresh worker) replays an earlier turn only when every entry is a replay:
+/// then no timed return; with one fresh entry it is a new turn and returns
+/// home.
+#[intent_test_macros::daemon_test]
+async fn a_flushed_batch_returns_home_only_when_it_carries_a_fresh_entry() {
+    for (entries, returns) in [
+        (vec![("retry one", true), ("retry two", true)], false),
+        (vec![("retry one", true), ("fresh message", false)], true),
+    ] {
+        let fx = Fixture::new(json!({ "response": "answered" })).await;
+        let first = fx.profile("First", true).await;
+        let past = chrono::Utc::now() - chrono::Duration::minutes(1);
+        fx.away(&first, state_json("claude-code", &first, past, 0))
+            .await;
+        queue_entries(&fx, &entries).await;
+
+        fx.mgr
+            .clone()
+            .try_drain_queue(fx.agent.clone(), fx.ws.clone())
+            .await;
+        timeout_settled(&fx.mgr, &fx.agent).await;
+
+        let expected = if returns {
+            "claude-code"
+        } else {
+            first.as_str()
+        };
+        assert_eq!(
+            fx.row().await.provider.as_deref(),
+            Some(expected),
+            "{entries:?}"
+        );
+        assert_eq!(
+            notices(&fx.messages().await, "provider_returned").len(),
+            usize::from(returns),
+            "{entries:?}"
+        );
+    }
+}
+
+/// `agent.sendQueuedMessageNow` on a stale entry (queued before the
+/// agent's latest completion report) replays an earlier turn, even though
+/// its row is only persisted now: no timed return.
+#[intent_test_macros::daemon_test]
+async fn sending_a_stale_queued_entry_now_does_not_return_home() {
+    let fx = Fixture::new(json!({ "response": "answered" })).await;
+    let first = fx.profile("First", true).await;
+    let past = chrono::Utc::now() - chrono::Duration::minutes(1);
+    fx.away(&first, state_json("claude-code", &first, past, 0))
+        .await;
+    let (entry, _) = fx.mgr.services.enqueue_message(
+        &fx.agent,
+        "an old wake".to_string(),
+        None,
+        None,
+        None,
+        None,
+        false,
+        intent_core::MessageOrigin::Automatic,
+    );
+    // The agent reported completion after that entry was queued: stale.
+    let mut session = fx.row().await;
+    session.parent_agent_id = Some(AgentId::from("agent-parent"));
+    session.completion_report = Some("done".to_owned());
+    session.completion_report_timestamp = Some(now_iso());
+    fx.mgr
+        .services
+        .store
+        .update_agent_session(&fx.ws, &session)
+        .await
+        .unwrap();
+
+    fx.mgr
+        .send_queued_message_now(fx.agent.clone(), fx.ws.clone(), entry.id.clone())
+        .await
+        .expect("send now");
+    timeout_settled(&fx.mgr, &fx.agent).await;
+
+    assert_eq!(
+        fx.row().await.provider.as_deref(),
+        Some(first.as_str()),
+        "a stale replay never starts a timed return"
+    );
+    assert!(notices(&fx.messages().await, "provider_returned").is_empty());
+}
+
+/// A timed return rejected by home before output (non-quota) is retried as
+/// a replay after a daemon restart (the in-memory announcement is gone, the
+/// persisted state is not): the replay never starts a new switch, but home
+/// answering it writes exactly one `provider_returned` row and clears the
+/// timer and backoff.
+#[intent_test_macros::daemon_test]
+async fn a_replayed_retry_after_a_restart_still_announces_the_return() {
+    let fx = Fixture::new(json!({
+        "promptRpcError": { "code": -32603, "message": "Internal error", "data": "boom" },
+        "promptRpcErrorAttempts": 1,
+        "response": "answered on home",
+    }))
+    .await;
+    let first = fx.profile("First", true).await;
+    let past = chrono::Utc::now() - chrono::Duration::minutes(1);
+    fx.away(&first, state_json("claude-code", &first, past, 2))
+        .await;
+
+    let events = fx.send_as_user("hello again").await;
+    assert_eq!(of_type(&events, "agent:failed").len(), 1, "{events:#?}");
+    assert_eq!(fx.row().await.provider.as_deref(), Some("claude-code"));
+    assert_eq!(
+        fx.return_state().await.and_then(|s| s.returning),
+        Some(crate::provider_return::ReturnMode::Timer)
+    );
+
+    // Daemon restart: in-memory marks are gone; the persisted state stays.
+    fx.mgr
+        .services
+        .cancel_provider_return_announcement(&fx.agent);
+    fx.mgr
+        .agent_retry(fx.agent.clone(), fx.ws.clone())
+        .await
+        .expect("retry");
+    timeout_settled(&fx.mgr, &fx.agent).await;
+
+    assert_eq!(fx.row().await.provider.as_deref(), Some("claude-code"));
+    assert_eq!(
+        fx.return_state().await,
+        None,
+        "accepted: timer and backoff cleared"
+    );
+    let messages = fx.messages().await;
+    assert_eq!(
+        notices(&messages, "provider_returned").len(),
+        1,
+        "{messages:#?}"
+    );
+}

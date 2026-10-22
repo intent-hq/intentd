@@ -9070,6 +9070,10 @@ impl AgentManager {
             file_blocks: entry.file_blocks.clone(),
             message_metadata: entry.message_metadata.clone(),
             suppress_report_clear: stale,
+            // Classified before any row is persisted: a stale or an
+            // already-persisted entry replays an earlier turn (no timed
+            // return home, PROTOCOL §5.54).
+            replay: stale || entry.persisted,
             queued_at: Some(entry.queued_at.clone()),
             queued_submission_ids: entry.submission_ids(),
             recovery_sources: entry.recovery_sources.clone(),
@@ -9213,12 +9217,6 @@ impl AgentManager {
             .await;
         let entry_id = entry.id.clone();
         let turn_id = entry.turn_id.clone();
-        // An entry whose user row was already persisted retries an earlier
-        // turn (no timed return home, PROTOCOL §5.54).
-        let options = TurnOptions {
-            replay: options.replay || entry.persisted,
-            ..options
-        };
         self.spawn_worker(
             agent_id,
             workspace_id,
@@ -13881,9 +13879,15 @@ async fn run_message_worker(
             // A new turn: an earlier turn's unaccepted return attempt is
             // over. A continuation of the same turn keeps it pending.
             mgr.services.cancel_provider_return_announcement(&agent_id);
-            mgr.services
-                .begin_provider_return(&workspace_id, &agent_id)
-                .await;
+            // Boxed: keeps the return check's state off the worker's future
+            // (the deep send/interrupt paths overflow the test stack).
+            Box::pin(mgr.services.begin_provider_return(&workspace_id, &agent_id)).await;
+        } else if !redrive {
+            // A replay or continuation never starts a timed switch, but an
+            // owed return already persisted on home (e.g. a retry resumed
+            // after a daemon restart lost the in-memory mark) is re-armed so
+            // home's first output still announces it and clears the state.
+            Box::pin(mgr.services.rearm_provider_return_if_home(&agent_id)).await;
         }
         // Keep the large session-start future off the worker's inline state;
         // it is still polled and cancelled by this same worker.
@@ -14022,9 +14026,11 @@ async fn run_message_worker(
                         mgr.services.clear_failure_streak(&agent_id);
                         // A turn that went back to the home provider and
                         // completed there is home (PROTOCOL §5.54).
-                        mgr.services
-                            .complete_provider_return(&workspace_id, &agent_id)
-                            .await;
+                        Box::pin(
+                            mgr.services
+                                .complete_provider_return(&workspace_id, &agent_id),
+                        )
+                        .await;
                         // A completed turn also resets the consecutive
                         // idle-timeout streak (warn-and-continue).
                         consecutive_idle_timeouts = 0;
@@ -15105,6 +15111,11 @@ async fn prepare_flush_turn(
     // stale check before the wait note, both before the row persist so the
     // persisted row and the provider prompt carry the same content.
     let mut stale_flags = Vec::with_capacity(entries.len());
+    // Replay classification, captured BEFORE the rows below are persisted
+    // (which marks every entry persisted): the batch replays an earlier
+    // turn only when every entry does (PROTOCOL §5.54 — one fresh entry
+    // makes it a new turn, which may start a timed return home).
+    let mut all_replays = true;
     for entry in &mut entries {
         let stale = mgr.annotate_stale_redrive(agent_id, entry).await;
         annotate_dequeue_wait(entry);
@@ -15112,6 +15123,7 @@ async fn prepare_flush_turn(
         // groups them; this distinguishes them).
         stamp_queued_message_id(entry);
         stale_flags.push(stale);
+        all_replays &= stale || entry.persisted;
     }
     // Batch grouping stamp — after the wait stamps (it creates `queueInfo`
     // when absent; the wait stamp never overwrites an existing one): every
@@ -15218,6 +15230,7 @@ async fn prepare_flush_turn(
         file_blocks,
         message_metadata: entries[0].message_metadata.clone(),
         suppress_report_clear: stale_flags.iter().all(|&s| s),
+        replay: all_replays,
         queued_at: Some(entries[0].queued_at.clone()),
         latest_human_submission_at: entries
             .iter()

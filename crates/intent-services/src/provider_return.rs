@@ -504,6 +504,27 @@ impl Services {
         }
     }
 
+    /// Re-arm the first-output acceptance of a return attempt already
+    /// persisted on home (`returning` set, session on home), without
+    /// starting any switch. Used for a replay or continuation of a turn:
+    /// the in-memory mark does not survive a daemon restart, the persisted
+    /// state does. A no-op otherwise.
+    pub(crate) async fn rearm_provider_return_if_home(&self, agent_id: &AgentId) {
+        let Ok(session) = self.store.get_agent_session(agent_id).await else {
+            return;
+        };
+        let Some(state) = read_state(&session) else {
+            return;
+        };
+        let on_home = session
+            .provider
+            .as_deref()
+            .is_some_and(|p| provider_profiles::canonical_selection(p) == state.home);
+        if on_home && state.returning.is_some() {
+            self.arm_provider_return_announcement(agent_id);
+        }
+    }
+
     /// Drop the pending announcement (a new message, a teardown, or home
     /// rejecting the return before any output — then no `provider_returned`
     /// row is written).
