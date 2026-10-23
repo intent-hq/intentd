@@ -32,6 +32,8 @@ nix = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
 intentd-test-support = { path = "../intentd-test-support" }
+# Same version sqlx links; tests/store_open_fsync_stall.rs wraps its VFS.
+libsqlite3-sys = "0.30.1"
 trybuild = "1"
 tempfile = "3"
 tokio = { workspace = true }

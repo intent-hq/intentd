@@ -632,8 +632,9 @@ mod tests {
         );
     }
 
-    /// The write pool's connect batch (`intent_store::connect_write` also
-    /// sets `auto_vacuum`, which sqlx orders first, so the summary differs).
+    /// A connect batch led by another PRAGMA, as the write pool's was while
+    /// `intent_store::connect_write` still set `auto_vacuum` (sqlx orders it
+    /// first, so the summary differs).
     fn sqlx_write_pool_connect_pragma_event() {
         tracing::event!(
             target: "sqlx::query",
@@ -705,8 +706,8 @@ mod tests {
         assert!(warns[0].contains("statements=4"), "{warns:?}");
     }
 
-    /// The write pool's connect batch is excluded too (its summary starts
-    /// with `auto_vacuum`, but the batch still carries the marker).
+    /// A connect batch whose summary starts with another PRAGMA is excluded
+    /// too (`auto_vacuum` here, but the batch still carries the marker).
     #[test]
     fn write_pool_connect_pragma_batch_is_not_charged_to_the_dispatch() {
         let layer =
