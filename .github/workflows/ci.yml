@@ -90,14 +90,20 @@ jobs:
           # coverage-all, coverage-e2e and the Linux daemon-lifecycle leg run
           # only in the queue and take a free xl or heavy slot there (longest
           # first, so coverage-all gets the xl slot), or burst to WarpBuild.
-          # check takes an 8-CPU heavy slot (never the xl slot coverage-changed
-          # needs) but bursts as gh-linux-16x: WarpBuild measured it at p90 97%
-          # of 8 CPUs and 19.7 GB, so its merge-queue and overflow runs use 16.
+          # check asks for gh-linux-16x (WarpBuild measured it at p90 97% of 8
+          # CPUs and 19.7 GB), so it takes an xl slot when one is left after
+          # coverage-changed, else a heavy slot, else a 16x burst. Its minutes
+          # stay below coverage-changed's so coverage-changed (15.5 min on xl,
+          # ~33 on heavy) always picks first within a run. Two corners: with
+          # no xl slot and one heavy slot free, coverage-changed takes the
+          # heavy slot and check bursts; and the ranking is per run, so a
+          # concurrent PR's check can take the last xl slot before this run's
+          # coverage-changed asks, leaving it a heavy slot.
           # Minutes are typical PR / merge-queue durations. release-fast-path
           # (release branches only) and the gate keep the `runners` mapping.
           SLOT_JOBS: >-
             [
-            {"key":"check","label":"gh-linux-8x","burst":"gh-linux-16x","rust":true,"minutes":15,"events":["pull_request"]},
+            {"key":"check","label":"gh-linux-16x","rust":true,"minutes":12,"events":["pull_request"]},
             {"key":"coverage-changed","label":"gh-linux-16x","rust":true,"minutes":13,"events":["pull_request"]},
             {"key":"release-scripts","label":"ubuntu-24.04","minutes":6},
             {"key":"pr-static","label":"ubuntu-24.04","minutes":1,"events":["pull_request"]},
@@ -395,7 +401,7 @@ jobs:
     # Every other PR still runs it, and the merge queue always does.
     if: ${{ !cancelled() && needs.route.result == 'success' && (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && needs.release-fast-path.outputs.fast_path != 'true')) }}
     needs: [route, release-fast-path]
-    runs-on: ${{ fromJSON(needs.route.outputs.slots || '{}')['check'] || fromJSON('["warp-ubuntu-2404-x64-8x"]') }}
+    runs-on: ${{ fromJSON(needs.route.outputs.slots || '{}')['check'] || fromJSON('["warp-ubuntu-2404-x64-16x"]') }}
     # The cold-cache check job exhausted its 20-minute budget after its tests
     # passed in run 37305697722. Allow completion/cache margin without changing
     # individual test timeouts.

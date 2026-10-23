@@ -292,6 +292,17 @@ class RunnerPolicy(unittest.TestCase):
         # The sysctl raise only runs where the limit is low (hosted runners); slots have no sudo.
         self.assertIn('if ! [ "$(cat /proc/sys/fs/inotify/max_user_instances)" -ge 4096 ]; then', body['coverage-all'])
 
+    def test_pr_check_ranks_below_coverage_changed(self):
+        # check may take an xl slot, but only one coverage-changed leaves: the
+        # probe ranks Rust jobs by minutes, so check's must stay below
+        # coverage-changed's (15.5 min on xl, ~33 on an 8-CPU heavy slot).
+        listed = {entry['key']: entry for entry in slot_list((ROOT / '.github/workflows/ci.yml').read_text())}
+        self.assertEqual(listed['check'], {'key': 'check', 'label': 'gh-linux-16x', 'rust': True, 'minutes': 12, 'events': ['pull_request']})
+        self.assertEqual(listed['coverage-changed']['label'], 'gh-linux-16x')
+        self.assertTrue(listed['coverage-changed']['rust'])
+        self.assertLess(listed['check']['minutes'], listed['coverage-changed']['minutes'])
+        self.assertEqual(listed['check']['events'], listed['coverage-changed']['events'])
+
     def test_routed_linux_jobs_run_unprivileged(self):
         # A routed Linux job may land on an intent-cache slot, which has no sudo or Docker.
         skip = set(HOSTED_LINUX) | set(HEAVY_HOSTED_ONLY) | MAINTENANCE | EXCEPTIONS | HOSTED_CONTROL

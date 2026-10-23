@@ -455,6 +455,7 @@ const github = {
 const core = { info: message => logs.push(message), setOutput: (name, value) => { outputs[name] = value; } };
 const context = { repo: { owner: 'intent-hq', repo: 'intentd' }, runId: 99, eventName: fixture.eventName || 'push', payload: fixture.payload || {} };
 process.env.THRESHOLD = '2';
+process.env.XL_THRESHOLD = fixture.xlThreshold || '';
 process.env.LINUX_SIZE = '16';
 process.env.WINDOWS_RUNNER_DISABLED = fixture.windowsDisabled || '';
 process.env.MACOS_RUNNER_DISABLED = fixture.macosDisabled || '';
@@ -528,10 +529,15 @@ def runner(platform="macOS", arch="ARM64", *, status="online", busy=False, extra
 # routed Linux jobs ask for exactly these labels.
 CACHE = ["self-hosted", "linux", "x64", "intent-cache"]
 SMALL = ["self-hosted", "linux", "x64", "intent-cache-small"]
+XL = ["self-hosted", "linux", "x64", "intent-cache-xl"]
 
 
 def slot(**kwargs):
     return runner("Linux", "X64", extra=("intent-cache",), **kwargs)
+
+
+def xl_slot(**kwargs):
+    return runner("Linux", "X64", extra=("intent-cache-xl",), **kwargs)
 
 
 def small_slot(**kwargs):
@@ -635,10 +641,10 @@ class RunnerAvailabilityTests(unittest.TestCase):
                     outputs = route_outputs(self.workflow, result["outputs"], event)
                     hosted = event == "merge_group" or not idle
                     slots = json.loads(outputs["slots"])
-                    # The one free heavy slot goes to `check` on a PR; the queue lists no heavy job.
-                    # Without a slot, check bursts as gh-linux-16x (CPU-bound on 8 CPUs).
-                    self.assertEqual(slots["check"], CACHE if event == "pull_request" and idle else ["warp-ubuntu-2404-x64-16x"])
-                    self.assertEqual(slots["coverage-changed"], ["warp-ubuntu-2404-x64-16x"])
+                    # The one free heavy slot goes to `coverage-changed` on a PR (it ranks
+                    # above check); the queue lists no heavy job. check bursts to its 16x WarpBuild runner.
+                    self.assertEqual(slots["check"], ["warp-ubuntu-2404-x64-16x"])
+                    self.assertEqual(slots["coverage-changed"], CACHE if event == "pull_request" and idle else ["warp-ubuntu-2404-x64-16x"])
                     # Free standard labels never take a self-hosted slot, even an idle one.
                     self.assertEqual(slots["release-scripts"], ["ubuntu-24.04"])
                     # Unlisted heavy jobs only get a slot that is still free after the listed ones.
@@ -657,7 +663,7 @@ class RunnerAvailabilityTests(unittest.TestCase):
         # The queue-only coverage suites read their own merge_group slots (the
         # slot hosts raise the inotify limit to 32768).
         # Their fallback, if the route job failed, is the listed size's WarpBuild runner.
-        for job_id, label in {"check": "warp-ubuntu-2404-x64-8x", "coverage-changed": "warp-ubuntu-2404-x64-16x",
+        for job_id, label in {"check": "warp-ubuntu-2404-x64-16x", "coverage-changed": "warp-ubuntu-2404-x64-16x",
                               "coverage-e2e": "warp-ubuntu-2404-x64-16x", "coverage-all": "warp-ubuntu-2404-x64-16x"}.items():
             with self.subTest(job=job_id):
                 self.assertEqual(self.workflow["jobs"][job_id]["runs-on"],
@@ -733,7 +739,8 @@ class RunnerAvailabilityTests(unittest.TestCase):
     def test_pr_fits_heavy_rust_jobs_to_free_slots(self):
         same_repo = {"pull_request": {"head": {"repo": {"full_name": "intent-hq/intentd"}}}}
         busy = {"status": "in_progress", "labels": CACHE, "created_at": "2099-01-01T00:00:00Z"}
-        for free, expected in ((2, ["check", "coverage-changed"]), (1, ["check"]), (0, [])):
+        # coverage-changed ranks above check, so a single free slot goes to it.
+        for free, expected in ((2, ["check", "coverage-changed"]), (1, ["coverage-changed"]), (0, [])):
             with self.subTest(free=free):
                 result = run_route(self.workflow, org=[slot(), slot()], eventName="pull_request",
                                    payload=same_repo, jobs=[busy] * (2 - free))
@@ -746,6 +753,32 @@ class RunnerAvailabilityTests(unittest.TestCase):
         self.assertEqual(slots["check"], ["warp-ubuntu-2404-x64-16x"])
         self.assertNotIn(CACHE, slots.values())
         self.assertNotIn(SMALL, slots.values())
+
+    def test_pr_check_takes_an_xl_slot_only_after_coverage_changed(self):
+        # Two xl slots (intent-ci1 and intent-ci2) and two heavy slots online.
+        # coverage-changed (15.5 min on xl, ~33 on heavy) always picks first;
+        # check takes what is left: xl, then heavy, then a 16x burst.
+        same_repo = {"pull_request": {"head": {"repo": {"full_name": "intent-hq/intentd"}}}}
+        fleet = [xl_slot(), xl_slot(), slot(), slot()]
+        def busy(labels):
+            return {"status": "in_progress", "labels": labels, "created_at": "2099-01-01T00:00:00Z"}
+        for xl_free, heavy_free, coverage, check in (
+                (2, 2, XL, XL),
+                (1, 2, XL, CACHE),
+                (0, 2, CACHE, CACHE),
+                # Both xl slots busy, one heavy slot free: coverage-changed takes
+                # the heavy slot and check bursts.
+                (0, 1, CACHE, ["warp-ubuntu-2404-x64-16x"]),
+                (0, 0, ["warp-ubuntu-2404-x64-16x"], ["warp-ubuntu-2404-x64-16x"])):
+            with self.subTest(xl_free=xl_free, heavy_free=heavy_free):
+                jobs = [busy(XL)] * (2 - xl_free) + [busy(CACHE)] * (2 - heavy_free)
+                result = run_route(self.workflow, org=fleet, eventName="pull_request", payload=same_repo,
+                                   jobs=jobs, xlThreshold="2")
+                slots = json.loads(result["outputs"]["slots"])
+                self.assertEqual((slots["coverage-changed"], slots["check"]), (coverage, check))
+        # In the merge queue check is unlisted for the event and bursts at 16x.
+        result = run_route(self.workflow, org=fleet, eventName="merge_group", xlThreshold="2")
+        self.assertEqual(json.loads(result["outputs"]["slots"])["check"], ["warp-ubuntu-2404-x64-16x"])
 
     def test_windows_bursts_without_explicit_idle_capacity(self):
         missing_busy = runner("Windows", "X64")
