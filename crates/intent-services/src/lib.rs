@@ -511,9 +511,9 @@ struct WorkspaceAggregateSnapshot {
     task_stats: Option<HashMap<WorkspaceId, WorkspaceTaskStats>>,
     sessions: Option<HashMap<WorkspaceId, Vec<AgentSession>>>,
     unread: Option<HashSet<WorkspaceId>>,
-    active_hooks: HashSet<WorkspaceId>,
+    /// Workspaces owning an active hook or script monitor (one UNION read).
+    active_hooks_or_script_monitors: HashSet<WorkspaceId>,
     active_pr_monitors: HashSet<WorkspaceId>,
-    active_script_monitors: HashSet<WorkspaceId>,
     /// Each workspace's displayStatus-relevant PR monitor rows from the
     /// list's ONE bulk monitor read; folded per row during enrichment,
     /// once the workspace's own PR copies are at hand
@@ -3446,16 +3446,15 @@ impl Services {
                 .workspaces_with_unread_top_level_sessions_by_workspace(workspace_ids),
             self.compute_cow_supported(),
         );
-        let (active_hooks, monitors, legacy_question_tails, git_roots, active_script_monitors) = tokio::join!(
-            self.store.workspaces_with_active_hooks(workspace_ids),
+        let (active_hooks_or_script_monitors, monitors, legacy_question_tails, git_roots) = tokio::join!(
+            self.store
+                .workspaces_with_active_hooks_or_script_monitors(workspace_ids),
             self.store
                 .list_display_status_pr_monitors_by_workspaces(workspace_ids),
             self.store
                 .list_legacy_question_tail_candidates_by_workspace(workspace_ids),
             self.store
                 .list_workspace_git_roots_with_prs(include_archived),
-            self.store
-                .workspaces_with_active_script_monitors(workspace_ids),
         );
 
         let task_stats = match task_stats {
@@ -3588,9 +3587,8 @@ impl Services {
             task_stats,
             sessions,
             unread: unread.ok(),
-            active_hooks: active_hooks.unwrap_or_default(),
+            active_hooks_or_script_monitors: active_hooks_or_script_monitors.unwrap_or_default(),
             active_pr_monitors,
-            active_script_monitors: active_script_monitors.unwrap_or_default(),
             monitor_rows,
             git_root_prs,
             legacy_question_holds,
@@ -3657,9 +3655,8 @@ impl Services {
         }
         ws.cow_supported = snapshot.cow_supported;
         let unread = snapshot.unread.as_ref().map(|ids| ids.contains(&ws.id));
-        let waiting = snapshot.active_hooks.contains(&ws.id)
+        let waiting = snapshot.active_hooks_or_script_monitors.contains(&ws.id)
             || snapshot.active_pr_monitors.contains(&ws.id)
-            || snapshot.active_script_monitors.contains(&ws.id)
             || sessions.is_some_and(|sessions| {
                 self.workspace_has_waiting_agent_subscriptions_in_sessions(&ws.id, sessions)
             });
