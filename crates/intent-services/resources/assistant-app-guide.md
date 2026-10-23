@@ -565,7 +565,7 @@ check the device's connection to Intent before trying to change assignments.
 
 ## Inspect a failed response and recover
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/agent/agent-attention-toast-service.ts; src/store/renderer/slices/agent-session/sagas/agent-failure-toast-saga.ts; src/features/notifications/agent-idle-toast-service.ts. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/agent/agent-attention-toast-service.ts; src/store/renderer/slices/agent-session/sagas/agent-failure-toast-saga.ts; src/features/notifications/main/notification.service.ts. -->
 
 While the desktop app is in front, an agent finishing work shows an in-app
 notification naming the agent and its workspace instead of a system notification;
