@@ -986,9 +986,15 @@ pub struct MergeRequirementCheck {
 #[serde(rename_all = "camelCase")]
 pub struct MergeRequirementsChecks {
     pub total: i64,
+    /// Checks that ran and passed; skipped checks are counted in `skipped`.
     pub passed: i64,
     pub failed: i64,
     pub pending: i64,
+    /// Checks the forge skipped without running. They do not block merge.
+    /// Serde-defaulted so persisted monitor baselines written before the
+    /// field existed still parse (without phantom diff lines).
+    #[serde(default)]
+    pub skipped: i64,
     /// Every check, in rollup order, each with its own `required` flag.
     pub items: Vec<MergeRequirementCheck>,
     /// Names of the required checks that are failing.
@@ -1018,11 +1024,21 @@ impl MergeRequirementsChecks {
             passed: tally("passed"),
             failed: tally("failed"),
             pending: tally("pending"),
+            skipped: tally("skipped"),
             failing_required: names("failed"),
             pending_required: names("pending"),
             required_known,
             items,
         }
+    }
+
+    /// Names of the checks reporting `status`, in rollup order.
+    pub(crate) fn names_with(&self, status: &str) -> Vec<&str> {
+        self.items
+            .iter()
+            .filter(|c| c.status == status)
+            .map(|c| c.name.as_str())
+            .collect()
     }
 
     /// REST observes check runs but neither legacy statuses nor required flags.
@@ -1355,6 +1371,7 @@ fn check_status_word(state: CheckState) -> &'static str {
     match state {
         CheckState::Pending => "pending",
         CheckState::Success | CheckState::Neutral => "passed",
+        CheckState::Skipped => "skipped",
         CheckState::Failure | CheckState::Cancelled => "failed",
     }
 }
@@ -1406,7 +1423,9 @@ impl NameEvidence {
     }
 }
 
-/// How far a check outcome is from letting the PR merge.
+/// How far a check outcome is from letting the PR merge. A skipped check
+/// counts as passed here: GitHub treats a skipped required check as
+/// satisfied.
 fn outcome_severity(state: CheckState) -> u8 {
     match check_status_word(state) {
         "failed" => 2,
@@ -1418,13 +1437,14 @@ fn outcome_severity(state: CheckState) -> u8 {
 /// Last resort among same-name runs with equal (or equally unknown) starts:
 /// a real failure over a success, and a `cancelled` run last — a
 /// `concurrency`-cancelled duplicate must never shadow the run that actually
-/// completed.
+/// completed, and a `skipped` twin ranks below every run that ran.
 fn check_state_rank(state: CheckState) -> u8 {
     match state {
-        CheckState::Pending => 4,
-        CheckState::Failure => 3,
-        CheckState::Success => 2,
-        CheckState::Neutral => 1,
+        CheckState::Pending => 5,
+        CheckState::Failure => 4,
+        CheckState::Success => 3,
+        CheckState::Neutral => 2,
+        CheckState::Skipped => 1,
         CheckState::Cancelled => 0,
     }
 }
@@ -2884,6 +2904,99 @@ mod tests {
                 rest == Some("dirty") || graphql == Some("DIRTY")
             );
         }
+    }
+
+    /// Incident: intentd#2581 at 6c92d3256 (run 39724275631) had 23 green
+    /// checks plus `coverage-all` / `coverage-e2e` skipped, and the snapshot
+    /// reported 25/25 passed. Skipped checks are counted on their own.
+    fn skipped_incident_signals(required: bool) -> MergeRequirementSignals {
+        let mut checks: Vec<RollupCheck> = (1..=23)
+            .map(|i| rollup(&format!("job-{i:02}"), CheckState::Success, required))
+            .collect();
+        checks.insert(5, rollup("coverage-all", CheckState::Skipped, required));
+        checks.push(rollup("coverage-e2e", CheckState::Skipped, required));
+        MergeRequirementSignals {
+            checks,
+            checks_known: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn skipped_checks_are_counted_apart_from_passed() {
+        let p = pr(PrState::Open, false, Some(true), Some("clean"));
+        let req = merge_requirements(
+            &p,
+            Some(&skipped_incident_signals(false)),
+            &[],
+            &agg(0, 0),
+            Some(0),
+        );
+        let c = &req.checks;
+        assert_eq!(
+            (c.total, c.passed, c.skipped, c.failed, c.pending),
+            (25, 23, 2, 0, 0)
+        );
+        assert_eq!(
+            c.names_with("skipped"),
+            vec!["coverage-all", "coverage-e2e"]
+        );
+        let wire = serde_json::to_value(c).unwrap();
+        assert_eq!(wire["skipped"], 2);
+        assert_eq!(wire["passed"], 23);
+    }
+
+    #[test]
+    fn skipped_required_checks_do_not_block_merge() {
+        let p = pr(PrState::Open, false, Some(true), Some("clean"));
+        let req = merge_requirements(
+            &p,
+            Some(&skipped_incident_signals(true)),
+            &[],
+            &agg(0, 0),
+            Some(0),
+        );
+        assert_eq!(req.checks.skipped, 2);
+        assert!(req.checks.failing_required.is_empty(), "{:?}", req.checks);
+        assert!(req.checks.pending_required.is_empty(), "{:?}", req.checks);
+    }
+
+    #[test]
+    fn a_real_run_beats_a_skipped_same_name_duplicate() {
+        let p = pr(PrState::Open, false, Some(true), Some("clean"));
+        for order in [
+            vec![
+                rollup("gate", CheckState::Skipped, true),
+                rollup("gate", CheckState::Success, true),
+            ],
+            vec![
+                rollup("gate", CheckState::Success, true),
+                rollup("gate", CheckState::Skipped, true),
+            ],
+        ] {
+            let signals = MergeRequirementSignals {
+                checks: order,
+                checks_known: true,
+                ..Default::default()
+            };
+            let req = merge_requirements(&p, Some(&signals), &[], &agg(0, 0), Some(0));
+            assert_eq!(
+                (req.checks.total, req.checks.passed, req.checks.skipped),
+                (1, 1, 0)
+            );
+            assert_eq!(req.checks.items[0].status, "passed");
+        }
+    }
+
+    #[test]
+    fn checks_without_a_skipped_count_still_deserialize() {
+        let legacy = serde_json::json!({
+            "total": 1, "passed": 1, "failed": 0, "pending": 0,
+            "items": [{"name": "build", "status": "passed", "required": true}],
+            "failingRequired": [], "pendingRequired": [], "requiredKnown": true,
+        });
+        let checks: MergeRequirementsChecks = serde_json::from_value(legacy).unwrap();
+        assert_eq!((checks.passed, checks.skipped), (1, 0));
     }
 
     #[test]

@@ -191,7 +191,7 @@ fn plural(n: i64) -> &'static str {
 /// name's required flag, independently of uncertainty for other check names.
 ///
 /// Normal success transitions are suppressed: a check going `pending` →
-/// `passed`, or appearing already green, is expected progress rather than a
+/// `passed` or `skipped`, or appearing already green or skipped, is expected progress rather than a
 /// reportable change — the suite-completion summary in
 /// [`V1::pr_diff_lines`] covers the "everything finished" moment. A
 /// `failed` → `passed` recovery IS reported, since it resolves a previously
@@ -214,13 +214,14 @@ fn diff_checks(old: &PrMonitorSnapshot, new: &PrMonitorSnapshot) -> Vec<String> 
     for check in &n.items {
         match before.get(&check.name) {
             None => {
-                if check.status != "passed" {
+                if !matches!(check.status.as_str(), "passed" | "skipped") {
                     changes.push(format!("check started: {} ({})", check.name, check.status));
                 }
             }
             Some(prev) => {
                 if prev.status != check.status
-                    && !(check.status == "passed" && prev.status == "pending")
+                    && !(matches!(check.status.as_str(), "passed" | "skipped")
+                        && prev.status == "pending")
                 {
                     changes.push(format!(
                         "check {}: {} → {}",
@@ -1074,14 +1075,12 @@ impl Harness for V1 {
             && n.checks.pending == 0
             && n.checks.total > 0
         {
-            changes.push(if n.checks.failed == 0 {
-                format!("all checks passed ({})", n.checks.total)
-            } else {
-                format!(
-                    "all checks completed: {} passed, {} failed",
-                    n.checks.passed, n.checks.failed
-                )
-            });
+            changes.push(super::review_wake::checks_completed(
+                n.checks.total,
+                n.checks.passed,
+                n.checks.failed,
+                &n.checks.names_with("skipped"),
+            ));
         }
 
         // CI never started on the head (intentd#2531): reported once per
