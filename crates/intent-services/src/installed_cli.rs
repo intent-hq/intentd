@@ -452,10 +452,6 @@ impl InstalledContext {
         if let Some(cwd) = launch.as_std().get_current_dir() {
             command.current_dir(cwd);
         }
-        // The version check runs the provider CLI like an agent launch does.
-        // (On Linux the probe supervisor rebuilds the command, so it applies
-        // the same demotion to itself.)
-        intent_acp::AgentPriority::from_env().apply(&mut command);
         // The task owns the process and its resource leases even if its caller
         // stops awaiting. Only confirmed cleanup releases the actual resources.
         let bytes =

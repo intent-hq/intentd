@@ -559,6 +559,19 @@ impl AgentPriority {
         self.apply_std(cmd.as_std_mut());
     }
 
+    /// The nice value a child of this process gets under this demotion
+    /// (`None` when this process's own nice cannot be read).
+    #[cfg(unix)]
+    #[must_use]
+    pub fn expected_nice(self) -> Option<i32> {
+        let own = nice_of(0).ok()?;
+        Some(if self.nice_increment > 0 {
+            target_nice(own, self.nice_increment)
+        } else {
+            own
+        })
+    }
+
     /// [`Self::apply`] for a synchronous [`std::process::Command`].
     pub fn apply_std(self, cmd: &mut std::process::Command) {
         apply_reduced_priority(cmd, self.nice_increment);

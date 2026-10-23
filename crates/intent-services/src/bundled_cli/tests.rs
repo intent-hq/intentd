@@ -294,15 +294,6 @@ fn version_dirs_are_plain_relative_names() {
     );
 }
 
-/// The nice value an agent process should start at: the daemon's own plus
-/// the configured increment, capped at 19 (see `intent_acp::AgentPriority`).
-#[cfg(target_os = "linux")]
-fn demoted_nice() -> i32 {
-    // SAFETY: plain syscall wrapper with no pointer arguments.
-    let own = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
-    (own + intent_acp::AgentPriority::from_env().nice_increment).min(19)
-}
-
 /// Regression: the bundled-CLI `npm install` (the heaviest disk user an
 /// agent launch triggers) ran at the daemon's own priority.
 #[cfg(target_os = "linux")]
@@ -324,5 +315,11 @@ async fn npm_install_runs_at_reduced_priority() {
         .trim()
         .parse()
         .unwrap();
-    assert!(nice >= demoted_nice(), "npm ran at nice {nice}");
+    let expected = intent_acp::AgentPriority::from_env()
+        .expected_nice()
+        .unwrap();
+    assert!(
+        nice >= expected,
+        "npm ran at nice {nice}, expected {expected}"
+    );
 }

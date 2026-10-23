@@ -246,7 +246,8 @@ async fn verify_version(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    intent_acp::AgentPriority::from_env().apply(&mut command);
+    // The short version check stays at the daemon's priority (unlike the
+    // install above): starving it could fail a good install on its budget.
     let output = match tokio::time::timeout(VERIFY_TIMEOUT, command.output()).await {
         Err(_) => {
             return Err(format!(

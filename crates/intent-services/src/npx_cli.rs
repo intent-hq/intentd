@@ -125,7 +125,9 @@ fn run_npx_version_probe(npx: &Path) -> Option<String> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    intent_acp::AgentPriority::from_env().apply_std(&mut command);
+    // Deliberately NOT demoted like agents: a tiny probe on a 3s budget gains
+    // the daemon nothing by yielding, and a CPU-starved probe would time out
+    // and mark a working npx unavailable.
     let mut child = command.spawn().ok()?;
 
     let timeout = Duration::from_secs(3);

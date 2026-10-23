@@ -177,12 +177,12 @@ async fn installed_cli_version_uses_final_environment_and_cwd() {
     assert_eq!(context.observe(&cmd).await.unwrap().1, version);
 }
 
-/// Regression: the installed-CLI `--version` check ran at the daemon's own
-/// priority (on Linux the probe supervisor also dropped any demotion set on
-/// the command it rebuilds).
+/// The installed-CLI `--version` check stays at the daemon's priority: a
+/// demoted 3s check can time out on a busy machine, and a failed check
+/// blocks the agent launch.
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn installed_cli_version_check_runs_at_reduced_priority() {
+async fn installed_cli_version_check_runs_at_daemon_priority() {
     let version = current(InstalledCli::Claude);
     let record = tempfile::tempdir().unwrap();
     let nice_file = record.path().join("cli.nice");
@@ -206,13 +206,14 @@ async fn installed_cli_version_check_runs_at_reduced_priority() {
         .trim()
         .parse()
         .unwrap();
-    // SAFETY: plain syscall wrapper with no pointer arguments.
-    let own = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
-    let expected = (own + intent_acp::AgentPriority::from_env().nice_increment).min(19);
-    assert!(
-        nice >= expected,
-        "CLI ran at nice {nice}, expected {expected}"
-    );
+    // The daemon's own nice: the expectation with no increment.
+    let own = intent_acp::AgentPriority {
+        nice_increment: 0,
+        ..intent_acp::AgentPriority::from_env()
+    }
+    .expected_nice()
+    .unwrap();
+    assert_eq!(nice, own, "CLI version check must not be demoted");
 }
 
 #[test]
