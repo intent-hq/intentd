@@ -423,7 +423,8 @@ pub(crate) fn derive_check_state(status: &str, conclusion: Option<&str>) -> Chec
     }
     match conclusion {
         Some("success") => CheckState::Success,
-        Some("neutral" | "skipped") => CheckState::Neutral,
+        Some("neutral") => CheckState::Neutral,
+        Some("skipped") => CheckState::Skipped,
         Some("cancelled") => CheckState::Cancelled,
         _ => CheckState::Failure,
     }
@@ -3009,6 +3010,10 @@ mod tests {
         );
         assert_eq!(
             derive_check_state("completed", Some("skipped")),
+            CheckState::Skipped
+        );
+        assert_eq!(
+            derive_check_state("completed", Some("neutral")),
             CheckState::Neutral
         );
         assert_eq!(

@@ -19992,6 +19992,8 @@ pub(crate) mod pr {
         assert_eq!(v["checks"]["failed"], 1);
         assert_eq!(v["checks"]["pending"], 1);
         assert_eq!(v["checks"]["failedNames"], json!(["test"]));
+        assert_eq!(v["checks"]["skipped"], 0);
+        assert_eq!(v["checks"]["skippedNames"], json!([]));
         // Review decision from the aggregated actionable reviews.
         assert_eq!(v["reviews"]["decision"], "approved");
         assert_eq!(v["reviews"]["approvals"], 1);

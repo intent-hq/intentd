@@ -80,7 +80,7 @@ Open Settings and use these sidebar labels (English labels shown):
 
 | Section | What it contains | Canonical link |
 | --- | --- | --- |
-| Appearance | Theme, colors, language, fonts, and chat display (such as Collapse tool activity) | `/settings?tab=display#theme` |
+| Appearance | Theme, colors, language, fonts, and chat display | `/settings?tab=display#theme` |
 | General | Notifications, updates, external apps, GitHub link behavior | `/settings?tab=app-behavior#notifications` |
 | Input and shortcuts | Voice dictation and keyboard shortcuts | `/settings?tab=input#keyboard-shortcuts` |
 | Agent defaults | Global instructions and agent features | `/settings?tab=agent-behavior#global-instructions` |
