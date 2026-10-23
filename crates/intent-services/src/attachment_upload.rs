@@ -1044,7 +1044,11 @@ impl Services {
             sha256: Some(declared_sha.clone()),
         });
         // A retire that landed while the payload was assembling: the
-        // folder is gone, so nothing may be placed into it.
+        // folder is gone, so nothing may be placed into it. The archive
+        // fence (held by retire from its row flip through the folder sweep)
+        // spans the check AND the placement, so a retire cannot start
+        // between them and the placement can never recreate a swept folder.
+        let fence = self.archive_fence.acquire(&workspace_id).await;
         self.refuse_if_retired(&workspace_id).await?;
         let result = self
             .place_attachment_registered(
@@ -1065,6 +1069,7 @@ impl Services {
                 );
                 e
             })?;
+        drop(fence);
 
         // Session retired; staging deleted.
         self.attachment_uploads
