@@ -79,9 +79,7 @@ def violations(text, filename):
 
 # Free labels may still be listed; the route always gives them their GitHub label.
 POOLED = {'gh-linux-8x', 'gh-linux-16x', 'ubuntu-22.04', 'ubuntu-24.04'}
-# A job may burst to a bigger runner than its listed pool label: it reads the slot
-# only when the slot is self-hosted, else `cloud` for the burst label (group 5).
-SLOT_READ = re.compile(r"outputs\.slots \|\| '\{\}'\)\[(?:'([\w-]+)'|format\('([\w-]+)-\{0\}', matrix\.\w+\))\] \|\| (?:fromJSON\(needs\.[\w-]+\.outputs\.cloud \|\| '\{\}'\)\['([\w.-]+)'\] \|\| )?(?:fromJSON\('\[\"([\w.-]+)\"\]'\)|fromJSON\(needs\.[\w-]+\.outputs\.runners \|\| '\{\}'\)\[matrix\.(\w+)\])")
+SLOT_READ = re.compile(r"outputs\.slots \|\| '\{\}'\)\[(?:'([\w-]+)'|format\('([\w-]+)-\{0\}', matrix\.\w+\))\] \|\| (?:fromJSON\('\[\"([\w.-]+)\"\]'\)|fromJSON\(needs\.[\w-]+\.outputs\.runners \|\| '\{\}'\)\[matrix\.(\w+)\])")
 
 
 def slot_list(text):
@@ -100,6 +98,10 @@ def slot_violations(text):
     for entry in listed:
         if entry.get('label') not in POOLED:
             errors.append(f"{entry['key']}: {entry.get('label')} is not an intent-cache pool label")
+        # `burst` only upsizes a heavy job's burst runner (paid 8x to paid 16x); it
+        # must never turn a free label paid or shrink a job.
+        if 'burst' in entry and (entry.get('label'), entry['burst']) != ('gh-linux-8x', 'gh-linux-16x'):
+            errors.append(f"{entry['key']}: burst {entry['burst']} must upsize gh-linux-8x to gh-linux-16x")
     for job, body in jobs(text).items():
         runner = re.search(r'^    runs-on: (.+)$', body, re.M)
         # A matrix row may read its own slot in its `os` value (runs-on: matrix.os).
@@ -111,8 +113,8 @@ def slot_violations(text):
                 errors.append(f'{job}: reads an unlisted slot')
                 continue
             used.add(entry['key'])
-            if entry['label'] != read[4]:
-                errors.append(f"{job}: fallback {read[4]} differs from listed {entry['label']}")
+            if entry['label'] != read[3]:
+                errors.append(f"{job}: fallback {read[3]} differs from listed {entry['label']}")
             only = re.search(r"^    if: github\.event_name == '(\w+)'$", body, re.M)
             if only and entry.get('events') != [only[1]]:
                 errors.append(f'{job}: runs only on {only[1]} but lists events {entry.get("events")}')
@@ -125,15 +127,9 @@ def slot_violations(text):
             errors.append(f'{job}: reads an unlisted slot')
             continue
         used.add(key)
-        if read[3]:
-            guard = f"fromJSON(needs.route.outputs.slots || '{{}}')['{key}'][0] == 'self-hosted' && "
-            if read[3] not in POOLED or read[4] != read[3]:
-                errors.append(f"{job}: burst {read[3]} must be a pool label and its fallback")
-            if not runner[1].startswith('${{ ' + guard):
-                errors.append(f'{job}: reads cloud without taking only a self-hosted slot first')
-        elif read[4] and entry['label'] != read[4]:
-            errors.append(f"{job}: fallback {read[4]} differs from listed {entry['label']}")
-        if read[5] and entry['label'] not in body:
+        if read[3] and entry['label'] != read[3]:
+            errors.append(f"{job}: fallback {read[3]} differs from listed {entry['label']}")
+        if read[4] and entry['label'] not in body:
             errors.append(f"{job}: no matrix leg asks for the listed {entry['label']}")
         if bool(read[2]) != bool(entry.get('shards') or entry.get('legs')):
             errors.append(f'{job}: matrix legs and the slot list disagree')
@@ -219,15 +215,6 @@ class RunnerPolicy(unittest.TestCase):
         self.assertEqual(len(slot_violations(listing.format('gh-linux-8x', ',"events":["merge_group"]') + job)), 1)
         self.assertEqual(len(slot_violations(listing.format('windows-2025', ',"events":["merge_group"]') + job)), 2)
         self.assertEqual(slot_violations('jobs:\n' + job), ['a: reads an unlisted slot'])
-        # A heavy-slot job may burst to the 16-core runner, but only behind the self-hosted guard.
-        burst = "fromJSON(needs.route.outputs.slots || '{}')['a'] || fromJSON(needs.route.outputs.cloud || '{}')['gh-linux-16x'] || fromJSON('[\"gh-linux-16x\"]') }}"
-        guarded = "  a:\n    runs-on: ${{ fromJSON(needs.route.outputs.slots || '{}')['a'][0] == 'self-hosted' && " + burst + "\n"
-        heavy = listing.format('gh-linux-8x', '')
-        self.assertEqual(slot_violations(heavy + guarded), [])
-        self.assertEqual(slot_violations(heavy + "  a:\n    runs-on: ${{ " + burst + "\n"),
-                         ['a: reads cloud without taking only a self-hosted slot first'])
-        self.assertEqual(slot_violations(heavy + guarded.replace('["gh-linux-16x"]', '["gh-linux-8x"]')),
-                         ['a: burst gh-linux-16x must be a pool label and its fallback'])
         row = "  b:\n    strategy:\n      matrix:\n        include:\n          - os: ${{ fromJSON(needs.route.outputs.slots || '{}')['b-linux'] || fromJSON('[\"gh-linux-16x\"]') }}\n    runs-on: ${{ matrix.os }}\n"
         rows = '    with:\n      slot_jobs: >-\n        [{{"key":"b-linux","label":"{}"}}]\njobs:\n'
         self.assertEqual(slot_violations(rows.format('gh-linux-16x') + row), [])
@@ -239,6 +226,14 @@ class RunnerPolicy(unittest.TestCase):
         self.assertEqual(slot_violations(events.format(',"events":["merge_group"]') + queued), [])
         self.assertEqual(slot_violations(events.format('') + queued), ['b: runs only on merge_group but lists events None'])
 
+        # A burst label only upsizes a heavy job; free or downsized bursts are rejected.
+        bursts = '    with:\n      slot_jobs: >-\n        [{{"key":"a","label":"{}","burst":"{}","events":["merge_group"]}}]\njobs:\n'
+        heavy = job.replace('ubuntu-24.04', 'gh-linux-8x')
+        self.assertEqual(slot_violations(bursts.format('gh-linux-8x', 'gh-linux-16x') + heavy), [])
+        self.assertEqual(slot_violations(bursts.format('ubuntu-24.04', 'gh-linux-16x') + job),
+                         ['a: burst gh-linux-16x must upsize gh-linux-8x to gh-linux-16x'])
+        self.assertEqual(slot_violations(bursts.format('gh-linux-16x', 'gh-linux-8x') + job.replace('ubuntu-24.04', 'gh-linux-16x')),
+                         ['a: burst gh-linux-8x must upsize gh-linux-8x to gh-linux-16x'])
     def test_all_workloads_are_routed(self):
         for path in (ROOT / '.github/workflows').glob('*.yml'):
             with self.subTest(workflow=path.name):
