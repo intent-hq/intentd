@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.31] - 2026-10-23
+
+### 🚀 Features
+
+- *(pr-monitor)* Flag a PR head on which CI never started ([#2604](https://github.com/intent-hq/intentd/pull/2604))
+
+
 ## [0.11.30] - 2026-10-22
 
 ### 🚀 Features
