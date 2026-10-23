@@ -208,8 +208,11 @@ the first `::`; `_shard_rest` also runs top-level tests and the nested
 `mod tests` of every unnamed module. libtest's filters are substring matches
 (`tests::` would also match `discussion_ops::tests::`), so each shard runs
 the binary through `bazel/module_shard_test.sh`, which lists the tests, picks
-by top-level module and runs the picks with `--exact`. Every test runs in
-exactly one shard. The assignment is the fixed `MODULE_SHARDS` table, not computed from
+by module path and runs the picks with `--exact`. A table entry may also be a
+nested module path such as `tests::rules`, which takes those tests from the
+shard naming the enclosing module; this keeps a few `tests` and
+`workspace_status` submodules in automatic shard 6 while their parents sit in
+manual shards. Every test runs in exactly one shard. The assignment is the fixed `MODULE_SHARDS` table, not computed from
 file sizes, so editing or adding unit tests never changes the BUILD file; a
 new module runs in `_shard_rest`. To rebalance, paste the output of
 `python3 scripts/bazel-gen.py --suggest-shards intent-services` into the

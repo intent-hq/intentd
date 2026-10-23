@@ -613,18 +613,21 @@ class ModuleShardSelection(unittest.TestCase):
         self.write("crates/a/src/lib.rs", lib)
         for module in ("m1", "sub", "tests", "discussion_ops", "new_module"):
             self.write(f"crates/a/src/{module}.rs", "")
-        for name, value in (("ROOT", self.tmp), ("MODULE_SHARDS", {"a": [["m1"], ["tests"]]}),
-                            ("MANUAL_SHARDS", {("a", 2): "test reason"})):
+        for name, value in (("ROOT", self.tmp), ("MANUAL_SHARDS", {("a", 2): "test reason"})):
             patcher = mock.patch.object(gen, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
         subprocess.run(["cargo", "generate-lockfile", "--offline"], cwd=self.tmp, check=True, capture_output=True)
-        with contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(gen.main([]), 0)
         self.binary = self.tmp / "lib_test_binary"
         self.binary.write_text(FAKE_LIBTEST)
         self.binary.chmod(0o755)
         Path(str(self.binary) + ".json").write_text(json.dumps(self.TESTS))
+        self.generate([["m1"], ["tests"]])
+
+    def generate(self, shards):
+        """Regenerate the fixture's BUILD with `shards` as its MODULE_SHARDS entry."""
+        with mock.patch.object(gen, "MODULE_SHARDS", {"a": shards}), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(gen.main([]), 0)
         self.rules = Package(self.tmp / "crates/a").evaluate_build()
 
     def write(self, rel, text):
@@ -687,12 +690,77 @@ class ModuleShardSelection(unittest.TestCase):
                                     "top_level_fn"},
         })
 
+    def test_a_nested_module_path_overrides_its_parents_shard(self):
+        self.generate([["m1", "tests::helpers"], ["tests"]])
+        selected = {name: self.run_target(name)
+                    for name in ("lib_test_shard1", "lib_test_shard2", "lib_test_shard_rest")}
+        self.assertEqual(selected, {
+            "lib_test_shard1": {"m1::a", "m1::tests::b", "tests::helpers::e"},
+            "lib_test_shard2": {"tests::d"},
+            "lib_test_shard_rest": {"sub::m1::c", "discussion_ops::tests::y", "new_module::tests::x",
+                                    "top_level_fn"},
+        })
+        self.assertNotIn("manual", self.rules["lib_test_shard1"][1].get("tags") or [])
+
     def test_an_empty_shard_runs_nothing(self):
         launcher = self.tmp / "empty.sh"
         launcher.write_text(module_shard_launcher(str(self.binary), ["absent"], []))
         launcher.chmod(0o755)
         out = subprocess.run([str(launcher)], check=True, capture_output=True, text=True)
         self.assertNotIn("RUN ", out.stdout)
+
+
+class IntentServicesShards(unittest.TestCase):
+    """The real intent-services shard table, run through its generated BUILD file."""
+
+    # One test of each module whose tests left automatic CI when shards started
+    # selecting by real top-level module (intentd#2597): they live in modules
+    # (`tests`, `workspace_status`) or a shard (4) that is otherwise manual.
+    AUTOMATIC = [
+        "tests::drafts_events::draft_attachments_round_trip_through_store",
+        "tests::last_activity_events::append_message_op_schedules_last_activity_only_for_user_role",
+        "tests::rules::assembly_appends_suggested_prompts_for_top_level_agent",
+        "tests::setup_lifecycle_events::duplicate_emits_immediate_completed",
+        "tests::turn_token_usage::agent_rename_refreshes_token_usage_agent_names",
+        "workspace_status::display_status_events::activity_begin_in_grace_window_cancels_idle_demotion",
+        "worktree_presence::tests::known_git_checkout_without_git_entry_is_missing",
+    ]
+    # Their parent modules' other tests keep their manual shards.
+    MANUAL = [
+        "tests::add_persists_and_reports_position",
+        "workspace_status::display_status::active_monitor_open_pr_is_pr_open_or_pr_ready",
+    ]
+
+    def test_moved_modules_run_in_exactly_one_automatic_shard(self):
+        tmp = Path(tempfile.mkdtemp(prefix="bazel-services-shards-"))
+        self.addCleanup(shutil.rmtree, tmp)
+        binary = tmp / "lib_test_binary"
+        binary.write_text(FAKE_LIBTEST)
+        binary.chmod(0o755)
+        Path(str(binary) + ".json").write_text(json.dumps(self.AUTOMATIC + self.MANUAL))
+        rules = Package(ROOT / "crates/intent-services").evaluate_build()
+        runs: dict[str, list[str]] = {}
+        for name, (kind, attrs) in sorted(rules.items()):
+            if not (attrs.get("include_modules") or attrs.get("exclude_modules")):
+                continue
+            launcher = tmp / f"{name}.sh"
+            launcher.write_text(module_shard_launcher(
+                str(binary), attrs.get("include_modules", []), attrs.get("exclude_modules", [])))
+            launcher.chmod(0o755)
+            out = subprocess.run([str(launcher)] + (attrs.get("args") or []), check=True, capture_output=True,
+                                 text=True)
+            manual = "manual" in (attrs.get("tags") or [])
+            for line in out.stdout.splitlines():
+                if line.startswith("RUN "):
+                    runs.setdefault(line[4:], []).append((name, manual))
+        for test in self.AUTOMATIC:
+            with self.subTest(test=test):
+                self.assertEqual(len(runs.get(test, [])), 1, runs.get(test))
+                self.assertFalse(runs[test][0][1], f"{test} runs only in manual {runs[test][0][0]}")
+        for test in self.MANUAL:
+            with self.subTest(test=test):
+                self.assertEqual(len(runs.get(test, [])), 1, runs.get(test))
+                self.assertTrue(runs[test][0][1], f"{test} moved out of its manual shard")
 
 
 def module_shard_launcher(binary: str, include: list[str], exclude: list[str]) -> str:

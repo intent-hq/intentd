@@ -7,10 +7,10 @@ and run environment are forwarded unchanged; `args`, `tags`, `timeout` and the
 other common test attributes apply to the runner target.
 
 With `include_modules` or `exclude_modules` the target runs only the tests
-whose top-level module (the test name up to the first `::`) is in
-`include_modules` and not in `exclude_modules`, through
-bazel/module_shard_test.sh. libtest's own filters are substring matches and
-cannot express that.
+under a module path in `include_modules` and under none in `exclude_modules`,
+through bazel/module_shard_test.sh. A module path is a top-level module (the
+test name up to the first `::`) or a nested one such as `tests::rules`.
+libtest's own filters are substring matches and cannot express that.
 """
 
 def _shared_binary_test_impl(ctx):
@@ -58,10 +58,10 @@ shared_binary_test = rule(
             doc = "Extra client environment variables passed to the test.",
         ),
         "exclude_modules": attr.string_list(
-            doc = "Skip tests whose top-level module is one of these.",
+            doc = "Skip tests under one of these module paths.",
         ),
         "include_modules": attr.string_list(
-            doc = "Run only tests whose top-level module is one of these.",
+            doc = "Run only tests under one of these module paths.",
         ),
         "_module_shard_launcher": attr.label(
             default = Label("//bazel:module_shard_test.sh"),

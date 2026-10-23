@@ -209,11 +209,13 @@ KNOWN_FAILING[("intent-services", "intent-services")] = {
 
 # Unit-test binaries split into several Bazel targets by top-level module, so
 # Bazel runs them as parallel processes (rules_rust has no test sharding).
-# Each `<target>_shardN` runs the tests whose top-level module (the test name
-# up to the first `::`) is one of its modules; `<target>_shard_rest` runs every
-# other test, including top-level tests and nested `mod tests` of unlisted
-# modules. bazel/module_shard_test.sh does the selection, since libtest's
-# filters are substring matches. Every test runs in exactly one shard.
+# Each `<target>_shardN` runs the tests under one of its module paths: a
+# top-level module (the test name up to the first `::`) or a nested one such as
+# `tests::rules`, which takes those tests from the shard listing its enclosing
+# module. `<target>_shard_rest` runs every other test, including top-level
+# tests and nested `mod tests` of unlisted modules. bazel/module_shard_test.sh
+# does the selection, since libtest's filters are substring matches. Every test
+# runs in exactly one shard.
 #
 # The assignment is a fixed table, not derived from the sources: balancing by
 # file size reshuffled most shards whenever a module grew by a few hundred
@@ -261,7 +263,7 @@ MODULE_SHARDS: dict[str, list[list[str]]] = {
             "conditional_write_precedence_tests", "disk_usage", "fast_mode", "github_auth_ops",
             "issue_cache", "linear_ops", "model_preference", "primitive_ops", "provider_return",
             "repository_context_output", "script_monitor", "test_support", "tests", "tool_block",
-            "tracked_changes_sweep", "v2_3_goldens", "workspace_vocabulary", "worktree_presence"
+            "tracked_changes_sweep", "v2_3_goldens", "workspace_vocabulary"
         ],
         [
             "antigravity_install", "attachment_upload", "browser_tabs", "codex_diagnostics",
@@ -277,7 +279,12 @@ MODULE_SHARDS: dict[str, list[list[str]]] = {
             "nested_repos", "pagination", "provider_profiles", "provider_test_prompt", "repo_config",
             "repository_admission", "repository_context_live", "settings_registry", "token_usage",
             "transfer_remotes", "transfer_selection_contract", "usage_semantics", "v1_1_goldens",
-            "v2_5_goldens", "workspace_branch"
+            "v2_5_goldens", "workspace_branch", "worktree_presence",
+            # Ran automatically until shards selected by real module; their
+            # enclosing modules sit in manual shards 2 and 4.
+            "tests::drafts_events", "tests::last_activity_events", "tests::rules",
+            "tests::setup_lifecycle_events", "tests::turn_token_usage",
+            "workspace_status::display_status_events"
         ],
         [
             "agent_manager"
@@ -306,7 +313,7 @@ MANUAL_SHARDS: dict[tuple[str, int], str] = {
     ),
     ("intent-services", 4): (
         "no failure recorded for these modules; kept manual because the shard 4 that ran timed out "
-        "at 900 s (only 2 of today's 23 modules were in it); not yet run with this module set"
+        "at 900 s (only a few of today's modules were in it); not yet run with this module set"
     ),
     ("intent-services", 8): (
         "agent_ops tests (pre_publish_group_record_*, pr_monitor_waiting_idle_*, principal_stamp_*, "
@@ -941,13 +948,20 @@ def render_build(ws: Workspace, package: dict, nextest: NextestPolicy) -> str:
                 reason = MANUAL_SHARDS.get((name, index))
                 if reason:
                     rules.append(Comment(f"manual: {reason}"))
+                # A nested path listed in another shard overrides this one's
+                # enclosing module (`tests::rules` vs `tests`).
+                nested = sorted(m for other in shards if other is not bucket for m in other
+                                if any(m.startswith(f"{b}::") for b in bucket))
                 emit(
                     f"_shard{index}",
                     skips,
                     exclusive + (["manual"] if reason else []),
-                    {"include_modules": bucket, **({"timeout": "eternal"} if reason else {})},
+                    {"include_modules": bucket, **({"exclude_modules": nested} if nested else {}),
+                     **({"timeout": "eternal"} if reason else {})},
                 )
-            emit("_shard_rest", skips, exclusive, {"exclude_modules": sorted(m for b in shards for m in b)})
+            listed = {m for b in shards for m in b}
+            outer = sorted(m for m in listed if not any(m.startswith(f"{o}::") for o in listed))
+            emit("_shard_rest", skips, exclusive, {"exclude_modules": outer})
         else:
             emit("", skips, exclusive, {})
         if serial:

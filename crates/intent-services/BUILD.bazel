@@ -466,6 +466,7 @@ shared_binary_test(
         "transfer_git",
         "workspace_status",
     ],
+    exclude_modules = ["workspace_status::display_status_events"],
     tags = [
         "manual",
         "no-sandbox",
@@ -619,7 +620,7 @@ shared_binary_test(
     ],
 )
 
-# manual: no failure recorded for these modules; kept manual because the shard 4 that ran timed out at 900 s (only 2 of today's 23 modules were in it); not yet run with this module set
+# manual: no failure recorded for these modules; kept manual because the shard 4 that ran timed out at 900 s (only a few of today's modules were in it); not yet run with this module set
 shared_binary_test(
     name = "lib_test_shard4",
     binary = ":lib_test_binary",
@@ -751,7 +752,13 @@ shared_binary_test(
         "tracked_changes_sweep",
         "v2_3_goldens",
         "workspace_vocabulary",
-        "worktree_presence",
+    ],
+    exclude_modules = [
+        "tests::drafts_events",
+        "tests::last_activity_events",
+        "tests::rules",
+        "tests::setup_lifecycle_events",
+        "tests::turn_token_usage",
     ],
     tags = [
         "manual",
@@ -1041,6 +1048,13 @@ shared_binary_test(
         "v1_1_goldens",
         "v2_5_goldens",
         "workspace_branch",
+        "worktree_presence",
+        "tests::drafts_events",
+        "tests::last_activity_events",
+        "tests::rules",
+        "tests::setup_lifecycle_events",
+        "tests::turn_token_usage",
+        "workspace_status::display_status_events",
     ],
     tags = [
         "no-sandbox",
