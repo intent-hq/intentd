@@ -82,8 +82,9 @@ case "$1 $2" in
   'release view')
     [[ "$repo" == "$STUB_REPO" && "$3" == "channel-$STUB_CHANNEL" ]] || die 'wrong release lookup target'
     if has_arg --json; then
-      # Alpha downgrade guard: list the channel release's assets. The live
-      # manifest (named like the uploaded file) exists only when STUB_LIVE is set.
+      # Alpha downgrade guard: draft state plus asset names. The live manifest
+      # (named like the uploaded file) exists when STUB_LIVE is set or an
+      # earlier run in this scenario uploaded one.
       record assets
       [[ "$STUB_CHANNEL" == alpha ]] || die 'only alpha reads the live manifest'
       if [[ "${STUB_LIVE_ERROR:-}" == assets ]]; then
@@ -91,8 +92,9 @@ case "$1 $2" in
         exit 1
       fi
       live_name=""
-      [[ -z "${STUB_LIVE:-}" ]] || live_name=$(basename "$STUB_MANIFEST")
-      jq -nc --arg live "$live_name" '{assets: ([{name: "notes.txt"}] + (if $live == "" then [] else [{name: $live}] end))}' | jq -r "$query"
+      [[ -z "${STUB_LIVE:-}" && ! -f "$STUB_DIR/uploaded.json" ]] || live_name=$(basename "$STUB_MANIFEST")
+      jq -nc --arg live "$live_name" --argjson draft "${STUB_DRAFT:-false}" \
+        '{isDraft: $draft, assets: ([{name: "notes.txt"}] + (if $live == "" then [] else [{name: $live}] end))}' | jq -r "$query"
     else
       # Retained so regression tests also exercise the unchanged buggy script.
       lookup view
@@ -104,6 +106,10 @@ case "$1 $2" in
     if [[ "${STUB_LIVE_ERROR:-}" == download ]]; then
       echo 'gh: download failed (HTTP 502)' >&2
       exit 1
+    fi
+    if [[ -f "$STUB_DIR/uploaded.json" ]]; then
+      cat "$STUB_DIR/uploaded.json"
+      exit 0
     fi
     case "$STUB_LIVE" in
       garbage) echo 'not json' ;;
@@ -213,6 +219,7 @@ run_case() (
     live_garbage|live_noversion) export STUB_SCENARIO=existing STUB_LIVE=${1#live_} ;;
     assets_error|download_error) export STUB_SCENARIO=existing STUB_LIVE=0.11.31 STUB_LIVE_ERROR=${1%_error}; new_version=0.11.32 ;;
     race_newer) export STUB_SCENARIO=race STUB_LIVE=0.11.32; new_version=0.11.31 ;;
+    drafted_newer) export STUB_SCENARIO=existing STUB_DRAFT=true STUB_LIVE=0.11.32; new_version=0.11.31 ;;
     new_invalid) export STUB_SCENARIO=existing; new_version=v1.2 ;;
     beta_rollback|stable_rollback) export STUB_SCENARIO=existing STUB_CHANNEL=${1%_rollback} STUB_LIVE=9.9.9 ;;
   esac
@@ -244,17 +251,22 @@ run_case() (
       expect_calls 'lookup assets download upload refresh-read draft publish'
       contains "$STUB_DIR/stderr" "live alpha manifest on $STUB_REPO is $STUB_LIVE; publishing $new_version"
       not_contains "$STUB_DIR/stdout" '::warning::' ;;
-    live_newer|live_numeric_newer|live_release_vs_rc|live_rc_numeric|race_newer)
+    live_newer|live_numeric_newer|live_release_vs_rc|live_rc_numeric|race_newer|drafted_newer)
       [[ "$status" == 0 ]] || fail 'an older version must be skipped, not fail the release'
-      if [[ "$1" == race_newer ]]; then
-        expect_calls 'lookup create lookup assets download'
-      else expect_calls 'lookup assets download'; fi
+      case "$1" in
+        race_newer) expect_calls 'lookup create lookup assets download' ;;
+        # A skipped publish still repairs a channel release stuck in DRAFT.
+        drafted_newer) expect_calls 'lookup assets download refresh-read draft publish' ;;
+        *) expect_calls 'lookup assets download' ;;
+      esac
       contains "$STUB_DIR/stdout" "::warning::Not publishing alpha $new_version to $STUB_REPO: the alpha channel already points at newer $STUB_LIVE."
+      contains "$STUB_DIR/stdout" 'to roll back on purpose, delete alpha manifest.json from channel-alpha and re-run'
       [[ ! -f "$STUB_DIR/uploaded.json" ]] || fail 'older manifest was uploaded' ;;
     live_garbage|live_noversion)
       [[ "$status" != 0 ]] || fail 'an unreadable live manifest must fail publication'
       expect_calls 'lookup assets download'
-      contains "$STUB_DIR/stderr" 'has no readable version' ;;
+      contains "$STUB_DIR/stderr" 'has no readable X.Y.Z[-prerelease] version'
+      not_contains "$STUB_DIR/stderr" 'not json' ;;
     assets_error|download_error)
       [[ "$status" != 0 ]] || fail 'a failed live manifest read must fail publication'
       if [[ "$1" == assets_error ]]; then
@@ -268,7 +280,7 @@ run_case() (
     new_invalid)
       [[ "$status" != 0 ]] || fail 'an invalid new version must fail before any GitHub call'
       [[ ! -s "$STUB_DIR/calls" ]] || fail "unexpected calls: $(tr '\n' ' ' <"$STUB_DIR/calls")"
-      contains "$STUB_DIR/stderr" "has no valid .version (got: 'v1.2')" ;;
+      contains "$STUB_DIR/stderr" 'has no valid X.Y.Z[-prerelease] .version' ;;
     beta_rollback|stable_rollback)
       [[ "$status" == 0 ]] || fail 'beta/stable rollbacks must still publish'
       expect_calls 'lookup upload refresh-read draft publish' ;;
@@ -276,7 +288,8 @@ run_case() (
       [[ "$status" == 0 ]] || fail 'first publication failed'
       run_publisher
       [[ "$status" == 0 ]] || fail 'same-version publication failed'
-      expect_calls 'lookup assets upload refresh-read draft publish lookup assets upload refresh-read draft publish' ;;
+      # The second run reads back the first run's manifest (same version).
+      expect_calls 'lookup assets upload refresh-read draft publish lookup assets download upload refresh-read draft publish' ;;
     race)
       [[ "$status" == 0 ]] || fail 'lost creation race must recover'
       expect_calls 'lookup create lookup assets upload refresh-read draft publish'
@@ -312,7 +325,7 @@ run_case() (
 if (($# == 0)); then
   set -- forbidden service unauthorized inaccessible transport partial absent empty existing drafted same_repo stable beta repeat race reread_error still_absent upload_error draft_error refresh_error \
     live_missing live_newer live_equal live_older live_numeric_newer live_numeric_older live_release_vs_rc live_rc_vs_release live_rc_numeric \
-    live_garbage live_noversion assets_error download_error race_newer new_invalid beta_rollback stable_rollback
+    live_garbage live_noversion assets_error download_error race_newer drafted_newer new_invalid beta_rollback stable_rollback
 fi
 failed=0
 for scenario in "$@"; do
