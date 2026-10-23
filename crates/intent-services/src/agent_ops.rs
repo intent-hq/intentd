@@ -18260,6 +18260,42 @@ fn resume_continuation_text(interrupted_at: &str, now: time::OffsetDateTime) -> 
     )
 }
 
+/// Transcript marker for a restart resume whose row carries
+/// [`crate::agent_workers::INTERRUPTED_WITH_WORKERS_REASON`]: the agent may
+/// have been idle (no turn to interrupt) while its background tasks ran.
+pub(crate) const RESUME_WORKERS_MARKER_TEXT: &str = "The harness shut down while background \
+     tasks were running, which stopped them. Continuing below.";
+
+/// Restart-resume transcript marker for an untagged row (a mid-turn capture).
+pub(crate) const RESUME_MARKER_TEXT: &str =
+    "The previous turn was interrupted because the harness shut down. Continuing below.";
+
+/// Appended to the restart-resume continuation when the row carries
+/// [`crate::agent_workers::INTERRUPTED_WITH_WORKERS_REASON`]
+/// (intent-hq/intent#7658): the shutdown killed the provider and its
+/// background workers, so their completion reports will never arrive.
+pub(crate) const RESUME_WORKERS_LOST_NOTE: &str = "Background tasks you started before the \
+     shutdown (such as commands run in the background) were stopped by it and will not report \
+     back. Check what they completed, and restart any you still need.";
+
+/// The marker and continuation a restart resume delivers for a claimed row
+/// with this `interrupted_at` and `reason`.
+fn resume_marker_and_continuation(
+    interrupted_at: &str,
+    reason: Option<&str>,
+    now: time::OffsetDateTime,
+) -> (&'static str, String) {
+    let continuation = resume_continuation_text(interrupted_at, now);
+    if reason == Some(crate::agent_workers::INTERRUPTED_WITH_WORKERS_REASON) {
+        (
+            RESUME_WORKERS_MARKER_TEXT,
+            format!("{continuation} {RESUME_WORKERS_LOST_NOTE}"),
+        )
+    } else {
+        (RESUME_MARKER_TEXT, continuation)
+    }
+}
+
 /// The rebuilt interrupted-turn tail for a restart resume: the prompt-only
 /// recap text plus any attachment blocks the replayed user rows carried.
 /// Persisted user rows keep their image/file blocks (STAB-133), and dropping
@@ -18892,8 +18928,11 @@ impl Services {
         // is already the transcript tail — skip the duplicate append. A failed
         // append is treated like a failed continuation delivery: reset the row
         // to pending and surface the error.
-        let marker_text =
-            "The previous turn was interrupted because the harness shut down. Continuing below.";
+        let (marker_text, continuation) = resume_marker_and_continuation(
+            &interrupted.interrupted_at,
+            interrupted.reason.as_deref(),
+            time::OffsetDateTime::now_utc(),
+        );
         let marker_content = json!([{
             "type": "text",
             "text": marker_text,
@@ -18930,12 +18969,11 @@ impl Services {
         }
 
         // Deliver continuation message (with the humanized outage duration
-        // when the claimed row's `interrupted_at` yields one). The metadata
+        // when the claimed row's `interrupted_at` yields one, and the lost
+        // background-task note for a `background_workers` row). The metadata
         // tag persists on the user row so a later restart's recap can
         // identify the continuation without matching its text (an ordinary
         // user request opening with the same wording must still be replayed).
-        let continuation =
-            resume_continuation_text(&interrupted.interrupted_at, time::OffsetDateTime::now_utc());
         let continuation_metadata = json!({
             "type": RESUME_CONTINUATION_METADATA_TYPE,
             "source": "system",

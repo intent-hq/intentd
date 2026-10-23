@@ -47745,8 +47745,11 @@ mod resume_tail_recap {
 /// and the never-fail fallback (`resume_continuation_text`).
 mod resume_continuation {
     use crate::agent_ops::{
-        humanize_outage_duration, resume_continuation_text, RESUME_CONTINUATION_FALLBACK_TEXT,
+        humanize_outage_duration, resume_continuation_text, resume_marker_and_continuation,
+        RESUME_CONTINUATION_FALLBACK_TEXT, RESUME_MARKER_TEXT, RESUME_WORKERS_LOST_NOTE,
+        RESUME_WORKERS_MARKER_TEXT,
     };
+    use crate::agent_workers::INTERRUPTED_WITH_WORKERS_REASON;
     use time::format_description::well_known::Rfc3339;
     use time::OffsetDateTime;
 
@@ -47769,6 +47772,51 @@ mod resume_continuation {
         assert_eq!(humanize_outage_duration(2 * 86_400 - 1), "47 hours");
         assert_eq!(humanize_outage_duration(2 * 86_400), "2 days");
         assert_eq!(humanize_outage_duration(3 * 86_400 + 5), "3 days");
+    }
+
+    /// intent-hq/intent#7658: a row tagged `background_workers` gets the
+    /// background-task marker and the lost-task note after the duration
+    /// wording; untagged and other-reason rows keep today's marker and text.
+    #[test]
+    fn background_worker_rows_get_the_lost_task_wording() {
+        let now = parse("2026-08-15T12:00:15Z");
+        let (marker, text) = resume_marker_and_continuation(
+            "2026-08-15T12:00:00Z",
+            Some(INTERRUPTED_WITH_WORKERS_REASON),
+            now,
+        );
+        assert_eq!(marker, RESUME_WORKERS_MARKER_TEXT);
+        assert_eq!(
+            text,
+            format!(
+                "{} {RESUME_WORKERS_LOST_NOTE}",
+                resume_continuation_text("2026-08-15T12:00:00Z", now)
+            )
+        );
+        assert!(text.starts_with("You were interrupted for about 15 seconds"));
+        assert!(text.contains("will not report back"));
+
+        let (marker, text) = resume_marker_and_continuation(
+            "not-a-timestamp",
+            Some(INTERRUPTED_WITH_WORKERS_REASON),
+            now,
+        );
+        assert_eq!(marker, RESUME_WORKERS_MARKER_TEXT);
+        assert_eq!(
+            text,
+            format!("{RESUME_CONTINUATION_FALLBACK_TEXT} {RESUME_WORKERS_LOST_NOTE}")
+        );
+
+        for reason in [None, Some("system_suspend")] {
+            let (marker, text) =
+                resume_marker_and_continuation("2026-08-15T12:00:00Z", reason, now);
+            assert_eq!(marker, RESUME_MARKER_TEXT, "{reason:?}");
+            assert_eq!(
+                text,
+                resume_continuation_text("2026-08-15T12:00:00Z", now),
+                "{reason:?}"
+            );
+        }
     }
 
     /// The delivered wording embeds the duration.

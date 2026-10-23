@@ -753,3 +753,53 @@ fn registry_has_running_workers_follows_the_current_generation() {
     workers.release(&agent);
     assert!(!workers.has_running_workers(&agent), "released");
 }
+
+/// Graceful shutdown's restart-interruption query: every agent whose current
+/// generation vouches for a running worker, with its workspace, and nothing
+/// else (ended, disconnected, unsupported or released generations).
+#[test]
+fn running_worker_agents_lists_only_agents_with_a_running_worker() {
+    let workers = AgentWorkers::default();
+    assert!(
+        workers.running_worker_agents().is_empty(),
+        "no generation held"
+    );
+
+    let begin = |agent: &str, ws: &str, negotiated: bool| {
+        let mut s = scope("claude-code");
+        s.agent_id = AgentId::from(agent);
+        s.workspace_id = WorkspaceId::from(ws);
+        workers.begin(s, &identity("claude-code"), negotiated, Weak::new());
+    };
+    begin("agent-running", "ws-1", true);
+    begin("agent-ended", "ws-1", true);
+    begin("agent-disconnected", "ws-2", true);
+    begin("agent-unsupported", "ws-2", false);
+    begin("agent-released", "ws-2", true);
+    begin("agent-none", "ws-2", true);
+    for agent in [
+        "agent-running",
+        "agent-ended",
+        "agent-disconnected",
+        "agent-unsupported",
+        "agent-released",
+    ] {
+        workers.ingest(
+            &AgentId::from(agent),
+            "generation-A",
+            &frame(spawn("w"), 1000),
+        );
+    }
+    workers.ingest(
+        &AgentId::from("agent-ended"),
+        "generation-A",
+        &frame(state("w", "completed"), 2000),
+    );
+    workers.disconnect(&AgentId::from("agent-disconnected"), "generation-A");
+    workers.release(&AgentId::from("agent-released"));
+
+    assert_eq!(
+        workers.running_worker_agents(),
+        vec![(AgentId::from("agent-running"), WorkspaceId::from("ws-1"))]
+    );
+}
