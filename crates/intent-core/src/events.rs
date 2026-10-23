@@ -360,6 +360,10 @@ pub const WORKSPACE_DISPLAY_STATUS_CHANGED: &str = "workspace:displayStatus-chan
 // `{ workspaceId, waiting }` (§6.7) flips the workspace wait indicator with
 // no follow-up fetch.
 pub const WORKSPACE_WAITING_CHANGED: &str = "workspace:waiting-changed";
+// Orthogonal `Workspace.scriptsRunning` flag transition (PROTOCOL §5.1 /
+// §6.5): a command-mode script run entered or left flight. Self-sufficient
+// payload `{ workspaceId, scriptsRunning }` (§6.7).
+pub const WORKSPACE_SCRIPTS_RUNNING_CHANGED: &str = "workspace:scriptsRunning-changed";
 /// Changed-only authoritative workspace task counts.
 pub const WORKSPACE_TASK_STATS_CHANGED: &str = "workspace:task-stats-changed";
 // Token/credit usage recomputed by the daemon-internal scan job (§5.23 / §19.1).
@@ -701,6 +705,7 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     WORKSPACE_ATTENTION_CHANGED,
     WORKSPACE_DISPLAY_STATUS_CHANGED,
     WORKSPACE_WAITING_CHANGED,
+    WORKSPACE_SCRIPTS_RUNNING_CHANGED,
     WORKSPACE_TASK_STATS_CHANGED,
     WORKSPACE_TOKEN_USAGE_CHANGED,
     WORKSPACE_CONTEXT_CHANGED,
@@ -982,6 +987,7 @@ pub const COLLABORATOR_EVENT_TYPES: &[(&str, &str)] = &[
     (WORKSPACE_DELETED, "Workspace: a workspace row was deleted; id only."),
     (WORKSPACE_DISPLAY_STATUS_CHANGED, "Workspace: the display status changed (workspace channel delta)."),
     (WORKSPACE_OPENED, "Workspace: a workspace was opened; id only."),
+    (WORKSPACE_SCRIPTS_RUNNING_CHANGED, "Workspace: the command-scripts-running marker changed (workspace channel delta)."),
     (WORKSPACE_SETUP_COMPLETED, "Workspace: setup finished; id and outcome."),
     (WORKSPACE_SETUP_STARTED, "Workspace: setup started; id only."),
     (WORKSPACE_TASK_STATS_CHANGED, "Workspace: authoritative task statistics changed."),

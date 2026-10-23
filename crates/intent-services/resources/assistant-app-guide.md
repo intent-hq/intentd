@@ -289,7 +289,7 @@ directories. Workspaces already stored in the daemon remain available.
 
 <!-- Sources: packages/intentd/crates/intentd/src/main.rs; packages/cloudlands-fe/src/routes/(app)/settings/+page.svelte. -->
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceBoard,HomeWorkspaceDetail,HomeWorkspacePullBadge}.svelte; src/features/home/home.css. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceBoard,HomeWorkspaceDetail,HomeWorkspacePullBadge}.svelte; src/features/home/home-model.ts; src/features/home/home.css. -->
 
 In **Home → Workspaces**, list rows and board cards show organization/repository
 labels in views that include multiple repositories. When an organization is selected,
@@ -297,6 +297,13 @@ labels show only the repository name. Narrow lists hide the row label; the selec
 workspace's preview header shows its repository. Local repositories show their name
 or path. Long labels truncate; hover to read the full name. Repository-specific
 views identify the repository in the page heading.
+
+Grouped by status, Home sorts workspaces into **Needs you**, **Running**, **Waiting**,
+and **Done & idle**, in that priority order. **Running** covers an agent at work or a
+running command script such as a build or test; a dev server or other service script
+alone does not count. **Waiting** covers workspaces watching something external: a
+monitored PR, a background hook, a delegated agent, a script run monitor, or a PR in
+the merge queue. The **Waiting** filter shows the same workspaces.
 
 The PR badge in list and board views prioritizes draft PRs, then open PRs
 (including conflicted or queued PRs), then merged and closed PRs. Within the same

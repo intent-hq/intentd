@@ -1142,6 +1142,7 @@ fn workspace_for_materialize(workspace_id: &WorkspaceId, row: &serde_json::Value
         pull_requests_total: None,
         display_status: None,
         waiting: false,
+        scripts_running: false,
         checkout_mode: None,
         disk_usage: None,
         membership: None,
