@@ -565,7 +565,13 @@ check the device's connection to Intent before trying to change assignments.
 
 ## Inspect a failed response and recover
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/agent/agent-attention-toast-service.ts; src/store/renderer/slices/agent-session/sagas/agent-failure-toast-saga.ts. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/agent/agent-attention-toast-service.ts; src/store/renderer/slices/agent-session/sagas/agent-failure-toast-saga.ts; src/features/notifications/main/notification.service.ts. -->
+
+While the desktop app is in front, an agent finishing work shows an in-app
+notification naming the agent and its workspace instead of a system notification;
+choose **Switch To** to open that agent's conversation. It is skipped when that
+workspace is already selected while **Settings → General → Notifications → Only when
+unfocused** is on (the default); turn that off to get it there too.
 
 **Switch To** notifications for agent failures, attention requests, and automatic
 workspace unarchiving are skipped when that workspace is already selected, even
