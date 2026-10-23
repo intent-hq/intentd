@@ -789,21 +789,72 @@ pub const PROJECTION_TEXT_BLOCK_CAP: u32 = 4096;
 /// projected to clients.
 pub const MANUAL_CHOICE_METADATA_KEY: &str = "manualChoice";
 
-/// SQL for a whole-document `metadata` write whose new document is
-/// `new_doc` (an expression, evaluated twice): the stored
-/// [`MANUAL_CHOICE_METADATA_KEY`] token is authoritative, so it is kept when
-/// present (and `keep_if` holds) and never taken from `new_doc` otherwise. A
-/// caller's stale snapshot (without the token, or with an older one) can
-/// then neither erase a newer manual choice nor bring back a used one.
-fn manual_choice_preserving_metadata(new_doc: &str, keep_if: &str) -> String {
-    let key = MANUAL_CHOICE_METADATA_KEY;
+/// Session `metadata` key holding the provider return state (PROTOCOL
+/// §5.54 Backup failover). Written only by the single-key writers; internal:
+/// never projected to clients.
+pub const PROVIDER_RETURN_METADATA_KEY: &str = "providerReturn";
+
+/// Daemon-owned `metadata` keys: each has dedicated single-key writers, and
+/// whole-document writes ([`Store::update_agent_session`],
+/// [`Store::update_agent_session_metadata`]) never set or clear them, so a
+/// caller's stale snapshot cannot erase a newer value or bring back an old
+/// one (PROTOCOL §5.54 shared quota state).
+const DAEMON_OWNED_METADATA_KEYS: [&str; 2] =
+    [MANUAL_CHOICE_METADATA_KEY, PROVIDER_RETURN_METADATA_KEY];
+
+/// The two binds a whole-document `metadata` write needs (see
+/// [`daemon_owned_preserving_metadata`]): the caller's document without the
+/// daemon-owned keys, as written when the stored row has none of them; and
+/// the same as an object (a non-object document kept under
+/// `priorNonObjectMetadata`, the convention of the single-key writers), into
+/// which the stored daemon-owned keys are merged. Returned as
+/// `(raw, object)`.
+fn whole_metadata_binds(
+    value: Option<&serde_json::Value>,
+) -> Result<(Option<String>, Option<String>)> {
+    let stripped = value.map(|v| match v {
+        serde_json::Value::Object(map) => {
+            let mut map = map.clone();
+            for key in DAEMON_OWNED_METADATA_KEYS {
+                map.remove(key);
+            }
+            serde_json::Value::Object(map)
+        }
+        other => other.clone(),
+    });
+    let object = match &stripped {
+        None => serde_json::json!({}),
+        Some(v @ serde_json::Value::Object(_)) => v.clone(),
+        Some(other) => serde_json::json!({ "priorNonObjectMetadata": other }),
+    };
+    Ok((
+        encode_metadata(stripped.as_ref())?,
+        encode_metadata(Some(&object))?,
+    ))
+}
+
+/// SQL for a whole-document `metadata` write. `object_doc` and `raw_doc`
+/// are expressions over the two [`whole_metadata_binds`] values (`object_doc`
+/// comes first in the statement). When the stored row carries a
+/// daemon-owned key, the stored values are merged into `object_doc` (the
+/// manual-choice token only while `keep_choice_if` holds); otherwise
+/// `raw_doc` is written as is.
+fn daemon_owned_preserving_metadata(
+    object_doc: &str,
+    raw_doc: &str,
+    keep_choice_if: &str,
+) -> String {
+    let [choice, ret] = DAEMON_OWNED_METADATA_KEYS;
     format!(
         "CASE WHEN metadata IS NOT NULL AND json_valid(metadata) \
               AND json_type(metadata) = 'object' \
-              AND json_type(metadata, '$.{key}') IS NOT NULL AND ({keep_if}) \
-             THEN json_set(COALESCE({new_doc}, '{{}}'), '$.{key}', \
-                           json_extract(metadata, '$.{key}')) \
-         ELSE json_remove({new_doc}, '$.{key}') END"
+              AND (json_type(metadata, '$.{choice}') IS NOT NULL \
+                   OR json_type(metadata, '$.{ret}') IS NOT NULL) \
+             THEN json_patch({object_doc}, json_object(\
+                 '{choice}', CASE WHEN ({keep_choice_if}) \
+                                  THEN json(metadata -> '$.{choice}') END, \
+                 '{ret}', json(metadata -> '$.{ret}'))) \
+         ELSE {raw_doc} END"
     )
 }
 
@@ -2991,7 +3042,7 @@ impl Store {
         if binding_changed {
             lifecycle.begin(&[crate::RepositoryLifecycleKey::Agent(s.id.clone())])?;
         }
-        let metadata = encode_metadata(s.metadata.as_ref())?;
+        let (metadata_raw, metadata_object) = whole_metadata_binds(s.metadata.as_ref())?;
         let mut tx = if remember_specialist || notifications_muted.is_some() {
             Some(
                 self.write_pool()
@@ -3002,15 +3053,22 @@ impl Store {
         } else {
             None
         };
-        // The pending manual-choice token (PROTOCOL §5.54 shared quota
-        // state) is owned by its dedicated writers: this full-document write
-        // keeps the stored one while the selection is unchanged and drops it
-        // when this write changes the selection (the token named the old one).
-        // SQLite evaluates every SET expression on the old row, so `model` and
-        // `provider` here are the stored values.
-        let metadata_sql = manual_choice_preserving_metadata(
-            "CASE WHEN json_extract(metadata, '$.chiefPromptVersion') IS NULL \
-             THEN json_remove(?, '$.chiefPromptVersion') ELSE ? END",
+        // The daemon-owned keys (the manual-choice token and the return
+        // state, PROTOCOL §5.54) are owned by their dedicated writers: this
+        // whole-document write keeps the stored values and never takes them
+        // from `s`. The token is dropped when this write changes the
+        // selection (it named the old one). SQLite evaluates every SET
+        // expression on the old row, so `model` and `provider` here are the
+        // stored values.
+        let chief = |doc: &str| {
+            format!(
+                "CASE WHEN json_extract(metadata, '$.chiefPromptVersion') IS NULL \
+                 THEN json_remove({doc}, '$.chiefPromptVersion') ELSE {doc} END"
+            )
+        };
+        let metadata_sql = daemon_owned_preserving_metadata(
+            &chief("?"),
+            &chief("?"),
             "model IS ? AND provider IS ?",
         );
         let sql = format!(
@@ -3050,14 +3108,14 @@ impl Store {
             .bind(json_col_to_db(s.image_blocks.as_ref())?)
             .bind(json_col_to_db(s.file_blocks.as_ref())?)
             .bind(i64::from(s.is_background))
-            // keep_if (stored selection unchanged), then the new document twice
-            // (kept-token and dropped-token branches), two binds each.
+            // The object document (twice, in `chief`), keep_choice_if (stored
+            // selection unchanged), then the raw document (twice).
+            .bind(&metadata_object)
+            .bind(&metadata_object)
             .bind(&s.model)
             .bind(&s.provider)
-            .bind(&metadata)
-            .bind(&metadata)
-            .bind(&metadata)
-            .bind(&metadata)
+            .bind(&metadata_raw)
+            .bind(&metadata_raw)
             .bind(&s.sandbox_id)
             .bind(&s.sandbox_path)
             .bind(&s.sandbox_branch)
@@ -3729,17 +3787,17 @@ impl Store {
         metadata: Option<&serde_json::Value>,
         updated_at: &str,
     ) -> Result<()> {
-        // The stored manual-choice token is kept (see
-        // `manual_choice_preserving_metadata`): a caller's snapshot never
-        // erases or restores it.
+        // The daemon-owned keys are kept as stored (see
+        // `daemon_owned_preserving_metadata`): a caller's snapshot never
+        // erases or restores them.
         let sql = format!(
             "UPDATE agent_session SET metadata={}, updated_at=? WHERE id=? AND workspace_id=?",
-            manual_choice_preserving_metadata("?", "1")
+            daemon_owned_preserving_metadata("?", "?", "1")
         );
-        let metadata = encode_metadata(metadata)?;
+        let (metadata_raw, metadata_object) = whole_metadata_binds(metadata)?;
         let rows = sqlx::query(&sql)
-            .bind(&metadata)
-            .bind(&metadata)
+            .bind(&metadata_object)
+            .bind(&metadata_raw)
             .bind(updated_at)
             .bind(&id.0)
             .bind(&workspace_id.0)
@@ -14570,6 +14628,165 @@ mod tests {
         let metadata = row.metadata.expect("metadata");
         assert!(metadata.get(MANUAL_CHOICE_METADATA_KEY).is_none());
         assert_eq!(metadata["providerReturn"]["home"], "claude-code");
+        assert_eq!(metadata["keep"], 1);
+    }
+
+    /// Review of intentd#2624: whole-document writes keep the daemon-owned
+    /// keys (the manual-choice token and the return state) as stored, for
+    /// every document shape a stale snapshot can carry (JSON null, array,
+    /// scalar, object), and never bring back stale values.
+    #[tokio::test]
+    async fn whole_document_writes_keep_daemon_owned_keys_for_any_shape() {
+        use intent_core::now_iso;
+
+        use uuid::Uuid;
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-daemon-owned".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let shapes = [
+            serde_json::json!(null),
+            serde_json::json!([1, 2]),
+            serde_json::json!("legacy"),
+            serde_json::json!(7),
+        ];
+        for shape in shapes {
+            for full_row in [true, false] {
+                let case = format!("{shape} full_row={full_row}");
+                let agent_id = AgentId(format!("agent-{}", Uuid::new_v4()));
+                let mut session = baseline_test_session(&agent_id, &ws_id, &ts, None);
+                session.provider = Some("claude-code".to_string());
+                session.model = Some("opus".to_string());
+                store.insert_agent_session(&session).await.expect("insert");
+                let mut stale = store.get_agent_session(&agent_id).await.expect("get");
+                stale.metadata = Some(shape.clone());
+                store
+                    .set_agent_session_model_choice(
+                        &ws_id,
+                        &agent_id,
+                        "opus",
+                        Some("claude-code"),
+                        Some("t1"),
+                        &now_iso(),
+                    )
+                    .await
+                    .expect("choose");
+                store
+                    .set_agent_session_metadata_key_json(
+                        &ws_id,
+                        &agent_id,
+                        PROVIDER_RETURN_METADATA_KEY,
+                        r#"{"home":"claude-code@new"}"#,
+                        &now_iso(),
+                    )
+                    .await
+                    .expect("return state");
+                if full_row {
+                    store
+                        .update_agent_session(&ws_id, &stale)
+                        .await
+                        .expect("update");
+                } else {
+                    store
+                        .update_agent_session_metadata(
+                            &ws_id,
+                            &agent_id,
+                            stale.metadata.as_ref(),
+                            &now_iso(),
+                        )
+                        .await
+                        .expect("metadata write");
+                }
+                let metadata = store
+                    .get_agent_session(&agent_id)
+                    .await
+                    .expect("get")
+                    .metadata
+                    .expect("metadata");
+                assert_eq!(metadata[MANUAL_CHOICE_METADATA_KEY], "t1", "{case}");
+                assert_eq!(
+                    metadata[PROVIDER_RETURN_METADATA_KEY]["home"], "claude-code@new",
+                    "{case}"
+                );
+                assert_eq!(metadata["priorNonObjectMetadata"], shape, "{case}");
+            }
+        }
+
+        // Stale object documents: stored values win, absent ones stay absent.
+        let agent_id = AgentId(format!("agent-{}", Uuid::new_v4()));
+        let mut session = baseline_test_session(&agent_id, &ws_id, &ts, None);
+        session.provider = Some("claude-code".to_string());
+        session.model = Some("opus".to_string());
+        store.insert_agent_session(&session).await.expect("insert");
+        let mut stale = store.get_agent_session(&agent_id).await.expect("get");
+        stale.metadata = Some(serde_json::json!({
+            "keep": 1,
+            MANUAL_CHOICE_METADATA_KEY: "old",
+            PROVIDER_RETURN_METADATA_KEY: { "home": "claude-code@old", "returning": "timer" },
+        }));
+        for full_row in [true, false] {
+            if full_row {
+                store
+                    .update_agent_session(&ws_id, &stale)
+                    .await
+                    .expect("update");
+            } else {
+                store
+                    .update_agent_session_metadata(
+                        &ws_id,
+                        &agent_id,
+                        stale.metadata.as_ref(),
+                        &now_iso(),
+                    )
+                    .await
+                    .expect("metadata write");
+            }
+            let metadata = store
+                .get_agent_session(&agent_id)
+                .await
+                .expect("get")
+                .metadata
+                .unwrap();
+            assert_eq!(metadata["keep"], 1);
+            assert!(
+                metadata.get(MANUAL_CHOICE_METADATA_KEY).is_none(),
+                "full_row={full_row}"
+            );
+            assert!(
+                metadata.get(PROVIDER_RETURN_METADATA_KEY).is_none(),
+                "full_row={full_row}"
+            );
+        }
+        store
+            .set_agent_session_metadata_key_json(
+                &ws_id,
+                &agent_id,
+                PROVIDER_RETURN_METADATA_KEY,
+                r#"{"home":"claude-code@new"}"#,
+                &now_iso(),
+            )
+            .await
+            .expect("return state");
+        store
+            .update_agent_session(&ws_id, &stale)
+            .await
+            .expect("update");
+        let metadata = store
+            .get_agent_session(&agent_id)
+            .await
+            .expect("get")
+            .metadata
+            .unwrap();
+        assert_eq!(
+            metadata[PROVIDER_RETURN_METADATA_KEY],
+            serde_json::json!({ "home": "claude-code@new" }),
+            "replaced as a whole, never merged with the stale state"
+        );
+        assert!(metadata.get(MANUAL_CHOICE_METADATA_KEY).is_none());
         assert_eq!(metadata["keep"], 1);
     }
 

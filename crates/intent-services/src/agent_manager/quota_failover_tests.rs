@@ -2806,3 +2806,44 @@ async fn a_stale_full_session_write_keeps_the_latest_choice() {
         assert_eq!(fx.row().await.provider.as_deref(), Some(second.as_str()));
     }
 }
+
+/// Review of intentd#2624: a stale whole-session write (what
+/// `agent.rename` does with the session it read) taken while away with a
+/// due return timer does not bring back the return state that later manual
+/// choices cleared. The first turn tries the latest choice, and the next
+/// turn stays on it instead of returning to the old home.
+#[intent_test_macros::daemon_test]
+async fn a_stale_rename_does_not_restore_a_cleared_return_state() {
+    let fx = Fixture::new(json!({ "response": "answered" })).await;
+    let first = fx.profile("First", true).await;
+    let past = chrono::Utc::now() - chrono::Duration::minutes(1);
+    fx.away(&first, state_json("claude-code", &first, past, 0))
+        .await;
+    let stale = fx.row().await;
+    assert!(crate::provider_return::read_state(&stale).is_some());
+    set_model(&fx, "sonnet").await;
+    set_model(&fx, "opus").await;
+    assert_eq!(fx.return_state().await, None, "the choice is the new home");
+    let mut renamed = stale.clone();
+    renamed.name = "renamed".to_owned();
+    fx.mgr
+        .services
+        .store
+        .update_agent_session(&fx.ws, &renamed)
+        .await
+        .unwrap();
+    let row = fx.row().await;
+    assert_eq!(row.name, "renamed");
+    assert_eq!(fx.return_state().await, None, "stale state not restored");
+    assert!(token_of(&row).is_some());
+
+    for turn in ["first turn", "second turn"] {
+        let events = fx.send_as_user(turn).await;
+        assert!(of_type(&events, "agent:failed").is_empty(), "{events:#?}");
+        let row = fx.row().await;
+        assert_eq!(row.provider.as_deref(), Some(first.as_str()), "{turn}");
+        assert_eq!(fx.return_state().await, None, "{turn}");
+    }
+    assert!(notices(&fx.messages().await, "provider_returned").is_empty());
+    assert!(notices(&fx.messages().await, "provider_failover").is_empty());
+}

@@ -29,7 +29,7 @@ use crate::provider_profiles;
 use crate::Services;
 
 /// Session `metadata` key holding [`ProviderReturnState`].
-pub(crate) const PROVIDER_RETURN_METADATA_KEY: &str = "providerReturn";
+pub(crate) const PROVIDER_RETURN_METADATA_KEY: &str = intent_store::PROVIDER_RETURN_METADATA_KEY;
 
 /// `metadata.type` of the notice persisted when a conversation is back home.
 pub(crate) const PROVIDER_RETURNED_NOTICE_TYPE: &str = "provider_returned";
