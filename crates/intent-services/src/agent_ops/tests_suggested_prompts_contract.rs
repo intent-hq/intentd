@@ -183,6 +183,25 @@ fn suggested_prompts_broken_opener_before_a_block_keeps_trailing_prose() {
     }
 }
 
+/// The scan is forward-only (it reruns on every streamed preview frame): many
+/// blocks and inline mentions of both spellings, interleaved, all clean.
+#[test]
+fn suggested_prompts_many_blocks_and_mentions_clean_in_one_pass() {
+    let unit = "Step <!-- suggested-prompts x --> done.\n<!-- suggested-prompts\nA --> B\n-->\n\
+                Note &lt;!-- suggested-prompts y --&gt; ok.\n&lt;!-- suggested-prompts\nRun\n--&gt;\n";
+    let text = format!("{}Final answer.", unit.repeat(500));
+    let cleaned = clean_response_text(&text);
+    assert_eq!(cleaned.matches("Step  done.").count(), 500);
+    assert_eq!(cleaned.matches("Note  ok.").count(), 500);
+    assert!(
+        !cleaned.contains("suggested-prompts")
+            && !cleaned.contains("-->")
+            && !cleaned.contains("--&gt;")
+    );
+    assert!(!cleaned.contains("Run") && !cleaned.contains("A "));
+    assert!(cleaned.ends_with("Final answer."));
+}
+
 /// Fences are not tracked: a persisted tail can start inside a code fence, and
 /// the real block after it is still removed; a closer in a fenced example
 /// still ends an open block, as in the old preview.

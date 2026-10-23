@@ -2195,9 +2195,9 @@ fn is_prompt_closer(line: &str, escaped: bool) -> bool {
 /// text block's tail, which can start inside a fence and invert fence state.
 /// Shared cases: monorepo `docs/protocol/suggested-prompts.md`.
 fn strip_prompt_blocks(s: &str) -> String {
-    const INLINE: [(&str, &str, bool); 2] = [
-        ("<!-- suggested-prompts", "-->", false),
-        ("&lt;!-- suggested-prompts", "--&gt;", true),
+    const INLINE: [(&str, &str); 2] = [
+        ("<!-- suggested-prompts", "-->"),
+        ("&lt;!-- suggested-prompts", "--&gt;"),
     ];
     if !s.contains("suggested-prompts") {
         return s.to_owned();
@@ -2217,38 +2217,49 @@ fn strip_prompt_blocks(s: &str) -> String {
         })
         .collect();
     let mut out = String::with_capacity(s.len());
+    // Every search moves forward only, so the scan stays linear in the text
+    // however many blocks or markers it holds (it reruns on each streamed
+    // preview frame): `bi` is the first block opener at or after `at`, and
+    // `marks` caches each spelling's next marker (`None` once none is left).
     let mut at = 0;
+    let mut bi = 0;
+    let mut marks = INLINE.map(|(marker, _)| s.find(marker));
     while at < s.len() {
-        let block = blocks.iter().position(|b| b.0 >= at);
-        let inline = INLINE
+        while blocks.get(bi).is_some_and(|b| b.0 < at) {
+            bi += 1;
+        }
+        for (mark, (marker, _)) in marks.iter_mut().zip(INLINE) {
+            if mark.is_some_and(|m| m < at) {
+                *mark = s[at..].find(marker).map(|i| at + i);
+            }
+        }
+        let inline = marks
             .iter()
-            .filter_map(|&(marker, closer, _)| {
-                s[at..].find(marker).map(|i| (at + i, marker, closer))
-            })
+            .zip(INLINE)
+            .filter_map(|(mark, (marker, closer))| mark.map(|m| (m, marker, closer)))
             .min_by_key(|m| m.0);
-        let next_block_after = |pos: usize| blocks.iter().find(|b| b.0 > pos).map(|b| b.0);
+        let block = blocks.get(bi).copied();
         match (block, inline) {
-            (Some(b), inline) if inline.is_none_or(|m| blocks[b].0 <= m.0) => {
-                let (pos, line, escaped) = blocks[b];
+            (Some((pos, line, escaped)), inline) if inline.is_none_or(|m| pos <= m.0) => {
                 out.push_str(&s[at..pos]);
-                let limit = blocks.get(b + 1).map_or(lines.len(), |next| next.1);
+                let next = blocks.get(bi + 1);
+                let limit = next.map_or(lines.len(), |next| next.1);
                 let close = (line + 1..limit).find(|&j| is_prompt_closer(lines[j].1, escaped));
-                at = match (close, blocks.get(b + 1)) {
+                at = match (close, next) {
                     (Some(j), _) => lines[j].0 + lines[j].1.len(),
                     (None, Some(next)) => next.0,
                     (None, None) => s.len(),
                 };
             }
-            (_, Some((pos, marker, closer))) => {
+            (next, Some((pos, marker, closer))) => {
+                // Here any next block opener lies after `pos`; the span ends
+                // at the first closer before it, else at it (or the end).
                 out.push_str(&s[at..pos]);
                 let from = pos + marker.len();
-                let close = s[from..].find(closer).map(|j| from + j + closer.len());
-                at = match (close, next_block_after(pos)) {
-                    (Some(c), Some(next)) if next < c => next,
-                    (Some(c), _) => c,
-                    (None, Some(next)) => next,
-                    (None, None) => s.len(),
-                };
+                let limit = next.map_or(s.len(), |b| b.0).max(from);
+                at = s[from..limit]
+                    .find(closer)
+                    .map_or(limit, |j| from + j + closer.len());
             }
             (_, None) => {
                 out.push_str(&s[at..]);
