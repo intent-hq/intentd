@@ -1107,7 +1107,7 @@ fn endpoint_request_carries_only_allowlisted_params_and_user_agent() {
     assert_eq!(
         *target,
         format!(
-            "/channel/stable.json?p={TARGET_TRIPLE}&v={}&src=script&k=manual&d=1",
+            "/channel/stable.json?p={TARGET_TRIPLE}&v={}&src=script&k=manual&d=1&w=1&m=1&i=1&a=0d",
             env!("CARGO_PKG_VERSION")
         )
     );
@@ -1118,7 +1118,66 @@ fn endpoint_request_carries_only_allowlisted_params_and_user_agent() {
             env!("CARGO_PKG_VERSION")
         )
     );
-    assert_eq!(state::load(&paths.state_path).last_check_day, None);
+    let state = state::load(&paths.state_path);
+    assert_eq!(state.last_check_day, None);
+    assert_eq!(state.last_week, None);
+    assert_eq!(state.last_month, None);
+}
+
+/// The query of the `n`th request the stub endpoint received.
+fn query_of(seen: &RequestLog, n: usize) -> String {
+    let seen = seen.lock().unwrap();
+    seen[n].0.split_once('?').unwrap().1.to_string()
+}
+
+#[test]
+fn fresh_install_keeps_install_flag_until_a_check_succeeds() {
+    let (url, seen) = serve_endpoint(Endpoint::NotFound);
+    let dir = tempfile::tempdir().unwrap();
+    let paths = paths_in(dir.path());
+    let github = serve_release("0.2.0", b"fake daemon 0.2.0", false);
+    let updater = Updater::with_base_url(paths.clone(), &github)
+        .unwrap()
+        .with_update_endpoint(Some(endpoint(&url)));
+    updater
+        .check_and_install(Channel::Stable, CheckTrigger::Startup)
+        .unwrap();
+    // The first-seen date is recorded up front as a fresh install, so the
+    // GitHub fallback installing a daemon does not turn it into an upgrade.
+    let state = state::load(&paths.state_path);
+    assert!(state.first_seen_day.is_some());
+    assert!(!state.first_seen_estimated);
+    assert_eq!(state.current_version.as_deref(), Some("0.2.0"));
+    updater
+        .check_and_install(Channel::Stable, CheckTrigger::Daily)
+        .unwrap();
+    // The failed endpoint check advanced nothing: the retry carries the
+    // same flags.
+    assert!(query_of(&seen, 0).ends_with("&d=1&w=1&m=1&i=1&a=0d"));
+    assert!(query_of(&seen, 1).ends_with("&d=1&w=1&m=1&i=1&a=0d"));
+    let state = state::load(&paths.state_path);
+    assert_eq!(state.last_week, None);
+    assert_eq!(state.last_month, None);
+}
+
+#[test]
+fn upgraded_install_is_estimated_and_never_sends_install() {
+    let (url, seen) = serve_endpoint(Endpoint::NotFound);
+    let dir = tempfile::tempdir().unwrap();
+    let paths = paths_in(dir.path());
+    preinstall(&paths, "0.1.0", Channel::Stable);
+    let github = serve_release("0.2.0", b"fake daemon 0.2.0", false);
+    let updater = Updater::with_base_url(paths.clone(), &github)
+        .unwrap()
+        .with_update_endpoint(Some(endpoint(&url)));
+    updater
+        .check_and_install(Channel::Stable, CheckTrigger::Daily)
+        .unwrap();
+    // The sitter dir was created just now, so the estimate is today.
+    assert!(query_of(&seen, 0).ends_with("&d=1&w=1&m=1&i=0&a=0d"));
+    let state = state::load(&paths.state_path);
+    assert!(state.first_seen_estimated);
+    assert!(state.first_seen_day.is_some());
 }
 
 #[test]
