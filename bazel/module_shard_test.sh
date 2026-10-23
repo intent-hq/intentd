@@ -8,6 +8,9 @@
 # `foo::tests::`. This lists the binary's tests, picks by real top-level
 # module, and runs the picks with --exact. Other arguments (--skip patterns,
 # --test-threads) apply to the listing and are forwarded to the run.
+#
+# Plain bash on purpose: an external filter (awk) failing inside the
+# selection would go unseen by `set -e` and leave every shard silently empty.
 set -euo pipefail
 
 binary=@@BINARY@@
@@ -16,19 +19,24 @@ exclude=" @@EXCLUDE@@ "
 
 listing="$("$binary" --list --format terse "$@")"
 names=()
-while IFS= read -r name; do
-  [ -n "$name" ] && names+=("$name")
-done <<EOF
-$(printf '%s\n' "$listing" | awk -v include="$include" -v exclude="$exclude" '
-  / test$/ {
-    name = substr($0, 1, length($0) - length(": test"))
-    top = name
-    sub(/::.*/, "", top)
-    if (include != "  " && index(include, " " top " ") == 0) next
-    if (index(exclude, " " top " ") > 0) next
-    print name
-  }')
-EOF
+while IFS= read -r line; do
+  case "$line" in
+    *": test") ;;
+    *) continue ;;
+  esac
+  name="${line%: test}"
+  top="${name%%::*}"
+  if [ "$include" != "  " ]; then
+    case "$include" in
+      *" $top "*) ;;
+      *) continue ;;
+    esac
+  fi
+  case "$exclude" in
+    *" $top "*) continue ;;
+  esac
+  names+=("$name")
+done <<< "$listing"
 
 if [ "${#names[@]}" -eq 0 ]; then
   echo "module_shard_test: no tests in this shard's modules"

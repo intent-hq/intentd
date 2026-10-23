@@ -16,6 +16,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -641,8 +642,22 @@ class ModuleShardSelection(unittest.TestCase):
                 str(self.binary), attrs.get("include_modules", []), attrs.get("exclude_modules", [])))
             launcher.chmod(0o755)
             command = [str(launcher)]
-        out = subprocess.run(command + (attrs.get("args") or []), check=True, capture_output=True, text=True)
+        out = subprocess.run(command + (attrs.get("args") or []), check=True, capture_output=True, text=True,
+                             env={"PATH": str(self.minimal_path())})
         return {line[4:] for line in out.stdout.splitlines() if line.startswith("RUN ")}
+
+    def minimal_path(self):
+        """Only bash, env and python3 (for the fake binary): the launcher must not
+        depend on host tools such as awk, whose variants differ between hosts
+        (gawk rejects variable names mawk accepts, and a failure inside the
+        selection went unseen)."""
+        bin_dir = self.tmp / "minimal-bin"
+        if not bin_dir.exists():
+            bin_dir.mkdir()
+            for tool, path in (("bash", shutil.which("bash")), ("env", shutil.which("env")),
+                               ("python3", sys.executable)):
+                (bin_dir / tool).symlink_to(path)
+        return bin_dir
 
     def test_rest_shard_runs_nested_tests_of_unlisted_modules(self):
         rest = self.run_target("lib_test_shard_rest")
