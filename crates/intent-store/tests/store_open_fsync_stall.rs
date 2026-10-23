@@ -212,3 +212,57 @@ async fn reopening_a_created_store_connects_without_fsync() {
     );
     pool.close().await;
 }
+
+/// `auto_vacuum` and WAL of a closed database file, read on a fresh
+/// connection so no pool setting can mask the file's own header.
+async fn file_modes(path: &Path) -> (i64, String) {
+    use sqlx::{ConnectOptions, Connection, Row};
+    let mut conn = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(path)
+        .connect()
+        .await
+        .expect("inspect database file");
+    let auto_vacuum = sqlx::query("PRAGMA auto_vacuum")
+        .fetch_one(&mut conn)
+        .await
+        .expect("read auto_vacuum")
+        .get(0);
+    let journal_mode = sqlx::query("PRAGMA journal_mode")
+        .fetch_one(&mut conn)
+        .await
+        .expect("read journal_mode")
+        .get(0);
+    conn.close().await.expect("close inspection connection");
+    (auto_vacuum, journal_mode)
+}
+
+/// Pool connections no longer set `auto_vacuum`, so the creation step alone
+/// must leave every new database incremental and in WAL — on the plain and
+/// the daemon-owned open paths alike.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fresh_databases_are_created_incremental_and_wal() {
+    let _serial = SERIAL.lock().await;
+    install_shim();
+    disarm();
+    let dir = tempfile::tempdir().unwrap();
+
+    let plain = dir.path().join("plain.db");
+    open(&plain).await.close().await;
+    assert_eq!(
+        file_modes(&plain).await,
+        (2, "wal".to_string()),
+        "Store::open"
+    );
+
+    let owned = dir.path().join("owned.db");
+    intent_store::Store::open_for_daemon(&owned)
+        .await
+        .unwrap_or_else(|error| panic!("open daemon store: {error}"))
+        .close()
+        .await;
+    assert_eq!(
+        file_modes(&owned).await,
+        (2, "wal".to_string()),
+        "Store::open_for_daemon"
+    );
+}

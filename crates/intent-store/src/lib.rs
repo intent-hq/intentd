@@ -934,9 +934,11 @@ async fn connect_write_owned(
     // No `auto_vacuum` here: `create_database_file` establishes it, and the
     // pragma rewrites the header in an fsynced write transaction on every
     // connect even when the mode is unchanged — inside `acquire_timeout`.
+    // Nor `create_if_missing`: a file missing here was removed after
+    // `create_database_file`, and recreating it would skip `auto_vacuum`.
     let opts = SqliteConnectOptions::new()
         .filename(db_path)
-        .create_if_missing(true)
+        .create_if_missing(false)
         .foreign_keys(true)
         .busy_timeout(Duration::from_secs(5));
     let opts = if owner.is_none() {
@@ -980,7 +982,7 @@ async fn create_database_file(
 ) -> Result<()> {
     use sqlx::{ConnectOptions, Connection};
 
-    match std::fs::metadata(db_path) {
+    match tokio::fs::metadata(db_path).await {
         Ok(meta) if meta.len() > 0 => return Ok(()),
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -1103,7 +1105,9 @@ fn retain_pool_owner(
                 )?;
                 // Neither pool sets `auto_vacuum`: `create_database_file`
                 // establishes it once (see `connect_write_owned`).
-                sqlx::query("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL")
+                // Spaced like sqlx's own batch so intentd's rpc_profile
+                // marker (`PRAGMA journal_mode = `) recognizes it as setup.
+                sqlx::query("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL")
                     .execute(connection)
                     .await?;
                 Ok(())
@@ -1130,36 +1134,6 @@ fn retain_owner(
         }),
         None => options,
     }
-}
-
-/// Legacy test helper: builds a single pool (`max_connections=20`) for tests
-/// that predate the write/read pool split. New tests should use `Store::open`.
-///
-/// # Errors
-///
-/// Returns `Error::Internal` if the pool cannot be opened (or the acquire timeout is exceeded).
-#[cfg(test)]
-pub async fn connect(db_path: &Path) -> Result<SqlitePool> {
-    let opts = SqliteConnectOptions::new()
-        .filename(db_path)
-        .create_if_missing(true)
-        .auto_vacuum(sqlx::sqlite::SqliteAutoVacuum::Incremental)
-        .journal_mode(SqliteJournalMode::Wal)
-        .foreign_keys(true)
-        .busy_timeout(Duration::from_secs(5))
-        .synchronous(sqlx::sqlite::SqliteSynchronous::Normal);
-
-    SqlitePoolOptions::new()
-        .max_connections(20)
-        .acquire_timeout(Duration::from_secs(10))
-        .connect_with(opts)
-        .await
-        .map_err(|e| match e {
-            sqlx::Error::PoolTimedOut => {
-                Error::Internal("database pool exhausted (acquire timeout exceeded)".to_string())
-            }
-            _ => Error::Internal(format!("failed to open database: {e}")),
-        })
 }
 
 /// Encode tags as a JSON-array TEXT column.
