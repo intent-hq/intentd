@@ -4,3 +4,7 @@ lcov.info
 coverage-summary.txt
 /packaging/libexec/tailcat
 /packaging/libexec/tailcat.exe
+
+# Python bytecode caches: never tracked (scripts/check-no-python-cache.sh fails CI on one).
+__pycache__/
+*.pyc
