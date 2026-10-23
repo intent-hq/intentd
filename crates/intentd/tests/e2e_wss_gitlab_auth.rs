@@ -291,7 +291,8 @@ async fn await_auth_changed(ws: &mut Ws, status: &str, secs: u64) -> Value {
 /// deliberately triggered.
 async fn await_auth_changed_matching(ws: &mut Ws, status: Option<&str>, secs: u64) -> Value {
     let status = status.unwrap_or("<any>");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(secs));
     loop {
         let remaining = deadline
             .checked_duration_since(tokio::time::Instant::now())
@@ -2848,6 +2849,7 @@ async fn run_interleaving(case: &'static Case) {
                     .await
                 });
                 assert!(
+                    // fixed-deadline: allow — stays under the 30s GitLab HTTP READ_WRITE_TIMEOUT: several of these run back to back against one held exchange, which would fail and release the gate
                     timeout(Duration::from_millis(750), &mut handle)
                         .await
                         .is_err(),
@@ -2905,6 +2907,7 @@ async fn run_interleaving(case: &'static Case) {
                 } else {
                     if matches!((case.holder, action), (Holder::Refresh, Action::Revoke(_))) {
                         assert!(
+                            // fixed-deadline: allow — stays under the 30s GitLab HTTP READ_WRITE_TIMEOUT: several of these run back to back against one held exchange, which would fail and release the gate
                             timeout(Duration::from_millis(750), &mut handle)
                                 .await
                                 .is_err(),
@@ -2933,6 +2936,7 @@ async fn run_interleaving(case: &'static Case) {
                 // safe direction — the gate never lets it through early), and
                 // the PAT must not be in the secrets file.
                 assert!(
+                    // fixed-deadline: allow — stays under the 30s GitLab HTTP READ_WRITE_TIMEOUT: several of these run back to back against one held exchange, which would fail and release the gate
                     timeout(Duration::from_millis(750), &mut handle)
                         .await
                         .is_err(),

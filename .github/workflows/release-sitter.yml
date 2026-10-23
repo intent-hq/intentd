@@ -125,7 +125,7 @@ jobs:
             os: gh-windows-16x
     # Linux legs stay on the hosted label: they run sudo (apt configuration,
     # cross-build packages), which the intent-cache runner containers lack.
-    runs-on: ${{ (contains(matrix.os, 'ubuntu') || contains(matrix.os, 'linux')) && matrix.os || fromJSON(needs.runner-route.outputs.runners || '{}')[matrix.os] || matrix.os }}
+    runs-on: ${{ (contains(matrix.os, 'ubuntu') || contains(matrix.os, 'linux')) && (fromJSON(needs.runner-route.outputs.cloud || '{}')[matrix.os] || matrix.os) || fromJSON(needs.runner-route.outputs.runners || '{}')[matrix.os] || matrix.os }}
     timeout-minutes: 30
     env:
       TARGET: ${{ matrix.target }}

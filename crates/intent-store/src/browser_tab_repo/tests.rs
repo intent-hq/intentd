@@ -714,9 +714,12 @@ async fn concurrent_first_reports_admit_exactly_one_host() {
     };
     tokio::pin!(race);
     assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(200), &mut race)
-            .await
-            .is_err(),
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_millis(200)),
+            &mut race
+        )
+        .await
+        .is_err(),
         "both reports wait on the write connection"
     );
     drop(writer);

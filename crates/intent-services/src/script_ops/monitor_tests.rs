@@ -1229,9 +1229,8 @@ async fn monitor_storage_failure_retries_reserved_trigger_without_duplicate_or_t
         .await
         .unwrap();
     mgr.reconcile_monitor(&h.ws, mid).await.unwrap();
-    let row = monitor_snapshot(&h.services.store, &h.ws, mid)
-        .await
-        .unwrap();
+    // Maintenance may win settlement before its terminal event is published.
+    let row = monitor_row(&h, mid, "triggered").await;
     assert_eq!(row.state, "triggered");
     assert_eq!(row.trigger.unwrap().observed_line_count, 1);
     mgr.stop(&h.ws, &id).await.unwrap();

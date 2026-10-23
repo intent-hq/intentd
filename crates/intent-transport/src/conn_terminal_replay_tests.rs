@@ -13,7 +13,7 @@ async fn congested_terminal_forwarder_preserves_cursor_ranges_and_exit_order() {
         .tempdir()
         .unwrap();
     let store = Store::open(&dir.path().join("bus.db")).await.unwrap();
-    let bus = EventBus::new(store);
+    let bus = EventBus::new(store.clone());
     // Closing the bus flushes this whole batch without any sleep or timing race.
     let sub = bus.subscribe(SubscriptionFilter {
         batch_window: Some(std::time::Duration::from_secs(3600)),
@@ -49,6 +49,7 @@ async fn congested_terminal_forwarder_preserves_cursor_ranges_and_exit_order() {
     let (priority, _priority_rx) = mpsc::channel(1);
     let (bulk, mut rx) = mpsc::channel(1);
     let forwarder = recovery::forward(
+        Arc::new(intent_services::Services::new(store)),
         sub,
         None,
         None,

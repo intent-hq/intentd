@@ -100,6 +100,7 @@ fn event(workspace: &str, kind: &str, data: Value) -> NewEvent {
 }
 fn forwarder(out: OutboundSender) -> Forwarder {
     Forwarder {
+        api: Arc::new(Api),
         gate: None,
         membership: None,
         scope: Some("ws-a".into()),
@@ -478,6 +479,7 @@ async fn recovery_foreign_activity_cannot_expand_guest_marker_scope_or_disclose_
     let (handle,) = crate::context::with_request_context(true, Some(caller), async {
         let gate = events::MembershipGate::for_current_caller(&api).unwrap();
         (spawn_forwarder(forward(
+            Arc::clone(&api),
             sub,
             Some((gate, membership)),
             Some("ws-a".into()),
@@ -869,4 +871,97 @@ async fn recovery_completed_fence_guard_cannot_cancel_reused_request_id() {
     second.await.unwrap();
     drop(second_guard);
     assert!(!output.is_closed());
+}
+
+struct DiscussionProjectionApi {
+    mode: std::sync::atomic::AtomicU8,
+    calls: std::sync::atomic::AtomicUsize,
+}
+impl WorkspaceApi for DiscussionProjectionApi {
+    fn discussion_project_event(
+        &self,
+        mut event: Event,
+    ) -> futures::future::BoxFuture<'_, intent_core::Result<Option<Event>>> {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.calls.fetch_add(1, SeqCst);
+        Box::pin(async move {
+            match self.mode.load(SeqCst) {
+                0 => Ok(None),
+                1 => {
+                    event.data = json!({"visibleToRecipient":true});
+                    Ok(Some(event))
+                }
+                _ => Err(intent_core::Error::Internal(
+                    "projection unavailable".into(),
+                )),
+            }
+        })
+    }
+}
+fn private_item(kind: &str) -> EventItem {
+    let mut event = file_item("private").event().clone();
+    event.event_type = kind.into();
+    event.data = json!({"unprojectedSecret":"must not escape"});
+    EventItem::Latest(event)
+}
+
+#[tokio::test]
+async fn recovery_discussion_and_typing_projection_fail_closed_without_a_guest_gate() {
+    use std::sync::atomic::{AtomicU8, AtomicUsize};
+    for kind in [
+        intent_core::events::DISCUSSION_MESSAGE,
+        intent_core::events::DISCUSSION_REACTION,
+        intent_core::events::PRESENCE_CHANGED,
+    ] {
+        for mode in [0, 1, 2] {
+            let (out, mut rx) = outbound_channel();
+            let mut f = forwarder(out);
+            f.api = Arc::new(DiscussionProjectionApi {
+                mode: AtomicU8::new(mode),
+                calls: AtomicUsize::new(0),
+            });
+            assert!(f.send_item(private_item(kind)).await);
+            if mode == 1 {
+                let frame = rx.bulk.try_recv().expect("projected event delivered");
+                let frame: Value = serde_json::from_str(&frame).unwrap();
+                assert_eq!(
+                    frame["params"]["event"]["data"],
+                    json!({"visibleToRecipient":true})
+                );
+            }
+            assert!(
+                rx.bulk.try_recv().is_err(),
+                "raw or denied payload escaped for {kind}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn recovery_discussion_access_is_projected_after_backpressure_clears() {
+    use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering::SeqCst};
+    let (out, mut rx) = outbound_channel();
+    for _ in 0..BULK_CAPACITY {
+        out.bulk.try_send("occupied".into()).unwrap();
+    }
+    let api = Arc::new(DiscussionProjectionApi {
+        mode: AtomicU8::new(1),
+        calls: AtomicUsize::new(0),
+    });
+    let mut f = forwarder(out);
+    f.api = api.clone();
+    let mut send = Box::pin(f.send_item(private_item(intent_core::events::DISCUSSION_MESSAGE)));
+    assert!(futures::poll!(&mut send).is_pending());
+    assert_eq!(api.calls.load(SeqCst), 0);
+    api.mode.store(0, SeqCst);
+    assert_eq!(rx.bulk.recv().await.unwrap(), "occupied");
+    assert!(send.await);
+    assert_eq!(api.calls.load(SeqCst), 1);
+    for _ in 1..BULK_CAPACITY {
+        assert_eq!(rx.bulk.try_recv().unwrap(), "occupied");
+    }
+    assert!(
+        rx.bulk.try_recv().is_err(),
+        "revoked discussion escaped after capacity became available"
+    );
 }

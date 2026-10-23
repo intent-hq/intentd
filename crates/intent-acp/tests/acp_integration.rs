@@ -366,6 +366,7 @@ fn spawn_prompt(
                         if cancelled.load(Ordering::SeqCst) {
                             break;
                         }
+                        // fixed-deadline: allow — not a deadline: the mock's cancel-flag re-check tick; stretching it only delays cancel detection
                         let _ = tokio::time::timeout(Duration::from_millis(25), fut).await;
                     }
                 }

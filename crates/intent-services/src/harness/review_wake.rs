@@ -70,6 +70,15 @@ pub(crate) fn checklist(r: &Value, ready: bool) -> String {
         checks.push_str(" (required-check flags unavailable)");
     }
     lines.push(checks);
+    let stall = &r["checksNotStarted"];
+    if let Some(head) = stall["headSha"].as_str() {
+        let short: String = head.chars().take(8).collect();
+        lines.push(format!(
+            "checks never started on head {short} (none reported {}+ min after its commit) \
+             — push again or rebase to trigger CI",
+            text(&stall["thresholdMinutes"])
+        ));
+    }
     let threads = &r["threads"];
     let count = threads["unresolved"].as_i64().map_or_else(
         || "unknown (thread resolution state unreadable)".into(),

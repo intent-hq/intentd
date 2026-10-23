@@ -575,6 +575,12 @@ pub struct TurnOptions {
     /// delivered report queryable via `agent.get`. Fresh turns leave this
     /// `false` and clear as today.
     pub suppress_report_clear: bool,
+    /// `true` when this turn replays an earlier one rather than starting a
+    /// new turn: a stale (#576) redelivery or a requeued entry whose user
+    /// row already reached the transcript (a terminal-failure retry). Such a
+    /// turn never starts a timed return to the home provider (PROTOCOL
+    /// §5.54); carried through every worker spawn path.
+    pub replay: bool,
     /// The drained entry's original `queued_at`, threaded through so a
     /// terminal-failure requeue (STAB-112) re-enqueues with the ORIGINAL
     /// timestamp instead of stamping `now_iso()` — keeping the #576 staleness
@@ -701,6 +707,7 @@ fn turn_options_for_entry(entry: &QueuedMessage, stale: bool) -> TurnOptions {
         file_blocks: entry.file_blocks.clone(),
         message_metadata: entry.message_metadata.clone(),
         suppress_report_clear: stale,
+        replay: stale || entry.persisted,
         queued_at: Some(entry.queued_at.clone()),
         queued_submission_ids: entry.submission_ids(),
         recovery_sources: entry.recovery_sources.clone(),
@@ -2874,6 +2881,7 @@ pub struct AgentManager {
     next_admission: AtomicUsize,
     /// Claimed startup side effects must finish before retirement detaches.
     turn_start_gates: crate::agent_ops::AgentRetirementGates,
+    active_discussion_turns: Mutex<HashMap<AgentId, String>>,
     /// Start of the current stretch with no turn in flight: `Some(boot)`
     /// initially, cleared on the `busy` empty → non-empty edge and re-armed
     /// on the non-empty → empty edge. Every access — the two writers AND the
@@ -3146,6 +3154,7 @@ impl AgentManager {
             turn_admissions: Mutex::new(HashMap::new()),
             next_admission: AtomicUsize::new(0),
             turn_start_gates: crate::agent_ops::AgentRetirementGates::default(),
+            active_discussion_turns: Mutex::default(),
             idle_since: Arc::new(Mutex::new(Some(Instant::now()))),
             reap_claims: Arc::new(Mutex::new(HashSet::new())),
             agent_ws: Arc::new(Mutex::new(HashMap::new())),
@@ -5728,7 +5737,7 @@ impl AgentManager {
                 group_source_ids.push(id.to_string());
             }
         }
-        let (body, excluded_group_sources) = self
+        let (body, excluded_group_sources, continues_cut_short_turn) = self
             .build_turn_body_with_group_replay(
                 agent_id,
                 &combined,
@@ -5823,7 +5832,12 @@ impl AgentManager {
                         .as_ref()
                         .is_some_and(|source| excluded_group_sources.contains(source));
                 let in_envelope = !batch && !history_covers_prepend && i == 0;
-                if !covered && !in_envelope {
+                // A quota failover continuing a cut-short turn (PROTOCOL
+                // §5.54) already replays every request of this delivery in
+                // the turn section; re-appending their text after the
+                // continuation would invite repeated work. Attachments are
+                // not in the text replay, so they are still delivered.
+                if !covered && !in_envelope && !continues_cut_short_turn {
                     let text = if batch && !group.is_prepend {
                         message_number += 1;
                         format!("\n\nMessage #{}:\n{}", message_number, group.content)
@@ -6056,9 +6070,27 @@ impl AgentManager {
         content: &str,
         flushed_ids: Option<&[String]>,
         group_source_ids: &[String],
-    ) -> (String, HashSet<String>) {
+    ) -> (String, HashSet<String>, bool) {
+        let failover_replay = self.services.quota_failover_replay_pending(agent_id);
         if !self.take_recreated(agent_id) {
-            return (content.to_string(), HashSet::new());
+            // A resumed native session (no replay) already holds the cut-short
+            // turn's history from the backup's earlier prompt; it still gets
+            // the continuation instead of the message again.
+            if failover_replay
+                && self
+                    .services
+                    .store
+                    .get_agent_messages(agent_id, None)
+                    .await
+                    .is_ok_and(|messages| partial_turn_follows_last_user(&messages))
+            {
+                return (
+                    crate::quota_failover::QUOTA_FAILOVER_CONTINUATION.to_string(),
+                    HashSet::new(),
+                    true,
+                );
+            }
+            return (content.to_string(), HashSet::new(), false);
         }
         // The per-block cap is read live so a `config.toml` edit applies to
         // the next replay without a daemon restart. The bounded replay read
@@ -6104,6 +6136,50 @@ impl AgentManager {
                 .iter()
                 .position(|message| queue_source(message).is_some_and(|id| ids.contains(&id)))
         });
+        // Quota failover mid-turn (PROTOCOL §5.54): when the failed attempt
+        // already persisted assistant/tool rows after the current user row,
+        // the backup continues that turn — older history, then the cut-short
+        // turn (user request + every tool call it made, never dropped for
+        // size; see `format_cut_short_turn`), then a continuation instruction
+        // instead of the re-sent message. Applies to every send shape
+        // (direct, live flush, saved groups).
+        if failover_replay && partial_turn_follows_last_user(&messages) {
+            // The current turn starts at its first user row: the flushed
+            // batch's first row, the earliest saved group source, else the
+            // newest user row. Everything before it is older history.
+            let group_start = messages.iter().position(|message| {
+                message.role == "user"
+                    && (excluded_group_sources.contains(&message.id)
+                        || queue_source(message)
+                            .is_some_and(|source| excluded_group_sources.contains(&source)))
+            });
+            let last_user = messages.iter().rposition(|message| message.role == "user");
+            let start = first_flushed
+                .into_iter()
+                .chain(group_start)
+                .chain(last_user)
+                .min()
+                .unwrap_or(0);
+            let keep = |message: &&intent_core::AgentMessage| {
+                !crate::agent_ops::is_qualified_monitor_message(message)
+            };
+            let prior: Vec<_> = messages[..start].iter().filter(keep).cloned().collect();
+            let current: Vec<_> = messages[start..].iter().filter(keep).cloned().collect();
+            let turn = crate::history_xml::format_cut_short_turn(
+                &prior,
+                &current,
+                crate::history_xml::MAX_HISTORY_CHARS,
+                tool_content_chars,
+            );
+            return (
+                format!(
+                    "{turn}\n\n{}",
+                    crate::quota_failover::QUOTA_FAILOVER_CONTINUATION
+                ),
+                excluded_group_sources,
+                true,
+            );
+        }
         let prior: &[_] = if let Some(index) = first_flushed {
             // Preserve the existing boundary for an ordinary live flush.
             &messages[..index]
@@ -6118,7 +6194,7 @@ impl AgentManager {
             }
         };
         if prior.is_empty() {
-            return (content.to_string(), excluded_group_sources);
+            return (content.to_string(), excluded_group_sources, false);
         }
         // Unlike the existing live-flush boundary, saved group sources may
         // precede unrelated conversation. Remove only matched source rows.
@@ -6142,6 +6218,7 @@ impl AgentManager {
         (
             format!("{history_xml}\n\n{content}"),
             excluded_group_sources,
+            false,
         )
     }
 
@@ -6400,6 +6477,16 @@ impl AgentManager {
             self.retain_finishing_worker(worker);
         }
         if sync_store && !self.is_shutting_down() {
+            let discussion_turn = self
+                .active_discussion_turns
+                .lock()
+                .unwrap()
+                .remove(agent_id);
+            if let Some(turn) = discussion_turn {
+                self.services
+                    .set_discussion_activity(&turn, "stopped", None)
+                    .await;
+            }
             self.services.settle_script_monitor_worker(agent_id).await;
         }
         self.services
@@ -6433,6 +6520,9 @@ impl AgentManager {
         // inherit the old count and hit the cap early.
         self.services.take_truncation_redrive(agent_id);
         self.services.clear_truncation_redrives(agent_id);
+        // The aborted worker's quota failover chain (PROTOCOL §5.54) belongs
+        // to the aborted turn; the next worker re-arms its own.
+        self.services.disarm_quota_failover(agent_id);
         {
             let mut armed = self.stop_redelivery.lock().unwrap();
             match redelivery {
@@ -6575,6 +6665,16 @@ impl AgentManager {
         if let Some(worker) = self.workers.lock().unwrap().remove(agent_id) {
             worker.abort();
             self.retain_finishing_worker(worker);
+        }
+        let discussion_turn = self
+            .active_discussion_turns
+            .lock()
+            .unwrap()
+            .remove(agent_id);
+        if let Some(turn) = discussion_turn {
+            self.services
+                .set_discussion_activity(&turn, "stopped", None)
+                .await;
         }
         self.services.settle_script_monitor_worker(agent_id).await;
         // The abort may have landed between the streaming path's terminal-
@@ -8989,6 +9089,7 @@ impl AgentManager {
             file_blocks: next.file_blocks.clone(),
             message_metadata: next.message_metadata.clone(),
             suppress_report_clear: stale,
+            replay: stale || next.persisted,
             queued_at: Some(next.queued_at.clone()),
             queued_submission_ids: next.submission_ids(),
             recovery_sources: next.recovery_sources.clone(),
@@ -9159,6 +9260,10 @@ impl AgentManager {
             file_blocks: entry.file_blocks.clone(),
             message_metadata: entry.message_metadata.clone(),
             suppress_report_clear: stale,
+            // Classified before any row is persisted: a stale or an
+            // already-persisted entry replays an earlier turn (no timed
+            // return home, PROTOCOL §5.54).
+            replay: stale || entry.persisted,
             queued_at: Some(entry.queued_at.clone()),
             queued_submission_ids: entry.submission_ids(),
             recovery_sources: entry.recovery_sources.clone(),
@@ -9593,17 +9698,24 @@ impl AgentManager {
                     Ok(ws) if ws.archived
                 )
             {
-                return self
-                    .send_message(agent_id, workspace_id, content, message_id, options)
-                    .await;
+                return Box::pin(self.send_message(
+                    agent_id,
+                    workspace_id,
+                    content,
+                    message_id,
+                    options,
+                ))
+                .await;
             }
             self.preempt_busy_turn(&agent_id, &mut options).await;
             // The slot was just released (or was never held): the send path claims
             // it and streams the interrupt message right away rather than queueing.
             // If a concurrent send wins the race the message queues instead — it is
             // still delivered by that worker's drain loop, never dropped.
-            self.send_message(agent_id, workspace_id, content, message_id, options)
-                .await
+            // The send can synchronously drain its append-failure fallback. Keep
+            // its large future out of this interrupt frame so the nested drain
+            // also fits on the default thread stack under coverage instrumentation.
+            Box::pin(self.send_message(agent_id, workspace_id, content, message_id, options)).await
         })
         .await
     }
@@ -9746,6 +9858,47 @@ impl AgentManager {
         }
     }
 
+    fn track_discussion_turn(&self, agent: &AgentId, options: &TurnOptions) {
+        let mut active = self.active_discussion_turns.lock().unwrap();
+        if crate::discussion_activity::is_discussion(options.message_metadata.as_ref()) {
+            if let Some(turn) = &options.turn_id {
+                active.insert(agent.clone(), turn.clone());
+            }
+        } else {
+            active.remove(agent);
+        }
+    }
+
+    fn clear_discussion_turn(&self, agent: &AgentId, options: &TurnOptions) {
+        let mut active = self.active_discussion_turns.lock().unwrap();
+        if active.get(agent) == options.turn_id.as_ref() {
+            active.remove(agent);
+        }
+    }
+
+    /// Fence new admissions, then abort only the worker owning this invocation.
+    pub(crate) async fn stop_discussion_turn(&self, agent: &AgentId, turn: &str) {
+        let gate = self.turn_start_gates.for_agent(agent);
+        let _admission = gate.lock().await;
+        {
+            let mut active = self.active_discussion_turns.lock().unwrap();
+            if active.get(agent).map(String::as_str) != Some(turn) {
+                return;
+            }
+            self.services.pin_live_turn(agent);
+            if let Some(worker) = self.workers.lock().unwrap().remove(agent) {
+                worker.abort();
+                self.retain_finishing_worker(worker);
+            }
+            active.remove(agent);
+        }
+        self.interrupt_inner(agent, InterruptReason::UserStop, None)
+            .await;
+        // Explicit stopped invocations can only be resumed with Retry.
+        self.stop_redelivery.lock().unwrap().remove(agent);
+        self.sync_stop_redelivery(agent).await;
+    }
+
     /// Spawn (and track) the background turn worker for an agent. The caller must
     /// already hold the in-flight slot (`try_begin`). `user_persisted` reports
     /// whether the initial turn's user row durably reached the transcript, so a
@@ -9775,6 +9928,7 @@ impl AgentManager {
         if options.turn_id.is_none() {
             options.turn_id = Some(new_message_id());
         }
+        self.track_discussion_turn(&agent_id, &options);
         self.services
             .track_script_monitor_worker(&agent_id, options.message_metadata.as_ref());
         // Consume a pending zero-output stop redelivery
@@ -9799,7 +9953,9 @@ impl AgentManager {
         // flush rebuilds the same aggregate order as this turn (entry
         // prepends in entry order, then the stop redelivery) instead of
         // losing it with the discarded aggregate prepend.
-        let armed = if options.monitor_turn.is_none() {
+        let armed = if options.monitor_turn.is_none()
+            && !crate::discussion_activity::is_discussion(options.message_metadata.as_ref())
+        {
             self.stop_redelivery.lock().unwrap().remove(&agent_id)
         } else {
             None
@@ -10760,7 +10916,9 @@ impl AgentManager {
 
     /// Whether a pending `model_changed` row for the provider hop
     /// `from_provider` → `to_provider` is the deferred last-turn commit of a
-    /// re-home the transcript already announces (intent-hq/intent#5737): the
+    /// re-home (intent-hq/intent#5737) or a quota failover (PROTOCOL §5.54,
+    /// a `provider_failover` row for the same selection hop) the transcript
+    /// already announces. For a re-home: the
     /// agent's newest identity-change system row
     /// ([`intent_store::Store::latest_agent_identity_notice`]) is a
     /// `provider_rehomed` notice for that same hop, both sides canonicalized
@@ -10778,9 +10936,21 @@ impl AgentManager {
         to_provider: &str,
     ) -> bool {
         let canonical = |id: &str| intent_providers::provider_config(id).id;
-        if canonical(from_provider) == canonical(to_provider) {
+        let selection = crate::provider_profiles::canonical_selection;
+        // A model-only change is never an announced switch. A hop between two
+        // configurations of one base can only be a quota failover.
+        if selection(from_provider) == selection(to_provider) {
             return false;
         }
+        // A timed return home: its `provider_returned` row is the notice.
+        if self
+            .services
+            .is_announced_provider_return(agent_id, from_provider, to_provider)
+            .await
+        {
+            return true;
+        }
+        let same_base = canonical(from_provider) == canonical(to_provider);
         let latest = match self
             .services
             .store
@@ -10796,7 +10966,32 @@ impl AgentManager {
         let Some(latest) = latest else {
             return false;
         };
-        if latest["type"].as_str() != Some("provider_rehomed") {
+        // Quota failover (PROTOCOL §5.54): the `provider_failover` rows of
+        // this turn already name the hop between selections (profiles
+        // included) — one row, or an unbroken chain when a backup's own setup
+        // also ran out before another one succeeded.
+        if latest["type"].as_str() == Some(crate::quota_failover::PROVIDER_FAILOVER_NOTICE_TYPE) {
+            return match self
+                .services
+                .store
+                .recent_agent_identity_notices(
+                    agent_id,
+                    crate::quota_failover::FAILOVER_CHAIN_READ_LIMIT,
+                )
+                .await
+            {
+                Ok(notices) => crate::quota_failover::failover_chain_announces(
+                    &notices,
+                    from_provider,
+                    to_provider,
+                ),
+                Err(e) => {
+                    tracing::warn!(agent = %agent_id, error = %e, "failed to read identity notices; keeping the model-change notice");
+                    false
+                }
+            };
+        }
+        if same_base || latest["type"].as_str() != Some("provider_rehomed") {
             return false;
         }
         let hop = |key: &str| latest[key].as_str().map(canonical);
@@ -11216,6 +11411,13 @@ impl AgentManager {
             &settings,
             self.chief_cwd_root.as_deref(),
         )?;
+        // Backup failover (PROTOCOL §5.54): the identity this attempt starts
+        // with — a failure only fails over while the session still carries it.
+        self.services.note_quota_failover_attempt(
+            agent_id,
+            &resolved.selection,
+            session.model.as_deref(),
+        );
 
         // Check if the agent's model/provider has changed (via agent.setModel).
         // If so, tear down the existing child and force a respawn with the new model.
@@ -11464,11 +11666,15 @@ impl AgentManager {
         // Record the identity this attempt runs under BEFORE anything below
         // can fail: a spawn or session-setup failure is attributed to the
         // provider that was actually tried, not to whatever the last committed
-        // turn ran on. Cleared on success at the end of this method.
+        // turn ran on. Cleared on success at the end of this method. The
+        // selection is recorded: a bare provider's selection is its canonical
+        // id, and a profile attempt names its reference (PROTOCOL §5.54: a
+        // quota exhaustion names the last reference tried, and failover must
+        // attribute the failure to the configuration that actually ran).
         self.spawn_attempt_provider
             .lock()
             .unwrap()
-            .insert(agent_id.clone(), resolved.provider.id.to_string());
+            .insert(agent_id.clone(), resolved.selection.clone());
         let private_history = if let Some(session_id) = &session.acp_session_id {
             self.services
                 .store
@@ -11544,6 +11750,12 @@ impl AgentManager {
             &mut resolved,
         ))
         .await;
+        // Backup failover: a turn that started on the provider default now
+        // runs under the filled model, which the session row also carries.
+        if let (None, Some(filled)) = (session.model.as_deref(), filled_model.as_deref()) {
+            self.services
+                .note_quota_failover_filled_model(agent_id, filled);
+        }
         // Model-change transcript notice: only AFTER the child + ACP session
         // are provably up under the new identity — a failed spawn/switch must
         // not persist a notice or commit `last_turn_*` to an identity the
@@ -12695,7 +12907,10 @@ fn redelivery_prepend(
     if messages
         .iter()
         .rfind(|message| message.role == "user")
-        .is_some_and(crate::agent_ops::is_qualified_monitor_message)
+        .is_some_and(|message| {
+            crate::agent_ops::is_qualified_monitor_message(message)
+                || crate::discussion_activity::is_discussion(message.metadata.as_ref())
+        })
     {
         return None;
     }
@@ -13280,6 +13495,15 @@ fn resolve_spawn(
     // A profile shares its base provider's installation, paths and launch
     // configuration; only the environment overlay differs.
     let provider_id = intent_providers::base_provider_id(&provider_id).to_owned();
+    // Test seam: let the mock ACP agent stand in for a profile-capable base
+    // (`codex` / `claude-code`) so profile selections spawn a real child in
+    // unit tests. The selection identity is unchanged.
+    #[cfg(test)]
+    let provider_id = if std::env::var("MOCK_AGENT_STANDS_IN_FOR").is_ok_and(|b| b == provider_id) {
+        "mock".to_owned()
+    } else {
+        provider_id
+    };
     // Whitespace-bearing ids are effective-model display names persisted
     // onto `model` by the pre-monorepo#1534 D13 resolution (legacy rows,
     // e.g. `Opus 4.8`) — stats/attribution values, not spawnable model ids.
@@ -13759,7 +13983,8 @@ fn dequeue_worker_raced_tail(
 ) -> Option<(Vec<QueuedMessage>, DrainingGuard)> {
     // The head was popped before the slot reclaim, so queue selectors can no
     // longer see its monitor identity. Never attach unrelated work to its wake.
-    if next.monitor_turn.is_some()
+    if crate::discussion_activity::is_discussion(next.message_metadata.as_ref())
+        || next.monitor_turn.is_some()
         || crate::script_monitor::monitor_id(next.message_metadata.as_ref()).is_some()
     {
         return None;
@@ -13809,7 +14034,43 @@ async fn run_message_worker(
     // [`MAX_CONSECUTIVE_IDLE_TIMEOUT_REDRIVES`] the worker injects a warning
     // turn instead of failing; past it the timeout takes the terminal path.
     let mut consecutive_idle_timeouts: u32 = 0;
+    // Backup failover (PROTOCOL §5.54): set when the attempt about to run
+    // redrives the SAME message (a quota failover or a silent redrive), so
+    // the references already tried for it stay excluded; every other loop
+    // pass starts a new message with a fresh chain.
+    let mut keep_failover_chain = false;
+    // Set when the next loop pass continues the same logical turn rather
+    // than starting a new one (an idle-timeout warning turn, a truncation
+    // nudge, a stale or requeued redelivery): no timed return home there.
+    let mut continuation_turn = false;
     'outer: loop {
+        mgr.track_discussion_turn(&agent_id, &options);
+        if crate::discussion_activity::is_discussion(options.message_metadata.as_ref()) {
+            let turn = options.turn_id.as_deref().expect("discussion turn id");
+            match mgr
+                .services
+                .store
+                .discussion_invocation_allowed(turn, &agent_id)
+                .await
+            {
+                Ok(true) => {
+                    mgr.services
+                        .set_discussion_activity(turn, "working", None)
+                        .await;
+                }
+                Ok(false) => {
+                    mgr.clear_discussion_turn(&agent_id, &options);
+                    mgr.finish_monitor_worker(&agent_id, &workspace_id, admission)
+                        .await;
+                    return;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "retrying discussion admission");
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    continue 'outer;
+                }
+            }
+        }
         if let Some(owner) = options.monitor_turn.take() {
             if let Some(turn) = owner.take() {
                 // Keep the qualified turn future out of the ordinary worker frame.
@@ -13886,6 +14147,27 @@ async fn run_message_worker(
             mgr.finish_monitor_worker(&agent_id, &workspace_id, admission)
                 .await;
             return;
+        }
+        let redrive = std::mem::take(&mut keep_failover_chain);
+        let continuation = std::mem::take(&mut continuation_turn) || options.replay;
+        mgr.services.arm_quota_failover(&agent_id, redrive);
+        // Timed return to the home provider (PROTOCOL §5.54): at the start of
+        // every new turn, whatever its origin (user, agent-to-agent,
+        // delegation, wake) — never on a redrive, retry or replay of the
+        // same turn, and never mid-turn.
+        if !redrive && !continuation {
+            // A new turn: an earlier turn's unaccepted return attempt is
+            // over. A continuation of the same turn keeps it pending.
+            mgr.services.cancel_provider_return_announcement(&agent_id);
+            // Boxed: keeps the return check's state off the worker's future
+            // (the deep send/interrupt paths overflow the test stack).
+            Box::pin(mgr.services.begin_provider_return(&workspace_id, &agent_id)).await;
+        } else if !redrive {
+            // A replay or continuation never starts a timed switch, but an
+            // owed return already persisted on home (e.g. a retry resumed
+            // after a daemon restart lost the in-memory mark) is re-armed so
+            // home's first output still announces it and clears the state.
+            Box::pin(mgr.services.rearm_provider_return_if_home(&agent_id)).await;
         }
         // Keep the large session-start future off the worker's inline state;
         // it is still polled and cancelled by this same worker.
@@ -14010,7 +14292,19 @@ async fn run_message_worker(
                     )
                     .await
                 {
-                    Ok(_stop_reason) => {
+                    Ok(stop_reason) => {
+                        mgr.clear_discussion_turn(&agent_id, &options);
+                        mgr.services
+                            .settle_discussion_options(
+                                &options,
+                                if stop_reason == StopReason::Cancelled {
+                                    "stopped"
+                                } else {
+                                    "completed"
+                                },
+                                None,
+                            )
+                            .await;
                         if let Some(id) =
                             crate::script_monitor::monitor_id(options.message_metadata.as_ref())
                         {
@@ -14022,6 +14316,13 @@ async fn run_message_worker(
                         // streak (monorepo#840): the session is provably not
                         // poisoned.
                         mgr.services.clear_failure_streak(&agent_id);
+                        // A turn that went back to the home provider and
+                        // completed there is home (PROTOCOL §5.54).
+                        Box::pin(
+                            mgr.services
+                                .complete_provider_return(&workspace_id, &agent_id),
+                        )
+                        .await;
                         // A completed turn also resets the consecutive
                         // idle-timeout streak (warn-and-continue).
                         consecutive_idle_timeouts = 0;
@@ -14058,6 +14359,7 @@ async fn run_message_worker(
                             )
                             .await;
                             content = nudge;
+                            continuation_turn = true;
                             options = TurnOptions {
                                 turn_id: Some(nudge_turn_id),
                                 message_metadata: Some(nudge_metadata),
@@ -14085,6 +14387,10 @@ async fn run_message_worker(
                     }
                     Err(e) => {
                         if is_benign_turn_error(&e) {
+                            mgr.clear_discussion_turn(&agent_id, &options);
+                            mgr.services
+                                .settle_discussion_options(&options, "stopped", None)
+                                .await;
                             if let Some(id) =
                                 crate::script_monitor::monitor_id(options.message_metadata.as_ref())
                             {
@@ -14096,7 +14402,11 @@ async fn run_message_worker(
                             // Keep draining: any queued message re-spawns lazily.
                             tracing::warn!(agent = %agent_id, error = %e, "agent turn ended (benign)");
                             consecutive_idle_timeouts = 0;
-                        } else if prompt_idle_timeout_error(&e) {
+                        } else if prompt_idle_timeout_error(&e)
+                            && !crate::discussion_activity::is_discussion(
+                                options.message_metadata.as_ref(),
+                            )
+                        {
                             // Warn-and-continue: the turn went the whole idle
                             // window silent. `run_prompt_turn` already flushed
                             // the partial transcript and emitted a NORMAL
@@ -14261,6 +14571,7 @@ async fn run_message_worker(
                                     }
                                 }
                                 content = warning;
+                                continuation_turn = true;
                                 options = TurnOptions {
                                     turn_id: Some(warning_turn_id),
                                     // The same delivery remains owned until its continuation ends.
@@ -14405,10 +14716,28 @@ async fn run_message_worker(
                             // Tear down the dead child and loop back through
                             // `retry_spawn` with the SAME content/options.
                             silent_redrive_used = true;
+                            keep_failover_chain = true;
                             tracing::warn!(
                                 agent = %agent_id,
                                 error = %e,
                                 "transport closed before output — redriving the prompt once on a fresh child"
+                            );
+                            mgr.kill_child_only(&agent_id).await;
+                            continue 'outer;
+                        } else if crate::quota_failover::is_quota_failover_error(&e) {
+                            // Backup failover (PROTOCOL §5.54): `run_prompt_turn`
+                            // already switched the agent onto a backup profile
+                            // and swallowed this attempt. Redrive the SAME
+                            // content/options on a fresh child of the backup —
+                            // its new identity opens a fresh native session with
+                            // Intent history replayed; the user row is not
+                            // persisted again. Bounded: the chain never retries
+                            // a reference for this message.
+                            keep_failover_chain = true;
+                            tracing::warn!(
+                                agent = %agent_id,
+                                error = %e,
+                                "provider quota exhausted — redriving the turn on a backup profile"
                             );
                             mgr.kill_child_only(&agent_id).await;
                             continue 'outer;
@@ -14450,6 +14779,39 @@ async fn run_message_worker(
                     // Cancellation is not provider failure. Leave the admitted
                     // slot for shutdown's interrupted-turn capture.
                     return;
+                }
+                // Backup failover for a rejected session setup (PROTOCOL
+                // §5.54): the spawn attempt hit its quota, so switch onto the
+                // next backup and loop back through the spawn with the same
+                // message instead of surfacing `agent:failed`. The attempt's
+                // provider record is consumed here because no terminal
+                // publisher runs for the swallowed attempt.
+                let attempted = mgr
+                    .spawn_attempt_provider
+                    .lock()
+                    .unwrap()
+                    .get(&agent_id)
+                    .cloned();
+                if intent_acp::message_is_quota_exceeded(&e.to_string())
+                    && mgr
+                        .services
+                        .try_quota_failover(
+                            &workspace_id,
+                            &agent_id,
+                            attempted.as_deref(),
+                            &e.to_string(),
+                        )
+                        .await
+                {
+                    mgr.spawn_attempt_provider.lock().unwrap().remove(&agent_id);
+                    tracing::warn!(
+                        agent = %agent_id,
+                        error = %e,
+                        "provider quota exhausted at session setup — retrying on a backup profile"
+                    );
+                    keep_failover_chain = true;
+                    mgr.kill_child_only(&agent_id).await;
+                    continue 'outer;
                 }
                 match stderr_capture_hint(&mgr, &agent_id, &e).await {
                     Some(log) => tracing::warn!(
@@ -14624,6 +14986,9 @@ async fn run_message_worker(
             // A terminal-failure requeue whose user row already reached the
             // transcript before its failed turn began must not duplicate the
             // row on retry; otherwise persist now and remember the outcome.
+            // A stale or already-persisted (requeued) entry replays an
+            // earlier turn rather than starting a new one.
+            continuation_turn = stale || next.persisted;
             user_persisted = if next.monitor_turn.is_some() || next.persisted {
                 true
             } else {
@@ -14650,6 +15015,7 @@ async fn run_message_worker(
                 file_blocks: next_file_blocks,
                 message_metadata: next.message_metadata.clone(),
                 suppress_report_clear: stale,
+                replay: stale || next.persisted,
                 queued_at: Some(next.queued_at.clone()),
                 queued_submission_ids,
                 recovery_sources: next.recovery_sources.clone(),
@@ -14831,6 +15197,9 @@ async fn run_message_worker(
                 .await;
             let next_image_blocks = next.image_blocks.clone();
             let next_file_blocks = next.file_blocks.clone();
+            // A stale or already-persisted (requeued) entry replays an
+            // earlier turn rather than starting a new one.
+            continuation_turn = stale || next.persisted;
             user_persisted = if next.monitor_turn.is_some() || next.persisted {
                 true
             } else {
@@ -14857,6 +15226,7 @@ async fn run_message_worker(
                 file_blocks: next_file_blocks,
                 message_metadata: next.message_metadata.clone(),
                 suppress_report_clear: stale,
+                replay: stale || next.persisted,
                 queued_at: Some(next.queued_at.clone()),
                 queued_submission_ids,
                 recovery_sources: next.recovery_sources.clone(),
@@ -15041,6 +15411,11 @@ async fn prepare_flush_turn(
     // stale check before the wait note, both before the row persist so the
     // persisted row and the provider prompt carry the same content.
     let mut stale_flags = Vec::with_capacity(entries.len());
+    // Replay classification, captured BEFORE the rows below are persisted
+    // (which marks every entry persisted): the batch replays an earlier
+    // turn only when every entry does (PROTOCOL §5.54 — one fresh entry
+    // makes it a new turn, which may start a timed return home).
+    let mut all_replays = true;
     for entry in &mut entries {
         let stale = mgr.annotate_stale_redrive(agent_id, entry).await;
         annotate_dequeue_wait(entry);
@@ -15048,6 +15423,7 @@ async fn prepare_flush_turn(
         // groups them; this distinguishes them).
         stamp_queued_message_id(entry);
         stale_flags.push(stale);
+        all_replays &= stale || entry.persisted;
     }
     // Batch grouping stamp — after the wait stamps (it creates `queueInfo`
     // when absent; the wait stamp never overwrites an existing one): every
@@ -15154,6 +15530,7 @@ async fn prepare_flush_turn(
         file_blocks,
         message_metadata: entries[0].message_metadata.clone(),
         suppress_report_clear: stale_flags.iter().all(|&s| s),
+        replay: all_replays,
         queued_at: Some(entries[0].queued_at.clone()),
         latest_human_submission_at: entries
             .iter()
@@ -15617,6 +15994,19 @@ fn is_retryable_spawn_error(err: &Error) -> bool {
     false
 }
 
+/// Whether assistant rows (a cut-short attempt's partial work) follow the
+/// newest user row of `messages`.
+fn partial_turn_follows_last_user(messages: &[intent_core::AgentMessage]) -> bool {
+    messages
+        .iter()
+        .rposition(|message| message.role == "user")
+        .is_some_and(|index| {
+            messages[index + 1..]
+                .iter()
+                .any(|message| message.role == "assistant")
+        })
+}
+
 /// Retry `ensure_started` up to `MAX_SPAWN_ATTEMPTS` times with jittered
 /// backoff. On each retry (after the first failure), tear down the failed
 /// child, publish an `agent:stream:status` retry hint, and spawn a fresh
@@ -15657,7 +16047,23 @@ async fn retry_spawn_owned(
             Err(e) => {
                 let retryable = is_retryable_spawn_error(&e);
                 let error_msg = e.to_string();
-                let will_retry = retryable && attempt < MAX_SPAWN_ATTEMPTS;
+                // Backup failover (PROTOCOL §5.54): a quota-rejected setup
+                // with a backup candidate skips the remaining same-provider
+                // retries — a spent quota stays spent — so the worker fails
+                // over at once. Without a candidate the retries run as today.
+                let attempted = mgr
+                    .spawn_attempt_provider
+                    .lock()
+                    .unwrap()
+                    .get(agent_id)
+                    .cloned();
+                let will_retry = retryable
+                    && attempt < MAX_SPAWN_ATTEMPTS
+                    && !(intent_acp::message_is_quota_exceeded(&error_msg)
+                        && mgr
+                            .services
+                            .has_quota_failover_candidate(agent_id, attempted.as_deref())
+                            .await);
                 let captured = if will_retry {
                     stderr_capture_hint(mgr, agent_id, &e).await
                 } else {
@@ -16116,6 +16522,15 @@ async fn publish_error_status_and_requeue(
     persisted: bool,
     error: PersistedTerminalError,
 ) {
+    mgr.clear_discussion_turn(agent_id, options);
+    if crate::discussion_activity::is_discussion(options.message_metadata.as_ref()) {
+        mgr.services
+            .settle_discussion_options(options, "failed", Some(&error.error_text))
+            .await;
+        publish_terminal_error_status_via_services(&mgr.services, agent_id, workspace_id, &error)
+            .await;
+        return;
+    }
     publish_terminal_error_status_via_services(&mgr.services, agent_id, workspace_id, &error).await;
     let PersistedTerminalError {
         error_text,
@@ -20050,8 +20465,11 @@ mod disabled_provider_rehome_tests {
 
     async fn drain(sub: &mut crate::events::Subscription) -> Vec<intent_core::Event> {
         let mut events = Vec::new();
-        while let Ok(Some(batch)) =
-            tokio::time::timeout(Duration::from_millis(300), sub.recv()).await
+        while let Ok(Some(batch)) = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            sub.recv(),
+        )
+        .await
         {
             events.extend(batch);
         }
@@ -24151,6 +24569,11 @@ mod legacy_identity_tests;
 #[cfg(all(test, unix))]
 #[path = "agent_manager/fast_mode_tests.rs"]
 mod fast_mode_tests;
+
+// Unix-only like its shared mock-agent helpers (`dead_child_respawn_tests`).
+#[cfg(all(test, unix))]
+#[path = "agent_manager/quota_failover_tests.rs"]
+mod quota_failover_tests;
 
 #[cfg(test)]
 #[path = "agent_manager/future_size_tests.rs"]

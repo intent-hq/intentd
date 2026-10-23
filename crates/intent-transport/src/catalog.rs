@@ -106,6 +106,13 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
     "crossWorkspace.listSiblings",
     "crossWorkspace.readNote",
     "debug.sampleStacks",
+    "discussion.conversations",
+    "discussion.list",
+    "discussion.react",
+    "discussion.recipients",
+    "discussion.retryAgent",
+    "discussion.send",
+    "discussion.stopAgent",
     "event.agentActivity",
     "event.query",
     "event.workspaceSummary",
@@ -264,6 +271,7 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
     "providers.profiles.create",
     "providers.profiles.delete",
     "providers.profiles.list",
+    "providers.profiles.reorder",
     "providers.profiles.update",
     "repo.list",
     "repo.remove",
@@ -409,6 +417,7 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
     "workspace.members.leave",
     "workspace.members.list",
     "workspace.members.remove",
+    "workspace.members.setRole",
     "workspace.repositoryContext",
     "workspace.repositoryContext.capture",
     "workspace.repositoryContext.release",
@@ -560,25 +569,26 @@ pub(crate) const REVERSE_METHODS: &[&str] = &[
 /// methods a guest may *attempt*.
 ///
 /// Owner-only by design (never listed): every `host.*` method but the two
-/// display probes, `browser.*`, `forward.*`, `terminal.*`, `script.*`,
+/// display probes, `browser.*`, `forward.*`, `terminal.*`, script definition writes,
 /// `github.*` / `linear.*` / `sentry.*` / `voice.*` (act with the primary
 /// user's third-party credentials), `settings.*`, `repo.*`, `mcp.*`,
 /// `server.*` / `pairing.*` / `system.*` (except `system.capabilities` and
 /// `system.status`, the latter served as the guest-safe projection
 /// `control::collaborator_status_json` rather than the administrator's
 /// snapshot),
-/// `workspace.create` / `git.clone` (arbitrary host paths), agent creation /
-/// delegation (`agent.create` / `agent.delegate` / `agent.wakeOrCreate`;
-/// decided 2026-09-19: guests steer existing agents only), agent / hook /
+/// `workspace.create` / `git.clone` (arbitrary host paths), agent delegation
+/// (`agent.delegate` / `agent.wakeOrCreate`), agent / hook /
 /// PR-monitor deletion, and `agent.replaceMessages` — it persists
 /// client-supplied user rows verbatim, so a non-owner could forge
 /// `fromPrincipalId` attribution; collaborators keep
 /// `agent.editAndRegenerate` for the edit flow. The golden test in
 /// `catalog/tests.rs` freezes the refused remainder so a new method must be
-/// classified explicitly.
+/// classified explicitly. Manager-only creation and saved-script operations
+/// are admitted here and checked against current workspace roles in services.
 pub(crate) const COLLABORATOR_METHODS: &[(&str, &str)] = &[
     ("agent.appendMessage", "Steer: appends a row to a workspace agent conversation; the caller's principal is stamped on user rows and, for a collaborator member, a user row's content carries the sender preamble (other roles byte-identical). Workspace-scoped, no host reach."),
     ("agent.cancelSubscriptions", "Steer: cancels an agent's own event subscriptions / delegation groups. Agent-scoped bookkeeping, no host reach."),
+    ("agent.create", "Manager: creates agents with workspace-scoped configuration; services check the durable role and reject protected overrides."),
     ("agent.dismissQuestions", "Steer: dismisses an agent's pending structured questions. Agent-scoped state only."),
     ("agent.editAndRegenerate", "Steer: edits a user message and regenerates from it; the edited content carries the collaborator sender preamble. Conversation write, workspace-scoped."),
     ("agent.editQueuedMessage", "Steer: edits a queued message; a collaborator's edit of a human-authored entry carries the sender preamble. Intentional exception: a collaborator's edit of an agent-authored (A2A / automatic) entry is NOT preambled — its sender stays the originating agent's header and the edit is recorded by the principal stamp. Queue write, agent-scoped."),
@@ -633,6 +643,13 @@ pub(crate) const COLLABORATOR_METHODS: &[(&str, &str)] = &[
     ("crossWorkspace.listNotes", "Read: notes of a sibling workspace. Membership-filtered in the service layer."),
     ("crossWorkspace.listSiblings", "Read: sibling workspaces sharing the repo. Membership-filtered in the service layer."),
     ("crossWorkspace.readNote", "Read: a sibling workspace note. Membership-filtered in the service layer."),
+    ("discussion.conversations", "Read: bounded participant or explicitly granted agent conversation discovery."),
+    ("discussion.list", "Read: bounded discussion history; human participation or explicit agent grant required."),
+    ("discussion.react", "Write: set an authenticated participant reaction; human-only, idempotent desired state."),
+    ("discussion.recipients", "Read: bounded effective workspace member picker for human conversations."),
+    ("discussion.retryAgent", "Write: retry a failed or stopped addressed invocation once; human participant only."),
+    ("discussion.send", "Write: authenticated discussion message; explicit agent recipients only, caller-stamped author."),
+    ("discussion.stopAgent", "Write: stop only the addressed discussion invocation; human participant only."),
     ("drafts.clear", "Per-client: clears the caller's own draft. Keyed by the connection's principal-scoped client id."),
     ("drafts.get", "Per-client: reads the caller's own draft. Keyed by the connection's principal-scoped client id."),
     ("drafts.set", "Per-client: saves the caller's own draft. Keyed by the connection's principal-scoped client id."),
@@ -727,6 +744,14 @@ pub(crate) const COLLABORATOR_METHODS: &[(&str, &str)] = &[
     ("principal.revokeSelf", "Guest lifecycle: the caller revokes its OWN credentials and leaves its workspaces; the administrator is refused in the service layer. Self-directed only, no target parameter."),
     ("providers.catalog", "Client boot: static provider catalog for the composer. No credentials."),
     ("rules.get", "Read: only the global base-system-prompt override for a currently admitted guest; services recheck durable admission. Other guest rule reads and all writes remain refused."),
+    ("script.get", "Manager: operates existing saved scripts in this workspace; services recheck the durable role. No command overrides or PTY input."),
+    ("script.list", "Manager: operates existing saved scripts in this workspace; services recheck the durable role. No command overrides or PTY input."),
+    ("script.output", "Manager: operates existing saved scripts in this workspace; services recheck the durable role. No command overrides or PTY input."),
+    ("script.restart", "Manager: operates existing saved scripts in this workspace; services recheck the durable role. No command overrides or PTY input."),
+    ("script.run", "Manager: runs an existing saved script by ID; services recheck its purpose and the durable role; no command overrides."),
+    ("script.start", "Manager: operates existing saved scripts in this workspace; services recheck the durable role. No command overrides or PTY input."),
+    ("script.status", "Manager: operates existing saved scripts in this workspace; services recheck the durable role. No command overrides or PTY input."),
+    ("script.stop", "Manager: operates existing saved scripts in this workspace; services recheck the durable role. No command overrides or PTY input."),
     ("scriptMonitor.get", "Read: selected active script monitor. Workspace membership required."),
     ("scriptMonitor.list", "Read: bounded script monitor rows, optionally filtered to an owner. Workspace membership required."),
     ("search.cancel", "Read: cancels the caller's own search."),
@@ -787,6 +812,7 @@ pub(crate) const COLLABORATOR_METHODS: &[(&str, &str)] = &[
     ("workspace.markSeen", "Steer: clears the workspace unseen marker."),
     ("workspace.members.leave", "Guest lifecycle: the caller drops its OWN collaborator membership of a workspace; owners cannot leave. Self-directed only, no target parameter; removal of others stays owner-only."),
     ("workspace.members.list", "Read: the membership roster (principal fields + role) of a member workspace. Removal stays owner-only."),
+    ("workspace.members.setRole", "Owner: updates a direct guest role; services enforce owner authority and immutable ownership."),
     ("workspace.repositoryContext", "Read: original socket/root lease; durable repository membership is rechecked. Host account metadata remains administrator-only."),
     ("workspace.repositoryContext.capture", "Read acquisition: original socket and workspace/root only; require_member decides durable local inventory permission, never write permission."),
     ("workspace.repositoryContext.release", "Release: only an original socket-owned repository lease; no cross-socket lookup or new authority."),
@@ -827,7 +853,6 @@ pub(crate) const MEMBER_METHODS: &[&str] = &[
     "accept-changes.release",
     "agent.cancelDelete",
     "agent.completeOnce",
-    "agent.create",
     "agent.delegate",
     "agent.delete",
     "agent.diagnostics",
@@ -903,16 +928,8 @@ pub(crate) const MEMBER_METHODS: &[&str] = &[
     "sandbox.cow.merge",
     "script.archive",
     "script.create",
-    "script.get",
-    "script.list",
-    "script.output",
     "script.remove",
-    "script.restart",
     "script.restore",
-    "script.run",
-    "script.start",
-    "script.status",
-    "script.stop",
     "scriptMonitor.cancel",
     "scriptMonitor.cancelRun",
     "sentry.assignIssue",

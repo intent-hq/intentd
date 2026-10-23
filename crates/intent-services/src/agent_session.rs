@@ -4867,8 +4867,29 @@ impl Services {
             }
             _ => (false, None),
         };
+        // Backup failover (PROTOCOL §5.54): a quota rejection with an untried
+        // backup profile of the same base switches the agent onto it here,
+        // before any terminal effect, so this attempt is swallowed — no
+        // Error status / stop_reason, no `agent:failed` — and the turn worker
+        // redrives the same user message on the backup. Output this attempt
+        // already persisted stays in the transcript. Only a worker-armed turn
+        // can fail over, and the chain is bounded per user turn.
+        let quota_failover = prompt_quota_failure
+            && prompt_actionable_error.is_none()
+            && self
+                .try_quota_failover(
+                    workspace_id,
+                    agent_id,
+                    prompt_quota_provider.as_deref(),
+                    &result
+                        .as_ref()
+                        .err()
+                        .map(ToString::to_string)
+                        .unwrap_or_default(),
+                )
+                .await;
         if let Err(e) = &result {
-            if !pre_output_transport_failure && !prompt_idle_timeout {
+            if !pre_output_transport_failure && !prompt_idle_timeout && !quota_failover {
                 let fallback = Error::Internal(format!("session/prompt failed: {e}"));
                 let wrapped = prompt_actionable_error.as_ref().unwrap_or(&fallback);
                 if !crate::agent_manager::prompt_cancellation_error(wrapped) {
@@ -4903,7 +4924,9 @@ impl Services {
         // registration order) when any were drained — omitted otherwise
         // (monorepo#732 fix wave: live delivery of turn-end attachments).
         if !pre_output_transport_failure {
-            let outcome = if result.is_err() {
+            let outcome = if quota_failover {
+                "quota_failover"
+            } else if result.is_err() {
                 "failed"
             } else if suspected_truncated && truncation_redrive {
                 "suspected_truncated_redrive"
@@ -5087,6 +5110,16 @@ impl Services {
                     "agent:idle suppressed — ready-to-send queue non-empty",
                 );
             }
+            Err(e) if quota_failover => {
+                // Swallowed (PROTOCOL §5.54 Backup failover): the agent now
+                // runs on a backup and stays busy until the redriven turn
+                // ends; that turn emits its own terminal events.
+                tracing::debug!(
+                    agent = %agent_id,
+                    error = %e,
+                    "quota failure switched to a backup profile — the worker redrives the turn",
+                );
+            }
             Err(e) if pre_output_transport_failure => {
                 // Suppressed (monorepo#764): no user-visible failure for this
                 // attempt — the worker decides between a silent redrive and
@@ -5159,7 +5192,12 @@ impl Services {
             }
         }
         result.map_err(|e| {
-            if pre_output_transport_failure {
+            if quota_failover {
+                Error::Internal(format!(
+                    "{} {e}",
+                    crate::quota_failover::PROMPT_QUOTA_FAILOVER_PREFIX
+                ))
+            } else if pre_output_transport_failure {
                 Error::Internal(format!("{PROMPT_PRE_OUTPUT_TRANSPORT_PREFIX} {e}"))
             } else if idle_timeout_streamed {
                 // Streamed-activity marker for the worker's consecutive-
@@ -6252,6 +6290,14 @@ impl Services {
         else {
             return false;
         };
+        // A timed return home is announced at home's first output, ahead of
+        // it (PROTOCOL §5.54 backup failover).
+        if matches!(
+            mapped,
+            MappedUpdate::Chunk { .. } | MappedUpdate::ToolCall(_)
+        ) {
+            Box::pin(self.announce_provider_return_if_pending(workspace_id, agent_id)).await;
+        }
         let message_id = transcript.message_id.clone();
         match mapped {
             MappedUpdate::Chunk {

@@ -360,7 +360,7 @@ async fn optional_owner_closes_on_constructor_panic_error_unpolled_and_pending_d
             let optional = read.capture_optional().unwrap();
             let local = optional.metadata();
             assert!(tokio::time::timeout(
-                std::time::Duration::from_millis(5),
+                intentd_test_support::test_timeout(std::time::Duration::from_millis(5)),
                 optional
                     .run_optional(|_| std::future::pending::<AdmissionResult<()>>())
                     .unwrap()

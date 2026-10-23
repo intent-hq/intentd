@@ -220,9 +220,12 @@ mod channel_tests {
             json!({ "agentId": "agent-A" }),
         ));
         assert!(
-            tokio::time::timeout(Duration::from_millis(300), rx.bulk.recv())
-                .await
-                .is_err(),
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(300)),
+                rx.bulk.recv()
+            )
+            .await
+            .is_err(),
             "no push after revocation"
         );
 

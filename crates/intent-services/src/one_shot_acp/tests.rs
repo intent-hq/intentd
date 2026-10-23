@@ -588,7 +588,10 @@ async fn response_pending_at_a_phase_boundary_is_carried_into_the_next_phase() {
     serve_requests_while(
         &mut responder,
         &mut requests,
-        tokio::time::timeout(Duration::from_millis(50), std::future::pending::<()>()),
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(50)),
+            std::future::pending::<()>(),
+        ),
     )
     .await
     .expect_err("the phase clock ends the first phase");

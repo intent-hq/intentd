@@ -807,6 +807,28 @@ fn note_subscribe_params_projection_mirrors_note_list() {
         assert!(err.contains("projection"), "{err}");
     }
 
+    // `maxContentBytes` (truncated note reads): absent / null → unbounded;
+    // a positive integer is the limit; the protocol's invalid vectors are a
+    // -32602 before the ack.
+    for (raw, want) in [
+        (r#"{"workspaceId":"w"}"#, None),
+        (r#"{"workspaceId":"w","maxContentBytes":null}"#, None),
+        (
+            r#"{"workspaceId":"w","maxContentBytes":512000}"#,
+            Some(512_000),
+        ),
+        (r#"{"workspaceId":"w","maxContentBytes":7.0}"#, Some(7)),
+    ] {
+        let v = parse(raw);
+        let p = parse_note_subscribe_params(v.as_object().unwrap()).unwrap();
+        assert_eq!(p.max_content_bytes, want, "{raw}");
+    }
+    for bad in ["0", "-1", "1.5", "\"10\"", "true"] {
+        let v = parse(&format!(r#"{{"workspaceId":"w","maxContentBytes":{bad}}}"#));
+        let err = parse_note_subscribe_params(v.as_object().unwrap()).unwrap_err();
+        assert_eq!(err, "maxContentBytes must be a positive integer", "{bad}");
+    }
+
     // The shared parser (task/agent channels) keeps treating the key as an
     // ignored unknown param — no new validation on those channels.
     let v = parse(r#"{"workspaceId":"w","projection":"bogus"}"#);
@@ -2597,6 +2619,7 @@ mod task_delta_re_read {
                 &ws(),
                 &note_event(event_type, "n-1"),
                 Some(NoteListProjection::Slim),
+                None,
             )
             .await
             .expect("delta");
@@ -2605,12 +2628,56 @@ mod task_delta_re_read {
             assert_eq!(row["contentPreview"].as_str().map(str::len), Some(500));
             assert_eq!(row["contentLength"].as_i64(), Some(1000));
         }
-        let delta = note_delta(&api, &ws(), &note_event(NOTE_UPDATED, "n-1"), None)
+        let delta = note_delta(&api, &ws(), &note_event(NOTE_UPDATED, "n-1"), None, None)
             .await
             .expect("delta");
         let row = &delta["updated"][0];
         assert_eq!(row["content"].as_str().map(str::len), Some(1000));
         assert!(row.get("contentPreview").is_none(), "full row: {row}");
+    }
+
+    #[tokio::test]
+    async fn note_delta_max_content_bytes_truncates_like_note_get() {
+        // Truncated note reads: `added`/`updated` re-reads of a large note
+        // carry the cut prefix plus the markers, the same row `note.get`
+        // serves; a note under the limit arrives full without markers, and
+        // slim rows ignore the limit.
+        let mut note = note_with(None);
+        note.content = "line one\nline two\nline three\n".to_string();
+        let full_bytes = note.content.len();
+        let api = StaticNoteApi::new(Some(note.clone()));
+        for (event_type, key) in [(NOTE_CREATED, "added"), (NOTE_UPDATED, "updated")] {
+            let delta = note_delta(&api, &ws(), &note_event(event_type, "n-1"), None, Some(20))
+                .await
+                .expect("delta");
+            let row = &delta[key][0];
+            assert_eq!(row["content"], "line one\nline two\n");
+            assert_eq!(row["contentTruncated"], true);
+            assert_eq!(row["contentBytes"], full_bytes);
+            assert_eq!(row, &intent_core::note_bounded_row(note.clone(), 20));
+        }
+        let delta = note_delta(
+            &api,
+            &ws(),
+            &note_event(NOTE_UPDATED, "n-1"),
+            None,
+            Some(1_000),
+        )
+        .await
+        .expect("delta");
+        assert_eq!(delta["updated"][0], serde_json::to_value(&note).unwrap());
+        let delta = note_delta(
+            &api,
+            &ws(),
+            &note_event(NOTE_UPDATED, "n-1"),
+            Some(NoteListProjection::Slim),
+            Some(5),
+        )
+        .await
+        .expect("delta");
+        let row = &delta["updated"][0];
+        assert!(row.get("content").is_none() && row.get("contentTruncated").is_none());
+        assert_eq!(row["contentLength"].as_u64(), Some(full_bytes as u64));
     }
 
     #[tokio::test]
@@ -5872,8 +5939,11 @@ mod channel_membership {
     /// Every `subscription.push` delta on the bulk lane until it stays quiet.
     async fn deltas(rx: &mut OutboundReceiver) -> Vec<Value> {
         let mut out = Vec::new();
-        while let Ok(Some(frame)) =
-            tokio::time::timeout(Duration::from_millis(300), rx.bulk.recv()).await
+        while let Ok(Some(frame)) = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            rx.bulk.recv(),
+        )
+        .await
         {
             let v: Value = serde_json::from_str(&frame).unwrap();
             assert_eq!(v["method"], "subscription.push");

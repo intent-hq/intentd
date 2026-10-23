@@ -130,10 +130,13 @@ async fn send(write_half: &mut (impl AsyncWriteExt + Unpin), frame: Value) {
 
 async fn read_json(reader: &mut BufReader<OwnedReadHalf>, secs: u64) -> Value {
     let mut line = String::new();
-    let n = timeout(Duration::from_secs(secs), reader.read_line(&mut line))
-        .await
-        .expect("timed out waiting for a frame")
-        .expect("read failed");
+    let n = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(secs)),
+        reader.read_line(&mut line),
+    )
+    .await
+    .expect("timed out waiting for a frame")
+    .expect("read failed");
     assert!(n > 0, "connection closed unexpectedly");
     serde_json::from_str(line.trim_end()).expect("invalid JSON frame")
 }

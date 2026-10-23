@@ -46,9 +46,6 @@ env:
   # Same for the xl pool (intent-cache-xl, 16 threads per slot), which serves
   # gh-linux-16x jobs before they overflow to intent-cache; 0 disables it.
   LINUX_XL_BURST_THRESHOLD: ${{ vars.CI_LINUX_XL_SLOTS || '0' }}
-  # Same for the fast pool (intent-cache-small, one core per slot), which
-  # serves the jobs that ask for a standard ubuntu-* label.
-  LINUX_SMALL_BURST_THRESHOLD: ${{ vars.CI_LINUX_SMALL_SLOTS || '6' }}
 
 # The heavy jobs share two self-hosted Linux slots, so cancel
 # superseded PR runs instead of letting them back up the queue (push-to-main
@@ -58,8 +55,8 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # All workloads prefer compatible self-hosted capacity. Keep the probe
-  # hosted so unavailable self-hosted runners cannot block the GitHub-hosted fallback.
+  # Paid-label workloads prefer compatible self-hosted capacity; free standard labels run on GitHub. Keep the probe
+  # hosted so unavailable self-hosted runners cannot block the burst fallback (WarpBuild, or GitHub).
   route:
     if: github.event_name == 'push' || github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
     permissions:
@@ -72,6 +69,7 @@ jobs:
     outputs:
       runners: ${{ steps.decide.outputs.runners }}
       slots: ${{ steps.decide.outputs.slots }}
+      cloud: ${{ steps.decide.outputs.cloud }}
       linux_labels: ${{ steps.heavy.outputs.linux_labels }}
       check_labels: ${{ steps.heavy.outputs.check_labels }}
       linux_burst: ${{ steps.heavy.outputs.linux_burst }}
@@ -85,18 +83,21 @@ jobs:
         env:
           THRESHOLD: ${{ env.LINUX_BURST_THRESHOLD }}
           XL_THRESHOLD: ${{ env.LINUX_XL_BURST_THRESHOLD }}
-          SMALL_THRESHOLD: ${{ env.LINUX_SMALL_BURST_THRESHOLD }}
           # Pooled jobs that start together once routing finishes; each reads
           # outputs.slots[key] (see runner-route.yml for the fields). check
           # and coverage-changed list pull_request only: the merge queue keeps
-          # them on GitHub-hosted larger runners (see the `heavy` step below).
-          # The Linux daemon-lifecycle leg runs only in the queue and takes a
-          # free xl or heavy slot there, or goes hosted.
+          # them on their burst runner, WarpBuild (see the `heavy` step below).
+          # coverage-all, coverage-e2e and the Linux daemon-lifecycle leg run
+          # only in the queue and take a free xl or heavy slot there (longest
+          # first, so coverage-all gets the xl slot), or burst to WarpBuild.
+          # check takes an 8-CPU heavy slot (never the xl slot coverage-changed
+          # needs) but bursts as gh-linux-16x: WarpBuild measured it at p90 97%
+          # of 8 CPUs and 19.7 GB, so its merge-queue and overflow runs use 16.
           # Minutes are typical PR / merge-queue durations. release-fast-path
           # (release branches only) and the gate keep the `runners` mapping.
           SLOT_JOBS: >-
             [
-            {"key":"check","label":"gh-linux-8x","rust":true,"minutes":15,"events":["pull_request"]},
+            {"key":"check","label":"gh-linux-8x","burst":"gh-linux-16x","rust":true,"minutes":15,"events":["pull_request"]},
             {"key":"coverage-changed","label":"gh-linux-16x","rust":true,"minutes":13,"events":["pull_request"]},
             {"key":"release-scripts","label":"ubuntu-24.04","minutes":6},
             {"key":"pr-static","label":"ubuntu-24.04","minutes":1,"events":["pull_request"]},
@@ -104,11 +105,14 @@ jobs:
             {"key":"conflict-markers","label":"ubuntu-24.04","events":["pull_request"]},
             {"key":"deb-packaging","label":"ubuntu-24.04","events":["merge_group","push"]},
             {"key":"pi-session-paths","label":"ubuntu-24.04","minutes":1,"legs":[22,24],"events":["merge_group","push"]},
+            {"key":"coverage-all","label":"gh-linux-16x","rust":true,"minutes":22,"events":["merge_group"]},
+            {"key":"coverage-e2e","label":"gh-linux-16x","rust":true,"minutes":11,"events":["merge_group"]},
             {"key":"daemon-lifecycle-linux","label":"gh-linux-16x","rust":true,"minutes":4,"events":["merge_group"]}
             ]
           LINUX_RUNNER_DISABLED: ${{ vars.CI_LINUX_RUNNER_DISABLED }}
           WINDOWS_RUNNER_DISABLED: ${{ vars.CI_WINDOWS_RUNNER_DISABLED }}
           MACOS_RUNNER_DISABLED: ${{ vars.CI_MACOS_RUNNER_DISABLED }}
+          WARPBUILD_DISABLED: ${{ vars.CI_WARPBUILD_DISABLED }}
         with:
           github-token: ${{ secrets.CI_QUEUE_READ_TOKEN || github.token }}
           script: |
@@ -119,8 +123,6 @@ jobs:
               linux: ['self-hosted', 'linux', 'x64', 'intent-cache'],
               // 16-core jobs: 16 threads per slot.
               xl: ['self-hosted', 'linux', 'x64', 'intent-cache-xl'],
-              // Fast jobs: 1 core / 3 GB per slot.
-              small: ['self-hosted', 'linux', 'x64', 'intent-cache-small'],
               arm: ['self-hosted', 'Linux', 'ARM64'],
               windows: ['self-hosted', 'Windows', 'X64'],
               macos: ['self-hosted', 'macOS', 'ARM64'],
@@ -129,18 +131,45 @@ jobs:
             const disabled = {
               linux: process.env.LINUX_RUNNER_DISABLED === 'true',
               xl: process.env.LINUX_RUNNER_DISABLED === 'true',
-              small: process.env.LINUX_RUNNER_DISABLED === 'true',
               arm: process.env.LINUX_RUNNER_DISABLED === 'true',
               windows: process.env.WINDOWS_RUNNER_DISABLED === 'true',
               macos: process.env.MACOS_RUNNER_DISABLED === 'true',
               intel: process.env.MACOS_RUNNER_DISABLED === 'true',
             };
+            // Standard GitHub-hosted runners are free for public repositories, so
+            // jobs asking for them always run there and never take a self-hosted slot.
+            const free = ['ubuntu-22.04', 'ubuntu-24.04', 'ubuntu-latest', 'ubuntu-24.04-arm', 'windows-2022', 'windows-2025'];
+            // Paid GitHub labels and the WarpBuild runner each bursts to instead
+            // (same cores except Macs, which get 12 because every Mac job is CPU-bound;
+            // Windows stays on Server 2022, macOS 15 keeps signed builds off macOS 26).
+            // Intel Macs have no WarpBuild equivalent and stay on GitHub.
+            const warp = {
+              'gh-linux-8x': 'warp-ubuntu-2404-x64-8x',
+              'gh-linux-16x': 'warp-ubuntu-2404-x64-16x',
+              'gh-linux-arm64-8x': 'warp-ubuntu-2404-arm64-8x',
+              'gh-windows-16x': 'warp-windows-2022-x64-16x',
+              'macos-26-xlarge': 'warp-macos-26-arm64-12x',
+              'macos-15-xlarge': 'warp-macos-15-arm64-12x',
+            };
+            // WarpBuild health is tracked per OS and architecture (ubuntu-x64, ubuntu-arm64, windows-x64, macos-arm64).
+            const family = (label) => {
+              const m = /^warp-(ubuntu|windows|macos)-.*-(x64|arm64)-/.exec(String(label).toLowerCase());
+              return m ? `${m[1]}-${m[2]}` : null;
+            };
+            // A queued job older than `minutes`; `unknownIsOld` decides a job whose age is unreadable.
+            const queuedOver = (j, minutes, unknownIsOld) => j.status === 'queued' &&
+              (Number.isFinite(Date.parse(j.created_at)) ? Date.parse(j.created_at) < Date.now() - minutes * 60 * 1000 : unknownIsOld);
             const burst = Object.fromEntries(Object.keys(fleets).map(k => [k, true]));
             const reasons = Object.fromEntries(Object.keys(fleets).map(k => [k, 'availability not established']));
             // Free slots per Linux pool: online slots (capped by the threshold) minus jobs queued or running on them.
-            const free = {};
+            const slotsFree = {};
             const pr = context.payload?.pull_request;
             const fork = context.eventName === 'pull_request' && pr?.head?.repo?.full_name !== `${context.repo.owner}/${context.repo.repo}`;
+            // Fork pull requests never spend WarpBuild minutes; the kill switch sends everything to GitHub.
+            const warpOn = !fork && process.env.WARPBUILD_DISABLED !== 'true';
+            // A WarpBuild OS/architecture whose jobs sit queued for 10 minutes is treated as down.
+            // An unreadable queue says nothing about WarpBuild, so it keeps WarpBuild.
+            const warpStuck = Object.fromEntries(Object.values(warp).map(label => [family(label), false]));
             try {
               if (fork) throw new Error('fork pull request requires an isolated hosted runner');
               let runners;
@@ -154,8 +183,8 @@ jobs:
                 runners.filter(r => r.status === 'online' && labels.every(l => (r.labels || []).some(x => x.name?.toLowerCase() === l.toLowerCase()))),
               ]));
               const jobs = [];
-              // A missing sibling view is unknown demand, not zero demand. Fail open to GitHub-hosted runners.
-              if (Object.values(online).some(rs => rs.length)) {
+              // A missing sibling view is unknown demand, not zero demand. Fail open to burst runners.
+              if (warpOn || Object.values(online).some(rs => rs.length)) {
                 for (const repo of new Set(['intent', 'intentd', 'cloudlands-fe', context.repo.repo])) {
                   const seen = new Set();
                   for (const status of ['queued', 'in_progress']) {
@@ -168,76 +197,87 @@ jobs:
                   }
                 }
               }
-              const thresholds = {linux: Number(process.env.THRESHOLD || '2'), xl: Number(process.env.XL_THRESHOLD || '0'), small: Number(process.env.SMALL_THRESHOLD || '6')};
+              for (const j of jobs) {
+                if (!queuedOver(j, 10, false)) continue;
+                for (const label of j.labels || []) if (family(label) in warpStuck) warpStuck[family(label)] = true;
+              }
+              const thresholds = {linux: Number(process.env.THRESHOLD || '2'), xl: Number(process.env.XL_THRESHOLD || '0')};
               if (Object.values(thresholds).some(n => !Number.isInteger(n) || n < 0)) throw new Error('invalid queue threshold');
               for (const [key, labels] of Object.entries(fleets)) {
                 const demand = jobs.filter(j => ['queued', 'in_progress'].includes(j.status) && labels.every(l => (j.labels || []).some(x => x.toLowerCase() === l.toLowerCase())));
-                const stale = demand.some(j => j.status === 'queued' && (!Number.isFinite(Date.parse(j.created_at)) || Date.parse(j.created_at) < Date.now() - 15 * 60 * 1000));
+                const stale = demand.some(j => queuedOver(j, 15, true));
                 const native = !(key in thresholds);
                 const capacity = native ? online[key].filter(r => r.busy === false).length : online[key].length;
                 const limit = native ? capacity - 1 : Math.min(thresholds[key], capacity);
                 const depth = native ? demand.filter(j => j.status === 'queued').length : demand.length;
                 burst[key] = disabled[key] || capacity === 0 || stale || (native ? depth > limit : depth >= limit);
-                if (!native) free[key] = burst[key] ? 0 : limit - depth;
-                reasons[key] = disabled[key] ? 'disabled for maintenance' : capacity === 0 ? 'no available compatible runner' : stale ? 'stalled or unknown-age queue' : `queue depth=${depth} threshold=${limit} online=${online[key].length}${native ? '' : ` free=${free[key]}`}`;
+                if (!native) slotsFree[key] = burst[key] ? 0 : limit - depth;
+                reasons[key] = disabled[key] ? 'disabled for maintenance' : capacity === 0 ? 'no available compatible runner' : stale ? 'stalled or unknown-age queue' : `queue depth=${depth} threshold=${limit} online=${online[key].length}${native ? '' : ` free=${slotsFree[key]}`}`;
               }
             } catch (error) {
               for (const key of Object.keys(fleets)) reasons[key] = `probe failed (${error.message})`;
-              for (const key of Object.keys(free)) free[key] = 0;
+              for (const key of Object.keys(slotsFree)) slotsFree[key] = 0;
             }
-            // Keys are the GitHub-hosted fallback labels jobs ask for; values are
-            // the self-hosted fleet labels, or the key itself when the fleet bursts.
+            // Where a GitHub label runs when it does not take a self-hosted slot:
+            // its WarpBuild runner while WarpBuild is on and moving, else itself.
+            const cloud = (label) => warpOn && warp[label] && !warpStuck[family(warp[label])] ? [warp[label]] : [label];
+            // Keys are the GitHub labels jobs ask for; values are the self-hosted
+            // fleet labels, or the burst runner when the fleet bursts.
             // A label listed under several pools takes the first with a free slot.
             const hosted = {
               // 16-core jobs prefer xl slots and overflow to heavy slots before
-              // going hosted, so with no xl slot free they route as they did
+              // bursting, so with no xl slot free they route as they did
               // before xl existed. 8-core jobs never take an xl slot.
               xl: ['gh-linux-16x'],
-              // Larger runners carry the heavy jobs; standard runners the fast ones.
               linux: ['gh-linux-8x', 'gh-linux-16x'],
-              small: ['ubuntu-22.04', 'ubuntu-24.04'],
-              arm: ['ubuntu-24.04-arm', 'gh-linux-arm64-8x'],
-              windows: ['windows-2022', 'windows-2025', 'gh-windows-16x'],
+              arm: ['gh-linux-arm64-8x'],
+              windows: ['gh-windows-16x'],
               macos: ['macos-26-xlarge'],
               intel: ['macos-latest-large'],
             };
             // Free slots go to the caller's listed jobs one at a time: Rust-compiling
             // jobs first (they reuse the slot's local cache), then the longest, then
             // list order. Listed jobs that do not fit, or that skip this event, get
-            // their hosted label directly; matrix legs are ranked separately.
+            // their burst runner directly, sized by `burst` when set (a CPU-bound
+            // job keeps its slot size but bursts bigger); matrix legs are ranked
+            // separately.
             // Concurrent runs read the same free count before either job is queued,
             // so a pool may briefly run a job or two over its slot count.
             let requests = [];
             try {
               requests = JSON.parse(process.env.SLOT_JOBS || '[]').flatMap(j => (j.legs || (j.shards ? Array.from({length: j.shards}, (_, n) => n + 1) : null))?.map(leg => ({...j, key: `${j.key}-${leg}`})) ?? [j]);
             } catch (error) {
-              core.info(`slot list unreadable (${error.message}); listed jobs use hosted labels`);
+              core.info(`slot list unreadable (${error.message}); listed jobs use burst runners`);
             }
             const slots = {};
-            const granted = Object.fromEntries(Object.keys(free).map(k => [k, 0]));
+            const granted = Object.fromEntries(Object.keys(slotsFree).map(k => [k, 0]));
             const ranked = requests.map((r, i) => ({...r, i})).sort((a, b) => (b.rust === true) - (a.rust === true) || (b.minutes || 0) - (a.minutes || 0) || a.i - b.i);
             for (const r of ranked) {
               const runs = !Array.isArray(r.events) || r.events.includes(context.eventName);
-              const key = runs && Object.keys(hosted).find(k => k in free && hosted[k].includes(r.label) && free[k] > 0);
+              const key = runs && Object.keys(hosted).find(k => k in slotsFree && hosted[k].includes(r.label) && slotsFree[k] > 0);
               if (key) {
-                free[key] -= 1;
+                slotsFree[key] -= 1;
                 granted[key] += 1;
                 slots[r.key] = fleets[key];
-              } else slots[r.key] = [r.label];
+              } else slots[r.key] = cloud(r.burst || r.label);
             }
             // Unlisted jobs (single-job workflows, jobs that start after the listed
             // ones) use a pool only while a slot is still free.
-            for (const key of Object.keys(free)) {
-              burst[key] = free[key] <= 0;
+            for (const key of Object.keys(slotsFree)) {
+              burst[key] = slotsFree[key] <= 0;
               if (granted[key]) reasons[key] += ` granted=${granted[key]}`;
             }
-            const mapping = {};
+            const mapping = Object.fromEntries(free.map(label => [label, [label]]));
             for (const [key, labels] of Object.entries(hosted)) {
-              for (const label of labels) if (!mapping[label] || mapping[label][0] === label) mapping[label] = burst[key] ? [label] : fleets[key];
+              for (const label of labels) if (!mapping[label] || mapping[label][0] !== 'self-hosted') mapping[label] = burst[key] ? cloud(label) : fleets[key];
             }
+            // Jobs that must not use a self-hosted runner (sudo, Docker, release signing) read `cloud`.
+            const clouds = Object.fromEntries([...free, ...Object.keys(warp), 'macos-latest-large'].map(label => [label, cloud(label)]));
             for (const key of Object.keys(fleets)) core.info(`${key} routing: burst=${burst[key]} (${reasons[key]})`);
+            for (const key of Object.keys(warpStuck)) core.info(`warpbuild ${key}: ${!warpOn ? (fork ? 'off (fork pull request)' : 'off (CI_WARPBUILD_DISABLED)') : warpStuck[key] ? 'off (queued over 10 minutes)' : 'on'}`);
             core.setOutput('runners', JSON.stringify(mapping));
             core.setOutput('slots', JSON.stringify(slots));
+            core.setOutput('cloud', JSON.stringify(clouds));
             const linuxLabels = mapping[`gh-linux-${process.env.LINUX_SIZE || '8'}x`];
             core.setOutput('linux_labels', JSON.stringify(linuxLabels));
             core.setOutput('linux_burst', String(linuxLabels[0] !== 'self-hosted'));
@@ -246,12 +286,12 @@ jobs:
             core.setOutput('macos_labels', JSON.stringify(mapping['macos-26-xlarge']));
             for (const key of ['windows', 'macos']) core.setOutput(`${key}_burst`, String(burst[key]));
       # check and coverage-changed (through `slots`, which list pull_request
-      # only) and coverage-e2e and coverage-all (through linux_labels) stay
-      # hosted in the merge queue. Their parallel e2e daemons each hold several
-      # inotify instances, and the intent-cache hosts share a 128-instance
-      # limit across all slots (coverage-all raises it with sudo on hosted
-      # runners). The Linux daemon-lifecycle leg, one daemon at a time, reads
-      # its own `slots` entry, so it takes a slot only when one is free. Before slot fitting existed, one queue run started ~4 heavy jobs at once,
+      # only) take their burst runner (WarpBuild) in the merge queue.
+      # coverage-all, coverage-e2e and the Linux daemon-lifecycle leg read
+      # their own merge_group `slots` entries, so only as many take a slot as
+      # are free and the rest burst to WarpBuild (the slot hosts raise
+      # fs.inotify.max_user_instances to 32768 for their parallel daemons).
+      # Nothing reads this step's linux_labels or check_labels any more. Before slot fitting existed, one queue run started ~4 heavy jobs at once,
       # sized for 16 CPUs, and the shared mapping sent all of them to the
       # same two 8-CPU intent-cache slots, one after another, past the
       # queue's time budget. PR and push
@@ -265,12 +305,17 @@ jobs:
           LINUX_LABELS: ${{ steps.decide.outputs.linux_labels }}
           CHECK_LABELS: ${{ steps.decide.outputs.check_labels }}
           LINUX_BURST: ${{ steps.decide.outputs.linux_burst }}
+          CLOUD: ${{ steps.decide.outputs.cloud }}
         run: |
+          # The burst runner for a GitHub label (WarpBuild, or the label itself).
+          burst_runner() {
+            jq -ce --arg label "$1" '.[$label] // empty' <<< "${CLOUD:-{\}}" 2>/dev/null || printf '["%s"]\n' "$1"
+          }
           if [[ "$EVENT" == merge_group ]]; then
-            LINUX_LABELS="[\"gh-linux-${LINUX_SIZE}x\"]"
-            CHECK_LABELS='["gh-linux-8x"]'
+            LINUX_LABELS=$(burst_runner "gh-linux-${LINUX_SIZE}x")
+            CHECK_LABELS=$(burst_runner gh-linux-8x)
             LINUX_BURST=true
-            echo "heavy linux routing: burst=true (merge queue keeps heavy Rust jobs on GitHub-hosted larger runners)"
+            echo "heavy linux routing: burst=true (merge queue: the shared linux_labels mapping takes the burst runner $LINUX_LABELS; listed jobs use their own slots)"
           fi
           {
             echo "linux_labels=$LINUX_LABELS"
@@ -1150,8 +1195,9 @@ jobs:
     # the repo's own ruleset, so no same-repo fork guard applies.
     needs: route
     if: ${{ !cancelled() && github.event_name == 'merge_group' && needs.route.result == 'success' }}
-    runs-on: ${{ fromJSON(needs.route.outputs.linux_labels) }}
-    timeout-minutes: 30
+    runs-on: ${{ fromJSON(needs.route.outputs.slots || '{}')['coverage-e2e'] || fromJSON('["gh-linux-16x"]') }}
+    # ~11 min on gh-linux-16x; an 8-CPU heavy slot (xl busy) takes about twice that.
+    timeout-minutes: 45
     env:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
@@ -1290,10 +1336,18 @@ jobs:
     # empty output on merge_group).
     needs: route
     if: ${{ !cancelled() && github.event_name == 'merge_group' && needs.route.result == 'success' }}
-    runs-on: ${{ fromJSON(needs.route.outputs.linux_labels) }}
+    runs-on: ${{ fromJSON(needs.route.outputs.slots || '{}')['coverage-all'] || fromJSON('["gh-linux-16x"]') }}
     # Include LLVM report generation after the full suite on shared runners.
-    timeout-minutes: 45
+    # ~22 min on gh-linux-16x or the xl slot; an 8-CPU heavy slot (xl busy)
+    # takes about twice that. Stay under the merge queue's 60-minute check
+    # response timeout: CI Gate requires this job, so a later finish ejects
+    # the entry anyway.
+    timeout-minutes: 55
     env:
+      # WarpBuild runners preset NODE_OPTIONS (GitHub-hosted runners do not), and
+      # the ACP callback fixture refuses any NODE_OPTIONS injection; clear it so
+      # the job behaves the same on every runner it bursts to.
+      NODE_OPTIONS: ''
       # Merge each binary's executions into eight locked raw profiles instead
       # of retaining a multi-megabyte profile for every nextest process.
       LLVM_PROFILE_FILE_NAME: "intent-%8m.profraw"
@@ -1342,10 +1396,14 @@ jobs:
       # metadata, skills, specialists), so the kernel default of 128
       # instances can exhaust mid-run — watcher starts in unrelated tests
       # then fail with EMFILE "Too many open files" (intentd PR #882).
-      # Needs passwordless sudo: this merge-queue-only job always runs on
-      # a GitHub-hosted runner (see the route job's `heavy` step), never on intent-cache.
+      # Hosted runners need passwordless sudo for it. The intent-cache slots
+      # have no sudo, and their hosts already set 32768
+      # (infra/runners/sysctl.conf), so the raise is skipped there.
       - name: Raise inotify instance limit
-        run: sudo -n sysctl -q -w fs.inotify.max_user_instances=4096
+        run: |
+          if ! [ "$(cat /proc/sys/fs/inotify/max_user_instances)" -ge 4096 ]; then
+            sudo -n sysctl -q -w fs.inotify.max_user_instances=4096
+          fi
       - name: Resolve pinned Rust channel
         id: toolchain
         shell: bash
@@ -1375,7 +1433,7 @@ jobs:
       - name: Verify bounded coverage profile pooling
         run: python3 -I -B scripts/test-coverage-profile-pool.py
       - name: Run combined coverage
-        timeout-minutes: 43
+        timeout-minutes: 53
         # Armed bound-caller seam — see coverage-e2e's run step.
         env:
           INTENTD_ASSERT_BOUND_CALLER: "1"
@@ -1421,6 +1479,10 @@ jobs:
     # Shared-runner coverage can exceed 30 minutes while still making progress.
     timeout-minutes: 60
     env:
+      # WarpBuild runners preset NODE_OPTIONS (GitHub-hosted runners do not), and
+      # the ACP callback fixture refuses any NODE_OPTIONS injection; clear it so
+      # the job behaves the same on every runner it bursts to.
+      NODE_OPTIONS: ''
       # Share the full-coverage pool: nextest launches one process per test.
       # Bound retained raw profiles per binary without dropping execution counts.
       LLVM_PROFILE_FILE_NAME: "intent-%8m.profraw"
@@ -1882,6 +1944,7 @@ jobs:
           python3 -B scripts/test-prerelease-cleanup-workflow.py
           python3 -B scripts/test-release-rust-cache.py
           python3 -I -B scripts/test-optional-intel-release.py
+          python3 -B scripts/test-release-host-network.py
           python3 -B scripts/test-setup-sccache.py
           python3 -I -B scripts/test-coverage-storage.py
           python3 -B scripts/test-hosted-runners.py
@@ -1949,6 +2012,23 @@ jobs:
         run: |
           python3 -S scripts/test-auto-pin-acp-adapter.py
           python3 -S scripts/test-provider-cli-metadata.py
+          python3 -S scripts/test-check-provider-error-corpus.py
+      # Downloads the pinned claude-agent-acp, Claude Agent SDK and codex-acp
+      # packages and fails when they emit an error kind (or a usage-limit
+      # wording) the quota classifier's corpus does not cover, so a rolling
+      # adapter pin PR cannot add a limit failover silently misses
+      # (intent-hq/intent#7615). An npm outage (exit 75) only warns, so a
+      # registry blip cannot fail unrelated PRs or eject merge-queue entries;
+      # any corpus drift still fails the job.
+      - name: Check the provider error corpus against the pinned adapters
+        run: |
+          status=0
+          python3 -S scripts/check-provider-error-corpus.py || status=$?
+          if [ "$status" -eq 75 ]; then
+            echo "::warning::npm was unreachable; the provider error corpus was not checked against the pinned adapters."
+          elif [ "$status" -ne 0 ]; then
+            exit "$status"
+          fi
       - name: Test the release-plz no-op baseline
         run: python3 -S scripts/test-release-plz-noop.py
       - uses: taiki-e/install-action@v2

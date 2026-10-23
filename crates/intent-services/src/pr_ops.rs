@@ -1134,6 +1134,32 @@ impl MergeQueueEjection {
                 .as_deref()
                 .is_some_and(|reason| reason.eq_ignore_ascii_case("merged"))
     }
+
+    /// Whether the PR's CURRENT merge-queue entry began after this ejection,
+    /// i.e. the PR was re-queued since and the ejection no longer applies
+    /// (intent-hq/intent#7523: an ejection first observed after the re-queue
+    /// was reported as news while the queue was about to land the PR). True
+    /// only when `requirements` reports the PR queued with an `enqueuedAt`
+    /// strictly later than [`Self::at`]; a missing entry, missing or
+    /// unparseable timestamp is not proof of staleness and returns false.
+    /// The PR monitor adopts a superseded ejection into its baselines
+    /// silently, so it never becomes a change line.
+    pub(crate) fn superseded_by_queue_entry(&self, requirements: &MergeRequirements) -> bool {
+        if requirements.is_in_merge_queue != Some(true) {
+            return false;
+        }
+        let Some(enqueued_at) = requirements
+            .merge_queue
+            .as_ref()
+            .and_then(|entry| entry.enqueued_at.as_deref())
+        else {
+            return false;
+        };
+        match (parse_iso(enqueued_at), parse_iso(&self.at)) {
+            (Some(enqueued_at), Some(ejected_at)) => enqueued_at > ejected_at,
+            _ => false,
+        }
+    }
 }
 
 /// The `threads` block of the checklist.
@@ -1216,6 +1242,112 @@ pub struct MergeRequirements {
     /// Serde-defaulted so persisted baselines predating it still parse.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge_queue: Option<intent_sourcecontrol::MergeQueueEntry>,
+    /// Present when CI never started on the current head: zero check runs
+    /// and statuses [`CHECKS_NOT_STARTED_AFTER`] past the head's commit time
+    /// (see [`checks_not_started`]). Derived when the checklist is served or
+    /// polled — never by [`merge_requirements`] — so a cached read still
+    /// crosses the threshold. Serde-defaulted so persisted baselines
+    /// predating it still parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checks_not_started: Option<ChecksNotStarted>,
+}
+
+/// How long a PR head may carry no check runs at all before the checklist
+/// flags that CI never started on it (intentd#2531: a head re-pushed right
+/// before a merge-queue ejection got no workflow runs for five hours).
+pub(crate) const CHECKS_NOT_STARTED_AFTER: time::Duration = time::Duration::minutes(15);
+
+/// The `checksNotStarted` checklist entry: the head on which no check run or
+/// status appeared within [`CHECKS_NOT_STARTED_AFTER`] of its commit time.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChecksNotStarted {
+    /// The PR head the flag is about — the monitor's one-wake-per-head key.
+    pub head_sha: String,
+    /// The head commit's forge-reported commit time (RFC 3339): the host
+    /// exposes no push time, so this is the stall clock's anchor.
+    pub head_committed_at: String,
+    /// The wait applied before flagging, in whole minutes.
+    pub threshold_minutes: i64,
+}
+
+/// What the never-started-CI derivation needs beyond the checklist itself,
+/// captured from one forge read and kept with the cached snapshot so the
+/// verdict can be re-derived at any later `now`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ChecksStartEvidence {
+    /// The head the commit time belongs to — only set when the probe's head
+    /// matches the PR record's.
+    pub(crate) head_sha: Option<String>,
+    /// The head commit's commit time (RFC 3339), when the host reports it.
+    pub(crate) head_committed_at: Option<String>,
+    /// Whether the base branch's rules were readable and require at least
+    /// one status check — the guard that keeps repositories without required
+    /// CI from ever flagging.
+    pub(crate) checks_required: bool,
+}
+
+impl ChecksStartEvidence {
+    /// The evidence a probe carries for the PR record `pr`.
+    pub(crate) fn from_signals(
+        pr: &PullRequest,
+        signals: Option<&MergeRequirementSignals>,
+    ) -> Self {
+        let Some(signals) = signals else {
+            return Self::default();
+        };
+        let same_head = signals.checks_head_sha.is_some() && signals.checks_head_sha == pr.head_sha;
+        Self {
+            head_sha: pr.head_sha.clone().filter(|_| same_head),
+            head_committed_at: signals.head_committed_at.clone().filter(|_| same_head),
+            checks_required: signals
+                .branch_rules
+                .as_ref()
+                .is_some_and(|r| !r.required_status_checks.is_empty()),
+        }
+    }
+}
+
+/// Whether CI never started on the PR head: the PR is open and ready (a
+/// draft may legitimately run nothing until `ready_for_review`) and KNOWN
+/// to be conflict-free (GitHub starts no `pull_request` workflow on a
+/// conflicting head, and an unknown verdict may be hiding one), its checks were freshly observed and number zero, the base
+/// branch requires status checks, and [`CHECKS_NOT_STARTED_AFTER`] has
+/// passed since the head's commit time. Every unknown input — no commit
+/// time, unreadable rules, unobserved checks — yields `None`: absence means
+/// "not flagged or unknown", never "CI is running".
+pub(crate) fn checks_not_started(
+    requirements: &MergeRequirements,
+    checks_observed: bool,
+    evidence: &ChecksStartEvidence,
+    now: OffsetDateTime,
+) -> Option<ChecksNotStarted> {
+    // Positive conflict-free evidence: `has_conflicts == false` alone also
+    // holds while GitHub recomputes mergeability (`mergeable: None`,
+    // `mergeStateStatus: UNKNOWN`) — and conflicts are themselves a reason
+    // `pull_request` CI never starts.
+    let conflict_free = requirements.mergeable == Some(true)
+        && !requirements.has_conflicts
+        && requirements
+            .merge_state_status
+            .as_deref()
+            .is_none_or(|s| !s.eq_ignore_ascii_case("UNKNOWN") && !s.eq_ignore_ascii_case("DIRTY"));
+    if requirements.state != "open"
+        || !conflict_free
+        || !checks_observed
+        || requirements.checks.total != 0
+        || !evidence.checks_required
+    {
+        return None;
+    }
+    let head_sha = evidence.head_sha.as_ref().filter(|s| !s.is_empty())?;
+    let committed_at = evidence.head_committed_at.as_ref()?;
+    let committed = parse_iso(committed_at)?;
+    (now - committed >= CHECKS_NOT_STARTED_AFTER).then(|| ChecksNotStarted {
+        head_sha: head_sha.clone(),
+        head_committed_at: committed_at.clone(),
+        threshold_minutes: CHECKS_NOT_STARTED_AFTER.whole_minutes(),
+    })
 }
 
 /// The checklist word for a rollup check's state.
@@ -1476,6 +1608,7 @@ pub(crate) fn merge_requirements(
             .and_then(|s| s.merge_queue_removal.as_ref())
             .and_then(|r| MergeQueueEjection::from_removal(r, state)),
         merge_queue: signals.and_then(queued_merge_queue_entry),
+        checks_not_started: None,
     }
 }
 
@@ -1602,6 +1735,9 @@ pub(crate) struct MergeRequirementsRead {
     /// `MergeRequirements::is_in_merge_queue`, this keeps the reported
     /// `false` — what `GithubPullRequest.isInMergeQueue` carries.
     pub(crate) merge_queue_reported: Option<bool>,
+    /// The inputs [`checks_not_started`] re-derives the never-started-CI
+    /// flag from at serve / poll time.
+    pub(crate) checks_start: ChecksStartEvidence,
 }
 
 /// [`merge_requirements_for_pr`] reporting per-sub-read completeness (see
@@ -1679,6 +1815,7 @@ pub(crate) async fn merge_requirements_for_pr_detailed(
         check_runs_known: runs_complete,
         status_checks: status_checks(signals.as_ref()),
         merge_queue_reported,
+        checks_start: ChecksStartEvidence::from_signals(pr, signals.as_ref()),
     })
 }
 
@@ -1745,6 +1882,7 @@ pub(crate) async fn merge_requirements_from_observation(
         check_runs_known: runs_complete,
         status_checks: status_checks(Some(&signals)),
         merge_queue_reported,
+        checks_start: ChecksStartEvidence::from_signals(pr, Some(&signals)),
     })
 }
 
@@ -2762,6 +2900,7 @@ mod tests {
             ],
             checks_head_sha: None,
             checks_known: true,
+            head_committed_at: None,
             branch_rules: Some(intent_sourcecontrol::BranchRules {
                 required_approving_review_count: Some(2),
                 required_conversation_resolution: Some(true),
@@ -2825,6 +2964,7 @@ mod tests {
             checks: vec![rollup("build", CheckState::Success, false)],
             checks_head_sha: None,
             checks_known: true,
+            head_committed_at: None,
             branch_rules: None,
             is_in_merge_queue: None,
             merge_queue_removal: None,
@@ -3448,5 +3588,228 @@ mod tests {
             MergeMethod::Rebase
         );
         assert!(validate_merge_method(Some("bad")).is_err());
+    }
+
+    // ── checksNotStarted (intentd#2531) ─────────────────────────────────
+
+    const STALL_HEAD: &str = "8c0e5137c0000000000000000000000000000000";
+
+    fn stall_now() -> OffsetDateTime {
+        parse_iso("2026-10-21T04:00:00Z").unwrap()
+    }
+
+    /// The checklist and evidence of the intentd#2531 head: open, no
+    /// conflicts, zero check runs on a base branch that requires checks.
+    fn stall_inputs(
+        committed_at: &str,
+        checks: Vec<RollupCheck>,
+    ) -> (MergeRequirements, ChecksStartEvidence) {
+        let mut p = pr(PrState::Open, false, Some(true), Some("blocked"));
+        p.head_sha = Some(STALL_HEAD.into());
+        let signals = MergeRequirementSignals {
+            checks,
+            checks_known: true,
+            checks_head_sha: Some(STALL_HEAD.into()),
+            head_committed_at: Some(committed_at.into()),
+            branch_rules: Some(intent_sourcecontrol::BranchRules {
+                required_status_checks: vec!["build".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let req = merge_requirements(&p, Some(&signals), &[], &agg(0, 0), Some(0));
+        (req, ChecksStartEvidence::from_signals(&p, Some(&signals)))
+    }
+
+    #[test]
+    fn checks_not_started_flags_a_zero_run_head_past_the_threshold() {
+        let (req, evidence) = stall_inputs("2026-10-20T23:12:00Z", vec![]);
+        // `merge_requirements` itself never derives it: it is clock-bound.
+        assert_eq!(req.checks_not_started, None);
+        assert_eq!(
+            checks_not_started(&req, true, &evidence, stall_now()),
+            Some(ChecksNotStarted {
+                head_sha: STALL_HEAD.into(),
+                head_committed_at: "2026-10-20T23:12:00Z".into(),
+                threshold_minutes: 15,
+            })
+        );
+    }
+
+    #[test]
+    fn checks_not_started_never_flags_a_head_with_runs() {
+        for state in [
+            CheckState::Pending,
+            CheckState::Success,
+            CheckState::Failure,
+        ] {
+            let (req, evidence) =
+                stall_inputs("2026-10-20T23:12:00Z", vec![rollup("build", state, true)]);
+            assert_eq!(
+                checks_not_started(&req, true, &evidence, stall_now()),
+                None,
+                "{state:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn checks_not_started_waits_out_the_threshold_on_a_fresh_head() {
+        let (req, evidence) = stall_inputs("2026-10-21T03:50:00Z", vec![]);
+        // Ten minutes after the push: inside the threshold, not flagged.
+        assert_eq!(checks_not_started(&req, true, &evidence, stall_now()), None);
+        // One second short of fifteen minutes: still not flagged.
+        let almost = parse_iso("2026-10-21T04:04:59Z").unwrap();
+        assert_eq!(checks_not_started(&req, true, &evidence, almost), None);
+        // The same cached read at the threshold: flagged.
+        let at = parse_iso("2026-10-21T04:05:00Z").unwrap();
+        assert!(checks_not_started(&req, true, &evidence, at).is_some());
+    }
+
+    #[test]
+    fn checks_not_started_never_guesses_from_unknown_or_excusing_inputs() {
+        let (base, evidence) = stall_inputs("2026-10-20T23:12:00Z", vec![]);
+        let flag = |req: &MergeRequirements, observed: bool, ev: &ChecksStartEvidence| {
+            checks_not_started(req, observed, ev, stall_now())
+        };
+        assert!(flag(&base, true, &evidence).is_some(), "control");
+
+        // Checks unobserved (degraded read): unknown, not zero.
+        assert_eq!(flag(&base, false, &evidence), None);
+        // Conflicts: GitHub starts no pull_request workflow on such a head.
+        let mut conflicted = base.clone();
+        conflicted.has_conflicts = true;
+        assert_eq!(flag(&conflicted, true, &evidence), None);
+        // Merged / closed PRs need no CI.
+        for state in ["merged", "closed"] {
+            let mut done = base.clone();
+            done.state = state.into();
+            assert_eq!(flag(&done, true, &evidence), None, "{state}");
+        }
+        // Drafts: workflows may only trigger on `ready_for_review`.
+        let mut draft = base.clone();
+        draft.state = "draft".into();
+        assert_eq!(flag(&draft, true, &evidence), None);
+        // No required checks on the base (or unreadable rules): a repo
+        // without required CI never flags.
+        let no_ci = ChecksStartEvidence {
+            checks_required: false,
+            ..evidence.clone()
+        };
+        assert_eq!(flag(&base, true, &no_ci), None);
+        // No commit time (GitLab, REST-only) or an unparsable one.
+        for committed in [None, Some("not a date".to_string())] {
+            let ev = ChecksStartEvidence {
+                head_committed_at: committed,
+                ..evidence.clone()
+            };
+            assert_eq!(flag(&base, true, &ev), None);
+        }
+        // No head identity.
+        let headless = ChecksStartEvidence {
+            head_sha: None,
+            ..evidence.clone()
+        };
+        assert_eq!(flag(&base, true, &headless), None);
+    }
+
+    #[test]
+    fn checks_not_started_requires_known_conflict_free_mergeability() {
+        let (base, evidence) = stall_inputs("2026-10-20T23:12:00Z", vec![]);
+        let flag = |req: &MergeRequirements| checks_not_started(req, true, &evidence, stall_now());
+        assert!(flag(&base).is_some(), "control: mergeable, BLOCKED-free");
+        // GitHub recomputing: no verdict yet, or an UNKNOWN merge state.
+        let mut recomputing = base.clone();
+        recomputing.mergeable = None;
+        assert_eq!(flag(&recomputing), None);
+        let mut unknown_state = base.clone();
+        unknown_state.merge_state_status = Some("UNKNOWN".into());
+        assert_eq!(flag(&unknown_state), None);
+        // Contradictory inputs never read as conflict-free.
+        let mut not_mergeable = base.clone();
+        not_mergeable.mergeable = Some(false);
+        assert_eq!(flag(&not_mergeable), None);
+        let mut dirty_but_mergeable = base.clone();
+        dirty_but_mergeable.merge_state_status = Some("DIRTY".into());
+        assert_eq!(flag(&dirty_but_mergeable), None);
+        // A known BLOCKED (waiting on the missing required checks) is the
+        // intentd#2531 shape and still flags.
+        let mut blocked = base.clone();
+        blocked.merge_state_status = Some("BLOCKED".into());
+        assert!(flag(&blocked).is_some());
+    }
+
+    #[test]
+    fn checks_start_evidence_requires_the_probe_head_to_match_the_pr() {
+        let mut p = pr(PrState::Open, false, Some(true), None);
+        p.head_sha = Some(STALL_HEAD.into());
+        let signals =
+            |probe_head: Option<&str>, rules: Option<Vec<&str>>| MergeRequirementSignals {
+                checks_head_sha: probe_head.map(String::from),
+                head_committed_at: Some("2026-10-20T23:12:00Z".into()),
+                branch_rules: rules.map(|names| intent_sourcecontrol::BranchRules {
+                    required_status_checks: names.into_iter().map(String::from).collect(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+        let matching = ChecksStartEvidence::from_signals(
+            &p,
+            Some(&signals(Some(STALL_HEAD), Some(vec!["build"]))),
+        );
+        assert_eq!(matching.head_sha.as_deref(), Some(STALL_HEAD));
+        assert_eq!(
+            matching.head_committed_at.as_deref(),
+            Some("2026-10-20T23:12:00Z")
+        );
+        assert!(matching.checks_required);
+        // A probe that observed another head lends no commit time.
+        for probe in [Some("ffffffff"), None] {
+            let other =
+                ChecksStartEvidence::from_signals(&p, Some(&signals(probe, Some(vec!["build"]))));
+            assert_eq!(
+                (other.head_sha, other.head_committed_at),
+                (None, None),
+                "{probe:?}"
+            );
+        }
+        // Rules without required checks, unreadable rules, or no probe.
+        assert!(
+            !ChecksStartEvidence::from_signals(&p, Some(&signals(Some(STALL_HEAD), Some(vec![]))))
+                .checks_required
+        );
+        assert!(
+            !ChecksStartEvidence::from_signals(&p, Some(&signals(Some(STALL_HEAD), None)))
+                .checks_required
+        );
+        assert_eq!(
+            ChecksStartEvidence::from_signals(&p, None),
+            ChecksStartEvidence::default()
+        );
+    }
+
+    #[test]
+    fn checks_not_started_is_presence_detected_on_the_wire() {
+        let (mut req, evidence) = stall_inputs("2026-10-20T23:12:00Z", vec![]);
+        let wire = serde_json::to_value(&req).unwrap();
+        assert!(
+            wire.get("checksNotStarted").is_none(),
+            "omitted, never null"
+        );
+        req.checks_not_started = checks_not_started(&req, true, &evidence, stall_now());
+        let wire = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            wire["checksNotStarted"],
+            serde_json::json!({
+                "headSha": STALL_HEAD,
+                "headCommittedAt": "2026-10-20T23:12:00Z",
+                "thresholdMinutes": 15,
+            })
+        );
+        // A checklist persisted before the field existed still parses.
+        let mut old = wire;
+        old.as_object_mut().unwrap().remove("checksNotStarted");
+        let parsed: MergeRequirements = serde_json::from_value(old).unwrap();
+        assert_eq!(parsed.checks_not_started, None);
     }
 }

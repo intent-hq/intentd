@@ -1070,9 +1070,12 @@ async fn member_execution_enablement_projects_complete_canonical_policy() {
         "an empty effective list is still present"
     );
     assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(25), forge.accept())
-            .await
-            .is_err(),
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_millis(25)),
+            forge.accept()
+        )
+        .await
+        .is_err(),
         "policy/configured reads must not probe repository authorization"
     );
 }
@@ -1164,11 +1167,12 @@ async fn member_execution_enablement_events_follow_committed_changes_and_reset()
         .unwrap();
         assert_eq!(noop["revision"], update["revision"]);
         assert_eq!(noop["applied"], json!([]));
-        assert!(
-            tokio::time::timeout(Duration::from_millis(25), events.recv())
-                .await
-                .is_err()
-        );
+        assert!(tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(25)),
+            events.recv()
+        )
+        .await
+        .is_err());
     }
     let reset = with_caller(
         Caller::Daemon,
@@ -1197,11 +1201,12 @@ async fn member_execution_enablement_events_follow_committed_changes_and_reset()
         .await
         .unwrap();
     assert_eq!(noop["revision"], reset["revision"]);
-    assert!(
-        tokio::time::timeout(Duration::from_millis(75), events.recv())
-            .await
-            .is_err()
-    );
+    assert!(tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(75)),
+        events.recv()
+    )
+    .await
+    .is_err());
     worker.abort();
     let _ = worker.await;
 }

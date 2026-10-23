@@ -93,6 +93,54 @@ fn not_found(message: impl Into<String>) -> RpcErr {
     }
 }
 
+/// An integral JSON number at or above `min`, accepting integral floats
+/// (`10.0`) like the reference `Number.isInteger`; anything else is `None`.
+fn json_integer_at_least(value: &Value, min: u64) -> Option<u64> {
+    let n = value.as_u64().or_else(|| {
+        let f = value.as_f64()?;
+        // Integral, non-negative and below 2^53 → exact in u64.
+        #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let n =
+            (f.fract() == 0.0 && (0.0..9_007_199_254_740_992.0).contains(&f)).then_some(f as u64);
+        n
+    })?;
+    (n >= min).then_some(n)
+}
+
+/// `maxContentBytes` on `note.get` / `note.subscribe` (truncated note reads):
+/// absent or `null` → `None` (the unbounded read, byte-identical); a positive
+/// integer → the UTF-8 byte limit; anything else → the documented `-32602`.
+pub(crate) fn max_content_bytes_param(
+    params: &Map<String, Value>,
+) -> std::result::Result<Option<usize>, &'static str> {
+    match params.get("maxContentBytes") {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => json_integer_at_least(v, 1)
+            .map(|n| Some(usize::try_from(n).unwrap_or(usize::MAX)))
+            .ok_or("maxContentBytes must be a positive integer"),
+    }
+}
+
+fn parse_max_content_bytes(
+    params: &Map<String, Value>,
+) -> std::result::Result<Option<usize>, RpcErr> {
+    max_content_bytes_param(params).map_err(invalid_params)
+}
+
+/// `baseContentBytes` on whole-content note writes (truncated-read write
+/// guard): absent or `null` → unguarded; a non-negative integer → the
+/// writer's base size; anything else → the documented `-32602`.
+fn parse_base_content_bytes(
+    params: &Map<String, Value>,
+) -> std::result::Result<Option<u64>, RpcErr> {
+    match params.get("baseContentBytes") {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => json_integer_at_least(v, 0)
+            .map(Some)
+            .ok_or_else(|| invalid_params("baseContentBytes must be a non-negative integer")),
+    }
+}
+
 /// Map a domain [`Error`] to its JSON-RPC representation (§9). Internal errors
 /// surface as `-32603 "Internal error"` carrying the original cause in `data`.
 fn domain_to_rpc(e: Error) -> RpcErr {
@@ -139,6 +187,21 @@ fn domain_to_rpc(e: Error) -> RpcErr {
             code: e.code(),
             message: e.to_string(),
             data: Some(json!({ "code": "base-ref-unresolvable", "baseRef": base_ref })),
+        },
+        // Guarded whole-content note write whose base size did not match the
+        // resolved base (or the base is unknown): -32602 with the documented
+        // machine-readable data, no write ("Truncated note reads").
+        ref e @ Error::ContentBaseMismatch {
+            base_content_bytes,
+            resolved_base_bytes,
+        } => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({
+                "code": "content-base-mismatch",
+                "baseContentBytes": base_content_bytes,
+                "resolvedBaseBytes": resolved_base_bytes,
+            })),
         },
         // Provider profile failure (§5.54): -32602 (or -32603 for an
         // unreadable profile file) with the service-built `data` verbatim —
@@ -639,6 +702,33 @@ fn encode_dispatch_result(
     }
 }
 
+fn discussion_optional_id(
+    params: &Map<String, Value>,
+    key: &str,
+) -> std::result::Result<Option<String>, RpcErr> {
+    params
+        .get(key)
+        .map(|v| {
+            v.as_str()
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .ok_or_else(|| invalid_params(format!("{key} must be a non-empty string")))
+        })
+        .transpose()
+}
+fn discussion_limit(params: &Map<String, Value>) -> std::result::Result<u32, RpcErr> {
+    params
+        .get("limit")
+        .map(|v| {
+            v.as_u64()
+                .filter(|n| (1..=100).contains(n))
+                .and_then(|n| u32::try_from(n).ok())
+                .ok_or_else(|| invalid_params("limit must be an integer from 1 to 100"))
+        })
+        .transpose()
+        .map(|v| v.unwrap_or(50))
+}
+
 /// Dispatch a validated request to the injected [`WorkspaceApi`].
 async fn dispatch(
     api: &dyn WorkspaceApi,
@@ -1017,6 +1107,170 @@ async fn dispatch(
             let ws = api.mark_seen(id).await.map_err(workspace_err)?;
             Ok(json!({ "workspace": ws }))
         }
+        "discussion.conversations" | "discussion.recipients" => {
+            let id = require_workspace_id(params)?;
+            let limit = discussion_limit(params)?;
+            if method == "discussion.conversations" {
+                api.discussion_conversations(id, discussion_optional_id(params, "beforeId")?, limit)
+                    .await
+                    .map_err(domain_to_rpc)
+            } else {
+                let query = match params.get("query") {
+                    None => String::new(),
+                    Some(v) => v
+                        .as_str()
+                        .ok_or_else(|| invalid_params("query must be a string"))?
+                        .to_string(),
+                };
+                api.discussion_recipients(
+                    id,
+                    query,
+                    discussion_optional_id(params, "afterPrincipalId")?,
+                    limit,
+                )
+                .await
+                .map_err(domain_to_rpc)
+            }
+        }
+        "discussion.list" => {
+            let id = require_workspace_id(params)?;
+            let before = params
+                .get("beforeSequence")
+                .map(|v| {
+                    v.as_i64()
+                        .filter(|n| *n > 0)
+                        .ok_or_else(|| invalid_params("beforeSequence must be a positive integer"))
+                })
+                .transpose()?;
+            let after = params
+                .get("afterSequence")
+                .map(|v| {
+                    v.as_i64().filter(|n| *n >= 0).ok_or_else(|| {
+                        invalid_params("afterSequence must be a nonnegative integer")
+                    })
+                })
+                .transpose()?;
+            if before.is_some() && after.is_some() {
+                return Err(invalid_params(
+                    "beforeSequence and afterSequence are mutually exclusive",
+                ));
+            }
+            let limit = params
+                .get("limit")
+                .map(|v| {
+                    v.as_u64()
+                        .filter(|n| (1..=100).contains(n))
+                        .and_then(|n| u32::try_from(n).ok())
+                        .ok_or_else(|| invalid_params("limit must be an integer from 1 to 100"))
+                })
+                .transpose()?
+                .unwrap_or(intent_core::discussion::DISCUSSION_PAGE_DEFAULT);
+            let page = api
+                .discussion_list(
+                    id,
+                    discussion_optional_id(params, "conversationId")?
+                        .unwrap_or_else(|| "default".into()),
+                    before,
+                    after,
+                    limit,
+                )
+                .await
+                .map_err(domain_to_rpc)?;
+            to_result_value(&page)
+        }
+        "discussion.react" => {
+            let id = require_workspace_id(params)?;
+            let message_id = require_str_param(params, "messageId")?;
+            let reaction = require_str_param(params, "reaction")?;
+            let active = params
+                .get("active")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| invalid_params("active must be a boolean"))?;
+            let result = api
+                .discussion_react(
+                    id,
+                    discussion_optional_id(params, "conversationId")?
+                        .unwrap_or_else(|| "default".into()),
+                    message_id,
+                    reaction,
+                    active,
+                )
+                .await
+                .map_err(domain_to_rpc)?;
+            to_result_value(&result)
+        }
+        "discussion.stopAgent" | "discussion.retryAgent" => {
+            let request: intent_core::discussion::DiscussionAgentControl =
+                serde_json::from_value(Value::Object(params.clone())).map_err(|_| {
+                    invalid_params("expected workspaceId, messageId, agentId and positive attempt")
+                })?;
+            if request.attempt == 0
+                || request.message_id.trim().is_empty()
+                || request.agent_id.as_str().is_empty()
+            {
+                return Err(invalid_params("invalid discussion invocation"));
+            }
+            api.discussion_control_agent(request, method == "discussion.retryAgent")
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "discussion.send" => {
+            let id = require_workspace_id(params)?;
+            let message_id = require_str_param(params, "messageId")?;
+            let body = require_str_param(params, "body")?;
+            let conversation_id = discussion_optional_id(params, "conversationId")?;
+            let recipient_principal_ids = params
+                .get("recipientPrincipalIds")
+                .map(|v| {
+                    v.as_array()
+                        .ok_or_else(|| invalid_params("recipientPrincipalIds must be an array"))?
+                        .iter()
+                        .map(|p| {
+                            p.as_str()
+                                .filter(|s| !s.is_empty())
+                                .map(intent_core::PrincipalId::from)
+                                .ok_or_else(|| {
+                                    invalid_params(
+                                        "recipientPrincipalIds must contain nonempty strings",
+                                    )
+                                })
+                        })
+                        .collect::<std::result::Result<Vec<_>, _>>()
+                })
+                .transpose()?;
+            let recipient_agent_ids = params
+                .get("recipientAgentIds")
+                .map(|value| {
+                    serde_json::from_value::<Vec<intent_core::AgentId>>(value.clone()).map_err(
+                        |_| invalid_params("recipientAgentIds must be an array of strings"),
+                    )
+                })
+                .transpose()?
+                .unwrap_or_default();
+            let result = api
+                .discussion_send(
+                    id,
+                    message_id,
+                    body,
+                    intent_core::discussion::DiscussionTarget {
+                        agent_mentions: params
+                            .get("agentMentions")
+                            .map(|v| {
+                                serde_json::from_value(v.clone())
+                                    .map_err(|_| invalid_params("invalid agentMentions"))
+                            })
+                            .transpose()?
+                            .unwrap_or_default(),
+                        recipient_agent_ids,
+                        conversation_id,
+                        recipient_principal_ids,
+                        reply_to_message_id: discussion_optional_id(params, "replyToMessageId")?,
+                    },
+                )
+                .await
+                .map_err(domain_to_rpc)?;
+            to_result_value(&result)
+        }
         // `workspace.members.*` (multiplayer w3): membership roster of one
         // workspace. Member+ may list; add / removal are Owner-only in the
         // service layer (`-32003` for a collaborator, `-32602` for a
@@ -1040,6 +1294,18 @@ async fn dispatch(
                 .await
                 .map_err(workspace_err)?;
             Ok(r)
+        }
+        "workspace.members.setRole" => {
+            let id = require_workspace_id(params)?;
+            let principal_id = require_str_param(params, "principalId")?;
+            let role = match require_str_param(params, "role")?.as_str() {
+                "collaborator" => intent_core::WorkspaceRole::Collaborator,
+                "manager" => intent_core::WorkspaceRole::Manager,
+                _ => return Err(invalid_params("role must be collaborator or manager")),
+            };
+            api.workspace_members_set_role(id, intent_core::PrincipalId::from(principal_id), role)
+                .await
+                .map_err(workspace_err)
         }
         "workspace.members.remove" => {
             let id = require_workspace_id(params)?;
@@ -1330,8 +1596,14 @@ async fn dispatch(
         "note.get" => {
             let ws = require_ws_note(params)?;
             let note_id = require_note_id(params)?;
+            let max_content_bytes = parse_max_content_bytes(params)?;
             match api.get_note(ws, note_id).await {
-                Ok(note) => Ok(json!({ "note": note })),
+                Ok(note) => match max_content_bytes {
+                    Some(limit) => {
+                        Ok(json!({ "note": intent_core::note_bounded_row(note, limit) }))
+                    }
+                    None => Ok(json!({ "note": note })),
+                },
                 Err(Error::NotFound(_)) => Err(not_found("Note not found")),
                 Err(e) => Err(domain_to_rpc(e)),
             }
@@ -1365,6 +1637,7 @@ async fn dispatch(
                 title: opt_str(params, "title"),
                 tags: opt_tags(params, "tags"),
                 expected_version: opt_int(params, "expectedVersion"),
+                base_content_bytes: parse_base_content_bytes(params)?,
             };
             let note = api
                 .update_note(ws, note_id, input)
@@ -1426,8 +1699,17 @@ async fn dispatch(
             let content = require_str_param(params, "content")?;
             let confirm = parse_confirm(params);
             let expected_version = opt_int(params, "expectedVersion");
+            let base_content_bytes = parse_base_content_bytes(params)?;
             let result = api
-                .set_note_content(ws, note_id, content, confirm, expected_version, None)
+                .set_note_content_guarded(
+                    ws,
+                    note_id,
+                    content,
+                    confirm,
+                    expected_version,
+                    base_content_bytes,
+                    None,
+                )
                 .await
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
@@ -4190,6 +4472,10 @@ async fn dispatch(
                 .await
                 .map_err(domain_to_rpc)
         }
+        "providers.profiles.reorder" => api
+            .provider_profiles_reorder(Value::Object(params.clone()))
+            .await
+            .map_err(domain_to_rpc),
         "unsloth.status" => {
             // Observe the daemon-managed singleton Unsloth server
             // (monorepo#878); no workspaceId — the server is daemon-global.
@@ -4734,16 +5020,58 @@ async fn dispatch(
                 .map_err(domain_to_rpc)
         }
         "script.start" => {
+            if matches!(
+                intent_core::current_caller(),
+                Some(intent_core::Caller::Wire {
+                    host_role: intent_core::HostRole::Guest,
+                    ..
+                })
+            ) && params
+                .keys()
+                .any(|k| !["workspaceId", "scriptId"].contains(&k.as_str()))
+            {
+                return Err(invalid_params(
+                    "saved script operations accept only workspaceId and scriptId",
+                ));
+            }
             let ws = require_ws_note(params)?;
             let script_id = require_str_param(params, "scriptId")?;
             api.script_start(ws, script_id).await.map_err(domain_to_rpc)
         }
         "script.stop" => {
+            if matches!(
+                intent_core::current_caller(),
+                Some(intent_core::Caller::Wire {
+                    host_role: intent_core::HostRole::Guest,
+                    ..
+                })
+            ) && params
+                .keys()
+                .any(|k| !["workspaceId", "scriptId"].contains(&k.as_str()))
+            {
+                return Err(invalid_params(
+                    "saved script operations accept only workspaceId and scriptId",
+                ));
+            }
             let ws = require_ws_note(params)?;
             let script_id = require_str_param(params, "scriptId")?;
             api.script_stop(ws, script_id).await.map_err(domain_to_rpc)
         }
         "script.restart" => {
+            if matches!(
+                intent_core::current_caller(),
+                Some(intent_core::Caller::Wire {
+                    host_role: intent_core::HostRole::Guest,
+                    ..
+                })
+            ) && params
+                .keys()
+                .any(|k| !["workspaceId", "scriptId"].contains(&k.as_str()))
+            {
+                return Err(invalid_params(
+                    "saved script operations accept only workspaceId and scriptId",
+                ));
+            }
             let ws = require_ws_note(params)?;
             let script_id = require_str_param(params, "scriptId")?;
             api.script_restart(ws, script_id)
@@ -4768,6 +5096,26 @@ async fn dispatch(
                 .map_err(domain_to_rpc)
         }
         "script.run" => {
+            if matches!(
+                intent_core::current_caller(),
+                Some(intent_core::Caller::Wire {
+                    host_role: intent_core::HostRole::Guest,
+                    ..
+                })
+            ) && params.keys().any(|k| {
+                ![
+                    "workspaceId",
+                    "scriptId",
+                    "maxLines",
+                    "timeoutSeconds",
+                    "timeout",
+                ]
+                .contains(&k.as_str())
+            }) {
+                return Err(invalid_params(
+                    "saved script run accepts only IDs and output/timeout options",
+                ));
+            }
             let ws = require_ws_note(params)?;
             let script_id = require_str_param(params, "scriptId")?;
             let max_lines = opt_int(params, "maxLines");

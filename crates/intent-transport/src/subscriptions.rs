@@ -92,6 +92,10 @@ pub(crate) struct NoteSubscribeParams {
     pub workspace_id: String,
     pub replace_group: Option<String>,
     pub projection: Option<NoteListProjection>,
+    /// Note-channel-only `maxContentBytes` (truncated note reads): fixed for
+    /// the subscription's lifetime, it bounds every full row's `content`
+    /// with [`intent_core::note_bounded_row`]. `None` keeps rows unchanged.
+    pub max_content_bytes: Option<usize>,
 }
 
 /// Parsed `workspace.subscribe` params (§6.1). The workspace channel is global
@@ -257,6 +261,7 @@ pub(crate) fn parse_subscribe_params(
         workspace_id,
         replace_group: replace_group(params),
         projection: None,
+        max_content_bytes: None,
     })
 }
 
@@ -276,6 +281,8 @@ pub(crate) fn parse_note_subscribe_params(
         Some(Value::String(s)) if s == "slim" => Some(NoteListProjection::Slim),
         Some(_) => return Err("projection must be \"slim\" or \"full\"".to_string()),
     };
+    parsed.max_content_bytes =
+        crate::router::max_content_bytes_param(params).map_err(str::to_string)?;
     Ok(parsed)
 }
 
@@ -570,6 +577,7 @@ pub(crate) async fn note_delta(
     workspace_id: &WorkspaceId,
     event: &Event,
     projection: Option<NoteListProjection>,
+    max_content_bytes: Option<usize>,
 ) -> Option<Value> {
     let note_id = event.data.get("noteId").and_then(Value::as_str)?;
     match event.event_type.as_str() {
@@ -578,14 +586,14 @@ pub(crate) async fn note_delta(
                 .get_note(workspace_id.clone(), NoteId::from(note_id))
                 .await
                 .ok()?;
-            Some(json!({ "added": [note_row(note, projection)?] }))
+            Some(json!({ "added": [note_row(note, projection, max_content_bytes)?] }))
         }
         NOTE_UPDATED => {
             let note = api
                 .get_note(workspace_id.clone(), NoteId::from(note_id))
                 .await
                 .ok()?;
-            Some(json!({ "updated": [note_row(note, projection)?] }))
+            Some(json!({ "updated": [note_row(note, projection, max_content_bytes)?] }))
         }
         NOTE_DELETED => Some(json!({ "removedIds": [note_id] })),
         _ => None,
@@ -595,11 +603,19 @@ pub(crate) async fn note_delta(
 /// Serialize one note-channel row under the subscription's projection: full
 /// (`None`) keeps the complete wire `Note` byte-identical to before;
 /// [`NoteListProjection::Slim`] serves the bounded `note.list` slim row
-/// (`content` → `contentPreview` + `contentLength`, §5.2).
-fn note_row(note: Note, projection: Option<NoteListProjection>) -> Option<Value> {
-    match projection {
-        Some(NoteListProjection::Slim) => Some(note_list_slim_row(note)),
-        None => serde_json::to_value(note).ok(),
+/// (`content` → `contentPreview` + `contentLength`, §5.2). A full row under
+/// `maxContentBytes` is cut by the truncated-read rule
+/// ([`intent_core::note_bounded_row`]); slim rows carry no `content`, so the
+/// limit has no effect on them.
+fn note_row(
+    note: Note,
+    projection: Option<NoteListProjection>,
+    max_content_bytes: Option<usize>,
+) -> Option<Value> {
+    match (projection, max_content_bytes) {
+        (Some(NoteListProjection::Slim), _) => Some(note_list_slim_row(note)),
+        (None, Some(limit)) => Some(intent_core::note_bounded_row(note, limit)),
+        (None, None) => serde_json::to_value(note).ok(),
     }
 }
 
@@ -2111,7 +2127,7 @@ pub(crate) async fn channel_delta(
         // The note channel uses the dedicated `forward_note_subscription`
         // path (which threads the subscription's v8.2 projection), so this
         // generic arm is unreachable for `Note`; full rows keep it faithful.
-        Channel::Note => note_delta(api, workspace_id, event, None).await,
+        Channel::Note => note_delta(api, workspace_id, event, None, None).await,
         Channel::Agent => agent_delta(api, event).await,
         // The workspace channel's tombstone scoping is stateful (the
         // forwarder threads the subscriber's visible-id set); this generic
