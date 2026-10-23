@@ -335,9 +335,12 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     loop {
-        let next = timeout(Duration::from_secs(secs), ws.next())
-            .await
-            .expect("wss event timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(secs)),
+            ws.next(),
+        )
+        .await
+        .expect("wss event timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");

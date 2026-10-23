@@ -4253,6 +4253,7 @@ mod display_status_events {
     }
 
     async fn assert_silent(sub: &mut Subscription) {
+        // fixed-deadline: allow — stays under the 500ms idle debounce set by DebounceEnvGuard::new("500") below while outlasting the 100ms one
         let res = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
         assert!(res.is_err(), "expected no displayStatus event: {res:?}");
     }

@@ -245,8 +245,11 @@ mod collaborator_fan_out {
     /// bulk lane until it stays quiet for a short window.
     async fn delivered(rx: &mut OutboundReceiver) -> Vec<(String, String)> {
         let mut out = Vec::new();
-        while let Ok(Some(frame)) =
-            tokio::time::timeout(Duration::from_millis(300), rx.bulk.recv()).await
+        while let Ok(Some(frame)) = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            rx.bulk.recv(),
+        )
+        .await
         {
             let v: Value = serde_json::from_str(&frame).unwrap();
             assert_eq!(v["method"], "events.event");
@@ -577,8 +580,11 @@ mod collaborator_fan_out {
             .await
             .unwrap();
         let mut out = Vec::new();
-        while let Ok(Some(frame)) =
-            tokio::time::timeout(Duration::from_millis(300), h.rx.bulk.recv()).await
+        while let Ok(Some(frame)) = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            h.rx.bulk.recv(),
+        )
+        .await
         {
             let v: Value = serde_json::from_str(&frame).unwrap();
             assert_eq!(v["params"]["event"]["type"], AGENT_QUEUE_UPDATED);
@@ -658,8 +664,11 @@ mod collaborator_fan_out {
             h.bus.publish(&ev).await.unwrap();
         }
         let mut out = Vec::new();
-        while let Ok(Some(frame)) =
-            tokio::time::timeout(Duration::from_millis(300), h.rx.bulk.recv()).await
+        while let Ok(Some(frame)) = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            h.rx.bulk.recv(),
+        )
+        .await
         {
             let v: Value = serde_json::from_str(&frame).unwrap();
             assert_eq!(v["params"]["event"]["type"], AGENT_QUEUE_PROCESSING);

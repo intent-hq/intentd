@@ -156,9 +156,12 @@ fn readiness_marker_replaces_links_without_overwriting_their_target() {
 async fn cancellation_is_sticky_for_late_waiters() {
     let cancel = Cancellation::default();
     cancel.cancel();
-    tokio::time::timeout(Duration::from_millis(50), cancel.cancelled())
-        .await
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(50)),
+        cancel.cancelled(),
+    )
+    .await
+    .unwrap();
 }
 
 #[tokio::test]

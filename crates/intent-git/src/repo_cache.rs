@@ -3136,7 +3136,7 @@ mod tests {
         let guard = lock.lock().await;
 
         let read = tokio::time::timeout(
-            Duration::from_millis(500),
+            intentd_test_support::test_timeout(Duration::from_millis(500)),
             list_cached_branches(root.path(), "acme", "widget"),
         )
         .await
