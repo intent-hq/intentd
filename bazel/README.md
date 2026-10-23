@@ -43,25 +43,26 @@ of the main repo's packages.
 
 ## Linker
 
-Bazel links Rust with **rustc's bundled rust-lld**, the same linker Cargo uses
-on x86_64 Linux since Rust 1.90 (`readelf -p .comment` on either binary shows
-`Linker: LLD <rustc's LLVM version>`). rustc still drives the link through the
-system `cc`, as under Cargo.
+Bazel links Rust with **GNU ld (bfd)**, driven by the system `cc`. Cargo on
+x86_64 Linux (Rust 1.90 and later) links with rustc's bundled **rust-lld**
+instead, so the two builds use different linkers; `readelf -p .comment` on a
+binary shows `Linker: LLD ...` only for the Cargo build. Releases stay on
+Cargo, so shipped binaries are unaffected.
 
-The auto-configured C++ toolchain (rules_cc `unix_cc_configure`) adds
-`-fuse-ld=lld` when the host has a system `ld.lld`, otherwise
-`-fuse-ld=gold`, to every link. Those flags override rustc's own choice, so
-Rust used whichever linker the host had (gold, deprecated for Rust, on CI
-runners without lld). `.bazelrc` appends `-Clink-arg=-fuse-ld=lld` to every
-Rust action, target and exec (proc-macros, build scripts, `process_wrapper`).
-The last `-fuse-ld` wins, and rustc's `-B<sysroot>/lib/rustlib/<triple>/bin/gcc-ld`
-precedes the toolchain's `-B/usr/bin`, so rustc's rust-lld is found before
-any system `ld.lld`. It ships with the Rust toolchain, so runners need no
-extra package. C/C++ links (none today) keep the auto-configured linker.
+Why not rust-lld under Bazel: rustc uses its bundled lld only while the linker
+is its default `cc`. rules_rust passes `-C linker=<toolchain gcc>`, so rustc
+drops it, and forcing it back (`-Clink-self-contained=+linker`,
+`-Clinker-features=+lld`) needs unstable flags on our stable toolchain. A
+system `ld.lld` is not on every runner.
 
-On other hosts (aarch64 Linux, where rustc does not use its bundled lld by default)
-the flag needs a system `ld.lld`; Cargo uses the system default linker there.
-CI builds only on x86_64 Linux.
+Why not the auto-configured linker: rules_cc's `unix_cc_configure` adds
+`-fuse-ld=lld` to every link when the host has a system `ld.lld`, otherwise
+`-fuse-ld=gold`, which is deprecated for Rust (rustc warns on every link).
+`.bazelrc` appends `-Clink-arg=-fuse-ld=bfd` to every Rust action, target and
+exec (proc-macros, build scripts, `process_wrapper`); the last `-fuse-ld`
+wins. bfd ships with binutils, which gcc needs anyway, so no runner needs an
+extra package and every host links the same way. C/C++ links (none today)
+keep the auto-configured linker.
 
 ## Generated files
 
