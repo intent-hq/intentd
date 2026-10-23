@@ -2691,3 +2691,118 @@ async fn a_switch_ahead_of_the_turn_yields_to_a_choice_saved_after_the_read() {
     assert!(token_of(&row).is_some(), "left for the turn that reads it");
     assert!(notices(&fx.messages().await, "provider_failover").is_empty());
 }
+
+/// Review of intentd#2624: a timed (or early, home seen working) return home
+/// whose session read predates manual choices ending on the same pair
+/// (M2, then M1 again) does not move the session: the latest choice is
+/// tried first, and its stale return state is not brought back.
+#[intent_test_macros::daemon_test]
+async fn a_stale_return_home_yields_to_a_later_choice_of_the_same_pair() {
+    for early in [false, true] {
+        let fx = Fixture::new(json!({ "response": "answered" })).await;
+        let first = fx.profile("First", true).await;
+        let _second = fx.profile("Second", true).await;
+        let now = chrono::Utc::now();
+        let return_after = if early {
+            now + chrono::Duration::hours(3)
+        } else {
+            now - chrono::Duration::hours(1)
+        };
+        fx.away(&first, state_json("claude-code", &first, return_after, 0))
+            .await;
+        if early {
+            mark_working_elsewhere(&fx, "claude-code");
+        }
+        let stale = fx.row().await;
+        assert!(token_of(&stale).is_none());
+        assert!(crate::provider_return::read_state(&stale).is_some());
+        set_model(&fx, "sonnet").await;
+        set_model(&fx, "opus").await;
+        let latest = token_of(&fx.row().await).expect("latest choice pending");
+        let services = &fx.mgr.services;
+
+        services
+            .return_home_if_due_from(&fx.ws, &fx.agent, stale)
+            .await;
+
+        let row = fx.row().await;
+        assert_eq!(
+            row.provider.as_deref(),
+            Some(first.as_str()),
+            "early={early}"
+        );
+        assert_eq!(row.model.as_deref(), Some("opus"));
+        assert_eq!(token_of(&row).as_deref(), Some(latest.as_str()));
+        assert!(
+            fx.return_state().await.is_none(),
+            "stale state not restored"
+        );
+        mark_exhausted_elsewhere(&fx, &first);
+        services.avoid_exhausted_provider(&fx.ws, &fx.agent).await;
+        assert_eq!(fx.row().await.provider.as_deref(), Some(first.as_str()));
+        assert!(notices(&fx.messages().await, "provider_failover").is_empty());
+    }
+}
+
+/// The on-home bookkeeping of a stale return read (home took the turn) does
+/// not bring back a return state a later manual choice cleared.
+#[intent_test_macros::daemon_test]
+async fn a_stale_on_home_read_does_not_restore_a_cleared_return_state() {
+    let fx = Fixture::new(json!({ "response": "answered" })).await;
+    let first = fx.profile("First", true).await;
+    let later = chrono::Utc::now() + chrono::Duration::hours(3);
+    fx.away("claude-code", state_json("claude-code", &first, later, 0))
+        .await;
+    let stale = fx.row().await;
+    set_model(&fx, "sonnet").await;
+    set_model(&fx, "opus").await;
+    assert!(fx.return_state().await.is_none());
+
+    fx.mgr
+        .services
+        .return_home_if_due_from(&fx.ws, &fx.agent, stale)
+        .await;
+
+    assert!(fx.return_state().await.is_none());
+    assert!(token_of(&fx.row().await).is_some());
+}
+
+/// Review of intentd#2624: a stale whole-session write (what `agent.rename`
+/// does with the session it read) neither erases the latest manual choice
+/// nor, once that choice is used, brings an older token back.
+#[intent_test_macros::daemon_test]
+async fn a_stale_full_session_write_keeps_the_latest_choice() {
+    for stale_has_older_token in [false, true] {
+        let fx = Fixture::new(json!({ "response": "answered" })).await;
+        let first = fx.profile("First", true).await;
+        let second = fx.profile("Second", true).await;
+        fx.away(&first, Value::Null).await;
+        if stale_has_older_token {
+            set_model(&fx, "opus").await;
+        }
+        let stale = fx.row().await;
+        assert_eq!(token_of(&stale).is_some(), stale_has_older_token);
+        set_model(&fx, "sonnet").await;
+        set_model(&fx, "opus").await;
+        let latest = token_of(&fx.row().await).expect("latest choice pending");
+        let store = &fx.mgr.services.store;
+        let mut renamed = stale.clone();
+        renamed.name = "renamed".to_owned();
+        store.update_agent_session(&fx.ws, &renamed).await.unwrap();
+        let row = fx.row().await;
+        assert_eq!(row.name, "renamed");
+        assert_eq!(token_of(&row).as_deref(), Some(latest.as_str()));
+
+        mark_exhausted_elsewhere(&fx, &first);
+        let services = &fx.mgr.services;
+        services.avoid_exhausted_provider(&fx.ws, &fx.agent).await;
+        assert_eq!(fx.row().await.provider.as_deref(), Some(first.as_str()));
+        assert!(notices(&fx.messages().await, "provider_failover").is_empty());
+
+        // Used up; a stale document does not restore a token.
+        store.update_agent_session(&fx.ws, &renamed).await.unwrap();
+        assert!(token_of(&fx.row().await).is_none());
+        services.avoid_exhausted_provider(&fx.ws, &fx.agent).await;
+        assert_eq!(fx.row().await.provider.as_deref(), Some(second.as_str()));
+    }
+}

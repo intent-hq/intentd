@@ -386,7 +386,10 @@ impl Services {
     /// Persist `state` only while the session still carries the provider
     /// and model it was derived from (see
     /// `Store::set_agent_session_metadata_key_json_if_identity`), so stale
-    /// bookkeeping never lands after a concurrent manual choice.
+    /// bookkeeping never lands after a concurrent manual choice. With
+    /// `yield_to_manual_choice` it also yields to a pending manual choice
+    /// token, for a caller whose read may predate a choice of the same
+    /// selection.
     pub(crate) async fn persist_provider_return_state_if_identity(
         &self,
         workspace_id: &WorkspaceId,
@@ -394,6 +397,7 @@ impl Services {
         expected_provider: &str,
         expected_model: Option<&str>,
         state: &ProviderReturnState,
+        yield_to_manual_choice: bool,
     ) -> bool {
         match self
             .store
@@ -404,6 +408,7 @@ impl Services {
                 expected_model,
                 PROVIDER_RETURN_METADATA_KEY,
                 &json!(state).to_string(),
+                yield_to_manual_choice,
                 &now_iso(),
             )
             .await
@@ -466,10 +471,31 @@ impl Services {
     /// can no longer run (profile removed, base disabled) is given up — the
     /// current configuration becomes home. A concurrent provider change
     /// wins.
+    ///
+    /// Every write yields to a pending manual choice token (PROTOCOL §5.54):
+    /// the session read can predate a manual choice, even one of the same
+    /// selection, and that choice's first turn tries it.
     pub(crate) async fn return_home_if_due(&self, workspace_id: &WorkspaceId, agent_id: &AgentId) {
         let Ok(session) = self.store.get_agent_session(agent_id).await else {
             return;
         };
+        self.return_home_if_due_from(workspace_id, agent_id, session)
+            .await;
+    }
+
+    /// [`Self::return_home_if_due`] on a session snapshot already read,
+    /// which may be stale by now.
+    pub(crate) async fn return_home_if_due_from(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        session: AgentSession,
+    ) {
+        // A pending manual choice in the snapshot itself: its first turn
+        // tries it (the avoid step consumes the token).
+        if manual_choice_token(&session).is_some() {
+            return;
+        }
         let Some(mut state) = read_state(&session) else {
             return;
         };
@@ -497,6 +523,7 @@ impl Services {
                         current,
                         session.model.as_deref(),
                         &state,
+                        true,
                     )
                     .await
                 {
@@ -536,7 +563,8 @@ impl Services {
         state.away_on = current_selection;
         state.returning = Some(ReturnMode::Timer);
         // The move home and its bookkeeping are one statement (see
-        // `try_quota_failover`): a concurrent manual choice wins.
+        // `try_quota_failover`): a concurrent manual choice wins, including
+        // one of the same selection saved since this read (its token).
         let landed = self
             .store
             .failover_agent_session_provider(
@@ -546,7 +574,7 @@ impl Services {
                 session.model.as_deref(),
                 &state.home,
                 Some((PROVIDER_RETURN_METADATA_KEY, &json!(state).to_string())),
-                false,
+                true,
                 &now_iso(),
             )
             .await

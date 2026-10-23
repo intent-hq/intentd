@@ -478,6 +478,7 @@ impl Services {
                     &from,
                     session.model.as_deref(),
                     &failed,
+                    false,
                 )
                 .await;
             }

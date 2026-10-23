@@ -789,6 +789,24 @@ pub const PROJECTION_TEXT_BLOCK_CAP: u32 = 4096;
 /// projected to clients.
 pub const MANUAL_CHOICE_METADATA_KEY: &str = "manualChoice";
 
+/// SQL for a whole-document `metadata` write whose new document is
+/// `new_doc` (an expression, evaluated twice): the stored
+/// [`MANUAL_CHOICE_METADATA_KEY`] token is authoritative, so it is kept when
+/// present (and `keep_if` holds) and never taken from `new_doc` otherwise. A
+/// caller's stale snapshot (without the token, or with an older one) can
+/// then neither erase a newer manual choice nor bring back a used one.
+fn manual_choice_preserving_metadata(new_doc: &str, keep_if: &str) -> String {
+    let key = MANUAL_CHOICE_METADATA_KEY;
+    format!(
+        "CASE WHEN metadata IS NOT NULL AND json_valid(metadata) \
+              AND json_type(metadata) = 'object' \
+              AND json_type(metadata, '$.{key}') IS NOT NULL AND ({keep_if}) \
+             THEN json_set(COALESCE({new_doc}, '{{}}'), '$.{key}', \
+                           json_extract(metadata, '$.{key}')) \
+         ELSE json_remove({new_doc}, '$.{key}') END"
+    )
+}
+
 /// Applied at message-write time to maintain the persisted
 /// `agent_session.last_assistant_preview` / `last_user_preview` columns
 /// (0066): `None` when `content` is not a JSON array; otherwise the
@@ -2984,58 +3002,74 @@ impl Store {
         } else {
             None
         };
-        let query = sqlx::query(
+        // The pending manual-choice token (PROTOCOL §5.54 shared quota
+        // state) is owned by its dedicated writers: this full-document write
+        // keeps the stored one while the selection is unchanged and drops it
+        // when this write changes the selection (the token named the old one).
+        // SQLite evaluates every SET expression on the old row, so `model` and
+        // `provider` here are the stored values.
+        let metadata_sql = manual_choice_preserving_metadata(
+            "CASE WHEN json_extract(metadata, '$.chiefPromptVersion') IS NULL \
+             THEN json_remove(?, '$.chiefPromptVersion') ELSE ? END",
+            "model IS ? AND provider IS ?",
+        );
+        let sql = format!(
             "UPDATE agent_session SET backend_session_id=?, acp_session_id=?, name=?, \
              name_explicitly_set=?, model=?, provider=?, status=?, is_active=?, system_prompt=?, \
              updated_at=?, parent_agent_id=?, specialist=?, task_note_id=?, skip_auto_commit=?, \
              completion_report=?, completion_report_timestamp=?, delegation_depth=?, \
              initial_message=?, context_references=?, image_blocks=?, file_blocks=?, \
-             is_background=?, metadata=CASE \
-                 WHEN json_extract(metadata, '$.chiefPromptVersion') IS NULL \
-                 THEN json_remove(?, '$.chiefPromptVersion') ELSE ? END, \
+             is_background=?, metadata={metadata_sql}, \
              sandbox_id=?, sandbox_path=?, sandbox_branch=?, \
              stop_reason=?, stop_reason_timestamp=?, \
              reasoning_effort_auto=CASE WHEN ? THEN 0 WHEN reasoning_effort IS ? \
                  THEN reasoning_effort_auto ELSE 0 END, \
              reasoning_effort=? \
-             WHERE id=? AND workspace_id=?",
-        )
-        .bind(s.backend_session_id.as_ref().map(|b| b.0.clone()))
-        .bind(&s.acp_session_id)
-        .bind(&s.name)
-        .bind(i64::from(s.name_explicitly_set))
-        .bind(&s.model)
-        .bind(&s.provider)
-        .bind(enum_to_db(&s.status)?)
-        .bind(i64::from(s.is_active))
-        .bind(&s.system_prompt)
-        .bind(&s.updated_at)
-        .bind(s.parent_agent_id.as_ref().map(|b| b.0.clone()))
-        .bind(&s.specialist)
-        .bind(s.task_note_id.as_ref().map(|n| n.0.clone()))
-        .bind(i64::from(s.skip_auto_commit))
-        .bind(&s.completion_report)
-        .bind(&s.completion_report_timestamp)
-        .bind(s.delegation_depth)
-        .bind(&s.initial_message)
-        .bind(json_col_to_db(s.context_references.as_ref())?)
-        .bind(json_col_to_db(s.image_blocks.as_ref())?)
-        .bind(json_col_to_db(s.file_blocks.as_ref())?)
-        .bind(i64::from(s.is_background))
-        .bind(&metadata)
-        .bind(&metadata)
-        .bind(&s.sandbox_id)
-        .bind(&s.sandbox_path)
-        .bind(&s.sandbox_branch)
-        .bind(&s.stop_reason)
-        .bind(&s.stop_reason_timestamp)
-        // An explicit effort write, or any effort change, clears the daemon's
-        // Auto-pin flag; an unrelated rewrite of the same value keeps it.
-        .bind(explicit_effort)
-        .bind(&s.reasoning_effort)
-        .bind(&s.reasoning_effort)
-        .bind(&s.id.0)
-        .bind(&workspace_id.0);
+             WHERE id=? AND workspace_id=?"
+        );
+        let query = sqlx::query(&sql)
+            .bind(s.backend_session_id.as_ref().map(|b| b.0.clone()))
+            .bind(&s.acp_session_id)
+            .bind(&s.name)
+            .bind(i64::from(s.name_explicitly_set))
+            .bind(&s.model)
+            .bind(&s.provider)
+            .bind(enum_to_db(&s.status)?)
+            .bind(i64::from(s.is_active))
+            .bind(&s.system_prompt)
+            .bind(&s.updated_at)
+            .bind(s.parent_agent_id.as_ref().map(|b| b.0.clone()))
+            .bind(&s.specialist)
+            .bind(s.task_note_id.as_ref().map(|n| n.0.clone()))
+            .bind(i64::from(s.skip_auto_commit))
+            .bind(&s.completion_report)
+            .bind(&s.completion_report_timestamp)
+            .bind(s.delegation_depth)
+            .bind(&s.initial_message)
+            .bind(json_col_to_db(s.context_references.as_ref())?)
+            .bind(json_col_to_db(s.image_blocks.as_ref())?)
+            .bind(json_col_to_db(s.file_blocks.as_ref())?)
+            .bind(i64::from(s.is_background))
+            // keep_if (stored selection unchanged), then the new document twice
+            // (kept-token and dropped-token branches), two binds each.
+            .bind(&s.model)
+            .bind(&s.provider)
+            .bind(&metadata)
+            .bind(&metadata)
+            .bind(&metadata)
+            .bind(&metadata)
+            .bind(&s.sandbox_id)
+            .bind(&s.sandbox_path)
+            .bind(&s.sandbox_branch)
+            .bind(&s.stop_reason)
+            .bind(&s.stop_reason_timestamp)
+            // An explicit effort write, or any effort change, clears the daemon's
+            // Auto-pin flag; an unrelated rewrite of the same value keeps it.
+            .bind(explicit_effort)
+            .bind(&s.reasoning_effort)
+            .bind(&s.reasoning_effort)
+            .bind(&s.id.0)
+            .bind(&workspace_id.0);
         let rows = match tx.as_mut() {
             Some(tx) => query.execute(&mut **tx).await,
             None => query.execute(self.write_pool()).await,
@@ -3429,7 +3463,10 @@ impl Store {
     /// bookkeeping tied to an identity it observed never lands after a
     /// concurrent `agent.setModel` moved the session. `Ok(false)` on a
     /// mismatch; `NotFound` when the session is absent. `key` must be a
-    /// trusted constant.
+    /// trusted constant. With `yield_to_manual_choice` the write also does
+    /// not land while a manual choice token ([`MANUAL_CHOICE_METADATA_KEY`])
+    /// is pending: the caller's read predates that choice, whose selection
+    /// can equal the one it read.
     ///
     /// # Errors
     ///
@@ -3443,6 +3480,7 @@ impl Store {
         expected_model: Option<&str>,
         key: &str,
         value: &str,
+        yield_to_manual_choice: bool,
         updated_at: &str,
     ) -> Result<bool> {
         let rows = sqlx::query(
@@ -3455,7 +3493,10 @@ impl Store {
                  END, \
                  '$.' || ?, json(?)), \
              updated_at = ? \
-             WHERE id = ? AND workspace_id = ? AND provider = ? AND model IS ?",
+             WHERE id = ? AND workspace_id = ? AND provider = ? AND model IS ? \
+               AND (? = 0 OR metadata IS NULL OR NOT json_valid(metadata) \
+                    OR json_type(metadata) != 'object' \
+                    OR json_type(metadata, '$.' || ?) IS NULL)",
         )
         .bind(key)
         .bind(value)
@@ -3464,6 +3505,8 @@ impl Store {
         .bind(&workspace_id.0)
         .bind(expected_provider)
         .bind(expected_model)
+        .bind(i64::from(yield_to_manual_choice))
+        .bind(MANUAL_CHOICE_METADATA_KEY)
         .execute(self.write_pool())
         .await
         .map_err(|e| Error::Internal(format!("guarded session metadata write failed: {e}")))?
@@ -3686,17 +3729,24 @@ impl Store {
         metadata: Option<&serde_json::Value>,
         updated_at: &str,
     ) -> Result<()> {
-        let rows = sqlx::query(
-            "UPDATE agent_session SET metadata=?, updated_at=? WHERE id=? AND workspace_id=?",
-        )
-        .bind(encode_metadata(metadata)?)
-        .bind(updated_at)
-        .bind(&id.0)
-        .bind(&workspace_id.0)
-        .execute(self.write_pool())
-        .await
-        .map_err(|e| Error::Internal(format!("update agent session metadata failed: {e}")))?
-        .rows_affected();
+        // The stored manual-choice token is kept (see
+        // `manual_choice_preserving_metadata`): a caller's snapshot never
+        // erases or restores it.
+        let sql = format!(
+            "UPDATE agent_session SET metadata={}, updated_at=? WHERE id=? AND workspace_id=?",
+            manual_choice_preserving_metadata("?", "1")
+        );
+        let metadata = encode_metadata(metadata)?;
+        let rows = sqlx::query(&sql)
+            .bind(&metadata)
+            .bind(&metadata)
+            .bind(updated_at)
+            .bind(&id.0)
+            .bind(&workspace_id.0)
+            .execute(self.write_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("update agent session metadata failed: {e}")))?
+            .rows_affected();
         if rows == 0 {
             return Err(Error::NotFound(format!("agent session {id}")));
         }
@@ -14523,6 +14573,169 @@ mod tests {
         assert_eq!(metadata["keep"], 1);
     }
 
+    /// Review of intentd#2624: the stored manual-choice token is
+    /// authoritative against whole-document writers. A stale snapshot
+    /// (without the token, or with an older one) neither erases a newer
+    /// choice nor restores a used one; a write that changes the selection
+    /// drops it; the yielding identity-guarded writer does not land while it
+    /// is pending.
+    #[tokio::test]
+    async fn stale_full_writes_keep_the_stored_manual_choice() {
+        use intent_core::now_iso;
+
+        use uuid::Uuid;
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-manual-choice-stale".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId(format!("agent-{}", Uuid::new_v4()));
+        let mut session = baseline_test_session(&agent_id, &ws_id, &ts, None);
+        session.provider = Some("claude-code".to_string());
+        session.model = Some("opus".to_string());
+        session.metadata = Some(serde_json::json!({ "keep": 1 }));
+        store.insert_agent_session(&session).await.expect("insert");
+        let get = || {
+            let store = store.clone();
+            let agent_id = agent_id.clone();
+            async move { store.get_agent_session(&agent_id).await.expect("get") }
+        };
+        let token_in = |s: &AgentSession| {
+            s.metadata.as_ref().and_then(|m| {
+                m.get(MANUAL_CHOICE_METADATA_KEY)
+                    .and_then(|t| t.as_str().map(str::to_owned))
+            })
+        };
+        let choose = |model: &'static str, t: &'static str| {
+            let store = store.clone();
+            let agent_id = agent_id.clone();
+            let ws_id = ws_id.clone();
+            async move {
+                store
+                    .set_agent_session_model_choice(
+                        &ws_id,
+                        &agent_id,
+                        model,
+                        Some("claude-code"),
+                        Some(t),
+                        &now_iso(),
+                    )
+                    .await
+                    .expect("choose");
+            }
+        };
+
+        let stale_none = get().await;
+        choose("opus", "t1").await;
+        let stale_t1 = get().await;
+        choose("sonnet", "t2").await;
+        choose("opus", "t3").await;
+
+        // A stale rename-style full-row write, without the token.
+        let mut renamed = stale_none.clone();
+        renamed.name = "renamed".to_string();
+        store
+            .update_agent_session(&ws_id, &renamed)
+            .await
+            .expect("update");
+        let row = get().await;
+        assert_eq!(row.name, "renamed");
+        assert_eq!(token_in(&row).as_deref(), Some("t3"));
+        assert_eq!(row.metadata.as_ref().unwrap()["keep"], 1);
+        // With an older token: the stored one wins.
+        store
+            .update_agent_session(&ws_id, &stale_t1)
+            .await
+            .expect("update");
+        assert_eq!(token_in(&get().await).as_deref(), Some("t3"));
+        store
+            .update_agent_session_metadata(
+                &ws_id,
+                &agent_id,
+                stale_t1.metadata.as_ref(),
+                &now_iso(),
+            )
+            .await
+            .expect("metadata write");
+        assert_eq!(token_in(&get().await).as_deref(), Some("t3"));
+        store
+            .update_agent_session_metadata(&ws_id, &agent_id, None, &now_iso())
+            .await
+            .expect("metadata write");
+        assert_eq!(token_in(&get().await).as_deref(), Some("t3"));
+
+        // The yielding identity-guarded writer waits for the pending choice.
+        assert!(!store
+            .set_agent_session_metadata_key_json_if_identity(
+                &ws_id,
+                &agent_id,
+                "claude-code",
+                Some("opus"),
+                "providerReturn",
+                "{}",
+                true,
+                &now_iso(),
+            )
+            .await
+            .expect("yielding write"));
+        assert!(get()
+            .await
+            .metadata
+            .unwrap()
+            .get("providerReturn")
+            .is_none());
+
+        // Once used, a stale document never brings a token back.
+        assert!(store
+            .take_agent_session_manual_choice(&ws_id, &agent_id, "t3")
+            .await
+            .expect("take"));
+        store
+            .update_agent_session(&ws_id, &stale_t1)
+            .await
+            .expect("update");
+        assert_eq!(token_in(&get().await), None);
+        store
+            .update_agent_session_metadata(
+                &ws_id,
+                &agent_id,
+                stale_t1.metadata.as_ref(),
+                &now_iso(),
+            )
+            .await
+            .expect("metadata write");
+        assert_eq!(token_in(&get().await), None);
+        assert!(store
+            .set_agent_session_metadata_key_json_if_identity(
+                &ws_id,
+                &agent_id,
+                "claude-code",
+                Some("opus"),
+                "providerReturn",
+                "{}",
+                true,
+                &now_iso(),
+            )
+            .await
+            .expect("yielding write, nothing pending"));
+
+        // A full-row write that changes the selection drops the token: it
+        // named the previous selection.
+        choose("opus", "t4").await;
+        let mut moved = get().await;
+        moved.model = Some("sonnet".to_string());
+        store
+            .update_agent_session(&ws_id, &moved)
+            .await
+            .expect("update");
+        let row = get().await;
+        assert_eq!(row.model.as_deref(), Some("sonnet"));
+        assert_eq!(token_in(&row), None);
+    }
+
     /// The failover writer can carry one metadata key in the same statement
     /// (the provider move and the return bookkeeping are atomic), and the
     /// identity-guarded metadata writer refuses once a concurrent switch
@@ -14586,6 +14799,7 @@ mod tests {
                 Some("opus"),
                 "providerReturn",
                 state,
+                false,
                 &now_iso(),
             )
             .await
@@ -14598,6 +14812,7 @@ mod tests {
                 Some("opus"),
                 "providerReturn",
                 "null",
+                false,
                 &now_iso(),
             )
             .await
