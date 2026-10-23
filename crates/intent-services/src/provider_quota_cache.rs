@@ -20,10 +20,11 @@
 //! daemon restart each conversation's persisted return timer applies as
 //! before.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Duration, Utc};
+use intent_core::AgentId;
 
 use crate::provider_profiles;
 
@@ -39,28 +40,33 @@ pub(crate) enum QuotaHealth {
         marked_at: DateTime<Utc>,
         until: DateTime<Utc>,
     },
-    /// An attempt produced output at `at`.
-    Working { at: DateTime<Utc> },
+    /// The latest attempt produced output.
+    Working,
 }
 
 /// Shared across `Services` clones (see the module docs).
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ProviderQuotaCache {
     entries: Arc<Mutex<HashMap<String, QuotaHealth>>>,
+    /// Agents whose provider or model the user chose by hand since their
+    /// last turn started: that turn tries the choice even when it is marked
+    /// (a manual choice is the new starting point), see
+    /// [`Self::take_manual_choice`].
+    manual_choices: Arc<Mutex<HashSet<AgentId>>>,
 }
 
 impl ProviderQuotaCache {
-    /// Record a quota failure on `selection` at `now`; returns the time the
-    /// mark lasts until. The newest failure always replaces the entry.
+    /// Record a quota failure on `selection` at `now`. The mark lasts until
+    /// `reported` (the reset time parsed from the error) when usable, else
+    /// [`MARK_DURATION`]. The newest failure always replaces the entry.
     pub(crate) fn mark_exhausted(
         &self,
         selection: &str,
-        error_text: &str,
+        reported: Option<DateTime<Utc>>,
         now: DateTime<Utc>,
-    ) -> DateTime<Utc> {
-        let until = crate::provider_return::parse_reset_time(error_text, now)
-            .filter(|t| *t <= now + crate::provider_return::MAX_REPORTED_HORIZON)
-            .unwrap_or(now + MARK_DURATION);
+    ) {
+        let until =
+            crate::provider_return::usable_reset(reported, now).unwrap_or(now + MARK_DURATION);
         let selection = provider_profiles::canonical_selection(selection);
         tracing::info!(provider = %selection, until = %until, "provider marked out of quota for all conversations");
         self.entries.lock().unwrap().insert(
@@ -70,40 +76,45 @@ impl ProviderQuotaCache {
                 until,
             },
         );
-        until
     }
 
     /// Record that an attempt on `selection` which started at
     /// `attempt_started` produced output at `now`. An exhausted mark is only
     /// replaced when it was recorded before the attempt started: a turn
     /// already in flight when another one hit the quota proves nothing about
-    /// the quota now. Returns whether the entry changed to working.
+    /// the quota now.
     pub(crate) fn mark_working(
         &self,
         selection: &str,
         attempt_started: DateTime<Utc>,
         now: DateTime<Utc>,
-    ) -> bool {
+    ) {
         let selection = provider_profiles::canonical_selection(selection);
         let mut entries = self.entries.lock().unwrap();
         match entries.get(&selection) {
+            Some(QuotaHealth::Working) => {}
             Some(QuotaHealth::Exhausted { marked_at, until })
-                if *marked_at >= attempt_started && now < *until =>
-            {
-                false
-            }
-            Some(QuotaHealth::Working { .. }) => {
-                entries.insert(selection, QuotaHealth::Working { at: now });
-                false
-            }
+                if *marked_at >= attempt_started && now < *until => {}
             previous => {
-                if matches!(previous, Some(QuotaHealth::Exhausted { .. })) {
+                if previous.is_some() {
                     tracing::info!(provider = %selection, "provider quota available again for all conversations");
                 }
-                entries.insert(selection, QuotaHealth::Working { at: now });
-                true
+                entries.insert(selection, QuotaHealth::Working);
             }
         }
+    }
+
+    /// The user chose `agent`'s provider or model by hand: its next turn
+    /// tries that choice even when it is marked exhausted.
+    pub(crate) fn note_manual_choice(&self, agent: &AgentId) {
+        self.manual_choices.lock().unwrap().insert(agent.clone());
+    }
+
+    /// Consume `agent`'s pending manual choice (see
+    /// [`Self::note_manual_choice`]): whether this turn must not be moved
+    /// away from its configuration ahead of the attempt.
+    pub(crate) fn take_manual_choice(&self, agent: &AgentId) -> bool {
+        self.manual_choices.lock().unwrap().remove(agent)
     }
 
     /// The time `selection`'s exhausted mark lasts until, while it is live at
@@ -135,7 +146,7 @@ impl ProviderQuotaCache {
         let selection = provider_profiles::canonical_selection(selection);
         matches!(
             self.entries.lock().unwrap().get(&selection),
-            Some(QuotaHealth::Working { .. })
+            Some(QuotaHealth::Working)
         )
     }
 
@@ -144,7 +155,7 @@ impl ProviderQuotaCache {
         let mut entries = self.entries.lock().unwrap();
         entries.retain(|_, health| match health {
             QuotaHealth::Exhausted { until, .. } => now < *until,
-            QuotaHealth::Working { .. } => true,
+            QuotaHealth::Working => true,
         });
         entries
             .iter()

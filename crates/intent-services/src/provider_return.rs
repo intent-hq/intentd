@@ -48,7 +48,7 @@ const BACKOFF_CAP: Duration = Duration::hours(24);
 
 /// A reported reset time further out than this is not trusted (a misparse);
 /// the fallback or backoff applies instead.
-pub(crate) const MAX_REPORTED_HORIZON: Duration = Duration::days(7);
+const MAX_REPORTED_HORIZON: Duration = Duration::days(7);
 
 /// Agents whose current message is a timed return home not yet announced:
 /// the `provider_returned` row is written at home's first output, before it
@@ -117,6 +117,15 @@ pub(crate) fn read_state_from(metadata: Option<&Value>) -> Option<ProviderReturn
         .and_then(|v| serde_json::from_value(v.clone()).ok())
 }
 
+/// `reported` when it is a usable reset time at `now`: in the future and no
+/// further out than [`MAX_REPORTED_HORIZON`] (a misparse otherwise).
+pub(crate) fn usable_reset(
+    reported: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    reported.filter(|t| *t > now && *t <= now + MAX_REPORTED_HORIZON)
+}
+
 /// The backoff after the `step`-th failed return (1-based): 1h, 2h, 4h, …
 /// capped at 24h.
 pub(crate) fn backoff_delay(step: u32) -> Duration {
@@ -144,7 +153,7 @@ pub(crate) fn on_switch(
 ) -> ProviderReturnState {
     let from = provider_profiles::canonical_selection(from);
     let to = provider_profiles::canonical_selection(to);
-    let reported = reported.filter(|t| *t > now && *t <= now + MAX_REPORTED_HORIZON);
+    let reported = usable_reset(reported, now);
     let Some(mut state) = state else {
         return ProviderReturnState {
             home: from,
@@ -168,6 +177,30 @@ pub(crate) fn on_switch(
     state
 }
 
+/// The state after a switch `from` → `to` made at the start of a turn,
+/// without an attempt, because the shared quota cache marks `from`
+/// exhausted until `until`: [`on_switch`], except that leaving a marked home
+/// is not a failed return (home was not tried), so the backoff and
+/// return-after time stay as they are.
+pub(crate) fn on_skip(
+    state: Option<ProviderReturnState>,
+    from: &str,
+    to: &str,
+    until: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> ProviderReturnState {
+    let from_selection = provider_profiles::canonical_selection(from);
+    let to_selection = provider_profiles::canonical_selection(to);
+    match state {
+        Some(mut state) if from_selection == state.home && to_selection != state.home => {
+            state.away_on = to_selection;
+            state.returning = None;
+            state
+        }
+        state => on_switch(state, from, to, Some(until), now),
+    }
+}
+
 /// Home rejected a return before producing any output: one more failed
 /// return. The next return-after is the reported reset (when usable), else
 /// the next backoff step. The return mode is kept: when nothing else was
@@ -178,7 +211,7 @@ pub(crate) fn on_failed_return(
     reported: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
 ) -> ProviderReturnState {
-    let reported = reported.filter(|t| *t > now && *t <= now + MAX_REPORTED_HORIZON);
+    let reported = usable_reset(reported, now);
     state.backoff_step = state.backoff_step.saturating_add(1);
     state.return_after = rfc3339(reported.unwrap_or(now + backoff_delay(state.backoff_step)));
     state
@@ -402,14 +435,18 @@ impl Services {
     /// At the start of a new turn, pick where it starts: back home when due
     /// ([`Self::return_home_if_due`]), then away from a configuration the
     /// shared quota cache marks exhausted
-    /// ([`Self::avoid_exhausted_provider`]).
+    /// ([`Self::avoid_exhausted_provider`]) — except on the first turn after
+    /// a manual provider or model choice, which tries that choice.
     pub(crate) async fn begin_provider_return(
         &self,
         workspace_id: &WorkspaceId,
         agent_id: &AgentId,
     ) {
+        let manual = self.provider_quota_cache.take_manual_choice(agent_id);
         self.return_home_if_due(workspace_id, agent_id).await;
-        self.avoid_exhausted_provider(workspace_id, agent_id).await;
+        if !manual {
+            self.avoid_exhausted_provider(workspace_id, agent_id).await;
+        }
     }
 
     /// When the conversation is away and its return-after passed, start this

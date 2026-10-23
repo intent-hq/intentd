@@ -2164,11 +2164,10 @@ async fn a_replayed_retry_after_a_restart_still_announces_the_return() {
 /// Another conversation's quota failure on `selection`, now; returns when
 /// the mark lapses.
 fn mark_exhausted_elsewhere(fx: &Fixture, selection: &str) -> chrono::DateTime<chrono::Utc> {
-    fx.mgr.services.provider_quota_cache.mark_exhausted(
-        selection,
-        "usage limit reached",
-        chrono::Utc::now(),
-    )
+    let cache = &fx.mgr.services.provider_quota_cache;
+    let now = chrono::Utc::now();
+    cache.mark_exhausted(selection, None, now);
+    cache.exhausted_until(selection, now).expect("just marked")
 }
 
 /// Another conversation's turn, started after any earlier mark, producing
@@ -2483,4 +2482,52 @@ async fn a_redrive_never_returns_home_on_the_cache() {
         "the redrive follows the rotation, not the cache"
     );
     assert!(notices(&fx.messages().await, "provider_returned").is_empty());
+}
+
+/// The first turn after the user picks a configuration by hand tries it,
+/// even when another conversation marked it out of quota.
+#[intent_test_macros::daemon_test]
+async fn a_manual_choice_is_tried_even_when_marked() {
+    let fx = Fixture::new(json!({ "response": "answered on the chosen one" })).await;
+    let first = fx.profile("First", true).await;
+    let _second = fx.profile("Second", true).await;
+    fx.mgr
+        .services
+        .agent_set_model_op(fx.agent.clone(), "opus".to_owned(), Some(first.clone()))
+        .await
+        .expect("setModel");
+    mark_exhausted_elsewhere(&fx, &first);
+
+    let events = fx.send("please answer").await;
+
+    assert!(of_type(&events, "agent:failed").is_empty(), "{events:#?}");
+    assert_eq!(fx.row().await.provider.as_deref(), Some(first.as_str()));
+    assert!(notices(&fx.messages().await, "provider_failover").is_empty());
+    assert!(
+        fx.mgr
+            .services
+            .provider_quota_cache
+            .is_known_working(&first),
+        "the chosen configuration answered, clearing its mark"
+    );
+}
+
+/// Leaving a marked home ahead of a turn is not a failed return: the
+/// backoff step and return-after time stay as they were.
+#[intent_test_macros::daemon_test]
+async fn skipping_a_marked_home_does_not_back_off() {
+    let fx = Fixture::new(json!({ "response": "answered on the backup" })).await;
+    let first = fx.profile("First", true).await;
+    let future = chrono::Utc::now() + chrono::Duration::hours(2);
+    let state = state_json("claude-code", &first, future, 2);
+    fx.away("claude-code", state.clone()).await;
+    mark_exhausted_elsewhere(&fx, "claude-code");
+
+    fx.send("hello again").await;
+
+    assert_eq!(fx.row().await.provider.as_deref(), Some(first.as_str()));
+    let after = fx.return_state().await.expect("away from home");
+    assert_eq!(after.backoff_step, 2, "not a failed return");
+    assert_eq!(after.return_after, state["returnAfter"].as_str().unwrap());
+    assert_eq!(after.away_on, first);
 }

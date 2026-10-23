@@ -258,10 +258,16 @@ impl Services {
     }
 
     /// Record a quota failure on `selection` in the shared cache, so every
-    /// other conversation skips it until it resets.
-    pub(crate) fn note_provider_exhausted(&self, selection: &str, error_text: &str) {
+    /// other conversation skips it until `reported` (the error's reset time,
+    /// when usable) or the default mark duration.
+    fn note_provider_exhausted(
+        &self,
+        selection: &str,
+        reported: Option<chrono::DateTime<chrono::Utc>>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) {
         self.provider_quota_cache
-            .mark_exhausted(selection, error_text, chrono::Utc::now());
+            .mark_exhausted(selection, reported, now);
     }
 
     /// Configurations the shared cache marks exhausted right now.
@@ -398,13 +404,16 @@ impl Services {
                 return false;
             }
         };
+        let now = chrono::Utc::now();
+        let reported = crate::provider_return::parse_reset_time(error_text, now);
         // Every other conversation learns of the spent quota now, whether or
-        // not this one can fail over.
-        if let Some(failed) = failed_provider
-            .or(session.provider.as_deref())
-            .filter(|p| !p.trim().is_empty())
-        {
-            self.note_provider_exhausted(failed, error_text);
+        // not this one can fail over. The failed attempt's own provider
+        // record is authoritative; without one, the session's provider is
+        // only used once the identity check below proves it is the one that
+        // failed (never a configuration the user switched to meanwhile).
+        let recorded = failed_provider.filter(|p| !p.trim().is_empty());
+        if let Some(failed) = recorded {
+            self.note_provider_exhausted(failed, reported, now);
         }
         if self
             .chain_for_failed_attempt(agent_id, &session, failed_provider)
@@ -412,6 +421,11 @@ impl Services {
         {
             tracing::info!(agent = %agent_id, "no armed attempt, or provider/model changed since the failed attempt; quota failover skipped");
             return false;
+        }
+        if recorded.is_none() {
+            if let Some(failed) = session.provider.as_deref().filter(|p| !p.trim().is_empty()) {
+                self.note_provider_exhausted(failed, reported, now);
+            }
         }
         let Some(from) = session.provider.clone() else {
             return false;
@@ -450,8 +464,6 @@ impl Services {
             }
             target
         };
-        let now = chrono::Utc::now();
-        let reported = crate::provider_return::parse_reset_time(error_text, now);
         let Some(target) = target else {
             // Nothing left to try. When this was home rejecting a return
             // before any output, it still counts as a failed return: the
@@ -490,10 +502,14 @@ impl Services {
     /// ([`Self::try_quota_failover`]) and of a switch ahead of a turn whose
     /// configuration the shared cache marks exhausted
     /// ([`Self::avoid_exhausted_provider`]). `reported` is the reset time
-    /// feeding the return timer. `cut_short` marks the message as a turn a
-    /// failover interrupted, so its redrive continues the partial work.
-    /// Returns whether the switch landed (a concurrent provider or model
-    /// change wins the compare-and-set).
+    /// feeding the return timer. `after_failed_attempt` is set for a
+    /// failover: the message is a turn the failure interrupted (its redrive
+    /// continues the partial work) and leaving home counts as a failed
+    /// return. A switch ahead of the turn has neither: the backup receives
+    /// the original message, and the return state follows
+    /// [`crate::provider_return::on_skip`]. Returns whether the switch
+    /// landed (a concurrent provider or model change wins the
+    /// compare-and-set).
     ///
     /// The switch persists the target as the agent's provider with the same
     /// model and the return state in one statement, emits `agent:updated`,
@@ -509,7 +525,7 @@ impl Services {
         return_state: Option<crate::provider_return::ProviderReturnState>,
         reported: Option<chrono::DateTime<chrono::Utc>>,
         profiles: &[ProfileMeta],
-        cut_short: bool,
+        after_failed_attempt: bool,
     ) -> bool {
         let Some(from) = session.provider.clone() else {
             return false;
@@ -517,8 +533,18 @@ impl Services {
         let from_selection = provider_profiles::canonical_selection(&from);
         let now = chrono::Utc::now();
         let model = session.model.clone().filter(|m| !m.is_empty());
-        let next_state =
-            crate::provider_return::on_switch(return_state, &from_selection, target, reported, now);
+        let next_state = match reported.filter(|_| !after_failed_attempt) {
+            Some(until) => {
+                crate::provider_return::on_skip(return_state, &from_selection, target, until, now)
+            }
+            None => crate::provider_return::on_switch(
+                return_state,
+                &from_selection,
+                target,
+                reported,
+                now,
+            ),
+        };
         let next_state_json = json!(next_state).to_string();
         // The move and its return bookkeeping land in one statement, so a
         // concurrent `agent.setModel` (which clears the state) either wins
@@ -553,10 +579,10 @@ impl Services {
             agent = %agent_id,
             from_provider = %from_selection,
             to_provider = %target,
-            cut_short,
+            after_failed_attempt,
             "provider quota exhausted; switching to backup profile"
         );
-        if cut_short {
+        if after_failed_attempt {
             self.quota_failover_replays
                 .lock()
                 .unwrap()

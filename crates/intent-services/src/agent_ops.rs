@@ -5835,9 +5835,11 @@ impl Services {
             tracing::warn!(agent = %agent_id, error = %e, "clear resolved display model failed");
         }
         // A manual choice is the new home provider: any pending return to
-        // the old one (PROTOCOL §5.54 backup failover) is dropped.
+        // the old one (PROTOCOL §5.54 backup failover) is dropped, and the
+        // next turn tries it even if the shared quota state marks it.
         self.clear_provider_return_state(&workspace_id, &agent_id)
             .await;
+        self.provider_quota_cache.note_manual_choice(&agent_id);
         self.publish_agent_mutation_event(
             &workspace_id,
             &agent_id,
