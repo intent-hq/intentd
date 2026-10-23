@@ -592,3 +592,111 @@ fn default_activation_keys_round_trip_and_never_match_profile_ids() {
     assert!(is_unrenamed_default_name(""));
     assert!(!is_unrenamed_default_name("Defaults"));
 }
+
+// ---------------------------------------------------------------------------
+// Auth demotion follows the settings a live process actually runs with.
+// ---------------------------------------------------------------------------
+
+async fn saved_overlay(fx: &Fixture, reference: &str) -> intent_acp::ProfileEnv {
+    fx.svc
+        .resolve_profile_env(reference)
+        .await
+        .unwrap()
+        .expect("saved overlay")
+}
+
+#[intent_test_macros::daemon_test]
+async fn an_earlier_settings_default_process_never_demotes_the_newly_saved_account() {
+    let fx = Fixture::new().await;
+    let ws = intent_core::WorkspaceId::from("ws-auth");
+    let old = intent_core::AgentId::from("a-old");
+    // Account A: the bare Default, no overrides yet.
+    let _lease = fx
+        .svc
+        .register_default_process(&ws, &old, "codex")
+        .await
+        .unwrap();
+    // The user saves account B while A's turn runs.
+    fx.update_default(json!({
+        "baseProviderId": "codex",
+        "env": [{ "key": "CODEX_HOME", "kind": "set", "value": "/accounts/b" }],
+    }))
+    .await
+    .unwrap();
+    let b = saved_overlay(&fx, "codex").await;
+    // A reports auth-required: nothing is demoted, B stays usable.
+    fx.svc.auth_owner(&old, "codex").await.demote();
+    assert_eq!(crate::provider_auth::cached_profile_auth_verdict(&b), None);
+    assert_ne!(
+        crate::provider_auth::cached_auth_verdict("codex"),
+        Some(false)
+    );
+    // A process on the saved settings still demotes them.
+    let fresh = intent_core::AgentId::from("a-new");
+    fx.svc.auth_owner(&fresh, "codex").await.demote();
+    assert_eq!(
+        crate::provider_auth::cached_profile_auth_verdict(&b),
+        Some(false)
+    );
+}
+
+#[intent_test_macros::daemon_test]
+async fn an_overlaid_process_never_demotes_the_bare_account_after_overrides_are_cleared() {
+    let fx = Fixture::new().await;
+    let ws = intent_core::WorkspaceId::from("ws-auth");
+    let old = intent_core::AgentId::from("a-old");
+    fx.update_default(json!({
+        "baseProviderId": "claude-code",
+        "env": [{ "key": "CLAUDE_CONFIG_DIR", "kind": "set", "value": "/accounts/a" }],
+    }))
+    .await
+    .unwrap();
+    let a = saved_overlay(&fx, "claude-code").await;
+    let _lease = fx
+        .svc
+        .register_profile_process(&ws, &old, &a)
+        .await
+        .unwrap();
+    crate::provider_auth::seed_auth_verdict_for_tests("claude-code", Some(true));
+    fx.update_default(json!({ "baseProviderId": "claude-code", "env": [] }))
+        .await
+        .unwrap();
+    fx.svc.auth_owner(&old, "claude-code").await.demote();
+    assert_eq!(
+        crate::provider_auth::cached_auth_verdict("claude-code"),
+        Some(true),
+        "the bare installation keeps its verdict"
+    );
+}
+
+#[intent_test_macros::daemon_test]
+async fn an_earlier_settings_profile_process_never_demotes_the_saved_profile() {
+    let fx = Fixture::new().await;
+    let ws = intent_core::WorkspaceId::from("ws-auth");
+    let old = intent_core::AgentId::from("a-old");
+    let created = fx
+        .create(
+            "codex",
+            "Work",
+            json!([{ "key": "CODEX_HOME", "kind": "set", "value": "/accounts/a" }]),
+        )
+        .await;
+    let id = created["profile"]["id"].as_str().unwrap().to_owned();
+    let reference = format!("codex@{id}");
+    let a = saved_overlay(&fx, &reference).await;
+    let _lease = fx
+        .svc
+        .register_profile_process(&ws, &old, &a)
+        .await
+        .unwrap();
+    fx.svc
+        .provider_profiles_update_impl(
+            id,
+            json!({ "env": [{ "key": "CODEX_HOME", "kind": "set", "value": "/accounts/b" }] }),
+        )
+        .await
+        .unwrap();
+    let b = saved_overlay(&fx, &reference).await;
+    fx.svc.auth_owner(&old, &reference).await.demote();
+    assert_eq!(crate::provider_auth::cached_profile_auth_verdict(&b), None);
+}
