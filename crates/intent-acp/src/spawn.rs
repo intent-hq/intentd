@@ -9,7 +9,10 @@
 //! (nice `daemon + 5` on Unix, one priority class below the daemon's on
 //! Windows; see [`agent_nice`]) so an agent process tree competing for CPU
 //! never starves the daemon that drives it — and never outranks it, however
-//! the daemon itself was niced.
+//! the daemon itself was niced. Disk IO is demoted the same way (see
+//! [`crate::io_priority`]). [`AgentPriority`] bundles both so every agent
+//! launch path — including the short-lived adapter runs spawned outside this
+//! module — applies the same policy.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -23,6 +26,9 @@ use tokio::io::AsyncRead;
 use tokio::process::{Child, Command};
 
 use crate::error::{AcpError, AcpResult};
+use crate::io_priority::{
+    agent_io_priority, apply_reduced_io_priority, io_priority_shortfall, AgentIoPriority,
+};
 use crate::profile_env::ProfileEnv;
 use crate::transport::{Connection, ConnectionHooks};
 
@@ -520,8 +526,70 @@ fn reduced_priority_shortfall(pid: u32, increment: i32) -> Option<String> {
     })
 }
 
+/// The CPU + IO priority demotion an agent child starts with: nice
+/// increment per [`agent_nice`] and IO priority per
+/// [`crate::io_priority::agent_io_priority`]. Use [`Self::from_env`] +
+/// [`Self::apply`] on any command that launches an agent process tree (ACP
+/// adapter, npx/node, provider CLI) so it can never starve the daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentPriority {
+    /// Nice increment over the daemon's own nice (`0` = unchanged).
+    pub nice_increment: i32,
+    /// Disk IO demotion.
+    pub io: AgentIoPriority,
+}
+
+impl AgentPriority {
+    /// The configured demotion ([`AGENT_NICE_ENV`],
+    /// [`crate::io_priority::AGENT_IO_PRIORITY_ENV`]).
+    #[must_use]
+    pub fn from_env() -> Self {
+        Self {
+            nice_increment: agent_nice(),
+            io: agent_io_priority(),
+        }
+    }
+
+    /// Configure `cmd` so its child starts at this reduced CPU and IO
+    /// priority (never above the daemon's). Never makes the spawn fail.
+    pub fn apply(self, cmd: &mut Command) {
+        apply_reduced_priority(cmd, self.nice_increment);
+        apply_reduced_io_priority(cmd, self.io);
+    }
+
+    /// Why the freshly spawned child `pid` is not running at this demotion,
+    /// if it is not (see [`reduced_priority_shortfall`] and
+    /// [`io_priority_shortfall`]); `None` when it is or cannot be checked.
+    #[must_use]
+    pub fn shortfall(self, pid: u32) -> Option<String> {
+        #[cfg(unix)]
+        let cpu = reduced_priority_shortfall(pid, self.nice_increment);
+        #[cfg(not(unix))]
+        let cpu: Option<String> = None;
+        let io = io_priority_shortfall(pid, self.io);
+        match (cpu, io) {
+            (None, None) => None,
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (Some(a), Some(b)) => Some(format!("{a}; {b}")),
+        }
+    }
+
+    /// Log a warning when the child `pid` (if known) missed this demotion.
+    pub fn warn_on_shortfall(self, pid: Option<u32>, command: &str) {
+        if let Some(shortfall) = pid.and_then(|pid| self.shortfall(pid)) {
+            tracing::warn!(
+                command = %command,
+                pid,
+                nice_increment = self.nice_increment,
+                io_priority = ?self.io,
+                "agent child not started at reduced priority: {shortfall}"
+            );
+        }
+    }
+}
+
 /// Build the `tokio` command (args + env + enriched `PATH` + piped stdio +
-/// `kill_on_drop` + reduced priority per [`agent_nice`]) without spawning
+/// `kill_on_drop` + reduced CPU/IO priority per [`AgentPriority`]) without spawning
 /// it. Exposed for testing/inspection.
 ///
 /// When `opts.provider_binary` is set (resolved to an absolute path), spawns
@@ -695,7 +763,11 @@ fn build_command_in(
     // only reaches the direct child, leaving grandchildren orphaned (§5.6).
     #[cfg(unix)]
     cmd.process_group(0);
-    apply_reduced_priority(&mut cmd, nice_increment);
+    AgentPriority {
+        nice_increment,
+        io: agent_io_priority(),
+    }
+    .apply(&mut cmd);
     cmd
 }
 
@@ -872,7 +944,6 @@ pub fn spawn_prepared_provider(
         command: mut cmd,
         npx_launch_dir,
     } = prepared;
-    #[cfg(unix)]
     let nice_increment = agent_nice();
     let (launch, target) = opts.launch_target();
     let command_name = target.to_string_lossy().into_owned();
@@ -892,18 +963,11 @@ pub fn spawn_prepared_provider(
             AcpError::Spawn(format!("{command_name}: {e}"))
         }
     })?;
-    #[cfg(unix)]
-    if let Some(shortfall) = child
-        .id()
-        .and_then(|pid| reduced_priority_shortfall(pid, nice_increment))
-    {
-        tracing::warn!(
-            command = %command_name,
-            pid = child.id(),
-            nice_increment,
-            "agent child not started at reduced priority: {shortfall}"
-        );
+    AgentPriority {
+        nice_increment,
+        io: agent_io_priority(),
     }
+    .warn_on_shortfall(child.id(), &command_name);
     let stdin = child
         .stdin
         .take()
@@ -2333,6 +2397,43 @@ mod reduced_priority_tests {
                     target_nice(own, 19)
                 )),
                 "{shortfall}"
+            );
+        }
+        drop(child);
+    }
+
+    /// The production builder applies the configured IO demotion too: the
+    /// child it spawns reports no IO shortfall against the env-derived
+    /// [`AgentPriority`].
+    #[tokio::test]
+    async fn build_command_applies_the_configured_io_priority() {
+        let provider = sh_provider("exec sleep 30");
+        let opts = SpawnOptions::new(&provider);
+        let mut cmd = build_command_with_captured_env(&opts, &BTreeMap::new(), DEFAULT_AGENT_NICE);
+        let child = cmd.spawn().expect("spawn sleeper");
+        let pid = child.id().expect("child pid");
+        let priority = AgentPriority {
+            nice_increment: DEFAULT_AGENT_NICE,
+            io: crate::io_priority::agent_io_priority(),
+        };
+        assert_eq!(priority.shortfall(pid), None);
+        #[cfg(target_os = "linux")]
+        if priority.io == crate::io_priority::AgentIoPriority::Low {
+            use crate::io_priority::linux;
+            let own = linux::get(0).expect("own ioprio");
+            let got = linux::get(i32::try_from(pid).unwrap()).expect("child ioprio");
+            assert!(
+                linux::rank(got) >= linux::rank(own),
+                "child never outranks the daemon"
+            );
+            assert!(
+                linux::rank(got)
+                    >= linux::rank(linux::value(
+                        linux::IOPRIO_CLASS_BE,
+                        linux::IOPRIO_LEVEL_LOWEST
+                    )),
+                "child at {}",
+                linux::describe(got)
             );
         }
         drop(child);

@@ -2501,15 +2501,18 @@ const AUGGIE_MODELS_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// `.mjs` shim's `#!/usr/bin/env node` resolves in a packaged-app
 /// environment.
 async fn auggie_output(auggie: &std::path::Path, args: &[&str]) -> Option<std::process::Output> {
-    tokio::time::timeout(
-        AUGGIE_MODELS_TIMEOUT,
-        tokio::process::Command::new(auggie)
+    tokio::time::timeout(AUGGIE_MODELS_TIMEOUT, {
+        let mut command = tokio::process::Command::new(auggie);
+        command
             .args(args)
             .env("PATH", intent_context::discovery::exec_path(auggie))
             .stdin(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .output(),
-    )
+            .kill_on_drop(true);
+        // The Auggie CLI is an agent process like any other: keep it from
+        // starving the daemon while it lists models.
+        intent_acp::AgentPriority::from_env().apply(&mut command);
+        command.output()
+    })
     .await
     .ok()?
     .ok()
