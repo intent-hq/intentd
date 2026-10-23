@@ -670,8 +670,8 @@ async fn explicit_discussion_address_drives_history_and_reply_without_automatic_
     );
     assert_eq!(prompt_log(&log).len(), 1);
 
-    // Private targeting must fail even when the human is a participant.
-    let private = wss_rpc(
+    // New private creation is rejected before any agent can be addressed.
+    let refused_create = wss_response(
         &mut rpc,
         7,
         "discussion.send",
@@ -681,9 +681,30 @@ async fn explicit_discussion_address_drives_history_and_reply_without_automatic_
         }),
     )
     .await;
-    let private_id = private["conversation"]["id"]
-        .as_str()
-        .expect("private conversation id");
+    assert!(refused_create.get("result").is_none(), "{refused_create}");
+    assert_eq!(refused_create["error"]["code"], -32602, "{refused_create}");
+
+    // Seed pre-existing history through persistence, since the live API cannot
+    // create private discussions. Agent targeting still fails for a participant.
+    let store = intent_store::Store::open(&daemon.data_dir.path().join("intentd.db"))
+        .await
+        .expect("open legacy fixture store");
+    let (private, _) = store
+        .send_discussion_message(
+            &intent_core::WorkspaceId(workspace.clone()),
+            "legacy-private",
+            "Private seed",
+            &serde_json::from_value(ordinary["message"]["author"].clone())
+                .expect("authenticated human author"),
+            &intent_core::discussion::DiscussionTarget {
+                recipient_principal_ids: Some(vec![intent_core::PrincipalId(member.clone())]),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("seed legacy private history");
+    store.close().await;
+    let private_id = &private.conversation.id;
     let refused = wss_response(
         &mut rpc,
         8,

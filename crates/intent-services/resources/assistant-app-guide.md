@@ -69,8 +69,10 @@ read receipts. These additions remain part of unreleased Multiplayer Labs.
 In the People panel's Activity list, nearby consecutive actions by the same person
 share an avatar. Each action remains individually selectable. **Load more** looks
 for older activity from people, even when automated events fill the recent feed.
+In agent chat, other people's typing appears as a compact status above the prompt
+without moving the messages or monitor cards.
 
-<!-- Source: packages/cloudlands-fe/src/features/presence/components/WorkspacePeopleActivity.svelte. -->
+<!-- Sources: packages/cloudlands-fe/src/features/presence/components/{WorkspacePeopleActivity,PresenceTypingIndicator}.svelte; packages/cloudlands-fe/src/lib/components/chat/ChatPanel.svelte. -->
 
 <!-- Sources: packages/intentd/crates/intent-core/src/discussion.rs; packages/intentd/crates/intent-services/src/discussion_ops.rs; packages/intentd/crates/intent-store/src/discussion_management_repo.rs; packages/intentd/crates/intent-acp/src/mcp_server/bindings/discussion.rs; packages/cloudlands-fe/src/features/discussions/components/{DiscussionThread,DiscussionMessageView,DiscussionMentionPicker,DiscussionUnreadBadge}.svelte; packages/cloudlands-fe/src/features/discussions/discussion-reference-navigation.ts; packages/cloudlands-fe/src/features/layout/tab-types/DiscussionTabType.svelte; packages/cloudlands-fe/src/store/renderer/slices/notifications/sagas/notifications-saga.ts; packages/cloudlands-fe/src/store/renderer/slices/workspace-discussion/workspace-discussion-selectors.ts. -->
 
