@@ -13,7 +13,7 @@ use intent_core::{
 };
 use serde_json::{json, Value};
 
-use crate::mcp_server::bindings::{map_err, opt_bool, opt_str, opt_vec_str};
+use crate::mcp_server::bindings::{map_err, opt_bool, opt_str, opt_strict_bool, opt_vec_str};
 
 pub(crate) const PRELUDE: &str = r"
     globalThis.ws = globalThis.ws || {};
@@ -89,9 +89,11 @@ async fn list(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, String
     // Retired workspaces are opt-in only (PROTOCOL §5.1): listed only with
     // an explicit `filter.includeRetired: true`, never via a status filter
     // alone.
-    let include_retired = filter_obj
-        .and_then(|f| opt_bool(f, "includeRetired"))
-        .unwrap_or(false);
+    let include_retired = match filter_obj {
+        Some(f) => opt_strict_bool(f, "includeRetired")?,
+        None => None,
+    }
+    .unwrap_or(false);
 
     // Fetch all workspaces (include archived so we can apply status filter)
     let workspaces = api
@@ -1427,6 +1429,47 @@ mod tests {
         let mut got = ids(opted_in);
         got.sort();
         assert_eq!(got, vec!["ws-live", "ws-retired"]);
+    }
+
+    /// `filter.includeRetired` is strictly boolean: explicit `false` behaves
+    /// like omission, and a non-boolean value is an invalid-params error
+    /// instead of silently meaning `false`.
+    #[tokio::test]
+    async fn list_rejects_a_non_boolean_include_retired() {
+        let fake = Arc::new(FakeApi::default());
+        let mut retired = make_workspace("ws-retired", "Retired");
+        retired.status = WorkspaceStatus::Retired;
+        retired.archived = true;
+        fake.workspaces
+            .lock()
+            .unwrap()
+            .extend([make_workspace("ws-live", "Live"), retired]);
+        let api: Arc<dyn WorkspaceApi> = fake;
+        let chief = WorkspaceId::chief();
+        let list = |filter: Value| {
+            let api = api.clone();
+            let chief = chief.clone();
+            async move { dispatch(&api, &chief, None, "list", &json!({ "filter": filter })).await }
+        };
+        let count = |v: Value| v.as_array().unwrap().len();
+
+        assert_eq!(
+            count(list(json!({ "includeRetired": false })).await.unwrap()),
+            1
+        );
+        assert_eq!(
+            count(list(json!({ "includeRetired": true })).await.unwrap()),
+            2
+        );
+        for bad in [json!("true"), Value::Null, json!(1), json!({})] {
+            let err = list(json!({ "includeRetired": bad.clone() }))
+                .await
+                .expect_err("non-boolean includeRetired must be rejected");
+            assert!(
+                err.contains("invalid params") && err.contains("includeRetired"),
+                "{bad}: {err}"
+            );
+        }
     }
 
     #[tokio::test]

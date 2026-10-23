@@ -437,6 +437,17 @@ pub(crate) fn opt_bool(args: &Value, key: &str) -> Option<bool> {
     args.get(key).and_then(Value::as_bool)
 }
 
+/// A strictly-typed optional boolean: absent is `Ok(None)`; any present
+/// value that is not a JSON boolean (`"true"`, `null`, a number, an object)
+/// is an invalid-params error rather than a silent `false`.
+pub(crate) fn opt_strict_bool(args: &Value, key: &str) -> Result<Option<bool>, String> {
+    match args.get(key) {
+        None => Ok(None),
+        Some(Value::Bool(b)) => Ok(Some(*b)),
+        Some(_) => Err(format!("invalid params: `{key}` must be a boolean")),
+    }
+}
+
 /// Pull an optional i64 field, tolerating JS numbers that arrived as strings.
 pub(crate) fn opt_i64(args: &Value, key: &str) -> Option<i64> {
     if let Some(v) = args.get(key).and_then(Value::as_i64) {

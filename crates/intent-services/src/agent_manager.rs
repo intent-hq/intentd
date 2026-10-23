@@ -2793,6 +2793,9 @@ enum TryBeginOutcome {
     Started(TurnAdmission),
     Busy,
     ReapClaimed,
+    /// The claim won, but the workspace is Retired and its revive failed:
+    /// the slot was released again and no turn started.
+    ReviveFailed,
 }
 
 /// Identity of a claimed slot. Teardown invalidates it, so an admitted send
@@ -7283,9 +7286,18 @@ impl AgentManager {
             Ok::<(), std::convert::Infallible>(())
         }) {
             Ok(((), admission)) => {
-                self.begin_turn_side_effects(agent_id, workspace_id, auto_unarchive, fence)
-                    .await;
-                TryBeginOutcome::Started(admission)
+                if self
+                    .begin_turn_side_effects(agent_id, workspace_id, auto_unarchive, fence)
+                    .await
+                {
+                    TryBeginOutcome::Started(admission)
+                } else {
+                    // Retired workspace whose revive failed: give the slot
+                    // back; the caller treats it as "not started" and keeps
+                    // the message queued.
+                    self.release_slot_sync(agent_id);
+                    TryBeginOutcome::ReviveFailed
+                }
             }
             Err(SlotClaimLoss::Busy) => TryBeginOutcome::Busy,
             Err(SlotClaimLoss::ReapClaimed) => TryBeginOutcome::ReapClaimed,
@@ -7323,9 +7335,20 @@ impl AgentManager {
         });
         match claimed {
             Ok(popped) => {
-                self.begin_turn_side_effects(agent_id, workspace_id, true, fence)
-                    .await;
-                Some(popped)
+                if self
+                    .begin_turn_side_effects(agent_id, workspace_id, true, fence)
+                    .await
+                {
+                    Some(popped)
+                } else {
+                    // Retired workspace whose revive failed: release the
+                    // slot and put the popped entry back at the queue head.
+                    let ((message, draining), _) = popped;
+                    self.release_slot_sync(agent_id);
+                    self.services.requeue_front(agent_id, message);
+                    drop(draining);
+                    None
+                }
             }
             Err(SlotClaimLoss::Busy | SlotClaimLoss::ReapClaimed) => {
                 // The slot holder's exit re-check probes the marker after
@@ -7467,7 +7490,7 @@ impl AgentManager {
         workspace_id: &WorkspaceId,
         auto_unarchive: bool,
         archive_fence: Option<crate::ArchiveFenceGuard>,
-    ) {
+    ) -> bool {
         #[cfg(test)]
         {
             let pause = self.turn_start_pause.lock().unwrap().take();
@@ -7488,9 +7511,17 @@ impl AgentManager {
             // the worker's raced re-claim, whose own post-claim archived
             // re-check parks instead of un-archiving (monorepo#2513).
             let outcome = if auto_unarchive {
-                self.services
+                match self
+                    .services
                     .auto_unarchive_on_turn_start_fenced(workspace_id, agent_id, archive_fence)
                     .await
+                {
+                    Ok(outcome) => outcome,
+                    // A RETIRED workspace whose revive failed has no
+                    // checkout: the turn must not start. No side effect
+                    // has run yet; the caller releases the claim.
+                    Err(_) => return false,
+                }
             } else {
                 drop(archive_fence);
                 None
@@ -7580,6 +7611,7 @@ impl AgentManager {
             )
             .await;
         }
+        true
     }
 
     /// Release the in-flight slot without persisting agent status (used when
@@ -10034,7 +10066,9 @@ impl AgentManager {
     ) -> Option<TurnAdmission> {
         match self.try_begin_outcome(agent_id, workspace_id, true).await {
             TryBeginOutcome::Started(admission) => Some(admission),
-            TryBeginOutcome::Busy | TryBeginOutcome::ReapClaimed => None,
+            TryBeginOutcome::Busy
+            | TryBeginOutcome::ReapClaimed
+            | TryBeginOutcome::ReviveFailed => None,
         }
     }
 
@@ -10227,7 +10261,9 @@ impl AgentManager {
             // notification instead — it is the tail of the dying child's
             // output and would have died with the handle's buffer had the
             // kill won the race to it.
-            TryBeginOutcome::ReapClaimed => return true,
+            // No checkout to run the wake in: drop the notification like a
+            // reap loss.
+            TryBeginOutcome::ReapClaimed | TryBeginOutcome::ReviveFailed => return true,
         };
         // Drive the turn in its own task registered in `workers`, so
         // `interrupt` / `interrupt_send_message` / `stop` abort an open wake

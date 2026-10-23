@@ -36874,7 +36874,12 @@ impl Services {
         workspace_id: &'a WorkspaceId,
         agent_id: &'a AgentId,
     ) -> BoxFuture<'a, Option<UnarchiveOutcome>> {
-        self.auto_unarchive_on_turn_start_fenced(workspace_id, agent_id, None)
+        Box::pin(async move {
+            self.auto_unarchive_on_turn_start_fenced(workspace_id, agent_id, None)
+                .await
+                .ok()
+                .flatten()
+        })
     }
 
     /// The archive fence a turn start takes BEFORE claiming its slot when
@@ -36905,19 +36910,25 @@ impl Services {
 
     /// `Services::auto_unarchive_on_turn_start` under an archive fence the
     /// caller may already hold ([`Services::turn_start_archive_fence`]).
+    ///
+    /// `Err` only when the workspace is RETIRED and its revive failed: a
+    /// turn must not start in a workspace without a checkout, so the caller
+    /// releases its claim and leaves the message queued. A failed unarchive
+    /// of a merely Archived workspace stays best-effort (`Ok(None)`; the
+    /// turn proceeds in the archived workspace as before).
     pub(crate) fn auto_unarchive_on_turn_start_fenced<'a>(
         &'a self,
         workspace_id: &'a WorkspaceId,
         agent_id: &'a AgentId,
         held_fence: Option<ArchiveFenceGuard>,
-    ) -> BoxFuture<'a, Option<UnarchiveOutcome>> {
+    ) -> BoxFuture<'a, Result<Option<UnarchiveOutcome>>> {
         Box::pin(async move {
             if workspace_id.is_chief() {
-                return None;
+                return Ok(None);
             }
-            match self.store.get_workspace(workspace_id).await {
-                Ok(ws) if ws.archived => {}
-                Ok(_) => return None,
+            let retired = match self.store.get_workspace(workspace_id).await {
+                Ok(ws) if ws.archived => ws.is_retired(),
+                Ok(_) => return Ok(None),
                 Err(e) => {
                     tracing::warn!(
                         workspace = %workspace_id.as_str(),
@@ -36925,9 +36936,9 @@ impl Services {
                         error = %e,
                         "auto-unarchive: workspace read failed; turn proceeds in archived workspace"
                     );
-                    return None;
+                    return Ok(None);
                 }
-            }
+            };
             // Name lookup is display-only: a lookup failure (or a session
             // with no row yet) degrades to `null`, never blocks the
             // unarchive.
@@ -36955,7 +36966,16 @@ impl Services {
                             "auto-unarchived workspace on agent turn start"
                         );
                     }
-                    outcome
+                    Ok(outcome)
+                }
+                Err(e) if retired => {
+                    tracing::warn!(
+                        workspace = %workspace_id.as_str(),
+                        agent = %agent_id,
+                        error = %e,
+                        "revive failed; turn not started in retired workspace"
+                    );
+                    Err(e)
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -36964,7 +36984,7 @@ impl Services {
                         error = %e,
                         "auto-unarchive failed; turn proceeds in archived workspace"
                     );
-                    None
+                    Ok(None)
                 }
             }
         })

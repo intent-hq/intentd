@@ -45,10 +45,7 @@ async fn list_siblings(
     ws: &WorkspaceId,
     args: &Value,
 ) -> Result<Value, String> {
-    let include_retired = args
-        .get("includeRetired")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let include_retired = super::opt_strict_bool(args, "includeRetired")?.unwrap_or(false);
     api.cross_workspace_list_siblings(ws.clone(), include_retired)
         .await
         .map_err(map_err)

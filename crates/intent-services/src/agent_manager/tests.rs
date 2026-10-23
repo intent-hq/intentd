@@ -3638,6 +3638,63 @@ fn init_revive_repo(dir: &std::path::Path) {
     repo.branch("feat-old", &commit, false).unwrap();
 }
 
+/// A turn start in a RETIRED workspace whose revive fails (the source
+/// repository is gone) does not start the turn: the claim is released, the
+/// session never goes `Active`, no checkout appears, and the row stays
+/// Retired. (A merely Archived workspace's unarchive stays best-effort.)
+#[tokio::test]
+async fn failed_revive_of_a_retired_workspace_does_not_start_the_turn() {
+    let root = test_tempdir("intentd-revive-fail-root-");
+    let (_tmp, mgr, _bus) = manager_with_bus_in(Some(root.path())).await;
+    let ws = WorkspaceId::from("ws-revive-fail");
+    let id = AgentId::from("a-revive-fail");
+    seed_agent(&mgr, &ws, &id).await;
+    let missing_repo = root.path().join("no-such-repo");
+    let wt = root.path().join(ws.as_str()).join("repo");
+    let mut row = mgr.services.store.get_workspace(&ws).await.unwrap();
+    row.repository_path = Some(missing_repo.to_string_lossy().into_owned());
+    row.worktree_path = Some(wt.to_string_lossy().into_owned());
+    row.checkout_mode = Some(intent_core::CheckoutMode::Worktree);
+    mgr.services
+        .store
+        .update_workspace_with_branch(&row, Some("feat-old"))
+        .await
+        .unwrap();
+    mgr.services
+        .store
+        .archive_workspace_detaching_guests(&ws, &now_iso())
+        .await
+        .expect("archive row");
+    assert!(mgr
+        .services
+        .store
+        .retire_workspace_if_archived(&ws, &now_iso())
+        .await
+        .expect("retire row"));
+    let status_before = mgr
+        .services
+        .store
+        .get_agent_session(&id)
+        .await
+        .unwrap()
+        .status;
+
+    assert!(
+        !mgr.try_begin(&id, &ws).await,
+        "no turn starts when the revive fails"
+    );
+    assert!(
+        !mgr.busy.lock().unwrap().contains(&id),
+        "the claimed slot was released"
+    );
+    let after = mgr.services.store.get_workspace(&ws).await.unwrap();
+    assert!(after.is_retired(), "row stays Retired: {:?}", after.status);
+    assert!(!wt.exists(), "nothing provisioned");
+    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(session.status, status_before, "session never went Active");
+    assert_ne!(session.status, AgentStatus::Active);
+}
+
 /// A winning `try_begin` in a RETIRED workspace revives it: a fresh blank
 /// checkout is provisioned at the same path on a new branch, the row flips
 /// to Active, ONE `workspace_revived` system row lands in the transcript,

@@ -1270,6 +1270,130 @@ async fn revive_refuses_an_unregistered_folder_and_keeps_it() {
     assert!(f.store.get_workspace(&id).await.unwrap().is_retired());
 }
 
+/// A linked worktree registered in the fixture repo at `<outside>/<id>/repo`,
+/// with a marker file — a real checkout the daemon does not own.
+fn outside_linked_worktree(
+    f: &Fixture,
+    outside: &std::path::Path,
+    id: &WorkspaceId,
+) -> std::path::PathBuf {
+    let parent = outside.join(id.as_str());
+    std::fs::create_dir_all(&parent).unwrap();
+    let wt = parent.join("repo");
+    git2::Repository::open(&f.repo)
+        .unwrap()
+        .worktree(&format!("outside-{}", id.as_str()), &wt, None)
+        .expect("add linked worktree");
+    std::fs::write(wt.join("keep.txt"), "user data").unwrap();
+    wt
+}
+
+/// An Active row whose persisted `worktreePath` is `path`.
+async fn insert_active_row(f: &Fixture, id: &WorkspaceId, path: &std::path::Path) {
+    let mut ws = super::workspace(id);
+    ws.repository_path = Some(f.repo.to_string_lossy().to_string());
+    ws.worktree_path = Some(path.to_string_lossy().to_string());
+    ws.checkout_mode = Some(intent_core::CheckoutMode::Worktree);
+    f.store.insert_workspace(&ws).await.expect("insert");
+}
+
+/// Both retire and revive refuse `path`, and the outside checkout keeps its
+/// files and its git worktree registration.
+async fn assert_escape_refused(
+    f: &Fixture,
+    id: &WorkspaceId,
+    path: &std::path::Path,
+    real: &std::path::Path,
+) {
+    insert_active_row(f, id, path).await;
+    let err = f.svc.retire_workspace(id.clone(), None).await.unwrap_err();
+    assert!(matches!(err, Error::RetireUnsupported { .. }), "{err:?}");
+    assert!(!f.store.get_workspace(id).await.unwrap().is_retired());
+    f.store.delete_workspace(id).await.expect("drop active row");
+
+    insert_retired_row(f, id, path).await;
+    assert!(f.svc.unarchive_workspace(id.clone()).await.is_err());
+    assert!(f.store.get_workspace(id).await.unwrap().is_retired());
+
+    // Give a (wrongly) spawned sweep time to run before checking.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        real.join("keep.txt").is_file(),
+        "outside checkout untouched"
+    );
+    assert!(
+        intent_git::worktree::is_registered_worktree(&f.repo, real),
+        "outside worktree still registered"
+    );
+}
+
+/// `<root>/../<outside>/<id>/repo` passes a lexical `starts_with(root)` but
+/// resolves outside the managed root: retire and revive both refuse it.
+#[intent_test_macros::daemon_test]
+async fn retire_and_revive_refuse_a_dotdot_escape() {
+    let f = fixture().await;
+    let outside = test_tempdir("intentd-retire-outside-");
+    let id = WorkspaceId::from("ws-dotdot");
+    let real = outside_linked_worktree(&f, outside.path(), &id);
+    let sibling = outside.path().file_name().unwrap();
+    assert_eq!(
+        outside.path().parent(),
+        f.root.parent(),
+        "sibling temp dirs"
+    );
+    let escaping = f
+        .root
+        .join("..")
+        .join(sibling)
+        .join(id.as_str())
+        .join("repo");
+    assert!(escaping.starts_with(&f.root), "lexically inside the root");
+    assert_escape_refused(&f, &id, &escaping, &real).await;
+}
+
+/// `<root>/<id>` is a symlink to an outside folder holding a registered
+/// checkout: the path is lexically owned, canonically outside — refused.
+#[intent_test_macros::daemon_test]
+async fn retire_and_revive_refuse_a_symlinked_ancestor_escape() {
+    let f = fixture().await;
+    let outside = test_tempdir("intentd-retire-outside-");
+    let id = WorkspaceId::from("ws-symlinked");
+    let real = outside_linked_worktree(&f, outside.path(), &id);
+    std::os::unix::fs::symlink(outside.path().join(id.as_str()), f.root.join(id.as_str())).unwrap();
+    let via_link = f.root.join(id.as_str()).join("repo");
+    assert!(
+        via_link.join("keep.txt").is_file(),
+        "link resolves to the checkout"
+    );
+    assert_escape_refused(&f, &id, &via_link, &real).await;
+}
+
+/// A missing checkout whose `<id>` parent resolves outside the root (via a
+/// symlinked directory under the root) is refused: no sweep removes the
+/// outside parent folder.
+#[intent_test_macros::daemon_test]
+async fn retire_refuses_a_missing_checkout_whose_parent_is_outside() {
+    let f = fixture().await;
+    let outside = test_tempdir("intentd-retire-outside-");
+    let id = WorkspaceId::from("ws-missing-outside");
+    let outside_parent = outside.path().join(id.as_str());
+    std::fs::create_dir_all(&outside_parent).unwrap();
+    std::fs::write(outside_parent.join("keep.txt"), "user data").unwrap();
+    std::os::unix::fs::symlink(outside.path(), f.root.join("link")).unwrap();
+    let missing = f.root.join("link").join(id.as_str()).join("repo");
+    assert!(!missing.exists());
+    insert_active_row(&f, &id, &missing).await;
+
+    let err = f.svc.retire_workspace(id.clone(), None).await.unwrap_err();
+    assert!(matches!(err, Error::RetireUnsupported { .. }), "{err:?}");
+    assert!(!f.store.get_workspace(&id).await.unwrap().is_retired());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        outside_parent.join("keep.txt").is_file(),
+        "outside parent kept"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Terminal admission: terminalId-only mutations and creation racing retire.
 // ---------------------------------------------------------------------------

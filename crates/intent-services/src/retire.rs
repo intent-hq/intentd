@@ -376,7 +376,10 @@ impl Services {
     /// root-anchored rule): the checkout's parent directory is named after
     /// the workspace id AND sits under a root the daemon provisions into
     /// (the boot workspaces root or the configured
-    /// `workspace.worktreesLocation`). A persisted path that fails it is a
+    /// `workspace.worktreesLocation`), checked on the canonical path
+    /// ([`resolve_within_root`]: no `..`, no symlinked ancestor escaping the
+    /// root, a missing checkout judged by its nearest existing ancestor). A
+    /// persisted path that fails it is a
     /// folder the daemon cannot prove it created, so retire is refused with
     /// `retire-unsupported` and nothing changes. A present folder must also
     /// be a linked worktree registered in the source repository.
@@ -388,10 +391,22 @@ impl Services {
         let worktrees_location = self.configured_worktrees_location();
         let owned = ws.worktree_path.as_deref().is_some_and(|wt| {
             crate::checkout_parent_is_workspace_dir(wt, &ws.id)
-                && (std::path::Path::new(wt).starts_with(&workspaces_root)
-                    || worktrees_location
-                        .as_deref()
-                        .is_some_and(|loc| std::path::Path::new(wt).starts_with(loc)))
+                && std::iter::once(workspaces_root.as_path())
+                    .chain(worktrees_location.as_deref())
+                    .any(|root| {
+                        // Canonical, not lexical: the resolved checkout's
+                        // `<id>` parent must sit strictly inside the root.
+                        resolve_within_root(std::path::Path::new(wt), root).is_some_and(
+                            |resolved| {
+                                crate::checkout_parent_is_workspace_dir(
+                                    &resolved.to_string_lossy(),
+                                    &ws.id,
+                                ) && resolved.parent().is_some_and(|parent| {
+                                    resolve_within_root(parent, root).is_some()
+                                })
+                            },
+                        )
+                    })
         });
         // …and the folder must be a linked worktree registered in its source
         // repository (a folder that is already gone has nothing to delete).
@@ -471,12 +486,21 @@ impl Services {
                 })
                 .await;
         }
-        let dirs = workspace_dir_candidates(
+        // Sweep only candidates that canonically resolve inside a managed
+        // root: a `<root>/<id>` that is a symlink to elsewhere is skipped.
+        let dirs: Vec<PathBuf> = workspace_dir_candidates(
             &ws.id,
             worktree_path.as_deref(),
             &workspaces_root,
             worktrees_location.as_deref(),
-        );
+        )
+        .into_iter()
+        .filter(|dir| {
+            std::iter::once(workspaces_root.as_path())
+                .chain(worktrees_location.as_deref())
+                .any(|root| resolve_within_root(dir, root).is_some())
+        })
+        .collect();
         let id = ws.id.clone();
         let removal = async move {
             let _fence = fence;
@@ -511,6 +535,42 @@ impl Services {
             );
         }
     }
+}
+
+/// Canonical containment of `path` in the managed `root`: `Some(resolved)`
+/// when `path` is absolute, has no `..` component, and — after resolving
+/// symlinks in its nearest existing ancestor (a missing checkout is judged
+/// by the folder that would hold it) — lies strictly inside the canonical
+/// `root`. A dangling symlink on the path, an unreadable root, or any escape
+/// yields `None`. Lexical `starts_with` is not enough: `<root>/../x` and a
+/// symlinked `<root>/<id>` both pass it while pointing outside the root.
+pub(crate) fn resolve_within_root(
+    path: &std::path::Path,
+    root: &std::path::Path,
+) -> Option<PathBuf> {
+    use std::path::Component;
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+    {
+        return None;
+    }
+    let root = std::fs::canonicalize(root).ok()?;
+    let mut existing = path;
+    let mut missing = Vec::new();
+    // `symlink_metadata`: a dangling symlink counts as present, so its
+    // canonicalization below fails closed instead of being treated as a
+    // plain missing component.
+    while existing.symlink_metadata().is_err() {
+        missing.push(existing.file_name()?);
+        existing = existing.parent()?;
+    }
+    let mut resolved = std::fs::canonicalize(existing).ok()?;
+    for name in missing.into_iter().rev() {
+        resolved.push(name);
+    }
+    (resolved != root && resolved.starts_with(&root)).then_some(resolved)
 }
 
 /// Retire is only for daemon-owned git worktrees: `cow` / `direct`
