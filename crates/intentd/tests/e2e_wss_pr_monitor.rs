@@ -376,6 +376,7 @@ impl SourceControl for StubForge {
                 .collect(),
             checks_head_sha: None,
             checks_known: true,
+            head_committed_at: None,
             branch_rules: Some(BranchRules {
                 required_approving_review_count: Some(1),
                 required_conversation_resolution: Some(true),

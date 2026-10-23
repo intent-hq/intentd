@@ -1084,6 +1084,29 @@ impl Harness for V1 {
             });
         }
 
+        // CI never started on the head (intentd#2531): reported once per
+        // head, keyed on the flagged SHA. Its clearing is silent — arriving
+        // checks, a new head or conflicts report themselves.
+        if let Some(stall) = &n.checks_not_started {
+            let flagged_before = o
+                .checks_not_started
+                .as_ref()
+                .is_some_and(|s| s.head_sha == stall.head_sha)
+                || [old, new].iter().any(|s| {
+                    s.checks_not_started_delivered.as_deref() == Some(stall.head_sha.as_str())
+                });
+            if !flagged_before {
+                let short: String = stall.head_sha.chars().take(8).collect();
+                changes.push(format!(
+                    "no checks reported for head {short} after {}+ min — CI may never have \
+                     started; push again (e.g. an empty commit) or rebase to trigger it \
+                     (expected only if the required checks are path-filtered or run only in \
+                     the merge queue)",
+                    stall.threshold_minutes
+                ));
+            }
+        }
+
         // Mergeability + residual signals. `unknown` is a transient GitHub
         // state ("still recomputing", e.g. while a merge-queue group is
         // processed), never an actionable signal — and the recomputation
