@@ -29,7 +29,7 @@ async fn refused_stage_response(after_commit: bool, expire_queue: bool) {
         op.progress.lock().unwrap().started = true;
         let create = create_lock(&connection, &op).unwrap();
         let held = create.clone().lock_owned().await;
-        let deadline = Instant::now() + frame_ttl();
+        let deadline = Instant::now() + QUEUE_DEADLINE;
         let work = async {
             let _capacity = capacity;
             let _finish = Completion(op.clone());
@@ -46,7 +46,7 @@ async fn refused_stage_response(after_commit: bool, expire_queue: bool) {
             usize::from(after_commit)
         );
         let metadata_holder = if expire_queue {
-            tokio::time::advance(frame_ttl()).await;
+            tokio::time::advance(QUEUE_DEADLINE).await;
             None
         } else {
             // The real worker has passed preflight and is waiting for its
@@ -139,6 +139,14 @@ async fn native_review_refused_later_stage_retains_actual_commit_in_original_his
 
 // Keep paused time from auto-advancing while the real SQLite/provider workers
 // run. Tests advance only the deadline under examination, without wall sleeps.
+// Queue-isolation tests hand `run` their own queue deadline and cross it on a
+// paused clock; no production frame timer is involved, so they keep the
+// production 15s rather than the stretched `frame_ttl()`, which would only move
+// the advance closer to the fixed `STAGE_TTL` (120s) and `LEASE_TTL` (300s)
+// they must stay under. `native_review_frame_wait_stretches_with_the_test_timeout_multiplier`
+// covers the stretched frame wait itself.
+const QUEUE_DEADLINE: Duration = super::super::FRAME_TTL_BASE;
+
 async fn with_review_clock<T>(work: impl Future<Output = T>) -> T {
     tokio::time::pause();
     let result = tokio::select! {
@@ -173,7 +181,7 @@ async fn native_review_queue_deadline_does_not_retire_admitted_commit_or_next_st
             .begin_with("BEGIN IMMEDIATE")
             .await
             .unwrap();
-        let deadline = Instant::now() + frame_ttl();
+        let deadline = Instant::now() + QUEUE_DEADLINE;
         let work = async {
             let _capacity = capacity;
             let _finish = Completion(op.clone());
@@ -185,7 +193,7 @@ async fn native_review_queue_deadline_does_not_retire_admitted_commit_or_next_st
             () = wait_until(|| !op.progress.lock().unwrap().effects.is_empty()
                 && f.services.store.write_pool().num_idle() == 0) => {},
         }
-        tokio::time::advance(frame_ttl() + Duration::from_secs(1)).await;
+        tokio::time::advance(QUEUE_DEADLINE + Duration::from_secs(1)).await;
         // Poll the actual sole owner after the deadline while its real worker
         // is still held. This makes the old queue timeout branch deterministic.
         std::future::poll_fn(|cx| {
@@ -255,7 +263,7 @@ async fn native_review_queue_expiry_drops_unentered_work_before_capacity_and_loc
         f.services
             .worktree_locks
             .with_lock(&f.git.path, || async {
-                let deadline = Instant::now() + frame_ttl();
+                let deadline = Instant::now() + QUEUE_DEADLINE;
                 let work = async {
                     let _capacity = capacity;
                     let _finish = Completion(op.clone());
@@ -269,7 +277,7 @@ async fn native_review_queue_expiry_drops_unentered_work_before_capacity_and_loc
                 .await;
                 // Tokio rounds timer deadlines up to a millisecond tick. Cross
                 // that tick while leaving the production deadline unchanged.
-                tokio::time::advance(frame_ttl() + Duration::from_millis(1)).await;
+                tokio::time::advance(QUEUE_DEADLINE + Duration::from_millis(1)).await;
                 assert!(work.await.is_err());
                 assert_eq!(c.review.workers.available_permits(), WORKERS);
                 assert_eq!(
@@ -314,7 +322,7 @@ async fn native_review_queue_deadline_wins_ready_first_claim_after_observation()
         op.progress.lock().unwrap().started = true;
         let create = create_lock(&c, &op).unwrap();
         let held = create.clone().lock_owned().await;
-        let deadline = Instant::now() + frame_ttl();
+        let deadline = Instant::now() + QUEUE_DEADLINE;
         let work = async {
             let _capacity = capacity;
             let _finish = Completion(op.clone());
@@ -332,7 +340,7 @@ async fn native_review_queue_deadline_wins_ready_first_claim_after_observation()
             .try_with_lock(&f.git.path, || async {})
             .await
             .is_none());
-        tokio::time::advance(frame_ttl()).await;
+        tokio::time::advance(QUEUE_DEADLINE).await;
         // Both expiry and the real blocking worker can now progress. Even if
         // that worker wins scheduling, its first consuming claim is too late.
         drop(held);
@@ -372,12 +380,14 @@ async fn frame_check(frame: &dyn RepositoryReadRequestScope) -> Result<()> {
 
 // Coverage CI stretches test budgets with INTENTD_TEST_TIMEOUT_MULTIPLIER; an
 // unstarted frame must stay admitted for the stretched 15s, not the fixed one,
-// or a slow runner refuses it as "Repository review unavailable".
+// or a slow runner refuses it as "Repository review unavailable". The stretch
+// stops at x4 (60s), below the fixed STAGE_TTL and LEASE_TTL it races.
 #[intent_test_macros::daemon_test]
 async fn native_review_frame_wait_stretches_with_the_test_timeout_multiplier() {
     let f = Fixture::new().await;
     let s = f.socket().await;
-    let stretched = intentd_test_support::test_timeout(Duration::from_secs(15));
+    let stretched =
+        intentd_test_support::test_timeout(Duration::from_secs(15)).min(Duration::from_secs(60));
     with_review_clock(s.entered(async {
         let frame = s
             .owner
@@ -434,7 +444,7 @@ async fn native_review_member_boundary_refusal_preserves_failed_history_without_
                 let work = async {
                     let _capacity = capacity;
                     let _finish = Completion(operation.clone());
-                    run(&connection, &operation, &command, fixed_time + frame_ttl()).await
+                    run(&connection, &operation, &command, fixed_time + QUEUE_DEADLINE).await
                 };
                 tokio::pin!(work);
                 tokio::select! {
@@ -696,7 +706,7 @@ async fn native_review_queue_stage_wall_retains_owned_work_receipt_and_stops_nex
             .begin_with("BEGIN IMMEDIATE")
             .await
             .unwrap();
-        let deadline = Instant::now() + frame_ttl();
+        let deadline = Instant::now() + QUEUE_DEADLINE;
         let work = async {
             let _capacity = capacity;
             let _finish = Completion(op.clone());

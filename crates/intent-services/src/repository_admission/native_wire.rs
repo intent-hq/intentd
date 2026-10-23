@@ -110,7 +110,23 @@ fn request_wait(base: Duration) -> Duration {
     static SETTING: std::sync::LazyLock<Option<String>> = std::sync::LazyLock::new(|| {
         std::env::var(intentd_test_support::TIMEOUT_MULTIPLIER_ENV).ok()
     });
-    intentd_test_support::scale_test_timeout(base, SETTING.as_deref())
+    stretched_request_wait(base, SETTING.as_deref())
+}
+/// Highest stretch for the request waits. These waits race fixed timers that
+/// do not stretch, and production relies on them firing first: the 5s acquire
+/// against the GitLab client's 30s request timeout (crossed from x6, when a
+/// held provider call fails before the acquire wait elapses), the 15s frame
+/// against `STAGE_TTL` (120s, from x8) and `LEASE_TTL` (300s, at x20), and a
+/// test waiting for real frame expiry against nextest's 180s kill (from x12).
+/// x4 keeps those orders and still covers coverage CI's x3. (The 10s read
+/// limits meet the GitLab client's 30s at x3; no test holds a provider call
+/// across a read deadline, and the suite passes at x20.)
+#[cfg(test)]
+const REQUEST_WAIT_MAX_STRETCH: u32 = 4;
+#[cfg(test)]
+fn stretched_request_wait(base: Duration, multiplier: Option<&str>) -> Duration {
+    intentd_test_support::scale_test_timeout(base, multiplier)
+        .min(base.saturating_mul(REQUEST_WAIT_MAX_STRETCH))
 }
 
 fn unavailable() -> Error {
