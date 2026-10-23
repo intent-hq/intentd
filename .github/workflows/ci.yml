@@ -1901,8 +1901,9 @@ jobs:
   # --instrumented llvm-cov form; intent-hq/intentd#1947), and the stub-root
   # harness for the repo-root Makefile (every gate target forwards to the
   # monorepo root make with its command-line variables; a standalone clone or
-  # an unrelated parent Makefile gets the exit-2 refusal). Seconds-long like
-  # the other utility jobs, it uses the shared self-hosted-first route.
+  # an unrelated parent Makefile gets the exit-2 refusal). It also rejects
+  # tracked Python bytecode (scripts/check-no-python-cache.sh). Seconds-long
+  # like the other utility jobs, it uses the shared self-hosted-first route.
   release-scripts:
     needs: [route]
     runs-on: ${{ fromJSON(needs.route.outputs.slots || '{}')['release-scripts'] || fromJSON('["ubuntu-24.04"]') }}
@@ -1922,6 +1923,12 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.11'
+      # .gitignore covers new caches, but `git add -f` bypasses it; this job
+      # also runs in the merge queue and on main, unlike pr-static.
+      - name: Reject tracked Python bytecode
+        run: ./scripts/check-no-python-cache.sh
+      - name: Test the tracked Python bytecode check
+        run: ./scripts/test-check-no-python-cache.sh
       - name: Test release metadata and auto-cut guards (offline)
         run: |
           python3 -S scripts/test-release-pr-fast-path.py
