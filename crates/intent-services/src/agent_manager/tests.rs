@@ -27285,6 +27285,212 @@ async fn shutdown_captures_startup_turn_before_provider_handle_exists() {
     assert!(!mgr.contains(&id));
 }
 
+/// Give `id` a current §5.5b worker generation with one running worker, as a
+/// Claude `run_in_background` shell reports it.
+fn start_running_worker(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId) {
+    let adapter = crate::agent_workers::SUPPORTED_ADAPTERS
+        .iter()
+        .find(|a| a.provider == "claude-code")
+        .expect("claude adapter allowlisted");
+    let generation = format!("generation-{id}");
+    let workers = mgr.services.agent_workers();
+    workers.begin(
+        crate::agent_workers::Scope {
+            workspace_id: ws.clone(),
+            agent_id: id.clone(),
+            provider: "claude-code".into(),
+            acp_session_id: Some(format!("session-{id}")),
+            connection_generation: Some(generation.clone()),
+        },
+        &crate::agent_workers::AdapterIdentity {
+            name: Some(adapter.name.into()),
+            version: Some(adapter.version.into()),
+        },
+        true,
+        std::sync::Weak::new(),
+    );
+    workers.ingest(
+        id,
+        &generation,
+        &intent_acp::workers::WorkerFrame {
+            session_id: Some(format!("session-{id}")),
+            update: json!({
+                "sessionUpdate": "async_task_spawned", "asyncTaskId": "bg-1",
+                "taskType": "shell", "name": "npm run dev", "toolCallId": "call-1",
+                "canStop": true, "showInTranscript": false,
+            }),
+            received_at_ms: 1000,
+        },
+    );
+    assert!(workers.has_running_workers(id));
+}
+
+/// Regression: an agent that finished its turn while its provider still ran a
+/// background worker was not captured at graceful shutdown, so after the
+/// restart it never received the harness-interruption continuation and waited
+/// forever for a completion report from a worker the shutdown had killed.
+/// Every agent with a running worker is now enrolled, tagged
+/// `background_workers`; agents without one are unchanged.
+#[tokio::test]
+async fn checkpoint_shutdown_enrolls_agents_with_running_workers() {
+    let (_tmp, mgr) = manager().await;
+    let idle_worker = AgentId::from("idle-with-worker");
+    let busy_worker = AgentId::from("busy-with-worker");
+    let busy_plain = AgentId::from("busy-plain");
+    let idle_plain = AgentId::from("idle-plain");
+    let stale_worker = AgentId::from("stale-active-with-worker");
+    let completed_worker = AgentId::from("completed-with-worker");
+    let reported_child = AgentId::from("reported-child-with-worker");
+    // `seed_agent` inserts the workspace row, so each agent gets its own.
+    let ws_of = |id: &AgentId| WorkspaceId::from(format!("ws-{id}"));
+    for id in [
+        &idle_worker,
+        &busy_worker,
+        &busy_plain,
+        &idle_plain,
+        &stale_worker,
+        &completed_worker,
+        &reported_child,
+    ] {
+        seed_agent(&mgr, &ws_of(id), id).await;
+    }
+    // Finished agents keep their workers but are not interrupted: a completed
+    // agent, and a delegated child that already reported to its parent.
+    start_running_worker(&mgr, &ws_of(&completed_worker), &completed_worker);
+    mgr.services
+        .store
+        .set_agent_session_status(
+            &ws_of(&completed_worker),
+            &completed_worker,
+            AgentStatus::Completed,
+            false,
+            &now_iso(),
+            None,
+        )
+        .await
+        .unwrap();
+    start_running_worker(&mgr, &ws_of(&reported_child), &reported_child);
+    let mut child = mgr
+        .services
+        .store
+        .get_agent_session(&reported_child)
+        .await
+        .unwrap();
+    child.parent_agent_id = Some(AgentId::from("agent-parent"));
+    child.completion_report = Some("work done".to_string());
+    child.completion_report_timestamp = Some(now_iso());
+    mgr.services
+        .store
+        .update_agent_session(&ws_of(&reported_child), &child)
+        .await
+        .unwrap();
+    start_running_worker(&mgr, &ws_of(&idle_worker), &idle_worker);
+    start_running_worker(&mgr, &ws_of(&busy_worker), &busy_worker);
+    // Not busy, but its post-turn idle write has not landed: still `active`.
+    start_running_worker(&mgr, &ws_of(&stale_worker), &stale_worker);
+    mgr.services
+        .store
+        .set_agent_session_status(
+            &ws_of(&stale_worker),
+            &stale_worker,
+            AgentStatus::Active,
+            true,
+            &now_iso(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(mgr.try_begin(&busy_worker, &ws_of(&busy_worker)).await);
+    assert!(mgr.try_begin(&busy_plain, &ws_of(&busy_plain)).await);
+    let idle_status = mgr
+        .services
+        .store
+        .get_agent_session_status(&idle_worker)
+        .await
+        .unwrap();
+
+    for _ in 0..2 {
+        mgr.checkpoint_shutdown().await;
+        let store = &mgr.services.store;
+        let row = store
+            .get_interrupted_agent(&idle_worker)
+            .await
+            .unwrap()
+            .expect("idle agent with a running worker is enrolled");
+        assert_eq!(row.workspace_id, ws_of(&idle_worker));
+        assert_eq!(
+            row.reason.as_deref(),
+            Some(crate::agent_workers::INTERRUPTED_WITH_WORKERS_REASON)
+        );
+        assert_eq!(
+            row.prev_status,
+            serde_json::to_value(idle_status).unwrap().as_str().unwrap()
+        );
+
+        let row = store
+            .get_interrupted_agent(&busy_worker)
+            .await
+            .unwrap()
+            .expect("mid-turn agent is enrolled");
+        assert_eq!(
+            row.reason.as_deref(),
+            Some(crate::agent_workers::INTERRUPTED_WITH_WORKERS_REASON),
+            "a mid-turn agent's lost workers are tagged too"
+        );
+        assert_eq!(row.prev_status, "active");
+
+        let row = store
+            .get_interrupted_agent(&stale_worker)
+            .await
+            .unwrap()
+            .expect("an idle agent with a running worker is enrolled");
+        assert_eq!(row.prev_status, "idle", "not mid-turn: recorded as idle");
+
+        let row = store
+            .get_interrupted_agent(&busy_plain)
+            .await
+            .unwrap()
+            .expect("mid-turn agent is enrolled");
+        assert_eq!(row.reason, None, "no workers: today's untagged row");
+
+        for (id, why) in [
+            (&idle_plain, "an idle agent without workers"),
+            (&completed_worker, "a completed agent"),
+            (&reported_child, "a delegated child that already reported"),
+        ] {
+            assert!(
+                store.get_interrupted_agent(id).await.unwrap().is_none(),
+                "{why} is not enrolled"
+            );
+        }
+    }
+    // A kill before teardown leaves in-flight statuses for the startup heal,
+    // which must keep the tagged rows rather than re-upsert them untagged.
+    mgr.services.heal_stale_agent_sessions().await.unwrap();
+    for (id, prev) in [(&stale_worker, "idle"), (&busy_worker, "active")] {
+        let row = mgr
+            .services
+            .store
+            .get_interrupted_agent(id)
+            .await
+            .unwrap()
+            .expect("still enrolled after heal");
+        assert_eq!(
+            row.reason.as_deref(),
+            Some(crate::agent_workers::INTERRUPTED_WITH_WORKERS_REASON),
+            "heal keeps the tag of {id}"
+        );
+        assert_eq!(row.prev_status, prev, "heal keeps the status of {id}");
+    }
+    let candidates = mgr.services.prepare_startup_resume().await.unwrap();
+    let mut ids = candidates.ids().to_vec();
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec![busy_plain, busy_worker, idle_worker, stale_worker]
+    );
+}
+
 /// Holding the first persistence await must not leave later workers alive to
 /// mistake the shutdown spawn fence for a terminal provider failure.
 #[tokio::test]

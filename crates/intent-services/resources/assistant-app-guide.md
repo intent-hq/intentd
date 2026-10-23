@@ -341,7 +341,7 @@ PR and its latest status. Required checks that are still running or failing can
 block merging. If monitoring is paused or information is unavailable, wait for a
 fresh status before treating the PR as ready.
 
-<!-- Sources: packages/cloudlands-fe/src/lib/components/chat/{AgentWorkersRow,EventSubscriptionsCard}.svelte; packages/cloudlands-fe/src/features/agent-workers/agent-workers-channel.ts; packages/cloudlands-fe/src/store/renderer/slices/agent-workers/{agent-workers-selectors.ts,sagas/agent-workers-saga.ts} (connection-drop demotion); packages/cloudlands-fe/messages/en.json; packages/intentd/crates/intent-services/src/{agent_workers,agent_manager}.rs; packages/intentd/crates/intent-core/src/config.rs (DEFAULT_IDLE_REAP_MINUTES). -->
+<!-- Sources: packages/cloudlands-fe/src/lib/components/chat/{AgentWorkersRow,EventSubscriptionsCard}.svelte; packages/cloudlands-fe/src/features/agent-workers/agent-workers-channel.ts; packages/cloudlands-fe/src/store/renderer/slices/agent-workers/{agent-workers-selectors.ts,sagas/agent-workers-saga.ts} (connection-drop demotion); packages/cloudlands-fe/messages/en.json; packages/intentd/crates/intent-services/src/{agent_workers,agent_manager,agent_ops}.rs (restart capture and resume wording); packages/intentd/crates/intent-core/src/config.rs (DEFAULT_IDLE_REAP_MINUTES). -->
 
 When a Claude Code agent starts work in the background, such as a dev server
 command, its conversation shows a row for it marked **Running**. When the
@@ -361,6 +361,9 @@ backend → Idle reap minutes** (10 by default; Off disables it). Agents without
 running tasks close after Idle reap minutes. Before telling the user it stopped,
 confirm independently, for example by checking whether the dev server still
 responds. Such a row has no Stop and clears the next time the agent starts.
+Restarting Intent stops running background tasks. The agent is then listed with
+interrupted agents, and when resumed it is told its tasks were stopped and will
+not report back, so it can restart any it still needs.
 Codex and other providers do not report background tasks.
 
 <!-- Sources: packages/intentd/crates/intent-services/src/{provider_images,agent_manager,agent_session,agent_ops}.rs. -->

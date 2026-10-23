@@ -4660,7 +4660,17 @@ impl Services {
                 .to_string();
 
             // Insert interrupted_agent row (idempotent: second restart is a no-op).
-            if let Err(e) = self
+            // A pending row that graceful shutdown tagged with lost background
+            // workers (intent-hq/intent#7658) is the better record of this
+            // interruption: re-upserting would clear its tag (and prev_status).
+            let tagged = matches!(
+                self.store.get_interrupted_agent(&session.id).await,
+                Ok(Some(row)) if row.reason.as_deref()
+                    == Some(crate::agent_workers::INTERRUPTED_WITH_WORKERS_REASON)
+            );
+            if tagged {
+                tracing::debug!(agent_id = %session.id, "heal: keeping the background-workers interrupted_agent row");
+            } else if let Err(e) = self
                 .store
                 .insert_interrupted_agent(&session.id, &session.workspace_id, &prev_str, &now)
                 .await
