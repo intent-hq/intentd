@@ -47355,11 +47355,11 @@ mod resume_tail_recap {
              responding, and your restored session may predate the exchange below \
              — it is repeated here (parts of it may or may not already be in your \
              context).\n\n\
-             Note on escaping: text quoted in this replay is XML-escaped only so it can sit \
-             inside these tags (&lt; &gt; &amp; &quot; stand for < > & \"). The original \
-             messages used the literal characters. Write your own replies with literal \
-             characters too: for example <!-- suggested-prompts, never &lt;!-- \
-             suggested-prompts.\n\n\
+             Note on escaping: text quoted inside the XML tags of this message is XML-escaped \
+             only so it can be quoted (&lt; &gt; &amp; &quot; stand for < > & \"). The \
+             original messages used the literal characters. Write your own replies with \
+             literal characters too: for example <!-- and -->, never &lt;!-- and \
+             --&gt;.\n\n\
              The user's message, delivered before the interruption:\n\
              <interrupted_user_message>\nbuild a simple local webapp\n</interrupted_user_message>\n\n\
              Your partial response before the cut-off (it did NOT complete; anything \

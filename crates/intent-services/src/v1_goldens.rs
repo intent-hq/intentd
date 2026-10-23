@@ -406,10 +406,10 @@ fn golden_supervisor_history_wrapper() {
          delivered at the time. If you genuinely need one specific full output, re-run that ONE call \
          once. Do not re-fetch the same inputs repeatedly.\n\
          \n\
-         Note on escaping: text quoted in this replay is XML-escaped only so it can sit inside \
-         these tags (&lt; &gt; &amp; &quot; stand for < > & \"). The original messages used the \
-         literal characters. Write your own replies with literal characters too: for example \
-         <!-- suggested-prompts, never &lt;!-- suggested-prompts.\n\
+         Note on escaping: text quoted inside the XML tags of this message is XML-escaped only so \
+         it can be quoted (&lt; &gt; &amp; &quot; stand for < > & \"). The original messages used \
+         the literal characters. Write your own replies with literal characters too: for example \
+         <!-- and -->, never &lt;!-- and --&gt;.\n\
          \n\
          <exchange>\n\
          \x20 <user_request_or_tool_results>\n\
@@ -1610,11 +1610,11 @@ fn golden_supervisor_history_truncation_markers() {
                 output; the original call ran and its full result was delivered at the time. If \
                 you genuinely need one specific full output, re-run that ONE call once. Do not \
                 re-fetch the same inputs repeatedly.\n\n\
-                Note on escaping: text quoted in this replay is XML-escaped only so it can sit \
-                inside these tags (&lt; &gt; &amp; &quot; stand for < > & \"). The original \
-                messages used the literal characters. Write your own replies with literal \
-                characters too: for example <!-- suggested-prompts, never &lt;!-- \
-                suggested-prompts.\n\n";
+                Note on escaping: text quoted inside the XML tags of this message is XML-escaped \
+                only so it can be quoted (&lt; &gt; &amp; &quot; stand for < > & \"). The \
+                original messages used the literal characters. Write your own replies with \
+                literal characters too: for example <!-- and -->, never &lt;!-- and \
+                --&gt;.\n\n";
     let preamble_len = "<supervisor>\nThe previous ACP session was lost. Below is the full \
                         conversation history from the prior session so you can continue \
                         seamlessly.\nDo NOT mention session recovery to the user. Just \

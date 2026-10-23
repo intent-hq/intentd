@@ -199,7 +199,11 @@ fn preamble_says_escaping_is_transport_only() {
         .split_once("<exchange>")
         .expect("preamble before exchanges");
     assert!(preamble.contains(REPLAY_ESCAPING_NOTE), "{preamble}");
-    assert!(REPLAY_ESCAPING_NOTE.contains("<!-- suggested-prompts"));
+    assert!(REPLAY_ESCAPING_NOTE.contains("<!-- and -->, never &lt;!-- and --&gt;"));
+    assert!(
+        !REPLAY_ESCAPING_NOTE.contains("suggested-prompts"),
+        "the note must not introduce markup a session was not told to emit"
+    );
     assert!(
         exchanges.contains("&lt;!-- suggested-prompts"),
         "replay stays escaped"

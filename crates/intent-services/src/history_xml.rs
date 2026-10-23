@@ -41,11 +41,13 @@ fn supervisor_preamble(tool_content_chars: usize) -> String {
 /// [`escape_xml`] (history preamble, cut-short turn, restart recap). Without
 /// it a model that sees `&lt;!-- suggested-prompts` in the replay can copy
 /// the escaped spelling into its own reply, and the client then renders that
-/// block as raw text instead of prompt chips.
-pub(crate) const REPLAY_ESCAPING_NOTE: &str = "Note on escaping: text quoted in this replay is \
-XML-escaped only so it can sit inside these tags (&lt; &gt; &amp; &quot; stand for < > & \"). \
-The original messages used the literal characters. Write your own replies with literal \
-characters too: for example <!-- suggested-prompts, never &lt;!-- suggested-prompts.\n\n";
+/// block as raw text instead of prompt chips. The example stays generic (an
+/// HTML comment, not a named marker) so the note never introduces markup a
+/// session was not told to emit, such as prompts blocks for sub-agents.
+pub(crate) const REPLAY_ESCAPING_NOTE: &str = "Note on escaping: text quoted inside the XML \
+tags of this message is XML-escaped only so it can be quoted (&lt; &gt; &amp; &quot; stand for \
+< > & \"). The original messages used the literal characters. Write your own replies with \
+literal characters too: for example <!-- and -->, never &lt;!-- and --&gt;.\n\n";
 const SUPERVISOR_CLOSING: &str =
     "Continue the conversation from this point. Do not mention session recovery or interruption.\n</supervisor>";
 
@@ -524,21 +526,26 @@ pub(crate) fn format_cut_short_turn(
     // A history preamble carries the note inside its own budget, so the
     // replay gets the full remainder.
     let history_budget = max_chars.saturating_sub(turn.len());
-    let history = if prior.is_empty() {
-        String::new()
+    // The note goes ahead of the turn unless the replayed history's preamble
+    // (which `format_history_as_xml` emits whenever it renders anything)
+    // already carries it.
+    let (history, note) = if prior.is_empty() {
+        (String::new(), REPLAY_ESCAPING_NOTE)
     } else if history_budget
         <= supervisor_preamble(tool_content_chars).len() + SUPERVISOR_CLOSING.len()
     {
-        "<!-- earlier conversation omitted due to size limits -->".to_owned()
+        (
+            "<!-- earlier conversation omitted due to size limits -->".to_owned(),
+            REPLAY_ESCAPING_NOTE,
+        )
     } else {
-        format_history_as_xml(prior, history_budget, tool_content_chars)
-    };
-    // `format_history_as_xml` output opens with the preamble (and its note)
-    // whenever it renders anything; the size-limit placeholder does not.
-    let note = if history.starts_with("<supervisor>") {
-        ""
-    } else {
-        REPLAY_ESCAPING_NOTE
+        let history = format_history_as_xml(prior, history_budget, tool_content_chars);
+        let note = if history.is_empty() {
+            REPLAY_ESCAPING_NOTE
+        } else {
+            ""
+        };
+        (history, note)
     };
     if history.is_empty() {
         format!("{note}{turn}")
