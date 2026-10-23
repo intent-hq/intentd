@@ -323,7 +323,7 @@ API:
   ws.mcp.listTools(serverId) → { tools: [...] }  // Forward `tools/list` to one enabled external MCP server; the raw MCP result. Errors when the server is disabled (globally or for this workspace) or not running.
   ws.mcp.callTool(serverId, toolName, args?, timeoutMs?) → result  // Forward `tools/call` to one enabled external MCP server and return the raw MCP result. `args` defaults to `{}`; `timeoutMs` is a per-call override the daemon caps at its own bound.
 
-  ws.crossWorkspace.listSiblings({ includeRetired? }?) → [workspaces]  // Other workspaces sharing the same repository (repo-scoped); retired ones only with includeRetired: true.
+  ws.crossWorkspace.listSiblings({ includeRetired? }?) → [workspaces]  // Other workspaces sharing the same repository (repo-scoped; retired only via includeRetired).
   ws.crossWorkspace.readNote(targetWorkspaceId, noteId) → note  // Read a note from another sibling workspace in the same repository. Use `listSiblings()` first to discover valid workspace IDs; use noteId=`spec` for its spec.
   ws.crossWorkspace.listNotes(targetWorkspaceId) → [notes]  // List notes in another sibling workspace. Use this before `readNote()` if you do not know which note IDs exist there.
 
@@ -475,7 +475,7 @@ API:
   ws.app.workspaces.delete(id) → ProposalCard  // Assistant workspace only. Proposes delete of a single workspace via ws.app.proposal.show; the user confirms before applying.
   ws.app.workspaces.get(id) → workspace  // Assistant workspace only. Get one workspace metadata summary.
   ws.app.workspaces.transfer(id, { destination? }?) → ProposalCard  // Assistant workspace only. Proposes a project transfer to another device; reads metadata and transfer warnings without exporting or stopping agents. `destination` is a saved device name or connection ID hint; omit it to let the user choose. The desktop shows the actual source and destination for approval or cancellation. After approval, agents stop for export; success archives the source without restarting agents on the destination.
-  ws.app.workspaces.list({ filter?, sort? }) → workspaces[]  // Assistant workspace only. Cross-workspace metadata list with query/status/repository/tags filtering; retired workspaces only with filter.includeRetired: true.
+  ws.app.workspaces.list({ filter?, sort? }) → workspaces[]  // Assistant workspace only. Cross-workspace metadata list with query/status/repository/tags filtering; retired only via filter.includeRetired.
   ws.app.workspaces.open(id, { openInNewWindow? }?) → { ok, queued }  // Assistant workspace only. Opens a workspace through workspace-operations-saga. Pass `{ openInNewWindow: true }` to open in a new window.
 
   ws.note.read(id) → { id, title, content, rawContent, tags, ... }  // Read a note. Use id=`spec` for the workspace spec. `content` is a DISPLAY rendering with line numbers like `   1 | text` — never write it back; `rawContent` is the editable Markdown to use for read-modify-write (the write ops reject numbered content).
@@ -614,7 +614,7 @@ API:
   ws.mcp.listTools(serverId) → { tools: [...] }  // Forward `tools/list` to one enabled external MCP server; the raw MCP result. Errors when the server is disabled (globally or for this workspace) or not running.
   ws.mcp.callTool(serverId, toolName, args?, timeoutMs?) → result  // Forward `tools/call` to one enabled external MCP server and return the raw MCP result. `args` defaults to `{}`; `timeoutMs` is a per-call override the daemon caps at its own bound.
 
-  ws.crossWorkspace.listSiblings({ includeRetired? }?) → [workspaces]  // Other workspaces sharing the same repository (repo-scoped); retired ones only with includeRetired: true.
+  ws.crossWorkspace.listSiblings({ includeRetired? }?) → [workspaces]  // Other workspaces sharing the same repository (repo-scoped; retired only via includeRetired).
   ws.crossWorkspace.readNote(targetWorkspaceId, noteId) → note  // Read a note from another sibling workspace in the same repository. Use `listSiblings()` first to discover valid workspace IDs; use noteId=`spec` for its spec.
   ws.crossWorkspace.listNotes(targetWorkspaceId) → [notes]  // List notes in another sibling workspace. Use this before `readNote()` if you do not know which note IDs exist there.
 
