@@ -35,6 +35,10 @@ pub(super) async fn spawn(command: Command) -> io::Result<super::Started> {
     let control_reader = above_stdio(control_reader.into_blocking_fd()?)?;
     let mut owner = supervisor(&command, &control_reader, &status_writer);
     drop(command);
+    // `supervisor` rebuilds the command from its program, args and env, which
+    // drops any `pre_exec` demotion set on it; the probed provider CLI is an
+    // agent process, so demote the supervisor it inherits from instead.
+    intent_acp::AgentPriority::from_env().apply(&mut owner);
     // SAFETY: child-only prctl/fcntl are syscalls with no allocation or locks.
     // Owned descriptors remain alive in this closure through the fork/exec.
     unsafe {

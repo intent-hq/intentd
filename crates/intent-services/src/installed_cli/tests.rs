@@ -177,6 +177,44 @@ async fn installed_cli_version_uses_final_environment_and_cwd() {
     assert_eq!(context.observe(&cmd).await.unwrap().1, version);
 }
 
+/// Regression: the installed-CLI `--version` check ran at the daemon's own
+/// priority (on Linux the probe supervisor also dropped any demotion set on
+/// the command it rebuilds).
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn installed_cli_version_check_runs_at_reduced_priority() {
+    let version = current(InstalledCli::Claude);
+    let record = tempfile::tempdir().unwrap();
+    let nice_file = record.path().join("cli.nice");
+    let (root, context) = fixture(
+        InstalledCli::Claude,
+        &format!(
+            "#!/bin/sh\ncut -d' ' -f19 /proc/$$/stat > '{}'\nprintf '{version}\\n'\n",
+            nice_file.display()
+        ),
+    );
+    assert_eq!(
+        context
+            .observe(&launch(&context, root.path()))
+            .await
+            .unwrap()
+            .1,
+        version
+    );
+    let nice: i32 = std::fs::read_to_string(&nice_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    // SAFETY: plain syscall wrapper with no pointer arguments.
+    let own = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+    let expected = (own + intent_acp::AgentPriority::from_env().nice_increment).min(19);
+    assert!(
+        nice >= expected,
+        "CLI ran at nice {nice}, expected {expected}"
+    );
+}
+
 #[test]
 fn installed_cli_env_namespace_custom_credentials_os_values_and_policy_precedence() {
     let (root, context) = fixture(InstalledCli::Codex, "#!/bin/sh\nexit 0\n");

@@ -445,12 +445,13 @@ fn target_nice(parent: i32, increment: i32) -> i32 {
 /// `pre_exec` (logging is not async-signal-safe there);
 /// [`reduced_priority_shortfall`] reports it from the parent once the child
 /// is up.
-fn apply_reduced_priority(cmd: &mut Command, increment: i32) {
+fn apply_reduced_priority(cmd: &mut std::process::Command, increment: i32) {
     if increment <= 0 {
         return;
     }
     #[cfg(unix)]
     {
+        use std::os::unix::process::CommandExt;
         // SAFETY: `getpriority`/`setpriority` are plain syscall wrappers that
         // take no pointers and touch no locks or heap state, so they are safe
         // to call between fork and exec.
@@ -486,7 +487,7 @@ fn apply_reduced_priority(cmd: &mut Command, increment: i32) {
             // parent's class) rather than guess.
             _ => return,
         };
-        cmd.creation_flags(below);
+        std::os::windows::process::CommandExt::creation_flags(cmd, below);
     }
 }
 
@@ -555,6 +556,11 @@ impl AgentPriority {
     /// Configure `cmd` so its child starts at this reduced CPU and IO
     /// priority (never above the daemon's). Never makes the spawn fail.
     pub fn apply(self, cmd: &mut Command) {
+        self.apply_std(cmd.as_std_mut());
+    }
+
+    /// [`Self::apply`] for a synchronous [`std::process::Command`].
+    pub fn apply_std(self, cmd: &mut std::process::Command) {
         apply_reduced_priority(cmd, self.nice_increment);
         apply_reduced_io_priority(cmd, self.io);
     }
@@ -2416,22 +2422,20 @@ mod reduced_priority_tests {
         };
         assert_eq!(priority.shortfall(pid), None);
         #[cfg(target_os = "linux")]
-        if priority.io == crate::io_priority::AgentIoPriority::Low {
+        if priority.io != crate::io_priority::AgentIoPriority::Off {
             use crate::io_priority::linux;
-            let own = linux::get(0).expect("own ioprio");
-            let got = linux::get(i32::try_from(pid).unwrap()).expect("child ioprio");
+            let own = linux::get_effective(0).expect("own ioprio");
+            let got = linux::get_effective(i32::try_from(pid).unwrap()).expect("child ioprio");
+            let expected = linux::target(own, priority.io).unwrap_or(own);
             assert!(
                 linux::rank(got) >= linux::rank(own),
                 "child never outranks the daemon"
             );
             assert!(
-                linux::rank(got)
-                    >= linux::rank(linux::value(
-                        linux::IOPRIO_CLASS_BE,
-                        linux::IOPRIO_LEVEL_LOWEST
-                    )),
-                "child at {}",
-                linux::describe(got)
+                linux::rank(got) >= linux::rank(expected),
+                "child at {}, expected {}",
+                linux::describe(got),
+                linux::describe(expected)
             );
         }
         drop(child);

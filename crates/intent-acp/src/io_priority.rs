@@ -10,13 +10,14 @@
 //!
 //! - **Linux:** `ioprio_set(IOPRIO_WHO_PROCESS)` in `pre_exec`. [`AgentIoPriority::Low`]
 //!   is the best-effort class at its least favourable level (7);
-//!   [`AgentIoPriority::Idle`] is the idle class. The kernel honours these
+//!   [`AgentIoPriority::Idle`] (the Linux default) is the idle class. The kernel honours these
 //!   only under an IO scheduler that implements priorities: BFQ honours
 //!   classes and levels, mq-deadline only classes (so `Low` is a no-op
 //!   there and only `Idle` separates agents from the daemon), and `none`
 //!   ignores both.
 //! - **macOS:** `setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_PROCESS)` in
-//!   `pre_exec`: `Low` is `IOPOL_UTILITY`, `Idle` is `IOPOL_THROTTLE`.
+//!   `pre_exec`: `Low` (the macOS default) is `IOPOL_UTILITY`, `Idle` is
+//!   `IOPOL_THROTTLE`.
 //! - **Elsewhere** (including Windows, which only lets a process put
 //!   *itself* into background IO mode) this is a no-op; the CPU demotion
 //!   still applies.
@@ -25,10 +26,9 @@
 //! the syscall results (logging is not async-signal-safe there), and on Linux
 //! [`io_priority_shortfall`] reports it from the parent once the child is up.
 
-use tokio::process::Command;
-
 /// Env var choosing the IO priority ACP agent children start at:
-/// `low` (default), `idle`, or `off` (leave IO priority untouched).
+/// `low`, `idle`, or `off` (leave IO priority untouched); unset means
+/// [`DEFAULT_AGENT_IO_PRIORITY`].
 pub const AGENT_IO_PRIORITY_ENV: &str = "INTENTD_AGENT_IO_PRIORITY";
 
 /// How far agent children's disk IO is demoted below the daemon's.
@@ -36,16 +36,25 @@ pub const AGENT_IO_PRIORITY_ENV: &str = "INTENTD_AGENT_IO_PRIORITY";
 pub enum AgentIoPriority {
     /// Leave the inherited IO priority untouched.
     Off,
-    /// Gentle demotion that cannot stall the child: Linux best-effort level
-    /// 7, macOS `IOPOL_UTILITY`.
+    /// Gentle demotion: Linux best-effort level 7 (honoured by BFQ only),
+    /// macOS `IOPOL_UTILITY`.
     Low,
-    /// Strongest demotion: Linux idle class, macOS `IOPOL_THROTTLE`. The child
-    /// may wait indefinitely while anything else on the machine uses the disk.
+    /// Strong demotion: Linux idle class, macOS `IOPOL_THROTTLE`. The child's
+    /// IO yields to everything else, bounded by the scheduler's aging
+    /// (mq-deadline's `prio_aging_expire`, BFQ's idle-class timeout).
     Idle,
 }
 
-/// IO priority agent children get when [`AGENT_IO_PRIORITY_ENV`] is unset.
-pub const DEFAULT_AGENT_IO_PRIORITY: AgentIoPriority = AgentIoPriority::Low;
+/// IO priority agent children get when [`AGENT_IO_PRIORITY_ENV`] is unset:
+/// [`AgentIoPriority::Idle`] on Linux, where the common mq-deadline
+/// scheduler honours IO classes but not levels (so `Low` would separate
+/// nothing), and [`AgentIoPriority::Low`] elsewhere — macOS `IOPOL_UTILITY`
+/// already demotes without the heavy `IOPOL_THROTTLE` throttling.
+pub const DEFAULT_AGENT_IO_PRIORITY: AgentIoPriority = if cfg!(target_os = "linux") {
+    AgentIoPriority::Idle
+} else {
+    AgentIoPriority::Low
+};
 
 /// The IO priority ACP agent children start at: [`AGENT_IO_PRIORITY_ENV`]
 /// when set to a recognised value, else [`DEFAULT_AGENT_IO_PRIORITY`].
@@ -85,12 +94,13 @@ fn agent_io_priority_from(raw: Option<&str>) -> AgentIoPriority {
 /// Configure `cmd` so the child starts at the reduced IO priority `want`
 /// (never more favourable than the IO priority it inherits from the daemon).
 /// [`AgentIoPriority::Off`] and unsupported platforms leave `cmd` untouched.
-pub fn apply_reduced_io_priority(cmd: &mut Command, want: AgentIoPriority) {
+pub fn apply_reduced_io_priority(cmd: &mut std::process::Command, want: AgentIoPriority) {
     if want == AgentIoPriority::Off {
         return;
     }
     #[cfg(target_os = "linux")]
     {
+        use std::os::unix::process::CommandExt;
         // SAFETY: `ioprio_get`/`ioprio_set`/`sched_getscheduler` are raw
         // syscalls with integer arguments only; they take no locks and touch
         // no heap state, so they are safe to call between fork and exec.
@@ -107,6 +117,7 @@ pub fn apply_reduced_io_priority(cmd: &mut Command, want: AgentIoPriority) {
     }
     #[cfg(target_os = "macos")]
     {
+        use std::os::unix::process::CommandExt;
         // SAFETY: `getiopolicy_np`/`setiopolicy_np` are thin wrappers over the
         // `iopolicysys` syscall with integer arguments only, so they are safe
         // to call between fork and exec.
@@ -382,9 +393,23 @@ mod tests {
 
     #[test]
     fn io_priority_defaults_when_unset_or_blank() {
-        assert_eq!(agent_io_priority_from(None), AgentIoPriority::Low);
-        assert_eq!(agent_io_priority_from(Some("")), AgentIoPriority::Low);
-        assert_eq!(agent_io_priority_from(Some("   ")), AgentIoPriority::Low);
+        assert_eq!(agent_io_priority_from(None), DEFAULT_AGENT_IO_PRIORITY);
+        assert_eq!(agent_io_priority_from(Some("")), DEFAULT_AGENT_IO_PRIORITY);
+        assert_eq!(
+            agent_io_priority_from(Some("   ")),
+            DEFAULT_AGENT_IO_PRIORITY
+        );
+    }
+
+    /// Linux defaults to the idle class (mq-deadline honours classes, not
+    /// levels); macOS and others to the gentle level.
+    #[test]
+    fn default_is_idle_on_linux_and_low_elsewhere() {
+        if cfg!(target_os = "linux") {
+            assert_eq!(DEFAULT_AGENT_IO_PRIORITY, AgentIoPriority::Idle);
+        } else {
+            assert_eq!(DEFAULT_AGENT_IO_PRIORITY, AgentIoPriority::Low);
+        }
     }
 
     #[test]
@@ -397,8 +422,11 @@ mod tests {
 
     #[test]
     fn io_priority_unrecognised_falls_back_to_default() {
-        assert_eq!(agent_io_priority_from(Some("high")), AgentIoPriority::Low);
-        assert_eq!(agent_io_priority_from(Some("7")), AgentIoPriority::Low);
+        assert_eq!(
+            agent_io_priority_from(Some("high")),
+            DEFAULT_AGENT_IO_PRIORITY
+        );
+        assert_eq!(agent_io_priority_from(Some("7")), DEFAULT_AGENT_IO_PRIORITY);
     }
 
     #[cfg(target_os = "linux")]
@@ -560,7 +588,7 @@ mod tests {
                 return; // the test process is itself already at or below BE7.
             }
             let mut cmd = family();
-            apply_reduced_io_priority(&mut cmd, AgentIoPriority::Low);
+            apply_reduced_io_priority(cmd.as_std_mut(), AgentIoPriority::Low);
             let (child, kid, grandkid, _grandchild) = spawn_family(cmd).await;
             assert_eq!(describe(kid), describe(BE7));
             assert_eq!(describe(grandkid), describe(BE7), "grandchild inherits");
@@ -576,7 +604,7 @@ mod tests {
         #[tokio::test]
         async fn idle_puts_child_and_grandchild_in_idle_class() {
             let mut cmd = family();
-            apply_reduced_io_priority(&mut cmd, AgentIoPriority::Idle);
+            apply_reduced_io_priority(cmd.as_std_mut(), AgentIoPriority::Idle);
             let (child, kid, grandkid, _grandchild) = spawn_family(cmd).await;
             assert_eq!(class(kid), IOPRIO_CLASS_IDLE);
             assert_eq!(class(grandkid), IOPRIO_CLASS_IDLE);
@@ -590,7 +618,7 @@ mod tests {
         async fn off_leaves_child_at_daemon_io_priority() {
             let own = get(0).expect("own ioprio");
             let mut cmd = family();
-            apply_reduced_io_priority(&mut cmd, AgentIoPriority::Off);
+            apply_reduced_io_priority(cmd.as_std_mut(), AgentIoPriority::Off);
             let (_child, kid, grandkid, _grandchild) = spawn_family(cmd).await;
             assert_eq!(kid, own);
             assert_eq!(grandkid, own);
@@ -609,7 +637,7 @@ mod tests {
                     Ok(())
                 });
             }
-            apply_reduced_io_priority(&mut cmd, AgentIoPriority::Low);
+            apply_reduced_io_priority(cmd.as_std_mut(), AgentIoPriority::Low);
             let (_child, kid, grandkid, _grandchild) = spawn_family(cmd).await;
             assert_eq!(class(kid), IOPRIO_CLASS_IDLE);
             assert_eq!(class(grandkid), IOPRIO_CLASS_IDLE);
@@ -633,7 +661,7 @@ mod tests {
                     Ok(())
                 });
             }
-            apply_reduced_io_priority(&mut cmd, AgentIoPriority::Low);
+            apply_reduced_io_priority(cmd.as_std_mut(), AgentIoPriority::Low);
             let (child, kid, grandkid, _grandchild) = spawn_family(cmd).await;
             assert_eq!(
                 class(kid),
@@ -654,7 +682,7 @@ mod tests {
         async fn shortfall_is_silent_for_an_exited_unreaped_child() {
             let mut cmd = Command::new("sh");
             cmd.args(["-c", "exit 0"]).kill_on_drop(true);
-            apply_reduced_io_priority(&mut cmd, AgentIoPriority::Idle);
+            apply_reduced_io_priority(cmd.as_std_mut(), AgentIoPriority::Idle);
             let child = cmd.spawn().expect("spawn sh");
             let pid = child.id().expect("child pid");
             let deadline = std::time::Instant::now()

@@ -409,3 +409,25 @@ async fn direct_adapter_skips_stale_npx_probe_and_package_launch() {
     assert!(lines("packages").is_empty());
     assert!(lines("native").is_empty());
 }
+
+/// Regression: the `npx --version` probe ran at the daemon's own priority.
+#[cfg(target_os = "linux")]
+#[test]
+fn npx_version_probe_runs_at_reduced_priority() {
+    let dir = tempfile::tempdir().unwrap();
+    let npx = dir.path().join("npx");
+    std::fs::write(&npx, "#!/bin/sh\ncut -d' ' -f19 /proc/$$/stat\n").unwrap();
+    std::fs::set_permissions(&npx, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let nice: i32 = super::run_npx_version_probe(&npx)
+        .expect("probe output")
+        .trim()
+        .parse()
+        .unwrap();
+    // SAFETY: plain syscall wrapper with no pointer arguments.
+    let own = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+    let expected = (own + intent_acp::AgentPriority::from_env().nice_increment).min(19);
+    assert!(
+        nice >= expected,
+        "npx ran at nice {nice}, expected {expected}"
+    );
+}

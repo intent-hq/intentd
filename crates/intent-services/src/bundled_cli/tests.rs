@@ -293,3 +293,36 @@ fn version_dirs_are_plain_relative_names() {
         Path::new("/r/anthropic-ai_claude-code/2.1.280")
     );
 }
+
+/// The nice value an agent process should start at: the daemon's own plus
+/// the configured increment, capped at 19 (see `intent_acp::AgentPriority`).
+#[cfg(target_os = "linux")]
+fn demoted_nice() -> i32 {
+    // SAFETY: plain syscall wrapper with no pointer arguments.
+    let own = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+    (own + intent_acp::AgentPriority::from_env().nice_increment).min(19)
+}
+
+/// Regression: the bundled-CLI `npm install` (the heaviest disk user an
+/// agent launch triggers) ran at the daemon's own priority.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn npm_install_runs_at_reduced_priority() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("root");
+    let record = temp.path().join("npm.nice");
+    let npm = fake_npm(
+        temp.path(),
+        &format!("cut -d' ' -f19 /proc/$$/stat > '{}'", record.display()),
+    );
+    let pin = bundled("0.160.1");
+    ensure_in(&root, &npm, &path_env(), InstalledCli::Codex, &pin, TIMEOUT)
+        .await
+        .unwrap();
+    let nice: i32 = std::fs::read_to_string(&record)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(nice >= demoted_nice(), "npm ran at nice {nice}");
+}
