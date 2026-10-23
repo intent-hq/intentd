@@ -409,3 +409,27 @@ async fn direct_adapter_skips_stale_npx_probe_and_package_launch() {
     assert!(lines("packages").is_empty());
     assert!(lines("native").is_empty());
 }
+
+/// The `npx --version` probe stays at the daemon's priority: a demoted 3s
+/// probe can time out on a busy machine and mark a working npx unavailable.
+#[cfg(target_os = "linux")]
+#[test]
+fn npx_version_probe_runs_at_daemon_priority() {
+    let dir = tempfile::tempdir().unwrap();
+    let npx = dir.path().join("npx");
+    std::fs::write(&npx, "#!/bin/sh\ncut -d' ' -f19 /proc/$$/stat\n").unwrap();
+    std::fs::set_permissions(&npx, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let nice: i32 = super::run_npx_version_probe(&npx)
+        .expect("probe output")
+        .trim()
+        .parse()
+        .unwrap();
+    // The daemon's own nice: the expectation with no increment.
+    let own = intent_acp::AgentPriority {
+        nice_increment: 0,
+        ..intent_acp::AgentPriority::from_env()
+    }
+    .expected_nice()
+    .unwrap();
+    assert_eq!(nice, own, "npx probe must not be demoted");
+}
