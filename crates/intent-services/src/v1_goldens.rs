@@ -790,6 +790,7 @@ fn merge_requirements(
         is_in_merge_queue: None,
         merge_queue_ejection: None,
         merge_queue: None,
+        checks_not_started: None,
     }
 }
 
@@ -807,6 +808,7 @@ pub(crate) fn pr_snapshot(state: &str) -> crate::pr_monitor::PrMonitorSnapshot {
         status_checks: Some(Vec::new()),
         required_check_names: None,
         observed_at: None,
+        checks_not_started_delivered: None,
     }
 }
 

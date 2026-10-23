@@ -23,7 +23,7 @@ HOSTED_LINUX = {
     ('v-release.yml', 'build-local-artifacts'): 'cargo-dist apt configuration and cross-build packages',
 }
 # Merge-queue-only heavy jobs that ci.yml's route `heavy` step always sends to their burst runner.
-HEAVY_HOSTED_ONLY = {('ci.yml', 'coverage-all'): 'raises fs.inotify.max_user_instances with sudo sysctl'}
+HEAVY_HOSTED_ONLY = {}
 MAINTENANCE = {('m1mac-smoke.yml', 'smoke'), ('provision-m1mac.yml', 'provision'), ('provision-m1mac.yml', 'verify'), ('macos-prune.yml', 'prune'), ('windows-prune.yml', 'prune')}
 
 
@@ -138,7 +138,7 @@ def slot_violations(text):
 
 POOL_OF = {'gh-linux-8x': 'heavy', 'gh-linux-16x': 'heavy'}
 # Merge-queue-only heavy jobs that ci.yml's route `heavy` step always sends to their burst runner.
-QUEUE_HOSTED = {('ci.yml', 'coverage-e2e'), ('ci.yml', 'coverage-all')}
+QUEUE_HOSTED = set()
 
 def pool_reads(body):
     """(pool, several legs?) for a job reading a pool-level mapping, else None."""
@@ -228,18 +228,24 @@ class RunnerPolicy(unittest.TestCase):
                 self.assertEqual(violations(path.read_text(), path.name), [])
 
     def test_queue_heavy_jobs_take_their_own_slots(self):
-        # The Linux daemon-lifecycle leg runs only in the merge queue; it is
-        # listed for merge_group so a free xl or heavy slot can take it, instead
-        # of the `heavy` step's always-hosted mapping. The coverage jobs stay
-        # hosted until the slot hosts raise their shared inotify limit.
+        # The merge-queue-only Rust jobs are listed for merge_group, so a free xl
+        # or heavy slot can take them; the rest burst to WarpBuild. The slot hosts
+        # raise fs.inotify.max_user_instances to 32768 (infra/runners/sysctl.conf).
         ci = (ROOT / '.github/workflows/ci.yml').read_text()
         listed = {entry['key']: entry for entry in slot_list(ci)}
-        self.assertNotIn('coverage-e2e', listed)
+        self.assertEqual(listed['coverage-all'], {'key': 'coverage-all', 'label': 'gh-linux-16x', 'rust': True, 'minutes': 22, 'events': ['merge_group']})
+        self.assertEqual(listed['coverage-e2e'], {'key': 'coverage-e2e', 'label': 'gh-linux-16x', 'rust': True, 'minutes': 11, 'events': ['merge_group']})
         self.assertEqual(listed['daemon-lifecycle-linux'], {'key': 'daemon-lifecycle-linux', 'label': 'gh-linux-16x', 'rust': True, 'minutes': 4, 'events': ['merge_group']})
         body = jobs(ci)
-        self.assertIn('outputs.linux_labels', body['coverage-e2e'])
+        for job in ('coverage-all', 'coverage-e2e'):
+            self.assertIn("runs-on: ${{ fromJSON(needs.route.outputs.slots || '{}')['%s'] || fromJSON('[\"gh-linux-16x\"]') }}" % job, body[job])
         self.assertIn("os: ${{ fromJSON(needs.route.outputs.slots || '{}')['daemon-lifecycle-linux'] || fromJSON('[\"gh-linux-16x\"]') }}", body['daemon-lifecycle'])
-        self.assertIn('outputs.linux_labels', body['coverage-all'])
+        # An 8-CPU heavy slot (xl busy) runs about twice as long as gh-linux-16x.
+        # Under the merge queue's 60-minute check response timeout.
+        self.assertIn('    timeout-minutes: 55\n', body['coverage-all'])
+        self.assertIn('    timeout-minutes: 45\n', body['coverage-e2e'])
+        # The sysctl raise only runs where the limit is low (hosted runners); slots have no sudo.
+        self.assertIn('if ! [ "$(cat /proc/sys/fs/inotify/max_user_instances)" -ge 4096 ]; then', body['coverage-all'])
 
     def test_routed_linux_jobs_run_unprivileged(self):
         # A routed Linux job may land on an intent-cache slot, which has no sudo or Docker.
