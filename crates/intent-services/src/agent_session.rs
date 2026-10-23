@@ -5052,14 +5052,6 @@ impl Services {
                 // and then the idle — never a "quiet idle" that later grows
                 // an attention card.
                 self.flush_deferred_attention(agent_id, workspace_id).await;
-                // Turn-end script wake guard: arm a completion wake for any
-                // live, unwatched command script this agent started BEFORE
-                // the idle is observable — group completion is recorded
-                // pre-publish below and defers only while a script monitor
-                // is active. A cancelled turn is the user's call.
-                if *stop_reason != StopReason::Cancelled {
-                    self.arm_idle_script_wakes(agent_id).await;
-                }
                 let mut data = json!({
                     "agentId": agent_id.0,
                     "reason": "stream_complete",
@@ -5859,8 +5851,6 @@ impl Services {
         // Surface an attention request the wake turn raised mid-flight before
         // the idle emit (same ordering as the prompt-turn idle).
         self.flush_deferred_attention(agent_id, workspace_id).await;
-        // Same pre-publish script wake guard as the prompt-turn idle.
-        self.arm_idle_script_wakes(agent_id).await;
         let mut data = json!({
             "agentId": agent_id.0,
             "reason": "harness_wake_complete",

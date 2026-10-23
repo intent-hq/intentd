@@ -7772,21 +7772,23 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
-    /// Record that `agent_id` started (or restarted) run `run_id` of a saved
-    /// script through `ws.script.start` / `ws.script.restart`. Attribution
-    /// only: if the agent's turn later ends while that command-mode run is
-    /// still live and nothing watches it, the daemon auto-arms a script
-    /// monitor so the agent is woken when the run finishes. In-memory and
-    /// best-effort; the default implementation ignores the record.
-    fn script_note_agent_start(
+    /// Default-on completion wake for an agent-started run: after
+    /// `ws.script.start` / `ws.script.restart` by `agent_id` accepts run
+    /// `run_id`, register the same monitor `ws.script.monitor` would (owned by
+    /// the agent) so the agent is woken when a command-mode run finishes even
+    /// if it ends its turn without arming anything. Returns the
+    /// `script.monitor` reply (`{ ok, monitor }` or a refusal), or `null` when
+    /// the script is not command-mode (services keep running by design). The
+    /// default implementation arms nothing.
+    fn script_start_monitor(
         &self,
         workspace_id: WorkspaceId,
         agent_id: AgentId,
         script_id: String,
         run_id: String,
-    ) -> BoxFuture<'_, Result<()>> {
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let _ = (workspace_id, agent_id, script_id, run_id);
-        Box::pin(async { Ok(()) })
+        Box::pin(async { Ok(serde_json::Value::Null) })
     }
 
     /// `script.stop`: stop a running script (cancels pending auto-restart);

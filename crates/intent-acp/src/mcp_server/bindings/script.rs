@@ -127,14 +127,14 @@ pub(crate) async fn dispatch(
         "create" => create(api, ws, args).await,
         "remove" => remove(api, ws, args).await,
         "start" => {
-            let reply = start(api, ws, args).await?;
-            note_agent_start(api, ws, caller, args, &reply).await;
+            let mut reply = start(api, ws, args).await?;
+            arm_start_monitor(api, ws, caller, args, &mut reply).await;
             Ok(reply)
         }
         "stop" => stop(api, ws, args).await,
         "restart" => {
-            let reply = restart(api, ws, args).await?;
-            note_agent_start(api, ws, caller, args, &reply).await;
+            let mut reply = restart(api, ws, args).await?;
+            arm_start_monitor(api, ws, caller, args, &mut reply).await;
             Ok(reply)
         }
         "output" => output(api, ws, args).await,
@@ -153,15 +153,18 @@ fn page_options(args: &Value) -> Result<Value, String> {
     Ok(options)
 }
 
-/// Attribute an agent-started run so the daemon can auto-arm a completion
-/// wake if the agent's turn ends while the run is still live and unwatched.
-/// Best-effort: a failed record never fails the start the agent asked for.
-async fn note_agent_start(
+/// Default-on completion wake: an agent that starts or restarts a
+/// command-mode script gets the same monitor `ws.script.monitor` would arm,
+/// reported under `autoMonitor` (the `script.monitor` reply: `{ ok, monitor }`
+/// or a refusal). Agents ended turns "waiting for the build" with nothing
+/// armed and stalled until someone noticed. Best-effort: a failed arm never
+/// fails the start the agent asked for; it is reported as `autoMonitorError`.
+async fn arm_start_monitor(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
     caller: Option<&AgentId>,
     args: &Value,
-    reply: &Value,
+    reply: &mut Value,
 ) {
     let (Some(agent), Ok(script_id), Some(run_id)) = (
         caller,
@@ -169,15 +172,18 @@ async fn note_agent_start(
         reply
             .get("runId")
             .and_then(Value::as_str)
-            .filter(|r| !r.is_empty()),
+            .filter(|r| !r.is_empty())
+            .map(str::to_owned),
     ) else {
         return;
     };
-    if let Err(error) = api
-        .script_note_agent_start(ws.clone(), agent.clone(), script_id, run_id.to_owned())
+    match api
+        .script_start_monitor(ws.clone(), agent.clone(), script_id, run_id)
         .await
     {
-        tracing::debug!(%error, "script start attribution failed");
+        Ok(Value::Null) => {}
+        Ok(monitor) => reply["autoMonitor"] = monitor,
+        Err(error) => reply["autoMonitorError"] = Value::String(error.to_string()),
     }
 }
 
