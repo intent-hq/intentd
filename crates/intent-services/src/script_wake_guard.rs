@@ -9,7 +9,11 @@
 //!
 //! The MCP binding records which agent started each run
 //! ([`Services::record_agent_script_start`]). When that agent's turn ends
-//! normally (`agent:idle`), every recorded run that is still live, is
+//! (prompt turn not cancelled, or a harness-wake turn), the idle emit sites
+//! call [`Services::arm_idle_script_wakes`] BEFORE recording delegation-group
+//! completion and publishing `agent:idle` — completion recording defers only
+//! while a script monitor is active, so arming later would let a parent see
+//! the child as finished while its build still runs. Every recorded run that is still live, is
 //! command-mode, and is not already covered — no active script monitor on the
 //! script, and no active hook of the agent whose code names the script — gets
 //! a script monitor owned by the agent. The existing monitor machinery then
@@ -20,11 +24,9 @@
 //! forgotten. A run whose agent still has queued messages is kept for the
 //! next idle, since the agent is about to take another turn anyway.
 
-use crate::events::SubscriptionFilter;
 use crate::Services;
-use intent_core::events::AGENT_IDLE;
-use intent_core::{AgentId, Event, HookState, ScriptMode, WorkspaceId};
-use serde_json::{json, Value};
+use intent_core::{AgentId, HookState, ScriptMode, WorkspaceId};
+use serde_json::json;
 
 /// Lifetime of an auto-armed monitor. Long enough for a slow gate on a
 /// heavily loaded host; on expiry the agent is still woken (state
@@ -86,58 +88,6 @@ impl Services {
             let excess = runs.len() - MAX_RECORDS_PER_AGENT;
             runs.drain(..excess);
         }
-    }
-
-    /// Spawn the `agent:idle` subscriber that arms missing script wakes.
-    /// No-op-safe without an event bus.
-    pub fn spawn_script_wake_guard_loop(&self) -> tokio::task::JoinHandle<()> {
-        let Some(bus) = self.event_bus.clone() else {
-            tracing::info!("script wake guard disabled: no event bus");
-            return intent_core::spawn_daemon(async {});
-        };
-        let services = self.clone();
-        intent_core::spawn_daemon(async move {
-            let mut sub = bus.subscribe(SubscriptionFilter {
-                event_types: vec![AGENT_IDLE.to_string()],
-                ..Default::default()
-            });
-            loop {
-                let events = tokio::select! {
-                    biased;
-                    () = services.settings_tasks.closed() => break,
-                    events = sub.recv() => events,
-                };
-                let Some(events) = events else { break };
-                for event in events {
-                    if services.settings_tasks.is_closed() {
-                        break;
-                    }
-                    services.handle_agent_idle_script_wake(&event).await;
-                }
-            }
-        })
-    }
-
-    /// One `agent:idle` event. Only a normal turn end arms wakes: a
-    /// cancelled or failed turn has a human or the failure path in charge.
-    pub(crate) async fn handle_agent_idle_script_wake(
-        &self,
-        event: &Event,
-    ) -> Vec<(StartedRun, WakeDecision)> {
-        if event.event_type != AGENT_IDLE {
-            return Vec::new();
-        }
-        let Some(agent) = event.data.get("agentId").and_then(Value::as_str) else {
-            return Vec::new();
-        };
-        let finish = event.data.get("finishReason").and_then(Value::as_str);
-        if !matches!(
-            finish,
-            Some("end_turn" | "max_tokens" | "max_turn_requests" | "stream_complete")
-        ) {
-            return Vec::new();
-        }
-        self.arm_idle_script_wakes(&AgentId::from(agent)).await
     }
 
     /// Decide every recorded run of `agent` and arm the uncovered live ones.
@@ -251,12 +201,17 @@ impl Services {
             return WakeDecision::Deferred;
         }
         let options = json!({"ttlMs": AUTO_SCRIPT_MONITOR_TTL_MS, "runId": run.run});
-        match intent_core::WorkspaceApi::script_monitor(
-            self,
-            ws.clone(),
-            agent.clone(),
-            run.script.clone(),
-            options,
+        // Daemon bookkeeping, not the turn's caller: bind explicitly so the
+        // membership gate never depends on which context ran the turn.
+        match intent_core::with_caller(
+            intent_core::Caller::Daemon,
+            intent_core::WorkspaceApi::script_monitor(
+                self,
+                ws.clone(),
+                agent.clone(),
+                run.script.clone(),
+                options,
+            ),
         )
         .await
         {

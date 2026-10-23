@@ -15,28 +15,6 @@ async fn agent_start(h: &Harness, agent: &intent_core::AgentId, id: &str) -> Str
     run
 }
 
-fn idle_event(agent: &intent_core::AgentId, finish: &str) -> intent_core::Event {
-    intent_core::Event {
-        id: "ev-idle".into(),
-        workspace_id: WorkspaceId::from("ws-any"),
-        timestamp: now_iso(),
-        event_type: intent_core::events::AGENT_IDLE.into(),
-        actor: intent_core::EventActor {
-            actor_type: intent_core::ActorType::Agent,
-            id: Some(agent.0.clone()),
-            name: None,
-            email: None,
-            model: None,
-            metadata: None,
-        },
-        session_id: None,
-        correlation_id: None,
-        parent_event_id: None,
-        metadata: None,
-        data: json!({"agentId": agent, "finishReason": finish}),
-    }
-}
-
 fn gate_command(gate: &std::path::Path, code: i32) -> String {
     format!(
         "while [ ! -e '{}' ]; do sleep 0.05; done; exit {code}",
@@ -64,10 +42,7 @@ async fn auto_wake_arms_monitor_and_wakes_owner_with_exit_status() {
     let id = create_simple(&h, "long build", &gate_command(&gate_path, 3), ScriptMode::Command).await;
     let run = agent_start(&h, &agent, &id).await;
 
-    let decisions = h
-        .services
-        .handle_agent_idle_script_wake(&idle_event(&agent, "end_turn"))
-        .await;
+    let decisions = h.services.arm_idle_script_wakes(&agent).await;
     assert_eq!(decisions.len(), 1, "{decisions:?}");
     let WakeDecision::Armed(monitor_id) = &decisions[0].1 else {
         panic!("expected an armed monitor: {decisions:?}");
@@ -164,18 +139,11 @@ async fn auto_wake_ignores_service_mode_scripts() {
 }
 
 #[intent_test_macros::daemon_test]
-async fn auto_wake_defers_while_messages_are_queued_and_skips_abnormal_finish() {
+async fn auto_wake_defers_while_messages_are_queued() {
     let h = harness().await;
     let agent = monitor_owner(&h, "builder").await;
     let id = create_simple(&h, "queued build", "sleep 30", ScriptMode::Command).await;
     agent_start(&h, &agent, &id).await;
-
-    // A cancelled turn is the user's call: nothing is armed or consumed.
-    assert!(h
-        .services
-        .handle_agent_idle_script_wake(&idle_event(&agent, "cancelled"))
-        .await
-        .is_empty());
 
     h.services
         .agent_queues
