@@ -22,7 +22,7 @@ jobs:
   headless-setup:
     if: github.event_name == 'workflow_dispatch'
     needs: [runner-route]
-    runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')['gh-windows-16x'] || fromJSON('["gh-windows-16x"]') }}
+    runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')['gh-windows-16x'] || fromJSON('["warp-windows-2022-x64-16x"]') }}
     timeout-minutes: 45
     defaults:
       run:

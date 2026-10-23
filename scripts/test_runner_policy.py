@@ -26,6 +26,39 @@ HOSTED_LINUX = {
 HEAVY_HOSTED_ONLY = {}
 MAINTENANCE = {('m1mac-smoke.yml', 'smoke'), ('provision-m1mac.yml', 'provision'), ('provision-m1mac.yml', 'verify'), ('macos-prune.yml', 'prune'), ('windows-prune.yml', 'prune')}
 
+# GitHub's larger runners are off: every paid size bursts to its WarpBuild
+# runner, read from the probe so the two never drift apart.
+WARP = dict(re.findall(r"'([\w.-]+)': '(warp-[\w.-]+)'", re.search(r"const warp = \{(.*?)\};", (ROOT / '.github/workflows/runner-route.yml').read_text(), re.S)[1]))
+
+
+def burst_label(label):
+    """Where a label runs without a self-hosted slot: a paid size on WarpBuild, a free label itself."""
+    return WARP.get(label, label)
+
+
+def paid_label_violations(text):
+    """Jobs that could still land on a GitHub larger runner (they are off).
+
+    A paid size reaches a runner only through the probe's mapping. A literal
+    fallback (used if the route job failed) names the WarpBuild label; a matrix
+    fallback to the raw size label is allowed only in jobs that are skipped
+    when the route job fails (no `!cancelled()` / `always()` in their `if`).
+    """
+    paid = '|'.join(map(re.escape, WARP))
+    errors = []
+    for job, body in jobs(text).items():
+        runner = re.search(r'^    runs-on: (.+)$', body, re.M)
+        runner = runner[1].strip() if runner else ''
+        if re.fullmatch(paid, runner.strip('"\'')):
+            errors.append(f'{job}: runs on the paid GitHub label {runner}')
+        for found in re.findall(r"""(?:fromJSON\('|\|\| ')\[\"(%s)\"\]'""" % paid, body):
+            errors.append(f'{job}: falls back to the paid GitHub label {found}')
+        guard = re.search(r'^    if: (.+)$', body, re.M)
+        survives = bool(guard and re.search(r'!cancelled\(\)|always\(\)', guard[1]))
+        if survives and re.search(r'\|\| matrix\.(?:runner|os) \}\}', runner) and re.search(r'(?:runner|os): (?:%s)\b' % paid, body):
+            errors.append(f'{job}: runs after a failed route job but falls back to a paid matrix label')
+    return errors
+
 
 def hosted_linux(key):
     return ("${{ (contains(%s, 'ubuntu') || contains(%s, 'linux')) && (fromJSON(needs.runner-route.outputs.cloud || '{}')[%s] || %s) || "
@@ -113,8 +146,8 @@ def slot_violations(text):
                 errors.append(f'{job}: reads an unlisted slot')
                 continue
             used.add(entry['key'])
-            if entry['label'] != read[3]:
-                errors.append(f"{job}: fallback {read[3]} differs from listed {entry['label']}")
+            if burst_label(entry['label']) != read[3]:
+                errors.append(f"{job}: fallback {read[3]} differs from {burst_label(entry['label'])} for listed {entry['label']}")
             only = re.search(r"^    if: github\.event_name == '(\w+)'$", body, re.M)
             if only and entry.get('events') != [only[1]]:
                 errors.append(f'{job}: runs only on {only[1]} but lists events {entry.get("events")}')
@@ -127,8 +160,8 @@ def slot_violations(text):
             errors.append(f'{job}: reads an unlisted slot')
             continue
         used.add(key)
-        if read[3] and entry['label'] != read[3]:
-            errors.append(f"{job}: fallback {read[3]} differs from listed {entry['label']}")
+        if read[3] and burst_label(entry['label']) != read[3]:
+            errors.append(f"{job}: fallback {read[3]} differs from {burst_label(entry['label'])} for listed {entry['label']}")
         if read[4] and entry['label'] not in body:
             errors.append(f"{job}: no matrix leg asks for the listed {entry['label']}")
         if bool(read[2]) != bool(entry.get('shards') or entry.get('legs')):
@@ -215,10 +248,10 @@ class RunnerPolicy(unittest.TestCase):
         self.assertEqual(len(slot_violations(listing.format('gh-linux-8x', ',"events":["merge_group"]') + job)), 1)
         self.assertEqual(len(slot_violations(listing.format('windows-2025', ',"events":["merge_group"]') + job)), 2)
         self.assertEqual(slot_violations('jobs:\n' + job), ['a: reads an unlisted slot'])
-        row = "  b:\n    strategy:\n      matrix:\n        include:\n          - os: ${{ fromJSON(needs.route.outputs.slots || '{}')['b-linux'] || fromJSON('[\"gh-linux-16x\"]') }}\n    runs-on: ${{ matrix.os }}\n"
+        row = "  b:\n    strategy:\n      matrix:\n        include:\n          - os: ${{ fromJSON(needs.route.outputs.slots || '{}')['b-linux'] || fromJSON('[\"warp-ubuntu-2404-x64-16x\"]') }}\n    runs-on: ${{ matrix.os }}\n"
         rows = '    with:\n      slot_jobs: >-\n        [{{"key":"b-linux","label":"{}"}}]\njobs:\n'
         self.assertEqual(slot_violations(rows.format('gh-linux-16x') + row), [])
-        self.assertEqual(slot_violations(rows.format('gh-linux-8x') + row), ['b: fallback gh-linux-16x differs from listed gh-linux-8x'])
+        self.assertEqual(slot_violations(rows.format('gh-linux-8x') + row), ['b: fallback warp-ubuntu-2404-x64-16x differs from warp-ubuntu-2404-x64-8x for listed gh-linux-8x'])
         self.assertEqual(slot_violations('jobs:\n' + row), ['b: reads an unlisted slot'])
         # A queue-only matrix row must list only that event, or it holds a slot on other events.
         queued = row.replace('    strategy:', "    if: github.event_name == 'merge_group'\n    strategy:", 1)
@@ -228,11 +261,11 @@ class RunnerPolicy(unittest.TestCase):
 
         # A burst label only upsizes a heavy job; free or downsized bursts are rejected.
         bursts = '    with:\n      slot_jobs: >-\n        [{{"key":"a","label":"{}","burst":"{}","events":["merge_group"]}}]\njobs:\n'
-        heavy = job.replace('ubuntu-24.04', 'gh-linux-8x')
+        heavy = job.replace('ubuntu-24.04', 'warp-ubuntu-2404-x64-8x')
         self.assertEqual(slot_violations(bursts.format('gh-linux-8x', 'gh-linux-16x') + heavy), [])
         self.assertEqual(slot_violations(bursts.format('ubuntu-24.04', 'gh-linux-16x') + job),
                          ['a: burst gh-linux-16x must upsize gh-linux-8x to gh-linux-16x'])
-        self.assertEqual(slot_violations(bursts.format('gh-linux-16x', 'gh-linux-8x') + job.replace('ubuntu-24.04', 'gh-linux-16x')),
+        self.assertEqual(slot_violations(bursts.format('gh-linux-16x', 'gh-linux-8x') + job.replace('ubuntu-24.04', 'warp-ubuntu-2404-x64-16x')),
                          ['a: burst gh-linux-8x must upsize gh-linux-8x to gh-linux-16x'])
     def test_all_workloads_are_routed(self):
         for path in (ROOT / '.github/workflows').glob('*.yml'):
@@ -250,8 +283,8 @@ class RunnerPolicy(unittest.TestCase):
         self.assertEqual(listed['daemon-lifecycle-linux'], {'key': 'daemon-lifecycle-linux', 'label': 'gh-linux-16x', 'rust': True, 'minutes': 4, 'events': ['merge_group']})
         body = jobs(ci)
         for job in ('coverage-all', 'coverage-e2e'):
-            self.assertIn("runs-on: ${{ fromJSON(needs.route.outputs.slots || '{}')['%s'] || fromJSON('[\"gh-linux-16x\"]') }}" % job, body[job])
-        self.assertIn("os: ${{ fromJSON(needs.route.outputs.slots || '{}')['daemon-lifecycle-linux'] || fromJSON('[\"gh-linux-16x\"]') }}", body['daemon-lifecycle'])
+            self.assertIn("runs-on: ${{ fromJSON(needs.route.outputs.slots || '{}')['%s'] || fromJSON('[\"warp-ubuntu-2404-x64-16x\"]') }}" % job, body[job])
+        self.assertIn("os: ${{ fromJSON(needs.route.outputs.slots || '{}')['daemon-lifecycle-linux'] || fromJSON('[\"warp-ubuntu-2404-x64-16x\"]') }}", body['daemon-lifecycle'])
         # An 8-CPU heavy slot (xl busy) runs about twice as long as gh-linux-16x.
         # Under the merge queue's 60-minute check response timeout.
         self.assertIn('    timeout-minutes: 55\n', body['coverage-all'])
@@ -305,8 +338,32 @@ class RunnerPolicy(unittest.TestCase):
         self.assertIn("  LINUX_BURST_THRESHOLD: ${{ vars.CI_LINUX_HEAVY_SLOTS || '2' }}\n", ci)
         self.assertIn("  LINUX_XL_BURST_THRESHOLD: ${{ vars.CI_LINUX_XL_SLOTS || '0' }}\n", ci)
         self.assertNotIn('SMALL', ci)
-        self.assertIn('          WARPBUILD_DISABLED: ${{ vars.CI_WARPBUILD_DISABLED }}\n', ci)
+        # GitHub's larger runners are off, so there is no switch back to them.
+        self.assertNotIn('WARPBUILD_DISABLED', ci)
         self.assertIn('          XL_THRESHOLD: ${{ env.LINUX_XL_BURST_THRESHOLD }}\n', ci)
+
+    def test_no_job_can_land_on_a_github_larger_runner(self):
+        for path in (ROOT / '.github/workflows').glob('*.yml'):
+            if path.name == 'runner-route.yml':
+                continue
+            with self.subTest(workflow=path.name):
+                self.assertEqual(paid_label_violations(path.read_text()), [])
+
+    def test_paid_label_detection(self):
+        self.assertEqual(sorted(WARP), ['gh-linux-16x', 'gh-linux-8x', 'gh-linux-arm64-8x', 'gh-windows-16x', 'gh-windows-8x', 'macos-15-xlarge', 'macos-26-xlarge'])
+        slot = "${{ fromJSON(needs.route.outputs.slots || '{}')['a'] || fromJSON('[\"%s\"]') }}"
+        job = 'jobs:\n  a:\n    runs-on: %s\n'
+        self.assertEqual(paid_label_violations(job % (slot % 'warp-ubuntu-2404-x64-16x')), [])
+        self.assertEqual(paid_label_violations(job % (slot % 'gh-linux-16x')), ['a: falls back to the paid GitHub label gh-linux-16x'])
+        self.assertEqual(paid_label_violations(job % 'gh-windows-16x'), ['a: runs on the paid GitHub label gh-windows-16x'])
+        windows = "${{ fromJSON(needs.route.outputs.windows_labels || '[\"gh-windows-16x\"]') }}"
+        self.assertEqual(paid_label_violations('jobs:\n  a:\n    strategy:\n      matrix:\n        include:\n          - os: %s\n    runs-on: ${{ matrix.os }}\n' % windows),
+                         ['a: falls back to the paid GitHub label gh-windows-16x'])
+        # A matrix fallback matters only when the job still runs after the route job failed.
+        matrix = "jobs:\n  a:\n%s    strategy:\n      matrix:\n        include:\n        - os: gh-linux-16x\n    runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')[matrix.os] || matrix.os }}\n"
+        self.assertEqual(paid_label_violations(matrix % "    if: github.ref == 'refs/heads/main'\n"), [])
+        self.assertEqual(paid_label_violations(matrix % "    if: ${{ !cancelled() }}\n"),
+                         ['a: runs after a failed route job but falls back to a paid matrix label'])
 
     def test_policy_rejects_new_paid_pins(self):
         for label in ['gh-linux-8x', 'gh-linux-16x', 'gh-windows-16x', 'macos-26-xlarge', 'macos-15-xlarge',
