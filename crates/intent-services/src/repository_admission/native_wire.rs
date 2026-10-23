@@ -64,9 +64,70 @@ const NOTICE_LIMIT: usize = 64;
 const READ_LIMIT: usize = 64;
 const WORKER_LIMIT: usize = 2;
 const LEASE_TTL: Duration = Duration::from_secs(300);
-const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
-const READ_TIMEOUT: Duration = Duration::from_secs(10);
-const FRAME_TTL: Duration = Duration::from_secs(15);
+const READ_TIMEOUT_BASE: Duration = Duration::from_secs(10);
+/// Production bound on acquiring a native request's source, credentials or
+/// authority. Read it through [`acquire_wait`].
+const ACQUIRE_BASE: Duration = Duration::from_secs(5);
+/// Production lifetime of an unstarted native request frame. Read it through
+/// [`frame_ttl`].
+const FRAME_TTL_BASE: Duration = Duration::from_secs(15);
+
+/// How long a native wire, review, resource-read or selection request may
+/// wait to acquire what it needs before it is refused.
+fn acquire_wait() -> Duration {
+    request_wait(ACQUIRE_BASE)
+}
+/// How long a native request frame stays admitted before it starts.
+fn frame_ttl() -> Duration {
+    request_wait(FRAME_TTL_BASE)
+}
+/// Bound on one native context read once its lease is held.
+fn read_timeout() -> Duration {
+    request_wait(READ_TIMEOUT_BASE)
+}
+/// Production keeps the fixed bounds.
+#[cfg(not(test))]
+const fn request_wait(base: Duration) -> Duration {
+    base
+}
+// Every non-test build (the daemon, and `repository-test-fixtures` e2e builds)
+// keeps the fixed bounds; checked at compile time, where no test can reach.
+#[cfg(not(test))]
+const _: () = assert!(
+    request_wait(ACQUIRE_BASE).as_nanos() == 5_000_000_000
+        && request_wait(READ_TIMEOUT_BASE).as_nanos() == 10_000_000_000
+        && request_wait(FRAME_TTL_BASE).as_nanos() == 15_000_000_000
+);
+/// Unit tests stretch the bounds (and every module's other request limits,
+/// so their production order holds) with `INTENTD_TEST_TIMEOUT_MULTIPLIER`, as
+/// every test budget does: coverage CI runs these real Git/SQLite workers on
+/// oversubscribed runners, where a fixed 5s acquire refused a prepare as
+/// "Repository review unavailable" (intentd#2581). The setting is read once
+/// per process so production deadlines and a test's paused-clock advances
+/// always agree.
+#[cfg(test)]
+fn request_wait(base: Duration) -> Duration {
+    static SETTING: std::sync::LazyLock<Option<String>> = std::sync::LazyLock::new(|| {
+        std::env::var(intentd_test_support::TIMEOUT_MULTIPLIER_ENV).ok()
+    });
+    stretched_request_wait(base, SETTING.as_deref())
+}
+/// Highest stretch for the request waits. These waits race fixed timers that
+/// do not stretch, and production relies on them firing first: the 5s acquire
+/// against the GitLab client's 30s request timeout (crossed from x6, when a
+/// held provider call fails before the acquire wait elapses), the 15s frame
+/// against `STAGE_TTL` (120s, from x8) and `LEASE_TTL` (300s, at x20), and a
+/// test waiting for real frame expiry against nextest's 180s kill (from x12).
+/// x4 keeps those orders and still covers coverage CI's x3. (The 10s read
+/// limits meet the GitLab client's 30s at x3; no test holds a provider call
+/// across a read deadline, and the suite passes at x20.)
+#[cfg(test)]
+const REQUEST_WAIT_MAX_STRETCH: u32 = 4;
+#[cfg(test)]
+fn stretched_request_wait(base: Duration, multiplier: Option<&str>) -> Duration {
+    intentd_test_support::scale_test_timeout(base, multiplier)
+        .min(base.saturating_mul(REQUEST_WAIT_MAX_STRETCH))
+}
 
 fn unavailable() -> Error {
     Error::Forbidden("Repository context unavailable".into())
@@ -361,7 +422,7 @@ impl Connection {
             // caller-binding: allow — only finishes the original request lifetime; no service capability calls
             tokio::spawn(async move {
                 if let Some(retirement) = retirement {
-                    tokio::select! { () = retirement.native_cancelled() => return, () = tokio::time::sleep(FRAME_TTL) => {} }
+                    tokio::select! { () = retirement.native_cancelled() => return, () = tokio::time::sleep(frame_ttl()) => {} }
                 } else {
                     return;
                 }
@@ -871,7 +932,7 @@ pub(crate) fn capture(
     let request = Request::current(services);
     Box::pin(async move {
         let request = request.map_err(|_| unavailable())?;
-        tokio::time::timeout(ACQUIRE_TIMEOUT, capture_inner(&request, query))
+        tokio::time::timeout(acquire_wait(), capture_inner(&request, query))
             .await
             .map_err(|_| unavailable())?
             .map_err(|_| unavailable())
@@ -1080,7 +1141,7 @@ pub(crate) fn read(
         let request = request.map_err(|_| unavailable())?;
         let lease = find_lease(&request, &query).map_err(|_| unavailable())?;
         *request.state.lock().map_err(|_| unavailable())? = RequestState::Reading(lease.clone());
-        let result = tokio::time::timeout(READ_TIMEOUT, read_inner(&request, &lease))
+        let result = tokio::time::timeout(read_timeout(), read_inner(&request, &lease))
             .await
             .map_err(|_| AdmissionError::Unavailable)
             .and_then(|r| r);
@@ -1364,7 +1425,7 @@ impl Request {
         observed: Option<&Arc<Observation>>,
         transfer: &mut (dyn FnMut() -> Result<()> + Send),
     ) -> Result<()> {
-        let result = tokio::time::timeout(READ_TIMEOUT, async {
+        let result = tokio::time::timeout(read_timeout(), async {
             let _credential = self.connection.caller.legacy_lease().await?;
             validate(self, lease).await?;
             let locks = if let Some(original) = observed {
