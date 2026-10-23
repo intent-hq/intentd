@@ -408,47 +408,6 @@ impl Services {
         self.store.get_workspace(&workspace_id).await.map(|_| ())
     }
 
-    /// Chunk/session handles never confer another authenticated person's
-    /// transfer authority. Reconnects retain access through the same principal.
-    pub(crate) async fn require_import_actor(&self, id: &str, what: &str) -> Result<()> {
-        self.require_host_execution(what).await?;
-        let Some(principal) = gated_collaborator_caller(what)? else {
-            return Ok(());
-        };
-        let imports = self
-            .transfer_imports
-            .lock()
-            .expect("transfer import registry poisoned");
-        if imports
-            .get(id)
-            .is_some_and(|s| s.initiator.as_ref() != Some(&principal))
-        {
-            return Err(Error::NotFound(format!("import {id}")));
-        }
-        Ok(())
-    }
-
-    pub(crate) async fn require_export_actor(&self, id: &str, what: &str) -> Result<()> {
-        let Some(principal) = gated_collaborator_caller(what)? else {
-            return Ok(());
-        };
-        let session = self
-            .transfer_exports
-            .lock()
-            .expect("transfer export registry poisoned")
-            .get(id)
-            .map(|s| (s.workspace_id.clone(), s.initiator.clone()));
-        let Some((workspace, initiator)) = session else {
-            self.require_host_execution(what).await?;
-            return Ok(());
-        };
-        self.require_workspace_manager(&workspace, what).await?;
-        if initiator.as_ref() != Some(&principal) {
-            return Err(Error::NotFound(format!("export {id}")));
-        }
-        Ok(())
-    }
-
     /// Path-based `git.*` gate (`git.getBranches` / `branchStatus` / `pull` /
     /// `getRemoteUrl` take a caller-supplied `repoPath`): a collaborator may
     /// only name a path that is the worktree, repository path or a registered

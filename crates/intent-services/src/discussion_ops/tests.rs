@@ -796,7 +796,7 @@ async fn discussion_export_cannot_bypass_participant_authorization() {
         ));
     }
     assert!(
-        svc.transfer_exports.lock().unwrap().is_empty(),
+        svc.transfer_state().exports.lock().unwrap().is_empty(),
         "no readable export session"
     );
 }

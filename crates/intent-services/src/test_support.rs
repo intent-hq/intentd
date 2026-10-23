@@ -2,6 +2,7 @@
 
 pub(crate) mod provider_installed;
 mod scratch;
+pub(crate) mod submodule_fixture;
 pub(crate) use scratch::{test_tempdir, test_tempdir_in};
 
 /// Supply the canonical installed CLI required even by a mock ACP adapter:

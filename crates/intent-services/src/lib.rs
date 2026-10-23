@@ -97,6 +97,7 @@ mod enhance_ops;
 mod event_ops;
 mod event_subscriptions;
 pub mod events;
+mod feature_ports;
 mod file_ops;
 mod git_diff_singleflight;
 mod git_ops;
@@ -1501,8 +1502,6 @@ pub struct Services {
     test_review_monitoring_recipient: bool,
     #[cfg(test)]
     test_review_monitor_write_ready: Arc<Mutex<Option<Arc<tokio::sync::Notify>>>>,
-    #[cfg(test)]
-    test_export_monitor_preflight: Arc<Mutex<Option<transfer_export::MonitorExportBarrier>>>,
     /// Upper bound on one shared forge fetch within a PR-monitor sweep (60 s
     /// in production) — defense in depth above the client-level network
     /// timeouts, so a hung connection can never wedge the sweep loop. Tests
@@ -1550,13 +1549,6 @@ pub struct Services {
     /// every pending deletion. Shared across clones so every front door
     /// observes one set.
     pending_agent_deletes: delete_grace::OwnedPendingDeletes,
-    /// In-flight staged workspace imports (`workspace.import.*`, keyed by
-    /// `importId`): manifest + staging paths + chunk cursor between `begin`
-    /// and `commit`/`abort`. Shared across clones so chunks arriving over any
-    /// connection append to the same staging file. In-memory only — a daemon
-    /// restart drops pending imports (staging dirs are swept lazily by the
-    /// next `begin`), and the FE simply restarts the upload.
-    transfer_imports: Arc<Mutex<HashMap<String, transfer_import::ImportSession>>>,
     /// Coalesced safe-context invalidations and bounded provider verdicts.
     execution_invalidation: Arc<tokio::sync::Notify>,
     execution_readiness: Arc<Mutex<HashMap<String, Option<bool>>>>,
@@ -1578,24 +1570,11 @@ pub struct Services {
     /// [`with_idempotency`]: same-key first-use callers serialize on the
     /// key so one runs the operation and the rest replay its stored result.
     idempotency_inflight: Arc<IdempotencyInflight>,
-    /// In-flight source-side exports (`workspace.export.*`, keyed by
-    /// `exportId`): build state + sealed archive + WIP bookkeeping between
-    /// `start` and `finalize`/`abort`. In-memory only — a daemon restart
-    /// drops sessions (staging dirs are swept at boot and lazily by the next
-    /// `start`), and the FE simply restarts the export.
-    transfer_exports: Arc<Mutex<HashMap<String, transfer_export::ExportSession>>>,
-    /// Test seam: when set, consulted between export archive build stages
-    /// with the name of the stage about to run; returning an error fails the
-    /// build at that point, exercising the `workspace:transfer:failed`
-    /// cleanup path. Production wiring keeps `None`; tests inject via the
-    /// `#[cfg(test)]`-only `with_export_build_failpoint`.
-    export_build_failpoint: Option<ExportBuildFailpoint>,
+    /// Registered feature ports (see [`feature_ports`]). Feature state such
+    /// as in-flight transfer sessions lives in the port implementations;
+    /// shared across clones.
+    ports: feature_ports::FeaturePorts,
 }
-
-/// Test-only export build failpoint (see
-/// [`Services::export_build_failpoint`]): given the name of the stage about
-/// to run, returning `Some(error)` fails the build there.
-pub(crate) type ExportBuildFailpoint = Arc<dyn Fn(&str) -> Option<Error> + Send + Sync>;
 
 /// Pause inserted between per-workspace iterations of the background sweeps
 /// ([`Services::refresh_all_workspace_prs`] / [`Services::scan_all_token_usage`])
@@ -1888,8 +1867,6 @@ impl Services {
             test_review_monitoring_recipient: false,
             #[cfg(test)]
             test_review_monitor_write_ready: Arc::new(Mutex::new(None)),
-            #[cfg(test)]
-            test_export_monitor_preflight: Arc::default(),
             pr_monitor_fetch_timeout: pr_monitor::PR_MONITOR_FETCH_TIMEOUT,
             pr_refresh_fetch_timeout: PR_REFRESH_FETCH_TIMEOUT,
             sweep_rate_limit: Arc::new(rate_limit::RateLimitGate::default()),
@@ -1907,12 +1884,10 @@ impl Services {
             pending_agent_deletes: pending_deletes,
             execution_invalidation: Arc::new(tokio::sync::Notify::new()),
             execution_readiness: Arc::new(Mutex::new(HashMap::new())),
-            transfer_imports: Arc::new(Mutex::new(HashMap::new())),
             attachment_uploads: Arc::new(Mutex::new(HashMap::new())),
             attachment_idempotency_inflight: Arc::new(Mutex::new(HashMap::new())),
             idempotency_inflight: Arc::new(IdempotencyInflight::default()),
-            transfer_exports: Arc::new(Mutex::new(HashMap::new())),
-            export_build_failpoint: None,
+            ports: feature_ports::FeaturePorts::new(Arc::new(transfer::TransferFeature::default())),
         };
         services
             .gitlab_credential_gate
@@ -4870,16 +4845,6 @@ impl Services {
     #[must_use]
     pub fn with_workspaces_root(mut self, root: PathBuf) -> Self {
         self.workspaces_root = Some(root);
-        self
-    }
-
-    /// Test-only: fail the export archive build mid-flight. The closure is
-    /// consulted with the name of each build stage about to run; returning
-    /// `Some(error)` fails the build there, exercising the
-    /// `workspace:transfer:failed` cleanup path.
-    #[cfg(test)]
-    pub(crate) fn with_export_build_failpoint(mut self, failpoint: ExportBuildFailpoint) -> Self {
-        self.export_build_failpoint = Some(failpoint);
         self
     }
 
@@ -21483,11 +21448,7 @@ impl WorkspaceApi for Services {
         &self,
         id: WorkspaceId,
     ) -> BoxFuture<'_, Result<intent_core::transfer::TransferPlan>> {
-        Box::pin(async move {
-            self.require_workspace_manager(&id, "workspace.transferPlan")
-                .await?;
-            self.workspace_transfer_plan_op(id).await
-        })
+        self.ports.transfer().transfer_plan(self, id)
     }
 
     fn workspace_import_begin(
@@ -21496,11 +21457,9 @@ impl WorkspaceApi for Services {
         archive_size_bytes: u64,
         archive_sha256: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move {
-            self.require_host_execution("workspace.importBegin").await?;
-            self.workspace_import_begin_op(manifest, archive_size_bytes, archive_sha256)
-                .await
-        })
+        self.ports
+            .transfer()
+            .import_begin(self, manifest, archive_size_bytes, archive_sha256)
     }
 
     fn workspace_import_chunk(
@@ -21509,41 +21468,27 @@ impl WorkspaceApi for Services {
         seq: u64,
         data: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move {
-            self.require_import_actor(&import_id, "workspace.importChunk")
-                .await?;
-            self.workspace_import_chunk_op(import_id, seq, data).await
-        })
+        self.ports
+            .transfer()
+            .import_chunk(self, import_id, seq, data)
     }
 
     fn workspace_import_commit(
         &self,
         import_id: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move {
-            self.require_import_actor(&import_id, "workspace.importCommit")
-                .await?;
-            self.workspace_import_commit_op(import_id).await
-        })
+        self.ports.transfer().import_commit(self, import_id)
     }
 
     fn workspace_import_abort(
         &self,
         import_id: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move {
-            self.require_import_actor(&import_id, "workspace.importAbort")
-                .await?;
-            self.workspace_import_abort_op(import_id).await
-        })
+        self.ports.transfer().import_abort(self, import_id)
     }
 
     fn workspace_export_start(&self, id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move {
-            self.require_workspace_manager(&id, "workspace.export.start")
-                .await?;
-            self.workspace_export_start_op(id).await
-        })
+        self.ports.transfer().export_start(self, id)
     }
 
     fn workspace_export_read(
@@ -21551,11 +21496,7 @@ impl WorkspaceApi for Services {
         export_id: String,
         seq: u64,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move {
-            self.require_export_actor(&export_id, "workspace.export.read")
-                .await?;
-            self.workspace_export_read_op(export_id, seq).await
-        })
+        self.ports.transfer().export_read(self, export_id, seq)
     }
 
     fn workspace_export_finalize(
@@ -21564,23 +21505,16 @@ impl WorkspaceApi for Services {
         archive_source: bool,
         final_status_message: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move {
-            self.require_export_actor(&export_id, "workspace.export.finalize")
-                .await?;
-            self.workspace_export_finalize_op(export_id, archive_source, final_status_message)
-                .await
-        })
+        self.ports
+            .transfer()
+            .export_finalize(self, export_id, archive_source, final_status_message)
     }
 
     fn workspace_export_abort(
         &self,
         export_id: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move {
-            self.require_export_actor(&export_id, "workspace.export.abort")
-                .await?;
-            self.workspace_export_abort_op(export_id).await
-        })
+        self.ports.transfer().export_abort(self, export_id)
     }
 
     fn create_workspace(

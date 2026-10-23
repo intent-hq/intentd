@@ -23388,17 +23388,22 @@ mod agent_retry_tests {
     }
 
     fn park_monitor_export(mgr: &AgentManager, ws: &WorkspaceId) {
-        mgr.services.transfer_exports.lock().unwrap().insert(
-            "monitor-worker-export".into(),
-            crate::transfer_export::ExportSession {
-                initiator: None,
-                workspace_id: ws.clone(),
-                staging_dir: std::env::temp_dir(),
-                state: crate::transfer_export::ExportState::Building { aborted: false },
-                wip_paths: vec![],
-                max_chunk_bytes: 100,
-            },
-        );
+        mgr.services
+            .transfer_state()
+            .exports
+            .lock()
+            .unwrap()
+            .insert(
+                "monitor-worker-export".into(),
+                crate::transfer_export::ExportSession {
+                    initiator: None,
+                    workspace_id: ws.clone(),
+                    staging_dir: std::env::temp_dir(),
+                    state: crate::transfer_export::ExportState::Building { aborted: false },
+                    wip_paths: vec![],
+                    max_chunk_bytes: 100,
+                },
+            );
     }
 
     async fn monitor_worker_exit_releases_slot(exporting: bool) {

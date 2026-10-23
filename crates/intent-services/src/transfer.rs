@@ -4,20 +4,194 @@
 //! written, snapshotted, or bundled here (the export archive itself is built
 //! by the transfer orchestrator, a separate surface).
 
+use std::any::Any;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use intent_core::transfer::{
     TransferAsset, TransferAttachment, TransferGitSummary, TransferManifest, TransferPlan,
     TransferSubmoduleSummary, TransferTableStat, TransferWarning, CREATING_INTENTD_VERSION,
     TRANSFER_FORMAT_VERSION,
 };
-use intent_core::{clock::now_iso, Error, Result, Workspace, WorkspaceId};
+use intent_core::{clock::now_iso, BoxFuture, Error, Result, Workspace, WorkspaceId};
 use intent_store::SandboxStatus;
 
+use crate::feature_ports::TransferPort;
 use crate::transfer_submodules::{
     estimate_submodule_bundle_bytes, find_unpublished_submodules, UnpublishedSubmodule,
 };
 use crate::{file_ops, git_ops, Services};
+
+/// The in-crate [`TransferPort`] implementation: owns every in-flight
+/// transfer session. One instance is registered by [`Services::new`] and
+/// shared by all `Services` clones, so chunks arriving over any connection
+/// reach the same session.
+#[derive(Default)]
+pub(crate) struct TransferFeature {
+    /// In-flight staged workspace imports (`workspace.import.*`, keyed by
+    /// `importId`): manifest + staging paths + chunk cursor between `begin`
+    /// and `commit`/`abort`. In-memory only — a daemon restart drops pending
+    /// imports (staging dirs are swept lazily by the next `begin`), and the
+    /// FE simply restarts the upload.
+    pub(crate) imports: Mutex<HashMap<String, crate::transfer_import::ImportSession>>,
+    /// In-flight source-side exports (`workspace.export.*`, keyed by
+    /// `exportId`): build state + sealed archive + WIP bookkeeping between
+    /// `start` and `finalize`/`abort`. In-memory only — a daemon restart
+    /// drops sessions (staging dirs are swept at boot and lazily by the next
+    /// `start`), and the FE simply restarts the export.
+    pub(crate) exports: Mutex<HashMap<String, crate::transfer_export::ExportSession>>,
+    /// Test seam: when set, consulted between export archive build stages
+    /// with the name of the stage about to run; returning an error fails the
+    /// build at that point, exercising the `workspace:transfer:failed`
+    /// cleanup path. Production wiring keeps `None`; tests inject via the
+    /// `#[cfg(test)]`-only `Services::with_export_build_failpoint`.
+    pub(crate) export_build_failpoint: Mutex<Option<crate::transfer_export::ExportBuildFailpoint>>,
+    #[cfg(test)]
+    pub(crate) test_export_monitor_preflight:
+        Mutex<Option<crate::transfer_export::MonitorExportBarrier>>,
+}
+
+impl Services {
+    /// The registered transfer feature and its session state.
+    pub(crate) fn transfer_state(&self) -> &TransferFeature {
+        self.ports
+            .transfer()
+            .as_any()
+            .downcast_ref::<TransferFeature>()
+            .expect("the in-crate transfer feature is registered")
+    }
+}
+
+impl TransferPort for TransferFeature {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn transfer_plan<'a>(
+        &'a self,
+        svc: &'a Services,
+        id: WorkspaceId,
+    ) -> BoxFuture<'a, Result<TransferPlan>> {
+        Box::pin(async move {
+            svc.require_workspace_manager(&id, "workspace.transferPlan")
+                .await?;
+            svc.workspace_transfer_plan_op(id).await
+        })
+    }
+
+    fn import_begin<'a>(
+        &'a self,
+        svc: &'a Services,
+        manifest: serde_json::Value,
+        archive_size_bytes: u64,
+        archive_sha256: String,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        Box::pin(async move {
+            svc.require_host_execution("workspace.importBegin").await?;
+            svc.workspace_import_begin_op(manifest, archive_size_bytes, archive_sha256)
+                .await
+        })
+    }
+
+    fn import_chunk<'a>(
+        &'a self,
+        svc: &'a Services,
+        import_id: String,
+        seq: u64,
+        data: String,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        Box::pin(async move {
+            svc.require_import_actor(&import_id, "workspace.importChunk")
+                .await?;
+            svc.workspace_import_chunk_op(import_id, seq, data).await
+        })
+    }
+
+    fn import_commit<'a>(
+        &'a self,
+        svc: &'a Services,
+        import_id: String,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        Box::pin(async move {
+            svc.require_import_actor(&import_id, "workspace.importCommit")
+                .await?;
+            svc.workspace_import_commit_op(import_id).await
+        })
+    }
+
+    fn import_abort<'a>(
+        &'a self,
+        svc: &'a Services,
+        import_id: String,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        Box::pin(async move {
+            svc.require_import_actor(&import_id, "workspace.importAbort")
+                .await?;
+            svc.workspace_import_abort_op(import_id).await
+        })
+    }
+
+    fn export_start<'a>(
+        &'a self,
+        svc: &'a Services,
+        id: WorkspaceId,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        Box::pin(async move {
+            svc.require_workspace_manager(&id, "workspace.export.start")
+                .await?;
+            svc.workspace_export_start_op(id).await
+        })
+    }
+
+    fn export_read<'a>(
+        &'a self,
+        svc: &'a Services,
+        export_id: String,
+        seq: u64,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        Box::pin(async move {
+            svc.require_export_actor(&export_id, "workspace.export.read")
+                .await?;
+            svc.workspace_export_read_op(export_id, seq).await
+        })
+    }
+
+    fn export_finalize<'a>(
+        &'a self,
+        svc: &'a Services,
+        export_id: String,
+        archive_source: bool,
+        final_status_message: Option<String>,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        Box::pin(async move {
+            svc.require_export_actor(&export_id, "workspace.export.finalize")
+                .await?;
+            svc.workspace_export_finalize_op(export_id, archive_source, final_status_message)
+                .await
+        })
+    }
+
+    fn export_abort<'a>(
+        &'a self,
+        svc: &'a Services,
+        export_id: String,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        Box::pin(async move {
+            svc.require_export_actor(&export_id, "workspace.export.abort")
+                .await?;
+            svc.workspace_export_abort_op(export_id).await
+        })
+    }
+
+    fn export_in_progress(&self, workspace_id: &str) -> bool {
+        self.exports
+            .lock()
+            .expect("export registry")
+            .values()
+            .any(|session| session.workspace_id.as_str() == workspace_id)
+    }
+}
 
 impl Services {
     /// Build the transfer plan for `id`: per-table row stats (spec §1
@@ -748,7 +922,7 @@ mod tests {
     /// clears all three; the plan itself writes nothing to either repo.
     #[tokio::test]
     async fn transfer_plan_warns_on_unpublished_submodule_until_pushed() {
-        use crate::transfer_submodules::test_fixture::{
+        use crate::test_support::submodule_fixture::{
             git, local_commit, superproject_with_submodule,
         };
 
@@ -840,7 +1014,7 @@ mod tests {
     /// (`published: false`), and the estimate includes both bundles.
     #[tokio::test]
     async fn transfer_plan_carries_published_parent_of_nested_submodule() {
-        use crate::transfer_submodules::test_fixture::{
+        use crate::test_support::submodule_fixture::{
             nested_unpublished_under_published_parent, NestedFixture,
         };
 
@@ -901,7 +1075,7 @@ mod tests {
     /// the worktree's `(path, sha)` is not repeated.
     #[tokio::test]
     async fn transfer_plan_reports_sandbox_only_submodule_as_not_carried() {
-        use crate::transfer_submodules::test_fixture::{
+        use crate::test_support::submodule_fixture::{
             git, local_commit, superproject_with_submodule,
         };
 
