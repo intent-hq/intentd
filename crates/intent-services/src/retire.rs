@@ -146,25 +146,27 @@ impl Services {
             intent_core::WorkspaceApi::archive_workspace(self, id.clone(), caller_agent_id.clone())
                 .await?;
         }
+        // Same fence as archive ↔ unarchive, held from before the script
+        // stop through the whole destructive tail (flip, uploads, agents,
+        // terminals, folder sweep — the guard moves into the sweep task): a
+        // revive waits for it, so this teardown never acts on a revived
+        // workspace's new turn, scripts, terminals, uploads or checkout.
+        // Nothing below waits on a turn (`stop_many` aborts workers) or takes
+        // the fence (script stops only take script locks), so a turn start
+        // blocked on this fence cannot deadlock it.
+        let fence = self.archive_fence.acquire(&id).await;
+        // Automatic retire re-checks under the fence (archive ↔ unarchive
+        // serialize on it), BEFORE anything is torn down: an unarchive that
+        // landed after the sweep listed the workspace always wins, and its
+        // resumed scripts and checkout are left untouched.
+        if archived_before.is_some() && !still_due(&self.store.get_workspace(&id).await?) {
+            return Ok(None);
+        }
         // Stop every running script and refuse new launches until the folder
         // is gone, so nothing writes into the checkout being removed. After
         // the flip below, `script.start` is refused by the retired guard.
         let _scripts_closed = self.script_manager().close_workspace(&id).await;
         let retired_at = now_iso();
-        // Same fence as archive ↔ unarchive, held from the flip through the
-        // whole destructive tail (uploads, agents, terminals, folder sweep —
-        // the guard moves into the sweep task): a revive waits for it, so
-        // this teardown never acts on a revived workspace's new turn,
-        // terminals, uploads or checkout. Nothing below waits on a turn
-        // (`stop_many` aborts workers), so a turn start blocked on this
-        // fence cannot deadlock it.
-        let fence = self.archive_fence.acquire(&id).await;
-        // Automatic retire re-checks under the fence (archive ↔ unarchive
-        // serialize on it), so an unarchive that landed after the sweep
-        // listed the workspace always wins and nothing is deleted.
-        if archived_before.is_some() && !still_due(&self.store.get_workspace(&id).await?) {
-            return Ok(None);
-        }
         let ws = {
             let flipped = self
                 .store

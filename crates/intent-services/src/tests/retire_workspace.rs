@@ -1121,3 +1121,63 @@ async fn auto_retire_with_a_huge_window_is_a_no_op() {
     assert_eq!(report, crate::AutoRetireReport::default());
     assert!(!f.store.get_workspace(&ws.id).await.unwrap().is_retired());
 }
+
+/// Review regression (intentd#2605): an unarchive that commits while the
+/// automatic retire waits for the archive fence must win BEFORE any
+/// teardown. The re-check runs under the fence ahead of the script stop, so
+/// the resumed workspace's scripts are never closed. With the script stop
+/// ahead of the fence, `close_workspace` would enter the park and the op
+/// would never finish.
+#[intent_test_macros::daemon_test]
+async fn auto_retire_op_does_not_stop_scripts_of_a_workspace_unarchived_while_waiting() {
+    let f = fixture().await;
+    let park = std::sync::Arc::new(crate::script_ops::SupervisePark::default());
+    let svc = f
+        .svc
+        .clone()
+        .with_script_workspace_closed_park(park.clone());
+    let ws = create_workspace(&f).await;
+    svc.archive_workspace(ws.id.clone(), None)
+        .await
+        .expect("archive");
+
+    // Hold the fence so the op stops at it, after its first (stale) read.
+    let guard = svc.archive_fence.acquire(&ws.id).await;
+    let op = intent_core::spawn_daemon({
+        let svc = svc.clone();
+        let id = ws.id.clone();
+        async move { svc.auto_retire_workspace_op(id, days_from_now(8)).await }
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!op.is_finished(), "the op waits on the held fence");
+    // An unarchive commits while the op is blocked (as `workspace.unarchive`
+    // would under the fence).
+    assert!(f
+        .store
+        .unarchive_workspace_if_archived(&ws.id, &crate::now_iso())
+        .await
+        .expect("unarchive flip"));
+    drop(guard);
+
+    let out = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        op,
+    )
+    .await
+    .expect("op must not park in the script stop")
+    .expect("join")
+    .expect("no error");
+    assert!(out.is_none(), "no longer due: {out:?}");
+    assert!(
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(100)),
+            park.entered.notified(),
+        )
+        .await
+        .is_err(),
+        "scripts must not be closed for a workspace that is no longer due"
+    );
+    let row = f.store.get_workspace(&ws.id).await.unwrap();
+    assert!(!row.archived && !row.is_retired());
+    assert!(std::path::Path::new(ws.worktree_path.as_deref().unwrap()).is_dir());
+}
