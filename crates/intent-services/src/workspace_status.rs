@@ -19,7 +19,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
-use intent_core::events::{WORKSPACE_DISPLAY_STATUS_CHANGED, WORKSPACE_WAITING_CHANGED};
+use intent_core::events::{
+    WORKSPACE_DISPLAY_STATUS_CHANGED, WORKSPACE_SCRIPTS_RUNNING_CHANGED, WORKSPACE_WAITING_CHANGED,
+};
 use intent_core::{
     now_iso, AgentId, PullRequestInfo, PullRequestStatus, Workspace, WorkspaceActivity,
     WorkspaceAttention, WorkspaceDisplayStatus, WorkspaceId, WorkspaceTaskStats,
@@ -281,6 +283,13 @@ impl Services {
                 .seed(&ws.id, waiting, waiting_generation);
             waiting
         };
+        // `scriptsRunning` reads the in-memory script registry directly (no
+        // store I/O), so the served value is always live; the read also seeds
+        // the `workspace:scriptsRunning-changed` baseline.
+        let scripts_generation = self.last_scripts_running.generation();
+        ws.scripts_running = self.workspace_scripts_running(&ws.id);
+        self.last_scripts_running
+            .seed(&ws.id, ws.scripts_running, scripts_generation);
         // Pre-read generation snapshot: a `workspace.delete` eviction racing
         // the awaits below must not have this seed resurrect the baseline.
         let generation = self.last_display_statuses.generation();
@@ -431,6 +440,9 @@ impl Services {
         self.workspace_has_active_hooks(workspace_id).await
             || self.workspace_has_active_pr_monitors(workspace_id).await
             || self
+                .workspace_has_active_script_monitors(workspace_id)
+                .await
+            || self
                 .workspace_has_waiting_agent_subscriptions(workspace_id)
                 .await
     }
@@ -573,6 +585,73 @@ impl Services {
     pub(crate) fn evict_display_status_baseline(&self, workspace_id: &WorkspaceId) {
         self.last_display_statuses.evict(workspace_id);
         self.last_waiting_statuses.evict(workspace_id);
+        self.last_scripts_running.evict(workspace_id);
+    }
+
+    /// Whether the workspace owns an `active` script run monitor (§5.8a), one
+    /// of the `waiting` signals. Fails open to `false` on a store error, like
+    /// the hook and PR-monitor probes.
+    pub(crate) async fn workspace_has_active_script_monitors(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> bool {
+        match self
+            .store
+            .workspaces_with_active_script_monitors(std::slice::from_ref(workspace_id))
+            .await
+        {
+            Ok(ids) => ids.contains(workspace_id),
+            Err(error) => {
+                tracing::warn!(
+                    workspace = %workspace_id.0,
+                    %error,
+                    "active-script-monitors waiting lookup failed; reads as none"
+                );
+                false
+            }
+        }
+    }
+
+    /// Recompute `Workspace.scriptsRunning` and publish
+    /// `workspace:scriptsRunning-changed` iff it transitioned (PROTOCOL §5.1 /
+    /// §6.5). Called from the script lifecycle choke points (every
+    /// `script:state` / `script:changed` publication and definition
+    /// removal). The derivation is one in-memory registry read; an unchanged
+    /// value returns before any store I/O. A missing baseline reads as
+    /// `false` — nothing runs before the daemon's first script start — so the
+    /// first run after a restart still emits. Best-effort like
+    /// [`Services::maybe_emit_waiting_changed`].
+    pub(crate) async fn maybe_emit_scripts_running_changed(&self, workspace_id: &WorkspaceId) {
+        if workspace_id.is_chief() {
+            return;
+        }
+        let generation = self.last_scripts_running.generation();
+        let running = self.workspace_scripts_running(workspace_id);
+        if self.last_scripts_running.get(workspace_id).unwrap_or(false) == running {
+            self.last_scripts_running
+                .seed(workspace_id, running, generation);
+            return;
+        }
+        // Deleted-workspace guard: never publish for (or seed a baseline of)
+        // a workspace whose row is gone.
+        if self.store.get_workspace(workspace_id).await.is_err() {
+            return;
+        }
+        self.last_scripts_running
+            .seed(workspace_id, false, generation);
+        let Some(transitioned) =
+            self.last_scripts_running
+                .record(workspace_id, running, generation)
+        else {
+            return;
+        };
+        if transitioned {
+            publish_event(
+                self.event_bus.as_ref(),
+                scripts_running_changed_event(workspace_id, running),
+            )
+            .await;
+        }
     }
 
     /// Recompute after a spec-body write. The spec's markdown gates
@@ -1397,6 +1476,23 @@ fn waiting_changed_event(workspace_id: &WorkspaceId, waiting: bool) -> NewEvent 
         data: serde_json::json!({
             "workspaceId": workspace_id.as_str(),
             "waiting": waiting,
+        }),
+    }
+}
+
+fn scripts_running_changed_event(workspace_id: &WorkspaceId, scripts_running: bool) -> NewEvent {
+    NewEvent {
+        workspace_id: workspace_id.clone(),
+        timestamp: now_iso(),
+        event_type: WORKSPACE_SCRIPTS_RUNNING_CHANGED.to_string(),
+        actor: system_actor(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data: serde_json::json!({
+            "workspaceId": workspace_id.as_str(),
+            "scriptsRunning": scripts_running,
         }),
     }
 }

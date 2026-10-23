@@ -145,6 +145,7 @@ pub(super) fn workspace(id: &WorkspaceId) -> Workspace {
         pull_requests_total: None,
         display_status: None,
         waiting: false,
+        scripts_running: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
