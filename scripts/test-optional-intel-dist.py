@@ -103,7 +103,9 @@ def main():
         fetched = (root / '.github/workflows/v-release.yml').read_text()
         subprocess.run(host_network, cwd=root, check=True)
         assert fetched == (root / '.github/workflows/v-release.yml').read_text()
-        assert 'CARGO_NET_OFFLINE: "true"' in fetched
+        # Both the global `dist build` and `dist host` run offline after a retried fetch.
+        assert fetched.count('CARGO_NET_OFFLINE: "true"') == 2
+        assert fetched.count('run: python3 -I -B scripts/fetch-locked-crates.py') == 2
         shutil.copy(ROOT / 'scripts/configure-runner-routing.py', root / 'scripts/configure-runner-routing.py')
         route_command = ['python3', '-I', '-B', 'scripts/configure-runner-routing.py']
         subprocess.run(route_command, cwd=root, check=True)
