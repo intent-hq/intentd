@@ -255,6 +255,7 @@ mod sentry_ops;
 mod settings;
 mod settings_registry;
 mod shell;
+mod stack_frame;
 pub(crate) mod stack_sample;
 mod task_effort;
 mod terminal_ops;

@@ -345,6 +345,11 @@ pub(crate) fn background_execution<T: Send + 'static>(
     future: impl Future<Output = T> + Send + 'static,
 ) -> impl Future<Output = T> + Send + 'static {
     let captured = EXECUTION_CALL.try_with(Clone::clone).ok();
+    // Boxed here, in this synchronous frame: `TaskLocalFuture::poll` keeps an
+    // `Option<F>`-sized temporary in its debug poll frame, so an unboxed
+    // worker future (the agent turn path) would be duplicated on the stack of
+    // every poll. See `crate::stack_frame`.
+    let future = Box::pin(future);
     async move {
         let context = if let Some(context) = captured {
             context

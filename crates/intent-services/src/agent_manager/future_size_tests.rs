@@ -18,23 +18,28 @@
 //! Re-measure: run `cargo nextest run -p intent-services --lib future_size`
 //! with a budget lowered to 0; the failure message lists every size.
 //!
-//! Removing only the `Box::pin(retry_spawn_owned(..))` in the worker does not
-//! grow the worker today (its size is set by other awaits), so
+//! Removing only the `boxed_await(|| retry_spawn_owned(..))` in the worker does
+//! not grow the worker today (its size is set by other awaits), so
 //! `RETRY_SPAWN_BUDGET` is the guard for the inner `ensure_started_owned` box.
+//!
+//! Stored future size is only half of the stack story: in a debug build each
+//! inline await also costs about twice the awaited future's size in the
+//! caller's POLL FRAME, which `size_of_val` cannot see. That half is guarded
+//! by `agent_manager::tests::turn_path_fits_reduced_stack`; see
+//! `crate::stack_frame`.
 
 use super::tests::manager;
 use super::*;
 
-/// `ensure_started_owned` itself (measured `28_912` bytes). Large by design —
-/// its callers box it; this cap only catches runaway growth of the body.
-const ENSURE_STARTED_BUDGET: usize = 36 * 1024;
-/// `retry_spawn_owned` (measured `6_864` bytes): holds `ensure_started_owned`
-/// behind `Box::pin`. Awaiting it inline grows this to ~29 KiB.
-const RETRY_SPAWN_BUDGET: usize = 9 * 1024;
-/// `run_message_worker` (measured `27_520` bytes): holds `retry_spawn_owned`
-/// and the monitor turn behind `Box::pin`. Inlining the whole turn-start
-/// chain grows this to ~40 KiB.
-const MESSAGE_WORKER_BUDGET: usize = 34 * 1024;
+/// `ensure_started_owned` itself (measured `7_824` bytes). Its callers box
+/// it; this cap only catches runaway growth of the body.
+const ENSURE_STARTED_BUDGET: usize = 10 * 1024;
+/// `retry_spawn_owned` (measured `568` bytes): holds `ensure_started_owned`
+/// behind `boxed_await`. Awaiting it inline grows this to ~8 KiB.
+const RETRY_SPAWN_BUDGET: usize = 2 * 1024;
+/// `run_message_worker` (measured `16_256` bytes): holds `retry_spawn_owned`,
+/// the monitor turn and its other large awaits behind `boxed_await`.
+const MESSAGE_WORKER_BUDGET: usize = 20 * 1024;
 
 #[cfg(debug_assertions)]
 #[tokio::test]
@@ -75,7 +80,8 @@ async fn turn_start_future_sizes_stay_within_budget() {
         over.is_empty(),
         "{}. An inline `.await` of a large future on the agent turn-start path grew it, which \
          overflows the stack on deep send/interrupt paths (intent-hq/intent#6658, \
-         intent-hq/intent#6741): wrap the large await in `Box::pin(...)`. If no await was \
+         intent-hq/intent#6741): build the large future off-frame with \
+         `crate::stack_frame::boxed_await(|| ...)`. If no await was \
          added (new locals, larger types, a toolchain bump), re-measure and raise the budget \
          in agent_manager/future_size_tests.rs only if the growth is intentional and bounded. \
          All sizes: {measured:?}",
