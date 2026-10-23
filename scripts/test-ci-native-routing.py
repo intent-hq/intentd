@@ -652,12 +652,12 @@ class RunnerAvailabilityTests(unittest.TestCase):
                     if idle:
                         self.assertEqual(json.loads(outputs["windows_labels"]), ["self-hosted", "Windows", "X64"])
                         self.assertEqual(json.loads(outputs["macos_labels"]), ["self-hosted", "macOS", "ARM64"])
-                    logged = "merge queue keeps heavy" in run_heavy(self.workflow, result["outputs"], event)[1]
+                    logged = "merge queue: the shared linux_labels mapping takes the burst runner" in run_heavy(self.workflow, result["outputs"], event)[1]
                     self.assertEqual(logged, event == "merge_group")
-        # The coverage suites need more inotify instances than a slot host allows.
-        for job_id in ("coverage-e2e", "coverage-all"):
-            self.assertEqual(self.workflow["jobs"][job_id]["runs-on"], "${{ fromJSON(needs.route.outputs.linux_labels) }}")
-        for job_id, label in {"check": "gh-linux-8x", "coverage-changed": "gh-linux-16x"}.items():
+        # The queue-only coverage suites read their own merge_group slots (the
+        # slot hosts raise the inotify limit to 32768).
+        for job_id, label in {"check": "gh-linux-8x", "coverage-changed": "gh-linux-16x",
+                              "coverage-e2e": "gh-linux-16x", "coverage-all": "gh-linux-16x"}.items():
             with self.subTest(job=job_id):
                 self.assertEqual(self.workflow["jobs"][job_id]["runs-on"],
                                  "${{ fromJSON(needs.route.outputs.slots || '{}')['%s'] || fromJSON('[\"%s\"]') }}" % (job_id, label))
@@ -702,14 +702,14 @@ class RunnerAvailabilityTests(unittest.TestCase):
                 cloud = json.loads(outputs["cloud"])
                 self.assertEqual(cloud["gh-linux-16x"], ["warp-ubuntu-2404-x64-16x"])
                 self.assertEqual(cloud["ubuntu-24.04"], ["ubuntu-24.04"])
-        # The merge queue keeps heavy Rust jobs off idle slots and on WarpBuild.
+        # In the merge queue the shared linux_labels mapping takes WarpBuild, not an idle slot.
         idle = [slot(), slot(), runner("Windows", "X64"), runner()]
         result = run_route(self.workflow, org=idle, eventName="merge_group", warpbuildDisabled="")
         outputs, logs = run_heavy(self.workflow, result["outputs"], "merge_group")
         self.assertEqual(json.loads(outputs["linux_labels"]), ["warp-ubuntu-2404-x64-16x"])
         self.assertEqual(json.loads(outputs["check_labels"]), ["warp-ubuntu-2404-x64-8x"])
         self.assertEqual(outputs["linux_burst"], "true")
-        self.assertIn("merge queue keeps heavy Rust jobs off the intent-cache slots", logs)
+        self.assertIn("merge queue: the shared linux_labels mapping takes the burst runner", logs)
         # Idle native runners still win over WarpBuild.
         outputs = route_outputs(self.workflow, result["outputs"], "merge_group")
         self.assertEqual(json.loads(outputs["windows_labels"]), ["self-hosted", "Windows", "X64"])
