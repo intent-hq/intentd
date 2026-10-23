@@ -805,3 +805,36 @@ async fn retire_aborts_in_flight_uploads() {
     assert!(!staging.exists(), "staging deleted on retire");
     assert!(f.svc.file_attachment_upload_commit(upload).await.is_err());
 }
+
+/// A revive racing an in-flight retire waits for the whole retire tail
+/// (teardown and folder sweep run under the archive fence): whichever order
+/// the two land in, an Active result always has a live checkout, and a
+/// Retired result has none.
+#[intent_test_macros::daemon_test]
+async fn retire_and_revive_racing_leave_a_consistent_workspace() {
+    let f = fixture().await;
+    let ws = create_workspace(&f).await;
+    let wt = std::path::PathBuf::from(ws.worktree_path.clone().unwrap());
+    // Both sides run concurrently on this task (it carries the bound
+    // caller the retire capability gate requires).
+    let retire = f.svc.retire_workspace(ws.id.clone(), None);
+    // Revive as soon as the row reads Retired (inside the retire tail).
+    let revive = async {
+        loop {
+            if f.store.get_workspace(&ws.id).await.unwrap().is_retired() {
+                return Some(f.svc.unarchive_workspace(ws.id.clone()).await);
+            }
+            tokio::task::yield_now().await;
+        }
+    };
+    let (retired, revived) = tokio::join!(retire, revive);
+    retired.expect("retire");
+    let revived = revived.expect("observed the retired row").expect("revive");
+    assert_eq!(revived.status, WorkspaceStatus::Active);
+    // Let any background sweep settle, then the revived folder must stand.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let row = f.store.get_workspace(&ws.id).await.unwrap();
+    assert_eq!(row.status, WorkspaceStatus::Active);
+    assert!(wt.join("README.md").is_file(), "revived checkout survives");
+    assert_eq!(head_branch(&wt), row.branch);
+}

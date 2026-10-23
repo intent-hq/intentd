@@ -116,10 +116,15 @@ impl Services {
         // the flip below, `script.start` is refused by the retired guard.
         let _scripts_closed = self.script_manager().close_workspace(&id).await;
         let retired_at = now_iso();
+        // Same fence as archive ↔ unarchive, held from the flip through the
+        // whole destructive tail (uploads, agents, terminals, folder sweep —
+        // the guard moves into the sweep task): a revive waits for it, so
+        // this teardown never acts on a revived workspace's new turn,
+        // terminals, uploads or checkout. Nothing below waits on a turn
+        // (`stop_many` aborts workers), so a turn start blocked on this
+        // fence cannot deadlock it.
+        let fence = self.archive_fence.acquire(&id).await;
         let ws = {
-            // Same fence as archive ↔ unarchive: the flip and its delta are
-            // ordered against a concurrent unarchive.
-            let _fence = self.archive_fence.acquire(&id).await;
             let flipped = self
                 .store
                 .retire_workspace_if_archived(&id, &retired_at)
@@ -177,7 +182,7 @@ impl Services {
         if let Some(worktree) = git_ops::worktree_path(&ws) {
             self.git_status_cache.evict(&worktree);
         }
-        self.remove_retired_checkout(&ws).await;
+        self.remove_retired_checkout(&ws, fence).await;
         let mut ws = ws;
         ws.activity = self.workspace_activity(&ws.id);
         self.attach_workspace_membership(&mut ws).await;
@@ -338,20 +343,12 @@ impl Services {
     /// remove the trash and sweep the daemon-owned `<parent>/<id>/`
     /// directory (the same candidates `workspace.delete` sweeps).
     /// Best-effort: failures are logged and the workspace stays retired.
-    async fn remove_retired_checkout(&self, ws: &Workspace) {
-        // Held until the folder sweep below finishes: a revive takes the same
-        // fence before provisioning at the same path, so the sweep can never
-        // delete a revived checkout. A revive that won the race already
-        // replaced the folder — nothing left to remove.
-        let fence = self.archive_fence.acquire(&ws.id).await;
-        if !self
-            .store
-            .get_workspace(&ws.id)
-            .await
-            .is_ok_and(|row| row.is_retired())
-        {
-            return;
-        }
+    ///
+    /// `fence` is the retire's archive-fence guard, held since the row flip
+    /// and released only when the folder sweep finishes: a revive takes the
+    /// same fence before provisioning at the same path, so the sweep can
+    /// never delete a revived checkout.
+    async fn remove_retired_checkout(&self, ws: &Workspace, fence: crate::ArchiveFenceGuard) {
         let workspaces_root = self
             .workspaces_root
             .clone()
