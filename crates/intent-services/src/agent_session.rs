@@ -6291,11 +6291,13 @@ impl Services {
             return false;
         };
         // A timed return home is announced at home's first output, ahead of
-        // it (PROTOCOL §5.54 backup failover).
+        // it, and the output proves the configuration's quota to every
+        // conversation (PROTOCOL §5.54 backup failover).
         if matches!(
             mapped,
             MappedUpdate::Chunk { .. } | MappedUpdate::ToolCall(_)
         ) {
+            self.note_provider_working(agent_id);
             Box::pin(self.announce_provider_return_if_pending(workspace_id, agent_id)).await;
         }
         let message_id = transcript.message_id.clone();

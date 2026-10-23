@@ -2154,3 +2154,333 @@ async fn a_replayed_retry_after_a_restart_still_announces_the_return() {
         "{messages:#?}"
     );
 }
+
+// ── Shared quota state (PROTOCOL §5.54 Backup failover) ──────────────────
+//
+// The daemon-wide cache (`crate::provider_quota_cache`) carries what one
+// conversation learned about a configuration's quota to every other one.
+// "Another conversation" is simulated by recording into the cache directly.
+
+/// Another conversation's quota failure on `selection`, now; returns when
+/// the mark lapses.
+fn mark_exhausted_elsewhere(fx: &Fixture, selection: &str) -> chrono::DateTime<chrono::Utc> {
+    fx.mgr.services.provider_quota_cache.mark_exhausted(
+        selection,
+        "usage limit reached",
+        chrono::Utc::now(),
+    )
+}
+
+/// Another conversation's turn, started after any earlier mark, producing
+/// output on `selection`.
+fn mark_working_elsewhere(fx: &Fixture, selection: &str) {
+    let later = chrono::Utc::now() + chrono::Duration::seconds(1);
+    fx.mgr
+        .services
+        .provider_quota_cache
+        .mark_working(selection, later, later);
+}
+
+/// A configuration another conversation found out of quota is skipped at the
+/// start of the turn: the agent moves to the backup before any attempt (one
+/// prompt, the original message, no failed attempt), announced by the usual
+/// `provider_failover` row, and its return timer follows the mark.
+#[intent_test_macros::daemon_test]
+async fn a_configuration_marked_out_of_quota_is_skipped_before_any_attempt() {
+    let fx = Fixture::new(json!({ "response": "answered on the backup" })).await;
+    let first = fx.profile("First", true).await;
+    let until = mark_exhausted_elsewhere(&fx, "claude-code");
+
+    let events = fx.send("please answer").await;
+
+    assert!(of_type(&events, "agent:failed").is_empty(), "{events:#?}");
+    let row = fx.row().await;
+    assert_eq!(row.provider.as_deref(), Some(first.as_str()));
+    assert_eq!(row.model.as_deref(), Some("opus"), "same model id");
+    let prompts = fx.prompts();
+    assert_eq!(
+        prompts.len(),
+        1,
+        "no attempt on the marked one: {prompts:#?}"
+    );
+    assert!(prompts[0].ends_with("please answer"), "{:?}", prompts[0]);
+    assert!(
+        !prompts[0].contains(crate::quota_failover::QUOTA_FAILOVER_CONTINUATION),
+        "nothing to continue: {:?}",
+        prompts[0]
+    );
+    let messages = fx.messages().await;
+    let failover = notices(&messages, "provider_failover");
+    assert_eq!(failover.len(), 1, "{messages:#?}");
+    assert_eq!(
+        failover[0].metadata,
+        Some(json!({
+            "type": "provider_failover",
+            "fromProvider": "claude-code",
+            "toProvider": first,
+            "model": "opus",
+            "reason": "quota-exceeded",
+        }))
+    );
+    assert!(
+        notices(&messages, "model_changed").is_empty(),
+        "{messages:#?}"
+    );
+    assert_eq!(user_rows(&messages, "please answer").len(), 1);
+    let state = fx.return_state().await.expect("away from home");
+    assert_eq!(state.home, "claude-code");
+    assert_eq!(state.away_on, first);
+    assert!(near(&state.return_after, until), "{}", state.return_after);
+    assert!(
+        fx.mgr
+            .services
+            .provider_quota_cache
+            .is_known_working(&first),
+        "the backup's output marks it working"
+    );
+}
+
+/// A quota failure is recorded for every conversation even when this one
+/// has nowhere to go; the failover that follows one lands on the backup and
+/// marks it working.
+#[intent_test_macros::daemon_test]
+async fn a_quota_failure_is_shared_and_output_marks_the_backup_working() {
+    let fx = Fixture::new(json!({
+        "promptRpcError": quota_error(),
+        "promptRpcErrorAttempts": 1,
+        "response": "answered on the backup",
+    }))
+    .await;
+    let first = fx.profile("First", true).await;
+    fx.send("please answer").await;
+    let cache = &fx.mgr.services.provider_quota_cache;
+    let now = chrono::Utc::now();
+    assert!(cache.is_exhausted("claude-code", now));
+    assert!(cache.is_known_working(&first));
+    assert!(!cache.is_exhausted(&first, now));
+}
+
+#[intent_test_macros::daemon_test]
+async fn a_quota_failure_without_backups_is_still_shared() {
+    let fx = Fixture::new(json!({
+        "promptRpcError": quota_error(),
+        "response": "unreached",
+    }))
+    .await;
+    let events = fx.send("please answer").await;
+    assert_eq!(of_type(&events, "agent:failed").len(), 1, "{events:#?}");
+    assert!(fx
+        .mgr
+        .services
+        .provider_quota_cache
+        .is_exhausted("claude-code", chrono::Utc::now()));
+}
+
+/// In the failover rotation, a backup another conversation found out of
+/// quota is passed over for one that is not.
+#[intent_test_macros::daemon_test]
+async fn the_failover_rotation_passes_over_a_marked_backup() {
+    let fx = Fixture::new(json!({
+        "promptRpcError": quota_error(),
+        "promptRpcErrorAttempts": 1,
+        "response": "answered on the second backup",
+    }))
+    .await;
+    let first = fx.profile("First", true).await;
+    let second = fx.profile("Second", true).await;
+    mark_exhausted_elsewhere(&fx, &first);
+
+    let events = fx.send("please answer").await;
+
+    assert!(of_type(&events, "agent:failed").is_empty(), "{events:#?}");
+    assert_eq!(fx.row().await.provider.as_deref(), Some(second.as_str()));
+    let messages = fx.messages().await;
+    let hops: Vec<(Value, Value)> = notices(&messages, "provider_failover")
+        .iter()
+        .map(|m| {
+            let md = m.metadata.as_ref().unwrap();
+            (md["fromProvider"].clone(), md["toProvider"].clone())
+        })
+        .collect();
+    assert_eq!(hops, vec![(json!("claude-code"), json!(second))]);
+}
+
+/// Every candidate marked: no switch ahead of the turn — it still tries its
+/// current configuration, then fails over to the next one in order.
+#[intent_test_macros::daemon_test]
+async fn every_candidate_marked_still_attempts_and_fails_over() {
+    let fx = Fixture::new(json!({
+        "promptRpcError": quota_error(),
+        "promptRpcErrorAttempts": 1,
+        "response": "answered on the backup",
+    }))
+    .await;
+    let first = fx.profile("First", true).await;
+    mark_exhausted_elsewhere(&fx, "claude-code");
+    mark_exhausted_elsewhere(&fx, &first);
+
+    let events = fx.send("please answer").await;
+
+    assert!(of_type(&events, "agent:failed").is_empty(), "{events:#?}");
+    assert_eq!(fx.row().await.provider.as_deref(), Some(first.as_str()));
+    let prompts = fx.prompts();
+    assert_eq!(
+        prompts.len(),
+        2,
+        "tried on Default, then the backup: {prompts:#?}"
+    );
+    let messages = fx.messages().await;
+    let hops: Vec<(Value, Value)> = notices(&messages, "provider_failover")
+        .iter()
+        .map(|m| {
+            let md = m.metadata.as_ref().unwrap();
+            (md["fromProvider"].clone(), md["toProvider"].clone())
+        })
+        .collect();
+    assert_eq!(hops, vec![(json!("claude-code"), json!(first))]);
+    assert!(
+        fx.mgr
+            .services
+            .provider_quota_cache
+            .is_known_working(&first),
+        "the backup answered, so its mark is cleared for everyone"
+    );
+}
+
+/// A conversation away from home goes back as soon as another conversation
+/// has seen home working, without waiting for its own timer.
+#[intent_test_macros::daemon_test]
+async fn home_seen_working_elsewhere_brings_the_conversation_back_early() {
+    let fx = Fixture::new(json!({ "response": "answered on home" })).await;
+    let first = fx.profile("First", true).await;
+    let future = chrono::Utc::now() + chrono::Duration::hours(4);
+    fx.away(&first, state_json("claude-code", &first, future, 0))
+        .await;
+    mark_exhausted_elsewhere(&fx, "claude-code");
+    mark_working_elsewhere(&fx, "claude-code");
+
+    let events = fx.send("hello again").await;
+
+    assert!(of_type(&events, "agent:failed").is_empty(), "{events:#?}");
+    assert_eq!(fx.row().await.provider.as_deref(), Some("claude-code"));
+    assert_eq!(fx.return_state().await, None, "home again: state cleared");
+    let messages = fx.messages().await;
+    let returned = notices(&messages, "provider_returned");
+    assert_eq!(returned.len(), 1, "{messages:#?}");
+    assert_eq!(
+        returned[0].metadata.as_ref().unwrap()["fromProvider"],
+        json!(first)
+    );
+    assert!(
+        notices(&messages, "provider_failover").is_empty(),
+        "{messages:#?}"
+    );
+}
+
+/// A due return waits while home is still marked out of quota: the turn
+/// stays on the backup, with no attempt on home and no notice.
+#[intent_test_macros::daemon_test]
+async fn a_due_return_waits_while_home_is_marked_out_of_quota() {
+    let fx = Fixture::new(json!({ "response": "answered on the backup" })).await;
+    let first = fx.profile("First", true).await;
+    let past = chrono::Utc::now() - chrono::Duration::minutes(1);
+    fx.away(&first, state_json("claude-code", &first, past, 0))
+        .await;
+    mark_exhausted_elsewhere(&fx, "claude-code");
+
+    let events = fx.send("hello again").await;
+
+    assert!(of_type(&events, "agent:failed").is_empty(), "{events:#?}");
+    assert_eq!(fx.row().await.provider.as_deref(), Some(first.as_str()));
+    assert_eq!(fx.prompts().len(), 1);
+    let state = fx.return_state().await.expect("still away");
+    assert_eq!(state.backoff_step, 0, "not a failed return");
+    let messages = fx.messages().await;
+    assert!(notices(&messages, "provider_returned").is_empty());
+    assert!(notices(&messages, "provider_failover").is_empty());
+}
+
+/// Away on a backup another conversation found out of quota, with home
+/// unmarked but not due: the turn starts on the next unmarked candidate
+/// in the rotation (here home, after the marked second backup), announced
+/// as a failover.
+#[intent_test_macros::daemon_test]
+async fn a_marked_backup_is_left_for_the_next_unmarked_candidate() {
+    let fx = Fixture::new(json!({ "response": "answered" })).await;
+    let first = fx.profile("First", true).await;
+    let second = fx.profile("Second", true).await;
+    let future = chrono::Utc::now() + chrono::Duration::hours(4);
+    fx.away(&first, state_json("claude-code", &first, future, 0))
+        .await;
+    mark_exhausted_elsewhere(&fx, &first);
+    mark_exhausted_elsewhere(&fx, &second);
+
+    fx.send("hello again").await;
+
+    assert_eq!(fx.row().await.provider.as_deref(), Some("claude-code"));
+    let messages = fx.messages().await;
+    let failover = notices(&messages, "provider_failover");
+    assert_eq!(failover.len(), 1, "{messages:#?}");
+    assert_eq!(
+        failover[0].metadata.as_ref().unwrap()["toProvider"],
+        json!("claude-code")
+    );
+    assert_eq!(fx.return_state().await, None, "home accepted the turn");
+}
+
+/// A redrive of the same turn never consults the cache to switch: home is
+/// seen working while the backup's attempt is in flight, yet the failover
+/// redrive follows the rotation to the next backup, not home.
+#[intent_test_macros::daemon_test]
+async fn a_redrive_never_returns_home_on_the_cache() {
+    let scratch = crate::test_support::test_tempdir("quota-cache-redrive-");
+    let entered = scratch.path().join("entered");
+    let release = scratch.path().join("release");
+    let fx = Fixture::new(json!({
+        "promptRpcError": quota_error(),
+        "promptRpcErrorAttempts": 1,
+        "promptReceiptGate": {
+            "suffix": "please answer",
+            "enteredFile": entered.to_str().unwrap(),
+            "releaseFile": release.to_str().unwrap(),
+        },
+        "response": "answered on the second backup",
+    }))
+    .await;
+    let first = fx.profile("First", true).await;
+    let second = fx.profile("Second", true).await;
+    let future = chrono::Utc::now() + chrono::Duration::hours(2);
+    fx.away(&first, state_json("claude-code", &first, future, 0))
+        .await;
+
+    fx.mgr
+        .send_message(
+            fx.agent.clone(),
+            fx.ws.clone(),
+            "please answer".to_string(),
+            None,
+            super::TurnOptions::default(),
+        )
+        .await
+        .expect("send_message spawns the worker inline");
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(20)),
+        async {
+            while !entered.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        },
+    )
+    .await
+    .expect("the prompt reaches the backup");
+    mark_working_elsewhere(&fx, "claude-code");
+    std::fs::write(&release, "go").unwrap();
+    timeout_settled(&fx.mgr, &fx.agent).await;
+
+    assert_eq!(
+        fx.row().await.provider.as_deref(),
+        Some(second.as_str()),
+        "the redrive follows the rotation, not the cache"
+    );
+    assert!(notices(&fx.messages().await, "provider_returned").is_empty());
+}

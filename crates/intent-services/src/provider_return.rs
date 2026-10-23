@@ -48,7 +48,7 @@ const BACKOFF_CAP: Duration = Duration::hours(24);
 
 /// A reported reset time further out than this is not trusted (a misparse);
 /// the fallback or backoff applies instead.
-const MAX_REPORTED_HORIZON: Duration = Duration::days(7);
+pub(crate) const MAX_REPORTED_HORIZON: Duration = Duration::days(7);
 
 /// Agents whose current message is a timed return home not yet announced:
 /// the `provider_returned` row is written at home's first output, before it
@@ -399,15 +399,27 @@ impl Services {
         }
     }
 
-    /// At the start of a user message: when the conversation is away and its
-    /// return-after passed, start this message on home. A home that can no
-    /// longer run (profile removed, base disabled) is given up — the current
-    /// configuration becomes home. A concurrent provider change wins.
+    /// At the start of a new turn, pick where it starts: back home when due
+    /// ([`Self::return_home_if_due`]), then away from a configuration the
+    /// shared quota cache marks exhausted
+    /// ([`Self::avoid_exhausted_provider`]).
     pub(crate) async fn begin_provider_return(
         &self,
         workspace_id: &WorkspaceId,
         agent_id: &AgentId,
     ) {
+        self.return_home_if_due(workspace_id, agent_id).await;
+        self.avoid_exhausted_provider(workspace_id, agent_id).await;
+    }
+
+    /// When the conversation is away and its return-after passed, start this
+    /// turn on home. The shared quota cache overrides the timer both ways:
+    /// a home another conversation has since seen working is returned to at
+    /// once, and a due return to a home marked exhausted waits. A home that
+    /// can no longer run (profile removed, base disabled) is given up — the
+    /// current configuration becomes home. A concurrent provider change
+    /// wins.
+    async fn return_home_if_due(&self, workspace_id: &WorkspaceId, agent_id: &AgentId) {
         let Ok(session) = self.store.get_agent_session(agent_id).await else {
             return;
         };
@@ -446,8 +458,15 @@ impl Services {
                 return;
             }
         }
-        if !return_due(&state, Utc::now()) {
-            return;
+        let now = Utc::now();
+        if !self.provider_quota_cache.is_known_working(&state.home) {
+            if !return_due(&state, now) {
+                return;
+            }
+            if self.provider_quota_cache.is_exhausted(&state.home, now) {
+                tracing::info!(agent = %agent_id, home = %state.home, "return due but home is still marked out of quota; staying on the current provider");
+                return;
+            }
         }
         let settings = self.effective_settings();
         if self
@@ -502,6 +521,57 @@ impl Services {
         if landed {
             self.arm_provider_return_announcement(agent_id);
         }
+    }
+
+    /// When the configuration this turn would start on is marked exhausted
+    /// by the shared quota cache, switch to the first candidate of its
+    /// rotation that is not marked, before any attempt — announced like a
+    /// failover after a failed attempt. The skipped configuration is not
+    /// counted as tried, so if the turn exhausts every other candidate it is
+    /// still tried once. When every candidate is marked, nothing moves and
+    /// the turn tries its current configuration. A concurrent provider
+    /// change wins.
+    pub(crate) async fn avoid_exhausted_provider(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+    ) {
+        let now = Utc::now();
+        let Ok(session) = self.store.get_agent_session(agent_id).await else {
+            return;
+        };
+        let Some(current) = session.provider.as_deref().filter(|p| !p.trim().is_empty()) else {
+            return;
+        };
+        let Some(until) = self.provider_quota_cache.exhausted_until(current, now) else {
+            return;
+        };
+        let Ok(profiles) = self.provider_profiles.profiles() else {
+            return;
+        };
+        let settings = self.effective_settings();
+        let return_state = read_state(&session);
+        let Some(target) = crate::quota_failover::first_unmarked_candidate(
+            current,
+            return_state.as_ref().map(|s| s.home.as_str()),
+            &self.provider_quota_cache.exhausted(now),
+            &profiles,
+            settings.providers.enabled.as_ref(),
+        ) else {
+            tracing::debug!(agent = %agent_id, provider = %current, "provider marked out of quota but no unmarked candidate; trying it anyway");
+            return;
+        };
+        self.switch_provider_for_quota(
+            workspace_id,
+            agent_id,
+            &session,
+            &target,
+            return_state,
+            Some(until),
+            &profiles,
+            false,
+        )
+        .await;
     }
 
     /// Re-arm the first-output acceptance of a return attempt already
