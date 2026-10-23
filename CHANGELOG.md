@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.34] - 2026-10-23
+
+### 🐛 Bug Fixes
+
+- *(pr-monitor)* Report merge-queue ejections on cheap polls ([#2622](https://github.com/intent-hq/intentd/pull/2622))
+
+
 ## [0.11.33] - 2026-10-23
 
 ### 🚀 Features
