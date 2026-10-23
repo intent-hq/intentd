@@ -6475,6 +6475,20 @@ fn live_preview_derivation_clips_trailing_partial_line() {
     assert_eq!(digest, None);
 }
 
+/// A reply that copied the HTML-escaped prompts block from an XML-escaped
+/// history replay must not surface `--&gt;` (or a prompt line) as the
+/// agent's last response; the literal block is stripped as before.
+#[test]
+fn last_response_strips_escaped_suggested_prompts_block() {
+    for text in [
+        "Report back when ready.\n\n&lt;!-- suggested-prompts\nRaise Type Check &amp; Lint's timeout.\n--&gt;",
+        "Report back when ready.\n\n<!-- suggested-prompts\nRaise the timeout.\n-->",
+    ] {
+        let (resp, _) = last_response_and_digest_from_blocks(&[text.to_owned()]);
+        assert_eq!(resp.as_deref(), Some("Report back when ready."), "{text}");
+    }
+}
+
 /// Live-turn overlay fallback: a slot whose blocks carry no text yet (early
 /// turn, tool-only so far) must NOT blank out the persisted preview; a busy
 /// worker with no slot and an orphan slot with no busy worker are both
@@ -47341,6 +47355,11 @@ mod resume_tail_recap {
              responding, and your restored session may predate the exchange below \
              — it is repeated here (parts of it may or may not already be in your \
              context).\n\n\
+             Note on escaping: text quoted in this replay is XML-escaped only so it can sit \
+             inside these tags (&lt; &gt; &amp; &quot; stand for < > & \"). The original \
+             messages used the literal characters. Write your own replies with literal \
+             characters too: for example <!-- suggested-prompts, never &lt;!-- \
+             suggested-prompts.\n\n\
              The user's message, delivered before the interruption:\n\
              <interrupted_user_message>\nbuild a simple local webapp\n</interrupted_user_message>\n\n\
              Your partial response before the cut-off (it did NOT complete; anything \
@@ -47348,6 +47367,26 @@ mod resume_tail_recap {
              <interrupted_partial_response>\nDelegating board webapp...\n</interrupted_partial_response>\n\n\
              </supervisor>"
         );
+    }
+
+    /// The recapped text is XML-escaped, so the recap carries the note that
+    /// the escaping is transport-only and replies use literal characters.
+    #[test]
+    fn recap_says_escaping_is_transport_only() {
+        let messages = vec![
+            user("fix <b> & ship"),
+            interrupted_assistant("Done.\n\n<!-- suggested-prompts\nShip it.\n-->"),
+        ];
+        let recap = build_resume_tail_recap(&messages).expect("recap");
+        assert!(
+            recap
+                .text
+                .contains(crate::history_xml::REPLAY_ESCAPING_NOTE),
+            "{}",
+            recap.text
+        );
+        assert!(recap.text.contains("fix &lt;b&gt; &amp; ship"));
+        assert!(recap.text.contains("&lt;!-- suggested-prompts"));
     }
 
     /// A SECOND restart mid-continuation: the tail now holds the original

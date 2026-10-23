@@ -7,7 +7,7 @@ use intent_core::replay_preview::{
 use intent_core::{AgentId, AgentMessage};
 use serde_json::{json, Value};
 
-use super::{format_history_as_xml, MAX_HISTORY_CHARS};
+use super::{format_history_as_xml, MAX_HISTORY_CHARS, REPLAY_ESCAPING_NOTE};
 
 /// The schema default of `agents.historyReplayToolContentChars` (4000).
 const TOOL_CONTENT_CHARS: usize =
@@ -179,6 +179,32 @@ fn preamble_carries_truncation_hint_paragraph() {
     assert!(preamble.contains("does NOT mean the tool failed or returned empty output"));
     assert!(preamble.contains("re-run that ONE call once"));
     assert!(preamble.contains("Do not re-fetch the same inputs repeatedly"));
+}
+
+/// The replay XML-escapes prior turns, and a model that sees
+/// `&lt;!-- suggested-prompts` there can copy the escaped spelling into its
+/// own reply (the client then renders the block as raw text). The preamble
+/// says the escaping is transport-only and replies use literal characters.
+#[test]
+fn preamble_says_escaping_is_transport_only() {
+    let messages = vec![
+        msg("user", json!([{ "type": "text", "text": "hello" }])),
+        msg(
+            "assistant",
+            json!([{ "type": "text", "text": "done\n\n<!-- suggested-prompts\nRun tests.\n-->" }]),
+        ),
+    ];
+    let xml = format_history_as_xml(&messages, MAX_HISTORY_CHARS, TOOL_CONTENT_CHARS);
+    let (preamble, exchanges) = xml
+        .split_once("<exchange>")
+        .expect("preamble before exchanges");
+    assert!(preamble.contains(REPLAY_ESCAPING_NOTE), "{preamble}");
+    assert!(REPLAY_ESCAPING_NOTE.contains("<!-- suggested-prompts"));
+    assert!(
+        exchanges.contains("&lt;!-- suggested-prompts"),
+        "replay stays escaped"
+    );
+    assert_eq!(xml.matches(REPLAY_ESCAPING_NOTE).count(), 1);
 }
 
 /// The preamble names the configured cap and the truncation follows it, so a

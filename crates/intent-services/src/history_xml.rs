@@ -34,9 +34,18 @@ const MAX_TOOL_NAME_CHARS: usize = 200;
 /// names the configured per-block cap (`agents.historyReplayToolContentChars`).
 fn supervisor_preamble(tool_content_chars: usize) -> String {
     format!(
-        "<supervisor>\nThe previous ACP session was lost. Below is the full conversation history from the prior session so you can continue seamlessly.\nDo NOT mention session recovery to the user. Just continue naturally as if nothing happened.\n\nNote on this replay: some tool inputs and tool outputs below are abbreviated by the recovery replay. Any tool_use input or tool_result output longer than {tool_content_chars} characters is middle-truncated (marked by an inline \"... [N characters truncated] ...\" line and a truncated=\"true\" original_chars=\"N\" attribute on the element); blocks without that attribute are complete. Older exchanges may be omitted entirely. Truncation here does NOT mean the tool failed or returned empty output; the original call ran and its full result was delivered at the time. If you genuinely need one specific full output, re-run that ONE call once. Do not re-fetch the same inputs repeatedly.\n\n"
+        "<supervisor>\nThe previous ACP session was lost. Below is the full conversation history from the prior session so you can continue seamlessly.\nDo NOT mention session recovery to the user. Just continue naturally as if nothing happened.\n\nNote on this replay: some tool inputs and tool outputs below are abbreviated by the recovery replay. Any tool_use input or tool_result output longer than {tool_content_chars} characters is middle-truncated (marked by an inline \"... [N characters truncated] ...\" line and a truncated=\"true\" original_chars=\"N\" attribute on the element); blocks without that attribute are complete. Older exchanges may be omitted entirely. Truncation here does NOT mean the tool failed or returned empty output; the original call ran and its full result was delivered at the time. If you genuinely need one specific full output, re-run that ONE call once. Do not re-fetch the same inputs repeatedly.\n\n{REPLAY_ESCAPING_NOTE}"
     )
 }
+/// Escaping disclosure for every replay that quotes prior text through
+/// [`escape_xml`] (history preamble, cut-short turn, restart recap). Without
+/// it a model that sees `&lt;!-- suggested-prompts` in the replay can copy
+/// the escaped spelling into its own reply, and the client then renders that
+/// block as raw text instead of prompt chips.
+pub(crate) const REPLAY_ESCAPING_NOTE: &str = "Note on escaping: text quoted in this replay is \
+XML-escaped only so it can sit inside these tags (&lt; &gt; &amp; &quot; stand for < > & \"). \
+The original messages used the literal characters. Write your own replies with literal \
+characters too: for example <!-- suggested-prompts, never &lt;!-- suggested-prompts.\n\n";
 const SUPERVISOR_CLOSING: &str =
     "Continue the conversation from this point. Do not mention session recovery or interruption.\n</supervisor>";
 
@@ -486,6 +495,9 @@ pub(crate) fn format_cut_short_turn(
     max_chars: usize,
     tool_content_chars: usize,
 ) -> String {
+    // Room for the escaping note, which precedes the turn whenever no
+    // history preamble (which already carries it) does.
+    let turn_cap = max_chars.saturating_sub(REPLAY_ESCAPING_NOTE.len());
     let user_xml = render_cut_short_user_request(current, tool_content_chars);
     let items = cut_short_partial_items(current);
     let full = render_cut_short_partial(&items, tool_content_chars, None);
@@ -495,20 +507,22 @@ pub(crate) fn format_cut_short_turn(
         )
     };
     let mut turn = wrap(&full);
-    if turn.len() > max_chars {
+    if turn.len() > turn_cap {
         let compact_overhead = wrap(&render_cut_short_partial(
             &items,
             tool_content_chars,
             Some(0),
         ))
         .len();
-        let text_budget = max_chars.saturating_sub(compact_overhead + MARKER_DIGITS_SLACK);
+        let text_budget = turn_cap.saturating_sub(compact_overhead + MARKER_DIGITS_SLACK);
         turn = wrap(&render_cut_short_partial(
             &items,
             tool_content_chars,
             Some(text_budget),
         ));
     }
+    // A history preamble carries the note inside its own budget, so the
+    // replay gets the full remainder.
     let history_budget = max_chars.saturating_sub(turn.len());
     let history = if prior.is_empty() {
         String::new()
@@ -519,10 +533,17 @@ pub(crate) fn format_cut_short_turn(
     } else {
         format_history_as_xml(prior, history_budget, tool_content_chars)
     };
-    if history.is_empty() {
-        turn
+    // `format_history_as_xml` output opens with the preamble (and its note)
+    // whenever it renders anything; the size-limit placeholder does not.
+    let note = if history.starts_with("<supervisor>") {
+        ""
     } else {
-        format!("{history}\n\n{turn}")
+        REPLAY_ESCAPING_NOTE
+    };
+    if history.is_empty() {
+        format!("{note}{turn}")
+    } else {
+        format!("{note}{history}\n\n{turn}")
     }
 }
 
