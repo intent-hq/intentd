@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.35] - 2026-10-23
+
+### 🐛 Bug Fixes
+
+- Report skipped PR checks separately from passed ([#2623](https://github.com/intent-hq/intentd/pull/2623))
+- *(store)* Create the database file before the write pool connects ([#2633](https://github.com/intent-hq/intentd/pull/2633))
+
+### 📚 Documentation
+
+- *(guide)* Drop the removed Collapse tool activity setting ([#2628](https://github.com/intent-hq/intentd/pull/2628))
+
+
 ## [0.11.34] - 2026-10-23
 
 ### 🐛 Bug Fixes
