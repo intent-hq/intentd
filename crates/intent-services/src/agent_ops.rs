@@ -2131,33 +2131,18 @@ fn text_blocks(content: &Value) -> Vec<String> {
         .collect()
 }
 
-/// Remove all `start..=end` delimited spans from `s` (inclusive of the
-/// markers). With `within_line`, a span must close on its own line and an
-/// unclosed one is kept; otherwise an unclosed span drops the rest of `s`.
-fn strip_spans(s: &str, start: &str, end: &str, within_line: bool) -> String {
+/// Remove all `start..=end` delimited spans from `s` (inclusive of the markers).
+fn strip_spans(s: &str, start: &str, end: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
     while let Some(i) = rest.find(start) {
+        out.push_str(&rest[..i]);
         let after = &rest[i + start.len()..];
-        let scope = if within_line {
-            after.split('\n').next().unwrap_or_default()
+        if let Some(j) = after.find(end) {
+            rest = &after[j + end.len()..];
         } else {
-            after
-        };
-        match scope.find(end) {
-            Some(j) => {
-                out.push_str(&rest[..i]);
-                rest = &after[j + end.len()..];
-            }
-            None if within_line => {
-                out.push_str(&rest[..i + start.len()]);
-                rest = after;
-            }
-            None => {
-                out.push_str(&rest[..i]);
-                rest = "";
-                break;
-            }
+            rest = "";
+            break;
         }
     }
     out.push_str(rest);
@@ -2179,7 +2164,8 @@ fn prompt_opener_at(line: &str) -> Option<(usize, bool)> {
 }
 
 /// A line that closes a block: the closer alone, or ending a final prompt
-/// whose text is not itself an opener (the desktop's fused-closer rule).
+/// (the desktop's fused-closer rule). A line holding a comment opener of its
+/// own (`<!-- note -->`) never closes a block, so the preview errs on hiding.
 fn is_prompt_closer(line: &str, escaped: bool) -> bool {
     let closer = if escaped { "--&gt;" } else { "-->" };
     let line = line.trim_end_matches([' ', '\t', '\r']);
@@ -2187,23 +2173,22 @@ fn is_prompt_closer(line: &str, escaped: bool) -> bool {
         return true;
     }
     line.strip_suffix(closer).is_some_and(|rest| {
-        let rest = rest.trim_end_matches([' ', '\t']);
-        !rest.trim().is_empty() && prompt_opener_at(rest).is_none()
+        !rest.trim().is_empty() && !rest.contains("<!--") && !rest.contains("&lt;!--")
     })
 }
 
-/// Remove suggested-prompts blocks line by line, in one pass over both
-/// spellings like the desktop's `scanSuggestedPrompts`: a block opens on a
+/// Remove well-formed suggested-prompts blocks line by line, in one pass over
+/// both spellings like the desktop's `scanSuggestedPrompts`: a block opens on a
 /// line ending in an opener and closes on a later closer line of the same
 /// spelling (alone, or fused with the final prompt), so an embedded arrow such
 /// as `A --> B` never ends it early. A later opener before any closer means
-/// the first was never closed. An unclosed block stays visible unless
-/// `streaming` (the reply is still being written), when it hides the rest.
+/// the first was never closed; unclosed blocks are left for
+/// [`clean_response_text`]'s first-closer pass.
 ///
 /// Code fences are deliberately not tracked: persisted previews keep only a
 /// text block's tail, which can start inside a fence and invert fence state.
 /// Shared cases: monorepo `docs/protocol/suggested-prompts.md`.
-fn strip_prompt_blocks(s: &str, streaming: bool) -> String {
+fn strip_prompt_blocks(s: &str) -> String {
     if !s.contains("suggested-prompts") {
         return s.to_owned();
     }
@@ -2240,13 +2225,7 @@ fn strip_prompt_blocks(s: &str, streaming: bool) -> String {
             }
             // Reopened: the first opener was never closed and stays.
             Some((reopen, false)) => i = reopen,
-            None => {
-                if streaming {
-                    out.push_str(&s[copied..start + pos]);
-                    copied = s.len();
-                }
-                break;
-            }
+            None => break,
         }
     }
     out.push_str(&s[copied..]);
@@ -2276,15 +2255,17 @@ fn strip_group_tags(s: &str) -> String {
 
 /// Clean an assistant text block of digest/suggested-prompts/group markers,
 /// mirroring the TS `agent.list` cleaning before the last-line extraction.
-/// `streaming` marks a block still being written (see [`strip_prompt_blocks`]).
-fn clean_response_text(text: &str, streaming: bool) -> String {
-    let mut cleaned = strip_spans(text, "<agent_digest>", "</agent_digest>", false);
-    cleaned = strip_prompt_blocks(&cleaned, streaming);
-    // Inline mentions of either spelling (the HTML-escaped one a model can
-    // copy from an XML-escaped history replay, see
-    // `history_xml::REPLAY_ESCAPING_NOTE`), removed only within their line.
-    cleaned = strip_spans(&cleaned, "<!-- suggested-prompts", "-->", true);
-    cleaned = strip_spans(&cleaned, "&lt;!-- suggested-prompts", "--&gt;", true);
+/// Well-formed prompts blocks go first ([`strip_prompt_blocks`]); anything left
+/// (inline mentions, unclosed or mismatched blocks) falls back to the
+/// first-closer rule, which hides to end-of-text when unclosed, so the preview
+/// never shows prompt lines or block markup. Both spellings: the HTML-escaped
+/// one is what a model can copy from an XML-escaped history replay (see
+/// `history_xml::REPLAY_ESCAPING_NOTE`).
+fn clean_response_text(text: &str) -> String {
+    let mut cleaned = strip_spans(text, "<agent_digest>", "</agent_digest>");
+    cleaned = strip_prompt_blocks(&cleaned);
+    cleaned = strip_spans(&cleaned, "<!-- suggested-prompts", "-->");
+    cleaned = strip_spans(&cleaned, "&lt;!-- suggested-prompts", "--&gt;");
     cleaned = strip_group_tags(&cleaned);
     cleaned.trim().to_string()
 }
@@ -2311,19 +2292,9 @@ pub(crate) fn last_response_and_digest(
 pub(crate) fn last_response_and_digest_from_blocks(
     blocks: &[String],
 ) -> (Option<String>, Option<String>) {
-    response_and_digest(blocks, false)
-}
-
-/// [`last_response_and_digest_from_blocks`] with `final_streaming` marking the
-/// last block as still being written, so an unclosed prompts block in it is
-/// hidden instead of shown.
-fn response_and_digest(
-    blocks: &[String],
-    final_streaming: bool,
-) -> (Option<String>, Option<String>) {
     let mut digest: Option<String> = None;
     let mut last_response: Option<String> = None;
-    for (index, block) in blocks.iter().enumerate() {
+    for block in blocks {
         let text = block.trim();
         if text.is_empty() {
             continue;
@@ -2333,7 +2304,7 @@ fn response_and_digest(
                 digest = Some(d.trim().to_string());
             }
         }
-        let cleaned = clean_response_text(text, final_streaming && index + 1 == blocks.len());
+        let cleaned = clean_response_text(text);
         if !cleaned.is_empty() {
             let line = cleaned.lines().rfind(|l| !l.trim().is_empty()).map_or_else(
                 || cleaned.chars().take(200).collect(),
@@ -2369,7 +2340,8 @@ pub(crate) fn live_response_and_digest_from_blocks(
         return last_response_and_digest_from_blocks(blocks);
     }
     let (_, digest) = last_response_and_digest_from_blocks(blocks);
-    let (last_response, _) = response_and_digest(&clip_trailing_partial_line(blocks), true);
+    let (last_response, _) =
+        last_response_and_digest_from_blocks(&clip_trailing_partial_line(blocks));
     (last_response, digest)
 }
 
