@@ -384,7 +384,7 @@ async fn native_review_frame_wait_stretches_with_the_test_timeout_multiplier() {
             .capture_review(&Frame::Prepare(f.query(Stage::Commit)))
             .unwrap();
         frame_check(&*frame).await.unwrap();
-        tokio::time::advance(stretched - Duration::from_millis(1)).await;
+        tokio::time::advance(stretched.checked_sub(Duration::from_millis(1)).unwrap()).await;
         assert!(
             frame_check(&*frame).await.is_ok(),
             "unstarted frame refused before the stretched {stretched:?} frame wait"
