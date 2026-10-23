@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Offline tests for scripts/fetch-locked-crates.py, shared by the Release host
-job and scripts/test-optional-intel-dist.py.
+"""Offline tests for scripts/fetch-locked-crates.py, shared by the Release
+build-global-artifacts and host jobs and scripts/test-optional-intel-dist.py.
 
 The real dist test fetches crates once, with retries, and then runs every dist
 call offline. These tests stub `cargo` and `dist` on PATH, so they need neither

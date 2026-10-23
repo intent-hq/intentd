@@ -33046,13 +33046,10 @@ impl WorkspaceApi for Services {
             // than computed a second time. `checks.failedNames` lists every
             // failing check, in rollup order; `requirements.checks
             // .failingRequired` narrows it to the required ones.
-            let failed_names: Vec<&str> = requirements
-                .checks
-                .items
-                .iter()
-                .filter(|c| c.status == "failed")
-                .map(|c| c.name.as_str())
-                .collect();
+            // `checks.skippedNames` lists the checks skipped without running,
+            // which `passed` excludes.
+            let failed_names = requirements.checks.names_with("failed");
+            let skipped_names = requirements.checks.names_with("skipped");
 
             let mut snapshot = serde_json::json!({
                 "repo": repo_slug,
@@ -33073,7 +33070,9 @@ impl WorkspaceApi for Services {
                     "passed": requirements.checks.passed,
                     "failed": requirements.checks.failed,
                     "pending": requirements.checks.pending,
+                    "skipped": requirements.checks.skipped,
                     "failedNames": failed_names,
+                    "skippedNames": skipped_names,
                 },
                 "reviews": {
                     "decision": requirements.approvals.decision,
