@@ -12,7 +12,15 @@
 //!   cargo test target (per `cargo metadata --no-deps`, no build) nor declared
 //!   by a bare `mod <file>;` line in one of its crate's test target roots;
 //! - a `tests/suite_*.rs` root declares its modules out of sorted order, which
-//!   keeps the lists merge-friendly and makes a duplicate entry visible.
+//!   keeps the lists merge-friendly and makes a duplicate entry visible;
+//! - a suite module (`tests/<m>.rs` or anything under `tests/<m>/`) changes
+//!   process-global state in-process: `env::set_var(` / `env::remove_var(` /
+//!   `set_current_dir(` / `set_child_subreaper(`. nextest runs each test in its
+//!   own process, but plain `cargo test` runs a suite's tests as threads of one
+//!   process, where that state leaks into every other file's tests (the
+//!   reason such files are standalone `[[test]]` targets). A call that only
+//!   runs in a separately exec'd child opts out with
+//!   `// process-global: allow — <reason>` on the line above.
 //!
 //! Files under `tests/<dir>/` are not checked: they are helpers or module
 //! directories, reached through `mod` / `#[path]` from a root that the
@@ -24,6 +32,13 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const SUITE_PREFIX: &str = "suite_";
+const GLOBAL_STATE_CALLS: [&str; 4] = [
+    "env::set_var(",
+    "env::remove_var(",
+    "set_current_dir(",
+    "set_child_subreaper(",
+];
+const GLOBAL_STATE_MARKER: &str = "// process-global: allow — ";
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -116,6 +131,39 @@ fn first_unsorted(root_text: &str) -> Option<(String, String)> {
         .map(|w| (w[0].to_owned(), w[1].to_owned()))
 }
 
+/// `(line, call)` of every unmarked process-global call in `text`; comment
+/// lines are skipped, and a marker needs a non-empty reason.
+fn global_state_calls(text: &str) -> Vec<(usize, &'static str)> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut hits = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        if line.trim_start().starts_with("//") {
+            continue;
+        }
+        let marked = i > 0
+            && lines[i - 1]
+                .trim_start()
+                .strip_prefix(GLOBAL_STATE_MARKER)
+                .is_some_and(|reason| !reason.trim().is_empty());
+        if let Some(call) = GLOBAL_STATE_CALLS.iter().find(|c| line.contains(*c)) {
+            if !marked {
+                hits.push((i + 1, *call));
+            }
+        }
+    }
+    hits
+}
+
+fn collect_rs(path: &Path, out: &mut Vec<PathBuf>) {
+    if path.is_dir() {
+        for entry in fs::read_dir(path).into_iter().flatten().flatten() {
+            collect_rs(&entry.path(), out);
+        }
+    } else if path.extension().is_some_and(|e| e == "rs") {
+        out.push(path.to_path_buf());
+    }
+}
+
 fn violations(root: &Path) -> Vec<String> {
     let targets = test_target_sources(root);
     let mut out = Vec::new();
@@ -150,6 +198,28 @@ fn violations(root: &Path) -> Vec<String> {
                     "{}: `mod {after};` must sort after `mod {before};` (keep the suite list sorted, no duplicates)",
                     rel(stem)
                 ));
+            }
+            for module in declared_modules(text)
+                .into_iter()
+                .filter(|m| *m != "common")
+            {
+                let mut sources = Vec::new();
+                collect_rs(&tests.join(format!("{module}.rs")), &mut sources);
+                collect_rs(&tests.join(module), &mut sources);
+                sources.sort();
+                for source in sources {
+                    let body = fs::read_to_string(&source).unwrap_or_default();
+                    for (line, call) in global_state_calls(&body) {
+                        out.push(format!(
+                            "{}:{line}: `{call}` changes process-global state in a module of {}; \
+                             make the file a standalone [[test]] target (plain `cargo test` runs \
+                             a suite's tests as threads of one process), or mark a call that only \
+                             runs in a separately exec'd child with `{GLOBAL_STATE_MARKER}<reason>`",
+                            source.strip_prefix(root).unwrap().display(),
+                            rel(stem)
+                        ));
+                    }
+                }
             }
         }
     }
@@ -205,6 +275,20 @@ fn suite_lists_must_be_sorted_without_duplicates() {
     );
 }
 
+#[test]
+fn process_global_calls_need_a_reasoned_marker() {
+    let text = "fn a() {\n    std::env::set_var(\"X\", \"1\");\n}\n\
+                // std::env::remove_var(\"X\") in a comment\n\
+                // process-global: allow — child only\n\
+                nix::sys::prctl::set_child_subreaper(true)?;\n\
+                // process-global: allow — \n\
+                std::env::set_current_dir(\"/\");\n";
+    assert_eq!(
+        global_state_calls(text),
+        [(2, "env::set_var("), (8, "set_current_dir(")]
+    );
+}
+
 /// End to end through `cargo metadata`: a crate with `autotests = false`
 /// whose suite forgets one file.
 #[test]
@@ -228,12 +312,20 @@ fn autotests_false_crate_with_a_forgotten_file_fails() {
     write("crates/k/src/lib.rs", "");
     write("crates/k/tests/suite_k.rs", "mod common;\n\nmod one;\n");
     write("crates/k/tests/one.rs", "");
+    write(
+        "crates/k/tests/one/env.rs",
+        "fn f() { std::env::set_var(\"K\", \"1\"); }\n",
+    );
     write("crates/k/tests/two.rs", "");
     write("crates/k/tests/common/mod.rs", "");
     let found = violations(&root.canonicalize().unwrap());
-    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found.len(), 2, "{found:?}");
     assert!(
         found[0].starts_with("crates/k/tests/two.rs is neither"),
+        "{found:?}"
+    );
+    assert!(
+        found[1].starts_with("crates/k/tests/one/env.rs:1: `env::set_var(`"),
         "{found:?}"
     );
 }

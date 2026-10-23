@@ -1,4 +1,6 @@
-//! `suite_e2e`: every other integration test that uses `common` (`e2e_*` outside WSS, plus the daemon-level misc files), built as one test executable.
+//! `suite_e2e`: every other integration test that uses `common`
+//! and leaves process-global state alone, built as one test
+//! executable.
 //!
 //! Each integration-test file used to be its own target, and every target
 //! statically links the whole daemon, so one test build produced ~200
@@ -14,10 +16,8 @@ mod auggie_context_e2e;
 mod durable_command;
 mod e2e_config_precedence;
 mod e2e_core_cli_commands;
-mod e2e_core_daemon_control;
 mod e2e_core_hermetic_workspaces_guard;
 mod e2e_core_orphan_trash_sweep;
-mod e2e_core_slug_and_config;
 mod e2e_detached_lifecycle;
 mod e2e_doctor_codex;
 mod e2e_doctor_database_safety;
@@ -26,7 +26,6 @@ mod e2e_mcp_bridge_resilience;
 mod e2e_native_review_wire;
 mod e2e_note_comment_ops_bindings;
 mod e2e_private_profile;
-mod e2e_pty_job_control;
 mod e2e_services_agent_queue;
 mod e2e_services_note_ops;
 mod e2e_sitter_staged_restart;

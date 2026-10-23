@@ -3117,6 +3117,7 @@ mod driver_ownership {
             matches!(waitid(Id::PIDFd(own.as_fd()), OBSERVE), Err(Errno::ECHILD)),
             "pidfd wait support"
         );
+        // process-global: allow — runs only in the isolated `--exact` re-exec preflight() checks
         nix::sys::prctl::set_child_subreaper(true)?;
         anyhow::ensure!(
             nix::sys::prctl::get_child_subreaper()?,

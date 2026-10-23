@@ -31,7 +31,6 @@ mod e2e_wss_mcp_servers;
 mod e2e_wss_note_set_content_merge;
 mod e2e_wss_note_truncated_read;
 mod e2e_wss_npx_launch_isolation;
-mod e2e_wss_panic_safety;
 mod e2e_wss_pending_questions;
 mod e2e_wss_poisoned_session_recreate;
 mod e2e_wss_pool_contention_stress;

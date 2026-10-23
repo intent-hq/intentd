@@ -8,7 +8,7 @@
 
 #![cfg(unix)]
 
-use crate::common;
+mod common;
 
 use std::path::Path;
 use std::sync::Arc;

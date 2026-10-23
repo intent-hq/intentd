@@ -108,7 +108,7 @@ slow-timeout = { period = "90s", terminate-after = 2 }
 timing-serial = { max-threads = 1 }
 
 [[profile.default.overrides]]
-filter = '(binary_id(=intentd::suite_wss_agents) & test(/^e2e_wss_delegation_group_persist::/)) | (binary_id(=intentd::suite_wss_g_r) & test(/^e2e_wss_interrupted_agents::/)) | (binary_id(=intentd::suite_wss_g_r) & test(/^e2e_wss_resolve_interrupted::/)) | (binary_id(=intentd::suite_wss_s_z) & test(/^e2e_wss_serve_resume_all::/)) | (binary_id(=intentd::suite_wss_g_r) & test(/^e2e_wss_pool_contention_stress::/)) | (binary_id(=intentd::suite_wss_g_r) & test(/^e2e_wss_mcp_servers::/)) | (binary_id(=intentd::suite_wss_g_r) & test(/^e2e_wss_mcp_oauth_refresh::/)) | (binary_id(=intentd::suite_e2e) & test(/^e2e_pty_job_control::/))'
+filter = '(binary_id(=intentd::suite_wss_agents) & test(/^e2e_wss_delegation_group_persist::/)) | (binary_id(=intentd::suite_wss_g_r) & test(/^e2e_wss_interrupted_agents::/)) | (binary_id(=intentd::suite_wss_g_r) & test(/^e2e_wss_resolve_interrupted::/)) | (binary_id(=intentd::suite_wss_s_z) & test(/^e2e_wss_serve_resume_all::/)) | (binary_id(=intentd::suite_wss_g_r) & test(/^e2e_wss_pool_contention_stress::/)) | (binary_id(=intentd::suite_wss_g_r) & test(/^e2e_wss_mcp_servers::/)) | (binary_id(=intentd::suite_wss_g_r) & test(/^e2e_wss_mcp_oauth_refresh::/)) | binary_id(=intentd::e2e_pty_job_control)'
 threads-required = 'num-test-threads'
 priority = 100
 

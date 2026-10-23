@@ -2,7 +2,7 @@
 //!
 //! Tests token generation/rotation and config resolution WITHOUT spawning a daemon.
 
-use crate::common;
+mod common;
 
 use intent_core::Config;
 use intent_transport::{generate_token, get_or_create_token, AsyncTokenStore, FileTokenStore};

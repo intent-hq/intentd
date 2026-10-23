@@ -107,6 +107,44 @@ name = "tmp_hygiene_lint"
 [[test]]
 name = "workflow_grep_quiet_lint"
 
+# Mutate process-global state in-process (environment variables read by
+# Config::resolve or by an in-process daemon, PR_SET_CHILD_SUBREAPER), each with
+# at most a file-local lock. nextest isolates every test in its own process, but
+# plain `cargo test` runs a whole executable's tests as threads of one process,
+# where a suite would let these race with other files' tests.
+[[test]]
+name = "e2e_core_daemon_control"
+
+[[test]]
+name = "e2e_core_slug_and_config"
+
+[[test]]
+name = "e2e_pty_job_control"
+
+[[test]]
+name = "e2e_wss_panic_safety"
+
+[[test]]
+name = "uds_chief_workspace"
+
+[[test]]
+name = "uds_files"
+
+[[test]]
+name = "uds_git"
+
+[[test]]
+name = "uds_github"
+
+[[test]]
+name = "uds_integration"
+
+[[test]]
+name = "uds_linear"
+
+[[test]]
+name = "uds_sentry"
+
 # Needs the fixture feature, which a suite cannot require for only one module.
 [[test]]
 name = "e2e_wss_gitlab_auth"

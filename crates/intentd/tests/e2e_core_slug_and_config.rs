@@ -3,7 +3,7 @@
 //! Calls Services directly to exercise slug generation (`extract_local_slug`,
 //! `generate_workspace_slug`) and config parsing WITHOUT spawning a daemon.
 
-use crate::common;
+mod common;
 
 use intent_core::config::DEFAULT_IDLE_REAP_MINUTES;
 use intent_core::{Config, WorkspaceApi, WorkspaceCreate, WorkspaceCreateInitialAgent};

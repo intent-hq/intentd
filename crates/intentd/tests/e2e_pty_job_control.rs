@@ -28,7 +28,7 @@
 
 #![cfg(target_os = "linux")]
 
-use crate::common;
+mod common;
 
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
