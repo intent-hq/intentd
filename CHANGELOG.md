@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.36] - 2026-10-23
+
+### 📚 Documentation
+
+- *(guide)* Mention the in-app agent-finished notification ([#2629](https://github.com/intent-hq/intentd/pull/2629))
+
+
 ## [0.11.35] - 2026-10-23
 
 ### 🐛 Bug Fixes
