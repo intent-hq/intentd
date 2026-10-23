@@ -4,60 +4,32 @@
 Requires the version of dist pinned by dist-workspace.toml. No GitHub writes or
 native compilation; all generated artifacts live in a disposable local clone.
 
-Crates are fetched once up front, with retries, and every dist call then runs
-with CARGO_NET_OFFLINE=true so a crates.io blip cannot fail a dist step (runs
-39394522385 and 39355882408). scripts/test-optional-intel-dist-network.py
+Crates are fetched once up front, with retries (scripts/fetch-locked-crates.py),
+and every dist call then runs with CARGO_NET_OFFLINE=true so a crates.io blip
+cannot fail a dist step (runs 39394522385 and 39355882408). scripts/test-optional-intel-dist-network.py
 covers that handling offline.
 """
+import importlib.util
 import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
 import tempfile
-import time
 import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
 INTEL = 'x86_64-apple-darwin'
-FETCH = ['cargo', 'fetch', '--locked']
-# Worst case (deadline plus backoff) is under 8 minutes, inside the 15-minute
-# release-scripts job alongside its other steps.
-FETCH_ATTEMPTS = 4
-FETCH_ATTEMPT_TIMEOUT = 150
-FETCH_DEADLINE = 420
-
-
-def fetch_dependencies(root, env, attempts=FETCH_ATTEMPTS, sleep=time.sleep,
-                       attempt_timeout=FETCH_ATTEMPT_TIMEOUT, deadline=FETCH_DEADLINE, clock=time.monotonic):
-    """Download the locked crates, retrying transient network failures with backoff.
-
-    A hung attempt is killed after attempt_timeout and counts as a failure; no
-    attempt starts, or runs, past the overall deadline. HTTP/2 multiplexing is
-    off: it caused the crates.io "HTTP2 framing layer" error.
-    """
-    env = {**env, 'CARGO_NET_RETRY': '3', 'CARGO_HTTP_MULTIPLEXING': 'false'}
-    env.pop('CARGO_NET_OFFLINE', None)
-    end = clock() + deadline
-    tried = 0
-    for attempt in range(1, attempts + 1):
-        remaining = end - clock()
-        if remaining <= 0:
-            break
-        tried = attempt
-        try:
-            if subprocess.run(FETCH, cwd=root, env=env, timeout=min(attempt_timeout, remaining)).returncode == 0:
-                return
-        except subprocess.TimeoutExpired:
-            print(f'cargo fetch attempt {attempt} timed out', flush=True)
-        if attempt < attempts:
-            sleep(5 * 2 ** (attempt - 1))
-    raise SystemExit(f'FAIL: `{" ".join(FETCH)}` failed after {tried} attempts ({deadline}s limit); the network '
-                     '(crates.io) is unavailable, not the cargo-dist behaviour under test. Re-run the job.')
-
-
-def offline_env(env):
-    return {**env, 'CARGO_NET_OFFLINE': 'true'}
+_spec = importlib.util.spec_from_file_location('fetch_locked_crates', ROOT / 'scripts/fetch-locked-crates.py')
+_fetch = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_fetch)
+# Shared with the Release host job; re-exported for test-optional-intel-dist-network.py.
+FETCH = _fetch.FETCH
+FETCH_ATTEMPTS = _fetch.FETCH_ATTEMPTS
+FETCH_ATTEMPT_TIMEOUT = _fetch.FETCH_ATTEMPT_TIMEOUT
+FETCH_DEADLINE = _fetch.FETCH_DEADLINE
+fetch_dependencies = _fetch.fetch_dependencies
+offline_env = _fetch.offline_env
 
 
 def run_dist(root, env, *args):
@@ -129,6 +101,14 @@ def main():
         generated = (root / '.github/workflows/v-release.yml').read_text()
         subprocess.run(customize, cwd=root, check=True)
         assert generated == (root / '.github/workflows/v-release.yml').read_text()
+        shutil.copy(ROOT / 'scripts/configure-release-host-network.py',
+                    root / 'scripts/configure-release-host-network.py')
+        host_network = ['python3', '-I', '-B', 'scripts/configure-release-host-network.py']
+        subprocess.run(host_network, cwd=root, check=True)
+        fetched = (root / '.github/workflows/v-release.yml').read_text()
+        subprocess.run(host_network, cwd=root, check=True)
+        assert fetched == (root / '.github/workflows/v-release.yml').read_text()
+        assert 'CARGO_NET_OFFLINE: "true"' in fetched
         shutil.copy(ROOT / 'scripts/configure-runner-routing.py', root / 'scripts/configure-runner-routing.py')
         route_command = ['python3', '-I', '-B', 'scripts/configure-runner-routing.py']
         subprocess.run(route_command, cwd=root, check=True)
