@@ -2149,33 +2149,144 @@ fn strip_spans(s: &str, start: &str, end: &str) -> String {
     out
 }
 
-/// Remove suggested-prompts blocks: each span runs from `opener` to the first
-/// `closer` that ends its line (standalone, or fused with the final prompt), so
-/// an embedded arrow in a body line (`A --> B`) does not end the block early
-/// and leak its tail into the preview. A span with no line-ending closer falls
-/// back to the first `closer` anywhere, then to end-of-text, like
-/// [`strip_spans`]. Shared cases: monorepo `docs/protocol/suggested-prompts.md`.
+/// A fenced-code marker line (backtick or tilde, at most three spaces of
+/// indent): `(char, length, info)`.
+fn prompt_fence_marker(line: &str) -> Option<(char, usize, &str)> {
+    let body = line.trim_start_matches(' ');
+    if line.len() - body.len() > 3 {
+        return None;
+    }
+    let ch = body.chars().next().filter(|c| *c == '`' || *c == '~')?;
+    let len = body.len() - body.trim_start_matches(ch).len();
+    (len >= 3).then(|| (ch, len, &body[len..]))
+}
+
+/// Fence state after a marker: any marker opens a fence; only a matching,
+/// at-least-as-long, bare marker closes it.
+fn next_prompt_fence(
+    fence: Option<(char, usize)>,
+    marker: (char, usize, &str),
+) -> Option<(char, usize)> {
+    match fence {
+        None => Some((marker.0, marker.1)),
+        Some((ch, len)) if marker.0 == ch && marker.1 >= len && marker.2.trim().is_empty() => None,
+        open => open,
+    }
+}
+
+/// Byte offset of an opener that ends its line (a block opener), if any.
+fn block_opener_at(line: &str, opener: &str) -> Option<usize> {
+    let pos = line.rfind(opener)?;
+    line[pos + opener.len()..].trim().is_empty().then_some(pos)
+}
+
+/// A closer line: `closer` alone, or ending a non-empty, non-opener remainder
+/// (the final prompt fused with the closer).
+fn is_prompt_closer(line: &str, opener: &str, closer: &str) -> bool {
+    if line.trim() == closer {
+        return true;
+    }
+    line.strip_suffix(closer)
+        .is_some_and(|rest| !rest.trim().is_empty() && !rest.contains(opener))
+}
+
+/// Remove suggested-prompts blocks line by line, mirroring the desktop's
+/// `scanSuggestedPrompts`: a block opens on a line ending in `opener`
+/// outside a code fence and closes on a later `closer` line (alone or fused
+/// with the final prompt) outside a fence, so an embedded arrow such as
+/// `A --> B` never ends it early. Unlike the desktop this is a lossy preview
+/// cleaner: an opener with no closer hides the rest of the text (a block
+/// still streaming), and an inline `opener … closer` span within one line is
+/// removed. Shared cases: monorepo `docs/protocol/suggested-prompts.md`.
 fn strip_prompt_blocks(s: &str, opener: &str, closer: &str) -> String {
-    let ends_line = |tail: &str| {
-        let tail = tail.trim_start_matches([' ', '\t']);
-        tail.is_empty() || tail.starts_with('\n') || tail.starts_with("\r\n")
-    };
+    let mut lines = Vec::new();
+    let mut start = 0;
+    for line in s.split('\n') {
+        lines.push((start, line));
+        start += line.len() + 1;
+    }
     let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    while let Some(i) = rest.find(opener) {
-        out.push_str(&rest[..i]);
-        let after = &rest[i + opener.len()..];
-        let line_end = after
-            .match_indices(closer)
-            .map(|(j, _)| j + closer.len())
-            .find(|&end| ends_line(&after[end..]));
-        match line_end.or_else(|| after.find(closer).map(|j| j + closer.len())) {
-            Some(end) => rest = &after[end..],
-            None => {
-                rest = "";
+    let mut copied = 0;
+    let mut fence = None;
+    let mut i = 0;
+    while i < lines.len() {
+        let (start, line) = lines[i];
+        let text = line.trim_end_matches([' ', '\t', '\r']);
+        if let Some(marker) = prompt_fence_marker(text) {
+            fence = next_prompt_fence(fence, marker);
+            i += 1;
+            continue;
+        }
+        if fence.is_some() || !text.contains(opener) {
+            i += 1;
+            continue;
+        }
+        let block = block_opener_at(text, opener);
+        let inline_end = block.unwrap_or(line.len());
+        out.push_str(&s[copied..start]);
+        out.push_str(&strip_spans_within(&line[..inline_end], opener, closer));
+        copied = start + inline_end;
+        if block.is_none() {
+            i += 1;
+            continue;
+        }
+        match prompt_block_end(&lines[i + 1..], opener, closer) {
+            PromptBlockEnd::Closed(j) => {
+                let (close_start, close_line) = lines[i + 1 + j];
+                copied = close_start + close_line.len();
+                i += j + 2;
+            }
+            // The first opener was never closed and stays visible.
+            PromptBlockEnd::Reopened(j) => i += j + 1,
+            PromptBlockEnd::Unclosed => {
+                copied = s.len();
                 break;
             }
         }
+    }
+    out.push_str(&s[copied..]);
+    out
+}
+
+enum PromptBlockEnd {
+    /// Index (into the following lines) of the closer line.
+    Closed(usize),
+    /// Index of a later block opener reached before any closer.
+    Reopened(usize),
+    Unclosed,
+}
+
+/// Where a block opened just before `lines` ends, tracking fences.
+fn prompt_block_end(lines: &[(usize, &str)], opener: &str, closer: &str) -> PromptBlockEnd {
+    let mut fence = None;
+    for (j, &(_, line)) in lines.iter().enumerate() {
+        let text = line.trim_end_matches([' ', '\t', '\r']);
+        if let Some(marker) = prompt_fence_marker(text) {
+            fence = next_prompt_fence(fence, marker);
+            continue;
+        }
+        if fence.is_some() {
+            continue;
+        }
+        if is_prompt_closer(text, opener, closer) {
+            return PromptBlockEnd::Closed(j);
+        }
+        if block_opener_at(text, opener).is_some() {
+            return PromptBlockEnd::Reopened(j);
+        }
+    }
+    PromptBlockEnd::Unclosed
+}
+
+/// `strip_spans` bounded to one line: a span with no closer is kept.
+fn strip_spans_within(line: &str, opener: &str, closer: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(i) = rest.find(opener) {
+        let after = &rest[i + opener.len()..];
+        let Some(j) = after.find(closer) else { break };
+        out.push_str(&rest[..i]);
+        rest = &after[j + closer.len()..];
     }
     out.push_str(rest);
     out

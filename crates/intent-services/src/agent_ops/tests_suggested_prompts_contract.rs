@@ -9,6 +9,8 @@
 //! with a well-formed block (`blockStripped`) apply, and only their `cleaned`
 //! text is compared.
 
+use std::fmt::Write as _;
+
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -54,7 +56,10 @@ fn suggested_prompts_contract_copy_matches_its_lock() {
         "docs/protocol/fixtures/suggested-prompts/v1"
     );
     let digest = Sha256::digest(CASES.as_bytes());
-    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    let hex = digest.iter().fold(String::new(), |mut hex, byte| {
+        let _ = write!(hex, "{byte:02x}");
+        hex
+    });
     assert_eq!(
         lock["casesSha256"].as_str(),
         Some(hex.as_str()),
@@ -83,15 +88,15 @@ fn suggested_prompts_contract_strips_every_well_formed_block() {
         let input = case["input"].as_str().expect("input");
         let want = expect["cleaned"].as_str().expect("cleaned");
         let got = normalize(&clean_response_text(input));
-        match case["divergences"][CONSUMER].as_str() {
-            Some(reason) if got == want => failures.push(format!(
+        let reason = case["divergences"][CONSUMER].as_str();
+        if let Some(reason) = reason.filter(|_| got == want) {
+            failures.push(format!(
                 "{id}: listed as an intentd divergence ({reason}) but now matches; remove the entry"
-            )),
-            Some(_) => {}
-            None if got != want => failures.push(format!(
+            ));
+        } else if reason.is_none() && got != want {
+            failures.push(format!(
                 "{id}: cleaned text differs\n  want: {want:?}\n  got:  {got:?}"
-            )),
-            None => {}
+            ));
         }
     }
     assert!(
@@ -115,8 +120,8 @@ fn suggested_prompts_embedded_arrow_does_not_end_the_block() {
     }
 }
 
-/// Without a line-ending closer the old first-closer rule still applies, so
-/// an inline span keeps its preview.
+/// An inline `opener … closer` span within one line is still removed, and an
+/// opener with no closer hides the rest of the text (a block still streaming).
 #[test]
 fn suggested_prompts_inline_span_keeps_the_first_closer_rule() {
     assert_eq!(
@@ -127,4 +132,34 @@ fn suggested_prompts_inline_span_keeps_the_first_closer_rule() {
         clean_response_text("Done.\n<!-- suggested-prompts\nRun"),
         "Done."
     );
+}
+
+/// An inline mention of the opener never reaches past its own line, so it
+/// cannot swallow text up to a later block's closer.
+#[test]
+fn suggested_prompts_inline_mention_does_not_swallow_later_text() {
+    let text = "Updated the `<!-- suggested-prompts -->` parser.\nAll tests pass.\n\
+                <!-- suggested-prompts\nRun tests\n-->";
+    assert_eq!(
+        clean_response_text(text),
+        "Updated the `` parser.\nAll tests pass."
+    );
+    let unclosed_inline =
+        "See <!-- suggested-prompts here.\nTail.\n<!-- suggested-prompts\nRun\n-->";
+    assert_eq!(
+        clean_response_text(unclosed_inline),
+        "See <!-- suggested-prompts here.\nTail."
+    );
+}
+
+/// A block still streaming (no closer yet) hides the rest of the text, even
+/// when a body line has an embedded arrow, and a fenced example stays.
+#[test]
+fn suggested_prompts_unclosed_block_and_fenced_example() {
+    assert_eq!(
+        clean_response_text("Done.\n<!-- suggested-prompts\nA --> B\nRun tests\n"),
+        "Done."
+    );
+    let fenced = "Format:\n```\n<!-- suggested-prompts\nExample\n-->\n```\nEnd.";
+    assert_eq!(clean_response_text(fenced), fenced);
 }
