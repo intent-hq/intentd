@@ -47,10 +47,12 @@ enum Attempt {
     Failed,
 }
 
-fn classify<T>(result: &intent_core::Result<T>) -> Attempt {
+/// `Ok(None)` is the automatic op declining because the workspace is no
+/// longer due (unarchived, re-archived or retired since the sweep listed it).
+fn classify<T>(result: &intent_core::Result<Option<T>>) -> Attempt {
     match result {
-        Ok(_) => Attempt::Retired,
-        Err(intent_core::Error::RetireUnsupported { .. }) => Attempt::Skipped,
+        Ok(Some(_)) => Attempt::Retired,
+        Ok(None) | Err(intent_core::Error::RetireUnsupported { .. }) => Attempt::Skipped,
         Err(_) => Attempt::Failed,
     }
 }
@@ -75,7 +77,12 @@ impl Services {
         let Some(days) = days else {
             return report;
         };
-        let cutoff = now - time::Duration::days(i64::from(days));
+        // A window reaching before the earliest representable date (e.g.
+        // u32::MAX days) can never be due: skip the sweep instead of
+        // overflowing the subtraction.
+        let Some(cutoff) = now.checked_sub(time::Duration::days(i64::from(days))) else {
+            return report;
+        };
         let workspaces = match self
             .store
             .list_workspaces(WorkspaceListFilter::WITH_ARCHIVED)
@@ -91,23 +98,25 @@ impl Services {
             if !ws.archived || ws.is_retired() || ws.id.is_chief() {
                 continue;
             }
-            let archived_at = ws
+            let dated = ws
                 .archived_at
                 .as_deref()
-                .and_then(|stamp| OffsetDateTime::parse(stamp, &Rfc3339).ok());
-            match archived_at {
-                Some(at) if at < cutoff => {}
-                Some(_) => continue,
-                None => {
-                    report.skipped += 1;
-                    continue;
-                }
+                .is_some_and(|stamp| OffsetDateTime::parse(stamp, &Rfc3339).is_ok());
+            if !dated {
+                report.skipped += 1;
+                continue;
+            }
+            if !crate::retire::auto_retire_due(&ws, cutoff) {
+                continue;
             }
             if !self.auto_retire_eligible(&ws).await {
                 report.skipped += 1;
                 continue;
             }
-            let result = self.retire_workspace_op(ws.id.clone(), None).await;
+            // The listed row may be stale: the automatic op re-checks
+            // "still archived before the cutoff" under the archive fence and
+            // never archives an Active workspace.
+            let result = self.auto_retire_workspace_op(ws.id.clone(), cutoff).await;
             match classify(&result) {
                 Attempt::Retired => {
                     report.retired += 1;
@@ -123,8 +132,13 @@ impl Services {
                 // skipped quietly instead of warning every hour.
                 Attempt::Skipped => {
                     report.skipped += 1;
-                    if let Err(e) = &result {
-                        tracing::debug!(workspace = %ws.id, error = %e, "auto-retire: retire unsupported, skipped");
+                    match &result {
+                        Err(e) => {
+                            tracing::debug!(workspace = %ws.id, error = %e, "auto-retire: retire unsupported, skipped");
+                        }
+                        Ok(_) => {
+                            tracing::debug!(workspace = %ws.id, "auto-retire: no longer due, skipped");
+                        }
                     }
                 }
                 Attempt::Failed => {
@@ -204,8 +218,9 @@ mod tests {
     /// every sweep); any other error is a failure; success is a retire.
     #[test]
     fn classify_separates_unsupported_refusals_from_failures() {
-        assert_eq!(classify(&Ok::<(), Error>(())), Attempt::Retired);
-        let unsupported: intent_core::Result<()> = Err(Error::RetireUnsupported {
+        assert_eq!(classify(&Ok::<_, Error>(Some(()))), Attempt::Retired);
+        assert_eq!(classify(&Ok::<Option<()>, Error>(None)), Attempt::Skipped);
+        let unsupported: intent_core::Result<Option<()>> = Err(Error::RetireUnsupported {
             workspace_id: "ws-1".to_string(),
             checkout_mode: None,
         });
@@ -215,7 +230,7 @@ mod tests {
             Error::InvalidInput("unarchived while retiring".to_string()),
             Error::InvalidParams("pending delete".to_string()),
         ] {
-            assert_eq!(classify(&Err::<(), _>(err)), Attempt::Failed);
+            assert_eq!(classify(&Err::<Option<()>, _>(err)), Attempt::Failed);
         }
     }
 }

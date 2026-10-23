@@ -1043,3 +1043,81 @@ async fn auto_retire_reads_the_live_setting() {
     assert_eq!(svc.sweep_auto_retire_at(days_from_now(8)).await.retired, 1);
     assert!(f.store.get_workspace(&ws.id).await.unwrap().is_retired());
 }
+
+/// Review regression (intentd#2605): the sweep lists workspaces, then
+/// retires them later, so the row can be stale. A workspace unarchived after
+/// it was listed must be left alone: the automatic op never archives an
+/// Active workspace and never deletes its checkout.
+#[intent_test_macros::daemon_test]
+async fn auto_retire_op_leaves_a_workspace_unarchived_after_listing() {
+    let f = fixture().await;
+    let ws = create_workspace(&f).await;
+    f.svc
+        .archive_workspace(ws.id.clone(), None)
+        .await
+        .expect("archive");
+    f.svc
+        .unarchive_workspace(ws.id.clone())
+        .await
+        .expect("unarchive");
+
+    let out = f
+        .svc
+        .auto_retire_workspace_op(ws.id.clone(), days_from_now(8))
+        .await
+        .expect("no error");
+    assert!(out.is_none(), "not due any more: {out:?}");
+    let row = f.store.get_workspace(&ws.id).await.unwrap();
+    assert_eq!(row.status, WorkspaceStatus::Active);
+    assert!(!row.archived, "must not be re-archived");
+    assert!(std::path::Path::new(ws.worktree_path.as_deref().unwrap()).is_dir());
+}
+
+/// Review regression: a workspace re-archived after the sweep listed it
+/// carries a fresh `archivedAt` after the cutoff and is not retired.
+#[intent_test_macros::daemon_test]
+async fn auto_retire_op_skips_a_workspace_archived_after_the_cutoff() {
+    let f = fixture().await;
+    let ws = create_workspace(&f).await;
+    f.svc
+        .archive_workspace(ws.id.clone(), None)
+        .await
+        .expect("archive");
+
+    let out = f
+        .svc
+        .auto_retire_workspace_op(ws.id.clone(), days_from_now(-1))
+        .await
+        .expect("no error");
+    assert!(out.is_none(), "{out:?}");
+    assert!(!f.store.get_workspace(&ws.id).await.unwrap().is_retired());
+    assert!(std::path::Path::new(ws.worktree_path.as_deref().unwrap()).is_dir());
+
+    // The same op retires it once the cutoff is past its archivedAt.
+    let out = f
+        .svc
+        .auto_retire_workspace_op(ws.id.clone(), days_from_now(1))
+        .await
+        .expect("retire");
+    assert!(out.is_some_and(|w| w.is_retired()));
+}
+
+/// Review regression: the setting accepts any positive u32, and a window
+/// longer than the representable date range must not panic the sweep loop —
+/// nothing can be that old, so the sweep is a no-op.
+#[intent_test_macros::daemon_test]
+async fn auto_retire_with_a_huge_window_is_a_no_op() {
+    let f = fixture().await;
+    let ws = create_workspace(&f).await;
+    f.svc
+        .archive_workspace(ws.id.clone(), None)
+        .await
+        .expect("archive");
+
+    let report = f
+        .svc
+        .sweep_auto_retire_after(Some(u32::MAX), days_from_now(0))
+        .await;
+    assert_eq!(report, crate::AutoRetireReport::default());
+    assert!(!f.store.get_workspace(&ws.id).await.unwrap().is_retired());
+}

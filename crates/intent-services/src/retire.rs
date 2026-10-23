@@ -71,6 +71,38 @@ impl Services {
         id: WorkspaceId,
         caller_agent_id: Option<AgentId>,
     ) -> Result<Workspace> {
+        self.retire_workspace_inner(id, caller_agent_id, None)
+            .await
+            .map(|ws| ws.expect("a manual retire always returns the workspace"))
+    }
+
+    /// The automatic-retire entry point (PROTOCOL §5.1 "Automatic retire"):
+    /// retire `id` only if it is STILL archived (not Active, not already
+    /// retired) with an `archivedAt` before `archived_before`, re-checked
+    /// under the archive fence right before the flip. Never archives an
+    /// Active workspace — a workspace unarchived (or unarchived and
+    /// re-archived) after the sweep listed it is left alone. `Ok(None)`
+    /// when the preconditions no longer hold and nothing changed.
+    pub(crate) async fn auto_retire_workspace_op(
+        &self,
+        id: WorkspaceId,
+        archived_before: time::OffsetDateTime,
+    ) -> Result<Option<Workspace>> {
+        self.retire_workspace_inner(id, None, Some(archived_before))
+            .await
+    }
+
+    /// Shared retire body. `archived_before` is `None` for a manual
+    /// `workspace.retire` (always returns `Some`) and the automatic cutoff
+    /// otherwise (see [`Self::auto_retire_workspace_op`]).
+    async fn retire_workspace_inner(
+        &self,
+        id: WorkspaceId,
+        caller_agent_id: Option<AgentId>,
+        archived_before: Option<time::OffsetDateTime>,
+    ) -> Result<Option<Workspace>> {
+        let still_due =
+            |ws: &Workspace| archived_before.is_none_or(|cutoff| auto_retire_due(ws, cutoff));
         self.require_workspace_manager(&id, "workspace.retire")
             .await?;
         if id.is_chief() {
@@ -79,6 +111,9 @@ impl Services {
             ));
         }
         let current = self.store.get_workspace(&id).await?;
+        if !still_due(&current) {
+            return Ok(None);
+        }
         if !current.is_retired() {
             retire_supported(&current)?;
             self.require_owned_worktree(&current)?;
@@ -101,7 +136,7 @@ impl Services {
             let mut ws = current;
             ws.activity = self.workspace_activity(&ws.id);
             self.attach_workspace_membership(&mut ws).await;
-            return Ok(ws);
+            return Ok(Some(ws));
         }
         // Active → run the full archive teardown first (interrupt turns,
         // cancel hooks / PR monitors / script monitors, detach guests) and
@@ -124,6 +159,12 @@ impl Services {
         // (`stop_many` aborts workers), so a turn start blocked on this
         // fence cannot deadlock it.
         let fence = self.archive_fence.acquire(&id).await;
+        // Automatic retire re-checks under the fence (archive ↔ unarchive
+        // serialize on it), so an unarchive that landed after the sweep
+        // listed the workspace always wins and nothing is deleted.
+        if archived_before.is_some() && !still_due(&self.store.get_workspace(&id).await?) {
+            return Ok(None);
+        }
         let ws = {
             let flipped = self
                 .store
@@ -186,7 +227,7 @@ impl Services {
         let mut ws = ws;
         ws.activity = self.workspace_activity(&ws.id);
         self.attach_workspace_membership(&mut ws).await;
-        Ok(ws)
+        Ok(Some(ws))
     }
 
     /// Revive a retired workspace's checkout (PROTOCOL §5.1 "Revive"):
@@ -456,6 +497,21 @@ pub(crate) fn retire_supported(ws: &Workspace) -> Result<()> {
         return refuse(None);
     }
     Ok(())
+}
+
+/// Whether `ws` is due for automatic retire at `cutoff`: archived, not
+/// retired, with a readable `archivedAt` strictly before `cutoff`.
+pub(crate) fn auto_retire_due(ws: &Workspace, cutoff: time::OffsetDateTime) -> bool {
+    ws.archived
+        && !ws.is_retired()
+        && ws
+            .archived_at
+            .as_deref()
+            .and_then(|stamp| {
+                time::OffsetDateTime::parse(stamp, &time::format_description::well_known::Rfc3339)
+                    .ok()
+            })
+            .is_some_and(|at| at < cutoff)
 }
 
 /// The [`Error::WorkspaceRetired`] refusal for `workspace_id`.
