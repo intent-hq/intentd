@@ -1134,6 +1134,32 @@ impl MergeQueueEjection {
                 .as_deref()
                 .is_some_and(|reason| reason.eq_ignore_ascii_case("merged"))
     }
+
+    /// Whether the PR's CURRENT merge-queue entry began after this ejection,
+    /// i.e. the PR was re-queued since and the ejection no longer applies
+    /// (intent-hq/intent#7523: an ejection first observed after the re-queue
+    /// was reported as news while the queue was about to land the PR). True
+    /// only when `requirements` reports the PR queued with an `enqueuedAt`
+    /// strictly later than [`Self::at`]; a missing entry, missing or
+    /// unparseable timestamp is not proof of staleness and returns false.
+    /// The PR monitor adopts a superseded ejection into its baselines
+    /// silently, so it never becomes a change line.
+    pub(crate) fn superseded_by_queue_entry(&self, requirements: &MergeRequirements) -> bool {
+        if requirements.is_in_merge_queue != Some(true) {
+            return false;
+        }
+        let Some(enqueued_at) = requirements
+            .merge_queue
+            .as_ref()
+            .and_then(|entry| entry.enqueued_at.as_deref())
+        else {
+            return false;
+        };
+        match (parse_iso(enqueued_at), parse_iso(&self.at)) {
+            (Some(enqueued_at), Some(ejected_at)) => enqueued_at > ejected_at,
+            _ => false,
+        }
+    }
 }
 
 /// The `threads` block of the checklist.

@@ -3799,6 +3799,23 @@ impl Services {
                     .clone_from(&fresh.requirements.merge_queue_ejection);
                 s.ejection_tracked = true;
             }
+            // An ejection that predates the PR's current queue entry is
+            // history, not news (intent-hq/intent#7523: first observed
+            // after the re-queue, it was reported while the queue was about
+            // to land the PR). Adopt it silently, like the backfill above;
+            // persisting it in the baseline keeps the decision once a later
+            // poll loses the queue state (degraded probe, queue exit,
+            // terminal wake).
+            if fresh
+                .requirements
+                .merge_queue_ejection
+                .as_ref()
+                .is_some_and(|e| e.superseded_by_queue_entry(&fresh.requirements))
+            {
+                s.requirements
+                    .merge_queue_ejection
+                    .clone_from(&fresh.requirements.merge_queue_ejection);
+            }
         };
         if let Some(prev) = previous.as_mut() {
             backfill(prev);
@@ -6397,6 +6414,71 @@ mod tests {
             changes,
             vec!["removed from the merge queue (failed checks)"]
         );
+    }
+
+    /// An ejection older than the PR's current queue entry is superseded
+    /// (intent-hq/intent#7523), including across RFC 3339 offsets. Without a
+    /// strictly later, comparable entry time — not queued, no entry, no
+    /// `enqueuedAt`, unparseable, or an entry at or before the ejection —
+    /// it is not, so the monitor still reports it.
+    #[test]
+    fn an_ejection_is_superseded_only_by_a_later_queue_entry() {
+        let ejection = pr_ops::MergeQueueEjection {
+            at: "2026-10-21T13:18:28Z".into(),
+            reason: Some("failed_checks".into()),
+        };
+        let with = |queued: Option<bool>, enqueued_at: Option<&str>, entry: bool| {
+            snapshot(|s| {
+                s.requirements.merge_queue_ejection = Some(ejection.clone());
+                s.requirements.is_in_merge_queue = queued;
+                s.requirements.merge_queue = entry.then(|| intent_sourcecontrol::MergeQueueEntry {
+                    position: 1,
+                    queue_size: Some(1),
+                    state: Some("awaiting_checks".into()),
+                    enqueued_at: enqueued_at.map(Into::into),
+                    estimated_time_to_merge: None,
+                });
+            })
+            .requirements
+        };
+
+        for (label, requirements) in [
+            (
+                "re-queued",
+                with(Some(true), Some("2026-10-21T13:21:58Z"), true),
+            ),
+            (
+                "re-queued, other offset",
+                with(Some(true), Some("2026-10-21T15:21:58+02:00"), true),
+            ),
+        ] {
+            assert!(
+                ejection.superseded_by_queue_entry(&requirements),
+                "{label}: superseded"
+            );
+        }
+        for (label, requirements) in [
+            (
+                "entry predates ejection",
+                with(Some(true), Some("2026-10-21T13:00:00Z"), true),
+            ),
+            (
+                "same instant",
+                with(Some(true), Some("2026-10-21T13:18:28Z"), true),
+            ),
+            ("no enqueuedAt", with(Some(true), None, true)),
+            (
+                "unparseable enqueuedAt",
+                with(Some(true), Some("soon"), true),
+            ),
+            ("queued without entry", with(Some(true), None, false)),
+            ("not queued", with(None, Some("2026-10-21T13:21:58Z"), true)),
+        ] {
+            assert!(
+                !ejection.superseded_by_queue_entry(&requirements),
+                "{label}: still applies"
+            );
+        }
     }
 
     /// A persisted baseline written before `mergeQueueEjection` existed still
@@ -13603,6 +13685,122 @@ mod tests {
                 .count(),
             1,
             "no re-report after the wake: {text}"
+        );
+    }
+
+    /// intent-hq/intent#7523 regression: the PR was ejected (13:18:28Z) and
+    /// re-queued (13:21:58Z) before the monitor first observed the ejection.
+    /// The stale event predates the current queue entry, so it is adopted as
+    /// history and never reported — not even once a later poll loses the
+    /// queue state — while a later ejection is still news.
+    #[tokio::test]
+    async fn an_ejection_older_than_the_current_queue_entry_is_not_reported() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let svc = svc.with_pr_monitor_debounce_seconds(3600);
+        let monitor = register(&svc, &ws, &owner).await;
+
+        let stale = intent_sourcecontrol::MergeQueueRemoval {
+            at: "2026-10-21T13:18:28Z".into(),
+            reason: Some("failed_checks".into()),
+        };
+        forge.edit(|s| {
+            s.merge_queue_removal = Some(stale.clone());
+            s.in_merge_queue = Some(true);
+            s.merge_queue_entry = Some(intent_sourcecontrol::MergeQueueEntry {
+                position: 1,
+                queue_size: Some(1),
+                state: Some("awaiting_checks".into()),
+                enqueued_at: Some("2026-10-21T13:21:58Z".into()),
+                estimated_time_to_merge: None,
+            });
+        });
+        svc.poll_pr_monitors().await;
+        let row = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        assert!(
+            row.pending_changes
+                .iter()
+                .any(|c| c == "entered the merge queue"),
+            "the re-queue itself is observed: {:?}",
+            row.pending_changes
+        );
+        assert!(
+            !row.pending_changes
+                .iter()
+                .any(|c| c.starts_with("removed from the merge queue")),
+            "the superseded ejection is not reported: {:?}",
+            row.pending_changes
+        );
+        let last: PrMonitorSnapshot =
+            serde_json::from_str(row.last_snapshot.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            last.requirements
+                .merge_queue_ejection
+                .as_ref()
+                .map(|e| e.at.as_str()),
+            Some(stale.at.as_str()),
+            "the stale event stays in the snapshot as history"
+        );
+
+        // The decision persists once the queue state is lost before the
+        // wake: a degraded probe (the event is held, the queue state is
+        // not), then the PR leaving the queue with the stale event still
+        // the latest.
+        let assert_no_stale_line = |row: &PrMonitor, when: &str| {
+            assert!(
+                !row.pending_changes
+                    .iter()
+                    .any(|c| c.starts_with("removed from the merge queue")),
+                "{when}: the superseded ejection stays unreported: {:?}",
+                row.pending_changes
+            );
+        };
+        forge.edit(|s| s.fail_merge_requirements = true);
+        svc.poll_pr_monitors().await;
+        let row = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        assert_no_stale_line(&row, "degraded probe");
+        forge.edit(|s| {
+            s.fail_merge_requirements = false;
+            s.in_merge_queue = None;
+            s.merge_queue_entry = None;
+        });
+        svc.poll_pr_monitors().await;
+        let row = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        assert_no_stale_line(&row, "left the queue");
+
+        // The queue ejects the PR again: a NEW event, after the entry, is
+        // reported.
+        forge.edit(|s| {
+            s.merge_queue_removal = Some(intent_sourcecontrol::MergeQueueRemoval {
+                at: "2026-10-21T13:30:00Z".into(),
+                reason: Some("failed_checks".into()),
+            });
+            s.in_merge_queue = None;
+            s.merge_queue_entry = None;
+        });
+        svc.poll_pr_monitors().await;
+        let row = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        assert!(
+            row.pending_changes
+                .iter()
+                .any(|c| c == "removed from the merge queue (failed checks)"),
+            "a fresh ejection is still reported: {:?}",
+            row.pending_changes
         );
     }
 
