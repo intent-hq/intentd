@@ -511,6 +511,13 @@ def matrix_labels(value, outputs):
     """Evaluate only the actual matrix's output-or-JSON-fallback expression."""
     if isinstance(value, list):
         return value
+    # A granted self-hosted slot, else the burst label's `cloud` runner.
+    guarded = re.fullmatch(r"\$\{\{ fromJSON\(needs\.route\.outputs\.slots \|\| '\{\}'\)\['([\w-]+)'\]\[0\] == 'self-hosted' && fromJSON\(needs\.route\.outputs\.slots \|\| '\{\}'\)\['\1'\] \|\| fromJSON\(needs\.route\.outputs\.cloud \|\| '\{\}'\)\['([\w.-]+)'\] \|\| fromJSON\('([^']+)'\) \}\}", value)
+    if guarded:
+        granted = json.loads(outputs.get("slots", "") or "{}").get(guarded[1]) or []
+        if granted[:1] == ["self-hosted"]:
+            return granted
+        return json.loads(outputs.get("cloud", "") or "{}").get(guarded[2]) or json.loads(guarded[3])
     slot = re.fullmatch(r"\$\{\{ fromJSON\(needs\.route\.outputs\.slots \|\| '\{\}'\)\['([\w-]+)'\] \|\| fromJSON\('([^']+)'\) \}\}", value)
     if slot:
         return json.loads(outputs.get("slots", "") or "{}").get(slot[1]) or json.loads(slot[2])
@@ -638,6 +645,9 @@ class RunnerAvailabilityTests(unittest.TestCase):
                     slots = json.loads(outputs["slots"])
                     # The one free heavy slot goes to `check` on a PR; the queue lists no heavy job.
                     self.assertEqual(slots["check"], CACHE if event == "pull_request" and idle else ["gh-linux-8x"])
+                    # Without a heavy slot, check runs on the 16-core burst runner.
+                    self.assertEqual(matrix_labels(self.workflow["jobs"]["check"]["runs-on"], outputs),
+                                     CACHE if event == "pull_request" and idle else ["gh-linux-16x"])
                     self.assertEqual(slots["coverage-changed"], ["gh-linux-16x"])
                     # Free standard labels never take a self-hosted slot, even an idle one.
                     self.assertEqual(slots["release-scripts"], ["ubuntu-24.04"])
@@ -656,7 +666,7 @@ class RunnerAvailabilityTests(unittest.TestCase):
                     self.assertEqual(logged, event == "merge_group")
         # The queue-only coverage suites read their own merge_group slots (the
         # slot hosts raise the inotify limit to 32768).
-        for job_id, label in {"check": "gh-linux-8x", "coverage-changed": "gh-linux-16x",
+        for job_id, label in {"coverage-changed": "gh-linux-16x",
                               "coverage-e2e": "gh-linux-16x", "coverage-all": "gh-linux-16x"}.items():
             with self.subTest(job=job_id):
                 self.assertEqual(self.workflow["jobs"][job_id]["runs-on"],
@@ -687,7 +697,7 @@ class RunnerAvailabilityTests(unittest.TestCase):
     def test_bursts_go_to_warpbuild(self):
         same_repo = {"pull_request": {"head": {"repo": {"full_name": "intent-hq/intentd"}}}}
         warp = {"linux_labels": ["warp-ubuntu-2404-x64-16x"], "check_labels": ["warp-ubuntu-2404-x64-8x"],
-                "windows_labels": ["warp-windows-2022-x64-16x"], "macos_labels": ["warp-macos-26-arm64-6x"]}
+                "windows_labels": ["warp-windows-2022-x64-16x"], "macos_labels": ["warp-macos-26-arm64-12x"]}
         for event in ("pull_request", "push", "merge_group"):
             with self.subTest(event=event):
                 result = run_route(self.workflow, org=[], eventName=event, warpbuildDisabled="",
@@ -697,6 +707,9 @@ class RunnerAvailabilityTests(unittest.TestCase):
                     self.assertEqual(json.loads(outputs[key]), labels, key)
                 slots = json.loads(outputs["slots"])
                 self.assertEqual(slots["check"], ["warp-ubuntu-2404-x64-8x"])
+                # WarpBuild measured check CPU-bound on 8 CPUs, so its bursts take 16.
+                self.assertEqual(matrix_labels(self.workflow["jobs"]["check"]["runs-on"], outputs),
+                                 ["warp-ubuntu-2404-x64-16x"])
                 self.assertEqual(slots["coverage-changed"], ["warp-ubuntu-2404-x64-16x"])
                 self.assertEqual(slots["release-scripts"], ["ubuntu-24.04"])
                 cloud = json.loads(outputs["cloud"])
@@ -743,6 +756,9 @@ class RunnerAvailabilityTests(unittest.TestCase):
         # The kill switch sends every listed job to its hosted label.
         slots = json.loads(result["outputs"]["slots"])
         self.assertEqual(slots["check"], ["gh-linux-8x"])
+        self.assertEqual(matrix_labels(self.workflow["jobs"]["check"]["runs-on"], result["outputs"]), ["gh-linux-16x"])
+        # A failed route job (no outputs) still lands check on the 16-core label.
+        self.assertEqual(matrix_labels(self.workflow["jobs"]["check"]["runs-on"], {}), ["gh-linux-16x"])
         self.assertNotIn(CACHE, slots.values())
         self.assertNotIn(SMALL, slots.values())
 

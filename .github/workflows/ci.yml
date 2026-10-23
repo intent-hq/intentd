@@ -137,15 +137,16 @@ jobs:
             // jobs asking for them always run there and never take a self-hosted slot.
             const free = ['ubuntu-22.04', 'ubuntu-24.04', 'ubuntu-latest', 'ubuntu-24.04-arm', 'windows-2022', 'windows-2025'];
             // Paid GitHub labels and the WarpBuild runner each bursts to instead
-            // (same cores; Windows stays on Server 2022, macOS 15 keeps signed builds
-            // off macOS 26). Intel Macs have no WarpBuild equivalent and stay on GitHub.
+            // (same cores except Macs, which get 12 because every Mac job is CPU-bound;
+            // Windows stays on Server 2022, macOS 15 keeps signed builds off macOS 26).
+            // Intel Macs have no WarpBuild equivalent and stay on GitHub.
             const warp = {
               'gh-linux-8x': 'warp-ubuntu-2404-x64-8x',
               'gh-linux-16x': 'warp-ubuntu-2404-x64-16x',
               'gh-linux-arm64-8x': 'warp-ubuntu-2404-arm64-8x',
               'gh-windows-16x': 'warp-windows-2022-x64-16x',
-              'macos-26-xlarge': 'warp-macos-26-arm64-6x',
-              'macos-15-xlarge': 'warp-macos-15-arm64-6x',
+              'macos-26-xlarge': 'warp-macos-26-arm64-12x',
+              'macos-15-xlarge': 'warp-macos-15-arm64-12x',
             };
             // WarpBuild health is tracked per OS and architecture (ubuntu-x64, ubuntu-arm64, windows-x64, macos-arm64).
             const family = (label) => {
@@ -369,7 +370,12 @@ jobs:
     # Every other PR still runs it, and the merge queue always does.
     if: ${{ !cancelled() && needs.route.result == 'success' && (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && needs.release-fast-path.outputs.fast_path != 'true')) }}
     needs: [route, release-fast-path]
-    runs-on: ${{ fromJSON(needs.route.outputs.slots || '{}')['check'] || fromJSON('["gh-linux-8x"]') }}
+    # A granted heavy slot (8 CPUs), else the 16-core burst runner: WarpBuild
+    # measured check at p90 97% of 8 CPUs and 19.7 GB, so its bursts (every
+    # merge-queue run and PR overflow) take warp-ubuntu-2404-x64-16x. The slot
+    # stays listed as gh-linux-8x so check never takes the xl slot that
+    # coverage-changed needs on the same PR.
+    runs-on: ${{ fromJSON(needs.route.outputs.slots || '{}')['check'][0] == 'self-hosted' && fromJSON(needs.route.outputs.slots || '{}')['check'] || fromJSON(needs.route.outputs.cloud || '{}')['gh-linux-16x'] || fromJSON('["gh-linux-16x"]') }}
     # The cold-cache check job exhausted its 20-minute budget after its tests
     # passed in run 37305697722. Allow completion/cache margin without changing
     # individual test timeouts.
