@@ -9,6 +9,18 @@
 //! kind the pinned adapters can attach, plus their real limit and non-limit
 //! wordings. `scripts/check-provider-error-corpus.py` keeps the corpus in step
 //! with the pinned adapter packages.
+//!
+//! Two limits on what this proves:
+//! - claude-agent-acp files a result as a usage limit from its TEXT (the SDK's
+//!   `USAGE_LIMIT_ERROR_PREFIXES`) whatever its errorKind, and attaches no
+//!   `data` when the message carries no kind. So every Claude rendering is also
+//!   checked text-only; wordings the classifier only catches through the
+//!   errorKind marker are pinned as `textOnlyKnownGap`.
+//! - codex-acp raises a JSON-RPC prompt error only for the kinds the corpus
+//!   lists in `raisedAsRpcError` (usageLimitExceeded). The other codex kind
+//!   cases, including rateLimitExceeded and HTTP 429, are the typed-failure
+//!   shape intentd does not receive today; they stream as agent text, which
+//!   no classifier sees.
 
 use intent_acp::{
     is_quota_exceeded, is_transient_provider_fetch_failure, is_transient_upstream_disconnect,
@@ -106,29 +118,51 @@ fn rendering_cases(corpus: &Value) -> Vec<Case> {
     let renderings = corpus["renderings"]
         .as_array()
         .expect("renderings must be an array");
-    renderings
-        .iter()
-        .enumerate()
-        .map(|(index, entry)| {
-            let source = entry["source"]
-                .as_str()
-                .unwrap_or_else(|| panic!("renderings[{index}].source must be a string"));
-            let what = format!("renderings[{index}] ({source})");
-            let message = entry["message"]
-                .as_str()
-                .unwrap_or_else(|| panic!("{what}: message must be a string"));
-            Case {
-                quota: expect_quota(entry, &what),
-                known_gap: entry.get("knownGap").is_some(),
+    let mut cases = Vec::new();
+    for (index, entry) in renderings.iter().enumerate() {
+        let adapter = entry["adapter"]
+            .as_str()
+            .unwrap_or_else(|| panic!("renderings[{index}].adapter must be a string"));
+        let source = entry["source"]
+            .as_str()
+            .unwrap_or_else(|| panic!("renderings[{index}].source must be a string"));
+        let what = format!("{adapter} renderings[{index}] ({source})");
+        let message = entry["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{what}: message must be a string"));
+        let quota = expect_quota(entry, &what);
+        let error = JsonRpcError {
+            code: entry.get("code").and_then(Value::as_i64).unwrap_or(-32603),
+            message: message.to_string(),
+            data: entry.get("data").filter(|d| !d.is_null()).cloned(),
+        };
+        let text_only_gap = entry.get("textOnlyKnownGap").is_some();
+        if adapter == "claude-code" && error.data.is_some() {
+            // The same result without its errorKind, as claude-agent-acp sends
+            // a usage-limit message whose assistant error carries no kind.
+            cases.push(Case {
+                label: format!("{what} text only"),
                 error: JsonRpcError {
-                    code: entry.get("code").and_then(Value::as_i64).unwrap_or(-32603),
-                    message: message.to_string(),
-                    data: entry.get("data").filter(|d| !d.is_null()).cloned(),
+                    data: None,
+                    ..error.clone()
                 },
-                label: what,
-            }
-        })
-        .collect()
+                quota,
+                known_gap: text_only_gap,
+            });
+        } else {
+            assert!(
+                !text_only_gap,
+                "{what}: textOnlyKnownGap only applies to claude-code renderings with data"
+            );
+        }
+        cases.push(Case {
+            quota,
+            known_gap: entry.get("knownGap").is_some(),
+            error,
+            label: what,
+        });
+    }
+    cases
 }
 
 /// Every path a provider error reaches the classifier by: the typed error, its

@@ -13,7 +13,15 @@ reads the kinds out of their code, and fails when:
 - the corpus lists a kind the adapter no longer emits;
 - the adapter's own category for a kind (quota_exhausted / rate_limited versus
   anything else) disagrees with the corpus `expect`;
-- a Claude Agent SDK USAGE_LIMIT_ERROR_PREFIXES entry has no corpus rendering.
+- a Claude Agent SDK USAGE_LIMIT_ERROR_PREFIXES entry has no corpus rendering;
+- claude-agent-acp stops filing every SDK usage-limit message as quota_exhausted
+  regardless of its errorKind (the corpus relies on that override);
+- codex-acp raises a JSON-RPC prompt error for a different set of codexErrorInfo
+  kinds than the corpus `raisedAsRpcError` list (today only usageLimitExceeded;
+  every other codex kind streams as agent text and never reaches the classifier).
+
+A registry or network failure exits with NETWORK_EXIT (75) instead of 1, so CI
+can warn on an npm outage without hiding real corpus drift.
 
 CI runs it on every PR, so an adapter pin bump that adds an error kind fails
 before it merges. To fix a failure, add the kind (with a real rendering) to the
@@ -45,10 +53,15 @@ QUOTA_CATEGORIES = {"quota_exhausted", "rate_limited"}
 # through the full limit wordings (e.g. "You've hit your weekly limit").
 OPEN_PREFIXES = {"You've hit your", "You've reached your"}
 RENDERED_PREFIX = "Internal error: "
+NETWORK_EXIT = 75
 
 
 class Refusal(Exception):
     """The packages, the metadata, or the corpus cannot be read as expected."""
+
+
+class NetworkFailure(Refusal):
+    """npm could not be reached; says nothing about the corpus."""
 
 
 # --- Reading package source ------------------------------------------------
@@ -84,6 +97,11 @@ def claude_kinds(adapter_sources, sdk_types):
         if not body:
             continue
         found_mapping = True
+        if not re.search(r'if \(isUsageLimit\)\s*return "quota_exhausted";', body.group(1)):
+            raise Refusal(
+                "claude-agent-acp's providerFailureCategory no longer files every SDK "
+                "usage-limit message as quota_exhausted; re-check how limit results reach "
+                f"intentd and update {CORPUS}")
         pending = []
         for token in re.finditer(r'case "([A-Za-z_]+)":|return "([A-Za-z_]+)";', body.group(1)):
             if token.group(1):
@@ -103,14 +121,14 @@ def claude_kinds(adapter_sources, sdk_types):
     return kinds
 
 
-def claude_usage_limit_prefixes(sdk_module):
-    """The SDK's exported USAGE_LIMIT_ERROR_PREFIXES, from its bundled sdk.mjs."""
-    alias = re.search(r"\b([A-Za-z_$][\w$]*) as USAGE_LIMIT_ERROR_PREFIXES\b", sdk_module)
-    name = alias.group(1) if alias else "USAGE_LIMIT_ERROR_PREFIXES"
-    array = re.search(rf"(?<![\w$.]){re.escape(name)}\s*=\s*\[([^\]]*)\]", sdk_module)
-    if not array:
-        raise Refusal("the Claude Agent SDK no longer exports USAGE_LIMIT_ERROR_PREFIXES")
-    prefixes = js_strings(array.group(1))
+def claude_usage_limit_prefixes(sdk_types):
+    """The SDK's USAGE_LIMIT_ERROR_PREFIXES, from its sdk.d.ts tuple type."""
+    match = re.search(
+        r"USAGE_LIMIT_ERROR_PREFIXES:\s*readonly\s*\[((?:\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*'|[\s,])*)\]",
+        sdk_types)
+    if not match:
+        raise Refusal("the Claude Agent SDK no longer declares USAGE_LIMIT_ERROR_PREFIXES")
+    prefixes = js_strings(match.group(1))
     if not prefixes:
         raise Refusal("USAGE_LIMIT_ERROR_PREFIXES is empty")
     return prefixes
@@ -128,6 +146,17 @@ def codex_kinds(index_js):
             raise Refusal(f"{name} is empty")
         tables.append(pairs)
     return tables[0], tables[1]
+
+
+def codex_raised_kinds(index_js):
+    """codexErrorInfo kinds codex-acp turns into a JSON-RPC prompt error when the
+    client (like intentd) does not take typed session failures."""
+    kinds = re.findall(
+        r'if \(error62 === "([A-Za-z_]+)"\) \{\s*this\.failure = RequestError\.internalError\(',
+        index_js)
+    if not kinds:
+        raise Refusal("codex-acp no longer raises any codexErrorInfo as a prompt error")
+    return sorted(set(kinds))
 
 
 # --- Comparing with the corpus ---------------------------------------------
@@ -170,16 +199,22 @@ def compare_prefixes(corpus, prefixes):
     ]
 
 
-def check(corpus, claude_adapter_sources, claude_sdk_types, claude_sdk_module, codex_index):
+def check(corpus, claude_adapter_sources, claude_sdk_types, codex_index):
     kinds = corpus["kinds"]
     problems = compare_kinds(
         "claude-code", "errorKind", kinds["claude-code"]["values"],
         claude_kinds(claude_adapter_sources, claude_sdk_types))
-    problems += compare_prefixes(corpus, claude_usage_limit_prefixes(claude_sdk_module))
+    problems += compare_prefixes(corpus, claude_usage_limit_prefixes(claude_sdk_types))
     strings, structured = codex_kinds(codex_index)
     problems += compare_kinds("codex", "codexErrorInfo", kinds["codex"]["values"], strings)
     problems += compare_kinds(
         "codex", "structured codexErrorInfo", kinds["codex"]["structuredValues"], structured)
+    raised = codex_raised_kinds(codex_index)
+    if raised != sorted(kinds["codex"]["raisedAsRpcError"]):
+        problems.append(
+            f"codex: codex-acp now raises {raised} as JSON-RPC prompt errors, but the corpus "
+            f"`raisedAsRpcError` says {sorted(kinds['codex']['raisedAsRpcError'])}. Add real "
+            "renderings for the new kinds and update the list.")
     return problems
 
 
@@ -187,14 +222,14 @@ def check(corpus, claude_adapter_sources, claude_sdk_types, claude_sdk_module, c
 
 def fetch(url):
     last = None
-    for attempt in range(3):
+    for attempt in range(2):
         try:
-            with urllib.request.urlopen(url, timeout=60) as response:
+            with urllib.request.urlopen(url, timeout=20) as response:
                 return response.read()
         except OSError as error:
             last = error
             time.sleep(2 * (attempt + 1))
-    raise Refusal(f"could not download {url}: {last}")
+    raise NetworkFailure(f"could not download {url}: {last}")
 
 
 def package_files(name, version, wanted):
@@ -237,14 +272,14 @@ def main():
     pins = pinned_versions(ROOT)
     adapter = package_files(*pins["claude-adapter"],
                             lambda p: p.startswith("dist/") and p.endswith(".js"))
-    sdk = package_files(*pins["claude-sdk"], lambda p: p in ("sdk.d.ts", "sdk.mjs"))
+    sdk = package_files(*pins["claude-sdk"], lambda p: p == "sdk.d.ts")
     codex = package_files(*pins["codex-adapter"], lambda p: p == "dist/index.js")
-    for label, files, needed in (("claude-agent-sdk", sdk, ("sdk.d.ts", "sdk.mjs")),
+    for label, files, needed in (("claude-agent-sdk", sdk, ("sdk.d.ts",)),
                                  ("codex-acp", codex, ("dist/index.js",))):
         missing = [path for path in needed if path not in files]
         if missing:
             raise Refusal(f"{label} no longer ships {', '.join(missing)}")
-    problems = check(corpus, adapter, sdk["sdk.d.ts"], sdk["sdk.mjs"], codex["dist/index.js"])
+    problems = check(corpus, adapter, sdk["sdk.d.ts"], codex["dist/index.js"])
     checked = ", ".join(f"{name}@{version}" for name, version in pins.values())
     if problems:
         for problem in problems:
@@ -258,6 +293,9 @@ def main():
 if __name__ == "__main__":
     try:
         sys.exit(main())
+    except NetworkFailure as error:
+        print(f"::warning::{error}", file=sys.stderr)
+        sys.exit(NETWORK_EXIT)
     except (Refusal, KeyError, TypeError, ValueError) as error:
         print(f"::error::{error}", file=sys.stderr)
         sys.exit(1)

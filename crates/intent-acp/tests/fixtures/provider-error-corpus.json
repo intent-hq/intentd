@@ -4,7 +4,7 @@
     "Every entry is an error the pinned ACP adapters actually send to intentd, taken from the pinned packages, not hand-written.",
     "`kinds` lists every structured error kind each pinned adapter can attach. tests/provider_error_corpus.rs renders each kind and checks the classifier.",
     "scripts/check-provider-error-corpus.py downloads the pinned adapters and fails when they emit a kind missing here, when a listed kind disappears, when the adapter's own category disagrees with `expect`, or when a Claude Agent SDK usage-limit prefix has no rendering below. CI runs it on every PR, so an adapter pin bump that adds a limit wording fails before it merges.",
-    "`expect` is what intentd should do: `quota` means backup failover and the quota banner fire. `knownGap` marks a kind the classifier gets wrong today; the test asserts the gap still exists, so fixing it means deleting the field.",
+    "`expect` is what intentd should do: `quota` means backup failover and the quota banner fire. `knownGap` marks an entry the classifier gets wrong today, and `textOnlyKnownGap` a Claude rendering it only catches through its errorKind (claude-agent-acp can send the same text with no data); the test asserts each gap still exists, so fixing one means deleting the field.",
     "Renderings follow what intentd sees: intentd does not advertise the sessionFailure capability, so claude-agent-acp keeps the detail in `message` (`Internal error: <detail>`) and codex-acp only raises a JSON-RPC error for usageLimitExceeded (other codex kinds stream as text)."
   ],
   "kinds": {
@@ -34,8 +34,9 @@
       }
     },
     "codex": {
-      "$comment": "codex-acp attaches {\"message\", \"codexErrorInfo\"} as JSON-RPC data. String kinds and structured kinds (an object keyed by kind, carrying httpStatusCode) come from STRING_CODEX_ERROR_CATEGORIES and STRUCTURED_CODEX_ERROR_CATEGORIES. codex-acp maps any kind with httpStatusCode 429 to rate_limited, so the test also renders every structured kind with 429 and expects quota.",
+      "$comment": "codex-acp attaches {\"message\", \"codexErrorInfo\"} as JSON-RPC data. String kinds and structured kinds (an object keyed by kind, carrying httpStatusCode) come from STRING_CODEX_ERROR_CATEGORIES and STRUCTURED_CODEX_ERROR_CATEGORIES. codex-acp maps any kind with httpStatusCode 429 to rate_limited, so the test also renders every structured kind with 429 and expects quota. WIRE GAP: that mapping and every kind except those in raisedAsRpcError only exist on codex-acp's typed session-failure path, which intentd does not advertise. Today intentd receives rateLimitExceeded, HTTP 429 and the rest as streamed agent text with no prompt error, so neither failover nor the quota banner can see them; these kind cases pin the classifier for the day they arrive as errors.",
       "field": "codexErrorInfo",
+      "raisedAsRpcError": ["usageLimitExceeded"],
       "values": {
         "usageLimitExceeded": { "expect": "quota" },
         "rateLimitExceeded": { "expect": "quota" },
@@ -110,6 +111,7 @@
       "source": "Claude Code 2.1.280 team shared budget (group_pool)",
       "message": "Internal error: You've hit your team's shared budget. /model to switch models.",
       "data": { "errorKind": "rate_limit" },
+      "textOnlyKnownGap": "Starts with an SDK USAGE_LIMIT_ERROR_PREFIXES entry, so claude-agent-acp files it as quota_exhausted even with no errorKind; without the errorKind data no classifier marker matches the text.",
       "expect": "quota"
     },
     {
@@ -117,6 +119,7 @@
       "source": "Claude Code 2.1.280 model usage-credit limit (seven_day_overage_included)",
       "message": "Internal error: You've reached your Fable limit.",
       "data": { "errorKind": "rate_limit" },
+      "textOnlyKnownGap": "Starts with an SDK USAGE_LIMIT_ERROR_PREFIXES entry, so claude-agent-acp files it as quota_exhausted even with no errorKind; without the errorKind data no classifier marker matches the text.",
       "expect": "quota"
     },
     {
@@ -124,6 +127,7 @@
       "source": "Claude Agent SDK USAGE_LIMIT_ERROR_PREFIXES: model needs usage credits",
       "message": "Internal error: Fable 5 requires usage credits.",
       "data": { "errorKind": "rate_limit" },
+      "textOnlyKnownGap": "Starts with an SDK USAGE_LIMIT_ERROR_PREFIXES entry, so claude-agent-acp files it as quota_exhausted even with no errorKind; without the errorKind data no classifier marker matches the text.",
       "expect": "quota"
     },
     {
@@ -159,6 +163,7 @@
       "source": "Claude Agent SDK USAGE_LIMIT_ERROR_PREFIXES",
       "message": "Internal error: Your seat type doesn't include usage",
       "data": { "errorKind": "rate_limit" },
+      "textOnlyKnownGap": "Starts with an SDK USAGE_LIMIT_ERROR_PREFIXES entry, so claude-agent-acp files it as quota_exhausted even with no errorKind; without the errorKind data no classifier marker matches the text.",
       "expect": "quota"
     },
     {
@@ -194,6 +199,7 @@
       "source": "Claude Code 2.1.280 billing rejection",
       "message": "Internal error: Credit balance is too low",
       "data": { "errorKind": "billing_error" },
+      "textOnlyKnownGap": "Only caught through errorKind; no marker matches the text. Not an SDK usage-limit prefix, so the adapter does not file it as a limit without the kind either.",
       "expect": "quota"
     },
     {
@@ -201,6 +207,7 @@
       "source": "Claude Code 2.1.280 1M-context usage-credit rejection (tagged rate_limit)",
       "message": "Internal error: API Error: Usage credits required for 1M context · turn on usage credits at claude.ai/settings/usage (Settings → Usage)",
       "data": { "errorKind": "rate_limit" },
+      "textOnlyKnownGap": "Only caught through errorKind; no marker matches the text. Not an SDK usage-limit prefix, so the adapter does not file it as a limit without the kind either.",
       "expect": "quota"
     },
     {
@@ -215,6 +222,7 @@
       "source": "Claude Code 2.1.280 off-switch model block (tagged rate_limit)",
       "message": "Internal error: Claude Fable 5 is currently unavailable.",
       "data": { "errorKind": "rate_limit" },
+      "textOnlyKnownGap": "Only caught through errorKind; no marker matches the text. Not an SDK usage-limit prefix, so the adapter does not file it as a limit without the kind either.",
       "expect": "quota"
     },
     {
@@ -247,15 +255,29 @@
     },
     {
       "adapter": "claude-code",
-      "source": "claude-agent-acp error_max_turns result (no assistant error kind)",
+      "source": "claude-agent-acp error_max_turns result: message.errors from Claude Code 2.1.280 (`Reached maximum number of turns (${maxTurns})`), no assistant error kind",
       "message": "Internal error: Reached maximum number of turns (25)",
       "data": null,
       "expect": "not-quota"
     },
     {
       "adapter": "claude-code",
-      "source": "claude-agent-acp error_max_budget_usd result: a local --max-budget-usd cap, not the account allowance",
+      "source": "claude-agent-acp error_max_budget_usd result: message.errors from Claude Code 2.1.280 (`Reached maximum budget ($${budget})`), a local --max-budget-usd cap, not the account allowance",
       "message": "Internal error: Reached maximum budget ($5)",
+      "data": null,
+      "expect": "not-quota"
+    },
+    {
+      "adapter": "claude-code",
+      "source": "claude-agent-acp error_max_turns fallback when the result carries no errors (the subtype)",
+      "message": "Internal error: error_max_turns",
+      "data": null,
+      "expect": "not-quota"
+    },
+    {
+      "adapter": "claude-code",
+      "source": "claude-agent-acp error_max_budget_usd fallback when the result carries no errors (the subtype)",
+      "message": "Internal error: error_max_budget_usd",
       "data": null,
       "expect": "not-quota"
     },
@@ -270,7 +292,7 @@
     {
       "adapter": "claude-code",
       "source": "claude-agent-acp TURN_NO_RESULT_MESSAGE",
-      "message": "Internal error: The turn ended without a result: the agent went idle while this prompt was still in flight",
+      "message": "Internal error: The turn ended without a result: the agent went idle while this prompt was still in flight (e.g. the model stream dropped mid-turn). Any partial output may be incomplete; please retry.",
       "data": { "errorKind": "no_result" },
       "expect": "not-quota"
     },

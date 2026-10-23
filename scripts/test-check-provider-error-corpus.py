@@ -75,10 +75,17 @@ PREFIXES = [
 ]
 
 
-def sdk_module(prefixes):
-    # Minified like the real bundle: a short binding, exported under the public name.
-    literal = ",".join(json.dumps(p, ensure_ascii=False) for p in prefixes)
-    return f'var Cj=["This service is disabled for your org"],Aj=[{literal}];export{{Aj as USAGE_LIMIT_ERROR_PREFIXES,Cj as ORG_POLICY_LIMIT_PREFIXES}};'
+def quote(prefix):
+    # Like the real sdk.d.ts: single quotes unless the text holds an apostrophe.
+    return json.dumps(prefix, ensure_ascii=False) if "'" in prefix else f"'{prefix}'"
+
+
+def sdk_types(prefixes, union=SDK_TYPES):
+    tuple_type = ", ".join(quote(p) for p in prefixes)
+    return (union
+            + "export declare const ORG_POLICY_LIMIT_PREFIXES: readonly "
+              "['This service is disabled for your org'];\n"
+            + f"export declare const USAGE_LIMIT_ERROR_PREFIXES: readonly [{tuple_type}];\n")
 
 
 CODEX_INDEX_JS = '''
@@ -106,15 +113,24 @@ var STRUCTURED_CODEX_ERROR_CATEGORIES = {
   responseTooManyFailedAttempts: "transport_lost",
   activeTurnNotSteerable: "provider_error"
 };
+var CodexEventHandler = class {
+  async createErrorEvent(params) {
+    if (error62 === "usageLimitExceeded") {
+      this.failure = RequestError.internalError(
+        this.createTurnErrorData(params.error)
+      );
+    }
+  }
+};
 '''
 
 
-def run_check(corpus=CORPUS, adapter_js=ACP_AGENT_JS, sdk_types=SDK_TYPES,
+def run_check(corpus=CORPUS, adapter_js=ACP_AGENT_JS, union=SDK_TYPES,
               prefixes=PREFIXES, codex=CODEX_INDEX_JS, session_failure=SESSION_FAILURE_JS):
     return check_corpus.check(
         corpus,
         {"dist/session-failure-extension.js": session_failure, "dist/acp-agent.js": adapter_js},
-        sdk_types, sdk_module(prefixes), codex)
+        sdk_types(prefixes, union), codex)
 
 
 class CheckProviderErrorCorpus(unittest.TestCase):
@@ -122,7 +138,7 @@ class CheckProviderErrorCorpus(unittest.TestCase):
         self.assertEqual(run_check(), [])
 
     def test_new_sdk_error_kind_fails(self):
-        problems = run_check(sdk_types=SDK_TYPES.replace(";", " | 'plan_exhausted';"))
+        problems = run_check(union=SDK_TYPES.replace(";", " | 'plan_exhausted';"))
         self.assertEqual(len(problems), 1, problems)
         self.assertIn("`plan_exhausted`", problems[0])
         self.assertIn("does not classify it", problems[0])
@@ -169,18 +185,53 @@ class CheckProviderErrorCorpus(unittest.TestCase):
         self.assertEqual(len(problems), 1, problems)
         self.assertIn("Your plan's pooled allowance is spent", problems[0])
 
-    def test_prefix_literals_decode_minified_escapes(self):
-        module = 'var Aj=["Your org is out of usage \\xB7 contact your admin","You\\u2019re out"];export{Aj as USAGE_LIMIT_ERROR_PREFIXES};'
-        self.assertEqual(check_corpus.claude_usage_limit_prefixes(module),
-                         ["Your org is out of usage · contact your admin", "You’re out"])
+    def test_prefix_tuple_parses_both_quote_styles_and_brackets(self):
+        types = ("export declare const USAGE_LIMIT_ERROR_PREFIXES: readonly "
+                 "['Your org is out of usage · contact your admin', \"You've [briefly] hit\"];")
+        self.assertEqual(check_corpus.claude_usage_limit_prefixes(types),
+                         ["Your org is out of usage · contact your admin", "You've [briefly] hit"])
+
+    def test_dropping_the_usage_limit_override_refuses(self):
+        dropped = SESSION_FAILURE_JS.replace(
+            '    if (isUsageLimit)\n        return "quota_exhausted";\n', "")
+        self.assertNotEqual(dropped, SESSION_FAILURE_JS)
+        with self.assertRaises(check_corpus.Refusal):
+            run_check(session_failure=dropped)
+
+    def test_codex_raising_another_kind_fails(self):
+        codex = CODEX_INDEX_JS.replace(
+            "var CodexEventHandler = class {",
+            "var CodexEventHandler = class {\n  f() {\n"
+            '    if (error62 === "rateLimitExceeded") {\n'
+            "      this.failure = RequestError.internalError(data);\n    }\n  }")
+        problems = run_check(codex=codex)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("['rateLimitExceeded', 'usageLimitExceeded']", problems[0])
+
+    def test_network_failure_is_its_own_exit(self):
+        self.assertTrue(issubclass(check_corpus.NetworkFailure, check_corpus.Refusal))
+        self.assertEqual(check_corpus.NETWORK_EXIT, 75)
+        urlopen, sleep = check_corpus.urllib.request.urlopen, check_corpus.time.sleep
+
+        def unreachable(*args, **kwargs):
+            raise OSError("registry unreachable")
+        check_corpus.urllib.request.urlopen = unreachable
+        check_corpus.time.sleep = lambda seconds: None
+        try:
+            with self.assertRaises(check_corpus.NetworkFailure):
+                check_corpus.fetch("https://registry.npmjs.org/x")
+        finally:
+            check_corpus.urllib.request.urlopen, check_corpus.time.sleep = urlopen, sleep
 
     def test_unreadable_packages_refuse_instead_of_passing(self):
         with self.assertRaises(check_corpus.Refusal):
-            run_check(sdk_types="export declare type Other = 'x';")
+            run_check(union="export declare type Other = 'x';\n")
         with self.assertRaises(check_corpus.Refusal):
             run_check(session_failure="export function other() {}\n")
         with self.assertRaises(check_corpus.Refusal):
-            check_corpus.claude_usage_limit_prefixes("export{}")
+            check_corpus.claude_usage_limit_prefixes(SDK_TYPES)
+        with self.assertRaises(check_corpus.Refusal):
+            run_check(codex=CODEX_INDEX_JS.replace("error62 ===", "error62 !=="))
         with self.assertRaises(check_corpus.Refusal):
             run_check(codex="var STRING_CODEX_ERROR_CATEGORIES = {};")
 

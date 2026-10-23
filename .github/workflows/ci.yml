@@ -1999,9 +1999,18 @@ jobs:
       # packages and fails when they emit an error kind (or a usage-limit
       # wording) the quota classifier's corpus does not cover, so a rolling
       # adapter pin PR cannot add a limit failover silently misses
-      # (intent-hq/intent#7615).
+      # (intent-hq/intent#7615). An npm outage (exit 75) only warns, so a
+      # registry blip cannot fail unrelated PRs or eject merge-queue entries;
+      # any corpus drift still fails the job.
       - name: Check the provider error corpus against the pinned adapters
-        run: python3 -S scripts/check-provider-error-corpus.py
+        run: |
+          status=0
+          python3 -S scripts/check-provider-error-corpus.py || status=$?
+          if [ "$status" -eq 75 ]; then
+            echo "::warning::npm was unreachable; the provider error corpus was not checked against the pinned adapters."
+          elif [ "$status" -ne 0 ]; then
+            exit "$status"
+          fi
       - name: Test the release-plz no-op baseline
         run: python3 -S scripts/test-release-plz-noop.py
       - uses: taiki-e/install-action@v2
