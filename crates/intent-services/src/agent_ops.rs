@@ -2172,6 +2172,9 @@ fn strip_group_tags(s: &str) -> String {
 fn clean_response_text(text: &str) -> String {
     let mut cleaned = strip_spans(text, "<agent_digest>", "</agent_digest>");
     cleaned = strip_spans(&cleaned, "<!-- suggested-prompts", "-->");
+    // The HTML-escaped spelling a model can copy from an XML-escaped history
+    // replay (see `history_xml::REPLAY_ESCAPING_NOTE`).
+    cleaned = strip_spans(&cleaned, "&lt;!-- suggested-prompts", "--&gt;");
     cleaned = strip_group_tags(&cleaned);
     cleaned.trim().to_string()
 }
@@ -18396,8 +18399,7 @@ fn build_resume_tail_recap(messages: &[AgentMessage]) -> Option<ResumeTailRecap>
         .any(|s| matches!(s, TailSegment::Partial(_)));
     // Segments render first so the preamble can learn whether any of them
     // was middle-truncated (the hint is emitted only when something was
-    // actually abbreviated; untruncated, unelided recaps are byte-identical
-    // to before).
+    // actually abbreviated; untruncated, unelided recaps carry no hint).
     let mut body = String::new();
     let mut segment_groups = Vec::new();
     let mut truncated_any = false;
@@ -18441,6 +18443,7 @@ fn build_resume_tail_recap(messages: &[AgentMessage]) -> Option<ResumeTailRecap>
          — it is repeated here (parts of it may or may not already be in your \
          context).\n\n",
     );
+    recap.push_str(crate::history_xml::REPLAY_ESCAPING_NOTE);
     if truncated_any || elided > 0 {
         recap.push_str(RESUME_RECAP_TRUNCATION_HINT);
     }
