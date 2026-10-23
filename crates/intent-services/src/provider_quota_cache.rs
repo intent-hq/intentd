@@ -79,16 +79,34 @@ impl AgentChoices {
     }
 }
 
+/// What a manual choice selects: the configuration and the model. A turn
+/// start only uses up a record of exactly the pair it read, so a turn on the
+/// old model never uses up a same-configuration model change still saving.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ChoiceKey {
+    selection: String,
+    model: Option<String>,
+}
+
+impl ChoiceKey {
+    fn new(selection: &str, model: Option<&str>) -> Self {
+        Self {
+            selection: provider_profiles::canonical_selection(selection),
+            model: model.filter(|m| !m.is_empty()).map(str::to_owned),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct PendingChoice {
-    selection: String,
+    choice: ChoiceKey,
     /// A turn already started on it while the persist was in flight.
     consumed: bool,
 }
 
 #[derive(Debug)]
 struct CommittedChoice {
-    selection: String,
+    choice: ChoiceKey,
     /// When the persist was known to have landed.
     generation: u64,
 }
@@ -174,13 +192,14 @@ impl ProviderQuotaCache {
         }
     }
 
-    /// The user is choosing `selection` for `agent` by hand. Recorded BEFORE
+    /// The user is choosing `selection` with `model` for `agent` by hand. Recorded BEFORE
     /// the choice is persisted, so any turn start that reads the persisted
     /// choice also sees this record (see [`Self::take_manual_choice`]).
     pub(crate) fn begin_manual_choice(
         &self,
         agent: &AgentId,
         selection: &str,
+        model: Option<&str>,
     ) -> ManualChoiceGuard {
         let mut choices = self.manual_choices.lock().unwrap();
         choices.generation += 1;
@@ -193,7 +212,7 @@ impl ProviderQuotaCache {
             .insert(
                 token,
                 PendingChoice {
-                    selection: provider_profiles::canonical_selection(selection),
+                    choice: ChoiceKey::new(selection, model),
                     consumed: false,
                 },
             );
@@ -219,9 +238,9 @@ impl ProviderQuotaCache {
                 choices.generation += 1;
                 agent_choices
                     .committed
-                    .retain(|c| c.selection != pending.selection);
+                    .retain(|c| c.choice != pending.choice);
                 agent_choices.committed.push(CommittedChoice {
-                    selection: pending.selection,
+                    choice: pending.choice,
                     generation: choices.generation,
                 });
             }
@@ -233,29 +252,36 @@ impl ProviderQuotaCache {
 
     /// Stamp a turn start's session read: call BEFORE reading the session,
     /// and pass the result to [`Self::take_manual_choice`] with the
-    /// configuration that read returned.
+    /// configuration and model that read returned.
     pub(crate) fn manual_choice_read(&self) -> u64 {
         let mut choices = self.manual_choices.lock().unwrap();
         choices.generation += 1;
         choices.generation
     }
 
-    /// Whether a turn starting on `current` (read after `read`) is the first
-    /// on one of `agent`'s manual choices: it then tries `current` and is
-    /// never moved away ahead of the attempt. Every record of `current` is
-    /// used up. A committed choice of another configuration that landed
+    /// Whether a turn starting on `current` with `model` (read after `read`)
+    /// is the first on one of `agent`'s manual choices: it then tries
+    /// `current` and is never moved away ahead of the attempt. Every record
+    /// of that configuration and model is used up. A committed choice of
+    /// anything else that landed
     /// before the read was replaced by a later write and is dropped; one
     /// that landed after, and every in-flight one, is kept for the turn that
     /// reads it.
-    pub(crate) fn take_manual_choice(&self, agent: &AgentId, current: &str, read: u64) -> bool {
-        let current = provider_profiles::canonical_selection(current);
+    pub(crate) fn take_manual_choice(
+        &self,
+        agent: &AgentId,
+        current: &str,
+        model: Option<&str>,
+        read: u64,
+    ) -> bool {
+        let current = ChoiceKey::new(current, model);
         let mut choices = self.manual_choices.lock().unwrap();
         let Some(agent_choices) = choices.by_agent.get_mut(agent) else {
             return false;
         };
         let mut matched = false;
         agent_choices.committed.retain(|c| {
-            if c.selection == current {
+            if c.choice == current {
                 matched = true;
                 false
             } else {
@@ -263,7 +289,7 @@ impl ProviderQuotaCache {
             }
         });
         for pending in agent_choices.pending.values_mut() {
-            if pending.selection == current && !pending.consumed {
+            if pending.choice == current && !pending.consumed {
                 pending.consumed = true;
                 matched = true;
             }

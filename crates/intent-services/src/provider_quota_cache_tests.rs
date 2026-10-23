@@ -120,10 +120,12 @@ fn clones_share_the_same_state() {
     assert!(clone.is_exhausted("codex", now));
 }
 
+const MODEL: Option<&str> = Some("opus");
+
 /// A turn start: stamp, then check what the session read returned.
 fn take(cache: &ProviderQuotaCache, agent: &AgentId, current: &str) -> bool {
     let read = cache.manual_choice_read();
-    cache.take_manual_choice(agent, current, read)
+    cache.take_manual_choice(agent, current, MODEL, read)
 }
 
 #[test]
@@ -132,7 +134,7 @@ fn a_manual_choice_is_consumed_once_by_a_turn_on_that_choice() {
     let agent = AgentId::from("agent-manual");
     assert!(!take(&cache, &agent, "claude-code@work"));
     cache
-        .begin_manual_choice(&agent, "claude-code@work")
+        .begin_manual_choice(&agent, "claude-code@work", MODEL)
         .commit();
     assert!(cache.clone().is_pending_or_committed(&agent));
     assert!(take(&cache, &agent, "claude-code@work"));
@@ -145,15 +147,15 @@ fn a_choice_landing_after_the_read_is_kept_for_the_next_turn() {
     let cache = ProviderQuotaCache::default();
     let agent = AgentId::from("agent-manual");
     // In flight while a turn reads the old configuration.
-    let choice = cache.begin_manual_choice(&agent, "claude-code@work");
+    let choice = cache.begin_manual_choice(&agent, "claude-code@work", MODEL);
     assert!(!take(&cache, &agent, "claude-code"));
     choice.commit();
     // Persisted after a turn's read began, which then returned the old one.
     let read = cache.manual_choice_read();
     cache
-        .begin_manual_choice(&agent, "claude-code@personal")
+        .begin_manual_choice(&agent, "claude-code@personal", MODEL)
         .commit();
-    assert!(!cache.take_manual_choice(&agent, "claude-code", read));
+    assert!(!cache.take_manual_choice(&agent, "claude-code", MODEL, read));
     assert!(take(&cache, &agent, "claude-code@personal"));
     // `@work` landed before that read, so a later write replaced it.
     assert!(!take(&cache, &agent, "claude-code@work"));
@@ -163,7 +165,7 @@ fn a_choice_landing_after_the_read_is_kept_for_the_next_turn() {
 fn a_turn_on_an_in_flight_choice_uses_it_up() {
     let cache = ProviderQuotaCache::default();
     let agent = AgentId::from("agent-manual");
-    let choice = cache.begin_manual_choice(&agent, "claude-code@work");
+    let choice = cache.begin_manual_choice(&agent, "claude-code@work", MODEL);
     assert!(take(&cache, &agent, "claude-code@work"));
     choice.commit();
     assert!(!take(&cache, &agent, "claude-code@work"));
@@ -174,19 +176,19 @@ fn a_failed_persist_discards_only_its_own_record() {
     let cache = ProviderQuotaCache::default();
     let agent = AgentId::from("agent-manual");
     // A failed first choice leaves nothing behind.
-    drop(cache.begin_manual_choice(&agent, "claude-code@work"));
+    drop(cache.begin_manual_choice(&agent, "claude-code@work", MODEL));
     assert!(!take(&cache, &agent, "claude-code@work"));
     assert!(!cache.is_pending_or_committed(&agent));
     // A successful choice of B survives a later failed change on B.
     cache
-        .begin_manual_choice(&agent, "claude-code@work")
+        .begin_manual_choice(&agent, "claude-code@work", MODEL)
         .commit();
-    drop(cache.begin_manual_choice(&agent, "claude-code@work"));
+    drop(cache.begin_manual_choice(&agent, "claude-code@work", MODEL));
     assert!(take(&cache, &agent, "claude-code@work"));
     // A failed change to C ends before a later successful one to C.
-    let failed = cache.begin_manual_choice(&agent, "claude-code@work");
+    let failed = cache.begin_manual_choice(&agent, "claude-code@work", MODEL);
     cache
-        .begin_manual_choice(&agent, "claude-code@personal")
+        .begin_manual_choice(&agent, "claude-code@personal", MODEL)
         .commit();
     drop(failed);
     assert!(take(&cache, &agent, "claude-code@personal"));
@@ -201,10 +203,10 @@ fn overlapping_failed_changes_keep_the_earlier_successful_choice() {
         let cache = ProviderQuotaCache::default();
         let agent = AgentId::from("agent-manual");
         cache
-            .begin_manual_choice(&agent, "claude-code@work")
+            .begin_manual_choice(&agent, "claude-code@work", MODEL)
             .commit();
-        let t2 = cache.begin_manual_choice(&agent, "claude-code@personal");
-        let t3 = cache.begin_manual_choice(&agent, "claude-code@personal");
+        let t2 = cache.begin_manual_choice(&agent, "claude-code@personal", MODEL);
+        let t3 = cache.begin_manual_choice(&agent, "claude-code@personal", MODEL);
         if second_fails_first {
             drop(t3);
             drop(t2);
@@ -216,4 +218,19 @@ fn overlapping_failed_changes_keep_the_earlier_successful_choice() {
         assert!(take(&cache, &agent, "claude-code@work"));
         assert!(!cache.is_pending_or_committed(&agent));
     }
+}
+
+/// Review of intentd#2624: a turn that read the old model on the same
+/// configuration does not use up a model change still saving.
+#[test]
+fn a_turn_on_the_old_model_keeps_a_same_configuration_model_change() {
+    let cache = ProviderQuotaCache::default();
+    let agent = AgentId::from("agent-manual");
+    let choice = cache.begin_manual_choice(&agent, "claude-code@work", Some("sonnet"));
+    let read = cache.manual_choice_read();
+    assert!(!cache.take_manual_choice(&agent, "claude-code@work", Some("opus"), read));
+    choice.commit();
+    let read = cache.manual_choice_read();
+    assert!(cache.take_manual_choice(&agent, "claude-code@work", Some("sonnet"), read));
+    assert!(!cache.is_pending_or_committed(&agent));
 }

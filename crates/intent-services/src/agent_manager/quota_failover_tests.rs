@@ -2579,7 +2579,7 @@ async fn a_failed_later_choice_keeps_the_earlier_exemption() {
     // A later setModel on the same configuration whose persist fails: the
     // guard `agent_set_model_op` holds is dropped uncommitted by its `?`.
     let cache = &services.provider_quota_cache;
-    drop(cache.begin_manual_choice(&fx.agent, &first));
+    drop(cache.begin_manual_choice(&fx.agent, &first, Some("opus")));
 
     services.avoid_exhausted_provider(&fx.ws, &fx.agent).await;
 
@@ -2604,8 +2604,8 @@ async fn overlapping_failed_choices_keep_the_earlier_exemption() {
         .expect("setModel");
     mark_exhausted_elsewhere(&fx, &first);
     let cache = &services.provider_quota_cache;
-    let t2 = cache.begin_manual_choice(&fx.agent, &second);
-    let t3 = cache.begin_manual_choice(&fx.agent, &second);
+    let t2 = cache.begin_manual_choice(&fx.agent, &second, Some("opus"));
+    let t3 = cache.begin_manual_choice(&fx.agent, &second, Some("opus"));
     drop(t2);
     drop(t3);
 
@@ -2614,4 +2614,44 @@ async fn overlapping_failed_choices_keep_the_earlier_exemption() {
     assert_eq!(fx.row().await.provider.as_deref(), Some(first.as_str()));
     assert!(notices(&fx.messages().await, "provider_failover").is_empty());
     assert!(!cache.is_pending_or_committed(&fx.agent), "used up");
+}
+
+/// Review of intentd#2624: an `agent.setModel` to another model on the same
+/// configuration is still saving when a turn starts and reads the old
+/// model. That turn does not use up the new choice: once it is saved and
+/// the configuration is marked, the first turn on the new model tries it.
+#[intent_test_macros::daemon_test]
+async fn a_turn_on_the_old_model_keeps_a_model_change_still_saving() {
+    let fx = Fixture::new(json!({ "response": "answered" })).await;
+    let first = fx.profile("First", true).await;
+    let _second = fx.profile("Second", true).await;
+    fx.away(&first, Value::Null).await;
+    let services = &fx.mgr.services;
+    let cache = &services.provider_quota_cache;
+    // What `agent_set_model_op` holds while its write is in flight.
+    let choice = cache.begin_manual_choice(&fx.agent, &first, Some("sonnet"));
+    // A turn start reads the old model.
+    services.avoid_exhausted_provider(&fx.ws, &fx.agent).await;
+    // The write lands and the call returns successfully.
+    services
+        .store
+        .set_agent_session_model(
+            &fx.ws,
+            &fx.agent,
+            "sonnet",
+            Some(first.as_str()),
+            &intent_core::now_iso(),
+        )
+        .await
+        .expect("persist");
+    choice.commit();
+    // The old-model attempt hits the quota.
+    mark_exhausted_elsewhere(&fx, &first);
+
+    services.avoid_exhausted_provider(&fx.ws, &fx.agent).await;
+
+    let row = fx.row().await;
+    assert_eq!(row.provider.as_deref(), Some(first.as_str()));
+    assert_eq!(row.model.as_deref(), Some("sonnet"));
+    assert!(notices(&fx.messages().await, "provider_failover").is_empty());
 }

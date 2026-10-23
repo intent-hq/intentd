@@ -5817,7 +5817,7 @@ impl Services {
         // call), which discards only this call's record.
         let manual_choice = provider.as_deref().map(|chosen| {
             self.provider_quota_cache
-                .begin_manual_choice(&agent_id, chosen)
+                .begin_manual_choice(&agent_id, chosen, Some(&model_id))
         });
         self.store
             .set_agent_session_model(

@@ -583,10 +583,12 @@ impl Services {
         // before persisting it, so a choice landing while this turn starts
         // is either not read here (and stays recorded for the next turn) or
         // read together with its record.
-        if self
-            .provider_quota_cache
-            .take_manual_choice(agent_id, current, read)
-        {
+        if self.provider_quota_cache.take_manual_choice(
+            agent_id,
+            current,
+            session.model.as_deref(),
+            read,
+        ) {
             return;
         }
         let Some(until) = self.provider_quota_cache.exhausted_until(current, now) else {
