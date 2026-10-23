@@ -47745,9 +47745,10 @@ mod resume_tail_recap {
 /// and the never-fail fallback (`resume_continuation_text`).
 mod resume_continuation {
     use crate::agent_ops::{
-        humanize_outage_duration, resume_continuation_text, resume_marker_and_continuation,
+        humanize_outage_duration, resume_continuation_text, InterruptedCapture,
+        ABANDON_NOTICE_TEXT, ABANDON_WORKERS_MID_TURN_NOTICE_TEXT, ABANDON_WORKERS_NOTICE_TEXT,
         RESUME_CONTINUATION_FALLBACK_TEXT, RESUME_MARKER_TEXT, RESUME_WORKERS_LOST_NOTE,
-        RESUME_WORKERS_MARKER_TEXT,
+        RESUME_WORKERS_MARKER_TEXT, RESUME_WORKERS_MID_TURN_MARKER_TEXT,
     };
     use crate::agent_workers::INTERRUPTED_WITH_WORKERS_REASON;
     use time::format_description::well_known::Rfc3339;
@@ -47774,49 +47775,98 @@ mod resume_continuation {
         assert_eq!(humanize_outage_duration(3 * 86_400 + 5), "3 days");
     }
 
-    /// intent-hq/intent#7658: a row tagged `background_workers` gets the
-    /// background-task marker and the lost-task note after the duration
-    /// wording; untagged and other-reason rows keep today's marker and text.
+    /// intent-hq/intent#7658: rows are classified by their reason tag and
+    /// recorded status. Untagged rows (and other reasons) are mid-turn
+    /// whatever their status; a tagged row is mid-turn only when its status
+    /// is an in-flight one.
     #[test]
-    fn background_worker_rows_get_the_lost_task_wording() {
-        let now = parse("2026-08-15T12:00:15Z");
-        let (marker, text) = resume_marker_and_continuation(
-            "2026-08-15T12:00:00Z",
-            Some(INTERRUPTED_WITH_WORKERS_REASON),
-            now,
-        );
-        assert_eq!(marker, RESUME_WORKERS_MARKER_TEXT);
-        assert_eq!(
-            text,
-            format!(
-                "{} {RESUME_WORKERS_LOST_NOTE}",
-                resume_continuation_text("2026-08-15T12:00:00Z", now)
-            )
-        );
-        assert!(text.starts_with("You were interrupted for about 15 seconds"));
-        assert!(text.contains("will not report back"));
-
-        let (marker, text) = resume_marker_and_continuation(
-            "not-a-timestamp",
-            Some(INTERRUPTED_WITH_WORKERS_REASON),
-            now,
-        );
-        assert_eq!(marker, RESUME_WORKERS_MARKER_TEXT);
-        assert_eq!(
-            text,
-            format!("{RESUME_CONTINUATION_FALLBACK_TEXT} {RESUME_WORKERS_LOST_NOTE}")
-        );
-
-        for reason in [None, Some("system_suspend")] {
-            let (marker, text) =
-                resume_marker_and_continuation("2026-08-15T12:00:00Z", reason, now);
-            assert_eq!(marker, RESUME_MARKER_TEXT, "{reason:?}");
+    fn interrupted_capture_classifies_by_reason_and_status() {
+        let tag = Some(INTERRUPTED_WITH_WORKERS_REASON);
+        for status in ["active", "idle", "Idle", "error"] {
             assert_eq!(
-                text,
-                resume_continuation_text("2026-08-15T12:00:00Z", now),
-                "{reason:?}"
+                InterruptedCapture::of(None, status),
+                InterruptedCapture::MidTurn
+            );
+            assert_eq!(
+                InterruptedCapture::of(Some("system_suspend"), status),
+                InterruptedCapture::MidTurn
             );
         }
+        for status in ["active", "Processing", "Waiting"] {
+            assert_eq!(
+                InterruptedCapture::of(tag, status),
+                InterruptedCapture::MidTurnWithWorkers,
+                "{status}"
+            );
+        }
+        for status in ["idle", "Idle", "error", "not-a-status"] {
+            assert_eq!(
+                InterruptedCapture::of(tag, status),
+                InterruptedCapture::IdleWithWorkers,
+                "{status}"
+            );
+        }
+    }
+
+    /// Each capture's marker, continuation, abandon notice and tail replay:
+    /// tagged rows get the lost-task note after the duration wording, an idle
+    /// capture replays no tail (a turn the user stopped stays stopped), and
+    /// untagged rows keep today's wording.
+    #[test]
+    fn interrupted_capture_wording_and_tail_replay() {
+        let now = parse("2026-08-15T12:00:15Z");
+        let at = "2026-08-15T12:00:00Z";
+        let base = resume_continuation_text(at, now);
+        assert!(base.starts_with("You were interrupted for about 15 seconds"));
+        let noted = format!("{base} {RESUME_WORKERS_LOST_NOTE}");
+        let cases = [
+            (
+                InterruptedCapture::MidTurn,
+                RESUME_MARKER_TEXT,
+                base.clone(),
+                ABANDON_NOTICE_TEXT,
+                true,
+            ),
+            (
+                InterruptedCapture::MidTurnWithWorkers,
+                RESUME_WORKERS_MID_TURN_MARKER_TEXT,
+                noted.clone(),
+                ABANDON_WORKERS_MID_TURN_NOTICE_TEXT,
+                true,
+            ),
+            (
+                InterruptedCapture::IdleWithWorkers,
+                RESUME_WORKERS_MARKER_TEXT,
+                noted,
+                ABANDON_WORKERS_NOTICE_TEXT,
+                false,
+            ),
+        ];
+        for (capture, marker, continuation, abandon, replays) in cases {
+            assert_eq!(
+                capture.resume_marker_and_continuation(at, now),
+                (marker, continuation),
+                "{capture:?}"
+            );
+            assert_eq!(capture.abandon_notice(), abandon, "{capture:?}");
+            assert_eq!(capture.replays_tail(), replays, "{capture:?}");
+        }
+        assert!(RESUME_WORKERS_LOST_NOTE.contains("will not report back"));
+        assert_eq!(
+            RESUME_MARKER_TEXT,
+            "The previous turn was interrupted because the harness shut down. Continuing below."
+        );
+        assert_eq!(
+            ABANDON_NOTICE_TEXT,
+            "This conversation was interrupted because intentd restarted. The agent's \
+             in-flight work was terminated."
+        );
+        assert_eq!(
+            InterruptedCapture::IdleWithWorkers
+                .resume_marker_and_continuation("not-a-timestamp", now)
+                .1,
+            format!("{RESUME_CONTINUATION_FALLBACK_TEXT} {RESUME_WORKERS_LOST_NOTE}")
+        );
     }
 
     /// The delivered wording embeds the duration.

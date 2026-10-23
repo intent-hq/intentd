@@ -11794,8 +11794,11 @@ impl AgentManager {
         // lost — including agents that ended their turn and are idle, which
         // the in-flight capture below would otherwise skip.
         let with_workers = self.services.agent_workers().running_worker_agents();
-        let has_workers = |id: &AgentId| with_workers.iter().any(|(w, _)| w == id);
-        let mut enrolled: HashSet<AgentId> = HashSet::new();
+        let worker_ids: HashSet<&AgentId> = with_workers.iter().map(|(id, _)| id).collect();
+        // Agents the in-flight capture below took responsibility for, whether
+        // or not its row write succeeded: the idle capture must never record
+        // a mid-turn agent as idle.
+        let mut captured_mid_turn: HashSet<AgentId> = HashSet::new();
         // Pin every live slot before aborting any worker: dropping its future
         // drops the LiveTurnGuard, which would otherwise erase partial output.
         for (id, _) in &in_flight {
@@ -11873,6 +11876,7 @@ impl AgentManager {
                 tracing::debug!(agent_id = %id, "graceful shutdown: turn already settled, no in-flight interrupted_agent row");
                 continue;
             }
+            captured_mid_turn.insert(id.clone());
             // Read the current persisted status BEFORE end_turn settles it to RuntimeIdle.
             // Use get_agent_session_status (lightweight, skips message log).
             // RACE: try_begin inserts into busy BEFORE persist_status(Active) completes, so
@@ -11920,40 +11924,51 @@ impl AgentManager {
             // Insert the interrupted_agent row (idempotent upsert: if a prior crash captured
             // this agent and the daemon was restarted without the FE resolving it, the row
             // is refreshed to the latest state).
-            let reason =
-                has_workers(id).then_some(crate::agent_workers::INTERRUPTED_WITH_WORKERS_REASON);
-            match self
+            let reason = worker_ids
+                .contains(id)
+                .then_some(crate::agent_workers::INTERRUPTED_WITH_WORKERS_REASON);
+            if let Err(e) = self
                 .services
                 .store
                 .insert_interrupted_agent_with_reason(id, workspace_id, &prev_str, &now, reason)
                 .await
             {
-                Ok(_) => {
-                    enrolled.insert(id.clone());
-                }
-                Err(e) => {
-                    tracing::warn!(agent_id = %id, workspace_id = %workspace_id, error = %e, "graceful shutdown: failed to insert interrupted_agent row");
-                }
+                tracing::warn!(agent_id = %id, workspace_id = %workspace_id, error = %e, "graceful shutdown: failed to insert interrupted_agent row");
             }
         }
         // Agents outside a turn whose background workers this shutdown kills
         // (intent-hq/intent#7658). The row's prev_status is the agent's own
         // (idle) status; the reason tag drives the resume wording. None of
-        // these is mid-turn (busy, unsettled agents were enrolled above), so
+        // these is mid-turn (busy, unsettled agents were captured above), so
         // an in-flight status is a post-turn idle write that has not landed
-        // yet and is recorded as idle.
+        // yet and is recorded as idle. Finished agents are left alone: a
+        // deleted, retired or completed agent, or a delegated child that
+        // already reported (its parent owns the follow-up, and a pending row
+        // would hold its delegation group open).
         for (id, workspace_id) in &with_workers {
-            if enrolled.contains(id) {
+            if captured_mid_turn.contains(id) {
                 continue;
             }
-            let prev_status = match self.services.store.get_agent_session_status(id).await {
-                Ok(AgentStatus::Deleted) => continue,
-                Ok(status) if crate::is_stale_in_flight_status(status) => AgentStatus::RuntimeIdle,
-                Ok(status) => status,
+            let session = match self.services.store.get_agent_session_summary(id).await {
+                Ok(session) => session,
                 Err(e) => {
-                    tracing::warn!(agent_id = %id, error = %e, "graceful shutdown: could not read status of an agent with running workers");
+                    tracing::warn!(agent_id = %id, error = %e, "graceful shutdown: could not read an agent with running workers");
                     continue;
                 }
+            };
+            let finished = matches!(
+                session.status,
+                AgentStatus::Deleted | AgentStatus::Completed
+            ) || session.retired_at.is_some()
+                || (session.parent_agent_id.is_some() && session.completion_report.is_some());
+            if finished {
+                tracing::debug!(agent_id = %id, status = ?session.status, "graceful shutdown: finished agent with running workers, no interrupted_agent row");
+                continue;
+            }
+            let prev_status = if crate::is_stale_in_flight_status(session.status) {
+                AgentStatus::RuntimeIdle
+            } else {
+                session.status
             };
             let Ok(serde_json::Value::String(prev_str)) = serde_json::to_value(prev_status) else {
                 tracing::warn!(agent_id = %id, status = ?prev_status, "graceful shutdown: status did not encode to a string, skipping interrupted_agent row");

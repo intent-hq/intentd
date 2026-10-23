@@ -18260,15 +18260,20 @@ fn resume_continuation_text(interrupted_at: &str, now: time::OffsetDateTime) -> 
     )
 }
 
-/// Transcript marker for a restart resume whose row carries
-/// [`crate::agent_workers::INTERRUPTED_WITH_WORKERS_REASON`]: the agent may
-/// have been idle (no turn to interrupt) while its background tasks ran.
-pub(crate) const RESUME_WORKERS_MARKER_TEXT: &str = "The harness shut down while background \
-     tasks were running, which stopped them. Continuing below.";
-
-/// Restart-resume transcript marker for an untagged row (a mid-turn capture).
+/// Restart-resume transcript marker for a row captured mid-turn.
 pub(crate) const RESUME_MARKER_TEXT: &str =
     "The previous turn was interrupted because the harness shut down. Continuing below.";
+
+/// Restart-resume transcript marker for a mid-turn row tagged
+/// [`crate::agent_workers::INTERRUPTED_WITH_WORKERS_REASON`].
+pub(crate) const RESUME_WORKERS_MID_TURN_MARKER_TEXT: &str = "The previous turn was \
+     interrupted because the harness shut down, which also stopped running background tasks. \
+     Continuing below.";
+
+/// Restart-resume transcript marker for an idle agent captured only because
+/// its background tasks were running (no turn was interrupted).
+pub(crate) const RESUME_WORKERS_MARKER_TEXT: &str = "The harness shut down while background \
+     tasks were running, which stopped them. Continuing below.";
 
 /// Appended to the restart-resume continuation when the row carries
 /// [`crate::agent_workers::INTERRUPTED_WITH_WORKERS_REASON`]
@@ -18278,21 +18283,82 @@ pub(crate) const RESUME_WORKERS_LOST_NOTE: &str = "Background tasks you started 
      shutdown (such as commands run in the background) were stopped by it and will not report \
      back. Check what they completed, and restart any you still need.";
 
-/// The marker and continuation a restart resume delivers for a claimed row
-/// with this `interrupted_at` and `reason`.
-fn resume_marker_and_continuation(
-    interrupted_at: &str,
-    reason: Option<&str>,
-    now: time::OffsetDateTime,
-) -> (&'static str, String) {
-    let continuation = resume_continuation_text(interrupted_at, now);
-    if reason == Some(crate::agent_workers::INTERRUPTED_WITH_WORKERS_REASON) {
-        (
-            RESUME_WORKERS_MARKER_TEXT,
-            format!("{continuation} {RESUME_WORKERS_LOST_NOTE}"),
-        )
-    } else {
-        (RESUME_MARKER_TEXT, continuation)
+/// Abandon notice for a row captured mid-turn (the historical wording).
+pub(crate) const ABANDON_NOTICE_TEXT: &str = "This conversation was interrupted because intentd \
+     restarted. The agent's in-flight work was terminated.";
+
+/// Abandon notice for a mid-turn row whose background tasks also stopped.
+pub(crate) const ABANDON_WORKERS_MID_TURN_NOTICE_TEXT: &str = "This conversation was \
+     interrupted because intentd restarted. The agent's in-flight work and running background \
+     tasks were terminated.";
+
+/// Abandon notice for an idle agent captured only for its background tasks.
+pub(crate) const ABANDON_WORKERS_NOTICE_TEXT: &str =
+    "intentd restarted, which terminated the agent's running background tasks.";
+
+/// How a claimed `interrupted_agent` row was captured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InterruptedCapture {
+    /// Mid-turn, no background tasks known lost (every untagged row).
+    MidTurn,
+    /// Mid-turn, and its background tasks were stopped too.
+    MidTurnWithWorkers,
+    /// Idle (no turn in flight); only its background tasks were stopped.
+    IdleWithWorkers,
+}
+
+impl InterruptedCapture {
+    /// Classify a row by its `reason` tag and `prev_status`. A tagged row is
+    /// idle when its recorded status is not an in-flight one: graceful
+    /// shutdown records in-flight statuses only for busy agents.
+    pub(crate) fn of(reason: Option<&str>, prev_status: &str) -> Self {
+        if reason != Some(crate::agent_workers::INTERRUPTED_WITH_WORKERS_REASON) {
+            return Self::MidTurn;
+        }
+        let in_flight = serde_json::from_value::<intent_core::AgentStatus>(Value::String(
+            prev_status.to_owned(),
+        ))
+        .is_ok_and(crate::is_stale_in_flight_status);
+        if in_flight {
+            Self::MidTurnWithWorkers
+        } else {
+            Self::IdleWithWorkers
+        }
+    }
+
+    /// Whether a resume replays the transcript tail. An idle capture had no
+    /// interrupted turn: its tail (for example a turn the user stopped) is
+    /// already settled and must not be re-driven.
+    pub(crate) fn replays_tail(self) -> bool {
+        self != Self::IdleWithWorkers
+    }
+
+    pub(crate) fn abandon_notice(self) -> &'static str {
+        match self {
+            Self::MidTurn => ABANDON_NOTICE_TEXT,
+            Self::MidTurnWithWorkers => ABANDON_WORKERS_MID_TURN_NOTICE_TEXT,
+            Self::IdleWithWorkers => ABANDON_WORKERS_NOTICE_TEXT,
+        }
+    }
+
+    /// The marker and continuation a restart resume delivers.
+    pub(crate) fn resume_marker_and_continuation(
+        self,
+        interrupted_at: &str,
+        now: time::OffsetDateTime,
+    ) -> (&'static str, String) {
+        let continuation = resume_continuation_text(interrupted_at, now);
+        match self {
+            Self::MidTurn => (RESUME_MARKER_TEXT, continuation),
+            Self::MidTurnWithWorkers => (
+                RESUME_WORKERS_MID_TURN_MARKER_TEXT,
+                format!("{continuation} {RESUME_WORKERS_LOST_NOTE}"),
+            ),
+            Self::IdleWithWorkers => (
+                RESUME_WORKERS_MARKER_TEXT,
+                format!("{continuation} {RESUME_WORKERS_LOST_NOTE}"),
+            ),
+        }
     }
 }
 
@@ -18928,9 +18994,10 @@ impl Services {
         // is already the transcript tail — skip the duplicate append. A failed
         // append is treated like a failed continuation delivery: reset the row
         // to pending and surface the error.
-        let (marker_text, continuation) = resume_marker_and_continuation(
+        let capture =
+            InterruptedCapture::of(interrupted.reason.as_deref(), &interrupted.prev_status);
+        let (marker_text, continuation) = capture.resume_marker_and_continuation(
             &interrupted.interrupted_at,
-            interrupted.reason.as_deref(),
             time::OffsetDateTime::now_utc(),
         );
         let marker_content = json!([{
@@ -18995,8 +19062,14 @@ impl Services {
         // ATTACHMENTS still ride (the history XML is text-only), so the tail
         // reaches the agent exactly once on either branch. The recap is
         // built from the pre-marker `session` snapshot, so the just-appended
-        // interruption marker never leaks into it.
-        let recap = build_resume_tail_recap(&session.messages);
+        // interruption marker never leaks into it. An idle background-task
+        // capture interrupted no turn, so its tail is already settled and is
+        // not replayed ([`InterruptedCapture::replays_tail`]).
+        let recap = if capture.replays_tail() {
+            build_resume_tail_recap(&session.messages)
+        } else {
+            None
+        };
 
         // Use the send-message machinery to deliver the continuation (lazily
         // respawns the provider and resumes via ACP `session/load`).
@@ -19100,7 +19173,8 @@ impl Services {
             )));
         }
 
-        let text = "This conversation was interrupted because intentd restarted. The agent's in-flight work was terminated.";
+        let text = InterruptedCapture::of(interrupted.reason.as_deref(), &interrupted.prev_status)
+            .abandon_notice();
         let content = json!([{
             "type": "text",
             "text": text,
