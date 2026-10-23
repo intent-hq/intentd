@@ -2,9 +2,9 @@
 """Download the locked crates once, retrying transient crates.io failures.
 
 Callers then run cargo-dist with CARGO_NET_OFFLINE=true, so its internal
-`cargo metadata` needs no network. Used by the Release `host` job (v0.11.31
-publication failed twice on crates.io HTTP2/TLS errors in run 39880269962,
-intent-hq/intent#7639) and by scripts/test-optional-intel-dist.py (runs
+`cargo metadata` needs no network. Used by the Release `build-global-artifacts`
+and `host` jobs (v0.11.31 publication failed twice on crates.io HTTP2/TLS errors
+in run 39880269962, intent-hq/intent#7639) and by scripts/test-optional-intel-dist.py (runs
 39394522385 and 39355882408). scripts/test-optional-intel-dist-network.py
 covers the retry handling offline.
 
@@ -22,7 +22,7 @@ FETCH = ['cargo', 'fetch', '--locked']
 FETCH_ATTEMPTS = 4
 FETCH_ATTEMPT_TIMEOUT = 150
 FETCH_DEADLINE = 420
-# The Release host job has no tight budget, and on a shared self-hosted slot
+# The Release global-build and host jobs have no tight budget, and on a shared self-hosted slot
 # cargo may wait on another job's package-cache lock: allow more per attempt.
 RELEASE_ATTEMPT_TIMEOUT = 300
 RELEASE_DEADLINE = 900
