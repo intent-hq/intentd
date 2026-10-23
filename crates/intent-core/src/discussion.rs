@@ -132,6 +132,8 @@ fn default_conversation_id() -> String {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiscussionConversation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub id: String,
     pub workspace_id: WorkspaceId,
     pub kind: String,
@@ -148,6 +150,7 @@ pub struct DiscussionSendResult {
 
 #[derive(Debug, Clone, Default)]
 pub struct DiscussionTarget {
+    pub create_conversation: bool,
     pub principal_mentions: Vec<DiscussionPrincipalMention>,
     pub agent_mentions: Vec<DiscussionAgentMention>,
     pub recipient_agent_ids: Vec<AgentId>,

@@ -332,11 +332,43 @@ fn recipients(ids: &[PrincipalId]) -> DiscussionTarget {
     }
 }
 
+fn new_conversation() -> DiscussionTarget {
+    DiscussionTarget {
+        create_conversation: true,
+        ..Default::default()
+    }
+}
+
+impl Services {
+    // Seed historical rows via the persistence API; production callers cannot create these.
+    async fn seed_legacy_discussion(
+        &self,
+        ws: &WorkspaceId,
+        key: &str,
+        body: &str,
+        target: &DiscussionTarget,
+    ) -> Result<DiscussionSendResult> {
+        let principal = self.discussion_human(ws).await?;
+        let p = self.store.get_principal(&principal).await?;
+        let author = DiscussionAuthor {
+            principal_id: Some(principal),
+            agent_id: None,
+            login: p.login,
+            display_name: p.display_name,
+            avatar_url: p.avatar_url,
+        };
+        self.store
+            .send_discussion_message(ws, key, body, &author, target)
+            .await
+            .map(|(result, _)| result)
+    }
+}
+
 #[tokio::test]
 async fn discussion_conversations_atomic_creation_retry_and_bounded_discovery() {
     let (_tmp, svc, ws, p) = conversation_fixture().await;
     let caller = human(&p[1].id);
-    let target = recipients(&[p[2].id.clone(), p[3].id.clone()]);
+    let target = new_conversation();
     let (a, b) = tokio::join!(
         with_caller(
             caller.clone(),
@@ -352,7 +384,7 @@ async fn discussion_conversations_atomic_creation_retry_and_bounded_discovery() 
         serde_json::to_value(a.clone()).unwrap(),
         serde_json::to_value(b.unwrap()).unwrap()
     );
-    assert_eq!(a.conversation.kind, "group");
+    assert_eq!(a.conversation.kind, "workspace");
     assert_eq!(a.message.sequence, 1);
     assert_eq!(a.message.conversation_id, a.conversation.id);
     let mut renamed = p[1].clone();
@@ -360,12 +392,7 @@ async fn discussion_conversations_atomic_creation_retry_and_bounded_discovery() 
     svc.store.upsert_principal(&renamed).await.unwrap();
     let retry = with_caller(
         caller.clone(),
-        svc.discussion_send_to_op(
-            &ws,
-            "first",
-            "hello",
-            &recipients(&[p[3].id.clone(), p[2].id.clone()]),
-        ),
+        svc.discussion_send_to_op(&ws, "first", "hello", &new_conversation()),
     )
     .await
     .unwrap();
@@ -412,7 +439,7 @@ async fn discussion_conversations_atomic_creation_retry_and_bounded_discovery() 
             svc.discussion_send_to_op(&ws, "unknown", "hello", &recipients(&[p[4].id.clone()]))
         )
         .await,
-        Err(Error::NotFound(_))
+        Err(Error::InvalidParams(_))
     ));
     let first = with_caller(
         caller.clone(),
@@ -436,11 +463,11 @@ async fn discussion_conversations_atomic_creation_retry_and_bounded_discovery() 
     );
     let direct = with_caller(
         caller.clone(),
-        svc.discussion_send_to_op(&ws, "direct", "dm", &recipients(&[p[2].id.clone()])),
+        svc.discussion_send_to_op(&ws, "direct", "dm", &new_conversation()),
     )
     .await
     .unwrap();
-    assert_eq!(direct.conversation.kind, "direct");
+    assert_eq!(direct.conversation.kind, "workspace");
     assert_eq!(direct.message.sequence, 1);
     let second = with_caller(
         caller.clone(),
@@ -496,7 +523,7 @@ async fn discussion_conversations_authorize_participants_even_for_owner_and_offl
     let alice = human(&p[1].id);
     let created = with_caller(
         alice.clone(),
-        svc.discussion_send_to_op(&ws, "first", "private", &recipients(&[p[2].id.clone()])),
+        svc.seed_legacy_discussion(&ws, "first", "private", &recipients(&[p[2].id.clone()])),
     )
     .await
     .unwrap();
@@ -607,7 +634,7 @@ async fn discussion_private_typing_projection_and_target_validation_are_atomic()
     let alice = human(&p[1].id);
     let made = with_caller(
         alice.clone(),
-        svc.discussion_send_to_op(&ws, "dm", "private", &recipients(&[p[2].id.clone()])),
+        svc.seed_legacy_discussion(&ws, "dm", "private", &recipients(&[p[2].id.clone()])),
     )
     .await
     .unwrap();
@@ -696,7 +723,7 @@ async fn discussion_private_typing_projection_and_target_validation_are_atomic()
 async fn discussion_store_rechecks_sender_membership_but_retry_survives_recipient_removal() {
     let (_tmp, svc, ws, p) = conversation_fixture().await;
     let alice = human(&p[1].id);
-    let recipients = recipients(&[p[2].id.clone()]);
+    let recipients = new_conversation();
     let created = with_caller(
         alice.clone(),
         svc.discussion_send_to_op(&ws, "private", "original", &recipients),
@@ -772,7 +799,7 @@ async fn discussion_export_cannot_bypass_participant_authorization() {
     let (_tmp, svc, ws, p) = conversation_fixture().await;
     with_caller(
         human(&p[1].id),
-        svc.discussion_send_to_op(
+        svc.seed_legacy_discussion(
             &ws,
             "private",
             "private body",
@@ -806,7 +833,7 @@ async fn discussion_reactions_are_idempotent_projected_and_participant_scoped() 
     let (_tmp, svc, ws, p) = conversation_fixture().await;
     let made = with_caller(
         human(&p[1].id),
-        svc.discussion_send_to_op(&ws, "dm", "private", &recipients(&[p[2].id.clone()])),
+        svc.discussion_send_to_op(&ws, "dm", "private", &new_conversation()),
     )
     .await
     .unwrap();
@@ -896,8 +923,6 @@ async fn discussion_reactions_are_idempotent_projected_and_participant_scoped() 
         );
     }
     for caller in [
-        human(&p[0].id),
-        human(&p[3].id),
         human(&p[4].id),
         Caller::Agent {
             agent_id: AgentId::new(),
@@ -966,12 +991,7 @@ async fn discussion_replies_bind_retry_and_snapshot_without_cross_conversation_l
     let caller = human(&p[1].id);
     let made = with_caller(
         caller.clone(),
-        svc.discussion_send_to_op(
-            &ws,
-            "original",
-            "Original quote",
-            &recipients(&[p[2].id.clone()]),
-        ),
+        svc.discussion_send_to_op(&ws, "original", "Original quote", &new_conversation()),
     )
     .await
     .unwrap();
@@ -1025,7 +1045,7 @@ async fn discussion_replies_bind_retry_and_snapshot_without_cross_conversation_l
         },
         DiscussionTarget {
             reply_to_message_id: Some(made.message.id.clone()),
-            ..recipients(&[p[3].id.clone()])
+            ..new_conversation()
         },
         DiscussionTarget {
             reply_to_message_id: Some("missing".into()),
@@ -1154,3 +1174,5 @@ async fn discussion_reaction_concurrency_and_send_retry_keep_viewer_state() {
 mod agents;
 
 mod principal_mentions;
+
+mod management;

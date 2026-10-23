@@ -119,62 +119,29 @@ async fn discussion_principal_mentions_require_current_members_and_private_parti
     target.recipient_principal_ids = Some(vec![people[2].id.clone()]);
     let created = with_caller(
         human(&people[1].id),
-        svc.discussion_send_to_op(&ws, "private", body, &target),
+        svc.seed_legacy_discussion(&ws, "legacy", body, &target),
     )
     .await
     .unwrap();
-    assert_eq!(
-        created.message.principal_mentions,
-        target.principal_mentions
-    );
-    assert_eq!(
-        with_caller(
-            human(&people[1].id),
-            svc.discussion_send_to_op(&ws, "private", body, &target)
-        )
-        .await
-        .unwrap()
-        .message,
-        created.message
-    );
-    let mut outsider = mentioned(&people[3].id);
-    outsider.conversation_id = Some(created.conversation.id.clone());
+    target.recipient_principal_ids = None;
+    target.conversation_id = Some(created.conversation.id.clone());
     assert!(matches!(
         with_caller(
             human(&people[1].id),
-            svc.discussion_send_to_op(&ws, "not-participant", body, &outsider)
+            svc.discussion_send_to_op(&ws, "new", body, &target)
         )
         .await,
-        Err(Error::NotFound(_))
+        Err(Error::Forbidden(_))
     ));
-    outsider.conversation_id = None;
-    outsider.recipient_principal_ids = Some(vec![people[2].id.clone()]);
-    assert!(matches!(
-        with_caller(
-            human(&people[1].id),
-            svc.discussion_send_to_op(&ws, "bad-first-send", body, &outsider)
-        )
-        .await,
-        Err(Error::NotFound(_))
-    ));
-    let conversations = with_caller(
+    let mut public = mentioned(&people[2].id);
+    public.create_conversation = true;
+    let sent = with_caller(
         human(&people[1].id),
-        svc.discussion_conversations_op(&ws, None, 50),
+        svc.discussion_send_to_op(&ws, "public", body, &public),
     )
     .await
     .unwrap();
-    assert_eq!(
-        conversations["conversations"].as_array().unwrap().len(),
-        2,
-        "failed first send must roll back its conversation"
-    );
-    let author = created.message.author;
-    assert!(matches!(
-        svc.store
-            .send_discussion_message(&ws, "store-bypass", body, &author, &outsider)
-            .await,
-        Err(Error::NotFound(_))
-    ));
+    assert_eq!(sent.message.principal_mentions, public.principal_mentions);
     let agent_author = DiscussionAuthor {
         principal_id: None,
         agent_id: Some(AgentId::from("agent")),
@@ -194,7 +161,6 @@ async fn discussion_principal_mentions_require_current_members_and_private_parti
             .await,
         Err(Error::Forbidden(_))
     ));
-    // Direct service callers cannot bypass human-only notification creation.
     assert!(matches!(
         with_caller(
             Caller::Agent {

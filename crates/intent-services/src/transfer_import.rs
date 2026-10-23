@@ -1371,6 +1371,13 @@ fn transform_rows(
                         .is_some_and(|payload| has_discussion_reference(&payload))
                 });
             }
+            "workspace_discussion_conversation" => {
+                for object in &mut objects {
+                    let map = expect_object(&table, object)?;
+                    map.insert("first_principal_id".into(), serde_json::Value::Null);
+                    map.insert("first_client_message_id".into(), serde_json::Value::Null);
+                }
+            }
             "workspace_discussion_message" | "discussion_participant" | "discussion_reaction" => {
                 for object in &mut objects {
                     let map = expect_object(&table, object)?;

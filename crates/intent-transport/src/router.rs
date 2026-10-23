@@ -1065,6 +1065,17 @@ async fn dispatch(
             let ws = api.mark_seen(id).await.map_err(workspace_err)?;
             Ok(json!({ "workspace": ws }))
         }
+        "discussion.rename" | "discussion.delete" => {
+            let ws = require_workspace_id(params)?;
+            let id = require_non_empty_str(params, "conversationId")?;
+            if method == "discussion.delete" {
+                api.discussion_delete(ws, id).await.map_err(domain_to_rpc)
+            } else {
+                api.discussion_rename(ws, id, require_str_param(params, "name")?)
+                    .await
+                    .map_err(domain_to_rpc)
+            }
+        }
         "discussion.conversations" | "discussion.recipients" => {
             let id = require_workspace_id(params)?;
             let limit = discussion_limit(params)?;
@@ -1211,6 +1222,15 @@ async fn dispatch(
                     message_id,
                     body,
                     intent_core::discussion::DiscussionTarget {
+                        create_conversation: params
+                            .get("createConversation")
+                            .map(|v| {
+                                v.as_bool().ok_or_else(|| {
+                                    invalid_params("createConversation must be a boolean")
+                                })
+                            })
+                            .transpose()?
+                            .unwrap_or(false),
                         principal_mentions: params
                             .get("principalMentions")
                             .map(|v| {

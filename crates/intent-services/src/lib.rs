@@ -19028,6 +19028,7 @@ impl WorkspaceApi for Services {
             caps.insert("discussionAgentMessaging".into(), serde_json::json!(1));
             caps.insert("discussionAgentActivity".into(), serde_json::json!(1));
             caps.insert("discussionPrincipalMentions".into(), serde_json::json!(1));
+            caps.insert("discussionManagement".into(), serde_json::json!(1));
             if let Some(cow_supported) = self.compute_cow_supported().await {
                 caps.insert("cowSupported".to_string(), serde_json::json!(cow_supported));
             }
@@ -34747,6 +34748,29 @@ impl WorkspaceApi for Services {
             .await
         })
     }
+    fn discussion_rename(
+        &self,
+        workspace_id: WorkspaceId,
+        conversation_id: String,
+        name: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.discussion_manage_op(&workspace_id, &conversation_id, Some(&name))
+                .await
+        })
+    }
+
+    fn discussion_delete(
+        &self,
+        workspace_id: WorkspaceId,
+        conversation_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.discussion_manage_op(&workspace_id, &conversation_id, None)
+                .await
+        })
+    }
+
     fn discussion_conversations(
         &self,
         workspace_id: WorkspaceId,

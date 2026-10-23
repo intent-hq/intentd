@@ -34,11 +34,16 @@ commands, change credentials, or manage sharing. Host membership retains its exi
 authority. Role downgrades apply to subsequent operations on open connections.
 
 Only when explicitly asked about workspace discussions: this unreleased Multiplayer
-Labs feature supports reactions 👍 👎 👀 ✅ 🙈. The emoji picker has no tooltips;
+Labs feature supports multiple workspace-wide discussions. Start a discussion by
+sending its first message; everyone with workspace access can read and participate.
+Workspace owners and managers can rename discussions; only workspace owners can
+delete them, including the default discussion. Existing private history remains
+visible only to its original participants and is read-only; new private discussions
+are unavailable. Discussions support reactions 👍 👎 👀 ✅ 🙈. The emoji picker has no tooltips;
 hover or focus an existing reaction to see who reacted, and click to toggle yours.
 Legacy 🙂 can be removed. Agents can react only
 after explicit addressing in the workspace-wide discussion; reactions never wake
-agents. Private discussions remain human-only. Imported reaction names are historical
+agents. Imported reaction names are historical
 snapshots, not local access.
 
 An agent author's name or avatar opens that agent beside the discussion. If the
@@ -63,7 +68,7 @@ share an avatar. Each action remains individually selectable.
 
 <!-- Source: packages/cloudlands-fe/src/features/presence/components/WorkspacePeopleActivity.svelte. -->
 
-<!-- Sources: packages/intentd/crates/intent-core/src/discussion.rs; packages/intentd/crates/intent-services/src/discussion_ops.rs; packages/intentd/crates/intent-acp/src/mcp_server/bindings/discussion.rs; packages/cloudlands-fe/src/features/discussions/components/{DiscussionThread,DiscussionMessageView,DiscussionMentionPicker,DiscussionUnreadBadge}.svelte; packages/cloudlands-fe/src/features/discussions/discussion-reference-navigation.ts; packages/cloudlands-fe/src/store/renderer/slices/notifications/sagas/notifications-saga.ts; packages/cloudlands-fe/src/store/renderer/slices/workspace-discussion/workspace-discussion-selectors.ts. -->
+<!-- Sources: packages/intentd/crates/intent-core/src/discussion.rs; packages/intentd/crates/intent-services/src/discussion_ops.rs; packages/intentd/crates/intent-store/src/discussion_management_repo.rs; packages/intentd/crates/intent-acp/src/mcp_server/bindings/discussion.rs; packages/cloudlands-fe/src/features/discussions/components/{DiscussionThread,DiscussionMessageView,DiscussionMentionPicker,DiscussionUnreadBadge}.svelte; packages/cloudlands-fe/src/features/discussions/discussion-reference-navigation.ts; packages/cloudlands-fe/src/features/layout/tab-types/DiscussionTabType.svelte; packages/cloudlands-fe/src/store/renderer/slices/notifications/sagas/notifications-saga.ts; packages/cloudlands-fe/src/store/renderer/slices/workspace-discussion/workspace-discussion-selectors.ts. -->
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/settings/MobileSettings.svelte; src/features/devices/{PersonalDevicesPanel.svelte,personal-devices-selectors.ts}; src/store/renderer/slices/principal/principal-selectors.ts; src/store/renderer/slices/websocket-api/sagas/websocket-api-saga.ts; messages/en.json. -->
 

@@ -297,7 +297,7 @@ async fn discussion_conversation_migration_preserves_default_history_and_retry()
         .insert_workspace(&sample_workspace(&ws, "Existing discussion", false))
         .await
         .unwrap();
-    sqlx::raw_sql("DROP TABLE discussion_agent_activity; DROP TABLE discussion_agent_delivery; DROP TABLE discussion_agent_grant; DROP TABLE discussion_reaction; DROP TABLE workspace_discussion_message; DROP TABLE discussion_participant; DROP TABLE discussion_conversation;")
+    sqlx::raw_sql("DROP TABLE discussion_agent_activity; DROP TABLE discussion_agent_delivery; DROP TABLE discussion_agent_grant; DROP TABLE discussion_reaction; DROP TABLE workspace_discussion_message; DROP TABLE discussion_participant; DROP TABLE discussion_conversation; DROP TABLE workspace_discussion_conversation;")
         .execute(store.write_pool()).await.unwrap();
     sqlx::raw_sql(include_str!("../migrations/0165_workspace_discussions.sql"))
         .execute(store.write_pool())
@@ -342,6 +342,12 @@ async fn discussion_conversation_migration_preserves_default_history_and_retry()
         .unwrap();
     sqlx::raw_sql(include_str!(
         "../migrations/0172_discussion_principal_mentions.sql"
+    ))
+    .execute(store.write_pool())
+    .await
+    .unwrap();
+    sqlx::raw_sql(include_str!(
+        "../migrations/0173_workspace_discussion_management.sql"
     ))
     .execute(store.write_pool())
     .await

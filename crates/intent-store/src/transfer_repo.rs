@@ -49,6 +49,7 @@ pub const TRANSFER_TABLES: &[(&str, &str)] = &[
     // Historical human identity is immutable attribution, not a grant or a
     // principal FK. Import clears the private retry principal to avoid rebinding.
     ("discussion_conversation", "workspace_id = ?1"),
+    ("workspace_discussion_conversation", "workspace_id = ?1"),
     ("discussion_participant", "workspace_id = ?1"),
     ("workspace_discussion_message", "workspace_id = ?1"),
     ("discussion_reaction", "workspace_id = ?1"),
@@ -1471,6 +1472,7 @@ mod tests {
             format!("INSERT INTO note_line_attribution (note_id, workspace_id, computed_at, attributions_json) VALUES ('n1', '{ws}', '{t}', '[]')"),
             format!("INSERT INTO comment (id, thread_id, note_id, workspace_id, kind, content, author, author_type, anchor_json, created_at, updated_at) VALUES ('c-{ws}', 'th', 'n1', '{ws}', 'comment', 'hi', 'u', 'user', '{{}}', '{t}', '{t}')"),
             format!("INSERT INTO discussion_conversation(id,workspace_id,kind,participants_json,created_at) VALUES ('conversation-{ws}','{ws}','direct','[]','{t}')"),
+            format!("INSERT INTO workspace_discussion_conversation(workspace_id,id,name,created_at) VALUES ('{ws}','shared-{ws}','Plans','{t}')"),
             format!("INSERT INTO discussion_participant(conversation_id,workspace_id,source_principal_id,principal_id) VALUES ('conversation-{ws}','{ws}','human-{ws}','human-{ws}')"),
             format!(r#"INSERT INTO workspace_discussion_message (id,workspace_id,sequence,principal_id,client_message_id,body,author_json,created_at) VALUES ('discussion-{ws}','{ws}',1,'human-{ws}','retry','hello','{{"principalId":"human-{ws}","login":"human","displayName":null,"avatarUrl":null}}','{t}')"#),
             format!("INSERT INTO discussion_reaction(id,workspace_id,message_id,principal_id,reaction) VALUES ('reaction-{ws}','{ws}','discussion-{ws}','human-{ws}','👍')"),
@@ -2083,6 +2085,7 @@ note_version: note_id, workspace_id, v, date, author_id, author_name, author_typ
 note_line_attribution: note_id, workspace_id, computed_at, attributions_json
 comment: id, thread_id, note_id, workspace_id, kind, content, author, author_type, status, parent_id, anchor_json, anchor_text, extra_json, created_at, updated_at
 discussion_conversation: id, workspace_id, kind, participants_json, created_at
+workspace_discussion_conversation: workspace_id, id, name, first_message_id, first_principal_id, first_client_message_id, created_at, deleted_at
 discussion_participant: conversation_id, workspace_id, source_principal_id, principal_id
 workspace_discussion_message: id, workspace_id, conversation_id, sequence, principal_id, client_message_id, body, author_json, created_at, reply_to_message_id, reply_to_json, reactions_json, reaction_version, agent_id, recipient_agent_ids_json, agent_activity_json, agent_mentions_json, principal_mentions_json
 discussion_reaction: id, workspace_id, message_id, principal_id, agent_id, reaction, author_json
