@@ -67,12 +67,23 @@ class HostNetwork(unittest.TestCase):
         with self.assertRaises(ValueError):
             configure.configure(GENERATED + GENERATED.split('steps:\n', 1)[1])
 
-    def test_only_the_host_job_goes_offline(self):
-        jobs = yaml.safe_load(WORKFLOW.read_text())['jobs']
-        for name, job in jobs.items():
-            if name == 'host':
-                continue
+    def test_existing_host_step_env_is_rejected_not_duplicated(self):
+        for env_first in (True, False):
+            run = '        run: |\n          dist host\n'
+            env = '        env:\n          FOO: bar\n'
+            body = env + run if env_first else run + env
+            template = GENERATED.split('      - id: host\n')[0] + '      - id: host\n        shell: bash\n' + body
+            with self.assertRaises(ValueError):
+                configure.configure(template)
+
+    def test_only_the_host_publication_step_goes_offline(self):
+        doc = yaml.safe_load(WORKFLOW.read_text())
+        self.assertNotIn('CARGO_NET_OFFLINE', doc.get('env') or {}, 'workflow-level env')
+        for name, job in doc['jobs'].items():
+            self.assertNotIn('CARGO_NET_OFFLINE', job.get('env') or {}, f'{name}: job-level env')
             for step in job.get('steps', []):
+                if name == 'host' and step.get('id') == 'host':
+                    continue
                 self.assertNotIn('CARGO_NET_OFFLINE', step.get('env') or {}, f'{name}: {step}')
 
 

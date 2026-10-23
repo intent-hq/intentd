@@ -23,13 +23,7 @@ INTEL = 'x86_64-apple-darwin'
 _spec = importlib.util.spec_from_file_location('fetch_locked_crates', ROOT / 'scripts/fetch-locked-crates.py')
 _fetch = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_fetch)
-# Shared with the Release host job; re-exported for test-optional-intel-dist-network.py.
-FETCH = _fetch.FETCH
-FETCH_ATTEMPTS = _fetch.FETCH_ATTEMPTS
-FETCH_ATTEMPT_TIMEOUT = _fetch.FETCH_ATTEMPT_TIMEOUT
-FETCH_DEADLINE = _fetch.FETCH_DEADLINE
-fetch_dependencies = _fetch.fetch_dependencies
-offline_env = _fetch.offline_env
+NOT_UNDER_TEST = ' A network failure here is not the cargo-dist behaviour under test.'
 
 
 def run_dist(root, env, *args):
@@ -46,8 +40,9 @@ def main():
         shutil.copy(ROOT / 'dist-workspace.toml', root / 'dist-workspace.toml')
         shutil.copy(ROOT / 'scripts/optional-intel-release.py', root / 'scripts/optional-intel-release.py')
         env = {**os.environ, 'CARGO_TERM_PROGRESS_WHEN': 'never'}
-        fetch_dependencies(root, env)
-        env = offline_env(env)
+        _fetch.install_toolchain(root, env)
+        _fetch.fetch_dependencies(root, env, hint=NOT_UNDER_TEST)
+        env = _fetch.offline_env(env)
 
         def dist(*args):
             return run_dist(root, env, *args)

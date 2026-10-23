@@ -29,6 +29,11 @@ def configure(text):
         return text
     if text.count(HOST_STEP) != 1:
         raise ValueError('cargo-dist template changed; expected exactly one `- id: host` bash step')
+    start = text.index(HOST_STEP) + len(HOST_STEP)
+    following = text.find('\n      - ', start)
+    step = text[start:] if following < 0 else text[start:following]
+    if '\n        env:' in '\n' + step:
+        raise ValueError('cargo-dist template changed; the host step already has env: — merge CARGO_NET_OFFLINE by hand')
     return text.replace(HOST_STEP, CONFIGURED, 1)
 
 

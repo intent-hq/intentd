@@ -22,15 +22,23 @@ FETCH = ['cargo', 'fetch', '--locked']
 FETCH_ATTEMPTS = 4
 FETCH_ATTEMPT_TIMEOUT = 150
 FETCH_DEADLINE = 420
+# The Release host job has no tight budget, and on a shared self-hosted slot
+# cargo may wait on another job's package-cache lock: allow more per attempt.
+RELEASE_ATTEMPT_TIMEOUT = 300
+RELEASE_DEADLINE = 900
+TOOLCHAIN_ATTEMPTS = 3
 
 
 def fetch_dependencies(root, env, attempts=FETCH_ATTEMPTS, sleep=time.sleep,
-                       attempt_timeout=FETCH_ATTEMPT_TIMEOUT, deadline=FETCH_DEADLINE, clock=time.monotonic):
+                       attempt_timeout=FETCH_ATTEMPT_TIMEOUT, deadline=FETCH_DEADLINE, clock=time.monotonic,
+                       hint=''):
     """Download the locked crates, retrying transient network failures with backoff.
 
     A hung attempt is killed after attempt_timeout and counts as a failure; no
     attempt starts, or runs, past the overall deadline. HTTP/2 multiplexing is
-    off: it caused the crates.io "HTTP2 framing layer" error.
+    off: it caused the crates.io "HTTP2 framing layer" error. Callers install
+    the rustup toolchain first (install_toolchain) so attempts time only the
+    fetch.
     """
     env = {**env, 'CARGO_NET_RETRY': '3', 'CARGO_HTTP_MULTIPLEXING': 'false'}
     env.pop('CARGO_NET_OFFLINE', None)
@@ -48,8 +56,20 @@ def fetch_dependencies(root, env, attempts=FETCH_ATTEMPTS, sleep=time.sleep,
             print(f'cargo fetch attempt {attempt} timed out', flush=True)
         if attempt < attempts:
             sleep(5 * 2 ** (attempt - 1))
-    raise SystemExit(f'FAIL: `{" ".join(FETCH)}` failed after {tried} attempts ({deadline}s limit); the network '
-                     '(crates.io) is unavailable. Re-run the job.')
+    raise SystemExit(f'FAIL: `{" ".join(FETCH)}` failed after {tried} attempts ({deadline}s limit). The retries '
+                     'cover crates.io network errors (curl, HTTP2, TLS); re-run the job if the cargo errors above '
+                     f'are network errors, otherwise fix the reported cause.{hint}')
+
+
+def install_toolchain(root, env, attempts=TOOLCHAIN_ATTEMPTS, sleep=time.sleep):
+    """Let rustup install the rust-toolchain.toml channel outside the fetch timeouts."""
+    for attempt in range(1, attempts + 1):
+        if subprocess.run(['cargo', '--version'], cwd=root, env=env).returncode == 0:
+            return
+        if attempt < attempts:
+            sleep(5 * 2 ** (attempt - 1))
+    raise SystemExit(f'FAIL: installing the pinned Rust toolchain (`cargo --version`) failed {attempts} times; '
+                     'see the rustup errors above.')
 
 
 def offline_env(env):
@@ -57,5 +77,7 @@ def offline_env(env):
 
 
 if __name__ == '__main__':
-    fetch_dependencies(ROOT, {**os.environ, 'CARGO_TERM_PROGRESS_WHEN': 'never'})
+    env = {**os.environ, 'CARGO_TERM_PROGRESS_WHEN': 'never'}
+    install_toolchain(ROOT, env)
+    fetch_dependencies(ROOT, env, attempt_timeout=RELEASE_ATTEMPT_TIMEOUT, deadline=RELEASE_DEADLINE)
     print('locked crates fetched; later cargo calls can run with CARGO_NET_OFFLINE=true', flush=True)
