@@ -126,6 +126,10 @@ fn suggested_prompts_malformed_markup_stays_hidden() {
         "Done.\n<!-- suggested-prompts\nRun tests",
         "Done.\n<!-- suggested-prompts Run tests\nReview\n-->",
         "Done.\n\n&lt;!-- suggested-prompts\nRun the tests.\n-->",
+        "Done.\n\n<!-- suggested-prompts\nRun --> tests\n",
+        "Done.\n\n<!-- suggested-prompts\nRun --> tests\nOpen PR",
+        "Done.\n<!--suggested-prompts\nRun tests\n",
+        "Done.\n<!-- suggested-prompts\nA --> B\nRun tests\n--></group>",
     ] {
         assert_eq!(
             last_response_and_digest_from_blocks(&[text.to_owned()])
@@ -153,7 +157,30 @@ fn suggested_prompts_inline_mentions() {
     );
     let fused_mention =
         "Done.\n<!-- suggested-prompts\nExplain the <!-- suggested-prompts marker -->\nMore";
-    assert_eq!(clean_response_text(fused_mention), "Done.\n\nMore");
+    assert_eq!(clean_response_text(fused_mention), "Done.");
+}
+
+/// A broken opener before a valid block keeps the reply that follows the
+/// block: removing the block must not leave the broken opener unclosed and
+/// hide everything to the end (both spellings, reopened and inline).
+#[test]
+fn suggested_prompts_broken_opener_before_a_block_keeps_trailing_prose() {
+    for text in [
+        "Intro\n<!-- suggested-prompts\nOld\n<!-- suggested-prompts\nRun\n-->\nFinal answer.",
+        "Intro\n&lt;!-- suggested-prompts\nOld\n&lt;!-- suggested-prompts\nRun\n--&gt;\nFinal answer.",
+        "Intro\n<!-- suggested-prompts\nOld\n&lt;!-- suggested-prompts\nRun\n--&gt;\nFinal answer.",
+        "See <!-- suggested-prompts here.\nTail.\n<!-- suggested-prompts\nRun\n-->\nFinal answer.",
+        "See &lt;!-- suggested-prompts here.\nTail.\n&lt;!-- suggested-prompts\nRun\n--&gt;\nFinal answer.",
+        "See <!-- suggested-prompts here.\n<!-- suggested-prompts\nA --> B\nRun\n-->\nFinal answer.",
+    ] {
+        assert_eq!(
+            last_response_and_digest_from_blocks(&[text.to_owned()])
+                .0
+                .as_deref(),
+            Some("Final answer."),
+            "{text:?}"
+        );
+    }
 }
 
 /// Fences are not tracked: a persisted tail can start inside a code fence, and
@@ -168,4 +195,21 @@ fn suggested_prompts_fence_blind() {
         clean_response_text(fenced),
         "```\n\nBody text that must survive."
     );
+}
+
+/// Whatever a shared case expects of the desktop, the preview never shows
+/// block markup: no opener and no bare closer line survives cleaning.
+#[test]
+fn suggested_prompts_preview_never_shows_markup() {
+    for case in cases() {
+        let id = case["id"].as_str().expect("id");
+        let cleaned = clean_response_text(case["input"].as_str().expect("input"));
+        for line in cleaned.lines() {
+            let line = line.trim();
+            assert!(
+                !line.contains("suggested-prompts") && line != "-->" && line != "--&gt;",
+                "{id}: markup in preview {cleaned:?}"
+            );
+        }
+    }
 }

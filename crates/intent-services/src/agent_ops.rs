@@ -2177,58 +2177,85 @@ fn is_prompt_closer(line: &str, escaped: bool) -> bool {
     })
 }
 
-/// Remove well-formed suggested-prompts blocks line by line, in one pass over
-/// both spellings like the desktop's `scanSuggestedPrompts`: a block opens on a
-/// line ending in an opener and closes on a later closer line of the same
-/// spelling (alone, or fused with the final prompt), so an embedded arrow such
-/// as `A --> B` never ends it early. A later opener before any closer means
-/// the first was never closed; unclosed blocks are left for
-/// [`clean_response_text`]'s first-closer pass.
+/// Remove suggested-prompts markup in one pass over the original text, taking
+/// each opener of either spelling in order:
+/// - A block opener (a line ending in an opener, like the desktop's
+///   `scanSuggestedPrompts`) closes on a later closer line of the same
+///   spelling: the closer alone, or fused with the final prompt. An embedded
+///   arrow such as `A --> B` never ends it early.
+/// - A block reopened by another block opener before any closer is hidden up
+///   to that opener, which then starts its own block.
+/// - An unclosed block (still streaming, or cut off) hides the rest of the text.
+/// - Any other opener (an inline mention, or text after the opener on its
+///   line) keeps the old first-closer rule, but stops at the next block opener
+///   so it never swallows a later block or the reply after it.
 ///
+/// The preview errs on hiding: no prompt line or block markup reaches it.
 /// Code fences are deliberately not tracked: persisted previews keep only a
 /// text block's tail, which can start inside a fence and invert fence state.
 /// Shared cases: monorepo `docs/protocol/suggested-prompts.md`.
 fn strip_prompt_blocks(s: &str) -> String {
+    const INLINE: [(&str, &str, bool); 2] = [
+        ("<!-- suggested-prompts", "-->", false),
+        ("&lt;!-- suggested-prompts", "--&gt;", true),
+    ];
     if !s.contains("suggested-prompts") {
         return s.to_owned();
     }
     let mut lines = Vec::new();
-    let mut start = 0;
+    let mut offset = 0;
     for line in s.split('\n') {
-        lines.push((start, line));
-        start += line.len() + 1;
+        lines.push((offset, line));
+        offset += line.len() + 1;
     }
+    // Block openers in text order: (byte offset, line index, escaped).
+    let blocks: Vec<(usize, usize, bool)> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &(start, line))| {
+            prompt_opener_at(line).map(|(pos, escaped)| (start + pos, i, escaped))
+        })
+        .collect();
     let mut out = String::with_capacity(s.len());
-    let mut copied = 0;
-    let mut i = 0;
-    while i < lines.len() {
-        let (start, line) = lines[i];
-        let Some((pos, escaped)) = prompt_opener_at(line) else {
-            i += 1;
-            continue;
-        };
-        let end = lines[i + 1..]
+    let mut at = 0;
+    while at < s.len() {
+        let block = blocks.iter().position(|b| b.0 >= at);
+        let inline = INLINE
             .iter()
-            .enumerate()
-            .find_map(|(j, &(_, next))| {
-                if is_prompt_closer(next, escaped) {
-                    Some((i + 1 + j, true))
-                } else {
-                    prompt_opener_at(next).map(|_| (i + 1 + j, false))
-                }
-            });
-        match end {
-            Some((close, true)) => {
-                out.push_str(&s[copied..start + pos]);
-                copied = lines[close].0 + lines[close].1.len();
-                i = close + 1;
+            .filter_map(|&(marker, closer, _)| {
+                s[at..].find(marker).map(|i| (at + i, marker, closer))
+            })
+            .min_by_key(|m| m.0);
+        let next_block_after = |pos: usize| blocks.iter().find(|b| b.0 > pos).map(|b| b.0);
+        match (block, inline) {
+            (Some(b), inline) if inline.is_none_or(|m| blocks[b].0 <= m.0) => {
+                let (pos, line, escaped) = blocks[b];
+                out.push_str(&s[at..pos]);
+                let limit = blocks.get(b + 1).map_or(lines.len(), |next| next.1);
+                let close = (line + 1..limit).find(|&j| is_prompt_closer(lines[j].1, escaped));
+                at = match (close, blocks.get(b + 1)) {
+                    (Some(j), _) => lines[j].0 + lines[j].1.len(),
+                    (None, Some(next)) => next.0,
+                    (None, None) => s.len(),
+                };
             }
-            // Reopened: the first opener was never closed and stays.
-            Some((reopen, false)) => i = reopen,
-            None => break,
+            (_, Some((pos, marker, closer))) => {
+                out.push_str(&s[at..pos]);
+                let from = pos + marker.len();
+                let close = s[from..].find(closer).map(|j| from + j + closer.len());
+                at = match (close, next_block_after(pos)) {
+                    (Some(c), Some(next)) if next < c => next,
+                    (Some(c), _) => c,
+                    (None, Some(next)) => next,
+                    (None, None) => s.len(),
+                };
+            }
+            (_, None) => {
+                out.push_str(&s[at..]);
+                at = s.len();
+            }
         }
     }
-    out.push_str(&s[copied..]);
     out
 }
 
@@ -2255,18 +2282,14 @@ fn strip_group_tags(s: &str) -> String {
 
 /// Clean an assistant text block of digest/suggested-prompts/group markers,
 /// mirroring the TS `agent.list` cleaning before the last-line extraction.
-/// Well-formed prompts blocks go first ([`strip_prompt_blocks`]); anything left
-/// (inline mentions, unclosed or mismatched blocks) falls back to the
-/// first-closer rule, which hides to end-of-text when unclosed, so the preview
-/// never shows prompt lines or block markup. Both spellings: the HTML-escaped
-/// one is what a model can copy from an XML-escaped history replay (see
+/// Both prompts spellings ([`strip_prompt_blocks`]): the HTML-escaped one is
+/// what a model can copy from an XML-escaped history replay (see
 /// `history_xml::REPLAY_ESCAPING_NOTE`).
 fn clean_response_text(text: &str) -> String {
     let mut cleaned = strip_spans(text, "<agent_digest>", "</agent_digest>");
-    cleaned = strip_prompt_blocks(&cleaned);
-    cleaned = strip_spans(&cleaned, "<!-- suggested-prompts", "-->");
-    cleaned = strip_spans(&cleaned, "&lt;!-- suggested-prompts", "--&gt;");
+    // Group tags go first so one on an opener or closer line cannot break it.
     cleaned = strip_group_tags(&cleaned);
+    cleaned = strip_prompt_blocks(&cleaned);
     cleaned.trim().to_string()
 }
 
