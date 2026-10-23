@@ -61,17 +61,30 @@ pub(crate) type DisplayStatusCache = LastObservedCache<WorkspaceDisplayStatus>;
 /// Last-observed orthogonal `waiting` flag per workspace (PROTOCOL §5.1).
 pub(crate) type WaitingStatusCache = LastObservedCache<bool>;
 
-/// Per-workspace ordering gate for the `scriptsRunning` recompute: the
-/// registry read, baseline record, and `workspace:scriptsRunning-changed`
-/// publication run under it, so recomputes triggered by different scripts of
-/// one workspace (each holding only its own publication lock) cannot publish
-/// out of order. Different workspaces never contend.
+/// All `Workspace.scriptsRunning` recompute state, behind ONE `Arc` on
+/// `Services` (every extra `Services` field is copied into each future that
+/// captures a services clone, and deep agent-turn futures sit near the test
+/// thread's stack limit):
+///
+/// - `cache`: the last-observed value per workspace, the transition baseline
+///   for `workspace:scriptsRunning-changed`;
+/// - `locks`: the per-workspace ordering gate. The registry read, baseline
+///   record and publication run under it, so recomputes triggered by
+///   different scripts of one workspace (each holding only its own
+///   publication lock) cannot publish out of order. Different workspaces
+///   never contend;
+/// - `park` (tests only): see [`ScriptsRunningPark`].
 #[derive(Default)]
-pub(crate) struct ScriptsRunningLocks(Mutex<HashMap<WorkspaceId, Arc<tokio::sync::Mutex<()>>>>);
+pub(crate) struct ScriptsRunningState {
+    cache: WaitingStatusCache,
+    locks: Mutex<HashMap<WorkspaceId, Arc<tokio::sync::Mutex<()>>>>,
+    #[cfg(test)]
+    park: Mutex<Option<Arc<ScriptsRunningPark>>>,
+}
 
-impl ScriptsRunningLocks {
+impl ScriptsRunningState {
     fn lock_for(&self, workspace_id: &WorkspaceId) -> Arc<tokio::sync::Mutex<()>> {
-        self.0
+        self.locks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .entry(workspace_id.clone())
@@ -79,9 +92,11 @@ impl ScriptsRunningLocks {
             .clone()
     }
 
-    /// Drop a deleted workspace's gate; a holder keeps its own `Arc`.
+    /// Drop a deleted workspace's baseline and gate; a gate holder keeps its
+    /// own `Arc`.
     fn evict(&self, workspace_id: &WorkspaceId) {
-        self.0
+        self.cache.evict(workspace_id);
+        self.locks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(workspace_id);
@@ -323,9 +338,10 @@ impl Services {
         // `scriptsRunning` reads the in-memory script registry directly (no
         // store I/O), so the served value is always live; the read also seeds
         // the `workspace:scriptsRunning-changed` baseline.
-        let scripts_generation = self.last_scripts_running.generation();
+        let scripts_generation = self.scripts_running_state.cache.generation();
         ws.scripts_running = self.workspace_scripts_running(&ws.id);
-        self.last_scripts_running
+        self.scripts_running_state
+            .cache
             .seed(&ws.id, ws.scripts_running, scripts_generation);
         // Pre-read generation snapshot: a `workspace.delete` eviction racing
         // the awaits below must not have this seed resurrect the baseline.
@@ -622,8 +638,7 @@ impl Services {
     pub(crate) fn evict_display_status_baseline(&self, workspace_id: &WorkspaceId) {
         self.last_display_statuses.evict(workspace_id);
         self.last_waiting_statuses.evict(workspace_id);
-        self.last_scripts_running.evict(workspace_id);
-        self.scripts_running_locks.evict(workspace_id);
+        self.scripts_running_state.evict(workspace_id);
     }
 
     /// Whether the workspace owns an `active` script run monitor (§5.8a), one
@@ -668,12 +683,19 @@ impl Services {
         // read → record → publish sequence per workspace, and re-read the
         // registry after the store await below, so a recompute that observed
         // an older state can never publish (or record) it after a newer one.
-        let gate = self.scripts_running_locks.lock_for(workspace_id);
+        let gate = self.scripts_running_state.lock_for(workspace_id);
         let _serialized = gate.lock().await;
-        let generation = self.last_scripts_running.generation();
+        let generation = self.scripts_running_state.cache.generation();
         let running = self.workspace_scripts_running(workspace_id);
-        if self.last_scripts_running.get(workspace_id).unwrap_or(false) == running {
-            self.last_scripts_running
+        if self
+            .scripts_running_state
+            .cache
+            .get(workspace_id)
+            .unwrap_or(false)
+            == running
+        {
+            self.scripts_running_state
+                .cache
                 .seed(workspace_id, running, generation);
             return;
         }
@@ -685,10 +707,12 @@ impl Services {
             return;
         }
         let running = self.workspace_scripts_running(workspace_id);
-        self.last_scripts_running
+        self.scripts_running_state
+            .cache
             .seed(workspace_id, false, generation);
         let Some(transitioned) =
-            self.last_scripts_running
+            self.scripts_running_state
+                .cache
                 .record(workspace_id, running, generation)
         else {
             return;
@@ -707,7 +731,8 @@ impl Services {
     pub(crate) fn arm_scripts_running_park(&self) -> Arc<ScriptsRunningPark> {
         let park = Arc::new(ScriptsRunningPark::default());
         *self
-            .scripts_running_park
+            .scripts_running_state
+            .park
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(park.clone());
         park
@@ -716,7 +741,8 @@ impl Services {
     #[cfg(test)]
     async fn park_scripts_running_recompute(&self) {
         let park = self
-            .scripts_running_park
+            .scripts_running_state
+            .park
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
