@@ -647,7 +647,7 @@ client without the user's instruction.
 
 ## Add context, run a task, and find results
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/{WorkspaceLayout,MultiSelectTabbedSidebar,NoteMetadataBar}.svelte; src/lib/components/workspace/sidebar/{SidebarSectionTabs,WorkspaceSidebarRail,WorkspaceProgressCard,AddContextSection,ContextPanel,NotesPanel}.svelte; src/lib/utils/shortcut-bindings.ts; messages/en.json. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/{WorkspaceLayout,MultiSelectTabbedSidebar,NoteMetadataBar}.svelte; src/lib/components/workspace/sidebar/{SidebarSectionTabs,WorkspaceSidebarRail,WorkspaceProgressCard,AddContextSection,ContextPanel,NotesPanel}.svelte; src/store/renderer/slices/sidebar-nav/sagas/sidebar-section-navigation-saga.ts; src/lib/utils/shortcut-bindings.ts; messages/en.json. -->
 
 Use the icon tabs above the expanded sidebar's content panel to switch sections.
 Hover over an icon for its section name; scroll the row horizontally when space
@@ -657,8 +657,14 @@ When collapsed, the sidebar leaves a slim vertical icon rail. Hover over or focu
 a section tab to reveal just its content panel beside it, aligned with the tab
 when space allows. The panel fits its contents; longer sections scroll within the
 available space. Moving the pointer between tabs smoothly switches the preview
-without changing your remembered section; click a tab to keep that selection. The rail's
-sidebar toggle pins it open; the expanded sidebar's toggle collapses it.
+without changing your remembered section. Clicking a tab also opens its default
+content: **Agents** opens the main agent, **Context** the Spec, **Changes** the
+changes list, and **Files** a root README (otherwise the first root file, then a
+file inside a folder). **Browsers** opens the first browser in its list; **Shells**
+opens the first terminal, creating one when none exists. Keyboard focus in the
+expanded tab row opens the same defaults; in the collapsed rail, press Enter or
+Space to activate the previewed section. The rail's sidebar toggle pins it open;
+the expanded sidebar's toggle collapses it.
 **Toggle Sidebar** still uses
 **⌘B** on macOS or **Ctrl+B** on Windows/Linux by default.
 
