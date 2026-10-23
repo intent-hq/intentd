@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.38] - 2026-10-23
+
+### 🐛 Bug Fixes
+
+- *(agents)* Interrupt idle agents whose background workers a restart kills ([#2638](https://github.com/intent-hq/intentd/pull/2638))
+
+
 ## [0.11.37] - 2026-10-23
 
 ### 🚀 Features
