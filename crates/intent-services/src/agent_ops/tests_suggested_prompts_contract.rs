@@ -9,12 +9,10 @@
 //! with a well-formed block (`blockStripped`) apply, and only their `cleaned`
 //! text is compared.
 
-use std::fmt::Write as _;
-
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 
-use super::clean_response_text;
+use super::{clean_response_text, live_response_and_digest_from_blocks};
+use crate::attachment_upload::sha256_hex;
 
 const CASES: &str = include_str!("../../tests/fixtures/suggested-prompts/v1/cases.json");
 const LOCK: &str = include_str!("../../tests/fixtures/suggested-prompts.lock.json");
@@ -55,11 +53,7 @@ fn suggested_prompts_contract_copy_matches_its_lock() {
         lock["sourcePath"],
         "docs/protocol/fixtures/suggested-prompts/v1"
     );
-    let digest = Sha256::digest(CASES.as_bytes());
-    let hex = digest.iter().fold(String::new(), |mut hex, byte| {
-        let _ = write!(hex, "{byte:02x}");
-        hex
-    });
+    let hex = sha256_hex(CASES.as_bytes());
     assert_eq!(
         lock["casesSha256"].as_str(),
         Some(hex.as_str()),
@@ -87,7 +81,7 @@ fn suggested_prompts_contract_strips_every_well_formed_block() {
         checked += 1;
         let input = case["input"].as_str().expect("input");
         let want = expect["cleaned"].as_str().expect("cleaned");
-        let got = normalize(&clean_response_text(input));
+        let got = normalize(&clean_response_text(input, false));
         let reason = case["divergences"][CONSUMER].as_str();
         if let Some(reason) = reason.filter(|_| got == want) {
             failures.push(format!(
@@ -115,51 +109,77 @@ fn suggested_prompts_embedded_arrow_does_not_end_the_block() {
         "Done.\n\n<!-- suggested-prompts\nA --> B -->",
         "Done.\n\n&lt;!-- suggested-prompts\nA --&gt; B\n--&gt;",
         "Done.\r\n<!-- suggested-prompts\r\nA --> B\r\n-->",
+        "Done.\n<!--suggested-prompts\nRun tests\n-->",
+        "Done.\n<!--\tsuggested-prompts  \nRun tests\n-->",
     ] {
-        assert_eq!(clean_response_text(text), "Done.", "{text:?}");
+        assert_eq!(clean_response_text(text, false), "Done.", "{text:?}");
     }
 }
 
-/// An inline `opener … closer` span within one line is still removed, and an
-/// opener with no closer hides the rest of the text (a block still streaming).
+/// An inline `opener … closer` span is removed within its own line, and an
+/// inline mention never reaches past its line to a later block's closer.
 #[test]
-fn suggested_prompts_inline_span_keeps_the_first_closer_rule() {
+fn suggested_prompts_inline_mentions_stay_on_their_line() {
     assert_eq!(
-        clean_response_text("Write a <!-- suggested-prompts block --> at the end."),
+        clean_response_text(
+            "Write a <!-- suggested-prompts block --> at the end.",
+            false
+        ),
         "Write a  at the end."
     );
-    assert_eq!(
-        clean_response_text("Done.\n<!-- suggested-prompts\nRun"),
-        "Done."
-    );
-}
-
-/// An inline mention of the opener never reaches past its own line, so it
-/// cannot swallow text up to a later block's closer.
-#[test]
-fn suggested_prompts_inline_mention_does_not_swallow_later_text() {
     let text = "Updated the `<!-- suggested-prompts -->` parser.\nAll tests pass.\n\
                 <!-- suggested-prompts\nRun tests\n-->";
     assert_eq!(
-        clean_response_text(text),
+        clean_response_text(text, false),
         "Updated the `` parser.\nAll tests pass."
     );
     let unclosed_inline =
         "See <!-- suggested-prompts here.\nTail.\n<!-- suggested-prompts\nRun\n-->";
     assert_eq!(
-        clean_response_text(unclosed_inline),
+        clean_response_text(unclosed_inline, false),
         "See <!-- suggested-prompts here.\nTail."
+    );
+    let fused_mention =
+        "Done.\n<!-- suggested-prompts\nExplain the <!-- suggested-prompts marker -->\nMore";
+    assert_eq!(clean_response_text(fused_mention, false), "Done.\n\nMore");
+}
+
+/// A finished reply keeps an unclosed block's text (like the desktop); only a
+/// block still streaming hides the rest, so no prompt line leaks mid-turn.
+#[test]
+fn suggested_prompts_unclosed_block_hides_only_while_streaming() {
+    let text = "Done.\n<!-- suggested-prompts\nA --> B\nRun tests";
+    assert_eq!(clean_response_text(text, false), text);
+    assert_eq!(clean_response_text(text, true), "Done.");
+    let blocks = vec![format!("{text}\n")];
+    assert_eq!(
+        live_response_and_digest_from_blocks(&blocks, true)
+            .0
+            .as_deref(),
+        Some("Done.")
+    );
+    let fenced = "<!-- suggested-prompts\n\n```markdown\n-->\n```\n\nBody text that must survive.";
+    assert_eq!(
+        clean_response_text(fenced, false),
+        "```\n\nBody text that must survive."
     );
 }
 
-/// A block still streaming (no closer yet) hides the rest of the text, even
-/// when a body line has an embedded arrow, and a fenced example stays.
+/// The other spelling's opener before any closer means the first block was
+/// never closed: it stays, and the second block is removed.
 #[test]
-fn suggested_prompts_unclosed_block_and_fenced_example() {
+fn suggested_prompts_either_spelling_reopens() {
+    let text = "A\n<!-- suggested-prompts\nX\n&lt;!-- suggested-prompts\nRun\n--&gt;\nTail";
     assert_eq!(
-        clean_response_text("Done.\n<!-- suggested-prompts\nA --> B\nRun tests\n"),
-        "Done."
+        clean_response_text(text, false),
+        "A\n<!-- suggested-prompts\nX\n\nTail"
     );
-    let fenced = "Format:\n```\n<!-- suggested-prompts\nExample\n-->\n```\nEnd.";
-    assert_eq!(clean_response_text(fenced), fenced);
+}
+
+/// Persisted previews keep a block's tail, which can start inside a code
+/// fence: fences are not tracked, so the real block is still removed.
+#[test]
+fn suggested_prompts_block_after_a_cut_fence_is_removed() {
+    let tail = "x\n```\nDone.\n<!-- suggested-prompts\nRun tests\n-->";
+    assert_eq!(clean_response_text(tail, false), "x\n```\nDone.");
 }

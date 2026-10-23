@@ -2131,74 +2131,82 @@ fn text_blocks(content: &Value) -> Vec<String> {
         .collect()
 }
 
-/// Remove all `start..=end` delimited spans from `s` (inclusive of the markers).
-fn strip_spans(s: &str, start: &str, end: &str) -> String {
+/// Remove all `start..=end` delimited spans from `s` (inclusive of the
+/// markers). With `within_line`, a span must close on its own line and an
+/// unclosed one is kept; otherwise an unclosed span drops the rest of `s`.
+fn strip_spans(s: &str, start: &str, end: &str, within_line: bool) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
     while let Some(i) = rest.find(start) {
-        out.push_str(&rest[..i]);
         let after = &rest[i + start.len()..];
-        if let Some(j) = after.find(end) {
-            rest = &after[j + end.len()..];
+        let scope = if within_line {
+            after.split('\n').next().unwrap_or_default()
         } else {
-            rest = "";
-            break;
+            after
+        };
+        match scope.find(end) {
+            Some(j) => {
+                out.push_str(&rest[..i]);
+                rest = &after[j + end.len()..];
+            }
+            None if within_line => {
+                out.push_str(&rest[..i + start.len()]);
+                rest = after;
+            }
+            None => {
+                out.push_str(&rest[..i]);
+                rest = "";
+                break;
+            }
         }
     }
     out.push_str(rest);
     out
 }
 
-/// A fenced-code marker line (backtick or tilde, at most three spaces of
-/// indent): `(char, length, info)`.
-fn prompt_fence_marker(line: &str) -> Option<(char, usize, &str)> {
-    let body = line.trim_start_matches(' ');
-    if line.len() - body.len() > 3 {
-        return None;
-    }
-    let ch = body.chars().next().filter(|c| *c == '`' || *c == '~')?;
-    let len = body.len() - body.trim_start_matches(ch).len();
-    (len >= 3).then(|| (ch, len, &body[len..]))
+/// Opener of a suggested-prompts block that ends `line`, mirroring the
+/// desktop's `(<|&lt;)!--[ \t]*suggested-prompts[ \t]*$`: its byte offset and
+/// whether it is the HTML-escaped spelling.
+fn prompt_opener_at(line: &str) -> Option<(usize, bool)> {
+    let line = line.trim_end_matches([' ', '\t', '\r']);
+    [("<!--", false), ("&lt;!--", true)]
+        .into_iter()
+        .find_map(|(marker, escaped)| {
+            let pos = line.rfind(marker)?;
+            let rest = line[pos + marker.len()..].trim_start_matches([' ', '\t']);
+            (rest == "suggested-prompts").then_some((pos, escaped))
+        })
 }
 
-/// Fence state after a marker: any marker opens a fence; only a matching,
-/// at-least-as-long, bare marker closes it.
-fn next_prompt_fence(
-    fence: Option<(char, usize)>,
-    marker: (char, usize, &str),
-) -> Option<(char, usize)> {
-    match fence {
-        None => Some((marker.0, marker.1)),
-        Some((ch, len)) if marker.0 == ch && marker.1 >= len && marker.2.trim().is_empty() => None,
-        open => open,
-    }
-}
-
-/// Byte offset of an opener that ends its line (a block opener), if any.
-fn block_opener_at(line: &str, opener: &str) -> Option<usize> {
-    let pos = line.rfind(opener)?;
-    line[pos + opener.len()..].trim().is_empty().then_some(pos)
-}
-
-/// A closer line: `closer` alone, or ending a non-empty, non-opener remainder
-/// (the final prompt fused with the closer).
-fn is_prompt_closer(line: &str, opener: &str, closer: &str) -> bool {
-    if line.trim() == closer {
+/// A line that closes a block: the closer alone, or ending a final prompt
+/// whose text is not itself an opener (the desktop's fused-closer rule).
+fn is_prompt_closer(line: &str, escaped: bool) -> bool {
+    let closer = if escaped { "--&gt;" } else { "-->" };
+    let line = line.trim_end_matches([' ', '\t', '\r']);
+    if line.trim_start_matches([' ', '\t']) == closer {
         return true;
     }
-    line.strip_suffix(closer)
-        .is_some_and(|rest| !rest.trim().is_empty() && !rest.contains(opener))
+    line.strip_suffix(closer).is_some_and(|rest| {
+        let rest = rest.trim_end_matches([' ', '\t']);
+        !rest.trim().is_empty() && prompt_opener_at(rest).is_none()
+    })
 }
 
-/// Remove suggested-prompts blocks line by line, mirroring the desktop's
-/// `scanSuggestedPrompts`: a block opens on a line ending in `opener`
-/// outside a code fence and closes on a later `closer` line (alone or fused
-/// with the final prompt) outside a fence, so an embedded arrow such as
-/// `A --> B` never ends it early. Unlike the desktop this is a lossy preview
-/// cleaner: an opener with no closer hides the rest of the text (a block
-/// still streaming), and an inline `opener … closer` span within one line is
-/// removed. Shared cases: monorepo `docs/protocol/suggested-prompts.md`.
-fn strip_prompt_blocks(s: &str, opener: &str, closer: &str) -> String {
+/// Remove suggested-prompts blocks line by line, in one pass over both
+/// spellings like the desktop's `scanSuggestedPrompts`: a block opens on a
+/// line ending in an opener and closes on a later closer line of the same
+/// spelling (alone, or fused with the final prompt), so an embedded arrow such
+/// as `A --> B` never ends it early. A later opener before any closer means
+/// the first was never closed. An unclosed block stays visible unless
+/// `streaming` (the reply is still being written), when it hides the rest.
+///
+/// Code fences are deliberately not tracked: persisted previews keep only a
+/// text block's tail, which can start inside a fence and invert fence state.
+/// Shared cases: monorepo `docs/protocol/suggested-prompts.md`.
+fn strip_prompt_blocks(s: &str, streaming: bool) -> String {
+    if !s.contains("suggested-prompts") {
+        return s.to_owned();
+    }
     let mut lines = Vec::new();
     let mut start = 0;
     for line in s.split('\n') {
@@ -2207,88 +2215,41 @@ fn strip_prompt_blocks(s: &str, opener: &str, closer: &str) -> String {
     }
     let mut out = String::with_capacity(s.len());
     let mut copied = 0;
-    let mut fence = None;
     let mut i = 0;
     while i < lines.len() {
         let (start, line) = lines[i];
-        let text = line.trim_end_matches([' ', '\t', '\r']);
-        if let Some(marker) = prompt_fence_marker(text) {
-            fence = next_prompt_fence(fence, marker);
+        let Some((pos, escaped)) = prompt_opener_at(line) else {
             i += 1;
             continue;
-        }
-        if fence.is_some() || !text.contains(opener) {
-            i += 1;
-            continue;
-        }
-        let block = block_opener_at(text, opener);
-        let inline_end = block.unwrap_or(line.len());
-        out.push_str(&s[copied..start]);
-        out.push_str(&strip_spans_within(&line[..inline_end], opener, closer));
-        copied = start + inline_end;
-        if block.is_none() {
-            i += 1;
-            continue;
-        }
-        match prompt_block_end(&lines[i + 1..], opener, closer) {
-            PromptBlockEnd::Closed(j) => {
-                let (close_start, close_line) = lines[i + 1 + j];
-                copied = close_start + close_line.len();
-                i += j + 2;
+        };
+        let end = lines[i + 1..]
+            .iter()
+            .enumerate()
+            .find_map(|(j, &(_, next))| {
+                if is_prompt_closer(next, escaped) {
+                    Some((i + 1 + j, true))
+                } else {
+                    prompt_opener_at(next).map(|_| (i + 1 + j, false))
+                }
+            });
+        match end {
+            Some((close, true)) => {
+                out.push_str(&s[copied..start + pos]);
+                copied = lines[close].0 + lines[close].1.len();
+                i = close + 1;
             }
-            // The first opener was never closed and stays visible.
-            PromptBlockEnd::Reopened(j) => i += j + 1,
-            PromptBlockEnd::Unclosed => {
-                copied = s.len();
+            // Reopened: the first opener was never closed and stays.
+            Some((reopen, false)) => i = reopen,
+            None => {
+                if streaming {
+                    out.push_str(&s[copied..start + pos]);
+                    copied = s.len();
+                }
                 break;
             }
         }
     }
     out.push_str(&s[copied..]);
-    out
-}
-
-enum PromptBlockEnd {
-    /// Index (into the following lines) of the closer line.
-    Closed(usize),
-    /// Index of a later block opener reached before any closer.
-    Reopened(usize),
-    Unclosed,
-}
-
-/// Where a block opened just before `lines` ends, tracking fences.
-fn prompt_block_end(lines: &[(usize, &str)], opener: &str, closer: &str) -> PromptBlockEnd {
-    let mut fence = None;
-    for (j, &(_, line)) in lines.iter().enumerate() {
-        let text = line.trim_end_matches([' ', '\t', '\r']);
-        if let Some(marker) = prompt_fence_marker(text) {
-            fence = next_prompt_fence(fence, marker);
-            continue;
-        }
-        if fence.is_some() {
-            continue;
-        }
-        if is_prompt_closer(text, opener, closer) {
-            return PromptBlockEnd::Closed(j);
-        }
-        if block_opener_at(text, opener).is_some() {
-            return PromptBlockEnd::Reopened(j);
-        }
-    }
-    PromptBlockEnd::Unclosed
-}
-
-/// `strip_spans` bounded to one line: a span with no closer is kept.
-fn strip_spans_within(line: &str, opener: &str, closer: &str) -> String {
-    let mut out = String::with_capacity(line.len());
-    let mut rest = line;
-    while let Some(i) = rest.find(opener) {
-        let after = &rest[i + opener.len()..];
-        let Some(j) = after.find(closer) else { break };
-        out.push_str(&rest[..i]);
-        rest = &after[j + closer.len()..];
-    }
-    out.push_str(rest);
     out
 }
 
@@ -2315,12 +2276,15 @@ fn strip_group_tags(s: &str) -> String {
 
 /// Clean an assistant text block of digest/suggested-prompts/group markers,
 /// mirroring the TS `agent.list` cleaning before the last-line extraction.
-fn clean_response_text(text: &str) -> String {
-    let mut cleaned = strip_spans(text, "<agent_digest>", "</agent_digest>");
-    cleaned = strip_prompt_blocks(&cleaned, "<!-- suggested-prompts", "-->");
-    // The HTML-escaped spelling a model can copy from an XML-escaped history
-    // replay (see `history_xml::REPLAY_ESCAPING_NOTE`).
-    cleaned = strip_prompt_blocks(&cleaned, "&lt;!-- suggested-prompts", "--&gt;");
+/// `streaming` marks a block still being written (see [`strip_prompt_blocks`]).
+fn clean_response_text(text: &str, streaming: bool) -> String {
+    let mut cleaned = strip_spans(text, "<agent_digest>", "</agent_digest>", false);
+    cleaned = strip_prompt_blocks(&cleaned, streaming);
+    // Inline mentions of either spelling (the HTML-escaped one a model can
+    // copy from an XML-escaped history replay, see
+    // `history_xml::REPLAY_ESCAPING_NOTE`), removed only within their line.
+    cleaned = strip_spans(&cleaned, "<!-- suggested-prompts", "-->", true);
+    cleaned = strip_spans(&cleaned, "&lt;!-- suggested-prompts", "--&gt;", true);
     cleaned = strip_group_tags(&cleaned);
     cleaned.trim().to_string()
 }
@@ -2347,9 +2311,19 @@ pub(crate) fn last_response_and_digest(
 pub(crate) fn last_response_and_digest_from_blocks(
     blocks: &[String],
 ) -> (Option<String>, Option<String>) {
+    response_and_digest(blocks, false)
+}
+
+/// [`last_response_and_digest_from_blocks`] with `final_streaming` marking the
+/// last block as still being written, so an unclosed prompts block in it is
+/// hidden instead of shown.
+fn response_and_digest(
+    blocks: &[String],
+    final_streaming: bool,
+) -> (Option<String>, Option<String>) {
     let mut digest: Option<String> = None;
     let mut last_response: Option<String> = None;
-    for block in blocks {
+    for (index, block) in blocks.iter().enumerate() {
         let text = block.trim();
         if text.is_empty() {
             continue;
@@ -2359,7 +2333,7 @@ pub(crate) fn last_response_and_digest_from_blocks(
                 digest = Some(d.trim().to_string());
             }
         }
-        let cleaned = clean_response_text(text);
+        let cleaned = clean_response_text(text, final_streaming && index + 1 == blocks.len());
         if !cleaned.is_empty() {
             let line = cleaned.lines().rfind(|l| !l.trim().is_empty()).map_or_else(
                 || cleaned.chars().take(200).collect(),
@@ -2395,8 +2369,7 @@ pub(crate) fn live_response_and_digest_from_blocks(
         return last_response_and_digest_from_blocks(blocks);
     }
     let (_, digest) = last_response_and_digest_from_blocks(blocks);
-    let (last_response, _) =
-        last_response_and_digest_from_blocks(&clip_trailing_partial_line(blocks));
+    let (last_response, _) = response_and_digest(&clip_trailing_partial_line(blocks), true);
     (last_response, digest)
 }
 
