@@ -780,7 +780,7 @@ impl Services {
     /// common no-watch case costs no store read; otherwise this is one
     /// message-free session-summaries read. Best-effort: a store read
     /// failure is logged and fails open to `false` (mirrors
-    /// [`Services::workspace_has_active_hooks`]) so list/get emission is
+    /// [`Services::workspace_has_active_hooks_or_script_monitors`]) so list/get emission is
     /// never wedged and activity is never fabricated.
     pub(crate) async fn workspace_has_waiting_agent_subscriptions(
         &self,

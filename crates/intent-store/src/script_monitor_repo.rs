@@ -234,31 +234,6 @@ impl Store {
         tx.commit().await.map_err(db)
     }
 
-    /// Requested workspaces that own at least one `active` script monitor, in
-    /// one aggregate statement (the `Workspace.waiting` signal, §5.1). No
-    /// monitor rows are hydrated.
-    /// # Errors
-    /// Returns database errors.
-    pub async fn workspaces_with_active_script_monitors(
-        &self,
-        workspace_ids: &[WorkspaceId],
-    ) -> Result<std::collections::HashSet<WorkspaceId>> {
-        if workspace_ids.is_empty() {
-            return Ok(std::collections::HashSet::new());
-        }
-        let placeholders = vec!["?"; workspace_ids.len()].join(",");
-        let sql = format!(
-            "SELECT DISTINCT workspace_id FROM script_monitor WHERE state='active' \
-             AND workspace_id IN ({placeholders})"
-        );
-        let mut query = sqlx::query_scalar::<_, String>(&sql);
-        for id in workspace_ids {
-            query = query.bind(id.as_str());
-        }
-        let rows = query.fetch_all(self.read_pool()).await.map_err(db)?;
-        Ok(rows.into_iter().map(WorkspaceId).collect())
-    }
-
     /// Requested workspaces that own an active hook or an `active` script
     /// monitor — the two row-backed `Workspace.waiting` signals (§5.1) — in
     /// ONE statement, so `workspace.list` / `workspace.subscribe` keep their

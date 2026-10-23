@@ -490,11 +490,9 @@ impl Services {
     /// best-effort/fail-open like the probes it reuses (a store read
     /// failure reads `false`, never wedges list/get emission).
     pub(crate) async fn workspace_is_waiting(&self, workspace_id: &WorkspaceId) -> bool {
-        self.workspace_has_active_hooks(workspace_id).await
+        self.workspace_has_active_hooks_or_script_monitors(workspace_id)
+            .await
             || self.workspace_has_active_pr_monitors(workspace_id).await
-            || self
-                .workspace_has_active_script_monitors(workspace_id)
-                .await
             || self
                 .workspace_has_waiting_agent_subscriptions(workspace_id)
                 .await
@@ -641,16 +639,17 @@ impl Services {
         self.scripts_running_state.evict(workspace_id);
     }
 
-    /// Whether the workspace owns an `active` script run monitor (§5.8a), one
-    /// of the `waiting` signals. Fails open to `false` on a store error, like
-    /// the hook and PR-monitor probes.
-    pub(crate) async fn workspace_has_active_script_monitors(
+    /// Whether the workspace owns an active hook or an `active` script run
+    /// monitor (§5.8a) — two of the `waiting` signals, read in ONE statement
+    /// so `workspace.get` keeps its statement budget. Fails open to `false`
+    /// on a store error, like the PR-monitor probe.
+    pub(crate) async fn workspace_has_active_hooks_or_script_monitors(
         &self,
         workspace_id: &WorkspaceId,
     ) -> bool {
         match self
             .store
-            .workspaces_with_active_script_monitors(std::slice::from_ref(workspace_id))
+            .workspaces_with_active_hooks_or_script_monitors(std::slice::from_ref(workspace_id))
             .await
         {
             Ok(ids) => ids.contains(workspace_id),
@@ -658,7 +657,7 @@ impl Services {
                 tracing::warn!(
                     workspace = %workspace_id.0,
                     %error,
-                    "active-script-monitors waiting lookup failed; reads as none"
+                    "active hooks/script-monitors waiting lookup failed; reads as none"
                 );
                 false
             }

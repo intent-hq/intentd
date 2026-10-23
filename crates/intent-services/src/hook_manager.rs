@@ -1294,34 +1294,6 @@ impl Services {
         by_agent
     }
 
-    /// Whether the workspace owns any ACTIVE (`scheduled`/`running`) hook —
-    /// a `Workspace.waiting` signal (§5.1, via
-    /// [`Services::workspace_is_waiting`]): an idle agent still watching via
-    /// a background hook reads as waiting, without promoting the
-    /// `displayStatus` rollup. SQL-side count-only aggregate — no row
-    /// hydration and no dependence on how many terminal rows the workspace
-    /// accumulated. Best-effort: a store read failure is logged
-    /// and fails open to `false` (mirrors
-    /// [`Services::workspace_attention_signals`]) so list/get emission is
-    /// never wedged and activity is never fabricated.
-    pub(crate) async fn workspace_has_active_hooks(&self, workspace_id: &WorkspaceId) -> bool {
-        match self
-            .store
-            .count_active_hooks_by_workspace(workspace_id)
-            .await
-        {
-            Ok(n) => n > 0,
-            Err(e) => {
-                tracing::warn!(
-                    workspace = %workspace_id.0,
-                    error = %e,
-                    "active-hooks displayStatus lookup failed; reads as none"
-                );
-                false
-            }
-        }
-    }
-
     /// Stamp `waitingOnHooks` onto an `agent:idle`-style event `data` object
     /// when `agent_id` owns at least one active hook (the field is omitted —
     /// never `[]` — otherwise, and an existing stamp is left untouched).
@@ -5504,7 +5476,7 @@ mod tests {
     #[tokio::test]
     async fn active_hook_sets_waiting_without_promoting_display_status() {
         let (_tmp, _root, svc, ws, owner) = setup().await;
-        assert!(!svc.workspace_has_active_hooks(&ws).await);
+        assert!(!svc.workspace_has_active_hooks_or_script_monitors(&ws).await);
         let out = svc
             .hook_schedule_op(
                 &ws,
@@ -5518,7 +5490,7 @@ mod tests {
             .await
             .expect("schedule");
         let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
-        assert!(svc.workspace_has_active_hooks(&ws).await);
+        assert!(svc.workspace_has_active_hooks_or_script_monitors(&ws).await);
         let mut row = svc.store().get_workspace(&ws).await.unwrap();
         svc.enrich_workspace_aggregates(&mut row).await;
         assert!(
@@ -5535,7 +5507,7 @@ mod tests {
         svc.hook_cancel_op(&ws, &hook.hook_id, Some(&owner))
             .await
             .expect("cancel");
-        assert!(!svc.workspace_has_active_hooks(&ws).await);
+        assert!(!svc.workspace_has_active_hooks_or_script_monitors(&ws).await);
         let mut row = svc.store().get_workspace(&ws).await.unwrap();
         svc.enrich_workspace_aggregates(&mut row).await;
         assert!(!row.waiting, "terminal hooks never read waiting");
