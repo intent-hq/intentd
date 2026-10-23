@@ -36360,6 +36360,20 @@ impl Services {
         id: WorkspaceId,
         auto_unarchive: Option<serde_json::Value>,
     ) -> Result<(Workspace, Option<UnarchiveOutcome>)> {
+        self.unarchive_workspace_inner_fenced(id, auto_unarchive, None)
+            .await
+    }
+
+    /// [`Services::unarchive_workspace_inner`] with an optional archive
+    /// fence the caller already holds (the turn-start path takes it before
+    /// claiming its slot — see [`Services::turn_start_archive_fence`]); the
+    /// flip then runs under that hold instead of re-acquiring the fence.
+    async fn unarchive_workspace_inner_fenced(
+        &self,
+        id: WorkspaceId,
+        auto_unarchive: Option<serde_json::Value>,
+        held_fence: Option<ArchiveFenceGuard>,
+    ) -> Result<(Workspace, Option<UnarchiveOutcome>)> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         let manager = self.agent_manager();
@@ -36381,7 +36395,10 @@ impl Services {
         // a fresh blank checkout on a new branch, provisioned under the same
         // fence so the retire folder sweep can never delete it.
         let (flipped, revived) = {
-            let _fence = self.archive_fence.acquire(&id).await;
+            let _fence = match held_fence {
+                Some(fence) => fence,
+                None => self.archive_fence.acquire(&id).await,
+            };
             let current = store.get_workspace(&id).await?;
             if current.is_retired() {
                 let revived = self.revive_retired_checkout(&current).await?;
@@ -36517,10 +36534,48 @@ impl Services {
     /// unarchive's drain kick re-enters `try_begin` (bounded at runtime —
     /// the row is Active by then, so the re-entrant read short-circuits —
     /// but the inferred future type would be infinite).
+    #[cfg(test)]
     pub(crate) fn auto_unarchive_on_turn_start<'a>(
         &'a self,
         workspace_id: &'a WorkspaceId,
         agent_id: &'a AgentId,
+    ) -> BoxFuture<'a, Option<UnarchiveOutcome>> {
+        self.auto_unarchive_on_turn_start_fenced(workspace_id, agent_id, None)
+    }
+
+    /// The archive fence a turn start takes BEFORE claiming its slot when
+    /// the workspace is Archived (or Retired), held through the claim and
+    /// the auto-unarchive / revive flip
+    /// ([`Services::auto_unarchive_on_turn_start_fenced`]). Retirement holds
+    /// the same fence from its Retired flip through its whole teardown —
+    /// including `stop_many`, which releases in-flight slots — so a turn
+    /// claimed before that fence would have its admission silently cleared
+    /// by the stop and its revive notice and prompt lost. Taking the fence
+    /// first orders the claim strictly after any retirement teardown, and
+    /// no retirement can start between the claim and the revive. Lock order
+    /// is turn-start gate → archive fence; nothing holding the fence takes a
+    /// turn-start gate. `None` for chief, an Active row, or a read failure
+    /// (the turn proceeds unfenced exactly as before).
+    pub(crate) async fn turn_start_archive_fence(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Option<ArchiveFenceGuard> {
+        if workspace_id.is_chief() {
+            return None;
+        }
+        match self.store.get_workspace(workspace_id).await {
+            Ok(ws) if ws.archived => Some(self.archive_fence.acquire(workspace_id).await),
+            _ => None,
+        }
+    }
+
+    /// `Services::auto_unarchive_on_turn_start` under an archive fence the
+    /// caller may already hold ([`Services::turn_start_archive_fence`]).
+    pub(crate) fn auto_unarchive_on_turn_start_fenced<'a>(
+        &'a self,
+        workspace_id: &'a WorkspaceId,
+        agent_id: &'a AgentId,
+        held_fence: Option<ArchiveFenceGuard>,
     ) -> BoxFuture<'a, Option<UnarchiveOutcome>> {
         Box::pin(async move {
             if workspace_id.is_chief() {
@@ -36554,7 +36609,7 @@ impl Services {
                 "agentName": agent_name,
             });
             match self
-                .unarchive_workspace_inner(workspace_id.clone(), Some(stamp))
+                .unarchive_workspace_inner_fenced(workspace_id.clone(), Some(stamp), held_fence)
                 .await
             {
                 Ok((_, outcome)) => {

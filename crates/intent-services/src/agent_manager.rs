@@ -7171,11 +7171,19 @@ impl AgentManager {
     ) -> TryBeginOutcome {
         let gate = self.turn_start_gates.for_agent(agent_id);
         let _starting = gate.lock().await;
+        // Archived / Retired workspace: take the archive fence BEFORE the
+        // claim so a retirement teardown (whose `stop_many` releases slots)
+        // can neither clear this admission nor interleave before the revive.
+        let fence = if auto_unarchive {
+            self.services.turn_start_archive_fence(workspace_id).await
+        } else {
+            None
+        };
         match self.claim_slot_sync(agent_id, workspace_id, || {
             Ok::<(), std::convert::Infallible>(())
         }) {
             Ok(((), admission)) => {
-                self.begin_turn_side_effects(agent_id, workspace_id, auto_unarchive)
+                self.begin_turn_side_effects(agent_id, workspace_id, auto_unarchive, fence)
                     .await;
                 TryBeginOutcome::Started(admission)
             }
@@ -7205,6 +7213,7 @@ impl AgentManager {
     ) -> Option<((QueuedMessage, DrainingGuard), TurnAdmission)> {
         let gate = self.turn_start_gates.for_agent(agent_id);
         let _starting = gate.lock().await;
+        let fence = self.services.turn_start_archive_fence(workspace_id).await;
         let claimed = self.claim_slot_sync(agent_id, workspace_id, || {
             match self.services.claim_parked_recovery_send(agent_id) {
                 RecoverySendClaim::Drained(popped) => Ok(*popped),
@@ -7214,7 +7223,7 @@ impl AgentManager {
         });
         match claimed {
             Ok(popped) => {
-                self.begin_turn_side_effects(agent_id, workspace_id, true)
+                self.begin_turn_side_effects(agent_id, workspace_id, true, fence)
                     .await;
                 Some(popped)
             }
@@ -7357,6 +7366,7 @@ impl AgentManager {
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
         auto_unarchive: bool,
+        archive_fence: Option<crate::ArchiveFenceGuard>,
     ) {
         #[cfg(test)]
         {
@@ -7379,9 +7389,10 @@ impl AgentManager {
             // re-check parks instead of un-archiving (monorepo#2513).
             let outcome = if auto_unarchive {
                 self.services
-                    .auto_unarchive_on_turn_start(workspace_id, agent_id)
+                    .auto_unarchive_on_turn_start_fenced(workspace_id, agent_id, archive_fence)
                     .await
             } else {
+                drop(archive_fence);
                 None
             };
             // The flip actually persisted: record the system transcript row
