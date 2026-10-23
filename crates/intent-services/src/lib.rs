@@ -740,6 +740,11 @@ pub struct Services {
     /// One bounded-backoff owner per child deferred by a pending script wake
     /// or an unreadable outbox. Generations prevent losing a racing deferral.
     pending_completion_retries: Arc<Mutex<HashMap<AgentId, u64>>>,
+    /// The monitor `ws.script.start` armed by default, per (workspace,
+    /// script). An explicit `ws.script.monitor` by the same owner replaces it
+    /// so the agent's own TTL / output pattern apply. In-memory: after a
+    /// restart the default monitor simply behaves like an explicit one.
+    auto_start_monitors: Arc<Mutex<HashMap<(WorkspaceId, String), String>>>,
     /// Delegation-group ids with an active aggregated-wake retry task.
     completion_group_delivery_retries: Arc<Mutex<HashSet<String>>>,
     /// Per-agent consecutive-identical-terminal-failure streak (monorepo#840):
@@ -1702,6 +1707,7 @@ impl Services {
             provider_preparation: Arc::default(),
             completion_delivery_retries: Arc::new(Mutex::new(HashMap::new())),
             pending_completion_retries: Arc::new(Mutex::new(HashMap::new())),
+            auto_start_monitors: Arc::new(Mutex::new(HashMap::new())),
             completion_group_delivery_retries: Arc::new(Mutex::new(HashSet::new())),
             agent_failure_streaks: Arc::new(Mutex::new(HashMap::new())),
             pending_terminal_error: Arc::new(Mutex::new(HashMap::new())),
@@ -21155,6 +21161,8 @@ impl WorkspaceApi for Services {
             let _archive = self.archive_fence.acquire(&workspace_id).await;
             let retirement = self.agent_retirement_gates.for_agent(&agent_id);
             let _retirement = retirement.lock().await;
+            self.replace_auto_start_monitor(&workspace_id, &agent_id, &script_id)
+                .await?;
             self.script_manager()
                 .monitor(&workspace_id, &agent_id, &script_id, options)
                 .await
@@ -21218,13 +21226,28 @@ impl WorkspaceApi for Services {
                 Some(def) if def.mode == intent_core::ScriptMode::Command => {}
                 _ => return Ok(serde_json::Value::Null),
             }
-            self.script_monitor(
-                workspace_id,
-                agent_id,
-                script_id,
-                serde_json::json!({"ttlMs": script_ops::AUTO_START_MONITOR_TTL_MS, "runId": run_id}),
-            )
-            .await
+            let existing = self
+                .active_script_monitor_ids(&workspace_id, &script_id)
+                .await?;
+            let reply = self
+                .script_monitor(
+                    workspace_id.clone(),
+                    agent_id,
+                    script_id.clone(),
+                    serde_json::json!({"ttlMs": script_ops::AUTO_START_MONITOR_TTL_MS, "runId": run_id}),
+                )
+                .await?;
+            // Remember only a monitor this call created: one the agent armed
+            // itself (or another owner's) must never be replaced later.
+            if let Some(id) = reply["monitor"]["monitorId"].as_str() {
+                if reply["ok"] == true && !existing.iter().any(|e| e == id) {
+                    self.auto_start_monitors
+                        .lock()
+                        .unwrap()
+                        .insert((workspace_id, script_id), id.to_owned());
+                }
+            }
+            Ok(reply)
         })
     }
 
