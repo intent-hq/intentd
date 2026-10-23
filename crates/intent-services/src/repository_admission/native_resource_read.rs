@@ -26,7 +26,7 @@ use intent_store::{RepositoryAuthoritySnapshot, RepositoryLifecycleKey};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 
-use super::{acquire_wait, frame_ttl, Connection, Services};
+use super::{acquire_wait, frame_ttl, request_wait, Connection, Services};
 use crate::observation_adapter::ConnectionObservations;
 use crate::pr_monitor::qualified_cache::{
     CacheAdmissionGuard, CacheDelivery, CacheError, CacheFailure, CacheRequest, ManagedCacheRequest,
@@ -65,7 +65,12 @@ pub(crate) mod scoped;
 
 const LIMIT: usize = 64;
 const TTL: Duration = Duration::from_secs(300);
-const READ: Duration = Duration::from_secs(10);
+const READ_BASE: Duration = Duration::from_secs(10);
+/// Bound on one native resource read; stretched in unit tests like every
+/// native request wait.
+fn read_limit() -> Duration {
+    request_wait(READ_BASE)
+}
 
 fn unavailable() -> Error {
     Error::Forbidden("Repository resource read unavailable".into())
@@ -1009,7 +1014,7 @@ async fn detail_inner(
         biased;
         ()=stop.native_cancelled()=>Err(unavailable()),
         ()=lease_stop.native_cancelled()=>Err(unavailable()),
-        result=tokio::time::timeout(READ,read_inner(r,&lease,target,refresh))=>result.map_err(denied)?,
+        result=tokio::time::timeout(read_limit(),read_inner(r,&lease,target,refresh))=>result.map_err(denied)?,
     }
 }
 
@@ -1059,7 +1064,7 @@ async fn read_inner(
         directory.clone(),
         first,
         reader.clone(),
-        READ,
+        read_limit(),
         target.clone(),
     )
     .map_err(denied)?;
@@ -1067,7 +1072,7 @@ async fn read_inner(
         directory.clone(),
         admit().map_err(denied)?,
         reader,
-        READ,
+        read_limit(),
         target.clone(),
     )
     .map_err(denied)?;

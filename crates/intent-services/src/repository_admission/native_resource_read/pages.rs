@@ -13,13 +13,13 @@ use intent_sourcecontrol::{
 };
 
 use super::{
-    credentials, cursors, denied, entry, failure, observations, unavailable, valid_repository,
-    valid_target, validate_resource_url, Arc, AtomicBool, BoxFuture, CacheAdmissionGuard,
-    CacheDelivery, CacheError, CacheFailure, CacheRequest, Frame, Lease, ManagedCacheRequest,
-    Mutex, Ordering, Quota, ReadAuthority, RepositoryAuthorityRequest, RepositoryCollectionTarget,
-    RepositoryCredentialTransport, RepositoryCredentialUse, RepositoryReadEligibility,
-    RepositoryReadOperation, RepositoryResourceKind, RepositoryResponseAttribution, Request,
-    Result, ReviewTarget, Services, State, READ,
+    credentials, cursors, denied, entry, failure, observations, read_limit, unavailable,
+    valid_repository, valid_target, validate_resource_url, Arc, AtomicBool, BoxFuture,
+    CacheAdmissionGuard, CacheDelivery, CacheError, CacheFailure, CacheRequest, Frame, Lease,
+    ManagedCacheRequest, Mutex, Ordering, Quota, ReadAuthority, RepositoryAuthorityRequest,
+    RepositoryCollectionTarget, RepositoryCredentialTransport, RepositoryCredentialUse,
+    RepositoryReadEligibility, RepositoryReadOperation, RepositoryResourceKind,
+    RepositoryResponseAttribution, Request, Result, ReviewTarget, Services, State,
 };
 use crate::pr_monitor::qualified_cache::{summaries, CacheDenialObserver};
 use crate::repository_credentials::read::{
@@ -49,7 +49,7 @@ pub(crate) fn list(
                 biased;
                 ()=stop.native_cancelled()=>Err(unavailable()),
                 ()=lease_stop.native_cancelled()=>Err(unavailable()),
-                value=tokio::time::timeout(READ, list_inner(&r, &lease, q))=>value.map_err(denied)?,
+                value=tokio::time::timeout(read_limit(), list_inner(&r, &lease, q))=>value.map_err(denied)?,
             }
         })
     })
@@ -230,7 +230,7 @@ async fn list_inner(
         c.services
             .gitlab_repository_secret_reader()
             .map_err(denied)?,
-        READ,
+        read_limit(),
         query,
     )
     .map_err(denied)?;
@@ -467,7 +467,7 @@ pub(crate) fn discussions(
                 biased;
                 ()=stop.native_cancelled()=>Err(unavailable()),
                 ()=lease_stop.native_cancelled()=>Err(unavailable()),
-                value=tokio::time::timeout(READ,discussions_inner(&r,&lease,q))=>value.map_err(denied)?,
+                value=tokio::time::timeout(read_limit(),discussions_inner(&r,&lease,q))=>value.map_err(denied)?,
             }
         })
     })
@@ -500,7 +500,7 @@ async fn discussions_inner(
         c.services
             .gitlab_repository_secret_reader()
             .map_err(denied)?,
-        READ,
+        read_limit(),
         q.target.clone(),
     )
     .map_err(denied)?;

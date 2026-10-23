@@ -64,7 +64,7 @@ const NOTICE_LIMIT: usize = 64;
 const READ_LIMIT: usize = 64;
 const WORKER_LIMIT: usize = 2;
 const LEASE_TTL: Duration = Duration::from_secs(300);
-const READ_TIMEOUT: Duration = Duration::from_secs(10);
+const READ_TIMEOUT_BASE: Duration = Duration::from_secs(10);
 /// Production bound on acquiring a native request's source, credentials or
 /// authority. Read it through [`acquire_wait`].
 const ACQUIRE_BASE: Duration = Duration::from_secs(5);
@@ -72,8 +72,8 @@ const ACQUIRE_BASE: Duration = Duration::from_secs(5);
 /// [`frame_ttl`].
 const FRAME_TTL_BASE: Duration = Duration::from_secs(15);
 
-/// How long a native wire, review, resource-read, child-git or selection
-/// request may wait to acquire what it needs before it is refused.
+/// How long a native wire, review, resource-read or selection request may
+/// wait to acquire what it needs before it is refused.
 fn acquire_wait() -> Duration {
     request_wait(ACQUIRE_BASE)
 }
@@ -81,12 +81,25 @@ fn acquire_wait() -> Duration {
 fn frame_ttl() -> Duration {
     request_wait(FRAME_TTL_BASE)
 }
+/// Bound on one native context read once its lease is held.
+fn read_timeout() -> Duration {
+    request_wait(READ_TIMEOUT_BASE)
+}
 /// Production keeps the fixed bounds.
 #[cfg(not(test))]
 const fn request_wait(base: Duration) -> Duration {
     base
 }
-/// Unit tests stretch the bounds with `INTENTD_TEST_TIMEOUT_MULTIPLIER`, as
+// Every non-test build (the daemon, and `repository-test-fixtures` e2e builds)
+// keeps the fixed bounds; checked at compile time, where no test can reach.
+#[cfg(not(test))]
+const _: () = assert!(
+    request_wait(ACQUIRE_BASE).as_nanos() == 5_000_000_000
+        && request_wait(READ_TIMEOUT_BASE).as_nanos() == 10_000_000_000
+        && request_wait(FRAME_TTL_BASE).as_nanos() == 15_000_000_000
+);
+/// Unit tests stretch the bounds (and every module's other request limits,
+/// so their production order holds) with `INTENTD_TEST_TIMEOUT_MULTIPLIER`, as
 /// every test budget does: coverage CI runs these real Git/SQLite workers on
 /// oversubscribed runners, where a fixed 5s acquire refused a prepare as
 /// "Repository review unavailable" (intentd#2581). The setting is read once
@@ -1112,7 +1125,7 @@ pub(crate) fn read(
         let request = request.map_err(|_| unavailable())?;
         let lease = find_lease(&request, &query).map_err(|_| unavailable())?;
         *request.state.lock().map_err(|_| unavailable())? = RequestState::Reading(lease.clone());
-        let result = tokio::time::timeout(READ_TIMEOUT, read_inner(&request, &lease))
+        let result = tokio::time::timeout(read_timeout(), read_inner(&request, &lease))
             .await
             .map_err(|_| AdmissionError::Unavailable)
             .and_then(|r| r);
@@ -1396,7 +1409,7 @@ impl Request {
         observed: Option<&Arc<Observation>>,
         transfer: &mut (dyn FnMut() -> Result<()> + Send),
     ) -> Result<()> {
-        let result = tokio::time::timeout(READ_TIMEOUT, async {
+        let result = tokio::time::timeout(read_timeout(), async {
             let _credential = self.connection.caller.legacy_lease().await?;
             validate(self, lease).await?;
             let locks = if let Some(original) = observed {
