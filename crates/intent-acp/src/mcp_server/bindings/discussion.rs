@@ -102,6 +102,14 @@ pub(crate) async fn dispatch(
                             req_str(args, "messageId")?,
                             req_str(args, "body")?,
                             intent_core::discussion::DiscussionTarget {
+                                principal_mentions: args
+                                    .get("principalMentions")
+                                    .map(|v| {
+                                        serde_json::from_value(v.clone())
+                                            .map_err(|_| "invalid principalMentions".to_string())
+                                    })
+                                    .transpose()?
+                                    .unwrap_or_default(),
                                 conversation_id: Some(req_str(args, "conversationId")?),
                                 recipient_agent_ids: recipients,
                                 agent_mentions: args
@@ -208,6 +216,15 @@ mod tests {
                     vec![AgentId::from("agent-target")]
                 );
                 assert_eq!(target.recipient_principal_ids, None);
+                if !target.principal_mentions.is_empty() {
+                    assert_eq!(
+                        serde_json::to_value(&target.principal_mentions).unwrap(),
+                        json!([{"principalId":"human","name":"Bob","start":0,"end":4}])
+                    );
+                    return Err(Error::Forbidden(
+                        "human mentions reached service gate".into(),
+                    ));
+                }
                 Err(Error::NotFound("binding reached".into()))
             })
         }
@@ -231,6 +248,20 @@ mod tests {
             .await
             .unwrap_err()
             .contains("binding reached"));
+        let mut person = args.clone();
+        person["principalMentions"] =
+            json!([{"principalId":"human","name":"Bob","start":0,"end":4}]);
+        assert!(dispatch(&api, &ws, Some(&agent), "send", &person)
+            .await
+            .unwrap_err()
+            .contains("human mentions reached service gate"));
+        for invalid in [Value::Null, json!({}), json!([{"principalId":"human"}])] {
+            person["principalMentions"] = invalid;
+            assert!(dispatch(&api, &ws, Some(&agent), "send", &person)
+                .await
+                .unwrap_err()
+                .contains("invalid principalMentions"));
+        }
         let mut react = json!({"conversationId":"default","messageId":"server-message","reaction":"👀","active":true,"workspaceId":"forged","agentId":"forged","principalId":"forged","author":{"agentId":"forged"}});
         assert_eq!(
             dispatch(&api, &ws, Some(&agent), "react", &react)

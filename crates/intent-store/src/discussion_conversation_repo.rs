@@ -206,7 +206,11 @@ impl Store {
                 "agent messaging is available only in the workspace discussion".into(),
             ));
         }
+        if agent_id.is_some() && !target.principal_mentions.is_empty() {
+            return Err(Error::Forbidden("only humans may mention people".into()));
+        }
         intent_core::discussion::validate_agent_mentions(body, target)?;
+        intent_core::discussion::validate_principal_mentions(body, target)?;
         let mut recipients = target.recipient_agent_ids.clone();
         recipients.sort();
         if recipients.len() > intent_core::discussion::DISCUSSION_RECIPIENT_MAX
@@ -261,7 +265,8 @@ impl Store {
                     .unwrap_or(DEFAULT_CONVERSATION)
                     == message.conversation_id
             };
-            if message.agent_mentions != target.agent_mentions
+            if message.principal_mentions != target.principal_mentions
+                || message.agent_mentions != target.agent_mentions
                 || message.recipient_agent_ids != recipients
                 || message.body != body
                 || !same_target
@@ -277,6 +282,7 @@ impl Store {
                     return Err(missing());
                 }
             }
+            validate_principal_recipients(&mut tx, ws, &message.conversation_id, target).await?;
             tx.commit().await.map_err(|e| db(&e))?;
             return Ok((
                 DiscussionSendResult {
@@ -331,6 +337,7 @@ impl Store {
             }
             read_conversation(&mut tx, ws, id).await?
         };
+        validate_principal_recipients(&mut tx, ws, &conversation.id, target).await?;
         let reply = if let Some(reply_id) = &target.reply_to_message_id {
             let row = sqlx::query("SELECT * FROM workspace_discussion_message WHERE workspace_id=? AND conversation_id=? AND id=?")
                 .bind(ws.as_str()).bind(&conversation.id).bind(reply_id).fetch_optional(&mut *tx).await.map_err(|e|db(&e))?.ok_or_else(missing)?;
@@ -348,10 +355,11 @@ impl Store {
         };
         let id = uuid::Uuid::now_v7().to_string();
         sqlx::query("INSERT INTO workspace_discussion_message(id,workspace_id,conversation_id,sequence,principal_id,client_message_id,body,author_json,created_at,reply_to_message_id,reply_to_json) VALUES(?,?,?,(SELECT COALESCE(MAX(sequence),0)+1 FROM workspace_discussion_message WHERE workspace_id=? AND conversation_id=?),?,?,?,?,?,?,?)").bind(&id).bind(ws.as_str()).bind(&conversation.id).bind(ws.as_str()).bind(&conversation.id).bind(principal_id.map(PrincipalId::as_str)).bind(key).bind(body).bind(serde_json::to_string(author).map_err(|e|Error::Internal(e.to_string()))?).bind(now_iso()).bind(&target.reply_to_message_id).bind(reply).execute(&mut *tx).await.map_err(|e|db(&e))?;
-        sqlx::query("UPDATE workspace_discussion_message SET agent_id=?,recipient_agent_ids_json=?,agent_mentions_json=? WHERE id=?")
+        sqlx::query("UPDATE workspace_discussion_message SET agent_id=?,recipient_agent_ids_json=?,agent_mentions_json=?,principal_mentions_json=? WHERE id=?")
             .bind(agent_id.map(intent_core::AgentId::as_str))
             .bind(serde_json::to_string(&recipients).map_err(|e| Error::Internal(e.to_string()))?)
-            .bind(serde_json::to_string(&target.agent_mentions).map_err(|e| Error::Internal(e.to_string()))?).bind(&id).execute(&mut *tx).await.map_err(|e| db(&e))?;
+            .bind(serde_json::to_string(&target.agent_mentions).map_err(|e| Error::Internal(e.to_string()))?)
+            .bind(serde_json::to_string(&target.principal_mentions).map_err(|e| Error::Internal(e.to_string()))?).bind(&id).execute(&mut *tx).await.map_err(|e| db(&e))?;
         for recipient in &recipients {
             super::discussion_activity_repo::insert(&mut tx, &id, recipient, &now_iso()).await?;
             sqlx::query("INSERT OR IGNORE INTO discussion_agent_grant(workspace_id,conversation_id,agent_id) VALUES(?,?,?)")
@@ -377,4 +385,36 @@ impl Store {
             true,
         ))
     }
+}
+
+/// One bounded query checks live membership and participation, including on retries.
+async fn validate_principal_recipients(
+    conn: &mut SqliteConnection,
+    ws: &WorkspaceId,
+    conversation_id: &str,
+    target: &DiscussionTarget,
+) -> Result<()> {
+    if target.principal_mentions.is_empty() {
+        return Ok(());
+    }
+    let ids: std::collections::HashSet<_> = target
+        .principal_mentions
+        .iter()
+        .map(|m| &m.principal_id)
+        .collect();
+    let sql = format!("SELECT COUNT(*) FROM principal p WHERE p.id IN (SELECT value FROM json_each(?)) AND {ELIGIBLE} AND (?='default' OR EXISTS(SELECT 1 FROM discussion_participant d WHERE d.workspace_id=? AND d.conversation_id=? AND d.principal_id=p.id))");
+    let count: i64 = sqlx::query_scalar(&sql)
+        .bind(serde_json::to_string(&ids).map_err(|e| Error::Internal(e.to_string()))?)
+        .bind(ws.as_str())
+        .bind(ws.as_str())
+        .bind(conversation_id)
+        .bind(ws.as_str())
+        .bind(conversation_id)
+        .fetch_one(conn)
+        .await
+        .map_err(|e| db(&e))?;
+    if count != i64::try_from(ids.len()).map_err(|e| Error::Internal(e.to_string()))? {
+        return Err(missing());
+    }
+    Ok(())
 }

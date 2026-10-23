@@ -700,7 +700,11 @@ impl Store {
                         query,
                         table,
                         key,
-                        if *table == "workspace_discussion_message" && key == "agent_activity_json"
+                        if *table == "workspace_discussion_message"
+                            && matches!(
+                                key.as_str(),
+                                "agent_activity_json" | "principal_mentions_json"
+                            )
                         {
                             &empty_activity
                         } else if history_metadata.is_some() && key == "metadata" {
@@ -1646,6 +1650,54 @@ mod tests {
             .is_none());
     }
 
+    #[tokio::test]
+    async fn discussion_import_clears_principal_notification_identities_and_keeps_text() {
+        let source_db = TempDb::new();
+        let source = Store::open(&source_db.path).await.unwrap();
+        seed(&source, "ws-mention-import").await;
+        let ws = WorkspaceId::from("ws-mention-import");
+        let mentions =
+            serde_json::json!([{"principalId":"collision","name":"Bob","start":0,"end":4}])
+                .to_string();
+        sqlx::query("UPDATE workspace_discussion_message SET body='@Bob',principal_mentions_json=? WHERE workspace_id=?")
+            .bind(&mentions).bind(ws.as_str()).execute(source.write_pool()).await.unwrap();
+        let exported = source.transfer_export_rows(&ws).await.unwrap();
+        let messages = exported
+            .iter()
+            .find(|(t, _)| t == "workspace_discussion_message")
+            .unwrap()
+            .1
+            .clone();
+        assert_eq!(messages[0]["principal_mentions_json"], mentions);
+        for legacy in [false, true] {
+            let destination_db = TempDb::new();
+            let destination = Store::open(&destination_db.path).await.unwrap();
+            seed(&destination, "ws-mention-import").await;
+            sqlx::query("DELETE FROM workspace_discussion_message WHERE workspace_id=?")
+                .bind(ws.as_str())
+                .execute(destination.write_pool())
+                .await
+                .unwrap();
+            let mut rows = messages.clone();
+            if legacy {
+                rows[0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("principal_mentions_json");
+            }
+            destination
+                .transfer_import_rows(&[("workspace_discussion_message".into(), rows)])
+                .await
+                .unwrap();
+            let history = destination
+                .list_discussion_messages(&ws, None, None, 50)
+                .await
+                .unwrap();
+            assert_eq!(history.messages[0].body, "@Bob");
+            assert!(history.messages[0].principal_mentions.is_empty());
+        }
+    }
+
     /// Regression for intent-hq/intent#4876: the export reads every table
     /// from ONE snapshot. A writer commits versioned note updates (`note.rev`
     /// bump + matching `note_version` row, one write transaction each) in a
@@ -2032,7 +2084,7 @@ note_line_attribution: note_id, workspace_id, computed_at, attributions_json
 comment: id, thread_id, note_id, workspace_id, kind, content, author, author_type, status, parent_id, anchor_json, anchor_text, extra_json, created_at, updated_at
 discussion_conversation: id, workspace_id, kind, participants_json, created_at
 discussion_participant: conversation_id, workspace_id, source_principal_id, principal_id
-workspace_discussion_message: id, workspace_id, conversation_id, sequence, principal_id, client_message_id, body, author_json, created_at, reply_to_message_id, reply_to_json, reactions_json, reaction_version, agent_id, recipient_agent_ids_json, agent_activity_json, agent_mentions_json
+workspace_discussion_message: id, workspace_id, conversation_id, sequence, principal_id, client_message_id, body, author_json, created_at, reply_to_message_id, reply_to_json, reactions_json, reaction_version, agent_id, recipient_agent_ids_json, agent_activity_json, agent_mentions_json, principal_mentions_json
 discussion_reaction: id, workspace_id, message_id, principal_id, agent_id, reaction, author_json
 draft: workspace_id, agent_id, client_id, text, updated_at, attachments
 agent_session: id, workspace_id, backend_session_id, acp_session_id, name, name_explicitly_set, model, provider, status, is_active, system_prompt, created_at, updated_at, parent_agent_id, specialist, task_note_id, skip_auto_commit, completion_report, completion_report_timestamp, delegation_depth, initial_message, context_references, image_blocks, is_background, metadata, sandbox_id, sandbox_path, sandbox_branch, stop_reason, token_usage, token_usage_baseline, resolved_model, last_turn_model, last_turn_provider, last_assistant_preview, last_user_preview, attention_request_kind, attention_request_reason, attention_request_timestamp, last_message_role, stop_reason_timestamp, reasoning_effort, effort_levels, last_message_id, file_blocks, task_graph_enabled, harness_version, harness_features, last_tool_use_preview, retired_at, message_count, assistant_message_count, conversation_bytes, notifications_muted, last_turn_effort, reasoning_effort_auto

@@ -112,7 +112,8 @@ async fn discussion_human_attribution_isolation_live_history_and_retry_over_wss(
     let first = sent["result"]["message"].clone();
     assert!(first["id"].is_string(), "{sent}");
     assert_ne!(first["id"], "same-client-id");
-    assert_eq!(first.as_object().unwrap().len(), 14);
+    assert_eq!(first.as_object().unwrap().len(), 15);
+    assert_eq!(first["principalMentions"], json!([]));
     assert_eq!(first["agentActivity"], json!([]));
     assert_eq!(first["agentMentions"], json!([]));
     assert_eq!(first["recipientAgentIds"], json!([]));
@@ -1208,5 +1209,101 @@ async fn discussion_activity_controls_recheck_wss_membership_and_restore_version
         retried["result"]["activity"]
     );
     owner.close().await;
+    srv.ws.stop().await;
+}
+
+#[tokio::test]
+async fn discussion_principal_mentions_wire_contract_validation_access_and_retry_over_wss() {
+    let srv = start(WsOptions::default()).await;
+    let mut alice = Guest::connect(&srv, &"e1".repeat(32)).await;
+    let mut bob = Guest::connect(&srv, &"e2".repeat(32)).await;
+    let outsider = Guest::connect(&srv, &"e3".repeat(32)).await;
+    let ws = WorkspaceId::new();
+    srv.store
+        .insert_workspace(&fixture_workspace(&ws))
+        .await
+        .unwrap();
+    for principal in [&alice.principal, &bob.principal] {
+        srv.store
+            .add_workspace_member(&ws, &principal.id, WorkspaceRole::Collaborator)
+            .await
+            .unwrap();
+    }
+    let mut events = PresenceClient::open(srv.port, srv.cfg.clone(), &"e2".repeat(32)).await;
+    let hello = events
+        .call(
+            1,
+            "client.hello",
+            json!({"name":"Principal mention contract"}),
+        )
+        .await;
+    assert_eq!(
+        hello["result"]["server"]["capabilities"]["discussionPrincipalMentions"],
+        1
+    );
+    let caps = alice.call("system.capabilities", json!({})).await;
+    assert_eq!(caps["result"]["discussionPrincipalMentions"], 1);
+    events
+        .call(
+            2,
+            "events.subscribe",
+            json!({"eventTypes":["discussion:message"]}),
+        )
+        .await;
+    let mentions = json!([{"principalId":bob.principal.id,"name":"Bob","start":3,"end":7}]);
+    let params = json!({"workspaceId":ws,"messageId":"selected-person","body":"😀 @Bob","principalMentions":mentions});
+    let sent = alice.call("discussion.send", params.clone()).await;
+    assert_eq!(sent["jsonrpc"], "2.0");
+    assert!(sent.get("id").is_some());
+    assert!(sent.get("error").is_none(), "{sent}");
+    let message = sent["result"]["message"].clone();
+    assert_eq!(message["principalMentions"], mentions);
+    assert_eq!(message["recipientAgentIds"], json!([]));
+    assert_eq!(message["body"], "😀 @Bob");
+    assert_eq!(
+        events.event("discussion:message").await["data"]["message"],
+        message
+    );
+    let retry = alice.call("discussion.send", params.clone()).await;
+    assert_eq!(retry["result"], sent["result"]);
+    let history = bob.call("discussion.list", json!({"workspaceId":ws})).await;
+    assert_eq!(history["result"]["messages"], json!([message]));
+    for invalid in [
+        Value::Null,
+        json!({}),
+        json!([{"principalId":bob.principal.id,"name":"Bob","start":3,"end":7,"extra":true}]),
+        json!([{"principalId":bob.principal.id,"name":"Bob","start":3.5,"end":7}]),
+        json!([{"principalId":bob.principal.id,"name":"Bob","start":-1,"end":7}]),
+        json!([{"principalId":bob.principal.id,"name":"Bob","start":2,"end":7}]),
+        json!([]),
+    ] {
+        let mut changed = params.clone();
+        changed["principalMentions"] = invalid;
+        let rejected = alice.call("discussion.send", changed).await;
+        assert_eq!(rejected["error"]["code"], -32602, "{rejected}");
+    }
+    let mut inaccessible = params.clone();
+    inaccessible["messageId"] = json!("outsider");
+    inaccessible["principalMentions"][0]["principalId"] = json!(outsider.principal.id);
+    assert_eq!(
+        alice.call("discussion.send", inaccessible).await["error"]["data"]["code"],
+        "not-found"
+    );
+    let plain = alice
+        .call(
+            "discussion.send",
+            json!({"workspaceId":ws,"messageId":"plain","body":"😀 @Bob"}),
+        )
+        .await;
+    assert_eq!(plain["result"]["message"]["principalMentions"], json!([]));
+    srv.store
+        .remove_workspace_member(&ws, &bob.principal.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        alice.call("discussion.send", params).await["error"]["data"]["code"],
+        "not-found"
+    );
+    events.close().await;
     srv.ws.stop().await;
 }

@@ -1211,6 +1211,14 @@ async fn dispatch(
                     message_id,
                     body,
                     intent_core::discussion::DiscussionTarget {
+                        principal_mentions: params
+                            .get("principalMentions")
+                            .map(|v| {
+                                serde_json::from_value(v.clone())
+                                    .map_err(|_| invalid_params("invalid principalMentions"))
+                            })
+                            .transpose()?
+                            .unwrap_or_default(),
                         agent_mentions: params
                             .get("agentMentions")
                             .map(|v| {

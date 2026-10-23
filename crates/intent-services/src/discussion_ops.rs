@@ -148,6 +148,9 @@ impl Services {
             Some(Caller::Agent { agent_id }) => Some(agent_id),
             _ => None,
         };
+        if agent_id.is_some() && !target.principal_mentions.is_empty() {
+            return Err(Error::Forbidden("only humans may mention people".into()));
+        }
         let principal_id = if let Some(agent) = &agent_id {
             if target.recipient_principal_ids.is_some() {
                 return Err(Error::Forbidden(

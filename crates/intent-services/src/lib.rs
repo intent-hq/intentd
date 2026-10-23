@@ -19027,6 +19027,7 @@ impl WorkspaceApi for Services {
             caps.insert("workspaceGuestRoles".into(), serde_json::json!(1));
             caps.insert("discussionAgentMessaging".into(), serde_json::json!(1));
             caps.insert("discussionAgentActivity".into(), serde_json::json!(1));
+            caps.insert("discussionPrincipalMentions".into(), serde_json::json!(1));
             if let Some(cow_supported) = self.compute_cow_supported().await {
                 caps.insert("cowSupported".to_string(), serde_json::json!(cow_supported));
             }
