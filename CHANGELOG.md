@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.37] - 2026-10-23
+
+### 🚀 Features
+
+- *(acp)* Lower agent IO priority and demote ephemeral adapter runs ([#2634](https://github.com/intent-hq/intentd/pull/2634))
+
+
 ## [0.11.36] - 2026-10-23
 
 ### 📚 Documentation
