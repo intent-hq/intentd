@@ -426,6 +426,9 @@ mod tests_catalog_default_model;
 #[cfg(test)]
 mod tests_unknown_model;
 
+#[cfg(test)]
+mod tests_suggested_prompts_contract;
+
 /// Resolve the default model from settings when no explicit model is supplied
 /// at agent creation time. Precedence chain (the per-workspace override tier
 /// was removed in monorepo#1000; the background-agent tier was removed in
@@ -2146,6 +2149,38 @@ fn strip_spans(s: &str, start: &str, end: &str) -> String {
     out
 }
 
+/// Remove suggested-prompts blocks: each span runs from `opener` to the first
+/// `closer` that ends its line (standalone, or fused with the final prompt), so
+/// an embedded arrow in a body line (`A --> B`) does not end the block early
+/// and leak its tail into the preview. A span with no line-ending closer falls
+/// back to the first `closer` anywhere, then to end-of-text, like
+/// [`strip_spans`]. Shared cases: monorepo `docs/protocol/suggested-prompts.md`.
+fn strip_prompt_blocks(s: &str, opener: &str, closer: &str) -> String {
+    let ends_line = |tail: &str| {
+        let tail = tail.trim_start_matches([' ', '\t']);
+        tail.is_empty() || tail.starts_with('\n') || tail.starts_with("\r\n")
+    };
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find(opener) {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + opener.len()..];
+        let line_end = after
+            .match_indices(closer)
+            .map(|(j, _)| j + closer.len())
+            .find(|&end| ends_line(&after[end..]));
+        match line_end.or_else(|| after.find(closer).map(|j| j + closer.len())) {
+            Some(end) => rest = &after[end..],
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Drop `<group:…>` / `</group…>` tags (the streamed response group markers).
 fn strip_group_tags(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -2171,10 +2206,10 @@ fn strip_group_tags(s: &str) -> String {
 /// mirroring the TS `agent.list` cleaning before the last-line extraction.
 fn clean_response_text(text: &str) -> String {
     let mut cleaned = strip_spans(text, "<agent_digest>", "</agent_digest>");
-    cleaned = strip_spans(&cleaned, "<!-- suggested-prompts", "-->");
+    cleaned = strip_prompt_blocks(&cleaned, "<!-- suggested-prompts", "-->");
     // The HTML-escaped spelling a model can copy from an XML-escaped history
     // replay (see `history_xml::REPLAY_ESCAPING_NOTE`).
-    cleaned = strip_spans(&cleaned, "&lt;!-- suggested-prompts", "--&gt;");
+    cleaned = strip_prompt_blocks(&cleaned, "&lt;!-- suggested-prompts", "--&gt;");
     cleaned = strip_group_tags(&cleaned);
     cleaned.trim().to_string()
 }
