@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.33] - 2026-10-23
+
+### 🚀 Features
+
+- *(sitter)* Send weekly/monthly/install flags and install age ([#2600](https://github.com/intent-hq/intentd/pull/2600))
+
+### 🐛 Bug Fixes
+
+- *(pr-monitor)* Ignore merge-queue ejections older than the current queue entry ([#2595](https://github.com/intent-hq/intentd/pull/2595))
+
+### 🧪 Testing
+
+- Classify every fixed test wait and empty the fixed-deadline baseline ([#2603](https://github.com/intent-hq/intentd/pull/2603))
+
+
 ## [0.11.32] - 2026-10-23
 
 ### 🐛 Bug Fixes
