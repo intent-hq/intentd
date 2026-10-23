@@ -26,7 +26,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 #[path = "e2e_wss_wake_or_create/daemon_exit.rs"]
 mod daemon_exit;
 #[path = "e2e_wss_wake_or_create/fixture_identity.rs"]

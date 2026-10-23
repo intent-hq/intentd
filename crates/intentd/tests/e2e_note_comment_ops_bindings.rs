@@ -6,7 +6,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 

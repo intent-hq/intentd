@@ -503,7 +503,11 @@ jobs:
         if: github.event_name == 'merge_group'
         env:
           INTENTD_ASSERT_BOUND_CALLER: "1"
-        run: cargo test --locked -p intentd --features repository-test-fixtures --test e2e_wss_gitlab_auth --test e2e_wss_invite_join_gitlab --test e2e_repository_resource_read -- --test-threads=2
+        # The invitation and checkout files are modules of suite targets
+        # (tests/suite_*.rs); the module filter keeps the run to their tests.
+        run: |
+          cargo test --locked -p intentd --features repository-test-fixtures --test e2e_wss_gitlab_auth -- --test-threads=2
+          cargo test --locked -p intentd --features repository-test-fixtures --test suite_wss_g_r --test suite_wss_repo -- --test-threads=2 e2e_wss_invite_join_gitlab:: e2e_repository_resource_read::
 
       - uses: taiki-e/install-action@cargo-shear
       # Blocking unused-dependency gate: fails when any crate declares a
@@ -817,12 +821,12 @@ jobs:
                   "tunnel::tests::connect_reset_preserves_error_before_deadline",
                   "tunnel::tests::connect_success_before_deadline_relays",
               ]),
-              (["-p", "intentd", "--test", "e2e_wss_tunnel"], [
-                  "tunnel_open_echo_eof_close_lifecycle",
-                  "tunnel_open_err_for_closed_port_keeps_connection_alive",
-                  "tunnel_close_tears_down_and_frees_stream_id",
-                  "tunnel_connections_counted_in_health_and_stopped",
-                  "tunnel_unauthenticated_upgrade_rejected",
+              (["-p", "intentd", "--test", "suite_wss_s_z"], [
+                  "e2e_wss_tunnel::tunnel_open_echo_eof_close_lifecycle",
+                  "e2e_wss_tunnel::tunnel_open_err_for_closed_port_keeps_connection_alive",
+                  "e2e_wss_tunnel::tunnel_close_tears_down_and_frees_stream_id",
+                  "e2e_wss_tunnel::tunnel_connections_counted_in_health_and_stopped",
+                  "e2e_wss_tunnel::tunnel_unauthenticated_upgrade_rejected",
               ]),
           ]
 
@@ -1040,7 +1044,7 @@ jobs:
           INTENTD_SETUP_TOOLCHAIN: ${{ steps.toolchain.outputs.channel }}
         run: |
           rustup run "$INTENTD_SETUP_TOOLCHAIN" cargo test --locked -p intent-pty --lib --target ${{ matrix.target }} conpty_startup::tests -- --nocapture
-          rustup run "$INTENTD_SETUP_TOOLCHAIN" cargo test -p intentd --test e2e_wss_setup_headless --target ${{ matrix.target }} -- --nocapture
+          rustup run "$INTENTD_SETUP_TOOLCHAIN" cargo test -p intentd --test suite_wss_s_z --target ${{ matrix.target }} e2e_wss_setup_headless:: -- --nocapture
       - uses: actions/upload-artifact@v7
         if: always()
         with:
@@ -1141,13 +1145,13 @@ jobs:
             exit 1
           fi
           rustup run "$INTENTD_DIAGNOSTIC_TOOLCHAIN" cargo test -p intent-services --lib --target ${{ matrix.target }} "$filter" -- --nocapture
-          listed=$(rustup run "$INTENTD_DIAGNOSTIC_TOOLCHAIN" cargo test -p intentd --test e2e_doctor_codex --target ${{ matrix.target }} -- --list)
+          listed=$(rustup run "$INTENTD_DIAGNOSTIC_TOOLCHAIN" cargo test -p intentd --test suite_e2e --target ${{ matrix.target }} e2e_doctor_codex:: -- --list)
           printf '%s\n' "$listed"
           if ! grep -F 'macos_catalog_rejection_precedes_npm_authentication_and_probe_state: test' <<< "$listed" > /dev/null; then
             echo '::error::macOS doctor command regression was not selected.'
             exit 1
           fi
-          rustup run "$INTENTD_DIAGNOSTIC_TOOLCHAIN" cargo test -p intentd --test e2e_doctor_codex --target ${{ matrix.target }} -- --nocapture
+          rustup run "$INTENTD_DIAGNOSTIC_TOOLCHAIN" cargo test -p intentd --test suite_e2e --target ${{ matrix.target }} e2e_doctor_codex:: -- --nocapture
       # These retained workspace fixtures used to skip on Linux before reaching
       # their unbound caller. Require native CoW operations and original oracles.
       - name: Retained workspace CoW fixtures (macOS runtime)

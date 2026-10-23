@@ -3,7 +3,7 @@
 //! separate real TLS/WSS coverage in `e2e_wss_github_device_flow`.
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::path::Path;
 use std::process::{Command, Stdio};
