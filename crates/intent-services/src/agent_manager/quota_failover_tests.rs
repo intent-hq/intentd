@@ -2491,9 +2491,12 @@ async fn a_manual_choice_is_tried_even_when_marked() {
     let fx = Fixture::new(json!({ "response": "answered on the chosen one" })).await;
     let first = fx.profile("First", true).await;
     let _second = fx.profile("Second", true).await;
+    // On the profile already, so the explicit choice below needs no
+    // cross-provider availability gate (CI runners lack the provider CLIs).
+    fx.away(&first, Value::Null).await;
     fx.mgr
         .services
-        .agent_set_model_op(fx.agent.clone(), "opus".to_owned(), Some(first.clone()))
+        .agent_set_model_op(fx.agent.clone(), "opus".to_owned(), None)
         .await
         .expect("setModel");
     mark_exhausted_elsewhere(&fx, &first);
