@@ -90,11 +90,14 @@ jobs:
           # coverage-all, coverage-e2e and the Linux daemon-lifecycle leg run
           # only in the queue and take a free xl or heavy slot there (longest
           # first, so coverage-all gets the xl slot), or burst to WarpBuild.
+          # check takes an 8-CPU heavy slot (never the xl slot coverage-changed
+          # needs) but bursts as gh-linux-16x: WarpBuild measured it at p90 97%
+          # of 8 CPUs and 19.7 GB, so its merge-queue and overflow runs use 16.
           # Minutes are typical PR / merge-queue durations. release-fast-path
           # (release branches only) and the gate keep the `runners` mapping.
           SLOT_JOBS: >-
             [
-            {"key":"check","label":"gh-linux-8x","rust":true,"minutes":15,"events":["pull_request"]},
+            {"key":"check","label":"gh-linux-8x","burst":"gh-linux-16x","rust":true,"minutes":15,"events":["pull_request"]},
             {"key":"coverage-changed","label":"gh-linux-16x","rust":true,"minutes":13,"events":["pull_request"]},
             {"key":"release-scripts","label":"ubuntu-24.04","minutes":6},
             {"key":"pr-static","label":"ubuntu-24.04","minutes":1,"events":["pull_request"]},
@@ -137,15 +140,16 @@ jobs:
             // jobs asking for them always run there and never take a self-hosted slot.
             const free = ['ubuntu-22.04', 'ubuntu-24.04', 'ubuntu-latest', 'ubuntu-24.04-arm', 'windows-2022', 'windows-2025'];
             // Paid GitHub labels and the WarpBuild runner each bursts to instead
-            // (same cores; Windows stays on Server 2022, macOS 15 keeps signed builds
-            // off macOS 26). Intel Macs have no WarpBuild equivalent and stay on GitHub.
+            // (same cores except Macs, which get 12 because every Mac job is CPU-bound;
+            // Windows stays on Server 2022, macOS 15 keeps signed builds off macOS 26).
+            // Intel Macs have no WarpBuild equivalent and stay on GitHub.
             const warp = {
               'gh-linux-8x': 'warp-ubuntu-2404-x64-8x',
               'gh-linux-16x': 'warp-ubuntu-2404-x64-16x',
               'gh-linux-arm64-8x': 'warp-ubuntu-2404-arm64-8x',
               'gh-windows-16x': 'warp-windows-2022-x64-16x',
-              'macos-26-xlarge': 'warp-macos-26-arm64-6x',
-              'macos-15-xlarge': 'warp-macos-15-arm64-6x',
+              'macos-26-xlarge': 'warp-macos-26-arm64-12x',
+              'macos-15-xlarge': 'warp-macos-15-arm64-12x',
             };
             // WarpBuild health is tracked per OS and architecture (ubuntu-x64, ubuntu-arm64, windows-x64, macos-arm64).
             const family = (label) => {
@@ -234,7 +238,9 @@ jobs:
             // Free slots go to the caller's listed jobs one at a time: Rust-compiling
             // jobs first (they reuse the slot's local cache), then the longest, then
             // list order. Listed jobs that do not fit, or that skip this event, get
-            // their burst runner directly; matrix legs are ranked separately.
+            // their burst runner directly, sized by `burst` when set (a CPU-bound
+            // job keeps its slot size but bursts bigger); matrix legs are ranked
+            // separately.
             // Concurrent runs read the same free count before either job is queued,
             // so a pool may briefly run a job or two over its slot count.
             let requests = [];
@@ -253,7 +259,7 @@ jobs:
                 slotsFree[key] -= 1;
                 granted[key] += 1;
                 slots[r.key] = fleets[key];
-              } else slots[r.key] = cloud(r.label);
+              } else slots[r.key] = cloud(r.burst || r.label);
             }
             // Unlisted jobs (single-job workflows, jobs that start after the listed
             // ones) use a pool only while a slot is still free.
@@ -1938,6 +1944,7 @@ jobs:
           python3 -B scripts/test-prerelease-cleanup-workflow.py
           python3 -B scripts/test-release-rust-cache.py
           python3 -I -B scripts/test-optional-intel-release.py
+          python3 -B scripts/test-release-host-network.py
           python3 -B scripts/test-setup-sccache.py
           python3 -I -B scripts/test-coverage-storage.py
           python3 -B scripts/test-hosted-runners.py

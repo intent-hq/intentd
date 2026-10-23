@@ -7,9 +7,10 @@
 //! ([`paths`]), the channel config and resolution ([`config`]), persisted
 //! sitter state ([`state`]), the channel-manifest schema ([`manifest`]),
 //! the update engine ([`updater`]), update-check telemetry
-//! ([`telemetry`]), the post-restart readiness wait
+//! ([`telemetry`]) and its activity flags ([`activity`]), the post-restart readiness wait
 //! ([`readiness`]), and the daemon supervisor loop ([`supervisor`]).
 
+pub mod activity;
 pub mod cli;
 pub mod config;
 pub mod manifest;

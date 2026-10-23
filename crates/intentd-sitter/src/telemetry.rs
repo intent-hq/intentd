@@ -1,7 +1,8 @@
 //! Anonymous update-check telemetry: the `updates.intentapp.dev` endpoint.
 //!
 //! When telemetry is on, the manifest fetch goes through
-//! `https://updates.intentapp.dev/channel/<ch>.json?p=&v=&src=&k=&d=` first.
+//! `https://updates.intentapp.dev/channel/<ch>.json?p=&v=&src=&k=&d=&w=&m=&i=&a=`
+//! first.
 //! The endpoint counts the check and answers with a 302 to the fixed GitHub
 //! channel asset; GitHub stays the only source of manifests:
 //! [`check_redirect`] accepts only the official asset URL for the same
@@ -9,9 +10,10 @@
 //! redirected at all is refused. Any failure falls back to the GitHub bases.
 //!
 //! Only non-identifying values are sent: the build's target triple, the
-//! sitter version, the install source, the check trigger, and whether this
-//! is the first check of the UTC day (from a date in `state.json`, never an
-//! identifier).
+//! sitter version, the install source, the check trigger, whether this is
+//! the first check of the UTC day, ISO week, or month, whether it is a fresh
+//! install's first check, and a coarse install-age bucket (all from dates
+//! in `state.json`, never an identifier; see [`crate::activity`]).
 //!
 //! Opt-out ([`opted_out`]): `DO_NOT_TRACK=1`, `INTENTD_DISABLE_TELEMETRY=1`,
 //! or `telemetry = false` in `<data_dir>/sitter/config.toml`. The
@@ -25,6 +27,7 @@ use std::time::Duration;
 use reqwest::Url;
 use time::OffsetDateTime;
 
+use crate::activity::Activity;
 use crate::cli::Channel;
 use crate::config;
 
@@ -223,10 +226,19 @@ pub struct CheckParams<'a> {
     pub version: &'a str,
     pub source: InstallSource,
     pub trigger: CheckTrigger,
-    pub first_of_day: bool,
+    pub activity: Activity,
 }
 
-/// `<base>/channel/<ch>.json?p=&v=&src=&k=&d=`, query values URL-encoded.
+fn flag(on: bool) -> &'static str {
+    if on {
+        "1"
+    } else {
+        "0"
+    }
+}
+
+/// `<base>/channel/<ch>.json?p=&v=&src=&k=&d=&w=&m=&i=&a=`, query values
+/// URL-encoded.
 ///
 /// # Errors
 /// Returns the parse error when `base_url` is not a valid URL.
@@ -244,7 +256,11 @@ pub fn update_check_url(
         .append_pair("v", params.version)
         .append_pair("src", params.source.as_str())
         .append_pair("k", params.trigger.as_str())
-        .append_pair("d", if params.first_of_day { "1" } else { "0" });
+        .append_pair("d", flag(params.activity.first_of_day))
+        .append_pair("w", flag(params.activity.first_of_week))
+        .append_pair("m", flag(params.activity.first_of_month))
+        .append_pair("i", flag(params.activity.install))
+        .append_pair("a", params.activity.age.as_str());
     Ok(url)
 }
 
@@ -370,6 +386,7 @@ impl UpdateEndpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::activity::AgeBucket;
     use std::collections::HashMap;
     use time::macros::datetime;
 
@@ -541,26 +558,38 @@ mod tests {
             version: "0.1.28",
             source: InstallSource::Brew,
             trigger: CheckTrigger::Daily,
-            first_of_day: true,
+            activity: Activity {
+                first_of_day: true,
+                first_of_week: true,
+                first_of_month: false,
+                install: true,
+                age: AgeBucket::Day0,
+            },
         };
         assert_eq!(
             update_check_url("https://updates.intentapp.dev/", Channel::Stable, &params)
                 .unwrap()
                 .as_str(),
-            "https://updates.intentapp.dev/channel/stable.json?p=aarch64-apple-darwin&v=0.1.28&src=brew&k=daily&d=1"
+            "https://updates.intentapp.dev/channel/stable.json?p=aarch64-apple-darwin&v=0.1.28&src=brew&k=daily&d=1&w=1&m=0&i=1&a=0d"
         );
         let params = CheckParams {
             platform: "x86_64-unknown-linux-gnu",
             version: "1.0.0-beta.1+build.5",
             source: InstallSource::Deb,
             trigger: CheckTrigger::Idle,
-            first_of_day: false,
+            activity: Activity {
+                first_of_day: false,
+                first_of_week: false,
+                first_of_month: true,
+                install: false,
+                age: AgeBucket::Over365,
+            },
         };
         assert_eq!(
             update_check_url(UPDATE_ENDPOINT_BASE_URL, Channel::Beta, &params)
                 .unwrap()
                 .as_str(),
-            "https://updates.intentapp.dev/channel/beta.json?p=x86_64-unknown-linux-gnu&v=1.0.0-beta.1%2Bbuild.5&src=deb&k=idle&d=0"
+            "https://updates.intentapp.dev/channel/beta.json?p=x86_64-unknown-linux-gnu&v=1.0.0-beta.1%2Bbuild.5&src=deb&k=idle&d=0&w=0&m=1&i=0&a=365d%2B"
         );
     }
 

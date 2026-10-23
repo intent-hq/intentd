@@ -637,7 +637,8 @@ class RunnerAvailabilityTests(unittest.TestCase):
                     hosted = event == "merge_group" or not idle
                     slots = json.loads(outputs["slots"])
                     # The one free heavy slot goes to `check` on a PR; the queue lists no heavy job.
-                    self.assertEqual(slots["check"], CACHE if event == "pull_request" and idle else ["gh-linux-8x"])
+                    # Without a slot, check bursts as gh-linux-16x (CPU-bound on 8 CPUs).
+                    self.assertEqual(slots["check"], CACHE if event == "pull_request" and idle else ["gh-linux-16x"])
                     self.assertEqual(slots["coverage-changed"], ["gh-linux-16x"])
                     # Free standard labels never take a self-hosted slot, even an idle one.
                     self.assertEqual(slots["release-scripts"], ["ubuntu-24.04"])
@@ -687,7 +688,7 @@ class RunnerAvailabilityTests(unittest.TestCase):
     def test_bursts_go_to_warpbuild(self):
         same_repo = {"pull_request": {"head": {"repo": {"full_name": "intent-hq/intentd"}}}}
         warp = {"linux_labels": ["warp-ubuntu-2404-x64-16x"], "check_labels": ["warp-ubuntu-2404-x64-8x"],
-                "windows_labels": ["warp-windows-2022-x64-16x"], "macos_labels": ["warp-macos-26-arm64-6x"]}
+                "windows_labels": ["warp-windows-2022-x64-16x"], "macos_labels": ["warp-macos-26-arm64-12x"]}
         for event in ("pull_request", "push", "merge_group"):
             with self.subTest(event=event):
                 result = run_route(self.workflow, org=[], eventName=event, warpbuildDisabled="",
@@ -696,7 +697,7 @@ class RunnerAvailabilityTests(unittest.TestCase):
                 for key, labels in warp.items():
                     self.assertEqual(json.loads(outputs[key]), labels, key)
                 slots = json.loads(outputs["slots"])
-                self.assertEqual(slots["check"], ["warp-ubuntu-2404-x64-8x"])
+                self.assertEqual(slots["check"], ["warp-ubuntu-2404-x64-16x"])
                 self.assertEqual(slots["coverage-changed"], ["warp-ubuntu-2404-x64-16x"])
                 self.assertEqual(slots["release-scripts"], ["ubuntu-24.04"])
                 cloud = json.loads(outputs["cloud"])
@@ -742,7 +743,7 @@ class RunnerAvailabilityTests(unittest.TestCase):
                            payload=same_repo, linuxDisabled="true")
         # The kill switch sends every listed job to its hosted label.
         slots = json.loads(result["outputs"]["slots"])
-        self.assertEqual(slots["check"], ["gh-linux-8x"])
+        self.assertEqual(slots["check"], ["gh-linux-16x"])
         self.assertNotIn(CACHE, slots.values())
         self.assertNotIn(SMALL, slots.values())
 
