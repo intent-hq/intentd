@@ -565,13 +565,17 @@ check the device's connection to Intent before trying to change assignments.
 
 ## Inspect a failed response and recover
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/agent/agent-attention-toast-service.ts; src/store/renderer/slices/agent-session/sagas/agent-failure-toast-saga.ts. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/agent/agent-attention-toast-service.ts; src/store/renderer/slices/agent-session/sagas/agent-failure-toast-saga.ts; src/features/notifications/agent-idle-toast-service.ts. -->
 
-**Switch To** notifications for agent failures, attention requests, and automatic
-workspace unarchiving are skipped when that workspace is already selected, even
-if another conversation, file, or note is open. Notifications for other workspaces
-can still appear. The workspace's agent status and conversation notices remain
-available.
+While the desktop app is in front, an agent finishing work shows an in-app
+notification naming the agent and its workspace instead of a system notification;
+choose **Switch To** to open that agent's conversation.
+
+**Switch To** notifications for agent failures, attention requests, finished agents,
+and automatic workspace unarchiving are skipped when that workspace is already
+selected, even if another conversation, file, or note is open. Notifications for
+other workspaces can still appear. The workspace's agent status and conversation
+notices remain available.
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/chat/{StreamingStatus,TurnFailureNotice,FailureDetails,QueuedMessageList,QueuedMessageActions,ChatPanel}.svelte; messages/en.json. -->
 
