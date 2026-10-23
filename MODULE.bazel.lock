@@ -528,7 +528,7 @@
           "FILE:@@//bazel/prod-workspace/crates/intent-test-macros/Cargo.toml 6dd6c9c1d79db3c7fc329c3538cf26fc9a62f23f5027a815814224ddf26f6a51",
           "FILE:@@//bazel/prod-workspace/crates/intent-transport/Cargo.toml bca9558a244df58e29fbc9a843d630bff981c50fe3e2a618f8262399dd1ec195",
           "FILE:@@//bazel/prod-workspace/crates/intentd/Cargo.toml aa49604e1f93d272bb2ca3b90d3fa6524ebb2c6bdcd6db4865ea6105fbc8569d",
-          "FILE:@@//bazel/prod-workspace/crates/intentd-sitter/Cargo.toml 623b447007e59ff5299c73a75253e9221e88881e618df279eaae68f9e61780c9",
+          "FILE:@@//bazel/prod-workspace/crates/intentd-sitter/Cargo.toml d25f83f4d2d62b35751fd7d7999fe288e1655ea5f4b14e13fcb921878c9310df",
           "FILE:@@//bazel/prod-workspace/crates/intentd-test-support/Cargo.toml a4e0f12c8a934b1dfb235e6ecd9baab40f480a27e819c96342bbe5b2c3562dfa",
           "FILE:@@//bazel/prod-workspace/vendor/pprof/Cargo.toml de5391db989943a7c6fbd48e0365eb37a5498ac9e7dfe45c37ee2e99bf302ce6",
           "FILE:@@//Cargo.lock f901dd399d69342a8a36ee0b760e0338c101a078b8cb59580c6909e681f45aad",
@@ -550,7 +550,7 @@
           "FILE:@@//crates/intent-test-macros/Cargo.toml 69a41726fe7d511f8a219fe68490c3fc24b208340c9d616ad86cf8e200ba5fbb",
           "FILE:@@//crates/intent-transport/Cargo.toml 11785bebf609bd9c6f0772b62944980319479cabd79112ab6b1c799b56c63082",
           "FILE:@@//crates/intent-voice/Cargo.toml 225ba417ca27091e79ddc0c00041aa41d6fe0a4b877acf5ffc298c38d993edca",
-          "FILE:@@//crates/intentd-sitter/Cargo.toml 7e09a9a1efce715c62e5ecca56c5b397c577c1d67b5080c4dfccba89b456ac4e",
+          "FILE:@@//crates/intentd-sitter/Cargo.toml 4fe22ab6a3c846e53f7a09be65e00a28000dc1331366ce73980cb9740736b0d8",
           "FILE:@@//crates/intentd-test-support/Cargo.toml 28fb43495cda333eeda82505ed93dd37700e73c5c5bfb9026fc3f7a64ca24775",
           "FILE:@@//crates/intentd/Cargo.toml 3cd0b8115ea5a9d847882aeecbdb43ca806b264f03ac66dc62e3399dfb959d1b",
           "FILE:@@//vendor/pprof/Cargo.toml de5391db989943a7c6fbd48e0365eb37a5498ac9e7dfe45c37ee2e99bf302ce6"
