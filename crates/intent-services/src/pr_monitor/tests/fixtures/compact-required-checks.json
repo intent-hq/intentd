@@ -30,6 +30,7 @@
             "passed": 0,
             "failed": 0,
             "pending": 0,
+            "skipped": 0,
             "failingRequired": 0,
             "pendingRequired": 0,
             "requiredKnown": true
@@ -63,6 +64,7 @@
           "passed": 0,
           "failed": 0,
           "pending": 0,
+          "skipped": 0,
           "items": [],
           "failingRequired": [],
           "pendingRequired": [],
@@ -112,6 +114,7 @@
             "passed": 0,
             "failed": 0,
             "pending": 1,
+            "skipped": 0,
             "failingRequired": 0,
             "pendingRequired": 1,
             "requiredKnown": true
@@ -145,6 +148,7 @@
           "passed": 0,
           "failed": 0,
           "pending": 1,
+          "skipped": 0,
           "items": [
             {
               "name": "build",
@@ -202,6 +206,7 @@
             "passed": 0,
             "failed": 0,
             "pending": 2,
+            "skipped": 0,
             "failingRequired": 0,
             "pendingRequired": 2,
             "requiredKnown": true
@@ -235,6 +240,7 @@
           "passed": 0,
           "failed": 0,
           "pending": 2,
+          "skipped": 0,
           "items": [
             {
               "name": "build",
@@ -298,6 +304,7 @@
             "passed": 0,
             "failed": 3,
             "pending": 3,
+            "skipped": 0,
             "failingRequired": 2,
             "pendingRequired": 2,
             "requiredKnown": true
@@ -331,6 +338,7 @@
           "passed": 0,
           "failed": 3,
           "pending": 3,
+          "skipped": 0,
           "items": [
             {
               "name": "test",
@@ -417,6 +425,7 @@
             "passed": 0,
             "failed": 1,
             "pending": 1,
+            "skipped": 0,
             "failingRequired": 0,
             "pendingRequired": 0,
             "requiredKnown": true
@@ -450,6 +459,7 @@
           "passed": 0,
           "failed": 1,
           "pending": 1,
+          "skipped": 0,
           "items": [
             {
               "name": "optional-fail",
@@ -510,6 +520,7 @@
             "passed": 0,
             "failed": 1,
             "pending": 1,
+            "skipped": 0,
             "failingRequired": 0,
             "pendingRequired": 0,
             "requiredKnown": false
@@ -542,6 +553,7 @@
           "passed": 0,
           "failed": 1,
           "pending": 1,
+          "skipped": 0,
           "items": [
             {
               "name": "test",
@@ -597,6 +609,7 @@
             "passed": 0,
             "failed": 0,
             "pending": 0,
+            "skipped": 0,
             "failingRequired": 0,
             "pendingRequired": 0,
             "requiredKnown": false
@@ -629,6 +642,7 @@
           "passed": 0,
           "failed": 0,
           "pending": 0,
+          "skipped": 0,
           "items": [],
           "failingRequired": [],
           "pendingRequired": [],
@@ -673,6 +687,7 @@
             "passed": 0,
             "failed": 0,
             "pending": 0,
+            "skipped": 0,
             "failingRequired": 0,
             "pendingRequired": 0,
             "requiredKnown": true
@@ -705,6 +720,7 @@
           "passed": 0,
           "failed": 0,
           "pending": 0,
+          "skipped": 0,
           "items": [],
           "failingRequired": [],
           "pendingRequired": [],

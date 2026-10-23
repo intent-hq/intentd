@@ -125,6 +125,9 @@ pub enum CheckState {
     Failure,
     Neutral,
     Cancelled,
+    /// The check was skipped without running (GitHub conclusion / GitLab job
+    /// status `skipped`). Distinct from [`CheckState::Neutral`], which ran.
+    Skipped,
 }
 
 /// A pull/merge/change request, normalized across hosts.

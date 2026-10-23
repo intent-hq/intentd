@@ -2441,6 +2441,7 @@ dependencies = [
  "image",
  "intent-core",
  "intentd-test-support",
+ "libsqlite3-sys",
  "nix 0.31.3",
  "rand 0.10.3",
  "serde",

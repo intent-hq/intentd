@@ -137,15 +137,16 @@ fn run_imports(root: &Path, contract: &Value, fault: &str) -> Result<Value, Stri
 /// Migrate one destination database for the whole worker run and close it,
 /// leaving a single checkpointed file that every case copies.
 ///
-/// Creating a database from nothing commits about six fsyncs inside the write
-/// pool's 10s connect deadline: file creation, the WAL switch and an
-/// `auto_vacuum` header write all land before `synchronous = NORMAL` applies.
-/// Every migration then runs on top of that. Paying both for each case
-/// stalled one case's first connection past the deadline on a shared runner
-/// with a slow disk ("write pool exhausted", cloudlands-fe merge-group run
-/// 39612275470). A copy is still a pristine destination per case (see
-/// `template_copy_matches_a_fresh_destination`). Its connect only
-/// pays the header write, and its `Store::open` applies no migrations.
+/// Creating a database from nothing commits about six fsyncs (file creation,
+/// the WAL switch and the `auto_vacuum` header) and every migration runs on
+/// top of that. Those fsyncs once ran inside the write pool's 10s connect
+/// deadline and stalled a case past it on a shared runner with a slow disk
+/// ("write pool exhausted", cloudlands-fe merge-group run 39612275470);
+/// `intent-store` now creates the file before the pool exists. The template
+/// still saves each case the fsyncs and the migrations. A copy is still a
+/// pristine destination per case (see
+/// `template_copy_matches_a_fresh_destination`), and its `Store::open`
+/// applies no migrations.
 async fn migrated_template(dir: &Path) -> PathBuf {
     let path = dir.join("template.db");
     let store = Store::open(&path).await.unwrap();
