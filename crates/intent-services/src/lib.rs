@@ -33020,7 +33020,11 @@ impl WorkspaceApi for Services {
             // monitoring.
             let (entry, _) = self.serve_pr(&repo_ref, pr_number).await?;
             let pr = entry.pr;
-            let requirements = entry.snapshot.requirements;
+            // The never-started-CI flag is derived against the clock at
+            // serve time, so a cached entry still crosses the threshold.
+            let requirements = entry
+                .snapshot
+                .requirements_at(time::OffsetDateTime::now_utc());
             let review_comment_count = entry.snapshot.review_comment_count;
             let state = pr_ops::derive_status_state(&pr);
             let mergeable_state = pr

@@ -2,6 +2,31 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.32] - 2026-10-23
+
+### 🐛 Bug Fixes
+
+- *(history)* Tell replayed models the XML escaping is not part of the text ([#2614](https://github.com/intent-hq/intentd/pull/2614))
+
+### 🧪 Testing
+
+- Check the quota classifier against real ACP adapter errors ([#2612](https://github.com/intent-hq/intentd/pull/2612))
+
+
+## [0.11.31] - 2026-10-23
+
+### 🚀 Features
+
+- *(pr-monitor)* Flag a PR head on which CI never started ([#2604](https://github.com/intent-hq/intentd/pull/2604))
+
+
+## [0.11.30] - 2026-10-22
+
+### 🚀 Features
+
+- Add workspace discussions, agent messaging and guest roles ([#2432](https://github.com/intent-hq/intentd/pull/2432))
+
+
 ## [0.11.29] - 2026-10-22
 
 ### 🐛 Bug Fixes
