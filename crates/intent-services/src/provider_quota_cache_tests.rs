@@ -125,7 +125,7 @@ fn a_manual_choice_is_consumed_once_by_a_turn_on_that_choice() {
     let cache = ProviderQuotaCache::default();
     let agent = AgentId::from("agent-manual");
     assert!(!cache.take_manual_choice(&agent, "claude-code@work"));
-    cache.note_manual_choice(&agent, "claude-code@work");
+    let _ = cache.note_manual_choice(&agent, "claude-code@work");
     // A turn starting on another configuration (the choice not persisted
     // yet when it read the session) leaves the record for the next turn.
     assert!(!cache.take_manual_choice(&agent, "claude-code"));
@@ -134,15 +134,28 @@ fn a_manual_choice_is_consumed_once_by_a_turn_on_that_choice() {
 }
 
 #[test]
-fn a_newer_choice_replaces_an_older_one_and_a_failed_persist_is_forgotten() {
+fn a_failed_persist_rolls_back_only_its_own_record() {
     let cache = ProviderQuotaCache::default();
     let agent = AgentId::from("agent-manual");
-    cache.note_manual_choice(&agent, "claude-code@work");
-    cache.note_manual_choice(&agent, "claude-code@personal");
-    cache.forget_manual_choice(&agent, "claude-code@work");
+    // A failed first choice leaves nothing behind.
+    let failed = cache.note_manual_choice(&agent, "claude-code@work");
+    cache.rollback_manual_choice(&agent, failed);
     assert!(!cache.take_manual_choice(&agent, "claude-code@work"));
+    // A successful choice of B, not tried yet, survives a later failed
+    // change on B (the session still carries the first choice).
+    let _ = cache.note_manual_choice(&agent, "claude-code@work");
+    let failed = cache.note_manual_choice(&agent, "claude-code@work");
+    cache.rollback_manual_choice(&agent, failed);
+    assert!(cache.take_manual_choice(&agent, "claude-code@work"));
+    // ...and a later failed change to another configuration restores it.
+    let _ = cache.note_manual_choice(&agent, "claude-code@work");
+    let failed = cache.note_manual_choice(&agent, "claude-code@personal");
+    cache.rollback_manual_choice(&agent, failed);
+    assert!(!cache.take_manual_choice(&agent, "claude-code@personal"));
+    assert!(cache.take_manual_choice(&agent, "claude-code@work"));
+    // A rollback after a newer choice replaced the record is a no-op.
+    let failed = cache.note_manual_choice(&agent, "claude-code@work");
+    let _ = cache.note_manual_choice(&agent, "claude-code@personal");
+    cache.rollback_manual_choice(&agent, failed);
     assert!(cache.take_manual_choice(&agent, "claude-code@personal"));
-    cache.note_manual_choice(&agent, "claude-code@work");
-    cache.forget_manual_choice(&agent, "claude-code@work");
-    assert!(!cache.take_manual_choice(&agent, "claude-code@work"));
 }

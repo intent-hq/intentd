@@ -52,7 +52,31 @@ pub(crate) struct ProviderQuotaCache {
     /// started on yet: the first turn that starts on exactly that
     /// configuration tries it even when it is marked (a manual choice is the
     /// new starting point), see [`Self::take_manual_choice`].
-    manual_choices: Arc<Mutex<HashMap<AgentId, String>>>,
+    manual_choices: Arc<Mutex<ManualChoices>>,
+}
+
+/// Pending manual choices, each stamped with the token of the
+/// `agent.setModel` call that recorded it.
+#[derive(Debug, Default)]
+struct ManualChoices {
+    next_token: u64,
+    by_agent: HashMap<AgentId, ManualChoiceRecord>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ManualChoiceRecord {
+    selection: String,
+    token: u64,
+}
+
+/// One recorded manual choice, returned by
+/// [`ProviderQuotaCache::note_manual_choice`] so a failed persist can undo
+/// exactly that record (see [`ProviderQuotaCache::rollback_manual_choice`]).
+#[derive(Debug)]
+#[must_use = "a failed persist must roll the record back"]
+pub(crate) struct ManualChoiceToken {
+    token: u64,
+    previous: Option<ManualChoiceRecord>,
 }
 
 impl ProviderQuotaCache {
@@ -107,21 +131,38 @@ impl ProviderQuotaCache {
     /// The user is choosing `selection` for `agent` by hand. Recorded BEFORE
     /// the choice is persisted, so any turn start that reads the persisted
     /// choice also sees this record (see [`Self::take_manual_choice`]). A
-    /// newer choice replaces an older one.
-    pub(crate) fn note_manual_choice(&self, agent: &AgentId, selection: &str) {
-        self.manual_choices.lock().unwrap().insert(
+    /// newer choice replaces an older one; the returned token remembers the
+    /// replaced record for [`Self::rollback_manual_choice`].
+    pub(crate) fn note_manual_choice(&self, agent: &AgentId, selection: &str) -> ManualChoiceToken {
+        let mut choices = self.manual_choices.lock().unwrap();
+        choices.next_token += 1;
+        let token = choices.next_token;
+        let previous = choices.by_agent.insert(
             agent.clone(),
-            provider_profiles::canonical_selection(selection),
+            ManualChoiceRecord {
+                selection: provider_profiles::canonical_selection(selection),
+                token,
+            },
         );
+        ManualChoiceToken { token, previous }
     }
 
-    /// Drop the record of a manual choice of `selection` whose persist
-    /// failed (a newer choice is kept).
-    pub(crate) fn forget_manual_choice(&self, agent: &AgentId, selection: &str) {
-        let selection = provider_profiles::canonical_selection(selection);
+    /// The persist of the choice behind `token` failed: put back the record
+    /// it replaced (an earlier successful choice no turn has tried yet), or
+    /// none. A no-op when a newer choice has replaced it, or a turn already
+    /// consumed it.
+    pub(crate) fn rollback_manual_choice(&self, agent: &AgentId, token: ManualChoiceToken) {
         let mut choices = self.manual_choices.lock().unwrap();
-        if choices.get(agent) == Some(&selection) {
-            choices.remove(agent);
+        if choices.by_agent.get(agent).map(|r| r.token) != Some(token.token) {
+            return;
+        }
+        match token.previous {
+            Some(previous) => {
+                choices.by_agent.insert(agent.clone(), previous);
+            }
+            None => {
+                choices.by_agent.remove(agent);
+            }
         }
     }
 
@@ -132,8 +173,12 @@ impl ProviderQuotaCache {
     pub(crate) fn take_manual_choice(&self, agent: &AgentId, current: &str) -> bool {
         let current = provider_profiles::canonical_selection(current);
         let mut choices = self.manual_choices.lock().unwrap();
-        if choices.get(agent) == Some(&current) {
-            choices.remove(agent);
+        if choices
+            .by_agent
+            .get(agent)
+            .is_some_and(|r| r.selection == current)
+        {
+            choices.by_agent.remove(agent);
             true
         } else {
             false

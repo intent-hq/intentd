@@ -5813,10 +5813,10 @@ impl Services {
         // Recorded before the persist (PROTOCOL §5.54 shared quota state):
         // a turn start that reads the new choice also sees that it is a
         // manual one, so it is tried rather than moved off ahead of time.
-        if let Some(chosen) = provider.as_deref() {
+        let manual_choice = provider.as_deref().map(|chosen| {
             self.provider_quota_cache
-                .note_manual_choice(&agent_id, chosen);
-        }
+                .note_manual_choice(&agent_id, chosen)
+        });
         if let Err(e) = self
             .store
             .set_agent_session_model(
@@ -5828,9 +5828,9 @@ impl Services {
             )
             .await
         {
-            if let Some(chosen) = provider.as_deref() {
+            if let Some(token) = manual_choice {
                 self.provider_quota_cache
-                    .forget_manual_choice(&agent_id, chosen);
+                    .rollback_manual_choice(&agent_id, token);
             }
             return Err(e);
         }
