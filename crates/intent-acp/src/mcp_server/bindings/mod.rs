@@ -179,9 +179,11 @@ pub(crate) const RETIRED_SEND_METHODS: [&str; 2] = ["agent.send", "agent.sendToT
 
 /// `ws.*` bindings a caller in a retired workspace may still use (PROTOCOL
 /// §5.1 "Retired workspaces"): reads of the kept rows and daemon-global
-/// reads, plus the documented revive trigger `workspace.unarchive`.
-/// Every other binding — note / task / comment / primitive writes, files
-/// (the folder is gone), scripts, terminals, git, hooks, agents — is
+/// reads (including `file.read` / `file.list`, which report the missing
+/// folder with their own error), plus the documented revive trigger
+/// `workspace.unarchive`. Every other binding — note / task / comment /
+/// primitive writes, file writes and `file.getAttachment` (it copies into
+/// the workspace), scripts, terminals, git, hooks, agents — is
 /// refused with `workspace-retired`. Fail-closed: a binding not listed here
 /// is treated as a mutation.
 pub(crate) const RETIRED_ALLOWED_METHODS: &[&str] = &[
@@ -206,6 +208,8 @@ pub(crate) const RETIRED_ALLOWED_METHODS: &[&str] = &[
     "event.agentActivity",
     "event.query",
     "event.workspaceSummary",
+    "file.list",
+    "file.read",
     "git.listRoots",
     "hook.get",
     "hook.list",
@@ -735,6 +739,8 @@ mod retired_workspace_tests {
             "note.create",
             "task.updateStatus",
             "file.write",
+            "file.delete",
+            "file.getAttachment",
             "git.commit",
         ] {
             let err = call("ws-retired", method).await.unwrap_err();
@@ -757,6 +763,8 @@ mod retired_workspace_tests {
             "agent.readConversation",
             "workspace.details",
             "workspace.unarchive",
+            "file.read",
+            "file.list",
         ] {
             let out = call("ws-retired", method).await;
             assert!(
