@@ -1056,3 +1056,72 @@ async fn concurrent_desktop_workspace_deletes_do_not_block_lifecycle_writers() {
     assert!(store.get_agent_session_summary(&agent).await.is_err());
     store.get_agent_session_summary(&kept_agent).await.unwrap();
 }
+
+#[tokio::test]
+async fn cancelled_desktop_workspace_delete_releases_gate_and_retry_drains_state() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.unwrap();
+    let workspace = seed_workspace(&store, "desktop-cancelled-delete").await;
+    let agent = AgentId::from("desktop-cancelled-agent");
+    store
+        .insert_agent_session(&sample_agent_session(&agent, &workspace))
+        .await
+        .unwrap();
+    let principal = store.get_primary_principal().await.unwrap().id;
+    store
+        .desktop_set_permission(&principal, &workspace, &agent, "physical", true)
+        .await
+        .unwrap();
+    let barrier = std::sync::Arc::new(crate::desktop_repo::DeleteBarrier::default());
+    *store.desktop_delete_barrier.lock().unwrap() = Some(barrier.clone());
+    let mut deleting = Box::pin(store.delete_workspace(&workspace));
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            tokio::select! {
+                () = barrier.entered.notified() => {},
+                result = &mut deleting => panic!("deletion finished before cancellation: {result:?}"),
+            }
+        },
+    )
+    .await
+    .expect("deletion reaches the committed desktop sweep");
+    assert!(!store
+        .desktop_permission(&principal, &workspace, &agent, "physical")
+        .await
+        .unwrap());
+    assert!(store
+        .desktop_set_permission(&principal, &workspace, &agent, "physical", true)
+        .await
+        .is_err());
+
+    // Cancel after the private-state sweep commits, before the agent is removed.
+    // The live target can admit a fresh explicit grant once teardown is dropped.
+    drop(deleting);
+    *store.desktop_delete_barrier.lock().unwrap() = None;
+    store.get_workspace(&workspace).await.unwrap();
+    store.get_agent_session_summary(&agent).await.unwrap();
+    store
+        .desktop_set_permission(&principal, &workspace, &agent, "physical", true)
+        .await
+        .expect("cancellation must release the desktop admission gate");
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        store.delete_workspace(&workspace),
+    )
+    .await
+    .expect("retry must release lifecycle serialization and complete")
+    .unwrap();
+    let remaining: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM settings WHERE key GLOB 'desktop.v1/*' AND json_extract(value,'$.workspaceId')=?",
+    )
+    .bind(workspace.as_str())
+    .fetch_one(store.read_pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        remaining, 0,
+        "retry must sweep newly admitted desktop state"
+    );
+    assert!(store.get_agent_session_summary(&agent).await.is_err());
+}

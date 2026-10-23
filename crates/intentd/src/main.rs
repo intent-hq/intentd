@@ -7432,7 +7432,7 @@ async fn cmd_stop() -> ExitCode {
     };
     let owned = process.matches_record(&config.pid_path, pid);
     let rpc = tokio::time::timeout(
-        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        Duration::from_secs(5),
         rpc_call(&config.socket_path, "system.shutdown", json!({})),
     )
     .await;
