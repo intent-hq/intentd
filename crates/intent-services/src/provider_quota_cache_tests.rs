@@ -121,11 +121,28 @@ fn clones_share_the_same_state() {
 }
 
 #[test]
-fn a_manual_choice_is_consumed_once() {
+fn a_manual_choice_is_consumed_once_by_a_turn_on_that_choice() {
     let cache = ProviderQuotaCache::default();
     let agent = AgentId::from("agent-manual");
-    assert!(!cache.take_manual_choice(&agent));
-    cache.note_manual_choice(&agent);
-    assert!(cache.clone().take_manual_choice(&agent));
-    assert!(!cache.take_manual_choice(&agent));
+    assert!(!cache.take_manual_choice(&agent, "claude-code@work"));
+    cache.note_manual_choice(&agent, "claude-code@work");
+    // A turn starting on another configuration (the choice not persisted
+    // yet when it read the session) leaves the record for the next turn.
+    assert!(!cache.take_manual_choice(&agent, "claude-code"));
+    assert!(cache.clone().take_manual_choice(&agent, "claude-code@work"));
+    assert!(!cache.take_manual_choice(&agent, "claude-code@work"));
+}
+
+#[test]
+fn a_newer_choice_replaces_an_older_one_and_a_failed_persist_is_forgotten() {
+    let cache = ProviderQuotaCache::default();
+    let agent = AgentId::from("agent-manual");
+    cache.note_manual_choice(&agent, "claude-code@work");
+    cache.note_manual_choice(&agent, "claude-code@personal");
+    cache.forget_manual_choice(&agent, "claude-code@work");
+    assert!(!cache.take_manual_choice(&agent, "claude-code@work"));
+    assert!(cache.take_manual_choice(&agent, "claude-code@personal"));
+    cache.note_manual_choice(&agent, "claude-code@work");
+    cache.forget_manual_choice(&agent, "claude-code@work");
+    assert!(!cache.take_manual_choice(&agent, "claude-code@work"));
 }

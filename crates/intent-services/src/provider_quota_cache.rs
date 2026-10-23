@@ -20,7 +20,7 @@
 //! daemon restart each conversation's persisted return timer applies as
 //! before.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Duration, Utc};
@@ -48,11 +48,11 @@ pub(crate) enum QuotaHealth {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ProviderQuotaCache {
     entries: Arc<Mutex<HashMap<String, QuotaHealth>>>,
-    /// Agents whose provider or model the user chose by hand since their
-    /// last turn started: that turn tries the choice even when it is marked
-    /// (a manual choice is the new starting point), see
-    /// [`Self::take_manual_choice`].
-    manual_choices: Arc<Mutex<HashSet<AgentId>>>,
+    /// Per agent, the configuration the user chose by hand that no turn has
+    /// started on yet: the first turn that starts on exactly that
+    /// configuration tries it even when it is marked (a manual choice is the
+    /// new starting point), see [`Self::take_manual_choice`].
+    manual_choices: Arc<Mutex<HashMap<AgentId, String>>>,
 }
 
 impl ProviderQuotaCache {
@@ -104,17 +104,40 @@ impl ProviderQuotaCache {
         }
     }
 
-    /// The user chose `agent`'s provider or model by hand: its next turn
-    /// tries that choice even when it is marked exhausted.
-    pub(crate) fn note_manual_choice(&self, agent: &AgentId) {
-        self.manual_choices.lock().unwrap().insert(agent.clone());
+    /// The user is choosing `selection` for `agent` by hand. Recorded BEFORE
+    /// the choice is persisted, so any turn start that reads the persisted
+    /// choice also sees this record (see [`Self::take_manual_choice`]). A
+    /// newer choice replaces an older one.
+    pub(crate) fn note_manual_choice(&self, agent: &AgentId, selection: &str) {
+        self.manual_choices.lock().unwrap().insert(
+            agent.clone(),
+            provider_profiles::canonical_selection(selection),
+        );
     }
 
-    /// Consume `agent`'s pending manual choice (see
-    /// [`Self::note_manual_choice`]): whether this turn must not be moved
-    /// away from its configuration ahead of the attempt.
-    pub(crate) fn take_manual_choice(&self, agent: &AgentId) -> bool {
-        self.manual_choices.lock().unwrap().remove(agent)
+    /// Drop the record of a manual choice of `selection` whose persist
+    /// failed (a newer choice is kept).
+    pub(crate) fn forget_manual_choice(&self, agent: &AgentId, selection: &str) {
+        let selection = provider_profiles::canonical_selection(selection);
+        let mut choices = self.manual_choices.lock().unwrap();
+        if choices.get(agent) == Some(&selection) {
+            choices.remove(agent);
+        }
+    }
+
+    /// Whether a turn starting on `current` is the first on `agent`'s
+    /// manual choice: it then tries `current` and is never moved away
+    /// ahead of the attempt. Consumed on a match; a record for another
+    /// configuration is kept for the turn that starts on it.
+    pub(crate) fn take_manual_choice(&self, agent: &AgentId, current: &str) -> bool {
+        let current = provider_profiles::canonical_selection(current);
+        let mut choices = self.manual_choices.lock().unwrap();
+        if choices.get(agent) == Some(&current) {
+            choices.remove(agent);
+            true
+        } else {
+            false
+        }
     }
 
     /// The time `selection`'s exhausted mark lasts until, while it is live at

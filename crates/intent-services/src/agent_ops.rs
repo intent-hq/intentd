@@ -5810,7 +5810,15 @@ impl Services {
         // `session/new`, and replays history as `<supervisor>` XML.
         let provider = model_provider;
         let workspace_id = session.workspace_id;
-        self.store
+        // Recorded before the persist (PROTOCOL §5.54 shared quota state):
+        // a turn start that reads the new choice also sees that it is a
+        // manual one, so it is tried rather than moved off ahead of time.
+        if let Some(chosen) = provider.as_deref() {
+            self.provider_quota_cache
+                .note_manual_choice(&agent_id, chosen);
+        }
+        if let Err(e) = self
+            .store
             .set_agent_session_model(
                 &workspace_id,
                 &agent_id,
@@ -5818,7 +5826,14 @@ impl Services {
                 provider.as_deref(),
                 &now_iso(),
             )
-            .await?;
+            .await
+        {
+            if let Some(chosen) = provider.as_deref() {
+                self.provider_quota_cache
+                    .forget_manual_choice(&agent_id, chosen);
+            }
+            return Err(e);
+        }
         // The stored model changed, so any persisted display resolution (D14)
         // now names the wrong model — clear it; the next session open
         // re-resolves against the new id. Best-effort: the setModel itself
@@ -5835,11 +5850,9 @@ impl Services {
             tracing::warn!(agent = %agent_id, error = %e, "clear resolved display model failed");
         }
         // A manual choice is the new home provider: any pending return to
-        // the old one (PROTOCOL §5.54 backup failover) is dropped, and the
-        // next turn tries it even if the shared quota state marks it.
+        // the old one (PROTOCOL §5.54 backup failover) is dropped.
         self.clear_provider_return_state(&workspace_id, &agent_id)
             .await;
-        self.provider_quota_cache.note_manual_choice(&agent_id);
         self.publish_agent_mutation_event(
             &workspace_id,
             &agent_id,

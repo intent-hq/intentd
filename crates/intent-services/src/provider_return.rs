@@ -442,11 +442,8 @@ impl Services {
         workspace_id: &WorkspaceId,
         agent_id: &AgentId,
     ) {
-        let manual = self.provider_quota_cache.take_manual_choice(agent_id);
         self.return_home_if_due(workspace_id, agent_id).await;
-        if !manual {
-            self.avoid_exhausted_provider(workspace_id, agent_id).await;
-        }
+        self.avoid_exhausted_provider(workspace_id, agent_id).await;
     }
 
     /// When the conversation is away and its return-after passed, start this
@@ -456,7 +453,7 @@ impl Services {
     /// can no longer run (profile removed, base disabled) is given up — the
     /// current configuration becomes home. A concurrent provider change
     /// wins.
-    async fn return_home_if_due(&self, workspace_id: &WorkspaceId, agent_id: &AgentId) {
+    pub(crate) async fn return_home_if_due(&self, workspace_id: &WorkspaceId, agent_id: &AgentId) {
         let Ok(session) = self.store.get_agent_session(agent_id).await else {
             return;
         };
@@ -580,6 +577,17 @@ impl Services {
         let Some(current) = session.provider.as_deref().filter(|p| !p.trim().is_empty()) else {
             return;
         };
+        // The first turn on a manual choice tries it. Checked against the
+        // configuration just read: `agent.setModel` records the choice
+        // before persisting it, so a choice landing while this turn starts
+        // is either not read here (and stays recorded for the next turn) or
+        // read together with its record.
+        if self
+            .provider_quota_cache
+            .take_manual_choice(agent_id, current)
+        {
+            return;
+        }
         let Some(until) = self.provider_quota_cache.exhausted_until(current, now) else {
             return;
         };

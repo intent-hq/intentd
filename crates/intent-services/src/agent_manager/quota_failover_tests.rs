@@ -2534,3 +2534,30 @@ async fn skipping_a_marked_home_does_not_back_off() {
     assert_eq!(after.return_after, state["returnAfter"].as_str().unwrap());
     assert_eq!(after.away_on, first);
 }
+
+/// The explicit choice lands while a turn is starting — after the start's
+/// timed-return step, before its marked-configuration step: the turn still
+/// tries the chosen configuration (no `provider_failover`), and the
+/// exemption is used up by it.
+#[intent_test_macros::daemon_test]
+async fn a_manual_choice_landing_during_turn_start_is_still_tried() {
+    let fx = Fixture::new(json!({ "response": "answered" })).await;
+    let first = fx.profile("First", true).await;
+    let second = fx.profile("Second", true).await;
+    fx.away(&first, Value::Null).await;
+    mark_exhausted_elsewhere(&fx, &first);
+    let services = &fx.mgr.services;
+
+    services.return_home_if_due(&fx.ws, &fx.agent).await;
+    services
+        .agent_set_model_op(fx.agent.clone(), "opus".to_owned(), None)
+        .await
+        .expect("setModel");
+    services.avoid_exhausted_provider(&fx.ws, &fx.agent).await;
+
+    assert_eq!(fx.row().await.provider.as_deref(), Some(first.as_str()));
+    assert!(notices(&fx.messages().await, "provider_failover").is_empty());
+    // Used up: the next turn start moves off the still-marked choice.
+    services.avoid_exhausted_provider(&fx.ws, &fx.agent).await;
+    assert_eq!(fx.row().await.provider.as_deref(), Some(second.as_str()));
+}
