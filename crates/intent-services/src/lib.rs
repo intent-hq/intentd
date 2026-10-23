@@ -59,6 +59,7 @@ mod agent_ops;
 mod agent_session;
 mod agent_subscriptions;
 mod agent_workers;
+mod auto_retire;
 mod retire;
 /// The §5.5b wire-ID rule, shared by the transport's request validation.
 pub use intent_acp::workers::is_wire_id;
@@ -309,6 +310,7 @@ mod v2_5_goldens;
 mod v2_7_goldens;
 
 pub use acp_adapter::{adapter_slot_limit, init_adapter_slots, live_adapters};
+pub use auto_retire::AutoRetireReport;
 pub use config_watcher::{ConfigWatcher, PreparedReloadAdmission};
 pub(crate) use mcp_servers::McpHub;
 pub use settings::{

@@ -838,3 +838,208 @@ async fn retire_and_revive_racing_leave_a_consistent_workspace() {
     assert!(wt.join("README.md").is_file(), "revived checkout survives");
     assert_eq!(head_branch(&wt), row.branch);
 }
+
+// ---------------------------------------------------------------------------
+// Automatic retire (PROTOCOL §5.1 "Automatic retire", §5.12
+// `workspace.autoRetireArchivedAfterDays`): a periodic sweep retires
+// workspaces archived longer than the configured number of days.
+// ---------------------------------------------------------------------------
+
+fn days_from_now(days: i64) -> time::OffsetDateTime {
+    time::OffsetDateTime::now_utc() + time::Duration::days(days)
+}
+
+/// Off by default: with no `workspace.autoRetireArchivedAfterDays`, the
+/// sweep retires nothing, however long a workspace has been archived.
+#[intent_test_macros::daemon_test]
+async fn auto_retire_is_off_by_default() {
+    let f = fixture().await;
+    let ws = create_workspace(&f).await;
+    f.svc
+        .archive_workspace(ws.id.clone(), None)
+        .await
+        .expect("archive");
+
+    let report = f.svc.sweep_auto_retire_at(days_from_now(3650)).await;
+    assert_eq!(report, crate::AutoRetireReport::default());
+    let row = f.store.get_workspace(&ws.id).await.unwrap();
+    assert!(!row.is_retired());
+    assert!(row.archived);
+    assert!(std::path::Path::new(ws.worktree_path.as_deref().unwrap()).is_dir());
+}
+
+/// With 7 days: a workspace archived 8 days ago is retired (folder removed,
+/// one retire delta), one archived 6 days ago is not, and an Active
+/// workspace is never touched. A second sweep is a no-op (idempotent).
+#[intent_test_macros::daemon_test]
+async fn auto_retire_retires_only_workspaces_archived_past_the_threshold() {
+    let f = fixture().await;
+    let old = create_workspace(&f).await;
+    let active = create_workspace(&f).await;
+    f.svc
+        .archive_workspace(old.id.clone(), None)
+        .await
+        .expect("archive");
+
+    // Archived "6 days ago": not yet due.
+    let report = f
+        .svc
+        .sweep_auto_retire_after(Some(7), days_from_now(6))
+        .await;
+    assert_eq!(report.retired, 0, "{report:?}");
+    assert!(!f.store.get_workspace(&old.id).await.unwrap().is_retired());
+
+    // Archived "8 days ago": retired through the workspace.retire path.
+    let mut sub = subscribe_updates(&f, &old.id);
+    let report = f
+        .svc
+        .sweep_auto_retire_after(Some(7), days_from_now(8))
+        .await;
+    assert_eq!(report.retired, 1, "{report:?}");
+    assert_eq!(report.failed, 0, "{report:?}");
+    let row = f.store.get_workspace(&old.id).await.unwrap();
+    assert!(row.is_retired());
+    assert!(row.retired_at.is_some());
+    wait_gone(std::path::Path::new(old.worktree_path.as_deref().unwrap())).await;
+    let changes = drain_changes(&mut sub).await;
+    assert!(
+        changes
+            .iter()
+            .any(|c| c["status"] == "Retired" && c["archived"] == true),
+        "retire delta published: {changes:?}"
+    );
+
+    let untouched = f.store.get_workspace(&active.id).await.unwrap();
+    assert_eq!(untouched.status, WorkspaceStatus::Active);
+    assert!(!untouched.archived);
+    assert!(std::path::Path::new(active.worktree_path.as_deref().unwrap()).is_dir());
+
+    // Idempotent: the retired workspace is not swept again.
+    let again = f
+        .svc
+        .sweep_auto_retire_after(Some(7), days_from_now(30))
+        .await;
+    assert_eq!(again, crate::AutoRetireReport::default());
+}
+
+/// Fail-soft per workspace: a due workspace whose retire is refused (a
+/// folder that is not a registered worktree) is counted as skipped — not a
+/// failure, so it does not warn every sweep — and left intact, and the sweep
+/// still retires the other due workspace.
+#[intent_test_macros::daemon_test]
+async fn auto_retire_is_fail_soft_per_workspace() {
+    let f = fixture().await;
+    let id = WorkspaceId::from("ws-auto-unregistered");
+    let folder = f.root.join(id.as_str()).join("repo");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("keep.txt"), "user data").unwrap();
+    let mut bad = super::workspace(&id);
+    bad.repository_path = Some(f.repo.to_string_lossy().to_string());
+    bad.worktree_path = Some(folder.to_string_lossy().to_string());
+    bad.checkout_mode = Some(intent_core::CheckoutMode::Worktree);
+    bad.archived = true;
+    bad.archived_at = Some(crate::now_iso());
+    f.store.insert_workspace(&bad).await.expect("insert");
+    let good = create_workspace(&f).await;
+    f.svc
+        .archive_workspace(good.id.clone(), None)
+        .await
+        .expect("archive");
+
+    let report = f
+        .svc
+        .sweep_auto_retire_after(Some(7), days_from_now(8))
+        .await;
+    assert_eq!(report.retired, 1, "{report:?}");
+    assert_eq!(report.skipped, 1, "{report:?}");
+    assert_eq!(report.failed, 0, "{report:?}");
+    assert!(f.store.get_workspace(&good.id).await.unwrap().is_retired());
+    let kept = f.store.get_workspace(&id).await.unwrap();
+    assert!(!kept.is_retired());
+    assert!(
+        folder.join("keep.txt").is_file(),
+        "refused folder untouched"
+    );
+}
+
+/// Remote and retire-unsupported workspaces (here a `direct` checkout, whose
+/// folder is the repository) are skipped without an attempt, and an
+/// archived row without `archivedAt` is never treated as overdue.
+#[intent_test_macros::daemon_test]
+async fn auto_retire_skips_remote_unsupported_and_undated_workspaces() {
+    let f = fixture().await;
+    let mut inserted = Vec::new();
+    for (name, remote, mode, dated) in [
+        (
+            "ws-auto-remote",
+            true,
+            intent_core::CheckoutMode::Worktree,
+            true,
+        ),
+        (
+            "ws-auto-direct",
+            false,
+            intent_core::CheckoutMode::Direct,
+            true,
+        ),
+        (
+            "ws-auto-undated",
+            false,
+            intent_core::CheckoutMode::Worktree,
+            false,
+        ),
+    ] {
+        let id = WorkspaceId::from(name);
+        let folder = f.root.join(name).join("repo");
+        std::fs::create_dir_all(&folder).unwrap();
+        let mut ws = super::workspace(&id);
+        ws.repository_path = Some(f.repo.to_string_lossy().to_string());
+        ws.worktree_path = Some(folder.to_string_lossy().to_string());
+        ws.checkout_mode = Some(mode);
+        ws.is_remote = remote;
+        ws.archived = true;
+        ws.archived_at = dated.then(crate::now_iso);
+        f.store.insert_workspace(&ws).await.expect("insert");
+        inserted.push((id, folder));
+    }
+
+    let report = f
+        .svc
+        .sweep_auto_retire_after(Some(1), days_from_now(30))
+        .await;
+    assert_eq!(report.retired, 0, "{report:?}");
+    assert_eq!(report.failed, 0, "{report:?}");
+    assert_eq!(report.skipped, 3, "{report:?}");
+    for (id, folder) in inserted {
+        assert!(
+            !f.store.get_workspace(&id).await.unwrap().is_retired(),
+            "{id}"
+        );
+        assert!(folder.is_dir(), "{id} folder untouched");
+    }
+}
+
+/// The sweep reads the setting live from the settings registry: once
+/// `workspace.autoRetireArchivedAfterDays = 7` is set, an overdue archived
+/// workspace is retired on the next sweep without a restart.
+#[intent_test_macros::daemon_test]
+async fn auto_retire_reads_the_live_setting() {
+    let f = fixture().await;
+    let cfg = f.root.join("auto-retire.config.toml");
+    let registry = std::sync::Arc::new(crate::SettingsRegistry::load(cfg).expect("registry"));
+    let svc = f.svc.clone().with_settings_registry(registry.clone());
+    let ws = create_workspace(&f).await;
+    svc.archive_workspace(ws.id.clone(), None)
+        .await
+        .expect("archive");
+
+    assert_eq!(svc.sweep_auto_retire_at(days_from_now(8)).await.retired, 0);
+    registry
+        .apply(&[(
+            "workspace.autoRetireArchivedAfterDays".to_string(),
+            serde_json::json!(7),
+        )])
+        .expect("set");
+    assert_eq!(svc.sweep_auto_retire_at(days_from_now(8)).await.retired, 1);
+    assert!(f.store.get_workspace(&ws.id).await.unwrap().is_retired());
+}
