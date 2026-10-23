@@ -17844,25 +17844,21 @@ async fn worker_driven_streaming_failure_records_streak_exactly_once() {
 /// Error status, the terminal `agent:failed` + `agent:stream:end` pair
 /// (emitted by the terminal-failure path, since `run_prompt_turn` suppressed
 /// it for the marker error), and the message requeued for `agent.retry`.
-#[tokio::test]
-async fn second_pre_output_transport_failure_takes_terminal_path() {
-    second_pre_output_transport_failure_scenario().await;
-}
-
-/// Stack-headroom guard for the agent-turn path. The pre-output transport
-/// failure scenario nests the deepest turn-path poll frames on one thread
-/// (`run_message_worker` → `retry_spawn_owned` → `ensure_started_owned` →
-/// `start_session_owned` → `start_session_opened` → session load, twice, then
-/// the terminal-failure path). Debug poll frames there once filled the whole
-/// 2 MiB default test stack (the scenario needed ~2.08 MB, so any small
-/// addition overflowed); with the turn path's await sites built off-frame by
-/// [`crate::stack_frame::boxed_await`] it needs ~570 KiB. Running it on a
-/// 1 MiB thread keeps at least half the default stack free: a stack overflow
+///
+/// Also the stack-headroom guard for the agent-turn path, so it runs on a
+/// reduced 1 MiB stack instead of the 2 MiB default. The scenario nests the
+/// deepest turn-path poll frames on one thread (`run_message_worker` →
+/// `retry_spawn_owned` → `ensure_started_owned` → `start_session_owned` →
+/// `start_session_opened` → session load, twice, then the terminal-failure
+/// path). Debug poll frames there once filled the whole default stack (the
+/// scenario needed ~2.08 MB, so any small addition overflowed); with the
+/// turn path's await sites built off-frame by
+/// [`crate::stack_frame::boxed_await`] it needs ~570 KiB. A stack overflow
 /// here (the process aborts with SIGSEGV) means a new large future is being
 /// awaited inline on the turn path — build it with `boxed_await` instead of
 /// raising this budget.
 #[test]
-fn turn_path_fits_reduced_stack() {
+fn second_pre_output_transport_failure_takes_terminal_path() {
     const TURN_PATH_STACK_BUDGET: usize = 1024 * 1024;
     std::thread::Builder::new()
         .name("turn-path-stack-guard".into())
@@ -17876,7 +17872,7 @@ fn turn_path_fits_reduced_stack() {
         })
         .expect("spawn the reduced-stack thread")
         .join()
-        .expect("turn path completes within the reduced stack");
+        .expect("the scenario's assertions hold");
 }
 
 async fn second_pre_output_transport_failure_scenario() {

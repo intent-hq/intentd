@@ -4521,11 +4521,10 @@ impl AgentManager {
                 // new/recreate sessions have no buffered replay.
                 {
                     let mut guard = notes.lock().await;
-                    Services::drain_replay_notifications(
-                        &mut guard,
-                        agent_id,
-                        Some(&session_record.workspace_id),
-                    )
+                    let (guard_mut, ws) = (&mut guard, &session_record.workspace_id);
+                    boxed_await(move || {
+                        Services::drain_replay_notifications(guard_mut, agent_id, Some(ws))
+                    })
                     .await;
                 }
                 boxed_await(|| {
@@ -11360,9 +11359,12 @@ impl AgentManager {
         // materialized at this activation choke point — every turn (first
         // spawn, resume, respawn, wake) funnels through here. One-time and
         // idempotent; a no-op for stamped rows.
-        self.services
-            .materialize_legacy_harness_features(&mut session)
-            .await;
+        let session_mut = &mut session;
+        boxed_await(move || {
+            self.services
+                .materialize_legacy_harness_features(session_mut)
+        })
+        .await;
         let workspace = boxed_await(|| self.services.store.get_workspace(workspace_id))
             .await
             .ok();
@@ -11745,16 +11747,19 @@ impl AgentManager {
         // id (`fill_identity_from_session_open`). The child runs exactly that
         // model, so adopt it as the resolved identity: the notice/commit
         // below and the next turn's respawn comparison see the same id.
-        let filled_model = self
-            .adopt_filled_model(
+        let (session_ref, workspace_ref, settings_ref, resolved_ref) =
+            (&session, workspace.as_ref(), &settings, &mut resolved);
+        let filled_model = boxed_await(move || {
+            self.adopt_filled_model(
                 agent_id,
                 workspace_id,
-                &session,
-                workspace.as_ref(),
-                &settings,
-                &mut resolved,
+                session_ref,
+                workspace_ref,
+                settings_ref,
+                resolved_ref,
             )
-            .await;
+        })
+        .await;
         // Backup failover: a turn that started on the provider default now
         // runs under the filled model, which the session row also carries.
         if let (None, Some(filled)) = (session.model.as_deref(), filled_model.as_deref()) {
@@ -14337,7 +14342,6 @@ async fn run_message_worker(
                         mgr.services.clear_failure_streak(&agent_id);
                         // A turn that went back to the home provider and
                         // completed there is home (PROTOCOL §5.54).
-
                         boxed_await(|| {
                             mgr.services
                                 .complete_provider_return(&workspace_id, &agent_id)
@@ -14534,11 +14538,15 @@ async fn run_message_worker(
                                         .map(|h| h.execution.runtime.notifications());
                                     if let Some(notes) = notes {
                                         let mut guard = notes.lock().await;
-                                        Services::drain_replay_notifications(
-                                            &mut guard,
-                                            &agent_id,
-                                            Some(&workspace_id),
-                                        )
+                                        let (guard_mut, agent, ws) =
+                                            (&mut guard, &agent_id, &workspace_id);
+                                        boxed_await(move || {
+                                            Services::drain_replay_notifications(
+                                                guard_mut,
+                                                agent,
+                                                Some(ws),
+                                            )
+                                        })
                                         .await;
                                     }
                                 } else {
@@ -15020,15 +15028,17 @@ async fn run_message_worker(
             // annotated content reaches both the persisted user row and the
             // provider prompt. Runs before the next iteration's report clear,
             // so `completion_report_timestamp` is still visible here.
-            let stale = mgr.annotate_stale_redrive(&agent_id, &mut next).await;
+            let (worker, agent, next_mut) = (&mgr, &agent_id, &mut next);
+            let stale = boxed_await(move || worker.annotate_stale_redrive(agent, next_mut)).await;
             // Dequeue-wait note: same placement contract as the stale check.
             annotate_dequeue_wait(&mut next);
             // Identity link: same placement as the single-entry drain arm.
             stamp_queued_message_id(&mut next);
             // Delivery-time unblocked hints (monorepo#2044): resolved at
             // render time, same placement as the single-entry drain arm.
-            annotate_unblocked_hints(&mgr.services, &agent_id, std::slice::from_mut(&mut next))
-                .await;
+            let (services, agent, next_mut) =
+                (&mgr.services, &agent_id, std::slice::from_mut(&mut next));
+            boxed_await(move || annotate_unblocked_hints(services, agent, next_mut)).await;
             // Drain-start signal (monorepo#1022): covers redrives that skip
             // the user-row append below. Emitted AFTER the stale-redrive
             // annotation so the payload's `content` matches what is
@@ -15254,15 +15264,17 @@ async fn run_message_worker(
             // Stale-redrive check (#576): same contract as the pre-release
             // drain arm. Runs only after the slot is re-claimed so a message
             // handed back via `requeue_front` below is never annotated here.
-            let stale = mgr.annotate_stale_redrive(&agent_id, &mut next).await;
+            let (worker, agent, next_mut) = (&mgr, &agent_id, &mut next);
+            let stale = boxed_await(move || worker.annotate_stale_redrive(agent, next_mut)).await;
             // Dequeue-wait note: same placement contract as the stale check.
             annotate_dequeue_wait(&mut next);
             // Identity link: same contract as the pre-release drain arm.
             stamp_queued_message_id(&mut next);
             // Delivery-time unblocked hints (monorepo#2044): same contract
             // as the pre-release drain arm.
-            annotate_unblocked_hints(&mgr.services, &agent_id, std::slice::from_mut(&mut next))
-                .await;
+            let (services, agent, next_mut) =
+                (&mgr.services, &agent_id, std::slice::from_mut(&mut next));
+            boxed_await(move || annotate_unblocked_hints(services, agent, next_mut)).await;
             // Drain-start signal (monorepo#1022): same contract as the
             // pre-release drain arm — emitted AFTER the stale-redrive
             // annotation so the payload's `content` matches the turn.

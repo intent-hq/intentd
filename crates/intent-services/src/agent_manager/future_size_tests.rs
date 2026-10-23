@@ -25,8 +25,8 @@
 //! Stored future size is only half of the stack story: in a debug build each
 //! inline await also costs about twice the awaited future's size in the
 //! caller's POLL FRAME, which `size_of_val` cannot see. That half is guarded
-//! by `agent_manager::tests::turn_path_fits_reduced_stack`; see
-//! `crate::stack_frame`.
+//! by `second_pre_output_transport_failure_takes_terminal_path` in
+//! `agent_manager::tests` (runs on a 1 MiB stack); see `crate::stack_frame`.
 
 use super::tests::manager;
 use super::*;

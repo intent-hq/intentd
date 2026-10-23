@@ -11,12 +11,17 @@
 //!
 //! [`boxed_await`] builds the future inside its own short-lived,
 //! never-inlined frame and returns it already boxed, so the caller's poll
-//! frame holds just the closure's captures plus a pointer. The agent-turn path
-//! (`run_message_worker` → `retry_spawn_owned` → `ensure_started_owned` →
-//! `start_session_opened`) nests several large poll frames on one stack, so
-//! its await sites use it; the reduced-stack guard
-//! `agent_manager::tests::turn_path_fits_reduced_stack` keeps the path within
-//! budget.
+//! frame holds just the closure's captures plus a pointer.
+//!
+//! The agent-turn path (`run_message_worker` → `retry_spawn_owned` →
+//! `ensure_started_owned` → `start_session_owned` → `start_session_opened` →
+//! session load) nests several poll frames on one stack. Rule there: await
+//! every crate async fn or method through `boxed_await`, including small
+//! ones, since their size changes silently; await runtime primitives
+//! (`tokio::time::sleep`, lock acquisition, `Notify`) directly. The guards are
+//! `agent_manager::tests::second_pre_output_transport_failure_takes_terminal_path`
+//! (runs the path on a 1 MiB stack) and `agent_manager::future_size_tests`
+//! (stored future sizes).
 
 use std::future::Future;
 use std::pin::Pin;

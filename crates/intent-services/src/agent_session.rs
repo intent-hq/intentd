@@ -3383,9 +3383,10 @@ impl Services {
         cwd: impl Into<PathBuf>,
         mcp_servers: Vec<McpServer>,
     ) -> Result<Option<AcpSessionOpened>> {
-        let Some(prepared) =
-            boxed_await(|| self.prepare_acp_load(conn, None, init, agent_id, cwd, mcp_servers))
-                .await?
+        // `prepare_acp_load` boxes its body; its own future is pointer-sized.
+        let Some(prepared) = self
+            .prepare_acp_load(conn, None, init, agent_id, cwd, mcp_servers)
+            .await?
         else {
             return Ok(None);
         };
@@ -3622,33 +3623,27 @@ impl Services {
             bootstrap
                 .with_current(|| Ok(()))
                 .map_err(|_| unavailable())?;
-            let prepared = boxed_await(|| callbacks
-                .prepare_review_history(&acp_session_id, native.context().clone()))
-                .await
-                .map_err(|_| unavailable())?;
+            let prepared = boxed_await(|| {
+                callbacks.prepare_review_history(&acp_session_id, native.context().clone())
+            })
+            .await
+            .map_err(|_| unavailable())?;
             let target = prepared
                 .load_target(cwd.clone(), mcp_servers.clone(), meta.clone())
                 .map_err(|_| unavailable())?;
-            let verified = boxed_await(|| bootstrap
-                .verify_history(prepared.messages()))
+            let verified = boxed_await(|| bootstrap.verify_history(prepared.messages()))
                 .await
                 .map_err(|_| unavailable())?;
-            let admitted = boxed_await(|| verified
-                .admit(Arc::new(self.clone())))
+            let admitted = boxed_await(|| verified.admit(Arc::new(self.clone())))
                 .await
                 .map_err(|_| unavailable())?;
             admitted
                 .retain_native_context()
                 .map_err(|_| unavailable())?;
-            let opened = boxed_await(|| prepared
-                .load(
-                    callbacks,
-                    cwd,
-                    mcp_servers,
-                    meta,
-                    admitted.bind_load(target),
-                ))
-                .await;
+            let opened = boxed_await(|| {
+                prepared.load(callbacks, cwd, mcp_servers, meta, admitted.bind_load(target))
+            })
+            .await;
             if let Ok(opened) = &opened {
                 if native.is_retired()
                     || !opened
@@ -3665,8 +3660,7 @@ impl Services {
             }
             opened
         } else if let Some(callbacks) = callbacks {
-            boxed_await(|| callbacks
-                .load_session(&acp_session_id, cwd, mcp_servers, meta))
+            boxed_await(|| callbacks.load_session(&acp_session_id, cwd, mcp_servers, meta))
                 .await
         } else {
             boxed_await(|| session::load_session(conn, &acp_session_id, cwd, mcp_servers, meta))
