@@ -82,7 +82,11 @@ async fn read_json(reader: &mut BufReader<OwnedReadHalf>) -> Value {
 
 async fn expect_no_frame(reader: &mut BufReader<OwnedReadHalf>) {
     let mut line = String::new();
-    let r = timeout(Duration::from_millis(400), reader.read_line(&mut line)).await;
+    let r = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(400)),
+        reader.read_line(&mut line),
+    )
+    .await;
     if let Ok(Ok(n)) = r {
         assert!(n == 0, "unexpected frame after unsubscribe: {line}");
     }

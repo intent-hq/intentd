@@ -57,6 +57,7 @@ impl ScriptManager {
         if self.locks.is_closing(ws) {
             return Err(Error::NotFound(format!("workspace {ws}")));
         }
+        self.require_admission(ws, id).await?;
         if self
             .scripts
             .lock()

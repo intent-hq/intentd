@@ -19,10 +19,12 @@ class HostedRunners(unittest.TestCase):
             self.assertEqual(re.findall(r'depot-(?:ubuntu|windows|macos)[\w.-]*', path.read_text()), [], str(path))
 
     def test_every_fallback_key_is_routed(self):
-        # A key missing from runner-route's hosted list silently skips the
-        # self-hosted fleet and always runs (and bills) on GitHub.
+        # A paid key missing from runner-route's hosted list silently skips the
+        # self-hosted fleet and always runs (and bills) on its burst runner.
         route = (ROOT / '.github/workflows/runner-route.yml').read_text()
         hosted = set(re.findall(r"'([\w.-]+)'", route.split('const hosted = {', 1)[1].split('};', 1)[0]))
+        # Free standard labels always run on GitHub by design.
+        hosted |= set(re.findall(r"'([\w.-]+)'", route.split('const free = [', 1)[1].split('];', 1)[0]))
         self.assertIn('gh-linux-16x', hosted)
         used = set()
         for path in (ROOT / '.github').rglob('*.yml'):

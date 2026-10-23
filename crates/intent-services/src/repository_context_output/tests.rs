@@ -1091,9 +1091,12 @@ async fn context_output_mixed_original_worktree_locks_omit_only_optional_and_kee
             holder.await.unwrap();
         } else {
             assert!(
-                tokio::time::timeout(Duration::from_millis(80), &mut task)
-                    .await
-                    .is_err(),
+                tokio::time::timeout(
+                    intentd_test_support::test_timeout(Duration::from_millis(80)),
+                    &mut task
+                )
+                .await
+                .is_err(),
                 "shared required lock cannot be bypassed"
             );
             if mode == "shared-retired" {

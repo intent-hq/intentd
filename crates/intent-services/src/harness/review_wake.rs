@@ -23,6 +23,37 @@ fn plural(n: i64) -> &'static str {
     }
 }
 
+/// Names of the skipped checks in a wire `checks.items` array, in order.
+pub(crate) fn skipped_names(items: &Value) -> Vec<&str> {
+    items
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter(|item| item["status"] == "skipped")
+                .filter_map(|item| item["name"].as_str())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The one aggregate line for a check suite that finished. "all checks
+/// passed" is reserved for suites where every check ran and passed; skipped
+/// checks are counted and named on their own.
+pub(crate) fn checks_completed(total: i64, passed: i64, failed: i64, skipped: &[&str]) -> String {
+    if failed == 0 && skipped.is_empty() {
+        return format!("all checks passed ({total})");
+    }
+    let mut line = format!("all checks completed: {passed} passed");
+    if failed > 0 || skipped.is_empty() {
+        let _ = write!(line, ", {failed} failed");
+    }
+    if !skipped.is_empty() {
+        let _ = write!(line, ", {} skipped ({})", skipped.len(), skipped.join(", "));
+    }
+    line
+}
+
 pub(crate) fn checklist(r: &Value, ready: bool) -> String {
     let mut lines = vec![format!("state: {}", text(&r["state"]))];
     let a = &r["approvals"];
@@ -43,12 +74,18 @@ pub(crate) fn checklist(r: &Value, ready: bool) -> String {
         lines.push(format!("changes requested by {n} reviewer{}", plural(n)));
     }
     let c = &r["checks"];
+    let skipped = skipped_names(&c["items"]);
     let mut checks = if ["passed", "failed", "pending", "total"]
         .iter()
         .all(|key| c[*key].is_number())
     {
+        let skipped_count = if skipped.is_empty() {
+            String::new()
+        } else {
+            format!(", {} skipped", skipped.len())
+        };
         format!(
-            "checks: {} passed, {} failed, {} pending (of {})",
+            "checks: {} passed, {} failed, {} pending{skipped_count} (of {})",
             text(&c["passed"]),
             text(&c["failed"]),
             text(&c["pending"]),
@@ -57,6 +94,9 @@ pub(crate) fn checklist(r: &Value, ready: bool) -> String {
     } else {
         "checks: unknown (check results unavailable)".into()
     };
+    if !skipped.is_empty() {
+        let _ = write!(checks, "; skipped: {}", skipped.join(", "));
+    }
     for (key, label) in [
         ("failingRequired", "failing required"),
         ("pendingRequired", "pending required"),
@@ -70,6 +110,15 @@ pub(crate) fn checklist(r: &Value, ready: bool) -> String {
         checks.push_str(" (required-check flags unavailable)");
     }
     lines.push(checks);
+    let stall = &r["checksNotStarted"];
+    if let Some(head) = stall["headSha"].as_str() {
+        let short: String = head.chars().take(8).collect();
+        lines.push(format!(
+            "checks never started on head {short} (none reported {}+ min after its commit) \
+             — push again or rebase to trigger CI",
+            text(&stall["thresholdMinutes"])
+        ));
+    }
     let threads = &r["threads"];
     let count = threads["unresolved"].as_i64().map_or_else(
         || "unknown (thread resolution state unreadable)".into(),

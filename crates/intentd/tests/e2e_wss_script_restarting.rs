@@ -189,7 +189,8 @@ async fn wss_rpc(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value 
 /// `script:output`, pings) are skipped — so consecutive calls observe the
 /// `script:state` stream in bus order.
 async fn next_state(ws: &mut TlsWs, script_id: &str, secs: u64) -> Value {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(secs));
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         assert!(

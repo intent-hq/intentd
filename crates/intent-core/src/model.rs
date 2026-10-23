@@ -388,6 +388,14 @@ pub struct Workspace {
     /// when no wait signal is live.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub waiting: bool,
+    /// Daemon-owned orthogonal script flag (PROTOCOL §5.1): `true` while the
+    /// workspace has a command-mode script run in flight (service-mode
+    /// scripts never count). Read live from the in-memory script registry on
+    /// the same emit path as `waiting`; never persisted; omitted (not
+    /// `false`) when nothing runs. Feeds neither `activity` nor
+    /// `displayStatus`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub scripts_running: bool,
     /// Durable token/credit usage accounting (§5.23 / §19.1), materialized by the
     /// daemon-internal periodic scan job and surfaced by `workspace.getTokenUsage`.
     /// Omitted (not `null`) until the first scan writes a snapshot.
@@ -830,6 +838,7 @@ pub fn chief_workspace() -> Workspace {
         display_status: None,
         attention_reminder: None,
         waiting: false,
+        scripts_running: false,
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
@@ -1850,6 +1859,11 @@ pub struct NoteUpdateInput {
     /// Optimistic-concurrency gate: when `Some`, the write only succeeds if the
     /// note's current `rev` matches; absent → last-writer-wins (PROTOCOL §5.6).
     pub expected_version: Option<i64>,
+    /// Truncated-read write guard (`baseContentBytes`): on the content arm,
+    /// the UTF-8 size of the writer's base text; a mismatch with the stored
+    /// content refuses the write (`Error::ContentBaseMismatch`). Ignored on
+    /// the metadata arm.
+    pub base_content_bytes: Option<u64>,
 }
 
 /// Wire input for `note.add` (PROTOCOL §5.2).
@@ -3226,6 +3240,62 @@ pub fn note_list_slim_row(mut note: Note) -> serde_json::Value {
             "contentLength".to_string(),
             serde_json::json!(content.chars().count()),
         );
+    }
+    value
+}
+
+/// Byte length of the longest prefix of `content` that the truncated-read
+/// cut rule keeps under `limit` UTF-8 bytes, or `None` when the whole
+/// `content` fits (the row is then served unchanged).
+///
+/// The prefix ends right after the last line feed within the limit; with no
+/// line feed in range it ends on the last UTF-8 character boundary, stepping
+/// back one byte so a `\r\n` pair is never split (protocol `note.get`
+/// "Truncated note reads", fixtures `notes/truncated-read.json`).
+#[must_use]
+pub fn truncated_content_len(content: &str, limit: usize) -> Option<usize> {
+    let bytes = content.as_bytes();
+    if bytes.len() <= limit {
+        return None;
+    }
+    if let Some(lf) = bytes[..limit].iter().rposition(|&b| b == b'\n') {
+        return Some(lf + 1);
+    }
+    let mut end = limit;
+    while end > 0 && !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    if end > 0 && bytes[end - 1] == b'\r' && bytes[end] == b'\n' {
+        end -= 1;
+    }
+    Some(end)
+}
+
+/// Serialize one `Note` for a read that opted in with `maxContentBytes`
+/// (`note.get`, `note.subscribe`): a note whose content fits serializes
+/// exactly as the unbounded row; a larger one carries the
+/// [`truncated_content_len`] prefix plus `contentTruncated: true` and
+/// `contentBytes` (the full stored UTF-8 size). Every other field is
+/// unchanged. The content is cut in place, so the full body is never copied.
+#[must_use]
+pub fn note_bounded_row(mut note: Note, max_content_bytes: usize) -> serde_json::Value {
+    let full_bytes = note.content.len();
+    let cut = truncated_content_len(&note.content, max_content_bytes);
+    if let Some(end) = cut {
+        note.content.truncate(end);
+    }
+    let mut value = serde_json::to_value(&note).unwrap_or_else(|e| {
+        tracing::warn!(note_id = %note.id.0, error = %e, "note_bounded_row: serializing note failed; serving null row");
+        serde_json::Value::Null
+    });
+    if cut.is_some() {
+        if let serde_json::Value::Object(map) = &mut value {
+            map.insert(
+                "contentTruncated".to_string(),
+                serde_json::Value::Bool(true),
+            );
+            map.insert("contentBytes".to_string(), serde_json::json!(full_bytes));
+        }
     }
     value
 }
@@ -5876,7 +5946,10 @@ impl Principal {
 #[serde(rename_all = "lowercase")]
 pub enum WorkspaceRole {
     Owner,
+    /// Participant in the UI; retain the original wire/database word.
     Collaborator,
+    /// A guest allowed to create agents and operate saved scripts, not an owner.
+    Manager,
 }
 
 impl WorkspaceRole {
@@ -5886,6 +5959,7 @@ impl WorkspaceRole {
         match self {
             WorkspaceRole::Owner => "owner",
             WorkspaceRole::Collaborator => "collaborator",
+            WorkspaceRole::Manager => "manager",
         }
     }
 }
@@ -7510,6 +7584,7 @@ mod tests {
             display_status: None,
             attention_reminder: None,
             waiting: false,
+            scripts_running: false,
             token_usage: None,
             cow_supported: None,
             browser_client_id: None,
@@ -7549,6 +7624,18 @@ mod tests {
         assert_eq!(v["waiting"], serde_json::json!(true));
         let back: Workspace = serde_json::from_value(v).unwrap();
         assert_eq!(back, waiting_ws);
+
+        // Presence-detected `scriptsRunning`: omitted when false.
+        assert!(serde_json::to_value(&ws)
+            .unwrap()
+            .get("scriptsRunning")
+            .is_none());
+        let mut running_ws = ws.clone();
+        running_ws.scripts_running = true;
+        let v = serde_json::to_value(&running_ws).unwrap();
+        assert_eq!(v["scriptsRunning"], serde_json::json!(true));
+        let back: Workspace = serde_json::from_value(v).unwrap();
+        assert_eq!(back, running_ws);
     }
 
     /// The card aggregates serialize with the exact nested field names + casing

@@ -2863,6 +2863,7 @@ pub struct AgentManager {
     next_admission: AtomicUsize,
     /// Claimed startup side effects must finish before retirement detaches.
     turn_start_gates: crate::agent_ops::AgentRetirementGates,
+    active_discussion_turns: Mutex<HashMap<AgentId, String>>,
     /// Start of the current stretch with no turn in flight: `Some(boot)`
     /// initially, cleared on the `busy` empty → non-empty edge and re-armed
     /// on the non-empty → empty edge. Every access — the two writers AND the
@@ -3133,6 +3134,7 @@ impl AgentManager {
             turn_admissions: Mutex::new(HashMap::new()),
             next_admission: AtomicUsize::new(0),
             turn_start_gates: crate::agent_ops::AgentRetirementGates::default(),
+            active_discussion_turns: Mutex::default(),
             idle_since: Arc::new(Mutex::new(Some(Instant::now()))),
             reap_claims: Arc::new(Mutex::new(HashSet::new())),
             agent_ws: Arc::new(Mutex::new(HashMap::new())),
@@ -6454,6 +6456,16 @@ impl AgentManager {
             self.retain_finishing_worker(worker);
         }
         if sync_store && !self.is_shutting_down() {
+            let discussion_turn = self
+                .active_discussion_turns
+                .lock()
+                .unwrap()
+                .remove(agent_id);
+            if let Some(turn) = discussion_turn {
+                self.services
+                    .set_discussion_activity(&turn, "stopped", None)
+                    .await;
+            }
             self.services.settle_script_monitor_worker(agent_id).await;
         }
         self.services
@@ -6632,6 +6644,16 @@ impl AgentManager {
         if let Some(worker) = self.workers.lock().unwrap().remove(agent_id) {
             worker.abort();
             self.retain_finishing_worker(worker);
+        }
+        let discussion_turn = self
+            .active_discussion_turns
+            .lock()
+            .unwrap()
+            .remove(agent_id);
+        if let Some(turn) = discussion_turn {
+            self.services
+                .set_discussion_activity(&turn, "stopped", None)
+                .await;
         }
         self.services.settle_script_monitor_worker(agent_id).await;
         // The abort may have landed between the streaming path's terminal-
@@ -9615,17 +9637,24 @@ impl AgentManager {
                     Ok(ws) if ws.archived
                 )
             {
-                return self
-                    .send_message(agent_id, workspace_id, content, message_id, options)
-                    .await;
+                return Box::pin(self.send_message(
+                    agent_id,
+                    workspace_id,
+                    content,
+                    message_id,
+                    options,
+                ))
+                .await;
             }
             self.preempt_busy_turn(&agent_id, &mut options).await;
             // The slot was just released (or was never held): the send path claims
             // it and streams the interrupt message right away rather than queueing.
             // If a concurrent send wins the race the message queues instead — it is
             // still delivered by that worker's drain loop, never dropped.
-            self.send_message(agent_id, workspace_id, content, message_id, options)
-                .await
+            // The send can synchronously drain its append-failure fallback. Keep
+            // its large future out of this interrupt frame so the nested drain
+            // also fits on the default thread stack under coverage instrumentation.
+            Box::pin(self.send_message(agent_id, workspace_id, content, message_id, options)).await
         })
         .await
     }
@@ -9768,6 +9797,47 @@ impl AgentManager {
         }
     }
 
+    fn track_discussion_turn(&self, agent: &AgentId, options: &TurnOptions) {
+        let mut active = self.active_discussion_turns.lock().unwrap();
+        if crate::discussion_activity::is_discussion(options.message_metadata.as_ref()) {
+            if let Some(turn) = &options.turn_id {
+                active.insert(agent.clone(), turn.clone());
+            }
+        } else {
+            active.remove(agent);
+        }
+    }
+
+    fn clear_discussion_turn(&self, agent: &AgentId, options: &TurnOptions) {
+        let mut active = self.active_discussion_turns.lock().unwrap();
+        if active.get(agent) == options.turn_id.as_ref() {
+            active.remove(agent);
+        }
+    }
+
+    /// Fence new admissions, then abort only the worker owning this invocation.
+    pub(crate) async fn stop_discussion_turn(&self, agent: &AgentId, turn: &str) {
+        let gate = self.turn_start_gates.for_agent(agent);
+        let _admission = gate.lock().await;
+        {
+            let mut active = self.active_discussion_turns.lock().unwrap();
+            if active.get(agent).map(String::as_str) != Some(turn) {
+                return;
+            }
+            self.services.pin_live_turn(agent);
+            if let Some(worker) = self.workers.lock().unwrap().remove(agent) {
+                worker.abort();
+                self.retain_finishing_worker(worker);
+            }
+            active.remove(agent);
+        }
+        self.interrupt_inner(agent, InterruptReason::UserStop, None)
+            .await;
+        // Explicit stopped invocations can only be resumed with Retry.
+        self.stop_redelivery.lock().unwrap().remove(agent);
+        self.sync_stop_redelivery(agent).await;
+    }
+
     /// Spawn (and track) the background turn worker for an agent. The caller must
     /// already hold the in-flight slot (`try_begin`). `user_persisted` reports
     /// whether the initial turn's user row durably reached the transcript, so a
@@ -9797,6 +9867,7 @@ impl AgentManager {
         if options.turn_id.is_none() {
             options.turn_id = Some(new_message_id());
         }
+        self.track_discussion_turn(&agent_id, &options);
         self.services
             .track_script_monitor_worker(&agent_id, options.message_metadata.as_ref());
         // Consume a pending zero-output stop redelivery
@@ -9821,7 +9892,9 @@ impl AgentManager {
         // flush rebuilds the same aggregate order as this turn (entry
         // prepends in entry order, then the stop redelivery) instead of
         // losing it with the discarded aggregate prepend.
-        let armed = if options.monitor_turn.is_none() {
+        let armed = if options.monitor_turn.is_none()
+            && !crate::discussion_activity::is_discussion(options.message_metadata.as_ref())
+        {
             self.stop_redelivery.lock().unwrap().remove(&agent_id)
         } else {
             None
@@ -11714,6 +11787,18 @@ impl AgentManager {
         // to spawn. Include those workers, not only installed handles, or their
         // resolved interruption row would be lost at this shutdown.
         let in_flight = self.list_busy();
+        // Agents whose provider still runs a background worker (§5.5b): the
+        // teardown after this checkpoint kills the provider tree and the
+        // worker with it, so its completion report never arrives. Capture them
+        // before any await so the restart resume tells each agent its work was
+        // lost — including agents that ended their turn and are idle, which
+        // the in-flight capture below would otherwise skip.
+        let with_workers = self.services.agent_workers().running_worker_agents();
+        let worker_ids: HashSet<&AgentId> = with_workers.iter().map(|(id, _)| id).collect();
+        // Agents the in-flight capture below took responsibility for, whether
+        // or not its row write succeeded: the idle capture must never record
+        // a mid-turn agent as idle.
+        let mut captured_mid_turn: HashSet<AgentId> = HashSet::new();
         // Pin every live slot before aborting any worker: dropping its future
         // drops the LiveTurnGuard, which would otherwise erase partial output.
         for (id, _) in &in_flight {
@@ -11788,9 +11873,10 @@ impl AgentManager {
             // work is only finishing post-turn bookkeeping: recording it would
             // make the next startup deliver a second continuation.
             if self.turn_settled(id) && !self.services.has_ready_to_send(id) {
-                tracing::debug!(agent_id = %id, "graceful shutdown: turn already settled, no interrupted_agent row");
+                tracing::debug!(agent_id = %id, "graceful shutdown: turn already settled, no in-flight interrupted_agent row");
                 continue;
             }
+            captured_mid_turn.insert(id.clone());
             // Read the current persisted status BEFORE end_turn settles it to RuntimeIdle.
             // Use get_agent_session_status (lightweight, skips message log).
             // RACE: try_begin inserts into busy BEFORE persist_status(Active) completes, so
@@ -11838,13 +11924,69 @@ impl AgentManager {
             // Insert the interrupted_agent row (idempotent upsert: if a prior crash captured
             // this agent and the daemon was restarted without the FE resolving it, the row
             // is refreshed to the latest state).
+            let reason = worker_ids
+                .contains(id)
+                .then_some(crate::agent_workers::INTERRUPTED_WITH_WORKERS_REASON);
             if let Err(e) = self
                 .services
                 .store
-                .insert_interrupted_agent(id, workspace_id, &prev_str, &now)
+                .insert_interrupted_agent_with_reason(id, workspace_id, &prev_str, &now, reason)
                 .await
             {
                 tracing::warn!(agent_id = %id, workspace_id = %workspace_id, error = %e, "graceful shutdown: failed to insert interrupted_agent row");
+            }
+        }
+        // Agents outside a turn whose background workers this shutdown kills
+        // (intent-hq/intent#7658). The row's prev_status is the agent's own
+        // (idle) status; the reason tag drives the resume wording. None of
+        // these is mid-turn (busy, unsettled agents were captured above), so
+        // an in-flight status is a post-turn idle write that has not landed
+        // yet and is recorded as idle. Finished agents are left alone: a
+        // deleted, retired or completed agent, or a delegated child that
+        // already reported (its parent owns the follow-up, and a pending row
+        // would hold its delegation group open).
+        for (id, workspace_id) in &with_workers {
+            if captured_mid_turn.contains(id) {
+                continue;
+            }
+            let session = match self.services.store.get_agent_session_summary(id).await {
+                Ok(session) => session,
+                Err(e) => {
+                    tracing::warn!(agent_id = %id, error = %e, "graceful shutdown: could not read an agent with running workers");
+                    continue;
+                }
+            };
+            let finished = matches!(
+                session.status,
+                AgentStatus::Deleted | AgentStatus::Completed
+            ) || session.retired_at.is_some()
+                || (session.parent_agent_id.is_some() && session.completion_report.is_some());
+            if finished {
+                tracing::debug!(agent_id = %id, status = ?session.status, "graceful shutdown: finished agent with running workers, no interrupted_agent row");
+                continue;
+            }
+            let prev_status = if crate::is_stale_in_flight_status(session.status) {
+                AgentStatus::RuntimeIdle
+            } else {
+                session.status
+            };
+            let Ok(serde_json::Value::String(prev_str)) = serde_json::to_value(prev_status) else {
+                tracing::warn!(agent_id = %id, status = ?prev_status, "graceful shutdown: status did not encode to a string, skipping interrupted_agent row");
+                continue;
+            };
+            if let Err(e) = self
+                .services
+                .store
+                .insert_interrupted_agent_with_reason(
+                    id,
+                    workspace_id,
+                    &prev_str,
+                    &now,
+                    Some(crate::agent_workers::INTERRUPTED_WITH_WORKERS_REASON),
+                )
+                .await
+            {
+                tracing::warn!(agent_id = %id, workspace_id = %workspace_id, error = %e, "graceful shutdown: failed to insert interrupted_agent row for an agent with running workers");
             }
         }
     }
@@ -12765,7 +12907,10 @@ fn redelivery_prepend(
     if messages
         .iter()
         .rfind(|message| message.role == "user")
-        .is_some_and(crate::agent_ops::is_qualified_monitor_message)
+        .is_some_and(|message| {
+            crate::agent_ops::is_qualified_monitor_message(message)
+                || crate::discussion_activity::is_discussion(message.metadata.as_ref())
+        })
     {
         return None;
     }
@@ -13838,7 +13983,8 @@ fn dequeue_worker_raced_tail(
 ) -> Option<(Vec<QueuedMessage>, DrainingGuard)> {
     // The head was popped before the slot reclaim, so queue selectors can no
     // longer see its monitor identity. Never attach unrelated work to its wake.
-    if next.monitor_turn.is_some()
+    if crate::discussion_activity::is_discussion(next.message_metadata.as_ref())
+        || next.monitor_turn.is_some()
         || crate::script_monitor::monitor_id(next.message_metadata.as_ref()).is_some()
     {
         return None;
@@ -13898,6 +14044,33 @@ async fn run_message_worker(
     // nudge, a stale or requeued redelivery): no timed return home there.
     let mut continuation_turn = false;
     'outer: loop {
+        mgr.track_discussion_turn(&agent_id, &options);
+        if crate::discussion_activity::is_discussion(options.message_metadata.as_ref()) {
+            let turn = options.turn_id.as_deref().expect("discussion turn id");
+            match mgr
+                .services
+                .store
+                .discussion_invocation_allowed(turn, &agent_id)
+                .await
+            {
+                Ok(true) => {
+                    mgr.services
+                        .set_discussion_activity(turn, "working", None)
+                        .await;
+                }
+                Ok(false) => {
+                    mgr.clear_discussion_turn(&agent_id, &options);
+                    mgr.finish_monitor_worker(&agent_id, &workspace_id, admission)
+                        .await;
+                    return;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "retrying discussion admission");
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    continue 'outer;
+                }
+            }
+        }
         if let Some(owner) = options.monitor_turn.take() {
             if let Some(turn) = owner.take() {
                 // Keep the qualified turn future out of the ordinary worker frame.
@@ -14119,7 +14292,19 @@ async fn run_message_worker(
                     )
                     .await
                 {
-                    Ok(_stop_reason) => {
+                    Ok(stop_reason) => {
+                        mgr.clear_discussion_turn(&agent_id, &options);
+                        mgr.services
+                            .settle_discussion_options(
+                                &options,
+                                if stop_reason == StopReason::Cancelled {
+                                    "stopped"
+                                } else {
+                                    "completed"
+                                },
+                                None,
+                            )
+                            .await;
                         if let Some(id) =
                             crate::script_monitor::monitor_id(options.message_metadata.as_ref())
                         {
@@ -14202,6 +14387,10 @@ async fn run_message_worker(
                     }
                     Err(e) => {
                         if is_benign_turn_error(&e) {
+                            mgr.clear_discussion_turn(&agent_id, &options);
+                            mgr.services
+                                .settle_discussion_options(&options, "stopped", None)
+                                .await;
                             if let Some(id) =
                                 crate::script_monitor::monitor_id(options.message_metadata.as_ref())
                             {
@@ -14213,7 +14402,11 @@ async fn run_message_worker(
                             // Keep draining: any queued message re-spawns lazily.
                             tracing::warn!(agent = %agent_id, error = %e, "agent turn ended (benign)");
                             consecutive_idle_timeouts = 0;
-                        } else if prompt_idle_timeout_error(&e) {
+                        } else if prompt_idle_timeout_error(&e)
+                            && !crate::discussion_activity::is_discussion(
+                                options.message_metadata.as_ref(),
+                            )
+                        {
                             // Warn-and-continue: the turn went the whole idle
                             // window silent. `run_prompt_turn` already flushed
                             // the partial transcript and emitted a NORMAL
@@ -16329,6 +16522,15 @@ async fn publish_error_status_and_requeue(
     persisted: bool,
     error: PersistedTerminalError,
 ) {
+    mgr.clear_discussion_turn(agent_id, options);
+    if crate::discussion_activity::is_discussion(options.message_metadata.as_ref()) {
+        mgr.services
+            .settle_discussion_options(options, "failed", Some(&error.error_text))
+            .await;
+        publish_terminal_error_status_via_services(&mgr.services, agent_id, workspace_id, &error)
+            .await;
+        return;
+    }
     publish_terminal_error_status_via_services(&mgr.services, agent_id, workspace_id, &error).await;
     let PersistedTerminalError {
         error_text,
@@ -18142,6 +18344,7 @@ mod role_reminder_tests {
             display_status: None,
             attention_reminder: None,
             waiting: false,
+            scripts_running: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
@@ -20263,8 +20466,11 @@ mod disabled_provider_rehome_tests {
 
     async fn drain(sub: &mut crate::events::Subscription) -> Vec<intent_core::Event> {
         let mut events = Vec::new();
-        while let Ok(Some(batch)) =
-            tokio::time::timeout(Duration::from_millis(300), sub.recv()).await
+        while let Ok(Some(batch)) = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            sub.recv(),
+        )
+        .await
         {
             events.extend(batch);
         }
@@ -22838,6 +23044,7 @@ mod agent_retry_tests {
             display_status: None,
             attention_reminder: None,
             waiting: false,
+            scripts_running: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,

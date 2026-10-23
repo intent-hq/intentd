@@ -184,12 +184,15 @@ tab with an error pointing at `showTab`. Note that re-issuing
 `openTab { url, visible: true }` on a URL you already have hidden does NOT reveal it:
 a dedupe hit never changes the reused tab's visibility — use `showTab`.
 
-All of this works even when the workspace is not currently visible in the app: the
-operations succeed and apply their effects to the persisted layout state, and
+All of this works even when the workspace is not currently visible in the app — or
+not open in any window at all, in which case an open app window hosts it in the
+background without showing it: the operations succeed and apply their effects to the
+persisted layout state, and
 `showTab { focus: true }` / `focusTab` / `openTab { visible: true }` skip the actual
 UI focus attempt, carrying a workspace-not-visible `warning` string in the action
-result. A capture op (`screenshot`, `getAccessibilityTree`, `evaluate`) on an unmounted
-tab of a not-in-view workspace mounts the tab on demand under the request deadline and
+result. A capture op (`screenshot`, `getAccessibilityTree`, `evaluate`, and also `snapshot`
+and the capture-session actions) on an unmounted tab of a not-in-view workspace mounts
+the tab on demand under the request deadline and
 succeeds with the same `warning`; when the mount, settle, or paint cannot happen it
 fails with a structured `errorCode` (`workspace-not-visible`, `deadline-exhausted`,
 `still-loading`, `navigated-away`, `not-painting`). `navigate` mounts on demand too but

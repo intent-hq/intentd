@@ -84,6 +84,7 @@ fn workspace(id: &WorkspaceId) -> Workspace {
         display_status: None,
         attention_reminder: None,
         waiting: false,
+        scripts_running: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
@@ -406,6 +407,11 @@ fn golden_supervisor_history_wrapper() {
          mean the tool failed or returned empty output; the original call ran and its full result was \
          delivered at the time. If you genuinely need one specific full output, re-run that ONE call \
          once. Do not re-fetch the same inputs repeatedly.\n\
+         \n\
+         Note on escaping: text quoted inside the XML tags of this message is XML-escaped only so \
+         it can be quoted (&lt; &gt; &amp; &quot; stand for < > & \"). The original messages used \
+         the literal characters. Write your own replies with literal characters too: for example \
+         <!-- and -->, never &lt;!-- and --&gt;.\n\
          \n\
          <exchange>\n\
          \x20 <user_request_or_tool_results>\n\
@@ -770,6 +776,7 @@ fn merge_requirements(
             passed: 2,
             failed: 0,
             pending: 1,
+            skipped: 0,
             items: vec![],
             failing_required: vec![],
             pending_required: vec!["build".to_string()],
@@ -791,6 +798,7 @@ fn merge_requirements(
         is_in_merge_queue: None,
         merge_queue_ejection: None,
         merge_queue: None,
+        checks_not_started: None,
     }
 }
 
@@ -803,11 +811,13 @@ pub(crate) fn pr_snapshot(state: &str) -> crate::pr_monitor::PrMonitorSnapshot {
         review_comment_count: 1,
         requirements: merge_requirements(state, 0, 1),
         ejection_tracked: true,
+        skipped_tracked: true,
         checks_unobserved: false,
         checks_seed_pending: false,
         status_checks: Some(Vec::new()),
         required_check_names: None,
         observed_at: None,
+        checks_not_started_delivered: None,
     }
 }
 
@@ -1605,7 +1615,12 @@ fn golden_supervisor_history_truncation_markers() {
                 omitted entirely. Truncation here does NOT mean the tool failed or returned empty \
                 output; the original call ran and its full result was delivered at the time. If \
                 you genuinely need one specific full output, re-run that ONE call once. Do not \
-                re-fetch the same inputs repeatedly.\n\n";
+                re-fetch the same inputs repeatedly.\n\n\
+                Note on escaping: text quoted inside the XML tags of this message is XML-escaped \
+                only so it can be quoted (&lt; &gt; &amp; &quot; stand for < > & \"). The \
+                original messages used the literal characters. Write your own replies with \
+                literal characters too: for example <!-- and -->, never &lt;!-- and \
+                --&gt;.\n\n";
     let preamble_len = "<supervisor>\nThe previous ACP session was lost. Below is the full \
                         conversation history from the prior session so you can continue \
                         seamlessly.\nDo NOT mention session recovery to the user. Just \

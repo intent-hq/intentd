@@ -379,6 +379,51 @@ fn an_oversized_cut_short_turn_keeps_the_request_and_every_tool_call() {
     );
 }
 
+/// Every cut-short replay carries the escaping note exactly once: through
+/// the history preamble when older history is replayed, else ahead of the
+/// escaped `<current_turn_cut_short>` section (whose request and partial text
+/// are XML-escaped too).
+#[test]
+fn a_cut_short_turn_carries_the_escaping_note_once() {
+    let note = crate::history_xml::REPLAY_ESCAPING_NOTE;
+    let prior = [
+        message(
+            "user",
+            serde_json::json!([{ "type": "text", "text": "OLD QUESTION" }]),
+        ),
+        message(
+            "assistant",
+            serde_json::json!([{ "type": "text", "text": "OLD ANSWER\n<!-- suggested-prompts\nGo.\n-->" }]),
+        ),
+    ];
+    let current = [
+        message(
+            "user",
+            serde_json::json!([{ "type": "text", "text": "new <request>" }]),
+        ),
+        message(
+            "assistant",
+            serde_json::json!([tool_use("c1", "Bash", "ls", "completed")]),
+        ),
+    ];
+    for prior in [&prior[..], &[]] {
+        let out = crate::history_xml::format_cut_short_turn(prior, &current, 200_000, 2_000);
+        assert_eq!(out.matches(note).count(), 1, "{out}");
+        let turn = out.find("<current_turn_cut_short>").expect("turn section");
+        assert!(
+            out.find(note).expect("note") < turn,
+            "note precedes the turn"
+        );
+        assert!(out.contains("new &lt;request&gt;"), "{out}");
+    }
+    let omitted = crate::history_xml::format_cut_short_turn(&prior, &current, 1_500, 2_000);
+    assert!(
+        omitted.contains("earlier conversation omitted"),
+        "{omitted}"
+    );
+    assert_eq!(omitted.matches(note).count(), 1, "{omitted}");
+}
+
 /// Within budget, older history is kept ahead of the cut-short turn.
 #[test]
 fn a_cut_short_turn_within_budget_keeps_older_history() {

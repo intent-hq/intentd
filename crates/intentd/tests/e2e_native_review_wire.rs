@@ -2040,6 +2040,7 @@ async fn driver_loop(descriptor: &DriverDescriptor) -> DriverResult<()> {
         }
         Ok::<(), anyhow::Error>(())
     };
+    // fixed-deadline: allow — stays under the review descriptor's server-set lifetime_seconds, after which the daemon revokes it
     let outcome = timeout(
         Duration::from_secs(descriptor.lifetime_seconds.saturating_sub(10))
             .saturating_sub(started.elapsed()),

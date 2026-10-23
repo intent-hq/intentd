@@ -17,9 +17,11 @@
 //! emit `workspace:displayStatus-changed` or touch the baseline.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-use intent_core::events::{WORKSPACE_DISPLAY_STATUS_CHANGED, WORKSPACE_WAITING_CHANGED};
+use intent_core::events::{
+    WORKSPACE_DISPLAY_STATUS_CHANGED, WORKSPACE_SCRIPTS_RUNNING_CHANGED, WORKSPACE_WAITING_CHANGED,
+};
 use intent_core::{
     now_iso, AgentId, PullRequestInfo, PullRequestStatus, Workspace, WorkspaceActivity,
     WorkspaceAttention, WorkspaceDisplayStatus, WorkspaceId, WorkspaceTaskStats,
@@ -58,6 +60,58 @@ pub(crate) type DisplayStatusCache = LastObservedCache<WorkspaceDisplayStatus>;
 
 /// Last-observed orthogonal `waiting` flag per workspace (PROTOCOL §5.1).
 pub(crate) type WaitingStatusCache = LastObservedCache<bool>;
+
+/// All `Workspace.scriptsRunning` recompute state, behind ONE `Arc` on
+/// `Services` (every extra `Services` field is copied into each future that
+/// captures a services clone, and deep agent-turn futures sit near the test
+/// thread's stack limit):
+///
+/// - `cache`: the last-observed value per workspace, the transition baseline
+///   for `workspace:scriptsRunning-changed`;
+/// - `locks`: the per-workspace ordering gate. The registry read, baseline
+///   record and publication run under it, so recomputes triggered by
+///   different scripts of one workspace (each holding only its own
+///   publication lock) cannot publish out of order. Different workspaces
+///   never contend;
+/// - `park` (tests only): see [`ScriptsRunningPark`].
+#[derive(Default)]
+pub(crate) struct ScriptsRunningState {
+    cache: WaitingStatusCache,
+    locks: Mutex<HashMap<WorkspaceId, Arc<tokio::sync::Mutex<()>>>>,
+    #[cfg(test)]
+    park: Mutex<Option<Arc<ScriptsRunningPark>>>,
+}
+
+impl ScriptsRunningState {
+    fn lock_for(&self, workspace_id: &WorkspaceId) -> Arc<tokio::sync::Mutex<()>> {
+        self.locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(workspace_id.clone())
+            .or_default()
+            .clone()
+    }
+
+    /// Drop a deleted workspace's baseline and gate; a gate holder keeps its
+    /// own `Arc`.
+    fn evict(&self, workspace_id: &WorkspaceId) {
+        self.cache.evict(workspace_id);
+        self.locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(workspace_id);
+    }
+}
+
+/// Test seam: parks the next `scriptsRunning` recompute that observed a
+/// transition, after its first registry read and before its store await, so
+/// a test can interleave a newer script start (one-shot).
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct ScriptsRunningPark {
+    pub(crate) entered: tokio::sync::Notify,
+    pub(crate) release: tokio::sync::Notify,
+}
 
 struct CacheInner<T> {
     map: HashMap<WorkspaceId, T>,
@@ -281,6 +335,14 @@ impl Services {
                 .seed(&ws.id, waiting, waiting_generation);
             waiting
         };
+        // `scriptsRunning` reads the in-memory script registry directly (no
+        // store I/O), so the served value is always live; the read also seeds
+        // the `workspace:scriptsRunning-changed` baseline.
+        let scripts_generation = self.scripts_running_state.cache.generation();
+        ws.scripts_running = self.workspace_scripts_running(&ws.id);
+        self.scripts_running_state
+            .cache
+            .seed(&ws.id, ws.scripts_running, scripts_generation);
         // Pre-read generation snapshot: a `workspace.delete` eviction racing
         // the awaits below must not have this seed resurrect the baseline.
         let generation = self.last_display_statuses.generation();
@@ -428,7 +490,8 @@ impl Services {
     /// best-effort/fail-open like the probes it reuses (a store read
     /// failure reads `false`, never wedges list/get emission).
     pub(crate) async fn workspace_is_waiting(&self, workspace_id: &WorkspaceId) -> bool {
-        self.workspace_has_active_hooks(workspace_id).await
+        self.workspace_has_active_hooks_or_script_monitors(workspace_id)
+            .await
             || self.workspace_has_active_pr_monitors(workspace_id).await
             || self
                 .workspace_has_waiting_agent_subscriptions(workspace_id)
@@ -576,6 +639,119 @@ impl Services {
         self.last_waiting_statuses.evict(workspace_id);
         if let Ok(mut cache) = self.last_attention_reminder_reasons.lock() {
             cache.remove(workspace_id);
+        }
+        self.scripts_running_state.evict(workspace_id);
+    }
+
+    /// Whether the workspace owns an active hook or an `active` script run
+    /// monitor (§5.8a) — two of the `waiting` signals, read in ONE statement
+    /// so `workspace.get` keeps its statement budget. Fails open to `false`
+    /// on a store error, like the PR-monitor probe.
+    pub(crate) async fn workspace_has_active_hooks_or_script_monitors(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> bool {
+        match self
+            .store
+            .workspaces_with_active_hooks_or_script_monitors(std::slice::from_ref(workspace_id))
+            .await
+        {
+            Ok(ids) => ids.contains(workspace_id),
+            Err(error) => {
+                tracing::warn!(
+                    workspace = %workspace_id.0,
+                    %error,
+                    "active hooks/script-monitors waiting lookup failed; reads as none"
+                );
+                false
+            }
+        }
+    }
+
+    /// Recompute `Workspace.scriptsRunning` and publish
+    /// `workspace:scriptsRunning-changed` iff it transitioned (PROTOCOL §5.1 /
+    /// §6.5). Called from the script lifecycle choke points (every
+    /// `script:state` / `script:changed` publication and definition
+    /// removal). The derivation is one in-memory registry read; an unchanged
+    /// value returns before any store I/O. A missing baseline reads as
+    /// `false` — nothing runs before the daemon's first script start — so the
+    /// first run after a restart still emits. Best-effort like
+    /// [`Services::maybe_emit_waiting_changed`].
+    pub(crate) async fn maybe_emit_scripts_running_changed(&self, workspace_id: &WorkspaceId) {
+        if workspace_id.is_chief() {
+            return;
+        }
+        // Callers hold only their own script's publication lock, so two
+        // scripts of one workspace can recompute concurrently. Serialize the
+        // read → record → publish sequence per workspace, and re-read the
+        // registry after the store await below, so a recompute that observed
+        // an older state can never publish (or record) it after a newer one.
+        let gate = self.scripts_running_state.lock_for(workspace_id);
+        let _serialized = gate.lock().await;
+        let generation = self.scripts_running_state.cache.generation();
+        let running = self.workspace_scripts_running(workspace_id);
+        if self
+            .scripts_running_state
+            .cache
+            .get(workspace_id)
+            .unwrap_or(false)
+            == running
+        {
+            self.scripts_running_state
+                .cache
+                .seed(workspace_id, running, generation);
+            return;
+        }
+        #[cfg(test)]
+        self.park_scripts_running_recompute().await;
+        // Deleted-workspace guard: never publish for (or seed a baseline of)
+        // a workspace whose row is gone.
+        if self.store.get_workspace(workspace_id).await.is_err() {
+            return;
+        }
+        let running = self.workspace_scripts_running(workspace_id);
+        self.scripts_running_state
+            .cache
+            .seed(workspace_id, false, generation);
+        let Some(transitioned) =
+            self.scripts_running_state
+                .cache
+                .record(workspace_id, running, generation)
+        else {
+            return;
+        };
+        if transitioned {
+            publish_event(
+                self.event_bus.as_ref(),
+                scripts_running_changed_event(workspace_id, running),
+            )
+            .await;
+        }
+    }
+
+    /// Arm [`ScriptsRunningPark`]: the next transitioning recompute parks.
+    #[cfg(test)]
+    pub(crate) fn arm_scripts_running_park(&self) -> Arc<ScriptsRunningPark> {
+        let park = Arc::new(ScriptsRunningPark::default());
+        *self
+            .scripts_running_state
+            .park
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(park.clone());
+        park
+    }
+
+    #[cfg(test)]
+    async fn park_scripts_running_recompute(&self) {
+        let park = self
+            .scripts_running_state
+            .park
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(park) = park {
+            park.entered.notify_one();
+            park.release.notified().await;
         }
     }
 
@@ -1401,6 +1577,23 @@ fn waiting_changed_event(workspace_id: &WorkspaceId, waiting: bool) -> NewEvent 
         data: serde_json::json!({
             "workspaceId": workspace_id.as_str(),
             "waiting": waiting,
+        }),
+    }
+}
+
+fn scripts_running_changed_event(workspace_id: &WorkspaceId, scripts_running: bool) -> NewEvent {
+    NewEvent {
+        workspace_id: workspace_id.clone(),
+        timestamp: now_iso(),
+        event_type: WORKSPACE_SCRIPTS_RUNNING_CHANGED.to_string(),
+        actor: system_actor(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data: serde_json::json!({
+            "workspaceId": workspace_id.as_str(),
+            "scriptsRunning": scripts_running,
         }),
     }
 }
@@ -4257,6 +4450,7 @@ mod display_status_events {
     }
 
     async fn assert_silent(sub: &mut Subscription) {
+        // fixed-deadline: allow — stays under the 500ms idle debounce set by DebounceEnvGuard::new("500") below while outlasting the 100ms one
         let res = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
         assert!(res.is_err(), "expected no displayStatus event: {res:?}");
     }

@@ -63,6 +63,9 @@ github-custom-job-permissions = { "publish-channel-manifest" = { contents = "wri
 # `python3 scripts/configure-release-concurrency.py` to restore the shared lock.
 # Then run `python3 scripts/configure-optional-intel-release.py` to restore
 # release-only Intel planning, failure isolation, and validated publication targets.
+# Then run `python3 scripts/configure-release-host-network.py` to restore the
+# retried crate fetch before the offline global `dist build` and `dist host`
+# (intent-hq/intent#7639).
 # scripts/test-prerelease-cleanup-workflow.py enforces the generated block and
 # ensures the post-announce reusable workflow never reacquires the caller lock.
 allow-dirty = ["ci"]

@@ -31,7 +31,7 @@ use intent_store::{
 };
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
-use super::{Connection, Services};
+use super::{acquire_wait, frame_ttl, request_wait, Connection, Services};
 use crate::repository_admission::lifecycle::{RepositorySourceLifetime, RepositorySubscription};
 use crate::repository_admission::{
     AdmissionError, RepositoryAuthorityFacts, RepositoryAuthorityProvenance,
@@ -42,9 +42,12 @@ const GLOBAL_LIMIT: usize = 256;
 const WORKER_LIMIT: usize = 2;
 const RECONCILE_LIMIT: usize = 64;
 const NOTICE_LIMIT: usize = 64;
-const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
-const FRAME_TTL: Duration = Duration::from_secs(15);
-const ADMISSION_TIMEOUT: Duration = Duration::from_secs(10);
+const ADMISSION_TIMEOUT_BASE: Duration = Duration::from_secs(10);
+/// Bound on selection admission; stretched in unit tests like every native
+/// request wait.
+fn admission_timeout() -> Duration {
+    request_wait(ADMISSION_TIMEOUT_BASE)
+}
 const LEASE_TTL: Duration = Duration::from_secs(300);
 const RECEIPT_TTL: Duration = Duration::from_secs(300);
 
@@ -468,7 +471,7 @@ impl Request {
     fn check(&self) -> Result<()> {
         self.connection.entered().map_err(denied)?;
         self.connection.selection.check()?;
-        if self.completed.load(Ordering::Acquire) || Instant::now() >= self.created + FRAME_TTL {
+        if self.completed.load(Ordering::Acquire) || Instant::now() >= self.created + frame_ttl() {
             return Err(unavailable());
         }
         self.lifetime
@@ -625,7 +628,7 @@ pub(super) fn capture_frame(c: &Connection, frame: Frame) -> Arc<dyn RepositoryR
         let weak = Arc::downgrade(&request);
         // caller-binding: allow — only finishes the original request lifetime; no service capability calls
         tokio::spawn(async move {
-            tokio::select! { () = retirement.native_cancelled() => {}, () = tokio::time::sleep(FRAME_TTL) => {} }
+            tokio::select! { () = retirement.native_cancelled() => {}, () = tokio::time::sleep(frame_ttl()) => {} }
             if let Some(request) = weak.upgrade() {
                 request.finish();
             }
@@ -789,7 +792,7 @@ impl RepositoryReadRequestScope for Request {
                             .native_dispatch(|| {
                                 op.disclosure.retirement().native_dispatch(|| {
                                     if self.completed.load(Ordering::Acquire)
-                                        || Instant::now() >= self.created + FRAME_TTL
+                                        || Instant::now() >= self.created + frame_ttl()
                                         || self.consumed.swap(true, Ordering::AcqRel)
                                     {
                                         return Err(AdmissionError::Retired);
@@ -809,7 +812,7 @@ impl RepositoryReadRequestScope for Request {
                     .map_err(denied)
             };
             checked(&request, async {
-                tokio::time::timeout(ADMISSION_TIMEOUT, operation)
+                tokio::time::timeout(admission_timeout(), operation)
                     .await
                     .map_err(denied)?
             })
@@ -869,7 +872,7 @@ fn entry<'a, T: Send + 'static>(
 pub(crate) fn capture(services: &Services, query: Query) -> BoxFuture<'_, Result<Capture>> {
     entry(services, &Frame::Capture(query), |request| {
         Box::pin(async move {
-            tokio::time::timeout(ACQUIRE_TIMEOUT, acquire(&request))
+            tokio::time::timeout(acquire_wait(), acquire(&request))
                 .await
                 .map_err(denied)?
         })
@@ -1121,7 +1124,7 @@ async fn mutate(request: &Arc<Request>) -> Result<Attempt> {
             wake.await;
         }
     };
-    match tokio::time::timeout(ADMISSION_TIMEOUT, wait).await {
+    match tokio::time::timeout(admission_timeout(), wait).await {
         Ok(result) => result,
         Err(_) => op.attempt(),
     }
@@ -1162,7 +1165,7 @@ async fn run_write(request: &Request, op: &Operation) -> Receipt {
             || {
                 request.check()?;
                 op.write_current()?;
-                if Instant::now() >= request.created + ADMISSION_TIMEOUT {
+                if Instant::now() >= request.created + admission_timeout() {
                     return Err(unavailable());
                 }
                 c.parent
@@ -1175,7 +1178,7 @@ async fn run_write(request: &Request, op: &Operation) -> Receipt {
                             .native_dispatch(|| {
                                 op.write.retirement().native_dispatch(|| {
                                     if request.completed.load(Ordering::Acquire)
-                                        || Instant::now() >= request.created + ADMISSION_TIMEOUT
+                                        || Instant::now() >= request.created + admission_timeout()
                                     {
                                         return Err(AdmissionError::Retired);
                                     }

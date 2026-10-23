@@ -88,6 +88,9 @@ mod delete_grace;
 mod delivery_tasks;
 mod device_ops;
 mod discovery_cache;
+mod discussion_activity;
+mod discussion_delivery;
+mod discussion_ops;
 mod disk_usage;
 mod drafts;
 mod enhance_ops;
@@ -269,6 +272,8 @@ mod transfer_roundtrip;
 #[cfg(all(test, unix))]
 mod transfer_selection_contract;
 mod transfer_submodules;
+#[cfg(test)]
+mod truncated_read_guard_tests;
 mod unsloth_server;
 mod voice_ops;
 mod workspace_aggregates;
@@ -507,7 +512,8 @@ struct WorkspaceAggregateSnapshot {
     task_stats: Option<HashMap<WorkspaceId, WorkspaceTaskStats>>,
     sessions: Option<HashMap<WorkspaceId, Vec<AgentSession>>>,
     unread: Option<HashSet<WorkspaceId>>,
-    active_hooks: HashSet<WorkspaceId>,
+    /// Workspaces owning an active hook or script monitor (one UNION read).
+    active_hooks_or_script_monitors: HashSet<WorkspaceId>,
     active_pr_monitors: HashSet<WorkspaceId>,
     /// Each workspace's displayStatus-relevant PR monitor rows from the
     /// list's ONE bulk monitor read; folded per row during enrichment,
@@ -1190,6 +1196,10 @@ pub struct Services {
     /// `workspace_status` module. Shared across clones so every service
     /// handle compares against the same last-emitted value.
     last_waiting_statuses: Arc<workspace_status::WaitingStatusCache>,
+    /// `Workspace.scriptsRunning` recompute state (§5.1): the transition
+    /// baseline, per-workspace ordering gates and test seam, behind one `Arc`
+    /// to keep `Services` (and every future holding a clone) small.
+    scripts_running_state: Arc<workspace_status::ScriptsRunningState>,
     /// REV-1 agent-initiated reverse-dispatch seam: when an agent calls
     /// `ws.browser.exec` via the MCP front door there is no ambient client
     /// connection to reverse-dispatch on, so [`WorkspaceApi::browser_exec`]
@@ -1281,6 +1291,7 @@ pub struct Services {
     /// connections (multiplayer w4).
     principal_revocations: invite_ops::PrincipalRevocations,
     human_instruction_authority: Arc<tokio::sync::RwLock<()>>,
+    discussion_control_gates: Arc<agent_ops::AgentRetirementGates>,
     #[cfg(test)]
     invite_create_commit_pause: Arc<member_removal::MutationBarrier>,
     #[cfg(test)]
@@ -1792,6 +1803,7 @@ impl Services {
             last_display_statuses: Arc::new(workspace_status::DisplayStatusCache::default()),
             last_attention_reminder_reasons: Arc::new(Mutex::new(HashMap::new())),
             last_waiting_statuses: Arc::new(workspace_status::WaitingStatusCache::default()),
+            scripts_running_state: Arc::new(workspace_status::ScriptsRunningState::default()),
             reverse_dispatch: None,
             server_control: Arc::new(OnceLock::new()),
             invite_links: Arc::new(OnceLock::new()),
@@ -1816,6 +1828,7 @@ impl Services {
             invite_nonces: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             invite_nonce_permits: invite_ops::new_nonce_permits(),
             human_instruction_authority: Arc::new(tokio::sync::RwLock::new(())),
+            discussion_control_gates: Arc::default(),
             #[cfg(test)]
             invite_create_commit_pause: Arc::new(member_removal::MutationBarrier::default()),
             #[cfg(test)]
@@ -3030,6 +3043,13 @@ impl Services {
         script_ops::command_activity(&self.scripts, &self.script_locks)
     }
 
+    /// Whether `workspace_id` has a command-mode script run in flight — the
+    /// [`Self::command_script_activity`] predicate scoped to one workspace,
+    /// backing `Workspace.scriptsRunning` (§5.1). One registry lock, no I/O.
+    pub(crate) fn workspace_scripts_running(&self, workspace_id: &WorkspaceId) -> bool {
+        script_ops::workspace_command_running(&self.scripts, workspace_id)
+    }
+
     /// Clean daemon shutdown (monorepo#1526): flag every managed script with
     /// user-stop semantics (so no auto-restart races the teardown), kill every
     /// PTY session the host tracks — scripts and terminals alike — in one
@@ -3427,8 +3447,9 @@ impl Services {
                 .workspaces_with_unread_top_level_sessions_by_workspace(workspace_ids),
             self.compute_cow_supported(),
         );
-        let (active_hooks, monitors, legacy_question_tails, git_roots) = tokio::join!(
-            self.store.workspaces_with_active_hooks(workspace_ids),
+        let (active_hooks_or_script_monitors, monitors, legacy_question_tails, git_roots) = tokio::join!(
+            self.store
+                .workspaces_with_active_hooks_or_script_monitors(workspace_ids),
             self.store
                 .list_display_status_pr_monitors_by_workspaces(workspace_ids),
             self.store
@@ -3590,7 +3611,7 @@ impl Services {
             task_stats,
             sessions,
             unread: unread.ok(),
-            active_hooks: active_hooks.unwrap_or_default(),
+            active_hooks_or_script_monitors: active_hooks_or_script_monitors.unwrap_or_default(),
             active_pr_monitors,
             monitor_rows,
             git_root_prs,
@@ -3660,7 +3681,7 @@ impl Services {
         }
         ws.cow_supported = snapshot.cow_supported;
         let unread = snapshot.unread.as_ref().map(|ids| ids.contains(&ws.id));
-        let waiting = snapshot.active_hooks.contains(&ws.id)
+        let waiting = snapshot.active_hooks_or_script_monitors.contains(&ws.id)
             || snapshot.active_pr_monitors.contains(&ws.id)
             || sessions.is_some_and(|sessions| {
                 self.workspace_has_waiting_agent_subscriptions_in_sessions(&ws.id, sessions)
@@ -4700,7 +4721,17 @@ impl Services {
                 .to_string();
 
             // Insert interrupted_agent row (idempotent: second restart is a no-op).
-            if let Err(e) = self
+            // A pending row that graceful shutdown tagged with lost background
+            // workers (intent-hq/intent#7658) is the better record of this
+            // interruption: re-upserting would clear its tag (and prev_status).
+            let tagged = matches!(
+                self.store.get_interrupted_agent(&session.id).await,
+                Ok(Some(row)) if row.reason.as_deref()
+                    == Some(crate::agent_workers::INTERRUPTED_WITH_WORKERS_REASON)
+            );
+            if tagged {
+                tracing::debug!(agent_id = %session.id, "heal: keeping the background-workers interrupted_agent row");
+            } else if let Err(e) = self
                 .store
                 .insert_interrupted_agent(&session.id, &session.workspace_id, &prev_str, &now)
                 .await
@@ -11186,6 +11217,27 @@ fn check_set_content_reduction(
     Ok(())
 }
 
+/// Truncated-read write guard: compare the writer's `baseContentBytes` with
+/// the UTF-8 size of the base `merge` resolved — the stored `current`
+/// content on the exact path, the retained snapshot on the merge path. The
+/// last-writer-wins path has no known base, so a guarded write is refused
+/// there rather than overwriting text the writer never saw.
+fn check_content_base(expected: u64, merge: &SetContentMerge, current: &str) -> Result<()> {
+    let resolved = match merge.outcome {
+        "exact" => Some(current.len()),
+        "merged" => merge.base.as_deref().map(str::len),
+        _ => None,
+    }
+    .map(|len| u64::try_from(len).unwrap_or(u64::MAX));
+    if resolved == Some(expected) {
+        return Ok(());
+    }
+    Err(Error::ContentBaseMismatch {
+        base_content_bytes: expected,
+        resolved_base_bytes: resolved,
+    })
+}
+
 /// How [`persist_merged_content`] turns one attempt's merged text into the
 /// text it persists.
 #[derive(Clone, Copy)]
@@ -11231,6 +11283,16 @@ struct ContentWrite<'a> {
     author: &'a NoteVersionAuthor,
     /// Method label for the merge trace.
     op: &'static str,
+    /// The writer's `baseContentBytes` (truncated-read write guard): when
+    /// `Some`, every attempt refuses the write with
+    /// [`Error::ContentBaseMismatch`] unless it equals the UTF-8 size of the
+    /// base that attempt resolves (the stored content on the exact path, the
+    /// merge snapshot on the stale path; an unknown base always refuses, so
+    /// a guarded write never degrades to last-writer-wins). Without
+    /// `expected_version` a retry after a lost rev gate is refused too: the
+    /// concurrent text was never the writer's base. `None` (surgical ops,
+    /// agents, MCP) is unguarded.
+    base_content_bytes: Option<u64>,
 }
 
 /// Read-merge-persist loop every client content write runs through
@@ -11267,6 +11329,7 @@ async fn persist_merged_content(
         policy,
         author,
         op,
+        base_content_bytes,
     } = write;
     let normalized;
     let merge_input = match policy {
@@ -11285,6 +11348,16 @@ async fn persist_merged_content(
         };
         let old_content = note.content.clone();
         let current_rev = note.rev;
+        if let (Some(expected), None, true) = (base_content_bytes, expected_version, attempt > 1) {
+            // A guarded write without `expectedVersion` checked its base
+            // against the row the previous attempt read; a write that landed
+            // since is text the writer never saw, so it is refused rather
+            // than retried over (the caller holds no rev to merge from).
+            return Err(Error::ContentBaseMismatch {
+                base_content_bytes: expected,
+                resolved_base_bytes: Some(u64::try_from(old_content.len()).unwrap_or(u64::MAX)),
+            });
+        }
         let merge = merge_set_content(
             store,
             workspace_id,
@@ -11294,6 +11367,9 @@ async fn persist_merged_content(
             expected_version,
         )
         .await?;
+        if let Some(expected) = base_content_bytes {
+            check_content_base(expected, &merge, &old_content)?;
+        }
         if let ContentWritePolicy::SetContent {
             confirm_replacement,
         } = policy
@@ -12297,6 +12373,7 @@ async fn append_primitive(
             policy: ContentWritePolicy::Surgical,
             author: &author,
             op: "primitive.append",
+            base_content_bytes: None,
         },
     )
     .await?;
@@ -19015,6 +19092,12 @@ impl WorkspaceApi for Services {
             // (§5.1); it is included as true/false when the probe ran and
             // omitted when it could not run (presence-detected by clients).
             let mut caps = serde_json::Map::new();
+            caps.insert("discussionConversations".into(), serde_json::json!(1));
+            caps.insert("discussionMessageActions".into(), serde_json::json!(1));
+            caps.insert("discussionReactions".into(), serde_json::json!(1));
+            caps.insert("workspaceGuestRoles".into(), serde_json::json!(1));
+            caps.insert("discussionAgentMessaging".into(), serde_json::json!(1));
+            caps.insert("discussionAgentActivity".into(), serde_json::json!(1));
             if let Some(cow_supported) = self.compute_cow_supported().await {
                 caps.insert("cowSupported".to_string(), serde_json::json!(cow_supported));
             }
@@ -20955,7 +21038,7 @@ impl WorkspaceApi for Services {
     fn script_list(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
         Box::pin(async move {
-            self.require_workspace_manager(&workspace_id, "script.list")
+            self.require_workspace_operator(&workspace_id, "script.list")
                 .await?;
             mgr.list(&workspace_id).await
         })
@@ -20968,7 +21051,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
         Box::pin(async move {
-            self.require_workspace_manager(&workspace_id, "script.list")
+            self.require_workspace_operator(&workspace_id, "script.list")
                 .await?;
             mgr.list_filtered(&workspace_id, archive).await
         })
@@ -20980,7 +21063,7 @@ impl WorkspaceApi for Services {
         options: serde_json::Value,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            self.require_workspace_manager(&workspace_id, "script.list")
+            self.require_workspace_operator(&workspace_id, "script.list")
                 .await?;
             let options = intent_core::script_lists::ScriptListOptions::parse(&options, false)?;
             if options.summary {
@@ -20998,9 +21081,11 @@ impl WorkspaceApi for Services {
         script_id: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
-            self.require_workspace_manager(&workspace_id, "script.get")
+            self.require_saved_script_operator(&workspace_id, &script_id, "script.get")
                 .await?;
-            self.script_manager().get(&workspace_id, &script_id).await
+            let mgr = self.script_manager();
+            let _read = mgr.scoped_read_guard(&workspace_id, &script_id).await?;
+            mgr.get(&workspace_id, &script_id).await
         })
     }
     fn script_monitor_list_view(
@@ -21168,7 +21253,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
         Box::pin(async move {
-            self.require_workspace_manager(&workspace_id, "script.start")
+            self.require_saved_script_operator(&workspace_id, &script_id, "script.start")
                 .await?;
             mgr.start(&workspace_id, &script_id).await
         })
@@ -21181,7 +21266,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
         Box::pin(async move {
-            self.require_workspace_manager(&workspace_id, "script.stop")
+            self.require_saved_script_operator(&workspace_id, &script_id, "script.stop")
                 .await?;
             mgr.stop(&workspace_id, &script_id).await
         })
@@ -21194,7 +21279,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
         Box::pin(async move {
-            self.require_workspace_manager(&workspace_id, "script.restart")
+            self.require_saved_script_operator(&workspace_id, &script_id, "script.restart")
                 .await?;
             mgr.restart(&workspace_id, &script_id).await
         })
@@ -21210,9 +21295,10 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
         Box::pin(async move {
-            self.require_workspace_manager(&workspace_id, "script.output")
+            self.require_saved_script_operator(&workspace_id, &script_id, "script.output")
                 .await?;
             mgr.ensure_known(&workspace_id, &script_id).await?;
+            let _read = mgr.scoped_read_guard(&workspace_id, &script_id).await?;
             mgr.output(
                 &workspace_id,
                 &script_id,
@@ -21231,9 +21317,10 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
         Box::pin(async move {
-            self.require_workspace_manager(&workspace_id, "script.status")
+            self.require_saved_script_operator(&workspace_id, &script_id, "script.status")
                 .await?;
             mgr.ensure_known(&workspace_id, &script_id).await?;
+            let _read = mgr.scoped_read_guard(&workspace_id, &script_id).await?;
             mgr.status(&workspace_id, &script_id)
         })
     }
@@ -21247,10 +21334,15 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let mgr = self.script_manager();
         Box::pin(async move {
-            self.require_workspace_manager(&workspace_id, "script.run")
+            self.require_saved_script_operator(&workspace_id, &script_id, "script.run")
                 .await?;
-            mgr.run(&workspace_id, &script_id, max_lines, timeout_seconds)
-                .await
+            let result = mgr
+                .run(&workspace_id, &script_id, max_lines, timeout_seconds)
+                .await?;
+            // A command may finish after the owner downgraded this open socket.
+            self.require_saved_script_operator(&workspace_id, &script_id, "script.run")
+                .await?;
+            Ok(result)
         })
     }
 
@@ -22586,6 +22678,7 @@ impl WorkspaceApi for Services {
                         display_status: None,
                         attention_reminder: None,
                         waiting: false,
+                        scripts_running: false,
                         checkout_mode: None,
                         disk_usage: None,
                         pending_delete_at: None,
@@ -24610,6 +24703,7 @@ impl WorkspaceApi for Services {
                 display_status: None,
                 attention_reminder: None,
                 waiting: false,
+                scripts_running: false,
                 checkout_mode: None,
                 disk_usage: None,
                 pending_delete_at: None,
@@ -26052,10 +26146,30 @@ impl WorkspaceApi for Services {
             if let Some(content) = input.content.as_deref() {
                 note_ops::reject_numbered_read_presentation(content)?;
             }
-            let expected_version = input.expected_version;
+            let caller_expected_version = input.expected_version;
+            let mut expected_version = caller_expected_version;
             let mut note = fetch_note(&store, &workspace_id, &note_id).await?;
             // content present → raw full set; otherwise title/tags metadata.
             let content_changed = input.content.is_some();
+            if let (true, Some(base)) = (content_changed, input.base_content_bytes) {
+                // Truncated-read write guard, after the strict
+                // `expectedVersion` check (a stale value is `-32005` first).
+                // The persist below is then gated on the rev just checked, so
+                // a write landing in between cannot be overwritten unseen.
+                if expected_version.is_some_and(|v| v != note.rev) {
+                    let current = serde_json::to_value(&note)
+                        .map_err(|e| Error::Internal(format!("encode current note failed: {e}")))?;
+                    return Err(Error::Conflict { current });
+                }
+                let stored = u64::try_from(note.content.len()).unwrap_or(u64::MAX);
+                if stored != base {
+                    return Err(Error::ContentBaseMismatch {
+                        base_content_bytes: base,
+                        resolved_base_bytes: Some(stored),
+                    });
+                }
+                expected_version = Some(note.rev);
+            }
             let mut reanchor_plan: Option<ReanchorPlan> = None;
             if let Some(content) = input.content {
                 // Plain versioned write: a stale `expectedVersion` surfaces
@@ -26081,8 +26195,30 @@ impl WorkspaceApi for Services {
             if content_changed {
                 // FE-only `note.update`: no caller-agent context on this arm
                 // (transport router path), so the version author is the user.
-                persist_note_content(&store, &note, expected_version, &user_version_author())
-                    .await?;
+                match persist_note_content(&store, &note, expected_version, &user_version_author())
+                    .await
+                {
+                    // A guarded write the caller sent without
+                    // `expectedVersion` lost the rev gate pinned above: a
+                    // concurrent writer changed the note after the size
+                    // check, which the contract reports as a base mismatch.
+                    Err(Error::Conflict { current }) if caller_expected_version.is_none() => {
+                        if let Some(base) = input.base_content_bytes {
+                            let resolved = current
+                                .get("content")
+                                .and_then(serde_json::Value::as_str)
+                                .map(|c| u64::try_from(c.len()).unwrap_or(u64::MAX));
+                            return Err(Error::ContentBaseMismatch {
+                                base_content_bytes: base,
+                                resolved_base_bytes: resolved,
+                            });
+                        }
+                        return Err(Error::Conflict { current });
+                    }
+                    other => {
+                        other?;
+                    }
+                }
             } else {
                 // Metadata-scoped: leaves the stored content untouched even
                 // when a content write committed after the fetch above.
@@ -26176,6 +26312,7 @@ impl WorkspaceApi for Services {
                     policy: ContentWritePolicy::Surgical,
                     author: &author,
                     op: "note.add",
+                    base_content_bytes: None,
                 },
             )
             .await?;
@@ -26266,6 +26403,7 @@ impl WorkspaceApi for Services {
                     policy: ContentWritePolicy::Surgical,
                     author: &author,
                     op: "note.edit",
+                    base_content_bytes: None,
                 },
             )
             .await?;
@@ -26354,6 +26492,7 @@ impl WorkspaceApi for Services {
                     policy: ContentWritePolicy::Surgical,
                     author: &author,
                     op: "note.editLines",
+                    base_content_bytes: None,
                 },
             )
             .await?;
@@ -26415,6 +26554,27 @@ impl WorkspaceApi for Services {
         expected_version: Option<i64>,
         caller_agent_id: Option<AgentId>,
     ) -> BoxFuture<'_, Result<NoteSetContentResult>> {
+        self.set_note_content_guarded(
+            workspace_id,
+            note_id,
+            content,
+            confirm_replacement,
+            expected_version,
+            None,
+            caller_agent_id,
+        )
+    }
+
+    fn set_note_content_guarded(
+        &self,
+        workspace_id: WorkspaceId,
+        note_id: NoteId,
+        content: String,
+        confirm_replacement: bool,
+        expected_version: Option<i64>,
+        base_content_bytes: Option<u64>,
+        caller_agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<NoteSetContentResult>> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         let services = self.clone();
@@ -26444,6 +26604,7 @@ impl WorkspaceApi for Services {
                     },
                     author: &author,
                     op: "note.setContent",
+                    base_content_bytes,
                 },
             )
             .await?;
@@ -26978,6 +27139,7 @@ impl WorkspaceApi for Services {
                     policy: ContentWritePolicy::Surgical,
                     author: &author,
                     op: "task.updateStatus",
+                    base_content_bytes: None,
                 },
             )
             .await?;
@@ -27169,6 +27331,7 @@ impl WorkspaceApi for Services {
                             policy: ContentWritePolicy::Surgical,
                             author: &author,
                             op: "task.update",
+                            base_content_bytes: None,
                         },
                     )
                     .await?;
@@ -31161,8 +31324,28 @@ impl WorkspaceApi for Services {
             // background flag); lifecycle, session, model, prompt, task and
             // attachment fields are the owner's.
             if !capability::collaborator_editable_agent_update(&changes) {
-                self.require_agent_owner(&agent_id, "agent.update (protected fields)")
+                let model_preferences = changes.as_object().is_some_and(|fields| {
+                    fields.keys().all(|key| {
+                        [
+                            "name",
+                            "nameExplicitlySet",
+                            "isBackground",
+                            "reasoningEffort",
+                        ]
+                        .contains(&key.as_str())
+                    })
+                });
+                if model_preferences {
+                    let workspace_id = self.agent_workspace(&agent_id).await?;
+                    self.require_workspace_operator(
+                        &workspace_id,
+                        "agent.update (model preferences)",
+                    )
                     .await?;
+                } else {
+                    self.require_agent_owner(&agent_id, "agent.update (protected fields)")
+                        .await?;
+                }
             }
             self.agent_update_op(agent_id, changes).await
         })
@@ -31306,7 +31489,34 @@ impl WorkspaceApi for Services {
         extra: intent_core::AgentCreateExtra,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         self.execution_call(async move {
-            self.require_member(&workspace_id).await?;
+            let manager = self
+                .require_workspace_operator(&workspace_id, "agent.create")
+                .await?;
+            if manager
+                && (parent_agent_id.is_some()
+                    || extra.workspace_path.is_some()
+                    || extra.workspace_context.is_some()
+                    || extra.agent_type.is_some()
+                    || extra.metadata.as_ref().is_some_and(|m| {
+                        !m.as_object().is_some_and(|o| {
+                            o.keys().all(|k| {
+                                [
+                                    "initialMessage",
+                                    "contextReferences",
+                                    "contextRefs",
+                                    "imageBlocks",
+                                    "fileBlocks",
+                                    "isBackground",
+                                ]
+                                .contains(&k.as_str())
+                            })
+                        })
+                    }))
+            {
+                return Err(Error::Forbidden(
+                    "agent.create protected configuration requires the workspace owner".into(),
+                ));
+            }
             if let Some(model) = model.as_deref() {
                 reject_compound_model("model", model)?;
             }
@@ -32933,7 +33143,11 @@ impl WorkspaceApi for Services {
             // monitoring.
             let (entry, _) = self.serve_pr(&repo_ref, pr_number).await?;
             let pr = entry.pr;
-            let requirements = entry.snapshot.requirements;
+            // The never-started-CI flag is derived against the clock at
+            // serve time, so a cached entry still crosses the threshold.
+            let requirements = entry
+                .snapshot
+                .requirements_at(time::OffsetDateTime::now_utc());
             let review_comment_count = entry.snapshot.review_comment_count;
             let state = pr_ops::derive_status_state(&pr);
             let mergeable_state = pr
@@ -32955,13 +33169,10 @@ impl WorkspaceApi for Services {
             // than computed a second time. `checks.failedNames` lists every
             // failing check, in rollup order; `requirements.checks
             // .failingRequired` narrows it to the required ones.
-            let failed_names: Vec<&str> = requirements
-                .checks
-                .items
-                .iter()
-                .filter(|c| c.status == "failed")
-                .map(|c| c.name.as_str())
-                .collect();
+            // `checks.skippedNames` lists the checks skipped without running,
+            // which `passed` excludes.
+            let failed_names = requirements.checks.names_with("failed");
+            let skipped_names = requirements.checks.names_with("skipped");
 
             let mut snapshot = serde_json::json!({
                 "repo": repo_slug,
@@ -32982,7 +33193,9 @@ impl WorkspaceApi for Services {
                     "passed": requirements.checks.passed,
                     "failed": requirements.checks.failed,
                     "pending": requirements.checks.pending,
+                    "skipped": requirements.checks.skipped,
                     "failedNames": failed_names,
+                    "skippedNames": skipped_names,
                 },
                 "reviews": {
                     "decision": requirements.approvals.decision,
@@ -34602,6 +34815,93 @@ impl WorkspaceApi for Services {
 
     // `workspace.members.*` (multiplayer w3) — see `capability`.
 
+    fn discussion_list(
+        &self,
+        workspace_id: WorkspaceId,
+        conversation_id: String,
+        before_sequence: Option<i64>,
+        after_sequence: Option<i64>,
+        limit: u32,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.discussion_history_op(
+                &workspace_id,
+                &conversation_id,
+                before_sequence,
+                after_sequence,
+                limit,
+            )
+            .await
+        })
+    }
+    fn discussion_send(
+        &self,
+        workspace_id: WorkspaceId,
+        message_id: String,
+        body: String,
+        target: intent_core::discussion::DiscussionTarget,
+    ) -> BoxFuture<'_, Result<intent_core::discussion::DiscussionSendResult>> {
+        Box::pin(async move {
+            self.discussion_send_to_op(&workspace_id, &message_id, &body, &target)
+                .await
+        })
+    }
+    fn discussion_control_agent(
+        &self,
+        request: intent_core::discussion::DiscussionAgentControl,
+        retry: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.discussion_control_op(request, retry))
+    }
+    fn discussion_react(
+        &self,
+        workspace_id: WorkspaceId,
+        conversation_id: String,
+        message_id: String,
+        reaction: String,
+        active: bool,
+    ) -> BoxFuture<'_, Result<intent_core::discussion::DiscussionReactionState>> {
+        Box::pin(async move {
+            self.discussion_react_op(
+                &workspace_id,
+                &conversation_id,
+                &message_id,
+                &reaction,
+                active,
+            )
+            .await
+        })
+    }
+    fn discussion_conversations(
+        &self,
+        workspace_id: WorkspaceId,
+        before_id: Option<String>,
+        limit: u32,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.discussion_conversations_op(&workspace_id, before_id.as_deref(), limit)
+                .await
+        })
+    }
+    fn discussion_recipients(
+        &self,
+        workspace_id: WorkspaceId,
+        query: String,
+        after_id: Option<String>,
+        limit: u32,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.discussion_recipients_op(&workspace_id, &query, after_id.as_deref(), limit)
+                .await
+        })
+    }
+    fn discussion_project_event(
+        &self,
+        event: intent_core::Event,
+    ) -> BoxFuture<'_, Result<Option<intent_core::Event>>> {
+        Box::pin(async move { self.discussion_project_event_op(event).await })
+    }
+
     fn workspace_members_list(
         &self,
         workspace_id: WorkspaceId,
@@ -34616,6 +34916,18 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             self.workspace_members_add_op(&workspace_id, &principal_id)
+                .await
+        })
+    }
+
+    fn workspace_members_set_role(
+        &self,
+        workspace_id: WorkspaceId,
+        principal_id: intent_core::PrincipalId,
+        role: intent_core::WorkspaceRole,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.workspace_members_set_role_op(&workspace_id, &principal_id, role)
                 .await
         })
     }

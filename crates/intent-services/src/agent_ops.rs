@@ -1794,7 +1794,9 @@ impl QueuedMessage {
     }
 
     fn can_merge_pending(&self, incoming: &Self) -> bool {
-        !self.persisted
+        !crate::discussion_activity::is_discussion(self.message_metadata.as_ref())
+            && !crate::discussion_activity::is_discussion(incoming.message_metadata.as_ref())
+            && !self.persisted
             && !incoming.persisted
             && !self.has_attachments()
             && !incoming.has_attachments()
@@ -2170,6 +2172,9 @@ fn strip_group_tags(s: &str) -> String {
 fn clean_response_text(text: &str) -> String {
     let mut cleaned = strip_spans(text, "<agent_digest>", "</agent_digest>");
     cleaned = strip_spans(&cleaned, "<!-- suggested-prompts", "-->");
+    // The HTML-escaped spelling a model can copy from an XML-escaped history
+    // replay (see `history_xml::REPLAY_ESCAPING_NOTE`).
+    cleaned = strip_spans(&cleaned, "&lt;!-- suggested-prompts", "--&gt;");
     cleaned = strip_group_tags(&cleaned);
     cleaned.trim().to_string()
 }
@@ -2496,15 +2501,18 @@ const AUGGIE_MODELS_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// `.mjs` shim's `#!/usr/bin/env node` resolves in a packaged-app
 /// environment.
 async fn auggie_output(auggie: &std::path::Path, args: &[&str]) -> Option<std::process::Output> {
-    tokio::time::timeout(
-        AUGGIE_MODELS_TIMEOUT,
-        tokio::process::Command::new(auggie)
+    tokio::time::timeout(AUGGIE_MODELS_TIMEOUT, {
+        let mut command = tokio::process::Command::new(auggie);
+        command
             .args(args)
             .env("PATH", intent_context::discovery::exec_path(auggie))
             .stdin(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .output(),
-    )
+            .kill_on_drop(true);
+        // The Auggie CLI is an agent process like any other: keep it from
+        // starving the daemon while it lists models.
+        intent_acp::AgentPriority::from_env().apply(&mut command);
+        command.output()
+    })
     .await
     .ok()?
     .ok()
@@ -7848,6 +7856,12 @@ impl Services {
             if let Some(gate) = gate.as_ref() {
                 gate.check(&queue[position])?;
             }
+            if crate::discussion_activity::is_discussion(queue[position].message_metadata.as_ref())
+            {
+                return Err(Error::InvalidParams(
+                    "discussion requests are immutable; use discussion.stopAgent to cancel".into(),
+                ));
+            }
             let was = queue[position].editing;
             let edit_id = if was {
                 queue[position]
@@ -8043,6 +8057,13 @@ impl Services {
                     gate.check(entry)?;
                 }
             }
+            if entry.is_some_and(|entry| {
+                crate::discussion_activity::is_discussion(entry.message_metadata.as_ref())
+            }) {
+                return Err(Error::InvalidParams(
+                    "use discussion.stopAgent to cancel a discussion request".into(),
+                ));
+            }
             entry
                 .and_then(|entry| {
                     crate::script_monitor::monitor_id(entry.message_metadata.as_ref())
@@ -8118,6 +8139,12 @@ impl Services {
                 return Err(Error::InvalidParams(format!(
                     "queued message {message_id} belongs to another sender (or the user) and cannot be removed"
                 )));
+            }
+            if crate::discussion_activity::is_discussion(queue[position].message_metadata.as_ref())
+            {
+                return Err(Error::InvalidParams(
+                    "use discussion.stopAgent to cancel a discussion request".into(),
+                ));
             }
             queue.remove(position);
         }
@@ -16618,7 +16645,8 @@ impl Services {
         // Preserve each script wake's durable identity and lifecycle fence through worker admission.
         if queue.iter().any(|m| {
             m.ready_to_send()
-                && (m.monitor_turn.is_some()
+                && (crate::discussion_activity::is_discussion(m.message_metadata.as_ref())
+                    || m.monitor_turn.is_some()
                     || crate::script_monitor::monitor_id(m.message_metadata.as_ref()).is_some())
         }) {
             return None;
@@ -17013,16 +17041,27 @@ impl Services {
 
     /// Drop all queued messages for an agent (used by `agent.editAndRegenerate`,
     /// which supersedes the queue with the regenerated message). Returns `true`
-    /// iff the queue previously held at least one message — the caller uses this
-    /// to decide whether to publish `agent:queue:updated`.
+    /// iff an entry was removed. Correlated discussion requests are retained;
+    /// only their own Stop control cancels them. The caller uses the result to
+    /// decide whether to publish `agent:queue:updated`.
     pub(crate) fn clear_queue(&self, agent_id: &AgentId) -> bool {
         let mut guard = self
             .agent_queues
             .lock()
             .expect("agent queue registry poisoned");
-        let had = guard.get(agent_id).is_some_and(|q| !q.is_empty());
-        guard.remove(agent_id);
-        had
+        let Some(queue) = guard.get_mut(agent_id) else {
+            return false;
+        };
+        let previous = queue.len();
+        // Regenerating an unrelated chat turn does not cancel discussion requests.
+        queue.retain(|entry| {
+            crate::discussion_activity::is_discussion(entry.message_metadata.as_ref())
+        });
+        let changed = queue.len() != previous;
+        if queue.is_empty() {
+            guard.remove(agent_id);
+        }
+        changed
     }
 
     /// Snapshot the current queue contents as wire-shape `QueuedMessage` JSON
@@ -17194,7 +17233,11 @@ impl Services {
                 let idx = queue
                     .iter()
                     .position(|m| m.matches_submission(message_id))?;
-                if queue[idx].monitor_turn.is_some() {
+                if queue[idx].monitor_turn.is_some()
+                    || crate::discussion_activity::is_discussion(
+                        queue[idx].message_metadata.as_ref(),
+                    )
+                {
                     refused = Some(Error::Forbidden(
                         "monitor updates require their original delivery route".into(),
                     ));
@@ -17275,6 +17318,7 @@ impl Services {
                 gate.check(entry)?;
             }
             if !entry.ready_to_send()
+                || crate::discussion_activity::is_discussion(entry.message_metadata.as_ref())
                 || entry.monitor_turn.is_some()
                 || crate::script_monitor::monitor_id(entry.message_metadata.as_ref()).is_some()
             {
@@ -17521,6 +17565,7 @@ impl Services {
     ///
     /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     pub async fn rehydrate_agent_queues(&self) -> Result<usize> {
+        self.store.recover_discussion_activity().await?;
         let rows = self.store.load_all_agent_queues().await?;
         let max_order = rows
             .iter()
@@ -17619,6 +17664,7 @@ impl Services {
         for (agent_id, message_id, hold_until) in held {
             self.arm_hold_release_timer(&agent_id, &message_id, &hold_until);
         }
+        count += self.dispatch_discussion_deliveries(None, false).await?;
         Ok(count)
     }
 
@@ -18225,6 +18271,108 @@ fn resume_continuation_text(interrupted_at: &str, now: time::OffsetDateTime) -> 
     )
 }
 
+/// Restart-resume transcript marker for a row captured mid-turn.
+pub(crate) const RESUME_MARKER_TEXT: &str =
+    "The previous turn was interrupted because the harness shut down. Continuing below.";
+
+/// Restart-resume transcript marker for a mid-turn row tagged
+/// [`crate::agent_workers::INTERRUPTED_WITH_WORKERS_REASON`].
+pub(crate) const RESUME_WORKERS_MID_TURN_MARKER_TEXT: &str = "The previous turn was \
+     interrupted because the harness shut down, which also stopped running background tasks. \
+     Continuing below.";
+
+/// Restart-resume transcript marker for an idle agent captured only because
+/// its background tasks were running (no turn was interrupted).
+pub(crate) const RESUME_WORKERS_MARKER_TEXT: &str = "The harness shut down while background \
+     tasks were running, which stopped them. Continuing below.";
+
+/// Appended to the restart-resume continuation when the row carries
+/// [`crate::agent_workers::INTERRUPTED_WITH_WORKERS_REASON`]
+/// (intent-hq/intent#7658): the shutdown killed the provider and its
+/// background workers, so their completion reports will never arrive.
+pub(crate) const RESUME_WORKERS_LOST_NOTE: &str = "Background tasks you started before the \
+     shutdown (such as commands run in the background) were stopped by it and will not report \
+     back. Check what they completed, and restart any you still need.";
+
+/// Abandon notice for a row captured mid-turn (the historical wording).
+pub(crate) const ABANDON_NOTICE_TEXT: &str = "This conversation was interrupted because intentd \
+     restarted. The agent's in-flight work was terminated.";
+
+/// Abandon notice for a mid-turn row whose background tasks also stopped.
+pub(crate) const ABANDON_WORKERS_MID_TURN_NOTICE_TEXT: &str = "This conversation was \
+     interrupted because intentd restarted. The agent's in-flight work and running background \
+     tasks were terminated.";
+
+/// Abandon notice for an idle agent captured only for its background tasks.
+pub(crate) const ABANDON_WORKERS_NOTICE_TEXT: &str =
+    "intentd restarted, which terminated the agent's running background tasks.";
+
+/// How a claimed `interrupted_agent` row was captured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InterruptedCapture {
+    /// Mid-turn, no background tasks known lost (every untagged row).
+    MidTurn,
+    /// Mid-turn, and its background tasks were stopped too.
+    MidTurnWithWorkers,
+    /// Idle (no turn in flight); only its background tasks were stopped.
+    IdleWithWorkers,
+}
+
+impl InterruptedCapture {
+    /// Classify a row by its `reason` tag and `prev_status`. A tagged row is
+    /// idle when its recorded status is not an in-flight one: graceful
+    /// shutdown records in-flight statuses only for busy agents.
+    pub(crate) fn of(reason: Option<&str>, prev_status: &str) -> Self {
+        if reason != Some(crate::agent_workers::INTERRUPTED_WITH_WORKERS_REASON) {
+            return Self::MidTurn;
+        }
+        let in_flight = serde_json::from_value::<intent_core::AgentStatus>(Value::String(
+            prev_status.to_owned(),
+        ))
+        .is_ok_and(crate::is_stale_in_flight_status);
+        if in_flight {
+            Self::MidTurnWithWorkers
+        } else {
+            Self::IdleWithWorkers
+        }
+    }
+
+    /// Whether a resume replays the transcript tail. An idle capture had no
+    /// interrupted turn: its tail (for example a turn the user stopped) is
+    /// already settled and must not be re-driven.
+    pub(crate) fn replays_tail(self) -> bool {
+        self != Self::IdleWithWorkers
+    }
+
+    pub(crate) fn abandon_notice(self) -> &'static str {
+        match self {
+            Self::MidTurn => ABANDON_NOTICE_TEXT,
+            Self::MidTurnWithWorkers => ABANDON_WORKERS_MID_TURN_NOTICE_TEXT,
+            Self::IdleWithWorkers => ABANDON_WORKERS_NOTICE_TEXT,
+        }
+    }
+
+    /// The marker and continuation a restart resume delivers.
+    pub(crate) fn resume_marker_and_continuation(
+        self,
+        interrupted_at: &str,
+        now: time::OffsetDateTime,
+    ) -> (&'static str, String) {
+        let continuation = resume_continuation_text(interrupted_at, now);
+        match self {
+            Self::MidTurn => (RESUME_MARKER_TEXT, continuation),
+            Self::MidTurnWithWorkers => (
+                RESUME_WORKERS_MID_TURN_MARKER_TEXT,
+                format!("{continuation} {RESUME_WORKERS_LOST_NOTE}"),
+            ),
+            Self::IdleWithWorkers => (
+                RESUME_WORKERS_MARKER_TEXT,
+                format!("{continuation} {RESUME_WORKERS_LOST_NOTE}"),
+            ),
+        }
+    }
+}
+
 /// The rebuilt interrupted-turn tail for a restart resume: the prompt-only
 /// recap text plus any attachment blocks the replayed user rows carried.
 /// Persisted user rows keep their image/file blocks (STAB-133), and dropping
@@ -18364,8 +18512,7 @@ fn build_resume_tail_recap(messages: &[AgentMessage]) -> Option<ResumeTailRecap>
         .any(|s| matches!(s, TailSegment::Partial(_)));
     // Segments render first so the preamble can learn whether any of them
     // was middle-truncated (the hint is emitted only when something was
-    // actually abbreviated; untruncated, unelided recaps are byte-identical
-    // to before).
+    // actually abbreviated; untruncated, unelided recaps carry no hint).
     let mut body = String::new();
     let mut segment_groups = Vec::new();
     let mut truncated_any = false;
@@ -18409,6 +18556,7 @@ fn build_resume_tail_recap(messages: &[AgentMessage]) -> Option<ResumeTailRecap>
          — it is repeated here (parts of it may or may not already be in your \
          context).\n\n",
     );
+    recap.push_str(crate::history_xml::REPLAY_ESCAPING_NOTE);
     if truncated_any || elided > 0 {
         recap.push_str(RESUME_RECAP_TRUNCATION_HINT);
     }
@@ -18857,8 +19005,12 @@ impl Services {
         // is already the transcript tail — skip the duplicate append. A failed
         // append is treated like a failed continuation delivery: reset the row
         // to pending and surface the error.
-        let marker_text =
-            "The previous turn was interrupted because the harness shut down. Continuing below.";
+        let capture =
+            InterruptedCapture::of(interrupted.reason.as_deref(), &interrupted.prev_status);
+        let (marker_text, continuation) = capture.resume_marker_and_continuation(
+            &interrupted.interrupted_at,
+            time::OffsetDateTime::now_utc(),
+        );
         let marker_content = json!([{
             "type": "text",
             "text": marker_text,
@@ -18895,12 +19047,11 @@ impl Services {
         }
 
         // Deliver continuation message (with the humanized outage duration
-        // when the claimed row's `interrupted_at` yields one). The metadata
+        // when the claimed row's `interrupted_at` yields one, and the lost
+        // background-task note for a `background_workers` row). The metadata
         // tag persists on the user row so a later restart's recap can
         // identify the continuation without matching its text (an ordinary
         // user request opening with the same wording must still be replayed).
-        let continuation =
-            resume_continuation_text(&interrupted.interrupted_at, time::OffsetDateTime::now_utc());
         let continuation_metadata = json!({
             "type": RESUME_CONTINUATION_METADATA_TYPE,
             "source": "system",
@@ -18922,8 +19073,14 @@ impl Services {
         // ATTACHMENTS still ride (the history XML is text-only), so the tail
         // reaches the agent exactly once on either branch. The recap is
         // built from the pre-marker `session` snapshot, so the just-appended
-        // interruption marker never leaks into it.
-        let recap = build_resume_tail_recap(&session.messages);
+        // interruption marker never leaks into it. An idle background-task
+        // capture interrupted no turn, so its tail is already settled and is
+        // not replayed ([`InterruptedCapture::replays_tail`]).
+        let recap = if capture.replays_tail() {
+            build_resume_tail_recap(&session.messages)
+        } else {
+            None
+        };
 
         // Use the send-message machinery to deliver the continuation (lazily
         // respawns the provider and resumes via ACP `session/load`).
@@ -19027,7 +19184,8 @@ impl Services {
             )));
         }
 
-        let text = "This conversation was interrupted because intentd restarted. The agent's in-flight work was terminated.";
+        let text = InterruptedCapture::of(interrupted.reason.as_deref(), &interrupted.prev_status)
+            .abandon_notice();
         let content = json!([{
             "type": "text",
             "text": text,

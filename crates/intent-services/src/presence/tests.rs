@@ -398,7 +398,11 @@ async fn caret_updates_are_member_gated_including_the_deferred_flush() {
             .is_none()
     })
     .await;
-    let leaked = tokio::time::timeout(Duration::from_millis(50), sub.recv()).await;
+    let leaked = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(50)),
+        sub.recv(),
+    )
+    .await;
     assert!(
         leaked.is_err(),
         "no caret leaves after the membership ended: {leaked:?}"
@@ -514,7 +518,11 @@ async fn profile_persisted_after_first_sight_refreshes_rosters_without_a_reconne
         .apply_primary_identity(applied, &identity)
         .await
         .expect("idempotent");
-    let quiet = tokio::time::timeout(Duration::from_millis(100), sub.recv()).await;
+    let quiet = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(100)),
+        sub.recv(),
+    )
+    .await;
     assert!(
         quiet.is_err(),
         "an unchanged profile re-emits nothing: {quiet:?}"
@@ -595,7 +603,11 @@ async fn first_sight_read_racing_the_identity_write_installs_the_fresh_profile()
         .await
         .expect("snapshot");
     assert_eq!(snapshot["members"][0]["login"], "octocat");
-    let quiet = tokio::time::timeout(Duration::from_millis(100), sub.recv()).await;
+    let quiet = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(100)),
+        sub.recv(),
+    )
+    .await;
     assert!(quiet.is_err(), "one roster, from the connect: {quiet:?}");
 }
 
@@ -933,4 +945,272 @@ async fn focus_move_during_async_projection_never_restores_old_target() {
     .await
     .unwrap();
     assert_eq!(result.unwrap()["target"], Value::Null);
+}
+
+#[tokio::test]
+async fn discussion_typing_validates_human_hello_and_membership_without_mutation() {
+    use intent_core::{with_caller, AgentId, Caller, Error, WorkspaceId};
+    let tmp = crate::tests::TempDb::new();
+    let root = crate::tests::WorkspacesRoot::new();
+    let (store, services, ws, caller) = member_services(&tmp, &root).await;
+    let params = json!({"focus":[],"discussionTyping":{"workspaceId":ws}});
+    for nonhuman in [
+        Caller::Daemon,
+        Caller::Agent {
+            agent_id: AgentId::new(),
+        },
+    ] {
+        assert!(matches!(
+            with_caller(
+                nonhuman,
+                services.presence_update_op("c".into(), params.clone())
+            )
+            .await,
+            Err(Error::Forbidden(_))
+        ));
+    }
+    assert!(matches!(
+        services
+            .presence_update_op("c".into(), params.clone())
+            .await,
+        Err(Error::Forbidden(_))
+    ));
+    assert!(matches!(
+        with_caller(
+            caller.clone(),
+            services.presence_update_op("c".into(), params.clone())
+        )
+        .await,
+        Err(Error::InvalidParams(_))
+    ));
+    with_caller(caller.clone(), services.presence_connect_op("c".into()))
+        .await
+        .unwrap();
+    with_caller(
+        caller.clone(),
+        services.presence_update_op("c".into(), params),
+    )
+    .await
+    .unwrap();
+    let before = with_caller(caller.clone(), services.presence_snapshot_op(ws.clone()))
+        .await
+        .unwrap();
+    for target in [
+        json!({}),
+        json!({"workspaceId":""}),
+        json!({"workspaceId":null}),
+        json!({"workspaceId":1}),
+        json!("workspace"),
+        json!([]),
+        json!(true),
+    ] {
+        assert!(matches!(
+            with_caller(
+                caller.clone(),
+                services
+                    .presence_update_op("c".into(), json!({"focus":[],"discussionTyping":target}))
+            )
+            .await,
+            Err(Error::InvalidParams(_))
+        ));
+    }
+    let private = WorkspaceId::new();
+    store
+        .insert_workspace(&crate::tests::workspace(&private))
+        .await
+        .unwrap();
+    for target in [private, WorkspaceId::new()] {
+        assert!(matches!(
+            with_caller(
+                caller.clone(),
+                services.presence_update_op(
+                    "c".into(),
+                    json!({"focus":[],"discussionTyping":{"workspaceId":target}})
+                )
+            )
+            .await,
+            Err(Error::NotFound(_))
+        ));
+    }
+    assert_eq!(
+        with_caller(caller.clone(), services.presence_snapshot_op(ws.clone()))
+            .await
+            .unwrap(),
+        before
+    );
+    for nonhuman in [
+        Caller::Daemon,
+        Caller::Agent {
+            agent_id: AgentId::new(),
+        },
+    ] {
+        let snapshot = with_caller(nonhuman, services.presence_snapshot_op(ws.clone()))
+            .await
+            .unwrap();
+        assert_eq!(snapshot["members"].as_array().unwrap().len(), 1);
+        assert!(snapshot["members"][0].get("discussionTyping").is_none());
+        assert_eq!(snapshot["members"][0]["typing"], json!([]));
+    }
+    let principal = caller.principal_id().unwrap();
+    store.remove_workspace_member(&ws, principal).await.unwrap();
+    assert!(matches!(
+        with_caller(
+            caller.clone(),
+            services.presence_update_op(
+                "c".into(),
+                json!({"focus":[],"discussionTyping":{"workspaceId":ws}})
+            )
+        )
+        .await,
+        Err(Error::NotFound(_))
+    ));
+    let owner = store.get_primary_principal().await.unwrap();
+    let snapshot = with_caller(
+        Caller::Wire {
+            principal_id: owner.id,
+            host_role: intent_core::HostRole::Owner,
+        },
+        services.presence_snapshot_op(ws),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        snapshot["members"],
+        json!([]),
+        "removed member never appears in the roster"
+    );
+    let owner = store.get_primary_principal().await.unwrap();
+    let owner = Caller::Wire {
+        principal_id: owner.id,
+        host_role: intent_core::HostRole::Owner,
+    };
+    with_caller(owner.clone(), services.presence_connect_op("owner".into()))
+        .await
+        .unwrap();
+    assert!(matches!(
+        with_caller(
+            owner,
+            services.presence_update_op(
+                "owner".into(),
+                json!({"focus":[],"discussionTyping":{"workspaceId":WorkspaceId::new()}})
+            )
+        )
+        .await,
+        Err(Error::NotFound(_))
+    ));
+}
+
+#[tokio::test]
+async fn discussion_typing_lifecycle_sources_pulses_targets_and_clearing() {
+    use intent_core::{with_caller, WorkspaceId, WorkspaceRole};
+    let tmp = crate::tests::TempDb::new();
+    let root = crate::tests::WorkspacesRoot::new();
+    let (store, services, ws, caller) = member_services(&tmp, &root).await;
+    let other = WorkspaceId::new();
+    store
+        .insert_workspace(&crate::tests::workspace(&other))
+        .await
+        .unwrap();
+    store
+        .add_workspace_member(
+            &other,
+            caller.principal_id().unwrap(),
+            WorkspaceRole::Collaborator,
+        )
+        .await
+        .unwrap();
+    let update = |connection: &str, target: &WorkspaceId| {
+        with_caller(
+            caller.clone(),
+            services.presence_update_op(
+                connection.into(),
+                json!({"focus":[],"discussionTyping":{"workspaceId":target}}),
+            ),
+        )
+    };
+    let snapshot =
+        |target: WorkspaceId| with_caller(caller.clone(), services.presence_snapshot_op(target));
+    for id in ["one", "two"] {
+        with_caller(caller.clone(), services.presence_connect_op(id.into()))
+            .await
+            .unwrap();
+    }
+    let source = update("one", &ws).await.unwrap()["typingSource"].clone();
+    let first = snapshot(ws.clone()).await.unwrap()["members"][0]["discussionTyping"][0].clone();
+    assert_eq!(first["source"], source);
+    assert_eq!(first.as_object().unwrap().len(), 4);
+    update("one", &ws).await.unwrap();
+    let second = snapshot(ws.clone()).await.unwrap()["members"][0]["discussionTyping"][0].clone();
+    assert_eq!(first["since"], second["since"]);
+    assert!(second["pulse"].as_u64().unwrap() > first["pulse"].as_u64().unwrap());
+    let source2 = update("two", &ws).await.unwrap()["typingSource"].clone();
+    assert_ne!(source2, source);
+    let both = snapshot(ws.clone()).await.unwrap()["members"][0]["discussionTyping"].clone();
+    let entries = both.as_array().unwrap();
+    assert_eq!(entries.len(), 2);
+    assert!(entries[0]["source"].as_str().unwrap() < entries[1]["source"].as_str().unwrap());
+    assert_eq!(
+        entries.iter().find(|t| t["source"] == source).unwrap(),
+        &second
+    );
+    assert_eq!(
+        snapshot(ws.clone()).await.unwrap()["members"][0]["discussionTyping"],
+        both,
+        "reads cannot refresh activity"
+    );
+    update("one", &other).await.unwrap();
+    let old = snapshot(ws.clone()).await.unwrap();
+    assert_eq!(
+        old["members"][0]["discussionTyping"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(old["members"][0]["discussionTyping"][0]["source"], source2);
+    let moved = snapshot(other.clone()).await.unwrap()["members"][0]["discussionTyping"][0].clone();
+    assert_eq!(moved["source"], source);
+    assert!(moved["pulse"].as_u64().unwrap() > second["pulse"].as_u64().unwrap());
+    for clear in [
+        json!({"focus":[]}),
+        json!({"focus":[],"discussionTyping":null}),
+    ] {
+        with_caller(
+            caller.clone(),
+            services.presence_update_op("one".into(), clear),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            snapshot(other.clone()).await.unwrap()["members"][0]["discussionTyping"],
+            json!([])
+        );
+        update("one", &other).await.unwrap();
+        let resumed =
+            snapshot(other.clone()).await.unwrap()["members"][0]["discussionTyping"][0].clone();
+        assert!(resumed["pulse"].as_u64().unwrap() > moved["pulse"].as_u64().unwrap());
+    }
+    services.presence_disconnect_op("one".into()).await;
+    assert_eq!(
+        snapshot(other).await.unwrap()["members"][0]["discussionTyping"],
+        json!([])
+    );
+    assert_eq!(
+        snapshot(ws.clone()).await.unwrap()["members"][0]["discussionTyping"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    services.presence_disconnect_op("two".into()).await;
+    assert_eq!(snapshot(ws.clone()).await.unwrap()["members"], json!([]));
+    assert!(store
+        .query_events(&intent_store::EventQuery {
+            workspace_id: Some(ws),
+            event_types: vec!["presence:changed".into()],
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .is_empty());
 }

@@ -18,6 +18,14 @@ use intent_acp::workers::WorkerFrame;
 use intent_core::{AgentId, WorkspaceId};
 use serde_json::{json, Map, Value};
 
+/// `interrupted_agent.reason` for an agent that a graceful shutdown captured
+/// while its provider still ran a background worker. The shutdown kills the
+/// provider tree and every worker with it, so the worker's completion report
+/// never arrives; the tag lets the restart resume tell the agent so. Not an
+/// `InterruptReason` wire value, and not resumed by the wake orchestrator
+/// (which takes only `system_suspend` rows).
+pub(crate) const INTERRUPTED_WITH_WORKERS_REASON: &str = "background_workers";
+
 /// Rows retained per generation.
 pub(crate) const MAX_ROWS: usize = 256;
 /// Distinct task IDs admitted per generation (tombstones included).
@@ -679,6 +687,21 @@ impl AgentWorkers {
         self.lock()
             .get(agent_id)
             .is_some_and(|e| e.projection.has_running_workers())
+    }
+
+    /// Every agent whose current generation vouches for a running worker
+    /// ([`Projection::has_running_workers`]), with its workspace, sorted by
+    /// agent ID. Graceful shutdown enrolls these as interrupted before it
+    /// tears their providers (and so their workers) down.
+    pub(crate) fn running_worker_agents(&self) -> Vec<(AgentId, WorkspaceId)> {
+        let mut agents: Vec<(AgentId, WorkspaceId)> = self
+            .lock()
+            .iter()
+            .filter(|(_, e)| e.projection.has_running_workers())
+            .map(|(id, e)| (id.clone(), e.projection.scope.workspace_id.clone()))
+            .collect();
+        agents.sort();
+        agents
     }
 
     /// Resolve a stop request. `None` is not-found.

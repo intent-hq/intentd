@@ -193,26 +193,32 @@ fn extract_fastpath_methods() -> HashSet<String> {
 // Provider adapter preparation (13.6): +1 fast-path method.
 // Cancellable note deletion (13.10): +3 router methods.
 // Legacy workspace import removal (15.0): -1 fast-path method.
-// PR workspace lookup (`prWorkspaceLookup: 1`): +1 router method.
+// Human workspace discussions: +5 router methods; PR workspace lookup: +1.
 // Named provider profiles (§5.54): +4 router methods.
 // Provider profile order (§5.54 `providers.profiles.reorder`): +1 router method.
+// Generic event recovery adds the events.fence fast path.
+// Correlated discussion controls: +2 router methods.
+// Persisted guest roles: +1 owner-only role assignment method.
 // Startup status (14.1): +1 fast-path method.
 // Scoped repository pages and child Git policy (15.1): +8 router methods.
 // Provider worker observations (§5.5b, `agentWorkers: 1`): +2 router, +1 fast path.
 // Note paging removal: -3 router methods (cancellable note deletion).
-const EXPECTED_TOTAL_METHODS: usize = 449;
+const EXPECTED_TOTAL_METHODS: usize = 457;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// Protocol 12.0 removes five router methods, three fast paths and two aliases.
 /// Protocol 12.1 adds the three script-monitor controls.
 /// The subsequent git.commit removal removes one more router method.
 /// Protocol 13.10 adds three cancellable note deletion controls.
-/// `workspace.findByPullRequest` (`prWorkspaceLookup: 1`) adds one more.
+/// Five discussion methods and one PR workspace lookup method are additive.
 /// Named provider profiles (§5.54) add the four `providers.profiles.*` methods,
 /// then `providers.profiles.reorder`.
+/// Correlated discussion controls add `discussion.stopAgent` and `discussion.retryAgent`.
+/// Persisted guest roles add `workspace.members.setRole`.
+/// Scoped repository pages and child Git policy add eight router methods.
 /// Provider worker observations (§5.5b) add `agent.workers.list` / `.stop`.
 /// Removing note paging drops the three cancellable note deletion controls.
-const EXPECTED_ROUTER_METHODS: usize = 391;
+const EXPECTED_ROUTER_METHODS: usize = 399;
 
 /// Golden count: fast-path methods (intercepted before router).
 /// `agent.workers.subscribe` (§5.5b) holds per-connection subscription state.
@@ -528,6 +534,7 @@ const USER_ORIGIN_MESSAGE_ENTRY_POINTS: &[(&str, &str)] = &[
 ///   the author projection), never a human row; `agent.respondPermission`
 ///   and `agent.stop` drive turn control without appending a chat row
 ///   (question answers travel as `agent.sendMessage` content).
+/// - `discussion.*` uses its own human-only store, never the agent transcript.
 /// - `note.*`, `comment.*`, `task.*`, `github.*` write notes, comments and
 ///   forge objects — never the agent transcript; `accept-changes.*` and
 ///   `file-tracking.*` drive the worktree / PR flow the same way.
@@ -600,6 +607,13 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "crossWorkspace.listSiblings",
     "crossWorkspace.readNote",
     "debug.sampleStacks",
+    "discussion.conversations",
+    "discussion.list",
+    "discussion.react",
+    "discussion.recipients",
+    "discussion.retryAgent",
+    "discussion.send",
+    "discussion.stopAgent",
     "drafts.clear",
     "drafts.get",
     "drafts.set",
@@ -952,6 +966,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "workspace.members.leave",
     "workspace.members.list",
     "workspace.members.remove",
+    "workspace.members.setRole",
     "workspace.repositoryContext",
     "workspace.repositoryContext.capture",
     "workspace.repositoryContext.release",
@@ -1216,15 +1231,14 @@ fn client_callable_universe() -> BTreeSet<String> {
 /// or named here. The failure message prints the recomputed golden.
 ///
 /// Owner-only families: `host.*` but the two display probes, `browser.*`,
-/// `forward.*`, `terminal.*`, `script.*`, `github.*`, `linear.*`, `sentry.*`,
+/// `forward.*`, `terminal.*`, script definition writes, `github.*`, `linear.*`, `sentry.*`,
 /// `voice.*`, `settings.*`, `repo.*` / `repoConfig.*`, `mcp.*`, `server.*`,
 /// `pairing.*`, `providers.setup.*`, `system.*` (but `system.capabilities`
 /// and `system.status`),
 /// `rules.list` / `rules.update`, `sandbox.*`, `unsloth.*`, `debug.*`, workspace lifecycle /
 /// export / import / setup / browser-client pinning, `git.clone`,
-/// `git.agentCommit` (agent-only), agent creation / delegation (decided
-/// 2026-09-19: guests steer existing agents only — `agent.create`,
-/// `agent.delegate`, `agent.wakeOrCreate`), agent deletion / proposals /
+/// `git.agentCommit` (agent-only), agent delegation (`agent.delegate`,
+/// `agent.wakeOrCreate`), agent deletion / proposals /
 /// one-shot completions, `agent.replaceMessages` (persists client-supplied user rows
 /// verbatim, so a non-owner could forge `fromPrincipalId`), hook run/cancel,
 /// PR-monitor cancel/flush, daemon-wide metrics, and the `accept-changes.*` /
@@ -1240,7 +1254,6 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "accept-changes.release",
     "agent.cancelDelete",
     "agent.completeOnce",
-    "agent.create",
     "agent.delegate",
     "agent.delete",
     "agent.diagnostics",
@@ -1385,16 +1398,8 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "sandbox.cow.merge",
     "script.archive",
     "script.create",
-    "script.get",
-    "script.list",
-    "script.output",
     "script.remove",
-    "script.restart",
     "script.restore",
-    "script.run",
-    "script.start",
-    "script.status",
-    "script.stop",
     "scriptMonitor.cancel",
     "scriptMonitor.cancelRun",
     "sentry.assignIssue",
@@ -1657,15 +1662,12 @@ fn collaborator_lookup_canonicalises_aliases_and_denies_by_default() {
         "voice.transcribe",
         "workspace.create",
         "git.clone",
-        "agent.create",
         "agent.delegate",
         "agent.wakeOrCreate",
         "agent.delete",
         "agent.cancelDelete",
         "agent.replaceMessages",
         "terminal.list",
-        "script.get",
-        "script.list",
         "debug.sampleStacks",
     ] {
         assert!(!collaborator_may_call(refused), "{refused} must be refused");
@@ -1854,7 +1856,6 @@ mod unbound_owner_only_methods {
                 "agent.completeOnce",
                 json!({ "prompt": "p", "timeoutMs": 1 }),
             ),
-            ("agent.create", json!({ "workspaceId": ws })),
             (
                 "agent.delegate",
                 json!({ "workspaceId": ws, "taskNoteId": "t1" }),
@@ -2039,15 +2040,7 @@ mod unbound_owner_only_methods {
                 "script.create",
                 json!({ "workspaceId": ws, "name": "n", "command": "true", "mode": "command" }),
             ),
-            ("script.list", json!({ "workspaceId": ws })),
-            ("script.get", script.clone()),
-            ("script.output", script.clone()),
             ("script.remove", script.clone()),
-            ("script.restart", script.clone()),
-            ("script.run", script.clone()),
-            ("script.start", script.clone()),
-            ("script.status", script.clone()),
-            ("script.stop", script.clone()),
             (
                 "scriptMonitor.cancel",
                 json!({ "workspaceId": ws, "monitorId": "m1" }),

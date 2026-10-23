@@ -427,6 +427,7 @@ async fn boot() -> Fixture {
         display_status: None,
         attention_reminder: None,
         waiting: false,
+        scripts_running: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
@@ -556,22 +557,25 @@ async fn next_events(ws: &mut TlsWs, n: usize) -> Vec<Value> {
 /// Assert no further `events.event` notification arrives within a short
 /// window (the fold writes nothing for a PR nobody references).
 async fn assert_no_events(ws: &mut TlsWs) {
-    let idle = timeout(Duration::from_millis(600), async {
-        loop {
-            match ws.next().await.unwrap().unwrap() {
-                Message::Text(text) => {
-                    let v: Value = serde_json::from_str(&text).unwrap();
-                    if v["method"] == json!("events.event") {
-                        return v["params"]["event"].clone();
+    let idle = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(600)),
+        async {
+            loop {
+                match ws.next().await.unwrap().unwrap() {
+                    Message::Text(text) => {
+                        let v: Value = serde_json::from_str(&text).unwrap();
+                        if v["method"] == json!("events.event") {
+                            return v["params"]["event"].clone();
+                        }
                     }
+                    Message::Ping(p) => {
+                        let _ = ws.send(Message::Pong(p)).await;
+                    }
+                    _ => {}
                 }
-                Message::Ping(p) => {
-                    let _ = ws.send(Message::Pong(p)).await;
-                }
-                _ => {}
             }
-        }
-    })
+        },
+    )
     .await;
     if let Ok(evt) = idle {
         panic!("unexpected event: {evt}");

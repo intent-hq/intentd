@@ -163,7 +163,7 @@ async fn only_exact_opt_in_capability_yields_original_client() {
         assert!(!got.ordinary.authenticated);
         assert_eq!(conn.pending_len(), 0);
         assert!(timeout(
-            Duration::from_millis(10),
+            intentd_test_support::test_timeout(Duration::from_millis(10)),
             peer.read.read_line(&mut String::new())
         )
         .await
@@ -470,7 +470,7 @@ async fn dropping_and_cancelling_while_writer_is_full_never_enqueues_registratio
         assert_eq!(peer.read().await["method"], "fill");
     }
     assert!(timeout(
-        Duration::from_millis(10),
+        intentd_test_support::test_timeout(Duration::from_millis(10)),
         peer.read.read_line(&mut String::new())
     )
     .await
@@ -1228,9 +1228,12 @@ async fn monitor_prepared_history_rejects_malformed_lineage_and_retired_original
     reinitialize.await.unwrap().unwrap();
     // A later peer reply or ordinary successful initialize cannot reattach the
     // consuming preparation to a fresh generation, and no load was queued.
-    assert!(timeout(Duration::from_millis(20), peer.read())
-        .await
-        .is_err());
+    assert!(timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(20)),
+        peer.read()
+    )
+    .await
+    .is_err());
 }
 
 #[tokio::test]
@@ -1315,9 +1318,12 @@ async fn monitor_prepared_history_bound_target_refuses_changed_cwd_and_metadata(
             .await
             .is_err());
         assert!(
-            tokio::time::timeout(Duration::from_millis(20), peer.read())
-                .await
-                .is_err(),
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(20)),
+                peer.read()
+            )
+            .await
+            .is_err(),
             "changed load or fallback reached the peer"
         );
     }
@@ -1342,9 +1348,12 @@ async fn monitor_context_retirement_closes_before_poll_and_requires_exact_remote
         );
         assert!(sibling.is_current());
         assert!(
-            timeout(Duration::from_millis(20), peer.read())
-                .await
-                .is_err(),
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(20)),
+                peer.read()
+            )
+            .await
+            .is_err(),
             "begin performed asynchronous I/O"
         );
         let join = tokio::spawn(retirement.join());
@@ -1584,7 +1593,11 @@ async fn monitor_context_retirement_join_survives_waiter_drop_and_is_shared() {
             .begin_review_context_retirement("original", &context)
             .unwrap();
         let repeated = tokio::spawn(repeated.join());
-        let duplicate = timeout(Duration::from_millis(20), peer.read()).await;
+        let duplicate = timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(20)),
+            peer.read(),
+        )
+        .await;
         assert!(
             duplicate.is_err(),
             "a second waiter started a new native retirement request"
@@ -1603,9 +1616,12 @@ async fn monitor_context_retirement_join_survives_waiter_drop_and_is_shared() {
             .unwrap();
         assert_eq!(timeout(WAIT, again.join()).await.unwrap().is_ok(), joined);
         assert!(
-            timeout(Duration::from_millis(20), peer.read())
-                .await
-                .is_err(),
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(20)),
+                peer.read()
+            )
+            .await
+            .is_err(),
             "terminal join result triggered an implicit retry"
         );
         assert!(!receipt.is_current());
@@ -1624,9 +1640,12 @@ async fn monitor_context_retirement_drop_before_wait_retains_original_join() {
             .begin_review_context_retirement("original", &context)
             .unwrap(),
     );
-    let request = timeout(Duration::from_millis(100), peer.read())
-        .await
-        .expect("dropping the caller lost its exact remote retirement obligation");
+    let request = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(100)),
+        peer.read(),
+    )
+    .await
+    .expect("dropping the caller lost its exact remote retirement obligation");
     peer.reply(&request, json!({"retired":true})).await;
     assert!(timeout(
         WAIT,
@@ -1638,9 +1657,12 @@ async fn monitor_context_retirement_drop_before_wait_retains_original_join() {
     .await
     .unwrap()
     .is_ok());
-    assert!(timeout(Duration::from_millis(20), peer.read())
-        .await
-        .is_err());
+    assert!(timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(20)),
+        peer.read()
+    )
+    .await
+    .is_err());
     assert!(!receipt.is_current());
 }
 

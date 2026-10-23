@@ -2,6 +2,115 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.38] - 2026-10-23
+
+### 🐛 Bug Fixes
+
+- *(agents)* Interrupt idle agents whose background workers a restart kills ([#2638](https://github.com/intent-hq/intentd/pull/2638))
+
+
+## [0.11.37] - 2026-10-23
+
+### 🚀 Features
+
+- *(acp)* Lower agent IO priority and demote ephemeral adapter runs ([#2634](https://github.com/intent-hq/intentd/pull/2634))
+
+
+## [0.11.36] - 2026-10-23
+
+### 📚 Documentation
+
+- *(guide)* Mention the in-app agent-finished notification ([#2629](https://github.com/intent-hq/intentd/pull/2629))
+
+### 🧪 Testing
+
+- Scale native request acquire and frame waits with the test timeout multiplier ([#2626](https://github.com/intent-hq/intentd/pull/2626))
+
+
+## [0.11.35] - 2026-10-23
+
+### 🐛 Bug Fixes
+
+- Report skipped PR checks separately from passed ([#2623](https://github.com/intent-hq/intentd/pull/2623))
+- *(store)* Create the database file before the write pool connects ([#2633](https://github.com/intent-hq/intentd/pull/2633))
+
+### 📚 Documentation
+
+- *(guide)* Drop the removed Collapse tool activity setting ([#2628](https://github.com/intent-hq/intentd/pull/2628))
+
+
+## [0.11.34] - 2026-10-23
+
+### 🐛 Bug Fixes
+
+- *(pr-monitor)* Report merge-queue ejections on cheap polls ([#2622](https://github.com/intent-hq/intentd/pull/2622))
+
+
+## [0.11.33] - 2026-10-23
+
+### 🚀 Features
+
+- *(sitter)* Send weekly/monthly/install flags and install age ([#2600](https://github.com/intent-hq/intentd/pull/2600))
+
+### 🐛 Bug Fixes
+
+- *(pr-monitor)* Ignore merge-queue ejections older than the current queue entry ([#2595](https://github.com/intent-hq/intentd/pull/2595))
+
+### 🧪 Testing
+
+- Classify every fixed test wait and empty the fixed-deadline baseline ([#2603](https://github.com/intent-hq/intentd/pull/2603))
+
+
+## [0.11.32] - 2026-10-23
+
+### 🐛 Bug Fixes
+
+- *(history)* Tell replayed models the XML escaping is not part of the text ([#2614](https://github.com/intent-hq/intentd/pull/2614))
+
+### 🧪 Testing
+
+- Check the quota classifier against real ACP adapter errors ([#2612](https://github.com/intent-hq/intentd/pull/2612))
+
+
+## [0.11.31] - 2026-10-23
+
+### 🚀 Features
+
+- *(pr-monitor)* Flag a PR head on which CI never started ([#2604](https://github.com/intent-hq/intentd/pull/2604))
+
+
+## [0.11.30] - 2026-10-22
+
+### 🚀 Features
+
+- Add workspace discussions, agent messaging and guest roles ([#2432](https://github.com/intent-hq/intentd/pull/2432))
+
+
+## [0.11.29] - 2026-10-22
+
+### 🐛 Bug Fixes
+
+- Treat Claude Code weekly/session limit errors as quota ([#7615](https://github.com/intent-hq/intentd/pull/7615)) ([#2607](https://github.com/intent-hq/intentd/pull/2607))
+
+### 📚 Documentation
+
+- *(browser)* Document background hosting and snapshot mount-on-demand ([#2541](https://github.com/intent-hq/intentd/pull/2541))
+
+
+## [0.11.28] - 2026-10-22
+
+### 🚀 Features
+
+- Serve large notes truncated on request ([#2592](https://github.com/intent-hq/intentd/pull/2592))
+
+
+## [0.11.27] - 2026-10-22
+
+### 🚀 Features
+
+- Provider profile order, backup flag and automatic quota failover ([#2581](https://github.com/intent-hq/intentd/pull/2581))
+
+
 ## [0.11.26] - 2026-10-22
 
 ### 🔧 Refactor

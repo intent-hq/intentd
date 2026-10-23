@@ -196,7 +196,8 @@ async fn wss_event<S>(ws: &mut WebSocketStream<S>, secs: u64) -> Value
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(secs));
     loop {
         let remaining = match deadline.checked_duration_since(tokio::time::Instant::now()) {
             Some(d) if !d.is_zero() => d,
@@ -518,6 +519,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         display_status: None,
         attention_reminder: None,
         waiting: false,
+        scripts_running: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,

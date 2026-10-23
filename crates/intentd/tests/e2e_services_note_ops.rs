@@ -64,6 +64,7 @@ fn workspace(id: &WorkspaceId, path: &Path) -> Workspace {
         display_status: None,
         attention_reminder: None,
         waiting: false,
+        scripts_running: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,

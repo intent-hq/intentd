@@ -355,6 +355,7 @@ async fn seed_workspace_only(data_dir: &Path) -> String {
             display_status: None,
             attention_reminder: None,
             waiting: false,
+            scripts_running: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
