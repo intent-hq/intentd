@@ -1801,6 +1801,9 @@ fn map_acp_session_error(context: &str, e: &AcpError, provider_id: &str) -> Erro
 pub(crate) struct AuthOwner {
     selection: String,
     profile: Option<intent_acp::ProfileEnv>,
+    /// The selection may run with an overlay that could not be read: its
+    /// verdict is unknown, so nothing is demoted (never the bare Default).
+    unresolved: bool,
 }
 
 impl AuthOwner {
@@ -1809,10 +1812,14 @@ impl AuthOwner {
         Self {
             selection: provider_id.to_owned(),
             profile: None,
+            unresolved: false,
         }
     }
 
     fn demote(&self) {
+        if self.unresolved {
+            return;
+        }
         match &self.profile {
             Some(profile) => crate::provider_auth::demote_profile_auth_verdict(profile),
             None => crate::provider_auth::demote_auth_verdict(&self.selection),
@@ -1824,17 +1831,18 @@ impl Services {
     /// The [`AuthOwner`] of a resolved selection. A profile whose saved
     /// settings cannot be read demotes nothing (and never the Default).
     pub(crate) async fn auth_owner(&self, selection: &str) -> AuthOwner {
-        let profile = if crate::provider_profiles::may_have_overlay(selection) {
-            Box::pin(self.resolve_profile_env(selection))
-                .await
-                .ok()
-                .flatten()
+        let (profile, unresolved) = if crate::provider_profiles::may_have_overlay(selection) {
+            match Box::pin(self.resolve_profile_env(selection)).await {
+                Ok(profile) => (profile, false),
+                Err(_) => (None, true),
+            }
         } else {
-            None
+            (None, false)
         };
         AuthOwner {
             selection: selection.to_owned(),
             profile,
+            unresolved,
         }
     }
 }

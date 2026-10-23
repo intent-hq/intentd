@@ -540,6 +540,41 @@ fn fold_name(name: &str) -> String {
     name.chars().flat_map(char::to_lowercase).collect()
 }
 
+/// Whether a Default configuration name is not a rename: blank, or
+/// `Default` ignoring case (after trimming).
+pub(crate) fn is_unrenamed_default_name(name: &str) -> bool {
+    let name = name.trim();
+    name.is_empty() || fold_name(name) == fold_name(DEFAULT_NAME)
+}
+
+/// The shared shape rule for every display name: no control characters and
+/// at most [`MAX_NAME_CHARS`] after trimming.
+fn check_name_shape(name: &str, errors: &mut Vec<FieldError>) {
+    if name.chars().any(char::is_control) || name.chars().count() > MAX_NAME_CHARS {
+        errors.push(FieldError::new(
+            "name",
+            "name-invalid",
+            format!("Use at most {MAX_NAME_CHARS} characters and no control characters."),
+        ));
+    }
+}
+
+/// Whether another profile of `base_provider` (not `self_id`) uses `name`,
+/// ignoring case.
+fn profile_name_taken(
+    name: &str,
+    base_provider: &str,
+    existing: &[ProfileMeta],
+    self_id: Option<&str>,
+) -> bool {
+    let folded = fold_name(name);
+    existing.iter().any(|p| {
+        p.base_provider == base_provider
+            && Some(p.id.as_str()) != self_id
+            && fold_name(&p.name) == folded
+    })
+}
+
 /// Validate a display name; returns the trimmed name.
 pub(crate) fn validate_name(
     raw: &str,
@@ -557,25 +592,14 @@ pub(crate) fn validate_name(
         ));
         return name;
     }
-    if name.chars().any(char::is_control) || name.chars().count() > MAX_NAME_CHARS {
-        errors.push(FieldError::new(
-            "name",
-            "name-invalid",
-            format!("Use at most {MAX_NAME_CHARS} characters and no control characters."),
-        ));
-    }
-    let folded = fold_name(&name);
-    if folded == "default" {
+    check_name_shape(&name, errors);
+    if fold_name(&name) == fold_name(DEFAULT_NAME) {
         errors.push(FieldError::new(
             "name",
             "name-reserved",
             "Default names the original configuration; choose another name.",
         ));
-    } else if existing.iter().any(|p| {
-        p.base_provider == base_provider
-            && Some(p.id.as_str()) != self_id
-            && fold_name(&p.name) == folded
-    }) {
+    } else if profile_name_taken(&name, base_provider, existing, self_id) {
         errors.push(FieldError::new(
             "name",
             "name-duplicate",
@@ -612,22 +636,12 @@ pub(crate) fn validate_default_name(
     existing: &[ProfileMeta],
     errors: &mut Vec<FieldError>,
 ) -> Option<String> {
-    let name = raw.trim().to_string();
-    if name.is_empty() || fold_name(&name) == fold_name(DEFAULT_NAME) {
+    if is_unrenamed_default_name(raw) {
         return None;
     }
-    if name.chars().any(char::is_control) || name.chars().count() > MAX_NAME_CHARS {
-        errors.push(FieldError::new(
-            "name",
-            "name-invalid",
-            format!("Use at most {MAX_NAME_CHARS} characters and no control characters."),
-        ));
-    }
-    let folded = fold_name(&name);
-    if existing
-        .iter()
-        .any(|p| p.base_provider == base_provider && fold_name(&p.name) == folded)
-    {
+    let name = raw.trim().to_string();
+    check_name_shape(&name, errors);
+    if profile_name_taken(&name, base_provider, existing, None) {
         errors.push(FieldError::new(
             "name",
             "name-duplicate",
@@ -905,15 +919,16 @@ fn parse_file(bytes: &[u8]) -> Option<ProfilesFile> {
     let mut file: ProfilesFile = serde_json::from_slice(bytes).ok()?;
     // A blank or `Default` name is not a rename (hand edits included).
     for default in file.defaults.values_mut() {
-        if default
+        default.name = default
             .name
-            .as_ref()
-            .is_some_and(|n| n.trim().is_empty() || fold_name(n.trim()) == fold_name(DEFAULT_NAME))
-        {
-            default.name = None;
-        }
+            .take()
+            .filter(|n| !is_unrenamed_default_name(n))
+            .map(|n| n.trim().to_owned());
     }
-    file.defaults.retain(|_, d| !d.is_empty());
+    // An entry for a base this daemon does not know (a newer daemon's) is
+    // ignored rather than making every profile unreadable.
+    file.defaults
+        .retain(|base, d| !d.is_empty() && PROFILE_BASE_PROVIDERS.contains(&base.as_str()));
     if file.version != FILE_VERSION {
         return None;
     }
@@ -926,11 +941,10 @@ fn parse_file(bytes: &[u8]) -> Option<ProfilesFile> {
         .pending_env_cleanup
         .iter()
         .all(|id| is_valid_profile_id(id))
-        && file.defaults.iter().all(|(base, d)| {
-            PROFILE_BASE_PROVIDERS.contains(&base.as_str())
-                && d.env_id
-                    .as_ref()
-                    .is_none_or(|id| is_valid_profile_id(id) && ids.insert(id.clone()))
+        && file.defaults.values().all(|d| {
+            d.env_id
+                .as_ref()
+                .is_none_or(|id| is_valid_profile_id(id) && ids.insert(id.clone()))
         });
     well_formed.then_some(file)
 }
@@ -998,10 +1012,19 @@ fn default_config_json(base: &str, name: Option<&str>, env: &EnvDoc, running: us
     })
 }
 
+/// Prefix of a Default configuration's activation-registry key. The `:`
+/// keeps it disjoint from every profile id.
+const DEFAULT_ACTIVATION_PREFIX: &str = "default:";
+
 /// The activation-registry key of a base provider's Default configuration.
-/// The `:` keeps it disjoint from every profile id.
 pub(crate) fn default_activation_key(base: &str) -> String {
-    format!("default:{base}")
+    format!("{DEFAULT_ACTIVATION_PREFIX}{base}")
+}
+
+/// The base provider of a Default configuration's activation key, or `None`
+/// for a profile id.
+pub(crate) fn parse_default_activation_key(key: &str) -> Option<&str> {
+    key.strip_prefix(DEFAULT_ACTIVATION_PREFIX)
 }
 
 /// `change: "default-updated"` / `"default-activation"`: carries the base
@@ -1569,7 +1592,7 @@ impl Services {
         }
         let saved = self.provider_profiles.profiles().ok();
         for profile_id in &changes.profiles {
-            if let Some(base) = profile_id.strip_prefix("default:") {
+            if let Some(base) = parse_default_activation_key(profile_id) {
                 let revision = self.provider_profiles.bump_revision();
                 crate::publish_event(
                     self.event_bus.as_ref(),
@@ -1793,6 +1816,47 @@ impl Services {
         Ok(Value::Array(entries))
     }
 
+    /// Whether `provider_id`'s Default configuration has saved environment
+    /// overrides (in-memory; `false` while the profile file is unreadable).
+    pub(crate) fn default_has_overrides(&self, provider_id: &str) -> bool {
+        is_default_config_ref(provider_id)
+            && self
+                .provider_profiles
+                .defaults()
+                .ok()
+                .is_some_and(|d| d.get(provider_id).is_some_and(|d| d.env_id.is_some()))
+    }
+
+    /// [`crate::agent_ops::ensure_provider_available`] for a selection: a
+    /// Default configuration with saved overrides is not refused on the bare
+    /// installation's verdict (its own verdict is keyed by its overlay).
+    pub(crate) fn ensure_provider_available_for(
+        &self,
+        method: &str,
+        provider_id: &str,
+        providers: &intent_core::settings_file::ProvidersSettings,
+    ) -> Result<()> {
+        crate::agent_ops::ensure_provider_available_checked(
+            method,
+            provider_id,
+            providers,
+            !self.default_has_overrides(provider_id),
+        )
+    }
+
+    /// The fresh cached auth verdict of a selection's saved settings: a
+    /// profile's or an overridden Default's overlay verdict, else the bare
+    /// verdict. An unresolvable overlay is an error (fail closed).
+    pub(crate) async fn selection_auth_verdict(&self, selection: &str) -> Result<Option<bool>> {
+        if !may_have_overlay(selection) {
+            return Ok(crate::provider_auth::cached_auth_verdict(selection));
+        }
+        Ok(match Box::pin(self.resolve_profile_env(selection)).await? {
+            Some(overlay) => crate::provider_auth::cached_profile_auth_verdict(&overlay),
+            None => crate::provider_auth::cached_auth_verdict(selection),
+        })
+    }
+
     /// `host.providerAuthStatus` rows for Default configurations with saved
     /// overrides: each is probed with its overlay and cached under its
     /// reference plus fingerprint (never the base verdict). An unresolvable
@@ -1803,36 +1867,42 @@ impl Services {
         force: bool,
     ) -> Result<Value> {
         let paths = self.effective_settings().providers.paths;
-        let mut entries = Vec::new();
-        for base in PROFILE_BASE_PROVIDERS
+        let bases: Vec<&'static str> = PROFILE_BASE_PROVIDERS
             .iter()
             .copied()
             .filter(|base| provider_id.as_deref().is_none_or(|wanted| wanted == *base))
-        {
-            let has_overrides = self
-                .provider_profiles
-                .defaults()
-                .ok()
-                .is_some_and(|d| d.get(base).is_some_and(|d| d.env_id.is_some()));
-            if !has_overrides {
-                continue;
-            }
-            let entry = match self.resolve_profile_env(base).await {
+            .filter(|base| self.default_has_overrides(base))
+            .collect();
+        let mut entries: Vec<Value> = bases
+            .iter()
+            .map(|base| json!({ "id": base, "authenticated": null }))
+            .collect();
+        // Probes run in parallel, like the base and profile sweeps.
+        let mut probes = tokio::task::JoinSet::new();
+        for (index, base) in bases.into_iter().enumerate() {
+            match self.resolve_profile_env(base).await {
                 Ok(Some(overlay)) => {
-                    crate::provider_auth::profile_auth_status(
-                        Arc::new(overlay),
-                        force,
-                        paths.get(base).cloned(),
-                    )
-                    .await
+                    let override_path = paths.get(base).cloned();
+                    probes.spawn(async move {
+                        let entry = crate::provider_auth::profile_auth_status(
+                            Arc::new(overlay),
+                            force,
+                            override_path,
+                        )
+                        .await;
+                        (index, entry)
+                    });
                 }
-                Ok(None) => continue,
+                Ok(None) => {}
                 Err(e) => {
                     tracing::warn!(provider = %base, error = %e, "Default configuration auth check skipped");
-                    json!({ "id": base, "authenticated": null })
                 }
-            };
-            entries.push(entry);
+            }
+        }
+        while let Some(joined) = probes.join_next().await {
+            if let Ok((index, entry)) = joined {
+                entries[index] = entry;
+            }
         }
         Ok(Value::Array(entries))
     }
@@ -1998,9 +2068,12 @@ impl Services {
             return Err(field_errors(&errors));
         }
 
+        // A recorded environment whose document is missing reads empty
+        // (with no fingerprint); any env write replaces or clears it.
+        let saved_missing = current.env_id.is_some() && saved_doc.fingerprint.is_empty();
         let env_changed = entries
             .as_ref()
-            .is_some_and(|entries| *entries != saved_doc.entries);
+            .is_some_and(|entries| *entries != saved_doc.entries || saved_missing);
         let name_changed = name.as_ref().is_some_and(|n| *n != current.name);
         let key = default_activation_key(base);
         if !env_changed && !name_changed {

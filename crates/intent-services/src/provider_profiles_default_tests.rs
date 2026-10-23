@@ -419,6 +419,14 @@ async fn an_unreadable_default_environment_fails_closed() {
     // Settings still list (the missing document reads empty) and a save
     // replaces it, which recovers launches.
     assert_eq!(fx.defaults_row("codex").await["env"], json!([]));
+    // Clearing the (already missing) overrides removes the dangling envId.
+    let cleared = fx
+        .update_default(json!({ "baseProviderId": "codex", "env": [] }))
+        .await
+        .unwrap();
+    assert_eq!(cleared["activation"]["envChanged"], true);
+    assert!(fx.default_env_id("codex").is_none());
+    assert!(fx.svc.resolve_profile_env("codex").await.unwrap().is_none());
     fx.update_default(json!({
         "baseProviderId": "codex",
         "env": [{ "key": "CODEX_HOME", "kind": "set", "value": "/work" }],
@@ -537,4 +545,50 @@ async fn default_values_never_reach_events_or_the_profile_file() {
         .contains(SECRET));
     let catalog = fx.svc.providers_catalog().await.unwrap();
     assert!(!catalog.to_string().contains(SECRET));
+}
+
+#[intent_test_macros::daemon_test]
+async fn only_a_default_with_saved_overrides_skips_the_bare_verdict() {
+    let fx = Fixture::new().await;
+    fx.update_default(json!({ "baseProviderId": "codex", "name": "Personal" }))
+        .await
+        .unwrap();
+    // A rename alone is not an override.
+    assert!(!fx.svc.default_has_overrides("codex"));
+    fx.update_default(json!({
+        "baseProviderId": "codex",
+        "env": [{ "key": "OPENAI_API_KEY", "kind": "set", "value": SECRET }],
+    }))
+    .await
+    .unwrap();
+    assert!(fx.svc.default_has_overrides("codex"));
+    assert!(!fx.svc.default_has_overrides("claude-code"));
+    assert!(!fx.svc.default_has_overrides("auggie"));
+    assert!(!fx.svc.default_has_overrides("codex@pwork"));
+}
+
+#[intent_test_macros::daemon_test]
+async fn an_unknown_base_in_defaults_is_ignored_not_fatal() {
+    let fx = Fixture::new().await;
+    fx.create("codex", "Work", json!([])).await;
+    let mut file = fx.file();
+    file["defaults"] = json!({ "future-cli": { "name": "X" }, "codex": { "name": "  Home " } });
+    std::fs::write(fx.profiles_file(), file.to_string()).unwrap();
+    let fx = fx.restart().await;
+    let listed = fx.svc.provider_profiles_list_impl(None).await.unwrap();
+    assert_eq!(listed["profiles"].as_array().unwrap().len(), 1);
+    assert_eq!(fx.defaults_row("codex").await["name"], "Home");
+}
+
+#[test]
+fn default_activation_keys_round_trip_and_never_match_profile_ids() {
+    for base in PROFILE_BASE_PROVIDERS {
+        let key = default_activation_key(base);
+        assert_eq!(parse_default_activation_key(&key), Some(*base));
+        assert!(!is_valid_profile_id(&key));
+    }
+    assert_eq!(parse_default_activation_key("pwork"), None);
+    assert!(is_unrenamed_default_name(" default "));
+    assert!(is_unrenamed_default_name(""));
+    assert!(!is_unrenamed_default_name("Defaults"));
 }
