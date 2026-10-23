@@ -2576,14 +2576,42 @@ async fn a_failed_later_choice_keeps_the_earlier_exemption() {
         .await
         .expect("setModel");
     mark_exhausted_elsewhere(&fx, &first);
-    // A later setModel on the same configuration whose persist fails: what
-    // `agent_set_model_op` does around a failed store write.
+    // A later setModel on the same configuration whose persist fails: the
+    // guard `agent_set_model_op` holds is dropped uncommitted by its `?`.
     let cache = &services.provider_quota_cache;
-    let failed = cache.note_manual_choice(&fx.agent, &first);
-    cache.rollback_manual_choice(&fx.agent, failed);
+    drop(cache.begin_manual_choice(&fx.agent, &first));
 
     services.avoid_exhausted_provider(&fx.ws, &fx.agent).await;
 
     assert_eq!(fx.row().await.provider.as_deref(), Some(first.as_str()));
     assert!(notices(&fx.messages().await, "provider_failover").is_empty());
+}
+
+/// Review of intentd#2624: a successful, untried choice of a marked B, then
+/// two overlapping `agent.setModel` calls to C whose persists both fail
+/// (each guard dropped uncommitted, the second-started one first). The
+/// session still carries B and the next turn start tries it.
+#[intent_test_macros::daemon_test]
+async fn overlapping_failed_choices_keep_the_earlier_exemption() {
+    let fx = Fixture::new(json!({ "response": "answered" })).await;
+    let first = fx.profile("First", true).await;
+    let second = fx.profile("Second", true).await;
+    fx.away(&first, Value::Null).await;
+    let services = &fx.mgr.services;
+    services
+        .agent_set_model_op(fx.agent.clone(), "opus".to_owned(), None)
+        .await
+        .expect("setModel");
+    mark_exhausted_elsewhere(&fx, &first);
+    let cache = &services.provider_quota_cache;
+    let t2 = cache.begin_manual_choice(&fx.agent, &second);
+    let t3 = cache.begin_manual_choice(&fx.agent, &second);
+    drop(t2);
+    drop(t3);
+
+    services.avoid_exhausted_provider(&fx.ws, &fx.agent).await;
+
+    assert_eq!(fx.row().await.provider.as_deref(), Some(first.as_str()));
+    assert!(notices(&fx.messages().await, "provider_failover").is_empty());
+    assert!(!cache.is_pending_or_committed(&fx.agent), "used up");
 }

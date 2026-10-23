@@ -571,6 +571,7 @@ impl Services {
         agent_id: &AgentId,
     ) {
         let now = Utc::now();
+        let read = self.provider_quota_cache.manual_choice_read();
         let Ok(session) = self.store.get_agent_session(agent_id).await else {
             return;
         };
@@ -584,7 +585,7 @@ impl Services {
         // read together with its record.
         if self
             .provider_quota_cache
-            .take_manual_choice(agent_id, current)
+            .take_manual_choice(agent_id, current, read)
         {
             return;
         }

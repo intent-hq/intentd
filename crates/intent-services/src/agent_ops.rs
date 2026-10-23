@@ -5813,12 +5813,13 @@ impl Services {
         // Recorded before the persist (PROTOCOL §5.54 shared quota state):
         // a turn start that reads the new choice also sees that it is a
         // manual one, so it is tried rather than moved off ahead of time.
+        // Dropped uncommitted on any failure below (including a cancelled
+        // call), which discards only this call's record.
         let manual_choice = provider.as_deref().map(|chosen| {
             self.provider_quota_cache
-                .note_manual_choice(&agent_id, chosen)
+                .begin_manual_choice(&agent_id, chosen)
         });
-        if let Err(e) = self
-            .store
+        self.store
             .set_agent_session_model(
                 &workspace_id,
                 &agent_id,
@@ -5826,13 +5827,9 @@ impl Services {
                 provider.as_deref(),
                 &now_iso(),
             )
-            .await
-        {
-            if let Some(token) = manual_choice {
-                self.provider_quota_cache
-                    .rollback_manual_choice(&agent_id, token);
-            }
-            return Err(e);
+            .await?;
+        if let Some(choice) = manual_choice {
+            choice.commit();
         }
         // The stored model changed, so any persisted display resolution (D14)
         // now names the wrong model — clear it; the next session open

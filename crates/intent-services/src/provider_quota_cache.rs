@@ -55,28 +55,74 @@ pub(crate) struct ProviderQuotaCache {
     manual_choices: Arc<Mutex<ManualChoices>>,
 }
 
-/// Pending manual choices, each stamped with the token of the
-/// `agent.setModel` call that recorded it.
+/// Manual choices per agent (see [`ProviderQuotaCache::begin_manual_choice`]).
+/// `generation` is one counter for every record and every turn-start read,
+/// so a committed choice can be ordered against the read that checks it.
 #[derive(Debug, Default)]
 struct ManualChoices {
-    next_token: u64,
-    by_agent: HashMap<AgentId, ManualChoiceRecord>,
+    generation: u64,
+    by_agent: HashMap<AgentId, AgentChoices>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct ManualChoiceRecord {
-    selection: String,
-    token: u64,
+#[derive(Debug, Default)]
+struct AgentChoices {
+    /// `agent.setModel` calls whose persist is in flight, by token. Never
+    /// pruned by a turn start: the persist may land after its read.
+    pending: HashMap<u64, PendingChoice>,
+    /// Choices whose persist succeeded and that no turn has started on.
+    committed: Vec<CommittedChoice>,
 }
 
-/// One recorded manual choice, returned by
-/// [`ProviderQuotaCache::note_manual_choice`] so a failed persist can undo
-/// exactly that record (see [`ProviderQuotaCache::rollback_manual_choice`]).
+impl AgentChoices {
+    fn is_empty(&self) -> bool {
+        self.pending.is_empty() && self.committed.is_empty()
+    }
+}
+
 #[derive(Debug)]
-#[must_use = "a failed persist must roll the record back"]
-pub(crate) struct ManualChoiceToken {
+struct PendingChoice {
+    selection: String,
+    /// A turn already started on it while the persist was in flight.
+    consumed: bool,
+}
+
+#[derive(Debug)]
+struct CommittedChoice {
+    selection: String,
+    /// When the persist was known to have landed.
+    generation: u64,
+}
+
+/// One in-flight manual choice, from [`ProviderQuotaCache::begin_manual_choice`].
+/// [`Self::commit`] after the persist succeeds; dropping it uncommitted (a
+/// failed persist, `?`, or a cancelled `agent.setModel`) discards only this
+/// call's record, so an earlier successful choice and other in-flight calls
+/// are untouched however the calls overlap.
+#[derive(Debug)]
+#[must_use = "commit after the persist succeeds"]
+pub(crate) struct ManualChoiceGuard {
+    cache: ProviderQuotaCache,
+    agent: AgentId,
     token: u64,
-    previous: Option<ManualChoiceRecord>,
+    finished: bool,
+}
+
+impl ManualChoiceGuard {
+    /// The persist succeeded: the choice is the agent's selection.
+    pub(crate) fn commit(mut self) {
+        self.finished = true;
+        self.cache
+            .finish_manual_choice(&self.agent, self.token, true);
+    }
+}
+
+impl Drop for ManualChoiceGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.cache
+                .finish_manual_choice(&self.agent, self.token, false);
+        }
+    }
 }
 
 impl ProviderQuotaCache {
@@ -130,59 +176,112 @@ impl ProviderQuotaCache {
 
     /// The user is choosing `selection` for `agent` by hand. Recorded BEFORE
     /// the choice is persisted, so any turn start that reads the persisted
-    /// choice also sees this record (see [`Self::take_manual_choice`]). A
-    /// newer choice replaces an older one; the returned token remembers the
-    /// replaced record for [`Self::rollback_manual_choice`].
-    pub(crate) fn note_manual_choice(&self, agent: &AgentId, selection: &str) -> ManualChoiceToken {
+    /// choice also sees this record (see [`Self::take_manual_choice`]).
+    pub(crate) fn begin_manual_choice(
+        &self,
+        agent: &AgentId,
+        selection: &str,
+    ) -> ManualChoiceGuard {
         let mut choices = self.manual_choices.lock().unwrap();
-        choices.next_token += 1;
-        let token = choices.next_token;
-        let previous = choices.by_agent.insert(
-            agent.clone(),
-            ManualChoiceRecord {
-                selection: provider_profiles::canonical_selection(selection),
+        choices.generation += 1;
+        let token = choices.generation;
+        choices
+            .by_agent
+            .entry(agent.clone())
+            .or_default()
+            .pending
+            .insert(
                 token,
-            },
-        );
-        ManualChoiceToken { token, previous }
+                PendingChoice {
+                    selection: provider_profiles::canonical_selection(selection),
+                    consumed: false,
+                },
+            );
+        ManualChoiceGuard {
+            cache: self.clone(),
+            agent: agent.clone(),
+            token,
+            finished: false,
+        }
     }
 
-    /// The persist of the choice behind `token` failed: put back the record
-    /// it replaced (an earlier successful choice no turn has tried yet), or
-    /// none. A no-op when a newer choice has replaced it, or a turn already
-    /// consumed it.
-    pub(crate) fn rollback_manual_choice(&self, agent: &AgentId, token: ManualChoiceToken) {
-        let mut choices = self.manual_choices.lock().unwrap();
-        if choices.by_agent.get(agent).map(|r| r.token) != Some(token.token) {
+    /// End the in-flight choice `token`: on success it becomes a committed
+    /// choice (unless a turn already started on it); on failure only its own
+    /// record goes.
+    fn finish_manual_choice(&self, agent: &AgentId, token: u64, persisted: bool) {
+        let mut guard = self.manual_choices.lock().unwrap();
+        let choices = &mut *guard;
+        let Some(agent_choices) = choices.by_agent.get_mut(agent) else {
             return;
+        };
+        if let Some(pending) = agent_choices.pending.remove(&token) {
+            if persisted && !pending.consumed {
+                choices.generation += 1;
+                agent_choices
+                    .committed
+                    .retain(|c| c.selection != pending.selection);
+                agent_choices.committed.push(CommittedChoice {
+                    selection: pending.selection,
+                    generation: choices.generation,
+                });
+            }
         }
-        match token.previous {
-            Some(previous) => {
-                choices.by_agent.insert(agent.clone(), previous);
-            }
-            None => {
-                choices.by_agent.remove(agent);
-            }
+        if agent_choices.is_empty() {
+            choices.by_agent.remove(agent);
         }
     }
 
-    /// Whether a turn starting on `current` is the first on `agent`'s
-    /// manual choice: it then tries `current` and is never moved away
-    /// ahead of the attempt. Consumed on a match; a record for another
-    /// configuration is kept for the turn that starts on it.
-    pub(crate) fn take_manual_choice(&self, agent: &AgentId, current: &str) -> bool {
+    /// Stamp a turn start's session read: call BEFORE reading the session,
+    /// and pass the result to [`Self::take_manual_choice`] with the
+    /// configuration that read returned.
+    pub(crate) fn manual_choice_read(&self) -> u64 {
+        let mut choices = self.manual_choices.lock().unwrap();
+        choices.generation += 1;
+        choices.generation
+    }
+
+    /// Whether a turn starting on `current` (read after `read`) is the first
+    /// on one of `agent`'s manual choices: it then tries `current` and is
+    /// never moved away ahead of the attempt. Every record of `current` is
+    /// used up. A committed choice of another configuration that landed
+    /// before the read was replaced by a later write and is dropped; one
+    /// that landed after, and every in-flight one, is kept for the turn that
+    /// reads it.
+    pub(crate) fn take_manual_choice(&self, agent: &AgentId, current: &str, read: u64) -> bool {
         let current = provider_profiles::canonical_selection(current);
         let mut choices = self.manual_choices.lock().unwrap();
-        if choices
-            .by_agent
-            .get(agent)
-            .is_some_and(|r| r.selection == current)
-        {
-            choices.by_agent.remove(agent);
-            true
-        } else {
-            false
+        let Some(agent_choices) = choices.by_agent.get_mut(agent) else {
+            return false;
+        };
+        let mut matched = false;
+        agent_choices.committed.retain(|c| {
+            if c.selection == current {
+                matched = true;
+                false
+            } else {
+                c.generation > read
+            }
+        });
+        for pending in agent_choices.pending.values_mut() {
+            if pending.selection == current && !pending.consumed {
+                pending.consumed = true;
+                matched = true;
+            }
         }
+        if agent_choices.is_empty() {
+            choices.by_agent.remove(agent);
+        }
+        matched
+    }
+
+    /// Whether any manual-choice record is held for `agent`.
+    #[cfg(test)]
+    pub(crate) fn is_pending_or_committed(&self, agent: &AgentId) -> bool {
+        self.manual_choices
+            .lock()
+            .unwrap()
+            .by_agent
+            .contains_key(agent)
     }
 
     /// The time `selection`'s exhausted mark lasts until, while it is live at
