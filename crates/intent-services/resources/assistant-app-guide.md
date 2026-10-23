@@ -37,7 +37,10 @@ Only when explicitly asked about workspace discussions: this unreleased Multipla
 Labs feature supports multiple workspace-wide discussions. Start a discussion by
 sending its first message; everyone with workspace access can read and participate.
 Workspace owners and managers can rename discussions; only workspace owners can
-delete them, including the default discussion. Existing private history remains
+delete them, including the default discussion. Open the discussion, then use the
+discussion panel's **…** menu for **Rename discussion** or **Delete discussion**.
+These controls require discussion-management support from the connected daemon.
+Existing private history remains
 visible only to its original participants and is read-only; new private discussions
 are unavailable. Discussions support reactions 👍 👎 👀 ✅ 🙈. The emoji picker has no tooltips;
 hover or focus an existing reaction to see who reacted, and click to toggle yours.
@@ -64,7 +67,8 @@ clear as focused discussion content is read; they are not durable cross-device
 read receipts. These additions remain part of unreleased Multiplayer Labs.
 
 In the People panel's Activity list, nearby consecutive actions by the same person
-share an avatar. Each action remains individually selectable.
+share an avatar. Each action remains individually selectable. **Load more** looks
+for older activity from people, even when automated events fill the recent feed.
 
 <!-- Source: packages/cloudlands-fe/src/features/presence/components/WorkspacePeopleActivity.svelte. -->
 
