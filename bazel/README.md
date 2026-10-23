@@ -41,6 +41,28 @@ crate_universe also writes a `BUILD.bazel` into `vendor/pprof` while it
 resolves. That file is git-ignored, and `.bazelignore` keeps the directory out
 of the main repo's packages.
 
+## Linker
+
+Bazel links Rust with **rustc's bundled rust-lld**, the same linker Cargo uses
+on x86_64 Linux since Rust 1.90 (`readelf -p .comment` on either binary shows
+`Linker: LLD <rustc's LLVM version>`). rustc still drives the link through the
+system `cc`, as under Cargo.
+
+The auto-configured C++ toolchain (rules_cc `unix_cc_configure`) adds
+`-fuse-ld=lld` when the host has a system `ld.lld`, otherwise
+`-fuse-ld=gold`, to every link. Those flags override rustc's own choice, so
+Rust used whichever linker the host had (gold, deprecated for Rust, on CI
+runners without lld). `.bazelrc` appends `-Clink-arg=-fuse-ld=lld` to every
+Rust action, target and exec (proc-macros, build scripts, `process_wrapper`).
+The last `-fuse-ld` wins, and rustc's `-B<sysroot>/lib/rustlib/<triple>/bin/gcc-ld`
+precedes the toolchain's `-B/usr/bin`, so rustc's rust-lld is found before
+any system `ld.lld`. It ships with the Rust toolchain, so runners need no
+extra package. C/C++ links (none today) keep the auto-configured linker.
+
+On other hosts (aarch64 Linux, where rustc does not use its bundled lld by default)
+the flag needs a system `ld.lld`; Cargo uses the system default linker there.
+CI builds only on x86_64 Linux.
+
 ## Generated files
 
 `scripts/bazel-gen.py` writes `crates/*/BUILD.bazel`, the root `BUILD.bazel`,
