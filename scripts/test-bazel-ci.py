@@ -13,6 +13,7 @@ import io
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -563,6 +564,120 @@ class GeneratorDiscovery(unittest.TestCase):
 
     def test_drift_guard_prints_the_same_fix(self):
         self.assertEqual(drift.FIX_COMMAND, gen.FIX_COMMAND)
+
+
+# A stand-in for a libtest binary: `--list --format terse`, positional filters,
+# `--skip` and `--exact` with libtest's matching (substring unless --exact).
+FAKE_LIBTEST = r'''#!/usr/bin/env python3
+import json, sys
+tests = json.loads(open(sys.argv[0] + ".json").read())
+args, filters, skips, exact, listing = sys.argv[1:], [], [], False, False
+i = 0
+while i < len(args):
+    arg = args[i]
+    if arg in ("--skip", "--format"):
+        if arg == "--skip":
+            skips.append(args[i + 1])
+        i += 2
+        continue
+    if arg == "--exact":
+        exact = True
+    elif arg == "--list":
+        listing = True
+    elif not arg.startswith("-"):
+        filters.append(arg)
+    i += 1
+match = (lambda p, n: p == n) if exact else (lambda p, n: p in n)
+for name in tests:
+    if (not filters or any(match(f, name) for f in filters)) and not any(match(s, name) for s in skips):
+        print(f"{name}: test" if listing else f"RUN {name}")
+'''
+
+
+class ModuleShardSelection(unittest.TestCase):
+    """Module shards select by real top-level module, not libtest's substring filters."""
+
+    TESTS = [
+        "m1::a", "m1::tests::b", "sub::m1::c", "tests::d", "tests::helpers::e",
+        "discussion_ops::tests::y", "new_module::tests::x", "top_level_fn",
+    ]
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="bazel-shard-test-"))
+        self.addCleanup(shutil.rmtree, self.tmp)
+        shutil.copy(ROOT / "rust-toolchain.toml", self.tmp / "rust-toolchain.toml")
+        (self.tmp / "Cargo.toml").write_text('[workspace]\nresolver = "2"\nmembers = ["crates/*"]\n')
+        lib = "".join(f"pub mod {m};\n" for m in ("m1", "sub", "tests", "discussion_ops", "new_module"))
+        self.write("crates/a/Cargo.toml", '[package]\nname = "a"\nversion = "0.1.0"\nedition = "2021"\n')
+        self.write("crates/a/src/lib.rs", lib)
+        for module in ("m1", "sub", "tests", "discussion_ops", "new_module"):
+            self.write(f"crates/a/src/{module}.rs", "")
+        for name, value in (("ROOT", self.tmp), ("MODULE_SHARDS", {"a": [["m1"], ["tests"]]}),
+                            ("MANUAL_SHARDS", {("a", 2): "test reason"})):
+            patcher = mock.patch.object(gen, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        subprocess.run(["cargo", "generate-lockfile", "--offline"], cwd=self.tmp, check=True, capture_output=True)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(gen.main([]), 0)
+        self.binary = self.tmp / "lib_test_binary"
+        self.binary.write_text(FAKE_LIBTEST)
+        self.binary.chmod(0o755)
+        Path(str(self.binary) + ".json").write_text(json.dumps(self.TESTS))
+        self.rules = Package(self.tmp / "crates/a").evaluate_build()
+
+    def write(self, rel, text):
+        (self.tmp / rel).parent.mkdir(parents=True, exist_ok=True)
+        (self.tmp / rel).write_text(text)
+
+    def run_target(self, name):
+        """The tests the target runs, as `bazel test` would run it."""
+        kind, attrs = self.rules[name]
+        self.assertEqual((kind, attrs["binary"]), ("shared_binary_test", ":lib_test_binary"))
+        command = [str(self.binary)]
+        if attrs.get("include_modules") or attrs.get("exclude_modules"):
+            launcher = self.tmp / f"{name}.sh"
+            launcher.write_text(module_shard_launcher(
+                str(self.binary), attrs.get("include_modules", []), attrs.get("exclude_modules", [])))
+            launcher.chmod(0o755)
+            command = [str(launcher)]
+        out = subprocess.run(command + (attrs.get("args") or []), check=True, capture_output=True, text=True)
+        return {line[4:] for line in out.stdout.splitlines() if line.startswith("RUN ")}
+
+    def test_rest_shard_runs_nested_tests_of_unlisted_modules(self):
+        rest = self.run_target("lib_test_shard_rest")
+        self.assertIn("new_module::tests::x", rest)
+        self.assertIn("discussion_ops::tests::y", rest)
+        self.assertNotIn("manual", self.rules["lib_test_shard_rest"][1]["tags"])
+        self.assertIn("manual", self.rules["lib_test_shard2"][1]["tags"])
+        manual = self.run_target("lib_test_shard2")
+        self.assertNotIn("new_module::tests::x", manual)
+        self.assertNotIn("discussion_ops::tests::y", manual)
+
+    def test_every_test_runs_in_exactly_its_top_level_modules_shard(self):
+        selected = {name: self.run_target(name)
+                    for name in ("lib_test_shard1", "lib_test_shard2", "lib_test_shard_rest")}
+        self.assertEqual(selected, {
+            "lib_test_shard1": {"m1::a", "m1::tests::b"},
+            "lib_test_shard2": {"tests::d", "tests::helpers::e"},
+            "lib_test_shard_rest": {"sub::m1::c", "discussion_ops::tests::y", "new_module::tests::x",
+                                    "top_level_fn"},
+        })
+
+    def test_an_empty_shard_runs_nothing(self):
+        launcher = self.tmp / "empty.sh"
+        launcher.write_text(module_shard_launcher(str(self.binary), ["absent"], []))
+        launcher.chmod(0o755)
+        out = subprocess.run([str(launcher)], check=True, capture_output=True, text=True)
+        self.assertNotIn("RUN ", out.stdout)
+
+
+def module_shard_launcher(binary: str, include: list[str], exclude: list[str]) -> str:
+    """bazel/module_shard_test.sh as shared_binary_test expands it."""
+    template = (ROOT / "bazel/module_shard_test.sh").read_text()
+    return (template.replace("@@BINARY@@", shlex.quote(binary))
+            .replace("@@INCLUDE@@", " ".join(shlex.quote(m) for m in include))
+            .replace("@@EXCLUDE@@", " ".join(shlex.quote(m) for m in exclude)))
 
 
 class RemoteCacheCredentials(unittest.TestCase):

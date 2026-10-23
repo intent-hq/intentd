@@ -1,4 +1,5 @@
 exports_files([
+    "module_shard_test.sh",
     "workspace_status.sh",
 ])
 

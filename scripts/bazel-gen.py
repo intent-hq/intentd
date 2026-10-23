@@ -209,16 +209,17 @@ KNOWN_FAILING[("intent-services", "intent-services")] = {
 
 # Unit-test binaries split into several Bazel targets by top-level module, so
 # Bazel runs them as parallel processes (rules_rust has no test sharding).
-# Each `<target>_shardN` runs the tests whose names contain one of its modules'
-# `module::` prefixes; `<target>_shard_rest` runs everything matching no shard.
-# A test therefore runs at least once; a name that also contains another
-# shard's prefix may run twice.
+# Each `<target>_shardN` runs the tests whose top-level module (the test name
+# up to the first `::`) is one of its modules; `<target>_shard_rest` runs every
+# other test, including top-level tests and nested `mod tests` of unlisted
+# modules. bazel/module_shard_test.sh does the selection, since libtest's
+# filters are substring matches. Every test runs in exactly one shard.
 #
 # The assignment is a fixed table, not derived from the sources: balancing by
 # file size reshuffled most shards whenever a module grew by a few hundred
 # bytes, so nearly every intent-services change failed the drift guard. A new
-# module runs in `_shard_rest` until it is added here; a removed one leaves a
-# prefix that matches nothing. `python3 scripts/bazel-gen.py --suggest-shards
+# module runs in `_shard_rest` until it is added here; a removed one selects
+# nothing. `python3 scripts/bazel-gen.py --suggest-shards
 # intent-services` prints a fresh size-balanced table to paste in.
 MODULE_SHARDS: dict[str, list[list[str]]] = {
     "intent-services": [
@@ -933,18 +934,20 @@ def render_build(ws: Workspace, package: dict, nextest: NextestPolicy) -> str:
         if manual_reason:
             rules.append(Comment(f"manual: {manual_reason}"))
         if shards:
-            prefixes = [f"{m}::" for bucket in shards for m in bucket]
+            # Select by real top-level module (bazel/module_shard_test.sh):
+            # libtest filters are substring matches, so a `tests::` filter
+            # would also take every nested `foo::tests::`.
             for index, bucket in enumerate(shards, 1):
                 reason = MANUAL_SHARDS.get((name, index))
                 if reason:
                     rules.append(Comment(f"manual: {reason}"))
                 emit(
                     f"_shard{index}",
-                    [f"{m}::" for m in bucket] + skips,
+                    skips,
                     exclusive + (["manual"] if reason else []),
-                    {"timeout": "eternal"} if reason else {},
+                    {"include_modules": bucket, **({"timeout": "eternal"} if reason else {})},
                 )
-            emit("_shard_rest", skips + [a for p in prefixes for a in ("--skip", p)], exclusive, {})
+            emit("_shard_rest", skips, exclusive, {"exclude_modules": sorted(m for b in shards for m in b)})
         else:
             emit("", skips, exclusive, {})
         if serial:

@@ -199,7 +199,13 @@ through `bazel/shared_binary_test.bzl`.
 
 Its unit-test binary (~7,600 tests) is split by top-level module into
 `lib_test_shard1`…`8`, plus `lib_test_shard_rest` for every module no shard
-names. The assignment is the fixed `MODULE_SHARDS` table, not computed from
+names. A test belongs to the shard of its top-level module, the name up to
+the first `::`; `_shard_rest` also runs top-level tests and the nested
+`mod tests` of every unnamed module. libtest's filters are substring matches
+(`tests::` would also match `discussion_ops::tests::`), so each shard runs
+the binary through `bazel/module_shard_test.sh`, which lists the tests, picks
+by top-level module and runs the picks with `--exact`. Every test runs in
+exactly one shard. The assignment is the fixed `MODULE_SHARDS` table, not computed from
 file sizes, so editing or adding unit tests never changes the BUILD file; a
 new module runs in `_shard_rest`. To rebalance, paste the output of
 `python3 scripts/bazel-gen.py --suggest-shards intent-services` into the
