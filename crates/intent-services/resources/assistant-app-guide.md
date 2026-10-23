@@ -657,12 +657,14 @@ When collapsed, the sidebar leaves a slim vertical icon rail. Hover over or focu
 a section tab to reveal just its content panel beside it, aligned with the tab
 when space allows. The panel fits its contents; longer sections scroll within the
 available space. Moving the pointer between tabs smoothly switches the preview
-without changing your remembered section. Selecting a different section leaves
-your open content in place. Click the already-selected tab to open its default
+without changing your remembered section. In the expanded sidebar, selecting a
+different section leaves your open content in place. Click the already-selected
+tab to open its default
 content: **Agents** opens the main agent, **Context** the Spec, **Changes** the
 changes list, and **Files** a root README (otherwise the first root file, then a
 file inside a folder). **Browsers** opens the first browser in its list; **Shells**
-opens the first terminal, creating one when none exists. Moving keyboard focus
+opens the first terminal, creating one when none exists. A click in the collapsed
+rail opens the section's default content immediately. Moving keyboard focus
 across the expanded row only selects the sidebar section. Enter or Space acts
 like a click in either layout. The rail's sidebar toggle pins it open;
 the expanded sidebar's toggle collapses it.
