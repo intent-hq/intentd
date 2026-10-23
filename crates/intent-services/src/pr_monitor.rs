@@ -436,6 +436,9 @@ pub(crate) type PrMonitorCatchUp = Arc<Mutex<HashMap<PrMonitorId, time::OffsetDa
 /// The diffable state of one monitored PR: the merge-requirements checklist
 /// plus the identity/comment-count fields the checklist itself does not
 /// carry. Persisted (JSON) as the monitor's baseline.
+// The bool fields are independent serde-defaulted persistence markers;
+// grouping them would change the persisted JSON shape.
+#[expect(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PrMonitorSnapshot {
@@ -455,6 +458,12 @@ pub(crate) struct PrMonitorSnapshot {
     /// silently instead of emitting a false post-upgrade wake.
     #[serde(default)]
     pub ejection_tracked: bool,
+    /// Whether this snapshot reports skipped checks as `skipped`. Baselines
+    /// persisted before skipped checks were told apart read `false`: their
+    /// skipped checks were encoded as `passed`, so the first tracked poll
+    /// re-encodes them silently instead of reporting `passed → skipped`.
+    #[serde(default)]
+    pub skipped_tracked: bool,
     /// No authoritative checks have been observed for this head yet. Internal
     /// persisted bookkeeping only; old snapshots retain their known baseline.
     #[serde(default)]
@@ -670,6 +679,7 @@ impl SharedPrSnapshot {
             review_comment_count: self.review_comment_count,
             requirements,
             ejection_tracked,
+            skipped_tracked: true,
             checks_unobserved,
             checks_seed_pending,
             status_checks: Some(status_checks),
@@ -1901,6 +1911,7 @@ fn pr_monitor_wire(m: &PrMonitor, paused_until: Option<&str>) -> Value {
                 "passed": r.checks.passed,
                 "failed": r.checks.failed,
                 "pending": r.checks.pending,
+                "skipped": r.checks.skipped,
                 "failingRequired": r.checks.failing_required.len(),
                 "pendingRequired": r.checks.pending_required.len(),
                 "requiredKnown": r.checks.required_known,
@@ -1944,6 +1955,27 @@ fn pr_monitor_wire(m: &PrMonitor, paused_until: Option<&str>) -> Value {
         obj.insert("lastSnapshot".to_string(), last);
     }
     out
+}
+
+/// Re-encode a baseline persisted before skipped checks were told apart:
+/// a check it recorded as `passed` that the tracked `fresh` snapshot reports
+/// as `skipped` was a skipped check under the old encoding, not a change.
+fn adopt_skipped_encoding(s: &mut PrMonitorSnapshot, fresh: &PrMonitorSnapshot) {
+    let skipped: HashSet<&str> = fresh
+        .requirements
+        .checks
+        .names_with("skipped")
+        .into_iter()
+        .collect();
+    let checks = &mut s.requirements.checks;
+    for check in &mut checks.items {
+        if check.status == "passed" && skipped.contains(check.name.as_str()) {
+            check.status = "skipped".into();
+            checks.passed -= 1;
+            checks.skipped += 1;
+        }
+    }
+    s.skipped_tracked = true;
 }
 
 /// Render the refreshed merge-requirements checklist as the wake's
@@ -3757,9 +3789,10 @@ impl Services {
                     .chain(std::iter::once(&fresh))
                 {
                     let observed_known = observed.known_required_checks();
-                    // A check first seen passing is silent too. Retain it even
-                    // while its flag is unknown. Copy only missing passing
-                    // names, keeping failures/removals pending for delivery.
+                    // A check first seen passing (or skipped) is silent too.
+                    // Retain it even while its flag is unknown. Copy only
+                    // missing passing/skipped names, keeping failures/removals
+                    // pending for delivery.
                     let names: HashSet<_> = s
                         .requirements
                         .checks
@@ -3773,7 +3806,10 @@ impl Services {
                             .checks
                             .items
                             .iter()
-                            .filter(|c| c.status == "passed" && !names.contains(&c.name))
+                            .filter(|c| {
+                                matches!(c.status.as_str(), "passed" | "skipped")
+                                    && !names.contains(&c.name)
+                            })
                             .cloned(),
                     );
                     let by_name: HashMap<_, _> = observed
@@ -3806,6 +3842,9 @@ impl Services {
                     required_known,
                 );
                 s.required_check_names = Some(known);
+            }
+            if fresh.skipped_tracked && !s.skipped_tracked {
+                adopt_skipped_encoding(s, &fresh);
             }
             if fresh.ejection_tracked && !s.ejection_tracked {
                 s.requirements
@@ -5915,6 +5954,7 @@ mod tests {
                     passed: 0,
                     failed: 0,
                     pending: 1,
+                    skipped: 0,
                     items: vec![pr_ops::MergeRequirementCheck {
                         name: "build".into(),
                         status: "pending".into(),
@@ -5944,6 +5984,7 @@ mod tests {
                 merge_queue: None,
             },
             ejection_tracked: true,
+            skipped_tracked: true,
             checks_unobserved: false,
             checks_seed_pending: false,
             status_checks: Some(Vec::new()),
@@ -6996,6 +7037,90 @@ mod tests {
             diff_snapshots(&base, &added_green).is_empty(),
             "a check that appears already passed must stay quiet"
         );
+    }
+
+    /// Incident intentd#2581 at 6c92d3256 (run 39724275631): 23 passed and
+    /// `coverage-all` / `coverage-e2e` skipped must never read as
+    /// "all checks passed".
+    fn skipped_incident(done: bool) -> PrMonitorSnapshot {
+        snapshot(|s| {
+            let c = &mut s.requirements.checks;
+            let names: Vec<String> = (1..=23)
+                .map(|i| format!("job-{i:02}"))
+                .chain(["coverage-all".to_string(), "coverage-e2e".to_string()])
+                .collect();
+            c.items = names
+                .iter()
+                .map(|name| pr_ops::MergeRequirementCheck {
+                    name: name.clone(),
+                    status: match (done, name.starts_with("coverage")) {
+                        (false, _) => "pending",
+                        (true, true) => "skipped",
+                        (true, false) => "passed",
+                    }
+                    .into(),
+                    required: false,
+                    url: None,
+                })
+                .collect();
+            c.total = 25;
+            c.pending_required.clear();
+            if done {
+                (c.passed, c.skipped, c.pending) = (23, 2, 0);
+            } else {
+                c.pending = 25;
+            }
+        })
+    }
+
+    #[test]
+    fn suite_completion_with_skipped_checks_names_them() {
+        let changes = diff_snapshots(&skipped_incident(false), &skipped_incident(true));
+        assert!(
+            !changes.iter().any(|c| c.contains("all checks passed")),
+            "{changes:?}"
+        );
+        assert_eq!(
+            changes,
+            vec![
+                "all checks completed: 23 passed, 2 skipped (coverage-all, coverage-e2e)"
+                    .to_string()
+            ]
+        );
+        let checklist = render_checklist(&skipped_incident(true));
+        assert!(
+            checklist.contains(
+                "checks: 23 passed, 0 failed, 0 pending, 2 skipped (of 25); \
+                 skipped: coverage-all, coverage-e2e"
+            ),
+            "{checklist}"
+        );
+    }
+
+    #[test]
+    fn skipped_checks_completion_with_a_failure_lists_all_outcomes() {
+        let mut done = skipped_incident(true);
+        let c = &mut done.requirements.checks;
+        c.items[0].status = "failed".into();
+        (c.passed, c.failed) = (22, 1);
+        let changes = diff_snapshots(&skipped_incident(false), &done);
+        assert!(changes.iter().any(|c| {
+            c == "all checks completed: 22 passed, 1 failed, 2 skipped (coverage-all, coverage-e2e)"
+        }));
+    }
+
+    #[test]
+    fn baseline_without_skipped_count_parses_without_diff_lines() {
+        let current = snapshot(|_| {});
+        let mut legacy = serde_json::to_value(&current).unwrap();
+        legacy["requirements"]["checks"]
+            .as_object_mut()
+            .unwrap()
+            .remove("skipped")
+            .expect("current baselines carry a skipped count");
+        let legacy: PrMonitorSnapshot = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.requirements.checks.skipped, 0);
+        assert!(diff_snapshots(&legacy, &current).is_empty());
     }
 
     #[test]
@@ -13543,6 +13668,177 @@ mod tests {
             )
             .await
             .unwrap());
+    }
+
+    /// Rewrite a monitor's persisted snapshot columns into the encoding used
+    /// before skipped checks were told apart: no `skippedTracked` marker, no
+    /// `skipped` count, and every skipped check recorded as `passed`.
+    async fn forge_pre_skipped_encoding(svc: &Services, id: &PrMonitorId) {
+        let row = svc.store().get_pr_monitor(id).await.unwrap();
+        let legacy = |col: &Option<String>| -> Option<String> {
+            let mut v: Value = serde_json::from_str(col.as_deref()?).ok()?;
+            v.as_object_mut()?.remove("skippedTracked");
+            let checks = v["requirements"]["checks"].as_object_mut()?;
+            let skipped = checks.remove("skipped")?.as_i64()?;
+            let passed = checks["passed"].as_i64()?;
+            checks.insert("passed".into(), json!(passed + skipped));
+            for item in checks.get_mut("items")?.as_array_mut()? {
+                if item["status"] == "skipped" {
+                    item["status"] = json!("passed");
+                }
+            }
+            serde_json::to_string(&v).ok()
+        };
+        let (last, baseline) = (legacy(&row.last_snapshot), legacy(&row.baseline_snapshot));
+        assert!(
+            last.is_some() && baseline.is_some(),
+            "both columns rewritten"
+        );
+        assert!(svc
+            .store()
+            .update_pr_monitor_poll(
+                id,
+                PrMonitorPollUpdate {
+                    last_snapshot: last.as_deref(),
+                    baseline_snapshot: baseline.as_deref(),
+                    pending_changes: &row.pending_changes,
+                    pending_since: row.pending_since.as_deref(),
+                    last_change_at: row.last_change_at.as_deref(),
+                    last_polled_at: row.last_polled_at.as_deref(),
+                    last_error: None,
+                    updated_at: &now_iso(),
+                    expected_updated_at: &row.updated_at,
+                },
+            )
+            .await
+            .unwrap());
+    }
+
+    /// The upgrade path for skipped checks: a baseline persisted before them
+    /// recorded `coverage-all` as `passed`. The first post-upgrade poll sees
+    /// it as `skipped` and must re-encode the baseline silently; a later real
+    /// `passed → skipped` transition is still reported.
+    #[tokio::test]
+    async fn a_pre_upgrade_baseline_adopts_skipped_checks_silently() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let svc = svc.with_pr_monitor_debounce_seconds(MIN_PR_MONITOR_DEBOUNCE_SECONDS);
+        let check = |name: &str, state: CheckState| RollupCheck {
+            name: name.into(),
+            kind: RollupCheckKind::CheckRun,
+            state,
+            is_required: false,
+            url: None,
+            started_at: None,
+        };
+        forge.edit(|s| {
+            s.checks = vec![
+                check("build", CheckState::Success),
+                check("coverage-all", CheckState::Skipped),
+                check("lint", CheckState::Success),
+            ];
+        });
+        let monitor = register(&svc, &ws, &owner).await;
+        forge_pre_skipped_encoding(&svc, &monitor.monitor_id).await;
+
+        forge.edit(|s| s.mergeable_state = "clean".into());
+        svc.poll_pr_monitors().await;
+        let row = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        assert!(
+            !row.pending_changes.iter().any(|c| c.contains("skipped")),
+            "the legacy encoding is adopted, not reported: {:?}",
+            row.pending_changes
+        );
+        let baseline: PrMonitorSnapshot =
+            serde_json::from_str(row.baseline_snapshot.as_deref().unwrap()).unwrap();
+        assert!(baseline.skipped_tracked);
+        assert_eq!(
+            (
+                baseline.requirements.checks.passed,
+                baseline.requirements.checks.skipped
+            ),
+            (2, 1)
+        );
+
+        forge.edit(|s| s.checks[2].state = CheckState::Skipped);
+        svc.poll_pr_monitors().await;
+        let row = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        assert!(
+            row.pending_changes
+                .iter()
+                .any(|c| c == "check lint: passed → skipped"),
+            "a real transition after adoption is reported: {:?}",
+            row.pending_changes
+        );
+    }
+
+    /// A check first seen already skipped on an unchanged head is silent,
+    /// like one first seen passing, but it must still be adopted into the
+    /// emit baseline so its later removal or required-flag flip reports.
+    #[tokio::test]
+    async fn a_check_first_seen_skipped_is_adopted_into_the_baseline() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let svc = svc.with_pr_monitor_debounce_seconds(MIN_PR_MONITOR_DEBOUNCE_SECONDS);
+        let monitor = register(&svc, &ws, &owner).await;
+        let skipped = |name: &str| RollupCheck {
+            name: name.into(),
+            kind: RollupCheckKind::CheckRun,
+            state: CheckState::Skipped,
+            is_required: false,
+            url: None,
+            started_at: None,
+        };
+        forge.edit(|s| {
+            s.checks.push(skipped("coverage-all"));
+            s.checks.push(skipped("coverage-e2e"));
+        });
+        svc.poll_pr_monitors().await;
+        let row = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        assert!(
+            row.pending_changes.is_empty(),
+            "checks first seen skipped are silent: {:?}",
+            row.pending_changes
+        );
+
+        forge.edit(|s| {
+            s.checks.retain(|c| c.name != "coverage-all");
+            s.checks
+                .iter_mut()
+                .find(|c| c.name == "coverage-e2e")
+                .unwrap()
+                .is_required = true;
+        });
+        svc.poll_pr_monitors().await;
+        let row = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        assert!(
+            row.pending_changes
+                .iter()
+                .any(|c| c == "check removed: coverage-all"),
+            "{:?}",
+            row.pending_changes
+        );
+        assert!(
+            row.pending_changes
+                .iter()
+                .any(|c| c == "check coverage-e2e is now required to merge"),
+            "{:?}",
+            row.pending_changes
+        );
     }
 
     /// The upgrade path for ejection tracking: a baseline persisted before
