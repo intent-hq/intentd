@@ -19,15 +19,18 @@ build --host_compilation_mode=fastbuild
 # Keep host environment out of action keys.
 build --incompatible_strict_action_env
 
-# Link Rust with GNU ld (bfd). The auto-configured C++ toolchain adds
-# `-fuse-ld=gold` (deprecated for Rust) or, on hosts with a system ld.lld,
-# `-fuse-ld=lld` to every link; a later `-fuse-ld=bfd` wins. bfd ships with
-# binutils, which gcc needs anyway, so every runner has it. Cargo instead uses
-# rustc's bundled rust-lld, which rustc drops once Bazel sets `-C linker`
-# (forcing it back needs unstable flags). Exec builds (proc-macros, build
-# scripts, process_wrapper) too. See bazel/README.md → Linker.
-build --@rules_rust//rust/settings:extra_rustc_flag=-Clink-arg=-fuse-ld=bfd
-build --@rules_rust//rust/settings:extra_exec_rustc_flag=-Clink-arg=-fuse-ld=bfd
+# Link Rust with rustc's bundled rust-lld, as Cargo does on x86_64 Linux
+# (Rust 1.90+): rustc drives `cc` with `-B<sysroot>/lib/rustlib/<triple>/bin/gcc-ld
+# -fuse-ld=lld`. rustc keeps that default only when the linker is named `cc`
+# (it turns it off for `gcc`), and the auto-configured C++ toolchain's
+# default_link_flags (`-fuse-ld=gold` or the system lld, `-B/usr/bin`,
+# relro/now, which rustc adds itself) would override it. So drive links
+# through `cc` and drop those flags, target and exec. rules_rust puts rust-lld
+# and gcc-ld/ in the toolchain sysroot it passes to every Rustc action, so no
+# runner needs a system lld. See bazel/README.md → Linker.
+common --repo_env=CC=cc
+build --features=-default_link_flags
+build --host_features=-default_link_flags
 
 # ---------------------------------------------------------------------------
 # Tests and lints. Generated targets: scripts/bazel-gen.py; see bazel/README.md.

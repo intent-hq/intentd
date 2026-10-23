@@ -43,26 +43,29 @@ of the main repo's packages.
 
 ## Linker
 
-Bazel links Rust with **GNU ld (bfd)**, driven by the system `cc`. Cargo on
-x86_64 Linux (Rust 1.90 and later) links with rustc's bundled **rust-lld**
-instead, so the two builds use different linkers; `readelf -p .comment` on a
-binary shows `Linker: LLD ...` only for the Cargo build. Releases stay on
-Cargo, so shipped binaries are unaffected.
+Bazel links Rust exactly as Cargo does on x86_64 Linux (Rust 1.90 and
+later): rustc drives the system `cc` with
+`-B<sysroot>/lib/rustlib/x86_64-unknown-linux-gnu/bin/gcc-ld -fuse-ld=lld`,
+so **rustc's bundled rust-lld** does the link. `readelf -p .comment` on a
+Cargo- or Bazel-built `intentd` shows the same `Linker: LLD <rustc's LLVM
+version>`. No runner needs a system lld: rules_rust puts `rust-lld` and
+`gcc-ld/` into the toolchain sysroot (`--sysroot`) that is an input of every
+Rustc action, target and exec (proc-macros, build scripts, `process_wrapper`).
 
-Why not rust-lld under Bazel: rustc uses its bundled lld only while the linker
-is its default `cc`. rules_rust passes `-C linker=<toolchain gcc>`, so rustc
-drops it, and forcing it back (`-Clink-self-contained=+linker`,
-`-Clinker-features=+lld`) needs unstable flags on our stable toolchain. A
-system `ld.lld` is not on every runner.
+Two `.bazelrc` settings make this work:
 
-Why not the auto-configured linker: rules_cc's `unix_cc_configure` adds
-`-fuse-ld=lld` to every link when the host has a system `ld.lld`, otherwise
-`-fuse-ld=gold`, which is deprecated for Rust (rustc warns on every link).
-`.bazelrc` appends `-Clink-arg=-fuse-ld=bfd` to every Rust action, target and
-exec (proc-macros, build scripts, `process_wrapper`); the last `-fuse-ld`
-wins. bfd ships with binutils, which gcc needs anyway, so no runner needs an
-extra package and every host links the same way. C/C++ links (none today)
-keep the auto-configured linker.
+- `--repo_env=CC=cc`: the auto-configured C++ toolchain (rules_cc
+  `unix_cc_configure`) links through `/usr/bin/cc` instead of
+  `/usr/bin/gcc`. rustc keeps its rust-lld default only when the linker is
+  named `cc` (or is unset, as under Cargo); for `gcc` it turns it off, and the
+  flags to force it back are unstable on our toolchain.
+- `--features=-default_link_flags` / `--host_features=-default_link_flags`:
+  that toolchain feature adds `-fuse-ld=gold` (or the system lld when the host
+  has one) and `-B/usr/bin` after rustc's own flags, which would override
+  rust-lld; gold is deprecated for Rust. It also carries
+  `-Wl,-no-as-needed`, `-Wl,-z,relro,-z,now` and `-pass-exit-codes`; rustc
+  adds relro/now itself, as under Cargo. C/C++ links (none today) lose these
+  flags too.
 
 ## Generated files
 
