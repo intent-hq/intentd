@@ -20,13 +20,17 @@
 //!   process, where that state leaks into every other file's tests (the
 //!   reason such files are standalone `[[test]]` targets). A call that only
 //!   runs in a separately exec'd child opts out with
-//!   `// process-global: allow — <reason>` on the line above.
+//!   `// process-global: allow — <reason>` on the line above;
+//! - a `--test <name>` in `.github/`, `scripts/` or the `Makefile` names a
+//!   suite module instead of a test target: cargo rejects it with "no test
+//!   target named", and jobs that only run in the merge queue would not show
+//!   that until a queued run fails (intentd#2635).
 //!
 //! Files under `tests/<dir>/` are not checked: they are helpers or module
 //! directories, reached through `mod` / `#[path]` from a root that the
 //! compiler already checks.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -154,6 +158,58 @@ fn global_state_calls(text: &str) -> Vec<(usize, &'static str)> {
     hits
 }
 
+/// `(line, name)` of every `--test <name>` in `text`, in any spelling a
+/// command takes: `--test name`, `--test=name`, or an argv list's
+/// `"--test", "name"`. `--tests` / `--test-threads` are not hits, and comment
+/// lines (`#` / `//`) are skipped.
+fn test_flag_targets(text: &str) -> Vec<(usize, String)> {
+    let mut hits = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') || trimmed.starts_with("//") {
+            continue;
+        }
+        let mut rest = line;
+        while let Some(at) = rest.find("--test") {
+            rest = &rest[at + "--test".len()..];
+            if !rest.starts_with([' ', '\t', '=', '"', '\'']) {
+                continue;
+            }
+            let name: String = rest
+                .trim_start_matches([' ', '\t', '=', '"', '\'', ','])
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+                .collect();
+            if !name.is_empty() {
+                hits.push((i + 1, name));
+            }
+        }
+    }
+    hits
+}
+
+/// CI and script files whose cargo commands name test targets.
+fn command_files(root: &Path) -> Vec<PathBuf> {
+    fn walk(path: &Path, out: &mut Vec<PathBuf>) {
+        if path.is_dir() {
+            if path.file_name().is_some_and(|n| n == "__pycache__") {
+                return;
+            }
+            for entry in fs::read_dir(path).into_iter().flatten().flatten() {
+                walk(&entry.path(), out);
+            }
+        } else if path.is_file() {
+            out.push(path.to_path_buf());
+        }
+    }
+    let mut out = Vec::new();
+    walk(&root.join(".github"), &mut out);
+    walk(&root.join("scripts"), &mut out);
+    out.push(root.join("Makefile"));
+    out.sort();
+    out
+}
+
 fn collect_rs(path: &Path, out: &mut Vec<PathBuf>) {
     if path.is_dir() {
         for entry in fs::read_dir(path).into_iter().flatten().flatten() {
@@ -167,6 +223,8 @@ fn collect_rs(path: &Path, out: &mut Vec<PathBuf>) {
 fn violations(root: &Path) -> Vec<String> {
     let targets = test_target_sources(root);
     let mut out = Vec::new();
+    // Suite module name -> its root's repo-relative path.
+    let mut suite_modules: BTreeMap<String, String> = BTreeMap::new();
     let mut crates: Vec<PathBuf> = fs::read_dir(root.join("crates"))
         .expect("read crates/")
         .flatten()
@@ -220,6 +278,28 @@ fn violations(root: &Path) -> Vec<String> {
                         ));
                     }
                 }
+            }
+            suite_modules.extend(
+                declared_modules(text)
+                    .into_iter()
+                    .filter(|m| *m != "common")
+                    .map(|m| (m.to_owned(), rel(stem))),
+            );
+        }
+    }
+    for file in command_files(root) {
+        let Ok(body) = fs::read_to_string(&file) else {
+            continue;
+        };
+        for (line, name) in test_flag_targets(&body) {
+            if let Some(suite) = suite_modules.get(&name) {
+                let suite_target = Path::new(suite).file_stem().unwrap().to_string_lossy();
+                out.push(format!(
+                    "{}:{line}: `--test {name}` names a module of {suite}, not a test target \
+                     (cargo fails with \"no test target named `{name}`\"); use \
+                     `--test {suite_target}` with a `{name}::` filter",
+                    file.strip_prefix(root).unwrap().display()
+                ));
             }
         }
     }
@@ -289,6 +369,21 @@ fn process_global_calls_need_a_reasoned_marker() {
     );
 }
 
+#[test]
+fn test_flags_are_found_in_every_spelling() {
+    let text = "cargo test -p intentd --test e2e_a 'x'\n\
+                run([\"cargo\", \"test\", \"--test\", \"e2e_b\", \"lifecycle_\"])\n\
+                cargo test --test=e2e-c --tests --test-threads=2\n\
+                # cargo test --test e2e_commented\n\
+                \"--test\" , \"suite_d\" --test $VAR\n";
+    let found = test_flag_targets(text);
+    let names: Vec<(usize, &str)> = found.iter().map(|(l, n)| (*l, n.as_str())).collect();
+    assert_eq!(
+        names,
+        [(1, "e2e_a"), (2, "e2e_b"), (3, "e2e-c"), (5, "suite_d")]
+    );
+}
+
 /// End to end through `cargo metadata`: a crate with `autotests = false`
 /// whose suite forgets one file.
 #[test]
@@ -318,14 +413,29 @@ fn autotests_false_crate_with_a_forgotten_file_fails() {
     );
     write("crates/k/tests/two.rs", "");
     write("crates/k/tests/common/mod.rs", "");
+    write(
+        "scripts/run.py",
+        "run([\"cargo\", \"test\", \"--test\", \"one\"])\n\
+         run([\"cargo\", \"test\", \"--test\", \"suite_k\", \"one::\"])\n",
+    );
+    write(
+        ".github/workflows/ci.yml",
+        "run: cargo test --test suite_k\n",
+    );
     let found = violations(&root.canonicalize().unwrap());
-    assert_eq!(found.len(), 2, "{found:?}");
+    assert_eq!(found.len(), 3, "{found:?}");
     assert!(
         found[0].starts_with("crates/k/tests/two.rs is neither"),
         "{found:?}"
     );
     assert!(
         found[1].starts_with("crates/k/tests/one/env.rs:1: `env::set_var(`"),
+        "{found:?}"
+    );
+    assert!(
+        found[2].starts_with(
+            "scripts/run.py:1: `--test one` names a module of crates/k/tests/suite_k.rs"
+        ),
         "{found:?}"
     );
 }

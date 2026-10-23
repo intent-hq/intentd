@@ -8,10 +8,14 @@
 //! `test_target_registration_lint` fails when a `tests/*.rs` file is neither a
 //! target nor declared below. Keep the list sorted.
 
-#![expect(
-    clippy::duplicate_mod,
-    reason = "e2e_wss_invite_join and e2e_wss_invite_join_gitlab each compile \
-              common/invitation_fixture_lifecycle.rs against their own `super::Daemon`"
+// Both invite-join modules are `#![cfg(unix)]`, so the duplicate exists only on Unix.
+#![cfg_attr(
+    unix,
+    expect(
+        clippy::duplicate_mod,
+        reason = "e2e_wss_invite_join and e2e_wss_invite_join_gitlab each compile \
+                  common/invitation_fixture_lifecycle.rs against their own `super::Daemon`"
+    )
 )]
 
 mod common;

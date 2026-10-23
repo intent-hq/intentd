@@ -801,12 +801,12 @@ jobs:
                   "tunnel::tests::connect_reset_preserves_error_before_deadline",
                   "tunnel::tests::connect_success_before_deadline_relays",
               ]),
-              (["-p", "intentd", "--test", "e2e_wss_tunnel"], [
-                  "tunnel_open_echo_eof_close_lifecycle",
-                  "tunnel_open_err_for_closed_port_keeps_connection_alive",
-                  "tunnel_close_tears_down_and_frees_stream_id",
-                  "tunnel_connections_counted_in_health_and_stopped",
-                  "tunnel_unauthenticated_upgrade_rejected",
+              (["-p", "intentd", "--test", "suite_wss_s_z"], [
+                  "e2e_wss_tunnel::tunnel_open_echo_eof_close_lifecycle",
+                  "e2e_wss_tunnel::tunnel_open_err_for_closed_port_keeps_connection_alive",
+                  "e2e_wss_tunnel::tunnel_close_tears_down_and_frees_stream_id",
+                  "e2e_wss_tunnel::tunnel_connections_counted_in_health_and_stopped",
+                  "e2e_wss_tunnel::tunnel_unauthenticated_upgrade_rejected",
               ]),
           ]
 
