@@ -11,8 +11,10 @@
 //! - **Linux:** `ioprio_set(IOPRIO_WHO_PROCESS)` in `pre_exec`. [`AgentIoPriority::Low`]
 //!   is the best-effort class at its least favourable level (7);
 //!   [`AgentIoPriority::Idle`] is the idle class. The kernel honours these
-//!   only under an IO scheduler that implements priorities (BFQ fully;
-//!   mq-deadline by class only); the `none` scheduler ignores them.
+//!   only under an IO scheduler that implements priorities: BFQ honours
+//!   classes and levels, mq-deadline only classes (so `Low` is a no-op
+//!   there and only `Idle` separates agents from the daemon), and `none`
+//!   ignores both.
 //! - **macOS:** `setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_PROCESS)` in
 //!   `pre_exec`: `Low` is `IOPOL_UTILITY`, `Idle` is `IOPOL_THROTTLE`.
 //! - **Elsewhere** (including Windows, which only lets a process put
@@ -47,9 +49,14 @@ pub const DEFAULT_AGENT_IO_PRIORITY: AgentIoPriority = AgentIoPriority::Low;
 
 /// The IO priority ACP agent children start at: [`AGENT_IO_PRIORITY_ENV`]
 /// when set to a recognised value, else [`DEFAULT_AGENT_IO_PRIORITY`].
+/// Read once per process, so a misconfigured value warns once rather than
+/// on every spawn.
 #[must_use]
 pub fn agent_io_priority() -> AgentIoPriority {
-    agent_io_priority_from(std::env::var(AGENT_IO_PRIORITY_ENV).ok().as_deref())
+    static RESOLVED: std::sync::OnceLock<AgentIoPriority> = std::sync::OnceLock::new();
+    *RESOLVED.get_or_init(|| {
+        agent_io_priority_from(std::env::var(AGENT_IO_PRIORITY_ENV).ok().as_deref())
+    })
 }
 
 /// [`agent_io_priority`] over an injected raw env value. Matching is
@@ -84,12 +91,12 @@ pub fn apply_reduced_io_priority(cmd: &mut Command, want: AgentIoPriority) {
     }
     #[cfg(target_os = "linux")]
     {
-        // SAFETY: `ioprio_get`/`ioprio_set` are raw syscalls with integer
-        // arguments only; they take no locks and touch no heap state, so they
-        // are safe to call between fork and exec.
+        // SAFETY: `ioprio_get`/`ioprio_set`/`sched_getscheduler` are raw
+        // syscalls with integer arguments only; they take no locks and touch
+        // no heap state, so they are safe to call between fork and exec.
         unsafe {
             cmd.pre_exec(move || {
-                if let Ok(inherited) = linux::get(0) {
+                if let Ok(inherited) = linux::get_effective(0) {
                     if let Some(target) = linux::target(inherited, want) {
                         let _ = linux::set(0, target);
                     }
@@ -136,7 +143,7 @@ pub fn io_priority_shortfall(pid: u32, want: AgentIoPriority) -> Option<String> 
         if want == AgentIoPriority::Off {
             return None;
         }
-        let parent = match linux::get(0) {
+        let parent = match linux::get_effective(0) {
             Ok(v) => v,
             Err(errno) => {
                 return Some(format!(
@@ -148,7 +155,7 @@ pub fn io_priority_shortfall(pid: u32, want: AgentIoPriority) -> Option<String> 
         let Ok(pid) = i32::try_from(pid) else {
             return None;
         };
-        let got = match linux::get(pid) {
+        let got = match linux::get_effective(pid) {
             Ok(v) => v,
             Err(libc::ESRCH) => return None,
             Err(errno) => {
@@ -158,13 +165,11 @@ pub fn io_priority_shortfall(pid: u32, want: AgentIoPriority) -> Option<String> 
                 ))
             }
         };
-        // An exited (zombie) child has already released its IO context, so
-        // it reads back as `none` whatever it ran at: not a shortfall.
-        if linux::has_exited(pid) {
-            return None;
-        }
         let expected = linux::target(parent, want).unwrap_or(parent);
-        (linux::rank(got) < linux::rank(expected)).then(|| {
+        // An exited (zombie) child has already released its IO context, so
+        // it reads back as `none` whatever it ran at: not a shortfall. Only
+        // checked on a mismatch, so the common path reads no `/proc` file.
+        (linux::rank(got) < linux::rank(expected) && !linux::has_exited(pid)).then(|| {
             format!(
                 "child runs at IO priority {}, expected at most as favourable as {} (daemon at {})",
                 linux::describe(got),
@@ -193,7 +198,10 @@ pub(crate) mod linux {
     pub(crate) const IOPRIO_CLASS_IDLE: i32 = 3;
     /// Least favourable level within the RT/BE classes.
     pub(crate) const IOPRIO_LEVEL_LOWEST: i32 = 7;
-    const IOPRIO_LEVEL_MASK: i32 = (1 << IOPRIO_CLASS_SHIFT) - 1;
+    /// `IOPRIO_PRIO_LEVEL`: the low 3 bits. Bits 3..13 carry the kernel 6.5+
+    /// hints (e.g. command duration limits), which are not part of the level.
+    const IOPRIO_LEVEL_MASK: i32 = 0x7;
+    const IOPRIO_CLASS_MASK: i32 = 0x7;
 
     /// Pack a class and level into an ioprio value.
     pub(crate) const fn value(class: i32, level: i32) -> i32 {
@@ -201,7 +209,7 @@ pub(crate) mod linux {
     }
 
     pub(crate) const fn class(v: i32) -> i32 {
-        v >> IOPRIO_CLASS_SHIFT
+        (v >> IOPRIO_CLASS_SHIFT) & IOPRIO_CLASS_MASK
     }
 
     pub(crate) const fn level(v: i32) -> i32 {
@@ -224,6 +232,32 @@ pub(crate) mod linux {
             Err(nix::errno::Errno::last_raw())
         } else {
             Ok(i32::try_from(got).unwrap_or(i32::MAX))
+        }
+    }
+
+    /// The ioprio of process `pid` (`0` = the caller) as the kernel actually
+    /// applies it: an explicit class as read, but the `NONE` class ("derived
+    /// from the CPU scheduler") resolved to idle for a `SCHED_IDLE` task,
+    /// which the kernel puts in the idle IO class. Without this a
+    /// `SCHED_IDLE` daemon reads as best-effort and its children would be
+    /// *raised* to best-effort/7. Async-signal-safe (raw syscalls only).
+    pub(crate) fn get_effective(pid: i32) -> Result<i32, i32> {
+        let v = get(pid)?;
+        if class(v) != IOPRIO_CLASS_NONE {
+            return Ok(v);
+        }
+        // SAFETY: integer-only syscall.
+        let policy = unsafe { libc::sched_getscheduler(pid) };
+        Ok(effective(v, policy))
+    }
+
+    /// [`get_effective`] over an already-read ioprio and scheduler policy
+    /// (a negative policy — the read failed — leaves `v` unchanged).
+    pub(crate) const fn effective(v: i32, policy: libc::c_int) -> i32 {
+        if class(v) == IOPRIO_CLASS_NONE && policy == libc::SCHED_IDLE {
+            value(IOPRIO_CLASS_IDLE, 0)
+        } else {
+            v
         }
     }
 
@@ -419,6 +453,34 @@ mod tests {
             assert!(rank(BE7) < rank(IDLE));
         }
 
+        /// A `SCHED_IDLE` daemon with no explicit ioprio runs in the idle IO
+        /// class; `low` must not raise its children to best-effort/7.
+        #[test]
+        fn sched_idle_none_class_counts_as_idle() {
+            let none = value(IOPRIO_CLASS_NONE, 0);
+            assert_eq!(effective(none, libc::SCHED_IDLE), IDLE);
+            assert_eq!(target(effective(none, libc::SCHED_IDLE), Low), None);
+            assert_eq!(target(effective(none, libc::SCHED_IDLE), Idle), None);
+            assert_eq!(effective(none, libc::SCHED_OTHER), none);
+            assert_eq!(effective(none, libc::SCHED_BATCH), none);
+            assert_eq!(effective(none, -1), none, "unreadable policy");
+            // An explicit class is taken as read, whatever the scheduler.
+            let be0 = value(IOPRIO_CLASS_BE, 0);
+            assert_eq!(effective(be0, libc::SCHED_IDLE), be0);
+        }
+
+        /// Kernel 6.5+ hint bits (3..13) are not part of the level: a hinted
+        /// best-effort/0 is still best-effort/0 and still gets demoted.
+        #[test]
+        fn hint_bits_do_not_count_as_level() {
+            let hinted_be0 = value(IOPRIO_CLASS_BE, 0) | (1 << 3);
+            assert_eq!(class(hinted_be0), IOPRIO_CLASS_BE);
+            assert_eq!(level(hinted_be0), 0);
+            assert_eq!(rank(hinted_be0), rank(value(IOPRIO_CLASS_BE, 0)));
+            assert_eq!(target(hinted_be0, Low), Some(BE7));
+            assert_eq!(describe(hinted_be0), "best-effort/0");
+        }
+
         #[test]
         fn describe_names_each_class() {
             assert_eq!(describe(0), "none (from nice)");
@@ -551,6 +613,37 @@ mod tests {
             let (_child, kid, grandkid, _grandchild) = spawn_family(cmd).await;
             assert_eq!(class(kid), IOPRIO_CLASS_IDLE);
             assert_eq!(class(grandkid), IOPRIO_CLASS_IDLE);
+        }
+
+        /// Regression: a `SCHED_IDLE` daemon with no explicit ioprio is in
+        /// the idle IO class, so `low` must leave its children there rather
+        /// than raise them to best-effort/7 (simulated by an earlier
+        /// `pre_exec` that switches the child to `SCHED_IDLE` first).
+        #[tokio::test]
+        async fn low_never_raises_a_sched_idle_parent() {
+            if class(get(0).expect("own ioprio")) != IOPRIO_CLASS_NONE {
+                return; // needs a test process with no explicit ioprio.
+            }
+            let mut cmd = family();
+            // SAFETY: integer/stack-pointer syscall between fork and exec.
+            unsafe {
+                cmd.pre_exec(|| {
+                    let param = libc::sched_param { sched_priority: 0 };
+                    let _ = libc::sched_setscheduler(0, libc::SCHED_IDLE, &raw const param);
+                    Ok(())
+                });
+            }
+            apply_reduced_io_priority(&mut cmd, AgentIoPriority::Low);
+            let (child, kid, grandkid, _grandchild) = spawn_family(cmd).await;
+            assert_eq!(
+                class(kid),
+                IOPRIO_CLASS_NONE,
+                "not raised: {}",
+                describe(kid)
+            );
+            assert_eq!(class(grandkid), IOPRIO_CLASS_NONE);
+            let pid = child.id().expect("child pid").cast_signed();
+            assert_eq!(get_effective(pid), Ok(IDLE));
         }
 
         /// Regression: a child that already exited but is not yet reaped

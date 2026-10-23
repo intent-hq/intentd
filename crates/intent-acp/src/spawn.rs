@@ -541,13 +541,15 @@ pub struct AgentPriority {
 
 impl AgentPriority {
     /// The configured demotion ([`AGENT_NICE_ENV`],
-    /// [`crate::io_priority::AGENT_IO_PRIORITY_ENV`]).
+    /// [`crate::io_priority::AGENT_IO_PRIORITY_ENV`]), read once per process
+    /// so a misconfigured value warns once rather than on every spawn.
     #[must_use]
     pub fn from_env() -> Self {
-        Self {
+        static RESOLVED: std::sync::OnceLock<AgentPriority> = std::sync::OnceLock::new();
+        *RESOLVED.get_or_init(|| Self {
             nice_increment: agent_nice(),
             io: agent_io_priority(),
-        }
+        })
     }
 
     /// Configure `cmd` so its child starts at this reduced CPU and IO
@@ -650,7 +652,11 @@ fn build_command_with_captured_env(
     captured: &BTreeMap<String, String>,
     nice_increment: i32,
 ) -> Command {
-    build_command_in(opts, captured, nice_increment, None, None)
+    let priority = AgentPriority {
+        nice_increment,
+        ..AgentPriority::from_env()
+    };
+    build_command_in(opts, captured, priority, None, None)
 }
 
 /// [`build_command_with_captured_env`] with the per-spawn [`NpxLaunchDir`]
@@ -658,7 +664,7 @@ fn build_command_with_captured_env(
 fn build_command_in(
     opts: &SpawnOptions,
     captured: &BTreeMap<String, String>,
-    nice_increment: i32,
+    priority: AgentPriority,
     npx_launch_dir: Option<&Path>,
     args: Option<Vec<String>>,
 ) -> Command {
@@ -763,11 +769,7 @@ fn build_command_in(
     // only reaches the direct child, leaving grandchildren orphaned (§5.6).
     #[cfg(unix)]
     cmd.process_group(0);
-    AgentPriority {
-        nice_increment,
-        io: agent_io_priority(),
-    }
-    .apply(&mut cmd);
+    priority.apply(&mut cmd);
     cmd
 }
 
@@ -852,13 +854,16 @@ impl SpawnedAgent {
 pub struct PreparedProvider {
     pub command: Command,
     npx_launch_dir: Option<NpxLaunchDir>,
+    /// The demotion applied to `command`, checked against the child once it
+    /// is spawned.
+    priority: AgentPriority,
 }
 
 /// Build a launch without starting a process.
 /// # Errors
 /// Returns a spawn error when the neutral directory cannot be created.
 pub fn prepare_provider(opts: &SpawnOptions) -> AcpResult<PreparedProvider> {
-    let nice_increment = agent_nice();
+    let priority = AgentPriority::from_env();
     let (_, target) = opts.launch_target();
     let command_name = target.to_string_lossy().into_owned();
     // An npx launch starts in a fresh neutral directory, never the workspace
@@ -873,16 +878,11 @@ pub fn prepare_provider(opts: &SpawnOptions) -> AcpResult<PreparedProvider> {
         None
     };
     let launch_cwd = npx_launch_dir.as_ref().map(NpxLaunchDir::path);
-    let command = build_command_in(
-        opts,
-        captured_credential_env(),
-        nice_increment,
-        launch_cwd,
-        None,
-    );
+    let command = build_command_in(opts, captured_credential_env(), priority, launch_cwd, None);
     Ok(PreparedProvider {
         command,
         npx_launch_dir,
+        priority,
     })
 }
 
@@ -908,10 +908,11 @@ pub fn prepare_npx_package(opts: &SpawnOptions, script: &str) -> AcpResult<Prepa
         "node".into(),
         script_path.to_string_lossy().into_owned(),
     ];
+    let priority = AgentPriority::from_env();
     let mut command = build_command_in(
         opts,
         captured_credential_env(),
-        agent_nice(),
+        priority,
         Some(dir.path()),
         Some(args),
     );
@@ -922,6 +923,7 @@ pub fn prepare_npx_package(opts: &SpawnOptions, script: &str) -> AcpResult<Prepa
     Ok(PreparedProvider {
         command,
         npx_launch_dir: Some(dir),
+        priority,
     })
 }
 
@@ -943,8 +945,8 @@ pub fn spawn_prepared_provider(
     let PreparedProvider {
         command: mut cmd,
         npx_launch_dir,
+        priority,
     } = prepared;
-    let nice_increment = agent_nice();
     let (launch, target) = opts.launch_target();
     let command_name = target.to_string_lossy().into_owned();
     let launch_cwd = npx_launch_dir.as_ref().map(NpxLaunchDir::path);
@@ -963,11 +965,7 @@ pub fn spawn_prepared_provider(
             AcpError::Spawn(format!("{command_name}: {e}"))
         }
     })?;
-    AgentPriority {
-        nice_increment,
-        io: agent_io_priority(),
-    }
-    .warn_on_shortfall(child.id(), &command_name);
+    priority.warn_on_shortfall(child.id(), &command_name);
     let stdin = child
         .stdin
         .take()
