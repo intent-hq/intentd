@@ -110,7 +110,10 @@ pub(super) fn handle(
             antigravity_profile: None,
             session_mcp_servers: vec![],
             spawned_model: None,
+            session_open_filled_model: None,
             spawned_provider: "claude-agent-acp".into(),
+            spawned_selection: crate::agent_manager::test_selection_for_command("claude-agent-acp"),
+            _activation: None,
             thought_level: None,
             config_options: None,
             confirmed_effort: None,
@@ -277,10 +280,13 @@ fn paused_session(
 }
 
 async fn arrived(receiver: tokio::sync::oneshot::Receiver<Value>) -> Value {
-    tokio::time::timeout(std::time::Duration::from_secs(10), receiver)
-        .await
-        .expect("actual ACP request arrived")
-        .unwrap()
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(10)),
+        receiver,
+    )
+    .await
+    .expect("actual ACP request arrived")
+    .unwrap()
 }
 
 pub(super) fn callback(origin: &RepositoryOrigin) -> Option<RepositoryCallbackContext> {
@@ -693,10 +699,13 @@ async fn actual_teardown_retires_the_source_leaf_before_aborting_work() {
             }
         }
         assert!(
-            tokio::time::timeout(std::time::Duration::from_secs(5), result)
-                .await
-                .unwrap()
-                .unwrap(),
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+                result
+            )
+            .await
+            .unwrap()
+            .unwrap(),
             "{action}"
         );
         assert!(!current(&callback.capture(), f.caller()).await, "{action}");
@@ -838,13 +847,17 @@ async fn concurrent_shutdown_joins_original_retirement_before_worker_cancellatio
     let dispatch = std::thread::spawn(move || {
         fence.dispatch(&mut move || {
             entered.send(()).unwrap();
-            held.recv_timeout(std::time::Duration::from_secs(5))
-                .unwrap();
+            held.recv_timeout(intentd_test_support::test_timeout(
+                std::time::Duration::from_secs(5),
+            ))
+            .unwrap();
             Ok(())
         })
     });
     inside
-        .recv_timeout(std::time::Duration::from_secs(5))
+        .recv_timeout(intentd_test_support::test_timeout(
+            std::time::Duration::from_secs(5),
+        ))
         .unwrap();
     let first_manager = f.manager.clone();
     let (first_done, first_result) = std::sync::mpsc::channel();
@@ -852,7 +865,8 @@ async fn concurrent_shutdown_joins_original_retirement_before_worker_cancellatio
         first_manager.begin_shutdown();
         first_done.send(()).unwrap();
     });
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now()
+        + intentd_test_support::test_timeout(std::time::Duration::from_secs(5));
     while !origin.state.lock().unwrap().retired {
         assert!(
             std::time::Instant::now() < deadline,
@@ -869,7 +883,9 @@ async fn concurrent_shutdown_joins_original_retirement_before_worker_cancellatio
         second_done.send(()).unwrap();
     });
     second_started
-        .recv_timeout(std::time::Duration::from_secs(5))
+        .recv_timeout(intentd_test_support::test_timeout(
+            std::time::Duration::from_secs(5),
+        ))
         .unwrap();
     let maps_free = f.manager.handles.try_lock().is_ok()
         && f.manager.stopping.try_lock().is_ok()
@@ -922,13 +938,16 @@ async fn removal_drains_retirement_without_holding_the_handles_map() {
         })
     });
     inside
-        .recv_timeout(std::time::Duration::from_secs(5))
+        .recv_timeout(intentd_test_support::test_timeout(
+            std::time::Duration::from_secs(5),
+        ))
         .unwrap();
     let handles = f.manager.handles.clone();
     let id = f.row.id.clone();
     let observed_origin = origin.clone();
     let removed = std::thread::spawn(move || take(&handles, &id, &origin, None));
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now()
+        + intentd_test_support::test_timeout(std::time::Duration::from_secs(5));
     while !observed_origin.state.lock().unwrap().retired {
         assert!(
             std::time::Instant::now() < deadline,
@@ -1427,7 +1446,9 @@ async fn metadata_completion_ordering(replace_handle: bool, install_before_origi
                 let _ = entered.send(());
                 // Never panic across SQLite's callback; test-side timeouts report
                 // a failed ordering and dropping the sender releases this worker.
-                let _ = resume.recv_timeout(std::time::Duration::from_secs(10));
+                let _ = resume.recv_timeout(intentd_test_support::test_timeout(
+                    std::time::Duration::from_secs(10),
+                ));
             }
         });
     drop(writer);
@@ -1450,10 +1471,13 @@ async fn metadata_completion_ordering(replace_handle: bool, install_before_origi
         .connection()
         .unwrap();
     let control = async {
-        tokio::time::timeout(std::time::Duration::from_secs(10), model_wait)
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(10)),
+            model_wait,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(
             f.stored().await.acp_session_id.as_deref(),
             Some("original-A")
@@ -1524,10 +1548,13 @@ async fn metadata_completion_ordering(replace_handle: bool, install_before_origi
         } else {
             Some((attempt, owner))
         };
-        tokio::time::timeout(std::time::Duration::from_secs(10), effort_wait)
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(10)),
+            effort_wait,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(current(&fresh.capture(), f.caller()).await);
         effort_release.send(()).unwrap();
         (replacement, fresh, peer, pending_install)
@@ -1703,10 +1730,13 @@ async fn manager_native_shutdown_case(positive: bool, cancel: bool, lost: bool) 
         .insert(f.row.id.clone(), handle);
     let manager = f.manager.clone();
     let mut shutdown = tokio::spawn(async move { manager.shutdown_with_native_outcome().await });
-    tokio::time::timeout(std::time::Duration::from_secs(5), reached)
-        .await
-        .unwrap()
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+        reached,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert!(native.is_retired());
     assert!(!native.is_joined());
     if cancel {
@@ -1718,7 +1748,11 @@ async fn manager_native_shutdown_case(positive: bool, cancel: bool, lost: bool) 
     }
     // A bounded held-peer window observes the actual shutdown future, not just
     // the allocation's independently driven retirement task.
-    let early = tokio::time::timeout(std::time::Duration::from_millis(100), &mut shutdown).await;
+    let early = tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_millis(100)),
+        &mut shutdown,
+    )
+    .await;
     let returned_early = early.is_ok();
     release.send(()).unwrap();
     let result = match early {
@@ -1843,11 +1877,14 @@ for line in sys.stdin:
         .insert(f.row.id.clone(), handle);
     let manager = f.manager.clone();
     let shutdown = tokio::spawn(async move { manager.shutdown_with_native_outcome().await });
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while !entered.exists() {
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-    })
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+        async {
+            while !entered.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        },
+    )
     .await
     .unwrap();
     assert!(native.is_retired());
@@ -1859,11 +1896,14 @@ for line in sys.stdin:
         "original child was killed before retirement response"
     );
     std::fs::write(release, "allow original response").unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(10), shutdown)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(10)),
+        shutdown,
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
     assert!(native.is_joined());
     assert!(
         !std::path::Path::new(&format!("/proc/{pid}")).exists(),
@@ -1963,37 +2003,49 @@ async fn manager_shutdown_retains_pending_native_startup_until_original_response
             )
             .await
     });
-    tokio::time::timeout(std::time::Duration::from_secs(5), reached)
-        .await
-        .unwrap()
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+        reached,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     f.manager.begin_shutdown();
     startup.abort();
     assert!(matches!(startup.await, Err(error) if error.is_cancelled()));
     let manager = f.manager.clone();
     let mut shutdown = tokio::spawn(async move { manager.shutdown_with_native_outcome().await });
     assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(100), &mut shutdown)
-            .await
-            .is_err(),
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_millis(100)),
+            &mut shutdown
+        )
+        .await
+        .is_err(),
         "shutdown lost pending producer"
     );
     assert!(connection.is_alive());
     release.send(()).unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(5), retirement)
-        .await
-        .unwrap()
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+        retirement,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert!(
         !shutdown.is_finished(),
         "shutdown lost original retirement outcome"
     );
     join.send(()).unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(5), shutdown)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+        shutdown,
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
     assert!(!f.manager.handles.lock().unwrap().contains_key(&f.row.id));
     assert!(f
         .manager

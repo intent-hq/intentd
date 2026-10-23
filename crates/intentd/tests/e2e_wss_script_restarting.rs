@@ -156,9 +156,12 @@ async fn wss_rpc(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value 
         .await
         .expect("send rpc frame");
     loop {
-        let next = timeout(Duration::from_secs(30), ws.next())
-            .await
-            .expect("wss rpc timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(30)),
+            ws.next(),
+        )
+        .await
+        .expect("wss rpc timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -186,7 +189,8 @@ async fn wss_rpc(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value 
 /// `script:output`, pings) are skipped — so consecutive calls observe the
 /// `script:state` stream in bus order.
 async fn next_state(ws: &mut TlsWs, script_id: &str, secs: u64) -> Value {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(secs));
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         assert!(

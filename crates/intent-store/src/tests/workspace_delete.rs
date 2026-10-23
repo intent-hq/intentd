@@ -11,7 +11,6 @@ use std::time::Duration;
 const HISTORY_ROWS: i64 = 1_201;
 const PRESTAGED_ROWS: i64 = 7;
 
-mod annotation_retirement;
 mod review;
 
 #[tokio::test]
@@ -76,12 +75,15 @@ async fn desktop_agent_delete_paths_wait_for_repository_retirement_after_sql() {
             }
         };
         tokio::pin!(operation);
-        tokio::time::timeout(Duration::from_secs(5), async {
-            tokio::select! {
-                result = &mut operation => panic!("completed before retirement: {result:?}"),
-                () = observer.entered.notified() => {}
-            }
-        })
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            async {
+                tokio::select! {
+                    result = &mut operation => panic!("completed before retirement: {result:?}"),
+                    () = observer.entered.notified() => {}
+                }
+            },
+        )
         .await
         .expect("agent deletion reaches retirement");
         assert!(
@@ -93,16 +95,22 @@ async fn desktop_agent_delete_paths_wait_for_repository_retirement_after_sql() {
         );
         // Retirement must not retain the sole SQL writer while awaiting a
         // native owner; unrelated writes can still progress.
-        let writer = tokio::time::timeout(Duration::from_secs(5), store.write_pool().acquire())
-            .await
-            .unwrap()
-            .unwrap();
+        let writer = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            store.write_pool().acquire(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         drop(writer);
         observer.release.notify_one();
-        assert!(tokio::time::timeout(Duration::from_secs(5), operation)
-            .await
-            .unwrap()
-            .unwrap());
+        assert!(tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            operation
+        )
+        .await
+        .unwrap()
+        .unwrap());
     }
 }
 
@@ -250,12 +258,12 @@ async fn loaded_workspace_delete_releases_writer_during_history_sweep() {
         }
         (observed_progress, observed_session_progress)
     };
-    let (deleted, (observed_progress, observed_session_progress)) =
-        tokio::time::timeout(Duration::from_secs(30), async {
-            tokio::join!(deleting, writing)
-        })
-        .await
-        .expect("delete and writer finish");
+    let (deleted, (observed_progress, observed_session_progress)) = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async { tokio::join!(deleting, writing) },
+    )
+    .await
+    .expect("delete and writer finish");
     deleted.expect("workspace delete");
     assert!(
         observed_progress,
@@ -409,7 +417,7 @@ async fn workspace_delete_cancellation_can_retry() {
             tx.commit().await.unwrap();
         }
     };
-    let held = tokio::time::timeout(Duration::from_secs(30), async {
+    let held = tokio::time::timeout(intentd_test_support::test_timeout(Duration::from_secs(30)), async {
         tokio::select! {
             held = observe => held,
             result = &mut deleting => panic!("deletion finished without observable progress: {result:?}"),
@@ -644,9 +652,10 @@ async fn workspace_delete_sweeps_heavy_children_before_final_transaction() {
         }
         saw_partial
     };
-    let (deleted, saw_partial) = tokio::time::timeout(Duration::from_secs(30), async {
-        tokio::join!(deleting, writing)
-    })
+    let (deleted, saw_partial) = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async { tokio::join!(deleting, writing) },
+    )
     .await
     .expect("cleanup completes");
     deleted.expect("no heavy final cascade");
@@ -907,13 +916,16 @@ async fn desktop_write_during_workspace_teardown_cannot_leave_orphan_after_failu
         let workspace = workspace.clone();
         tokio::spawn(async move { store.delete_workspace(&workspace).await })
     };
-    tokio::time::timeout(Duration::from_secs(5), barrier.entered.notified())
-        .await
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        barrier.entered.notified(),
+    )
+    .await
+    .unwrap();
     // A real producer enters after the successful scope sweep while the agent
     // still exists. It must be refused, not queued behind the whole teardown.
     let late_write = tokio::time::timeout(
-        Duration::from_secs(5),
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
         store.desktop_set_permission(&principal, &workspace, &agent, "physical", true),
     )
     .await
@@ -935,7 +947,7 @@ async fn desktop_write_during_workspace_teardown_cannot_leave_orphan_after_failu
         .desktop_claim_primary("late-request", &binding, "generation", true)
         .await;
     tokio::time::timeout(
-        Duration::from_secs(5),
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
         store.desktop_set_permission(&principal, &keeper, &kept_agent, "physical", true),
     )
     .await
@@ -999,12 +1011,15 @@ async fn concurrent_desktop_workspace_deletes_do_not_block_lifecycle_writers() {
     // The first deletion owns the desktop guard, has released lifecycle
     // serialization, and will need it again for its nested agent deletion.
     let mut first = Box::pin(store.delete_workspace(&workspace));
-    tokio::time::timeout(Duration::from_secs(10), async {
-        tokio::select! {
-            () = barrier.entered.notified() => {},
-            result = &mut first => panic!("deletion finished before the barrier: {result:?}"),
-        }
-    })
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            tokio::select! {
+                () = barrier.entered.notified() => {},
+                result = &mut first => panic!("deletion finished before the barrier: {result:?}"),
+            }
+        },
+    )
     .await
     .expect("first deletion reaches the desktop sweep barrier");
     *store.desktop_delete_barrier.lock().unwrap() = None;
@@ -1018,7 +1033,7 @@ async fn concurrent_desktop_workspace_deletes_do_not_block_lifecycle_writers() {
     })
     .await;
     tokio::time::timeout(
-        Duration::from_secs(10),
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
         store.insert_agent_session(&sample_agent_session(&kept_agent, &keeper)),
     )
     .await
@@ -1026,9 +1041,10 @@ async fn concurrent_desktop_workspace_deletes_do_not_block_lifecycle_writers() {
     .unwrap();
 
     barrier.release.notify_one();
-    let (first_result, second_result) = tokio::time::timeout(Duration::from_secs(10), async {
-        tokio::join!(first, second)
-    })
+    let (first_result, second_result) = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async { tokio::join!(first, second) },
+    )
     .await
     .expect("both workspace deletions must settle");
     first_result.unwrap();

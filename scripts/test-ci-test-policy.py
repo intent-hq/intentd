@@ -24,7 +24,7 @@ import yaml
 
 
 ROOT = Path(__file__).resolve().parent.parent
-JOBS = ("check", "build", "macos-services-runtime", "coverage-e2e", "coverage-all", "coverage-changed")
+JOBS = ("check", "build", "windows", "macos-services-runtime", "coverage-e2e", "coverage-all", "coverage-changed")
 # These required steps launch through Python or a Bash array; scanning shell
 # command prefixes cannot discover their runtime children. Execute their real
 # workflow bodies with a stub rustup in test_indirect_workflow_child_environments.
@@ -64,10 +64,10 @@ def coverage_budget_violations(workflow):
             errors.append(f"coverage-changed: {name} must retain its {limit}m phase bound")
     combined = workflow["jobs"]["coverage-all"]
     steps = [step for step in combined["steps"] if step.get("name") == "Run combined coverage"]
-    if type(combined.get("timeout-minutes")) is not int or combined["timeout-minutes"] != 45:
-        errors.append("coverage-all must reserve 2m outside its 43m combined phase")
-    if len(steps) != 1 or type(steps[0].get("timeout-minutes")) is not int or steps[0]["timeout-minutes"] != 43:
-        errors.append("coverage-all must retain its 43m compile/test/report bound")
+    if type(combined.get("timeout-minutes")) is not int or combined["timeout-minutes"] != 55:
+        errors.append("coverage-all must reserve 2m outside its 53m combined phase")
+    if len(steps) != 1 or type(steps[0].get("timeout-minutes")) is not int or steps[0]["timeout-minutes"] != 53:
+        errors.append("coverage-all must retain its 53m compile/test/report bound")
     return errors
 
 
@@ -97,8 +97,45 @@ def profile_pool_violations(workflow):
     return errors
 
 
+THREAD_STEP = "Size nextest threads from runner CPUs"
+THREAD_RUN = (
+    "cpus=$(nproc)\n"
+    "threads=$(( cpus < 16 ? cpus : 16 ))\n"
+    'echo "NEXTEST_TEST_THREADS=$threads" >> "$GITHUB_ENV"\n'
+    'echo "NEXTEST_TEST_THREADS=$threads (nproc=$cpus, cap 16)"\n'
+)
+COVERAGE_JOBS = ("coverage-e2e", "coverage-all", "coverage-changed")
+HARDCODED_THREADS = re.compile(r"(?:NEXTEST_TEST_THREADS=|--test-threads[= ])\d")
+
+
+def thread_sizing_violations(workflow):
+    """Coverage jobs size nextest from the runner's CPUs (min(nproc, 16)).
+
+    A fixed 16 oversubscribed the 8-CPU cpuset-pinned intent-cache heavy slot
+    2x and timed out latency-bound tests.
+    """
+    errors = []
+    if "NEXTEST_TEST_THREADS" in workflow.get("env", {}):
+        errors.append("workflow env must not fix NEXTEST_TEST_THREADS")
+    for job_id in COVERAGE_JOBS:
+        job = workflow["jobs"][job_id]
+        steps = job["steps"]
+        if "NEXTEST_TEST_THREADS" in job.get("env", {}):
+            errors.append(f"{job_id}: do not hardcode NEXTEST_TEST_THREADS; size it from nproc")
+        sizing = [s for s in steps if s.get("name") == THREAD_STEP]
+        if (len(sizing) != 1 or steps.index(sizing[0]) != 0 or sizing[0].get("run") != THREAD_RUN
+                or sizing[0].get("shell") != "bash" or "if" in sizing[0] or sizing[0].get("continue-on-error")):
+            errors.append(f"{job_id}: the first step must size NEXTEST_TEST_THREADS from nproc")
+        for step in steps:
+            if step.get("name") == THREAD_STEP:
+                continue
+            if "NEXTEST_TEST_THREADS" in step.get("env", {}) or HARDCODED_THREADS.search(str(step.get("run", ""))):
+                errors.append(f"{job_id}: {step.get('name')} must not override the sized nextest thread count")
+    return errors
+
+
 def violations(workflow, policy):
-    errors = coverage_budget_violations(workflow) + profile_pool_violations(workflow)
+    errors = coverage_budget_violations(workflow) + profile_pool_violations(workflow) + thread_sizing_violations(workflow)
     found = set()
     for name, job, step in test_steps(workflow):
         found.add(name)
@@ -140,15 +177,18 @@ def violations(workflow, policy):
 # this inventory explicit so scanner omissions cannot also erase mutations.
 REQUIRED_TEST_STEPS = {
     ("check", "Real import and public session contract"): 1,
+    ("check", "Real Claude adapter utility-session contract"): 1,
     ("check", "Source lints"): 1,
     ("check", "GitLab auth, invitations and checkout over real sockets with explicit test transports"): 1,
+    ("check", "No provider CLIs on the runner"): 1,
     ("check", "Coverage-skipped tests (STAB-40/43)"): 2,
     ("check", "Installer guard tests (install_ps1_owner)"): 1,
     # None: indirect Python/Bash-array routes are executed with a stub below.
     ("build", "Tunnel deadline and TLS controls (macOS runtime)"): None,
     ("macos-services-runtime", "Retained workspace CoW fixtures (macOS runtime)"): None,
-    ("build", "Headless workspace setup (Windows runtime)"): 1,
-    ("build", "Codex diagnostic process ownership (Windows runtime)"): 1,
+    # Post-merge only (push); see the `windows` job.
+    ("windows", "Headless workspace setup (Windows runtime)"): 2,
+    ("windows", "Codex diagnostic process ownership (Windows runtime)"): 1,
     ("macos-services-runtime", "Codex focused diagnostics (macOS runtime)"): 2,
     ("coverage-e2e", "Run e2e coverage"): 1,
     ("coverage-all", "Run combined coverage"): 1,
@@ -272,8 +312,72 @@ class CiPolicyTests(unittest.TestCase):
                     self.assertTrue(coverage_budget_violations(workflow))
                     self.assertTrue(violations(workflow, "1"))
 
+    def test_coverage_threads_are_sized_from_runner_cpus(self):
+        self.assertEqual(thread_sizing_violations(self.workflow), [])
+        for job_id in COVERAGE_JOBS:
+            steps = self.workflow["jobs"][job_id]["steps"]
+            first_test = min(steps.index(step) for name, _, step in test_steps(self.workflow) if name == job_id)
+            self.assertEqual(steps[0]["name"], THREAD_STEP)
+            self.assertLess(0, first_test)
+        for mutation in ("hardcoded-job", "missing", "late", "step-override", "fixed-run", "skipped", "skipped-bool", "cli-flag"):
+            for job_id in COVERAGE_JOBS:
+                with self.subTest(job=job_id, mutation=mutation):
+                    workflow = copy.deepcopy(self.workflow)
+                    job = workflow["jobs"][job_id]
+                    steps = job["steps"]
+                    sizing = steps[0]
+                    test_step = next(step for name, _, step in test_steps(workflow) if name == job_id)
+                    if mutation == "hardcoded-job":
+                        job.setdefault("env", {})["NEXTEST_TEST_THREADS"] = 16
+                    elif mutation == "missing":
+                        steps.remove(sizing)
+                    elif mutation == "late":
+                        steps.remove(sizing)
+                        steps.insert(steps.index(test_step) + 1, sizing)
+                    elif mutation == "step-override":
+                        test_step.setdefault("env", {})["NEXTEST_TEST_THREADS"] = "16"
+                    elif mutation == "fixed-run":
+                        sizing["run"] = 'echo "NEXTEST_TEST_THREADS=16" >> "$GITHUB_ENV"\n'
+                    elif mutation == "skipped":
+                        sizing["if"] = "false"
+                    elif mutation == "skipped-bool":
+                        sizing["if"] = False
+                    else:
+                        test_step["run"] += "\ncargo nextest run --test-threads 16\n"
+                    self.assertTrue(thread_sizing_violations(workflow))
+                    self.assertTrue(violations(workflow, "1"))
+
+    def test_hardcoded_threads_in_previous_workflow_are_rejected(self):
+        workflow = copy.deepcopy(self.workflow)
+        for job_id in COVERAGE_JOBS:
+            job = workflow["jobs"][job_id]
+            job["steps"] = [s for s in job["steps"] if s.get("name") != THREAD_STEP]
+            job["env"]["NEXTEST_TEST_THREADS"] = 16
+        errors = thread_sizing_violations(workflow)
+        for job_id in COVERAGE_JOBS:
+            self.assertIn(f"{job_id}: do not hardcode NEXTEST_TEST_THREADS; size it from nproc", errors)
+            self.assertIn(f"{job_id}: the first step must size NEXTEST_TEST_THREADS from nproc", errors)
+
+    def test_thread_sizing_step_caps_nproc_at_sixteen(self):
+        for cpus, expected in (("1", "1"), ("8", "8"), ("16", "16"), ("64", "16")):
+            with self.subTest(cpus=cpus), tempfile.TemporaryDirectory() as tmp:
+                stub = Path(tmp) / "nproc"
+                stub.write_text(f"#!/bin/sh\necho {cpus}\n")
+                stub.chmod(0o755)
+                github_env = Path(tmp) / "github_env"
+                result = subprocess.run(
+                    ["bash", "-e", "-c", THREAD_RUN],
+                    env={**os.environ, "PATH": f"{tmp}:{os.environ['PATH']}", "GITHUB_ENV": str(github_env)},
+                    capture_output=True, text=True, timeout=5,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(github_env.read_text(), f"NEXTEST_TEST_THREADS={expected}\n")
+                self.assertIn(f"NEXTEST_TEST_THREADS={expected} (nproc={cpus}, cap 16)", result.stdout)
+
     def test_full_coverage_budget_includes_report_generation(self):
-        self.assertEqual(self.workflow["jobs"]["coverage-all"]["timeout-minutes"], 45)
+        # 53m phase plus 2m: room for an 8-CPU heavy slot (~44 min) under the
+        # merge queue's 60-minute check response timeout.
+        self.assertEqual(self.workflow["jobs"]["coverage-all"]["timeout-minutes"], 55)
 
     def test_coverage_profile_pool_rejects_unbounded_or_unverified_collection(self):
         self.assertEqual(profile_pool_violations(self.workflow), [])

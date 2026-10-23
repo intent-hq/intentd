@@ -3,7 +3,13 @@
 
 Requires the version of dist pinned by dist-workspace.toml. No GitHub writes or
 native compilation; all generated artifacts live in a disposable local clone.
+
+Crates are fetched once up front, with retries (scripts/fetch-locked-crates.py),
+and every dist call then runs with CARGO_NET_OFFLINE=true so a crates.io blip
+cannot fail a dist step (runs 39394522385 and 39355882408). scripts/test-optional-intel-dist-network.py
+covers that handling offline.
 """
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -14,6 +20,14 @@ import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
 INTEL = 'x86_64-apple-darwin'
+_spec = importlib.util.spec_from_file_location('fetch_locked_crates', ROOT / 'scripts/fetch-locked-crates.py')
+_fetch = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_fetch)
+NOT_UNDER_TEST = ' A network failure here is not the cargo-dist behaviour under test.'
+
+
+def run_dist(root, env, *args):
+    return json.loads(subprocess.check_output(['dist', *args, '--output-format=json'], cwd=root, env=env))
 
 
 def main():
@@ -26,9 +40,12 @@ def main():
         shutil.copy(ROOT / 'dist-workspace.toml', root / 'dist-workspace.toml')
         shutil.copy(ROOT / 'scripts/optional-intel-release.py', root / 'scripts/optional-intel-release.py')
         env = {**os.environ, 'CARGO_TERM_PROGRESS_WHEN': 'never'}
+        _fetch.install_toolchain(root, env)
+        _fetch.fetch_dependencies(root, env, hint=NOT_UNDER_TEST)
+        env = _fetch.offline_env(env)
 
         def dist(*args):
-            return json.loads(subprocess.check_output(['dist', *args, '--output-format=json'], cwd=root, env=env))
+            return run_dist(root, env, *args)
 
         artifacts = root / 'target/distrib'
         manifest = dist('build', '--artifacts=lies')
@@ -72,13 +89,30 @@ def main():
         # Reapply the customization to real generated YAML, not only an
         # already-customized fixture. Existing unrelated customizations are
         # outside this script's ownership.
-        subprocess.run(['dist', 'generate'], cwd=root, check=True)
+        subprocess.run(['dist', 'generate'], cwd=root, env=env, check=True)
         shutil.copy(ROOT / 'scripts/configure-optional-intel-release.py', root / 'scripts/configure-optional-intel-release.py')
         customize = ['python3', '-I', '-B', 'scripts/configure-optional-intel-release.py']
         subprocess.run(customize, cwd=root, check=True)
         generated = (root / '.github/workflows/v-release.yml').read_text()
         subprocess.run(customize, cwd=root, check=True)
         assert generated == (root / '.github/workflows/v-release.yml').read_text()
+        shutil.copy(ROOT / 'scripts/configure-release-host-network.py',
+                    root / 'scripts/configure-release-host-network.py')
+        host_network = ['python3', '-I', '-B', 'scripts/configure-release-host-network.py']
+        subprocess.run(host_network, cwd=root, check=True)
+        fetched = (root / '.github/workflows/v-release.yml').read_text()
+        subprocess.run(host_network, cwd=root, check=True)
+        assert fetched == (root / '.github/workflows/v-release.yml').read_text()
+        # Both the global `dist build` and `dist host` run offline after a retried fetch.
+        assert fetched.count('CARGO_NET_OFFLINE: "true"') == 2
+        assert fetched.count('run: python3 -I -B scripts/fetch-locked-crates.py') == 2
+        shutil.copy(ROOT / 'scripts/configure-runner-routing.py', root / 'scripts/configure-runner-routing.py')
+        route_command = ['python3', '-I', '-B', 'scripts/configure-runner-routing.py']
+        subprocess.run(route_command, cwd=root, check=True)
+        routed = (root / '.github/workflows/v-release.yml').read_text()
+        subprocess.run(route_command, cwd=root, check=True)
+        assert routed == (root / '.github/workflows/v-release.yml').read_text()
+        assert "needs.runner-route.outputs.runners" in routed
         print('PASS: pinned cargo-dist includes successful Intel and removes partial Intel assets, checksums and release links')
 
 

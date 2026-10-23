@@ -42,6 +42,15 @@ permissions:
 # and marks the promoted version as Latest.
 on:
   pull_request:
+    paths:
+      - '**/Cargo.toml'
+      - 'Cargo.lock'
+      - 'dist-workspace.toml'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/*release*.yml'
+      - '.github/workflows/dist-*.yml'
+      - 'scripts/*release*'
+      - 'scripts/*dist*'
   push:
     tags:
       - 'v**[0-9]+.[0-9]+.[0-9]+*'
@@ -56,6 +65,14 @@ concurrency:
   queue: max
 
 jobs:
+  runner-route:
+    uses: ./.github/workflows/runner-route.yml
+    permissions:
+      contents: read
+      actions: read
+    secrets:
+      CI_QUEUE_READ_TOKEN: ${{ secrets.CI_QUEUE_READ_TOKEN }}
+
   # Run 'dist plan' (or host) to determine what tasks we need to do
   plan:
     # LOCAL CUSTOMIZATION: fork PRs get no CI — external PRs are not accepted
@@ -64,7 +81,8 @@ jobs:
     # never runs any of this workflow's jobs. Tag pushes and same-repo PRs
     # are unaffected. Re-apply this after any `dist generate`.
     if: ${{ !github.event.pull_request || github.event.pull_request.head.repo.full_name == github.repository }}
-    runs-on: "depot-ubuntu-24.04"
+    needs: [runner-route]
+    runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
     outputs:
       val: ${{ steps.plan.outputs.manifest }}
       tag: ${{ !github.event.pull_request && github.ref_name || '' }}
@@ -73,6 +91,9 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
@@ -119,12 +140,8 @@ jobs:
     name: build-local-artifacts (${{ join(matrix.targets, ', ') }})
     # Let the initial task tell us to not run (currently very blunt)
     needs:
-      - plan
-    # LOCAL CUSTOMIZATION: the leading `needs.plan.result == 'success'` guard
-    # short-circuits the fromJson calls when plan was skipped (fork PR — see
-    # plan's comment), which would otherwise choke on plan's empty outputs.
-    # Re-apply this after any `dist generate`.
-    if: ${{ needs.plan.result == 'success' && fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include != null && (needs.plan.outputs.publishing == 'true' || fromJson(needs.plan.outputs.val).ci.github.pr_run_mode == 'upload') }}
+      [plan, runner-route]
+    if: ${{ github.event_name != 'pull_request' && needs.plan.result == 'success' && fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include != null && (needs.plan.outputs.publishing == 'true' || fromJson(needs.plan.outputs.val).ci.github.pr_run_mode == 'upload') }}
     strategy:
       fail-fast: false
       # Target platforms/runners are computed by dist in create-release.
@@ -140,12 +157,15 @@ jobs:
       matrix: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix }}
     # LOCAL CUSTOMIZATION: only the isolated Intel Mac leg may fail.
     continue-on-error: ${{ matrix.optional }}
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ (contains(matrix.runner, 'ubuntu') || contains(matrix.runner, 'linux')) && (fromJSON(needs.runner-route.outputs.cloud || '{}')[matrix.runner] || matrix.runner) || fromJSON(needs.runner-route.outputs.runners || '{}')[matrix.runner] || matrix.runner }}
     container: ${{ matrix.container && matrix.container.image || null }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/${{ join(matrix.targets, '-') }}-dist-manifest.json
     steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
       - name: enable windows longpaths
         run: |
           git config --global core.longpaths true
@@ -213,7 +233,7 @@ jobs:
           # later steps. Without this, the first `cargo` invocation inside
           # `dist build` re-enters rustup's rust-toolchain.toml sync to add the
           # declared rustfmt/clippy components, which on the GitHub-hosted
-          # depot-ubuntu-24.04-16 images collides with the preinstalled Rust ("failed to
+          # gh-linux-16x images collides with the preinstalled Rust ("failed to
           # install component: 'rustfmt-preview-...', detected conflict:
           # 'bin/cargo-fmt'"), rolls back, and leaves the shim reporting cargo
           # as missing (v0.2.16 Release run 30706345522, aarch64-musl leg).
@@ -237,7 +257,7 @@ jobs:
           tmp=$(mktemp -d)
           fetch_prebuilt() { # $1=asset $2=sha256 $3=binary-name-in-archive
             curl -fsSL --retry 3 -o "$tmp/$1" "$base/$1"
-            # Git Bash on the hosted depot-windows-2022 runner ships coreutils'
+            # Git Bash on the hosted windows-2022 runner ships coreutils'
             # sha256sum but not the perl shasum; Linux runners have both.
             if command -v sha256sum >/dev/null 2>&1; then
               echo "$2  $tmp/$1" | sha256sum -c -
@@ -246,7 +266,7 @@ jobs:
             fi
             case "$1" in
               *.zip)
-                # unzip is absent from Git Bash and the depot-windows-2022 image;
+                # unzip is absent from Git Bash and the windows-2022 image;
                 # the image ships 7-Zip (7z on PATH) instead.
                 if command -v unzip >/dev/null 2>&1; then
                   unzip -q "$tmp/$1" -d "$tmp/x"
@@ -284,11 +304,13 @@ jobs:
           esac
           ls -l "$dest"
         shell: "bash"
-      - name: Configure Depot managed compiler cache
+      - name: Configure the self-hosted compiler cache
         shell: bash
         env:
-          DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
-        run: python3 scripts/setup-depot-sccache.py
+          INTENT_SCCACHE_ENDPOINT: ${{ vars.INTENT_SCCACHE_ENDPOINT }}
+          INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
+          INTENT_SCCACHE_MODE: ${{ vars.INTENT_SCCACHE_MODE }}
+        run: python3 scripts/setup-sccache.py
       - name: Install dist
         run: ${{ matrix.install_dist.run }}
       # Get the dist-manifest
@@ -330,13 +352,15 @@ jobs:
   # Build and package all the platform-agnostic(ish) things
   build-global-artifacts:
     needs:
-      - plan
-      - build-local-artifacts
-    runs-on: "depot-ubuntu-24.04"
+      [plan, build-local-artifacts, runner-route]
+    runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/global-dist-manifest.json
     steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
@@ -354,8 +378,15 @@ jobs:
           pattern: artifacts-*
           path: target/distrib/
           merge-multiple: true
+      # LOCAL CUSTOMIZATION: fetch crates with retries so the global `dist build`
+      # can run its cargo metadata offline. After `dist generate`, run
+      # python3 scripts/configure-release-host-network.py (source of this block).
+      - name: Fetch locked crates (retrying)
+        run: python3 -I -B scripts/fetch-locked-crates.py
       - id: cargo-dist
         shell: bash
+        env:
+          CARGO_NET_OFFLINE: "true"
         run: |
           targets=$(python3 scripts/optional-intel-release.py targets target/distrib)
           dist build ${{ needs.plan.outputs.tag-flag }} $targets --output-format=json "--artifacts=global" > dist-manifest.json
@@ -377,17 +408,17 @@ jobs:
   # Determines if we should publish/announce
   host:
     needs:
-      - plan
-      - build-local-artifacts
-      - build-global-artifacts
-    # Only run if we're "publishing", and only if plan, local and global didn't fail (skipped is fine)
+      [plan, build-local-artifacts, build-global-artifacts, runner-route]
     if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    runs-on: "depot-ubuntu-24.04"
+    runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
     outputs:
       val: ${{ steps.host.outputs.manifest }}
     steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
@@ -405,8 +436,15 @@ jobs:
           pattern: artifacts-*
           path: target/distrib/
           merge-multiple: true
+      # LOCAL CUSTOMIZATION: fetch crates with retries so `dist host` can run
+      # its cargo metadata offline. After `dist generate`, run
+      # python3 scripts/configure-release-host-network.py (source of this block).
+      - name: Fetch locked crates (retrying)
+        run: python3 -I -B scripts/fetch-locked-crates.py
       - id: host
         shell: bash
+        env:
+          CARGO_NET_OFFLINE: "true"
         run: |
           targets=$(python3 scripts/optional-intel-release.py targets target/distrib)
           dist host ${{ needs.plan.outputs.tag-flag }} $targets --steps=upload --steps=release --output-format=json > dist-manifest.json
@@ -454,13 +492,9 @@ jobs:
 
   announce:
     needs:
-      - plan
-      - host
-    # use "always() && ..." to allow us to wait for all publish jobs while
-    # still allowing individual publish jobs to skip themselves (for prereleases).
-    # "host" however must run to completion, no skipping allowed!
+      [plan, host, runner-route]
     if: ${{ always() && needs.host.result == 'success' }}
-    runs-on: "depot-ubuntu-24.04"
+    runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
@@ -478,5 +512,6 @@ jobs:
       plan: ${{ needs.plan.outputs.val }}
     secrets: inherit
     permissions:
+      actions: read
       "contents": "write"
       "pull-requests": "read"

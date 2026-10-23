@@ -90,16 +90,11 @@ fn force_hermetic_root_guard() {
 }
 
 /// Apply the timeout multiplier from the environment for coverage
-/// instrumentation. Reads `INTENTD_TEST_TIMEOUT_MULTIPLIER` (defaults to 1.0;
-/// non-finite values are ignored and values below 1.0 are clamped so budgets
-/// can only be extended; overflow saturates to `Duration::MAX`).
+/// instrumentation: delegates to [`intentd_test_support::test_timeout`]
+/// (`INTENTD_TEST_TIMEOUT_MULTIPLIER`, defaults to 1.0, never below 1.0,
+/// capped at 20x, saturating to `Duration::MAX`).
 pub fn test_timeout(base: Duration) -> Duration {
-    let multiplier = std::env::var("INTENTD_TEST_TIMEOUT_MULTIPLIER")
-        .ok()
-        .and_then(|s| s.parse::<f64>().ok())
-        .filter(|m| m.is_finite())
-        .unwrap_or(1.0);
-    Duration::try_from_secs_f64(base.as_secs_f64() * multiplier.max(1.0)).unwrap_or(Duration::MAX)
+    intentd_test_support::test_timeout(base)
 }
 
 /// Shared budget for waiting on daemon startup (UDS/socket ready): 60s base,
@@ -636,7 +631,11 @@ pub fn hermetic_serve_command(data_dir: &Path) -> std::process::Command {
 /// Sets no TCP-port env override, preserving explicit pins and listener restarts.
 pub fn hermetic_serve_command_fixed_port(data_dir: &Path) -> std::process::Command {
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_intentd"));
-    cmd.arg("serve").env("INTENTD_DATA_DIR", data_dir);
+    // A sandbox daemon's shell may export the user-tier relocation; fixtures
+    // own their user tier through HOME.
+    cmd.arg("serve")
+        .env("INTENTD_DATA_DIR", data_dir)
+        .env_remove("INTENTD_USER_SPECIALISTS_DIR");
     hermetic_fixture_identity(&mut cmd, data_dir);
     cmd
 }
@@ -1255,11 +1254,11 @@ mod tests {
                     caught_panic();
                     ready_tx.send((original, retained, owner)).expect("ready");
                     release_rx
-                        .recv_timeout(Duration::from_secs(5))
+                        .recv_timeout(intentd_test_support::test_timeout(Duration::from_secs(5)))
                         .expect("release");
                 });
                 let (failed_original, failed_retained, failed_owner) = ready_rx
-                    .recv_timeout(Duration::from_secs(5))
+                    .recv_timeout(intentd_test_support::test_timeout(Duration::from_secs(5)))
                     .expect("retained");
                 // KEEP_TMP intentionally leaves the original occupied, so name
                 // reuse only applies to the ordinary rename-on-panic policy.

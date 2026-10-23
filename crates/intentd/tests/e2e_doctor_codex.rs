@@ -123,6 +123,7 @@ impl Fixture {
         fs::copy(&runtime, bin.join("codex")).unwrap();
         #[cfg(target_os = "macos")]
         executable(&bin.join("codex"), &format!(
+            // cli-fixture-version: allow — doctor reports this exact measured version
             "#!/bin/sh\n[ \"$1\" = --version ] || exit 91\nprintf '%s\\n' '{{\"role\":\"raw\",\"version\":true}}' >> '{}'\nprintf 'codex-cli 0.333.4\\n'\n",
             root.path().join("events.jsonl").display()
         ));
@@ -564,6 +565,7 @@ fn live_ignores_runtime_override_and_uses_the_installed_cli() {
     let selected = fixture.root.path().join("override/bin/codex.js");
     executable(
         &selected,
+        // cli-fixture-version: allow — doctor must not report the unselected runtime version
         "#!/usr/bin/env node\nconsole.log('codex-cli 0.444.5');\n",
     );
     fs::write(

@@ -28,12 +28,25 @@ use crate::Services;
 
 /// Subscribe-time guard for AGENT callers (monorepo#1229): every explicit
 /// `agent:`-prefixed entry (exact types, the `agent:*` wildcard, and the
-/// observability events) and `chat:stream:delta` is rejected with
-/// `InvalidParams` — agents watch other agents via `ws.agent.watch`, not the
-/// event bus. A bare `*` passes: it is silently narrowed to the non-agent
-/// categories at resolution time ([`events::resolve_event_types_for_agent`]).
+/// observability events), `discussion:`-prefixed entries, `chat:stream:delta`,
+/// and the UI-only `prMonitor:refreshed` hint are rejected with `InvalidParams`.
+/// Agents watch other agents via `ws.agent.watch`, not the event bus. A bare `*`
+/// passes: it is silently narrowed to the non-agent categories at resolution time
+/// ([`events::resolve_event_types_for_agent`]).
 pub(crate) fn validate_agent_event_types(event_types: &[String]) -> Result<()> {
     for t in event_types {
+        if t.starts_with("discussion:") {
+            return Err(Error::InvalidParams(format!(
+                "\"{t}\" is not subscribable by agents: workspace discussions are human-only."
+            )));
+        }
+        if t == intent_core::events::PR_MONITOR_REFRESHED {
+            return Err(Error::InvalidParams(format!(
+                "\"{t}\" is not subscribable by agents: it is a UI-only re-read hint for \
+                 merge-queue movement, which never wakes agents. Read the queue position on \
+                 demand with ws.pr.snapshot(prNumber) or ws.pr.monitors()."
+            )));
+        }
         if events::is_agent_restricted_event_type(t) {
             return Err(Error::InvalidParams(format!(
                 "\"{t}\" is not subscribable by agents: agent events are internal. Use \
@@ -344,7 +357,7 @@ impl Services {
             )),
             // Match-time guard (monorepo#1229): agent-owned subscriptions —
             // including rehydrated rows persisted before the subscribe-time
-            // guard existed — never match agent events or `chat:stream:delta`.
+            // guard existed — never match restricted streams or human discussions.
             exclude_agent_events: true,
             ..Default::default()
         };
@@ -527,5 +540,25 @@ fn persisted_to_record(p: &PersistedEventSubscription) -> EventSubscriptionRecor
         // `as u64` cast into an astronomically large batch window.
         batch_window_ms: normalize_batch_window_ms(Some(p.batch_window_ms)),
         created_at: p.created_at.clone(),
+    }
+}
+
+#[cfg(test)]
+mod merge_queue_hint_tests {
+    use super::validate_agent_event_types;
+
+    #[test]
+    fn agents_cannot_subscribe_to_the_ui_only_queue_hint() {
+        let err = validate_agent_event_types(&["prMonitor:refreshed".to_string()])
+            .expect_err("the UI-only hint is off-limits to agents");
+        assert!(err.to_string().contains("ws.pr.snapshot"), "{err}");
+        // A mixed list registers nothing.
+        assert!(validate_agent_event_types(&[
+            "note:*".to_string(),
+            "prMonitor:refreshed".to_string()
+        ])
+        .is_err());
+        // The reportable monitor events stay subscribable.
+        assert!(validate_agent_event_types(&["prMonitor:changed".to_string()]).is_ok());
     }
 }

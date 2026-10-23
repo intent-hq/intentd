@@ -1,43 +1,33 @@
 name: CI
 on:
-  # Push-to-main runs only the release build matrix (+ route, which places
-  # its Windows entry, + deb-packaging + gate). The main ruleset routes
-  # every merge through the merge queue (see `merge_group` below) and
-  # blocks direct pushes, so every main commit's tree is identical to one a
-  # merge-queue (or, pre-queue, strict-up-to-date PR) run just tested — the
-  # test jobs (check/coverage-e2e/coverage-all) are push-skipped via their
-  # `if`s (CI audit, 2026-08).
+  # Push-to-main runs the macOS release build, packaging and runtime
+  # checks, and the Windows runtime validation (the `windows` job, install-ps1
+  # and the Windows pi-session-paths legs). Windows never runs on
+  # pull_request; the merge queue runs only the Windows lint (`windows-lint`:
+  # native check + target-gated Clippy), so a Windows-only compile or lint
+  # error cannot reach main. The runtime proofs are post-merge only, and a red
+  # or unfinished push CI Gate on the main tip blocks the next alpha cut
+  # (auto-cut-alpha.yml checks it before merging the Release PR). The main ruleset routes every merge
+  # through the merge queue (see `merge_group` below) and blocks direct
+  # pushes, so every main commit's tree is identical to one a merge-queue run
+  # just tested — the Linux/macOS test jobs (check/coverage-e2e/coverage-all)
+  # are push-skipped via their `if`s (CI audit, 2026-08).
   push:
     branches: [main]
   # Fork PRs get no CI: external PRs are not accepted (intent-hq/monorepo#417).
   # Every job reachable from pull_request carries a same-repo guard
   # (head.repo.full_name == github.repository) — directly or via the needs
   # chain — so fork PRs consume zero runner time and can never reach the
-  # self-hosted tinybox; close-fork-prs.yml auto-closes them. Same-repo PRs
+  # self-hosted runners; close-fork-prs.yml auto-closes them. Same-repo PRs
   # are completely unaffected.
   pull_request:
-  # Merge-queue runs (intent-hq/monorepo#2893): the queue tests the actual
-  # merged tree before it lands on main. CI is tiered by event: pull_request
-  # runs the fast feedback jobs (check / pr-title / conflict-markers /
-  # monorepo-consumer-checks / deb-packaging / release-scripts) plus
-  # coverage-changed, which runs only
-  # the PR's own changed tests under llvm-cov (pull_request-ONLY; see its
-  # comment); merge_group additionally runs the native build matrix, GitLab
-  # feature suite, and full instrumented coverage jobs (coverage-e2e /
-  # coverage-all), which are merge_group-ONLY — they no
-  # longer run on pull_request, so a PR's ~20 min coverage wall time is paid
-  # once, on the merged tree, instead of on every push to the PR. The gate is
-  # event-aware about this (see the gate comment): it requires the coverage
-  # jobs outright on merge_group and accepts their skip on pull_request /
-  # push, and the reverse for coverage-changed. The native matrix is skipped
-  # at job level on PRs; the focused daemon-lifecycle matrix still runs on
-  # PRs and merge groups with real Windows/macOS/Linux runtime proof.
-  # CI Gate requires native check, Clippy and runtime proofs on merge_group,
-  # and its release builds on push. CI Gate is the sole required status check.
-  # Merge groups are created by the repo's own ruleset from already-filed
-  # PRs, so they need no same-repo fork guard. pr-title / conflict-markers
-  # are PR-metadata checks that stay pull_request-only — the gate accepts
-  # their skip.
+  # PRs run Linux metadata, formatting, routing-policy and static consumer
+  # checks plus the Linux `check` job (clippy, source lints) and
+  # `coverage-changed` (the PR's changed tests). The queue reruns both and
+  # adds the Linux/macOS runtime matrices, the Windows lint and full
+  # instrumented coverage on the merged tree (no Windows runtime proofs —
+  # see `push` above); CI Gate enforces each
+  # tier.
   merge_group:
 
 permissions:
@@ -45,18 +35,19 @@ permissions:
   pull-requests: read
 
 env:
-  # Burst the Linux jobs to Depot larger runners when more than
-  # this many Linux jobs are queued/running ahead of this run (see the
-  # route job). tinybox runs 8 concurrent runner slots, so the threshold
-  # tolerates one queued/running job per slot before bursting. Note that
-  # jobs still blocked on `needs` are invisible to the jobs API, so only
-  # check/coverage jobs already released to tinybox (queued or running
-  # there) count toward the depth. Bursted jobs don't carry the
-  # self-hosted+Linux labels and stop counting toward the depth, so the
-  # system naturally falls back to tinybox as it frees up.
-  LINUX_BURST_THRESHOLD: 8
+  # Number of intent-cache Linux runner slots: the route job bursts Linux
+  # jobs to GitHub-hosted runners once this many intent-cache jobs are queued or running
+  # ahead of this run. Set the CI_LINUX_HEAVY_SLOTS org or repo variable when
+  # slots are added. Jobs still blocked on
+  # `needs` are invisible to the jobs API, so only jobs already released to
+  # the slots count. Bursted jobs don't carry the intent-cache label and
+  # stop counting, so routing returns to the slots as they free up.
+  LINUX_BURST_THRESHOLD: ${{ vars.CI_LINUX_HEAVY_SLOTS || '2' }}
+  # Same for the xl pool (intent-cache-xl, 16 threads per slot), which serves
+  # gh-linux-16x jobs before they overflow to intent-cache; 0 disables it.
+  LINUX_XL_BURST_THRESHOLD: ${{ vars.CI_LINUX_XL_SLOTS || '0' }}
 
-# The heavy jobs share the tinybox's 8 self-hosted runner slots, so cancel
+# The heavy jobs share two self-hosted Linux slots, so cancel
 # superseded PR runs instead of letting them back up the queue (push-to-main
 # runs are never cancelled).
 concurrency:
@@ -64,48 +55,24 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # Decides where the heavy Linux jobs (check / coverage-e2e / coverage-all /
-  # coverage-changed) run: the local tinybox runner when it is confirmed healthy, or
-  # Depot larger runners otherwise. Runs on a Depot runner so
-  # the burst decision is independent of the tinybox queue: when the probe
-  # ran on tinybox it queued behind the very backlog it measures (and
-  # deadlocked entirely with tinybox offline). The probe FAILS OPEN TO BURST:
-  # tinybox is only selected when the probe positively confirms an online
-  # self-hosted Linux runner AND an acceptable queue depth — any API error,
-  # missing permission, or an offline fleet routes to the burst runners, so
-  # CI cannot queue-deadlock when the fleet is down. If the job itself fails
-  # (timeout), the routed Linux jobs are skipped and need a re-run — a
-  # deliberate trade-off. The same probe also places the build job's Windows
-  # matrix entry (intent-hq/intent#5518): the self-hosted 5090pc runner when
-  # it is confirmed online, the org-hosted depot-windows-2022-16 runner otherwise —
-  # same fail-open rule, no queue-depth check (5090pc is single-slot).
-  # Both macOS native consumers use m1mac only when an online, idle ARM64
-  # runner is confirmed; otherwise they use Depot’s latest macOS (ARM64).
+  # Paid-label workloads prefer compatible self-hosted capacity; free standard labels run on GitHub. Keep the probe
+  # hosted so unavailable self-hosted runners cannot block the burst fallback (WarpBuild; GitHub's larger runners are off).
   route:
-    # Runs on push / merge_group / same-repo pull_request. Linux PR checks
-    # consume its decision; the native build entries use it on push and
-    # merge_group (intent-hq/intent#5518). On push its Linux consumers
-    # (check / coverage-e2e / coverage-all / coverage-changed) are
-    # push-skipped by their own `if`s (see the `on: push` comment), so only
-    # the native build decisions are used there.
-    # Skipped on fork PRs (see the `pull_request` trigger comment): route's
-    # skip cascades over the needs chain, skipping check / coverage-e2e /
-    # coverage-all / coverage-changed, so fork PRs can never reach tinybox.
-    # Runs on merge_group (see the trigger comment) — merge groups come from
-    # the repo's own ruleset, so no same-repo guard applies there.
     if: github.event_name == 'push' || github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
-    runs-on: depot-ubuntu-24.04
-    timeout-minutes: 5
     permissions:
       contents: read
-      # Reads the Actions queue; job-level so the other jobs don't inherit
-      # it (the optional cross-repo CI_QUEUE_READ_TOKEN is likewise only
-      # exposed to this job).
       actions: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      LINUX_SIZE: '16'
     outputs:
-      linux_labels: ${{ steps.decide.outputs.linux_labels }}
-      check_labels: ${{ steps.decide.outputs.check_labels }}
-      linux_burst: ${{ steps.decide.outputs.linux_burst }}
+      runners: ${{ steps.decide.outputs.runners }}
+      slots: ${{ steps.decide.outputs.slots }}
+      cloud: ${{ steps.decide.outputs.cloud }}
+      linux_labels: ${{ steps.heavy.outputs.linux_labels }}
+      check_labels: ${{ steps.heavy.outputs.check_labels }}
+      linux_burst: ${{ steps.heavy.outputs.linux_burst }}
       windows_labels: ${{ steps.decide.outputs.windows_labels }}
       windows_burst: ${{ steps.decide.outputs.windows_burst }}
       macos_labels: ${{ steps.decide.outputs.macos_labels }}
@@ -115,216 +82,320 @@ jobs:
         uses: actions/github-script@v9
         env:
           THRESHOLD: ${{ env.LINUX_BURST_THRESHOLD }}
+          XL_THRESHOLD: ${{ env.LINUX_XL_BURST_THRESHOLD }}
+          # Pooled jobs that start together once routing finishes; each reads
+          # outputs.slots[key] (see runner-route.yml for the fields). check
+          # and coverage-changed list pull_request only: the merge queue keeps
+          # them on their burst runner, WarpBuild (see the `heavy` step below).
+          # coverage-all, coverage-e2e and the Linux daemon-lifecycle leg run
+          # only in the queue and take a free xl or heavy slot there (longest
+          # first, so coverage-all gets the xl slot), or burst to WarpBuild.
+          # check takes an 8-CPU heavy slot (never the xl slot coverage-changed
+          # needs) but bursts as gh-linux-16x: WarpBuild measured it at p90 97%
+          # of 8 CPUs and 19.7 GB, so its merge-queue and overflow runs use 16.
+          # Minutes are typical PR / merge-queue durations. release-fast-path
+          # (release branches only) and the gate keep the `runners` mapping.
+          SLOT_JOBS: >-
+            [
+            {"key":"check","label":"gh-linux-8x","burst":"gh-linux-16x","rust":true,"minutes":15,"events":["pull_request"]},
+            {"key":"coverage-changed","label":"gh-linux-16x","rust":true,"minutes":13,"events":["pull_request"]},
+            {"key":"release-scripts","label":"ubuntu-24.04","minutes":6},
+            {"key":"pr-static","label":"ubuntu-24.04","minutes":1,"events":["pull_request"]},
+            {"key":"pr-title","label":"ubuntu-24.04","events":["pull_request"]},
+            {"key":"conflict-markers","label":"ubuntu-24.04","events":["pull_request"]},
+            {"key":"deb-packaging","label":"ubuntu-24.04","events":["merge_group","push"]},
+            {"key":"pi-session-paths","label":"ubuntu-24.04","minutes":1,"legs":[22,24],"events":["merge_group","push"]},
+            {"key":"coverage-all","label":"gh-linux-16x","rust":true,"minutes":22,"events":["merge_group"]},
+            {"key":"coverage-e2e","label":"gh-linux-16x","rust":true,"minutes":11,"events":["merge_group"]},
+            {"key":"daemon-lifecycle-linux","label":"gh-linux-16x","rust":true,"minutes":4,"events":["merge_group"]}
+            ]
+          LINUX_RUNNER_DISABLED: ${{ vars.CI_LINUX_RUNNER_DISABLED }}
           WINDOWS_RUNNER_DISABLED: ${{ vars.CI_WINDOWS_RUNNER_DISABLED }}
           MACOS_RUNNER_DISABLED: ${{ vars.CI_MACOS_RUNNER_DISABLED }}
-          LINUX_RUNNER_DISABLED: ${{ vars.CI_LINUX_RUNNER_DISABLED }}
         with:
-          # tinybox serves several repos on its runner slots, so the probe
-          # wants to size the queue across all of them — but the default
-          # GITHUB_TOKEN is repo-scoped and can only see intentd. Set the
-          # CI_QUEUE_READ_TOKEN secret (fine-grained PAT with actions:read
-          # on the sibling repos) to enable cross-repo counting; without
-          # it those repos are skipped and contribute 0. Routing to tinybox
-          # additionally requires the token to list the tinybox fleet: the
-          # runners are registered at the ORG level (shared across the
-          # repos via a runner group), so the token needs the org-level
-          # "Self-hosted runners" read permission for the org list to
-          # succeed. The default GITHUB_TOKEN cannot carry that permission,
-          # so without a suitably-scoped CI_QUEUE_READ_TOKEN the org list
-          # errors and the probe falls back to this repo's own runner list
-          # (fine-grained "Administration" repository permission, read) —
-          # currently empty, so every run bursts (safe: burst is the
-          # fail-open default; it just never uses tinybox).
           github-token: ${{ secrets.CI_QUEUE_READ_TOKEN || github.token }}
           script: |
-            const tinybox = ["self-hosted", "Linux", "X64"];
-            // The coverage jobs run the whole instrumented suite, so they
-            // burst to the biggest Depot Linux runner (16-core); check
-            // (fmt + clippy + a couple of tests) doesn't come close to
-            // saturating that, so it bursts to a cheaper 8-core runner
-            // instead.
-            const burst = ["depot-ubuntu-24.04-16"];
-            const checkBurst = ["depot-ubuntu-24.04-8"];
-            // The Windows build entry: the self-hosted 5090pc runner, or
-            // the org-hosted 16-core Windows runner (the one
-            // release-sitter.yml builds on) — cold workspace Clippy
-            // is slow on the 4-core windows-latest
-            // image.
-            const windowsSelfHosted = ["self-hosted", "Windows", "X64"];
-            const windowsBurst = ["depot-windows-2022-16"];
-            const macosSelfHosted = ["self-hosted", "macOS", "ARM64"];
-            // Latest standard Apple Silicon image.
-            const macosBurst = ["depot-macos-latest"];
-            const threshold = parseInt(process.env.THRESHOLD || "8", 10);
-            // FAIL OPEN TO BURST: tinybox is only selected when the probe
-            // positively confirms (a) an online self-hosted Linux runner
-            // visible to this repo (org-level list, or the repo-level
-            // fallback) and (b) a queue depth within the threshold. Any
-            // probe error — including a token that cannot list runners —
-            // routes to burst, so CI cannot queue-deadlock when the fleet
-            // is offline or unreadable. The Windows decision below shares
-            // the runner list and rule (a); it has no queue-depth rule.
-            //
-            // The self-hosted runners are registered at the ORG level
-            // (shared across the repos via a runner group), so probe the
-            // org runner list first. That call needs the org-level
-            // "Self-hosted runners" read permission on the token (see the
-            // github-token comment above); when it errors, fall back to
-            // the repo-level list, which only sees repo-registered
-            // runners (currently none — the degraded mode keeps
-            // bursting). An empty list still routes to burst by design
-            // (never deadlock on an invisible fleet).
-            // NOTE: the org list is NOT scoped to the runner groups this
-            // repo can access, so the probe assumes every online
-            // self-hosted+Linux+X64 org runner is the tinybox fleet in a
-            // group visible to this repo (and likewise every online
-            // self-hosted+Windows+X64 runner is 5090pc and every
-            // self-hosted+macOS+ARM64 runner is m1mac). Ops invariant:
-            // keep the fleet's group visible to the CI repos, and never
-            // register generically-labeled org runners outside it — a
-            // matching but inaccessible runner would route jobs onto
-            // labels nothing can serve. (Group-scoped listing via the
-            // runner-groups API was considered and rejected: it needs
-            // extra calls per group and fails on plans without
-            // runner-group support, which would silently regress the
-            // probe to always-burst.)
-            let runners = null;
-            let runnerSource = "org";
-            let runnerListError = null;
+            // No checkout: routing never executes code from a pull request.
+            // Org runners with these labels must be in groups shared with all three CI repos.
+            const fleets = {
+              // Heavy jobs (compile Rust or run over ~5 minutes): 8 cores / 48 GB per slot.
+              linux: ['self-hosted', 'linux', 'x64', 'intent-cache'],
+              // 16-core jobs: 16 threads per slot.
+              xl: ['self-hosted', 'linux', 'x64', 'intent-cache-xl'],
+              arm: ['self-hosted', 'Linux', 'ARM64'],
+              windows: ['self-hosted', 'Windows', 'X64'],
+              macos: ['self-hosted', 'macOS', 'ARM64'],
+            };
+            const disabled = {
+              linux: process.env.LINUX_RUNNER_DISABLED === 'true',
+              xl: process.env.LINUX_RUNNER_DISABLED === 'true',
+              arm: process.env.LINUX_RUNNER_DISABLED === 'true',
+              windows: process.env.WINDOWS_RUNNER_DISABLED === 'true',
+              macos: process.env.MACOS_RUNNER_DISABLED === 'true',
+            };
+            // Standard GitHub-hosted runners are free for public repositories, so
+            // jobs asking for them always run there and never take a self-hosted slot.
+            const free = ['ubuntu-22.04', 'ubuntu-24.04', 'ubuntu-latest', 'ubuntu-24.04-arm', 'windows-2022', 'windows-2025'];
+            // The paid sizes jobs ask for and the WarpBuild runner each bursts to.
+            // GitHub's larger runners are off, so a paid size never runs on GitHub
+            // (same cores except Macs, which get 12 because every Mac job is CPU-bound;
+            // Windows stays on Server 2022, macOS 15 keeps signed builds off macOS 26).
+            const warp = {
+              'gh-linux-8x': 'warp-ubuntu-2404-x64-8x',
+              'gh-linux-16x': 'warp-ubuntu-2404-x64-16x',
+              'gh-linux-arm64-8x': 'warp-ubuntu-2404-arm64-8x',
+              'gh-windows-8x': 'warp-windows-2022-x64-8x',
+              'gh-windows-16x': 'warp-windows-2022-x64-16x',
+              'macos-26-xlarge': 'warp-macos-26-arm64-12x',
+              'macos-15-xlarge': 'warp-macos-15-arm64-12x',
+            };
+            // Fork pull requests never spend WarpBuild minutes: a paid size runs on
+            // the free standard runner of its OS instead.
+            const forkRunner = {
+              'gh-linux-8x': 'ubuntu-24.04',
+              'gh-linux-16x': 'ubuntu-24.04',
+              'gh-linux-arm64-8x': 'ubuntu-24.04-arm',
+              'gh-windows-8x': 'windows-2022',
+              'gh-windows-16x': 'windows-2022',
+              'macos-26-xlarge': 'macos-latest',
+              'macos-15-xlarge': 'macos-15',
+            };
+            // WarpBuild health is tracked per OS and architecture (ubuntu-x64, ubuntu-arm64, windows-x64, macos-arm64).
+            const family = (label) => {
+              const m = /^warp-(ubuntu|windows|macos)-.*-(x64|arm64)-/.exec(String(label).toLowerCase());
+              return m ? `${m[1]}-${m[2]}` : null;
+            };
+            // A queued job older than `minutes`; `unknownIsOld` decides a job whose age is unreadable.
+            const queuedOver = (j, minutes, unknownIsOld) => j.status === 'queued' &&
+              (Number.isFinite(Date.parse(j.created_at)) ? Date.parse(j.created_at) < Date.now() - minutes * 60 * 1000 : unknownIsOld);
+            const burst = Object.fromEntries(Object.keys(fleets).map(k => [k, true]));
+            const reasons = Object.fromEntries(Object.keys(fleets).map(k => [k, 'availability not established']));
+            // Free slots per Linux pool: online slots (capped by the threshold) minus jobs queued or running on them.
+            const slotsFree = {};
+            const pr = context.payload?.pull_request;
+            const fork = context.eventName === 'pull_request' && pr?.head?.repo?.full_name !== `${context.repo.owner}/${context.repo.repo}`;
+            const warpOn = !fork;
+            // A WarpBuild OS/architecture whose jobs sit queued for 10 minutes is
+            // reported as a warning; with no other burst runner, jobs still go there.
+            const warpStuck = Object.fromEntries(Object.values(warp).map(label => [family(label), false]));
             try {
+              if (fork) throw new Error('fork pull request requires an isolated hosted runner');
+              let runners;
               try {
-                runners = await github.paginate(
-                  github.rest.actions.listSelfHostedRunnersForOrg,
-                  { org: context.repo.owner, per_page: 100 }
-                );
-              } catch (e) {
-                core.info(`org runner list failed (${e.message}); falling back to repo-level list`);
-                runnerSource = "repo";
-                runners = await github.paginate(
-                  github.rest.actions.listSelfHostedRunnersForRepo,
-                  { owner: context.repo.owner, repo: context.repo.repo, per_page: 100 }
-                );
+                runners = await github.paginate(github.rest.actions.listSelfHostedRunnersForOrg, {org: context.repo.owner, per_page: 100});
+              } catch (error) {
+                core.info(`org runner list failed (${error.message}); trying repository-visible runners`);
+                runners = await github.paginate(github.rest.actions.listSelfHostedRunnersForRepo, {...context.repo, per_page: 100});
               }
-            } catch (e) {
-              runnerListError = e;
-            }
-            const onlineWith = (labels, ignoreCase = false) => (runners || []).filter(r =>
-              r.status === "online" &&
-              labels.every(l => (r.labels || []).some(x => ignoreCase
-                ? typeof x.name === "string" && x.name.toLowerCase() === l.toLowerCase()
-                : x.name === l))
-            );
-            let useBurst = true;
-            let reason = "fail-open default";
-            try {
-              if (runnerListError) throw runnerListError;
-              const online = onlineWith(tinybox);
-              if (online.length === 0) {
-                reason = `no online self-hosted Linux runner (${runnerSource} list)`;
-              } else {
-                // Count self-hosted Linux jobs that are queued or running in
-                // queued/in-progress runs: a running job occupies a tinybox
-                // slot just as much as a queued one. Depot jobs
-                // — including this route job and bursted heavy jobs — don't
-                // match the self-hosted+Linux label filter, so they never
-                // inflate the depth. Sibling-repo probe failures are the
-                // documented degraded mode (skip, contribute 0); a failure
-                // on this repo's own probe means the depth is unknowable,
-                // so it rethrows into the fail-open burst path.
-                const owner = context.repo.owner;
-                const repos = ["intentd", "cloudlands-fe", "monorepo"];
-                let depth = 0;
-                for (const repo of repos) {
-                  try {
-                    for (const status of ["queued", "in_progress"]) {
-                      const runs = await github.rest.actions.listWorkflowRunsForRepo({ owner, repo, status, per_page: 20 });
-                      for (const run of runs.data.workflow_runs.filter(r => r.id !== context.runId).slice(0, 10)) {
-                        const jobs = await github.rest.actions.listJobsForWorkflowRun({ owner, repo, run_id: run.id, per_page: 100 });
-                        depth += jobs.data.jobs.filter(j => (j.status === "queued" || j.status === "in_progress") && j.labels.includes("self-hosted") && j.labels.includes("Linux")).length;
-                      }
+              const online = Object.fromEntries(Object.entries(fleets).map(([key, labels]) => [key,
+                runners.filter(r => r.status === 'online' && labels.every(l => (r.labels || []).some(x => x.name?.toLowerCase() === l.toLowerCase()))),
+              ]));
+              const jobs = [];
+              // A missing sibling view is unknown demand, not zero demand. Fail open to burst runners.
+              // With no self-hosted runner online there is no demand to weigh, so skip the listing.
+              if (Object.values(online).some(rs => rs.length)) {
+                for (const repo of new Set(['intent', 'intentd', 'cloudlands-fe', context.repo.repo])) {
+                  const seen = new Set();
+                  for (const status of ['queued', 'in_progress']) {
+                    const runs = await github.paginate(github.rest.actions.listWorkflowRunsForRepo, {owner: context.repo.owner, repo, status, per_page: 100});
+                    for (const run of runs) {
+                      if (run.id === context.runId || seen.has(run.id)) continue;
+                      seen.add(run.id);
+                      jobs.push(...await github.paginate(github.rest.actions.listJobsForWorkflowRun, {owner: context.repo.owner, repo, run_id: run.id, per_page: 100}));
                     }
-                  } catch (e) {
-                    if (repo === context.repo.repo) throw e;
-                    core.info(`queue probe skipped ${repo}: ${e.message}`);
                   }
                 }
-                useBurst = depth > threshold;
-                reason = `queue depth=${depth} threshold=${threshold} online=${online.length} (${runnerSource} list)`;
               }
-            } catch (e) {
-              useBurst = true;
-              reason = `probe failed (${e.message})`;
+              for (const j of jobs) {
+                if (!queuedOver(j, 10, false)) continue;
+                for (const label of j.labels || []) if (family(label) in warpStuck) warpStuck[family(label)] = true;
+              }
+              const thresholds = {linux: Number(process.env.THRESHOLD || '2'), xl: Number(process.env.XL_THRESHOLD || '0')};
+              if (Object.values(thresholds).some(n => !Number.isInteger(n) || n < 0)) throw new Error('invalid queue threshold');
+              for (const [key, labels] of Object.entries(fleets)) {
+                const demand = jobs.filter(j => ['queued', 'in_progress'].includes(j.status) && labels.every(l => (j.labels || []).some(x => x.toLowerCase() === l.toLowerCase())));
+                const stale = demand.some(j => queuedOver(j, 15, true));
+                const native = !(key in thresholds);
+                const capacity = native ? online[key].filter(r => r.busy === false).length : online[key].length;
+                const limit = native ? capacity - 1 : Math.min(thresholds[key], capacity);
+                const depth = native ? demand.filter(j => j.status === 'queued').length : demand.length;
+                burst[key] = disabled[key] || capacity === 0 || stale || (native ? depth > limit : depth >= limit);
+                if (!native) slotsFree[key] = burst[key] ? 0 : limit - depth;
+                reasons[key] = disabled[key] ? 'disabled for maintenance' : capacity === 0 ? 'no available compatible runner' : stale ? 'stalled or unknown-age queue' : `queue depth=${depth} threshold=${limit} online=${online[key].length}${native ? '' : ` free=${slotsFree[key]}`}`;
+              }
+            } catch (error) {
+              for (const key of Object.keys(fleets)) reasons[key] = `probe failed (${error.message})`;
+              for (const key of Object.keys(slotsFree)) slotsFree[key] = 0;
             }
-            if (process.env.LINUX_RUNNER_DISABLED === "true") {
-              useBurst = true;
-              reason = "self-hosted Linux disabled for maintenance";
-            }
-            core.info(`linux routing: burst=${useBurst} (${reason})`);
-            core.setOutput("linux_labels", JSON.stringify(useBurst ? burst : tinybox));
-            core.setOutput("check_labels", JSON.stringify(useBurst ? checkBurst : tinybox));
-            core.setOutput("linux_burst", String(useBurst));
-            // 5090pc is shared by native builds and lifecycle jobs. Prefer
-            // its free slot only when explicitly idle; a busy or unknown
-            // slot must burst rather than exhaust the merge queue timeout.
-            let windowsUseBurst = true;
-            let windowsReason = "fail-open default";
+            // Where a label runs when it does not take a self-hosted slot: a paid
+            // size's WarpBuild runner (its free standard runner on a fork), a free
+            // label itself.
+            const cloud = (label) => warp[label] ? [warpOn ? warp[label] : forkRunner[label]] : [label];
+            // Keys are the GitHub labels jobs ask for; values are the self-hosted
+            // fleet labels, or the burst runner when the fleet bursts.
+            // A label listed under several pools takes the first with a free slot.
+            const hosted = {
+              // 16-core jobs prefer xl slots and overflow to heavy slots before
+              // bursting, so with no xl slot free they route as they did
+              // before xl existed. 8-core jobs never take an xl slot.
+              xl: ['gh-linux-16x'],
+              linux: ['gh-linux-8x', 'gh-linux-16x'],
+              arm: ['gh-linux-arm64-8x'],
+              windows: ['gh-windows-16x'],
+              macos: ['macos-26-xlarge'],
+            };
+            // Free slots go to the caller's listed jobs one at a time: Rust-compiling
+            // jobs first (they reuse the slot's local cache), then the longest, then
+            // list order. Listed jobs that do not fit, or that skip this event, get
+            // their burst runner directly, sized by `burst` when set (a CPU-bound
+            // job keeps its slot size but bursts bigger); matrix legs are ranked
+            // separately.
+            // Concurrent runs read the same free count before either job is queued,
+            // so a pool may briefly run a job or two over its slot count.
+            let requests = [];
             try {
-              if (runnerListError) throw runnerListError;
-              const idle = onlineWith(windowsSelfHosted).filter(r => r.busy === false);
-              if (idle.length === 0) {
-                windowsReason = `no idle online self-hosted Windows runner (${runnerSource} list)`;
-              } else {
-                windowsUseBurst = false;
-                windowsReason = `idle=${idle.length} (${runnerSource} list)`;
-              }
-            } catch (e) {
-              windowsUseBurst = true;
-              windowsReason = `probe failed (${e.message})`;
+              requests = JSON.parse(process.env.SLOT_JOBS || '[]').flatMap(j => (j.legs || (j.shards ? Array.from({length: j.shards}, (_, n) => n + 1) : null))?.map(leg => ({...j, key: `${j.key}-${leg}`})) ?? [j]);
+            } catch (error) {
+              core.info(`slot list unreadable (${error.message}); listed jobs use burst runners`);
             }
-            // Allow maintenance without abandoning the free runner preference.
-            if (process.env.WINDOWS_RUNNER_DISABLED === "true") {
-              windowsUseBurst = true;
-              windowsReason = "self-hosted Windows disabled for maintenance";
+            const slots = {};
+            const granted = Object.fromEntries(Object.keys(slotsFree).map(k => [k, 0]));
+            const ranked = requests.map((r, i) => ({...r, i})).sort((a, b) => (b.rust === true) - (a.rust === true) || (b.minutes || 0) - (a.minutes || 0) || a.i - b.i);
+            for (const r of ranked) {
+              const runs = !Array.isArray(r.events) || r.events.includes(context.eventName);
+              const key = runs && Object.keys(hosted).find(k => k in slotsFree && hosted[k].includes(r.label) && slotsFree[k] > 0);
+              if (key) {
+                slotsFree[key] -= 1;
+                granted[key] += 1;
+                slots[r.key] = fleets[key];
+              } else slots[r.key] = cloud(r.burst || r.label);
             }
-            core.info(`windows routing: burst=${windowsUseBurst} (${windowsReason})`);
-            core.setOutput("windows_labels", JSON.stringify(windowsUseBurst ? windowsBurst : windowsSelfHosted));
-            core.setOutput("windows_burst", String(windowsUseBurst));
-            // macOS has no queue budget: only explicit idle availability
-            // selects self-hosted. Missing busy state is not proof of a
-            // free slot. Labels are case-insensitive in Actions; keep the
-            // existing Linux/Windows matching semantics above unchanged.
-            let macosUseBurst = true;
-            let macosReason = "fail-open default";
-            try {
-              if (runnerListError) throw runnerListError;
-              const idle = onlineWith(macosSelfHosted, true).filter(r => r.busy === false);
-              if (idle.length === 0) {
-                macosReason = `no idle online self-hosted macOS ARM64 runner (${runnerSource} list)`;
-              } else {
-                macosUseBurst = false;
-                macosReason = `idle=${idle.length} (${runnerSource} list)`;
-              }
-            } catch (e) {
-              macosUseBurst = true;
-              macosReason = `probe failed (${e.message})`;
+            // Unlisted jobs (single-job workflows, jobs that start after the listed
+            // ones) use a pool only while a slot is still free.
+            for (const key of Object.keys(slotsFree)) {
+              burst[key] = slotsFree[key] <= 0;
+              if (granted[key]) reasons[key] += ` granted=${granted[key]}`;
             }
-            if (process.env.MACOS_RUNNER_DISABLED === "true") {
-              macosUseBurst = true;
-              macosReason = "self-hosted macOS disabled for maintenance";
+            const mapping = Object.fromEntries(free.map(label => [label, [label]]));
+            for (const [key, labels] of Object.entries(hosted)) {
+              for (const label of labels) if (!mapping[label] || mapping[label][0] !== 'self-hosted') mapping[label] = burst[key] ? cloud(label) : fleets[key];
             }
-            core.info(`macos routing: burst=${macosUseBurst} (${macosReason})`);
-            core.setOutput("macos_labels", JSON.stringify(macosUseBurst ? macosBurst : macosSelfHosted));
-            core.setOutput("macos_burst", String(macosUseBurst));
+            // Jobs that must not use a self-hosted runner (sudo, Docker, release signing) read `cloud`.
+            const clouds = Object.fromEntries([...free, ...Object.keys(warp)].map(label => [label, cloud(label)]));
+            for (const key of Object.keys(fleets)) core.info(`${key} routing: burst=${burst[key]} (${reasons[key]})`);
+            for (const key of Object.keys(warpStuck)) {
+              if (!warpOn) core.info(`warpbuild ${key}: off (fork pull request: free standard runners)`);
+              else if (warpStuck[key]) core.warning(`warpbuild ${key}: jobs queued over 10 minutes; bursts still go to WarpBuild`);
+              else core.info(`warpbuild ${key}: on`);
+            }
+            core.setOutput('runners', JSON.stringify(mapping));
+            core.setOutput('slots', JSON.stringify(slots));
+            core.setOutput('cloud', JSON.stringify(clouds));
+            const linuxLabels = mapping[`gh-linux-${process.env.LINUX_SIZE || '8'}x`];
+            core.setOutput('linux_labels', JSON.stringify(linuxLabels));
+            core.setOutput('linux_burst', String(linuxLabels[0] !== 'self-hosted'));
+            core.setOutput('check_labels', JSON.stringify(mapping['gh-linux-8x']));
+            core.setOutput('windows_labels', JSON.stringify(mapping['gh-windows-16x']));
+            core.setOutput('macos_labels', JSON.stringify(mapping['macos-26-xlarge']));
+            for (const key of ['windows', 'macos']) core.setOutput(`${key}_burst`, String(burst[key]));
+      # check and coverage-changed (through `slots`, which list pull_request
+      # only) take their burst runner (WarpBuild) in the merge queue.
+      # coverage-all, coverage-e2e and the Linux daemon-lifecycle leg read
+      # their own merge_group `slots` entries, so only as many take a slot as
+      # are free and the rest burst to WarpBuild (the slot hosts raise
+      # fs.inotify.max_user_instances to 32768 for their parallel daemons).
+      # Nothing reads this step's linux_labels or check_labels any more. Before slot fitting existed, one queue run started ~4 heavy jobs at once,
+      # sized for 16 CPUs, and the shared mapping sent all of them to the
+      # same two 8-CPU intent-cache slots, one after another, past the
+      # queue's time budget. PR and push
+      # runs, and the light jobs routed through `runners`, keep the probe's
+      # choice. This override stays out of the probe script above, which is
+      # kept identical to runner-route.yml across intent, intentd and
+      # cloudlands-fe.
+      - id: heavy
+        env:
+          EVENT: ${{ github.event_name }}
+          LINUX_LABELS: ${{ steps.decide.outputs.linux_labels }}
+          CHECK_LABELS: ${{ steps.decide.outputs.check_labels }}
+          LINUX_BURST: ${{ steps.decide.outputs.linux_burst }}
+          CLOUD: ${{ steps.decide.outputs.cloud }}
+        run: |
+          # The burst runner for a paid size: its WarpBuild runner from `cloud`, or
+          # the same WarpBuild label when `cloud` is unreadable (GitHub's larger
+          # runners are off).
+          burst_runner() {
+            jq -ce --arg label "$1" '.[$label] // empty' <<< "${CLOUD:-{\}}" 2>/dev/null && return
+            case "$1" in
+              gh-linux-8x) echo '["warp-ubuntu-2404-x64-8x"]' ;;
+              gh-linux-16x) echo '["warp-ubuntu-2404-x64-16x"]' ;;
+              *) printf '["%s"]\n' "$1" ;;
+            esac
+          }
+          if [[ "$EVENT" == merge_group ]]; then
+            LINUX_LABELS=$(burst_runner "gh-linux-${LINUX_SIZE}x")
+            CHECK_LABELS=$(burst_runner gh-linux-8x)
+            LINUX_BURST=true
+            echo "heavy linux routing: burst=true (merge queue: the shared linux_labels mapping takes the burst runner $LINUX_LABELS; listed jobs use their own slots)"
+          fi
+          {
+            echo "linux_labels=$LINUX_LABELS"
+            echo "check_labels=$CHECK_LABELS"
+            echo "linux_burst=$LINUX_BURST"
+          } >> "$GITHUB_OUTPUT"
+
+  # Dependency-free PR policy checks; the PR's compiled Linux checks live in
+  # `check` and `coverage-changed`, and native runners stay queue-only.
+  pr-static:
+    needs: route
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ${{ fromJSON(needs.route.outputs.slots || '{}')['pr-static'] || fromJSON('["ubuntu-24.04"]') }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - run: python3 -m pip install 'PyYAML==6.0.3'
+      # The routing test executes the probe under node; install it explicitly
+      # rather than relying on the runner image.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+      - name: Check CI routing and gate failures
+        run: python3 -I -B scripts/test-ci-native-routing.py
+      # Release PRs run this job too: a release that would split the intentd
+      # version_group (intent-hq/intentd#2461) fails here before it merges.
+      - name: Check release-plz version groups stay in lockstep
+        run: python3 -S scripts/test-version-group.py
+      - name: Resolve formatting toolchain
+        id: rust
+        run: echo "channel=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de
+        with:
+          toolchain: ${{ steps.rust.outputs.channel }}
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  cache-smoke:
+    if: github.event_name == 'merge_group'
+    uses: ./.github/workflows/cache-smoke.yml
+    secrets: inherit
 
   check:
-    # Skipped on push to main — redundant re-test of a tree the PR CI already
-    # checked (see the `on: push` comment). The expression carries no status
-    # function, so the implicit success() still applies: a route failure —
-    # or a route skip, as on fork PRs — skips this job on pull_request
-    # exactly as before.
-    if: github.event_name != 'push'
-    needs: route
-    runs-on: ${{ fromJSON(needs.route.outputs.check_labels) }}
+    # Runs on same-repo PRs and in the merge queue; skipped on push to main —
+    # a redundant re-test of a tree the queue already checked (see the
+    # `on: push` comment). The expression carries no status function, so the
+    # route result is checked explicitly: a route failure — or a route skip,
+    # as on fork PRs — skips this job, and CI Gate rejects that skip.
+    # A same-repo PR whose diff is pure release metadata (release-fast-path)
+    # skips it too: the release PR differs from main's tip only in versions
+    # and the changelog, and main's tip already passed this job in the merge
+    # queue. Re-running it held each release-plz refresh ~14 min and starved
+    # the v0.11.9 release PR behind 15-minute main merges (intentd#2493).
+    # Every other PR still runs it, and the merge queue always does.
+    if: ${{ !cancelled() && needs.route.result == 'success' && (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && needs.release-fast-path.outputs.fast_path != 'true')) }}
+    needs: [route, release-fast-path]
+    runs-on: ${{ fromJSON(needs.route.outputs.slots || '{}')['check'] || fromJSON('["warp-ubuntu-2404-x64-8x"]') }}
     # The cold-cache check job exhausted its 20-minute budget after its tests
     # passed in run 37305697722. Allow completion/cache margin without changing
     # individual test timeouts.
@@ -334,82 +405,21 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
     steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
       - uses: actions/checkout@v7
-      - name: Configure Depot managed compiler cache
+      - name: Configure the self-hosted compiler cache
         shell: bash
         env:
-          DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
-        run: python3 scripts/setup-depot-sccache.py
-      # Fail-fast disk preflight — see the `check` job's comment for the full
-      # rationale (monorepo#1253). 30 GiB here: the instrumented coverage
-      # target dirs are multi-GiB and the run also writes profraw files.
-      - name: Disk-space preflight (tinybox only)
-        if: needs.route.outputs.linux_burst != 'true'
-        env:
-          NEED_GIB: 10
-          JOB_TARGET_SUBDIR: check
-        run: |
-          set -euo pipefail
-          own_dir="/raid/ci-target/intentd/$RUNNER_NAME/$JOB_TARGET_SUBDIR"
-          free_gib() { df -Pk /raid | awk 'NR==2 { printf "%d", $4 / 1048576 }'; }
-          echo "Free space on /raid: $(free_gib) GiB (need $NEED_GIB GiB)"
-          [ "$(free_gib)" -ge "$NEED_GIB" ] && exit 0
-          # Candidate selection for both tiers lives in
-          # scripts/ci-target-slot.sh purge-candidates (path allowlist,
-          # own-dir / own-slot skip, `.in-use` marker, recursive activity
-          # check; oldest top-level mtime first — intent-hq/intent#5256);
-          # this loop only deletes until the need is met. The producer runs
-          # ahead of this loop, so a candidate it buffered may have been
-          # marked by a job that started while earlier dirs were being
-          # deleted: is-purgeable repeats the marker + activity check
-          # immediately before each rm. `|| true` on rm tolerates another
-          # slot's preflight racing us to the same candidate, and the
-          # process substitution keeps a producer cut short by `break` from
-          # failing the step.
-          evict_until_free() {
-            local verb="$1" quiet_min="$2" dir
-            shift 2
-            while IFS= read -r dir; do
-              ./scripts/ci-target-slot.sh is-purgeable "$dir" --quiet-min "$quiet_min" || continue
-              echo "$verb: $dir"
-              rm -rf -- "$dir" || true
-              # `if`, not `[ ] && break`: a function returns its loop's last
-              # status, and a final unmet check would abort the step here.
-              if [ "$(free_gib)" -ge "$NEED_GIB" ]; then break; fi
-            done < <(./scripts/ci-target-slot.sh purge-candidates /raid/ci-target --quiet-min "$quiet_min" "$@")
-          }
-          # Stale tier: nothing inside touched within 2 days (-mmin gives a
-          # strict 48 h window; -mtime rounds to whole days).
-          echo "Below threshold — pruning stale ci-target dirs (monorepo#1253)"
-          evict_until_free pruning 2880 --skip-dir "$own_dir"
-          # Escalation tier: under heavy churn everything on the volume can
-          # be <2 days old (the 2026-08-20/08-21 exhaustions), leaving the
-          # stale pass nothing to prune — LRU-evict idle ci-target dirs
-          # until this job's need is met. Ordering key: the dir's own
-          # top-level mtime, matching the emergency purge — not
-          # tinybox-prune.yml's recursive last-activity scan. Cargo rarely
-          # touches the top level after creation, so this approximates
-          # creation order and a recently-used-but-idle dir can be evicted
-          # before a colder one; acceptable here, since every candidate is
-          # an idle warm cache and the ordering stays cheap for a per-job
-          # step. Concurrent preflights on other slots are safe: target
-          # dirs are warm caches (eviction costs a rebuild, not
-          # correctness), a live job's dir is shielded by its `.in-use`
-          # marker and, failing that, the recursive 15-minute activity
-          # check, and the own-slot skip covers every dir this slot may use.
-          if [ "$(free_gib)" -lt "$NEED_GIB" ]; then
-            echo "Still below threshold — LRU-evicting idle ci-target dirs (monorepo#1253)"
-            evict_until_free evicting 15 --skip-slot "$RUNNER_NAME"
-          fi
-          free="$(free_gib)"
-          if [ "$free" -lt "$NEED_GIB" ]; then
-            echo "::error::tinybox /raid has only ${free} GiB free (this job needs ${NEED_GIB} GiB) even after pruning stale dirs and LRU-evicting idle ones — manual cleanup needed, see intent-hq/monorepo#1253."
-            exit 1
-          fi
-      # openssl-sys needs the OpenSSL headers; depot-ubuntu-24.04 images preinstall
-      # libssl-dev but tinybox doesn't. Idempotent (skips once installed) and
-      # relies on the runner user's passwordless sudo. Co-tenant jobs on the
-      # shared runner race for the apt locks (monorepo#1515):
+          INTENT_SCCACHE_ENDPOINT: ${{ vars.INTENT_SCCACHE_ENDPOINT }}
+          INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
+          INTENT_SCCACHE_MODE: ${{ vars.INTENT_SCCACHE_MODE }}
+        run: python3 scripts/setup-sccache.py
+      # openssl-sys needs the OpenSSL headers. GitHub-hosted and intent-cache images
+      # ship libssl-dev, so this is normally a no-op; the install path needs
+      # passwordless sudo, which intent-cache slots do not have. Concurrent
+      # jobs can race for the apt locks (monorepo#1515):
       # DPkg::Lock::Timeout makes `install` wait for the dpkg locks, and the
       # retry loop covers `update`, whose lists lock has no wait option
       # (Debian bug #1069167).
@@ -423,32 +433,6 @@ jobs:
             done
             sudo -n apt-get -o DPkg::Lock::Timeout=300 install -y -qq libssl-dev
           fi
-      # Keep the target dir OUTSIDE the runner work dir: checkout's default
-      # clean (git clean -ffdx) wipes ignored files — including target/ — at
-      # the start of every job, and all jobs on this runner share one work
-      # dir. A per-job CARGO_TARGET_DIR on /raid survives both, which is
-      # what makes builds warm across runs (and why swatinem/rust-cache was
-      # dropped: GH cache save/restore would be pure overhead on top of it).
-      # The path is also keyed on $RUNNER_NAME: the 8 tinybox runner slots
-      # share the box, and without the key concurrent jobs would serialize
-      # on cargo's target-dir lock (and the coverage jobs would clobber each
-      # other — see their comments). The dirs live on the 300G /raid volume,
-      # off the (much smaller) root volume that holds $HOME — the root
-      # volume reached box-level ENOSPC when they lived there (monorepo#1253).
-      # Trade-off: up to 8 per-slot copies of each job's target dir;
-      # tinybox-prune.yml prunes /raid/ci-target on a schedule and the
-      # preflight above is the emergency backstop.
-      # Also marks the dir in use (scripts/ci-target-slot.sh mark;
-      # intent-hq/intent#5256): every cleaner — the preflight above on other
-      # slots, tinybox-prune.yml — skips a dir with a fresh `.in-use`
-      # marker, so a quiet compile phase can no longer make a live dir look
-      # idle. Released by the job's last step.
-      - name: Point CARGO_TARGET_DIR outside the work dir
-        if: needs.route.outputs.linux_burst != 'true'
-        run: |
-          target_dir="/raid/ci-target/intentd/$RUNNER_NAME/check"
-          echo "CARGO_TARGET_DIR=$target_dir" >> "$GITHUB_ENV"
-          ./scripts/ci-target-slot.sh mark "$target_dir"
       - name: Resolve pinned Rust channel
         id: toolchain
         shell: bash
@@ -467,8 +451,29 @@ jobs:
         env:
           INTENTD_ASSERT_BOUND_CALLER: "1"
         run: "cargo test -p intent-services --lib transfer_selection_contract::"
-      # Wrapped in scripts/ci-lld-retry.sh (intent-hq/intent#5256): on the
-      # tinybox slots rust-lld has failed to open objects rustc had just
+      # Real claude-agent-acp contract (claude_adapter_contract): the pinned
+      # adapter moves by auto-merging rolling PRs (auto-pin-acp-adapters.yml),
+      # so every PR and merge-queue run installs the exact pin and checks that
+      # it still applies the utility-session settings Intent sends. Offline
+      # beyond the npm install: a stand-in replaces the Claude CLI, no account.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.21.0
+      - name: Verify the Claude adapter pin provisioner offline
+        run: python3 -I -B -S scripts/test-prepare-claude-adapter-pin.py
+      - name: Install the pinned Claude adapter
+        run: |
+          set -euo pipefail
+          adapter=$(python3 -I -B -S scripts/prepare-claude-adapter-pin.py \
+            --cache-dir "$RUNNER_TEMP/claude-adapter-pin")
+          echo "INTENT_CLAUDE_ADAPTER_PIN_FIXTURE=$adapter" >> "$GITHUB_ENV"
+      - name: Real Claude adapter utility-session contract
+        env:
+          INTENTD_ASSERT_BOUND_CALLER: "1"
+          INTENT_REQUIRE_CLAUDE_ADAPTER_CONTRACT: "1"
+        run: "cargo test -p intent-services --lib claude_adapter_contract::"
+      # Wrapped in scripts/ci-lld-retry.sh (intent-hq/intent#5256): on a
+      # shared self-hosted host rust-lld has failed to open objects rustc had just
       # written under this job's own target dir (merge-queue run
       # 35200715354 — red in 6 s, queue entry ejected). The wrapper retries
       # exactly once, only on the `rust-lld: error: cannot open ... No such
@@ -500,19 +505,7 @@ jobs:
           INTENTD_ASSERT_BOUND_CALLER: "1"
         run: cargo test --locked -p intentd --features repository-test-fixtures --test e2e_wss_gitlab_auth --test e2e_wss_invite_join_gitlab --test e2e_repository_resource_read -- --test-threads=2
 
-      # Per-slot HOME for install-action — see the coverage-e2e job's comment
-      # for the full rationale (shared ~/.install-action tmp/bin race across
-      # the 8 tinybox slots; monorepo#1239).
-      - name: Key install-action dirs per runner slot
-        run: |
-          if [[ "${{ needs.route.outputs.linux_burst }}" == "true" ]]; then
-            echo "INSTALL_ACTION_HOME=$HOME" >> "$GITHUB_ENV"
-          else
-            echo "INSTALL_ACTION_HOME=$HOME/ci-install-action/$RUNNER_NAME" >> "$GITHUB_ENV"
-          fi
       - uses: taiki-e/install-action@cargo-shear
-        env:
-          HOME: ${{ env.INSTALL_ACTION_HOME }}
       # Blocking unused-dependency gate: fails when any crate declares a
       # dependency its code never uses. --deny-warnings promotes warnings
       # (e.g. unused optional dependencies) to errors so they cannot land
@@ -522,9 +515,18 @@ jobs:
       # each with a comment explaining why.
       - name: Unused dependencies (cargo-shear)
         run: cargo shear --deny-warnings
+      # CI is the guard against host-dependent tests: a test that relies on
+      # an installed provider CLI passes locally and fails here only while
+      # runners have none. Fail loudly if a runner image starts shipping one.
+      # Locally: scripts/test-without-provider-clis.sh (intentd#2462).
+      - name: No provider CLIs on the runner
+        env:
+          INTENTD_ASSERT_BOUND_CALLER: "1"
+        run: cargo test -p intent-providers --lib -- --ignored --exact provider_cli_guard::no_provider_cli_visible
       # The full suite is not run here: coverage-all executes it (instrumented,
       # via cargo llvm-cov nextest) and is the test gate in the merge queue
-      # (the coverage jobs are merge_group-only — see the trigger comment).
+      # (coverage-e2e / coverage-all are merge_group-only; PRs run only
+      # coverage-changed — see the trigger comment).
       # Running it plainly here as well would double the critical path. The
       # exception is the tests the coverage scripts skip: they are flaky under
       # llvm-cov instrumentation / heavy parallel load, so they run here
@@ -549,23 +551,24 @@ jobs:
       # which let the suite "pass" in ~0.014s without running a single block
       # (intent-hq/monorepo#4054). Provision pwsh 7.x here so the tests
       # actually execute. GitHub-hosted Ubuntu runners (the burst labels)
-      # preinstall pwsh, so this is a no-op there; on tinybox the pinned
-      # tarball is unpacked once into a per-slot dir (keyed on $RUNNER_NAME
-      # like the other per-slot dirs, ~180 MiB, reused across runs — per-slot
-      # so concurrent first-time installs on the 8 shared slots cannot
-      # clobber each other's downloads, the monorepo#1239 failure mode).
+      # preinstall pwsh, so this is a no-op there; elsewhere the pinned
+      # tarball is unpacked into a per-runner dir (keyed on $RUNNER_NAME,
+      # ~180 MiB, reused when the runner's home persists — per-runner so
+      # concurrent first-time installs on a shared home cannot clobber each
+      # other's downloads, the monorepo#1239 failure mode).
       # The cache probe runs the binary, so an executable-but-broken cache
       # self-heals by reinstalling, and the whole slot dir is wiped before a
       # (re)install so a version bump never strands old $version dirs.
       #
       # `pwsh --version` proves only that the binary runs; it never brings up
-      # a runspace. On 2026-09-18 every check run on tinybox went red with 14
+      # a runspace. On 2026-09-18 every check run on a shared self-hosted
+      # Linux host went red with 14
       # opaque driver failures (intent-hq/intent#5367, run 35346259015)
       # because pwsh died with `Stack overflow.` during startup: the
       # multicore-JIT profile it replays on every start
       # (~/.cache/powershell/StartupProfileData-NonInteractive, rewritten
-      # non-atomically at every exit) had been corrupted, and the tinybox
-      # slots share one $HOME, so every slot read the same broken file. Two
+      # non-atomically at every exit) had been corrupted, and the host's
+      # runner slots shared one $HOME, so every slot read the same file. Two
       # guards below: this step and the guard-test step point XDG_CACHE_HOME
       # at a job-private dir under $RUNNER_TEMP (harmless on burst runners),
       # so CI's own pwsh never reads or writes the shared home cache — the
@@ -634,29 +637,25 @@ jobs:
         run: |
           echo "pwsh: $(command -v pwsh) ($(pwsh --version)); XDG_CACHE_HOME=$XDG_CACHE_HOME; ulimit -s: $(ulimit -s)"
           cargo test -p intentd-sitter --test install_ps1_owner
-      # Release the `.in-use` marker the CARGO_TARGET_DIR step wrote
-      # (intent-hq/intent#5256). `always()` so a failed or cancelled job
-      # does not leave a live marker behind; a runner that dies mid-job
-      # leaves one that expires on its own after 4 h (see
-      # scripts/ci-target-slot.sh). Skipped on burst runners, where
-      # CARGO_TARGET_DIR is never set.
-      - name: Release per-slot target dir
-        if: ${{ always() && env.CARGO_TARGET_DIR != '' }}
-        run: ./scripts/ci-target-slot.sh unmark "$CARGO_TARGET_DIR"
-
   # Release metadata classification (intent-hq/monorepo#1374): retain the
   # audited diff-shape output and fail-safe script behavior. Native builds
   # and full coverage are now job-skipped on every PR, independent of this
-  # output; Linux checks and changed coverage still validate release PRs.
+  # output. On a PR, fast_path=true also skips `check` and `coverage-changed`
+  # (intentd#2493), and CI Gate accepts that skip only when this job
+  # succeeded. A non-release PR that forges the output still meets both
+  # jobs in the merge queue; auto-cut's direct merge re-classifies the diff
+  # with its own trusted script, which rejects workflow and script changes.
   # This PR-only job is skipped on merge_group / push, leaving its output
   # empty so the retained native step guards never bypass queue validation
   # or main release builds. CI Gate is the only required context; the old
   # per-matrix required-context constraint (intentd#868) no longer applies.
   release-fast-path:
-    runs-on: depot-ubuntu-24.04
-    # Same-repo PRs only (fork PRs get no CI — see the `pull_request`
-    # trigger comment).
-    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    needs: [route]
+    runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
+    # Same-repo release-plz PRs only (fork PRs get no CI — see the
+    # `pull_request` trigger comment). Ordinary PRs skip it at once, so the
+    # `check` / `coverage-changed` dependency costs them no queue time.
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'release-plz-')
     timeout-minutes: 5
     outputs:
       fast_path: ${{ steps.decide.outputs.fast_path }}
@@ -682,17 +681,18 @@ jobs:
           echo "${line:-fast_path=false}" >> "$GITHUB_OUTPUT"
 
   build:
-    # Native Rust validation runs once on the queue's merged tree; main
-    # pushes retain release builds. The explicit event allowlist prevents
-    # matrix expansion for all PRs, including forks and release-shaped PRs.
+    # Native macOS Rust validation runs once on the queue's merged tree; main
+    # pushes retain the release build. Windows lint lives in the queue-only
+    # `windows-lint` job and the Windows runtime proofs in the push-only
+    # `windows` job below. The explicit event allowlist prevents matrix
+    # expansion for all PRs, including forks and release-shaped PRs.
     # `!cancelled()` permits skipped release-fast-path and failed route
-    # dependencies: release metadata is PR-only, and each native OS has a hosted
-    # fallback when routing fails. CI Gate still rejects skipped Linux
+    # dependencies: release metadata is PR-only, and the native runner has a
+    # hosted fallback when routing fails. CI Gate still rejects skipped Linux
     # validation on merge_group after a route failure.
-    # `route` places the native entries (Windows: intent-hq/intent#5518; see the
-    # matrix) and runs on every event this job runs on. route runs on
-    # depot-ubuntu-24.04, so this dependency can never queue behind the
-    # self-hosted runners it decides about.
+    # `route` places the native entry and runs on every event this job runs
+    # on. route runs on ubuntu-24.04, so this dependency can never queue
+    # behind the self-hosted runners it decides about.
     needs: [release-fast-path, route]
     if: ${{ !cancelled() && (github.event_name == 'merge_group' || github.event_name == 'push') }}
     strategy:
@@ -702,27 +702,13 @@ jobs:
         include:
           # temporarily disabled — re-enable when needed
           # - target: x86_64-unknown-linux-gnu
-          #   os: depot-ubuntu-24.04
+          #   os: ubuntu-24.04
           # Prefer an idle self-hosted Apple Silicon runner (m1mac), else
           # use the latest hosted ARM64 image. Empty route output also falls back to
-          # hosted. Retain the historical macos-14 check name for continuity.
+          # hosted. Keep the check name independent of the runner.
           - target: aarch64-apple-darwin
-            os: ${{ fromJSON(needs.route.outputs.macos_labels || '["depot-macos-latest"]') }}
-            name: build (aarch64-apple-darwin, macos-14)
-          # Routed by the route job (intent-hq/intent#5518): the self-hosted
-          # 5090pc runner when the probe confirms it online, the org-hosted
-          # depot-windows-2022-16 runner otherwise (fail-open to burst, like the
-          # Linux jobs — an offline 5090pc used to leave this required check
-          # QUEUED forever and block every merge: intent-hq/intent#1382,
-          # #1583). The self-hosted labels are selected ONLY when route
-          # positively emitted them: an empty output — route failed, timed
-          # out, or was skipped (`!cancelled()` still runs this job) — falls
-          # back to the burst label, never to a runner nothing confirmed
-          # online. (The fallback also keeps `fromJSON('')` from failing the
-          # matrix expansion.) Retain the name below for check history.
-          - target: x86_64-pc-windows-msvc
-            os: ${{ fromJSON(needs.route.outputs.windows_labels || '["depot-windows-2022-16"]') }}
-            name: build (x86_64-pc-windows-msvc, self-hosted, Windows, X64)
+            os: ${{ fromJSON(needs.route.outputs.macos_labels || '["warp-macos-26-arm64-12x"]') }}
+            name: build (aarch64-apple-darwin)
     # Explicit per-entry names keep check history stable across runner changes.
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
@@ -736,32 +722,25 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
     steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
       - uses: actions/checkout@v7
-      # On the self-hosted Windows runner C:\WINDOWS\system32\bash.EXE (the
-      # WSL stub) shadows Git Bash in PATH, and WSL bash can't execute the
-      # runner's Windows-path step scripts. Prepend Git's bin dir so every
-      # later `shell: bash` step resolves Git Bash instead.
-      - name: Put Git Bash first on PATH (Windows)
-        if: needs.release-fast-path.outputs.fast_path != 'true' && runner.os == 'Windows'
-        shell: cmd
-        run: echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
-      - name: Configure Depot managed compiler cache
+      - name: Configure the self-hosted compiler cache
         if: needs.release-fast-path.outputs.fast_path != 'true'
         shell: bash
         env:
-          DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
-        run: python3 scripts/setup-depot-sccache.py
+          INTENT_SCCACHE_ENDPOINT: ${{ vars.INTENT_SCCACHE_ENDPOINT }}
+          INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
+          INTENT_SCCACHE_MODE: ${{ vars.INTENT_SCCACHE_MODE }}
+        run: python3 scripts/setup-sccache.py
       # Per-job persistent target dir outside the work dir, self-hosted
       # runners only (see the `check` job's comment for the rationale). The
-      # self-hosted runners are single-slot, so no $RUNNER_NAME key. On the
-      # Windows runner this runs under Git Bash, where $HOME is an MSYS-style
-      # path cargo (spawned from the default pwsh shell) can't use —
-      # $USERPROFILE carries the native C:\Users\... form, so prefer it when
-      # set.
+      # self-hosted macOS runner is single-slot, so no $RUNNER_NAME key.
       - name: Point CARGO_TARGET_DIR outside the work dir (self-hosted)
         if: needs.release-fast-path.outputs.fast_path != 'true' && contains(matrix.os, 'self-hosted')
         shell: bash
-        run: echo "CARGO_TARGET_DIR=${USERPROFILE:-$HOME}/ci-target/intentd/build-${{ matrix.target }}" >> "$GITHUB_ENV"
+        run: echo "CARGO_TARGET_DIR=$HOME/ci-target/intentd/build-${{ matrix.target }}" >> "$GITHUB_ENV"
       # Run before toolchain/build steps. Only known CI profiles are eligible;
       # Cargo locks remain held and their inodes survive every deletion.
       - name: Ensure macOS CI disk headroom
@@ -779,8 +758,7 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           targets: ${{ matrix.target }}
-          # clippy is needed by the target-gated lint step below, which runs
-          # on both the macOS and the Windows matrix entries.
+          # clippy is needed by the target-gated lint step below.
           components: clippy
       # Ephemeral GitHub-hosted runners have no persistent target dir, so
       # use the GH cache there instead (mirrors the `check` job's
@@ -794,20 +772,16 @@ jobs:
       - name: Check (native production configuration)
         if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'merge_group'
         run: cargo check --workspace --target ${{ matrix.target }}
-      # Clippy over target-gated code (intent-hq/monorepo#3285 for macOS,
-      # intent-hq/intentd#1813 for Windows): the `check` job lints on Linux,
-      # where `#[cfg(target_os = "macos")]` / `#[cfg(windows)]` /
-      # `#[cfg(not(unix))]` code is never compiled, so warnings in
-      # target-only code (including outer `#[allow]`s that only expand there
-      # and trip `clippy::allow_attributes`) land silently and break
-      # `make check` on every macOS or Windows dev box. Linting here (same
-      # invocation as the check job) closes the gap. It runs on
-      # merge-queue runs, not on push: the queue tests the actual merged
-      # tree, and a PR-only step let intent-hq/intentd#1825 (green on its
-      # own PR run) land a Windows-only E0433 via the queue — main's push
-      # run skipped the step, so ~8 open PRs failed the required gate until
-      # intent-hq/intentd#1835 fixed it. Main's push run builds a tree the
-      # queue already linted, so it stays skipped there. It runs on the
+      # Clippy over target-gated code (intent-hq/monorepo#3285): the `check`
+      # job lints on Linux, where `#[cfg(target_os = "macos")]` code is never
+      # compiled, so warnings in target-only code (including outer
+      # `#[allow]`s that only expand there and trip
+      # `clippy::allow_attributes`) land silently and break `make check` on
+      # every macOS dev box. Linting here (same invocation as the check job)
+      # closes the gap. It runs on merge-queue runs, not on push: the queue
+      # tests the actual merged tree, and main's push run builds a tree the
+      # queue already linted. (The Windows equivalent is the queue-only
+      # `windows-lint` job.) It runs on the
       # native runners rather than as Linux cross-target runs because
       # `cargo clippy --target <triple>` still executes the native build
       # scripts (libz-sys and friends try-compile C for the target even when
@@ -817,7 +791,7 @@ jobs:
       # is pull_request-only, so its output is empty on merge_group and the
       # `!= 'true'` guard lets the step run there.
       - name: Clippy (target-gated code)
-        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'merge_group' && (runner.os == 'macOS' || runner.os == 'Windows')
+        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'merge_group'
         run: cargo clippy --workspace --all-targets --target ${{ matrix.target }} -- -D warnings
       # Exercise the deterministic deadline oracle and real TLS controls on
       # macOS; listen backlog saturation cannot guarantee a pending connect.
@@ -911,21 +885,164 @@ jobs:
                   assert "running 1 test" in output.splitlines(), output
                   assert "test result: ok. 1 passed; 0 failed; 0 ignored;" in output, output
           PYTHON
+      - name: Build (release)
+        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'push'
+        run: cargo build --workspace --release --target ${{ matrix.target }}
+      - name: Warm merge queue check cache
+        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'push'
+        run: cargo check --workspace --target ${{ matrix.target }}
+
+  # Windows lint, merge queue only: the native production check and
+  # target-gated Clippy the Linux `check` job cannot see (`#[cfg(windows)]` /
+  # `#[cfg(not(unix))]` code, intent-hq/intentd#1813, #1825 → #1835). It runs
+  # in the queue so a Windows-only compile or lint error is caught on the
+  # merged tree before it lands (a unix-only test helper from #2574 turned
+  # main's push gate red when this ran post-merge). Pull requests still never
+  # wait on a Windows runner, and the push run does not repeat it: main's
+  # tree is one the queue just linted. ~9 minutes on WarpBuild Windows 16x,
+  # in parallel with the ~25-minute queue run.
+  # Routed by the route job (intent-hq/intent#5518): the self-hosted 5090pc
+  # runner when the probe confirms it idle, the WarpBuild
+  # gh-windows-16x burst runner otherwise. The self-hosted labels are
+  # selected ONLY when route positively emitted them: an empty output —
+  # route failed, timed out, or was skipped (`!cancelled()` still runs this
+  # job) — falls back to the hosted label, never to a runner nothing
+  # confirmed online (intent-hq/intent#1382, #1583). The single-entry matrix
+  # keeps `matrix.target` / `matrix.os` shared with the `build` job's steps.
+  windows-lint:
+    needs: [route]
+    if: ${{ !cancelled() && github.event_name == 'merge_group' }}
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            os: ${{ fromJSON(needs.route.outputs.windows_labels || '["warp-windows-2022-x64-16x"]') }}
+    name: Windows lint (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - uses: actions/checkout@v7
+      # See the `windows` job: Git Bash must shadow the WSL bash stub.
+      - name: Put Git Bash first on PATH (Windows)
+        shell: cmd
+        run: echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - name: Configure the self-hosted compiler cache
+        shell: bash
+        env:
+          INTENT_SCCACHE_ENDPOINT: ${{ vars.INTENT_SCCACHE_ENDPOINT }}
+          INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
+          INTENT_SCCACHE_MODE: ${{ vars.INTENT_SCCACHE_MODE }}
+        run: python3 scripts/setup-sccache.py
+      # Same persistent dir as the `windows` job: the self-hosted runner is
+      # single-slot, so sharing keeps it warm for both.
+      - name: Point CARGO_TARGET_DIR outside the work dir (self-hosted)
+        if: contains(matrix.os, 'self-hosted')
+        shell: bash
+        run: echo "CARGO_TARGET_DIR=${USERPROFILE:-$HOME}/ci-target/intentd/build-${{ matrix.target }}" >> "$GITHUB_ENV"
+      - name: Resolve pinned Rust channel
+        id: toolchain
+        shell: bash
+        run: |
+          channel=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n1)
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-11 (PR 185, --force-non-host)
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+          targets: ${{ matrix.target }}
+          components: clippy
+      # Non-test production configuration; see the `build` job's comment on
+      # why --all-targets Clippy cannot replace it.
+      - name: Check (native production configuration)
+        run: cargo check --workspace --target ${{ matrix.target }}
+      - name: Clippy (target-gated code)
+        run: cargo clippy --workspace --all-targets --target ${{ matrix.target }} -- -D warnings
+
+  # Windows runtime validation, post-merge only: the Windows runtime proofs,
+  # the daemon lifecycle proof and the release build run on push to main —
+  # never on pull_request or merge_group, so PRs and the queue never wait on
+  # them (the queue runs only `windows-lint` above). A Windows-only runtime
+  # failure therefore lands on main; the push CI Gate goes red and
+  # auto-cut-alpha.yml refuses to cut an alpha until a fix (or a re-run)
+  # turns it green. Routed like `windows-lint`.
+  windows:
+    needs: [route]
+    if: ${{ !cancelled() && github.event_name == 'push' }}
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            os: ${{ fromJSON(needs.route.outputs.windows_labels || '["warp-windows-2022-x64-16x"]') }}
+    name: Windows post-merge (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    # Runtime proofs + lifecycle proof + release build share one warm target
+    # dir. Kept at the pre-split budget: on a cold hosted runner these steps
+    # compile the test and release profiles from scratch, which is most of
+    # the time the job used to spend.
+    timeout-minutes: 120
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - uses: actions/checkout@v7
+      # On the self-hosted Windows runner C:\WINDOWS\system32\bash.EXE (the
+      # WSL stub) shadows Git Bash in PATH, and WSL bash can't execute the
+      # runner's Windows-path step scripts. Prepend Git's bin dir so every
+      # later `shell: bash` step resolves Git Bash instead.
+      - name: Put Git Bash first on PATH (Windows)
+        shell: cmd
+        run: echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - name: Configure the self-hosted compiler cache
+        shell: bash
+        env:
+          INTENT_SCCACHE_ENDPOINT: ${{ vars.INTENT_SCCACHE_ENDPOINT }}
+          INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
+          INTENT_SCCACHE_MODE: ${{ vars.INTENT_SCCACHE_MODE }}
+        run: python3 scripts/setup-sccache.py
+      # Persistent target dir outside the work dir on the single-slot
+      # self-hosted runner (see the `check` job's comment). Under Git Bash
+      # $HOME is an MSYS-style path cargo (spawned from the default pwsh
+      # shell) can't use — $USERPROFILE carries the native C:\Users\... form.
+      # windows-ci-cleanup.py prunes this directory.
+      - name: Point CARGO_TARGET_DIR outside the work dir (self-hosted)
+        if: contains(matrix.os, 'self-hosted')
+        shell: bash
+        run: echo "CARGO_TARGET_DIR=${USERPROFILE:-$HOME}/ci-target/intentd/build-${{ matrix.target }}" >> "$GITHUB_ENV"
+      - name: Resolve pinned Rust channel
+        id: toolchain
+        shell: bash
+        run: |
+          channel=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n1)
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-11 (PR 185, --force-non-host)
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+          targets: ${{ matrix.target }}
       - uses: actions/setup-node@v7
-        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'merge_group' && runner.os == 'Windows'
         with:
           node-version: 24
       - name: Headless workspace setup (Windows runtime)
-        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'merge_group' && runner.os == 'Windows'
         timeout-minutes: 20
         shell: bash
         env:
           INTENTD_ASSERT_BOUND_CALLER: "1"
           INTENTD_SETUP_EVIDENCE_DIR: ${{ github.workspace }}/setup-headless-evidence
           INTENTD_SETUP_TOOLCHAIN: ${{ steps.toolchain.outputs.channel }}
-        run: rustup run "$INTENTD_SETUP_TOOLCHAIN" cargo test -p intentd --test e2e_wss_setup_headless --target ${{ matrix.target }} -- --nocapture
+        run: |
+          rustup run "$INTENTD_SETUP_TOOLCHAIN" cargo test --locked -p intent-pty --lib --target ${{ matrix.target }} conpty_startup::tests -- --nocapture
+          rustup run "$INTENTD_SETUP_TOOLCHAIN" cargo test -p intentd --test e2e_wss_setup_headless --target ${{ matrix.target }} -- --nocapture
       - uses: actions/upload-artifact@v7
-        if: always() && needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'merge_group' && runner.os == 'Windows'
+        if: always()
         with:
           name: setup-headless-windows
           path: setup-headless-evidence
@@ -933,7 +1050,6 @@ jobs:
       # Execute the Windows Job Object fixtures on the native runner. They use
       # this test executable as the child, so no Node/npm/account setup is needed.
       - name: Codex diagnostic process ownership (Windows runtime)
-        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'merge_group' && runner.os == 'Windows'
         shell: bash
         env:
           INTENTD_ASSERT_BOUND_CALLER: "1"
@@ -948,12 +1064,13 @@ jobs:
             exit 1
           fi
           rustup run "$INTENTD_DIAGNOSTIC_TOOLCHAIN" cargo test -p intent-services --lib --target ${{ matrix.target }} "$filter" -- --nocapture
+      # The Windows leg of `daemon-lifecycle` (which keeps Linux and macOS in
+      # the queue). Its Clippy is covered by the queue's `windows-lint`.
+      - name: Native lifecycle runtime proof (Windows)
+        shell: bash
+        run: python3 -I -B scripts/test-daemon-lifecycle.py
       - name: Build (release)
-        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'push'
         run: cargo build --workspace --release --target ${{ matrix.target }}
-      - name: Warm merge queue check cache
-        if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'push'
-        run: cargo check --workspace --target ${{ matrix.target }}
 
   # Services test code generation must not share the native check/Clippy
   # budget: a cold macOS queue run reached discovery compilation with only
@@ -969,7 +1086,7 @@ jobs:
       matrix:
         include:
           - target: aarch64-apple-darwin
-            os: ${{ fromJSON(needs.route.outputs.macos_labels || '["depot-macos-latest"]') }}
+            os: ${{ fromJSON(needs.route.outputs.macos_labels || '["warp-macos-26-arm64-12x"]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     env:
@@ -977,12 +1094,17 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
     steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
       - uses: actions/checkout@v7
-      - name: Configure Depot managed compiler cache
+      - name: Configure the self-hosted compiler cache
         shell: bash
         env:
-          DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
-        run: python3 scripts/setup-depot-sccache.py
+          INTENT_SCCACHE_ENDPOINT: ${{ vars.INTENT_SCCACHE_ENDPOINT }}
+          INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
+          INTENT_SCCACHE_MODE: ${{ vars.INTENT_SCCACHE_MODE }}
+        run: python3 scripts/setup-sccache.py
       - name: Point CARGO_TARGET_DIR outside the work dir (self-hosted)
         if: contains(matrix.os, 'self-hosted')
         shell: bash
@@ -1093,68 +1215,42 @@ jobs:
     # the repo's own ruleset, so no same-repo fork guard applies.
     needs: route
     if: ${{ !cancelled() && github.event_name == 'merge_group' && needs.route.result == 'success' }}
-    runs-on: ${{ fromJSON(needs.route.outputs.linux_labels) }}
-    timeout-minutes: 30
+    runs-on: ${{ fromJSON(needs.route.outputs.slots || '{}')['coverage-e2e'] || fromJSON('["warp-ubuntu-2404-x64-16x"]') }}
+    # ~11 min on gh-linux-16x; an 8-CPU heavy slot (xl busy) takes about twice that.
+    timeout-minutes: 45
     env:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
-      # 16 on the 64-core tinybox: 32 was tuned for exclusive use of the box
-      # (at 64 threads the latency-bound stress tests — e.g.
-      # e2e_wss_pool_contention_stress's <2s read assert — blew their
-      # wall-clock bounds under llvm-cov load on both nextest tries), but up
-      # to 8 co-tenant jobs now share the box, so halve to 16 to keep those
-      # tests inside their bounds under co-tenancy. This also matches the
-      # 16-core depot-ubuntu-24.04-16 burst runner, so the value no longer varies by
-      # route.
-      NEXTEST_TEST_THREADS: 16
+      # NEXTEST_TEST_THREADS is set by the first step: min(nproc, 16). 16 is
+      # the 16-core gh-linux-16x burst runner; an intent-cache heavy slot is
+      # cpuset-pinned to 8 CPUs, where a fixed 16 oversubscribed 2x and timed
+      # out latency-bound tests. Higher counts (32 and 64 on a 64-core host)
+      # made the latency-bound stress tests — e.g.
+      # e2e_wss_pool_contention_stress's <2s read assert — blow their
+      # wall-clock bounds under llvm-cov load on both nextest tries, hence
+      # the cap.
     steps:
+      # First step: size nextest's pool from this runner before any test step.
+      - name: Size nextest threads from runner CPUs
+        shell: bash
+        run: |
+          cpus=$(nproc)
+          threads=$(( cpus < 16 ? cpus : 16 ))
+          echo "NEXTEST_TEST_THREADS=$threads" >> "$GITHUB_ENV"
+          echo "NEXTEST_TEST_THREADS=$threads (nproc=$cpus, cap 16)"
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
       - uses: actions/checkout@v7
-      - name: Configure Depot managed compiler cache
+      - name: Configure the self-hosted compiler cache
         shell: bash
         env:
-          DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
-        run: python3 scripts/setup-depot-sccache.py
-      # Fail-fast disk preflight — see the `check` job's comment for the full
-      # rationale (monorepo#1253). 30 GiB here: the instrumented coverage
-      # target dirs are multi-GiB and the run also writes profraw files.
-      - name: Disk-space preflight (tinybox only)
-        if: needs.route.outputs.linux_burst != 'true'
-        env:
-          NEED_GIB: 30
-          JOB_TARGET_SUBDIR: coverage-e2e
-        run: |
-          set -euo pipefail
-          own_dir="/raid/ci-target/intentd/$RUNNER_NAME/$JOB_TARGET_SUBDIR"
-          free_gib() { df -Pk /raid | awk 'NR==2 { printf "%d", $4 / 1048576 }'; }
-          echo "Free space on /raid: $(free_gib) GiB (need $NEED_GIB GiB)"
-          [ "$(free_gib)" -ge "$NEED_GIB" ] && exit 0
-          # Same two tiers as the `check` job's preflight (see its comment):
-          # selection in scripts/ci-target-slot.sh purge-candidates, a live
-          # is-purgeable recheck before each rm, this loop only deletes
-          # until the need is met.
-          evict_until_free() {
-            local verb="$1" quiet_min="$2" dir
-            shift 2
-            while IFS= read -r dir; do
-              ./scripts/ci-target-slot.sh is-purgeable "$dir" --quiet-min "$quiet_min" || continue
-              echo "$verb: $dir"
-              rm -rf -- "$dir" || true
-              if [ "$(free_gib)" -ge "$NEED_GIB" ]; then break; fi
-            done < <(./scripts/ci-target-slot.sh purge-candidates /raid/ci-target --quiet-min "$quiet_min" "$@")
-          }
-          echo "Below threshold — pruning stale ci-target dirs (monorepo#1253)"
-          evict_until_free pruning 2880 --skip-dir "$own_dir"
-          if [ "$(free_gib)" -lt "$NEED_GIB" ]; then
-            echo "Still below threshold — LRU-evicting idle ci-target dirs (monorepo#1253)"
-            evict_until_free evicting 15 --skip-slot "$RUNNER_NAME"
-          fi
-          free="$(free_gib)"
-          if [ "$free" -lt "$NEED_GIB" ]; then
-            echo "::error::tinybox /raid has only ${free} GiB free (this job needs ${NEED_GIB} GiB) even after pruning stale dirs and LRU-evicting idle ones — manual cleanup needed, see intent-hq/monorepo#1253."
-            exit 1
-          fi
-      # See the `check` job's comment: tinybox lacks the OpenSSL headers.
+          INTENT_SCCACHE_ENDPOINT: ${{ vars.INTENT_SCCACHE_ENDPOINT }}
+          INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
+          INTENT_SCCACHE_MODE: ${{ vars.INTENT_SCCACHE_MODE }}
+        run: python3 scripts/setup-sccache.py
+      # See the `check` job's comment on the OpenSSL headers.
       - name: Install libssl-dev if missing
         run: |
           if ! pkg-config --exists openssl; then
@@ -1165,21 +1261,6 @@ jobs:
             done
             sudo -n apt-get -o DPkg::Lock::Timeout=300 install -y -qq libssl-dev
           fi
-      # Per-job persistent target dir outside the work dir (see the `check`
-      # job's comment for the rationale). cargo llvm-cov honors it, and the
-      # scripts' `cargo llvm-cov clean --workspace` only cleans workspace
-      # crates + profraw, so dependency artifacts stay warm across runs.
-      # The $RUNNER_NAME key is a correctness requirement here, not just
-      # lock avoidance: that same clean means two coverage jobs on different
-      # slots sharing a dir would delete each other's artifacts mid-run.
-      # Also marks the dir in use — see the `check` job's CARGO_TARGET_DIR
-      # step (intent-hq/intent#5256); released by the job's last step.
-      - name: Point CARGO_TARGET_DIR outside the work dir
-        if: needs.route.outputs.linux_burst != 'true'
-        run: |
-          target_dir="/raid/ci-target/intentd/$RUNNER_NAME/coverage-e2e"
-          echo "CARGO_TARGET_DIR=$target_dir" >> "$GITHUB_ENV"
-          ./scripts/ci-target-slot.sh mark "$target_dir"
       - name: Resolve pinned Rust channel
         id: toolchain
         shell: bash
@@ -1193,32 +1274,8 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 22
-      # install-action derives every path it touches from $HOME: the bin dir
-      # (~/.install-action/bin here — tinybox's cargo lives at /usr/local/bin,
-      # outside $CARGO_HOME/bin, so the action always takes its fallback) and,
-      # crucially, its download scratch dir (~/.install-action/tmp), which is
-      # shared even when the bin dir isn't — so keying CARGO_HOME per slot
-      # would not help. The 8 tinybox slots share one $HOME, and concurrent
-      # installs clobber each other's downloads (curl error 23; monorepo#1239).
-      # Point the action at a per-slot HOME (keyed on $RUNNER_NAME like the
-      # ci-target dirs) so every path it derives is slot-private; only the
-      # install steps see the override, so rustup/CARGO_TARGET_DIR/registry
-      # caches under the real $HOME are untouched, and the action still adds
-      # its (now per-slot) bin dir to GITHUB_PATH for the later steps. Burst
-      # runners are ephemeral single-job machines, so they keep the real HOME.
-      - name: Key install-action dirs per runner slot
-        run: |
-          if [[ "${{ needs.route.outputs.linux_burst }}" == "true" ]]; then
-            echo "INSTALL_ACTION_HOME=$HOME" >> "$GITHUB_ENV"
-          else
-            echo "INSTALL_ACTION_HOME=$HOME/ci-install-action/$RUNNER_NAME" >> "$GITHUB_ENV"
-          fi
       - uses: taiki-e/install-action@cargo-llvm-cov
-        env:
-          HOME: ${{ env.INSTALL_ACTION_HOME }}
       - uses: taiki-e/install-action@nextest
-        env:
-          HOME: ${{ env.INSTALL_ACTION_HOME }}
       - name: Prepare native startup evidence
         id: native-evidence
         shell: bash
@@ -1290,12 +1347,6 @@ jobs:
           path: lcov.info
           if-no-files-found: warn
           retention-days: 3
-      # Release the `.in-use` marker — see the `check` job's last step
-      # (intent-hq/intent#5256).
-      - name: Release per-slot target dir
-        if: ${{ always() && env.CARGO_TARGET_DIR != '' }}
-        run: ./scripts/ci-target-slot.sh unmark "$CARGO_TARGET_DIR"
-
   coverage-all:
     # merge_group-ONLY — same gating and rationale as coverage-e2e (see its
     # comment and the `merge_group` trigger comment): job-level skipped on
@@ -1305,72 +1356,51 @@ jobs:
     # empty output on merge_group).
     needs: route
     if: ${{ !cancelled() && github.event_name == 'merge_group' && needs.route.result == 'success' }}
-    runs-on: ${{ fromJSON(needs.route.outputs.linux_labels) }}
+    runs-on: ${{ fromJSON(needs.route.outputs.slots || '{}')['coverage-all'] || fromJSON('["warp-ubuntu-2404-x64-16x"]') }}
     # Include LLVM report generation after the full suite on shared runners.
-    timeout-minutes: 45
+    # ~22 min on gh-linux-16x or the xl slot; an 8-CPU heavy slot (xl busy)
+    # takes about twice that. Stay under the merge queue's 60-minute check
+    # response timeout: CI Gate requires this job, so a later finish ejects
+    # the entry anyway.
+    timeout-minutes: 55
     env:
+      # WarpBuild runners preset NODE_OPTIONS (GitHub-hosted runners do not), and
+      # the ACP callback fixture refuses any NODE_OPTIONS injection; clear it so
+      # the job behaves the same on every runner it bursts to.
+      NODE_OPTIONS: ''
       # Merge each binary's executions into eight locked raw profiles instead
       # of retaining a multi-megabyte profile for every nextest process.
       LLVM_PROFILE_FILE_NAME: "intent-%8m.profraw"
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
-      # 16 on the 64-core tinybox: 32 was tuned for exclusive use of the box
-      # (at 64 threads the full workspace suite thrashed SQLite/WAL and
-      # wall-clock-timeout tests hard enough that even the nextest retry
-      # failed: concurrent_writes_no_sqlite_busy hit "database is locked" on
-      # both tries, bridge/auto-commit timing tests timed out), but up to 8
-      # co-tenant jobs now share the box, so halve to 16 to avoid the lock
-      # storms under co-tenancy. This also matches the 16-core depot-ubuntu-24.04-16
-      # burst runner, so the value no longer varies by route.
-      NEXTEST_TEST_THREADS: 16
+      # NEXTEST_TEST_THREADS is set by the first step: min(nproc, 16), as in
+      # coverage-e2e. The cap stays at 16 because higher counts (32 and 64
+      # on a 64-core host) thrashed SQLite/WAL and wall-clock-timeout tests
+      # hard enough that even the nextest retry failed:
+      # concurrent_writes_no_sqlite_busy hit "database is locked" on both
+      # tries, bridge/auto-commit timing tests timed out.
     steps:
+      # First step: size nextest's pool from this runner before any test step.
+      - name: Size nextest threads from runner CPUs
+        shell: bash
+        run: |
+          cpus=$(nproc)
+          threads=$(( cpus < 16 ? cpus : 16 ))
+          echo "NEXTEST_TEST_THREADS=$threads" >> "$GITHUB_ENV"
+          echo "NEXTEST_TEST_THREADS=$threads (nproc=$cpus, cap 16)"
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
       - uses: actions/checkout@v7
-      - name: Configure Depot managed compiler cache
+      - name: Configure the self-hosted compiler cache
         shell: bash
         env:
-          DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
-        run: python3 scripts/setup-depot-sccache.py
-      # Fail-fast disk preflight — see the `check` job's comment for the full
-      # rationale (monorepo#1253). 30 GiB here: the instrumented coverage
-      # target dirs are multi-GiB and the run also writes profraw files.
-      - name: Disk-space preflight (tinybox only)
-        if: needs.route.outputs.linux_burst != 'true'
-        env:
-          NEED_GIB: 30
-          JOB_TARGET_SUBDIR: coverage-all
-        run: |
-          set -euo pipefail
-          own_dir="/raid/ci-target/intentd/$RUNNER_NAME/$JOB_TARGET_SUBDIR"
-          free_gib() { df -Pk /raid | awk 'NR==2 { printf "%d", $4 / 1048576 }'; }
-          echo "Free space on /raid: $(free_gib) GiB (need $NEED_GIB GiB)"
-          [ "$(free_gib)" -ge "$NEED_GIB" ] && exit 0
-          # Same two tiers as the `check` job's preflight (see its comment):
-          # selection in scripts/ci-target-slot.sh purge-candidates, a live
-          # is-purgeable recheck before each rm, this loop only deletes
-          # until the need is met.
-          evict_until_free() {
-            local verb="$1" quiet_min="$2" dir
-            shift 2
-            while IFS= read -r dir; do
-              ./scripts/ci-target-slot.sh is-purgeable "$dir" --quiet-min "$quiet_min" || continue
-              echo "$verb: $dir"
-              rm -rf -- "$dir" || true
-              if [ "$(free_gib)" -ge "$NEED_GIB" ]; then break; fi
-            done < <(./scripts/ci-target-slot.sh purge-candidates /raid/ci-target --quiet-min "$quiet_min" "$@")
-          }
-          echo "Below threshold — pruning stale ci-target dirs (monorepo#1253)"
-          evict_until_free pruning 2880 --skip-dir "$own_dir"
-          if [ "$(free_gib)" -lt "$NEED_GIB" ]; then
-            echo "Still below threshold — LRU-evicting idle ci-target dirs (monorepo#1253)"
-            evict_until_free evicting 15 --skip-slot "$RUNNER_NAME"
-          fi
-          free="$(free_gib)"
-          if [ "$free" -lt "$NEED_GIB" ]; then
-            echo "::error::tinybox /raid has only ${free} GiB free (this job needs ${NEED_GIB} GiB) even after pruning stale dirs and LRU-evicting idle ones — manual cleanup needed, see intent-hq/monorepo#1253."
-            exit 1
-          fi
-      # See the `check` job's comment: tinybox lacks the OpenSSL headers.
+          INTENT_SCCACHE_ENDPOINT: ${{ vars.INTENT_SCCACHE_ENDPOINT }}
+          INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
+          INTENT_SCCACHE_MODE: ${{ vars.INTENT_SCCACHE_MODE }}
+        run: python3 scripts/setup-sccache.py
+      # See the `check` job's comment on the OpenSSL headers.
       - name: Install libssl-dev if missing
         run: |
           if ! pkg-config --exists openssl; then
@@ -1383,28 +1413,17 @@ jobs:
           fi
       # Raise the per-user inotify instance ceiling. The instrumented full
       # suite starts many real notify watchers in parallel (file, .git
-      # metadata, skills, specialists) and up to 8 co-tenant runner slots
-      # share the same user on the tinybox, so the kernel default of 128
+      # metadata, skills, specialists), so the kernel default of 128
       # instances can exhaust mid-run — watcher starts in unrelated tests
       # then fail with EMFILE "Too many open files" (intentd PR #882).
-      # Relies on the runner user's passwordless sudo, like the step above.
+      # Hosted runners need passwordless sudo for it. The intent-cache slots
+      # have no sudo, and their hosts already set 32768
+      # (infra/runners/sysctl.conf), so the raise is skipped there.
       - name: Raise inotify instance limit
-        run: sudo -n sysctl -q -w fs.inotify.max_user_instances=4096
-      # Per-job persistent target dir outside the work dir (see the `check`
-      # job's comment for the rationale). cargo llvm-cov honors it, and the
-      # scripts' `cargo llvm-cov clean --workspace` only cleans workspace
-      # crates + profraw, so dependency artifacts stay warm across runs.
-      # The $RUNNER_NAME key is a correctness requirement here, not just
-      # lock avoidance: that same clean means two coverage jobs on different
-      # slots sharing a dir would delete each other's artifacts mid-run.
-      # Also marks the dir in use — see the `check` job's CARGO_TARGET_DIR
-      # step (intent-hq/intent#5256); released by the job's last step.
-      - name: Point CARGO_TARGET_DIR outside the work dir
-        if: needs.route.outputs.linux_burst != 'true'
         run: |
-          target_dir="/raid/ci-target/intentd/$RUNNER_NAME/coverage-all"
-          echo "CARGO_TARGET_DIR=$target_dir" >> "$GITHUB_ENV"
-          ./scripts/ci-target-slot.sh mark "$target_dir"
+          if ! [ "$(cat /proc/sys/fs/inotify/max_user_instances)" -ge 4096 ]; then
+            sudo -n sysctl -q -w fs.inotify.max_user_instances=4096
+          fi
       - name: Resolve pinned Rust channel
         id: toolchain
         shell: bash
@@ -1427,28 +1446,14 @@ jobs:
           fixture=$(python3 -I -B -S scripts/prepare-acp-callback-fixture.py \
             --cache-dir "$RUNNER_TEMP/acp-callback-fixture" --build-from-source)
           echo "INTENT_ACP_CALLBACK_ADAPTER_FIXTURE=$fixture" >> "$GITHUB_ENV"
-      # Per-slot HOME for install-action — see the coverage-e2e job's comment
-      # for the full rationale (shared ~/.install-action tmp/bin race across
-      # the 8 tinybox slots; monorepo#1239).
-      - name: Key install-action dirs per runner slot
-        run: |
-          if [[ "${{ needs.route.outputs.linux_burst }}" == "true" ]]; then
-            echo "INSTALL_ACTION_HOME=$HOME" >> "$GITHUB_ENV"
-          else
-            echo "INSTALL_ACTION_HOME=$HOME/ci-install-action/$RUNNER_NAME" >> "$GITHUB_ENV"
-          fi
       - uses: taiki-e/install-action@cargo-llvm-cov
-        env:
-          HOME: ${{ env.INSTALL_ACTION_HOME }}
       - uses: taiki-e/install-action@nextest
-        env:
-          HOME: ${{ env.INSTALL_ACTION_HOME }}
       - name: Acquire the shared transfer selection contract
         uses: ./.github/actions/transfer-selection-fixtures
       - name: Verify bounded coverage profile pooling
         run: python3 -I -B scripts/test-coverage-profile-pool.py
       - name: Run combined coverage
-        timeout-minutes: 43
+        timeout-minutes: 53
         # Armed bound-caller seam — see coverage-e2e's run step.
         env:
           INTENTD_ASSERT_BOUND_CALLER: "1"
@@ -1480,45 +1485,32 @@ jobs:
           path: lcov.info
           if-no-files-found: warn
           retention-days: 3
-      # Release the `.in-use` marker — see the `check` job's last step
-      # (intent-hq/intent#5256).
-      - name: Release per-slot target dir
-        if: ${{ always() && env.CARGO_TARGET_DIR != '' }}
-        run: ./scripts/ci-target-slot.sh unmark "$CARGO_TARGET_DIR"
-
-  # pull_request-ONLY counterpart of coverage-e2e / coverage-all
-  # (intent-hq/intentd#1947): a test that was 20/20 green on its PR failed only
-  # under the merge queue's llvm-cov instrumentation and ejected the PR, so
-  # every same-repo PR now runs the nextest selection derived from its own
-  # changed paths (scripts/changed-tests.sh --instrumented — the same env,
-  # flags and auggie_context_e2e exclusion as scripts/coverage-e2e.sh) under
-  # instrumentation before it can be enqueued. The full instrumented suite
-  # stays merge_group-only (intent-hq/intent#4260). Two phases: a cheap
-  # bash+git dry run FIRST computes the selection, and every heavy step
-  # (disk preflight, libssl, toolchain, caches, cargo-llvm-cov / nextest
-  # install, the run itself) is gated on it having found something, so a PR
-  # without crates/ changes finishes in seconds. Gated like check on
-  # pull_request: required outright by the gate there (a skip after a route
-  # failure fails the gate), accepted as skipped on merge_group / push where
-  # it is job-level skipped by design. github.event.pull_request is only
-  # read inside the job (absent on merge_group, where the job never runs).
+  # Focused coverage of the diff's changed tests, required on same-repo PRs
+  # and in the queue (against the merged tree), retaining the callback fixture
+  # composition proof and its evidence alongside the full queue-only
+  # instrumented suites. A selection can legitimately be empty (no Rust
+  # changes), so a green run does not by itself mean tests executed.
   coverage-changed:
-    needs: route
-    if: ${{ !cancelled() && github.event_name == 'pull_request' && needs.route.result == 'success' }}
-    runs-on: ${{ fromJSON(needs.route.outputs.linux_labels) }}
+    # Skipped on release-metadata PRs for the same reason as `check`.
+    needs: [route, release-fast-path]
+    if: ${{ !cancelled() && needs.route.result == 'success' && (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && needs.release-fast-path.outputs.fast_path != 'true')) }}
+    runs-on: ${{ fromJSON(needs.route.outputs.slots || '{}')['coverage-changed'] || fromJSON('["warp-ubuntu-2404-x64-16x"]') }}
     # A multi-crate selection compiles and runs each scope sequentially.
     # Shared-runner coverage can exceed 30 minutes while still making progress.
     timeout-minutes: 60
     env:
+      # WarpBuild runners preset NODE_OPTIONS (GitHub-hosted runners do not), and
+      # the ACP callback fixture refuses any NODE_OPTIONS injection; clear it so
+      # the job behaves the same on every runner it bursts to.
+      NODE_OPTIONS: ''
       # Share the full-coverage pool: nextest launches one process per test.
       # Bound retained raw profiles per binary without dropping execution counts.
       LLVM_PROFILE_FILE_NAME: "intent-%8m.profraw"
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
-      # Same value and rationale as coverage-e2e (co-tenancy on tinybox,
-      # matches the 16-core burst runner).
-      NEXTEST_TEST_THREADS: 16
+      # NEXTEST_TEST_THREADS is set by the first step: min(nproc, 16), same
+      # rationale as coverage-e2e.
       CALLBACK_FIXTURE_TESTS: |
         callback_registration::tests::actual_adapter_sdk_and_rust_mcp_deliver_distinct_callback_preserving_old_result
         callback_registration::tests::actual_adapter_replacement_rejects_old_query_and_disabled_never_registers
@@ -1526,42 +1518,72 @@ jobs:
         agent_manager::repository_origin::callback_delivery::tests::live_context::confirmed_context_saved_legacy_and_disabled_outbound_messages_remain_ordinary
         agent_manager::repository_origin::callback_delivery::tests::live_context::confirmed_context_load_and_failed_load_new_keep_original_producers_and_capture
         agent_manager::repository_origin::callback_delivery::tests::live_context::confirmed_context_successful_zero_pending_absent_and_failed_never_conflate
-      BASE_REF: ${{ github.event.pull_request.base.ref }}
-      PR_NUMBER: ${{ github.event.pull_request.number }}
+      QUEUE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+      QUEUE_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+      PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+      PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
     steps:
-      # Depth 2 keeps both parents of the PR merge commit — HEAD^1 is the
-      # base-branch tip GitHub merged against, HEAD^2 the PR head — so the
-      # selection's base is HEAD^1 itself. The base is resolved from that
-      # merge commit, never from pull_request.base.sha: the payload's base.sha
-      # is not guaranteed to be the first parent of the merge commit the job
-      # checks out (github.sha), and when the two differ the depth-1 fetch of
-      # base.sha is a disconnected object `git merge-base` cannot connect to
-      # HEAD (intent-hq/intent#5414). Should the checkout ever be the branch head
-      # itself (no merge commit), the base branch and the PR head are fetched
-      # unshallowed so origin/<base> connects to HEAD. Both changed-tests.sh
-      # runs below read the same resolved BASE_SHA.
+      # First step: size nextest's pool from this runner before any test step.
+      - name: Size nextest threads from runner CPUs
+        shell: bash
+        run: |
+          cpus=$(nproc)
+          threads=$(( cpus < 16 ? cpus : 16 ))
+          echo "NEXTEST_TEST_THREADS=$threads" >> "$GITHUB_ENV"
+          echo "NEXTEST_TEST_THREADS=$threads (nproc=$cpus, cap 16)"
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
       - uses: actions/checkout@v7
         with:
-          fetch-depth: 2
-      - name: Configure Depot managed compiler cache
+          fetch-depth: 0
+      - name: Configure the self-hosted compiler cache
         shell: bash
         env:
-          DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
-        run: python3 scripts/setup-depot-sccache.py
-      - name: Resolve PR base from the merge commit
+          INTENT_SCCACHE_ENDPOINT: ${{ vars.INTENT_SCCACHE_ENDPOINT }}
+          INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
+          INTENT_SCCACHE_MODE: ${{ vars.INTENT_SCCACHE_MODE }}
+        run: python3 scripts/setup-sccache.py
+      # PRs check out GitHub's synthetic merge commit: its second parent is
+      # the PR head and its first parent the base tip it merged against —
+      # never pull_request.base.sha, which is not guaranteed to be that
+      # parent (intent-hq/intent#5414). The checkout is identified by the PR
+      # head SHA, not by "HEAD is a merge", because a branch tip can itself be
+      # a merge commit. If the checkout is ever the PR head itself, fall back
+      # to its merge-base with the base branch. Queue entries bind to the
+      # event's base/head pair.
+      - name: Resolve changed-test base from the event
         run: |
           set -euo pipefail
-          if git rev-parse -q --verify 'HEAD^2' >/dev/null; then
-            base=$(git rev-parse 'HEAD^1')
-            echo "base: HEAD^1 (merge-commit parent) = $base"
-          else
-            git fetch --no-tags --unshallow origin \
-              "+refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF" \
-              "+refs/pull/$PR_NUMBER/head:refs/remotes/pull/$PR_NUMBER/head"
-            base=$(git rev-parse "refs/remotes/origin/$BASE_REF")
-            echo "base: origin/$BASE_REF (HEAD is not a merge commit) = $base"
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            if ! [[ "$PR_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error title=coverage-changed: PR head unknown::PR_HEAD_SHA '$PR_HEAD_SHA' is not a commit SHA"
+              exit 1
+            fi
+            head=$(git rev-parse HEAD)
+            if [ "$head" = "$PR_HEAD_SHA" ]; then
+              if [ -z "$PR_BASE_REF" ]; then
+                echo "::error title=coverage-changed: PR base unknown::PR_BASE_REF is empty; cannot resolve the merge-base for checkout $head"
+                exit 1
+              fi
+              git fetch --no-tags origin "+refs/heads/$PR_BASE_REF:refs/remotes/origin/$PR_BASE_REF"
+              base=$(git merge-base "refs/remotes/origin/$PR_BASE_REF" HEAD)
+              echo "base: merge-base with origin/$PR_BASE_REF (checkout is the PR head) = $base"
+            elif [ "$(git rev-parse -q --verify 'HEAD^2' || true)" = "$PR_HEAD_SHA" ]; then
+              base=$(git rev-parse 'HEAD^1')
+              echo "base: HEAD^1 (PR merge-commit base parent) = $base"
+            else
+              echo "::error title=coverage-changed: unexpected checkout::HEAD $head is neither PR head $PR_HEAD_SHA nor a merge of it"
+              exit 1
+            fi
+            echo "BASE_SHA=$base" >> "$GITHUB_ENV"
+            exit 0
           fi
-          echo "BASE_SHA=$base" >> "$GITHUB_ENV"
+          [[ "$QUEUE_BASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$QUEUE_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$QUEUE_HEAD_SHA"
+          git fetch --no-tags --depth=1 origin "$QUEUE_BASE_SHA"
+          echo "BASE_SHA=$QUEUE_BASE_SHA" >> "$GITHUB_ENV"
       - name: Select changed tests (dry run)
         id: select
         run: |
@@ -1605,50 +1627,7 @@ jobs:
             cat "$plan"
             echo "\`\`\`"
           } >> "$GITHUB_STEP_SUMMARY"
-      # Fail-fast disk preflight — see the `check` job's comment for the full
-      # rationale (monorepo#1253). 30 GiB like coverage-e2e: this job shares
-      # coverage-e2e's per-slot target dir (see "Point CARGO_TARGET_DIR
-      # outside the work dir" below), so the own-dir skip must name it.
-      # Fail-fast disk preflight — see the `check` job's comment for the full
-      # rationale (monorepo#1253). 30 GiB here: the instrumented coverage
-      # target dirs are multi-GiB and the run also writes profraw files.
-      - name: Disk-space preflight (tinybox only)
-        if: steps.select.outputs.has_selection == 'true' && needs.route.outputs.linux_burst != 'true'
-        env:
-          NEED_GIB: 30
-          JOB_TARGET_SUBDIR: coverage-e2e
-        run: |
-          set -euo pipefail
-          own_dir="/raid/ci-target/intentd/$RUNNER_NAME/$JOB_TARGET_SUBDIR"
-          free_gib() { df -Pk /raid | awk 'NR==2 { printf "%d", $4 / 1048576 }'; }
-          echo "Free space on /raid: $(free_gib) GiB (need $NEED_GIB GiB)"
-          [ "$(free_gib)" -ge "$NEED_GIB" ] && exit 0
-          # Same two tiers as the `check` job's preflight (see its comment):
-          # selection in scripts/ci-target-slot.sh purge-candidates, a live
-          # is-purgeable recheck before each rm, this loop only deletes
-          # until the need is met.
-          evict_until_free() {
-            local verb="$1" quiet_min="$2" dir
-            shift 2
-            while IFS= read -r dir; do
-              ./scripts/ci-target-slot.sh is-purgeable "$dir" --quiet-min "$quiet_min" || continue
-              echo "$verb: $dir"
-              rm -rf -- "$dir" || true
-              if [ "$(free_gib)" -ge "$NEED_GIB" ]; then break; fi
-            done < <(./scripts/ci-target-slot.sh purge-candidates /raid/ci-target --quiet-min "$quiet_min" "$@")
-          }
-          echo "Below threshold — pruning stale ci-target dirs (monorepo#1253)"
-          evict_until_free pruning 2880 --skip-dir "$own_dir"
-          if [ "$(free_gib)" -lt "$NEED_GIB" ]; then
-            echo "Still below threshold — LRU-evicting idle ci-target dirs (monorepo#1253)"
-            evict_until_free evicting 15 --skip-slot "$RUNNER_NAME"
-          fi
-          free="$(free_gib)"
-          if [ "$free" -lt "$NEED_GIB" ]; then
-            echo "::error::tinybox /raid has only ${free} GiB free (this job needs ${NEED_GIB} GiB) even after pruning stale dirs and LRU-evicting idle ones — manual cleanup needed, see intent-hq/monorepo#1253."
-            exit 1
-          fi
-      # See the `check` job's comment: tinybox lacks the OpenSSL headers.
+      # See the `check` job's comment on the OpenSSL headers.
       - name: Install libssl-dev if missing
         if: steps.select.outputs.has_selection == 'true'
         run: |
@@ -1660,21 +1639,6 @@ jobs:
             done
             sudo -n apt-get -o DPkg::Lock::Timeout=300 install -y -qq libssl-dev
           fi
-      # Deliberately SHARES coverage-e2e's per-slot target dir instead of
-      # keying its own: a runner slot executes one job at a time, so the two
-      # never overlap on the same dir, both build the same instrumented
-      # profile, and sharing keeps the multi-GiB instrumented dependency
-      # cache warm across PR runs and queue runs alike (a separate dir would
-      # rebuild it from scratch on every slot). This job never runs `cargo
-      # llvm-cov clean`, so it cannot delete coverage-e2e's artifacts.
-      # Also marks the dir in use — see the `check` job's CARGO_TARGET_DIR
-      # step (intent-hq/intent#5256); released by the job's last step.
-      - name: Point CARGO_TARGET_DIR outside the work dir
-        if: steps.select.outputs.has_selection == 'true' && needs.route.outputs.linux_burst != 'true'
-        run: |
-          target_dir="/raid/ci-target/intentd/$RUNNER_NAME/coverage-e2e"
-          echo "CARGO_TARGET_DIR=$target_dir" >> "$GITHUB_ENV"
-          ./scripts/ci-target-slot.sh mark "$target_dir"
       - name: Resolve pinned Rust channel
         id: toolchain
         if: steps.select.outputs.has_selection == 'true'
@@ -1702,24 +1666,10 @@ jobs:
           fixture=$(python3 -I -B -S scripts/prepare-acp-callback-fixture.py \
             --cache-dir "$RUNNER_TEMP/acp-callback-fixture" --build-from-source)
           echo "INTENT_ACP_CALLBACK_ADAPTER_FIXTURE=$fixture" >> "$GITHUB_ENV"
-      # Per-slot install-action HOME — see coverage-e2e's comment
-      # (monorepo#1239).
-      - name: Key install-action dirs per runner slot
-        if: steps.select.outputs.has_selection == 'true'
-        run: |
-          if [[ "${{ needs.route.outputs.linux_burst }}" == "true" ]]; then
-            echo "INSTALL_ACTION_HOME=$HOME" >> "$GITHUB_ENV"
-          else
-            echo "INSTALL_ACTION_HOME=$HOME/ci-install-action/$RUNNER_NAME" >> "$GITHUB_ENV"
-          fi
       - uses: taiki-e/install-action@cargo-llvm-cov
         if: steps.select.outputs.has_selection == 'true'
-        env:
-          HOME: ${{ env.INSTALL_ACTION_HOME }}
       - uses: taiki-e/install-action@nextest
         if: steps.select.outputs.has_selection == 'true'
-        env:
-          HOME: ${{ env.INSTALL_ACTION_HOME }}
       - name: Acquire the shared transfer selection contract
         if: steps.select.outputs.has_selection == 'true'
         uses: ./.github/actions/transfer-selection-fixtures
@@ -1800,15 +1750,9 @@ jobs:
             ${{ runner.temp }}/callback-fixture-tests.json
           if-no-files-found: warn
           retention-days: 7
-      # Release the `.in-use` marker — see the `check` job's last step
-      # (intent-hq/intent#5256). CARGO_TARGET_DIR is empty when the
-      # selection was empty or on burst runners, so this is a no-op there.
-      - name: Release per-slot target dir
-        if: ${{ always() && env.CARGO_TARGET_DIR != '' }}
-        run: ./scripts/ci-target-slot.sh unmark "$CARGO_TARGET_DIR"
-
   pr-title:
-    runs-on: depot-ubuntu-24.04
+    needs: [route]
+    runs-on: ${{ fromJSON(needs.route.outputs.slots || '{}')['pr-title'] || fromJSON('["ubuntu-24.04"]') }}
     # Same-repo PRs only (fork PRs get no CI — see the `pull_request`
     # trigger comment).
     if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
@@ -1859,7 +1803,8 @@ jobs:
   # seven-'=' line only when the same file also has both of the other two,
   # so Markdown setext headings / code snippets don't false-positive.
   conflict-markers:
-    runs-on: depot-ubuntu-24.04
+    needs: [route]
+    runs-on: ${{ fromJSON(needs.route.outputs.slots || '{}')['conflict-markers'] || fromJSON('["ubuntu-24.04"]') }}
     # Same-repo PRs only (fork PRs get no CI — see the `pull_request`
     # trigger comment).
     if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
@@ -1906,17 +1851,25 @@ jobs:
   # #5489, #5497). Fix order when red: the checks compare this head against
   # monorepo `main` and every checker tolerates docs that lead the pin, so land
   # the monorepo docs PR first (the job summary names the file to update), then
-  # re-run this job; the later submodule bump then lands green.
+  # re-run all jobs or push (re-running only failed jobs keeps the monorepo
+  # commit `@main` resolved to on the first attempt); the later submodule bump
+  # then lands green. Keep `@main`: a SHA pin also pins those docs, so a
+  # docs-first fix needed a hand pin bump (#2476, #2481).
   # check-mcp-bindings is advisory here (its generated index must match the
   # pinned help text line for line, so the docs cannot lead an intentd change
   # to a binding's help line); it stays a hard error in the monorepo.
   # Runs on merge_group and same-repo pull_request (fork PRs get no CI — see
   # the `pull_request` trigger comment); skipped on push to main, where the
-  # tree was already checked by its PR run. Seconds-long on depot-ubuntu-24.04.
+  # tree was already checked in the queue. PRs run static contracts; the
+  # queued tree also runs the connected runtime proof.
   monorepo-consumer-checks:
     if: github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
     permissions:
+      actions: read
       contents: read
+    secrets:
+      CI_QUEUE_READ_TOKEN: ${{ secrets.CI_QUEUE_READ_TOKEN }}
+      INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
     uses: intent-hq/intent/.github/workflows/consumer-checks.yml@main
     with:
       component: intentd
@@ -1927,14 +1880,12 @@ jobs:
   # serve/stop, Restart=on-failure, WantedBy=default.target), and that
   # scripts/build-deb.sh produces a well-formed .deb (stub binary here; the
   # real release tarballs are repacked by .github/workflows/release-sitter.yml).
-  # Seconds-long like the other utility jobs, so it runs directly on
-  # depot-ubuntu-24.04, which has the required dpkg-deb / tar+xz toolchain
-  # preinstalled.
+  # Both the self-hosted Linux fleet and the GitHub-hosted fallback provide dpkg-deb / tar+xz.
   deb-packaging:
-    runs-on: depot-ubuntu-24.04
-    # Runs on push and same-repo PRs; skipped on fork PRs (see the
-    # `pull_request` trigger comment).
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    needs: [route]
+    runs-on: ${{ fromJSON(needs.route.outputs.slots || '{}')['deb-packaging'] || fromJSON('["ubuntu-24.04"]') }}
+    # Runs after queueing and on main pushes.
+    if: github.event_name == 'merge_group' || github.event_name == 'push'
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
@@ -1968,26 +1919,35 @@ jobs:
   # without a marker is left untouched — never collapsed to one section)
   # and scripts/notify-fixed-issues.sh (a mention-only reference or an open
   # issue never earns a release comment; a closed issue with a delivered
-  # linked fix PR does), the tinybox CI helpers
-  # (intent-hq/intent#5256): scripts/ci-lld-retry.sh (the rust-lld
-  # vanished-object signature earns exactly one retry; a genuine lint fails
-  # fast) and scripts/ci-target-slot.sh (a dir with a fresh `.in-use` marker
-  # is never a purge candidate; an unmarked idle one is), plus the
+  # linked fix PR does), scripts/ci-lld-retry.sh (intent-hq/intent#5256:
+  # the rust-lld vanished-object signature earns exactly one retry; a
+  # genuine lint fails fast), plus the
   # stubbed-cargo harness for scripts/changed-tests.sh (the changed-tests
   # selection the monorepo's `make test-changed` delegates to, and its
   # --instrumented llvm-cov form; intent-hq/intentd#1947), and the stub-root
   # harness for the repo-root Makefile (every gate target forwards to the
   # monorepo root make with its command-line variables; a standalone clone or
   # an unrelated parent Makefile gets the exit-2 refusal). Seconds-long like
-  # the other utility jobs, so it runs directly on depot-ubuntu-24.04.
+  # the other utility jobs, it uses the shared self-hosted-first route.
   release-scripts:
-    runs-on: depot-ubuntu-24.04
-    # Runs on push, merge_group and same-repo PRs; skipped on fork PRs (see the
-    # `pull_request` trigger comment).
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    timeout-minutes: 5
+    needs: [route]
+    runs-on: ${{ fromJSON(needs.route.outputs.slots || '{}')['release-scripts'] || fromJSON('["ubuntu-24.04"]') }}
+    # Runs on same-repo PRs (so a change to these scripts is proven before
+    # it queues), after queueing and on main pushes. Fork PRs skip it with
+    # the route job.
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.event_name == 'push'
+    # About 2 min on a hosted runner (measured on Depot); on a busy shared self-hosted slot it ran 5 min
+    # next to a PR's check and coverage-changed (run 39178412485) with every
+    # step passing, so the budget leaves self-hosted headroom.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
       - name: Test release metadata and auto-cut guards (offline)
         run: |
           python3 -S scripts/test-release-pr-fast-path.py
@@ -2004,21 +1964,37 @@ jobs:
           python3 -B scripts/test-prerelease-cleanup-workflow.py
           python3 -B scripts/test-release-rust-cache.py
           python3 -I -B scripts/test-optional-intel-release.py
-          python3 -B scripts/test-setup-depot-sccache.py
+          python3 -B scripts/test-release-host-network.py
+          python3 -B scripts/test-setup-sccache.py
           python3 -I -B scripts/test-coverage-storage.py
-          python3 -B scripts/test-depot-runners.py
+          python3 -B scripts/test-hosted-runners.py
+          python3 -B scripts/test-configure-runner-routing.py
           python3 -I -B scripts/test-native-review-artifact.py
+      - name: Test the local release-scripts runner (make test-release-scripts)
+        run: python3 -I -B scripts/test-release-scripts-local.py
+      - name: Test optional Intel cargo-dist network handling (offline)
+        run: python3 -I -B scripts/test-optional-intel-dist-network.py
       - name: Test optional Intel cargo-dist publication
         shell: bash
         run: |
           version=$(python3 -c 'import tomllib; print(tomllib.load(open("dist-workspace.toml", "rb"))["dist"]["cargo-dist-version"])')
-          curl --proto '=https' --tlsv1.2 -LsSf "https://github.com/axodotdev/cargo-dist/releases/download/v${version}/cargo-dist-installer.sh" | sh
-          python3 -I -B scripts/test-optional-intel-dist.py
+          # Job-private, unmanaged install: keeps cargo-dist out of a home
+          # directory that a persistent runner may share between jobs.
+          dir="$RUNNER_TEMP/cargo-dist"
+          curl --proto '=https' --tlsv1.2 -LsSf "https://github.com/axodotdev/cargo-dist/releases/download/v${version}/cargo-dist-installer.sh" \
+            | CARGO_DIST_UNMANAGED_INSTALL="$dir" sh
+          PATH="$dir:$PATH" python3 -I -B scripts/test-optional-intel-dist.py
       - name: Test local and CI caller policy
         run: |
           python3 -S scripts/test-test-policy.py
           python3 -I -B scripts/test-ci-test-policy.py
           python3 -I -B -S scripts/test-callback-build-scope.py
+          python3 -I -B scripts/test-subprocess-env-policy.py
+      - name: Test obsolete merge-run policy and workflow integration (offline)
+        run: |
+          python3 -I -B scripts/test-retire-obsolete-merge-runs.py
+          python3 -I -B scripts/test-retire-obsolete-merge-runs-caller.py
+          python3 -I -B scripts/test-retire-obsolete-merge-runs-workflow.py
       - name: Test native CI routing and gate results
         run: python3 -I -B scripts/test-ci-native-routing.py
       - name: Install release cache regression compiler
@@ -2027,11 +2003,13 @@ jobs:
           channel=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
           rustup toolchain install "$channel" --profile minimal --no-self-update
           echo "RUSTUP_TOOLCHAIN=$channel" >> "$GITHUB_ENV"
-      - name: Configure Depot managed compiler cache
+      - name: Configure the self-hosted compiler cache
         shell: bash
         env:
-          DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
-        run: python3 scripts/setup-depot-sccache.py
+          INTENT_SCCACHE_ENDPOINT: ${{ vars.INTENT_SCCACHE_ENDPOINT }}
+          INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
+          INTENT_SCCACHE_MODE: ${{ vars.INTENT_SCCACHE_MODE }}
+        run: python3 scripts/setup-sccache.py
       - name: Test WebDAV compiler reuse and source invalidation
         run: python3 -B scripts/test-release-cache-smoke.py
       - name: Test publish-channel-manifest.sh
@@ -2040,8 +2018,6 @@ jobs:
         run: ./scripts/test-mirror-release-assets.sh
       - name: Test ci-lld-retry.sh
         run: ./scripts/test-ci-lld-retry.sh
-      - name: Test ci-target-slot.sh
-        run: ./scripts/test-ci-target-slot.sh
       - name: Test Windows cleanup policy
         run: python3 -I -B scripts/test-windows-ci-cleanup.py
       - name: Test macOS cleanup safety and Cargo lock ownership
@@ -2052,17 +2028,32 @@ jobs:
         run: python3 -S scripts/test-changed-tests-stdin.py
       - name: Test the Makefile gate forwarder
         run: ./scripts/test-makefile-forwarder.sh
-      - name: Test the Codex ACP rolling pin PR automation
+      - name: Test the ACP adapter rolling pin PR automation
         run: |
-          python3 -S scripts/test-auto-pin-codex-acp.py
+          python3 -S scripts/test-auto-pin-acp-adapter.py
           python3 -S scripts/test-provider-cli-metadata.py
+          python3 -S scripts/test-check-provider-error-corpus.py
+      # Downloads the pinned claude-agent-acp, Claude Agent SDK and codex-acp
+      # packages and fails when they emit an error kind (or a usage-limit
+      # wording) the quota classifier's corpus does not cover, so a rolling
+      # adapter pin PR cannot add a limit failover silently misses
+      # (intent-hq/intent#7615). An npm outage (exit 75) only warns, so a
+      # registry blip cannot fail unrelated PRs or eject merge-queue entries;
+      # any corpus drift still fails the job.
+      - name: Check the provider error corpus against the pinned adapters
+        run: |
+          status=0
+          python3 -S scripts/check-provider-error-corpus.py || status=$?
+          if [ "$status" -eq 75 ]; then
+            echo "::warning::npm was unreachable; the provider error corpus was not checked against the pinned adapters."
+          elif [ "$status" -ne 0 ]; then
+            exit "$status"
+          fi
       - name: Test the release-plz no-op baseline
         run: python3 -S scripts/test-release-plz-noop.py
       - uses: taiki-e/install-action@v2
         with:
           tool: release-plz@0.3.162
-      - name: Test Cargo packaging and historical baseline compatibility
-        run: python3 -S scripts/test-release-plz-packaging.py
       - name: Test new-package release baseline and retirement
         run: python3 -S scripts/test-release-plz-baseline.py
       - name: Test daemon and sitter changelog separation
@@ -2074,22 +2065,21 @@ jobs:
   # that polls the task's log need Windows — scripts/install.ps1.Tests.ps1
   # (Pester) executes those marked blocks of the shipped script with the Task
   # Scheduler cmdlets mocked. Runs under both Windows PowerShell 5.1 (what
-  # `powershell -c "irm … | iex"` in the README uses) and pwsh 7. A
-  # GitHub-hosted runner rather than the self-hosted Windows build box: the
-  # tests need no Rust toolchain, and the hosted image ships Pester 5 and the
-  # ScheduledTasks module. Minutes-long, so no cache. Every test must run
+  # `powershell -c "irm … | iex"` in the README uses) and pwsh 7.
+  # Tests need no Rust toolchain; both runner paths must provide Pester 5 and
+  # the ScheduledTasks module. Minutes-long, so no cache. Every test must run
   # here — the register block self-skips off Windows, so a skip on this job
   # means the module went missing, and the step fails on it.
   install-ps1:
-    # Runs on push and same-repo PRs; skipped on fork PRs (see the
-    # `pull_request` trigger comment).
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    # Windows-only, so post-merge only (see the `windows` job).
+    if: github.event_name == 'push'
     strategy:
       fail-fast: false
       matrix:
         shell: [powershell, pwsh]
     name: install-ps1 (${{ matrix.shell }})
-    runs-on: depot-windows-2025
+    needs: [route]
+    runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['windows-2025'] || fromJSON('["windows-2025"]') }}
     timeout-minutes: 15
     # The matrix context is not available in a step-level `shell:` (the
     # workflow fails validation with "Unrecognized named-value: 'matrix'"),
@@ -2099,11 +2089,32 @@ jobs:
         shell: ${{ matrix.shell }}
     steps:
       - uses: actions/checkout@v7
+      - name: Prepare PowerShell 7
+        if: matrix.shell == 'pwsh'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (Get-Command pwsh -ErrorAction SilentlyContinue) { exit 0 }
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          $archive = Join-Path $env:RUNNER_TEMP 'powershell-7.6.7.zip'
+          $destination = Join-Path $env:RUNNER_TEMP 'powershell-7.6.7'
+          Invoke-WebRequest -UseBasicParsing -Uri 'https://github.com/PowerShell/PowerShell/releases/download/v7.6.7/PowerShell-7.6.7-win-x64.zip' -OutFile $archive
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash -ne 'd2f952ebdbf24386cb8923553aa58e41a846db35a6155ea04c58142a4b16dbb7') {
+            throw 'PowerShell archive checksum mismatch'
+          }
+          Expand-Archive -Path $archive -DestinationPath $destination -Force
+          & (Join-Path $destination 'pwsh.exe') -NoProfile -Command '$PSVersionTable.PSVersion'
+          if ($LASTEXITCODE -ne 0) { throw 'PowerShell 7 failed to start' }
+          $destination | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       - name: Pester (${{ matrix.shell }})
         run: |
           $ErrorActionPreference = 'Stop'
           $PSVersionTable.PSVersion
-          if (-not (Get-Module -ListAvailable Pester | Where-Object { $_.Version -ge [version]'5.0' })) {
+          if (-not (Get-Module -ListAvailable Pester | Where-Object { $_.Version -ge [version]'5.5' })) {
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            if (-not (Get-PackageProvider -ListAvailable | Where-Object { $_.Name -eq 'NuGet' -and $_.Version -ge [version]'2.8.5.201' })) {
+              Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser
+            }
             Install-Module Pester -Force -SkipPublisherCheck -Scope CurrentUser -MinimumVersion 5.5
           }
           Import-Module Pester -MinimumVersion 5.0
@@ -2120,15 +2131,19 @@ jobs:
   # Exercise the shipping Pi ACP package through real session/new, prompt and
   # session/load traffic. CMD quoting needs native Windows, not compilation or
   # Linux platform simulation. Both platforms also cover extension forwarding.
-  # The shipping-pin matrix is strict and required by CI Gate.
+  # The shipping-pin matrix is strict and required by CI Gate. Linux runs in
+  # the queue and on push; the Windows legs run post-merge only (see the
+  # `windows` job).
   pi-session-paths:
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    if: github.event_name == 'merge_group' || github.event_name == 'push'
     strategy:
       fail-fast: false
       matrix:
-        os: [depot-ubuntu-24.04, depot-windows-2025]
+        os: ${{ fromJSON(github.event_name == 'push' && '["ubuntu-24.04", "windows-2025"]' || '["ubuntu-24.04"]') }}
         node: [22, 24]
-    runs-on: ${{ matrix.os }}
+    needs: [route]
+    # Linux legs read their own slot; the Windows leg keeps the native mapping.
+    runs-on: ${{ matrix.os == 'ubuntu-24.04' && fromJSON(needs.route.outputs.slots || '{}')[format('pi-session-paths-{0}', matrix.node)] || fromJSON(needs.route.outputs.runners || '{}')[matrix.os] || matrix.os }}
     timeout-minutes: 10
     env:
       PI_ACP_TEST_ENTRY: ${{ github.workspace }}/.pi-acp-test/node_modules/pi-acp/dist/index.js
@@ -2143,6 +2158,10 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node }}
+      - name: Put Git Bash first on PATH (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
       - name: Install the exact production adapter pin
         run: |
           pin=$(node --input-type=module -e 'import {readFileSync} from "node:fs"; const s = readFileSync("crates/intent-providers/src/config.rs", "utf8"); const m = s.match(/pub const PI_ACP_NPX_PACKAGE: &str = "(pi-acp@[^"]+)";/); if (!m) throw new Error("Missing production Pi adapter pin"); console.log(m[1]);')
@@ -2181,20 +2200,22 @@ jobs:
           path: pi-path-evidence
           if-no-files-found: error
 
+  # Linux and macOS in the queue; the Windows lifecycle proof runs
+  # post-merge in the `windows` job.
   daemon-lifecycle:
     name: Daemon lifecycle (${{ matrix.platform }})
     needs: route
-    if: github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+    if: github.event_name == 'merge_group'
     strategy:
       fail-fast: false
       matrix:
         include:
+          # The Linux leg takes its own slot (listed in the route job's
+          # SLOT_JOBS); macOS keeps the shared mapping.
           - platform: linux
-            os: ${{ fromJSON(needs.route.outputs.linux_labels || '["depot-ubuntu-24.04-16"]') }}
+            os: ${{ fromJSON(needs.route.outputs.slots || '{}')['daemon-lifecycle-linux'] || fromJSON('["warp-ubuntu-2404-x64-16x"]') }}
           - platform: macos
-            os: ${{ fromJSON(needs.route.outputs.macos_labels || '["depot-macos-latest"]') }}
-          - platform: windows
-            os: ${{ fromJSON(needs.route.outputs.windows_labels || '["depot-windows-2022-16"]') }}
+            os: ${{ fromJSON(needs.route.outputs.macos_labels || '["warp-macos-26-arm64-12x"]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     env:
@@ -2202,74 +2223,22 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: 0
       CARGO_INCREMENTAL: 0
     steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
       - uses: actions/checkout@v7
-      # On the self-hosted Windows runner C:\WINDOWS\system32\bash.EXE (the
-      # WSL stub) shadows Git Bash in PATH, and WSL bash can't execute the
-      # runner's Windows-path step scripts. Prepend Git's bin dir so every
-      # later `shell: bash` step resolves Git Bash instead.
-      - name: Put Git Bash first on PATH (Windows)
-        if: runner.os == 'Windows'
-        shell: cmd
-        run: echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
-      - name: Configure Depot managed compiler cache
+      - name: Configure the self-hosted compiler cache
         shell: bash
         env:
-          DEPOT_SCCACHE_TOKEN: ${{ secrets.DEPOT_TOKEN }}
-        run: python3 scripts/setup-depot-sccache.py
-      # Persistent per-job outputs survive checkout's git clean. Linux uses
-      # /raid and a runner-slot key, with the same prune/marker rails as check.
-      # Fail-fast disk preflight — see the `check` job's comment for the full
-      # rationale (monorepo#1253). 30 GiB here: the instrumented coverage
-      # target dirs are multi-GiB and the run also writes profraw files.
-      - name: Disk-space preflight (tinybox only)
-        if: runner.os == 'Linux' && contains(matrix.os, 'self-hosted')
-        env:
-          NEED_GIB: 15
-          JOB_TARGET_SUBDIR: daemon-lifecycle
-        run: |
-          set -euo pipefail
-          own_dir="/raid/ci-target/intentd/$RUNNER_NAME/$JOB_TARGET_SUBDIR"
-          free_gib() { df -Pk /raid | awk 'NR==2 { printf "%d", $4 / 1048576 }'; }
-          echo "Free space on /raid: $(free_gib) GiB (need $NEED_GIB GiB)"
-          [ "$(free_gib)" -ge "$NEED_GIB" ] && exit 0
-          # Same two tiers as the `check` job's preflight (see its comment):
-          # selection in scripts/ci-target-slot.sh purge-candidates, a live
-          # is-purgeable recheck before each rm, this loop only deletes
-          # until the need is met.
-          evict_until_free() {
-            local verb="$1" quiet_min="$2" dir
-            shift 2
-            while IFS= read -r dir; do
-              ./scripts/ci-target-slot.sh is-purgeable "$dir" --quiet-min "$quiet_min" || continue
-              echo "$verb: $dir"
-              rm -rf -- "$dir" || true
-              if [ "$(free_gib)" -ge "$NEED_GIB" ]; then break; fi
-            done < <(./scripts/ci-target-slot.sh purge-candidates /raid/ci-target --quiet-min "$quiet_min" "$@")
-          }
-          echo "Below threshold — pruning stale ci-target dirs (monorepo#1253)"
-          evict_until_free pruning 2880 --skip-dir "$own_dir"
-          if [ "$(free_gib)" -lt "$NEED_GIB" ]; then
-            echo "Still below threshold — LRU-evicting idle ci-target dirs (monorepo#1253)"
-            evict_until_free evicting 15 --skip-slot "$RUNNER_NAME"
-          fi
-          free="$(free_gib)"
-          if [ "$free" -lt "$NEED_GIB" ]; then
-            echo "::error::tinybox /raid has only ${free} GiB free (this job needs ${NEED_GIB} GiB) even after pruning stale dirs and LRU-evicting idle ones — manual cleanup needed, see intent-hq/monorepo#1253."
-            exit 1
-          fi
-      - name: Point lifecycle target outside checkout (Linux)
-        if: runner.os == 'Linux' && contains(matrix.os, 'self-hosted')
+          INTENT_SCCACHE_ENDPOINT: ${{ vars.INTENT_SCCACHE_ENDPOINT }}
+          INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
+          INTENT_SCCACHE_MODE: ${{ vars.INTENT_SCCACHE_MODE }}
+        run: python3 scripts/setup-sccache.py
+      # The self-hosted macOS runner has one slot.
+      - name: Point lifecycle target outside checkout (macOS)
+        if: runner.os == 'macOS' && contains(matrix.os, 'self-hosted')
         shell: bash
-        run: |
-          target_dir="/raid/ci-target/intentd/$RUNNER_NAME/daemon-lifecycle"
-          echo "CARGO_TARGET_DIR=$target_dir" >> "$GITHUB_ENV"
-          ./scripts/ci-target-slot.sh mark "$target_dir"
-      # These runners have one slot. Prefer the native Windows home path:
-      # Cargo cannot use Git Bash's MSYS-style $HOME from native processes.
-      - name: Point lifecycle target outside checkout (macOS and Windows)
-        if: runner.os != 'Linux' && contains(matrix.os, 'self-hosted')
-        shell: bash
-        run: echo "CARGO_TARGET_DIR=${USERPROFILE:-$HOME}/ci-target/intentd/daemon-lifecycle-${{ matrix.platform }}" >> "$GITHUB_ENV"
+        run: echo "CARGO_TARGET_DIR=$HOME/ci-target/intentd/daemon-lifecycle-${{ matrix.platform }}" >> "$GITHUB_ENV"
       - name: Ensure macOS CI disk headroom
         if: runner.os == 'macOS' && contains(matrix.os, 'self-hosted')
         run: python3 -I -B scripts/macos-ci-cleanup.py --apply
@@ -2288,162 +2257,97 @@ jobs:
         run: |
           cargo clippy --locked -p intentd-sitter -p intentd --all-targets -- -D warnings
           python3 -I -B scripts/test-daemon-lifecycle.py
-      - name: Release lifecycle target dir
-        if: ${{ always() && runner.os == 'Linux' && contains(matrix.os, 'self-hosted') && env.CARGO_TARGET_DIR != '' }}
-        shell: bash
-        run: ./scripts/ci-target-slot.sh unmark "$CARGO_TARGET_DIR"
-
-  # CI Gate is the sole required status check. Every failed/cancelled result
-  # fails it; skips are accepted only for jobs intentionally absent by event.
-  # build is required on merge_group (native check, Clippy and runtime proofs) and push
-  # (release compilation); only pull_request accepts its job-level skip.
-  # check / monorepo-consumer-checks must succeed on PRs and merge_group.
-  # Full coverage is required on merge_group, changed coverage on PRs.
-  # pr-title / conflict-markers retain their PR-metadata skip handling.
-  # deb-packaging / release-scripts / install-ps1 / pi-session-paths must
-  # succeed on every non-fork run. The gate itself is skipped on fork PRs.
+  # Required context for each event: PRs certify only the lightweight tier.
+  # Queue entries require the Linux/macOS native/runtime/coverage proofs and
+  # the Windows lint; push requires the release builds, packaging checks and
+  # the Windows runtime validation (auto-cut-alpha.yml reads this push gate
+  # on the main tip before cutting an alpha). Missing/failed results never pass.
   gate:
     name: CI Gate
-    # Seconds-long job: pinned to depot-ubuntu-24.04 (see pr-title).
-    runs-on: depot-ubuntu-24.04
-    permissions: {}
-    # The same-repo clause skips the gate on fork PRs along with every other
-    # job (see the `pull_request` trigger comment): without it, always()
-    # would run the gate against all-skipped needs and report a spurious
-    # failure on PRs that get no CI by policy.
     if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
-    needs: [daemon-lifecycle, check, build, macos-services-runtime, coverage-e2e, coverage-all, coverage-changed, pr-title, conflict-markers, monorepo-consumer-checks, deb-packaging, release-scripts, install-ps1, pi-session-paths]
+    runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
+    needs: [route, pr-static, release-fast-path, cache-smoke, daemon-lifecycle, check, build, windows-lint, windows, macos-services-runtime, coverage-e2e, coverage-all, coverage-changed, pr-title, conflict-markers, monorepo-consumer-checks, deb-packaging, release-scripts, install-ps1, pi-session-paths]
     steps:
       - name: Check results
         run: |
-          if [ "${{ github.event_name }}" != "push" ] && [ "${{ needs.daemon-lifecycle.result }}" != "success" ]; then
-            echo "daemon-lifecycle must execute successfully on PR and merge queue"
-            exit 1
-          fi
-          if [ "${{ github.event_name }}" = "push" ]; then
-            case "${{ needs.daemon-lifecycle.result }}" in
-              success|skipped) ;;
-              *) exit 1 ;;
-            esac
-          fi
-          # PRs deliberately skip the general native build matrix. A skip on
-          # merge_group or push must never pass as native validation.
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            case "${{ needs.build.result }}" in
-              success|skipped) ;;
-              *)
-                echo "build did not succeed or skip"
-                exit 1
-                ;;
-            esac
-          elif [ "${{ needs.build.result }}" != "success" ]; then
-            echo "build must succeed outright on merge_group / push"
-            exit 1
-          fi
-          if [ "${{ github.event_name }}" = "merge_group" ]; then
-            if [ "${{ needs.macos-services-runtime.result }}" != "success" ]; then
-              echo "macos-services-runtime must succeed outright on merge_group"
-              exit 1
-            fi
-          else
-            case "${{ needs.macos-services-runtime.result }}" in
-              success|skipped) ;;
-              *) exit 1 ;;
-            esac
-          fi
-          if [ "${{ needs.deb-packaging.result }}" != "success" ] || \
-             [ "${{ needs.release-scripts.result }}" != "success" ] || \
-             [ "${{ needs.pi-session-paths.result }}" != "success" ] || \
-             [ "${{ needs.install-ps1.result }}" != "success" ]; then
-            echo "One or more required jobs failed"
-            exit 1
-          fi
-          # Event-aware on purpose: check must succeed outright on
-          # pull_request; only push runs (where it is job-skipped as
-          # redundant) accept skipped.
-          if [ "${{ github.event_name }}" = "push" ]; then
-            case "${{ needs.check.result }}" in
-              success|skipped) ;;
-              *)
-                echo "check did not succeed or skip"
-                exit 1
-                ;;
-            esac
-          elif [ "${{ needs.check.result }}" != "success" ]; then
-            echo "One or more required jobs failed"
-            exit 1
-          fi
-          # Event-aware on purpose: monorepo-consumer-checks must succeed
-          # outright on pull_request and merge_group; only push runs (where it
-          # is job-skipped as already checked by the PR run) accept skipped.
-          if [ "${{ github.event_name }}" = "push" ]; then
-            case "${{ needs.monorepo-consumer-checks.result }}" in
-              success|skipped) ;;
-              *)
-                echo "monorepo-consumer-checks did not succeed or skip"
-                exit 1
-                ;;
-            esac
-          elif [ "${{ needs.monorepo-consumer-checks.result }}" != "success" ]; then
-            echo "monorepo-consumer-checks must succeed outright on pull_request / merge_group"
-            exit 1
-          fi
-          # Event-aware on purpose: coverage-changed is pull_request-only, so
-          # there it must succeed outright (a skip after a route failure must
-          # not let an uninstrumented PR through); on merge_group and push it
-          # is job-skipped by design and the gate accepts skipped.
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            if [ "${{ needs.coverage-changed.result }}" != "success" ]; then
-              echo "coverage-changed must succeed outright on pull_request"
-              exit 1
-            fi
-          else
-            case "${{ needs.coverage-changed.result }}" in
-              success|skipped) ;;
-              *)
-                echo "coverage-changed did not succeed or skip"
-                exit 1
-                ;;
-            esac
-          fi
-          # Event-aware on purpose: coverage-e2e / coverage-all are
-          # merge_group-only, so on merge_group they must succeed outright
-          # (a skip must never let the queue land an untested tree); on
-          # pull_request and push they are job-skipped by design and the
-          # gate accepts skipped.
-          if [ "${{ github.event_name }}" = "merge_group" ]; then
-            if [ "${{ needs.coverage-e2e.result }}" != "success" ] || \
-               [ "${{ needs.coverage-all.result }}" != "success" ]; then
-              echo "coverage-e2e / coverage-all must succeed outright on merge_group"
-              exit 1
-            fi
-          else
-            case "${{ needs.coverage-e2e.result }}" in
-              success|skipped) ;;
-              *)
-                echo "coverage-e2e did not succeed or skip"
-                exit 1
-                ;;
-            esac
-            case "${{ needs.coverage-all.result }}" in
-              success|skipped) ;;
-              *)
-                echo "coverage-all did not succeed or skip"
-                exit 1
-                ;;
-            esac
-          fi
-          case "${{ needs.pr-title.result }}" in
-            success|skipped) ;;
-            *)
-              echo "pr-title did not succeed or skip"
-              exit 1
+          require() {
+            if [ "$2" != success ]; then echo "$1 must succeed ($2)"; exit 1; fi
+          }
+          optional() {
+            case "$2" in success|skipped) ;; *) echo "$1 failed ($2)"; exit 1 ;; esac
+          }
+          case "${{ github.event_name }}" in
+            pull_request)
+              require route "${{ needs.route.result }}"
+              require pr-static "${{ needs.pr-static.result }}"
+              # release-fast-path itself is advisory: a failed classifier must
+              # degrade to full CI, never block the PR. Release-metadata PRs
+              # skip the two slow test jobs (see `check`); the skip is accepted
+              # only when the classifier job succeeded and reported the fast
+              # path. Any other PR must run them.
+              slow=require
+              if [ "${{ needs.release-fast-path.result }}" = success ] && [ "${{ needs.release-fast-path.outputs.fast_path }}" = true ]; then
+                slow=optional
+              fi
+              optional cache-smoke "${{ needs.cache-smoke.result }}"
+              optional daemon-lifecycle "${{ needs.daemon-lifecycle.result }}"
+              "$slow" check "${{ needs.check.result }}"
+              optional build "${{ needs.build.result }}"
+              optional windows-lint "${{ needs.windows-lint.result }}"
+              optional windows "${{ needs.windows.result }}"
+              optional macos-services-runtime "${{ needs.macos-services-runtime.result }}"
+              optional coverage-e2e "${{ needs.coverage-e2e.result }}"
+              optional coverage-all "${{ needs.coverage-all.result }}"
+              "$slow" coverage-changed "${{ needs.coverage-changed.result }}"
+              require pr-title "${{ needs.pr-title.result }}"
+              require conflict-markers "${{ needs.conflict-markers.result }}"
+              require monorepo-consumer-checks "${{ needs.monorepo-consumer-checks.result }}"
+              optional deb-packaging "${{ needs.deb-packaging.result }}"
+              require release-scripts "${{ needs.release-scripts.result }}"
+              optional install-ps1 "${{ needs.install-ps1.result }}"
+              optional pi-session-paths "${{ needs.pi-session-paths.result }}"
               ;;
-          esac
-          case "${{ needs.conflict-markers.result }}" in
-            success|skipped) ;;
-            *)
-              echo "conflict-markers did not succeed or skip"
-              exit 1
+            merge_group)
+              require route "${{ needs.route.result }}"
+              optional pr-static "${{ needs.pr-static.result }}"
+              require cache-smoke "${{ needs.cache-smoke.result }}"
+              require daemon-lifecycle "${{ needs.daemon-lifecycle.result }}"
+              require check "${{ needs.check.result }}"
+              require build "${{ needs.build.result }}"
+              require windows-lint "${{ needs.windows-lint.result }}"
+              optional windows "${{ needs.windows.result }}"
+              require macos-services-runtime "${{ needs.macos-services-runtime.result }}"
+              require coverage-e2e "${{ needs.coverage-e2e.result }}"
+              require coverage-all "${{ needs.coverage-all.result }}"
+              require coverage-changed "${{ needs.coverage-changed.result }}"
+              optional pr-title "${{ needs.pr-title.result }}"
+              optional conflict-markers "${{ needs.conflict-markers.result }}"
+              require monorepo-consumer-checks "${{ needs.monorepo-consumer-checks.result }}"
+              require deb-packaging "${{ needs.deb-packaging.result }}"
+              require release-scripts "${{ needs.release-scripts.result }}"
+              optional install-ps1 "${{ needs.install-ps1.result }}"
+              require pi-session-paths "${{ needs.pi-session-paths.result }}"
               ;;
+            push)
+              require route "${{ needs.route.result }}"
+              optional pr-static "${{ needs.pr-static.result }}"
+              optional cache-smoke "${{ needs.cache-smoke.result }}"
+              optional daemon-lifecycle "${{ needs.daemon-lifecycle.result }}"
+              optional check "${{ needs.check.result }}"
+              require build "${{ needs.build.result }}"
+              optional windows-lint "${{ needs.windows-lint.result }}"
+              require windows "${{ needs.windows.result }}"
+              optional macos-services-runtime "${{ needs.macos-services-runtime.result }}"
+              optional coverage-e2e "${{ needs.coverage-e2e.result }}"
+              optional coverage-all "${{ needs.coverage-all.result }}"
+              optional coverage-changed "${{ needs.coverage-changed.result }}"
+              optional pr-title "${{ needs.pr-title.result }}"
+              optional conflict-markers "${{ needs.conflict-markers.result }}"
+              optional monorepo-consumer-checks "${{ needs.monorepo-consumer-checks.result }}"
+              require deb-packaging "${{ needs.deb-packaging.result }}"
+              require release-scripts "${{ needs.release-scripts.result }}"
+              require install-ps1 "${{ needs.install-ps1.result }}"
+              require pi-session-paths "${{ needs.pi-session-paths.result }}"
+              ;;
+            *) exit 1 ;;
           esac

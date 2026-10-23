@@ -163,7 +163,7 @@ async fn only_exact_opt_in_capability_yields_original_client() {
         assert!(!got.ordinary.authenticated);
         assert_eq!(conn.pending_len(), 0);
         assert!(timeout(
-            Duration::from_millis(10),
+            intentd_test_support::test_timeout(Duration::from_millis(10)),
             peer.read.read_line(&mut String::new())
         )
         .await
@@ -470,7 +470,7 @@ async fn dropping_and_cancelling_while_writer_is_full_never_enqueues_registratio
         assert_eq!(peer.read().await["method"], "fill");
     }
     assert!(timeout(
-        Duration::from_millis(10),
+        intentd_test_support::test_timeout(Duration::from_millis(10)),
         peer.read.read_line(&mut String::new())
     )
     .await
@@ -503,6 +503,26 @@ async fn queued_rpc_error_disconnect_and_foreign_reply_remain_uncertain() {
     }
 }
 
+/// The frozen da577fff callback adapter. Only the monorepo gate runner
+/// (`make test`, `make test-select`) sets the variable, from its verified
+/// offline cache; raw `cargo nextest` leaves it unset.
+fn callback_adapter_fixture() -> std::path::PathBuf {
+    const HINT: &str = "run these tests with make test-select E='<nextest filterset>' (or make \
+        test), which set it from the verified offline cache; raw cargo nextest does not. Setup: \
+        the monorepo's CONTRIBUTING.md#linux-x64-callback-gates";
+    let value = std::env::var_os("INTENT_ACP_CALLBACK_ADAPTER_FIXTURE")
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| {
+            panic!("INTENT_ACP_CALLBACK_ADAPTER_FIXTURE (the frozen da577fff adapter fixture) is unset: {HINT}")
+        });
+    std::fs::canonicalize(&value).unwrap_or_else(|error| {
+        panic!(
+            "INTENT_ACP_CALLBACK_ADAPTER_FIXTURE={} is not a usable fixture ({error}): {HINT}",
+            std::path::Path::new(&value).display()
+        )
+    })
+}
+
 struct NodePeer {
     // Kill the scripted adapter before deleting its allowed scratch directories.
     child: tokio::process::Child,
@@ -512,9 +532,7 @@ struct NodePeer {
 
 impl NodePeer {
     fn start() -> Self {
-        let adapter = std::env::var("INTENT_ACP_CALLBACK_ADAPTER_FIXTURE")
-            .expect("set INTENT_ACP_CALLBACK_ADAPTER_FIXTURE to the frozen da577fff local fixture");
-        let adapter = std::fs::canonicalize(adapter).unwrap();
+        let adapter = callback_adapter_fixture();
         let dependencies = std::fs::canonicalize(adapter.join("node_modules")).unwrap();
         let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/claude_callback_peer.mjs");
@@ -1210,9 +1228,12 @@ async fn monitor_prepared_history_rejects_malformed_lineage_and_retired_original
     reinitialize.await.unwrap().unwrap();
     // A later peer reply or ordinary successful initialize cannot reattach the
     // consuming preparation to a fresh generation, and no load was queued.
-    assert!(timeout(Duration::from_millis(20), peer.read())
-        .await
-        .is_err());
+    assert!(timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(20)),
+        peer.read()
+    )
+    .await
+    .is_err());
 }
 
 #[tokio::test]
@@ -1297,9 +1318,12 @@ async fn monitor_prepared_history_bound_target_refuses_changed_cwd_and_metadata(
             .await
             .is_err());
         assert!(
-            tokio::time::timeout(Duration::from_millis(20), peer.read())
-                .await
-                .is_err(),
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(20)),
+                peer.read()
+            )
+            .await
+            .is_err(),
             "changed load or fallback reached the peer"
         );
     }
@@ -1324,9 +1348,12 @@ async fn monitor_context_retirement_closes_before_poll_and_requires_exact_remote
         );
         assert!(sibling.is_current());
         assert!(
-            timeout(Duration::from_millis(20), peer.read())
-                .await
-                .is_err(),
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(20)),
+                peer.read()
+            )
+            .await
+            .is_err(),
             "begin performed asynchronous I/O"
         );
         let join = tokio::spawn(retirement.join());
@@ -1566,7 +1593,11 @@ async fn monitor_context_retirement_join_survives_waiter_drop_and_is_shared() {
             .begin_review_context_retirement("original", &context)
             .unwrap();
         let repeated = tokio::spawn(repeated.join());
-        let duplicate = timeout(Duration::from_millis(20), peer.read()).await;
+        let duplicate = timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(20)),
+            peer.read(),
+        )
+        .await;
         assert!(
             duplicate.is_err(),
             "a second waiter started a new native retirement request"
@@ -1585,9 +1616,12 @@ async fn monitor_context_retirement_join_survives_waiter_drop_and_is_shared() {
             .unwrap();
         assert_eq!(timeout(WAIT, again.join()).await.unwrap().is_ok(), joined);
         assert!(
-            timeout(Duration::from_millis(20), peer.read())
-                .await
-                .is_err(),
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(20)),
+                peer.read()
+            )
+            .await
+            .is_err(),
             "terminal join result triggered an implicit retry"
         );
         assert!(!receipt.is_current());
@@ -1606,9 +1640,12 @@ async fn monitor_context_retirement_drop_before_wait_retains_original_join() {
             .begin_review_context_retirement("original", &context)
             .unwrap(),
     );
-    let request = timeout(Duration::from_millis(100), peer.read())
-        .await
-        .expect("dropping the caller lost its exact remote retirement obligation");
+    let request = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(100)),
+        peer.read(),
+    )
+    .await
+    .expect("dropping the caller lost its exact remote retirement obligation");
     peer.reply(&request, json!({"retired":true})).await;
     assert!(timeout(
         WAIT,
@@ -1620,8 +1657,48 @@ async fn monitor_context_retirement_drop_before_wait_retains_original_join() {
     .await
     .unwrap()
     .is_ok());
-    assert!(timeout(Duration::from_millis(20), peer.read())
-        .await
-        .is_err());
+    assert!(timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(20)),
+        peer.read()
+    )
+    .await
+    .is_err());
     assert!(!receipt.is_current());
+}
+
+/// PROTOCOL §5.5b: a provider that requests workers sends the AIR
+/// async-tasks extension merged beside the callback offer; one that does not
+/// sends no `jetbrains` key at all (codex-acp would switch formats on it).
+#[tokio::test]
+async fn initialize_requests_async_tasks_only_for_opted_in_providers() {
+    for (requests, expected) in [
+        (
+            true,
+            json!({ "air": { "version": 1, "capabilities": ["asyncTasks"] } }),
+        ),
+        (false, Value::Null),
+    ] {
+        let (conn, mut peer) = pair(64 * 1024);
+        let mut provider = config();
+        provider.requests_agent_workers = requests;
+        let run = tokio::spawn(async move {
+            handshake_with_callbacks(conn, &provider, CallbackOffer::V1)
+                .await
+                .unwrap()
+        });
+        let request = peer.read().await;
+        let meta = &request["params"]["clientCapabilities"]["_meta"];
+        assert_eq!(meta["jetbrains"], expected, "requests={requests}");
+        assert_eq!(
+            meta[META_KEY],
+            json!({ "version": 1 }),
+            "callback offer kept"
+        );
+        peer.reply(
+            &request,
+            json!({ "protocolVersion": 1, "agentCapabilities": {}, "authMethods": [] }),
+        )
+        .await;
+        run.await.unwrap();
+    }
 }

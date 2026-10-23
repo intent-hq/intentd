@@ -70,28 +70,34 @@ impl ProbeSocket {
     async fn rpc_frame(&mut self, method: &str, params: Value, observed: &mut Vec<Value>) -> Value {
         self.send(json!({"jsonrpc":"2.0","id":9123,"method":method,"params":params}))
             .await;
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let frame = self.recv().await;
-                if frame["id"] == 9123 {
-                    return frame;
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                loop {
+                    let frame = self.recv().await;
+                    if frame["id"] == 9123 {
+                        return frame;
+                    }
+                    self.observe(frame, observed).await;
                 }
-                self.observe(frame, observed).await;
-            }
-        })
+            },
+        )
         .await
         .unwrap()
     }
     async fn agent<F: Future>(&mut self, future: F, observed: &mut Vec<Value>) -> F::Output {
         tokio::pin!(future);
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                tokio::select! {
-                    result = &mut future => return result,
-                    frame = self.recv() => self.observe(frame, observed).await,
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                loop {
+                    tokio::select! {
+                        result = &mut future => return result,
+                        frame = self.recv() => self.observe(frame, observed).await,
+                    }
                 }
-            }
-        })
+            },
+        )
         .await
         .unwrap()
     }
@@ -116,15 +122,18 @@ impl ProbeSocket {
             })
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let frame = self.recv().await;
-                if frame["params"]["event"]["data"]["marker"] == marker {
-                    break;
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                loop {
+                    let frame = self.recv().await;
+                    if frame["params"]["event"]["data"]["marker"] == marker {
+                        break;
+                    }
+                    self.observe(frame, observed).await;
                 }
-                self.observe(frame, observed).await;
-            }
-        })
+            },
+        )
         .await
         .expect("subscription barrier must arrive");
     }
@@ -186,14 +195,17 @@ async fn verify_reads_and_rehello(uds: bool) {
                 .await
                 .unwrap();
             }));
-            let stream = tokio::time::timeout(Duration::from_secs(10), async {
-                loop {
-                    if let Ok(stream) = tokio::net::UnixStream::connect(&path).await {
-                        break stream;
+            let stream = tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(10)),
+                async {
+                    loop {
+                        if let Ok(stream) = tokio::net::UnixStream::connect(&path).await {
+                            break stream;
+                        }
+                        tokio::task::yield_now().await;
                     }
-                    tokio::task::yield_now().await;
-                }
-            })
+                },
+            )
             .await
             .unwrap();
             ProbeSocket::Uds(tokio::io::BufReader::new(stream))

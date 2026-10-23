@@ -8,10 +8,13 @@ use super::{
 use crate::repository_admission::read_request::RepositoryReadRequest;
 use crate::repository_admission::AdmissionResult;
 use crate::repository_read_source::{
-    self as source, CapturedReview, MonitorAuthority, ReadOutcome, ResolvedReview,
+    self as source, CapturedReview, MonitorAuthority, ReadOutcome, RefusalReason, ResolvedReview,
 };
 use intent_core::ReviewTarget;
 use intent_store::{MonitorTargetProvenance, PersistedMonitorTarget};
+
+/// Operation name logged with a refused monitor start.
+const OPERATION: &str = "pr.monitor";
 
 /// Proven producer classification only. Qualified output needs its own
 /// original recipient/authority route; stripping its fields is never legacy.
@@ -138,10 +141,14 @@ impl Services {
         captured: CapturedReview,
         retained: AdmissionResult<Arc<RepositoryReadRequest>>,
     ) -> Result<Value> {
+        use source::RefusalStage as Stage;
+        let refuse = |stage: Stage, reason: RefusalReason| {
+            source::refused_with(OPERATION, workspace, number, stage, reason)
+        };
         let prepared = match captured
-            .resolve(self)
+            .resolve_staged(self)
             .await
-            .map_err(|_| source::refused())?
+            .map_err(|refusal| source::refused_at(OPERATION, workspace, number, refusal))?
         {
             ResolvedReview::Unsupported => return Err(source::unsupported()),
             ResolvedReview::Github(repo) => {
@@ -157,15 +164,18 @@ impl Services {
             ResolvedReview::Managed(prepared) => prepared,
         };
         let authority = prepared
-            .monitor_authority(retained.map_err(|_| source::refused())?)
+            .monitor_authority(retained.map_err(|e| refuse(Stage::MonitorOwner, e.into()))?)
             .await
-            .map_err(|_| source::refused())?;
+            .map_err(|e| refuse(Stage::MonitorAuthority, e.into()))?;
         if authority.owner() != agent {
-            return Err(source::refused());
+            return Err(refuse(
+                Stage::OwnerMismatch,
+                RefusalReason::Detail("AuthorityOwnerDiffers"),
+            ));
         }
         authority
             .reserve_output(self)
-            .map_err(|_| source::refused())?;
+            .map_err(|e| refuse(Stage::OutputReservation, e.into()))?;
         let target = prepared.target.clone();
         let registration = self.pr_monitor_registration.enter(agent.clone());
         let _admission = registration.acquire().await;
@@ -173,13 +183,18 @@ impl Services {
         authority
             .validate(self)
             .await
-            .map_err(|_| source::refused())?;
+            .map_err(|e| refuse(Stage::AuthorityValidation, e.into()))?;
         let holder = self
             .store
             .find_active_qualified_pr_monitor_in_workspace(workspace, &target)
             .await?;
         if let Some(existing) = &holder {
-            same_connection(existing.monitor(), &authority)?;
+            same_connection(existing.monitor(), &authority).map_err(|_| {
+                refuse(
+                    Stage::SavedBinding,
+                    RefusalReason::Detail("BindingMismatch"),
+                )
+            })?;
             if let Some(PrMonitorHolder::Live(refusal)) = self
                 .classify_pr_monitor_holder(existing.monitor().clone(), agent)
                 .await?
@@ -187,7 +202,7 @@ impl Services {
                 authority
                     .validate(self)
                     .await
-                    .map_err(|_| source::refused())?;
+                    .map_err(|e| refuse(Stage::AuthorityValidation, e.into()))?;
                 let mut out = refusal.to_wire();
                 out["resource"] = json!(target);
                 return Ok(out);
@@ -207,10 +222,15 @@ impl Services {
                 return Err(Error::InvalidParams(format!("pr.monitor: agent already monitors {active} PRs (max {cap}); configure prMonitor.maxPerAgent (1–100) for a larger inventory")));
             }
         }
-        let ReadOutcome::Managed { result, .. } =
-            prepared.read().await.map_err(|_| source::refused())?
+        let ReadOutcome::Managed { result, .. } = prepared
+            .read()
+            .await
+            .map_err(|e| refuse(Stage::ManagedRead, e.into()))?
         else {
-            return Err(source::refused());
+            return Err(refuse(
+                Stage::ManagedRead,
+                RefusalReason::Detail("UnexpectedOutcome"),
+            ));
         };
         let (snapshot, retry_at) = match *result {
             Ok(read) => (
@@ -234,14 +254,14 @@ impl Services {
             Err(failure) => {
                 return Err(match failure.cause {
                     qualified_cache::CacheError::Provider(error) => pr_ops::map_sc_err(error),
-                    _ => source::refused(),
+                    cause => refuse(Stage::CacheRead, (&cause).into()),
                 })
             }
         };
         authority
             .validate(self)
             .await
-            .map_err(|_| source::refused())?;
+            .map_err(|e| refuse(Stage::AuthorityValidation, e.into()))?;
         let baseline = Some(
             json!({"monitorBinding": authority.binding, "qualifiedSnapshot":snapshot, "retryAt":retry_at}).to_string(),
         );
@@ -259,7 +279,12 @@ impl Services {
         let mut adopted_from = None;
         let monitor = if let Some(current) = current {
             let old = current.monitor().clone();
-            same_connection(&old, &authority)?;
+            same_connection(&old, &authority).map_err(|_| {
+                refuse(
+                    Stage::SavedBinding,
+                    RefusalReason::Detail("BindingMismatch"),
+                )
+            })?;
             if old.agent_id == *agent {
                 self.refresh_qualified_monitor(
                     current.clone(),
@@ -299,11 +324,17 @@ impl Services {
                 }
             }
         } else {
-            let (owner, name) = target
-                .repository
-                .project_path
-                .rsplit_once('/')
-                .ok_or_else(source::refused)?;
+            let (owner, name) =
+                target
+                    .repository
+                    .project_path
+                    .rsplit_once('/')
+                    .ok_or_else(|| {
+                        refuse(
+                            Stage::ProjectPath,
+                            RefusalReason::Detail("MissingOwnerSeparator"),
+                        )
+                    })?;
             let monitor = PrMonitor {
                 monitor_id: PrMonitorId::new(),
                 workspace_id: workspace.clone(),
@@ -333,10 +364,10 @@ impl Services {
         authority
             .validate(self)
             .await
-            .map_err(|_| source::refused())?;
+            .map_err(|e| refuse(Stage::AuthorityValidation, e.into()))?;
         self.review_monitor_authorities
             .lock()
-            .map_err(|_| source::refused())?
+            .map_err(|_| refuse(Stage::AuthorityRegistry, RefusalReason::Detail("Poisoned")))?
             .insert(monitor.monitor_id.clone(), authority.clone());
         self.emit_qualified_monitor_event(
             &authority,

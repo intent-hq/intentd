@@ -40,10 +40,13 @@ async fn desktop_lifecycle_normal_turn_and_mcp_transport_recreation_keep_control
             .unwrap();
         let mut reader = BufReader::new(read);
         let mut line = String::new();
-        tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut line))
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            reader.read_line(&mut line),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         let result: Value = serde_json::from_str(&line).unwrap();
         assert_ne!(result["result"]["isError"], true, "{result}");
         assert!(line.contains("alreadyGranted"), "{line}");
@@ -95,7 +98,7 @@ async fn desktop_lifecycle_terminal_turn_failure_revokes_active_and_pending_cont
         let options = TurnOptions::default();
         let failure = Error::Internal("desktop lifecycle test provider failure".into());
         tokio::time::timeout(
-            Duration::from_secs(10),
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
             intent_core::with_caller(
                 Caller::Daemon,
                 handle_terminal_turn_failure(

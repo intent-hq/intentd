@@ -432,7 +432,7 @@ mod tests {
             .spawn()
             .unwrap();
         let mut supervisor = TestChild(child);
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(10));
         let pid = loop {
             if let Ok(text) = std::fs::read_to_string(&record) {
                 if let Ok(pid) = text.parse::<u32>() {

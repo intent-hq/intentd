@@ -21,19 +21,19 @@ use crate::repository_credentials::read::{
 };
 use crate::repository_credentials::{RepositoryCredentialError, Result as CredentialResult};
 use crate::source_control_auth_ops::repository_owner::RepositoryReadEligibility;
-use intent_core::{RepositoryResourceKind, ReviewTarget};
+use intent_core::{RepositoryResourceKind, RepositoryTarget, ReviewTarget};
 use intent_sourcecontrol::{
     error::ProviderFailureKind, RateLimitStatus, ReviewDetails, ReviewObservation,
 };
 
 use crate::observation_adapter::{
-    complete_snapshot, ConnectionObservations, ObservationReceipt, ObservationTicket, QualifiedKey,
-    ReviewObservations,
+    complete_snapshot, ConnectionObservations, ListObservations, ObservationReceipt,
+    ObservationTicket, QualifiedKey, ReviewObservations,
 };
 use crate::observation_policy::{Coverage, Ineligible};
 
 use super::{
-    retain_pr_cache, PrCache, PrFingerprint, PrKey, PrReadPolicy, PR_MONITOR_MAX_CHEAP_AGE,
+    PrCache, PrFingerprint, PrKey, PrReadPolicy, PR_MONITOR_MAX_CHEAP_AGE,
     PR_MONITOR_MAX_CHEAP_POLLS,
 };
 
@@ -118,10 +118,84 @@ pub(crate) struct ManagedCacheRequest<'a> {
     pub(crate) with_authority: &'a CacheAdmissionGuard<'a>,
 }
 
+/// Sanitized notification only. It cannot replay a denial into a successor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AcceptedCacheDenial {
+    pub(crate) repository: RepositoryTarget,
+    pub(crate) coverage: CacheDenialCoverage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CacheDenialCoverage {
+    Connection,
+    Project,
+    Resource(ReviewTarget),
+    List(RepositoryResourceKind),
+}
+
+/// Borrowed only while the original R/P response guards are held. R selects
+/// current matching physical-caller/account recipients before entering them.
+/// The callback may update these metadata handles but cannot acquire a cache,
+/// R lock, do I/O, await, or retain this capability beyond the callback.
+pub(crate) struct GuardedCacheDenial<'a> {
+    original: &'a ConnectionObservations,
+    accepted: &'a AcceptedCacheDenial,
+}
+
+impl GuardedCacheDenial<'_> {
+    pub(crate) fn notification(&self) -> AcceptedCacheDenial {
+        self.accepted.clone()
+    }
+
+    pub(crate) fn apply_to(&self, recipient: &ConnectionObservations) -> bool {
+        if !recipient.same_connection(self.original) {
+            return false;
+        }
+        match &self.accepted.coverage {
+            CacheDenialCoverage::Connection => recipient.deny_connection(),
+            CacheDenialCoverage::Project => recipient.deny_project(&self.accepted.repository),
+            CacheDenialCoverage::Resource(target) => recipient.deny_resource(target),
+            CacheDenialCoverage::List(kind) => {
+                recipient.deny_list(&self.accepted.repository, *kind);
+            }
+        }
+        true
+    }
+}
+
+pub(crate) type CacheDenialObserver<'a> = dyn Fn(&GuardedCacheDenial<'_>) + Sync + 'a;
+
+fn observe_denial(
+    disposition: RepositoryResponseDisposition,
+    connection: &ConnectionObservations,
+    repository: &RepositoryTarget,
+    addressed: CacheDenialCoverage,
+    observer: Option<&CacheDenialObserver<'_>>,
+) {
+    use RepositoryResponseDisposition as D;
+    let coverage = match disposition {
+        D::AcceptedCredentialRejection => CacheDenialCoverage::Connection,
+        D::CurrentProjectDenial => CacheDenialCoverage::Project,
+        D::CurrentResourceDenial => addressed,
+        D::NoDenial | D::NotApplied | D::Unattributed | D::Indeterminate => return,
+    };
+    if let Some(observer) = observer {
+        let accepted = AcceptedCacheDenial {
+            repository: repository.clone(),
+            coverage,
+        };
+        observer(&GuardedCacheDenial {
+            original: connection,
+            accepted: &accepted,
+        });
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum DetailAccess<'r, 'a> {
     Legacy(&'r CacheRequest<'a>),
     Managed(&'r ManagedCacheRequest<'a>),
+    Observed(&'r ManagedCacheRequest<'a>, &'r CacheDenialObserver<'a>),
 }
 
 pub(crate) struct DetailOutcome<T> {
@@ -150,16 +224,28 @@ impl<T> From<RepositoryProviderRead<T>> for DetailOutcome<T> {
 }
 
 impl<'r, 'a> DetailAccess<'r, 'a> {
+    fn managed(self) -> Option<&'r ManagedCacheRequest<'a>> {
+        match self {
+            Self::Legacy(_) => None,
+            Self::Managed(r) | Self::Observed(r, _) => Some(r),
+        }
+    }
+    fn observer(self) -> Option<&'r CacheDenialObserver<'a>> {
+        match self {
+            Self::Observed(_, observer) => Some(observer),
+            _ => None,
+        }
+    }
     fn request(self) -> &'r CacheRequest<'a> {
         match self {
             Self::Legacy(r) => r,
-            Self::Managed(r) => &r.request,
+            Self::Managed(r) | Self::Observed(r, _) => &r.request,
         }
     }
     fn check(self, quota: RateLimitStatus) -> Result<(), CacheFailure> {
         match self {
             Self::Legacy(r) => r.check(quota),
-            Self::Managed(_) => self.with_current(quota, None, || Ok(())),
+            Self::Managed(_) | Self::Observed(_, _) => self.with_current(quota, None, || Ok(())),
         }
     }
     // Managed actions already hold the original R and P fences. Do not call
@@ -179,7 +265,7 @@ impl<'r, 'a> DetailAccess<'r, 'a> {
         attribution: Option<&RepositoryResponseAttribution>,
         action: impl FnOnce() -> Result<T, CacheFailure> + Send,
     ) -> Result<T, CacheFailure> {
-        if matches!(self, Self::Managed(_)) && attribution.is_none() {
+        if self.managed().is_some() && attribution.is_none() {
             return Err(CacheFailure {
                 cause: CacheError::Credential(RepositoryCredentialError::BoundaryMismatch),
                 quota,
@@ -193,7 +279,7 @@ impl<'r, 'a> DetailAccess<'r, 'a> {
         attribution: Option<&RepositoryResponseAttribution>,
         action: impl FnOnce() -> Result<T, CacheFailure> + Send,
     ) -> Result<T, CacheFailure> {
-        let Self::Managed(r) = self else {
+        let Some(r) = self.managed() else {
             return action();
         };
         r.request.check(quota)?;
@@ -240,6 +326,20 @@ pub(crate) enum CacheError {
     PageTooLarge,
 }
 
+impl CacheError {
+    /// Static variant name for daemon-side refusal logs; never the inner
+    /// message, which may carry provider text.
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            Self::Admission(_) => "Admission",
+            Self::Credential(_) => "Credential",
+            Self::Ineligible(_) => "Ineligible",
+            Self::Provider(_) => "Provider",
+            Self::PageTooLarge => "PageTooLarge",
+        }
+    }
+}
+
 /// Quota evidence survives rejection of a late payload as well as provider errors.
 #[derive(Debug)]
 pub(crate) struct CacheFailure {
@@ -274,8 +374,12 @@ pub(crate) struct CacheDelivery {
     check: Arc<DeliveryCheck>,
     controls: Vec<Arc<dyn intent_core::repository_request::RepositoryMonitorEventSource>>,
 }
-type DeliveryCheck =
-    dyn Fn(&[&CacheDelivery], &mut CacheAdmissionAction<'_>) -> CredentialResult<()> + Send + Sync;
+pub(crate) type CacheRevalidationCheck<'a> = dyn Fn() -> CredentialResult<()> + Send + Sync + 'a;
+pub(crate) type CacheRevalidationAction<'a> =
+    dyn FnMut(&CacheRevalidationCheck<'_>) -> CredentialResult<()> + Send + 'a;
+type DeliveryCheck = dyn Fn(&[&CacheDelivery], &mut CacheRevalidationAction<'_>) -> CredentialResult<()>
+    + Send
+    + Sync;
 impl std::fmt::Debug for CacheDelivery {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("CacheDelivery(original observation)")
@@ -285,6 +389,19 @@ impl CacheDelivery {
     pub(crate) fn with_current(
         &self,
         action: &mut CacheAdmissionAction<'_>,
+    ) -> CredentialResult<()> {
+        self.with_revalidation(&mut |check| {
+            check()?;
+            action()
+        })
+    }
+
+    /// Keep the original map locked and supply a borrowed metadata-only check.
+    /// The caller repeats it INSIDE its final R/P fence just before transfer.
+    /// This check never reacquires a cache or any caller/provider owner lock.
+    pub(crate) fn with_revalidation(
+        &self,
+        action: &mut CacheRevalidationAction<'_>,
     ) -> CredentialResult<()> {
         Self::with_controls(&self.controls.iter().collect::<Vec<_>>(), &mut || {
             (self.check)(&[self], action)
@@ -298,6 +415,16 @@ impl CacheDelivery {
         deliveries: &[&Self],
         action: &mut CacheAdmissionAction<'_>,
     ) -> CredentialResult<()> {
+        Self::with_all_revalidation(deliveries, &mut |check| {
+            check()?;
+            action()
+        })
+    }
+
+    pub(crate) fn with_all_revalidation(
+        deliveries: &[&Self],
+        action: &mut CacheRevalidationAction<'_>,
+    ) -> CredentialResult<()> {
         let mut ordered = deliveries.to_vec();
         ordered.sort_unstable_by_key(|delivery| delivery.cache);
         let mut controls = deliveries
@@ -306,7 +433,7 @@ impl CacheDelivery {
             .collect::<Vec<_>>();
         controls.sort_unstable_by_key(|c| Arc::as_ptr(c).cast::<()>() as usize);
         controls.dedup_by(|a, b| Arc::ptr_eq(a, b));
-        Self::with_controls(&controls, &mut || Self::with_groups(&ordered, action))
+        Self::with_controls(&controls, &mut || Self::with_groups(&ordered, &[], action))
     }
 
     /// Retain the requesting native lifetime alongside the original observation.
@@ -331,14 +458,22 @@ impl CacheDelivery {
 
     fn with_groups(
         deliveries: &[&Self],
-        action: &mut CacheAdmissionAction<'_>,
+        checks: &[&CacheRevalidationCheck<'_>],
+        action: &mut CacheRevalidationAction<'_>,
     ) -> CredentialResult<()> {
         let Some(first) = deliveries.first() else {
-            return action();
+            return action(&|| {
+                for check in checks {
+                    check()?;
+                }
+                Ok(())
+            });
         };
         let end = deliveries.partition_point(|delivery| delivery.cache == first.cache);
-        (first.check)(&deliveries[..end], &mut || {
-            Self::with_groups(&deliveries[end..], action)
+        (first.check)(&deliveries[..end], &mut |check| {
+            let mut all = checks.to_vec();
+            all.push(check);
+            Self::with_groups(&deliveries[end..], &all, action)
         })
     }
 }
@@ -346,10 +481,17 @@ enum DeliveryObservation {
     Complete(Arc<ObservationReceipt>),
     Partial(ObservationTicket),
 }
-struct DeliveryReceipt<K> {
-    key: CacheKey<K>,
-    connection: ConnectionObservations,
-    observation: DeliveryObservation,
+enum DeliveryReceipt<K> {
+    Resource {
+        key: CacheKey<K>,
+        connection: ConnectionObservations,
+        observation: DeliveryObservation,
+    },
+    Page {
+        connection: ConnectionObservations,
+        list: ListObservations,
+        targets: Vec<ReviewTarget>,
+    },
 }
 fn delivery<K: Eq + Hash + Send + Sync + 'static, L: Send + 'static, T: Send + 'static>(
     cache: Weak<Mutex<CacheMap<K, L, T>>>,
@@ -357,20 +499,47 @@ fn delivery<K: Eq + Hash + Send + Sync + 'static, L: Send + 'static, T: Send + '
     connection: ConnectionObservations,
     observation: DeliveryObservation,
 ) -> CacheDelivery {
+    delivery_receipt(
+        cache,
+        DeliveryReceipt::Resource {
+            key,
+            connection,
+            observation,
+        },
+    )
+}
+
+fn page_delivery<K: Eq + Hash + Send + Sync + 'static, L: Send + 'static, T: Send + 'static>(
+    cache: &SharedCache<K, L, T>,
+    connection: &ConnectionObservations,
+    list: &ListObservations,
+    targets: Vec<ReviewTarget>,
+) -> CacheDelivery {
+    delivery_receipt(
+        Arc::downgrade(cache),
+        DeliveryReceipt::Page {
+            connection: connection.clone(),
+            list: list.clone(),
+            targets,
+        },
+    )
+}
+
+fn delivery_receipt<K: Eq + Hash + Send + Sync + 'static, L: Send + 'static, T: Send + 'static>(
+    cache: Weak<Mutex<CacheMap<K, L, T>>>,
+    receipt: DeliveryReceipt<K>,
+) -> CacheDelivery {
     let identity = cache.as_ptr().addr();
     CacheDelivery {
         cache: identity,
         controls: Vec::new(),
-        receipt: Arc::new(DeliveryReceipt {
-            key,
-            connection,
-            observation,
-        }),
+        receipt: Arc::new(receipt),
         check: Arc::new(move |deliveries, action| {
             let cache = cache.upgrade().ok_or(RepositoryCredentialError::Retired)?;
             let locked = cache
                 .lock()
                 .map_err(|_| RepositoryCredentialError::Indeterminate)?;
+            let mut checks: Vec<Box<CacheRevalidationCheck<'static>>> = Vec::new();
             for delivery in deliveries {
                 if delivery.cache != identity {
                     return Err(RepositoryCredentialError::BoundaryMismatch);
@@ -379,23 +548,71 @@ fn delivery<K: Eq + Hash + Send + Sync + 'static, L: Send + 'static, T: Send + '
                     .receipt
                     .downcast_ref::<DeliveryReceipt<K>>()
                     .ok_or(RepositoryCredentialError::BoundaryMismatch)?;
-                let Some(CacheSlot::Qualified(slot)) = locked.get(&receipt.key) else {
-                    return Err(RepositoryCredentialError::Retired);
-                };
-                let current = slot.observations.belongs_to(&receipt.connection)
-                    && match &receipt.observation {
-                        DeliveryObservation::Complete(observation) => slot
-                            .observations
-                            .can_serve(observation, &receipt.connection),
-                        DeliveryObservation::Partial(ticket) => {
-                            slot.observations.validate(ticket).is_ok()
+                match receipt {
+                    DeliveryReceipt::Resource {
+                        key,
+                        connection,
+                        observation,
+                    } => {
+                        let Some(CacheSlot::Qualified(slot)) = locked.get(key) else {
+                            return Err(RepositoryCredentialError::Retired);
+                        };
+                        if !slot.observations.belongs_to(connection) {
+                            return Err(RepositoryCredentialError::Retired);
                         }
-                    };
-                if !current {
-                    return Err(RepositoryCredentialError::Retired);
+                        let check = match observation {
+                            DeliveryObservation::Complete(observation) => {
+                                if !slot.observations.can_serve(observation, connection) {
+                                    return Err(RepositoryCredentialError::Retired);
+                                }
+                                slot.observations.revalidate_receipt(observation)
+                            }
+                            DeliveryObservation::Partial(ticket) => {
+                                slot.observations
+                                    .validate(ticket)
+                                    .map_err(|_| RepositoryCredentialError::Retired)?;
+                                slot.observations.revalidate_ticket(ticket)
+                            }
+                        };
+                        checks.push(Box::new(move || {
+                            check
+                                .validate()
+                                .map_err(|_| RepositoryCredentialError::Retired)
+                        }));
+                    }
+                    DeliveryReceipt::Page {
+                        connection,
+                        list,
+                        targets,
+                    } => {
+                        if !targets.iter().all(|target| {
+                            matches!(locked.get(&CacheKey::Qualified(Box::new(connection.key(target.clone())))),
+                                Some(CacheSlot::Qualified(slot)) if slot.observations.belongs_to(connection))
+                        }) {
+                            return Err(RepositoryCredentialError::Retired);
+                        }
+                        let list = list.clone();
+                        let targets = targets.clone();
+                        checks.push(Box::new(move || {
+                            list.validate_start()
+                                .map_err(|_| RepositoryCredentialError::Retired)?;
+                            for target in &targets {
+                                list.validate_row(target)
+                                    .map_err(|_| RepositoryCredentialError::Retired)?;
+                            }
+                            Ok(())
+                        }));
+                    }
                 }
             }
-            action()
+            let check = || {
+                for check in &checks {
+                    check()?;
+                }
+                Ok(())
+            };
+            check()?;
+            action(&check)
         }),
     }
 }
@@ -597,50 +814,16 @@ pub(crate) fn finish_access<
         quota,
         attribution,
     } = outcome;
-    if let (DetailAccess::Managed(managed), Err(_)) = (access, &outcome) {
-        // The response error is already known. Eligibility/slot refusal must not
-        // turn it into a synthetic local error or discard its quota.
-        let mut locked = cache.lock().unwrap();
-        if let Some(CacheSlot::Qualified(slot)) = locked.get_mut(&request.key()) {
-            if slot.observations.belongs_to(request.connection) {
-                if let Some(attribution) = &attribution {
-                    let mut ticket = Some(ticket);
-                    let _ = (managed.with_authority)(&mut || {
-                        managed
-                            .eligibility
-                            .with_response(attribution, request.target, &mut |d| {
-                                use RepositoryResponseDisposition as D;
-                                let kind = match d {
-                                    D::AcceptedCredentialRejection => {
-                                        Some(ProviderFailureKind::CredentialRejected)
-                                    }
-                                    D::CurrentProjectDenial => {
-                                        Some(ProviderFailureKind::ProjectDenied)
-                                    }
-                                    D::CurrentResourceDenial => {
-                                        Some(ProviderFailureKind::ResourceDenied)
-                                    }
-                                    D::NoDenial => None,
-                                    D::NotApplied | D::Unattributed | D::Indeterminate => {
-                                        return Ok(())
-                                    }
-                                };
-                                let ticket = ticket
-                                    .take()
-                                    .ok_or(RepositoryCredentialError::Indeterminate)?;
-                                if slot.observations.failure_kind(ticket, kind).is_ok() {
-                                    slot.reuse_allowed = false;
-                                }
-                                Ok(())
-                            })
-                    });
-                }
-            }
-        }
-        return Err(CacheFailure {
-            cause: CacheError::Provider(outcome.err().unwrap()),
+    if let (Some(managed), Err(_)) = (access.managed(), &outcome) {
+        return Err(managed_failure(
+            cache,
+            managed,
+            ticket,
+            outcome.err().unwrap(),
             quota,
-        });
+            attribution.as_deref(),
+            (true, access.observer()),
+        ));
     }
     access.check(quota)?;
     let delivery_cache = Arc::downgrade(cache);
@@ -714,6 +897,199 @@ pub(crate) fn finish_access<
     })
 }
 
+/// Only the original provider's guarded disposition changes eligibility.
+/// Section errors do not change completeness of a retained detail payload.
+fn managed_failure<K, L, T>(
+    cache: &SharedCache<K, L, T>,
+    managed: &ManagedCacheRequest<'_>,
+    ticket: ObservationTicket,
+    error: intent_sourcecontrol::Error,
+    quota: RateLimitStatus,
+    attribution: Option<&RepositoryResponseAttribution>,
+    (disables_detail_reuse, observer): (bool, Option<&CacheDenialObserver<'_>>),
+) -> CacheFailure
+where
+    K: Eq + Hash + Send,
+    L: Send,
+    T: Send,
+{
+    let request = &managed.request;
+    let mut locked = cache.lock().unwrap();
+    if let Some(CacheSlot::Qualified(slot)) = locked.get_mut(&request.key()) {
+        if slot.observations.belongs_to(request.connection) {
+            if let Some(attribution) = attribution {
+                let mut ticket = Some(ticket);
+                let _ = (managed.with_authority)(&mut || {
+                    managed
+                        .eligibility
+                        .with_response(attribution, request.target, &mut |d| {
+                            use RepositoryResponseDisposition as D;
+                            let kind = match d {
+                                D::AcceptedCredentialRejection => {
+                                    Some(ProviderFailureKind::CredentialRejected)
+                                }
+                                D::CurrentProjectDenial => Some(ProviderFailureKind::ProjectDenied),
+                                D::CurrentResourceDenial => {
+                                    Some(ProviderFailureKind::ResourceDenied)
+                                }
+                                D::NoDenial => None,
+                                D::NotApplied | D::Unattributed | D::Indeterminate => return Ok(()),
+                            };
+                            let ticket = ticket
+                                .take()
+                                .ok_or(RepositoryCredentialError::Indeterminate)?;
+                            if slot.observations.failure_kind(ticket, kind).is_ok() {
+                                observe_denial(
+                                    d,
+                                    request.connection,
+                                    &request.target.repository,
+                                    CacheDenialCoverage::Resource(request.target.clone()),
+                                    observer,
+                                );
+                                if disables_detail_reuse {
+                                    slot.reuse_allowed = false;
+                                }
+                            }
+                            Ok(())
+                        })
+                });
+            }
+        }
+    }
+    // Application refusal must not erase the response's actual error or quota.
+    CacheFailure {
+        cause: CacheError::Provider(error),
+        quota,
+    }
+}
+
+/// Uncached fixed-resource sections share the original detail slot's denial
+/// and eviction fences. Success never installs a payload, extends its age, or
+/// recovers detail/summary coverage. Each provider call owns its own receipt.
+pub(crate) async fn read_managed_review_section<T, F, Fut>(
+    cache: &PrCache,
+    request: &ManagedCacheRequest<'_>,
+    monitored: &HashSet<PrKey>,
+    provider: F,
+) -> Result<CacheRead<T>, CacheFailure>
+where
+    T: Send,
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = RepositoryProviderRead<T>>,
+{
+    read_review_section_access(cache, DetailAccess::Managed(request), monitored, || async {
+        provider().await.into()
+    })
+    .await
+}
+
+/// Original managed read plus a guarded, notification-only denial observer.
+pub(crate) async fn read_managed_review_section_observed<T, F, Fut>(
+    cache: &PrCache,
+    request: &ManagedCacheRequest<'_>,
+    observer: &CacheDenialObserver<'_>,
+    monitored: &HashSet<PrKey>,
+    provider: F,
+) -> Result<CacheRead<T>, CacheFailure>
+where
+    T: Send,
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = RepositoryProviderRead<T>>,
+{
+    read_review_section_access(
+        cache,
+        DetailAccess::Observed(request, observer),
+        monitored,
+        || async { provider().await.into() },
+    )
+    .await
+}
+
+async fn read_review_section_access<T, F, Fut>(
+    cache: &PrCache,
+    access: DetailAccess<'_, '_>,
+    monitored: &HashSet<PrKey>,
+    provider: F,
+) -> Result<CacheRead<T>, CacheFailure>
+where
+    T: Send,
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = DetailOutcome<T>>,
+{
+    let request = access.request();
+    if request.target.kind == RepositoryResourceKind::Issue {
+        return Err(CacheFailure::ineligible(
+            Ineligible::DifferentSlot,
+            RateLimitStatus::default(),
+        ));
+    }
+    let Started::Read { ticket, .. } = start_access(cache, access, Duration::ZERO, |c| {
+        retain_pr_cache(c, monitored, Instant::now());
+    })?
+    else {
+        unreachable!("zero age never returns a cache hit")
+    };
+    let DetailOutcome {
+        value,
+        quota,
+        attribution,
+    } = provider().await;
+    let value = match value {
+        Ok(value) => value,
+        Err(error) => {
+            if let Some(managed) = access.managed() {
+                return Err(managed_failure(
+                    cache,
+                    managed,
+                    ticket,
+                    error,
+                    quota,
+                    attribution.as_deref(),
+                    (false, access.observer()),
+                ));
+            }
+            if request.check(quota).is_ok() {
+                let mut cache = cache.lock().unwrap();
+                if let Some(CacheSlot::Qualified(slot)) = cache.get_mut(&request.key()) {
+                    let kind = match &error {
+                        intent_sourcecontrol::Error::Provider(failure) => Some(failure.kind),
+                        _ => None,
+                    };
+                    let _ = slot.observations.failure_kind(ticket, kind);
+                }
+            }
+            return Err(CacheFailure {
+                cause: CacheError::Provider(error),
+                quota,
+            });
+        }
+    };
+    access.check(quota)?;
+    let mut locked = cache.lock().unwrap();
+    let slots = &mut *locked;
+    access.response_current(quota, attribution.as_deref(), || {
+        let Some(CacheSlot::Qualified(slot)) = slots.get(&request.key()) else {
+            return Err(CacheFailure::ineligible(Ineligible::DifferentSlot, quota));
+        };
+        slot.observations
+            .validate(&ticket)
+            .map_err(|e| CacheFailure::ineligible(e, quota))?;
+        access.check_in_action(quota)?;
+        retain_pr_cache(slots, monitored, Instant::now());
+        Ok(CacheRead {
+            value,
+            quota,
+            fetched: true,
+            delivery: delivery(
+                Arc::downgrade(cache),
+                request.key(),
+                request.connection.clone(),
+                DeliveryObservation::Partial(ticket),
+            ),
+        })
+    })
+}
+
 /// Existing limits apply across legacy AND qualified rows, including in-flight
 /// metadata. A monitored review remains exempt; issues pass no exemptions.
 pub(crate) fn retain<K: Clone + Eq + Hash, L, T>(
@@ -748,6 +1124,20 @@ pub(crate) fn retain<K: Clone + Eq + Hash, L, T>(
             cache.remove(&key);
         }
     }
+}
+
+/// Collection callers use the existing PR retention policy under the map lock.
+pub(crate) fn retain_pr_cache(
+    cache: &mut CacheMap<PrKey, super::LegacyPrCacheSlot, ReviewObservation>,
+    monitored: &HashSet<PrKey>,
+    now: Instant,
+) {
+    super::retain_pr_cache(cache, monitored, now);
+}
+
+/// Load the existing monitor exemptions before entering cache/provider guards.
+pub(crate) async fn monitored_review_keys(services: &crate::Services) -> HashSet<PrKey> {
+    services.monitored_pr_keys().await
 }
 
 /// Qualified review read with the legacy cheap-poll bounds and fingerprint.
@@ -798,6 +1188,33 @@ where
     read_review_access(
         cache,
         DetailAccess::Managed(request),
+        policy,
+        monitored,
+        || async { primary().await.into() },
+        || async { full().await.into() },
+    )
+    .await
+}
+
+/// Original managed read plus a guarded, notification-only denial observer.
+pub(crate) async fn read_managed_review_observed<P, PF, F, FF>(
+    cache: &PrCache,
+    request: &ManagedCacheRequest<'_>,
+    observer: &CacheDenialObserver<'_>,
+    policy: PrReadPolicy,
+    monitored: &HashSet<PrKey>,
+    primary: P,
+    full: F,
+) -> Result<CacheRead<ReviewObservation>, CacheFailure>
+where
+    P: FnOnce() -> PF,
+    PF: Future<Output = RepositoryProviderRead<ReviewDetails>>,
+    F: FnOnce() -> FF,
+    FF: Future<Output = RepositoryProviderRead<ReviewObservation>>,
+{
+    read_review_access(
+        cache,
+        DetailAccess::Observed(request, observer),
         policy,
         monitored,
         || async { primary().await.into() },

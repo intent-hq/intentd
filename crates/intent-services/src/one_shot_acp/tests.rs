@@ -418,7 +418,7 @@ const onPrompt = () => {{
     let slots = AdapterSlots::new(1);
     let started = std::time::Instant::now();
     let outcome = tokio::time::timeout(
-        Duration::from_secs(15),
+        intentd_test_support::test_timeout(Duration::from_secs(15)),
         run_one_shot_acp_in(
             None,
             &slots,
@@ -546,11 +546,14 @@ async fn feed_requests(conn: &Connection, peer_out: &mut DuplexStream, requests:
         .await
         .expect("peer write");
     let expected = seq + requests.len() as u64;
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while conn.client_request_seq() < expected {
-            tokio::task::yield_now().await;
-        }
-    })
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            while conn.client_request_seq() < expected {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
     .await
     .expect("reader forwards every request");
 }
@@ -585,7 +588,10 @@ async fn response_pending_at_a_phase_boundary_is_carried_into_the_next_phase() {
     serve_requests_while(
         &mut responder,
         &mut requests,
-        tokio::time::timeout(Duration::from_millis(50), std::future::pending::<()>()),
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(50)),
+            std::future::pending::<()>(),
+        ),
     )
     .await
     .expect_err("the phase clock ends the first phase");
@@ -600,20 +606,23 @@ async fn response_pending_at_a_phase_boundary_is_carried_into_the_next_phase() {
     let answer = serve_requests_while(
         &mut responder,
         &mut requests,
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let line = peer_in
-                    .next_line()
-                    .await
-                    .expect("peer read")
-                    .expect("peer line");
-                let msg: Value = serde_json::from_str(&line).expect("json");
-                if msg["id"] == json!(9001) {
-                    return msg;
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            async {
+                loop {
+                    let line = peer_in
+                        .next_line()
+                        .await
+                        .expect("peer read")
+                        .expect("peer line");
+                    let msg: Value = serde_json::from_str(&line).expect("json");
+                    if msg["id"] == json!(9001) {
+                        return msg;
+                    }
+                    assert_eq!(msg["method"], "x/fill", "unexpected line: {line}");
                 }
-                assert_eq!(msg["method"], "x/fill", "unexpected line: {line}");
-            }
-        }),
+            },
+        ),
     )
     .await
     .expect("the send carried across the phase boundary was never answered");
@@ -648,7 +657,7 @@ async fn phase_resolves_on_budget_while_a_response_send_is_pending_on_writer_cap
     let margin = Duration::from_secs(2);
     let started = std::time::Instant::now();
     let outcome = tokio::time::timeout(
-        Duration::from_secs(10),
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
         serve_requests_while(
             &mut responder,
             &mut requests,
@@ -911,7 +920,8 @@ fn started_count(log: &std::path::Path) -> usize {
 
 /// Poll `cond` until it holds, failing with `what` if it never does.
 async fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let deadline =
+        std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(20));
     while std::time::Instant::now() < deadline {
         if cond() {
             return;

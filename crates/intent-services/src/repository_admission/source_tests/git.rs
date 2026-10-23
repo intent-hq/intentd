@@ -480,7 +480,7 @@ async fn cancellation_retires_escaped_sources_before_releasing_the_worktree_lock
     assert!(task.await.unwrap_err().is_cancelled());
     assert_eq!(retirement.check_current(), Err(AdmissionError::Retired));
     tokio::time::timeout(
-        Duration::from_secs(2),
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
         locks.with_lock(&f.path, || async {
             assert_eq!(
                 escaped
@@ -514,7 +514,7 @@ async fn errors_release_the_lock_and_retire_the_session() {
     assert_eq!(result, Err(AdmissionError::Unavailable));
     assert_eq!(retirement.check_current(), Err(AdmissionError::Retired));
     tokio::time::timeout(
-        Duration::from_secs(2),
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
         locks.with_lock(&f.path, || async {}),
     )
     .await

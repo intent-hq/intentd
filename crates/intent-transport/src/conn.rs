@@ -22,8 +22,8 @@ use tokio::sync::{mpsc, OwnedSemaphorePermit};
 use tokio::task::JoinHandle;
 use tracing::Instrument;
 
-mod page_state;
 mod presence_focus;
+pub(crate) mod recovery;
 
 use crate::browser;
 use crate::catalog;
@@ -78,6 +78,7 @@ pub(crate) struct OutboundSender {
     priority: mpsc::Sender<crate::OutboundFrame>,
     bulk: mpsc::Sender<crate::OutboundFrame>,
     shutdown: Option<RpcLimiter>,
+    pub(crate) recovery: recovery::Output,
 }
 
 impl OutboundSender {
@@ -104,7 +105,11 @@ impl OutboundSender {
     /// Queue a bulk frame (event notification / subscription push). `Err`
     /// means the connection's writer is gone.
     pub(crate) async fn send_bulk(&self, frame: String) -> Result<(), ()> {
-        self.bulk.send(frame.into()).await.map_err(|_| ())
+        tokio::select! {
+            biased;
+            () = self.recovery.cancelled() => Err(()),
+            result = self.bulk.send(frame.into()) => result.map_err(|_| ()),
+        }
     }
 
     /// Reserve one slot on the priority lane, waiting for space when the
@@ -126,7 +131,7 @@ impl OutboundSender {
     /// Whether the writer has stopped draining (both lanes closed together;
     /// checking one suffices).
     pub(crate) fn is_closed(&self) -> bool {
-        self.priority.is_closed()
+        self.recovery.is_closed() || self.priority.is_closed()
     }
 
     /// Whether the priority lane holds neither a queued frame nor a reserved
@@ -170,6 +175,22 @@ impl OutboundReceiver {
     /// and both lanes are drained. Cancel-safe: no frame is lost when the
     /// caller races this against other select arms.
     pub(crate) async fn recv(&mut self) -> Option<crate::OutboundFrame> {
+        self.recv_with_bulk_gate(&mut None).await
+    }
+
+    pub(crate) async fn recv_with_bulk_gate(
+        &mut self,
+        gate: &mut Option<tokio::sync::watch::Receiver<bool>>,
+    ) -> Option<crate::OutboundFrame> {
+        async fn bulk(
+            rx: &mut mpsc::Receiver<crate::OutboundFrame>,
+            gate: &mut Option<tokio::sync::watch::Receiver<bool>>,
+        ) -> Option<crate::OutboundFrame> {
+            if let Some(gate) = gate {
+                gate.wait_for(|open| *open).await.ok()?;
+            }
+            rx.recv().await
+        }
         loop {
             // Drain whatever is already queued on the priority lane first.
             if self.priority_open {
@@ -187,7 +208,7 @@ impl OutboundReceiver {
                             Some(frame) => return Some(frame),
                             None => self.priority_open = false,
                         },
-                        frame = self.bulk.recv() => match frame {
+                        frame = bulk(&mut self.bulk, gate) => match frame {
                             Some(frame) => return Some(frame),
                             None => self.bulk_open = false,
                         },
@@ -197,7 +218,7 @@ impl OutboundReceiver {
                     Some(frame) => return Some(frame),
                     None => self.priority_open = false,
                 },
-                (false, true) => match self.bulk.recv().await {
+                (false, true) => match bulk(&mut self.bulk, gate).await {
                     Some(frame) => return Some(frame),
                     None => self.bulk_open = false,
                 },
@@ -210,13 +231,20 @@ impl OutboundReceiver {
 /// Build one connection's two-lane outbound queue ([`PRIORITY_CAPACITY`] /
 /// [`BULK_CAPACITY`] frames).
 pub(crate) fn outbound_channel() -> (OutboundSender, OutboundReceiver) {
+    outbound_channel_with_capacity(BULK_CAPACITY)
+}
+
+pub(crate) fn outbound_channel_with_capacity(
+    capacity: usize,
+) -> (OutboundSender, OutboundReceiver) {
     let (priority_tx, priority_rx) = mpsc::channel::<crate::OutboundFrame>(PRIORITY_CAPACITY);
-    let (bulk_tx, bulk_rx) = mpsc::channel::<crate::OutboundFrame>(BULK_CAPACITY);
+    let (bulk_tx, bulk_rx) = mpsc::channel::<crate::OutboundFrame>(capacity);
     (
         OutboundSender {
             priority: priority_tx,
             bulk: bulk_tx,
             shutdown: None,
+            recovery: recovery::Output::default(),
         },
         OutboundReceiver {
             priority: priority_rx,
@@ -251,6 +279,7 @@ struct ConnSub {
     lifecycle: Option<ChatLifecycle>,
     note_lease: bool,
     host_removal_control: bool,
+    recovery: Option<recovery::Lease>,
 }
 
 impl Drop for ConnSub {
@@ -276,6 +305,7 @@ impl Drop for ConnSub {
 pub(crate) struct ConnSubs {
     pub(crate) pairing: crate::pairing::ConnectionPairing,
     subs: HashMap<String, ConnSub>,
+    fences: Vec<JoinHandle<()>>,
     setup: crate::provider_setup::Connection,
     /// The server-bound hello used to refresh browser hosting on a live upgrade.
     pub(crate) hello_identity: Option<crate::reverse::ReverseClientIdentity>,
@@ -284,6 +314,18 @@ pub(crate) struct ConnSubs {
     /// `note.presence` lease — declared after `subs` so the forwarders'
     /// lease guards drop first.
     presence: presence::PresenceConn,
+    /// IDs of `agent.workers.subscribe` subscriptions (§5.5b), for the
+    /// per-connection cap; entries torn down via `events.unsubscribe` are
+    /// pruned against `subs` before counting.
+    worker_subs: HashSet<String>,
+}
+
+impl Drop for ConnSubs {
+    fn drop(&mut self) {
+        for task in &self.fences {
+            task.abort();
+        }
+    }
 }
 
 impl ConnSubs {
@@ -314,6 +356,7 @@ impl ConnSubs {
                 lifecycle,
                 note_lease: false,
                 host_removal_control: false,
+                recovery: None,
             },
         );
     }
@@ -336,6 +379,7 @@ impl ConnSubs {
                 lifecycle: None,
                 note_lease: true,
                 host_removal_control: false,
+                recovery: None,
             },
         );
     }
@@ -357,6 +401,20 @@ impl ConnSubs {
                 .await;
         }
         true
+    }
+
+    /// Drop `agent.workers.subscribe` entries whose forwarder has ended,
+    /// from both the registry and the per-connection worker cap (§5.5b).
+    fn reclaim_finished_workers(&mut self) {
+        let subs = &mut self.subs;
+        self.worker_subs.retain(|id| match subs.get(id) {
+            Some(live) if !live.handle.is_finished() => true,
+            Some(_) => {
+                subs.remove(id);
+                false
+            }
+            None => false,
+        });
     }
 
     /// Whether a registered forwarder has exited on its own (`None` for an
@@ -384,7 +442,7 @@ impl ConnSubs {
 /// Route one frame: deliver replies to daemon-initiated reverse RPCs (§12.4),
 /// then intercept the `system.*` control methods (`system.status` and
 /// `system.requestUpdate` on both transports;
-/// `system.shutdown`/`system.importLegacy` UDS-only via the
+/// `system.shutdown` UDS-only via the
 /// `is_uds` guard inside `control::handle`), the `host.status` capability
 /// probe (both transports), and the `events.` fast-path, else hand to the
 /// JSON-RPC dispatcher. `control` is
@@ -443,7 +501,11 @@ pub(crate) fn process_frame<'a>(
     let context = crate::context::CapturedFrame::capture();
     async move {
         context
-            .run(process_captured_frame(
+            // Boxed: `run` nests task-local scopes that each move the body
+            // by value, and debug builds give every scope a stack copy of
+            // this large per-frame future (WSS e2e tests overflowed the
+            // 2 MiB test-thread stack without it).
+            .run(Box::pin(process_captured_frame(
                 &context,
                 raw,
                 api,
@@ -457,7 +519,7 @@ pub(crate) fn process_frame<'a>(
                 client_id,
                 is_local,
                 limiter,
-            ))
+            )))
             .await
     }
 }
@@ -505,24 +567,6 @@ async fn process_captured_frame(
                 };
                 return out_tx.send_priority(frame).await.is_ok();
             }
-        }
-        // Admit opt-in state subscriptions before classifiers clone params/id.
-        if matches!(
-            value["method"].as_str(),
-            Some("note.subscribe" | "comment.subscribe")
-        ) && value["params"]["projection"] == "pageState"
-            && (raw.len() > 65_536 || !page_state::valid_id(value.get("id")))
-        {
-            let id = value.get("id").filter(|id| page_state::valid_id(Some(id)));
-            return send_fast_path_error(
-                events::IdInfo {
-                    present: value.get("id").is_some(),
-                    echo: id.cloned().unwrap_or(Value::Null),
-                },
-                "Invalid pageState subscription",
-                out_tx,
-            )
-            .await;
         }
         // A reply to a daemon-initiated reverse request (FE-served intents such
         // as `host.openExternal`, §12.4) — route it to the awaiting caller and
@@ -574,6 +618,25 @@ async fn process_captured_frame(
                 control::classify(value).filter(|req| control.services().admits(&req.method))
             {
                 let is_uds = !crate::context::is_tcp_connection();
+                if is_uds {
+                    if let Some(query) = control::gitlab_credential_query(&req) {
+                        let Ok(slot) = out_tx.reserve_priority().await else {
+                            return false;
+                        };
+                        finish_prepared_rpc(
+                            context,
+                            None,
+                            panic_guard::guard_prepared(
+                                &method,
+                                rpc_id.clone(),
+                                control::prepare_gitlab_credential(req, query, api.as_ref()),
+                            ),
+                            slot,
+                        )
+                        .await;
+                        return true;
+                    }
+                }
                 // A collaborator only ever reaches `system.status` here (the
                 // allowlist above refused the rest) and gets its guest-safe
                 // projection; the administrator keeps the full snapshot.
@@ -841,7 +904,12 @@ async fn process_captured_frame(
                 })();
                 if let Some((canonical, attachment)) = admitted {
                     let sent = out_tx
-                        .send_priority(client::attachment_result(&req, &canonical, is_local))
+                        .send_priority(client::attachment_result(
+                            &req,
+                            &canonical,
+                            is_local,
+                            hello_version(control),
+                        ))
                         .await
                         .is_ok();
                     if sent {
@@ -871,7 +939,14 @@ async fn process_captured_frame(
             subs.setup = crate::provider_setup::Connection::default();
             let mut bound = None;
             let frame = panic_guard::guard_frame(&method, rpc_id.clone(), async {
-                let outcome = client::handle(req, api.as_ref(), client_id, is_local).await;
+                let outcome = client::handle(
+                    req,
+                    api.as_ref(),
+                    client_id,
+                    is_local,
+                    hello_version(control),
+                )
+                .await;
                 bound = outcome.bound;
                 if control.and_then(|c| c.startup_status()).is_some() {
                     outcome.frame.map(|frame| {
@@ -975,6 +1050,15 @@ async fn process_captured_frame(
                 rpc_id.clone(),
                 out_tx,
                 handle_sub_fast_path(sub, api, bus, out_tx, subs),
+            )
+            .await;
+        }
+        if let Some(req) = crate::agent_workers::classify(value) {
+            return panic_guard::guard_send(
+                &method,
+                rpc_id.clone(),
+                out_tx,
+                handle_workers_subscribe(req, api, bus, out_tx, subs),
             )
             .await;
         }
@@ -1168,6 +1252,15 @@ async fn finish_prepared_rpc(
 /// else is answered inline so the error matrix is unchanged under load.
 /// Delegates to the router's [`check_envelope`] so both paths share one
 /// implementation of the envelope-validity rules.
+/// The `server.version` a `client.hello` advertises: the composition root's
+/// daemon version (intent-hq/intent#7256). Only library-level compositions
+/// without a control surface (no daemon binary) fall back to this crate's.
+fn hello_version(control: Option<&Arc<dyn SystemControl>>) -> &str {
+    control.map_or(env!("CARGO_PKG_VERSION"), |control| {
+        control.daemon_version()
+    })
+}
+
 fn is_dispatchable(parsed: Option<&Value>) -> bool {
     matches!(
         parsed.map(check_envelope),
@@ -1236,6 +1329,144 @@ async fn refuse_forbidden(method: &str, rpc_id: Option<Value>, out_tx: &Outbound
     }
 }
 
+/// `agent.workers.subscribe` (§5.5b): authorize via the list read, admit
+/// within the per-connection cap, ack, push the seq-0 snapshot, then one
+/// complete snapshot per change. The bus subscription is taken BEFORE the
+/// seq-0 read so no change is missed, and every later push re-reads the
+/// projection instead of forwarding event data, so a push is never older than
+/// one already sent. Returns `false` when the outbound channel is closed.
+pub(crate) async fn handle_workers_subscribe(
+    req: crate::agent_workers::WorkersSubscribe,
+    api: &Arc<dyn WorkspaceApi>,
+    bus: &EventBus,
+    out_tx: &OutboundSender,
+    subs: &mut ConnSubs,
+) -> bool {
+    let crate::agent_workers::WorkersSubscribe { id, params } = req;
+    let reply = |code: i32, message: &str, data_code: &str| {
+        events::error_frame_with_data(&id.echo, code, message, &json!({ "code": data_code }))
+    };
+    let ids = crate::router::wire_id(&params, "workspaceId")
+        .zip(crate::router::wire_id(&params, "agentId"));
+    let Some((workspace_id, agent_id)) = ids else {
+        let frame = reply(
+            -32602,
+            "workspaceId and agentId must be nonempty strings of at most 256 bytes without control characters",
+            "invalid-params",
+        );
+        return !id.present || out_tx.send_priority(frame).await.is_ok();
+    };
+    let (workspace_id, agent_id) = (
+        WorkspaceId::from(workspace_id),
+        AgentId::from(agent_id.as_str()),
+    );
+    // `workspace:updated` carries membership changes: each one re-checks the
+    // caller's access so a revoked member's subscription ends promptly even
+    // when the agent's workers are quiet.
+    let subscription = bus.subscribe(SubscriptionFilter {
+        event_types: vec![
+            intent_core::events::AGENT_WORKERS_CHANGED.to_string(),
+            WORKSPACE_UPDATED.to_string(),
+        ],
+        workspace_id: Some(workspace_id.0.clone()),
+        batch_window: None,
+        collaborator_only: crate::context::is_non_administrator_caller(),
+        ..Default::default()
+    });
+    let snapshot = match api
+        .agent_workers_list(workspace_id.clone(), agent_id.clone())
+        .await
+    {
+        Ok(snapshot) => snapshot,
+        Err(e) => {
+            let frame = match e {
+                intent_core::Error::InvalidParams(m) | intent_core::Error::InvalidInput(m) => {
+                    reply(-32602, &m, "invalid-params")
+                }
+                intent_core::Error::NotFound(_) | intent_core::Error::Forbidden(_) => {
+                    reply(-32602, "Agent not found", "not-found")
+                }
+                other => events::error_frame(&id.echo, -32603, &other.to_string()),
+            };
+            return !id.present || out_tx.send_priority(frame).await.is_ok();
+        }
+    };
+    // Reclaim every worker subscription whose forwarder ended (agent gone,
+    // access lost): its registry entry and its capacity slot. The registry
+    // therefore never holds more than the cap of ended worker entries.
+    subs.reclaim_finished_workers();
+    if subs.worker_subs.len() >= crate::agent_workers::MAX_WORKER_SUBSCRIPTIONS {
+        let frame = reply(
+            -32602,
+            "Too many agent.workers subscriptions on this connection",
+            "capacity",
+        );
+        return !id.present || out_tx.send_priority(frame).await.is_ok();
+    }
+    let subscription_id = events::next_subscription_id();
+    if id.present {
+        let ack = events::success_frame(&id.echo, &json!({ "subscriptionId": subscription_id }));
+        if out_tx.send_priority(ack).await.is_err() {
+            return false;
+        }
+    }
+    let initial = subscriptions::build_snapshot_push(&subscription_id, 0, &snapshot);
+    if out_tx.send_bulk(initial).await.is_err() {
+        return false;
+    }
+    let handle = spawn_forwarder(forward_workers(
+        subscription,
+        Arc::clone(api),
+        workspace_id,
+        agent_id,
+        subscription_id.clone(),
+        out_tx.clone(),
+    ));
+    subs.insert(subscription_id.clone(), handle, None, None);
+    subs.worker_subs.insert(subscription_id);
+    true
+}
+
+/// Push a fresh complete snapshot whenever the selected agent's projection
+/// changes. Ends when the connection closes or the read is refused (the agent
+/// is gone or the caller lost access).
+async fn forward_workers(
+    mut subscription: Subscription,
+    api: Arc<dyn WorkspaceApi>,
+    workspace_id: WorkspaceId,
+    agent_id: AgentId,
+    subscription_id: String,
+    out_tx: OutboundSender,
+) {
+    let mut seq = 0_u64;
+    while let Some(batch) = subscription.recv().await {
+        let changed = batch.iter().any(|e| {
+            e.event_type == intent_core::events::AGENT_WORKERS_CHANGED
+                && e.data.get("agentId").and_then(Value::as_str) == Some(agent_id.0.as_str())
+        });
+        let membership = batch.iter().any(|e| e.event_type == WORKSPACE_UPDATED);
+        if !changed && !membership {
+            continue;
+        }
+        let Ok(snapshot) = api
+            .agent_workers_list(workspace_id.clone(), agent_id.clone())
+            .await
+        else {
+            // Access lost or agent gone: end the stream. The per-connection
+            // cap does not count a finished forwarder.
+            return;
+        };
+        if !changed {
+            continue;
+        }
+        seq += 1;
+        let frame = subscriptions::build_snapshot_push(&subscription_id, seq, &snapshot);
+        if out_tx.send_bulk(frame).await.is_err() {
+            return;
+        }
+    }
+}
+
 /// Handle a classified `events.subscribe` / `events.unsubscribe` request,
 /// mirroring `handleSubscribe` / `handleUnsubscribe`. Returns `false` when the
 /// outbound channel is closed. `pub(crate)` for the conn-level collaborator
@@ -1248,13 +1479,18 @@ pub(crate) async fn handle_fast_path(
     subs: &mut ConnSubs,
 ) -> bool {
     match fast_path {
+        FastPath::Fence { id, params } => recovery::fence(id, &params, out_tx, subs),
         FastPath::Subscribe { id, params } => match events::parse_subscribe_params(&params) {
             Ok(p) => {
                 let events::SubscribeParams {
                     event_types,
                     workspace_id,
                     replace_group,
+                    loss_recovery,
                 } = p;
+                if loss_recovery && !id.present {
+                    return true;
+                }
                 if let Some(group) = replace_group.as_deref() {
                     subs.remove_group(api, group).await;
                 }
@@ -1272,7 +1508,7 @@ pub(crate) async fn handle_fast_path(
                 // travel on this firehose for anyone: they reach only the
                 // note's `note.presence.subscribe` lease holders.
                 let gate = events::MembershipGate::for_current_caller(api);
-                let scoped_workspace = gate.as_ref().and(workspace_id.clone());
+                let scoped_workspace = workspace_id.clone();
                 let membership_events = gate.as_ref().map(|_| {
                     bus.subscribe(SubscriptionFilter {
                         event_types: vec![WORKSPACE_UPDATED.to_string()],
@@ -1312,28 +1548,48 @@ pub(crate) async fn handle_fast_path(
                 // forwarder (bulk lane); the writer drains priority first, so
                 // it can never be preceded by an `events.event` notification.
                 if id.present {
-                    let frame = events::success_frame(
-                        &id.echo,
-                        &json!({ "subscriptionId": subscription_id }),
-                    );
+                    let mut result = json!({ "subscriptionId": subscription_id });
+                    if loss_recovery {
+                        result["lossRecovery"] = json!(1);
+                    }
+                    let frame = events::success_frame(&id.echo, &result);
                     if out_tx.send_priority(frame).await.is_err() {
                         return false;
                     }
                 }
                 // Spawned with the request context re-established: the gate's
                 // membership re-reads run under the subscriber's caller.
-                let handle = spawn_forwarder(forward_subscription(
+                let lifetime = recovery::Lifetime::new();
+                let mut fences = vec![subscription.fence_handle()];
+                if let Some(membership) = &membership_events {
+                    fences.push(membership.fence_handle());
+                }
+                let handle = spawn_forwarder(recovery::forward(
+                    Arc::clone(api),
                     subscription,
                     gate.map(|gate| (gate, membership_events.expect("paired with gate"))),
                     scoped_workspace,
                     subscription_id.clone(),
                     out_tx.clone(),
                     host_removal_control,
+                    loss_recovery,
+                    lifetime.clone(),
                 ));
                 subs.insert(subscription_id.clone(), handle, replace_group, None);
-                let sub = subs.subs.get_mut(&subscription_id).expect("just inserted");
-                sub.host_removal_control = host_removal_control;
-                sub.monitor_recipient = monitor_recipient;
+                subs.subs
+                    .get_mut(&subscription_id)
+                    .expect("just inserted")
+                    .host_removal_control = host_removal_control;
+                if loss_recovery {
+                    subs.subs
+                        .get_mut(&subscription_id)
+                        .expect("inserted")
+                        .recovery = Some(recovery::Lease { fences, lifetime });
+                }
+                subs.subs
+                    .get_mut(&subscription_id)
+                    .expect("inserted")
+                    .monitor_recipient = monitor_recipient;
                 true
             }
             Err(msg) => send_fast_path_error(id, &msg, out_tx).await,
@@ -1362,151 +1618,6 @@ async fn send_fast_path_error(id: events::IdInfo, message: &str, out_tx: &Outbou
     true
 }
 
-/// Forward filtered events from one bus subscription to the connection's
-/// outbound queue (bulk lane) as `events.event` notifications until the bus
-/// or connection closes. Aborted by [`ConnSub`] on unsubscribe / disconnect.
-///
-/// Under backpressure (the bulk lane is full) the high-volume transient
-/// types are conflated per key instead of blocking (see [`crate::conflate`]):
-/// latest-wins for `agent:stream:activity` / `file:*`, byte-concat for
-/// `terminal:data`. Non-conflatable events act as barriers — the buffer is
-/// flushed first (a conflated frame always lands before its stream's terminal
-/// event, e.g. `terminal:exit`), then the barrier blocks as before. With no
-/// congestion the buffer stays empty and every frame passes straight through.
-///
-/// A guarded subscriber's own unshare from `scoped_workspace` (the
-/// subscription's `workspaceId`, when one was given) ends the forwarder,
-/// like the scoped collection channels; a global stream stays alive for the
-/// subscriber's other member workspaces, the gate suppressing the rest. A
-/// guarded subscriber's `agent:queue:updated` frames carry only the queue
-/// entries its principal may see
-/// ([`events::project_queue_event_for_current_caller`]).
-async fn forward_subscription(
-    mut subscription: Subscription,
-    membership: Option<(events::MembershipGate, Subscription)>,
-    scoped_workspace: Option<String>,
-    subscription_id: String,
-    out_tx: OutboundSender,
-    host_removal_control: bool,
-) {
-    // Everything this forwarder emits travels on the bulk lane; conflation
-    // needs `reserve` / `try_reserve` on it, so hold the lane sender directly.
-    let out_tx = out_tx.bulk_sender();
-    let mut buffer: ConflationBuffer<EventItem> = ConflationBuffer::new();
-    let (mut gate, mut membership_events) = match membership {
-        Some((gate, sub)) => (Some(gate), Some(sub)),
-        None => (None, None),
-    };
-    loop {
-        tokio::select! {
-            biased;
-            // Drain a buffered conflated frame as soon as the lane has room.
-            permit = out_tx.reserve(), if !buffer.is_empty() => match permit {
-                Ok(permit) => {
-                    if let Some(item) = buffer.pop() {
-                        permit.send(item.into_frame(&subscription_id).into());
-                    }
-                }
-                Err(_) => return,
-            },
-            // Membership changes invalidate the gate's cached verdicts
-            // before the next matched event is considered.
-            maybe = async { membership_events.as_mut().expect("guarded").recv().await },
-                if membership_events.is_some() =>
-            {
-                match (maybe, gate.as_mut()) {
-                    (Some(batch), Some(gate)) => {
-                        for event in &batch {
-                            gate.observe_membership_event(event);
-                            if gate.is_own_unshare(event)
-                                && scoped_workspace.as_deref() == Some(event.workspace_id.as_str())
-                            {
-                                return;
-                            }
-                        }
-                    }
-                    _ => membership_events = None,
-                }
-            },
-            maybe = subscription.recv_delivery() => {
-                let Some(delivery) = maybe else {
-                    // Bus closed: flush anything still pending, then stop.
-                    let _ = buffer
-                        .drain_all(&out_tx, |item| item.into_frame(&subscription_id))
-                        .await;
-                    return;
-                };
-                let batch = match delivery {
-                    Delivery::Batch(batch) => batch,
-                    Delivery::Lagged(_) | Delivery::HistoryChanged => continue,
-                    Delivery::Monitor(output) => {
-                        if !buffer.drain_all(&out_tx, |item| item.into_frame(&subscription_id)).await { return; }
-                        if out_tx.send(crate::OutboundFrame::private(output.into_output())).await.is_err() { return; }
-                        continue;
-                    }
-                };
-                for mut event in batch {
-                    if !intent_core::desktop::event_visible(&event) { continue; }
-                    // The revocation branch sends this exact durable event once,
-                    // ahead of close, rather than racing its bulk forwarder.
-                    if host_removal_control && event.event_type == intent_core::events::HOST_MEMBERS_CHANGED
-                        && event.data["action"] == "removed"
-                        && crate::context::current_caller().and_then(|c| c.principal_id().cloned()).is_some_and(|id| event.data["principalId"] == id.0) {
-                        continue;
-                    }
-                    if let Some(gate) = gate.as_mut() {
-                        if !gate.allows(&event).await {
-                            continue;
-                        }
-                        // A gated (non-administrator) connection sees only
-                        // its own queue entries in `agent:queue:updated`, and
-                        // no `content` in `agent:queue:processing` for a
-                        // foreign entry.
-                        events::project_queue_event_for_current_caller(&mut event);
-                    }
-                    if let Some(key) = conflate::event_key(&event) {
-                        let item = EventItem::new(&key, event);
-                        let sid = &subscription_id;
-                        match conflate::offer(&mut buffer, key, item, &out_tx, |item| {
-                            item.into_frame(sid)
-                        }) {
-                            Enqueue::Closed => return,
-                            Enqueue::Sent | Enqueue::Buffered => {}
-                            // Buffer at capacity (too many distinct keys /
-                            // bytes pending): fall back to the original
-                            // blocking backpressure — flush, then send.
-                            Enqueue::Overflow(item) => {
-                                if !buffer
-                                    .drain_all(&out_tx, |item| item.into_frame(&subscription_id))
-                                    .await
-                                {
-                                    return;
-                                }
-                                if out_tx.send(item.into_frame(&subscription_id).into()).await.is_err() {
-                                    return;
-                                }
-                            }
-                        }
-                    } else {
-                        // Barrier: flush conflated frames first, then block.
-                        if !buffer
-                            .drain_all(&out_tx, |item| item.into_frame(&subscription_id))
-                            .await
-                        {
-                            return;
-                        }
-                        let frame =
-                            events::build_event_notification(&subscription_id, &event);
-                        if out_tx.send(frame.into()).await.is_err() {
-                            return;
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
 /// Handle a classified `note.subscribe` / `note.unsubscribe` request (TB-0 §1).
 /// Subscribe wires the bus subscription FIRST (so concurrent mutations are
 /// captured), enqueues the `{ subscriptionId }` response, then spawns the
@@ -1520,38 +1631,6 @@ pub(crate) async fn handle_sub_fast_path(
     out_tx: &OutboundSender,
     subs: &mut ConnSubs,
 ) -> bool {
-    let sub = match sub {
-        SubFastPath::Subscribe {
-            id,
-            channel,
-            params,
-        } if matches!(channel, Channel::Note | Channel::Comment) => {
-            let kind = if channel == Channel::Note {
-                crate::annotation_subscription::PageStateChannel::Note
-            } else {
-                crate::annotation_subscription::PageStateChannel::Comment
-            };
-            let value = Value::Object(params);
-            match crate::annotation_subscription::parse_page_state_subscription(kind, &value) {
-                Ok(Some(request)) => {
-                    return page_state::subscribe(id, channel, request, api, bus, out_tx, subs)
-                        .await
-                }
-                Ok(None) => {
-                    let Value::Object(params) = value else {
-                        unreachable!()
-                    };
-                    SubFastPath::Subscribe {
-                        id,
-                        channel,
-                        params,
-                    }
-                }
-                Err(message) => return send_fast_path_error(id, &message, out_tx).await,
-            }
-        }
-        other => other,
-    };
     match sub {
         SubFastPath::Subscribe {
             id,
@@ -1568,6 +1647,7 @@ pub(crate) async fn handle_sub_fast_path(
                     workspace_id,
                     replace_group,
                     projection,
+                    max_content_bytes,
                 } = p;
                 // Time the request-to-snapshot interval (intent-hq/intent#3707):
                 // the fast-path never enters the `rpc_dispatch` span, so this
@@ -1611,6 +1691,7 @@ pub(crate) async fn handle_sub_fast_path(
                     api.clone(),
                     WorkspaceId::from(workspace_id),
                     projection,
+                    max_content_bytes,
                     subscription,
                     membership,
                     subscription_id.clone(),
@@ -1918,6 +1999,9 @@ where
     let caller = crate::context::current_caller();
     let credential = intent_core::caller::current_wire_credential();
     let desktop = intent_core::desktop::current_connection();
+    // Heap-pin before composing task-local scopes: large chat forwarders would
+    // otherwise be copied through each wrapper on the subscribing task's stack.
+    let forwarder = Box::pin(forwarder);
     tokio::spawn(crate::context::with_credential_context(
         is_tcp, caller, credential, desktop, forwarder,
     ))
@@ -2025,6 +2109,7 @@ async fn forward_note_subscription(
     api: Arc<dyn WorkspaceApi>,
     workspace_id: WorkspaceId,
     projection: Option<intent_core::NoteListProjection>,
+    max_content_bytes: Option<usize>,
     mut subscription: Subscription,
     mut membership: Option<ChannelMembership>,
     subscription_id: String,
@@ -2039,7 +2124,15 @@ async fn forward_note_subscription(
                     .map(intent_core::note_list_slim_row)
                     .collect(),
             ),
-            None => serde_json::to_value(notes).unwrap_or_else(|_| Value::Array(Vec::new())),
+            None => match max_content_bytes {
+                Some(limit) => Value::Array(
+                    notes
+                        .into_iter()
+                        .map(|note| intent_core::note_bounded_row(note, limit))
+                        .collect(),
+                ),
+                None => serde_json::to_value(notes).unwrap_or_else(|_| Value::Array(Vec::new())),
+            },
         },
         Err(_) => Value::Array(Vec::new()),
     };
@@ -2051,8 +2144,14 @@ async fn forward_note_subscription(
     let mut seq: u64 = 1;
     while let Some(batch) = recv_visible(&mut subscription, &mut membership).await {
         for event in batch {
-            if let Some(delta) =
-                subscriptions::note_delta(api.as_ref(), &workspace_id, &event, projection).await
+            if let Some(delta) = subscriptions::note_delta(
+                api.as_ref(),
+                &workspace_id,
+                &event,
+                projection,
+                max_content_bytes,
+            )
+            .await
             {
                 let frame = subscriptions::build_delta_push(&subscription_id, seq, &delta);
                 if out_tx.send_bulk(frame).await.is_err() {
@@ -2452,7 +2551,7 @@ async fn chat_subscription_loop(
                         continue;
                     }
                     Delivery::Batch(batch) => batch,
-                    Delivery::Monitor(_) => continue,
+                    Delivery::Fence(_) | Delivery::Monitor(_) => continue,
                     Delivery::HistoryChanged => {
                         // No private row crosses the bus. Re-read using this
                         // original chat recipient and bind the replacement
@@ -2982,9 +3081,12 @@ mod tests {
             )
             .await
         );
-        tokio::time::timeout(Duration::from_secs(10), writer.entered.notified())
-            .await
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            writer.entered.notified(),
+        )
+        .await
+        .unwrap();
         limiter.begin_shutdown();
         assert!(
             !process_frame(
@@ -3011,9 +3113,12 @@ mod tests {
             () = std::future::ready(()) => {}
         }
         writer.release.notify_one();
-        tokio::time::timeout(Duration::from_secs(10), drained)
-            .await
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            drained,
+        )
+        .await
+        .unwrap();
         assert_eq!(writer.calls.load(Ordering::SeqCst), 1);
         assert_eq!(
             store.get_setting("test.admitted").await.unwrap().as_deref(),
@@ -3097,7 +3202,8 @@ mod tests {
             }));
         }
         // Both permits come free while the writer is still stalled.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now()
+            + intentd_test_support::test_timeout(std::time::Duration::from_secs(5));
         while limiter.available_permits() != Some(2) {
             assert!(
                 std::time::Instant::now() < deadline,

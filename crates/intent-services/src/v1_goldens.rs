@@ -406,6 +406,11 @@ fn golden_supervisor_history_wrapper() {
          delivered at the time. If you genuinely need one specific full output, re-run that ONE call \
          once. Do not re-fetch the same inputs repeatedly.\n\
          \n\
+         Note on escaping: text quoted inside the XML tags of this message is XML-escaped only so \
+         it can be quoted (&lt; &gt; &amp; &quot; stand for < > & \"). The original messages used \
+         the literal characters. Write your own replies with literal characters too: for example \
+         <!-- and -->, never &lt;!-- and --&gt;.\n\
+         \n\
          <exchange>\n\
          \x20 <user_request_or_tool_results>\n\
          \x20   <text>hi &lt;&amp;&gt;</text>\n\
@@ -769,6 +774,7 @@ fn merge_requirements(
             passed: 2,
             failed: 0,
             pending: 1,
+            skipped: 0,
             items: vec![],
             failing_required: vec![],
             pending_required: vec!["build".to_string()],
@@ -789,6 +795,8 @@ fn merge_requirements(
         rules_known: true,
         is_in_merge_queue: None,
         merge_queue_ejection: None,
+        merge_queue: None,
+        checks_not_started: None,
     }
 }
 
@@ -801,11 +809,13 @@ pub(crate) fn pr_snapshot(state: &str) -> crate::pr_monitor::PrMonitorSnapshot {
         review_comment_count: 1,
         requirements: merge_requirements(state, 0, 1),
         ejection_tracked: true,
+        skipped_tracked: true,
         checks_unobserved: false,
         checks_seed_pending: false,
         status_checks: Some(Vec::new()),
         required_check_names: None,
         observed_at: None,
+        checks_not_started_delivered: None,
     }
 }
 
@@ -1284,7 +1294,8 @@ pub(crate) async fn seed_agent(svc: &Services, ws: &WorkspaceId, id: &AgentId) {
 /// messages are present (generous deadline, monorepo#1358 precedent); on
 /// timeout return whatever was seen and let the caller's assert report it.
 pub(crate) async fn wake_texts_when(svc: &Services, id: &AgentId, expected: usize) -> Vec<String> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now()
+        + intentd_test_support::test_timeout(std::time::Duration::from_secs(10));
     loop {
         let session = svc.store().get_agent_session(id).await.expect("session");
         let texts: Vec<String> = session
@@ -1602,7 +1613,12 @@ fn golden_supervisor_history_truncation_markers() {
                 omitted entirely. Truncation here does NOT mean the tool failed or returned empty \
                 output; the original call ran and its full result was delivered at the time. If \
                 you genuinely need one specific full output, re-run that ONE call once. Do not \
-                re-fetch the same inputs repeatedly.\n\n";
+                re-fetch the same inputs repeatedly.\n\n\
+                Note on escaping: text quoted inside the XML tags of this message is XML-escaped \
+                only so it can be quoted (&lt; &gt; &amp; &quot; stand for < > & \"). The \
+                original messages used the literal characters. Write your own replies with \
+                literal characters too: for example <!-- and -->, never &lt;!-- and \
+                --&gt;.\n\n";
     let preamble_len = "<supervisor>\nThe previous ACP session was lost. Below is the full \
                         conversation history from the prior session so you can continue \
                         seamlessly.\nDo NOT mention session recovery to the user. Just \

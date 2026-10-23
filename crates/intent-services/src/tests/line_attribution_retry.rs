@@ -38,10 +38,13 @@ async fn setup() -> (TempDb, Services, EventBus, WorkspaceId, WorkspaceId, NoteI
 }
 
 async fn attribution_event(sub: &mut Subscription) -> Value {
-    let events = tokio::time::timeout(Duration::from_secs(20), sub.recv())
-        .await
-        .expect("attribution event without another edit")
-        .expect("subscription open");
+    let events = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(20)),
+        sub.recv(),
+    )
+    .await
+    .expect("attribution event without another edit")
+    .expect("subscription open");
     assert_eq!(events.len(), 1);
     let event = serde_json::to_value(&events[0]).unwrap();
     assert_eq!(event["type"], LINE_ATTRIBUTION_UPDATED);
@@ -52,8 +55,6 @@ async fn attribution_event(sub: &mut Subscription) -> Value {
 async fn attribution_retry_persists_and_emits_without_another_edit() {
     let (_tmp, services, bus, ws, _other_ws, id) = setup().await;
     let mut sub = bus.subscribe(SubscriptionFilter {
-        // Pending note invalidations are separate from the legacy ready result.
-        event_types: vec![LINE_ATTRIBUTION_UPDATED.into()],
         workspace_id: Some(ws.to_string()),
         ..Default::default()
     });
@@ -94,14 +95,10 @@ async fn attribution_retry_persists_and_emits_without_another_edit() {
 async fn newer_attribution_schedule_cancels_retry_without_cross_workspace_cancellation() {
     let (_tmp, services, bus, ws, other_ws, id) = setup().await;
     let mut sub = bus.subscribe(SubscriptionFilter {
-        // Pending note invalidations are separate from the legacy ready result.
-        event_types: vec![LINE_ATTRIBUTION_UPDATED.into()],
         workspace_id: Some(ws.to_string()),
         ..Default::default()
     });
     let mut other_sub = bus.subscribe(SubscriptionFilter {
-        // Pending note invalidations are separate from the legacy ready result.
-        event_types: vec![LINE_ATTRIBUTION_UPDATED.into()],
         workspace_id: Some(other_ws.to_string()),
         ..Default::default()
     });
@@ -120,11 +117,14 @@ async fn newer_attribution_schedule_cancels_retry_without_cross_workspace_cancel
     sqlx::query("UPDATE note SET content = 'new first line\nold', rev = rev + 1 WHERE workspace_id = ? AND id = ?")
         .bind(ws.as_str()).bind(id.as_str()).execute(&mut *held).await.unwrap();
     services.schedule_line_attribution_recompute(&ws, &id);
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !old.is_finished() {
-            tokio::task::yield_now().await;
-        }
-    })
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            while !old.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
     .await
     .expect("new schedule aborts old retry");
     drop(held);

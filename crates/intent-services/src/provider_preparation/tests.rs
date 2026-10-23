@@ -143,11 +143,14 @@ fn fake_job(dir: &Path, id: &'static str, release: Option<&Path>, fail: bool) ->
 
 #[cfg(unix)]
 async fn wait_for(mut condition: impl FnMut() -> bool) {
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while !condition() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            while !condition() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        },
+    )
     .await
     .expect("observable condition");
 }
@@ -311,10 +314,13 @@ async fn real_launch_cancels_preparation_before_taking_cache_lock() {
         run(job, DOWNLOAD_TIMEOUT, coordination.cancel.notified(), gate).await
     });
     wait_for(|| dir.path().join("codex/started").exists()).await;
-    let launch = tokio::time::timeout(Duration::from_secs(5), before_launch("codex"))
-        .await
-        .unwrap()
-        .unwrap();
+    let launch = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        before_launch("codex"),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert!(worker.await.unwrap().is_none());
     let pid: i32 = std::fs::read_to_string(dir.path().join("codex/started"))
         .unwrap()
@@ -390,16 +396,20 @@ require('node:fs').writeFileSync({}, JSON.stringify({{argv:process.argv.slice(2)
             npx_fallback_binary: Some(&npx),
             npx_fallback_package: provider.npx_only_package,
             node_max_old_space_mb: None,
+            profile_env: None,
         };
         let mut launch = intent_acp::spawn::prepare_provider(&opts).unwrap();
         launch
             .command
             .env("npm_config_offline", "true")
             .env("npm_config_script_shell", &shell);
-        let output = tokio::time::timeout(Duration::from_secs(30), launch.command.output())
-            .await
-            .unwrap()
-            .unwrap();
+        let output = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(30)),
+            launch.command.output(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(
             output.status.success(),
             "{id}: {}",
@@ -492,7 +502,7 @@ async fn foreground_npm_remains_exclusive_after_create_agent_returns() {
             if delayed {
                 held.lock()
                     .unwrap()
-                    .recv_timeout(Duration::from_secs(10))
+                    .recv_timeout(intentd_test_support::test_timeout(Duration::from_secs(10)))
                     .unwrap();
             }
             Some(fake_job(&root, id, None, false))

@@ -30,10 +30,13 @@ fn tab_id_of(ev: &Event) -> &str {
 }
 
 async fn recv_one(sub: &mut Subscription) -> Vec<Event> {
-    tokio::time::timeout(Duration::from_secs(10), sub.recv())
-        .await
-        .expect("batch in time")
-        .expect("subscription open")
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        sub.recv(),
+    )
+    .await
+    .expect("batch in time")
+    .expect("subscription open")
 }
 
 /// A `tabId` is bound to the workspace that created it. Events are
@@ -140,9 +143,12 @@ async fn workspace_change_is_rejected_without_events_or_row_changes() {
     assert_eq!(tab_id_of(&updated[0]), "t-1");
     assert_eq!(updated[0].data["changes"], json!({ "title": "after" }));
     assert!(
-        tokio::time::timeout(Duration::from_millis(200), sub_b.recv())
-            .await
-            .is_err(),
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            sub_b.recv()
+        )
+        .await
+        .is_err(),
         "workspace b received an event for a rejected report"
     );
 }
@@ -189,10 +195,13 @@ async fn remove_racing_sync_never_publishes_a_stale_opened_after_closed() {
     // Once the first `tab-opened` is out, the snapshot is committed and sync
     // is mid-publication; a remove issued now is the reviewer's race.
     let mut seen: Vec<Event> = Vec::new();
-    let first = tokio::time::timeout(Duration::from_secs(10), sub.recv())
-        .await
-        .expect("first batch in time")
-        .expect("subscription open");
+    let first = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        sub.recv(),
+    )
+    .await
+    .expect("first batch in time")
+    .expect("subscription open");
     assert!(first.iter().any(|e| e.event_type == BROWSER_TAB_OPENED));
     seen.extend(first);
     services
@@ -203,7 +212,8 @@ async fn remove_racing_sync_never_publishes_a_stale_opened_after_closed() {
     assert!(drop.is_empty(), "nothing to drop: {drop:?}");
 
     // Drain until every opened and the one closed have been delivered.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(10));
     while seen
         .iter()
         .filter(|e| e.event_type == BROWSER_TAB_OPENED)

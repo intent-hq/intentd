@@ -856,7 +856,7 @@ async fn cancelled_actual_file_read_retains_original_gate_until_worker_exit() {
                     ));
                 }
                 assert!(timeout(
-                    Duration::from_millis(30),
+                    intentd_test_support::test_timeout(Duration::from_millis(30)),
                     f.auth.service.gitlab_credential_gate.lock()
                 )
                 .await
@@ -952,7 +952,7 @@ async fn verified_same_binding_refresh_reacquires_real_file_without_resetting_qu
                     assert!(directory
                         .record_backoff(
                             ticket.dispatch_stamp(),
-                            Instant::now() + Duration::from_secs(60)
+                            Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(60))
                         )
                         .unwrap());
                     assert!(matches!(

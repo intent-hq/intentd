@@ -70,35 +70,38 @@ async fn desktop_wss_lost_start_reply_times_out_and_late_ready_never_grants() {
     .unwrap();
     socket.send(Message::Text(json!({"jsonrpc":"2.0","id":8101,"method":"desktop.respondPermission","params":{"workspaceId":ws,"requestId":pending["requestId"],"decision":"allow_once"}}).to_string().into())).await.unwrap();
     let mut withheld = None;
-    let failure = tokio::time::timeout(Duration::from_secs(25), async {
-        loop {
-            let frame = socket.next().await.unwrap().unwrap();
-            if let Message::Text(text) = frame {
-                let v: Value = serde_json::from_str(&text).unwrap();
-                if v["method"] == "desktop.control" {
-                    match v["params"]["operation"].as_str().unwrap() {
-                        "startControl" => {
-                            assert!(withheld.is_none());
-                            withheld = Some(v);
-                        }
-                        "endControl" => executor_reply(&mut socket, v, &mut calls).await,
-                        other => panic!(
+    let failure = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(25)),
+        async {
+            loop {
+                let frame = socket.next().await.unwrap().unwrap();
+                if let Message::Text(text) = frame {
+                    let v: Value = serde_json::from_str(&text).unwrap();
+                    if v["method"] == "desktop.control" {
+                        match v["params"]["operation"].as_str().unwrap() {
+                            "startControl" => {
+                                assert!(withheld.is_none());
+                                withheld = Some(v);
+                            }
+                            "endControl" => executor_reply(&mut socket, v, &mut calls).await,
+                            other => panic!(
                             "no native input or renewal permitted while readiness missing: {other}"
                         ),
+                        }
+                    } else if v["method"] == "events.event" {
+                        let event = &v["params"]["event"];
+                        assert_ne!(event["data"]["status"], "active");
+                        assert_ne!(event["data"]["outcome"], "granted");
+                        if event["type"] == "desktop:permission-resolved" {
+                            break event["data"].clone();
+                        }
+                    } else if v["id"] == 8101 {
+                        assert_eq!(v["result"]["accepted"], true);
                     }
-                } else if v["method"] == "events.event" {
-                    let event = &v["params"]["event"];
-                    assert_ne!(event["data"]["status"], "active");
-                    assert_ne!(event["data"]["outcome"], "granted");
-                    if event["type"] == "desktop:permission-resolved" {
-                        break event["data"].clone();
-                    }
-                } else if v["id"] == 8101 {
-                    assert_eq!(v["result"]["accepted"], true);
                 }
             }
-        }
-    })
+        },
+    )
     .await
     .expect("bounded native start timeout and cleanup");
     assert_eq!(failure["requestId"], pending["requestId"]);

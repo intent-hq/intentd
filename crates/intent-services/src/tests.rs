@@ -16,6 +16,7 @@ use intent_store::Store;
 use crate::{repository_backfill_probe_count, BackfillCandidate, Services};
 
 mod line_attribution_retry;
+mod orphan_flag_race;
 mod skill_list;
 mod task_list_latency;
 mod task_push;
@@ -651,6 +652,7 @@ async fn workspace_list_slims_token_usage_and_archived_agent_summary() {
         },
         by_model: BTreeMap::new(),
         by_agent_model: None,
+        agent_names: std::collections::BTreeMap::new(),
         last_scan_at: Some(now_iso()),
     };
 
@@ -932,6 +934,7 @@ async fn worst_case_workspace_list_row() -> Workspace {
         totals: totals(9),
         by_model: BTreeMap::from([("claude-opus-4-1".to_string(), totals(1))]),
         by_agent_model: None,
+        agent_names: std::collections::BTreeMap::new(),
         last_scan_at: Some(now_iso()),
     });
     row.cow_supported = Some(true);
@@ -1048,8 +1051,8 @@ async fn workspace_list_row_stays_within_row_budget() {
         .as_ref()
         .expect("active row keeps agentSummary");
     assert_eq!(summary.count, 10, "worst case carries ten agents");
-    // The eight-entry pool is capped to the five most recently updated with
-    // the linked PR (the oldest, `pr(0)`) retained and moved to the front.
+    // Keep the draft and both open PRs ahead of terminal PRs. The linked
+    // open PR (the oldest, `pr(0)`) wins only within its lifecycle state.
     assert_eq!(
         row.pull_requests
             .as_ref()
@@ -1057,7 +1060,7 @@ async fn workspace_list_row_stays_within_row_budget() {
             .iter()
             .map(|pr| pr.number)
             .collect::<Vec<_>>(),
-        vec![1_000, 1_007, 1_006, 1_005, 1_004]
+        vec![1_003, 1_000, 1_006, 1_007, 1_004]
     );
     assert_eq!(row.pull_requests_total, Some(8));
     assert!(row.active_pull_request.is_some());
@@ -1371,6 +1374,89 @@ async fn workspace_list_caps_pull_requests_get_keeps_full_pool() {
     }
 }
 
+#[intent_test_macros::daemon_test]
+async fn workspace_list_keeps_unfinished_root_prs_ahead_of_merged_active() {
+    use intent_core::{
+        PullRequestInfo, PullRequestStatus, WorkspaceGitRoot, WorkspaceGitRootId,
+        WorkspaceGitRootSource, WORKSPACE_LIST_PR_CAP,
+    };
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let id = WorkspaceId::new();
+    let mut row = workspace(&id);
+    let pr = |n: u64, repo: &str, status| PullRequestInfo {
+        id: n.to_string(),
+        number: n,
+        url: format!("https://github.com/intent-hq/{repo}/pull/{n}"),
+        title: format!("PR {n}"),
+        status,
+        created_at: "2026-01-01T00:00:00Z".into(),
+        updated_at: format!("2026-01-01T00:{n:02}:00Z"),
+        base_ref: None,
+        head_ref: None,
+        head_sha: None,
+        author: None,
+        mergeable: None,
+        mergeable_state: None,
+        is_draft: None,
+        is_in_merge_queue: None,
+    };
+    let merged = pr(7, "intent", PullRequestStatus::Merged);
+    row.active_pull_request = Some(merged.clone());
+    row.pr_url = Some(merged.url);
+    row.pr_number = Some(7);
+    row.pr_status = Some(PullRequestStatus::Merged);
+    row.pull_requests = Some(
+        (1..8)
+            .map(|n| pr(n, "intent", PullRequestStatus::Merged))
+            .collect(),
+    );
+    store.insert_workspace(&row).await.expect("workspace");
+    let mut draft = pr(1, "cloudlands-fe", PullRequestStatus::Open);
+    draft.is_draft = Some(true);
+    let open = pr(2, "cloudlands-fe", PullRequestStatus::Open);
+    store
+        .upsert_workspace_git_root(&WorkspaceGitRoot {
+            id: WorkspaceGitRootId::new(),
+            workspace_id: id.clone(),
+            path: "/tmp/unfinished-pr-root".into(),
+            source: WorkspaceGitRootSource::Agent,
+            repo_owner: Some("intent-hq".into()),
+            repo_name: Some("cloudlands-fe".into()),
+            registered_by_agent_ids: vec![],
+            registered_commit_sha: None,
+            pr_number: None,
+            pr_url: None,
+            pr_status: None,
+            pull_requests: Some(vec![draft.clone(), open.clone()]),
+            created_at: now_iso(),
+            updated_at: now_iso(),
+        })
+        .await
+        .expect("git root");
+
+    let root = tempfile::tempdir().expect("workspaces root");
+    let svc = Services::new(store).with_workspaces_root(root.path().to_path_buf());
+    for rows in [
+        svc.list_workspaces(true).await.unwrap(),
+        svc.list_workspaces_lite(true).await.unwrap(),
+    ] {
+        let listed = rows.iter().find(|ws| ws.id == id).unwrap();
+        let pool = listed.pull_requests.as_ref().unwrap();
+        assert_eq!(pool.len(), WORKSPACE_LIST_PR_CAP);
+        assert_eq!(listed.pull_requests_total, Some(9));
+        assert_eq!(pool[0].url, draft.url);
+        assert_eq!(pool[1].url, open.url);
+        assert_eq!(listed.active_pull_request.as_ref().unwrap().number, 7);
+    }
+    let detail = svc.get_workspace(id).await.unwrap();
+    let pool = detail.pull_requests.as_ref().unwrap();
+    assert_eq!(pool.len(), 9);
+    assert_eq!(detail.pull_requests_total, None);
+    assert_eq!(pool.iter().filter(|pr| pr.number == 1).count(), 2);
+}
+
 /// Frame-size regression guard for monorepo#3041: ~130 realistic rows —
 /// dogfooding-shaped (mostly archived, each with agent sessions, a fat
 /// persisted tokenUsage rollup, PR linkage, and a status message) — must
@@ -1493,6 +1579,7 @@ async fn workspace_list_of_130_realistic_rows_stays_under_1mib() {
                 ("gpt-5".to_string(), totals(3)),
             ]),
             by_agent_model: None,
+            agent_names: std::collections::BTreeMap::new(),
             last_scan_at: Some(now_iso()),
         });
         if i >= ACTIVE {
@@ -3846,7 +3933,7 @@ async fn set_content_retry_exhaustion_conflicts_without_writing() {
     .expect("arm trigger");
 
     let r = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
         svc.set_note_content(
             ws.clone(),
             id.clone(),
@@ -7804,6 +7891,7 @@ async fn update_note_full_content_with_task_block_auto_converts() {
                 title: None,
                 tags: None,
                 expected_version: None,
+                base_content_bytes: None,
             },
         )
         .await
@@ -10430,10 +10518,13 @@ mod change_event_parity {
 
     /// Receive exactly one published event, serialized to its wire JSON.
     async fn recv_one(sub: &mut Subscription) -> Value {
-        let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("event delivered")
-            .expect("subscription open");
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("event delivered")
+        .expect("subscription open");
         assert_eq!(batch.len(), 1, "expected exactly one event");
         serde_json::to_value(&batch[0]).expect("serialize event")
     }
@@ -10528,7 +10619,11 @@ mod change_event_parity {
         assert_eq!(second.id.0, first.id.0, "replay returns the original note");
 
         // No second event is published (the replay short-circuits before mutate).
-        let none = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
+        let none = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            sub.recv(),
+        )
+        .await;
         assert!(none.is_err(), "replay must not publish a second event");
     }
 
@@ -10850,8 +10945,11 @@ mod change_event_parity {
     /// batches into one ordered list of wire-JSON envelopes.
     async fn drain_events(sub: &mut Subscription) -> Vec<Value> {
         let mut out = Vec::new();
-        while let Ok(Some(batch)) =
-            tokio::time::timeout(Duration::from_millis(400), sub.recv()).await
+        while let Ok(Some(batch)) = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(400)),
+            sub.recv(),
+        )
+        .await
         {
             for ev in batch {
                 out.push(serde_json::to_value(&ev).expect("serialize event"));
@@ -11954,7 +12052,11 @@ mod change_event_parity {
         assert_eq!(comments.len(), 1, "replay must not duplicate the comment");
 
         // No second event is published (the replay short-circuits before mutate).
-        let none = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
+        let none = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            sub.recv(),
+        )
+        .await;
         assert!(none.is_err(), "replay must not publish a second event");
     }
 
@@ -12007,7 +12109,11 @@ mod change_event_parity {
             json!({ "noteId": "n-1", "commentId": reply.comment.id })
         );
         // Cardinality exactly 1: no additional publishes fire.
-        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
+        let quiet = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            sub.recv(),
+        )
+        .await;
         assert!(
             quiet.is_err(),
             "comment.respond must publish exactly one event, got extra: {quiet:?}"
@@ -12366,7 +12472,11 @@ mod change_event_parity {
                 }
             })
         );
-        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
+        let quiet = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            sub.recv(),
+        )
+        .await;
         assert!(
             quiet.is_err(),
             "archive_workspace must publish exactly one event, got extra: {quiet:?}"
@@ -12502,7 +12612,11 @@ mod change_event_parity {
                 }
             })
         );
-        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
+        let quiet = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            sub.recv(),
+        )
+        .await;
         assert!(quiet.is_err(), "unexpected extra event: {quiet:?}");
 
         // Store: only the owner row survives; the invite is closed.
@@ -12592,7 +12706,11 @@ mod change_event_parity {
             .expect("invites");
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].id, invite.id);
-        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
+        let quiet = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            sub.recv(),
+        )
+        .await;
         assert!(
             quiet.is_err(),
             "a rolled-back archive publishes nothing: {quiet:?}"
@@ -12674,7 +12792,11 @@ mod change_event_parity {
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &h.ws.0, "workspace:updated");
         assert_eq!(ev["data"]["changes"]["archived"], true);
-        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
+        let quiet = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            sub.recv(),
+        )
+        .await;
         assert!(quiet.is_err(), "unexpected extra event: {quiet:?}");
 
         let members = h
@@ -12765,7 +12887,11 @@ mod change_event_parity {
                 }
             })
         );
-        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
+        let quiet = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            sub.recv(),
+        )
+        .await;
         assert!(quiet.is_err(), "unexpected extra event: {quiet:?}");
 
         let members = h
@@ -12846,7 +12972,11 @@ mod change_event_parity {
             let ws = h.ws.clone();
             async move { svc.unarchive_workspace(ws).await }
         });
-        let pending = tokio::time::timeout(Duration::from_millis(200), &mut unarchive).await;
+        let pending = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            &mut unarchive,
+        )
+        .await;
         assert!(
             pending.is_err(),
             "unarchive must stay fenced behind the archive tail"
@@ -12915,7 +13045,8 @@ mod change_event_parity {
         // `archived: true` is skipped because the row was unarchived before
         // its fenced re-read — no stale archived delta after the unarchive.
         let mut lifecycle = Vec::new();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_secs(2));
         while lifecycle.len() < 3 {
             let batch = tokio::time::timeout_at(deadline, sub.recv())
                 .await
@@ -12933,19 +13064,22 @@ mod change_event_parity {
         assert_eq!(lifecycle[0]["removedPrincipalId"], guest.0, "{lifecycle:?}");
         assert_eq!(lifecycle[1]["archived"], false, "{lifecycle:?}");
         assert_eq!(lifecycle[2]["addedPrincipalId"], guest.0, "{lifecycle:?}");
-        let quiet = tokio::time::timeout(Duration::from_millis(200), async {
-            loop {
-                let batch = sub.recv().await.expect("subscription open");
-                for ev in batch {
-                    let ev = serde_json::to_value(&ev).expect("serialize event");
-                    if ev["type"] == "workspace:updated"
-                        && ev["data"]["changes"].get("archived").is_some()
-                    {
-                        return ev;
+        let quiet = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            async {
+                loop {
+                    let batch = sub.recv().await.expect("subscription open");
+                    for ev in batch {
+                        let ev = serde_json::to_value(&ev).expect("serialize event");
+                        if ev["type"] == "workspace:updated"
+                            && ev["data"]["changes"].get("archived").is_some()
+                        {
+                            return ev;
+                        }
                     }
                 }
-            }
-        })
+            },
+        )
         .await;
         assert!(
             quiet.is_err(),
@@ -13031,7 +13165,11 @@ mod change_event_parity {
                 .await
             }
         });
-        let pending = tokio::time::timeout(Duration::from_millis(200), &mut update).await;
+        let pending = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            &mut update,
+        )
+        .await;
         assert!(
             pending.is_err(),
             "workspace.update {{ archived: false }} must stay fenced behind the archive tail"
@@ -13107,7 +13245,8 @@ mod change_event_parity {
         // Lifecycle/membership deltas in order: removal (inside the fence),
         // the unarchive, the re-add — and no `archived: true` afterwards.
         let mut lifecycle = Vec::new();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_secs(2));
         while lifecycle.len() < 3 {
             let batch = tokio::time::timeout_at(deadline, sub.recv())
                 .await
@@ -13126,19 +13265,22 @@ mod change_event_parity {
         assert_eq!(lifecycle[0]["removedPrincipalId"], guest.0, "{lifecycle:?}");
         assert_eq!(lifecycle[1]["archived"], false, "{lifecycle:?}");
         assert_eq!(lifecycle[2]["addedPrincipalId"], guest.0, "{lifecycle:?}");
-        let quiet = tokio::time::timeout(Duration::from_millis(200), async {
-            loop {
-                let batch = sub.recv().await.expect("subscription open");
-                for ev in batch {
-                    let ev = serde_json::to_value(&ev).expect("serialize event");
-                    if ev["type"] == "workspace:updated"
-                        && ev["data"]["changes"].get("archived").is_some()
-                    {
-                        return ev;
+        let quiet = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            async {
+                loop {
+                    let batch = sub.recv().await.expect("subscription open");
+                    for ev in batch {
+                        let ev = serde_json::to_value(&ev).expect("serialize event");
+                        if ev["type"] == "workspace:updated"
+                            && ev["data"]["changes"].get("archived").is_some()
+                        {
+                            return ev;
+                        }
                     }
                 }
-            }
-        })
+            },
+        )
         .await;
         assert!(
             quiet.is_err(),
@@ -13202,7 +13344,7 @@ mod change_event_parity {
             .await
             .expect("stale full-row write");
         let card = tokio::time::timeout(
-            Duration::from_secs(2),
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
             h.services.update_workspace(
                 h.ws.clone(),
                 WorkspaceUpdate {
@@ -13256,7 +13398,8 @@ mod change_event_parity {
         // Deltas: the card update, the removal, then the archive's own
         // `archived: true`; never an `archived: false`.
         let mut seen = Vec::new();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_secs(2));
         while !seen
             .iter()
             .any(|c: &serde_json::Value| c["archived"] == json!(true))
@@ -13324,7 +13467,11 @@ mod change_event_parity {
                 }
             })
         );
-        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
+        let quiet = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            sub.recv(),
+        )
+        .await;
         assert!(
             quiet.is_err(),
             "unarchive_workspace must publish exactly one event, got extra: {quiet:?}"
@@ -13424,7 +13571,11 @@ mod change_event_parity {
                 }
             })
         );
-        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
+        let quiet = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            sub.recv(),
+        )
+        .await;
         assert!(
             quiet.is_err(),
             "auto-unarchive must publish exactly one event, got extra: {quiet:?}"
@@ -13448,7 +13599,11 @@ mod change_event_parity {
             .auto_unarchive_on_turn_start(&h.ws, &agent_id)
             .await;
         assert!(!flipped, "no flip on an active workspace");
-        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
+        let quiet = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            sub.recv(),
+        )
+        .await;
         assert!(
             quiet.is_err(),
             "active workspace must emit nothing, got: {quiet:?}"
@@ -13473,7 +13628,11 @@ mod change_event_parity {
             .auto_unarchive_on_turn_start(&missing, &agent_id)
             .await;
         assert!(!flipped, "a failed read reports no flip");
-        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
+        let quiet = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            sub.recv(),
+        )
+        .await;
         assert!(
             quiet.is_err(),
             "failed read must emit nothing, got: {quiet:?}"
@@ -13507,7 +13666,11 @@ mod change_event_parity {
             .expect("losing racer still succeeds");
         assert!(!flipped, "the losing racer must not claim the flip");
         assert!(!ws.archived, "the returned row reflects the Active state");
-        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
+        let quiet = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            sub.recv(),
+        )
+        .await;
         assert!(
             quiet.is_err(),
             "the losing racer must emit nothing, got: {quiet:?}"
@@ -14168,9 +14331,12 @@ mod change_event_parity {
         let services = h.services.clone();
         let ws_id = h.ws.clone();
         let task = intent_core::spawn_daemon(async move { services.mark_seen(ws_id).await });
-        tokio::time::timeout(Duration::from_secs(2), park.entered.notified())
-            .await
-            .expect("mark_seen reaches the attention write window");
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            park.entered.notified(),
+        )
+        .await
+        .expect("mark_seen reaches the attention write window");
 
         // Concurrent mutation while mark_seen sits parked before its write.
         let mut concurrent = h.store.get_workspace(&h.ws).await.expect("load");
@@ -14213,9 +14379,12 @@ mod change_event_parity {
         let ws_id = h.ws.clone();
         let task =
             intent_core::spawn_daemon(async move { services.dismiss_attention(ws_id).await });
-        tokio::time::timeout(Duration::from_secs(2), park.entered.notified())
-            .await
-            .expect("dismiss_attention reaches the attention write window");
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            park.entered.notified(),
+        )
+        .await
+        .expect("dismiss_attention reaches the attention write window");
 
         let mut concurrent = h.store.get_workspace(&h.ws).await.expect("load");
         concurrent.title = "renamed while parked".to_string();
@@ -14258,9 +14427,12 @@ mod change_event_parity {
                 .raise_attention(&ws_id, WorkspaceAttention::Unread)
                 .await
         });
-        tokio::time::timeout(Duration::from_secs(2), park.entered.notified())
-            .await
-            .expect("raise_attention reaches the attention write window");
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            park.entered.notified(),
+        )
+        .await
+        .expect("raise_attention reaches the attention write window");
 
         let mut concurrent = h.store.get_workspace(&h.ws).await.expect("load");
         concurrent.title = "renamed while parked".to_string();
@@ -14320,6 +14492,56 @@ mod change_event_parity {
         assert_eq!(
             ev["data"]["workspace"],
             serde_json::to_value(&created).expect("workspace json")
+        );
+        assert!(
+            ev["data"].get("origin").is_none(),
+            "a plain create carries no origin: {ev}"
+        );
+    }
+
+    /// An in-process create with `WorkspaceCreate::origin` (set by
+    /// `ws.workspace.applyProposal`) echoes it on `workspace:created` as
+    /// `data.origin` (§6.5) and never persists it on the row.
+    #[intent_test_macros::daemon_test]
+    async fn workspace_created_payload_carries_proposal_origin() {
+        use intent_core::{AgentId, WorkspaceCreate, WorkspaceCreateOrigin, WorkspaceId};
+        let h = harness().await;
+        let mut sub = h.bus.subscribe(SubscriptionFilter::default());
+        let created = h
+            .services
+            .create_workspace(
+                WorkspaceCreate {
+                    title: Some("Proposed workspace".to_string()),
+                    branch: Some("feat/proposed".to_string()),
+                    origin: Some(WorkspaceCreateOrigin::Proposal {
+                        proposal_id: "Create workspace: Follow up".to_string(),
+                        agent_id: AgentId::from("agent-source"),
+                        source_workspace_id: WorkspaceId::from("ws-source"),
+                    }),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+        let ev = recv_one(&mut sub).await;
+        assert_envelope(&ev, &created.id.0, "workspace:created");
+        assert_eq!(
+            ev["data"]["origin"],
+            serde_json::json!({
+                "kind": "proposal",
+                "proposalId": "Create workspace: Follow up",
+                "agentId": "agent-source",
+                "sourceWorkspaceId": "ws-source",
+            })
+        );
+        assert!(
+            serde_json::to_value(&created)
+                .expect("workspace json")
+                .get("origin")
+                .is_none(),
+            "origin is event-only, never a workspace field"
         );
     }
 
@@ -14693,7 +14915,11 @@ mod change_event_parity {
         );
 
         // No further events are published (the replay short-circuits the op).
-        let none = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
+        let none = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            sub.recv(),
+        )
+        .await;
         assert!(none.is_err(), "replay must not publish a second event");
     }
 
@@ -14896,7 +15122,11 @@ mod change_event_parity {
         assert_eq!(ev["data"]["title"], "Spec");
 
         // No further events fire — reseed publishes exactly once.
-        let quiet = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
+        let quiet = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            sub.recv(),
+        )
+        .await;
         assert!(
             quiet.is_err(),
             "reseed must publish exactly one event, got extra: {quiet:?}"
@@ -14923,7 +15153,11 @@ mod change_event_parity {
         let event = recv_one(&mut sub).await;
         assert_envelope(&event, &h.ws.0, "note:created");
         assert_eq!(event["data"]["noteId"], "spec");
-        let quiet = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
+        let quiet = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            sub.recv(),
+        )
+        .await;
         assert!(quiet.is_err(), "concurrent reseed must emit exactly once");
 
         let versions = h
@@ -14982,7 +15216,11 @@ mod change_event_parity {
         assert_eq!(spec_row.created_at, spec_before.created_at);
 
         // No further events fire for the untouched-spec list call.
-        let none = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
+        let none = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            sub.recv(),
+        )
+        .await;
         assert!(none.is_err(), "list must not publish for existing spec");
 
         // Version count unchanged.
@@ -15060,7 +15298,11 @@ mod change_event_parity {
             other => panic!("expected NotFound, got: {other:?}"),
         }
 
-        let none = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
+        let none = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            sub.recv(),
+        )
+        .await;
         assert!(
             none.is_err(),
             "unknown-workspace list must not publish a reseed event"
@@ -15115,7 +15357,11 @@ mod change_event_parity {
             "expected workspace NotFound, got: {err:?}"
         );
 
-        let none = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
+        let none = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            sub.recv(),
+        )
+        .await;
         assert!(
             none.is_err(),
             "deleted-workspace list must not publish a reseed event"
@@ -15135,7 +15381,11 @@ mod change_event_parity {
         let notes = h.services.list_notes(&chief).await.expect("list");
         assert!(notes.is_empty());
 
-        let none = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
+        let none = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            sub.recv(),
+        )
+        .await;
         assert!(none.is_err(), "chief list must not publish a reseed event");
     }
 
@@ -15371,7 +15621,11 @@ mod change_event_parity {
         // Idempotency: a second `note.list` is a no-op — no further events,
         // no additional version snapshots.
         let _ = h.services.list_notes(&h.ws).await.expect("list again");
-        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
+        let quiet = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            sub.recv(),
+        )
+        .await;
         assert!(
             quiet.is_err(),
             "second list must not republish after adoption"
@@ -15430,7 +15684,11 @@ mod change_event_parity {
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &h.ws.0, "note:created");
         assert_eq!(ev["data"]["noteId"], "spec");
-        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
+        let quiet = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            sub.recv(),
+        )
+        .await;
         assert!(quiet.is_err(), "no adoption events on ambiguous fallback");
     }
 
@@ -15540,7 +15798,11 @@ mod change_event_parity {
             .expect("stray present");
         assert_eq!(stray_now.content, "stray body");
 
-        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
+        let quiet = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            sub.recv(),
+        )
+        .await;
         assert!(quiet.is_err(), "healthy workspace must not fire adoption");
     }
 
@@ -16854,9 +17116,12 @@ mod change_event_parity {
                     .await
             })
         };
-        tokio::time::timeout(Duration::from_secs(2), park.entered.notified())
-            .await
-            .expect("task.update parks before its parent write");
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            park.entered.notified(),
+        )
+        .await
+        .expect("task.update parks before its parent write");
 
         // Another caller completes the task inside the window; materialization
         // rewrites the linked line to `[x]`.
@@ -16868,11 +17133,14 @@ mod change_event_parity {
         );
 
         park.release.notify_one();
-        let r = tokio::time::timeout(Duration::from_secs(2), writer)
-            .await
-            .expect("writer finishes")
-            .expect("writer task")
-            .expect("task.update");
+        let r = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            writer,
+        )
+        .await
+        .expect("writer finishes")
+        .expect("writer task")
+        .expect("task.update");
 
         assert_eq!(task_status(&h, T1).await, TaskStatus::Complete);
         assert_eq!(
@@ -16947,10 +17215,13 @@ mod mcp_callback {
         assert_eq!(persisted.content, "# A\nbody\n\nmore");
 
         // Event fired on the same bus the FE transport pushes from.
-        let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("event delivered")
-            .expect("subscription open");
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("event delivered")
+        .expect("subscription open");
         assert!(batch.iter().any(|e| e.event_type == NOTE_UPDATED));
     }
 
@@ -17448,10 +17719,13 @@ mod drafts_events {
             .expect("set draft");
         assert!(updated.is_some(), "a non-empty set stores a draft");
 
-        let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("event delivered")
-            .expect("subscription open");
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("event delivered")
+        .expect("subscription open");
         let ev = batch
             .iter()
             .find(|e| e.event_type == DRAFT_CHANGED)
@@ -17474,10 +17748,13 @@ mod drafts_events {
             .drafts_clear(ws.clone(), agent.clone(), client.clone())
             .await
             .expect("clear draft");
-        let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("event delivered")
-            .expect("subscription open");
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("event delivered")
+        .expect("subscription open");
         let ev = batch
             .iter()
             .find(|e| e.event_type == DRAFT_CHANGED)
@@ -17525,10 +17802,13 @@ mod drafts_events {
             .expect("set draft");
         assert!(updated.is_some(), "empty text with attachments persists");
 
-        let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("event delivered")
-            .expect("subscription open");
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("event delivered")
+        .expect("subscription open");
         let ev = batch
             .iter()
             .find(|e| e.event_type == DRAFT_CHANGED)
@@ -18552,6 +18832,7 @@ pub(crate) mod pr {
                 ],
                 checks_head_sha: None,
                 checks_known: true,
+                head_committed_at: None,
                 branch_rules: Some(BranchRules {
                     required_approving_review_count: Some(2),
                     required_conversation_resolution: Some(true),
@@ -18559,6 +18840,7 @@ pub(crate) mod pr {
                 }),
                 is_in_merge_queue: None,
                 merge_queue_removal: None,
+                merge_queue_entry: None,
             }),
             ..Default::default()
         })
@@ -19112,7 +19394,8 @@ pub(crate) mod pr {
             user_code: "WXYZ-9876".into(),
             verification_uri: "https://github.com/login/device".into(),
             interval: 5,
-            deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(600),
+            deadline: tokio::time::Instant::now()
+                + intentd_test_support::test_timeout(std::time::Duration::from_secs(600)),
             phase: crate::github_auth_ops::FlowPhase::Pending,
         };
         let id = seeded.wire_id();
@@ -19209,7 +19492,8 @@ pub(crate) mod pr {
                 user_code: "WXYZ-9876".into(),
                 verification_uri: "https://github.com/login/device".into(),
                 interval: 5,
-                deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(600),
+                deadline: tokio::time::Instant::now()
+                    + intentd_test_support::test_timeout(std::time::Duration::from_secs(600)),
                 phase: crate::github_auth_ops::FlowPhase::Denied,
             });
         }
@@ -19253,7 +19537,8 @@ pub(crate) mod pr {
                 user_code: "WXYZ-9876".into(),
                 verification_uri: "https://github.com/login/device".into(),
                 interval: 5,
-                deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(600),
+                deadline: tokio::time::Instant::now()
+                    + intentd_test_support::test_timeout(std::time::Duration::from_secs(600)),
                 phase: crate::github_auth_ops::FlowPhase::Pending,
             });
         }
@@ -19635,6 +19920,8 @@ pub(crate) mod pr {
         assert_eq!(v["checks"]["failed"], 1);
         assert_eq!(v["checks"]["pending"], 1);
         assert_eq!(v["checks"]["failedNames"], json!(["test"]));
+        assert_eq!(v["checks"]["skipped"], 0);
+        assert_eq!(v["checks"]["skippedNames"], json!([]));
         // Review decision from the aggregated actionable reviews.
         assert_eq!(v["reviews"]["decision"], "approved");
         assert_eq!(v["reviews"]["approvals"], 1);
@@ -22368,7 +22655,7 @@ pub(crate) mod pr {
         });
         let sc_dyn: Arc<dyn SourceControl> = sc.clone();
         let outcome = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
             svc.refresh_git_root_pr(root, &sc_dyn),
         )
         .await
@@ -22944,9 +23231,12 @@ pub(crate) mod pr {
             let svc = svc.clone();
             async move { svc.github_pulls_get("o".into(), "r".into(), 42).await }
         });
-        tokio::time::timeout(std::time::Duration::from_secs(2), park.entered.notified())
-            .await
-            .expect("pulls.get reaches the miss→fetch window");
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(2)),
+            park.entered.notified(),
+        )
+        .await
+        .expect("pulls.get reaches the miss→fetch window");
         assert!(forge.seen_get_pr.lock().unwrap().is_empty());
 
         // The concurrent fill (another on-demand reader or a sweep) stores
@@ -24182,7 +24472,7 @@ pub(crate) mod pr {
         .await;
         let svc = svc.with_pr_refresh_fetch_timeout(std::time::Duration::from_millis(200));
         let created = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(10)),
             svc.create_workspace(
                 intent_core::WorkspaceCreate {
                     title: Some("PR ws hung forge".to_string()),
@@ -25159,6 +25449,77 @@ mod file_tracking {
             st.files.iter().any(|f| f.path == "unstaged.txt"),
             "unstaged file survives the userRequested checkpoint"
         );
+    }
+
+    /// Regression (intent-hq/intent#7266): an agent `file.write` / `file.delete`
+    /// to an untracked git-ignored path records no `tracked_changes` row — it
+    /// can never be committed, so the row would stay `unstaged` and lock the
+    /// path forever — while a non-ignored write in the same call sequence
+    /// still records.
+    #[intent_test_macros::daemon_test]
+    async fn file_write_to_git_ignored_path_records_no_attribution() {
+        let repo = init_git_repo();
+        commit_file(&repo.dir, ".gitignore", ".dev/\n", "ignore .dev");
+        let (_t, svc, ws) = svc_with_repo(&repo).await;
+        let agent = Some(AgentId::from("agent-ign"));
+
+        svc.file_write(
+            ws.clone(),
+            ".dev/evidence.json".to_string(),
+            "{}\n".to_string(),
+            agent.clone(),
+        )
+        .await
+        .unwrap();
+        svc.file_delete(ws.clone(), ".dev/evidence.json".to_string(), agent.clone())
+            .await
+            .unwrap();
+        svc.file_write(
+            ws.clone(),
+            "real-change.txt".to_string(),
+            "x\n".to_string(),
+            agent,
+        )
+        .await
+        .unwrap();
+
+        let rows = svc.store().list_tracked_changes(&ws).await.unwrap();
+        let paths: Vec<&str> = rows.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(paths, vec!["real-change.txt"], "ignored path not recorded");
+        let snap = svc.compute_agent_locks(&ws).await;
+        assert!(
+            !snap
+                .locked_file_paths
+                .iter()
+                .any(|p| p.starts_with(".dev/")),
+            "no ignored path is ever locked: {:?}",
+            snap.locked_file_paths
+        );
+    }
+
+    /// A file git already tracks still records attribution even when it
+    /// matches `.gitignore` (force-added): it is a real, committable change
+    /// (intent-hq/intent#7266).
+    #[intent_test_macros::daemon_test]
+    async fn file_write_to_tracked_file_matching_gitignore_records_attribution() {
+        let repo = init_git_repo();
+        commit_file(&repo.dir, ".gitignore", "*.lock\n", "ignore locks");
+        commit_file(&repo.dir, "deps.lock", "v1\n", "force-add lockfile");
+        let (_t, svc, ws) = svc_with_repo(&repo).await;
+
+        svc.file_write(
+            ws.clone(),
+            "deps.lock".to_string(),
+            "v2\n".to_string(),
+            Some(AgentId::from("agent-lock")),
+        )
+        .await
+        .unwrap();
+
+        let rows = svc.store().list_tracked_changes(&ws).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, "deps.lock");
+        assert_eq!(rows[0].status, "modified");
     }
 
     /// An agent-context `file.write` records an attributed `tracked_changes`
@@ -26323,7 +26684,8 @@ mod file_tracking {
 
     /// Poll `cond` until it holds or the deadline passes (asserting on timeout).
     async fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now()
+            + intentd_test_support::test_timeout(std::time::Duration::from_secs(10));
         while !cond() {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -27683,10 +28045,13 @@ mod file_tracking {
 
         let root = git_root_row(&ws_id, &secondary.dir);
         let stored = svc.register_git_root(&root).await.unwrap();
-        let batch = tokio::time::timeout(std::time::Duration::from_secs(2), sub.recv())
-            .await
-            .expect("registered event")
-            .unwrap();
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("registered event")
+        .unwrap();
         assert_eq!(batch[0].event_type, "gitRoot:registered");
         assert_eq!(batch[0].data["gitRoot"]["id"], stored.id.as_str());
 
@@ -27695,10 +28060,13 @@ mod file_tracking {
         again.registered_by_agent_ids = vec![AgentId("agent-2".into())];
         let merged = svc.register_git_root(&again).await.unwrap();
         assert_eq!(merged.id, stored.id, "merged into the existing row");
-        let batch = tokio::time::timeout(std::time::Duration::from_secs(2), sub.recv())
-            .await
-            .expect("updated event")
-            .unwrap();
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("updated event")
+        .unwrap();
         assert_eq!(batch[0].event_type, "gitRoot:updated");
         assert_eq!(
             batch[0].data["gitRoot"]["registeredByAgentIds"],
@@ -27706,10 +28074,13 @@ mod file_tracking {
         );
 
         svc.unregister_git_root(&stored.id).await.unwrap();
-        let batch = tokio::time::timeout(std::time::Duration::from_secs(2), sub.recv())
-            .await
-            .expect("unregistered event")
-            .unwrap();
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("unregistered event")
+        .unwrap();
         assert_eq!(batch[0].event_type, "gitRoot:unregistered");
         assert_eq!(batch[0].data["gitRootId"], stored.id.as_str());
         assert_eq!(batch[0].data["path"], stored.path);
@@ -29721,10 +30092,13 @@ mod search_adapters {
     }
 
     async fn recv_event(sub: &mut Subscription) -> Value {
-        let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("event delivered")
-            .expect("subscription open");
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("event delivered")
+        .expect("subscription open");
         serde_json::to_value(&batch[0]).expect("serialize")
     }
 
@@ -31133,9 +31507,12 @@ mod rules {
             .await
             .expect("update");
 
-        let batch = tokio::time::timeout(Duration::from_secs(2), recv(&mut sub))
-            .await
-            .expect("event delivered");
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            recv(&mut sub),
+        )
+        .await
+        .expect("event delivered");
         let ev = serde_json::to_value(&batch[0]).unwrap();
         assert_eq!(ev["type"], "settings:changed");
         let changes = ev["data"]["changes"].as_array().expect("changes");
@@ -32842,11 +33219,16 @@ mod known_repo {
 
         // Wait for the backfill to complete and emit workspace:updated
         let mut updated_event = None;
-        for _ in 0..100 {
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(tokio::time::Duration::from_secs(6));
+        while tokio::time::Instant::now() < deadline {
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
             // Try to receive batched events (could be empty or timeout)
-            if let Ok(Some(batch)) =
-                tokio::time::timeout(tokio::time::Duration::from_millis(10), sub.recv()).await
+            if let Ok(Some(batch)) = tokio::time::timeout(
+                intentd_test_support::test_timeout(tokio::time::Duration::from_millis(10)),
+                sub.recv(),
+            )
+            .await
             {
                 for evt in batch {
                     if evt.event_type == "workspace:updated"
@@ -32923,7 +33305,8 @@ mod known_repo {
         )
         .await
         .expect("update repository path");
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(std::time::Duration::from_secs(5));
         loop {
             let updated = store
                 .get_workspace(&path_update_id)
@@ -34558,6 +34941,62 @@ mod worktree_provisioning {
         assert_eq!(ws2.branch, "aw/auth-fix-2");
     }
 
+    /// `workspace.create`'s initial agent pins the settings default provider
+    /// on its row, so a later `model.defaultProvider` change never moves the
+    /// workspace's first conversation (a NULL provider is a legacy row).
+    #[intent_test_macros::daemon_test]
+    async fn create_initial_agent_pins_the_default_provider() {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let config_dir = tempfile::tempdir().expect("temp config dir");
+        let registry = std::sync::Arc::new(
+            crate::SettingsRegistry::load(config_dir.path().join("config.toml"))
+                .expect("load registry"),
+        );
+        registry
+            .apply(&[(
+                "model.defaultProvider".to_string(),
+                serde_json::json!("auggie"),
+            )])
+            .expect("set default provider");
+        let (repo_dir, _, head_branch) = seed_repo("intentd-initpin-repo");
+        let root = unique_dir("intentd-initpin-root");
+        let svc = Services::new(store.clone())
+            .with_workspaces_root(root.0.clone())
+            .with_settings_registry(registry.clone());
+
+        let ws = svc
+            .create_workspace(
+                WorkspaceCreate {
+                    repository_path: Some(repo_dir.0.to_string_lossy().to_string()),
+                    base_ref: Some(head_branch.clone()),
+                    initial_agent: Some(intent_core::WorkspaceCreateInitialAgent {
+                        prompt: Some("pin the provider".to_string()),
+                        model: Some("sonnet4.5".to_string()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("create")
+            .workspace;
+        registry
+            .apply(&[(
+                "model.defaultProvider".to_string(),
+                serde_json::json!("codex"),
+            )])
+            .expect("change default provider");
+        let sessions = store.list_agent_sessions(&ws.id).await.expect("sessions");
+        let initial = sessions
+            .iter()
+            .find(|s| s.is_initial_agent())
+            .expect("initial agent");
+        assert_eq!(initial.provider.as_deref(), Some("auggie"));
+        assert_eq!(initial.model.as_deref(), Some("sonnet4.5"));
+    }
+
     /// An explicit `branch` wins untouched — no slug, prefix, or suffix.
     #[intent_test_macros::daemon_test]
     async fn create_keeps_explicit_branch_untouched() {
@@ -35248,12 +35687,15 @@ mod setup_lifecycle_events {
     /// spawn succeeded and the script is parked there).
     #[cfg(unix)]
     async fn wait_for_barrier(barrier: &Barrier) {
-        tokio::time::timeout(Duration::from_secs(20), async {
-            while !barrier.entered() {
-                // timing-guard: poll interval for the barrier's arrival file
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(20)),
+            async {
+                while !barrier.entered() {
+                    // timing-guard: poll interval for the barrier's arrival file
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            },
+        )
         .await
         .expect("setup script reached the barrier");
     }
@@ -35311,16 +35753,23 @@ mod setup_lifecycle_events {
     /// Receive one setup event (generous timeout: script paths cross a PTY
     /// spawn + reap poll), serialized to wire JSON.
     async fn recv_setup(sub: &mut Subscription) -> Value {
-        let batch = tokio::time::timeout(Duration::from_secs(20), sub.recv())
-            .await
-            .expect("setup event delivered")
-            .expect("subscription open");
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(20)),
+            sub.recv(),
+        )
+        .await
+        .expect("setup event delivered")
+        .expect("subscription open");
         assert_eq!(batch.len(), 1, "expected exactly one event per delivery");
         serde_json::to_value(&batch[0]).expect("serialize event")
     }
 
     async fn assert_quiet(sub: &mut Subscription) {
-        let quiet = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
+        let quiet = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            sub.recv(),
+        )
+        .await;
         assert!(quiet.is_err(), "no further setup events, got: {quiet:?}");
     }
 
@@ -38026,8 +38475,11 @@ mod initial_agent_orchestration {
     /// quiet, flattening batches into one ordered list of event types.
     async fn drain_event_types(sub: &mut crate::Subscription) -> Vec<String> {
         let mut types = Vec::new();
-        while let Ok(Some(batch)) =
-            tokio::time::timeout(Duration::from_millis(400), sub.recv()).await
+        while let Ok(Some(batch)) = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(400)),
+            sub.recv(),
+        )
+        .await
         {
             for ev in batch {
                 types.push(ev.event_type);
@@ -38436,8 +38888,11 @@ mod clone_orchestration {
 
     async fn drain_event_types(sub: &mut crate::Subscription) -> Vec<String> {
         let mut types = Vec::new();
-        while let Ok(Some(batch)) =
-            tokio::time::timeout(Duration::from_millis(400), sub.recv()).await
+        while let Ok(Some(batch)) = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(400)),
+            sub.recv(),
+        )
+        .await
         {
             for ev in batch {
                 types.push(ev.event_type);
@@ -39122,8 +39577,11 @@ mod clone_orchestration {
     /// Drain the subscription and return the full `git:clone:*` events.
     async fn drain_clone_frames(sub: &mut crate::Subscription) -> Vec<intent_core::Event> {
         let mut frames = Vec::new();
-        while let Ok(Some(batch)) =
-            tokio::time::timeout(Duration::from_millis(400), sub.recv()).await
+        while let Ok(Some(batch)) = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(400)),
+            sub.recv(),
+        )
+        .await
         {
             for ev in batch {
                 if ev.event_type.starts_with("git:clone:") {
@@ -39741,7 +40199,8 @@ mod repo_warm_cache {
     /// Await the warm's detached completion: poll until the cache slot for
     /// `owner/repo` exists AND a follow-up warm is accepted (flag cleared).
     async fn wait_for_warm_completion(svc: &Services, root: &std::path::Path, url: &str) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_secs(30));
         loop {
             match svc.repo_warm_cache(url.to_string()).await {
                 Ok(v) => {
@@ -39823,7 +40282,9 @@ mod repo_warm_cache {
             })
             .await
         });
-        held_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        held_rx
+            .recv_timeout(intentd_test_support::test_timeout(Duration::from_secs(10)))
+            .unwrap();
 
         let v = svc
             .repo_warm_cache(url.clone())
@@ -40631,10 +41092,13 @@ mod browser_client_pin {
         );
 
         // `workspace:updated` carries the self-sufficient delta.
-        let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("event delivered")
-            .expect("subscription open");
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("event delivered")
+        .expect("subscription open");
         let ev = serde_json::to_value(&batch[0]).unwrap();
         assert_eq!(ev["type"], "workspace:updated");
         assert_eq!(
@@ -40666,10 +41130,13 @@ mod browser_client_pin {
                 "resolved": { "clientId": "desktop-a", "name": "Desktop A" }
             })
         );
-        let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("event delivered")
-            .expect("subscription open");
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("event delivered")
+        .expect("subscription open");
         let ev = serde_json::to_value(&batch[0]).unwrap();
         assert_eq!(ev["data"]["changes"], json!({ "browserClientId": null }));
         assert_eq!(svc.get_workspace(ws).await.unwrap().browser_client_id, None);
@@ -40726,10 +41193,13 @@ mod browser_client_pin {
 
         let mut deltas: Vec<Value> = Vec::new();
         while deltas.len() < ROUNDS {
-            let batch = tokio::time::timeout(Duration::from_secs(5), sub.recv())
-                .await
-                .expect("all deltas delivered")
-                .expect("subscription open");
+            let batch = tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                sub.recv(),
+            )
+            .await
+            .expect("all deltas delivered")
+            .expect("subscription open");
             for ev in &batch {
                 let ev = serde_json::to_value(ev).unwrap();
                 assert_eq!(ev["type"], "workspace:updated");
@@ -40985,10 +41455,13 @@ mod browser_routing {
         });
         let mut out = Vec::new();
         while out.len() < want {
-            let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
-                .await
-                .expect("event delivered")
-                .expect("subscription open");
+            let batch = tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(2)),
+                sub.recv(),
+            )
+            .await
+            .expect("event delivered")
+            .expect("subscription open");
             for ev in &batch {
                 let ev = serde_json::to_value(ev).unwrap();
                 if ev["type"]
@@ -41594,9 +42067,12 @@ mod browser_routing {
                 .await
             }
         });
-        tokio::time::timeout(Duration::from_secs(2), dispatch.started.notified())
-            .await
-            .expect("claim dispatched");
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            dispatch.started.notified(),
+        )
+        .await
+        .expect("claim dispatched");
         assert_eq!(
             dispatch.targets.lock().unwrap().as_slice(),
             [ReverseTarget::Pinned(ClientId::from_string("desktop-a"))]
@@ -42293,10 +42769,13 @@ mod last_activity_events {
     }
 
     async fn recv_one(sub: &mut Subscription) -> Value {
-        let batch = timeout(Duration::from_secs(5), sub.recv())
-            .await
-            .expect("event delivered")
-            .expect("subscription open");
+        let batch = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            sub.recv(),
+        )
+        .await
+        .expect("event delivered")
+        .expect("subscription open");
         assert!(!batch.is_empty(), "expected at least one event");
         serde_json::to_value(&batch[0]).expect("serialize event")
     }
@@ -42311,7 +42790,8 @@ mod last_activity_events {
     /// which routinely fires well past its nominal window on loaded runners
     /// (monorepo#2585).
     async fn wait_for_persisted_last_activity(h: &Harness) -> String {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_secs(10));
         loop {
             if let Some(persisted) = h
                 .store
@@ -42337,7 +42817,8 @@ mod last_activity_events {
     /// — so an assertion that follows genuinely runs after the derivation
     /// instead of racing it behind a fixed sleep (monorepo#2585).
     async fn wait_for_debounce_settled(h: &Harness) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_secs(10));
         loop {
             let pending = h
                 .services
@@ -42420,7 +42901,8 @@ mod last_activity_events {
 
         // Bounded poll: the timer fires after the debounce window, takes the
         // NotFound arm, and must still sweep its map entry on the way out.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline =
+            std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(5));
         loop {
             let present = h
                 .services
@@ -42515,7 +42997,8 @@ mod last_activity_events {
 
         // Bounded poll: the timer fires after the debounce window, takes the
         // suppressed path, and must still sweep its map entry on the way out.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline =
+            std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(5));
         loop {
             let present = h
                 .services
@@ -42539,9 +43022,12 @@ mod last_activity_events {
         assert_envelope(&ev, &h.ws.0, "workspace:activity-changed");
         assert_eq!(ev["data"]["activity"], "agent_running");
         assert!(
-            timeout(Duration::from_millis(200), sub.recv())
-                .await
-                .is_err(),
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(200)),
+                sub.recv()
+            )
+            .await
+            .is_err(),
             "no idle event on the suppressed-fire path"
         );
     }
@@ -42590,7 +43076,8 @@ mod last_activity_events {
 
         // Bounded poll: the timer fires, hits the emit-time existence guard,
         // and must still sweep its map entry on the way out.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline =
+            std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(5));
         loop {
             let present = h
                 .services
@@ -42615,9 +43102,12 @@ mod last_activity_events {
         assert_envelope(&ev, &h.ws.0, "workspace:activity-changed");
         assert_eq!(ev["data"]["activity"], "agent_running");
         assert!(
-            timeout(Duration::from_millis(200), sub.recv())
-                .await
-                .is_err(),
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(200)),
+                sub.recv()
+            )
+            .await
+            .is_err(),
             "no idle event for a deleted workspace"
         );
     }
@@ -42688,7 +43178,12 @@ mod last_activity_events {
         assert_envelope(&ev1, &h.ws.0, "workspace:attention-changed");
 
         tokio::time::sleep(Duration::from_millis(200)).await;
-        while let Ok(Some(batch)) = timeout(Duration::from_millis(50), sub.recv()).await {
+        while let Ok(Some(batch)) = timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(50)),
+            sub.recv(),
+        )
+        .await
+        {
             for ev in &batch {
                 let ev = serde_json::to_value(ev).expect("serialize event");
                 assert_eq!(
@@ -42706,9 +43201,12 @@ mod last_activity_events {
 
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(
-            timeout(Duration::from_millis(50), sub.recv())
-                .await
-                .is_err(),
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(50)),
+                sub.recv()
+            )
+            .await
+            .is_err(),
             "no event on idempotent dismiss"
         );
     }
@@ -42743,7 +43241,8 @@ mod last_activity_events {
         // unconditional timed drain raced the debounce timer here: under
         // package load the window expired while the drain was still consuming,
         // which discarded the very event asserted below (intent#4886).
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_secs(5));
         let mut updated: Option<Value> = None;
         while updated.is_none() {
             let batch = tokio::time::timeout_at(deadline, sub.recv())
@@ -42772,7 +43271,8 @@ mod last_activity_events {
         // No second workspace:updated (coalesced) within a quiet window after
         // the first. One absolute deadline bounds the whole window, so a
         // stream of unrelated events cannot keep extending it.
-        let quiet_until = tokio::time::Instant::now() + Duration::from_millis(100);
+        let quiet_until = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_millis(100));
         while let Ok(Some(batch)) = tokio::time::timeout_at(quiet_until, sub.recv()).await {
             for ev in &batch {
                 let ev = serde_json::to_value(ev).expect("serialize event");
@@ -43117,9 +43617,12 @@ mod last_activity_events {
         assert_envelope(&ev, &h.ws.0, "workspace:tokenUsage-changed");
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(
-            timeout(Duration::from_millis(50), sub.recv())
-                .await
-                .is_err(),
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(50)),
+                sub.recv()
+            )
+            .await
+            .is_err(),
             "token recompute must not emit a lastActivity workspace:updated"
         );
 
@@ -43135,9 +43638,12 @@ mod last_activity_events {
         // idempotent re-scan.
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(
-            timeout(Duration::from_millis(50), sub.recv())
-                .await
-                .is_err(),
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(50)),
+                sub.recv()
+            )
+            .await
+            .is_err(),
             "no event on idempotent token scan"
         );
     }
@@ -43483,9 +43989,12 @@ mod last_activity_events {
 
         // No idle event should have been emitted.
         assert!(
-            timeout(Duration::from_millis(50), sub.recv())
-                .await
-                .is_err(),
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(50)),
+                sub.recv()
+            )
+            .await
+            .is_err(),
             "no idle event when re-begin cancels the debounce"
         );
 
@@ -43517,6 +44026,7 @@ mod last_activity_events {
         // Before the window expires, no idle event yet.
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
+            // fixed-deadline: allow — stays under the 100ms idle debounce (50ms sleep + this window), after which the idle event is legitimate
             timeout(Duration::from_millis(20), sub.recv())
                 .await
                 .is_err(),
@@ -43529,10 +44039,13 @@ mod last_activity_events {
         tokio::time::sleep(Duration::from_millis(80)).await;
         let mut events = Vec::new();
         while events.len() < 2 {
-            let batch = timeout(Duration::from_secs(2), sub.recv())
-                .await
-                .expect("debounced events delivered")
-                .expect("subscription open");
+            let batch = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(2)),
+                sub.recv(),
+            )
+            .await
+            .expect("debounced events delivered")
+            .expect("subscription open");
             for ev in &batch {
                 events.push(serde_json::to_value(ev).expect("serialize event"));
             }
@@ -43569,9 +44082,12 @@ mod last_activity_events {
 
         // No duplicate events.
         assert!(
-            timeout(Duration::from_millis(50), sub.recv())
-                .await
-                .is_err(),
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(50)),
+                sub.recv()
+            )
+            .await
+            .is_err(),
             "no duplicate idle event"
         );
     }
@@ -43994,10 +44510,13 @@ mod idle_workspace_archived_stamp {
     }
 
     async fn recv_idle(sub: &mut Subscription) -> Value {
-        let batch = timeout(Duration::from_secs(5), sub.recv())
-            .await
-            .expect("agent:idle delivered")
-            .expect("subscription open");
+        let batch = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            sub.recv(),
+        )
+        .await
+        .expect("agent:idle delivered")
+        .expect("subscription open");
         assert!(!batch.is_empty());
         serde_json::to_value(&batch[0]).expect("serialize event")
     }
@@ -44100,10 +44619,13 @@ mod turn_token_usage {
     }
 
     async fn recv_usage_event(sub: &mut Subscription) -> Value {
-        let batch = timeout(Duration::from_secs(5), sub.recv())
-            .await
-            .expect("tokenUsage-changed delivered")
-            .expect("subscription open");
+        let batch = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            sub.recv(),
+        )
+        .await
+        .expect("tokenUsage-changed delivered")
+        .expect("subscription open");
         assert!(!batch.is_empty());
         serde_json::to_value(&batch[0]).expect("serialize event")
     }
@@ -44539,9 +45061,12 @@ mod turn_token_usage {
             .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(10, 5, 0, 0)), None)
             .await;
         assert!(
-            timeout(Duration::from_millis(100), sub.recv())
-                .await
-                .is_err(),
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(100)),
+                sub.recv()
+            )
+            .await
+            .is_err(),
             "no event when the tally is unchanged"
         );
     }
@@ -44629,9 +45154,12 @@ mod turn_token_usage {
             .expect("scan ok");
         assert!(!changed, "zero recount must not overwrite the live tally");
         assert!(
-            timeout(Duration::from_millis(100), sub.recv())
-                .await
-                .is_err(),
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(100)),
+                sub.recv()
+            )
+            .await
+            .is_err(),
             "no event when the guard skips the write"
         );
         let reloaded = h.store.get_workspace(&h.ws).await.expect("reload");
@@ -44724,9 +45252,12 @@ mod turn_token_usage {
             .persist_turn_token_usage(&AgentId::new(), &h.ws, Some(&acp_usage(1, 1, 0, 0)), None)
             .await;
         assert!(
-            timeout(Duration::from_millis(100), sub.recv())
-                .await
-                .is_err(),
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(100)),
+                sub.recv()
+            )
+            .await
+            .is_err(),
             "no event when the session row is absent"
         );
         let ws = h.store.get_workspace(&h.ws).await.expect("reload");
@@ -44909,9 +45440,12 @@ mod turn_token_usage {
             .expect("scan ok");
         assert!(!changed, "scan agrees with the live tally");
         assert!(
-            timeout(Duration::from_millis(100), sub.recv())
-                .await
-                .is_err(),
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(100)),
+                sub.recv()
+            )
+            .await
+            .is_err(),
             "no event when scan matches the live tally"
         );
         let scanned = h
@@ -45240,7 +45774,12 @@ mod turn_token_usage {
         // Every emitted event carries a committed snapshot value — never a
         // torn/mixed aggregate.
         let mut seen = 0usize;
-        while let Ok(Some(batch)) = timeout(Duration::from_millis(200), sub.recv()).await {
+        while let Ok(Some(batch)) = timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            sub.recv(),
+        )
+        .await
+        {
             for ev in batch {
                 let data = serde_json::to_value(&ev).expect("serialize event");
                 let input = data["data"]["tokenUsage"]["totals"]["inputTokens"]
@@ -45876,6 +46415,177 @@ mod turn_token_usage {
                 .await
                 .is_none(),
             "no _meta at all"
+        );
+    }
+
+    async fn set_session_name(h: &Harness, agent: &AgentId, name: &str) {
+        sqlx::query("UPDATE agent_session SET name=? WHERE id=?")
+            .bind(name)
+            .bind(&agent.0)
+            .execute(h.store.write_pool())
+            .await
+            .expect("rename session");
+    }
+
+    async fn stored_usage(h: &Harness) -> intent_core::TokenUsage {
+        h.store
+            .get_workspace(&h.ws)
+            .await
+            .expect("workspace")
+            .token_usage
+            .expect("usage")
+    }
+
+    #[tokio::test]
+    async fn token_usage_carries_names_for_retired_and_named_agents() {
+        let h = harness().await;
+        let live = AgentId::new();
+        let retired = AgentId::new();
+        for agent in [&live, &retired] {
+            h.store
+                .insert_agent_session(&agent_session(agent, &h.ws, "model-a"))
+                .await
+                .expect("insert session");
+        }
+        set_session_name(&h, &live, "Coordinator").await;
+        set_session_name(&h, &retired, "PR reviewer").await;
+        sqlx::query("UPDATE agent_session SET retired_at=? WHERE id=?")
+            .bind(now_iso())
+            .bind(&retired.0)
+            .execute(h.store.write_pool())
+            .await
+            .expect("retire session");
+        h.services
+            .persist_turn_token_usage(&live, &h.ws, Some(&acp_usage(10, 0, 0, 0)), None)
+            .await;
+        h.services
+            .persist_turn_token_usage(&retired, &h.ws, Some(&acp_usage(20, 0, 0, 0)), None)
+            .await;
+
+        let usage = stored_usage(&h).await;
+        assert_eq!(usage.agent_names.len(), 2);
+        assert_eq!(usage.agent_names[&live.0], "Coordinator");
+        assert_eq!(usage.agent_names[&retired.0], "PR reviewer");
+        let wire = serde_json::to_value(&usage).expect("serialize usage");
+        assert_eq!(wire["agentNames"][&retired.0], "PR reviewer");
+    }
+
+    #[tokio::test]
+    async fn token_usage_omits_blank_names_and_agents_without_usage_rows() {
+        let h = harness().await;
+        let blank = AgentId::new();
+        let idle = AgentId::new();
+        for agent in [&blank, &idle] {
+            h.store
+                .insert_agent_session(&agent_session(agent, &h.ws, "model-a"))
+                .await
+                .expect("insert session");
+        }
+        set_session_name(&h, &blank, "   ").await;
+        set_session_name(&h, &idle, "Idle helper").await;
+        h.services
+            .persist_turn_token_usage(&blank, &h.ws, Some(&acp_usage(10, 0, 0, 0)), None)
+            .await;
+
+        let usage = stored_usage(&h).await;
+        assert!(usage.by_agent_id.contains_key(&blank.0));
+        assert!(
+            usage.by_agent_id.contains_key(&idle.0),
+            "the recompute seeds a bucket for the usage-less session"
+        );
+        assert!(
+            usage.agent_names.is_empty(),
+            "blank name and usage-less named session are both omitted: {:?}",
+            usage.agent_names
+        );
+        let wire = serde_json::to_value(&usage).expect("serialize usage");
+        assert!(
+            wire.get("agentNames").is_none(),
+            "empty map omitted from the wire"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_rename_refreshes_token_usage_agent_names() {
+        let h = harness().await;
+        let agent = AgentId::new();
+        let idle = AgentId::new();
+        for id in [&agent, &idle] {
+            h.store
+                .insert_agent_session(&agent_session(id, &h.ws, "model-a"))
+                .await
+                .expect("insert session");
+        }
+        set_session_name(&h, &agent, "Builder").await;
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(10, 0, 0, 0)), None)
+            .await;
+
+        let mut sub = subscribe_usage(&h);
+        h.services
+            .agent_rename_op(agent.clone(), "Release builder".into(), false)
+            .await
+            .expect("rename");
+        assert_eq!(
+            stored_usage(&h).await.agent_names[&agent.0],
+            "Release builder"
+        );
+        let event = recv_usage_event(&mut sub).await;
+        assert_eq!(
+            event["data"]["tokenUsage"]["agentNames"][&agent.0],
+            "Release builder"
+        );
+
+        let before = stored_usage(&h).await;
+        h.services
+            .agent_rename_op(idle.clone(), "Idle helper".into(), false)
+            .await
+            .expect("rename usage-less agent");
+        let after = stored_usage(&h).await;
+        assert_eq!(
+            after.last_scan_at, before.last_scan_at,
+            "renaming a usage-less agent writes nothing"
+        );
+        assert!(!after.agent_names.contains_key(&idle.0));
+    }
+
+    #[tokio::test]
+    async fn token_usage_name_trimmed_and_rename_alone_commits_on_recompute() {
+        let h = harness().await;
+        let agent = AgentId::new();
+        h.store
+            .insert_agent_session(&agent_session(&agent, &h.ws, "model-a"))
+            .await
+            .expect("insert session");
+        set_session_name(&h, &agent, "  Builder  ").await;
+        h.services
+            .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(10, 0, 0, 0)), None)
+            .await;
+        assert_eq!(stored_usage(&h).await.agent_names[&agent.0], "Builder");
+
+        let unchanged = h
+            .services
+            .recompute_workspace_token_usage(&h.ws, false)
+            .await
+            .expect("recompute");
+        assert!(!unchanged, "no counter or name change writes nothing");
+
+        set_session_name(&h, &agent, "Renamed builder").await;
+        let mut sub = subscribe_usage(&h);
+        let changed = h
+            .services
+            .recompute_workspace_token_usage(&h.ws, false)
+            .await
+            .expect("recompute after rename");
+        assert!(changed, "a name change alone is a snapshot change");
+        assert_eq!(
+            stored_usage(&h).await.agent_names[&agent.0],
+            "Renamed builder"
+        );
+        let event = recv_usage_event(&mut sub).await;
+        assert_eq!(
+            event["data"]["tokenUsage"]["agentNames"][&agent.0],
+            "Renamed builder"
         );
     }
 }
@@ -47117,9 +47827,12 @@ mod delete_grace_window {
             .schedule_workspace_delete(h.ws.clone(), 60_000)
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(10), h.services.shutdown_store_writers())
-            .await
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            h.services.shutdown_store_writers(),
+        )
+        .await
+        .unwrap();
         h.bus.shutdown().await.unwrap();
         h.services.store.close().await;
         let reopened = Store::open(&h.tmp.path).await.unwrap();
@@ -47346,10 +48059,13 @@ mod delete_grace_window {
             .schedule_workspace_delete(h.ws.clone(), 60_000)
             .await
             .expect("schedule");
-        let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("scheduled event delivered")
-            .expect("subscription open");
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("scheduled event delivered")
+        .expect("subscription open");
         let ev = serde_json::to_value(&batch[0]).expect("serialize");
         assert_eq!(ev["type"], "workspace:delete-scheduled");
         assert_eq!(
@@ -47361,10 +48077,13 @@ mod delete_grace_window {
             .cancel_workspace_delete(h.ws.clone())
             .await
             .expect("cancel");
-        let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("cancelled event delivered")
-            .expect("subscription open");
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("cancelled event delivered")
+        .expect("subscription open");
         let ev = serde_json::to_value(&batch[0]).expect("serialize");
         assert_eq!(ev["type"], "workspace:delete-cancelled");
         assert_eq!(ev["data"], serde_json::json!({ "workspaceId": h.ws.0 }));
@@ -47770,20 +48489,23 @@ mod agent_delete_grace_window {
             .await
             .unwrap();
         let held = h.services.store.write_pool().acquire().await.unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while h
-                .services
-                .pending_agent_deletes
-                .deadline(&crate::delete_grace::PendingDeleteSubject::Agent {
-                    workspace_id: h.ws.clone(),
-                    agent_id: h.agent.clone(),
-                })
-                .unwrap()
-                .is_some()
-            {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            async {
+                while h
+                    .services
+                    .pending_agent_deletes
+                    .deadline(&crate::delete_grace::PendingDeleteSubject::Agent {
+                        workspace_id: h.ws.clone(),
+                        agent_id: h.agent.clone(),
+                    })
+                    .unwrap()
+                    .is_some()
+                {
+                    tokio::task::yield_now().await;
+                }
+            },
+        )
         .await
         .expect("timer claimed its cascade");
         let shutdown = h.services.shutdown_store_writers();
@@ -47795,9 +48517,12 @@ mod agent_delete_grace_window {
         };
         drop(held);
         if !returned_early {
-            tokio::time::timeout(Duration::from_secs(5), &mut shutdown)
-                .await
-                .unwrap();
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                &mut shutdown,
+            )
+            .await
+            .unwrap();
         }
         assert!(
             !returned_early,
@@ -48048,10 +48773,13 @@ mod agent_delete_grace_window {
             .agent_schedule_delete_op(h.agent.clone(), None, 60_000)
             .await
             .expect("schedule");
-        let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("scheduled event delivered")
-            .expect("subscription open");
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("scheduled event delivered")
+        .expect("subscription open");
         let ev = serde_json::to_value(&batch[0]).expect("serialize");
         assert_eq!(ev["type"], "agent:delete-scheduled");
         assert_eq!(
@@ -48067,10 +48795,13 @@ mod agent_delete_grace_window {
             .agent_cancel_delete_op(h.agent.clone(), None)
             .await
             .expect("cancel");
-        let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("cancelled event delivered")
-            .expect("subscription open");
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("cancelled event delivered")
+        .expect("subscription open");
         let ev = serde_json::to_value(&batch[0]).expect("serialize");
         assert_eq!(ev["type"], "agent:delete-cancelled");
         assert_eq!(
@@ -48133,9 +48864,12 @@ mod agent_delete_grace_window {
             .await
             .expect("schedule");
         // Drain the schedule event so the assertions below start clean.
-        let _ = tokio::time::timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("scheduled event delivered");
+        let _ = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("scheduled event delivered");
 
         h.services
             .delete_workspace(h.ws.clone())
@@ -48160,8 +48894,11 @@ mod agent_delete_grace_window {
         // The cascade emits `agent:deleted` + `workspace:deleted`; no
         // `agent:delete-cancelled` sneaks in.
         let mut seen = Vec::new();
-        while let Ok(Some(batch)) =
-            tokio::time::timeout(Duration::from_millis(500), sub.recv()).await
+        while let Ok(Some(batch)) = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(500)),
+            sub.recv(),
+        )
+        .await
         {
             for ev in batch {
                 seen.push(serde_json::to_value(&ev).expect("serialize"));
@@ -48905,16 +49642,23 @@ mod derived_workspace_unread {
     }
 
     async fn recv_one(sub: &mut Subscription) -> Value {
-        let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("event delivered")
-            .expect("subscription open");
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("event delivered")
+        .expect("subscription open");
         assert_eq!(batch.len(), 1, "expected exactly one event");
         serde_json::to_value(&batch[0]).expect("serialize event")
     }
 
     async fn assert_silent(sub: &mut Subscription) {
-        let res = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
+        let res = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            sub.recv(),
+        )
+        .await;
         assert!(res.is_err(), "expected no attention event: {res:?}");
     }
 
@@ -49309,9 +50053,12 @@ mod derived_workspace_unread {
                 .agent_mark_seen_op(ws_id, AgentId::from("agent-a"), last_a)
                 .await
         });
-        tokio::time::timeout(Duration::from_secs(2), park.entered.notified())
-            .await
-            .expect("settle reaches the attention write window");
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            park.entered.notified(),
+        )
+        .await
+        .expect("settle reaches the attention write window");
 
         // New unread session lands while the settle sits parked between its
         // probe (which saw "all seen") and its write.
@@ -49547,18 +50294,24 @@ mod derived_workspace_unread {
         // entry: neither has probed yet, so neither can early-return on the
         // other's still-pending write.
         for _ in 0..2 {
-            tokio::time::timeout(Duration::from_secs(10), entry.entered.notified())
-                .await
-                .expect("retire reaches the settle entry");
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(10)),
+                entry.entered.notified(),
+            )
+            .await
+            .expect("retire reaches the settle entry");
         }
         entry.release.notify_one();
         entry.release.notify_one();
         // Both probes now see every session retired, so both settles reach
         // the attention-write window: neither has cleared yet.
         for _ in 0..2 {
-            tokio::time::timeout(Duration::from_secs(10), park.entered.notified())
-                .await
-                .expect("settle reaches the attention write window");
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(10)),
+                park.entered.notified(),
+            )
+            .await
+            .expect("settle reaches the attention write window");
         }
         park.release.notify_one();
         park.release.notify_one();
@@ -50218,7 +50971,7 @@ mod idempotency_serialization {
         cp.started.recv().await.expect("held op in flight");
 
         let other = tokio::time::timeout(
-            Duration::from_secs(30),
+            intentd_test_support::test_timeout(Duration::from_secs(30)),
             with_idempotency(
                 &race.inflight,
                 &store,

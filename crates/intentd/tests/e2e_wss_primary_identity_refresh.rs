@@ -314,7 +314,7 @@ async fn rpc_helper_gives_up_at_its_absolute_deadline_despite_continuous_pings()
     };
     let started = tokio::time::Instant::now();
     let outcome = timeout(
-        Duration::from_secs(10),
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
         rpc_within(&mut ws, DEADLINE, 1, "system.status", json!({})),
     )
     .await

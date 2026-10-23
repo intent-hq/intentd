@@ -140,7 +140,7 @@ async fn disabled_gh_credentials_survive_settings_and_revoke_over_wss() {
     rpc.close(None).await.unwrap();
     daemon.signal(nix::sys::signal::Signal::SIGTERM).unwrap();
     let exit = daemon
-        .wait_with_timeout(Duration::from_secs(10))
+        .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(10)))
         .unwrap()
         .expect("owned daemon stopped");
     assert!(exit.success(), "{exit}");
@@ -339,11 +339,12 @@ where
         .await
         .expect("send rpc frame");
     loop {
-        let next = timeout(Duration::from_secs(15), ws.next())
-            .await
-            .unwrap_or_else(|_| {
-                panic!("WSS RPC {method} (id {id}) timed out waiting for response")
-            });
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(15)),
+            ws.next(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("WSS RPC {method} (id {id}) timed out waiting for response"));
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -366,7 +367,8 @@ async fn await_auth_changed<S>(ws: &mut WebSocketStream<S>, status: &str, secs: 
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(secs));
     loop {
         let remaining = deadline
             .checked_duration_since(tokio::time::Instant::now())

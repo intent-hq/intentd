@@ -223,6 +223,15 @@ where
     Ok(())
 }
 
+#[cfg(any(unix, windows))]
+struct AbortWriter(tokio::task::AbortHandle);
+#[cfg(any(unix, windows))]
+impl Drop for AbortWriter {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Serve one connection: read newline-delimited frames, answer requests, push
 /// matching `events.event` notifications, and clean up all subscriptions on exit.
 /// Generic over the split stream halves so the Unix socket and Windows named
@@ -272,6 +281,7 @@ where
     let (out_tx, mut out_rx) = outbound_channel();
     let _retirements = read_connection.forward_retirements(out_tx.priority_sender());
     let writer_read_connection = read_connection.clone();
+    let writer_recovery = out_tx.recovery.clone();
     let writer = tokio::spawn(async move {
         let _retire_on_writer_exit = writer_read_connection;
         let mut write_half = write_half;
@@ -290,13 +300,19 @@ where
                 );
                 continue;
             }
-            if frame.write_uds(&mut write_half).await.is_err() {
+            if !writer_recovery
+                .prepare_frame(&frame)
+                .finish(async { frame.write_uds(&mut write_half).await.is_ok() })
+                .await
+            {
                 #[cfg(feature = "repository-test-fixtures")]
                 crate::private_output::fixture_discarded_queue(&mut out_rx);
                 break;
             }
         }
+        writer_recovery.close();
     });
+    let _abort_writer = AbortWriter(writer.abort_handle());
 
     let mut subs = ConnSubs::default();
     let reverse = ReverseChannel::new(out_tx.priority_sender());
@@ -310,73 +326,87 @@ where
     // Per-connection logical-client binding (§16): `None` until `client.hello`.
     let mut client_id: Option<intent_core::ClientId> = None;
     let mut line = Vec::new();
-    let io_result = loop {
-        line.clear();
-        match read_line_bounded(&mut reader, &mut line, crate::MAX_INBOUND_MESSAGE_BYTES).await {
-            Ok(BoundedLine::Eof) => break Ok(()),
-            Ok(BoundedLine::Line) => {}
-            Ok(BoundedLine::TooLong) => {
-                // Over-limit frame (monorepo#472): answer with a `-32600`
-                // error (`id: null` — the request was never parsed) and end
-                // the connection WITHOUT draining the rest of the oversized
-                // line into memory.
-                let frame = crate::events::error_frame(
-                    &serde_json::Value::Null,
-                    -32600,
-                    &format!(
-                        "message exceeds maximum size of {} bytes",
-                        crate::MAX_INBOUND_MESSAGE_BYTES
-                    ),
-                );
-                let _ = out_tx.send_priority(frame).await;
+    let connection = async {
+        loop {
+            line.clear();
+            match read_line_bounded(&mut reader, &mut line, crate::MAX_INBOUND_MESSAGE_BYTES).await
+            {
+                // An orderly input half-close leaves the peer's response
+                // reader alive. Drain admitted replies during cleanup; only
+                // recovery/security failure hard-cancels the writer.
+                Ok(BoundedLine::Eof) => break Ok(()),
+                Ok(BoundedLine::Line) => {}
+                Ok(BoundedLine::TooLong) => {
+                    // Over-limit frame (monorepo#472): answer with a `-32600`
+                    // error (`id: null` — the request was never parsed) and end
+                    // the connection WITHOUT draining the rest of the oversized
+                    // line into memory.
+                    let frame = crate::events::error_frame(
+                        &serde_json::Value::Null,
+                        -32600,
+                        &format!(
+                            "message exceeds maximum size of {} bytes",
+                            crate::MAX_INBOUND_MESSAGE_BYTES
+                        ),
+                    );
+                    let _ = out_tx.send_priority(frame).await;
+                    break Ok(());
+                }
+                Err(e) => break Err(e),
+            }
+            let Ok(text) = std::str::from_utf8(&line) else {
+                break Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "frame is not valid UTF-8",
+                ));
+            };
+            let trimmed = text.trim_end_matches(['\r', '\n']);
+            if trimmed.is_empty() {
+                continue;
+            }
+            // A send failure means the writer/client is gone → end the connection.
+            // UDS is the local control transport, so `is_local = true` (§12.3).
+            // Wrap in connection context (is_tcp=false for UDS) so server.* RPCs can
+            // gate on real origin (§5.2), with the primary principal bound.
+            let frame_ok = crate::context::with_credential_context(
+                false,
+                caller.clone(),
+                None,
+                reverse_guard.desktop_connection(),
+                read_connection.run(async {
+                    crate::context::with_repository_frame(trimmed, || {
+                        process_frame(
+                            trimmed,
+                            &api,
+                            &bus,
+                            &out_tx,
+                            &mut subs,
+                            &reverse,
+                            &reverse_guard,
+                            control.as_ref(),
+                            server_pairing_info.as_ref(),
+                            &mut client_id,
+                            true,
+                            &limiter,
+                        )
+                    })
+                    .await
+                }),
+            )
+            .await;
+            if !frame_ok || subs.pairing.revoked {
                 break Ok(());
             }
-            Err(e) => break Err(e),
-        }
-        let Ok(text) = std::str::from_utf8(&line) else {
-            break Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "frame is not valid UTF-8",
-            ));
-        };
-        let trimmed = text.trim_end_matches(['\r', '\n']);
-        if trimmed.is_empty() {
-            continue;
-        }
-        // A send failure means the writer/client is gone → end the connection.
-        // UDS is the local control transport, so `is_local = true` (§12.3).
-        // Wrap in connection context (is_tcp=false for UDS) so server.* RPCs can
-        // gate on real origin (§5.2), with the primary principal bound.
-        let frame_ok = crate::context::with_credential_context(
-            false,
-            caller.clone(),
-            None,
-            reverse_guard.desktop_connection(),
-            read_connection.run(async {
-                crate::context::with_repository_frame(trimmed, || {
-                    process_frame(
-                        trimmed,
-                        &api,
-                        &bus,
-                        &out_tx,
-                        &mut subs,
-                        &reverse,
-                        &reverse_guard,
-                        control.as_ref(),
-                        server_pairing_info.as_ref(),
-                        &mut client_id,
-                        true,
-                        &limiter,
-                    )
-                })
-                .await
-            }),
-        )
-        .await;
-        if !frame_ok || subs.pairing.revoked {
-            break Ok(());
         }
     };
+    let io_result = tokio::select! {
+        biased;
+        () = out_tx.recovery.cancelled() => Ok(()),
+        result = connection => result,
+    };
+    if out_tx.recovery.is_closed() {
+        writer.abort();
+    }
 
     read_connection.retire();
     // Cleanup: abort all subscriptions, then close the outbound
@@ -700,6 +730,54 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn recovery_legacy_input_half_close_drains_admitted_reply() {
+        use std::sync::Arc;
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+
+        struct LegacyApi;
+        impl intent_core::WorkspaceApi for LegacyApi {}
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = intent_store::Store::open(&dir.path().join("bus.db"))
+            .await
+            .unwrap();
+        let bus = intent_services::EventBus::new(store);
+        let (mut input, reader) = tokio::io::duplex(2048);
+        let (writer, output) = tokio::io::duplex(2048);
+        // Prebuffer input and its orderly EOF before starting the connection.
+        // The current-thread loop must admit the response before its writer
+        // has a chance to run, and must retain that response across half-close.
+        input.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"events.subscribe\",\"params\":{\"eventTypes\":[\"file:*\"]}}\n").await.unwrap();
+        input.shutdown().await.unwrap();
+        let task = tokio::spawn(super::handle_connection(
+            reader,
+            writer,
+            Arc::new(LegacyApi),
+            bus,
+            None,
+            None,
+            Arc::new(crate::reverse::PrimaryReverseRegistry::new()),
+            crate::rpc_limit::RpcLimiter::unlimited(),
+            Arc::new(crate::context::ReadConnectionOwners::default()),
+        ));
+        let mut lines = BufReader::new(output).lines();
+        let line = tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+            lines.next_line(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .expect("orderly input EOF must drain its admitted reply");
+        let reply: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(reply["id"], 7);
+        assert!(reply["result"]["subscriptionId"].is_string());
+        assert!(reply["result"].get("lossRecovery").is_none());
+        assert!(lines.next_line().await.unwrap().is_none());
+        task.await.unwrap().unwrap();
+    }
+
     // Deterministic writer failure in the actual local connection loop. The
     // request owner is the same private fixture used by the real UDS/TLS tests.
     #[tokio::test]
@@ -765,7 +843,7 @@ mod tests {
         ));
         input.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"settings.get\",\"params\":{\"path\":\"private\"}}\n").await.unwrap();
         tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
             handler.entered.notified(),
         )
         .await
@@ -773,34 +851,52 @@ mod tests {
         let original = api.connections.lock().unwrap()[0].clone();
         assert!(!original.is_closed());
         input.write_all(b"invalid-json\n").await.unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(5), failed.notified())
-            .await
-            .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while !original.is_closed() || !original.captured_are_retired() {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+            failed.notified(),
+        )
         .await
         .unwrap();
-        assert!(
-            !task.is_finished(),
-            "writer failure retired the cohort while the reader still waits"
-        );
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+            async {
+                while !original.is_closed() || !original.captured_are_retired() {
+                    tokio::task::yield_now().await;
+                }
+            },
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+            async {
+                while !task.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            },
+        )
+        .await
+        .expect("writer failure must cancel the physical connection");
         handler.release.notify_one();
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while limiter.try_acquire().is_err() {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+            async {
+                while limiter.try_acquire().is_err() {
+                    tokio::task::yield_now().await;
+                }
+            },
+        )
         .await
         .unwrap();
         drop(input);
-        tokio::time::timeout(std::time::Duration::from_secs(5), task)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+            task,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     }
 
     #[tokio::test]
@@ -835,7 +931,7 @@ mod tests {
             listener.0.clone(),
         ));
         tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
             primary.entered.notified(),
         )
         .await
@@ -850,11 +946,14 @@ mod tests {
                 .write_all(format!("{request}\n").as_bytes())
                 .await
                 .unwrap();
-            let line = tokio::time::timeout(std::time::Duration::from_secs(5), lines.next_line())
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap();
+            let line = tokio::time::timeout(
+                intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+                lines.next_line(),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
             let result: serde_json::Value = serde_json::from_str(&line).unwrap();
             assert_eq!(result.get("result").is_some(), path == "ordinary");
         }
@@ -862,10 +961,13 @@ mod tests {
         assert!(original.is_closed());
         assert!(original.captured_are_retired());
         drop(input);
-        tokio::time::timeout(std::time::Duration::from_secs(5), task)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+            task,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     }
 }

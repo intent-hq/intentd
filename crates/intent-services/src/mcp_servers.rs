@@ -2419,17 +2419,23 @@ for line in sys.stdin:
             starts.push(tokio::spawn(
                 async move { worker.start(config, true).await },
             ));
-            let (stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
-                .await
-                .unwrap()
-                .unwrap();
+            let (stream, _) = tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                listener.accept(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
             let (read, write) = stream.into_split();
             let mut reader = tokio::io::BufReader::new(read);
             let mut line = String::new();
-            tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
-                .await
-                .unwrap()
-                .unwrap();
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                reader.read_line(&mut line),
+            )
+            .await
+            .unwrap()
+            .unwrap();
             let pids: Vec<i32> = line
                 .split_whitespace()
                 .map(|pid| pid.parse().unwrap())
@@ -2444,34 +2450,42 @@ for line in sys.stdin:
         // B registers while A is still positively held in initialize.
         controls[1].write_all(b"x").await.unwrap();
         let second = starts.pop().unwrap();
-        let second_status = tokio::time::timeout(Duration::from_secs(5), second)
-            .await
-            .unwrap()
-            .unwrap();
+        let second_status = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            second,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(second_status["state"], "running");
         assert_eq!(hub.status("overlap")["pid"], cleanup.0[2]);
         controls[0].write_all(b"x").await.unwrap();
-        let first_status = tokio::time::timeout(Duration::from_secs(5), starts.pop().unwrap())
-            .await
-            .unwrap()
-            .unwrap();
+        let first_status = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            starts.pop().unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(first_status["state"], "running");
         hub.begin_background_shutdown();
         hub.shutdown().await;
-        let settled = tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if cleanup
-                    .0
-                    .iter()
-                    .all(|pid| kill(Pid::from_raw(*pid), None) == Err(nix::errno::Errno::ESRCH))
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .is_ok();
+        let settled =
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(1)),
+                async {
+                    loop {
+                        if cleanup.0.iter().all(|pid| {
+                            kill(Pid::from_raw(*pid), None) == Err(nix::errno::Errno::ESRCH)
+                        }) {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                },
+            )
+            .await
+            .is_ok();
         assert!(
             settled,
             "overlapping MCP starts discarded a child or descendant before reap"
@@ -2520,10 +2534,13 @@ for line in sys.stdin:
         let mut monitor = hub.spawn_health_monitor_with_interval(Duration::from_millis(1));
         let mut reader = tokio::io::BufReader::new(read);
         let mut line = String::new();
-        tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            reader.read_line(&mut line),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         let request: Value = serde_json::from_str(&line).unwrap();
         assert_eq!(request["method"], "ping");
         let response = json!({"jsonrpc":"2.0", "id":request["id"], "error":{"code":-32603,"message":"controlled ping failure"}});
@@ -2531,9 +2548,12 @@ for line in sys.stdin:
             .write_all(format!("{response}\n").as_bytes())
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(5), park.entered.notified())
-            .await
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            park.entered.notified(),
+        )
+        .await
+        .unwrap();
         assert!(!hub
             .inner
             .servers
@@ -2549,10 +2569,13 @@ for line in sys.stdin:
         .await;
         assert!(pending, "health monitor discarded a removed child");
         park.release.notify_one();
-        tokio::time::timeout(Duration::from_secs(5), monitor)
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            monitor,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         hub.shutdown().await;
         assert_eq!(
             nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid.cast_signed()), None),
@@ -2590,10 +2613,13 @@ for line in sys.stdin:
         hub.begin_background_shutdown();
         svc(None, &secrets, &hub).start_enabled().await;
         let monitor = hub.spawn_health_monitor();
-        tokio::time::timeout(Duration::from_secs(1), monitor)
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(1)),
+            monitor,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         hub.shutdown().await;
         bus.shutdown().await.unwrap();
         assert!(store
@@ -2634,10 +2660,13 @@ for line in sys.stdin:
         let status = status_value("s1", "running", Some(7), Some(2), None, Some(99));
         h.publish_status(&status).await;
 
-        let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("event delivered")
-            .expect("subscription open");
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("event delivered")
+        .expect("subscription open");
         assert_eq!(batch.len(), 1);
         let ev = &batch[0];
         assert_eq!(ev.event_type, MCP_SERVERS_STATUS_CHANGED);
@@ -3676,19 +3705,25 @@ for line in sys.stdin:
         let status = h.start(remote_cfg("r-flip", "http", &url), true).await;
         assert_eq!(status["state"], json!("running"));
         // Drain the `running` event.
-        let _ = tokio::time::timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("running event")
-            .expect("subscription open");
+        let _ = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("running event")
+        .expect("subscription open");
 
         guard.abort(); // stub gone → next probe fails
         let _ = guard.await; // listener provably dropped before the re-probe
         h.health_tick().await;
         assert_eq!(h.status("r-flip")["state"], json!("error"));
-        let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("error event delivered")
-            .expect("subscription open");
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("error event delivered")
+        .expect("subscription open");
         let data = serde_json::to_value(&batch[0].data).unwrap();
         assert_eq!(data["serverId"], json!("r-flip"));
         assert_eq!(data["status"]["state"], json!("error"));
@@ -3709,10 +3744,13 @@ for line in sys.stdin:
 
         let started = h.start(remote_cfg("r-same", "http", &url), true).await;
         assert_eq!(started["state"], json!("running"));
-        let _ = tokio::time::timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("running event")
-            .expect("subscription open");
+        let _ = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("running event")
+        .expect("subscription open");
         let started_at = started["startedAt"].clone();
 
         h.health_tick().await;
@@ -3721,9 +3759,12 @@ for line in sys.stdin:
         assert_eq!(now["state"], json!("running"));
         assert_eq!(now["startedAt"], started_at);
         assert!(
-            tokio::time::timeout(Duration::from_millis(300), sub.recv())
-                .await
-                .is_err(),
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(300)),
+                sub.recv()
+            )
+            .await
+            .is_err(),
             "no event on an unchanged state"
         );
     }
@@ -4122,7 +4163,9 @@ for line in sys.stdin:
         });
 
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_millis(200))
+            .timeout(intentd_test_support::test_timeout(Duration::from_millis(
+                200,
+            )))
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap();
@@ -4313,9 +4356,12 @@ for line in sys.stdin:
         assert_eq!(result["content"][0]["text"], json!("ok"));
         // An answered call is followed by nothing — no stray cancel.
         let mut extra = String::new();
-        let quiet = tokio::time::timeout(Duration::from_millis(100), reader.read_line(&mut extra))
-            .await
-            .is_err();
+        let quiet = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(100)),
+            reader.read_line(&mut extra),
+        )
+        .await
+        .is_err();
         assert!(quiet, "unexpected line after the answered call: {extra}");
     }
 
@@ -4776,7 +4822,9 @@ for line in sys.stdin:
             }
         });
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_millis(100))
+            .timeout(intentd_test_support::test_timeout(Duration::from_millis(
+                100,
+            )))
             .build()
             .unwrap();
         let e = client.post(&url).send().await.unwrap_err();

@@ -1536,6 +1536,13 @@ fn memory_budget_max_mb() -> f64 {
 /// clients a value is settable that the write path refuses. Clamping keeps the
 /// asymmetry strictly one-directional (catalog bound ≤ parse bound), which is
 /// the invariant every claim in these doc comments depends on.
+/// A catalog byte bound as a number; the bounds are far below 2^53, so the
+/// conversion is exact.
+#[expect(clippy::cast_precision_loss)]
+fn bytes_bound(bytes: u64) -> f64 {
+    bytes as f64
+}
+
 // MiB counts above 2^53 do not occur; loss-free in f64.
 #[expect(clippy::cast_precision_loss)]
 fn memory_budget_max_mb_for(total_memory_bytes: Option<u64>) -> f64 {
@@ -2403,6 +2410,30 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             Some(0.0),
             None,
             72.0,
+        ),
+        number(
+            "scripts.outputRetentionHours",
+            "Script output retention hours",
+            "Saved script run logs on disk older than this many hours are deleted, except the current run of a running script (0 disables the sweep; max 87600; applies live at each hourly sweep, no restart required)",
+            "scripts",
+            Some(0.0),
+            Some(f64::from(
+                intent_core::config::SCRIPT_OUTPUT_RETENTION_HOURS_MAX,
+            )),
+            f64::from(intent_core::config::DEFAULT_SCRIPT_OUTPUT_RETENTION_HOURS),
+        ),
+        number(
+            "scripts.outputMaxBytesPerRun",
+            "Script output max bytes per run",
+            "Largest on-disk log kept for one script run; past it the oldest output is dropped (64 KiB-1 GiB; applies to runs started after the change)",
+            "scripts",
+            Some(bytes_bound(
+                intent_core::config::SCRIPT_OUTPUT_MAX_BYTES_PER_RUN_MIN,
+            )),
+            Some(bytes_bound(
+                intent_core::config::SCRIPT_OUTPUT_MAX_BYTES_PER_RUN_MAX,
+            )),
+            bytes_bound(intent_core::config::DEFAULT_SCRIPT_OUTPUT_MAX_BYTES_PER_RUN),
         ),
         number(
             "workspaceApi.maxOutputChars",
@@ -4083,19 +4114,25 @@ mod tests {
                     .await
             }
         });
-        tokio::time::timeout(Duration::from_secs(5), notice.changed())
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            notice.changed(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(registry.get("git.autoCommit"), Some(json!(false)));
         std::fs::rename(&path, dir.path().join("config.saved")).unwrap();
         std::fs::create_dir(&path).unwrap();
         drop(held);
-        let error = tokio::time::timeout(Duration::from_secs(5), task)
-            .await
-            .unwrap()
-            .unwrap()
-            .expect_err("database refusal must trigger failing registry compensation");
+        let error = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            task,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .expect_err("database refusal must trigger failing registry compensation");
         assert!(!error.no_effect());
         assert_eq!(registry.get("git.autoCommit"), Some(json!(false)));
         assert!(path.is_dir());
@@ -4129,10 +4166,13 @@ mod tests {
         assert_eq!(applied["applied"][0]["origin"], got["origin"]);
         assert_eq!(got["origin"], json!("file"));
         assert_eq!(applied["revision"], got["revision"]);
-        let first_event = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
-            .await
-            .expect("initial write event")
-            .unwrap();
+        let first_event = tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+            events.recv(),
+        )
+        .await
+        .expect("initial write event")
+        .unwrap();
         assert_eq!(first_event[0].data["changes"], applied["applied"]);
         assert_eq!(first_event[0].data["revision"], got["revision"]);
 
@@ -4158,10 +4198,13 @@ mod tests {
             .settings_update(json!([{"path": "git.autoCommit", "value": false}]))
             .await
             .unwrap();
-        let next_event = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
-            .await
-            .expect("next real mutation event")
-            .unwrap();
+        let next_event = tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+            events.recv(),
+        )
+        .await
+        .expect("next real mutation event")
+        .unwrap();
         assert_eq!(next_event[0].data["changes"], next["applied"]);
         assert_eq!(next_event[0].data["revision"], next["revision"]);
     }
@@ -4228,10 +4271,13 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(applied["revision"], json!(1));
-            let event = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
-                .await
-                .expect("successful update event")
-                .unwrap();
+            let event = tokio::time::timeout(
+                intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+                events.recv(),
+            )
+            .await
+            .expect("successful update event")
+            .unwrap();
             assert_eq!(event.len(), 1);
             assert_eq!(event[0].data["revision"], applied["revision"]);
             assert_eq!(event[0].data["changes"], applied["applied"]);
@@ -5106,15 +5152,20 @@ mod tests {
                 ]))
                 .await
         });
-        tokio::task::spawn_blocking(move || parked_rx.recv_timeout(Duration::from_secs(5)))
-            .await
-            .unwrap()
-            .expect("sibling delete parked");
-        timeout(Duration::from_secs(5), async {
-            while !secrets.timed_out(REFRESH_SECRET_ACCOUNT) {
-                tokio::task::yield_now().await;
-            }
+        tokio::task::spawn_blocking(move || {
+            parked_rx.recv_timeout(intentd_test_support::test_timeout(Duration::from_secs(5)))
         })
+        .await
+        .unwrap()
+        .expect("sibling delete parked");
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            async {
+                while !secrets.timed_out(REFRESH_SECRET_ACCOUNT) {
+                    tokio::task::yield_now().await;
+                }
+            },
+        )
         .await
         .expect("write timeout fired");
         assert!(
@@ -5293,30 +5344,36 @@ mod tests {
                     .await
             }
         });
-        timeout(Duration::from_secs(5), entered.notified())
-            .await
-            .expect("actual secret write entered");
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            entered.notified(),
+        )
+        .await
+        .expect("actual secret write entered");
         if during_settle {
             // The initial write timeout puts its handle into detached; the
             // settler takes it out before waiting. Observe that handoff, not
             // an arbitrary sleep that might cancel the wrong stage.
-            timeout(Duration::from_secs(5), async {
-                loop {
-                    let (timed_out, taken) = {
-                        let state = services.secrets.state.lock().unwrap();
-                        let timed_out = state.last_warn.contains_key(SECRET_ACCOUNT);
-                        let taken = state.mutations.iter().any(|record| {
-                            record.account == SECRET_ACCOUNT
-                                && record.settling.load(std::sync::atomic::Ordering::SeqCst) > 0
-                        });
-                        (timed_out, taken)
-                    };
-                    if timed_out && taken {
-                        break;
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                async {
+                    loop {
+                        let (timed_out, taken) = {
+                            let state = services.secrets.state.lock().unwrap();
+                            let timed_out = state.last_warn.contains_key(SECRET_ACCOUNT);
+                            let taken = state.mutations.iter().any(|record| {
+                                record.account == SECRET_ACCOUNT
+                                    && record.settling.load(std::sync::atomic::Ordering::SeqCst) > 0
+                            });
+                            (timed_out, taken)
+                        };
+                        if timed_out && taken {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
                     }
-                    tokio::task::yield_now().await;
-                }
-            })
+                },
+            )
             .await
             .expect("settler owns the timed-out mutation");
         }
@@ -5332,9 +5389,12 @@ mod tests {
         // Always release real blocking work, including when RED asserts below.
         release.release();
         if !returned_early {
-            timeout(Duration::from_secs(5), &mut shutdown)
-                .await
-                .expect("shutdown settles the cancelled settings owner");
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                &mut shutdown,
+            )
+            .await
+            .expect("shutdown settles the cancelled settings owner");
         }
         assert!(
             !returned_early,
@@ -5399,9 +5459,12 @@ mod tests {
                     .await
             }
         });
-        timeout(Duration::from_secs(5), entered.notified())
-            .await
-            .expect("write parked");
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            entered.notified(),
+        )
+        .await
+        .expect("write parked");
         assert_eq!(
             raw.load(SECRET_ACCOUNT).unwrap().as_deref(),
             if delete { None } else { Some("new-token") }
@@ -5497,10 +5560,13 @@ mod tests {
             (2, other_secret["applied"].clone()),
             (3, expected),
         ] {
-            let events = timeout(Duration::from_secs(5), sub.recv())
-                .await
-                .unwrap()
-                .unwrap();
+            let events = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                sub.recv(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
             assert_eq!(events.len(), 1);
             assert_eq!(events[0].event_type, "settings:changed");
             assert_eq!(
@@ -5535,9 +5601,12 @@ mod tests {
                 ]))
                 .await
         });
-        timeout(Duration::from_secs(5), entered.notified())
-            .await
-            .unwrap();
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            entered.notified(),
+        )
+        .await
+        .unwrap();
         {
             let _revision = services.settings_revision_gate.write().await;
             services
@@ -5569,10 +5638,13 @@ mod tests {
             .settings_update(json!([{ "path": "git.autoCommit", "value": false }]))
             .await
             .unwrap();
-        let events = timeout(Duration::from_secs(5), sub.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let events = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            sub.recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(events[0].data["revision"], json!(1));
         assert_eq!(
             events[0].data["changes"][0]["path"],
@@ -5635,9 +5707,12 @@ mod tests {
                 ]))
                 .await
         });
-        timeout(Duration::from_secs(5), entered.notified())
-            .await
-            .expect("rollback parked");
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            entered.notified(),
+        )
+        .await
+        .expect("rollback parked");
         let mut second = services.settings_update(json!([
             { "path": SECRET_ACCOUNT, "value": "second-write" }
         ]));
@@ -5769,10 +5844,12 @@ mod tests {
             result
         };
         let driver = async {
-            tokio::task::spawn_blocking(move || parked_rx.recv_timeout(Duration::from_secs(5)))
-                .await
-                .unwrap()
-                .expect("the sibling delete must park");
+            tokio::task::spawn_blocking(move || {
+                parked_rx.recv_timeout(intentd_test_support::test_timeout(Duration::from_secs(5)))
+            })
+            .await
+            .unwrap()
+            .expect("the sibling delete must park");
             let rollback_claimed_delete = || {
                 secrets.timed_out(REFRESH_SECRET_ACCOUNT)
                     && secrets.detached_len(REFRESH_SECRET_ACCOUNT) == 0
@@ -5791,10 +5868,12 @@ mod tests {
         let err = result.expect_err("the timed-out sibling clear must surface");
         assert!(matches!(err, Error::Internal(_)), "got {err:?}");
 
-        tokio::task::spawn_blocking(move || done_rx.recv_timeout(Duration::from_secs(5)))
-            .await
-            .unwrap()
-            .expect("the parked delete must complete");
+        tokio::task::spawn_blocking(move || {
+            done_rx.recv_timeout(intentd_test_support::test_timeout(Duration::from_secs(5)))
+        })
+        .await
+        .unwrap()
+        .expect("the parked delete must complete");
         assert_eq!(
             raw_secrets.load(SECRET_ACCOUNT).unwrap().as_deref(),
             Some("glo_device"),
@@ -5909,10 +5988,12 @@ mod tests {
         );
 
         release_tx.send(()).unwrap();
-        tokio::task::spawn_blocking(move || done_rx.recv_timeout(Duration::from_secs(5)))
-            .await
-            .unwrap()
-            .expect("the parked delete must complete once released");
+        tokio::task::spawn_blocking(move || {
+            done_rx.recv_timeout(intentd_test_support::test_timeout(Duration::from_secs(5)))
+        })
+        .await
+        .unwrap()
+        .expect("the parked delete must complete once released");
         assert!(
             secrets
                 .settle_detached(REFRESH_SECRET_ACCOUNT)
@@ -6635,6 +6716,97 @@ mod tests {
     /// registered in `KNOWN_PATHS`; its description states that the sweep
     /// shrinks stored payloads older than N days to the replay preview and
     /// that 0 disables it. The live accessor maps 0 to `None`.
+    /// `scripts.outputRetentionHours` and `scripts.outputMaxBytesPerRun` are
+    /// catalog entries in `KNOWN_PATHS` with the `intent_core` bounds and
+    /// defaults, so `settings.get` / `settings.update` accept them.
+    #[tokio::test]
+    #[expect(clippy::float_cmp, clippy::cast_precision_loss)]
+    async fn script_output_settings_are_in_catalog_and_round_trip() {
+        use intent_core::config::{
+            DEFAULT_SCRIPT_OUTPUT_MAX_BYTES_PER_RUN, DEFAULT_SCRIPT_OUTPUT_RETENTION_HOURS,
+            SCRIPT_OUTPUT_MAX_BYTES_PER_RUN_MAX, SCRIPT_OUTPUT_MAX_BYTES_PER_RUN_MIN,
+            SCRIPT_OUTPUT_RETENTION_HOURS_MAX,
+        };
+        let bounds = [
+            (
+                "scripts.outputRetentionHours",
+                0.0,
+                f64::from(SCRIPT_OUTPUT_RETENTION_HOURS_MAX),
+                f64::from(DEFAULT_SCRIPT_OUTPUT_RETENTION_HOURS),
+            ),
+            (
+                "scripts.outputMaxBytesPerRun",
+                SCRIPT_OUTPUT_MAX_BYTES_PER_RUN_MIN as f64,
+                SCRIPT_OUTPUT_MAX_BYTES_PER_RUN_MAX as f64,
+                DEFAULT_SCRIPT_OUTPUT_MAX_BYTES_PER_RUN as f64,
+            ),
+        ];
+        for (path, min, max, default) in bounds {
+            let def = find_definition(path).unwrap_or_else(|| panic!("{path} missing"));
+            assert_eq!(def.category, "scripts");
+            assert!(!def.sensitive && !def.read_only);
+            assert!(
+                matches!(def.ty, SettingType::Number { min: Some(lo), max: Some(hi) } if lo == min && hi == max),
+                "{path}: {:?}",
+                def.ty
+            );
+            assert_eq!(def.default_value, Some(json!(default)));
+            assert!(KNOWN_PATHS.contains(&path), "{path} not in KNOWN_PATHS");
+            assert!(def.validate(&json!(max + 1.0)).is_err());
+        }
+
+        let tag = uuid::Uuid::new_v4();
+        let tmp = std::env::temp_dir().join(format!("intentd-settings-scripts-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+        let config_path = std::env::temp_dir().join(format!("intentd-settings-scripts-{tag}.toml"));
+        std::fs::write(&config_path, "").expect("write empty config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+        let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
+        let secrets = AsyncSecretStore::new(secrets);
+        let svc = SettingsService::new(&store, &secrets, Some(&registry));
+        let mut notices = registry.subscribe();
+
+        let got = svc.get("scripts.outputRetentionHours").await.expect("get");
+        assert_eq!(got["value"], json!(168.0));
+        assert_eq!(got["origin"], json!("default"));
+        svc.update(&json!([
+            { "path": "scripts.outputRetentionHours", "value": 0 },
+            { "path": "scripts.outputMaxBytesPerRun", "value": 1_048_576 },
+        ]))
+        .await
+        .expect("update");
+        assert!(notices.has_changed().expect("registry alive"));
+        let changed = notices.borrow_and_update().changed.clone();
+        for path in [
+            "scripts.outputRetentionHours",
+            "scripts.outputMaxBytesPerRun",
+        ] {
+            assert!(changed.contains(path), "{path} notice: {changed:?}");
+        }
+        let live = registry.snapshot().effective.clone();
+        assert_eq!(intent_core::config::script_output_retention_hours(&live), 0);
+        assert_eq!(
+            intent_core::config::script_output_max_bytes_per_run(&live),
+            1_048_576
+        );
+        let got = svc.get("scripts.outputMaxBytesPerRun").await.expect("get");
+        assert_eq!(got["value"], json!(1_048_576.0));
+        assert_eq!(got["origin"], json!("file"));
+        let err = svc
+            .update(&json!([{ "path": "scripts.outputMaxBytesPerRun", "value": 0 }]))
+            .await
+            .expect_err("0 is below the cap minimum");
+        assert!(matches!(err, Error::InvalidParams(_)), "{err:?}");
+
+        let _ = std::fs::remove_file(&config_path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
+        }
+    }
+
     #[test]
     fn tool_payload_retention_days_catalog_entry_is_toml_backed() {
         let def = find_definition("agents.toolPayloadRetentionDays")
@@ -8960,15 +9132,18 @@ mod rollback_order_tests {
             {"path":SECRET_ACCOUNT, "value":"newer-pat"}
         ]));
         if concurrent {
-            timeout(Duration::from_secs(5), entered.notified())
-                .await
-                .expect("rollback parked");
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                entered.notified(),
+            )
+            .await
+            .expect("rollback parked");
             assert!(
                 poll_fn(|cx| Poll::Ready(newer.as_mut().poll(cx).is_pending())).await,
                 "the newer request must remain pending while compensation is parked"
             );
             let ordinary = timeout(
-                Duration::from_secs(3),
+                intentd_test_support::test_timeout(Duration::from_secs(3)),
                 services.settings_get("notifications.volume".into()),
             )
             .await
@@ -8986,9 +9161,12 @@ mod rollback_order_tests {
         if concurrent {
             // Polling the outer request starts an owned task. Hold its backing
             // write through the intermediate assertions and revision-one probe.
-            timeout(Duration::from_secs(5), newer_entered.notified())
-                .await
-                .expect("newer write parked");
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                newer_entered.notified(),
+            )
+            .await
+            .expect("newer write parked");
             assert_eq!(
                 *secrets.write_order.lock().unwrap(),
                 [
@@ -9030,10 +9208,13 @@ mod rollback_order_tests {
             );
             assert_eq!(raw.load(REFRESH_SECRET_ACCOUNT).unwrap(), None);
             assert_eq!(raw.load(EXPIRES_AT_SECRET_ACCOUNT).unwrap(), None);
-            let events = timeout(Duration::from_secs(5), sub.recv())
-                .await
-                .expect("newer settings event")
-                .unwrap();
+            let events = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                sub.recv(),
+            )
+            .await
+            .expect("newer settings event")
+            .unwrap();
             assert_eq!(events.len(), 1);
             assert_eq!(events[0].data["revision"], json!(2));
             assert_eq!(
@@ -9182,9 +9363,12 @@ mod rollback_order_tests {
                 ]))
                 .await
         });
-        timeout(Duration::from_secs(5), entered.notified())
-            .await
-            .unwrap();
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            entered.notified(),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             raw.load(crate::github_auth_ops::SECRET_ACCOUNT)
                 .unwrap()
@@ -9193,14 +9377,17 @@ mod rollback_order_tests {
         );
         match action {
             "revoke" => {
-                timeout(Duration::from_secs(3), services.github_revoke())
-                    .await
-                    .expect("revoke remains responsive during unrelated secret write")
-                    .unwrap();
+                timeout(
+                    intentd_test_support::test_timeout(Duration::from_secs(3)),
+                    services.github_revoke(),
+                )
+                .await
+                .expect("revoke remains responsive during unrelated secret write")
+                .unwrap();
             }
             "alias" => {
                 timeout(
-                    Duration::from_secs(3),
+                    intentd_test_support::test_timeout(Duration::from_secs(3)),
                     services.source_control_revoke("github".into(), None),
                 )
                 .await
@@ -9214,10 +9401,13 @@ mod rollback_order_tests {
                     crate::github_auth_ops::credential_tests::accept_identity(),
                 )
                 .await;
-                timeout(Duration::from_secs(5), flow)
-                    .await
-                    .unwrap()
-                    .unwrap();
+                timeout(
+                    intentd_test_support::test_timeout(Duration::from_secs(5)),
+                    flow,
+                )
+                .await
+                .unwrap()
+                .unwrap();
             }
             _ => unreachable!(),
         }
@@ -9408,10 +9598,13 @@ mod rollback_order_tests {
             .await
             .unwrap();
         assert_eq!(next["revision"], json!(1));
-        let events = timeout(Duration::from_secs(5), sub.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let events = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            sub.recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data["revision"], json!(1));
         assert_eq!(events[0].data["changes"], next["applied"]);
@@ -9479,9 +9672,12 @@ mod rollback_order_tests {
                 ]))
                 .await
         });
-        timeout(Duration::from_secs(5), parked.notified())
-            .await
-            .unwrap();
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            parked.notified(),
+        )
+        .await
+        .unwrap();
         eprintln!(
             "at compensating hook: token={:?}; method={:?}",
             raw.load(crate::github_auth_ops::SECRET_ACCOUNT).unwrap(),
@@ -9489,10 +9685,13 @@ mod rollback_order_tests {
                 .unwrap()
         );
         if revoke {
-            let revoked = timeout(Duration::from_secs(5), services.github_revoke())
-                .await
-                .unwrap()
-                .unwrap();
+            let revoked = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                services.github_revoke(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
             assert_eq!(revoked["ok"], json!(true));
         } else {
             raw.store(crate::github_auth_ops::SECRET_ACCOUNT, "oauth-completed")
@@ -9504,11 +9703,14 @@ mod rollback_order_tests {
             .unwrap();
         }
         release.notify_one();
-        let error = timeout(Duration::from_secs(5), update)
-            .await
-            .unwrap()
-            .unwrap()
-            .expect_err("start failed");
+        let error = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            update,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .expect_err("start failed");
         let ordinary = services
             .settings_get("server.wsApi.enabled".into())
             .await
@@ -9634,11 +9836,14 @@ mod rollback_order_tests {
                 ]))
                 .await
         });
-        timeout(Duration::from_secs(5), parked.notified())
-            .await
-            .unwrap();
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            parked.notified(),
+        )
+        .await
+        .unwrap();
         let newer = timeout(
-            Duration::from_secs(3),
+            intentd_test_support::test_timeout(Duration::from_secs(3)),
             services.settings_update(json!([
                 {"path":"server.wsApi.enabled","value":true}
             ])),
@@ -9660,10 +9865,13 @@ mod rollback_order_tests {
             Some(5181),
             "stale compensation must not stop the newer listener"
         );
-        let events = timeout(Duration::from_secs(5), sub.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let events = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            sub.recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(
             events[0].data,
@@ -9756,10 +9964,13 @@ mod port_assignment_publication_tests {
                             .unwrap(),
                     )
                 };
-                let events = tokio::time::timeout(Duration::from_secs(5), sub.recv())
-                    .await
-                    .unwrap()
-                    .unwrap();
+                let events = tokio::time::timeout(
+                    intentd_test_support::test_timeout(Duration::from_secs(5)),
+                    sub.recv(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
                 assert_eq!(events.len(), 1);
                 let changes = &events[0].data["changes"];
                 let assignment = changes
@@ -9820,10 +10031,13 @@ mod port_assignment_publication_tests {
             registry.snapshot().ws_api_port_policy(),
             crate::WsApiPortPolicy::Fixed(5183)
         );
-        let events = tokio::time::timeout(Duration::from_secs(5), sub.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let events = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            sub.recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(
             events[0].data["changes"],
@@ -9883,9 +10097,12 @@ mod port_assignment_publication_tests {
                 ]))
                 .await
         });
-        tokio::time::timeout(Duration::from_secs(5), parked.notified())
-            .await
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            parked.notified(),
+        )
+        .await
+        .unwrap();
         let assigned = services
             .settings_get("server.wsApi.port".into())
             .await
@@ -9895,10 +10112,13 @@ mod port_assignment_publication_tests {
             assigned["revision"], 1,
             "assignment must have a revision before another reader enters"
         );
-        let first = tokio::time::timeout(Duration::from_secs(5), sub.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let first = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            sub.recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(first.len(), 1);
         assert_eq!(
             first[0].data["changes"],
@@ -9921,10 +10141,13 @@ mod port_assignment_publication_tests {
             final_port["revision"], 2,
             "old rollback must not announce newer assignment again"
         );
-        let second = tokio::time::timeout(Duration::from_secs(5), sub.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let second = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            sub.recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].data["changes"], newer["applied"]);
         let mut next = Box::pin(sub.recv());

@@ -4241,15 +4241,19 @@ mod display_status_events {
     }
 
     async fn recv_one(sub: &mut Subscription) -> Value {
-        let batch = tokio::time::timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("event delivered")
-            .expect("subscription open");
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("event delivered")
+        .expect("subscription open");
         assert_eq!(batch.len(), 1, "expected exactly one event");
         serde_json::to_value(&batch[0]).expect("serialize event")
     }
 
     async fn assert_silent(sub: &mut Subscription) {
+        // fixed-deadline: allow — stays under the 500ms idle debounce set by DebounceEnvGuard::new("500") below while outlasting the 100ms one
         let res = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
         assert!(res.is_err(), "expected no displayStatus event: {res:?}");
     }

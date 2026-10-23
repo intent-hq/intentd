@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Reapply optional Intel publication after cargo-dist generates v-release.yml."""
 from pathlib import Path
+import re
 
 
 def replace_once(text, old, new):
@@ -16,11 +17,12 @@ def configure(text):
         '          echo "dist ran successfully"\n          cat plan-dist-manifest.json',
         '          python3 scripts/optional-intel-release.py matrix plan-dist-manifest.json\n'
         '          echo "dist ran successfully"\n          cat plan-dist-manifest.json')
-    text = replace_once(text,
-        '    runs-on: ${{ matrix.runner }}',
+    runners = re.findall(r'^    runs-on: .*matrix\.runner.*$', text, re.M)
+    if len(runners) != 1:
+        raise ValueError('cargo-dist template changed; expected one local artifact runner')
+    text = replace_once(text, runners[0],
         '    # LOCAL CUSTOMIZATION: only the isolated Intel Mac leg may fail.\n'
-        '    continue-on-error: ${{ matrix.optional }}\n'
-        '    runs-on: ${{ matrix.runner }}')
+        '    continue-on-error: ${{ matrix.optional }}\n' + runners[0])
     text = replace_once(text,
         '          dist build ${{ needs.plan.outputs.tag-flag }} --output-format=json "--artifacts=global" > dist-manifest.json',
         '          targets=$(python3 scripts/optional-intel-release.py targets target/distrib)\n'

@@ -1,9 +1,9 @@
 //! Workspace repository: insert + list, mapping rows ↔ [`Workspace`] (§9.2).
 
 use intent_core::{
-    now_iso, AgentId, CheckoutMode, ClientId, ContextLink, Error, PullRequestInfo, Result,
-    SetupScript, TokenUsage, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceId,
-    WorkspaceStatus, CHIEF_WORKSPACE_ID,
+    now_iso, AgentId, CheckoutMode, ClientId, ContextLink, Error, PullRequestInfo,
+    PullRequestWorkspace, Result, SetupScript, TokenUsage, Workspace, WorkspaceActivity,
+    WorkspaceAttention, WorkspaceId, WorkspaceStatus, CHIEF_WORKSPACE_ID,
 };
 use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
@@ -27,6 +27,8 @@ const WORKSPACE_COLUMNS: &str = "id, title, branch, base_ref, base_commit_sha, s
 pub(crate) const CLEAR_NOTE_PARENT_BATCH_SQL: &str =
     "UPDATE note SET parent_id = NULL WHERE rowid IN \
     (SELECT rowid FROM note WHERE workspace_id = ? AND parent_id IS NOT NULL LIMIT ?)";
+pub(crate) const DELETE_NOTE_COMMENT_BATCH_SQL: &str = "DELETE FROM comment WHERE rowid IN \
+    (SELECT rowid FROM comment WHERE workspace_id = ? AND note_id IS NOT NULL LIMIT ?)";
 pub(crate) const DELETE_WORKSPACE_BROWSER_BATCH_SQL: &str =
     "DELETE FROM browser_tab WHERE rowid IN \
     (SELECT rowid FROM browser_tab WHERE workspace_id = ? LIMIT ?) RETURNING tab_id";
@@ -1071,15 +1073,31 @@ impl Store {
             delete_in_bounded_batches(self.write_pool(), &sql, &id.0, DELETE_CASCADE_BATCH).await?;
         }
 
-        // Publish a durable retirement fence only after bounded parent clears
-        // and an atomic final parent-link check. Drain annotation fan-out in
-        // separately limited statements before canonical parent deletion.
-        crate::workspace_annotation_cleanup::drain(self, &id.0).await?;
+        // A note's parent-clear trigger can otherwise update every child in
+        // one statement. Clear the links first, then sweep its heavy children
+        // before the notes themselves. All predicates remain workspace-scoped.
+        delete_in_bounded_batches(
+            self.write_pool(),
+            CLEAR_NOTE_PARENT_BATCH_SQL,
+            &id.0,
+            DELETE_CASCADE_BATCH,
+        )
+        .await?;
+        // Retired note paging rows (intent-hq/intent#7515) can greatly
+        // outnumber notes until the post-startup cleanup drops their tables.
+        // Remove them in bounded batches so no note batch cascades into them.
+        self.delete_workspace_retired_note_paging(&id.0).await?;
+        // Partial indexes contain only remaining parent links and note-bound
+        // comments, so batches do not rescan processed notes or no-note rows.
+        // Preserve comments with no note (no cascade before).
+        delete_in_bounded_batches(
+            self.write_pool(),
+            DELETE_NOTE_COMMENT_BATCH_SQL,
+            &id.0,
+            DELETE_CASCADE_BATCH,
+        )
+        .await?;
         for table in [
-            // Derived page rows can greatly outnumber notes; do not leave them
-            // to a single note/head foreign-key cascade.
-            "note_page_entry",
-            "note_page_piece",
             "note_version",
             "note_line_attribution",
             "note",
@@ -1090,6 +1108,7 @@ impl Store {
             "agent_metrics",
             "workspace_context_item",
             "workspace_git_root",
+            "pull_request_workspace",
             "workspace_invite",
             "workspace_mcp_disabled_server",
             "draft",
@@ -1434,6 +1453,45 @@ impl Store {
                 Error::Internal(format!("list workspaces referencing pr url failed: {e}"))
             })?;
         rows.iter().map(map_workspace_row).collect()
+    }
+
+    /// Workspaces linked to the PR whose canonical key is `pr_key`
+    /// (`workspace.findByPullRequest`, §5.1 "Pull request workspace lookup"),
+    /// most recently linked first, ties by id ascending. Links are recorded
+    /// by the migration 0161 triggers whenever a workspace or git root
+    /// persists a changed PR snapshot. Archived rows are included; remote rows
+    /// and the seeded virtual [`CHIEF_WORKSPACE_ID`] row never are. Reads only
+    /// the four projected columns. `pr_key` must already be canonical — see
+    /// `intent_core::pull_request_key`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn list_pull_request_workspaces(
+        &self,
+        pr_key: &str,
+    ) -> Result<Vec<PullRequestWorkspace>> {
+        let rows = sqlx::query(
+            "SELECT w.id, w.title, w.archived, p.linked_at FROM pull_request_workspace AS p \
+             JOIN workspace AS w ON w.id = p.workspace_id \
+             WHERE p.pr_key = ? AND w.id <> ? AND w.is_remote = 0 \
+             ORDER BY p.linked_at DESC, w.id ASC",
+        )
+        .bind(pr_key)
+        .bind(CHIEF_WORKSPACE_ID)
+        .fetch_all(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("list pull request workspaces failed: {e}")))?;
+        rows.iter()
+            .map(|row| {
+                Ok(PullRequestWorkspace {
+                    id: WorkspaceId(col(row, "id")?),
+                    title: col(row, "title")?,
+                    archived: col::<i64>(row, "archived")? != 0,
+                    linked_at: col(row, "linked_at")?,
+                })
+            })
+            .collect()
     }
 }
 

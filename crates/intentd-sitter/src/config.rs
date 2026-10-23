@@ -53,8 +53,9 @@ pub struct ResolvedChannel {
     pub origin: ChannelOrigin,
 }
 
-/// `config.toml` schema: a single optional `channel` key. Unknown keys are
-/// ignored on load; [`save_channel`] rewrites the whole file.
+/// `config.toml` schema: an optional `channel` key, plus `telemetry`
+/// (read separately by [`load_telemetry`]). Unknown keys are ignored on
+/// load; [`save_channel`] rewrites the file, keeping `telemetry`.
 #[derive(Debug, Default, Deserialize)]
 struct ConfigFile {
     channel: Option<Channel>,
@@ -89,9 +90,22 @@ pub fn load_channel(path: &Path) -> Option<Channel> {
     }
 }
 
+/// Load the `telemetry = true|false` switch from `path`, independently of
+/// the channel key (an invalid channel must not hide an opt-out). Missing,
+/// unreadable, or unparsable files, and a missing or non-boolean key, all
+/// yield `None` (telemetry stays on), silently: [`load_channel`] already
+/// warns about a bad file.
+#[must_use]
+pub fn load_telemetry(path: &Path) -> Option<bool> {
+    let contents = fs::read_to_string(path).ok()?;
+    let table = toml::from_str::<toml::Table>(&contents).ok()?;
+    table.get("telemetry")?.as_bool()
+}
+
 /// Persist `channel` as the config pin (creating parent directories),
 /// rewriting the whole file via a temp file + rename so a crash never
-/// leaves a truncated `config.toml`.
+/// leaves a truncated `config.toml`. A `telemetry` setting already in the
+/// file is kept.
 ///
 /// # Errors
 ///
@@ -100,8 +114,12 @@ pub fn save_channel(path: &Path, channel: Channel) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
+    let telemetry = load_telemetry(path)
+        .map(|telemetry| format!("telemetry = {telemetry}\n"))
+        .unwrap_or_default();
+    let contents = format!("channel = \"{channel}\"\n{telemetry}");
     let tmp = path.with_extension("toml.tmp");
-    fs::write(&tmp, format!("channel = \"{channel}\"\n"))?;
+    fs::write(&tmp, contents)?;
     fs::rename(&tmp, path)?;
     Ok(())
 }
@@ -169,6 +187,34 @@ mod tests {
         assert_eq!(load_channel(&path), None);
         fs::write(&path, "future_key = true\nchannel = \"beta\"\n").unwrap();
         assert_eq!(load_channel(&path), Some(Channel::Beta));
+    }
+
+    #[test]
+    fn telemetry_key_loads_independently_of_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        assert_eq!(load_telemetry(&path), None);
+        for (contents, expected) in [
+            ("telemetry = false\n", Some(false)),
+            ("telemetry = true\n", Some(true)),
+            ("channel = \"nightly\"\ntelemetry = false\n", Some(false)),
+            ("telemetry = \"no\"\n", None),
+            ("channel = \"beta\"\n", None),
+            ("not toml [", None),
+        ] {
+            fs::write(&path, contents).unwrap();
+            assert_eq!(load_telemetry(&path), expected, "{contents}");
+        }
+    }
+
+    #[test]
+    fn save_channel_keeps_telemetry_opt_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "telemetry = false\n").unwrap();
+        save_channel(&path, Channel::Beta).unwrap();
+        assert_eq!(load_channel(&path), Some(Channel::Beta));
+        assert_eq!(load_telemetry(&path), Some(false));
     }
 
     #[test]

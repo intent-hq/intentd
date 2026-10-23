@@ -476,7 +476,7 @@ impl RepositoryConnectionDirectory {
 }
 
 impl State {
-    fn child_idle(&self) -> Result<()> {
+    pub(super) fn child_idle(&self) -> Result<()> {
         match &self.child_active {
             Some(active) if active.indeterminate => Err(RepositoryCredentialError::Indeterminate),
             Some(_) => Err(RepositoryCredentialError::Mutating),
@@ -501,7 +501,7 @@ impl State {
             .as_ref()
             .ok_or(RepositoryCredentialError::Missing)
     }
-    fn advance(&mut self, value: u64) -> Result<u64> {
+    pub(super) fn advance(&mut self, value: u64) -> Result<u64> {
         value.checked_add(1).ok_or_else(|| {
             self.status = RepositoryConnectionState::Retired;
             self.reservation = None;

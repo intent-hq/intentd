@@ -36,6 +36,10 @@ pub(crate) struct MembershipGate {
 }
 
 impl MembershipGate {
+    pub(crate) fn clear(&mut self) {
+        self.verdicts.clear();
+    }
+
     const TTL: Duration = Duration::from_secs(30);
 
     /// A gate for the current request's caller, or `None` when the caller is
@@ -145,6 +149,48 @@ impl MembershipGate {
                     .await
                     .is_ok_and(|ws| ws.membership.is_some_and(|m| m.can_manage));
         }
+        if matches!(
+            event.event_type.as_str(),
+            intent_core::events::SCRIPT_CHANGED
+                | intent_core::events::SCRIPT_OUTPUT
+                | intent_core::events::SCRIPT_STATE
+        ) {
+            // Role and purpose are checked for every delivery, never cached.
+            if role.is_none() || workspace_id.is_empty() {
+                return false;
+            }
+            let Ok(ws) = self
+                .api
+                .get_workspace(WorkspaceId::from(workspace_id))
+                .await
+            else {
+                return false;
+            };
+            let Some(membership) = ws.membership else {
+                return false;
+            };
+            if membership.can_manage {
+                return true;
+            }
+            if membership.my_role != Some(intent_core::WorkspaceRole::Manager) {
+                return false;
+            }
+            if event.event_type == intent_core::events::SCRIPT_CHANGED {
+                // Definitions accompany changes, including removal after the
+                // persisted row is gone. The event is server-authored.
+                return event.data["action"] == "guest-access-revoked"
+                    || event.data["script"]["purpose"] == "saved"
+                    || (event.data["action"] == "removed" && event.data["purpose"] == "saved");
+            }
+            let Some(id) = event.data["scriptId"].as_str() else {
+                return false;
+            };
+            return self
+                .api
+                .script_get(WorkspaceId::from(workspace_id), id.to_owned())
+                .await
+                .is_ok_and(|script| script["purpose"] == "saved");
+        }
         if intent_core::events::is_member_execution_event_type(&event.event_type) {
             // Execution/context events never use the cached visibility verdict.
             // Revocation takes effect before a socket is physically closed.
@@ -238,6 +284,10 @@ pub(crate) struct IdInfo {
 
 /// A classified fast-path request awaiting handling by the connection task.
 pub(crate) enum FastPath {
+    Fence {
+        id: IdInfo,
+        params: Map<String, Value>,
+    },
     Subscribe {
         id: IdInfo,
         params: Map<String, Value>,
@@ -254,6 +304,7 @@ pub(crate) struct SubscribeParams {
     pub event_types: Vec<String>,
     pub workspace_id: Option<String>,
     pub replace_group: Option<String>,
+    pub loss_recovery: bool,
 }
 
 /// Global, monotonic subscription id counter (`ws-sub-<n>`). Mirrors the TS
@@ -295,6 +346,7 @@ pub(crate) fn classify(value: &Value) -> Option<FastPath> {
         .cloned()
         .unwrap_or_default();
     match method {
+        "events.fence" => Some(FastPath::Fence { id, params }),
         "events.subscribe" => Some(FastPath::Subscribe { id, params }),
         "events.unsubscribe" => Some(FastPath::Unsubscribe { id, params }),
         _ => None,
@@ -306,6 +358,18 @@ pub(crate) fn classify(value: &Value) -> Option<FastPath> {
 pub(crate) fn parse_subscribe_params(
     params: &Map<String, Value>,
 ) -> Result<SubscribeParams, String> {
+    let loss_recovery = match params.get("lossRecovery") {
+        None => false,
+        Some(value) if value.as_u64() == Some(1) => true,
+        Some(_) => return Err("lossRecovery must be 1".into()),
+    };
+    if loss_recovery
+        && params
+            .get("workspaceId")
+            .is_some_and(|v| v.as_str().is_none_or(str::is_empty))
+    {
+        return Err("workspaceId must be a nonempty string".into());
+    }
     let event_types = match params.get("eventTypes") {
         Some(Value::Array(arr)) if !arr.is_empty() => arr
             .iter()
@@ -315,6 +379,7 @@ pub(crate) fn parse_subscribe_params(
         _ => return Err("eventTypes must be a non-empty array of event type strings".to_string()),
     };
     Ok(SubscribeParams {
+        loss_recovery,
         event_types,
         workspace_id: opt_str(params, "workspaceId"),
         replace_group: opt_str(params, "replaceGroup"),

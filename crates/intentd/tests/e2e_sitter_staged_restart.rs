@@ -2,7 +2,8 @@
 //! REAL `intentd serve` process: a supervised daemon (the sitter advertises
 //! the handshake via `INTENTD_SITTER_IDLE_RESTART`) that receives SIGUSR2
 //! ("a newer version is staged") exits with the restart-for-update code —
-//! immediately when idle, and only once the in-flight turn ends when busy —
+//! immediately when idle, and only once the in-flight turn (or running
+//! command script) ends when busy —
 //! a SIGTERM while that restart is still pending exits 0, a SIGUSR2 landing
 //! while a requested stop (SIGTERM or `system.shutdown`) is still tearing
 //! down is ignored (the teardown is held open deterministically by a blocked
@@ -551,6 +552,126 @@ async fn idle_daemon_exits_with_restart_code_on_sigusr2() {
     assert!(log.contains("exiting for staged update restart"), "{log}");
 }
 
+/// Readiness must imply installed signal handling even when the spawned
+/// watcher has consumed its bootstrap receiver. The gate holds that task at
+/// its first poll while startup reaches the ready phase and serves normal RPCs;
+/// protected startup liveness alone must not satisfy this regression.
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn ready_daemon_handles_sigusr2_before_restart_watcher_runs() {
+    use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+    use std::os::unix::process::ExitStatusExt;
+
+    let Some(script) = mock_agent_script() else {
+        return;
+    };
+    let data_dir = common::test_tempdir("itd-sr-ready-");
+    let gate_path = data_dir.path().join("watcher.sock");
+    let gate = tokio::net::UnixListener::bind(&gate_path).expect("bind watcher gate");
+    let (mut daemon, socket) = launch_daemon_with(
+        data_dir.path(),
+        &script,
+        true,
+        &[(
+            "INTENTD_TEST_STAGED_RESTART_WATCHER_GATE",
+            gate_path.to_str().unwrap(),
+        )],
+    )
+    .await;
+    let (mut release, _) = tokio::time::timeout(common::daemon_startup_timeout(), gate.accept())
+        .await
+        .expect("restart watcher reached gate")
+        .expect("accept watcher gate");
+
+    let mut client = Client::connect(&socket).await;
+    let startup = client.rpc(1, "system.startupStatus", json!({})).await;
+    assert_eq!(startup["phase"], "ready", "{startup}");
+    let status = client.rpc(2, "system.status", json!({})).await;
+    assert!(status["version"].is_string(), "{status}");
+    let workspaces = client.rpc(3, "workspace.list", json!({})).await;
+    assert!(workspaces["workspaces"].is_array(), "{workspaces}");
+    eprintln!(
+        "operational readiness passed while restart watcher held: startup={startup}, status={status}"
+    );
+
+    // Queue the signal while the process is stopped, then release the gate
+    // before resuming. Pending signals are delivered before userspace runs:
+    // the unfixed watcher cannot race ahead and install its handler after kill.
+    let pid = Pid::from_raw(daemon.child.id().cast_signed());
+    daemon.signal(Signal::SIGSTOP);
+    let stopped = tokio::time::timeout(
+        exit_budget(),
+        tokio::task::spawn_blocking(move || waitpid(pid, Some(WaitPidFlag::WUNTRACED))),
+    )
+    .await
+    .expect("daemon stopped")
+    .expect("join stop observer")
+    .expect("observe daemon stop");
+    assert_eq!(stopped, WaitStatus::Stopped(pid, Signal::SIGSTOP));
+    daemon.signal(Signal::SIGUSR2);
+    release.write_u8(1).await.expect("release watcher gate");
+    daemon.signal(Signal::SIGCONT);
+
+    let status = daemon.wait_exit(exit_budget()).await.unwrap_or_else(|| {
+        panic!(
+            "ready daemon did not exit\n--- daemon log ---\n{}",
+            daemon.log()
+        )
+    });
+    assert_eq!(
+        status.code(),
+        Some(RESTART_FOR_UPDATE_EXIT_CODE),
+        "readiness preceded restart signal handling: exit={status}, signal={:?}\n--- daemon log ---\n{}",
+        status.signal(),
+        daemon.log()
+    );
+    assert!(daemon.log().contains("staged update restart accepted"));
+}
+
+/// Registration errors must stop bootstrap before even protected liveness, whether or not
+/// the sitter advertised the handshake. Use an invalid signal to exercise
+/// Tokio's real error path rather than bypassing registration.
+#[cfg(debug_assertions)]
+#[tokio::test]
+async fn signal_registration_failure_prevents_readiness() {
+    for advertised in [false, true] {
+        let data_dir = common::test_tempdir("itd-sr-signal-error-");
+        common::enable_ws_api(data_dir.path());
+        let log_path = data_dir.path().join("daemon.log");
+        let log = std::fs::File::create(&log_path).expect("create daemon log");
+        let workspaces = data_dir.path().join("workspaces");
+        std::fs::create_dir_all(&workspaces).expect("mkdir workspaces");
+        let mut command = common::hermetic_serve_command(data_dir.path());
+        command
+            .env("INTENTD_WORKSPACES_DIR", &workspaces)
+            .env("INTENTD_AUTH_TOKEN", TOKEN)
+            .env("INTENTD_TEST_STAGED_RESTART_SIGNAL_ERROR", "1")
+            .env("RUST_LOG", "info")
+            .env_remove(SITTER_IDLE_RESTART_ENV)
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(log));
+        if advertised {
+            command.env(SITTER_IDLE_RESTART_ENV, "1");
+        }
+        common::hermetic_fixture_identity(&mut command, data_dir.path());
+        let child = GuardedChild::spawn(&mut command).expect("spawn intentd serve");
+        let mut daemon = Daemon { child, log_path };
+        let status = daemon
+            .wait_exit(common::daemon_startup_timeout())
+            .await
+            .unwrap_or_else(|| panic!("startup did not fail\n{}", daemon.log()));
+        let log = daemon.log();
+        assert_eq!(status.code(), Some(1), "{status}\n{log}");
+        assert!(
+            log.contains("failed to install the SIGUSR2 handler"),
+            "{log}"
+        );
+        assert!(log.contains("Refusing to register signal -1"), "{log}");
+        assert!(!log.contains("listening"), "false readiness: {log}");
+        assert!(!data_dir.path().join("intentd.sock").exists(), "{log}");
+    }
+}
+
 /// A supervised daemon with a turn in flight accepts SIGUSR2 but keeps
 /// serving until the turn ends, then exits with the restart code.
 #[tokio::test]
@@ -609,6 +730,119 @@ async fn busy_daemon_defers_restart_until_turn_ends() {
     let status = daemon.wait_exit(exit_budget()).await.unwrap_or_else(|| {
         panic!(
             "daemon did not exit after the turn ended\n--- daemon log ---\n{}",
+            daemon.log()
+        )
+    });
+    assert_eq!(
+        status.code(),
+        Some(RESTART_FOR_UPDATE_EXIT_CODE),
+        "exit status {status}\n--- daemon log ---\n{}",
+        daemon.log()
+    );
+}
+
+/// A staged update restart that lands while a command-mode script is running
+/// waits for that script instead of killing it (the 2026-10-19 burn-down lost
+/// four Rust test runs to `daemon idle; exiting for staged update restart`
+/// because only agent turns counted as busy). No agent turn is in flight, so
+/// before the fix the daemon exited at once and the run reported exit code -1.
+/// With the fix the daemon keeps serving, `system.status` shows the deferral,
+/// the run finishes with its real exit code, and only then does the daemon
+/// exit with the restart code.
+#[tokio::test]
+async fn running_command_script_defers_restart_until_it_exits() {
+    let Some(script) = mock_agent_script() else {
+        return;
+    };
+    let data_dir_guard = common::test_tempdir("itd-sr-");
+    let workspace_id = seed_workspace(data_dir_guard.path()).await;
+    let (mut daemon, socket) = launch_daemon(data_dir_guard.path(), &script, true).await;
+    let mut client = Client::connect(&socket).await;
+
+    // The script blocks until the test releases it, so the deferral window
+    // is under test control rather than a fixed sleep racing a loaded runner.
+    let release = Barrier::new(data_dir_guard.path(), "script-release");
+    let marker = data_dir_guard.path().join("script-finished");
+    let command = format!("{} && touch '{}'", release.sh_wait(), marker.display());
+    client
+        .rpc(
+            1,
+            "script.create",
+            json!({
+                "workspaceId": workspace_id,
+                "name": "long check",
+                "command": command,
+                "mode": "command",
+                "scriptId": "long-check",
+            }),
+        )
+        .await;
+
+    // `script.run` blocks until the script exits; drive it on its own
+    // connection so this one stays free for status reads.
+    let mut runner = Client::connect(&socket).await;
+    let workspace = workspace_id.clone();
+    let run = tokio::spawn(async move {
+        runner
+            .rpc(
+                2,
+                "script.run",
+                json!({ "workspaceId": workspace, "scriptId": "long-check", "timeoutSeconds": 600 }),
+            )
+            .await
+    });
+    let deadline = Instant::now() + exit_budget();
+    loop {
+        let status = client
+            .rpc(
+                3,
+                "script.status",
+                json!({ "workspaceId": workspace_id, "scriptId": "long-check" }),
+            )
+            .await;
+        // Past `mark_running`: the PTY exists, not just the launch reservation.
+        if status["status"] == "running" && status["pid"].is_i64() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "script never started: {status}");
+        // timing-guard: poll interval for the observable `running with a pid` status, deadline-bounded.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    daemon.signal(Signal::SIGUSR2);
+    assert!(
+        daemon.wait_exit(stay_alive_window()).await.is_none(),
+        "daemon must not exit while a command script is running\n--- daemon log ---\n{}",
+        daemon.log()
+    );
+    let status = client.rpc(4, "system.status", json!({})).await;
+    let idle = &status["idleUpdateCheck"];
+    assert_eq!(idle["restartPending"], true, "{status}");
+    assert_eq!(idle["runningScripts"], 1, "{status}");
+    assert!(idle["restartDeferredUntil"].is_string(), "{status}");
+    assert_eq!(status["busyAgents"], 0, "{status}");
+    let log = daemon.log();
+    assert!(log.contains("staged update restart accepted"), "{log}");
+    assert!(
+        log.contains("staged update restart waiting for running scripts"),
+        "{log}"
+    );
+    assert!(!log.contains("exiting for staged update restart"), "{log}");
+
+    release.release();
+    let result = tokio::time::timeout(exit_budget(), run)
+        .await
+        .expect("script.run never returned")
+        .expect("script.run task");
+    assert_eq!(
+        result["exitCode"], 0,
+        "the run keeps its real exit code: {result}"
+    );
+    assert!(marker.exists(), "the script ran to completion");
+
+    let status = daemon.wait_exit(exit_budget()).await.unwrap_or_else(|| {
+        panic!(
+            "daemon did not exit after the script finished\n--- daemon log ---\n{}",
             daemon.log()
         )
     });

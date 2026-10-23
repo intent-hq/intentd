@@ -324,10 +324,13 @@ async fn fresh_approval_activates_then_queues_correlated_wake_once() {
         .unwrap(),
         json!({"accepted":true,"requestId":pending["requestId"]})
     );
-    let batch = tokio::time::timeout(Duration::from_secs(10), events.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    let batch = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        events.recv(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!(batch[0].data["outcome"], "granted");
     assert_eq!(batch[0].data["state"]["hint"], RELEASE_HINT);
     h.services.desktop_flush_outbox().await;
@@ -548,16 +551,20 @@ async fn owner_change_invalidates_active_control_and_old_permission_is_not_trans
     // Either this snapshot or the connection watcher can win invalidation.
     // Inactive authority is immediate; the ended event follows the durable
     // journal commit. Await that observable completion before reading its reason.
-    let ended = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let batch = events.recv().await.unwrap();
-            if let Some(event) = batch.into_iter().find(|event| {
-                event.data["sessionId"] == active["sessionId"] && event.data["status"] == "ended"
-            }) {
-                break event;
+    let ended = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                let batch = events.recv().await.unwrap();
+                if let Some(event) = batch.into_iter().find(|event| {
+                    event.data["sessionId"] == active["sessionId"]
+                        && event.data["status"] == "ended"
+                }) {
+                    break event;
+                }
             }
-        }
-    })
+        },
+    )
     .await
     .unwrap();
     assert_eq!(ended.data["reason"], "owner_changed");
@@ -597,10 +604,13 @@ async fn readiness_failure_is_a_correlated_failure_not_a_grant() {
     )
     .await
     .unwrap();
-    let events = tokio::time::timeout(Duration::from_secs(10), events.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    let events = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        events.recv(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!(events[0].data["outcome"], "failed");
     assert_eq!(events[0].data["state"], json!({"status":"inactive"}));
     assert_eq!(events[0].data["error"]["code"], "desktop-execution-failed");
@@ -639,10 +649,13 @@ async fn activation_failure_diagnostics_survive_outbox_and_conversation() {
             .await
             .unwrap();
         assert_eq!(accepted, json!({"accepted":true,"requestId":request}));
-        let batch = tokio::time::timeout(Duration::from_secs(10), events.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            events.recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(batch[0].data["outcome"], "failed");
         assert_eq!(batch[0].data["requestId"], request);
         assert_eq!(batch[0].data["error"], value(&failure));
@@ -770,10 +783,13 @@ async fn permission_nonfailure_wakes_keep_distinct_outcomes() {
                 DesktopState::Inactive
             );
         }
-        let batch = tokio::time::timeout(Duration::from_secs(10), events.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            events.recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(batch[0].data["outcome"], outcome);
         assert!(batch[0].data.get("error").is_none());
         let gate = h.services.desktop.gate(&h.agent);
@@ -1283,14 +1299,17 @@ async fn first_eligible_allow_claims_unassigned_primary_once() {
         .await
         .unwrap()
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while !matches!(
-            h.services.desktop.state(&h.agent),
-            DesktopState::Active { .. }
-        ) {
-            tokio::task::yield_now().await;
-        }
-    })
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        async {
+            while !matches!(
+                h.services.desktop.state(&h.agent),
+                DesktopState::Active { .. }
+            ) {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
     .await
     .unwrap();
     let live = h.services.desktop.get(&h.agent).unwrap();
@@ -1352,9 +1371,12 @@ async fn invalidation_during_permission_response_never_restores_request() {
             )
             .await
         });
-        tokio::time::timeout(Duration::from_secs(2), seen.notified())
-            .await
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            seen.notified(),
+        )
+        .await
+        .unwrap();
         h.executor.extra_connections.lock().unwrap().clear();
         h.executor.connection.lock().unwrap().connection_epoch = "disconnected".into();
         intent_core::with_caller(
@@ -1456,23 +1478,26 @@ async fn disconnected_candidate_does_not_prevent_last_live_denial() {
                 )),
             "the last connected candidate's Deny must be terminal"
         );
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let raw = h
-                    .services
-                    .store
-                    .get_setting(&format!("desktop.v1/request/{request}"))
-                    .await
-                    .unwrap()
-                    .unwrap();
-                let record: Value = serde_json::from_str(&raw).unwrap();
-                if !record["outcome"].is_null() {
-                    assert_eq!(record["outcome"], "denied");
-                    break;
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            async {
+                loop {
+                    let raw = h
+                        .services
+                        .store
+                        .get_setting(&format!("desktop.v1/request/{request}"))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let record: Value = serde_json::from_str(&raw).unwrap();
+                    if !record["outcome"].is_null() {
+                        assert_eq!(record["outcome"], "denied");
+                        break;
+                    }
+                    tokio::task::yield_now().await;
                 }
-                tokio::task::yield_now().await;
-            }
-        })
+            },
+        )
         .await
         .unwrap();
         assert!(h
@@ -1777,9 +1802,12 @@ async fn stop_during_action_validation_never_restores_active_control() {
         )
         .await
     });
-    tokio::time::timeout(Duration::from_secs(2), seen.notified())
-        .await
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        seen.notified(),
+    )
+    .await
+    .unwrap();
     let stopped = h.client("revoke", json!({"sessionId":active["sessionId"],"reason":"user_stop","stopReport":{"reportId":id(),"computerId":"physical","connectionEpoch":"epoch","stopReportToken":start["stopReportToken"]}})).await.unwrap();
     assert_eq!(stopped, json!({"revoked":true,"reported":true}));
     assert_eq!(h.services.desktop.state(&h.agent), DesktopState::Inactive);

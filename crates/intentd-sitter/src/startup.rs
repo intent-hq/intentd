@@ -681,9 +681,13 @@ mod tests {
             reader.read_to_string(&mut tail).unwrap();
             let _ = tx.send("eof".to_string());
         });
-        assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), "ready\n");
+        assert_eq!(
+            rx.recv_timeout(intentd_test_support::test_timeout(Duration::from_secs(5)))
+                .unwrap(),
+            "ready\n"
+        );
         nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(5));
         while !child_exited(&child.0).unwrap() {
             assert!(Instant::now() < deadline);
             pause(deadline);
@@ -691,7 +695,11 @@ mod tests {
         // The PID is still reserved: observing exit a second time must work.
         assert!(child_exited(&child.0).unwrap());
         stop_owned_child(&mut child.0, &dir.path().join("sitter.pid"));
-        assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), "eof");
+        assert_eq!(
+            rx.recv_timeout(intentd_test_support::test_timeout(Duration::from_secs(5)))
+                .unwrap(),
+            "eof"
+        );
         reader.join().unwrap();
     }
 }

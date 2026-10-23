@@ -166,9 +166,12 @@ async fn timer_claim_keeps_barrier_before_first_delete_sql() {
         .schedule_workspace_delete(h.ws.clone(), 0)
         .await
         .unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(5), reached.notified())
-        .await
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+        reached.notified(),
+    )
+    .await
+    .unwrap();
     let blocked = h.request(false).is_err();
     resume.notify_one();
     assert!(
@@ -267,19 +270,25 @@ impl DeletionGates {
     async fn abort(&self, key: &str) {
         let abort = self.0.lock().unwrap().aborts.remove(key).unwrap();
         abort.abort();
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while !abort.is_finished() {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+            async {
+                while !abort.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            },
+        )
         .await
         .unwrap();
     }
 }
 async fn reached(notify: &tokio::sync::Notify) {
-    tokio::time::timeout(std::time::Duration::from_secs(5), notify.notified())
-        .await
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+        notify.notified(),
+    )
+    .await
+    .unwrap();
 }
 fn subject(h: &Harness, agent: bool) -> crate::delete_grace::PendingDeleteSubject {
     if agent {
@@ -376,7 +385,9 @@ async fn real_dispatch_holds_every_scheduling_waiter_and_writer_first_rejects_de
             })
         });
         start
-            .recv_timeout(std::time::Duration::from_secs(5))
+            .recv_timeout(intentd_test_support::test_timeout(
+                std::time::Duration::from_secs(5),
+            ))
             .unwrap();
         let services = h.services.clone();
         let ws = h.ws.clone();
@@ -390,7 +401,8 @@ async fn real_dispatch_holds_every_scheduling_waiter_and_writer_first_rejects_de
                 services.schedule_workspace_delete(ws, 60_000).await
             }
         }));
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now()
+            + intentd_test_support::test_timeout(std::time::Duration::from_secs(5));
         while h.request(agent).is_ok() {
             assert!(std::time::Instant::now() < deadline);
             tokio::task::yield_now().await;

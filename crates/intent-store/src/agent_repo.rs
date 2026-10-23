@@ -339,7 +339,8 @@ pub(crate) fn unread_workspaces_batch_sql() -> String {
 }
 
 /// One agent session's usage inputs for the workspace token-usage tally
-/// (§5.23): `(agent_id, model, snapshot, baseline, message_usage)`.
+/// (§5.23): `(agent_id, model, snapshot, baseline, message_usage, cells, name)`,
+/// where `name` is the raw session display name.
 /// `message_usage` is non-empty only for sessions whose decoded snapshot and
 /// baseline carry no token report (the per-message fallback path — see
 /// [`Store::get_workspace_agent_usage_data`]), and carries only the usage
@@ -351,6 +352,7 @@ pub(crate) type AgentUsageRow = (
     Option<TokenUsageTotals>,
     Vec<serde_json::Value>,
     Vec<AgentUsageCellRow>,
+    String,
 );
 
 /// Indexed aggregate counts for delegated children of one parent agent.
@@ -474,7 +476,7 @@ pub(crate) async fn fetch_agent_usage_rows(
     conn: &mut sqlx::SqliteConnection,
     workspace_id: &WorkspaceId,
 ) -> Result<Vec<AgentUsageRow>> {
-    let session_sql = "SELECT id, COALESCE(NULLIF(resolved_model,''), model) AS model, token_usage, token_usage_baseline \
+    let session_sql = "SELECT id, name, COALESCE(NULLIF(resolved_model,''), model) AS model, token_usage, token_usage_baseline \
         FROM agent_session WHERE workspace_id = ?";
     let session_rows = sqlx::query(session_sql)
         .bind(&workspace_id.0)
@@ -498,7 +500,21 @@ pub(crate) async fn fetch_agent_usage_rows(
             .get::<Option<String>, _>("token_usage_baseline")
             .and_then(|s| serde_json::from_str(&s).ok());
 
-        result.push((agent_id, model, snapshot, baseline, Vec::new(), Vec::new()));
+        // Display name for `TokenUsage::agent_names` (§5.23); the services
+        // helper owns trimming and the empty-name rule.
+        let name = session_row
+            .get::<Option<String>, _>("name")
+            .unwrap_or_default();
+
+        result.push((
+            agent_id,
+            model,
+            snapshot,
+            baseline,
+            Vec::new(),
+            Vec::new(),
+            name,
+        ));
     }
 
     let mut by_agent = std::collections::HashMap::new();
@@ -2655,10 +2671,43 @@ impl Store {
         Ok(())
     }
 
+    /// Metadata of the agent's newest `limit` identity-change system rows
+    /// (the same row set as [`Store::latest_agent_identity_notice`]),
+    /// newest first. The quota failover suppression walks a chain of
+    /// consecutive `provider_failover` hops back to the last committed turn
+    /// identity (PROTOCOL §5.54). Unparseable metadata rows are skipped.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn recent_agent_identity_notices(
+        &self,
+        agent_id: &AgentId,
+        limit: u32,
+    ) -> Result<Vec<serde_json::Value>> {
+        let rows = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT metadata FROM agent_message \
+             WHERE agent_id=? AND role='system' \
+               AND json_extract(metadata, '$.type') \
+                   IN ('model_changed', 'provider_rehomed', 'provider_failover', 'provider_returned') \
+             ORDER BY seq DESC LIMIT ?",
+        )
+        .bind(&agent_id.0)
+        .bind(i64::from(limit))
+        .fetch_all(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("recent agent identity notices failed: {e}")))?;
+        Ok(rows
+            .into_iter()
+            .flatten()
+            .filter_map(|m| serde_json::from_str::<serde_json::Value>(&m).ok())
+            .collect())
+    }
+
     /// Metadata of the agent's newest `role: "system"` transcript row that
-    /// records a spawn-identity change — a `model_changed` or a
-    /// `provider_rehomed` notice — or `None` when the transcript carries
-    /// neither. The model-change notice path reads it to tell a re-home's
+    /// records a spawn-identity change — a `model_changed`, a
+    /// `provider_rehomed`, a `provider_failover` or a `provider_returned`
+    /// notice — or `None` when the transcript carries none of them. The model-change notice path reads it to tell a re-home's
     /// deferred last-turn commit (the newest such row is the
     /// `provider_rehomed` notice for this very provider hop) from an
     /// ordinary switch, durably across spawn retries, later turns and
@@ -2676,7 +2725,8 @@ impl Store {
         let raw = sqlx::query_scalar::<_, Option<String>>(
             "SELECT metadata FROM agent_message \
              WHERE agent_id=? AND role='system' \
-               AND json_extract(metadata, '$.type') IN ('model_changed', 'provider_rehomed') \
+               AND json_extract(metadata, '$.type') \
+                   IN ('model_changed', 'provider_rehomed', 'provider_failover', 'provider_returned') \
              ORDER BY seq DESC LIMIT 1",
         )
         .bind(&agent_id.0)
@@ -2812,13 +2862,19 @@ impl Store {
         workspace_id: &WorkspaceId,
         s: &AgentSession,
     ) -> Result<()> {
-        self.update_agent_session_with_preferences(workspace_id, s, false, None)
+        self.update_agent_session_with_preferences(workspace_id, s, false, None, false)
             .await
     }
 
     /// Atomically update a session, optional manual specialist memory, and an
     /// explicitly requested notification-mute patch. Ordinary row writes omit
     /// the patch so stale session snapshots cannot revert the user's toggle.
+    /// `explicit_effort` marks the row's `reasoning_effort` as an explicit
+    /// choice: the same UPDATE clears the Auto-pin mark
+    /// (`reasoning_effort_auto`) even when the value is unchanged, so no
+    /// concurrent `agent.setModel` can slip between the value and the mark.
+    /// Otherwise an unchanged value keeps the mark and a changed one clears
+    /// it.
     ///
     /// # Errors
     /// Returns an error if validation or either write fails.
@@ -2828,6 +2884,7 @@ impl Store {
         s: &AgentSession,
         remember_specialist: bool,
         notifications_muted: Option<bool>,
+        explicit_effort: bool,
     ) -> Result<()> {
         let mut lifecycle = self.repository_lifecycle_write().await?;
         // Lightweight invariant check: read only workspace_id, model,
@@ -2930,7 +2987,10 @@ impl Store {
                  WHEN json_extract(metadata, '$.chiefPromptVersion') IS NULL \
                  THEN json_remove(?, '$.chiefPromptVersion') ELSE ? END, \
              sandbox_id=?, sandbox_path=?, sandbox_branch=?, \
-             stop_reason=?, stop_reason_timestamp=?, reasoning_effort=? \
+             stop_reason=?, stop_reason_timestamp=?, \
+             reasoning_effort_auto=CASE WHEN ? THEN 0 WHEN reasoning_effort IS ? \
+                 THEN reasoning_effort_auto ELSE 0 END, \
+             reasoning_effort=? \
              WHERE id=? AND workspace_id=?",
         )
         .bind(s.backend_session_id.as_ref().map(|b| b.0.clone()))
@@ -2962,6 +3022,10 @@ impl Store {
         .bind(&s.sandbox_branch)
         .bind(&s.stop_reason)
         .bind(&s.stop_reason_timestamp)
+        // An explicit effort write, or any effort change, clears the daemon's
+        // Auto-pin flag; an unrelated rewrite of the same value keeps it.
+        .bind(explicit_effort)
+        .bind(&s.reasoning_effort)
         .bind(&s.reasoning_effort)
         .bind(&s.id.0)
         .bind(&workspace_id.0);
@@ -3078,9 +3142,18 @@ impl Store {
         {
             lifecycle.begin(&[crate::RepositoryLifecycleKey::Agent(id.clone())])?;
         }
+        // A level the daemon pinned from Auto (`reasoning_effort_auto`)
+        // belongs to the old model's default: a real model change resets it
+        // to Auto, so the new model's default applies (and is re-pinned at
+        // the next confirmed turn). A level someone chose is kept.
         let rows = sqlx::query(
-            "UPDATE agent_session SET model=?, provider=?, updated_at=? \
-             WHERE id=? AND workspace_id=?",
+            "UPDATE agent_session SET \
+               reasoning_effort = CASE WHEN reasoning_effort_auto = 1 AND model IS NOT ?1 \
+                                       THEN NULL ELSE reasoning_effort END, \
+               reasoning_effort_auto = CASE WHEN reasoning_effort_auto = 1 AND model IS NOT ?1 \
+                                            THEN 0 ELSE reasoning_effort_auto END, \
+               model=?1, provider=?2, updated_at=?3 \
+             WHERE id=?4 AND workspace_id=?5",
         )
         .bind(model)
         .bind(provider)
@@ -3137,7 +3210,8 @@ impl Store {
             lifecycle.begin(&[crate::RepositoryLifecycleKey::Agent(id.clone())])?;
         }
         let rows = sqlx::query(
-            "UPDATE agent_session SET provider=?, model=?, reasoning_effort=NULL, updated_at=? \
+            "UPDATE agent_session SET provider=?, model=?, reasoning_effort=NULL, \
+             reasoning_effort_auto=0, updated_at=? \
              WHERE id=? AND workspace_id=? AND provider IS ?",
         )
         .bind(provider)
@@ -3167,6 +3241,296 @@ impl Store {
         }
         lifecycle.settle_after_retirement().await?;
         Ok(false)
+    }
+
+    /// Move a session onto a backup provider profile after a quota failure
+    /// (PROTOCOL §5.54 Backup failover): a narrow write of `provider` and
+    /// `updated_at`, plus — when `metadata_key` is `Some((key, json))` —
+    /// that one `metadata` key, in the same statement. The model id and reasoning effort carry over
+    /// unchanged — a backup is a profile of the same base provider, so the
+    /// write is what `agent.setModel` with the same model would persist.
+    /// Like [`Store::rehome_agent_session_provider`] it may change `provider`
+    /// after first real use, and it is a compare-and-set on the `provider`
+    /// and `model` columns: a concurrent `agent.setModel` that moved the
+    /// session — to another provider, or to another model on the same one —
+    /// between the caller's read and this write is never overwritten
+    /// (`Ok(false)`, nothing mutated), so the notice and `agent:updated`
+    /// never name a stale model. Scoped to `workspace_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the agent session does not exist in the workspace; `Error::Internal` if the database operation fails.
+    #[expect(clippy::too_many_arguments)]
+    pub async fn failover_agent_session_provider(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        expected_provider: &str,
+        expected_model: Option<&str>,
+        provider: &str,
+        metadata_key: Option<(&str, &str)>,
+        updated_at: &str,
+    ) -> Result<bool> {
+        let mut lifecycle = self.repository_lifecycle_write().await?;
+        let current = self.get_agent_session_summary(id).await?;
+        if current.workspace_id == *workspace_id
+            && current.provider.as_deref() == Some(expected_provider)
+            && current.model.as_deref() == expected_model
+            && expected_provider != provider
+        {
+            lifecycle.begin(&[crate::RepositoryLifecycleKey::Agent(id.clone())])?;
+        }
+        // The optional metadata key (a JSON value) lands in the SAME
+        // statement, so the provider move and its bookkeeping are atomic:
+        // a concurrent writer can never observe one without the other.
+        let (key, value) = metadata_key.unzip();
+        let rows = sqlx::query(
+            "UPDATE agent_session SET provider=?, \
+             metadata = CASE WHEN ? IS NULL THEN metadata ELSE json_set(\
+                 CASE \
+                     WHEN metadata IS NULL THEN '{}' \
+                     WHEN json_type(metadata) = 'object' THEN metadata \
+                     ELSE json_object('priorNonObjectMetadata', json(metadata)) \
+                 END, \
+                 '$.' || ?, json(?)) END, \
+             updated_at=? \
+             WHERE id=? AND workspace_id=? AND provider=? AND model IS ?",
+        )
+        .bind(provider)
+        .bind(key)
+        .bind(key)
+        .bind(value)
+        .bind(updated_at)
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .bind(expected_provider)
+        .bind(expected_model)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("failover agent session provider failed: {e}")))?
+        .rows_affected();
+        if rows > 0 {
+            lifecycle.settle_after_retirement().await?;
+            return Ok(true);
+        }
+        let exists = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM agent_session WHERE id=? AND workspace_id=?",
+        )
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .fetch_one(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("failover agent session provider failed: {e}")))?;
+        if exists == 0 {
+            return Err(Error::NotFound(format!("agent session {id}")));
+        }
+        lifecycle.settle_after_retirement().await?;
+        Ok(false)
+    }
+
+    /// Set one JSON `metadata` key only while the session still carries
+    /// `expected_provider` and `expected_model` (compare-and-set): daemon
+    /// bookkeeping tied to an identity it observed never lands after a
+    /// concurrent `agent.setModel` moved the session. `Ok(false)` on a
+    /// mismatch; `NotFound` when the session is absent. `key` must be a
+    /// trusted constant.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the agent session does not exist in the workspace; `Error::Internal` if the database operation fails.
+    #[expect(clippy::too_many_arguments)]
+    pub async fn set_agent_session_metadata_key_json_if_identity(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        expected_provider: &str,
+        expected_model: Option<&str>,
+        key: &str,
+        value: &str,
+        updated_at: &str,
+    ) -> Result<bool> {
+        let rows = sqlx::query(
+            "UPDATE agent_session SET \
+             metadata = json_set(\
+                 CASE \
+                     WHEN metadata IS NULL THEN '{}' \
+                     WHEN json_type(metadata) = 'object' THEN metadata \
+                     ELSE json_object('priorNonObjectMetadata', json(metadata)) \
+                 END, \
+                 '$.' || ?, json(?)), \
+             updated_at = ? \
+             WHERE id = ? AND workspace_id = ? AND provider = ? AND model IS ?",
+        )
+        .bind(key)
+        .bind(value)
+        .bind(updated_at)
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .bind(expected_provider)
+        .bind(expected_model)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("guarded session metadata write failed: {e}")))?
+        .rows_affected();
+        if rows > 0 {
+            return Ok(true);
+        }
+        let exists = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM agent_session WHERE id=? AND workspace_id=?",
+        )
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .fetch_one(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("guarded session metadata write failed: {e}")))?;
+        if exists == 0 {
+            return Err(Error::NotFound(format!("agent session {id}")));
+        }
+        Ok(false)
+    }
+
+    /// Pin the provider of a legacy session — one whose `provider` column is
+    /// NULL or blank — at turn start. Every create pins its provider, so a
+    /// NULL column only survives on rows written before that rule; pinning it
+    /// stops the session from following later `model.defaultProvider`
+    /// changes. A narrow write of `provider` and `updated_at` only, and a
+    /// compare-and-set on the column still being NULL/blank: a concurrent
+    /// `agent.setModel` that pinned a provider first wins and the call
+    /// returns `Ok(false)` without mutating anything. Scoped to
+    /// `workspace_id` (defense-in-depth).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the agent session does not exist in the workspace; `Error::Internal` if the database operation fails.
+    pub async fn pin_agent_session_provider_if_null(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        provider: &str,
+        updated_at: &str,
+    ) -> Result<bool> {
+        // No lifecycle invalidation: the pinned provider is the one the
+        // session already resolves to (its last turn's, else the current
+        // default), so its repository bindings stay valid.
+        let lifecycle = self.repository_lifecycle_write().await?;
+        let current = self.get_agent_session_summary(id).await?;
+        let rows = sqlx::query(
+            "UPDATE agent_session SET provider=?, updated_at=? \
+             WHERE id=? AND workspace_id=? AND (provider IS NULL OR provider='')",
+        )
+        .bind(provider)
+        .bind(updated_at)
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("pin agent session provider failed: {e}")))?
+        .rows_affected();
+        lifecycle.settle_after_retirement().await?;
+        if rows == 0 && current.workspace_id != *workspace_id {
+            return Err(Error::NotFound(format!("agent session {id}")));
+        }
+        Ok(rows > 0)
+    }
+
+    /// Fill a session's `model` / `reasoning_effort` from the identity a turn
+    /// actually ran under, only where the column is still NULL or blank (a
+    /// legacy row, or a create that could not resolve them up front — a cold
+    /// catalog cache, or an effort left to the provider). Values already set
+    /// are never overwritten, so an `agent.setModel` / effort change racing
+    /// the commit wins. `None` arguments leave their column alone. A filled
+    /// effort is the provider's level for an Auto session, so it sets
+    /// `reasoning_effort_auto` (reset on the next real model change by
+    /// [`Store::set_agent_session_model`]). Returns whether any column
+    /// changed. Scoped to `workspace_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn fill_agent_session_identity_if_null(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        model: Option<&str>,
+        reasoning_effort: Option<&str>,
+        updated_at: &str,
+    ) -> Result<bool> {
+        let model = model.filter(|m| !m.trim().is_empty());
+        let reasoning_effort = reasoning_effort.filter(|e| !e.trim().is_empty());
+        if model.is_none() && reasoning_effort.is_none() {
+            return Ok(false);
+        }
+        // No lifecycle invalidation: the filled values are the ones the
+        // running provider already reports, so nothing the session's
+        // repository bindings depend on changes.
+        let lifecycle = self.repository_lifecycle_write().await?;
+        let rows = sqlx::query(
+            "UPDATE agent_session SET \
+               model = CASE WHEN (model IS NULL OR model='') AND ?1 IS NOT NULL \
+                            THEN ?1 ELSE model END, \
+               reasoning_effort_auto = CASE WHEN (reasoning_effort IS NULL OR reasoning_effort='') \
+                                        AND ?2 IS NOT NULL THEN 1 ELSE reasoning_effort_auto END, \
+               reasoning_effort = CASE WHEN (reasoning_effort IS NULL OR reasoning_effort='') \
+                                        AND ?2 IS NOT NULL THEN ?2 ELSE reasoning_effort END, \
+               updated_at = ?3 \
+             WHERE id=?4 AND workspace_id=?5 AND ( \
+               ((model IS NULL OR model='') AND ?1 IS NOT NULL) OR \
+               ((reasoning_effort IS NULL OR reasoning_effort='') AND ?2 IS NOT NULL))",
+        )
+        .bind(model)
+        .bind(reasoning_effort)
+        .bind(updated_at)
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("fill agent session identity failed: {e}")))?
+        .rows_affected();
+        lifecycle.settle_after_retirement().await?;
+        Ok(rows > 0)
+    }
+
+    /// Fill a NULL/blank `reasoning_effort` with the level the provider
+    /// confirmed for a turn, marked Auto-pinned (`reasoning_effort_auto`),
+    /// only while the row still carries the provider and model that turn
+    /// started with (`expected_*`, `None` matching NULL). A concurrent
+    /// `agent.setModel` / provider change that landed first therefore never
+    /// inherits the old identity's level. Returns whether the fill landed.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn fill_agent_session_effort_if_identity(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        effort: &str,
+        expected_provider: Option<&str>,
+        expected_model: Option<&str>,
+        updated_at: &str,
+    ) -> Result<bool> {
+        if effort.trim().is_empty() {
+            return Ok(false);
+        }
+        let lifecycle = self.repository_lifecycle_write().await?;
+        let rows = sqlx::query(
+            "UPDATE agent_session SET reasoning_effort=?, reasoning_effort_auto=1, updated_at=? \
+             WHERE id=? AND workspace_id=? \
+               AND (reasoning_effort IS NULL OR TRIM(reasoning_effort)='') \
+               AND provider IS ? AND model IS ?",
+        )
+        .bind(effort)
+        .bind(updated_at)
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .bind(expected_provider)
+        .bind(expected_model)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("fill agent session effort failed: {e}")))?
+        .rows_affected();
+        lifecycle.settle_after_retirement().await?;
+        Ok(rows > 0)
     }
 
     /// Persist the assembled system prompt (the spawn path): a narrow write
@@ -12369,9 +12733,9 @@ mod tests {
             .get_workspace_agent_usage_data(&ws_id)
             .await
             .expect("usage rollup");
-        let (_, rollup_model, _, _, _, _) = rows
+        let (_, rollup_model, _, _, _, _, _) = rows
             .into_iter()
-            .find(|(id, _, _, _, _, _)| *id == agent_id.0)
+            .find(|(id, _, _, _, _, _, _)| *id == agent_id.0)
             .expect("rollup row");
         assert_eq!(rollup_model.as_deref(), Some("claude-opus-4"));
     }
@@ -13491,6 +13855,177 @@ mod tests {
         assert!(result4.is_ok(), "name change should succeed");
     }
 
+    /// The confirmed-effort fill lands only while the row still carries the
+    /// turn's provider/model: a model switch that landed first never inherits
+    /// the old model's level. A landed fill is Auto-pinned; an explicit
+    /// choice clears the mark.
+    #[tokio::test]
+    async fn effort_fill_is_guarded_by_the_turn_identity() {
+        use intent_core::now_iso;
+
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-effort-guard".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId("agent-effort-guard".to_string());
+        let mut session = baseline_test_session(&agent_id, &ws_id, &ts, Some("acp-live"));
+        session.provider = Some("codex".to_string());
+        session.model = Some("model-a".to_string());
+        session.reasoning_effort = None;
+        store.insert_agent_session(&session).await.expect("insert");
+        store
+            .set_agent_session_model(&ws_id, &agent_id, "model-b", Some("codex"), &ts)
+            .await
+            .expect("racing model switch");
+        assert!(
+            !store
+                .fill_agent_session_effort_if_identity(
+                    &ws_id,
+                    &agent_id,
+                    "high",
+                    Some("codex"),
+                    Some("model-a"),
+                    &ts
+                )
+                .await
+                .unwrap(),
+            "model A's level must not land on model B"
+        );
+        assert_eq!(
+            store
+                .get_agent_session(&agent_id)
+                .await
+                .unwrap()
+                .reasoning_effort,
+            None
+        );
+        assert!(store
+            .fill_agent_session_effort_if_identity(
+                &ws_id,
+                &agent_id,
+                "low",
+                Some("codex"),
+                Some("model-b"),
+                &ts
+            )
+            .await
+            .unwrap());
+        let auto = |store: &Store| {
+            let store = store.clone();
+            let id = agent_id.0.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT reasoning_effort_auto FROM agent_session WHERE id=?",
+                )
+                .bind(id)
+                .fetch_one(store.read_pool())
+                .await
+                .unwrap()
+            }
+        };
+        assert_eq!(auto(&store).await, 1, "a landed fill is Auto-pinned");
+        let mut row = store.get_agent_session(&agent_id).await.unwrap();
+        store
+            .update_agent_session_with_preferences(&ws_id, &row, false, None, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            auto(&store).await,
+            1,
+            "an unrelated same-value rewrite keeps the mark"
+        );
+        row.reasoning_effort = Some("low".into());
+        store
+            .update_agent_session_with_preferences(&ws_id, &row, false, None, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            auto(&store).await,
+            0,
+            "an explicit same-value choice clears the mark in the same write"
+        );
+    }
+
+    /// `pin_agent_session_provider_if_null` only lands on a NULL/blank
+    /// provider (compare-and-set: a provider pinned first wins), and
+    /// `fill_agent_session_identity_if_null` only fills NULL/blank columns.
+    #[tokio::test]
+    async fn legacy_identity_writers_fill_only_unset_columns() {
+        use intent_core::now_iso;
+
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-legacy-identity".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId("agent-legacy-identity".to_string());
+        let mut session = baseline_test_session(&agent_id, &ws_id, &ts, Some("acp-live"));
+        session.provider = None;
+        session.model = None;
+        session.reasoning_effort = None;
+        store.insert_agent_session(&session).await.expect("insert");
+
+        let other = WorkspaceId("ws-other".to_string());
+        assert!(matches!(
+            store
+                .pin_agent_session_provider_if_null(&other, &agent_id, "codex", &ts)
+                .await,
+            Err(Error::NotFound(_))
+        ));
+        assert!(store
+            .pin_agent_session_provider_if_null(&ws_id, &agent_id, "codex", &ts)
+            .await
+            .unwrap());
+        assert!(
+            !store
+                .pin_agent_session_provider_if_null(&ws_id, &agent_id, "claude-code", &ts)
+                .await
+                .unwrap(),
+            "an already pinned provider is never overwritten"
+        );
+
+        assert!(!store
+            .fill_agent_session_identity_if_null(&other, &agent_id, Some("x"), Some("y"), &ts)
+            .await
+            .unwrap());
+        assert!(store
+            .fill_agent_session_identity_if_null(&ws_id, &agent_id, Some("gpt-5"), None, &ts)
+            .await
+            .unwrap());
+        assert!(store
+            .fill_agent_session_identity_if_null(
+                &ws_id,
+                &agent_id,
+                Some("other-model"),
+                Some("medium"),
+                &ts
+            )
+            .await
+            .unwrap());
+        assert!(!store
+            .fill_agent_session_identity_if_null(
+                &ws_id,
+                &agent_id,
+                Some("other-model"),
+                Some("high"),
+                &ts
+            )
+            .await
+            .unwrap());
+        let got = store.get_agent_session(&agent_id).await.unwrap();
+        assert_eq!(got.provider.as_deref(), Some("codex"));
+        assert_eq!(got.model.as_deref(), Some("gpt-5"), "set model kept");
+        assert_eq!(got.reasoning_effort.as_deref(), Some("medium"));
+        assert_eq!(got.acp_session_id.as_deref(), Some("acp-live"));
+    }
+
     /// The narrow `set_agent_session_model` writer (`agent.setModel`,
     /// monorepo#882): a cross-provider switch lands even after first real use
     /// (`acp_session_id` set) — the case `update_agent_session`'s
@@ -13690,6 +14225,189 @@ mod tests {
         assert_eq!(after.provider.as_deref(), Some("mock"));
     }
 
+    /// The narrow `failover_agent_session_provider` writer (quota failover,
+    /// PROTOCOL §5.54 Backup failover): only `provider` and `updated_at`
+    /// change — the model id and reasoning effort carry over to the backup,
+    /// as `agent.setModel` with the same model would keep them. Compare-and-
+    /// set on the provider the caller read; a wrong workspace is `NotFound`.
+    #[tokio::test]
+    async fn failover_agent_session_provider_switches_only_the_provider() {
+        use intent_core::now_iso;
+
+        use uuid::Uuid;
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-failover".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId(format!("agent-{}", Uuid::new_v4()));
+        let mut session = baseline_test_session(&agent_id, &ws_id, &ts, Some("acp-live"));
+        session.provider = Some("claude-code".to_string());
+        session.model = Some("opus".to_string());
+        session.reasoning_effort = Some("high".to_string());
+        store.insert_agent_session(&session).await.expect("insert");
+
+        let err = store
+            .failover_agent_session_provider(
+                &WorkspaceId("ws-other".to_string()),
+                &agent_id,
+                "claude-code",
+                Some("opus"),
+                "claude-code@pbackup",
+                None,
+                &now_iso(),
+            )
+            .await
+            .expect_err("cross-workspace write must not mutate");
+        assert!(matches!(err, Error::NotFound(_)), "got: {err:?}");
+
+        let landed = store
+            .failover_agent_session_provider(
+                &ws_id,
+                &agent_id,
+                "claude-code@pother",
+                Some("opus"),
+                "claude-code@pbackup",
+                None,
+                &now_iso(),
+            )
+            .await
+            .expect("stale expected provider is not an error");
+        assert!(!landed, "compare-and-set must not land on a mismatch");
+        let unchanged = store.get_agent_session(&agent_id).await.expect("get");
+        assert_eq!(unchanged.provider.as_deref(), Some("claude-code"));
+
+        // Same provider, but the model moved since the caller's read: no
+        // write, so a notice can never name a stale model.
+        let landed = store
+            .failover_agent_session_provider(
+                &ws_id,
+                &agent_id,
+                "claude-code",
+                Some("sonnet"),
+                "claude-code@pbackup",
+                None,
+                &now_iso(),
+            )
+            .await
+            .expect("stale expected model is not an error");
+        assert!(!landed, "compare-and-set covers the model too");
+        let unchanged = store.get_agent_session(&agent_id).await.expect("get");
+        assert_eq!(unchanged.provider.as_deref(), Some("claude-code"));
+
+        let updated_at = now_iso();
+        let landed = store
+            .failover_agent_session_provider(
+                &ws_id,
+                &agent_id,
+                "claude-code",
+                Some("opus"),
+                "claude-code@pbackup",
+                None,
+                &updated_at,
+            )
+            .await
+            .expect("failover after first real use");
+        assert!(landed);
+        let after = store.get_agent_session(&agent_id).await.expect("get after");
+        assert_eq!(after.provider.as_deref(), Some("claude-code@pbackup"));
+        assert_eq!(after.model.as_deref(), Some("opus"), "model id unchanged");
+        assert_eq!(after.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(after.updated_at, updated_at);
+        assert_eq!(after.acp_session_id.as_deref(), Some("acp-live"));
+        assert_eq!(after.name, "Baseline", "unrelated columns untouched");
+    }
+
+    /// The failover writer can carry one metadata key in the same statement
+    /// (the provider move and the return bookkeeping are atomic), and the
+    /// identity-guarded metadata writer refuses once a concurrent switch
+    /// moved the session, so stale bookkeeping can never land after it.
+    #[tokio::test]
+    async fn failover_bookkeeping_is_atomic_with_the_move_and_identity_guarded() {
+        use intent_core::now_iso;
+
+        use uuid::Uuid;
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-failover-meta".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let agent_id = AgentId(format!("agent-{}", Uuid::new_v4()));
+        let mut session = baseline_test_session(&agent_id, &ws_id, &ts, None);
+        session.provider = Some("claude-code".to_string());
+        session.model = Some("opus".to_string());
+        session.metadata = Some(serde_json::json!({ "keep": 1 }));
+        store.insert_agent_session(&session).await.expect("insert");
+
+        let state = r#"{"home":"claude-code","awayOn":"claude-code@pb"}"#;
+        assert!(store
+            .failover_agent_session_provider(
+                &ws_id,
+                &agent_id,
+                "claude-code",
+                Some("opus"),
+                "claude-code@pb",
+                Some(("providerReturn", state)),
+                &now_iso(),
+            )
+            .await
+            .unwrap());
+        let after = store.get_agent_session(&agent_id).await.unwrap();
+        assert_eq!(after.provider.as_deref(), Some("claude-code@pb"));
+        let metadata = after.metadata.unwrap();
+        assert_eq!(metadata["providerReturn"]["awayOn"], "claude-code@pb");
+        assert_eq!(metadata["keep"], 1, "sibling keys preserved");
+
+        // A user switch lands; stale bookkeeping for the old identity is refused.
+        store
+            .set_agent_session_model(
+                &ws_id,
+                &agent_id,
+                "opus",
+                Some("claude-code@pwork"),
+                &now_iso(),
+            )
+            .await
+            .unwrap();
+        assert!(!store
+            .set_agent_session_metadata_key_json_if_identity(
+                &ws_id,
+                &agent_id,
+                "claude-code@pb",
+                Some("opus"),
+                "providerReturn",
+                state,
+                &now_iso(),
+            )
+            .await
+            .unwrap());
+        assert!(store
+            .set_agent_session_metadata_key_json_if_identity(
+                &ws_id,
+                &agent_id,
+                "claude-code@pwork",
+                Some("opus"),
+                "providerReturn",
+                "null",
+                &now_iso(),
+            )
+            .await
+            .unwrap());
+        let cleared = store
+            .get_agent_session(&agent_id)
+            .await
+            .unwrap()
+            .metadata
+            .unwrap();
+        assert!(cleared["providerReturn"].is_null());
+    }
+
     /// `latest_agent_identity_notice` (intent-hq/intent#5737) returns the
     /// newest system `model_changed` / `provider_rehomed` row's metadata
     /// only: other system rows, user/assistant rows carrying those types,
@@ -13802,6 +14520,35 @@ mod tests {
             .expect("model_changed row");
         assert_eq!(latest["type"], "model_changed", "newest identity row wins");
         assert_eq!(latest["toProvider"], "a");
+
+        // A quota failover switch is an identity change too.
+        append(
+            &agent_id,
+            "system",
+            serde_json::json!({ "type": "provider_failover", "fromProvider": "a", "toProvider": "c" }),
+        )
+        .await;
+        let latest = store
+            .latest_agent_identity_notice(&agent_id)
+            .await
+            .expect("read")
+            .expect("provider_failover row");
+        assert_eq!(latest["type"], "provider_failover");
+        assert_eq!(latest["toProvider"], "c");
+
+        let recent = store
+            .recent_agent_identity_notices(&agent_id, 2)
+            .await
+            .expect("read");
+        let types: Vec<_> = recent.iter().map(|m| m["type"].clone()).collect();
+        assert_eq!(
+            types,
+            vec![
+                serde_json::json!("provider_failover"),
+                serde_json::json!("model_changed")
+            ],
+            "newest first, bounded, identity rows only"
+        );
     }
 
     /// monorepo#1936 regression: the spawn path's system-prompt persist is a

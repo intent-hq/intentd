@@ -8,12 +8,6 @@
 /// Domain error type for intentd.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// Bounded cancellable deletion control failure.
-    #[error("{}", .0.wire_code())]
-    NoteDelete(crate::note_delete::NoteDeleteError),
-    /// Bounded note page failure; never carries source content.
-    #[error("{}", .0.wire_code())]
-    NotePage(crate::note_page::NotePageError),
     /// Safe member recovery for a classified execution authorization error.
     /// The source preserves the owner's established error contract internally.
     #[error("{}", authorization.message())]
@@ -69,6 +63,28 @@ pub enum Error {
     /// stop matching on prose (monorepo#761).
     #[error("invalid params: cannot resolve base ref '{base_ref}'")]
     BaseRefUnresolvable { base_ref: String },
+
+    /// A guarded whole-content note write (`note.setContent` / the content
+    /// arm of `note.update` carrying `baseContentBytes`) whose base size does
+    /// not match the base the daemon resolved, or whose base is unknown
+    /// (`resolved_base_bytes: None`). Nothing is written. Surfaces as
+    /// `-32602` with `error.data = { code: "content-base-mismatch",
+    /// baseContentBytes, resolvedBaseBytes }` (protocol "Truncated note reads").
+    #[error("Content base does not match the stored note; re-read the full note and retry.")]
+    ContentBaseMismatch {
+        base_content_bytes: u64,
+        resolved_base_bytes: Option<u64>,
+    },
+
+    /// A named provider profile request failed (PROTOCOL §5.54). `data`
+    /// carries the machine-readable discriminator (`data.code`, e.g.
+    /// `invalid-params` + `fieldErrors`, `provider-profile-in-use` + `inUse`,
+    /// `provider-profile-not-found`, `provider-profiles-unreadable`) and is
+    /// passed through verbatim as `error.data`. `internal` selects `-32603`
+    /// (an unreadable profile file); otherwise `-32602`. Neither `message`
+    /// nor `data` ever carries an environment value.
+    #[error("{}", .0.message)]
+    ProviderProfile(Box<ProviderProfileFailure>),
 
     /// A `workspace.create` clone/provisioning step failed.
     /// Carries a machine-readable category plus a sanitized human-readable
@@ -180,6 +196,13 @@ pub enum Error {
     /// "source control auth error" (monorepo#2961). Surfaces as `-32603`.
     #[error("source control rate limited: {0}")]
     RateLimited(String),
+
+    /// A request forwarded to an agent's provider adapter failed (JSON-RPC
+    /// error, timeout, or the connection ended before or during the request),
+    /// e.g. `agent.workers.stop` (PROTOCOL §5.5b). Surfaces as `-32603` with
+    /// `data.code: "provider-error"`.
+    #[error("provider request failed: {0}")]
+    ProviderRequest(String),
 
     /// The bound caller lacks the capability for this operation (multiplayer
     /// w3 capability matrix: an Owner-only or administrator-only method
@@ -528,15 +551,18 @@ impl Error {
     #[must_use]
     pub fn code(&self) -> i32 {
         match self {
-            Error::NoteDelete(kind) => kind.rpc_code(),
             Error::ExecutionAuthorization { source, .. } => match source.as_ref() {
                 Error::CloneFailed { .. } | Error::SourceControlUnauthorized { .. } => source.code(),
                 _ => -32603,
             },
 
-            Error::NotePage(crate::note_page::NotePageError::Preparing | crate::note_page::NotePageError::ResourceLimit) => -32006,
-            Error::NotePage(crate::note_page::NotePageError::Stale)
-            | Error::Conflict { .. } => -32005,
+            Error::ProviderProfile(failure) => {
+                if failure.internal {
+                    -32603
+                } else {
+                    -32602
+                }
+            }
             Error::IdentityMismatch
             | Error::IdentityInUse
             | Error::HostMembershipRequired
@@ -544,8 +570,8 @@ impl Error {
             | Error::NotFound(_)
             | Error::InvalidInput(_)
             | Error::BaseRefUnresolvable { .. }
-            | Error::NotAFile { .. }
-            | Error::NotePage(_) => -32602,
+            | Error::ContentBaseMismatch { .. }
+            | Error::NotAFile { .. } => -32602,
             Error::CloneFailed { category, .. } => match category {
                 CloneErrorCategory::PathInvalid | CloneErrorCategory::DestinationExistsNonEmpty => {
                     -32602
@@ -567,13 +593,42 @@ impl Error {
             | Error::DeviceGrantUnsupported { .. }
             | Error::SourceControlUnauthorized { .. }
             | Error::RateLimited(_)
+            | Error::ProviderRequest(_)
             | Error::IdentityProof(_)
             | Error::IdentityUnverifiable { .. }
             // Unsupported: map to internal error for now
             | Error::Unsupported(_) => -32603,
+            Error::Conflict { .. } => -32005,
             Error::Forbidden(_) => -32003,
             Error::Invite(kind) => kind.code(),
         }
+    }
+}
+
+/// Payload of [`Error::ProviderProfile`], boxed to keep [`Error`] small.
+#[derive(Debug)]
+pub struct ProviderProfileFailure {
+    /// `-32603` when true (unreadable profile file); otherwise `-32602`.
+    pub internal: bool,
+    /// Human message; never carries an environment value.
+    pub message: String,
+    /// `error.data`, passed through verbatim (`data.code` plus details).
+    pub data: serde_json::Value,
+}
+
+impl Error {
+    /// Build an [`Error::ProviderProfile`].
+    #[must_use]
+    pub fn provider_profile(
+        internal: bool,
+        message: impl Into<String>,
+        data: serde_json::Value,
+    ) -> Self {
+        Self::ProviderProfile(Box::new(ProviderProfileFailure {
+            internal,
+            message: message.into(),
+            data,
+        }))
     }
 }
 

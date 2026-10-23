@@ -104,7 +104,7 @@ async fn executor_reply(socket: &mut Socket, request: Value, calls: &mut Vec<Val
 }
 async fn drive<F: Future>(socket: &mut Socket, future: F, calls: &mut Vec<Value>) -> F::Output {
     tokio::pin!(future);
-    tokio::time::timeout(Duration::from_secs(15),async {
+    tokio::time::timeout(intentd_test_support::test_timeout(Duration::from_secs(15)),async {
         loop { tokio::select! {
             result=&mut future => return result,
             message=socket.next()=> match message.unwrap().unwrap() {
@@ -124,23 +124,26 @@ async fn call(socket: &mut Socket, method: &str, params: Value, calls: &mut Vec<
         ))
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(15), async {
-        loop {
-            match socket.next().await.unwrap().unwrap() {
-                Message::Text(text) => {
-                    let v: Value = serde_json::from_str(&text).unwrap();
-                    if v["method"] == "desktop.control" {
-                        executor_reply(socket, v, calls).await;
-                    } else if v["id"] == 1001 {
-                        assert_eq!(v["jsonrpc"], "2.0");
-                        return v;
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(15)),
+        async {
+            loop {
+                match socket.next().await.unwrap().unwrap() {
+                    Message::Text(text) => {
+                        let v: Value = serde_json::from_str(&text).unwrap();
+                        if v["method"] == "desktop.control" {
+                            executor_reply(socket, v, calls).await;
+                        } else if v["id"] == 1001 {
+                            assert_eq!(v["jsonrpc"], "2.0");
+                            return v;
+                        }
                     }
+                    Message::Ping(bytes) => socket.send(Message::Pong(bytes)).await.unwrap(),
+                    _ => {}
                 }
-                Message::Ping(bytes) => socket.send(Message::Pong(bytes)).await.unwrap(),
-                _ => {}
             }
-        }
-    })
+        },
+    )
     .await
     .expect("desktop WSS RPC timed out")
 }
@@ -152,7 +155,7 @@ async fn drive_pair<F: Future>(
     bc: &mut Vec<Value>,
 ) -> F::Output {
     tokio::pin!(future);
-    tokio::time::timeout(Duration::from_secs(15),async {
+    tokio::time::timeout(intentd_test_support::test_timeout(Duration::from_secs(15)),async {
         loop {tokio::select! {
             result=&mut future=>return result,
             message=a.next()=> {if let Message::Text(text)=message.unwrap().unwrap() {let v:Value=serde_json::from_str(&text).unwrap(); if v["method"]=="desktop.control" {executor_reply(a,v,ac).await;} else {ac.push(v);}}},
@@ -387,19 +390,22 @@ async fn desktop_wss_consent_tickets_revoke_and_no_replay() {
     let prompt = if let Some(prompt) = buffered {
         prompt
     } else {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let message = socket.next().await.unwrap().unwrap();
-                if let Message::Text(text) = message {
-                    let v: Value = serde_json::from_str(&text).unwrap();
-                    if v["method"] == "events.event"
-                        && v["params"]["event"]["type"] == "desktop:permission-requested"
-                    {
-                        break v;
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                loop {
+                    let message = socket.next().await.unwrap().unwrap();
+                    if let Message::Text(text) = message {
+                        let v: Value = serde_json::from_str(&text).unwrap();
+                        if v["method"] == "events.event"
+                            && v["params"]["event"]["type"] == "desktop:permission-requested"
+                        {
+                            break v;
+                        }
                     }
                 }
-            }
-        })
+            },
+        )
         .await
         .unwrap()
     };
@@ -568,9 +574,10 @@ async fn desktop_wss_consent_tickets_revoke_and_no_replay() {
             }
         }
     };
-    let (outcome, ()) = tokio::time::timeout(Duration::from_secs(15), async {
-        tokio::join!(action, disconnect)
-    })
+    let (outcome, ()) = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(15)),
+        async { tokio::join!(action, disconnect) },
+    )
     .await
     .unwrap();
     let error = outcome.unwrap_err();
@@ -963,9 +970,10 @@ async fn desktop_wss_disconnect_execution_classification_reaches_mcp() {
                 }
             }
         };
-        let (response, ()) = tokio::time::timeout(Duration::from_secs(15), async {
-            tokio::join!(bridge.handle_message(&request), disconnect)
-        })
+        let (response, ()) = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(15)),
+            async { tokio::join!(bridge.handle_message(&request), disconnect) },
+        )
         .await
         .unwrap();
         let response = response.expect("MCP disconnect response");

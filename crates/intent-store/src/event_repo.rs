@@ -41,6 +41,9 @@ pub struct NewEvent {
 /// fields are ignored. Results are ordered newest-first (`timestamp` DESC).
 #[derive(Debug, Clone, Default)]
 pub struct EventQuery {
+    /// Human discussions are not agent context. Filter legacy durable rows in
+    /// SQL before limits/offsets, without hiding unrelated agent history.
+    pub exclude_discussion_events: bool,
     /// Guests may read only their own device events, including legacy/durable
     /// rows. Applied in SQL before limits and paging, not after fetching.
     pub client_principal_id: Option<intent_core::PrincipalId>,
@@ -234,6 +237,9 @@ impl Store {
             qb.push(")))");
         } else {
             qb.push(")");
+        }
+        if q.exclude_discussion_events {
+            qb.push(" AND event_type NOT GLOB 'discussion:*'");
         }
         if let Some(principal) = &q.client_principal_id {
             qb.push(" AND (event_type NOT IN (");

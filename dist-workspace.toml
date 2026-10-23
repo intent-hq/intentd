@@ -51,17 +51,21 @@ post-announce-jobs = ["./publish-channel-manifest"]
 # called reusable workflow requests or the run startup-fails. Overriding here
 # replaces the inherited workflow-level permissions, so contents: write must
 # be restated.
-github-custom-job-permissions = { "publish-channel-manifest" = { contents = "write", pull-requests = "read" } }
+github-custom-job-permissions = { "publish-channel-manifest" = { contents = "write", pull-requests = "read", actions = "read" } }
 # v-release.yml is hand-edited: `gh release create` always passes --prerelease
 # so every tagged release lands as an alpha Pre-release (promote-stable.yml clears
 # the flag and marks the promoted version Latest). dist has no config knob for
 # that, and `dist plan` fails the PR check on any hand edit, so the CI freshness
 # check is relaxed here. Re-apply the customization after any `dist init` /
 # `dist generate`; it is marked LOCAL CUSTOMIZATION in v-release.yml.
+# Also run python3 scripts/configure-runner-routing.py after generation.
 # Release writer concurrency is also a local customization: after generation run
 # `python3 scripts/configure-release-concurrency.py` to restore the shared lock.
 # Then run `python3 scripts/configure-optional-intel-release.py` to restore
 # release-only Intel planning, failure isolation, and validated publication targets.
+# Then run `python3 scripts/configure-release-host-network.py` to restore the
+# retried crate fetch before the offline global `dist build` and `dist host`
+# (intent-hq/intent#7639).
 # scripts/test-prerelease-cleanup-workflow.py enforces the generated block and
 # ensures the post-announce reusable workflow never reacquires the caller lock.
 allow-dirty = ["ci"]
@@ -70,28 +74,28 @@ allow-dirty = ["ci"]
 # runner image guarantees (see the file header for details).
 github-build-setup = "../dist-build-setup.yml"
 
-# Depot runs every release job. Pin host triples explicitly so cargo-dist's
+# GitHub-hosted labels are fallback keys resolved by runner-route.yml. Pin host triples so cargo-dist's
 # runner-name heuristic cannot change cross-compilation behavior. Both Apple
 # targets build on ARM64; Linux musl keeps its existing x64 glibc build host.
 [dist.github-custom-runners]
-global = "depot-ubuntu-24.04"
+global = "ubuntu-24.04"
 
 [dist.github-custom-runners.aarch64-apple-darwin]
-runner = "depot-macos-latest"
+runner = "macos-26-xlarge"
 host = "aarch64-apple-darwin"
 
 [dist.github-custom-runners.x86_64-apple-darwin]
-runner = "depot-macos-latest"
+runner = "macos-26-xlarge"
 host = "aarch64-apple-darwin"
 
 [dist.github-custom-runners.x86_64-unknown-linux-musl]
-runner = "depot-ubuntu-24.04-16"
+runner = "gh-linux-16x"
 host = "x86_64-unknown-linux-gnu"
 
 [dist.github-custom-runners.aarch64-unknown-linux-musl]
-runner = "depot-ubuntu-24.04-16"
+runner = "gh-linux-16x"
 host = "x86_64-unknown-linux-gnu"
 
 [dist.github-custom-runners.x86_64-pc-windows-msvc]
-runner = "depot-windows-2022-16"
+runner = "gh-windows-16x"
 host = "x86_64-pc-windows-msvc"

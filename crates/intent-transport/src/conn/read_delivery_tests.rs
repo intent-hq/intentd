@@ -658,10 +658,13 @@ impl Harness {
     }
 
     async fn response(&mut self) -> Value {
-        let frame = tokio::time::timeout(Duration::from_secs(5), self.rx.recv_priority())
-            .await
-            .unwrap()
-            .unwrap();
+        let frame = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            self.rx.recv_priority(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         serde_json::from_str(&frame).unwrap()
     }
 
@@ -723,11 +726,14 @@ async fn original_retirement_prevents_the_prepared_private_response() {
 }
 
 async fn until(mut ready: impl FnMut() -> bool) {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !ready() {
-            tokio::task::yield_now().await;
-        }
-    })
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            while !ready() {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
     .await
     .unwrap();
 }
@@ -1059,11 +1065,14 @@ async fn actual_uds_binding_and_listener_shutdown_preserve_original_cohorts() {
             .write_all(format!("{}\n", request("private")).as_bytes())
             .await
             .unwrap();
-        let line = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+        let line = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            lines.next_line(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
         assert_eq!(
             serde_json::from_str::<Value>(&line).unwrap()["result"]["scoped"],
             true
@@ -1088,11 +1097,14 @@ async fn actual_uds_binding_and_listener_shutdown_preserve_original_cohorts() {
             .write_all(format!("{}\n", request(path)).as_bytes())
             .await
             .unwrap();
-        let line = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+        let line = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            lines.next_line(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
         assert_eq!(
             serde_json::from_str::<Value>(&line)
                 .unwrap()
@@ -1162,17 +1174,20 @@ async fn connect_wss(port: u16, certificate: &crate::TlsCertificate, token: &str
 async fn ws_response(socket: &mut TestWebSocket) -> Value {
     use futures::StreamExt as _;
 
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match socket.next().await.unwrap().unwrap() {
-                tokio_tungstenite::tungstenite::Message::Text(text) => {
-                    return serde_json::from_str(&text).unwrap()
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            loop {
+                match socket.next().await.unwrap().unwrap() {
+                    tokio_tungstenite::tungstenite::Message::Text(text) => {
+                        return serde_json::from_str(&text).unwrap()
+                    }
+                    tokio_tungstenite::tungstenite::Message::Ping(_) => {}
+                    other => panic!("expected original response, got {other:?}"),
                 }
-                tokio_tungstenite::tungstenite::Message::Ping(_) => {}
-                other => panic!("expected original response, got {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await
     .unwrap()
 }
@@ -1381,9 +1396,12 @@ async fn actual_wss_principal_revocation_drains_ordinary_reply_but_denies_held_p
         ))
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), handler.entered.notified())
-        .await
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        handler.entered.notified(),
+    )
+    .await
+    .unwrap();
     let original = api.connections.lock().unwrap()[0].clone();
     let scope = original.scopes.lock().unwrap()[0].clone();
     assert_eq!(
@@ -1410,9 +1428,12 @@ async fn actual_wss_principal_revocation_drains_ordinary_reply_but_denies_held_p
         ))
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), revoke_reply.entered.notified())
-        .await
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        revoke_reply.entered.notified(),
+    )
+    .await
+    .unwrap();
     until(|| original.is_closed()).await;
     assert!(scope.state.lock().unwrap().retired);
     revoke_reply.release.notify_one();
@@ -1638,7 +1659,7 @@ async fn native_review_consumed_packet_faults_never_replay_primitive_or_reply() 
 #[test]
 fn native_review_companion_capability_is_explicit_and_versioned() {
     let server = crate::client::server_json(false, "linux", "fixture", "fixture", None, true);
-    assert_eq!(server["protocolVersion"], "14.1");
+    assert_eq!(server["protocolVersion"], crate::protocol::PROTOCOL_VERSION);
     assert_eq!(server["capabilities"]["gitlabCheckout"], 1);
     assert_eq!(server["capabilities"]["gitlabCheckoutRepoConfig"], 1);
     assert_eq!(server["capabilities"]["gitlabCheckoutOwnerAvatar"], 1);

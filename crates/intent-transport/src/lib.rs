@@ -54,7 +54,7 @@ fn disable_node_compile_cache() {
 }
 
 mod accept_backoff;
-mod annotation_subscription;
+mod agent_workers;
 pub mod auth;
 pub(crate) mod browser;
 pub mod catalog;

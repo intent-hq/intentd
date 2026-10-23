@@ -70,10 +70,13 @@ async fn desktop_lifecycle_explicit_release_ignores_late_environment_report() {
             assert_eq!(result, json!({"revoked":false,"reported":false}));
         };
         let ended = if during_teardown {
-            tokio::time::timeout(Duration::from_secs(10), async {
-                let (ended, ()) = tokio::join!(release, late_report);
-                ended
-            })
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(10)),
+                async {
+                    let (ended, ()) = tokio::join!(release, late_report);
+                    ended
+                },
+            )
             .await
             .unwrap()
             .unwrap()
@@ -199,17 +202,20 @@ async fn desktop_lifecycle_pending_invalidation_reports_cause_and_request() {
     );
     // A concurrent watcher may remove authority before committing the outcome.
     // The correlated resolution event is emitted after that durable commit.
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let batch = events.recv().await.unwrap();
-            if batch.iter().any(|event| {
-                event.data["requestId"] == pending["requestId"]
-                    && event.data["outcome"] == "invalidated"
-            }) {
-                break;
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                let batch = events.recv().await.unwrap();
+                if batch.iter().any(|event| {
+                    event.data["requestId"] == pending["requestId"]
+                        && event.data["outcome"] == "invalidated"
+                }) {
+                    break;
+                }
             }
-        }
-    })
+        },
+    )
     .await
     .expect("pending invalidation must durably resolve this request");
     let message = outcome(&h, "requestId", pending["requestId"].as_str().unwrap()).await;
@@ -251,10 +257,13 @@ async fn desktop_lifecycle_terminal_failure_before_grant_delivery_keeps_actual_r
     )
     .await
     .unwrap();
-    let batch = tokio::time::timeout(Duration::from_secs(10), events.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    let batch = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        events.recv(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!(batch[0].data["outcome"], "granted");
     let active = h.services.desktop.state(&h.agent);
     let DesktopState::Active { session_id, .. } = active else {
@@ -390,10 +399,13 @@ async fn desktop_lifecycle_invalid_native_result_reports_outcome_unknown_reason(
         assert_eq!(failure.detail, "Invalid native desktop result");
         assert_eq!(failure.execution.as_deref(), Some("unknown"));
         assert_eq!(h.services.desktop.state(&h.agent), DesktopState::Inactive);
-        let ended = tokio::time::timeout(Duration::from_secs(10), events.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let ended = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            events.recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(ended[0].data["sessionId"], active["sessionId"]);
         assert_eq!(ended[0].data["reason"], "outcome_unknown");
         let message = outcome(&h, "sessionId", active["sessionId"].as_str().unwrap()).await;

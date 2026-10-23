@@ -372,7 +372,7 @@ async fn both_aliases_use_original_tcp_response_admission_and_preserve_completed
             gate.release.add_permits(1);
             let mut line = String::new();
             tokio::time::timeout(
-                Duration::from_secs(10),
+                intentd_test_support::test_timeout(Duration::from_secs(10)),
                 BufReader::new(socket).read_line(&mut line),
             )
             .await

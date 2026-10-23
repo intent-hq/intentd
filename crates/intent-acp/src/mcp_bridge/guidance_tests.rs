@@ -527,6 +527,7 @@ async fn pending_guidance_preserves_ping_response_and_cancels_on_peer_disconnect
     drop(reader);
     // Observe cancellation before the independent one-second guidance budget,
     // proving disconnect tears down the producer task rather than detaching it.
+    // fixed-deadline: allow — stays under the 1s guidance PREPARE_TIMEOUT (mcp_server/repository_guidance.rs) so only the disconnect can cancel
     timeout(Duration::from_millis(500), source.cancelled.notified())
         .await
         .unwrap();

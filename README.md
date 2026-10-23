@@ -75,8 +75,8 @@ packaged and named `intentd` (built from `crates/intentd-sitter`). On the first
 default) — served from the public
 [intent-hq/intentd-releases](https://github.com/intent-hq/intentd-releases) mirror
 first, with a coded fallback to this repo (see
-[Channel manifests](#channel-manifests)) — checks for updates at startup and then every
-12–24 hours, forwards daemon CLI args verbatim, and respawns the daemon
+[Channel manifests](#channel-manifests)) — checks for updates at most once a day on
+stable (every 12–24 hours on alpha/beta; see [How updates work](#how-updates-work)), forwards daemon CLI args verbatim, and respawns the daemon
 if it crashes. Background `start` launches this same supervised `serve`; one-shot
 subcommands (`doctor`, `status`, `stop`, `call`, …) run the already-installed daemon immediately
 without checking for or installing updates. You never install the daemon binary
@@ -100,6 +100,18 @@ directly.
 > guide lives on the
 > [intent-hq/intentd-releases README](https://github.com/intent-hq/intentd-releases#readme);
 > keep the two in sync when editing this section.
+
+**Anonymous update statistics.** The sitter fetches each channel manifest through
+`https://updates.intentapp.dev/channel/<channel>.json` first. The request carries
+only the target triple, sitter version, install source (`brew` / `deb` / `script` /
+`windows` / `unknown`), check trigger (`startup` / `daily` / `idle` / `manual`), and a once-per-UTC-day flag (from a date in
+`state.json`); no IDs are sent and the IP is not stored. The endpoint answers with a
+redirect, and the sitter accepts only the official
+`github.com/intent-hq/{intentd-releases,intentd}` channel asset (then GitHub's asset
+hosts), so manifests always come from GitHub. Any failure — down, 404, slow, or an
+unexpected redirect — falls back to GitHub directly. To opt out, set
+`DO_NOT_TRACK=1` or `INTENTD_DISABLE_TELEMETRY=1`, or add `telemetry = false` to
+`<data-dir>/sitter/config.toml` (kept when `intentd sitter channel` rewrites the pin).
 
 ### Requirements
 
@@ -372,11 +384,21 @@ literally (`intentd -- restart` sends `restart` to the daemon).
 ### How updates work
 
 - On `intentd serve` the sitter checks the channel manifest at startup and then on a
-  randomized 12–24 h cadence; when a newer daemon version lands it downloads,
-  sha256-verifies, and installs it atomically, then restarts the daemon on the new
-  version. Unless the channel was pinned by flag/env at launch, each check re-reads
-  the `config.toml` pin first, so `intentd sitter channel` takes effect on a running
-  service without a restart.
+  schedule that depends on the channel; when a newer daemon version lands it
+  downloads, sha256-verifies, and installs it atomically, then restarts the daemon on
+  the new version. Unless the channel was pinned by flag/env at launch, each check
+  re-reads the `config.toml` pin first, so `intentd sitter channel` takes effect on a
+  running service without a restart.
+- **Stable** makes at most one successful automatic check per UTC day: at startup
+  if no check succeeded today (otherwise it starts the installed version with no
+  request), then a local tick about every hour checks only once the UTC day has
+  rolled over, so most installs check within the first hour after midnight UTC. A
+  failed check (offline) is not counted, so the next tick retries. A newer version
+  is staged and the daemon restarts into it the next moment no turn is in flight;
+  if it still has not 24 h after staging, the sitter forces the restart.
+  `last_check_at` in `state.json` records the last successful automatic check.
+- **Alpha and beta** keep the randomized 12–24 h cadence, which force-restarts onto
+  a found version, plus the idle-triggered checks below.
 - Manifest fetches try the public `intent-hq/intentd-releases` mirror first and fall
   back to this repo's release URLs if the mirror fetch fails (see
   [Channel manifests](#channel-manifests)). Archive URLs come from inside the chosen
@@ -384,16 +406,18 @@ literally (`intentd -- restart` sends `restart` to the daemon).
 - Automatic checks are strictly **newer-only** — they never downgrade. The only
   downgrade path is an explicit `intentd sitter channel <channel> --redownload`
   (see [Channels](#channels)).
-- Idle daemons update sooner than that cadence: once no agent has had a turn in
+- On alpha and beta, idle daemons update sooner than that cadence: once no agent has had a turn in
   flight for `updates.idleGraceSeconds` (default 120 s), the daemon asks its sitter to
   check right away (via `SIGUSR2`, at most every `updates.idleCheckIntervalMinutes`,
   default 60), the sitter stages any newer version, and the daemon restarts into it
   the next moment no turn is in flight — so an idle daemon picks up a publish within
   about an hour, while a continuously busy daemon still gets the forced 12–24 h
   restart. `updates.checkOnIdle=false` (a live setting, no restart) disables the
-  idle-triggered path and leaves only the periodic one.
-- `intentd update` forces a check right away — no waiting on the 12–24 h cadence and
-  no restart required; `intentd update --check` reports what would happen without
+  idle-triggered path and leaves only the periodic one. On stable an idle request
+  makes no network check unless the day's check is still due, but it still lets an
+  already-staged version restart.
+- `intentd update` forces a check right away on every channel (it never counts as
+  stable's daily check) — no waiting for the scheduled check and no restart required; `intentd update --check` reports what would happen without
   installing (see [Channels](#channels)).
 - One-shot subcommands (`doctor`, `status`, `stop`, `call`, …) never check for or
   install updates: they run the already-installed daemon directly. If no daemon is
@@ -609,6 +633,28 @@ daemon's `settings.update` pipeline (the same path the settings UI uses), which 
 starts the listener immediately — no restart needed. Interactively this is a `[Y/n]`
 prompt; unattended runs (non-TTY stdin) must pass `--yes`/`-y` to opt in, otherwise the
 command fails with guidance.
+
+The payload only advertises addresses another device can dial, so a daemon listening
+on loopback only (the default `server.bindAddress`, `127.0.0.1`) with no tunnel has
+nothing to advertise and `pair` refuses. When the client reaches this machine through
+a local forward on the same port instead, name the host it dials with `--host` (an IP
+address or hostname; the port always comes from the daemon): `pair` then prints the
+URL, a `Host:`/`Port:` pair, the token, and the fingerprint for that host (read via
+`server.pairingInfo`). `--host` works with `--yes`, `--rotate`, `--png`, and `--svg`.
+
+#### Windows app with intentd in WSL
+
+WSL forwards Windows `localhost` to loopback listeners inside WSL, so keep the default
+loopback bind and pair through `localhost`:
+
+```bash
+intentd start                              # standalone install; or the systemd user service
+intentd pair --yes --host localhost        # enables external connections if needed
+```
+
+In the Windows app, choose **Add device** and enter host `localhost` with the printed
+port and token (or paste the printed URL into the host field), then confirm the
+fingerprint matches the printed one.
 
 ### Durable evidence for long saved commands (Unix)
 
@@ -852,11 +898,15 @@ The design docs live in the monorepo under `docs/`:
 - [intent-hq/intent](https://github.com/intent-hq/intent) — engineering monorepo
   that mounts this repo at `packages/intentd` and holds the cross-cutting docs and tooling.
 
-### Depot CI and compiler cache
+### CI runners and compiler cache
 
-Routed jobs prefer the free self-hosted fleet and burst to Depot when the fleet
-is unavailable or busy. Depot Linux checks use 8 CPUs and coverage/release
-compilation uses 16 CPUs. Physical-host pruning remains scheduled.
+Routed jobs prefer the free self-hosted fleet and burst to the matching WarpBuild
+runner when the fleet is unavailable or busy. GitHub's larger runners are off, so
+a paid size never runs on GitHub: a job whose route job failed falls back to the
+WarpBuild label, and fork pull requests (auto-closed) get free standard runners. `check` takes an 8-CPU heavy slot but bursts as
+`gh-linux-16x` (WarpBuild 16x), as do coverage and release compilation; Windows
+uses `gh-windows-16x` (WarpBuild 16x) and Apple Silicon uses `macos-26-xlarge`
+(WarpBuild 12x). Physical-host pruning remains scheduled.
 To bypass self-hosted runners during maintenance, set the repository variable
 `CI_LINUX_RUNNER_DISABLED=true`, `CI_WINDOWS_RUNNER_DISABLED=true`, or
 `CI_MACOS_RUNNER_DISABLED=true`.
@@ -864,13 +914,16 @@ Restore the default self-hosted preference by deleting that variable with
 `gh variable delete <VARIABLE> --repo intent-hq/intentd` after recovery.
 Each override affects only its named platform.
 
-`scripts/setup-depot-sccache.py` installs pinned, checksum-verified sccache directly.
-Depot supplies its job-scoped WebDAV endpoint. Self-hosted runners use the
-`DEPOT_TOKEN` Actions secret, or existing `SCCACHE_WEBDAV_*` environment settings.
-Without credentials, compilation proceeds uncached with a notice. Rust caches
-use the managed service, without Rust cache actions or Actions cache archives.
-The build-only release-cache workflow warms release inputs; the managed smoke
-workflow verifies compiler hits across jobs and invalidation after source changes.
+`scripts/setup-sccache.py` installs pinned, checksum-verified sccache directly,
+without Rust cache actions or Actions cache archives. The organization variable
+`INTENT_SCCACHE_ENDPOINT` points every Rust CI and release build at the
+self-hosted sccache WebDAV cache, authenticated by the `INTENT_SCCACHE_TOKEN`
+secret. Every job that receives secrets (main,
+releases, the cache producer and same-repo pull requests) reads and writes it;
+`INTENT_SCCACHE_MODE=READ_ONLY` overrides that. Fork pull requests get no
+token and build uncached, as does every build when the variable is deleted.
+The build-only release-cache workflow warms release inputs; the cache smoke
+workflow (`cache-smoke.yml`) verifies compiler hits across jobs and invalidation after source changes.
 
 ### Windows CI disk cleanup
 
@@ -883,18 +936,11 @@ unknown owner or insufficient eligible space fails visibly.
 Cleanup locks existing Cargo lock files without allocating new ones, so a full
 disk can still be recovered. The legacy Cargo lock is required for each profile.
 
-Before the new workflow lands, the existing Mac maintenance dispatcher can run
-it from this branch without merging:
-
-```sh
-gh workflow run macos-prune.yml --repo intent-hq/intentd --ref ci/depot-managed-cache -f runner=5090pc -f apply=false
-# Inspect the dry-run, then use -f apply=true -f verify_build=true.
-```
-
-Once available on main, invoke `windows-prune.yml` directly. After cleanup,
+Invoke `windows-prune.yml` directly (dry-run first, then
+`-f apply=true -f verify_build=true`). After cleanup,
 verify a self-hosted Windows build before removing the maintenance routing
 variable documented above. The optional `verify_build=true` input compiles the
 real daemon with the pinned Rust toolchain after a successful apply; it has no
-effect on dry runs. It uses Depot managed sccache when `DEPOT_TOKEN` is configured.
+effect on dry runs. It uses the same self-hosted compiler cache as CI.
 The cleanup log reports actual free bytes before
 and after deletion; a rebuild repopulates any evicted debug cache.

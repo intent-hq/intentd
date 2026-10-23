@@ -15,19 +15,22 @@ async fn through_marker(
     ))
     .await
     .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        let mut received = Vec::new();
-        loop {
-            for event in events.recv().await.expect("subscription open") {
-                if event.event_type == WORKSPACE_UPDATED
-                    && event.data["changes"]["title"] == "presence notification barrier"
-                {
-                    return received;
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            let mut received = Vec::new();
+            loop {
+                for event in events.recv().await.expect("subscription open") {
+                    if event.event_type == WORKSPACE_UPDATED
+                        && event.data["changes"]["title"] == "presence notification barrier"
+                    {
+                        return received;
+                    }
+                    received.push(event);
                 }
-                received.push(event);
             }
-        }
-    })
+        },
+    )
     .await
     .expect("event delivery barrier")
 }
@@ -189,8 +192,13 @@ async fn membership_addition_presence(cached: bool, online: bool, self_removal: 
             !presence.is_empty(),
             "committed addition must notify {workspace}; cached={cached}, online={online}: {received:?}"
         );
+        // The bus carries the human roster; daemon snapshots intentionally
+        // omit discussion typing. Compare against a human with inherited access.
         let expected = with_caller(
-            Caller::Daemon,
+            Caller::Wire {
+                principal_id: f.primary.clone(),
+                host_role: HostRole::Owner,
+            },
             f.services.presence_snapshot_op(workspace.clone()),
         )
         .await

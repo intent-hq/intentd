@@ -256,19 +256,22 @@ async fn http_status(port: u16, cfg: Arc<ClientConfig>, request: &str) -> u16 {
     tls.flush().await.expect("flush");
     let mut buf = Vec::new();
     let mut byte = [0u8; 1];
-    let _ = timeout(Duration::from_secs(3), async {
-        loop {
-            match tls.read(&mut byte).await {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {
-                    buf.push(byte[0]);
-                    if buf.ends_with(b"\r\n") {
-                        break;
+    let _ = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(3)),
+        async {
+            loop {
+                match tls.read(&mut byte).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        buf.push(byte[0]);
+                        if buf.ends_with(b"\r\n") {
+                            break;
+                        }
                     }
                 }
             }
-        }
-    })
+        },
+    )
     .await;
     String::from_utf8_lossy(&buf)
         .split_whitespace()
@@ -402,14 +405,17 @@ async fn e2e_transport_full() {
     // --- graceful `intentd stop`: clean socket + pidfile, then clean restart ---
     let stop_dir = data_dir.clone();
     let stop = tokio::task::spawn_blocking(move || run_cli(&stop_dir, &["stop"]));
-    let reaped = timeout(Duration::from_secs(15), async {
-        loop {
-            if matches!(daemon.child.try_wait(), Ok(Some(_))) {
-                return true;
+    let reaped = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(15)),
+        async {
+            loop {
+                if matches!(daemon.child.try_wait(), Ok(Some(_))) {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
+        },
+    )
     .await
     .unwrap_or(false);
     assert!(reaped, "daemon did not exit after stop");
@@ -621,15 +627,18 @@ async fn e2e_idle_session_reaping() {
 
     // The idle agent must be reaped by the TTL sweep — the live registry count
     // returns to zero with no explicit `agent.stop`.
-    let reaped = timeout(Duration::from_secs(15), async {
-        loop {
-            let st = uds_rpc(&socket, 4, "system.status", json!({})).await;
-            if st["result"]["agents"].as_u64() == Some(0) {
-                return true;
+    let reaped = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(15)),
+        async {
+            loop {
+                let st = uds_rpc(&socket, 4, "system.status", json!({})).await;
+                if st["result"]["agents"].as_u64() == Some(0) {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    })
+        },
+    )
     .await
     .unwrap_or(false);
     assert!(reaped, "idle agent was not reaped by the TTL sweep");
@@ -719,5 +728,45 @@ async fn e2e_auto_vacuum_activation_on_legacy_db() {
         "startup should have activated auto_vacuum=INCREMENTAL"
     );
     pool.close().await;
+    drop(daemon);
+}
+
+/// intent-hq/intent#7256: a REAL `intentd serve` must report its own crate
+/// version from both `client.hello` (`server.version`) and `system.status`.
+/// The library crates are versioned separately by release-plz and can lag the
+/// daemon (v0.11.6 shipped with intent-transport at 0.11.5), so a library's
+/// `CARGO_PKG_VERSION` is never a valid source for the daemon version.
+#[tokio::test]
+async fn e2e_hello_and_status_report_the_intentd_crate_version() {
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let daemon = Daemon {
+        child: spawn_serve(&data_dir, "uds", &[]),
+    };
+    let socket = data_dir.join("intentd.sock");
+    assert!(
+        await_uds(&socket).await,
+        "daemon did not start (see {}/daemon.log)",
+        data_dir.display()
+    );
+
+    let hello = uds_rpc(
+        &socket,
+        1,
+        "client.hello",
+        json!({"clientId": "version-probe"}),
+    )
+    .await;
+    assert_eq!(
+        hello["result"]["server"]["version"],
+        env!("CARGO_PKG_VERSION"),
+        "client.hello: {hello}"
+    );
+    let status = uds_rpc(&socket, 2, "system.status", json!({})).await;
+    assert_eq!(
+        status["result"]["version"],
+        env!("CARGO_PKG_VERSION"),
+        "system.status: {status}"
+    );
     drop(daemon);
 }

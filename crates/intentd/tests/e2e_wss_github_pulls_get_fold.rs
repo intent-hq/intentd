@@ -528,22 +528,25 @@ async fn wss_rpc(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value 
 /// Collect the next `n` `events.event` notifications (any type), in order.
 async fn next_events(ws: &mut TlsWs, n: usize) -> Vec<Value> {
     let mut out = Vec::with_capacity(n);
-    timeout(Duration::from_secs(10), async {
-        while out.len() < n {
-            match ws.next().await.unwrap().unwrap() {
-                Message::Text(text) => {
-                    let v: Value = serde_json::from_str(&text).unwrap();
-                    if v["method"] == json!("events.event") {
-                        out.push(v["params"]["event"].clone());
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            while out.len() < n {
+                match ws.next().await.unwrap().unwrap() {
+                    Message::Text(text) => {
+                        let v: Value = serde_json::from_str(&text).unwrap();
+                        if v["method"] == json!("events.event") {
+                            out.push(v["params"]["event"].clone());
+                        }
                     }
+                    Message::Ping(p) => {
+                        let _ = ws.send(Message::Pong(p)).await;
+                    }
+                    _ => {}
                 }
-                Message::Ping(p) => {
-                    let _ = ws.send(Message::Pong(p)).await;
-                }
-                _ => {}
             }
-        }
-    })
+        },
+    )
     .await
     .unwrap_or_else(|_| panic!("timed out after {} of {n} events: {out:?}", out.len()));
     out
@@ -552,22 +555,25 @@ async fn next_events(ws: &mut TlsWs, n: usize) -> Vec<Value> {
 /// Assert no further `events.event` notification arrives within a short
 /// window (the fold writes nothing for a PR nobody references).
 async fn assert_no_events(ws: &mut TlsWs) {
-    let idle = timeout(Duration::from_millis(600), async {
-        loop {
-            match ws.next().await.unwrap().unwrap() {
-                Message::Text(text) => {
-                    let v: Value = serde_json::from_str(&text).unwrap();
-                    if v["method"] == json!("events.event") {
-                        return v["params"]["event"].clone();
+    let idle = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(600)),
+        async {
+            loop {
+                match ws.next().await.unwrap().unwrap() {
+                    Message::Text(text) => {
+                        let v: Value = serde_json::from_str(&text).unwrap();
+                        if v["method"] == json!("events.event") {
+                            return v["params"]["event"].clone();
+                        }
                     }
+                    Message::Ping(p) => {
+                        let _ = ws.send(Message::Pong(p)).await;
+                    }
+                    _ => {}
                 }
-                Message::Ping(p) => {
-                    let _ = ws.send(Message::Pong(p)).await;
-                }
-                _ => {}
             }
-        }
-    })
+        },
+    )
     .await;
     if let Ok(evt) = idle {
         panic!("unexpected event: {evt}");

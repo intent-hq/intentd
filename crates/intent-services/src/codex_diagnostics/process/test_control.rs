@@ -121,14 +121,17 @@ pub async fn next(
     stage: Stage,
     finished: bool,
 ) -> Event {
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        loop {
-            let event = receiver.recv().await.expect("cleanup event stream closed");
-            if event.stage == stage && event.finished == finished {
-                return event;
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(10)),
+        async {
+            loop {
+                let event = receiver.recv().await.expect("cleanup event stream closed");
+                if event.stage == stage && event.finished == finished {
+                    return event;
+                }
             }
-        }
-    })
+        },
+    )
     .await
     .expect("cleanup reached expected barrier")
 }

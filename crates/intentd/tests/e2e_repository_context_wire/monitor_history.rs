@@ -370,12 +370,15 @@ async fn monitor_history_real_wss_cold_original_account_and_chat() {
 }
 
 async fn wait_marker(path: &Path) {
-    timeout(Duration::from_secs(30), async {
-        while !path.exists() {
-            // timing-guard: wait for the selected daemon writer barrier
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async {
+            while !path.exists() {
+                // timing-guard: wait for the selected daemon writer barrier
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        },
+    )
     .await
     .unwrap();
 }
@@ -496,22 +499,25 @@ async fn held_socket_history(wss: bool, replace_source: bool, unchanged: bool) {
         return;
     }
     let mut received = Vec::new();
-    timeout(Duration::from_secs(15), async {
-        match &mut doc.socket {
-            Socket::Uds(stream) => {
-                stream.read_to_end(&mut received).await.unwrap();
-            }
-            Socket::Ws(socket) => {
-                while let Some(frame) = socket.next().await {
-                    match frame {
-                        Ok(Message::Text(text)) => received.extend_from_slice(text.as_bytes()),
-                        Ok(Message::Close(_)) | Err(_) => break,
-                        _ => {}
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(15)),
+        async {
+            match &mut doc.socket {
+                Socket::Uds(stream) => {
+                    stream.read_to_end(&mut received).await.unwrap();
+                }
+                Socket::Ws(socket) => {
+                    while let Some(frame) = socket.next().await {
+                        match frame {
+                            Ok(Message::Text(text)) => received.extend_from_slice(text.as_bytes()),
+                            Ok(Message::Close(_)) | Err(_) => break,
+                            _ => {}
+                        }
                     }
                 }
             }
-        }
-    })
+        },
+    )
     .await
     .unwrap();
     assert!(
@@ -741,48 +747,55 @@ async fn restart_native_daemon_mode(h: &mut Harness, endpoint: &str, abrupt: boo
         let mut control = h.uds().await;
         success(&control.rpc("system.shutdown", json!({})).await);
     }
-    timeout(Duration::from_secs(30), async {
-        loop {
-            if let Some(status) = h.child.try_wait().unwrap() {
-                if abrupt {
-                    use std::os::unix::process::ExitStatusExt;
-                    assert_eq!(
-                        status.signal(),
-                        Some(9),
-                        "original daemon was not killed: {status}"
-                    );
-                } else {
-                    assert!(
-                        status.success(),
-                        "original daemon shutdown failed: {status}"
-                    );
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async {
+            loop {
+                if let Some(status) = h.child.try_wait().unwrap() {
+                    if abrupt {
+                        use std::os::unix::process::ExitStatusExt;
+                        assert_eq!(
+                            status.signal(),
+                            Some(9),
+                            "original daemon was not killed: {status}"
+                        );
+                    } else {
+                        assert!(
+                            status.success(),
+                            "original daemon shutdown failed: {status}"
+                        );
+                    }
+                    break;
                 }
-                break;
+                // timing-guard: observe real daemon shutdown and native join
+                tokio::time::sleep(Duration::from_millis(25)).await;
             }
-            // timing-guard: observe real daemon shutdown and native join
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("original daemon did not finish shutdown");
     if abrupt {
-        timeout(Duration::from_secs(30), async {
-            loop {
-                let bytes =
-                    std::fs::read(h.dir.path().join("native-runtime/native-processes.json"))
-                        .unwrap();
-                if let Ok(processes) = serde_json::from_slice::<Value>(&bytes) {
-                    if processes.as_array().unwrap().iter().all(|p| {
-                        p["closed"] == true
-                            && !Path::new(&format!("/proc/{}", p["pid"].as_u64().unwrap())).exists()
-                    }) {
-                        break;
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(30)),
+            async {
+                loop {
+                    let bytes =
+                        std::fs::read(h.dir.path().join("native-runtime/native-processes.json"))
+                            .unwrap();
+                    if let Ok(processes) = serde_json::from_slice::<Value>(&bytes) {
+                        if processes.as_array().unwrap().iter().all(|p| {
+                            p["closed"] == true
+                                && !Path::new(&format!("/proc/{}", p["pid"].as_u64().unwrap()))
+                                    .exists()
+                        }) {
+                            break;
+                        }
                     }
+                    // timing-guard: observe original native child containment after daemon SIGKILL
+                    tokio::time::sleep(Duration::from_millis(25)).await;
                 }
-                // timing-guard: observe original native child containment after daemon SIGKILL
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-        })
+            },
+        )
         .await
         .expect("original native child survived abrupt daemon loss");
     }
@@ -919,23 +932,26 @@ async fn native_daemon_case(
     success(&client.rpc("agent.sendMessage",json!({"workspaceId":h.workspace,"agentId":agent,"content":"Ordinary daemon startup control"})).await);
     let store = Store::open(&h.dir.path().join("intentd.db")).await.unwrap();
     let model = h.dir.path().join("native-runtime/model.json");
-    timeout(Duration::from_secs(45), async {
-        loop {
-            let session = store.get_agent_session(&agent).await.unwrap();
-            if model.exists() && session.status == intent_core::AgentStatus::RuntimeIdle {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(45)),
+        async {
+            loop {
+                let session = store.get_agent_session(&agent).await.unwrap();
+                if model.exists() && session.status == intent_core::AgentStatus::RuntimeIdle {
+                    break;
+                }
+                if session.status == intent_core::AgentStatus::Error {
+                    panic!(
+                        "native daemon startup failed: {:?}\n{}",
+                        session.status,
+                        std::fs::read_to_string(h.dir.path().join("daemon.log")).unwrap()
+                    );
+                }
+                // timing-guard: wait for actual daemon provider turn completion
+                tokio::time::sleep(Duration::from_millis(25)).await;
             }
-            if session.status == intent_core::AgentStatus::Error {
-                panic!(
-                    "native daemon startup failed: {:?}\n{}",
-                    session.status,
-                    std::fs::read_to_string(h.dir.path().join("daemon.log")).unwrap()
-                );
-            }
-            // timing-guard: wait for actual daemon provider turn completion
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("native daemon turn did not complete");
     let session = store.get_agent_session(&agent).await.unwrap();
@@ -1015,23 +1031,26 @@ async fn native_daemon_case(
         };
         if deliver_monitor {
             *account.review_state.lock().unwrap() = "merged";
-            timeout(Duration::from_secs(90), async {
-                loop {
-                    let current: Value =
-                        serde_json::from_slice(&std::fs::read(&model).unwrap()).unwrap();
-                    let row = store.get_pr_monitor(&rows[0].monitor_id).await.unwrap();
-                    let session = store.get_agent_session(&agent).await.unwrap();
-                    if current.as_array().unwrap().len() >= 3
-                        && row.pending_changes.is_empty()
-                        && session.status == intent_core::AgentStatus::RuntimeIdle
-                    {
-                        requests = current;
-                        break;
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(90)),
+                async {
+                    loop {
+                        let current: Value =
+                            serde_json::from_slice(&std::fs::read(&model).unwrap()).unwrap();
+                        let row = store.get_pr_monitor(&rows[0].monitor_id).await.unwrap();
+                        let session = store.get_agent_session(&agent).await.unwrap();
+                        if current.as_array().unwrap().len() >= 3
+                            && row.pending_changes.is_empty()
+                            && session.status == intent_core::AgentStatus::RuntimeIdle
+                        {
+                            requests = current;
+                            break;
+                        }
+                        // timing-guard: observe actual scheduled forge poll and native delivery completion
+                        tokio::time::sleep(Duration::from_millis(25)).await;
                     }
-                    // timing-guard: observe actual scheduled forge poll and native delivery completion
-                    tokio::time::sleep(Duration::from_millis(25)).await;
-                }
-            })
+                },
+            )
             .await
             .expect("original scheduled monitor did not reach native model");
             if let Some(case) = live_hold {
@@ -1040,17 +1059,20 @@ async fn native_daemon_case(
                 return;
             }
             if let Some((capable, id)) = live_chat.as_mut() {
-                let frames = timeout(Duration::from_secs(5), async {
-                    let mut frames = Vec::new();
-                    loop {
-                        let frame = push(capable, id).await;
-                        let found = frame.to_string().contains("pr_monitor_wake");
-                        frames.push(frame);
-                        if found {
-                            return frames;
+                let frames = timeout(
+                    intentd_test_support::test_timeout(Duration::from_secs(5)),
+                    async {
+                        let mut frames = Vec::new();
+                        loop {
+                            let frame = push(capable, id).await;
+                            let found = frame.to_string().contains("pr_monitor_wake");
+                            frames.push(frame);
+                            if found {
+                                return frames;
+                            }
                         }
-                    }
-                })
+                    },
+                )
                 .await
                 .expect("qualified live chat did not receive persisted monitor wake");
                 let update = frames.last().unwrap();
@@ -1177,17 +1199,20 @@ async fn native_daemon_case(
             authorize(&mut fresh, "pat-second").await;
             let response=fresh.rpc("agent.sendMessage",json!({"workspaceId":h.workspace,"agentId":agent,"content":"Replacement account must not consume private history"})).await;
             if response.get("error").is_none() {
-                timeout(Duration::from_secs(45), async {
-                    loop {
-                        let current = store.get_agent_session(&agent).await.unwrap();
-                        if current.status == intent_core::AgentStatus::Error {
-                            break;
+                timeout(
+                    intentd_test_support::test_timeout(Duration::from_secs(45)),
+                    async {
+                        loop {
+                            let current = store.get_agent_session(&agent).await.unwrap();
+                            if current.status == intent_core::AgentStatus::Error {
+                                break;
+                            }
+                            assert!(!model.exists(), "replacement account reached native model");
+                            // timing-guard: wait for original private admission refusal through manager
+                            tokio::time::sleep(Duration::from_millis(25)).await;
                         }
-                        assert!(!model.exists(), "replacement account reached native model");
-                        // timing-guard: wait for original private admission refusal through manager
-                        tokio::time::sleep(Duration::from_millis(25)).await;
-                    }
-                })
+                    },
+                )
                 .await
                 .expect("replacement account did not receive a private admission refusal");
             }
@@ -1226,22 +1251,25 @@ async fn native_daemon_case(
         }
         authorize(&mut fresh, "stored-pat").await;
         success(&fresh.rpc("agent.sendMessage",json!({"workspaceId":h.workspace,"agentId":agent,"content":"Ordinary followup after cold daemon restart"})).await);
-        timeout(Duration::from_secs(45), async {
-            loop {
-                let current = store.get_agent_session(&agent).await.unwrap();
-                if model.exists() && current.status == intent_core::AgentStatus::RuntimeIdle {
-                    break;
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(45)),
+            async {
+                loop {
+                    let current = store.get_agent_session(&agent).await.unwrap();
+                    if model.exists() && current.status == intent_core::AgentStatus::RuntimeIdle {
+                        break;
+                    }
+                    assert_ne!(
+                        current.status,
+                        intent_core::AgentStatus::Error,
+                        "restarted private LOAD failed: {}",
+                        std::fs::read_to_string(h.dir.path().join("daemon-restarted.log")).unwrap()
+                    );
+                    // timing-guard: actual restarted daemon LOAD and ordinary turn completion
+                    tokio::time::sleep(Duration::from_millis(25)).await;
                 }
-                assert_ne!(
-                    current.status,
-                    intent_core::AgentStatus::Error,
-                    "restarted private LOAD failed: {}",
-                    std::fs::read_to_string(h.dir.path().join("daemon-restarted.log")).unwrap()
-                );
-                // timing-guard: actual restarted daemon LOAD and ordinary turn completion
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-        })
+            },
+        )
         .await
         .expect("restarted private LOAD did not complete");
         let replay: Value = serde_json::from_slice(&std::fs::read(&model).unwrap()).unwrap();

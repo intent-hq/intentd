@@ -2222,7 +2222,8 @@ async fn opencode_cli_timeout_kills_child_and_reports_timeout() {
         .parse()
         .expect("pid");
     let pid = nix::unistd::Pid::from_raw(pid);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now()
+        + intentd_test_support::test_timeout(std::time::Duration::from_secs(5));
     while nix::sys::signal::kill(pid, None).is_ok() {
         assert!(
             std::time::Instant::now() < deadline,
@@ -2466,6 +2467,30 @@ fn auth_required_detection() {
     assert!(is_auth_required_error(-32000, "please sign in first"));
     assert!(!is_auth_required_error(-32000, "internal error"));
     assert!(!is_auth_required_error(0, "model not found"));
+}
+
+#[test]
+fn auth_required_detection_recognizes_claude_expired_oauth() {
+    for message in [
+        "Internal error: Failed to authenticate: OAuth session expired and could not be refreshed",
+        "Failed to authenticate: OAuth session expired and could not be refreshed",
+        "FAILED TO AUTHENTICATE: OAUTH SESSION EXPIRED AND COULD NOT BE REFRESHED",
+    ] {
+        assert!(is_auth_required_error(-32603, message), "{message}");
+    }
+}
+
+#[test]
+fn auth_required_detection_rejects_unrelated_expiry() {
+    for message in [
+        "Internal error",
+        "session expired",
+        "tool execution deadline expired",
+        "Failed to refresh model catalog",
+        "OAuth callback listener failed to start",
+    ] {
+        assert!(!is_auth_required_error(-32603, message), "{message}");
+    }
 }
 
 #[test]

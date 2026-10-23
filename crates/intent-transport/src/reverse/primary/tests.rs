@@ -66,10 +66,13 @@ async fn dispatch_and_reply(
                 .await
         }
     });
-    let frame = tokio::time::timeout(Duration::from_millis(500), rx.recv())
-        .await
-        .expect("frame arrives")
-        .expect("outbound frame");
+    let frame = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(500)),
+        rx.recv(),
+    )
+    .await
+    .expect("frame arrives")
+    .expect("outbound frame");
     let value: serde_json::Value = serde_json::from_str(&frame).expect("json");
     let id = value
         .get("id")

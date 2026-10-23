@@ -469,9 +469,12 @@ async fn secret_wait_cannot_outlive_stage_retirement_or_directory_replacement() 
         *bridge.secrets.pause.lock().unwrap() = Some((entered.clone(), release.clone()));
         let owner = bridge.clone();
         let pending = tokio::spawn(async move { owner.token(&callback, false).await });
-        tokio::time::timeout(Duration::from_secs(2), entered.notified())
-            .await
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            entered.notified(),
+        )
+        .await
+        .unwrap();
         match variant {
             0 => bridge.rig.retirement.retire(),
             1 => {
@@ -513,9 +516,12 @@ async fn retirement_during_authority_read_cannot_release_a_secret() {
     *bridge.rig.source.pause.lock().unwrap() = Some((entered.clone(), release.clone()));
     let owner = bridge.clone();
     let pending = tokio::spawn(async move { owner.token(&callback, false).await });
-    tokio::time::timeout(Duration::from_secs(2), entered.notified())
-        .await
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        entered.notified(),
+    )
+    .await
+    .unwrap();
     bridge.rig.retirement.retire();
     release.notify_one();
     assert!(matches!(

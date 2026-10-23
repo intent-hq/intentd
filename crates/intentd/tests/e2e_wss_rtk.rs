@@ -177,11 +177,14 @@ async fn wss_rpc(
 
     // Loop until we receive the response matching our request id, skipping Ping/Pong
     loop {
-        let msg = timeout(Duration::from_secs(10), ws.next())
-            .await
-            .expect("ws rpc timeout")
-            .expect("ws closed")
-            .expect("ws error");
+        let msg = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            ws.next(),
+        )
+        .await
+        .expect("ws rpc timeout")
+        .expect("ws closed")
+        .expect("ws error");
         if let Message::Text(text) = msg {
             let v: Value = serde_json::from_str(&text).expect("invalid json");
             if v["id"] == id {
@@ -199,9 +202,12 @@ async fn wss_event(
     secs: u64,
 ) -> Value {
     loop {
-        let next = timeout(Duration::from_secs(secs), ws.next())
-            .await
-            .expect("wss event timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(secs)),
+            ws.next(),
+        )
+        .await
+        .expect("wss event timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");

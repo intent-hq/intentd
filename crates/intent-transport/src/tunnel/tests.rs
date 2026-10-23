@@ -115,10 +115,13 @@ impl ConnectHarness {
             client,
         };
         let started = Instant::now();
-        tokio::time::timeout(Duration::from_secs(1), first_poll)
-            .await
-            .expect("relay starts")
-            .expect("connect polled");
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(1)),
+            first_poll,
+        )
+        .await
+        .expect("relay starts")
+        .expect("connect polled");
         assert_eq!(Instant::now(), started, "readiness must not advance time");
         harness
     }
@@ -139,28 +142,35 @@ impl ConnectHarness {
     }
 
     async fn receive(&mut self) -> Frame {
-        let outbound = tokio::time::timeout(Duration::from_secs(1), self.out_rx.recv())
-            .await
-            .expect("relay produces a frame")
-            .expect("relay output remains open");
+        let outbound = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(1)),
+            self.out_rx.recv(),
+        )
+        .await
+        .expect("relay produces a frame")
+        .expect("relay output remains open");
         assert!(send_outbound_frame(&mut self.sink, &mut self.streams, outbound).await);
-        let Message::Binary(bytes) =
-            tokio::time::timeout(Duration::from_secs(1), self.client.next())
-                .await
-                .expect("outbound frame reaches the WebSocket")
-                .unwrap()
-                .unwrap()
-        else {
+        let Message::Binary(bytes) = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(1)),
+            self.client.next(),
+        )
+        .await
+        .expect("outbound frame reaches the WebSocket")
+        .unwrap()
+        .unwrap() else {
             panic!("expected binary tunnel frame");
         };
         Frame::decode(&bytes).unwrap()
     }
 
     async fn assert_terminal(&mut self) {
-        tokio::time::timeout(Duration::from_secs(1), &mut self.relay)
-            .await
-            .expect("failed connect finishes")
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(1)),
+            &mut self.relay,
+        )
+        .await
+        .expect("failed connect finishes")
+        .unwrap();
         self.dropped.try_recv().expect("connect future dropped");
         assert!(self.streams.is_empty(), "terminal frame frees stream id");
         assert!(
@@ -265,18 +275,21 @@ async fn connect_success_before_deadline_relays() {
         "old connect deadline cannot close success"
     );
     tokio::time::resume();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        assert!(forward_to_stream(&mut t.sink, &mut t.streams, 7, data(vec![42])).await);
-        assert_eq!(peer.read_u8().await.unwrap(), 42);
-        peer.write_u8(42).await.unwrap();
-        assert_eq!(
-            t.receive().await,
-            Frame::Data {
-                stream_id: 7,
-                payload: vec![42]
-            },
-        );
-    })
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            assert!(forward_to_stream(&mut t.sink, &mut t.streams, 7, data(vec![42])).await);
+            assert_eq!(peer.read_u8().await.unwrap(), 42);
+            peer.write_u8(42).await.unwrap();
+            assert_eq!(
+                t.receive().await,
+                Frame::Data {
+                    stream_id: 7,
+                    payload: vec![42]
+                },
+            );
+        },
+    )
     .await
     .expect("real TCP echo after the connect deadline");
     t.relay.abort();
@@ -352,7 +365,7 @@ async fn full_stream_queue_closes_only_that_stream() {
                 .unwrap();
         }
         assert!(tokio::time::timeout(
-            Duration::from_secs(1),
+            intentd_test_support::test_timeout(Duration::from_secs(1)),
             forward_to_stream(&mut sink, &mut streams, 1, message),
         )
         .await
@@ -363,12 +376,14 @@ async fn full_stream_queue_closes_only_that_stream() {
             .await
             .expect_err("blocked relay aborted")
             .is_cancelled());
-        let Message::Binary(bytes) = tokio::time::timeout(Duration::from_secs(1), client.next())
-            .await
-            .expect("stream CLOSE must arrive promptly")
-            .expect("stream CLOSE message")
-            .expect("read stream CLOSE")
-        else {
+        let Message::Binary(bytes) = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(1)),
+            client.next(),
+        )
+        .await
+        .expect("stream CLOSE must arrive promptly")
+        .expect("stream CLOSE message")
+        .expect("read stream CLOSE") else {
             panic!("expected stream CLOSE");
         };
         assert_eq!(
@@ -959,18 +974,11 @@ async fn inbound_byte_budget_is_shared_and_released() {
     streams.remove(&1).unwrap().abort.abort();
 }
 
-/// Deadline for one step of progress by the code under test, scaled for slow
-/// environments (coverage runs export `INTENTD_TEST_TIMEOUT_MULTIPLIER`);
-/// the multiplier is never below 1.0, non-finite values are ignored, and an
-/// out-of-range product saturates instead of panicking.
+/// Deadline for one step of progress by the code under test: 5s scaled for
+/// slow environments (coverage runs export `INTENTD_TEST_TIMEOUT_MULTIPLIER`)
+/// via the shared [`intentd_test_support::test_timeout`].
 fn deadline() -> Duration {
-    let multiplier = std::env::var("INTENTD_TEST_TIMEOUT_MULTIPLIER")
-        .ok()
-        .and_then(|s| s.parse::<f64>().ok())
-        .filter(|m| m.is_finite())
-        .unwrap_or(1.0)
-        .max(1.0);
-    Duration::try_from_secs_f64(5.0 * multiplier).unwrap_or(Duration::MAX)
+    intentd_test_support::test_timeout(Duration::from_secs(5))
 }
 
 /// Poll `ready` on a short interval until it holds or `deadline()` passes;
@@ -1258,12 +1266,13 @@ async fn recv_data_bytes(
     let mut received = 0;
     let mut chunks = Vec::new();
     while received < expected {
-        let outbound = tokio::time::timeout(Duration::from_secs(5), out_rx.recv())
-            .await
-            .unwrap_or_else(|_| {
-                panic!("relay stalled after {received} of {expected} granted bytes")
-            })
-            .expect("relay alive");
+        let outbound = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            out_rx.recv(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("relay stalled after {received} of {expected} granted bytes"))
+        .expect("relay alive");
         match outbound.frame {
             Frame::Data {
                 stream_id: 1,
@@ -1324,10 +1333,13 @@ async fn credit_replenishment_resumes_exactly_the_granted_bytes() {
         out_tx,
         TunnelLimits::default(),
     ));
-    let opened = tokio::time::timeout(Duration::from_secs(5), out_rx.recv())
-        .await
-        .expect("OPEN_OK within the deadline")
-        .expect("relay alive");
+    let opened = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        out_rx.recv(),
+    )
+    .await
+    .expect("OPEN_OK within the deadline")
+    .expect("relay alive");
     assert_eq!(opened.frame, Frame::OpenOk { stream_id: 1 });
     let window = usize::try_from(TUNNEL_INITIAL_CREDIT_BYTES).unwrap();
     recv_data_bytes(&mut out_rx, window).await;
@@ -1427,10 +1439,13 @@ async fn starved_relay_with(
             }
         }
     });
-    let opened = tokio::time::timeout(Duration::from_secs(5), out_rx.recv())
-        .await
-        .expect("OPEN_OK within the deadline")
-        .expect("relay alive");
+    let opened = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        out_rx.recv(),
+    )
+    .await
+    .expect("OPEN_OK within the deadline")
+    .expect("relay alive");
     assert_eq!(opened.frame, Frame::OpenOk { stream_id: 1 });
     StarvedRelay {
         relay,
@@ -1485,10 +1500,13 @@ async fn half_closed_zero_credit_stream_survives_and_forwards_eof_on_grant() {
     );
     assert!(!t.relay.is_finished());
     t.credit.grant(1);
-    let eof = tokio::time::timeout(Duration::from_secs(5), t.out_rx.recv())
-        .await
-        .expect("deferred EOF forwarded once credit returns")
-        .expect("relay alive");
+    let eof = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        t.out_rx.recv(),
+    )
+    .await
+    .expect("deferred EOF forwarded once credit returns")
+    .expect("relay alive");
     assert_eq!(eof.frame, Frame::Eof { stream_id: 1 });
     let next = tokio::time::timeout(STARVATION_IDLE * 2, t.out_rx.recv())
         .await
@@ -1522,10 +1540,13 @@ async fn starved_stream_with_waiting_output_closes_after_idle_timeout() {
         "closed after {:?}, before the starvation deadline",
         exhausted_at.elapsed()
     );
-    tokio::time::timeout(Duration::from_secs(5), t.relay)
-        .await
-        .expect("relay task ends with its CLOSE")
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        t.relay,
+    )
+    .await
+    .expect("relay task ends with its CLOSE")
+    .unwrap();
 }
 
 /// A client `CREDIT` cancels the pending starvation deadline: grants spaced
@@ -2000,10 +2021,13 @@ async fn blocked_sink_client_stalls_only_its_own_stream_at_the_credit_window() {
     drop(cmd_tx);
     drop(client_sink);
     drop(client_stream);
-    tokio::time::timeout(Duration::from_secs(5), connection)
-        .await
-        .expect("connection loop ends once its command channel closes")
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        connection,
+    )
+    .await
+    .expect("connection loop ends once its command channel closes")
+    .unwrap();
     reply_producer.abort();
     echo_peer.abort();
 }
