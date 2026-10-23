@@ -129,6 +129,32 @@ class ReleaseNetwork(unittest.TestCase):
             with self.subTest(name), self.assertRaises(ValueError):
                 configure.configure(template)
 
+    def test_new_unconfigured_step_next_to_configured_block_is_rejected(self):
+        configured = configure.configure(GENERATED)
+        host_start = '  # Determines if we should publish/announce\n'
+        drifted = {
+            'build-global-artifacts': configured.replace(
+                host_start, configure.GLOBAL_STEP + '        run: echo new\n' + host_start),
+            'host': configured + configure.HOST_STEP + '        run: echo new\n',
+        }
+        for job, text in drifted.items():
+            self.assertNotEqual(text, configured, job)
+            with self.subTest(job), self.assertRaises(ValueError):
+                configure.configure(text)
+
+    def test_search_is_bounded_to_each_job_in_the_jobs_block(self):
+        # host as the last step of its job: the next job's header-level env must
+        # not be mistaken for the host step's env.
+        later = '  announce:\n    needs: [host]\n    env:\n      GH_TOKEN: token\n    steps:\n      - run: echo\n'
+        once = configure.configure(GENERATED + later)
+        self.assertEqual(jobs(once)['announce'], jobs('jobs:\n' + later)['announce'])
+        self.assertEqual(jobs(once)['host']['steps'][2]['env'], {'CARGO_NET_OFFLINE': 'true'})
+        # Same-named keys outside `jobs:` (here under `on:`) are not jobs.
+        triggers = 'on:\n  host:\n    x: 1\n  build-global-artifacts:\n    x: 1\n'
+        self.assertEqual(configure.configure(triggers + GENERATED), triggers + once.split(later)[0])
+        with self.assertRaises(ValueError):
+            configure.configure(GENERATED.replace('jobs:\n', 'workflows:\n'))
+
     def test_existing_step_env_is_rejected_not_duplicated(self):
         env = '        env:\n          FOO: bar\n'
         run = '        shell: bash\n        run: |\n'

@@ -36,42 +36,53 @@ GLOBAL_CONFIGURED = (
     '      # python3 scripts/configure-release-host-network.py (source of this block).\n'
     + FETCH_STEP + GLOBAL_STEP + OFFLINE_ENV
 )
+HOST_JOB = 'host'
+JOBS = re.compile(r'^jobs:\n', re.MULTILINE)
+TOP_LEVEL_KEY = re.compile(r'^[^\s#]', re.MULTILINE)
 JOB_HEADER = re.compile(r'^  [A-Za-z0-9_-]+:\n', re.MULTILINE)
 
 
-def _configure_step(text, step, configured, what):
-    """Replace the one `step` header in text with `configured`; text is a job or the whole workflow."""
-    if configured in text:
-        return text
-    if text.count(step) != 1:
+def _job_span(text, job):
+    """Return the [start, end) span of `job` within the top-level `jobs:` mapping."""
+    jobs = list(JOBS.finditer(text))
+    if len(jobs) != 1:
+        raise ValueError('cargo-dist template changed; expected exactly one top-level `jobs:`')
+    body = jobs[0].end()
+    after = TOP_LEVEL_KEY.search(text, body)
+    jobs_end = len(text) if after is None else after.start()
+    header = f'  {job}:\n'
+    headers = [m for m in JOB_HEADER.finditer(text, body, jobs_end)]
+    starts = [i for i, m in enumerate(headers) if m.group() == header]
+    if len(starts) != 1:
+        raise ValueError(f'cargo-dist template changed; expected exactly one `{job}` job')
+    i = starts[0]
+    end = headers[i + 1].start() if i + 1 < len(headers) else jobs_end
+    return headers[i].start(), end
+
+
+def _configure_job(text, job_name, step, configured, what):
+    """Replace the one `step` header inside `job_name` with `configured`, failing loudly on drift."""
+    start, end = _job_span(text, job_name)
+    job = text[start:end]
+    if job.count(step) != 1:
         raise ValueError(f'cargo-dist template changed; expected exactly one {what} bash step')
-    start = text.index(step) + len(step)
-    following = text.find('\n      - ', start)
-    body = text[start:] if following < 0 else text[start:following]
+    if configured in job:
+        return text
+    step_start = job.index(step) + len(step)
+    following = job.find('\n      - ', step_start)
+    body = job[step_start:] if following < 0 else job[step_start:following]
     if '\n        env:' in '\n' + body:
         raise ValueError(f'cargo-dist template changed; the {what} step already has env: '
                          '— merge CARGO_NET_OFFLINE by hand')
-    return text.replace(step, configured, 1)
-
-
-def _job_span(text, job):
-    header = f'  {job}:\n'
-    starts = [m.start() for m in JOB_HEADER.finditer(text) if m.group() == header]
-    if len(starts) != 1:
-        raise ValueError(f'cargo-dist template changed; expected exactly one `{job}` job')
-    start = starts[0]
-    following = JOB_HEADER.search(text, start + len(header))
-    return start, len(text) if following is None else following.start()
+    return text[:start] + job.replace(step, configured, 1) + text[end:]
 
 
 def configure_host(text):
-    return _configure_step(text, HOST_STEP, HOST_CONFIGURED, '`- id: host`')
+    return _configure_job(text, HOST_JOB, HOST_STEP, HOST_CONFIGURED, '`- id: host`')
 
 
 def configure_global(text):
-    start, end = _job_span(text, GLOBAL_JOB)
-    job = _configure_step(text[start:end], GLOBAL_STEP, GLOBAL_CONFIGURED, f'{GLOBAL_JOB} `- id: cargo-dist`')
-    return text[:start] + job + text[end:]
+    return _configure_job(text, GLOBAL_JOB, GLOBAL_STEP, GLOBAL_CONFIGURED, f'{GLOBAL_JOB} `- id: cargo-dist`')
 
 
 def configure(text):
