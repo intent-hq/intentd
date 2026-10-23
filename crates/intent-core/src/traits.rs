@@ -7772,6 +7772,23 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// Record that `agent_id` started (or restarted) run `run_id` of a saved
+    /// script through `ws.script.start` / `ws.script.restart`. Attribution
+    /// only: if the agent's turn later ends while that command-mode run is
+    /// still live and nothing watches it, the daemon auto-arms a script
+    /// monitor so the agent is woken when the run finishes. In-memory and
+    /// best-effort; the default implementation ignores the record.
+    fn script_note_agent_start(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        script_id: String,
+        run_id: String,
+    ) -> BoxFuture<'_, Result<()>> {
+        let _ = (workspace_id, agent_id, script_id, run_id);
+        Box::pin(async { Ok(()) })
+    }
+
     /// `script.stop`: stop a running script (cancels pending auto-restart);
     /// returns `{ ok, scriptId }` (PROTOCOL §5.8). Workspace-scoped.
     fn script_stop(

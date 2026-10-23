@@ -3252,6 +3252,7 @@ mod tests {
     include!("script_ops/lifecycle_tests.rs");
     include!("script_ops/retirement_tests.rs");
     include!("script_ops/monitor_tests.rs");
+    include!("script_ops/auto_wake_tests.rs");
     include!("script_ops/snapshot_tests.rs");
     include!("script_ops/output_tests.rs");
     include!("script_ops/cleanup_tests.rs");

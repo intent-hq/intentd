@@ -2538,6 +2538,11 @@ async fn cmd_serve_owned(
     // `Linked-Note-Id:` trailers via `git_agent_commit`. No-op-safe without an
     // event bus. Aborted on clean shutdown.
     let auto_commit_loop = startup_work.spawn(|| services.spawn_auto_commit_loop());
+    // Script wake guard: when an agent's turn ends while a command-mode
+    // script it started is still running and unwatched, auto-arm a script
+    // monitor so the agent is woken with the run's result. Aborted on clean
+    // shutdown.
+    let script_wake_guard_loop = startup_work.spawn(|| services.spawn_script_wake_guard_loop());
     // Agent-locks recompute worker (§5.19/§6.5): watch agent lifecycle, task
     // status, auto-commit policy, and tracked-change events and publish the
     // per-workspace `changes:agent-locks` snapshot when it changes. No-op-safe
@@ -3229,6 +3234,8 @@ async fn cmd_serve_owned(
     let _ = completion_delivery.await;
     auto_commit_loop.abort();
     let _ = auto_commit_loop.await;
+    script_wake_guard_loop.abort();
+    let _ = script_wake_guard_loop.await;
     agent_locks_loop.abort();
     let _ = agent_locks_loop.await;
     tracked_changes_sweep.abort();

@@ -250,6 +250,7 @@ mod script_monitor;
 mod script_ops;
 mod script_output_cleanup;
 mod script_output_store;
+mod script_wake_guard;
 pub mod worktree_presence;
 pub use script_ops::CommandScriptActivity;
 mod search_ops;
@@ -740,6 +741,9 @@ pub struct Services {
     /// One bounded-backoff owner per child deferred by a pending script wake
     /// or an unreadable outbox. Generations prevent losing a racing deferral.
     pending_completion_retries: Arc<Mutex<HashMap<AgentId, u64>>>,
+    /// Agent-started script runs awaiting their starter's next turn end
+    /// (see [`script_wake_guard`]). In-memory: runs do not survive a restart.
+    script_starters: Arc<Mutex<HashMap<AgentId, Vec<script_wake_guard::StartedRun>>>>,
     /// Delegation-group ids with an active aggregated-wake retry task.
     completion_group_delivery_retries: Arc<Mutex<HashSet<String>>>,
     /// Per-agent consecutive-identical-terminal-failure streak (monorepo#840):
@@ -1702,6 +1706,7 @@ impl Services {
             provider_preparation: Arc::default(),
             completion_delivery_retries: Arc::new(Mutex::new(HashMap::new())),
             pending_completion_retries: Arc::new(Mutex::new(HashMap::new())),
+            script_starters: Arc::new(Mutex::new(HashMap::new())),
             completion_group_delivery_retries: Arc::new(Mutex::new(HashSet::new())),
             agent_failure_streaks: Arc::new(Mutex::new(HashMap::new())),
             pending_terminal_error: Arc::new(Mutex::new(HashMap::new())),
@@ -21199,6 +21204,19 @@ impl WorkspaceApi for Services {
             self.require_saved_script_operator(&workspace_id, &script_id, "script.start")
                 .await?;
             mgr.start(&workspace_id, &script_id).await
+        })
+    }
+
+    fn script_note_agent_start(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        script_id: String,
+        run_id: String,
+    ) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            self.record_agent_script_start(&workspace_id, &agent_id, &script_id, &run_id);
+            Ok(())
         })
     }
 

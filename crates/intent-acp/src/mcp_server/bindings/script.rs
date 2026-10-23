@@ -126,9 +126,17 @@ pub(crate) async fn dispatch(
         "restore" => archive(api, ws, args, false).await,
         "create" => create(api, ws, args).await,
         "remove" => remove(api, ws, args).await,
-        "start" => start(api, ws, args).await,
+        "start" => {
+            let reply = start(api, ws, args).await?;
+            note_agent_start(api, ws, caller, args, &reply).await;
+            Ok(reply)
+        }
         "stop" => stop(api, ws, args).await,
-        "restart" => restart(api, ws, args).await,
+        "restart" => {
+            let reply = restart(api, ws, args).await?;
+            note_agent_start(api, ws, caller, args, &reply).await;
+            Ok(reply)
+        }
         "output" => output(api, ws, args).await,
         "status" => status(api, ws, args).await,
         "run" => run(api, ws, budget, args).await,
@@ -143,6 +151,34 @@ fn page_options(args: &Value) -> Result<Value, String> {
     let mut options = args.clone();
     options["view"] = Value::String("summary".into());
     Ok(options)
+}
+
+/// Attribute an agent-started run so the daemon can auto-arm a completion
+/// wake if the agent's turn ends while the run is still live and unwatched.
+/// Best-effort: a failed record never fails the start the agent asked for.
+async fn note_agent_start(
+    api: &Arc<dyn WorkspaceApi>,
+    ws: &WorkspaceId,
+    caller: Option<&AgentId>,
+    args: &Value,
+    reply: &Value,
+) {
+    let (Some(agent), Ok(script_id), Some(run_id)) = (
+        caller,
+        req_str(args, "scriptId"),
+        reply
+            .get("runId")
+            .and_then(Value::as_str)
+            .filter(|r| !r.is_empty()),
+    ) else {
+        return;
+    };
+    if let Err(error) = api
+        .script_note_agent_start(ws.clone(), agent.clone(), script_id, run_id.to_owned())
+        .await
+    {
+        tracing::debug!(%error, "script start attribution failed");
+    }
 }
 
 fn monitor_owner(caller: Option<&AgentId>) -> Result<AgentId, String> {
