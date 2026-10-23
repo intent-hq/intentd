@@ -5810,27 +5810,20 @@ impl Services {
         // `session/new`, and replays history as `<supervisor>` XML.
         let provider = model_provider;
         let workspace_id = session.workspace_id;
-        // Recorded before the persist (PROTOCOL §5.54 shared quota state):
-        // a turn start that reads the new choice also sees that it is a
-        // manual one, so it is tried rather than moved off ahead of time.
-        // Dropped uncommitted on any failure below (including a cancelled
-        // call), which discards only this call's record.
-        let manual_choice = provider.as_deref().map(|chosen| {
-            self.provider_quota_cache
-                .begin_manual_choice(&agent_id, chosen, Some(&model_id))
-        });
+        // A fresh token marks this write as a manual choice, in the same
+        // statement as the selection (PROTOCOL §5.54 shared quota state):
+        // the first turn that reads it tries the choice even when marked.
+        let manual_choice = uuid::Uuid::now_v7().to_string();
         self.store
-            .set_agent_session_model(
+            .set_agent_session_model_choice(
                 &workspace_id,
                 &agent_id,
                 &model_id,
                 provider.as_deref(),
+                Some(&manual_choice),
                 &now_iso(),
             )
             .await?;
-        if let Some(choice) = manual_choice {
-            choice.commit();
-        }
         // The stored model changed, so any persisted display resolution (D14)
         // now names the wrong model — clear it; the next session open
         // re-resolves against the new id. Best-effort: the setModel itself

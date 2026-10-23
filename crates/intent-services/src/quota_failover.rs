@@ -561,6 +561,9 @@ impl Services {
                     crate::provider_return::PROVIDER_RETURN_METADATA_KEY,
                     &next_state_json,
                 )),
+                // A switch ahead of the turn yields to a manual choice
+                // saved since the caller's read (PROTOCOL §5.54).
+                !after_failed_attempt,
                 &now_iso(),
             )
             .await

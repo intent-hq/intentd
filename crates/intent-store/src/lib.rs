@@ -98,7 +98,7 @@ pub use agent_repo::{
     MessageFtsMatch, MonitorMessageProvenance, PreparedMonitorMessage, PrunedToolField,
     PrunedToolPayload, ReplaceMessage, ReviewContextEnrollment, ReviewContextEnrollmentIntent,
     ReviewContextOwnerKey, SessionMessageProjection, UsageMessageOrigin, UserMessageIndexItem,
-    PROJECTION_TEXT_BLOCK_CAP,
+    MANUAL_CHOICE_METADATA_KEY, PROJECTION_TEXT_BLOCK_CAP,
 };
 pub use attachment_repo::{AttachmentIdempotencyBinding, AttachmentRecord};
 pub use completion_watch_repo::PersistedCompletionWatch;

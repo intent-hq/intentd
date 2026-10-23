@@ -101,12 +101,25 @@ pub(crate) fn read_state(session: &AgentSession) -> Option<ProviderReturnState> 
     read_state_from(session.metadata.as_ref())
 }
 
-/// Remove the return state from a session about to leave the daemon
-/// (`agent.getSession`): it is internal bookkeeping, kept in storage only.
+/// Remove the return state and manual-choice token from a session about to
+/// leave the daemon (`agent.getSession`): internal bookkeeping, kept in
+/// storage only.
 pub(crate) fn strip_internal_metadata(session: &mut AgentSession) {
     if let Some(Value::Object(metadata)) = session.metadata.as_mut() {
         metadata.remove(PROVIDER_RETURN_METADATA_KEY);
+        metadata.remove(intent_store::MANUAL_CHOICE_METADATA_KEY);
     }
+}
+
+/// The pending manual-choice token of `session`, written with its current
+/// selection by `agent.setModel` (PROTOCOL §5.54 shared quota state).
+pub(crate) fn manual_choice_token(session: &AgentSession) -> Option<String> {
+    session
+        .metadata
+        .as_ref()?
+        .get(intent_store::MANUAL_CHOICE_METADATA_KEY)?
+        .as_str()
+        .map(str::to_owned)
 }
 
 /// [`read_state`] on a raw session `metadata` value.
@@ -533,6 +546,7 @@ impl Services {
                 session.model.as_deref(),
                 &state.home,
                 Some((PROVIDER_RETURN_METADATA_KEY, &json!(state).to_string())),
+                false,
                 &now_iso(),
             )
             .await
@@ -570,25 +584,39 @@ impl Services {
         workspace_id: &WorkspaceId,
         agent_id: &AgentId,
     ) {
-        let now = Utc::now();
-        let read = self.provider_quota_cache.manual_choice_read();
         let Ok(session) = self.store.get_agent_session(agent_id).await else {
             return;
         };
+        self.avoid_exhausted_provider_from(workspace_id, agent_id, &session)
+            .await;
+    }
+
+    /// [`Self::avoid_exhausted_provider`] on a session snapshot already
+    /// read, which may be stale by now: every write it makes is a
+    /// compare-and-set against that snapshot.
+    pub(crate) async fn avoid_exhausted_provider_from(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        session: &AgentSession,
+    ) {
+        let now = Utc::now();
         let Some(current) = session.provider.as_deref().filter(|p| !p.trim().is_empty()) else {
             return;
         };
-        // The first turn on a manual choice tries it. Checked against the
-        // configuration just read: `agent.setModel` records the choice
-        // before persisting it, so a choice landing while this turn starts
-        // is either not read here (and stays recorded for the next turn) or
-        // read together with its record.
-        if self.provider_quota_cache.take_manual_choice(
-            agent_id,
-            current,
-            session.model.as_deref(),
-            read,
-        ) {
+        // The first turn on a manual choice tries it. The token was written
+        // with the selection just read, so it belongs to exactly that
+        // choice; clearing it is a compare-and-clear, so a newer choice
+        // (another token) stays for the turn that reads it. A choice saved
+        // after this read is protected by the switch below yielding to it.
+        if let Some(token) = manual_choice_token(session) {
+            if let Err(e) = self
+                .store
+                .take_agent_session_manual_choice(workspace_id, agent_id, &token)
+                .await
+            {
+                tracing::warn!(agent = %agent_id, error = %e, "clear manual choice token failed");
+            }
             return;
         }
         let Some(until) = self.provider_quota_cache.exhausted_until(current, now) else {
@@ -598,7 +626,7 @@ impl Services {
             return;
         };
         let settings = self.effective_settings();
-        let return_state = read_state(&session);
+        let return_state = read_state(session);
         let Some(target) = crate::quota_failover::first_unmarked_candidate(
             current,
             return_state.as_ref().map(|s| s.home.as_str()),
@@ -612,7 +640,7 @@ impl Services {
         self.switch_provider_for_quota(
             workspace_id,
             agent_id,
-            &session,
+            session,
             &target,
             return_state,
             Some(until),

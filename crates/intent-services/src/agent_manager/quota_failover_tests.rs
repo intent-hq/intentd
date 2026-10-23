@@ -2562,96 +2562,132 @@ async fn a_manual_choice_landing_during_turn_start_is_still_tried() {
     assert_eq!(fx.row().await.provider.as_deref(), Some(second.as_str()));
 }
 
-/// A successful choice not tried yet survives a later `agent.setModel` on it
-/// whose persist fails: the next turn still tries it.
+/// `agent.setModel` on the agent's current configuration with `model`.
+async fn set_model(fx: &Fixture, model: &str) {
+    fx.mgr
+        .services
+        .agent_set_model_op(fx.agent.clone(), model.to_owned(), None)
+        .await
+        .expect("setModel");
+}
+
+fn token_of(session: &AgentSession) -> Option<String> {
+    crate::provider_return::manual_choice_token(session)
+}
+
+/// The token is written with the selection and never leaves the daemon.
 #[intent_test_macros::daemon_test]
-async fn a_failed_later_choice_keeps_the_earlier_exemption() {
+async fn a_manual_choice_token_is_stored_with_the_selection_and_stripped() {
+    let fx = Fixture::new(json!({ "response": "answered" })).await;
+    let first = fx.profile("First", true).await;
+    fx.away(&first, Value::Null).await;
+    assert!(token_of(&fx.row().await).is_none());
+    set_model(&fx, "sonnet").await;
+    let row = fx.row().await;
+    assert_eq!(row.model.as_deref(), Some("sonnet"));
+    assert!(token_of(&row).is_some());
+    let mut projected = row.clone();
+    crate::provider_return::strip_internal_metadata(&mut projected);
+    assert!(token_of(&projected).is_none());
+    // An automatic write of the selection drops it.
+    fx.away(&first, Value::Null).await;
+    assert!(token_of(&fx.row().await).is_none());
+}
+
+/// Review of intentd#2624: a turn start's snapshot taken before a later
+/// model change on the same configuration does not use up that change:
+/// once it is saved and the configuration is marked, the first turn on the
+/// new model tries it.
+#[intent_test_macros::daemon_test]
+async fn a_stale_old_model_read_keeps_a_later_model_change() {
     let fx = Fixture::new(json!({ "response": "answered" })).await;
     let first = fx.profile("First", true).await;
     let _second = fx.profile("Second", true).await;
     fx.away(&first, Value::Null).await;
+    set_model(&fx, "opus").await;
+    let stale = fx.row().await;
+    set_model(&fx, "sonnet").await;
     let services = &fx.mgr.services;
+
+    // The turn start resumes with its old opus snapshot.
     services
-        .agent_set_model_op(fx.agent.clone(), "opus".to_owned(), None)
-        .await
-        .expect("setModel");
+        .avoid_exhausted_provider_from(&fx.ws, &fx.agent, &stale)
+        .await;
+    assert!(
+        token_of(&fx.row().await).is_some(),
+        "the sonnet choice is kept"
+    );
     mark_exhausted_elsewhere(&fx, &first);
-    // A later setModel on the same configuration whose persist fails: the
-    // guard `agent_set_model_op` holds is dropped uncommitted by its `?`.
-    let cache = &services.provider_quota_cache;
-    drop(cache.begin_manual_choice(&fx.agent, &first, Some("opus")));
-
-    services.avoid_exhausted_provider(&fx.ws, &fx.agent).await;
-
-    assert_eq!(fx.row().await.provider.as_deref(), Some(first.as_str()));
-    assert!(notices(&fx.messages().await, "provider_failover").is_empty());
-}
-
-/// Review of intentd#2624: a successful, untried choice of a marked B, then
-/// two overlapping `agent.setModel` calls to C whose persists both fail
-/// (each guard dropped uncommitted, the second-started one first). The
-/// session still carries B and the next turn start tries it.
-#[intent_test_macros::daemon_test]
-async fn overlapping_failed_choices_keep_the_earlier_exemption() {
-    let fx = Fixture::new(json!({ "response": "answered" })).await;
-    let first = fx.profile("First", true).await;
-    let second = fx.profile("Second", true).await;
-    fx.away(&first, Value::Null).await;
-    let services = &fx.mgr.services;
-    services
-        .agent_set_model_op(fx.agent.clone(), "opus".to_owned(), None)
-        .await
-        .expect("setModel");
-    mark_exhausted_elsewhere(&fx, &first);
-    let cache = &services.provider_quota_cache;
-    let t2 = cache.begin_manual_choice(&fx.agent, &second, Some("opus"));
-    let t3 = cache.begin_manual_choice(&fx.agent, &second, Some("opus"));
-    drop(t2);
-    drop(t3);
-
-    services.avoid_exhausted_provider(&fx.ws, &fx.agent).await;
-
-    assert_eq!(fx.row().await.provider.as_deref(), Some(first.as_str()));
-    assert!(notices(&fx.messages().await, "provider_failover").is_empty());
-    assert!(!cache.is_pending_or_committed(&fx.agent), "used up");
-}
-
-/// Review of intentd#2624: an `agent.setModel` to another model on the same
-/// configuration is still saving when a turn starts and reads the old
-/// model. That turn does not use up the new choice: once it is saved and
-/// the configuration is marked, the first turn on the new model tries it.
-#[intent_test_macros::daemon_test]
-async fn a_turn_on_the_old_model_keeps_a_model_change_still_saving() {
-    let fx = Fixture::new(json!({ "response": "answered" })).await;
-    let first = fx.profile("First", true).await;
-    let _second = fx.profile("Second", true).await;
-    fx.away(&first, Value::Null).await;
-    let services = &fx.mgr.services;
-    let cache = &services.provider_quota_cache;
-    // What `agent_set_model_op` holds while its write is in flight.
-    let choice = cache.begin_manual_choice(&fx.agent, &first, Some("sonnet"));
-    // A turn start reads the old model.
-    services.avoid_exhausted_provider(&fx.ws, &fx.agent).await;
-    // The write lands and the call returns successfully.
-    services
-        .store
-        .set_agent_session_model(
-            &fx.ws,
-            &fx.agent,
-            "sonnet",
-            Some(first.as_str()),
-            &intent_core::now_iso(),
-        )
-        .await
-        .expect("persist");
-    choice.commit();
-    // The old-model attempt hits the quota.
-    mark_exhausted_elsewhere(&fx, &first);
-
     services.avoid_exhausted_provider(&fx.ws, &fx.agent).await;
 
     let row = fx.row().await;
     assert_eq!(row.provider.as_deref(), Some(first.as_str()));
     assert_eq!(row.model.as_deref(), Some("sonnet"));
+    assert!(notices(&fx.messages().await, "provider_failover").is_empty());
+}
+
+/// Review of intentd#2624: M1 → M2 → M1 on the same configuration while a
+/// turn start holds a snapshot of the first M1. The value-equal stale
+/// snapshot carries the first choice's token, so it never uses up the
+/// final M1 choice, whether that write lands before or after the stale
+/// start resumes; the next turn on the final M1 tries it though marked.
+#[intent_test_macros::daemon_test]
+async fn returning_to_an_earlier_pair_keeps_the_latest_choice() {
+    for final_write_after_stale_start in [false, true] {
+        let fx = Fixture::new(json!({ "response": "answered" })).await;
+        let first = fx.profile("First", true).await;
+        let _second = fx.profile("Second", true).await;
+        fx.away(&first, Value::Null).await;
+        set_model(&fx, "opus").await;
+        let stale = fx.row().await;
+        set_model(&fx, "sonnet").await;
+        let services = &fx.mgr.services;
+        if final_write_after_stale_start {
+            services
+                .avoid_exhausted_provider_from(&fx.ws, &fx.agent, &stale)
+                .await;
+            set_model(&fx, "opus").await;
+        } else {
+            set_model(&fx, "opus").await;
+            services
+                .avoid_exhausted_provider_from(&fx.ws, &fx.agent, &stale)
+                .await;
+        }
+        let row = fx.row().await;
+        assert_eq!(row.model.as_deref(), Some("opus"));
+        assert!(token_of(&row).is_some(), "the final opus choice is kept");
+        assert_ne!(token_of(&row), token_of(&stale));
+        mark_exhausted_elsewhere(&fx, &first);
+
+        services.avoid_exhausted_provider(&fx.ws, &fx.agent).await;
+
+        assert_eq!(fx.row().await.provider.as_deref(), Some(first.as_str()));
+        assert!(notices(&fx.messages().await, "provider_failover").is_empty());
+        assert!(token_of(&fx.row().await).is_none(), "used up by that turn");
+    }
+}
+
+/// A turn start whose snapshot had no pending choice does not move a choice
+/// saved after its read, even one of the same configuration and model: the
+/// switch ahead of the turn yields to the stored token.
+#[intent_test_macros::daemon_test]
+async fn a_switch_ahead_of_the_turn_yields_to_a_choice_saved_after_the_read() {
+    let fx = Fixture::new(json!({ "response": "answered" })).await;
+    let first = fx.profile("First", true).await;
+    let _second = fx.profile("Second", true).await;
+    fx.away(&first, Value::Null).await;
+    let stale = fx.row().await;
+    assert!(token_of(&stale).is_none());
+    set_model(&fx, "opus").await;
+    mark_exhausted_elsewhere(&fx, &first);
+
+    fx.mgr
+        .services
+        .avoid_exhausted_provider_from(&fx.ws, &fx.agent, &stale)
+        .await;
+
+    let row = fx.row().await;
+    assert_eq!(row.provider.as_deref(), Some(first.as_str()));
+    assert!(token_of(&row).is_some(), "left for the turn that reads it");
     assert!(notices(&fx.messages().await, "provider_failover").is_empty());
 }
