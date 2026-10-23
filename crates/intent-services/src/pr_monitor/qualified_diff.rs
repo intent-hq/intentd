@@ -193,6 +193,11 @@ fn diff_checks(old: &Value, new: &Value) -> Vec<String> {
     }
     let empty = Vec::new();
     let previous = before["items"].as_array().unwrap_or(&empty);
+    // A baseline persisted before skipped checks were told apart has no
+    // `skipped` key and recorded them as `passed`: not a transition.
+    let legacy_skipped = before
+        .as_object()
+        .is_some_and(|c| !c.contains_key("skipped"));
     let mut changes = Vec::new();
     for item in items {
         let (Some(name), Some(status)) = (item["name"].as_str(), item["status"].as_str()) else {
@@ -200,7 +205,10 @@ fn diff_checks(old: &Value, new: &Value) -> Vec<String> {
         };
         if let Some(prior) = previous.iter().find(|p| p["name"] == name) {
             if let Some(was) = prior["status"].as_str() {
-                if was != status && !(was == "pending" && matches!(status, "passed" | "skipped")) {
+                if was != status
+                    && !(was == "pending" && matches!(status, "passed" | "skipped"))
+                    && !(legacy_skipped && was == "passed" && status == "skipped")
+                {
                     changes.push(format!("check {name}: {was} → {status}"));
                 }
             }
@@ -305,6 +313,24 @@ mod tests {
         assert_eq!(
             diff(&before, &after),
             vec!["all checks completed: 1 passed, 2 skipped (coverage-all, coverage-e2e)"]
+        );
+    }
+
+    #[test]
+    fn qualified_diff_legacy_baseline_skipped_encoding_is_not_a_transition() {
+        let mut legacy = snapshot("passed");
+        legacy["requirements"]["checks"]
+            .as_object_mut()
+            .unwrap()
+            .remove("skipped");
+        let mut skipped = snapshot("skipped");
+        skipped["requirements"]["checks"]["skipped"] = json!(1);
+        assert!(diff(&legacy, &skipped).is_empty());
+        let mut current = snapshot("passed");
+        current["requirements"]["checks"]["skipped"] = json!(0);
+        assert_eq!(
+            diff(&current, &skipped),
+            vec!["check build: passed → skipped"]
         );
     }
 
