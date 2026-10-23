@@ -2463,14 +2463,23 @@ pub(super) async fn manager() -> (TempDb, AgentManager) {
 /// Like [`manager`] but also returns the [`EventBus`] so a test can subscribe and
 /// assert which lifecycle events the manager publishes.
 async fn manager_with_bus() -> (TempDb, AgentManager, EventBus) {
+    manager_with_bus_in(None).await
+}
+
+/// [`manager_with_bus`] whose services provision under `root` (the
+/// daemon-owned workspaces root that retire / revive ownership checks use).
+async fn manager_with_bus_in(root: Option<&std::path::Path>) -> (TempDb, AgentManager, EventBus) {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
-    let services = Services::new_with_file_secrets(
+    let mut services = Services::new_with_file_secrets(
         store,
         intent_core::FileSecretStore::with_path(tmp.path.with_extension("secrets.json")),
     )
     .with_event_bus(bus.clone());
+    if let Some(root) = root {
+        services = services.with_workspaces_root(root.to_path_buf());
+    }
     let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
     (tmp, AgentManager::new(services, sink, 8), bus)
 }
@@ -3636,13 +3645,13 @@ fn init_revive_repo(dir: &std::path::Path) {
 /// all prior on-disk state is gone.
 #[tokio::test]
 async fn winning_try_begin_revives_a_retired_workspace() {
-    let (_tmp, mgr, bus) = manager_with_bus().await;
+    let root = test_tempdir("intentd-revive-root-");
+    let (_tmp, mgr, bus) = manager_with_bus_in(Some(root.path())).await;
     let ws = WorkspaceId::from("ws-revive");
     let id = AgentId::from("a-revive");
     seed_agent(&mgr, &ws, &id).await;
     let repo_dir = test_tempdir("intentd-revive-repo-");
     init_revive_repo(repo_dir.path());
-    let root = test_tempdir("intentd-revive-root-");
     let wt = root.path().join(ws.as_str()).join("repo");
     let mut row = mgr.services.store.get_workspace(&ws).await.unwrap();
     row.repository_path = Some(repo_dir.path().to_string_lossy().into_owned());
@@ -3778,13 +3787,13 @@ async fn winning_try_begin_revives_a_retired_workspace() {
 /// the same `stop_many` retire runs, then releases.
 #[tokio::test]
 async fn turn_start_during_retire_teardown_keeps_its_admission_and_notice() {
-    let (_tmp, mgr, _bus) = manager_with_bus().await;
+    let root = test_tempdir("intentd-revive-race-root-");
+    let (_tmp, mgr, _bus) = manager_with_bus_in(Some(root.path())).await;
     let ws = WorkspaceId::from("ws-revive-race");
     let id = AgentId::from("a-revive-race");
     seed_agent(&mgr, &ws, &id).await;
     let repo_dir = test_tempdir("intentd-revive-race-repo-");
     init_revive_repo(repo_dir.path());
-    let root = test_tempdir("intentd-revive-race-root-");
     let wt = root.path().join(ws.as_str()).join("repo");
     let mut row = mgr.services.store.get_workspace(&ws).await.unwrap();
     row.repository_path = Some(repo_dir.path().to_string_lossy().into_owned());

@@ -177,6 +177,65 @@ impl EvalBudget {
 /// retired caller's send returns the retired error and enqueues nothing.
 pub(crate) const RETIRED_SEND_METHODS: [&str; 2] = ["agent.send", "agent.sendToTask"];
 
+/// `ws.*` bindings a caller in a retired workspace may still use (PROTOCOL
+/// §5.1 "Retired workspaces"): reads of the kept rows and daemon-global
+/// reads, plus the documented revive trigger `workspace.unarchive`.
+/// Every other binding — note / task / comment / primitive writes, files
+/// (the folder is gone), scripts, terminals, git, hooks, agents — is
+/// refused with `workspace-retired`. Fail-closed: a binding not listed here
+/// is treated as a mutation.
+pub(crate) const RETIRED_ALLOWED_METHODS: &[&str] = &[
+    "agent.diagnostics",
+    "agent.getMessageBlock",
+    "agent.getQueue",
+    "agent.list",
+    "agent.listSpecialists",
+    "agent.readConversation",
+    "agent.snapshot",
+    "agent.status",
+    "agent.summary",
+    "browser.docs",
+    "browser.listTabs",
+    "comment.getThread",
+    "comment.list",
+    "crossWorkspace.listNotes",
+    "crossWorkspace.listSiblings",
+    "crossWorkspace.readNote",
+    "discussion.conversations",
+    "discussion.list",
+    "event.agentActivity",
+    "event.query",
+    "event.workspaceSummary",
+    "git.listRoots",
+    "hook.get",
+    "hook.list",
+    "mcp.listServers",
+    "mcp.listTools",
+    "note.list",
+    "note.listTasks",
+    "note.read",
+    "note.readAsset",
+    "pr.monitors",
+    "pr.snapshot",
+    "script.get",
+    "script.list",
+    "script.listPage",
+    "script.monitorDetails",
+    "script.monitors",
+    "script.monitorsPage",
+    "script.output",
+    "script.status",
+    "task.getMyTask",
+    "terminal.list",
+    "terminal.readOutput",
+    "workspace.context",
+    "workspace.details",
+    "workspace.info",
+    "workspace.referenceDocs",
+    "workspace.timeline",
+    "workspace.unarchive",
+];
+
 /// Dispatch one `host({ method, args })` frame to the matching per-namespace
 /// handler. Returns `Ok(None)` when the namespace is not owned here (unknown
 /// method); `Ok(Some(v))` on success and `Err(msg)` on a JS-visible failure.
@@ -215,10 +274,11 @@ pub(crate) async fn try_dispatch(
     }
     // Retired workspaces are read-only (PROTOCOL §5.1): an agent or hook
     // still running there (the agent that retired its own workspace, mid
-    // turn) must not write notes, tasks or files into it. Its folder is
-    // gone, so every other ws.* call is refused until the workspace is
-    // revived.
-    if !workspace_id.is_chief() {
+    // turn) must not write notes, tasks or files into it. Reads of the kept
+    // rows and the revive trigger stay available
+    // ([`RETIRED_ALLOWED_METHODS`]); every other ws.* call is refused until
+    // the workspace is revived.
+    if !workspace_id.is_chief() && !RETIRED_ALLOWED_METHODS.contains(&method) {
         if let Ok(Some(retired)) = api
             .retired_workspace_for(Some(workspace_id.clone()), None)
             .await
@@ -687,5 +747,50 @@ mod retired_workspace_tests {
             live.as_ref().err().is_none_or(|e| !e.contains("retired")),
             "{live:?}"
         );
+        // Reads of the kept rows and the revive trigger are not refused by
+        // the gate (the fake API may fail them for its own reasons).
+        for method in [
+            "note.read",
+            "note.list",
+            "task.getMyTask",
+            "comment.list",
+            "agent.readConversation",
+            "workspace.details",
+            "workspace.unarchive",
+        ] {
+            let out = call("ws-retired", method).await;
+            assert!(
+                out.as_ref().err().is_none_or(|e| !e.contains("retired")),
+                "{method}: {out:?}"
+            );
+        }
+    }
+
+    /// Every allowed method is a real binding (named by some binding's
+    /// `host({ method })` shim), so the list cannot silently go stale.
+    #[test]
+    fn retired_allowed_methods_are_binding_methods() {
+        fn collect(dir: &std::path::Path, out: &mut String) {
+            for entry in std::fs::read_dir(dir).expect("read bindings dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    collect(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push_str(&std::fs::read_to_string(&path).expect("read binding"));
+                }
+            }
+        }
+        let mut sources = String::new();
+        collect(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp_server/bindings"),
+            &mut sources,
+        );
+        for m in RETIRED_ALLOWED_METHODS {
+            assert!(
+                sources.contains(&format!("method: '{m}'"))
+                    || sources.contains(&format!("method: \"{m}\"")),
+                "{m} is not a ws.* binding method"
+            );
+        }
     }
 }

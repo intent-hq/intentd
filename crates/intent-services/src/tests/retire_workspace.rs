@@ -1181,3 +1181,214 @@ async fn auto_retire_op_does_not_stop_scripts_of_a_workspace_unarchived_while_wa
     assert!(!row.archived && !row.is_retired());
     assert!(std::path::Path::new(ws.worktree_path.as_deref().unwrap()).is_dir());
 }
+
+// ---------------------------------------------------------------------------
+// Ownership: `Retired` is entered only through workspace.retire, and revive
+// never detaches a folder the daemon cannot prove it owns.
+// ---------------------------------------------------------------------------
+
+/// A generic `workspace.update { status: "Retired" }` is refused on an
+/// Active and on an Archived workspace: the row, its `retiredAt` and its
+/// checkout are untouched (before the fix the store wrote `Retired` with
+/// `archived = false` and no `retiredAt`, skipping all teardown).
+#[intent_test_macros::daemon_test]
+async fn workspace_update_refuses_retired_status() {
+    let f = fixture().await;
+    let ws = create_workspace(&f).await;
+    let wt = std::path::PathBuf::from(ws.worktree_path.clone().unwrap());
+    for archive_first in [false, true] {
+        if archive_first {
+            f.svc
+                .archive_workspace(ws.id.clone(), None)
+                .await
+                .expect("archive");
+        }
+        let err = f
+            .svc
+            .update_workspace(
+                ws.id.clone(),
+                intent_core::WorkspaceUpdate {
+                    status: Some(WorkspaceStatus::Retired),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidParams(_)), "{err:?}");
+        let row = f.store.get_workspace(&ws.id).await.unwrap();
+        assert!(!row.is_retired(), "archived={archive_first}: {row:?}");
+        assert!(row.retired_at.is_none());
+        assert_eq!(row.archived, archive_first);
+        assert!(wt.is_dir(), "checkout untouched");
+    }
+}
+
+/// A retired row (status, `archived`, `retiredAt`) pointing at `folder`.
+async fn insert_retired_row(f: &Fixture, id: &WorkspaceId, folder: &std::path::Path) {
+    let mut ws = super::workspace(id);
+    ws.repository_path = Some(f.repo.to_string_lossy().to_string());
+    ws.worktree_path = Some(folder.to_string_lossy().to_string());
+    ws.checkout_mode = Some(intent_core::CheckoutMode::Worktree);
+    ws.status = WorkspaceStatus::Retired;
+    ws.archived = true;
+    ws.archived_at = Some(crate::now_iso());
+    ws.retired_at = Some(crate::now_iso());
+    f.store.insert_workspace(&ws).await.expect("insert");
+    assert!(f.store.get_workspace(id).await.unwrap().is_retired());
+}
+
+/// Revive of a retired row whose `worktreePath` is a user folder outside
+/// every daemon root is refused, and the folder is not renamed or deleted.
+#[intent_test_macros::daemon_test]
+async fn revive_refuses_a_path_outside_the_daemon_roots_and_keeps_it() {
+    let f = fixture().await;
+    let user = test_tempdir("intentd-retire-user-");
+    let folder = user.path().join("ws-foreign").join("repo");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("keep.txt"), "user data").unwrap();
+    let id = WorkspaceId::from("ws-foreign");
+    insert_retired_row(&f, &id, &folder).await;
+
+    assert!(f.svc.unarchive_workspace(id.clone()).await.is_err());
+    assert!(folder.join("keep.txt").is_file(), "user folder untouched");
+    assert!(f.store.get_workspace(&id).await.unwrap().is_retired());
+}
+
+/// Revive never detaches a folder at a daemon-root path that is not a
+/// linked worktree registered in the source repository.
+#[intent_test_macros::daemon_test]
+async fn revive_refuses_an_unregistered_folder_and_keeps_it() {
+    let f = fixture().await;
+    let id = WorkspaceId::from("ws-unregistered-revive");
+    let folder = f.root.join(id.as_str()).join("repo");
+    std::fs::create_dir_all(&folder).unwrap();
+    std::fs::write(folder.join("keep.txt"), "user data").unwrap();
+    insert_retired_row(&f, &id, &folder).await;
+
+    assert!(f.svc.unarchive_workspace(id.clone()).await.is_err());
+    assert!(folder.join("keep.txt").is_file(), "folder untouched");
+    assert!(f.store.get_workspace(&id).await.unwrap().is_retired());
+}
+
+// ---------------------------------------------------------------------------
+// Terminal admission: terminalId-only mutations and creation racing retire.
+// ---------------------------------------------------------------------------
+
+/// Flip `ws` to Retired in the store only (the window before retire's
+/// teardown, or a terminal that escaped the sweep).
+async fn flip_retired(f: &Fixture, ws: &WorkspaceId) {
+    f.store
+        .archive_workspace_detaching_guests(ws, &intent_core::now_iso())
+        .await
+        .unwrap();
+    assert!(f
+        .store
+        .retire_workspace_if_archived(ws, &intent_core::now_iso())
+        .await
+        .unwrap());
+}
+
+/// `terminal.write` / `resize` / `kill`, addressed only by `terminalId`,
+/// are refused with `workspace-retired` when the terminal's workspace is
+/// retired, and the terminal is not touched.
+#[intent_test_macros::daemon_test]
+async fn terminal_id_mutations_refused_on_a_retired_workspace() {
+    let f = fixture().await;
+    let ws = create_workspace(&f).await;
+    let created = f
+        .svc
+        .terminal_create(ws.id.clone(), 80, 24, None, None, None)
+        .await
+        .expect("terminal");
+    let terminal_id = created["terminalId"]
+        .as_str()
+        .expect("terminal id")
+        .to_string();
+    flip_retired(&f, &ws.id).await;
+    let is_retired = |e: &Error| matches!(e, Error::WorkspaceRetired { workspace_id } if *workspace_id == ws.id.0);
+
+    let err = f
+        .svc
+        .terminal_write(terminal_id.clone(), "echo hi\n".into())
+        .await
+        .unwrap_err();
+    assert!(is_retired(&err), "write: {err:?}");
+    let err = f
+        .svc
+        .terminal_resize(terminal_id.clone(), 100, 30)
+        .await
+        .unwrap_err();
+    assert!(is_retired(&err), "resize: {err:?}");
+    let err = f.svc.terminal_kill(terminal_id.clone()).await.unwrap_err();
+    assert!(is_retired(&err), "kill: {err:?}");
+    assert_eq!(f.svc.pty.list_scope(ws.id.as_str()).len(), 1);
+}
+
+/// A `terminal.create` that passes its first checks while retire holds the
+/// archive fence waits for it and is then refused: no PTY is spawned for a
+/// workspace that retired in the meantime.
+#[intent_test_macros::daemon_test]
+async fn terminal_create_racing_retire_spawns_nothing() {
+    let f = fixture().await;
+    let ws = create_workspace(&f).await;
+    let guard = f.svc.archive_fence.acquire(&ws.id).await;
+    let create = intent_core::spawn_daemon({
+        let svc = f.svc.clone();
+        let id = ws.id.clone();
+        async move { svc.terminal_create(id, 80, 24, None, None, None).await }
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    flip_retired(&f, &ws.id).await;
+    drop(guard);
+
+    let err = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        create,
+    )
+    .await
+    .expect("create finishes")
+    .expect("join")
+    .unwrap_err();
+    assert!(matches!(err, Error::WorkspaceRetired { .. }), "{err:?}");
+    assert!(f.svc.pty.list_scope(ws.id.as_str()).is_empty());
+}
+
+/// A direct `file.placeAttachment` that passed its first retired check
+/// while retire holds the archive fence waits for it, re-checks, and is
+/// refused: nothing is placed or registered for the retired workspace.
+#[intent_test_macros::daemon_test]
+async fn place_attachment_racing_retire_places_nothing() {
+    use base64::Engine as _;
+    let f = fixture().await;
+    let ws = create_workspace(&f).await;
+    let guard = f.svc.archive_fence.acquire(&ws.id).await;
+    let place = intent_core::spawn_daemon({
+        let svc = f.svc.clone();
+        let id = ws.id.clone();
+        async move {
+            svc.file_place_attachment(
+                id,
+                "late.txt".into(),
+                Some(base64::engine::general_purpose::STANDARD.encode(b"late")),
+                None,
+                None,
+                None,
+            )
+            .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    flip_retired(&f, &ws.id).await;
+    drop(guard);
+
+    let err = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        place,
+    )
+    .await
+    .expect("placement finishes")
+    .expect("join")
+    .unwrap_err();
+    assert!(matches!(err, Error::WorkspaceRetired { .. }), "{err:?}");
+    assert!(f.store.list_attachments(&ws.id).await.unwrap().is_empty());
+}

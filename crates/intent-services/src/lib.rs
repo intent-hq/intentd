@@ -20151,6 +20151,11 @@ impl WorkspaceApi for Services {
             // Management admission also permits deletion retries for missing
             // workspaces; a member must not spawn an unmanageable terminal there.
             self.require_member(&workspace_id).await?;
+            // Held from the retired check through the spawn: retire flips
+            // the row and sweeps the workspace's PTYs under the same fence,
+            // so a create admitted before the flip finishes spawning before
+            // the sweep lists terminals, and one after it is refused.
+            let _archive = self.archive_fence.acquire(&workspace_id).await;
             self.refuse_if_retired(&workspace_id).await?;
             terminal_ops::create_owned(
                 &self.terminal_tasks,
@@ -20179,6 +20184,7 @@ impl WorkspaceApi for Services {
             // Resolve the terminal's actual workspace before authorizing it.
             self.require_terminal_manager(&terminal_id, "terminal.write")
                 .await?;
+            self.refuse_terminal_if_retired(&terminal_id).await?;
             terminal_ops::write(&pty, &terminal_id, &data)
         })
     }
@@ -20193,6 +20199,7 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             self.require_terminal_manager(&terminal_id, "terminal.resize")
                 .await?;
+            self.refuse_terminal_if_retired(&terminal_id).await?;
             terminal_ops::resize(&pty, &terminal_id, cols, rows)
         })
     }
@@ -20202,6 +20209,7 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             self.require_terminal_manager(&terminal_id, "terminal.kill")
                 .await?;
+            self.refuse_terminal_if_retired(&terminal_id).await?;
             terminal_ops::kill(&pty, &terminal_id).await
         })
     }
@@ -20592,6 +20600,12 @@ impl WorkspaceApi for Services {
                     sha256: None,
                 },
             });
+            // Same fence + fresh retired check as the chunked commit: retire
+            // holds the fence from its row flip through the folder sweep, so
+            // placement (which creates `.intent/` dirs) can never recreate a
+            // swept checkout.
+            let _archive = self.archive_fence.acquire(&workspace_id).await;
+            self.refuse_if_retired(&workspace_id).await?;
             self.place_attachment_registered(
                 workspace_id,
                 &file_name,
@@ -23991,6 +24005,15 @@ impl WorkspaceApi for Services {
         }
         let mut changes = serde_json::to_value(&normalised).unwrap_or(serde_json::Value::Null);
         Box::pin(async move {
+            // `Retired` is entered only through `workspace.retire` / the
+            // automatic sweep (ownership proof, teardown, folder removal):
+            // a generic status write must never produce it.
+            if update.status == Some(WorkspaceStatus::Retired) {
+                return Err(Error::InvalidParams(
+                    "workspace.update: status \"Retired\" is set only by workspace.retire"
+                        .to_string(),
+                ));
+            }
             self.require_member(&id).await?;
             // Multiplayer w3: a member may steer the workspace card (title /
             // tags / status message / status image); every other field —

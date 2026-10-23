@@ -65,6 +65,19 @@ impl Services {
         }
     }
 
+    /// [`Self::refuse_if_retired`] for a call addressed only by `terminalId`
+    /// (`terminal.write` / `resize` / `kill`): the terminal's owning
+    /// workspace is resolved from the PTY registry. An unknown terminal
+    /// passes; the handler reports it with its usual `NotFound`.
+    pub(crate) async fn refuse_terminal_if_retired(&self, terminal_id: &str) -> Result<()> {
+        let Some(info) = intent_pty::PtyId::parse(terminal_id).and_then(|id| self.pty.info(id))
+        else {
+            return Ok(());
+        };
+        self.refuse_if_retired(&WorkspaceId::from(info.scope.as_str()))
+            .await
+    }
+
     /// `workspace.retire` body (see [`intent_core::WorkspaceApi::retire_workspace`]).
     pub(crate) async fn retire_workspace_op(
         &self,
@@ -159,8 +172,16 @@ impl Services {
         // serialize on it), BEFORE anything is torn down: an unarchive that
         // landed after the sweep listed the workspace always wins, and its
         // resumed scripts and checkout are left untouched.
-        if archived_before.is_some() && !still_due(&self.store.get_workspace(&id).await?) {
+        let fresh = self.store.get_workspace(&id).await?;
+        if archived_before.is_some() && !still_due(&fresh) {
             return Ok(None);
+        }
+        // Ownership is re-proved on the fresh row under the fence: a
+        // `worktreePath` written after the first check must not steer the
+        // destructive tail at a folder the daemon cannot prove it owns.
+        if !fresh.is_retired() {
+            retire_supported(&fresh)?;
+            self.require_owned_worktree(&fresh)?;
         }
         // Stop every running script and refuse new launches until the folder
         // is gone, so nothing writes into the checkout being removed. After
@@ -249,6 +270,9 @@ impl Services {
         ws: &Workspace,
     ) -> Result<Option<RevivedCheckout>> {
         retire_supported(ws)?;
+        // Same ownership proof as retire: revive detaches whatever sits at
+        // the persisted path, so that path must be daemon-owned.
+        self.require_owned_worktree(ws)?;
         let (Some(repo), Some(wt)) = (
             ws.repository_path.as_deref().map(PathBuf::from),
             ws.worktree_path.as_deref().map(PathBuf::from),
@@ -257,6 +281,7 @@ impl Services {
         };
         let previous_branch = ws.branch.clone();
         let name = ws.id.0.clone();
+        let checkout_mode = ws.checkout_mode;
         let (branch, sha, trash) = {
             let repo = repo.clone();
             let wt = wt.clone();
@@ -265,6 +290,15 @@ impl Services {
                 .with_lock(&repo.clone(), move || async move {
                     tokio::task::spawn_blocking(move || -> Result<_> {
                         let trash = if wt.exists() {
+                            // Only a linked worktree registered in the
+                            // source repository is detached; any other
+                            // folder at the path is left untouched.
+                            if !intent_git::worktree::is_registered_worktree(&repo, &wt) {
+                                return Err(Error::RetireUnsupported {
+                                    workspace_id: name.clone(),
+                                    checkout_mode,
+                                });
+                            }
                             intent_git::worktree::detach_worktree(&repo, &wt)?
                         } else {
                             None
@@ -392,6 +426,13 @@ impl Services {
     /// same fence before provisioning at the same path, so the sweep can
     /// never delete a revived checkout.
     async fn remove_retired_checkout(&self, ws: &Workspace, fence: crate::ArchiveFenceGuard) {
+        // Last ownership proof on the flipped row itself: nothing is
+        // detached unless the path is daemon-owned and still registered.
+        if let Err(e) = self.require_owned_worktree(ws) {
+            tracing::warn!(workspace = %ws.id.as_str(), error = %e, "retire: checkout not provably daemon-owned; folder left in place");
+            drop(fence);
+            return;
+        }
         let workspaces_root = self
             .workspaces_root
             .clone()
