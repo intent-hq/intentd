@@ -774,6 +774,7 @@ fn merge_requirements(
             passed: 2,
             failed: 0,
             pending: 1,
+            skipped: 0,
             items: vec![],
             failing_required: vec![],
             pending_required: vec!["build".to_string()],

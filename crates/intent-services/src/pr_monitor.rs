@@ -1901,6 +1901,7 @@ fn pr_monitor_wire(m: &PrMonitor, paused_until: Option<&str>) -> Value {
                 "passed": r.checks.passed,
                 "failed": r.checks.failed,
                 "pending": r.checks.pending,
+                "skipped": r.checks.skipped,
                 "failingRequired": r.checks.failing_required.len(),
                 "pendingRequired": r.checks.pending_required.len(),
                 "requiredKnown": r.checks.required_known,
@@ -5915,6 +5916,7 @@ mod tests {
                     passed: 0,
                     failed: 0,
                     pending: 1,
+                    skipped: 0,
                     items: vec![pr_ops::MergeRequirementCheck {
                         name: "build".into(),
                         status: "pending".into(),
@@ -6996,6 +6998,90 @@ mod tests {
             diff_snapshots(&base, &added_green).is_empty(),
             "a check that appears already passed must stay quiet"
         );
+    }
+
+    /// Incident intentd#2581 at 6c92d3256 (run 39724275631): 23 passed and
+    /// `coverage-all` / `coverage-e2e` skipped must never read as
+    /// "all checks passed".
+    fn skipped_incident(done: bool) -> PrMonitorSnapshot {
+        snapshot(|s| {
+            let c = &mut s.requirements.checks;
+            let names: Vec<String> = (1..=23)
+                .map(|i| format!("job-{i:02}"))
+                .chain(["coverage-all".to_string(), "coverage-e2e".to_string()])
+                .collect();
+            c.items = names
+                .iter()
+                .map(|name| pr_ops::MergeRequirementCheck {
+                    name: name.clone(),
+                    status: match (done, name.starts_with("coverage")) {
+                        (false, _) => "pending",
+                        (true, true) => "skipped",
+                        (true, false) => "passed",
+                    }
+                    .into(),
+                    required: false,
+                    url: None,
+                })
+                .collect();
+            c.total = 25;
+            c.pending_required.clear();
+            if done {
+                (c.passed, c.skipped, c.pending) = (23, 2, 0);
+            } else {
+                c.pending = 25;
+            }
+        })
+    }
+
+    #[test]
+    fn suite_completion_with_skipped_checks_names_them() {
+        let changes = diff_snapshots(&skipped_incident(false), &skipped_incident(true));
+        assert!(
+            !changes.iter().any(|c| c.contains("all checks passed")),
+            "{changes:?}"
+        );
+        assert_eq!(
+            changes,
+            vec![
+                "all checks completed: 23 passed, 2 skipped (coverage-all, coverage-e2e)"
+                    .to_string()
+            ]
+        );
+        let checklist = render_checklist(&skipped_incident(true));
+        assert!(
+            checklist.contains(
+                "checks: 23 passed, 0 failed, 0 pending, 2 skipped (of 25); \
+                 skipped: coverage-all, coverage-e2e"
+            ),
+            "{checklist}"
+        );
+    }
+
+    #[test]
+    fn skipped_checks_completion_with_a_failure_lists_all_outcomes() {
+        let mut done = skipped_incident(true);
+        let c = &mut done.requirements.checks;
+        c.items[0].status = "failed".into();
+        (c.passed, c.failed) = (22, 1);
+        let changes = diff_snapshots(&skipped_incident(false), &done);
+        assert!(changes.iter().any(|c| {
+            c == "all checks completed: 22 passed, 1 failed, 2 skipped (coverage-all, coverage-e2e)"
+        }));
+    }
+
+    #[test]
+    fn baseline_without_skipped_count_parses_without_diff_lines() {
+        let current = snapshot(|_| {});
+        let mut legacy = serde_json::to_value(&current).unwrap();
+        legacy["requirements"]["checks"]
+            .as_object_mut()
+            .unwrap()
+            .remove("skipped")
+            .expect("current baselines carry a skipped count");
+        let legacy: PrMonitorSnapshot = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.requirements.checks.skipped, 0);
+        assert!(diff_snapshots(&legacy, &current).is_empty());
     }
 
     #[test]

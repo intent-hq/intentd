@@ -200,7 +200,7 @@ fn diff_checks(old: &Value, new: &Value) -> Vec<String> {
         };
         if let Some(prior) = previous.iter().find(|p| p["name"] == name) {
             if let Some(was) = prior["status"].as_str() {
-                if was != status && !(was == "pending" && status == "passed") {
+                if was != status && !(was == "pending" && matches!(status, "passed" | "skipped")) {
                     changes.push(format!("check {name}: {was} → {status}"));
                 }
             }
@@ -216,7 +216,7 @@ fn diff_checks(old: &Value, new: &Value) -> Vec<String> {
                     }
                 }
             }
-        } else if status != "passed" {
+        } else if !matches!(status, "passed" | "skipped") {
             changes.push(format!("check started: {name} ({status})"));
         }
     }
@@ -234,11 +234,10 @@ fn diff_checks(old: &Value, new: &Value) -> Vec<String> {
             after["failed"].as_i64(),
         ) {
             if total > 0 {
-                changes.push(if failed == 0 {
-                    format!("all checks passed ({total})")
-                } else {
-                    format!("all checks completed: {passed} passed, {failed} failed")
-                });
+                let skipped = crate::harness::review_wake::skipped_names(&after["items"]);
+                changes.push(crate::harness::review_wake::checks_completed(
+                    total, passed, failed, &skipped,
+                ));
             }
         }
     }
@@ -272,6 +271,40 @@ mod tests {
         assert_eq!(
             diff(&snapshot("failed"), &snapshot("passed")),
             vec!["check build: failed → passed"]
+        );
+    }
+
+    #[test]
+    fn qualified_diff_completion_names_skipped_checks() {
+        let item = |name: &str, status: &str| json!({"name":name,"status":status,"required":true});
+        let with = |items: Vec<Value>, passed: i64, skipped: i64, pending: i64| {
+            json!({"state":"open","isDraft":false,"headSha":"abc","requirements":{"checks":{
+                "items":items,"requiredKnown":true,"total":3,"passed":passed,"skipped":skipped,
+                "failed":0,"pending":pending}}})
+        };
+        let before = with(
+            vec![
+                item("build", "pending"),
+                item("coverage-all", "pending"),
+                item("coverage-e2e", "pending"),
+            ],
+            0,
+            0,
+            3,
+        );
+        let after = with(
+            vec![
+                item("build", "passed"),
+                item("coverage-all", "skipped"),
+                item("coverage-e2e", "skipped"),
+            ],
+            1,
+            2,
+            0,
+        );
+        assert_eq!(
+            diff(&before, &after),
+            vec!["all checks completed: 1 passed, 2 skipped (coverage-all, coverage-e2e)"]
         );
     }
 
