@@ -5,7 +5,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 #[path = "e2e_wss_runtime_control/independent_installations.rs"]
 mod independent_installations;

@@ -28,7 +28,7 @@
 
 #![cfg(target_os = "linux")]
 
-mod common;
+use crate::common;
 
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
@@ -839,8 +839,7 @@ mod helper_tests {
 
     /// Set on the re-invoked test binary that runs `orphan_scenario`.
     const ORPHAN_CHILD_ENV: &str = "INTENTD_PTY_JC_ORPHAN_CHILD";
-    const ORPHAN_TEST: &str =
-        "helper_tests::reap_adopted_kills_and_reaps_orphan_inherited_as_subreaper";
+    const ORPHAN_TEST: &str = "reap_adopted_kills_and_reaps_orphan_inherited_as_subreaper";
 
     /// The P2 leak: a detached grandchild whose parent died before teardown
     /// is reachable neither by ancestry nor by session. As subreaper we
@@ -871,7 +870,12 @@ mod helper_tests {
         }
         let exe = std::env::current_exe().expect("current_exe");
         let out = Command::new(exe)
-            .args(["--exact", ORPHAN_TEST, "--nocapture", "--test-threads=1"])
+            .args([
+                "--exact",
+                &common::exact_test_name(module_path!(), ORPHAN_TEST),
+                "--nocapture",
+                "--test-threads=1",
+            ])
             .env(ORPHAN_CHILD_ENV, "1")
             .stdin(Stdio::null())
             .output()

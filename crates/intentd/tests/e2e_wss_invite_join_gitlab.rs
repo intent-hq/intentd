@@ -28,7 +28,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 #[path = "common/invitation_fixture_lifecycle.rs"]
 mod fixture_lifecycle;
 

@@ -7,6 +7,13 @@ repository.workspace = true
 license.workspace = true
 homepage.workspace = true
 description = "Intent backend daemon — local-first JSON-RPC daemon for the Intent domain model"
+# Integration tests are grouped into a few suite targets (tests/suite_*.rs)
+# instead of one executable per tests/*.rs file: each test executable links the
+# whole daemon (180-360 MiB), so ~200 per-file targets made one test build
+# ~50 GiB. Every target is listed below; `test_target_registration_lint`
+# (intent-core) fails when a tests/*.rs file is neither a target nor a module
+# of one, so a new file cannot be silently left out of the build.
+autotests = false
 
 [dependencies]
 # Keep this requirement major-only ("0", not "0.1.N"). release-plz 0.3.162
@@ -52,6 +59,55 @@ js-engine = ["dep:intent-js"]
 # Packaging and ordinary daemon builds must leave this feature disabled.
 repository-test-fixtures = ["intent-services/repository-test-fixtures", "intent-transport/repository-test-fixtures", "dep:intent-sourcecontrol"]
 
+# Suites: each file listed in tests/suite_<name>.rs is one module of it.
+[[test]]
+name = "suite_e2e"
+
+[[test]]
+name = "suite_uds"
+
+[[test]]
+name = "suite_wss_a_f"
+
+[[test]]
+name = "suite_wss_agents"
+
+[[test]]
+name = "suite_wss_g_r"
+
+[[test]]
+name = "suite_wss_repo"
+
+[[test]]
+name = "suite_wss_s_z"
+
+# Standalone targets. The two largest files are each as big as a suite, so
+# merging them would only serialize compilation; source lints must keep the
+# `_lint` target-name suffix (`cargo test --workspace --test '*_lint'`);
+# caller_binding_guard and the lints do not compile `common`, whose ctor sets
+# process-wide test env, so they must not share an executable with it.
+[[test]]
+name = "wss_integration"
+
+[[test]]
+name = "e2e_wss_agent_lifecycle"
+
+[[test]]
+name = "caller_binding_guard"
+
+[[test]]
+name = "repo_cache_path_lint"
+
+[[test]]
+name = "serve_spawn_lint"
+
+[[test]]
+name = "tmp_hygiene_lint"
+
+[[test]]
+name = "workflow_grep_quiet_lint"
+
+# Needs the fixture feature, which a suite cannot require for only one module.
 [[test]]
 name = "e2e_wss_gitlab_auth"
 required-features = ["repository-test-fixtures"]

@@ -12,7 +12,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 use common::test_timeout;
 
 use std::path::Path;

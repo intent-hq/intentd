@@ -79,10 +79,14 @@ def native_step_job(name):
 
 
 GITLAB_STEP = "GitLab auth, invitations and checkout over real sockets with explicit test transports"
+# e2e_wss_gitlab_auth is a standalone target; the invitation and checkout
+# files are modules of suite targets, selected by their module filter.
 GITLAB_COMMAND = (
     "cargo test --locked -p intentd --features repository-test-fixtures "
-    "--test e2e_wss_gitlab_auth --test e2e_wss_invite_join_gitlab "
-    "--test e2e_repository_resource_read -- --test-threads=2"
+    "--test e2e_wss_gitlab_auth -- --test-threads=2\n"
+    "cargo test --locked -p intentd --features repository-test-fixtures "
+    "--test suite_wss_g_r --test suite_wss_repo -- --test-threads=2 "
+    "e2e_wss_invite_join_gitlab:: e2e_repository_resource_read::\n"
 )
 
 
@@ -1047,7 +1051,7 @@ class NativeRoutingTests(unittest.TestCase):
                 elif mutation == "caller":
                     step["env"]["INTENTD_ASSERT_BOUND_CALLER"] = "0"
                 else:
-                    removed = {"feature": "--features repository-test-fixtures", "target": "--test e2e_repository_resource_read", "threads": "--test-threads=2"}[mutation]
+                    removed = {"feature": "--features repository-test-fixtures", "target": " e2e_repository_resource_read::", "threads": "--test-threads=2"}[mutation]
                     step["run"] = step["run"].replace(removed, "")
                 self.assertTrue(gitlab_errors(workflow))
 

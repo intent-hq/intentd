@@ -1,7 +1,7 @@
 //! The opt-in saved-command wrapper retains OS evidence independently of a PTY.
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::path::Path;
 use std::process::{Command, Stdio};

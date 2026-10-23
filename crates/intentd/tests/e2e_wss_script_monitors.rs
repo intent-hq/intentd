@@ -1,7 +1,7 @@
 //! Real authenticated TLS/WSS script monitor controls and lifecycle events.
 //! Registration uses the service endpoint called by the authenticated MCP helper.
 #![cfg(unix)]
-mod common;
+use crate::common;
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

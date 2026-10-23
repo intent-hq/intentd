@@ -12,7 +12,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 #[path = "e2e_wss_browser_client_pin/identity_isolation.rs"]
 mod identity_isolation;

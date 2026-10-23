@@ -14,7 +14,7 @@
 //! an in-process shortcut — it exercises the same wire path production agents
 //! use to rename their workspace on the first turn.
 
-mod common;
+use crate::common;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

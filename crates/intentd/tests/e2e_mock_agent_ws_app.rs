@@ -9,7 +9,7 @@
 //!
 //! Pattern: reuses the harness from `e2e_mock_agent_workspace_api_bindings.rs`.
 
-mod common;
+use crate::common;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

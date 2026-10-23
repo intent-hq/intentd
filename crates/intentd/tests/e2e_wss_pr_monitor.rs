@@ -15,7 +15,7 @@
 mod adaptive;
 #[path = "e2e_wss_pr_monitor/ancestry.rs"]
 mod ancestry;
-mod common;
+use crate::common;
 #[path = "../../intent-sourcecontrol/tests/support/qwen.rs"]
 mod qwen;
 #[path = "e2e_wss_pr_monitor/registration_visibility.rs"]

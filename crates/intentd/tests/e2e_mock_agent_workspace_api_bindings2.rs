@@ -8,7 +8,7 @@
 //! This file covers: **note**, **file**, **git**, **agent**, and **event** bindings.
 //! See `e2e_mock_agent_workspace_api_bindings.rs` for task and comment.
 
-mod common;
+use crate::common;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

@@ -15,7 +15,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
