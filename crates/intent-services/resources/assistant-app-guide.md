@@ -651,7 +651,8 @@ client without the user's instruction.
 
 Use the icon tabs above the expanded sidebar's content panel to switch sections.
 Hover over an icon for its section name; scroll the row horizontally when space
-is tight. **Agents** opens by default; your selected section is remembered.
+is tight. **Agents** opens by default; your selected section is remembered. Its
+tab shows the main agent's avatar, or a robot while no main agent is available.
 When collapsed, the sidebar leaves a slim vertical icon rail. Hover over or focus
 a section tab to reveal just its content panel beside it, aligned with the tab
 when space allows. The panel fits its contents; longer sections scroll within the
