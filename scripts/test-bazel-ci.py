@@ -643,8 +643,16 @@ class ModuleShardSelection(unittest.TestCase):
             launcher.chmod(0o755)
             command = [str(launcher)]
         out = subprocess.run(command + (attrs.get("args") or []), check=True, capture_output=True, text=True,
-                             env={"PATH": str(self.minimal_path())})
+                             env=self.minimal_env())
         return {line[4:] for line in out.stdout.splitlines() if line.startswith("RUN ")}
+
+    def minimal_env(self):
+        env = {"PATH": str(self.minimal_path())}
+        # The fake binary is Python; setup-python's interpreter needs its
+        # loader path (intentd#2490).
+        if "LD_LIBRARY_PATH" in os.environ:
+            env["LD_LIBRARY_PATH"] = os.environ["LD_LIBRARY_PATH"]
+        return env
 
     def minimal_path(self):
         """Only bash, env and python3 (for the fake binary): the launcher must not
