@@ -4349,36 +4349,42 @@ async fn wss_members_add_delivers_workspace_to_connected_guest() {
         json!({ "added": false, "memberCount": 2 }),
         "{again}"
     );
-    let quiet = tokio::time::timeout(Duration::from_millis(500), async {
-        loop {
-            match ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let v: Value = serde_json::from_str(&text).expect("json");
-                    if v["method"] == "subscription.push" {
-                        return v;
+    let quiet = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(500)),
+        async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v["method"] == "subscription.push" {
+                            return v;
+                        }
                     }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
                 }
-                Some(Ok(_)) => {}
-                other => panic!("expected text frame, got {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await;
     assert!(quiet.is_err(), "idempotent add pushed: {quiet:?}");
-    let quiet_owner = tokio::time::timeout(Duration::from_millis(500), async {
-        loop {
-            match owner_ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let v: Value = serde_json::from_str(&text).expect("json");
-                    if v["method"] == "events.event" {
-                        return v;
+    let quiet_owner = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(500)),
+        async {
+            loop {
+                match owner_ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v["method"] == "events.event" {
+                            return v;
+                        }
                     }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
                 }
-                Some(Ok(_)) => {}
-                other => panic!("expected text frame, got {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await;
     assert!(
         quiet_owner.is_err(),

@@ -5754,8 +5754,11 @@ mod channel_membership {
     /// Every `subscription.push` delta on the bulk lane until it stays quiet.
     async fn deltas(rx: &mut OutboundReceiver) -> Vec<Value> {
         let mut out = Vec::new();
-        while let Ok(Some(frame)) =
-            tokio::time::timeout(Duration::from_millis(300), rx.bulk.recv()).await
+        while let Ok(Some(frame)) = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            rx.bulk.recv(),
+        )
+        .await
         {
             let v: Value = serde_json::from_str(&frame).unwrap();
             assert_eq!(v["method"], "subscription.push");

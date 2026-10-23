@@ -398,7 +398,11 @@ async fn caret_updates_are_member_gated_including_the_deferred_flush() {
             .is_none()
     })
     .await;
-    let leaked = tokio::time::timeout(Duration::from_millis(50), sub.recv()).await;
+    let leaked = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(50)),
+        sub.recv(),
+    )
+    .await;
     assert!(
         leaked.is_err(),
         "no caret leaves after the membership ended: {leaked:?}"
@@ -514,7 +518,11 @@ async fn profile_persisted_after_first_sight_refreshes_rosters_without_a_reconne
         .apply_primary_identity(applied, &identity)
         .await
         .expect("idempotent");
-    let quiet = tokio::time::timeout(Duration::from_millis(100), sub.recv()).await;
+    let quiet = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(100)),
+        sub.recv(),
+    )
+    .await;
     assert!(
         quiet.is_err(),
         "an unchanged profile re-emits nothing: {quiet:?}"
@@ -595,7 +603,11 @@ async fn first_sight_read_racing_the_identity_write_installs_the_fresh_profile()
         .await
         .expect("snapshot");
     assert_eq!(snapshot["members"][0]["login"], "octocat");
-    let quiet = tokio::time::timeout(Duration::from_millis(100), sub.recv()).await;
+    let quiet = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(100)),
+        sub.recv(),
+    )
+    .await;
     assert!(quiet.is_err(), "one roster, from the connect: {quiet:?}");
 }
 

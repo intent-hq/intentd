@@ -23,7 +23,12 @@ use std::time::{Duration, Instant};
 
 /// Artificial watcher-init delay: far longer than any plausible daemon boot,
 /// so a daemon that still binds behind watcher init cannot pass by being fast.
-const WATCHER_DELAY: Duration = Duration::from_secs(120);
+/// Stretched by `INTENTD_TEST_TIMEOUT_MULTIPLIER` like the readiness budget
+/// (20s base), so the budget stays inside the delay at every multiplier —
+/// a fixed 120s delay fell below the 200s budget at 10x and failed every run.
+fn watcher_delay() -> Duration {
+    common::test_timeout(Duration::from_secs(120))
+}
 
 /// Layout for the spawned daemon: a short base dir (macOS caps UDS paths at
 /// ~104 bytes) holding the data dir and a hermetic workspaces root. The base
@@ -55,7 +60,7 @@ fn spawn_daemon(dirs: &TestDirs) -> Child {
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .env(
             "INTENTD_TEST_WATCHER_INIT_DELAY_MS",
-            WATCHER_DELAY.as_millis().to_string(),
+            watcher_delay().as_millis().to_string(),
         )
         // One Tokio worker: the harshest version of the saturated-runtime case.
         // A blocking init that is merely `spawn`ed lands on the same worker that
@@ -116,14 +121,15 @@ async fn listeners_bind_before_slow_watcher_init() {
     // runs, but well inside the artificial watcher delay, so passing proves
     // the bind did not wait on watcher registration.
     let budget = common::test_timeout(Duration::from_secs(20));
+    let watcher_delay = watcher_delay();
     assert!(
-        budget < WATCHER_DELAY,
-        "readiness budget {budget:?} must stay inside the watcher delay {WATCHER_DELAY:?}"
+        budget < watcher_delay,
+        "readiness budget {budget:?} must stay inside the watcher delay {watcher_delay:?}"
     );
     assert!(
         elapsed < budget,
         "daemon answered system.status only after {elapsed:?} (budget {budget:?}) with a \
-         {WATCHER_DELAY:?} watcher-init delay in effect — the listeners are still behind \
+         {watcher_delay:?} watcher-init delay in effect — the listeners are still behind \
          slow initialization\n--- daemon log ---\n{}",
         std::fs::read_to_string(&log_path).unwrap_or_default()
     );

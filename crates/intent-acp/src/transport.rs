@@ -1973,9 +1973,12 @@ mod prompt_transfer_tests {
     async fn no_frame(reader: &mut BufReader<tokio::io::DuplexStream>) {
         let mut extra = String::new();
         assert!(
-            tokio::time::timeout(Duration::from_millis(30), reader.read_line(&mut extra))
-                .await
-                .is_err(),
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(30)),
+                reader.read_line(&mut extra)
+            )
+            .await
+            .is_err(),
             "unexpected frame: {extra}"
         );
     }
@@ -2450,7 +2453,7 @@ mod prompt_retirement_tests {
         assert_eq!(conn.pending_len(), 0);
         let mut line = String::new();
         assert!(tokio::time::timeout(
-            Duration::from_millis(30),
+            intentd_test_support::test_timeout(Duration::from_millis(30)),
             BufReader::new(&mut reader).read_line(&mut line)
         )
         .await
@@ -2742,9 +2745,12 @@ mod cancel_on_timeout_tests {
         let request = read_json(&mut reader).await;
         assert_eq!(request["id"], json!(1));
         let mut extra = String::new();
-        let quiet = tokio::time::timeout(Duration::from_millis(100), reader.read_line(&mut extra))
-            .await
-            .is_err();
+        let quiet = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(100)),
+            reader.read_line(&mut extra),
+        )
+        .await
+        .is_err();
         assert!(quiet, "unexpected line after the request: {extra}");
     }
 }

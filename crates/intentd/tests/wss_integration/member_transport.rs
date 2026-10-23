@@ -673,9 +673,12 @@ async fn member_transport_browser_guest_first_ignores_other_member_change() {
         .await
         .is_err());
     assert!(
-        tokio::time::timeout(Duration::from_millis(100), guest.ws.next())
-            .await
-            .is_err(),
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(100)),
+            guest.ws.next()
+        )
+        .await
+        .is_err(),
         "guest received unexpected browser payload"
     );
     assert!(
@@ -784,9 +787,12 @@ async fn member_transport_browser_demotion_unbinds_and_keeps_default_controls() 
         .await
         .is_err());
     assert!(
-        tokio::time::timeout(Duration::from_millis(100), member.ws.next())
-            .await
-            .is_err(),
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(100)),
+            member.ws.next()
+        )
+        .await
+        .is_err(),
         "demoted member received unexpected browser payload"
     );
     assert_eq!(

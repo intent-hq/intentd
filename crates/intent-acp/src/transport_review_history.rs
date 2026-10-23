@@ -241,9 +241,12 @@ mod tests {
                 Box::new(admission),
             );
             let mut call = Box::pin(call);
-            assert!(tokio::time::timeout(Duration::from_millis(20), &mut call)
-                .await
-                .is_err());
+            assert!(tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(20)),
+                &mut call
+            )
+            .await
+            .is_err());
             assert_eq!(
                 calls.load(Ordering::SeqCst),
                 0,
