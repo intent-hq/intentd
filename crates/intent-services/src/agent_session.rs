@@ -1824,7 +1824,7 @@ impl Services {
     /// The [`AuthOwner`] of a resolved selection. A profile whose saved
     /// settings cannot be read demotes nothing (and never the Default).
     pub(crate) async fn auth_owner(&self, selection: &str) -> AuthOwner {
-        let profile = if crate::provider_profiles::is_qualified_ref(selection) {
+        let profile = if crate::provider_profiles::may_have_overlay(selection) {
             Box::pin(self.resolve_profile_env(selection))
                 .await
                 .ok()
@@ -3315,8 +3315,12 @@ impl Services {
             .profile_process_fingerprint(&stored.id, &selection)
             .await
         {
-            self.bind_native_session_settings(&stored.workspace_id, &stored.id, &fingerprint)
-                .await;
+            // An unbound session already reads as the empty Default
+            // fingerprint, so a Default without overrides writes nothing.
+            if Self::native_session_binding_differs(stored, &fingerprint) {
+                self.bind_native_session_settings(&stored.workspace_id, &stored.id, &fingerprint)
+                    .await;
+            }
         }
     }
 

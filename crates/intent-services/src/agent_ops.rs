@@ -4907,10 +4907,14 @@ impl Services {
             )?;
             // A profile is gated on its own saved settings' verdict, never
             // the base provider's Default verdict.
-            let verdict = if crate::provider_profiles::is_qualified_ref(p) {
-                Box::pin(self.resolve_profile_env(p))
-                    .await?
-                    .and_then(|profile| crate::provider_auth::cached_profile_auth_verdict(&profile))
+            // A Default configuration with saved overrides is gated on the
+            // verdict of those settings, like a profile.
+            let verdict = if crate::provider_profiles::may_have_overlay(p) {
+                match Box::pin(self.resolve_profile_env(p)).await? {
+                    Some(profile) => crate::provider_auth::cached_profile_auth_verdict(&profile),
+                    None if crate::provider_profiles::is_qualified_ref(p) => None,
+                    None => crate::provider_auth::cached_auth_verdict(p),
+                }
             } else {
                 crate::provider_auth::cached_auth_verdict(p)
             };
@@ -7363,8 +7367,17 @@ impl Services {
         let resolved = if intent_providers::installed_cli::InstalledCli::for_provider(&provider_id)
             .is_some()
         {
+            // A Default configuration's saved overrides select its catalog;
+            // the installed key folds in their fingerprint.
+            let overlay = if crate::provider_profiles::is_default_config_ref(&provider_id) {
+                Box::pin(self.resolve_profile_env(&provider_id))
+                    .await?
+                    .map(std::sync::Arc::new)
+            } else {
+                None
+            };
             self.models_catalog
-                .resolve_installed(&provider_id, force_refresh)
+                .resolve_installed_for(&provider_id, overlay, force_refresh)
                 .await
         } else {
             crate::model_catalog::resolve_with_cache(

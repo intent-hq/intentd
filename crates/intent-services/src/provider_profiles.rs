@@ -98,6 +98,19 @@ pub(crate) fn is_qualified_ref(reference: &str) -> bool {
     reference.contains(REF_SEPARATOR)
 }
 
+/// Whether `reference` names the Default configuration of a profile-capable
+/// base provider (bare canonical `codex` / `claude-code`), which may carry
+/// saved environment overrides.
+pub(crate) fn is_default_config_ref(reference: &str) -> bool {
+    PROFILE_BASE_PROVIDERS.contains(&reference)
+}
+
+/// Whether a process for `reference` may run with a saved overlay: a profile
+/// reference, or the Default configuration of a profile-capable base.
+pub(crate) fn may_have_overlay(reference: &str) -> bool {
+    is_qualified_ref(reference) || is_default_config_ref(reference)
+}
+
 /// The selection identity of a provider id: a qualified reference is its own
 /// identity (two profiles, or a profile and Default, never compare equal);
 /// a bare id or legacy alias canonicalizes through the registry.
@@ -198,11 +211,43 @@ impl ProfileMeta {
     }
 }
 
+/// One base provider's Default configuration overrides (PROTOCOL §5.54
+/// "Default configuration overrides"). `name` is present only for a renamed
+/// Default; `env_id` only while environment entries are saved. It names the
+/// secret-store document (`providerProfiles.<envId>.env`), minted like a
+/// profile id so a daemon sharing the secret store never reads or overwrites
+/// another daemon's Default environment.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DefaultMeta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) env_id: Option<String>,
+}
+
+impl DefaultMeta {
+    fn is_empty(&self) -> bool {
+        self.name.is_none() && self.env_id.is_none()
+    }
+}
+
+/// Default overrides keyed by base provider id (only non-empty entries).
+pub(crate) type Defaults = std::collections::BTreeMap<String, DefaultMeta>;
+
+/// The display name of an unrenamed Default configuration.
+pub(crate) const DEFAULT_NAME: &str = "Default";
+
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ProfilesFile {
     version: u32,
     profiles: Vec<ProfileMeta>,
+    /// Default configuration overrides; omitted when none is saved, so the
+    /// steady-state file keeps its original shape. An older daemon ignores
+    /// it and drops it on its next write.
+    #[serde(default, skip_serializing_if = "Defaults::is_empty")]
+    defaults: Defaults,
     /// Ids whose secret may exist without metadata (see module docs).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pending_env_cleanup: Vec<String>,
@@ -540,6 +585,58 @@ pub(crate) fn validate_name(
     name
 }
 
+/// A profile name that collides with its base provider's renamed Default
+/// (ignoring case) is a duplicate: both label configurations of one provider.
+pub(crate) fn check_default_name_conflict(
+    name: &str,
+    default_name: Option<&str>,
+    errors: &mut Vec<FieldError>,
+) {
+    if default_name.is_some_and(|d| fold_name(d) == fold_name(name))
+        && !errors.iter().any(|e| e.field == "name")
+    {
+        errors.push(FieldError::new(
+            "name",
+            "name-duplicate",
+            "The Default configuration of this provider already uses this name.",
+        ));
+    }
+}
+
+/// Validate a Default configuration name (`updateDefault`). Returns `None`
+/// for a name that is not a rename (blank, or `Default` ignoring case),
+/// otherwise the trimmed name.
+pub(crate) fn validate_default_name(
+    raw: &str,
+    base_provider: &str,
+    existing: &[ProfileMeta],
+    errors: &mut Vec<FieldError>,
+) -> Option<String> {
+    let name = raw.trim().to_string();
+    if name.is_empty() || fold_name(&name) == fold_name(DEFAULT_NAME) {
+        return None;
+    }
+    if name.chars().any(char::is_control) || name.chars().count() > MAX_NAME_CHARS {
+        errors.push(FieldError::new(
+            "name",
+            "name-invalid",
+            format!("Use at most {MAX_NAME_CHARS} characters and no control characters."),
+        ));
+    }
+    let folded = fold_name(&name);
+    if existing
+        .iter()
+        .any(|p| p.base_provider == base_provider && fold_name(&p.name) == folded)
+    {
+        errors.push(FieldError::new(
+            "name",
+            "name-duplicate",
+            "A profile for this provider already uses this name.",
+        ));
+    }
+    Some(name)
+}
+
 /// Validate env writes against the saved entries (`None` on create) and
 /// resolve them into the new stored list.
 pub(crate) fn validate_env(
@@ -636,6 +733,8 @@ pub(crate) fn validate_env(
 struct Loaded {
     /// `None` when the file is malformed or has an unknown version.
     profiles: Option<Arc<Vec<ProfileMeta>>>,
+    /// Default configuration overrides (meaningful only while readable).
+    defaults: Arc<Defaults>,
     pending: Vec<String>,
 }
 
@@ -660,6 +759,7 @@ impl ProviderProfileStore {
             path: None,
             loaded: RwLock::new(Loaded {
                 profiles: Some(Arc::new(Vec::new())),
+                defaults: Arc::default(),
                 pending: Vec::new(),
             }),
             mutation: tokio::sync::Mutex::new(()),
@@ -677,24 +777,28 @@ impl ProviderProfileStore {
                 if let Some(file) = parse_file(&bytes) {
                     Loaded {
                         profiles: Some(Arc::new(file.profiles)),
+                        defaults: Arc::new(file.defaults),
                         pending: file.pending_env_cleanup,
                     }
                 } else {
                     tracing::warn!(path = %path.display(), "provider profiles file is malformed or has an unknown version; profiles are unavailable until it is fixed");
                     Loaded {
                         profiles: None,
+                        defaults: Arc::default(),
                         pending: Vec::new(),
                     }
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Loaded {
                 profiles: Some(Arc::new(Vec::new())),
+                defaults: Arc::default(),
                 pending: Vec::new(),
             },
             Err(e) => {
                 tracing::warn!(path = %path.display(), error = %e, "provider profiles file is unreadable");
                 Loaded {
                     profiles: None,
+                    defaults: Arc::default(),
                     pending: Vec::new(),
                 }
             }
@@ -739,6 +843,20 @@ impl ProviderProfileStore {
             .is_some_and(|p| p.iter().any(|m| m.id == id && m.base_provider == base))
     }
 
+    /// Saved Default configuration overrides, or the unreadable error.
+    pub(crate) fn defaults(&self) -> Result<Arc<Defaults>> {
+        let loaded = self.loaded.read().unwrap();
+        loaded.profiles.as_ref().ok_or_else(unreadable)?;
+        Ok(loaded.defaults.clone())
+    }
+
+    /// The renamed Default of `base`, if any (`None` while unreadable).
+    pub(crate) fn default_name(&self, base: &str) -> Option<String> {
+        let loaded = self.loaded.read().unwrap();
+        loaded.profiles.as_ref()?;
+        loaded.defaults.get(base).and_then(|d| d.name.clone())
+    }
+
     pub(crate) async fn lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.mutation.lock().await
     }
@@ -750,10 +868,24 @@ impl ProviderProfileStore {
     /// Atomically persist `profiles` + `pending`, then publish the snapshot.
     /// Callers hold the mutation lock.
     fn persist(&self, profiles: Vec<ProfileMeta>, pending: Vec<String>) -> Result<()> {
+        let defaults = self.loaded.read().unwrap().defaults.as_ref().clone();
+        self.persist_with_defaults(profiles, defaults, pending)
+    }
+
+    /// [`Self::persist`] that also replaces the Default overrides. Empty
+    /// entries are dropped so the file only records real overrides.
+    fn persist_with_defaults(
+        &self,
+        profiles: Vec<ProfileMeta>,
+        mut defaults: Defaults,
+        pending: Vec<String>,
+    ) -> Result<()> {
+        defaults.retain(|_, d| !d.is_empty());
         if let Some(path) = &self.path {
             let file = ProfilesFile {
                 version: FILE_VERSION,
                 profiles: profiles.clone(),
+                defaults: defaults.clone(),
                 pending_env_cleanup: pending.clone(),
             };
             let bytes = serde_json::to_vec_pretty(&file)
@@ -762,6 +894,7 @@ impl ProviderProfileStore {
         }
         *self.loaded.write().unwrap() = Loaded {
             profiles: Some(Arc::new(profiles)),
+            defaults: Arc::new(defaults),
             pending,
         };
         Ok(())
@@ -769,7 +902,18 @@ impl ProviderProfileStore {
 }
 
 fn parse_file(bytes: &[u8]) -> Option<ProfilesFile> {
-    let file: ProfilesFile = serde_json::from_slice(bytes).ok()?;
+    let mut file: ProfilesFile = serde_json::from_slice(bytes).ok()?;
+    // A blank or `Default` name is not a rename (hand edits included).
+    for default in file.defaults.values_mut() {
+        if default
+            .name
+            .as_ref()
+            .is_some_and(|n| n.trim().is_empty() || fold_name(n.trim()) == fold_name(DEFAULT_NAME))
+        {
+            default.name = None;
+        }
+    }
+    file.defaults.retain(|_, d| !d.is_empty());
     if file.version != FILE_VERSION {
         return None;
     }
@@ -781,7 +925,13 @@ fn parse_file(bytes: &[u8]) -> Option<ProfilesFile> {
     }) && file
         .pending_env_cleanup
         .iter()
-        .all(|id| is_valid_profile_id(id));
+        .all(|id| is_valid_profile_id(id))
+        && file.defaults.iter().all(|(base, d)| {
+            PROFILE_BASE_PROVIDERS.contains(&base.as_str())
+                && d.env_id
+                    .as_ref()
+                    .is_none_or(|id| is_valid_profile_id(id) && ids.insert(id.clone()))
+        });
     well_formed.then_some(file)
 }
 
@@ -834,6 +984,39 @@ fn profile_json(meta: &ProfileMeta, env: &EnvDoc, running_processes: usize) -> V
         "updatedAt": meta.updated_at,
         "activation": { "runningProcesses": running_processes },
     })
+}
+
+/// The wire `DefaultConfig` of one base provider (masked; no values).
+fn default_config_json(base: &str, name: Option<&str>, env: &EnvDoc, running: usize) -> Value {
+    json!({
+        "baseProviderId": base,
+        "providerRef": base,
+        "name": name.unwrap_or(DEFAULT_NAME),
+        "env": env.entries.iter().map(StoredEnv::masked_json).collect::<Vec<_>>(),
+        "settingsFingerprint": env.fingerprint,
+        "activation": { "runningProcesses": running },
+    })
+}
+
+/// The activation-registry key of a base provider's Default configuration.
+/// The `:` keeps it disjoint from every profile id.
+pub(crate) fn default_activation_key(base: &str) -> String {
+    format!("default:{base}")
+}
+
+/// `change: "default-updated"` / `"default-activation"`: carries the base
+/// provider, never a profile id, summary or environment.
+fn default_changed_event(
+    revision: u64,
+    change: &str,
+    base_provider: &str,
+    env_changed: Option<bool>,
+) -> NewEvent {
+    profiles_changed_event_with(
+        json!({ "revision": revision, "change": change, "baseProviderId": base_provider }),
+        None,
+        env_changed,
+    )
 }
 
 fn profiles_changed_event(
@@ -1124,6 +1307,43 @@ pub(crate) fn batch_has_references(changes: &Value) -> bool {
     })
 }
 
+/// Whether a recorded native-session binding (`None` = never recorded)
+/// matches `fingerprint`: an absent binding counts as `""`, the fingerprint
+/// of a Default configuration with no saved overrides.
+pub(crate) fn binding_matches(binding: Option<&str>, fingerprint: &str) -> bool {
+    binding.unwrap_or("") == fingerprint
+}
+
+/// The recorded native-session settings binding of `stored`, if any.
+fn native_session_binding(stored: &intent_core::AgentSession) -> Option<&str> {
+    stored
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get(NATIVE_SESSION_SETTINGS_KEY))
+        .and_then(Value::as_str)
+}
+
+/// Build the launch overlay of a saved environment document. Reserved keys
+/// are dropped even if the stored document was edited outside the daemon,
+/// and `~` in an account directory expands here, before account-home lookup,
+/// isolation and fingerprinting, so every path agrees.
+fn overlay_from(reference: &str, base: &str, doc: EnvDoc) -> intent_acp::ProfileEnv {
+    let home = daemon_home();
+    let entries = doc
+        .entries
+        .into_iter()
+        .filter(|e| reserved_key_reason(e.key(), base).is_none())
+        .map(|e| match e {
+            StoredEnv::Set { key, value } => {
+                let value = expand_account_dir(&key, &value, home.as_deref());
+                (key, Some(value))
+            }
+            StoredEnv::Unset { key } => (key, None),
+        })
+        .collect();
+    intent_acp::ProfileEnv::new(reference, doc.fingerprint, entries)
+}
+
 // ---------------------------------------------------------------------------
 // Service surface
 // ---------------------------------------------------------------------------
@@ -1141,9 +1361,14 @@ impl Services {
         let Ok(profiles) = store.profiles() else {
             return;
         };
+        let defaults = store.defaults().unwrap_or_default();
         let mut remaining = Vec::new();
         for id in pending {
-            if profiles.iter().any(|p| p.id == id) {
+            if profiles.iter().any(|p| p.id == id)
+                || defaults
+                    .values()
+                    .any(|d| d.env_id.as_deref() == Some(id.as_str()))
+            {
                 continue;
             }
             if let Err(e) = self.secrets.delete(&env_account(&id)).await {
@@ -1168,7 +1393,7 @@ impl Services {
         reference: &str,
     ) -> Result<Option<intent_acp::ProfileEnv>> {
         if !is_qualified_ref(reference) {
-            return Ok(None);
+            return self.resolve_default_env(reference).await;
         }
         let missing = || replacement_required(reference, "profile-missing");
         let (base, id) = parse_profile_ref(reference).ok_or_else(missing)?;
@@ -1186,26 +1411,37 @@ impl Services {
                 "provider profile {reference} environment is unavailable"
             ))
         })?;
-        // `~` in an account directory expands here, before account-home
-        // lookup, isolation and fingerprinting, so every path agrees.
-        let home = daemon_home();
-        let entries = doc
-            .entries
-            .into_iter()
-            .filter(|e| reserved_key_reason(e.key(), base).is_none())
-            .map(|e| match e {
-                StoredEnv::Set { key, value } => {
-                    let value = expand_account_dir(&key, &value, home.as_deref());
-                    (key, Some(value))
-                }
-                StoredEnv::Unset { key } => (key, None),
-            })
-            .collect();
-        Ok(Some(intent_acp::ProfileEnv::new(
-            reference,
-            doc.fingerprint,
-            entries,
-        )))
+        Ok(Some(overlay_from(reference, base, doc)))
+    }
+
+    /// The Default configuration's saved overlay (PROTOCOL §5.54 "Default
+    /// configuration overrides"), keyed by the bare reference. `None` when
+    /// the reference is not a profile-capable base, nothing is saved, or the
+    /// profile file is unreadable (bare references keep today's behavior
+    /// then). A recorded environment whose secret cannot be read fails
+    /// closed: the Default never silently runs without its overrides.
+    async fn resolve_default_env(&self, reference: &str) -> Result<Option<intent_acp::ProfileEnv>> {
+        let Some(base) = PROFILE_BASE_PROVIDERS
+            .iter()
+            .copied()
+            .find(|base| *base == reference)
+        else {
+            return Ok(None);
+        };
+        let Some(env_id) = self
+            .provider_profiles
+            .defaults()
+            .ok()
+            .and_then(|d| d.get(base).and_then(|d| d.env_id.clone()))
+        else {
+            return Ok(None);
+        };
+        let doc = load_env(&self.secrets, &env_id).await?.ok_or_else(|| {
+            Error::Internal(format!(
+                "the {base} Default configuration environment is unavailable"
+            ))
+        })?;
+        Ok(Some(overlay_from(reference, base, doc)))
     }
 
     /// Selection gate for a provider reference about to be persisted or
@@ -1280,12 +1516,38 @@ impl Services {
         agent_id: &intent_core::AgentId,
         profile: &intent_acp::ProfileEnv,
     ) -> Option<crate::profile_activation::ActivationLease> {
-        let (token, changes) = self.profile_activation.register(
+        self.register_overlay_process(
             workspace_id,
             agent_id,
             profile.provider_ref(),
             profile.fingerprint(),
-        )?;
+        )
+        .await
+    }
+
+    /// Record a newly started Default-configuration process that runs with
+    /// no saved overrides (fingerprint `""`), so a later edit can report it
+    /// as running on earlier settings.
+    pub(crate) async fn register_default_process(
+        &self,
+        workspace_id: &intent_core::WorkspaceId,
+        agent_id: &intent_core::AgentId,
+        base: &str,
+    ) -> Option<crate::profile_activation::ActivationLease> {
+        self.register_overlay_process(workspace_id, agent_id, base, "")
+            .await
+    }
+
+    async fn register_overlay_process(
+        &self,
+        workspace_id: &intent_core::WorkspaceId,
+        agent_id: &intent_core::AgentId,
+        reference: &str,
+        fingerprint: &str,
+    ) -> Option<crate::profile_activation::ActivationLease> {
+        let (token, changes) =
+            self.profile_activation
+                .register(workspace_id, agent_id, reference, fingerprint)?;
         self.publish_activation_changes(changes).await;
         Some(crate::profile_activation::ActivationLease::new(
             self.clone(),
@@ -1307,6 +1569,15 @@ impl Services {
         }
         let saved = self.provider_profiles.profiles().ok();
         for profile_id in &changes.profiles {
+            if let Some(base) = profile_id.strip_prefix("default:") {
+                let revision = self.provider_profiles.bump_revision();
+                crate::publish_event(
+                    self.event_bus.as_ref(),
+                    default_changed_event(revision, "default-activation", base, None),
+                )
+                .await;
+                continue;
+            }
             if !saved
                 .as_ref()
                 .is_some_and(|all| all.iter().any(|p| p.id == *profile_id))
@@ -1334,14 +1605,32 @@ impl Services {
     /// The settings fingerprint the process serving `agent_id` under
     /// `selection` runs with: the live registration when present, else the
     /// saved one (the fingerprint a process started now would read). `None`
-    /// for a bare selection or an unresolvable profile.
+    /// for a bare selection without Default overrides support or an
+    /// unresolvable profile. A Default configuration with no saved entries
+    /// (or an unreadable one) reads `""`.
     pub(crate) async fn profile_process_fingerprint(
         &self,
         agent_id: &intent_core::AgentId,
         selection: &str,
     ) -> Option<String> {
-        if !is_qualified_ref(selection) {
+        if !may_have_overlay(selection) {
             return None;
+        }
+        if is_default_config_ref(selection) {
+            if let Some(live) = self
+                .profile_activation
+                .live_fingerprint(agent_id, selection)
+            {
+                return Some(live);
+            }
+            return Some(
+                Box::pin(self.resolve_profile_env(selection))
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|overlay| overlay.fingerprint().to_owned())
+                    .unwrap_or_default(),
+            );
         }
         if let Some(live) = self
             .profile_activation
@@ -1359,18 +1648,26 @@ impl Services {
     /// Whether the stored native session of `stored` was opened under the
     /// settings `fingerprint` (PROTOCOL §5.54: a native session id never
     /// crosses an account-relevant settings change). A session with no
-    /// recorded binding is treated as foreign, so it is recreated with
-    /// Intent history rather than loaded on possibly another account.
+    /// recorded binding counts as bound to `""`, the fingerprint of a
+    /// Default configuration with no saved overrides; profile fingerprints
+    /// are never empty, so an unbound session is foreign to every profile
+    /// and is recreated with Intent history rather than loaded on possibly
+    /// another account.
     pub(crate) fn native_session_bound_to(
         stored: &intent_core::AgentSession,
         fingerprint: &str,
     ) -> bool {
-        stored
-            .metadata
-            .as_ref()
-            .and_then(|m| m.get(NATIVE_SESSION_SETTINGS_KEY))
-            .and_then(Value::as_str)
-            == Some(fingerprint)
+        binding_matches(native_session_binding(stored), fingerprint)
+    }
+
+    /// Whether recording `fingerprint` for `stored` would change what
+    /// [`Self::native_session_bound_to`] reads (an absent binding already
+    /// reads as `""`).
+    pub(crate) fn native_session_binding_differs(
+        stored: &intent_core::AgentSession,
+        fingerprint: &str,
+    ) -> bool {
+        !binding_matches(native_session_binding(stored), fingerprint)
     }
 
     /// Record that `agent_id`'s current native session was opened under the
@@ -1496,6 +1793,50 @@ impl Services {
         Ok(Value::Array(entries))
     }
 
+    /// `host.providerAuthStatus` rows for Default configurations with saved
+    /// overrides: each is probed with its overlay and cached under its
+    /// reference plus fingerprint (never the base verdict). An unresolvable
+    /// Default reports `authenticated: null`.
+    pub(crate) async fn provider_default_auth_status_impl(
+        &self,
+        provider_id: Option<String>,
+        force: bool,
+    ) -> Result<Value> {
+        let paths = self.effective_settings().providers.paths;
+        let mut entries = Vec::new();
+        for base in PROFILE_BASE_PROVIDERS
+            .iter()
+            .copied()
+            .filter(|base| provider_id.as_deref().is_none_or(|wanted| wanted == *base))
+        {
+            let has_overrides = self
+                .provider_profiles
+                .defaults()
+                .ok()
+                .is_some_and(|d| d.get(base).is_some_and(|d| d.env_id.is_some()));
+            if !has_overrides {
+                continue;
+            }
+            let entry = match self.resolve_profile_env(base).await {
+                Ok(Some(overlay)) => {
+                    crate::provider_auth::profile_auth_status(
+                        Arc::new(overlay),
+                        force,
+                        paths.get(base).cloned(),
+                    )
+                    .await
+                }
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::warn!(provider = %base, error = %e, "Default configuration auth check skipped");
+                    json!({ "id": base, "authenticated": null })
+                }
+            };
+            entries.push(entry);
+        }
+        Ok(Value::Array(entries))
+    }
+
     /// `host.providerTestPrompt { providerId: providerRef }` (PROTOCOL
     /// §5.54): the live probe on the base installation under the profile's
     /// saved overlay. A missing profile needs a replacement.
@@ -1505,14 +1846,14 @@ impl Services {
         model: Option<String>,
         node_max_old_space_mb: Option<u32>,
     ) -> Result<Value> {
-        let profile = self
-            .resolve_profile_env(&provider_ref)
-            .await?
-            .ok_or_else(|| {
-                Error::InvalidParams(format!(
-                    "invalid params: not a provider profile reference: {provider_ref}"
-                ))
-            })?;
+        // A Default configuration runs under its saved overrides, when any
+        // (the bare base otherwise, exactly as before).
+        let profile = self.resolve_profile_env(&provider_ref).await?;
+        if profile.is_none() && !is_default_config_ref(&provider_ref) {
+            return Err(Error::InvalidParams(format!(
+                "invalid params: not a provider profile reference: {provider_ref}"
+            )));
+        }
         let paths: std::collections::HashMap<String, String> = self
             .effective_settings()
             .providers
@@ -1525,7 +1866,7 @@ impl Services {
             model.as_deref(),
             &paths,
             node_max_old_space_mb,
-            Some(Arc::new(profile)),
+            profile.map(Arc::new),
         )
         .await
         .map_err(Error::InvalidParams)
@@ -1557,7 +1898,223 @@ impl Services {
             let running = self.profile_activation.running_processes(&meta.id);
             rows.push(profile_json(meta, &env, running));
         }
-        Ok(json!({ "profiles": rows, "revision": store.revision() }))
+        let saved_defaults = store.defaults()?;
+        let mut defaults = Vec::new();
+        for base in PROFILE_BASE_PROVIDERS.iter().filter(|base| {
+            base_provider_id
+                .as_deref()
+                .is_none_or(|wanted| wanted == **base)
+        }) {
+            let saved = saved_defaults.get(*base).cloned().unwrap_or_default();
+            let env = self.load_default_env(&saved).await?;
+            let running = self
+                .profile_activation
+                .running_processes(&default_activation_key(base));
+            defaults.push(default_config_json(
+                base,
+                saved.name.as_deref(),
+                &env,
+                running,
+            ));
+        }
+        Ok(json!({ "profiles": rows, "defaults": defaults, "revision": store.revision() }))
+    }
+
+    /// The saved environment of one Default configuration for reads and
+    /// edits: empty (with the `""` fingerprint) when none is recorded or the
+    /// recorded document is missing, as for profiles, so a save can replace
+    /// it; an undecodable document is an error. Launches never use this:
+    /// they fail closed on a missing document ([`Self::resolve_profile_env`]).
+    async fn load_default_env(&self, saved: &DefaultMeta) -> Result<EnvDoc> {
+        let Some(env_id) = &saved.env_id else {
+            return Ok(EnvDoc::default());
+        };
+        let doc = load_env(&self.secrets, env_id).await?;
+        if doc.is_none() {
+            tracing::warn!("a Default configuration environment is missing; launches fail until it is saved again");
+        }
+        Ok(doc.unwrap_or_default())
+    }
+
+    /// `providers.catalog` `defaultNames`: the renamed Default of each base
+    /// provider, or `None` when none is renamed (or the file is unreadable).
+    pub(crate) fn provider_default_names(&self) -> Option<Value> {
+        let defaults = self.provider_profiles.defaults().ok()?;
+        let names: serde_json::Map<String, Value> = defaults
+            .iter()
+            .filter_map(|(base, d)| Some((base.clone(), json!(d.name.as_ref()?))))
+            .collect();
+        (!names.is_empty()).then_some(Value::Object(names))
+    }
+
+    pub(crate) async fn provider_profiles_update_default_impl(
+        &self,
+        params: Value,
+    ) -> Result<Value> {
+        Self::require_administrator("providers.profiles.updateDefault")?;
+        self.owned_profile_mutation(move |svc| async move {
+            svc.provider_profiles_update_default_owned(params).await
+        })
+        .await
+    }
+
+    /// `providers.profiles.updateDefault` (PROTOCOL §5.54 "Default
+    /// configuration overrides"). An environment change writes the new
+    /// document under a freshly minted `envId`, journals the new and the
+    /// previous id, then commits name and `envId` together through the
+    /// profile file's atomic rename; the previous secret is removed after
+    /// the commit. A failed file write removes the new secret, so the saved
+    /// name and environment are unchanged.
+    async fn provider_profiles_update_default_owned(&self, params: Value) -> Result<Value> {
+        let base = opt_string(&params, "baseProviderId")?
+            .ok_or_else(|| Error::InvalidParams("missing required param: baseProviderId".into()))?;
+        let raw_name = opt_string(&params, "name")?;
+        let writes = opt_env(&params)?;
+
+        let store = &self.provider_profiles;
+        let _guard = store.lock().await;
+        let profiles = store.profiles()?;
+        let mut defaults = store.defaults()?.as_ref().clone();
+        let Some(base) = PROFILE_BASE_PROVIDERS
+            .iter()
+            .copied()
+            .find(|candidate| *candidate == base)
+        else {
+            return Err(field_errors(&[FieldError::new(
+                "baseProviderId",
+                "base-provider-unsupported",
+                format!("{base} does not support profiles."),
+            )]));
+        };
+        let current = defaults.get(base).cloned().unwrap_or_default();
+        let saved_doc = self.load_default_env(&current).await?;
+
+        let mut errors = Vec::new();
+        let name = raw_name.map(|raw| validate_default_name(&raw, base, &profiles, &mut errors));
+        let entries = writes
+            .as_ref()
+            .map(|writes| validate_env(writes, base, Some(&saved_doc.entries), &mut errors));
+        if !errors.is_empty() {
+            return Err(field_errors(&errors));
+        }
+
+        let env_changed = entries
+            .as_ref()
+            .is_some_and(|entries| *entries != saved_doc.entries);
+        let name_changed = name.as_ref().is_some_and(|n| *n != current.name);
+        let key = default_activation_key(base);
+        if !env_changed && !name_changed {
+            let running = self.profile_activation.running_processes(&key);
+            return Ok(json!({
+                "defaultConfig": default_config_json(base, current.name.as_deref(), &saved_doc, running),
+                "revision": store.revision(),
+                "activation": { "envChanged": false, "runningProcesses": running },
+            }));
+        }
+
+        let mut next = current.clone();
+        if let Some(name) = name {
+            next.name = name;
+        }
+        let mut env = saved_doc;
+        let pending = store.pending();
+        let mut new_secret: Option<String> = None;
+        if env_changed {
+            let entries = entries.unwrap_or_default();
+            if entries.is_empty() {
+                next.env_id = None;
+                env = EnvDoc::default();
+            } else {
+                let doc = EnvDoc::fresh(entries);
+                let id = loop {
+                    let candidate = format!("d{}", random_token(12));
+                    if !profiles.iter().any(|p| p.id == candidate)
+                        && !pending.contains(&candidate)
+                        && !defaults
+                            .values()
+                            .any(|d| d.env_id.as_deref() == Some(candidate.as_str()))
+                    {
+                        break candidate;
+                    }
+                };
+                let mut journaled = pending.clone();
+                journaled.push(id.clone());
+                if let Some(previous) = &current.env_id {
+                    journaled.push(previous.clone());
+                }
+                store.persist(profiles.as_ref().clone(), journaled)?;
+                if let Err(e) = self.secrets.store(&env_account(&id), &doc.encode()?).await {
+                    if let Err(journal) = store.persist(profiles.as_ref().clone(), pending.clone())
+                    {
+                        tracing::warn!(error = %journal, "provider default journal rollback failed");
+                    }
+                    return Err(e);
+                }
+                new_secret = Some(id.clone());
+                next.env_id = Some(id);
+                env = doc;
+            }
+        }
+
+        // Commit point: name and envId land together. A removed environment
+        // journals its previous secret here; a replaced one already did.
+        let mut journal = store.pending();
+        if env_changed && new_secret.is_none() {
+            if let Some(previous) = &current.env_id {
+                journal.push(previous.clone());
+            }
+        }
+        defaults.insert(base.to_owned(), next.clone());
+        if let Err(e) = store.persist_with_defaults(
+            profiles.as_ref().clone(),
+            defaults.clone(),
+            journal.clone(),
+        ) {
+            if let Some(id) = &new_secret {
+                if let Err(cleanup) = self.secrets.delete(&env_account(id)).await {
+                    tracing::warn!(error = %cleanup, "provider default secret rollback failed; it is removed at next start");
+                }
+            }
+            return Err(e);
+        }
+        if env_changed {
+            let mut remaining = journal;
+            if let Some(id) = &new_secret {
+                remaining.retain(|p| p != id);
+            }
+            if let Some(previous) = &current.env_id {
+                match self.secrets.delete(&env_account(previous)).await {
+                    Ok(()) => remaining.retain(|p| p != previous),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "previous provider default secret delete failed; it is removed at next start");
+                    }
+                }
+            }
+            if let Err(e) =
+                store.persist_with_defaults(profiles.as_ref().clone(), defaults, remaining)
+            {
+                tracing::warn!(error = %e, "provider default cleanup journal update failed");
+            }
+        }
+
+        let revision = store.bump_revision();
+        crate::publish_event(
+            self.event_bus.as_ref(),
+            default_changed_event(revision, "default-updated", base, Some(env_changed)),
+        )
+        .await;
+        if env_changed {
+            let changes = self
+                .profile_activation
+                .saved_changed(&key, Some(&env.fingerprint));
+            self.publish_activation_changes(changes).await;
+        }
+        let running = self.profile_activation.running_processes(&key);
+        Ok(json!({
+            "defaultConfig": default_config_json(base, next.name.as_deref(), &env, running),
+            "revision": revision,
+            "activation": { "envChanged": env_changed, "runningProcesses": running },
+        }))
     }
 
     /// Run one profile mutation as an owned daemon task over a settled
@@ -1690,6 +2247,7 @@ impl Services {
             ));
         }
         let name = validate_name(&raw_name, &base, &profiles, None, &mut errors);
+        check_default_name_conflict(&name, store.default_name(&base).as_deref(), &mut errors);
         let entries = validate_env(&writes, &base, None, &mut errors);
         if !errors.is_empty() {
             return Err(field_errors(&errors));
@@ -1768,13 +2326,19 @@ impl Services {
 
         let mut errors = Vec::new();
         let name = raw_name.map(|raw| {
-            validate_name(
+            let name = validate_name(
                 &raw,
                 &current.base_provider,
                 &profiles,
                 Some(&profile_id),
                 &mut errors,
-            )
+            );
+            check_default_name_conflict(
+                &name,
+                store.default_name(&current.base_provider).as_deref(),
+                &mut errors,
+            );
+            name
         });
         let entries = writes.as_ref().map(|writes| {
             validate_env(
