@@ -17,7 +17,7 @@
 //! emit `workspace:displayStatus-changed` or touch the baseline.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use intent_core::events::{
     WORKSPACE_DISPLAY_STATUS_CHANGED, WORKSPACE_SCRIPTS_RUNNING_CHANGED, WORKSPACE_WAITING_CHANGED,
@@ -60,6 +60,43 @@ pub(crate) type DisplayStatusCache = LastObservedCache<WorkspaceDisplayStatus>;
 
 /// Last-observed orthogonal `waiting` flag per workspace (PROTOCOL §5.1).
 pub(crate) type WaitingStatusCache = LastObservedCache<bool>;
+
+/// Per-workspace ordering gate for the `scriptsRunning` recompute: the
+/// registry read, baseline record, and `workspace:scriptsRunning-changed`
+/// publication run under it, so recomputes triggered by different scripts of
+/// one workspace (each holding only its own publication lock) cannot publish
+/// out of order. Different workspaces never contend.
+#[derive(Default)]
+pub(crate) struct ScriptsRunningLocks(Mutex<HashMap<WorkspaceId, Arc<tokio::sync::Mutex<()>>>>);
+
+impl ScriptsRunningLocks {
+    fn lock_for(&self, workspace_id: &WorkspaceId) -> Arc<tokio::sync::Mutex<()>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(workspace_id.clone())
+            .or_default()
+            .clone()
+    }
+
+    /// Drop a deleted workspace's gate; a holder keeps its own `Arc`.
+    fn evict(&self, workspace_id: &WorkspaceId) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(workspace_id);
+    }
+}
+
+/// Test seam: parks the next `scriptsRunning` recompute that observed a
+/// transition, after its first registry read and before its store await, so
+/// a test can interleave a newer script start (one-shot).
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct ScriptsRunningPark {
+    pub(crate) entered: tokio::sync::Notify,
+    pub(crate) release: tokio::sync::Notify,
+}
 
 struct CacheInner<T> {
     map: HashMap<WorkspaceId, T>,
@@ -586,6 +623,7 @@ impl Services {
         self.last_display_statuses.evict(workspace_id);
         self.last_waiting_statuses.evict(workspace_id);
         self.last_scripts_running.evict(workspace_id);
+        self.scripts_running_locks.evict(workspace_id);
     }
 
     /// Whether the workspace owns an `active` script run monitor (§5.8a), one
@@ -625,6 +663,13 @@ impl Services {
         if workspace_id.is_chief() {
             return;
         }
+        // Callers hold only their own script's publication lock, so two
+        // scripts of one workspace can recompute concurrently. Serialize the
+        // read → record → publish sequence per workspace, and re-read the
+        // registry after the store await below, so a recompute that observed
+        // an older state can never publish (or record) it after a newer one.
+        let gate = self.scripts_running_locks.lock_for(workspace_id);
+        let _serialized = gate.lock().await;
         let generation = self.last_scripts_running.generation();
         let running = self.workspace_scripts_running(workspace_id);
         if self.last_scripts_running.get(workspace_id).unwrap_or(false) == running {
@@ -632,11 +677,14 @@ impl Services {
                 .seed(workspace_id, running, generation);
             return;
         }
+        #[cfg(test)]
+        self.park_scripts_running_recompute().await;
         // Deleted-workspace guard: never publish for (or seed a baseline of)
         // a workspace whose row is gone.
         if self.store.get_workspace(workspace_id).await.is_err() {
             return;
         }
+        let running = self.workspace_scripts_running(workspace_id);
         self.last_scripts_running
             .seed(workspace_id, false, generation);
         let Some(transitioned) =
@@ -651,6 +699,30 @@ impl Services {
                 scripts_running_changed_event(workspace_id, running),
             )
             .await;
+        }
+    }
+
+    /// Arm [`ScriptsRunningPark`]: the next transitioning recompute parks.
+    #[cfg(test)]
+    pub(crate) fn arm_scripts_running_park(&self) -> Arc<ScriptsRunningPark> {
+        let park = Arc::new(ScriptsRunningPark::default());
+        *self
+            .scripts_running_park
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(park.clone());
+        park
+    }
+
+    #[cfg(test)]
+    async fn park_scripts_running_recompute(&self) {
+        let park = self
+            .scripts_running_park
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(park) = park {
+            park.entered.notify_one();
+            park.release.notified().await;
         }
     }
 

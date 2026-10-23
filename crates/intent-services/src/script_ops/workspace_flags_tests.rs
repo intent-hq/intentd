@@ -179,3 +179,90 @@ async fn active_script_monitor_sets_and_clears_waiting() {
     assert_eq!(waiting_flag_events(&h).await, vec![true, false]);
     h.services.script_stop(h.ws.clone(), id).await.unwrap();
 }
+
+/// Regression (intentd#2637 review): recomputes triggered by different
+/// scripts of one workspace hold only their own publication locks, so an
+/// older recompute that read `false` and suspended in its store lookup must
+/// not publish (or record) that stale value after a newer command started.
+/// Park A's settling recompute across B's start; the workspace must end with
+/// `scriptsRunning: true` while B runs.
+#[intent_test_macros::daemon_test]
+async fn scripts_running_stale_recompute_cannot_override_newer_start() {
+    let h = harness().await;
+    let a = create_simple(&h, "a", "read value", ScriptMode::Command).await;
+    let b = create_simple(&h, "b", "read value", ScriptMode::Command).await;
+    h.services
+        .script_start(h.ws.clone(), a.clone())
+        .await
+        .expect("start a");
+    await_flag_events(vec![true], || scripts_running_events(&h)).await;
+
+    let park = h.services.arm_scripts_running_park();
+    let stop_a = {
+        let services = h.services.clone();
+        let ws = h.ws.clone();
+        intent_core::spawn_daemon(async move { services.script_stop(ws, a).await })
+    };
+    tokio::time::timeout(LIVENESS, park.entered.notified())
+        .await
+        .expect("a's settling recompute parked");
+    assert!(!h.services.workspace_scripts_running(&h.ws), "a settled");
+
+    let start_b = {
+        let services = h.services.clone();
+        let ws = h.ws.clone();
+        let b = b.clone();
+        intent_core::spawn_daemon(async move { services.script_start(ws, b).await })
+    };
+    let deadline = tokio::time::Instant::now() + LIVENESS;
+    while !h.services.workspace_scripts_running(&h.ws) {
+        assert!(tokio::time::Instant::now() < deadline, "b never started");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // Without the per-workspace gate, B's own lifecycle recompute would run
+    // now (a no-op against the still-`true` baseline); with it, B's recompute
+    // queues behind the parked one. Give the ungated path a bounded chance
+    // to reach `running` so the stale write below is the last word.
+    for _ in 0..40 {
+        let st = h
+            .services
+            .script_status(h.ws.clone(), b.clone())
+            .await
+            .expect("b status");
+        if st["status"] == "running" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    park.release.notify_one();
+    tokio::time::timeout(LIVENESS, stop_a)
+        .await
+        .expect("stop a settled")
+        .expect("stop task")
+        .expect("stop a");
+    tokio::time::timeout(LIVENESS, start_b)
+        .await
+        .expect("start b settled")
+        .expect("start task")
+        .expect("start b");
+    assert!(h.services.workspace_scripts_running(&h.ws), "b runs");
+    let events = scripts_running_events(&h).await;
+    assert_eq!(
+        events.last(),
+        Some(&true),
+        "last published transition matches the running command: {events:?}"
+    );
+    assert!(served_scripts_running(&h).await);
+
+    h.services
+        .script_stop(h.ws.clone(), b)
+        .await
+        .expect("stop b");
+    await_flag_events(
+        [events.clone(), vec![false]].concat(),
+        || scripts_running_events(&h),
+    )
+    .await;
+}

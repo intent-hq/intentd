@@ -1194,6 +1194,11 @@ pub struct Services {
     /// Last-observed `Workspace.scriptsRunning` per workspace (§5.1), the
     /// transition baseline for `workspace:scriptsRunning-changed`.
     last_scripts_running: Arc<workspace_status::WaitingStatusCache>,
+    /// Per-workspace ordering gate for the `scriptsRunning` recompute.
+    scripts_running_locks: Arc<workspace_status::ScriptsRunningLocks>,
+    /// Test seam parking one `scriptsRunning` recompute (shared across clones).
+    #[cfg(test)]
+    scripts_running_park: Arc<Mutex<Option<Arc<workspace_status::ScriptsRunningPark>>>>,
     /// REV-1 agent-initiated reverse-dispatch seam: when an agent calls
     /// `ws.browser.exec` via the MCP front door there is no ambient client
     /// connection to reverse-dispatch on, so [`WorkspaceApi::browser_exec`]
@@ -1797,6 +1802,9 @@ impl Services {
             last_display_statuses: Arc::new(workspace_status::DisplayStatusCache::default()),
             last_waiting_statuses: Arc::new(workspace_status::WaitingStatusCache::default()),
             last_scripts_running: Arc::new(workspace_status::WaitingStatusCache::default()),
+            scripts_running_locks: Arc::new(workspace_status::ScriptsRunningLocks::default()),
+            #[cfg(test)]
+            scripts_running_park: Arc::new(Mutex::new(None)),
             reverse_dispatch: None,
             server_control: Arc::new(OnceLock::new()),
             invite_links: Arc::new(OnceLock::new()),
