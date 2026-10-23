@@ -64,9 +64,41 @@ const NOTICE_LIMIT: usize = 64;
 const READ_LIMIT: usize = 64;
 const WORKER_LIMIT: usize = 2;
 const LEASE_TTL: Duration = Duration::from_secs(300);
-const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
-const FRAME_TTL: Duration = Duration::from_secs(15);
+/// Production bound on acquiring a native request's source, credentials or
+/// authority. Read it through [`acquire_wait`].
+const ACQUIRE_BASE: Duration = Duration::from_secs(5);
+/// Production lifetime of an unstarted native request frame. Read it through
+/// [`frame_ttl`].
+const FRAME_TTL_BASE: Duration = Duration::from_secs(15);
+
+/// How long a native wire, review, resource-read, child-git or selection
+/// request may wait to acquire what it needs before it is refused.
+fn acquire_wait() -> Duration {
+    request_wait(ACQUIRE_BASE)
+}
+/// How long a native request frame stays admitted before it starts.
+fn frame_ttl() -> Duration {
+    request_wait(FRAME_TTL_BASE)
+}
+/// Production keeps the fixed bounds.
+#[cfg(not(test))]
+const fn request_wait(base: Duration) -> Duration {
+    base
+}
+/// Unit tests stretch the bounds with `INTENTD_TEST_TIMEOUT_MULTIPLIER`, as
+/// every test budget does: coverage CI runs these real Git/SQLite workers on
+/// oversubscribed runners, where a fixed 5s acquire refused a prepare as
+/// "Repository review unavailable" (intentd#2581). The setting is read once
+/// per process so production deadlines and a test's paused-clock advances
+/// always agree.
+#[cfg(test)]
+fn request_wait(base: Duration) -> Duration {
+    static SETTING: std::sync::LazyLock<Option<String>> = std::sync::LazyLock::new(|| {
+        std::env::var(intentd_test_support::TIMEOUT_MULTIPLIER_ENV).ok()
+    });
+    intentd_test_support::scale_test_timeout(base, SETTING.as_deref())
+}
 
 fn unavailable() -> Error {
     Error::Forbidden("Repository context unavailable".into())
@@ -361,7 +393,7 @@ impl Connection {
             // caller-binding: allow — only finishes the original request lifetime; no service capability calls
             tokio::spawn(async move {
                 if let Some(retirement) = retirement {
-                    tokio::select! { () = retirement.native_cancelled() => return, () = tokio::time::sleep(FRAME_TTL) => {} }
+                    tokio::select! { () = retirement.native_cancelled() => return, () = tokio::time::sleep(frame_ttl()) => {} }
                 } else {
                     return;
                 }
@@ -871,7 +903,7 @@ pub(crate) fn capture(
     let request = Request::current(services);
     Box::pin(async move {
         let request = request.map_err(|_| unavailable())?;
-        tokio::time::timeout(ACQUIRE_TIMEOUT, capture_inner(&request, query))
+        tokio::time::timeout(acquire_wait(), capture_inner(&request, query))
             .await
             .map_err(|_| unavailable())?
             .map_err(|_| unavailable())

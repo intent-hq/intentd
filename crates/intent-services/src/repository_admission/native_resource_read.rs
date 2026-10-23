@@ -26,7 +26,7 @@ use intent_store::{RepositoryAuthoritySnapshot, RepositoryLifecycleKey};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 
-use super::{Connection, Services};
+use super::{acquire_wait, frame_ttl, Connection, Services};
 use crate::observation_adapter::ConnectionObservations;
 use crate::pr_monitor::qualified_cache::{
     CacheAdmissionGuard, CacheDelivery, CacheError, CacheFailure, CacheRequest, ManagedCacheRequest,
@@ -65,8 +65,6 @@ pub(crate) mod scoped;
 
 const LIMIT: usize = 64;
 const TTL: Duration = Duration::from_secs(300);
-const FRAME_TTL: Duration = Duration::from_secs(15);
-const ACQUIRE: Duration = Duration::from_secs(5);
 const READ: Duration = Duration::from_secs(10);
 
 fn unavailable() -> Error {
@@ -409,7 +407,7 @@ pub(super) fn capture_frame(c: &Connection, frame: Frame) -> Arc<dyn RepositoryR
         state: Mutex::new(State::Empty),
         output_admitted: Arc::new(AtomicBool::new(false)),
         permits,
-        deadline: Instant::now() + FRAME_TTL,
+        deadline: Instant::now() + frame_ttl(),
     });
     if let Some(lifetime) = &request.base.lifetime {
         let weak = Arc::downgrade(&request);
@@ -618,7 +616,7 @@ impl RepositoryReadRequestScope for Request {
                 Delivery::Capture(l) | Delivery::Read(l, _, _, _, _, _) => l.clone(),
                 Delivery::Public => unreachable!(),
             };
-            let result = tokio::time::timeout(ACQUIRE, async {
+            let result = tokio::time::timeout(acquire_wait(), async {
                 let _legacy = self.base.connection.caller.legacy_lease().await.map_err(denied)?;
                 self.validate(&lease).await?;
                 // Snapshot all private records before taking consuming fences.
@@ -695,7 +693,7 @@ fn entry<'a, T: Send + 'a>(
 pub(crate) fn capture(services: &Services, q: Query) -> BoxFuture<'_, Result<Capture>> {
     entry(services, &Frame::Capture(q), |r| {
         Box::pin(async move {
-            tokio::time::timeout(ACQUIRE, capture_inner(&r))
+            tokio::time::timeout(acquire_wait(), capture_inner(&r))
                 .await
                 .map_err(denied)?
         })
@@ -834,7 +832,7 @@ pub(crate) fn release(services: &Services, q: Bound) -> BoxFuture<'_, Result<Rel
 }
 async fn release_inner(r: &Request, id: &str) -> Result<Released> {
     // Release retains the same fixed original authority acquisition budget.
-    tokio::time::timeout(ACQUIRE, r.authority())
+    tokio::time::timeout(acquire_wait(), r.authority())
         .await
         .map_err(denied)??;
     if let Some(l) = r

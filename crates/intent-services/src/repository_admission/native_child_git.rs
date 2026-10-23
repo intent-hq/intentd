@@ -19,7 +19,7 @@ use intent_store::{RepositoryHostAuthoritySnapshot, RepositoryLifecycleKey};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::{Duration, Instant};
 
-use super::{Connection, Services};
+use super::{frame_ttl, Connection, Services};
 use crate::repository_admission::lifecycle::{RepositorySourceLifetime, RepositorySubscription};
 use crate::repository_admission::AdmissionError;
 use crate::source_control_auth_ops::checkout::CheckoutAuthority;
@@ -28,7 +28,6 @@ use crate::source_control_auth_ops::repository_owner::{
     GitlabChildPolicyExpected, GitlabChildPolicyReceipt,
 };
 
-const FRAME_TTL: Duration = Duration::from_secs(15);
 const WORK_LIMIT: Duration = Duration::from_secs(10);
 fn unavailable() -> Error {
     Error::Forbidden("Child Git unavailable".into())
@@ -212,7 +211,7 @@ pub(super) fn capture_frame(c: &Connection, frame: Frame) -> Arc<dyn RepositoryR
             _permits: (local, global),
             authority: Mutex::new(None),
             authorized: AtomicBool::new(false),
-            deadline: Instant::now() + FRAME_TTL,
+            deadline: Instant::now() + frame_ttl(),
         });
         // This is intentionally before queue admission and the first permission
         // await. No later account may replace this original captured producer.

@@ -31,7 +31,7 @@ use intent_store::{
 };
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
-use super::{Connection, Services};
+use super::{acquire_wait, frame_ttl, Connection, Services};
 use crate::repository_admission::lifecycle::{RepositorySourceLifetime, RepositorySubscription};
 use crate::repository_admission::{
     AdmissionError, RepositoryAuthorityFacts, RepositoryAuthorityProvenance,
@@ -42,8 +42,6 @@ const GLOBAL_LIMIT: usize = 256;
 const WORKER_LIMIT: usize = 2;
 const RECONCILE_LIMIT: usize = 64;
 const NOTICE_LIMIT: usize = 64;
-const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
-const FRAME_TTL: Duration = Duration::from_secs(15);
 const ADMISSION_TIMEOUT: Duration = Duration::from_secs(10);
 const LEASE_TTL: Duration = Duration::from_secs(300);
 const RECEIPT_TTL: Duration = Duration::from_secs(300);
@@ -468,7 +466,7 @@ impl Request {
     fn check(&self) -> Result<()> {
         self.connection.entered().map_err(denied)?;
         self.connection.selection.check()?;
-        if self.completed.load(Ordering::Acquire) || Instant::now() >= self.created + FRAME_TTL {
+        if self.completed.load(Ordering::Acquire) || Instant::now() >= self.created + frame_ttl() {
             return Err(unavailable());
         }
         self.lifetime
@@ -625,7 +623,7 @@ pub(super) fn capture_frame(c: &Connection, frame: Frame) -> Arc<dyn RepositoryR
         let weak = Arc::downgrade(&request);
         // caller-binding: allow — only finishes the original request lifetime; no service capability calls
         tokio::spawn(async move {
-            tokio::select! { () = retirement.native_cancelled() => {}, () = tokio::time::sleep(FRAME_TTL) => {} }
+            tokio::select! { () = retirement.native_cancelled() => {}, () = tokio::time::sleep(frame_ttl()) => {} }
             if let Some(request) = weak.upgrade() {
                 request.finish();
             }
@@ -789,7 +787,7 @@ impl RepositoryReadRequestScope for Request {
                             .native_dispatch(|| {
                                 op.disclosure.retirement().native_dispatch(|| {
                                     if self.completed.load(Ordering::Acquire)
-                                        || Instant::now() >= self.created + FRAME_TTL
+                                        || Instant::now() >= self.created + frame_ttl()
                                         || self.consumed.swap(true, Ordering::AcqRel)
                                     {
                                         return Err(AdmissionError::Retired);
@@ -869,7 +867,7 @@ fn entry<'a, T: Send + 'static>(
 pub(crate) fn capture(services: &Services, query: Query) -> BoxFuture<'_, Result<Capture>> {
     entry(services, &Frame::Capture(query), |request| {
         Box::pin(async move {
-            tokio::time::timeout(ACQUIRE_TIMEOUT, acquire(&request))
+            tokio::time::timeout(acquire_wait(), acquire(&request))
                 .await
                 .map_err(denied)?
         })

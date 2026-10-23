@@ -819,7 +819,7 @@ async fn native_selection_virtual_deadlines_retire_unclaimed_frame_and_receipt()
         .entered(async { s.owner.capture_selection(&Frame::Save(q)).unwrap() })
         .await;
     tokio::time::pause();
-    tokio::time::advance(FRAME_TTL + Duration::from_secs(1)).await;
+    tokio::time::advance(frame_ttl() + Duration::from_secs(1)).await;
     tokio::time::resume();
     scope.retire();
     assert_eq!(

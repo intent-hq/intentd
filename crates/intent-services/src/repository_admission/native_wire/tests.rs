@@ -1613,7 +1613,7 @@ async fn native_wire_queued_frame_expires_without_slot_or_service_entry() {
     .await;
     let request = request.unwrap();
     tokio::time::timeout(
-        FRAME_TTL + Duration::from_secs(2),
+        frame_ttl() + Duration::from_secs(2),
         request
             .lifetime
             .as_ref()
@@ -2787,4 +2787,21 @@ async fn native_wire_sidebar_member_exact_projection_and_unattested_facts() {
         Some(fixture.server.descriptor.instance().as_str()),
     );
     assert_eq!(fixture.server.control.requests.lock().unwrap().len(), calls);
+}
+
+// Production keeps the 5s acquire and 15s frame bounds; unit tests stretch both
+// exactly as every other test budget is stretched, so coverage CI's
+// INTENTD_TEST_TIMEOUT_MULTIPLIER=3 cannot refuse a slow but healthy request.
+#[test]
+fn native_request_waits_keep_production_bounds_and_stretch_with_the_test_multiplier() {
+    assert_eq!(ACQUIRE_BASE, Duration::from_secs(5));
+    assert_eq!(FRAME_TTL_BASE, Duration::from_secs(15));
+    assert_eq!(
+        acquire_wait(),
+        intentd_test_support::test_timeout(ACQUIRE_BASE)
+    );
+    assert_eq!(
+        frame_ttl(),
+        intentd_test_support::test_timeout(FRAME_TTL_BASE)
+    );
 }
