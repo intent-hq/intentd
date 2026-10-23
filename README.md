@@ -900,11 +900,12 @@ The design docs live in the monorepo under `docs/`:
 
 ### CI runners and compiler cache
 
-Routed jobs prefer the free self-hosted fleet and burst to GitHub-hosted runners
-when the fleet is unavailable or busy. Burst Linux checks use the `gh-linux-8x`
-org larger runner and coverage/release compilation uses `gh-linux-16x`; Windows
-uses `gh-windows-16x` and Apple Silicon uses `macos-26-xlarge`. The larger
-runners' group must allow public repositories. Physical-host pruning remains scheduled.
+Routed jobs prefer the free self-hosted fleet and burst to the matching WarpBuild
+runner (or the GitHub label itself when `CI_WARPBUILD_DISABLED` is `true`) when
+the fleet is unavailable or busy. `check` takes an 8-CPU heavy slot but bursts as
+`gh-linux-16x` (WarpBuild 16x), as do coverage and release compilation; Windows
+uses `gh-windows-16x` (WarpBuild 16x) and Apple Silicon uses `macos-26-xlarge`
+(WarpBuild 12x). The larger runners' group must allow public repositories. Physical-host pruning remains scheduled.
 To bypass self-hosted runners during maintenance, set the repository variable
 `CI_LINUX_RUNNER_DISABLED=true`, `CI_WINDOWS_RUNNER_DISABLED=true`, or
 `CI_MACOS_RUNNER_DISABLED=true`.
