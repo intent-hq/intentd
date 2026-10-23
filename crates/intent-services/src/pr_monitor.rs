@@ -1259,13 +1259,27 @@ async fn poll_pr(
                 entry.pr = pr.clone();
                 // Queue movement need not change updatedAt or mergeability.
                 // Keep the signal already returned by the folded observation
-                // even when the remaining checklist reuses the full fetch.
+                // even when the remaining checklist reuses the full fetch —
+                // the ejection too, or a re-queue before the next full fetch
+                // would hide it as superseded (intent-hq/intent#7523).
                 if let Some(observation) = &observation {
                     let queue = observation.signals.is_in_merge_queue;
                     entry.snapshot.merge_queue_reported = queue;
                     entry.snapshot.requirements.is_in_merge_queue = queue.filter(|&q| q);
                     entry.snapshot.requirements.merge_queue =
                         pr_ops::queued_merge_queue_entry(&observation.signals);
+                    entry.snapshot.requirements.merge_queue_ejection = observation
+                        .signals
+                        .merge_queue_removal
+                        .as_ref()
+                        .and_then(|removal| {
+                            pr_ops::MergeQueueEjection::from_removal(
+                                removal,
+                                &entry.snapshot.requirements.state,
+                            )
+                        });
+                    // The observation answered, so its ejection is known.
+                    entry.snapshot.ejection_known = true;
                 }
                 Some(entry.clone())
             }
@@ -13685,6 +13699,93 @@ mod tests {
                 .count(),
             1,
             "no re-report after the wake: {text}"
+        );
+    }
+
+    /// A merge-queue ejection is news on the very next poll, even when that
+    /// poll reuses the previous full fetch: GitHub leaves `updatedAt` alone
+    /// on queue movement, so the fingerprint is unchanged and only the
+    /// folded observation sees the removal. Waiting for the next FULL fetch
+    /// let a re-queue land first, and the ejection was then suppressed as
+    /// superseded (intent-hq/intent#7523). A removal that records a merge
+    /// is still never an ejection.
+    #[tokio::test]
+    async fn a_cheap_poll_reports_a_merge_queue_ejection() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let svc = svc.with_pr_monitor_debounce_seconds(3600);
+        forge.edit(|s| {
+            s.folded = Some(FoldedRead::default());
+            s.in_merge_queue = Some(true);
+            s.merge_queue_entry = Some(intent_sourcecontrol::MergeQueueEntry {
+                position: 1,
+                queue_size: Some(1),
+                state: Some("awaiting_checks".into()),
+                enqueued_at: Some("2026-10-21T13:10:00Z".into()),
+                estimated_time_to_merge: None,
+            });
+        });
+        let monitor = register(&svc, &ws, &owner).await;
+        svc.poll_pr_monitors().await;
+        let _ = svc
+            .pr_monitor_flush(&ws, &monitor.monitor_id)
+            .await
+            .unwrap();
+
+        let eject = |reason: &str| {
+            let removal = intent_sourcecontrol::MergeQueueRemoval {
+                at: "2026-10-21T13:18:28Z".into(),
+                reason: Some(reason.into()),
+            };
+            move |s: &mut ForgeState| {
+                s.in_merge_queue = Some(false);
+                s.merge_queue_entry = None;
+                s.merge_queue_removal = Some(removal);
+            }
+        };
+        let poll_cheaply = async |reason: &str| {
+            forge.edit_quiet(eject(reason));
+            let rules_before = forge.sub_fetches("branch_rules");
+            svc.poll_pr_monitors().await;
+            assert_eq!(
+                forge.sub_fetches("branch_rules"),
+                rules_before,
+                "the poll reused the previous full fetch: {:?}",
+                forge_reads(&forge)
+            );
+            svc.store()
+                .get_pr_monitor(&monitor.monitor_id)
+                .await
+                .unwrap()
+                .pending_changes
+        };
+
+        let merged = poll_cheaply("merged").await;
+        assert!(
+            !merged
+                .iter()
+                .any(|c| c.starts_with("removed from the merge queue")),
+            "a merge-recording removal is no ejection: {merged:?}"
+        );
+        let _ = svc
+            .pr_monitor_flush(&ws, &monitor.monitor_id)
+            .await
+            .unwrap();
+        forge.edit_quiet(|s| {
+            s.in_merge_queue = Some(true);
+            s.merge_queue_removal = None;
+        });
+        svc.poll_pr_monitors().await;
+        let _ = svc
+            .pr_monitor_flush(&ws, &monitor.monitor_id)
+            .await
+            .unwrap();
+
+        let ejected = poll_cheaply("failed_checks").await;
+        assert!(
+            ejected
+                .iter()
+                .any(|c| c == "removed from the merge queue (failed checks)"),
+            "the cheap poll reports the ejection: {ejected:?}"
         );
     }
 
