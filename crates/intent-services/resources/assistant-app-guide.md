@@ -647,7 +647,7 @@ client without the user's instruction.
 
 ## Add context, run a task, and find results
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/{WorkspaceLayout,MultiSelectTabbedSidebar,NoteMetadataBar}.svelte; src/lib/components/workspace/sidebar/{SidebarSectionTabs,WorkspaceSidebarRail,WorkspaceProgressCard,AddContextSection,ContextPanel,NotesPanel}.svelte; src/store/renderer/slices/sidebar-nav/sagas/sidebar-section-navigation-saga.ts; src/lib/utils/shortcut-bindings.ts; messages/en.json. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/{WorkspaceLayout,MultiSelectTabbedSidebar,NoteMetadataBar}.svelte; src/lib/components/workspace/sidebar/{SidebarSectionTabs,WorkspaceSidebarRail,WorkspaceProgressCard,AddContextSection,ContextPanel,NotesPanel,ExpandableFileSearch}.svelte; src/store/renderer/slices/sidebar-nav/sagas/sidebar-section-navigation-saga.ts; src/lib/utils/shortcut-bindings.ts; messages/en.json. -->
 
 Use the icon tabs above the expanded sidebar's content panel to switch sections.
 Hover over an icon for its section name; scroll the row horizontally when space
@@ -670,6 +670,10 @@ like a click in either layout. The rail's sidebar toggle pins it open;
 the expanded sidebar's toggle collapses it.
 **Toggle Sidebar** still uses
 **⌘B** on macOS or **Ctrl+B** on Windows/Linux by default.
+
+In **Files**, search and file actions sit beside the section title. Open search to
+find a file; use the arrow keys to choose a result and Enter to open it. Escape
+clears search and returns focus to its button.
 
 In the workspace sidebar, open **Context** to find the **Spec** and other notes.
 Use its **Add context** action to create a note. In layouts showing the Notes-panel
