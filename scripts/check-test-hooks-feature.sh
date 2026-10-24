@@ -29,6 +29,14 @@ else
   packages=(intentd intentd-sitter)
 fi
 
+# Resolve the manifest to an absolute path once, before cargo runs from its
+# directory below.
+if ! manifest_dir=$(cd "$(dirname "$manifest")" 2>/dev/null && pwd); then
+  echo "error: cannot read the production feature graph of ${packages[*]}: no directory for $manifest" >&2
+  exit 2
+fi
+manifest="$manifest_dir/$(basename "$manifest")"
+
 read -r -a flags <<<"${CARGO_TREE_FLAGS---locked}"
 args=()
 for package in "${packages[@]}"; do
@@ -38,7 +46,7 @@ done
 # Run from the manifest's directory: cargo reads .cargo/config.toml from the
 # invocation directory upward, and another workspace's config (patches,
 # sources) must not leak into this graph.
-if ! tree=$(cd "$(dirname "$manifest")" 2>/dev/null &&
+if ! tree=$(cd "$manifest_dir" &&
   cargo tree "${flags[@]}" --manifest-path "$manifest" "${args[@]}" \
     -e normal,build,features --target all --prefix none); then
   echo "error: cannot read the production feature graph of ${packages[*]}" >&2

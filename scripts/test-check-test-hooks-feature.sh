@@ -2,7 +2,8 @@
 # Regression tests for check-test-hooks-feature.sh: runs the real check
 # against throwaway cargo workspaces (path dependencies only, so no network).
 # A `test-hooks` feature turned on through a normal, build, target-specific or
-# forwarded edge must fail and name the crate; one turned on only from
+# forwarded edge must fail and name the crate (also via a relative manifest
+# path); one turned on only from
 # [dev-dependencies], or a look-alike feature name, must pass. Finally the
 # check must pass on this repo.
 #
@@ -94,6 +95,14 @@ expect_pass look_alike
 
 new_workspace normal 'core = { path = "../core", features = ["test-hooks"] }'
 expect_fail normal core
+
+# A relative manifest path resolves against the caller's directory.
+set +e
+out=$(cd "$tmp" && CARGO_TREE_FLAGS=--offline "$check" normal/Cargo.toml app 2>&1)
+rc=$?
+set -e
+[ "$rc" -eq 1 ] || fail "relative manifest: expected exit 1, got $rc: $out"
+grep -q '^::error::core feature "test-hooks"' <<<"$out" || fail "relative manifest: no ::error line for core: $out"
 
 new_workspace forwarded 'mid = { path = "../mid", features = ["test-hooks"] }'
 expect_fail forwarded core
