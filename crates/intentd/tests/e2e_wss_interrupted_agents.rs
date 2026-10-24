@@ -13,7 +13,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::os::unix::process::CommandExt;
 use std::path::Path;

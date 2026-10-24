@@ -1432,17 +1432,9 @@ async fn monitor_export_defers_delivery_and_queue_drain_until_abort() {
     row.reason = Some("ttl-expired".into());
     row.settled_at = Some(now_iso());
     h.services.store.settle_script_monitor(&row).await.unwrap();
-    h.services.transfer_exports.lock().unwrap().insert(
-        "export-test".into(),
-        crate::transfer_export::ExportSession {
-            initiator: None,
-            workspace_id: h.ws.clone(),
-            staging_dir: std::env::temp_dir(),
-            state: crate::transfer_export::ExportState::Building { aborted: false },
-            wip_paths: vec![],
-            max_chunk_bytes: 100,
-        },
-    );
+    h.services
+        .feature_transfer_port()
+        .park_building_export_for_test("export-test", &h.ws, None, std::env::temp_dir());
     h.services.dispatch_script_monitor(&row).await;
     assert!(h
         .services
@@ -1458,10 +1450,8 @@ async fn monitor_export_defers_delivery_and_queue_drain_until_abort() {
     assert!(!h.services.has_ready_to_send(&owner));
     assert!(h.services.dequeue_message(&owner).is_none());
     h.services
-        .transfer_exports
-        .lock()
-        .unwrap()
-        .remove("export-test");
+        .feature_transfer_port()
+        .remove_export_for_test("export-test");
     assert!(h.services.has_ready_to_send(&owner));
     let queued = h.services.dequeue_message(&owner).unwrap();
     assert_eq!(queued.id, format!("script-monitor:{}", row.monitor_id));

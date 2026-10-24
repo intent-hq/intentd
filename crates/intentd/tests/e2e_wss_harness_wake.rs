@@ -19,7 +19,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 #[path = "e2e_wss_harness_wake/compaction_restart.rs"]
 mod compaction_restart;
 

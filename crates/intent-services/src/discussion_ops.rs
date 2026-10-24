@@ -24,8 +24,12 @@ impl Services {
         Ok(principal_id)
     }
 
-    #[cfg(test)]
-    pub(crate) async fn discussion_list_op(
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub async fn discussion_list_op(
         &self,
         workspace_id: &WorkspaceId,
         before_sequence: Option<i64>,
@@ -38,8 +42,12 @@ impl Services {
             .await
     }
 
-    #[cfg(test)]
-    pub(crate) async fn discussion_send_op(
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub async fn discussion_send_op(
         &self,
         workspace_id: &WorkspaceId,
         message_id: &str,
@@ -68,7 +76,11 @@ impl Services {
         Ok(principal)
     }
 
-    pub(crate) async fn discussion_history_op(
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub async fn discussion_history_op(
         &self,
         ws: &WorkspaceId,
         id: &str,

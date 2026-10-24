@@ -156,73 +156,7 @@ impl TempDb {
     }
 }
 
-/// Serializes env-mutating tests: process env is global, so a test that SETS
-/// `MOCK_AGENT_SCRIPT_PATH` (or a retry-backoff knob) must not interleave
-/// with one that unsets it. Crate-wide (via the `pub(crate)` [`EnvGuard`]):
-/// tests in OTHER modules that mutate the same vars (e.g. `agent_session`'s
-/// idle-timeout tests and this module's worker redrive tests both pin
-/// `INTENTD_PROMPT_IDLE_TIMEOUT_MS`) must serialize through the same lock or
-/// one test's Drop-restore races another's live window.
-static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-/// Pins env vars for the guard's lifetime — holding [`ENV_LOCK`] so
-/// env-mutating tests serialize — and restores the prior values on drop so
-/// tests stay hermetic (mirrors `intent-acp`'s test `EnvGuard`).
-///
-/// The lock is held until the guard drops, so a test must use exactly ONE
-/// guard: constructing a second before the first drops deadlocks the test
-/// thread. Mutate every var (sets AND unsets) through a single
-/// [`EnvGuard::apply`] call instead.
-pub(crate) struct EnvGuard {
-    saved: Vec<(&'static str, Option<String>)>,
-    _lock: std::sync::MutexGuard<'static, ()>,
-}
-
-impl EnvGuard {
-    fn acquire() -> std::sync::MutexGuard<'static, ()> {
-        // A panicked test already restored its env in Drop before poisoning.
-        ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    /// Apply every `(key, value)` mutation under one guard: `Some(v)` sets
-    /// the var, `None` unsets it. Prior values are restored on drop.
-    pub(crate) fn apply(pairs: &[(&'static str, Option<&str>)]) -> Self {
-        let lock = Self::acquire();
-        let mut saved = Vec::new();
-        for (key, value) in pairs {
-            saved.push((*key, std::env::var(key).ok()));
-            match value {
-                Some(v) => std::env::set_var(key, v),
-                None => std::env::remove_var(key),
-            }
-        }
-        Self { saved, _lock: lock }
-    }
-
-    fn unset(key: &'static str) -> Self {
-        Self::apply(&[(key, None)])
-    }
-
-    /// Set every `(key, value)` pair for the guard's lifetime.
-    pub(crate) fn set_all(pairs: &[(&'static str, &str)]) -> Self {
-        let pairs: Vec<(&'static str, Option<&str>)> =
-            pairs.iter().map(|(k, v)| (*k, Some(*v))).collect();
-        Self::apply(&pairs)
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        for (key, prev) in &self.saved {
-            match prev {
-                Some(v) => std::env::set_var(key, v),
-                None => std::env::remove_var(key),
-            }
-        }
-    }
-}
+pub(crate) use crate::test_support::fixtures::EnvGuard;
 
 /// A kill callback that records the agents it was invoked for (the registry
 /// itself performs the follow-up `deregister`).
@@ -17852,8 +17786,38 @@ async fn worker_driven_streaming_failure_records_streak_exactly_once() {
 /// Error status, the terminal `agent:failed` + `agent:stream:end` pair
 /// (emitted by the terminal-failure path, since `run_prompt_turn` suppressed
 /// it for the marker error), and the message requeued for `agent.retry`.
-#[tokio::test]
-async fn second_pre_output_transport_failure_takes_terminal_path() {
+///
+/// Also the stack-headroom guard for the agent-turn path, so it runs on a
+/// reduced 1 MiB stack instead of the 2 MiB default. The scenario nests the
+/// deepest turn-path poll frames on one thread (`run_message_worker` →
+/// `retry_spawn_owned` → `ensure_started_owned` → `start_session_owned` →
+/// `start_session_opened` → session load, twice, then the terminal-failure
+/// path). Debug poll frames there once filled the whole default stack (the
+/// scenario needed ~2.08 MB, so any small addition overflowed); with the
+/// turn path's await sites built off-frame by
+/// [`crate::stack_frame::boxed_await`] it needs ~570 KiB. A stack overflow
+/// here (the process aborts with SIGSEGV) means a new large future is being
+/// awaited inline on the turn path — build it with `boxed_await` instead of
+/// raising this budget.
+#[test]
+fn second_pre_output_transport_failure_takes_terminal_path() {
+    const TURN_PATH_STACK_BUDGET: usize = 1024 * 1024;
+    std::thread::Builder::new()
+        .name("turn-path-stack-guard".into())
+        .stack_size(TURN_PATH_STACK_BUDGET)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("current-thread runtime")
+                .block_on(second_pre_output_transport_failure_scenario());
+        })
+        .expect("spawn the reduced-stack thread")
+        .join()
+        .expect("the scenario's assertions hold");
+}
+
+async fn second_pre_output_transport_failure_scenario() {
     let script = mock_agent_script();
     let scratch = test_tempdir("itd-764-twice-");
     let attempt_file = scratch.path().join("attempts");

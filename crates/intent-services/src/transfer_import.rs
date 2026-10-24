@@ -31,17 +31,15 @@ use intent_core::{clock::now_iso, AgentId, Error, Result, Workspace, WorkspaceId
 use intent_store::{Sandbox, SandboxStatus};
 use sha2::Digest as _;
 
+use crate::capability::gated_collaborator_caller;
 use crate::transfer_git::TransferRefsManifest;
 use crate::transfer_model_selection::{resolve_imported_selection, ImportedSelection};
 use crate::{publish_event, workspace_created_event, workspace_setup_completed_event, Services};
 
-/// Maximum DECODED bytes per `workspace.import.chunk` call. Base64 inflates
-/// this by 4/3 on the wire (~21.4 MiB), keeping the full JSON-RPC frame
-/// comfortably under the 40 MiB inbound cap (PROTOCOL §1.3).
-pub(crate) const IMPORT_MAX_CHUNK_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) use crate::feature_ports::IMPORT_MAX_CHUNK_BYTES;
 
 /// One in-flight staged import: everything `chunk`/`commit`/`abort` need
-/// between calls. Lives in [`Services::transfer_imports`]; in-memory only.
+/// between calls. Lives in [`crate::transfer::TransferFeature::imports`]; in-memory only.
 pub(crate) struct ImportSession {
     pub initiator: Option<intent_core::PrincipalId>,
     pub manifest: TransferManifest,
@@ -75,6 +73,27 @@ fn chunk_file_name(seq: u64) -> String {
 }
 
 impl Services {
+    /// Chunk/session handles never confer another authenticated person's
+    /// transfer authority. Reconnects retain access through the same principal.
+    pub(crate) async fn require_import_actor(&self, id: &str, what: &str) -> Result<()> {
+        self.require_host_execution(what).await?;
+        let Some(principal) = gated_collaborator_caller(what)? else {
+            return Ok(());
+        };
+        let imports = self
+            .transfer_state()
+            .imports
+            .lock()
+            .expect("transfer import registry poisoned");
+        if imports
+            .get(id)
+            .is_some_and(|s| s.initiator.as_ref() != Some(&principal))
+        {
+            return Err(Error::NotFound(format!("import {id}")));
+        }
+        Ok(())
+    }
+
     /// Root directory staged imports live under. Sibling of the workspace
     /// checkouts so the final asset/worktree moves stay on one filesystem.
     fn import_staging_root(&self) -> PathBuf {
@@ -140,7 +159,8 @@ impl Services {
         // import's directory as an orphan.
         {
             let mut imports = self
-                .transfer_imports
+                .transfer_state()
+                .imports
                 .lock()
                 .expect("transfer import registry poisoned");
             if imports
@@ -171,7 +191,8 @@ impl Services {
         self.sweep_orphaned_staging_dirs().await;
 
         if let Err(e) = tokio::fs::create_dir_all(&staging_dir).await {
-            self.transfer_imports
+            self.transfer_state()
+                .imports
                 .lock()
                 .expect("transfer import registry poisoned")
                 .remove(&import_id);
@@ -201,7 +222,8 @@ impl Services {
         while let Ok(Some(entry)) = entries.next_entry().await {
             let name = entry.file_name().to_string_lossy().to_string();
             let live = self
-                .transfer_imports
+                .transfer_state()
+                .imports
                 .lock()
                 .expect("transfer import registry poisoned")
                 .contains_key(&name);
@@ -258,7 +280,8 @@ impl Services {
         // both pass the check and push the total past the declared size.
         let (staging_dir, prior_this_seq, received) = {
             let mut imports = self
-                .transfer_imports
+                .transfer_state()
+                .imports
                 .lock()
                 .expect("transfer import registry poisoned");
             let session = imports
@@ -287,7 +310,8 @@ impl Services {
         if let Err(e) = tokio::fs::write(&path, &bytes).await {
             // Roll the reservation back so a retry accounts correctly.
             let mut imports = self
-                .transfer_imports
+                .transfer_state()
+                .imports
                 .lock()
                 .expect("transfer import registry poisoned");
             if let Some(session) = imports.get_mut(&import_id) {
@@ -315,7 +339,8 @@ impl Services {
     ) -> Result<serde_json::Value> {
         let session = {
             let mut imports = self
-                .transfer_imports
+                .transfer_state()
+                .imports
                 .lock()
                 .expect("transfer import registry poisoned");
             if imports.get(&import_id).is_some_and(|s| s.committing) {
@@ -352,7 +377,8 @@ impl Services {
         // gaps) never touch a flag another commit owns.
         let claim = {
             let mut imports = self
-                .transfer_imports
+                .transfer_state()
+                .imports
                 .lock()
                 .expect("transfer import registry poisoned");
             let session = imports
@@ -394,7 +420,8 @@ impl Services {
         let result = self.workspace_import_commit_body(&import_id, claim).await;
         if result.is_err() {
             if let Some(session) = self
-                .transfer_imports
+                .transfer_state()
+                .imports
                 .lock()
                 .expect("transfer import registry poisoned")
                 .get_mut(&import_id)
@@ -556,7 +583,8 @@ impl Services {
         let rehydrated = self.rehydrate_after_import().await;
 
         // Session retired; staging deleted.
-        self.transfer_imports
+        self.transfer_state()
+            .imports
             .lock()
             .expect("transfer import registry poisoned")
             .remove(import_id);
@@ -4546,7 +4574,8 @@ mod tests {
             .await
             .expect("chunk");
         // Simulate an in-flight first commit holding the claim.
-        svc.transfer_imports
+        svc.transfer_state()
+            .imports
             .lock()
             .unwrap()
             .get_mut(&import_id)
@@ -4561,7 +4590,8 @@ mod tests {
         // The rejection did not release the first commit's claim: the flag
         // is still set, and chunk/abort remain rejected.
         assert!(
-            svc.transfer_imports
+            svc.transfer_state()
+                .imports
                 .lock()
                 .unwrap()
                 .get(&import_id)
@@ -4582,7 +4612,8 @@ mod tests {
 
         // Release the claim (as the first commit's failure path would) and
         // the retry path works end to end.
-        svc.transfer_imports
+        svc.transfer_state()
+            .imports
             .lock()
             .unwrap()
             .get_mut(&import_id)
@@ -4612,7 +4643,7 @@ mod tests {
         // Register `import-live` directly (as a begin racing the sweep
         // would), so it is live in the registry but absent from any snapshot
         // taken before its directory existed.
-        svc.transfer_imports.lock().unwrap().insert(
+        svc.transfer_state().imports.lock().unwrap().insert(
             "import-live".to_string(),
             super::ImportSession {
                 initiator: None,

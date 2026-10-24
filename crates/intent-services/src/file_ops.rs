@@ -35,7 +35,11 @@ pub(crate) const ATTACHMENTS_DIR: &str = ".intent/attachments";
 /// `worktreePath || repositoryPath`, else empty — which [`is_within`] then
 /// fails closed instead of falling back to CWD-relative resolution
 /// (intent-hq/intent#3839).
-pub(crate) fn workspace_root(ws: &Workspace) -> String {
+#[expect(
+    clippy::must_use_candidate,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn workspace_root(ws: &Workspace) -> String {
     git_ops::worktree_path(ws)
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default()
@@ -232,10 +236,11 @@ fn io_err(e: &std::io::Error) -> Error {
 /// with the within-workspace guard — shared by the `getAttachment` copy path
 /// and the `getAttachmentInfo` exists-probe so a tampered row can never read
 /// or probe outside the store.
-pub(crate) fn resolve_attachment_source(
-    canonical_root: &str,
-    stored_path: &str,
-) -> Result<PathBuf> {
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn resolve_attachment_source(canonical_root: &str, stored_path: &str) -> Result<PathBuf> {
     resolve_within(canonical_root, stored_path)
 }
 
@@ -247,10 +252,10 @@ pub(crate) fn read(root: &str, path: &str) -> Result<Value> {
 }
 
 /// Maximum bytes served per `file.readChunk` call BEFORE base64 encoding.
-/// Matches the transfer chunk cap ([`crate::transfer_import::IMPORT_MAX_CHUNK_BYTES`])
+/// Matches the transfer chunk cap ([`crate::feature_ports::IMPORT_MAX_CHUNK_BYTES`])
 /// so the ~21.4 MiB encoded frame stays comfortably under the 40 MiB
 /// outbound cap (PROTOCOL §1.3).
-pub(crate) const READ_CHUNK_MAX_BYTES: usize = crate::transfer_import::IMPORT_MAX_CHUNK_BYTES;
+pub(crate) const READ_CHUNK_MAX_BYTES: usize = crate::feature_ports::IMPORT_MAX_CHUNK_BYTES;
 
 /// `file.readChunk` → `{ content (base64), bytesRead, size }` — one
 /// offset-windowed slice of a workspace file's raw bytes, the FE-ward

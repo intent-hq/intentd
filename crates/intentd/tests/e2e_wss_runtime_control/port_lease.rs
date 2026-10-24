@@ -73,7 +73,7 @@ impl Contender {
             .args([
                 "--ignored",
                 "--exact",
-                "port_lease::contender_process",
+                &common::exact_test_name(module_path!(), "contender_process"),
                 "--nocapture",
             ])
             .env("INTENTD_PORT_CONTENDER_SOCKET", socket)

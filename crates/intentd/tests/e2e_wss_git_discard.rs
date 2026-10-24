@@ -12,7 +12,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};

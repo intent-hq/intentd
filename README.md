@@ -502,7 +502,7 @@ including their optional dependencies. Set `INTENTD_TEST_CODEX_ADAPTER` and
 `INTENTD_TEST_CLAUDE_ADAPTER` to their package directories (containing `package.json`), then:
 
 ```bash
-cargo nextest run -p intentd --test e2e_wss_installed_cli --run-ignored all --test-threads 1
+cargo nextest run -p intentd --test suite_wss_g_r -E 'test(/^e2e_wss_installed_cli::/)' --run-ignored all --test-threads 1
 ```
 
 This Unix fixture requires Node and Python 3. It excludes host tracing only for its

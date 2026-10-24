@@ -18,7 +18,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};

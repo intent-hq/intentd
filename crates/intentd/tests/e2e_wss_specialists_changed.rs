@@ -10,7 +10,7 @@
 
 #[path = "wss_integration/claude_agents.rs"]
 mod claude_agents;
-mod common;
+use crate::common;
 
 use std::io::Write;
 use std::path::Path;

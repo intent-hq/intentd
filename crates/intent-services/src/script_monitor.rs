@@ -89,11 +89,9 @@ impl Services {
         let Some(md) = metadata.filter(|md| monitor_id(Some(md)).is_some()) else {
             return false;
         };
-        self.transfer_exports
-            .lock()
-            .expect("export registry")
-            .values()
-            .any(|session| md["workspaceId"].as_str() == Some(session.workspace_id.as_str()))
+        md["workspaceId"]
+            .as_str()
+            .is_some_and(|workspace| self.ports.transfer().export_in_progress(workspace))
     }
 
     pub(crate) fn defer_script_monitor_for_export(
@@ -118,7 +116,11 @@ impl Services {
         );
         true
     }
-    pub(crate) fn start_script_monitor_maintenance(&self) {
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub fn start_script_monitor_maintenance(&self) {
         if self
             .script_locks
             .monitor_maintenance

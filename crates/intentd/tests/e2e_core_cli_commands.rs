@@ -3,7 +3,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use intentd_test_support::GuardedChild;
 use std::os::unix::process::ExitStatusExt;

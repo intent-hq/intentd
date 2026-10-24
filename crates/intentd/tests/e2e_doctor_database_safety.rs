@@ -3,7 +3,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use intent_core::AgentId;
 use intent_store::Store;
@@ -146,7 +146,11 @@ impl Fixture {
     fn preflight(&self) {
         let mut probe = self.command(&std::env::current_exe().unwrap());
         probe
-            .args(["--exact", "diagnostic_fixture_is_isolated", "--nocapture"])
+            .args([
+                "--exact",
+                &common::exact_test_name(module_path!(), "diagnostic_fixture_is_isolated"),
+                "--nocapture",
+            ])
             .env(ISOLATION_PROBE, self.root.path());
         self.run(probe, "isolation");
     }

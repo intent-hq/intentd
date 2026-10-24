@@ -10,7 +10,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};

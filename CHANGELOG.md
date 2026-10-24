@@ -2,6 +2,41 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.40] - 2026-10-24
+
+### 🚀 Features
+
+- *(profiles)* Name and environment overrides for the Codex/Claude Code Default configuration ([#2640](https://github.com/intent-hq/intentd/pull/2640))
+
+### 🐛 Bug Fixes
+
+- Keep embedded arrows from ending a previewed prompts block ([#2625](https://github.com/intent-hq/intentd/pull/2625))
+
+### 🧪 Testing
+
+- *(intent-services)* Wait for live watches through a creation retry ([#2648](https://github.com/intent-hq/intentd/pull/2648))
+
+
+## [0.11.39] - 2026-10-24
+
+### 🚀 Features
+
+- *(failover)* Share provider quota state across conversations ([#2624](https://github.com/intent-hq/intentd/pull/2624))
+- *(workspace)* Add scriptsRunning flag and count script monitors as waiting ([#2637](https://github.com/intent-hq/intentd/pull/2637))
+
+### 🔧 Refactor
+
+- *(services)* Route workspace transfer through a feature port ([#2647](https://github.com/intent-hq/intentd/pull/2647))
+
+### ⚡ Performance
+
+- Shrink agent-turn poll frames to restore stack headroom ([#2642](https://github.com/intent-hq/intentd/pull/2642))
+
+### ⚙️ Miscellaneous Tasks
+
+- *(intentd)* Build integration tests as a few suite executables ([#2635](https://github.com/intent-hq/intentd/pull/2635))
+
+
 ## [0.11.38] - 2026-10-23
 
 ### 🐛 Bug Fixes

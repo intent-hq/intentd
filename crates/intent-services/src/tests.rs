@@ -77,20 +77,7 @@ impl Drop for DebounceEnvGuard {
 
 pub(crate) use crate::test_support::test_tempdir;
 
-/// `SQLite` db inside an RAII temp dir (see [`test_tempdir`]): the dir sweep on
-/// drop also covers the `-wal`/`-shm` sidecars and the `.config.toml` sibling.
-pub(crate) struct TempDb {
-    pub(crate) path: PathBuf,
-    _dir: tempfile::TempDir,
-}
-
-impl TempDb {
-    pub(crate) fn new() -> Self {
-        let dir = test_tempdir("intentd-svc-");
-        let path = dir.path().join("svc.db");
-        Self { path, _dir: dir }
-    }
-}
+pub(crate) use crate::test_support::fixtures::TempDb;
 
 /// A settings registry (backed by a config file next to the temp db, swept
 /// with [`TempDb`]'s dir) seeding `model.defaultProvider = "auggie"`: since
@@ -137,59 +124,7 @@ impl WorkspacesRoot {
     }
 }
 
-pub(crate) fn workspace(id: &WorkspaceId) -> Workspace {
-    let ts = now_iso();
-    Workspace {
-        id: id.clone(),
-        title: "WS".to_string(),
-        branch: "main".to_string(),
-        base_ref: None,
-        base_commit_sha: None,
-        status: WorkspaceStatus::Active,
-        status_message: None,
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
-        attention: WorkspaceAttention::None,
-        created_at: ts.clone(),
-        updated_at: ts,
-        last_activity: None,
-        last_content_activity: None,
-        tags: vec![],
-        path: None,
-        repository_path: None,
-        repository_owner: None,
-        repository_name: None,
-        worktree_path: None,
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
-        default_model: None,
-        pr_number: None,
-        pr_url: None,
-        pr_status: None,
-        active_pull_request: None,
-        pull_requests: None,
-        context_links: None,
-        archived: false,
-        archived_at: None,
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        pull_requests_total: None,
-        display_status: None,
-        attention_reminder: None,
-        waiting: false,
-        scripts_running: false,
-        checkout_mode: None,
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
-    }
-}
+pub(crate) use crate::test_support::fixtures::workspace;
 
 fn note(ws: &WorkspaceId, id: &str, content: &str) -> Note {
     let ts = now_iso();
@@ -17066,12 +17001,18 @@ mod change_event_parity {
     /// `task.update` (text + `todo`) projects `[ ]` from a read that saw the
     /// task `in_progress`; before its parent write lands, another caller
     /// completes the task and materialization rewrites the line to `[x]`.
-    /// The stale projection must not be three-way-merged onto the current
+    /// The stale projection must never be three-way-merged onto the current
     /// text (`[/]` → `[x]` vs `[/]` → `[ ]` char-interleave into `[x ]`, no
-    /// longer a checkbox): the gate miss re-derives from the fresh parent,
-    /// where the guard now refuses `todo` and the line projects `[x]`.
+    /// longer a checkbox). Since intent-hq/intent#7184 the completion's
+    /// materialization takes the parent's write lane, which the parked
+    /// `task.update` holds: the task note completes inside the window but its
+    /// line rewrite queues behind the parked write, so the parent is never
+    /// rewritten under the writer. The writer lands its line (text + the
+    /// marker it projected), releases the lane, and the queued
+    /// materialization re-projects the terminal `[x]` onto the renamed line
+    /// (the writer's own `todo` redirect is refused by the terminal guard).
     #[intent_test_macros::daemon_test]
-    async fn linked_line_write_re_derives_after_concurrent_completion() {
+    async fn linked_line_write_serializes_with_concurrent_completion() {
         let park = std::sync::Arc::new(crate::script_ops::SupervisePark::default());
         let h = harness_with_task_update_park(park.clone()).await;
         insert_task_note(&h, T1, TaskStatus::InProgress).await;
@@ -17125,13 +17066,37 @@ mod change_event_parity {
         .await
         .expect("task.update parks before its parent write");
 
-        // Another caller completes the task inside the window; materialization
-        // rewrites the linked line to `[x]`.
-        set_status(&h, T1, "complete").await;
+        // Another caller completes the task inside the window. The task note
+        // write lands, but its materialization waits on the parent's lane.
+        let completer = {
+            let services = h.services.clone();
+            let ws = h.ws.clone();
+            intent_core::spawn_daemon(async move {
+                services
+                    .task_update_note_status(
+                        ws,
+                        intent_core::NoteId::from(T1),
+                        "complete".to_string(),
+                        None,
+                        None,
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            async {
+                while task_status(&h, T1).await != TaskStatus::Complete {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            },
+        )
+        .await
+        .expect("the task note completes inside the window");
         assert_eq!(
             note_content(&h, "spec").await.0,
-            linked("[x]", "T", T1),
-            "completion materialized before the stale write"
+            linked("[/]", "T", T1),
+            "the completion's line rewrite queues behind the parked writer's lane"
         );
 
         park.release.notify_one();
@@ -17143,14 +17108,25 @@ mod change_event_parity {
         .expect("writer finishes")
         .expect("writer task")
         .expect("task.update");
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            completer,
+        )
+        .await
+        .expect("completer finishes")
+        .expect("completer task")
+        .expect("updateNoteStatus");
 
         assert_eq!(task_status(&h, T1).await, TaskStatus::Complete);
         assert_eq!(
             note_content(&h, "spec").await.0,
             format!("- [x] {new_text}"),
-            "re-derived line carries the terminal marker, not a merged `[x ]`"
+            "the queued materialization re-projects the terminal marker onto the renamed line, never a merged `[x ]`"
         );
-        assert_eq!(r.status, "done", "echoes the projected marker");
+        assert_eq!(
+            r.status, "todo",
+            "echoes the marker the writer projected and wrote"
+        );
         assert_eq!(r.new_text, new_text);
     }
 }

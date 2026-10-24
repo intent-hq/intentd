@@ -2154,3 +2154,696 @@ async fn a_replayed_retry_after_a_restart_still_announces_the_return() {
         "{messages:#?}"
     );
 }
+
+// ── Shared quota state (PROTOCOL §5.54 Backup failover) ──────────────────
+//
+// The daemon-wide cache (`crate::provider_quota_cache`) carries what one
+// conversation learned about a configuration's quota to every other one.
+// "Another conversation" is simulated by recording into the cache directly.
+
+/// Another conversation's quota failure on `selection`, now; returns when
+/// the mark lapses.
+fn mark_exhausted_elsewhere(fx: &Fixture, selection: &str) -> chrono::DateTime<chrono::Utc> {
+    let cache = &fx.mgr.services.provider_quota_cache;
+    let now = chrono::Utc::now();
+    cache.mark_exhausted(selection, None, now);
+    cache.exhausted_until(selection, now).expect("just marked")
+}
+
+/// Another conversation's turn, started after any earlier mark, producing
+/// output on `selection`.
+fn mark_working_elsewhere(fx: &Fixture, selection: &str) {
+    let later = chrono::Utc::now() + chrono::Duration::seconds(1);
+    fx.mgr
+        .services
+        .provider_quota_cache
+        .mark_working(selection, later, later);
+}
+
+/// A configuration another conversation found out of quota is skipped at the
+/// start of the turn: the agent moves to the backup before any attempt (one
+/// prompt, the original message, no failed attempt), announced by the usual
+/// `provider_failover` row, and its return timer follows the mark.
+#[intent_test_macros::daemon_test]
+async fn a_configuration_marked_out_of_quota_is_skipped_before_any_attempt() {
+    let fx = Fixture::new(json!({ "response": "answered on the backup" })).await;
+    let first = fx.profile("First", true).await;
+    let until = mark_exhausted_elsewhere(&fx, "claude-code");
+
+    let events = fx.send("please answer").await;
+
+    assert!(of_type(&events, "agent:failed").is_empty(), "{events:#?}");
+    let row = fx.row().await;
+    assert_eq!(row.provider.as_deref(), Some(first.as_str()));
+    assert_eq!(row.model.as_deref(), Some("opus"), "same model id");
+    let prompts = fx.prompts();
+    assert_eq!(
+        prompts.len(),
+        1,
+        "no attempt on the marked one: {prompts:#?}"
+    );
+    assert!(prompts[0].ends_with("please answer"), "{:?}", prompts[0]);
+    assert!(
+        !prompts[0].contains(crate::quota_failover::QUOTA_FAILOVER_CONTINUATION),
+        "nothing to continue: {:?}",
+        prompts[0]
+    );
+    let messages = fx.messages().await;
+    let failover = notices(&messages, "provider_failover");
+    assert_eq!(failover.len(), 1, "{messages:#?}");
+    assert_eq!(
+        failover[0].metadata,
+        Some(json!({
+            "type": "provider_failover",
+            "fromProvider": "claude-code",
+            "toProvider": first,
+            "model": "opus",
+            "reason": "quota-exceeded",
+        }))
+    );
+    assert!(
+        notices(&messages, "model_changed").is_empty(),
+        "{messages:#?}"
+    );
+    assert_eq!(user_rows(&messages, "please answer").len(), 1);
+    let state = fx.return_state().await.expect("away from home");
+    assert_eq!(state.home, "claude-code");
+    assert_eq!(state.away_on, first);
+    assert!(near(&state.return_after, until), "{}", state.return_after);
+    assert!(
+        fx.mgr
+            .services
+            .provider_quota_cache
+            .is_known_working(&first),
+        "the backup's output marks it working"
+    );
+}
+
+/// A quota failure is recorded for every conversation even when this one
+/// has nowhere to go; the failover that follows one lands on the backup and
+/// marks it working.
+#[intent_test_macros::daemon_test]
+async fn a_quota_failure_is_shared_and_output_marks_the_backup_working() {
+    let fx = Fixture::new(json!({
+        "promptRpcError": quota_error(),
+        "promptRpcErrorAttempts": 1,
+        "response": "answered on the backup",
+    }))
+    .await;
+    let first = fx.profile("First", true).await;
+    fx.send("please answer").await;
+    let cache = &fx.mgr.services.provider_quota_cache;
+    let now = chrono::Utc::now();
+    assert!(cache.is_exhausted("claude-code", now));
+    assert!(cache.is_known_working(&first));
+    assert!(!cache.is_exhausted(&first, now));
+}
+
+#[intent_test_macros::daemon_test]
+async fn a_quota_failure_without_backups_is_still_shared() {
+    let fx = Fixture::new(json!({
+        "promptRpcError": quota_error(),
+        "response": "unreached",
+    }))
+    .await;
+    let events = fx.send("please answer").await;
+    assert_eq!(of_type(&events, "agent:failed").len(), 1, "{events:#?}");
+    assert!(fx
+        .mgr
+        .services
+        .provider_quota_cache
+        .is_exhausted("claude-code", chrono::Utc::now()));
+}
+
+/// In the failover rotation, a backup another conversation found out of
+/// quota is passed over for one that is not.
+#[intent_test_macros::daemon_test]
+async fn the_failover_rotation_passes_over_a_marked_backup() {
+    let fx = Fixture::new(json!({
+        "promptRpcError": quota_error(),
+        "promptRpcErrorAttempts": 1,
+        "response": "answered on the second backup",
+    }))
+    .await;
+    let first = fx.profile("First", true).await;
+    let second = fx.profile("Second", true).await;
+    mark_exhausted_elsewhere(&fx, &first);
+
+    let events = fx.send("please answer").await;
+
+    assert!(of_type(&events, "agent:failed").is_empty(), "{events:#?}");
+    assert_eq!(fx.row().await.provider.as_deref(), Some(second.as_str()));
+    let messages = fx.messages().await;
+    let hops: Vec<(Value, Value)> = notices(&messages, "provider_failover")
+        .iter()
+        .map(|m| {
+            let md = m.metadata.as_ref().unwrap();
+            (md["fromProvider"].clone(), md["toProvider"].clone())
+        })
+        .collect();
+    assert_eq!(hops, vec![(json!("claude-code"), json!(second))]);
+}
+
+/// Every candidate marked: no switch ahead of the turn — it still tries its
+/// current configuration, then fails over to the next one in order.
+#[intent_test_macros::daemon_test]
+async fn every_candidate_marked_still_attempts_and_fails_over() {
+    let fx = Fixture::new(json!({
+        "promptRpcError": quota_error(),
+        "promptRpcErrorAttempts": 1,
+        "response": "answered on the backup",
+    }))
+    .await;
+    let first = fx.profile("First", true).await;
+    mark_exhausted_elsewhere(&fx, "claude-code");
+    mark_exhausted_elsewhere(&fx, &first);
+
+    let events = fx.send("please answer").await;
+
+    assert!(of_type(&events, "agent:failed").is_empty(), "{events:#?}");
+    assert_eq!(fx.row().await.provider.as_deref(), Some(first.as_str()));
+    let prompts = fx.prompts();
+    assert_eq!(
+        prompts.len(),
+        2,
+        "tried on Default, then the backup: {prompts:#?}"
+    );
+    let messages = fx.messages().await;
+    let hops: Vec<(Value, Value)> = notices(&messages, "provider_failover")
+        .iter()
+        .map(|m| {
+            let md = m.metadata.as_ref().unwrap();
+            (md["fromProvider"].clone(), md["toProvider"].clone())
+        })
+        .collect();
+    assert_eq!(hops, vec![(json!("claude-code"), json!(first))]);
+    assert!(
+        fx.mgr
+            .services
+            .provider_quota_cache
+            .is_known_working(&first),
+        "the backup answered, so its mark is cleared for everyone"
+    );
+}
+
+/// A conversation away from home goes back as soon as another conversation
+/// has seen home working, without waiting for its own timer.
+#[intent_test_macros::daemon_test]
+async fn home_seen_working_elsewhere_brings_the_conversation_back_early() {
+    let fx = Fixture::new(json!({ "response": "answered on home" })).await;
+    let first = fx.profile("First", true).await;
+    let future = chrono::Utc::now() + chrono::Duration::hours(4);
+    fx.away(&first, state_json("claude-code", &first, future, 0))
+        .await;
+    mark_exhausted_elsewhere(&fx, "claude-code");
+    mark_working_elsewhere(&fx, "claude-code");
+
+    let events = fx.send("hello again").await;
+
+    assert!(of_type(&events, "agent:failed").is_empty(), "{events:#?}");
+    assert_eq!(fx.row().await.provider.as_deref(), Some("claude-code"));
+    assert_eq!(fx.return_state().await, None, "home again: state cleared");
+    let messages = fx.messages().await;
+    let returned = notices(&messages, "provider_returned");
+    assert_eq!(returned.len(), 1, "{messages:#?}");
+    assert_eq!(
+        returned[0].metadata.as_ref().unwrap()["fromProvider"],
+        json!(first)
+    );
+    assert!(
+        notices(&messages, "provider_failover").is_empty(),
+        "{messages:#?}"
+    );
+}
+
+/// A due return waits while home is still marked out of quota: the turn
+/// stays on the backup, with no attempt on home and no notice.
+#[intent_test_macros::daemon_test]
+async fn a_due_return_waits_while_home_is_marked_out_of_quota() {
+    let fx = Fixture::new(json!({ "response": "answered on the backup" })).await;
+    let first = fx.profile("First", true).await;
+    let past = chrono::Utc::now() - chrono::Duration::minutes(1);
+    fx.away(&first, state_json("claude-code", &first, past, 0))
+        .await;
+    mark_exhausted_elsewhere(&fx, "claude-code");
+
+    let events = fx.send("hello again").await;
+
+    assert!(of_type(&events, "agent:failed").is_empty(), "{events:#?}");
+    assert_eq!(fx.row().await.provider.as_deref(), Some(first.as_str()));
+    assert_eq!(fx.prompts().len(), 1);
+    let state = fx.return_state().await.expect("still away");
+    assert_eq!(state.backoff_step, 0, "not a failed return");
+    let messages = fx.messages().await;
+    assert!(notices(&messages, "provider_returned").is_empty());
+    assert!(notices(&messages, "provider_failover").is_empty());
+}
+
+/// Away on a backup another conversation found out of quota, with home
+/// unmarked but not due: the turn starts on the next unmarked candidate
+/// in the rotation (here home, after the marked second backup), announced
+/// as a failover.
+#[intent_test_macros::daemon_test]
+async fn a_marked_backup_is_left_for_the_next_unmarked_candidate() {
+    let fx = Fixture::new(json!({ "response": "answered" })).await;
+    let first = fx.profile("First", true).await;
+    let second = fx.profile("Second", true).await;
+    let future = chrono::Utc::now() + chrono::Duration::hours(4);
+    fx.away(&first, state_json("claude-code", &first, future, 0))
+        .await;
+    mark_exhausted_elsewhere(&fx, &first);
+    mark_exhausted_elsewhere(&fx, &second);
+
+    fx.send("hello again").await;
+
+    assert_eq!(fx.row().await.provider.as_deref(), Some("claude-code"));
+    let messages = fx.messages().await;
+    let failover = notices(&messages, "provider_failover");
+    assert_eq!(failover.len(), 1, "{messages:#?}");
+    assert_eq!(
+        failover[0].metadata.as_ref().unwrap()["toProvider"],
+        json!("claude-code")
+    );
+    assert_eq!(fx.return_state().await, None, "home accepted the turn");
+}
+
+/// A redrive of the same turn never consults the cache to switch: home is
+/// seen working while the backup's attempt is in flight, yet the failover
+/// redrive follows the rotation to the next backup, not home.
+#[intent_test_macros::daemon_test]
+async fn a_redrive_never_returns_home_on_the_cache() {
+    let scratch = crate::test_support::test_tempdir("quota-cache-redrive-");
+    let entered = scratch.path().join("entered");
+    let release = scratch.path().join("release");
+    let fx = Fixture::new(json!({
+        "promptRpcError": quota_error(),
+        "promptRpcErrorAttempts": 1,
+        "promptReceiptGate": {
+            "suffix": "please answer",
+            "enteredFile": entered.to_str().unwrap(),
+            "releaseFile": release.to_str().unwrap(),
+        },
+        "response": "answered on the second backup",
+    }))
+    .await;
+    let first = fx.profile("First", true).await;
+    let second = fx.profile("Second", true).await;
+    let future = chrono::Utc::now() + chrono::Duration::hours(2);
+    fx.away(&first, state_json("claude-code", &first, future, 0))
+        .await;
+
+    fx.mgr
+        .send_message(
+            fx.agent.clone(),
+            fx.ws.clone(),
+            "please answer".to_string(),
+            None,
+            super::TurnOptions::default(),
+        )
+        .await
+        .expect("send_message spawns the worker inline");
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(20)),
+        async {
+            while !entered.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        },
+    )
+    .await
+    .expect("the prompt reaches the backup");
+    mark_working_elsewhere(&fx, "claude-code");
+    std::fs::write(&release, "go").unwrap();
+    timeout_settled(&fx.mgr, &fx.agent).await;
+
+    assert_eq!(
+        fx.row().await.provider.as_deref(),
+        Some(second.as_str()),
+        "the redrive follows the rotation, not the cache"
+    );
+    assert!(notices(&fx.messages().await, "provider_returned").is_empty());
+}
+
+/// The first turn after the user picks a configuration by hand tries it,
+/// even when another conversation marked it out of quota.
+#[intent_test_macros::daemon_test]
+async fn a_manual_choice_is_tried_even_when_marked() {
+    let fx = Fixture::new(json!({ "response": "answered on the chosen one" })).await;
+    let first = fx.profile("First", true).await;
+    let _second = fx.profile("Second", true).await;
+    // On the profile already, so the explicit choice below needs no
+    // cross-provider availability gate (CI runners lack the provider CLIs).
+    fx.away(&first, Value::Null).await;
+    fx.mgr
+        .services
+        .agent_set_model_op(fx.agent.clone(), "opus".to_owned(), None)
+        .await
+        .expect("setModel");
+    mark_exhausted_elsewhere(&fx, &first);
+
+    let events = fx.send("please answer").await;
+
+    assert!(of_type(&events, "agent:failed").is_empty(), "{events:#?}");
+    assert_eq!(fx.row().await.provider.as_deref(), Some(first.as_str()));
+    assert!(notices(&fx.messages().await, "provider_failover").is_empty());
+    assert!(
+        fx.mgr
+            .services
+            .provider_quota_cache
+            .is_known_working(&first),
+        "the chosen configuration answered, clearing its mark"
+    );
+}
+
+/// Leaving a marked home ahead of a turn is not a failed return: the
+/// backoff step and return-after time stay as they were.
+#[intent_test_macros::daemon_test]
+async fn skipping_a_marked_home_does_not_back_off() {
+    let fx = Fixture::new(json!({ "response": "answered on the backup" })).await;
+    let first = fx.profile("First", true).await;
+    let future = chrono::Utc::now() + chrono::Duration::hours(2);
+    let state = state_json("claude-code", &first, future, 2);
+    fx.away("claude-code", state.clone()).await;
+    mark_exhausted_elsewhere(&fx, "claude-code");
+
+    fx.send("hello again").await;
+
+    assert_eq!(fx.row().await.provider.as_deref(), Some(first.as_str()));
+    let after = fx.return_state().await.expect("away from home");
+    assert_eq!(after.backoff_step, 2, "not a failed return");
+    assert_eq!(after.return_after, state["returnAfter"].as_str().unwrap());
+    assert_eq!(after.away_on, first);
+}
+
+/// The explicit choice lands while a turn is starting — after the start's
+/// timed-return step, before its marked-configuration step: the turn still
+/// tries the chosen configuration (no `provider_failover`), and the
+/// exemption is used up by it.
+#[intent_test_macros::daemon_test]
+async fn a_manual_choice_landing_during_turn_start_is_still_tried() {
+    let fx = Fixture::new(json!({ "response": "answered" })).await;
+    let first = fx.profile("First", true).await;
+    let second = fx.profile("Second", true).await;
+    fx.away(&first, Value::Null).await;
+    mark_exhausted_elsewhere(&fx, &first);
+    let services = &fx.mgr.services;
+
+    services.return_home_if_due(&fx.ws, &fx.agent).await;
+    services
+        .agent_set_model_op(fx.agent.clone(), "opus".to_owned(), None)
+        .await
+        .expect("setModel");
+    services.avoid_exhausted_provider(&fx.ws, &fx.agent).await;
+
+    assert_eq!(fx.row().await.provider.as_deref(), Some(first.as_str()));
+    assert!(notices(&fx.messages().await, "provider_failover").is_empty());
+    // Used up: the next turn start moves off the still-marked choice.
+    services.avoid_exhausted_provider(&fx.ws, &fx.agent).await;
+    assert_eq!(fx.row().await.provider.as_deref(), Some(second.as_str()));
+}
+
+/// `agent.setModel` on the agent's current configuration with `model`.
+async fn set_model(fx: &Fixture, model: &str) {
+    fx.mgr
+        .services
+        .agent_set_model_op(fx.agent.clone(), model.to_owned(), None)
+        .await
+        .expect("setModel");
+}
+
+fn token_of(session: &AgentSession) -> Option<String> {
+    crate::provider_return::manual_choice_token(session)
+}
+
+/// The token is written with the selection and never leaves the daemon.
+#[intent_test_macros::daemon_test]
+async fn a_manual_choice_token_is_stored_with_the_selection_and_stripped() {
+    let fx = Fixture::new(json!({ "response": "answered" })).await;
+    let first = fx.profile("First", true).await;
+    fx.away(&first, Value::Null).await;
+    assert!(token_of(&fx.row().await).is_none());
+    set_model(&fx, "sonnet").await;
+    let row = fx.row().await;
+    assert_eq!(row.model.as_deref(), Some("sonnet"));
+    assert!(token_of(&row).is_some());
+    let mut projected = row.clone();
+    crate::provider_return::strip_internal_metadata(&mut projected);
+    assert!(token_of(&projected).is_none());
+    // An automatic write of the selection drops it.
+    fx.away(&first, Value::Null).await;
+    assert!(token_of(&fx.row().await).is_none());
+}
+
+/// Review of intentd#2624: a turn start's snapshot taken before a later
+/// model change on the same configuration does not use up that change:
+/// once it is saved and the configuration is marked, the first turn on the
+/// new model tries it.
+#[intent_test_macros::daemon_test]
+async fn a_stale_old_model_read_keeps_a_later_model_change() {
+    let fx = Fixture::new(json!({ "response": "answered" })).await;
+    let first = fx.profile("First", true).await;
+    let _second = fx.profile("Second", true).await;
+    fx.away(&first, Value::Null).await;
+    set_model(&fx, "opus").await;
+    let stale = fx.row().await;
+    set_model(&fx, "sonnet").await;
+    let services = &fx.mgr.services;
+
+    // The turn start resumes with its old opus snapshot.
+    services
+        .avoid_exhausted_provider_from(&fx.ws, &fx.agent, &stale)
+        .await;
+    assert!(
+        token_of(&fx.row().await).is_some(),
+        "the sonnet choice is kept"
+    );
+    mark_exhausted_elsewhere(&fx, &first);
+    services.avoid_exhausted_provider(&fx.ws, &fx.agent).await;
+
+    let row = fx.row().await;
+    assert_eq!(row.provider.as_deref(), Some(first.as_str()));
+    assert_eq!(row.model.as_deref(), Some("sonnet"));
+    assert!(notices(&fx.messages().await, "provider_failover").is_empty());
+}
+
+/// Review of intentd#2624: M1 → M2 → M1 on the same configuration while a
+/// turn start holds a snapshot of the first M1. The value-equal stale
+/// snapshot carries the first choice's token, so it never uses up the
+/// final M1 choice, whether that write lands before or after the stale
+/// start resumes; the next turn on the final M1 tries it though marked.
+#[intent_test_macros::daemon_test]
+async fn returning_to_an_earlier_pair_keeps_the_latest_choice() {
+    for final_write_after_stale_start in [false, true] {
+        let fx = Fixture::new(json!({ "response": "answered" })).await;
+        let first = fx.profile("First", true).await;
+        let _second = fx.profile("Second", true).await;
+        fx.away(&first, Value::Null).await;
+        set_model(&fx, "opus").await;
+        let stale = fx.row().await;
+        set_model(&fx, "sonnet").await;
+        let services = &fx.mgr.services;
+        if final_write_after_stale_start {
+            services
+                .avoid_exhausted_provider_from(&fx.ws, &fx.agent, &stale)
+                .await;
+            set_model(&fx, "opus").await;
+        } else {
+            set_model(&fx, "opus").await;
+            services
+                .avoid_exhausted_provider_from(&fx.ws, &fx.agent, &stale)
+                .await;
+        }
+        let row = fx.row().await;
+        assert_eq!(row.model.as_deref(), Some("opus"));
+        assert!(token_of(&row).is_some(), "the final opus choice is kept");
+        assert_ne!(token_of(&row), token_of(&stale));
+        mark_exhausted_elsewhere(&fx, &first);
+
+        services.avoid_exhausted_provider(&fx.ws, &fx.agent).await;
+
+        assert_eq!(fx.row().await.provider.as_deref(), Some(first.as_str()));
+        assert!(notices(&fx.messages().await, "provider_failover").is_empty());
+        assert!(token_of(&fx.row().await).is_none(), "used up by that turn");
+    }
+}
+
+/// A turn start whose snapshot had no pending choice does not move a choice
+/// saved after its read, even one of the same configuration and model: the
+/// switch ahead of the turn yields to the stored token.
+#[intent_test_macros::daemon_test]
+async fn a_switch_ahead_of_the_turn_yields_to_a_choice_saved_after_the_read() {
+    let fx = Fixture::new(json!({ "response": "answered" })).await;
+    let first = fx.profile("First", true).await;
+    let _second = fx.profile("Second", true).await;
+    fx.away(&first, Value::Null).await;
+    let stale = fx.row().await;
+    assert!(token_of(&stale).is_none());
+    set_model(&fx, "opus").await;
+    mark_exhausted_elsewhere(&fx, &first);
+
+    fx.mgr
+        .services
+        .avoid_exhausted_provider_from(&fx.ws, &fx.agent, &stale)
+        .await;
+
+    let row = fx.row().await;
+    assert_eq!(row.provider.as_deref(), Some(first.as_str()));
+    assert!(token_of(&row).is_some(), "left for the turn that reads it");
+    assert!(notices(&fx.messages().await, "provider_failover").is_empty());
+}
+
+/// Review of intentd#2624: a timed (or early, home seen working) return home
+/// whose session read predates manual choices ending on the same pair
+/// (M2, then M1 again) does not move the session: the latest choice is
+/// tried first, and its stale return state is not brought back.
+#[intent_test_macros::daemon_test]
+async fn a_stale_return_home_yields_to_a_later_choice_of_the_same_pair() {
+    for early in [false, true] {
+        let fx = Fixture::new(json!({ "response": "answered" })).await;
+        let first = fx.profile("First", true).await;
+        let _second = fx.profile("Second", true).await;
+        let now = chrono::Utc::now();
+        let return_after = if early {
+            now + chrono::Duration::hours(3)
+        } else {
+            now - chrono::Duration::hours(1)
+        };
+        fx.away(&first, state_json("claude-code", &first, return_after, 0))
+            .await;
+        if early {
+            mark_working_elsewhere(&fx, "claude-code");
+        }
+        let stale = fx.row().await;
+        assert!(token_of(&stale).is_none());
+        assert!(crate::provider_return::read_state(&stale).is_some());
+        set_model(&fx, "sonnet").await;
+        set_model(&fx, "opus").await;
+        let latest = token_of(&fx.row().await).expect("latest choice pending");
+        let services = &fx.mgr.services;
+
+        services
+            .return_home_if_due_from(&fx.ws, &fx.agent, stale)
+            .await;
+
+        let row = fx.row().await;
+        assert_eq!(
+            row.provider.as_deref(),
+            Some(first.as_str()),
+            "early={early}"
+        );
+        assert_eq!(row.model.as_deref(), Some("opus"));
+        assert_eq!(token_of(&row).as_deref(), Some(latest.as_str()));
+        assert!(
+            fx.return_state().await.is_none(),
+            "stale state not restored"
+        );
+        mark_exhausted_elsewhere(&fx, &first);
+        services.avoid_exhausted_provider(&fx.ws, &fx.agent).await;
+        assert_eq!(fx.row().await.provider.as_deref(), Some(first.as_str()));
+        assert!(notices(&fx.messages().await, "provider_failover").is_empty());
+    }
+}
+
+/// The on-home bookkeeping of a stale return read (home took the turn) does
+/// not bring back a return state a later manual choice cleared.
+#[intent_test_macros::daemon_test]
+async fn a_stale_on_home_read_does_not_restore_a_cleared_return_state() {
+    let fx = Fixture::new(json!({ "response": "answered" })).await;
+    let first = fx.profile("First", true).await;
+    let later = chrono::Utc::now() + chrono::Duration::hours(3);
+    fx.away("claude-code", state_json("claude-code", &first, later, 0))
+        .await;
+    let stale = fx.row().await;
+    set_model(&fx, "sonnet").await;
+    set_model(&fx, "opus").await;
+    assert!(fx.return_state().await.is_none());
+
+    fx.mgr
+        .services
+        .return_home_if_due_from(&fx.ws, &fx.agent, stale)
+        .await;
+
+    assert!(fx.return_state().await.is_none());
+    assert!(token_of(&fx.row().await).is_some());
+}
+
+/// Review of intentd#2624: a stale whole-session write (what `agent.rename`
+/// does with the session it read) neither erases the latest manual choice
+/// nor, once that choice is used, brings an older token back.
+#[intent_test_macros::daemon_test]
+async fn a_stale_full_session_write_keeps_the_latest_choice() {
+    for stale_has_older_token in [false, true] {
+        let fx = Fixture::new(json!({ "response": "answered" })).await;
+        let first = fx.profile("First", true).await;
+        let second = fx.profile("Second", true).await;
+        fx.away(&first, Value::Null).await;
+        if stale_has_older_token {
+            set_model(&fx, "opus").await;
+        }
+        let stale = fx.row().await;
+        assert_eq!(token_of(&stale).is_some(), stale_has_older_token);
+        set_model(&fx, "sonnet").await;
+        set_model(&fx, "opus").await;
+        let latest = token_of(&fx.row().await).expect("latest choice pending");
+        let store = &fx.mgr.services.store;
+        let mut renamed = stale.clone();
+        renamed.name = "renamed".to_owned();
+        store.update_agent_session(&fx.ws, &renamed).await.unwrap();
+        let row = fx.row().await;
+        assert_eq!(row.name, "renamed");
+        assert_eq!(token_of(&row).as_deref(), Some(latest.as_str()));
+
+        mark_exhausted_elsewhere(&fx, &first);
+        let services = &fx.mgr.services;
+        services.avoid_exhausted_provider(&fx.ws, &fx.agent).await;
+        assert_eq!(fx.row().await.provider.as_deref(), Some(first.as_str()));
+        assert!(notices(&fx.messages().await, "provider_failover").is_empty());
+
+        // Used up; a stale document does not restore a token.
+        store.update_agent_session(&fx.ws, &renamed).await.unwrap();
+        assert!(token_of(&fx.row().await).is_none());
+        services.avoid_exhausted_provider(&fx.ws, &fx.agent).await;
+        assert_eq!(fx.row().await.provider.as_deref(), Some(second.as_str()));
+    }
+}
+
+/// Review of intentd#2624: a stale whole-session write (what
+/// `agent.rename` does with the session it read) taken while away with a
+/// due return timer does not bring back the return state that later manual
+/// choices cleared. The first turn tries the latest choice, and the next
+/// turn stays on it instead of returning to the old home.
+#[intent_test_macros::daemon_test]
+async fn a_stale_rename_does_not_restore_a_cleared_return_state() {
+    let fx = Fixture::new(json!({ "response": "answered" })).await;
+    let first = fx.profile("First", true).await;
+    let past = chrono::Utc::now() - chrono::Duration::minutes(1);
+    fx.away(&first, state_json("claude-code", &first, past, 0))
+        .await;
+    let stale = fx.row().await;
+    assert!(crate::provider_return::read_state(&stale).is_some());
+    set_model(&fx, "sonnet").await;
+    set_model(&fx, "opus").await;
+    assert_eq!(fx.return_state().await, None, "the choice is the new home");
+    let mut renamed = stale.clone();
+    renamed.name = "renamed".to_owned();
+    fx.mgr
+        .services
+        .store
+        .update_agent_session(&fx.ws, &renamed)
+        .await
+        .unwrap();
+    let row = fx.row().await;
+    assert_eq!(row.name, "renamed");
+    assert_eq!(fx.return_state().await, None, "stale state not restored");
+    assert!(token_of(&row).is_some());
+
+    for turn in ["first turn", "second turn"] {
+        let events = fx.send_as_user(turn).await;
+        assert!(of_type(&events, "agent:failed").is_empty(), "{events:#?}");
+        let row = fx.row().await;
+        assert_eq!(row.provider.as_deref(), Some(first.as_str()), "{turn}");
+        assert_eq!(fx.return_state().await, None, "{turn}");
+    }
+    assert!(notices(&fx.messages().await, "provider_returned").is_empty());
+    assert!(notices(&fx.messages().await, "provider_failover").is_empty());
+}
