@@ -426,6 +426,9 @@ impl Registration {
     #[cfg(test)]
     fn diagnose(&self) -> String {
         let state = self.describe();
+        if self.live() {
+            return state.to_string();
+        }
         let last_error = match self.last_error.lock() {
             Ok(e) => e.clone(),
             Err(e) => e.into_inner().clone(),
@@ -439,10 +442,14 @@ impl Registration {
     fn settle(&self, live: bool) {
         if live {
             self.was_live.store(true, Ordering::Release);
-            self.set_last_error(None);
         }
         self.state
             .store(if live { REG_LIVE } else { REG_FAILED }, Ordering::Release);
+        if live {
+            // After the state flips, so a reader that saw `failed` still
+            // finds the cause; [`Self::diagnose`] ignores it once live.
+            self.set_last_error(None);
+        }
     }
 
     /// Settle as failed, recording why. The cause is stored before the state
@@ -2719,6 +2726,7 @@ mod tests {
     /// creations fail before the group's watcher is built.
     #[cfg(target_os = "linux")]
     async fn lost_live_root_closes_its_subscribers(creation_failures: usize, tag: &str) {
+        let budget = crate::events::TestBudget::liveness();
         let base = TempDir::new(tag);
         let ancestor = base.path.join("parent");
         let desired = ancestor.join("desired");
@@ -2732,9 +2740,9 @@ mod tests {
 
         let (sub_ancestor, _rx_ancestor, _) =
             hub.subscribe_with(&ancestor, RecursiveMode::NonRecursive);
-        sub_ancestor.probe().wait_live(LIVENESS).await;
+        sub_ancestor.probe().wait_live(budget.remaining()).await;
         let (sub_wide, _rx_wide, _) = hub.subscribe(&ancestor);
-        sub_wide.probe().wait_live(LIVENESS).await;
+        sub_wide.probe().wait_live(budget.remaining()).await;
         drop(sub_wide);
 
         assert_eq!(
@@ -2744,21 +2752,17 @@ mod tests {
         );
 
         let (sub_desired, mut rx_desired, _) = hub.subscribe(&desired);
-        sub_desired.probe().wait_live(LIVENESS).await;
+        sub_desired.probe().wait_live(budget.remaining()).await;
         assert!(
             sub_desired.registration.live(),
-            "precondition: the promoted root goes live on its first registration \
-             (registration {}, `desired` watch() attempts {}); {}",
-            sub_desired.registration.diagnose(),
-            fault.attempts(),
-            watch_capacity_diagnostics()
+            "precondition: the promoted root goes live on its first registration"
         );
         assert_eq!(fault.attempts(), 2);
 
         drop(sub_ancestor);
 
         // (a) The subscriber's channel closes rather than parking forever.
-        let closed = tokio::time::timeout(LIVENESS, async {
+        let closed = tokio::time::timeout(budget.remaining(), async {
             while rx_desired.recv().await.is_some() {}
         })
         .await;
@@ -2783,14 +2787,22 @@ mod tests {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let budget = crate::events::TestBudget::liveness();
         let base = TempDir::new("watch-cause");
+        let healthy = base.path.join("healthy");
         let root = base.path.join("faulty");
+        std::fs::create_dir_all(&healthy).expect("mk healthy");
         std::fs::create_dir_all(&root).expect("mk root");
         let fault = WatchFault::nth("faulty", 1);
         let hub = SharedWatchHub::with_watch_fault(&fault);
 
+        // A healthy root going live first means the group's watcher exists,
+        // so the faulty root's failure is its own `watch()` — even when a
+        // creation retry (the exhaustion this diagnoses) ran first.
+        let (sub_healthy, _rx_healthy, _) = hub.subscribe(&healthy);
+        sub_healthy.probe().wait_live(budget.remaining()).await;
         let (sub, _rx, _) = hub.subscribe(&root);
-        sub.wait_established(LIVENESS).await;
+        sub.wait_established(budget.remaining()).await;
         let diagnosis = sub.registration.diagnose();
         assert!(
             diagnosis.starts_with("failed; last failure: watch failed: injected watch failure"),

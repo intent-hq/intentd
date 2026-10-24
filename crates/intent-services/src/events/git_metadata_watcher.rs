@@ -1058,8 +1058,9 @@ mod tests {
             1,
             "one shared watch per canonical common dir"
         );
-        watcher_a.wait_established(crate::events::LIVENESS).await;
-        watcher_b.wait_established(crate::events::LIVENESS).await;
+        let budget = crate::events::TestBudget::liveness();
+        watcher_a.wait_established(budget.remaining()).await;
+        watcher_b.wait_established(budget.remaining()).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         // External ref churn in the SHARED repo (`<main>/.git/refs/heads/…`),
