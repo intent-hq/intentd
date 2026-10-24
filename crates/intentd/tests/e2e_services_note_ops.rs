@@ -12,8 +12,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use intent_core::{
-    now_iso, NoteAddInput, NoteCreate, NoteEditInput, NoteEditLinesInput, NoteId, Workspace,
-    WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
+    now_iso, NoteAddInput, NoteCreate, NoteEditInput, NoteEditLinesInput, NoteId, TaskStatus,
+    Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
 };
 use intent_services::{EventBus, Services};
 use intent_store::Store;
@@ -544,5 +544,81 @@ async fn concurrent_edits_across_two_notes_all_apply() {
             .await
             .expect("get note");
         assert!(!note.content.contains("open"), "{}", note.content);
+    }
+}
+
+/// Parallel `task.updateStatus` calls on LINKED checkbox lines of one note:
+/// each redirects to its task note and then rewrites its own line in the
+/// shared parent (materialization). Every task must end `complete` and every
+/// line must show `[x]` — no projection may be dropped after losing races
+/// against the other parent rewrites.
+#[intent_test_macros::daemon_test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_linked_task_status_updates_all_materialize() {
+    let (services, ws, _tmp) = setup().await;
+    let content = std::iter::once("# Plan".to_string())
+        .chain((0..WRITERS).map(|i| format!("@@@task\n# Linked step {i:02}\nDo step {i}.\n@@@")))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let note_id = create_note_with(&services, &ws, content).await;
+    let before = services
+        .list_note_tasks(ws.clone(), note_id.clone())
+        .await
+        .expect("list tasks");
+    assert_eq!(
+        before.len(),
+        WRITERS,
+        "task blocks converted to linked lines"
+    );
+
+    let results = run_together(WRITERS, |i| {
+        let (services, ws, note_id) = (Arc::clone(&services), ws.clone(), note_id.clone());
+        async move {
+            services
+                .task_update_status(
+                    ws,
+                    note_id,
+                    format!("Linked step {i:02}"),
+                    "done".to_string(),
+                    None,
+                )
+                .await
+        }
+    })
+    .await;
+    assert_eq!(failures(&results), Vec::<String>::new());
+
+    let after = services
+        .list_note_tasks(ws.clone(), note_id.clone())
+        .await
+        .expect("list tasks");
+    let stale: Vec<&str> = after
+        .iter()
+        .filter(|t| t.status != "done")
+        .map(|t| t.text.as_str())
+        .collect();
+    let note = services
+        .get_note(ws.clone(), note_id)
+        .await
+        .expect("get note");
+    assert!(
+        stale.is_empty(),
+        "lines not materialized to [x]: {stale:?}\n{}",
+        note.content
+    );
+    for task in &after {
+        let id = task
+            .task_note_id
+            .clone()
+            .expect("linked line carries its task note id");
+        let task_note = services
+            .get_note(ws.clone(), NoteId::from(id.as_str()))
+            .await
+            .expect("get task note");
+        assert_eq!(
+            task_note.metadata.task.as_ref().map(|t| t.status),
+            Some(TaskStatus::Complete),
+            "{}",
+            task.text
+        );
     }
 }
