@@ -268,23 +268,40 @@ where
 /// `agent:status-changed` publishes only after the store commit. A SIGKILL
 /// before that write leaves an active status, so startup recovery records an
 /// interrupted turn and (headless `auto`) resumes it with an extra prompt
-/// (#6058, intent-hq/intent#7706). Call before killing the daemon.
+/// (intent-hq/intent#6058, intent-hq/intent#7706). Call before killing the
+/// daemon. Fails fast, naming `context`, if the turn fails instead.
 async fn await_persisted_idle<S>(sub: &mut WebSocketStream<S>, agent_id: &str, context: &str)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    for _ in 0..120 {
-        let frame = wss_event(sub, 30).await;
-        let event = &frame["params"]["event"];
-        if event["type"] == "agent:status-changed"
-            && event["data"]["agentId"] == agent_id
-            && event["data"]["status"] == "idle"
-            && event["data"]["isActive"] == false
-        {
-            return;
+    let wait = async {
+        loop {
+            // The outer deadline fires first, so a timeout names `context`.
+            let frame = wss_event(sub, 60).await;
+            let event = &frame["params"]["event"];
+            if event["data"]["agentId"] != agent_id {
+                continue;
+            }
+            let status_changed = event["type"] == "agent:status-changed";
+            if status_changed
+                && event["data"]["status"] == "idle"
+                && event["data"]["isActive"] == false
+            {
+                return;
+            }
+            if event["type"] == "agent:failed"
+                || (status_changed && event["data"]["status"] == "error")
+            {
+                panic!("{context}: turn failed instead of settling: {event}");
+            }
         }
-    }
-    panic!("{context}: no persisted idle status for {agent_id}");
+    };
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        wait,
+    )
+    .await
+    .unwrap_or_else(|_| panic!("{context}: no persisted idle status for {agent_id}"));
 }
 
 /// Follow ordinary id-only message notifications to the persisted rows,
@@ -1044,7 +1061,7 @@ async fn assert_effective_codex_model_selection(
     .await;
     await_stream_end(&mut sub, agent_id).await;
     let prompts = read_config_log(&prompt_log);
-    assert_eq!(prompts.len(), if resume { 3 } else { 2 });
+    assert_eq!(prompts.len(), if resume { 3 } else { 2 }, "{prompts:?}");
     for prompt in prompts.iter().rev().take(2) {
         assert_eq!(prompt["effectiveModel"], expected, "{prompt}");
         assert_eq!(prompt["effectiveEffort"], effort, "{prompt}");
@@ -1093,7 +1110,7 @@ async fn assert_effective_codex_model_selection(
         .await;
         await_stream_end(&mut sub, agent_id).await;
         let prompts = read_config_log(&prompt_log);
-        assert_eq!(prompts.len(), 4);
+        assert_eq!(prompts.len(), 4, "{prompts:?}");
         assert_eq!(prompts[3]["effectiveModel"], "gpt-5.6-luna");
         assert_eq!(
             prompts[3]["effectiveEffort"],
@@ -2561,7 +2578,8 @@ async fn effort_notice_restart_case(load: bool) {
     );
     assert_eq!(read_config_log(&prompt_log)[1]["effectiveEffort"], "low");
 
-    // Wait for the persisted idle status so startup recovery cannot add a turn (#6058).
+    // Wait for the persisted idle status so startup recovery cannot add a turn
+    // (intent-hq/intent#6058).
     await_persisted_idle(
         &mut sub,
         agent_id,
