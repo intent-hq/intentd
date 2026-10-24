@@ -263,9 +263,9 @@ async fn note_update_metadata() {
 /// 5-attempt retry bound makes the pre-fix failure deterministic.
 const WRITERS: usize = 16;
 
-/// Upper bound for one concurrency test, so a lock-ordering bug fails fast
-/// instead of hanging the suite.
-const CONCURRENCY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// Upper bound (before the slow-runner multiplier) for one concurrency
+/// test, so a lock-ordering bug fails fast instead of hanging the suite.
+const CONCURRENCY_TIMEOUT_SECS: u64 = 60;
 
 async fn create_note_with(services: &Services, ws: &WorkspaceId, content: String) -> NoteId {
     services
@@ -305,7 +305,10 @@ where
             })
         })
         .collect();
-    let joined = tokio::time::timeout(CONCURRENCY_TIMEOUT, async {
+    let budget = intentd_test_support::test_timeout(std::time::Duration::from_secs(
+        CONCURRENCY_TIMEOUT_SECS,
+    ));
+    let joined = tokio::time::timeout(budget, async {
         let mut out = Vec::with_capacity(handles.len());
         for h in handles {
             out.push(h.await.expect("writer task panicked"));

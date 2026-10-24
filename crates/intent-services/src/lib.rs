@@ -26150,6 +26150,8 @@ impl WorkspaceApi for Services {
             let _mutation = self.workspace_mutations.enter(&workspace_id)?;
             self.require_member(&workspace_id).await?;
             note_ops::reject_numbered_read_presentation(&input.content)?;
+            // Resolved before taking the lane: it does not depend on the note.
+            let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
             let write_lane = self.lock_note_content(&workspace_id, &note_id).await;
             let note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
             let (incoming, position) = note_ops::apply_add(
@@ -26158,7 +26160,6 @@ impl WorkspaceApi for Services {
                 input.heading.as_deref(),
                 input.position.as_deref(),
             )?;
-            let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
             let read_rev = note.rev;
             let MergedContentWrite {
                 note,
@@ -26247,11 +26248,12 @@ impl WorkspaceApi for Services {
                 ));
             }
             note_ops::reject_numbered_read_presentation(&input.new)?;
+            // Resolved before taking the lane: it does not depend on the note.
+            let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
             let write_lane = self.lock_note_content(&workspace_id, &note_id).await;
             let note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
             let (incoming, match_position, was_empty) =
                 note_ops::apply_edit(&note.content, &input.old, &input.new)?;
-            let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
             let read_rev = note.rev;
             let MergedContentWrite {
                 note,
@@ -26338,11 +26340,12 @@ impl WorkspaceApi for Services {
             let _mutation = self.workspace_mutations.enter(&workspace_id)?;
             self.require_member(&workspace_id).await?;
             note_ops::reject_numbered_read_presentation(&input.content)?;
+            // Resolved before taking the lane: it does not depend on the note.
+            let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
             let write_lane = self.lock_note_content(&workspace_id, &note_id).await;
             let note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
             let incoming =
                 note_ops::apply_edit_lines(&note.content, input.start, input.end, &input.content)?;
-            let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
             let read_rev = note.rev;
             let MergedContentWrite {
                 note,
@@ -26957,6 +26960,8 @@ impl WorkspaceApi for Services {
             let checkbox = note_ops::checkbox_for(&status).ok_or_else(|| {
                 Error::Internal("Status must be 'done', 'todo', or 'in-progress'".to_string())
             })?;
+            // Resolved before taking the lane: it does not depend on the note.
+            let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
             let write_lane = self.lock_note_content(&workspace_id, &note_id).await;
             let note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
             let normalized = task_text.trim().to_string();
@@ -26965,8 +26970,9 @@ impl WorkspaceApi for Services {
                 None => None,
             };
             if let Some((task_id, task)) = linked {
-                // The redirect writes the task and materializes its parent
-                // lines (possibly in this note): release the lane first.
+                // The redirect is a task-note write plus parent-line
+                // materialization, not a content write of this note: hold
+                // the lane only for the direct content write below.
                 drop(write_lane);
                 // The line links a task note: the task's metadata status is
                 // the source of truth and the char is its projection, so the
@@ -27001,7 +27007,6 @@ impl WorkspaceApi for Services {
                 });
             }
             let updated = note_ops::apply_task_status(&note.content, &normalized, checkbox)?;
-            let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
             let read_rev = note.rev;
             let MergedContentWrite { note, .. } = persist_merged_content(
                 &store,
@@ -27107,6 +27112,8 @@ impl WorkspaceApi for Services {
             // with the stale marker into `[x ]` — no longer a checkbox, so
             // nothing could heal it (intent-hq/intentd#1857). Unlinked lines
             // carry no projection and keep the merging write.
+            // Resolved before taking the lane: it does not depend on the note.
+            let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
             let write_lane = self.lock_note_content(&workspace_id, &note_id).await;
             let mut attempt = 0;
             let (note, update, redirect, write_parent) = loop {
@@ -27194,7 +27201,6 @@ impl WorkspaceApi for Services {
                     break (note, update, redirect, false);
                 }
                 services.park_task_update_projection(attempt).await;
-                let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
                 let read_rev = note.rev;
                 if redirect.is_none() {
                     let merged = persist_merged_content(
@@ -27236,7 +27242,8 @@ impl WorkspaceApi for Services {
                     Err(e) => return Err(e),
                 }
             };
-            // Release before the redirect's task write materializes parents.
+            // The lane covers the parent content write only; the redirect's
+            // task write and materialization run after it.
             drop(write_lane);
             if write_parent {
                 publish_event(
