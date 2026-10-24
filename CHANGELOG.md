@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.41] - 2026-10-24
+
+### 🐛 Bug Fixes
+
+- *(notes)* Serialize content writes per note so parallel edits stop conflicting ([#2649](https://github.com/intent-hq/intentd/pull/2649))
+
+### 🔧 Refactor
+
+- *(services)* Expose a feature API and test-hooks feature ([#2650](https://github.com/intent-hq/intentd/pull/2650))
+
+### 🧪 Testing
+
+- *(intent-services)* Share the liveness budget with git-metadata event waits ([#2655](https://github.com/intent-hq/intentd/pull/2655))
+
+
 ## [0.11.40] - 2026-10-24
 
 ### 🚀 Features
