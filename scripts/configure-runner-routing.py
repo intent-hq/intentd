@@ -15,12 +15,14 @@ ROUTE = '''  runner-route:
 # cargo-dist's per-target build job (v-release.yml build-local-artifacts and
 # its release-cache.yml copy, daemon) runs sudo on Linux (apt configuration and
 # cross-build packages), which the unprivileged intent-cache runner containers
-# lack, so its Linux legs keep their hosted label.
+# lack, so its Linux legs take their burst runner (`cloud`: WarpBuild, or the
+# GitHub label when WarpBuild is off) and never a self-hosted slot.
 HOSTED_LINUX_JOBS = {'build-local-artifacts', 'daemon'}
 
 
 def hosted_linux(key):
-    return f"(contains({key}, 'ubuntu') || contains({key}, 'linux')) && {key} || "
+    return (f"(contains({key}, 'ubuntu') || contains({key}, 'linux')) && "
+            f"(fromJSON(needs.runner-route.outputs.cloud || '{{}}')[{key}] || {key}) || ")
 
 
 def configure(text):

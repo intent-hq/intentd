@@ -1667,9 +1667,12 @@ mod tests {
                     .identity_get_user("gitlab".into(), Some("gitlab.probe.test".into()))
                     .await
             });
-            tokio::time::timeout(Duration::from_secs(5), entered.notified())
-                .await
-                .unwrap();
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                entered.notified(),
+            )
+            .await
+            .unwrap();
             if outcome == 0 {
                 caller.abort();
                 assert!(caller.await.unwrap_err().is_cancelled());
@@ -1677,11 +1680,14 @@ mod tests {
                 if outcome == 4 {
                     fail.send(()).unwrap();
                 }
-                let error = tokio::time::timeout(Duration::from_secs(5), caller)
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .unwrap_err();
+                let error = tokio::time::timeout(
+                    intentd_test_support::test_timeout(Duration::from_secs(5)),
+                    caller,
+                )
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err();
                 assert!(
                     error.to_string().contains(if outcome == 4 {
                         "credential worker failed"
@@ -1703,10 +1709,13 @@ mod tests {
             let drain =
                 intent_core::spawn_daemon(async move { owner.shutdown_store_writers().await });
             assert_eq!(
-                tokio::time::timeout(Duration::from_secs(5), pending_rx)
-                    .await
-                    .unwrap()
-                    .unwrap(),
+                tokio::time::timeout(
+                    intentd_test_support::test_timeout(Duration::from_secs(5)),
+                    pending_rx
+                )
+                .await
+                .unwrap()
+                .unwrap(),
                 "settings-tasks"
             );
             assert!(!drain.is_finished());
@@ -1715,10 +1724,13 @@ mod tests {
             } else {
                 refresh_release.send(()).unwrap();
             }
-            tokio::time::timeout(Duration::from_secs(5), drain)
-                .await
-                .unwrap()
-                .unwrap();
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                drain,
+            )
+            .await
+            .unwrap()
+            .unwrap();
             server.await.unwrap();
             assert_eq!(entry.secrets.mutation_counts_for_test(), (0, 1));
             assert!(entry.gate.try_lock().is_ok());
@@ -1991,9 +2003,12 @@ mod tests {
                         .await
                 }
             });
-            tokio::time::timeout(Duration::from_secs(5), entered.notified())
-                .await
-                .unwrap();
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                entered.notified(),
+            )
+            .await
+            .unwrap();
             if outcome == 0 {
                 caller.abort();
                 assert!(caller.await.unwrap_err().is_cancelled());
@@ -2001,11 +2016,14 @@ mod tests {
                 if outcome == 4 {
                     fail.send(()).unwrap();
                 }
-                let error = tokio::time::timeout(Duration::from_secs(5), caller)
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .unwrap_err();
+                let error = tokio::time::timeout(
+                    intentd_test_support::test_timeout(Duration::from_secs(5)),
+                    caller,
+                )
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err();
                 assert!(
                     error.to_string().contains(if outcome == 4 {
                         "credential worker failed"
@@ -2031,22 +2049,31 @@ mod tests {
             let drain =
                 intent_core::spawn_daemon(async move { owner.shutdown_store_writers().await });
             assert_eq!(
-                tokio::time::timeout(Duration::from_secs(5), pending_rx)
-                    .await
-                    .unwrap()
-                    .unwrap(),
+                tokio::time::timeout(
+                    intentd_test_support::test_timeout(Duration::from_secs(5)),
+                    pending_rx
+                )
+                .await
+                .unwrap()
+                .unwrap(),
                 "settings-tasks"
             );
             assert!(!drain.is_finished());
             release.send(()).unwrap();
-            tokio::time::timeout(Duration::from_secs(5), drain)
-                .await
-                .unwrap()
-                .unwrap();
-            tokio::time::timeout(Duration::from_secs(5), server)
-                .await
-                .unwrap()
-                .unwrap();
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                drain,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                server,
+            )
+            .await
+            .unwrap()
+            .unwrap();
             assert!(entry.gate.try_lock().is_ok());
             assert_eq!(entry.secrets.mutation_counts_for_test(), (0, 1));
             assert_eq!(
@@ -2263,9 +2290,12 @@ mod tests {
             )
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(5), entered.notified())
-            .await
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            entered.notified(),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             entry
                 .store
@@ -2278,9 +2308,12 @@ mod tests {
         // completed physical write is held before returning the actual result.
         tokio::time::sleep(Duration::from_secs(11)).await;
         release.send(()).unwrap();
-        tokio::time::timeout(Duration::from_secs(5), service.shutdown_store_writers())
-            .await
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            service.shutdown_store_writers(),
+        )
+        .await
+        .unwrap();
         server.await.unwrap();
         let saved = account(&entry.store).unwrap();
         bus.shutdown().await.unwrap();
@@ -2398,14 +2431,17 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            tokio::time::timeout(Duration::from_secs(5), entered.notified())
-                .await
-                .unwrap();
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                entered.notified(),
+            )
+            .await
+            .unwrap();
             server.await.unwrap();
             if matches!(outcome, 3 | 5) {
                 fail.send(()).unwrap();
                 tokio::time::timeout(
-                    Duration::from_secs(5),
+                    intentd_test_support::test_timeout(Duration::from_secs(5)),
                     entry.secrets.gitlab_poll_worker_failed.notified(),
                 )
                 .await
@@ -2428,14 +2464,17 @@ mod tests {
                         )
                         .await
                 });
-                tokio::time::timeout(Duration::from_secs(5), async {
-                    loop {
-                        if entry.state.lock().await.generation != generation {
-                            break;
+                tokio::time::timeout(
+                    intentd_test_support::test_timeout(Duration::from_secs(5)),
+                    async {
+                        loop {
+                            if entry.state.lock().await.generation != generation {
+                                break;
+                            }
+                            tokio::task::yield_now().await;
                         }
-                        tokio::task::yield_now().await;
-                    }
-                })
+                    },
+                )
                 .await
                 .unwrap();
                 assert!(entry.state.lock().await.flow.is_none());
@@ -2451,10 +2490,13 @@ mod tests {
             let drain =
                 intent_core::spawn_daemon(async move { owner.shutdown_store_writers().await });
             assert_eq!(
-                tokio::time::timeout(Duration::from_secs(5), pending_rx)
-                    .await
-                    .unwrap()
-                    .unwrap(),
+                tokio::time::timeout(
+                    intentd_test_support::test_timeout(Duration::from_secs(5)),
+                    pending_rx
+                )
+                .await
+                .unwrap()
+                .unwrap(),
                 if outcome == 5 {
                     "settings-tasks"
                 } else if outcome == 3 {
@@ -2466,10 +2508,13 @@ mod tests {
             assert!(service.settings_tasks.is_closed());
             assert!(!drain.is_finished());
             release.send(()).unwrap();
-            tokio::time::timeout(Duration::from_secs(5), drain)
-                .await
-                .unwrap()
-                .unwrap();
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                drain,
+            )
+            .await
+            .unwrap()
+            .unwrap();
             if let Some(newer) = newer {
                 newer.await.unwrap().unwrap();
             }
@@ -2757,16 +2802,22 @@ mod tests {
                 .await
         });
         if close_during_http {
-            tokio::time::timeout(Duration::from_secs(5), entered.notified())
-                .await
-                .unwrap();
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                entered.notified(),
+            )
+            .await
+            .unwrap();
             service.begin_settings_shutdown();
             release.notify_one();
         }
-        let result = tokio::time::timeout(Duration::from_secs(5), caller)
-            .await
-            .unwrap()
-            .unwrap();
+        let result = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            caller,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         server.abort();
         let _ = server.await;
         let has_flow = entry.state.lock().await.flow.is_some();
@@ -2812,14 +2863,20 @@ mod tests {
             .unwrap();
         assert_eq!(result["ok"], true);
         server.await.unwrap();
-        tokio::time::timeout(Duration::from_secs(5), pending_rx)
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            pending_rx,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(entry.state.lock().await.flow.is_some());
-        tokio::time::timeout(Duration::from_secs(5), service.shutdown_store_writers())
-            .await
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            service.shutdown_store_writers(),
+        )
+        .await
+        .unwrap();
         assert!(entry.state.lock().await.flow.is_none());
         assert!(service.store_tasks.is_closed());
         assert!(entry
@@ -2910,7 +2967,7 @@ mod tests {
             user_code: "saved-code".into(),
             verification_uri: "https://github.com/login/device".into(),
             interval: 60,
-            deadline: Instant::now() + Duration::from_secs(900),
+            deadline: Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(900)),
             phase: FlowPhase::Pending,
         });
         if final_close {
@@ -3178,30 +3235,39 @@ mod tests {
                     )
                     .await
             });
-            tokio::time::timeout(Duration::from_secs(5), entered.notified())
-                .await
-                .unwrap();
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                entered.notified(),
+            )
+            .await
+            .unwrap();
             server.await.unwrap();
             if outcome == 0 {
                 caller.abort();
                 assert!(caller.await.unwrap_err().is_cancelled());
             } else if outcome == 3 {
                 fail.send(()).unwrap();
-                let error = tokio::time::timeout(Duration::from_secs(5), caller)
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .unwrap_err();
+                let error = tokio::time::timeout(
+                    intentd_test_support::test_timeout(Duration::from_secs(5)),
+                    caller,
+                )
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err();
                 assert!(
                     error.to_string().contains("PAT failed"),
                     "expected worker failure: {error}"
                 );
             } else {
-                let error = tokio::time::timeout(Duration::from_secs(5), caller)
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .unwrap_err();
+                let error = tokio::time::timeout(
+                    intentd_test_support::test_timeout(Duration::from_secs(5)),
+                    caller,
+                )
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err();
                 assert!(error.to_string().contains("timed out"));
             }
             assert!(entry.gate.try_lock().is_err());
@@ -3217,18 +3283,24 @@ mod tests {
             let drain =
                 intent_core::spawn_daemon(async move { worker.shutdown_store_writers().await });
             assert_eq!(
-                tokio::time::timeout(Duration::from_secs(5), pending_rx)
-                    .await
-                    .unwrap()
-                    .unwrap(),
+                tokio::time::timeout(
+                    intentd_test_support::test_timeout(Duration::from_secs(5)),
+                    pending_rx
+                )
+                .await
+                .unwrap()
+                .unwrap(),
                 "settings-tasks"
             );
             assert!(!drain.is_finished());
             release.send(()).unwrap();
-            tokio::time::timeout(Duration::from_secs(5), drain)
-                .await
-                .unwrap()
-                .unwrap();
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                drain,
+            )
+            .await
+            .unwrap()
+            .unwrap();
             assert!(entry.gate.try_lock().is_ok());
             assert_eq!(
                 entry.secrets.load(SECRET_ACCOUNT).await.unwrap().as_deref(),
@@ -3357,26 +3429,35 @@ mod tests {
                 intent_core::spawn_daemon(
                     async move { worker.identity_revoke(provider, host).await },
                 );
-            tokio::time::timeout(Duration::from_secs(5), entered.notified())
-                .await
-                .unwrap();
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                entered.notified(),
+            )
+            .await
+            .unwrap();
             if outcome == 0 {
                 caller.abort();
                 assert!(caller.await.unwrap_err().is_cancelled());
             } else if outcome == 3 {
                 fail.send(()).unwrap();
-                let error = tokio::time::timeout(Duration::from_secs(5), caller)
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .unwrap_err();
+                let error = tokio::time::timeout(
+                    intentd_test_support::test_timeout(Duration::from_secs(5)),
+                    caller,
+                )
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err();
                 assert!(error.to_string().contains("revoke failed"));
             } else {
-                let error = tokio::time::timeout(Duration::from_secs(5), caller)
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .unwrap_err();
+                let error = tokio::time::timeout(
+                    intentd_test_support::test_timeout(Duration::from_secs(5)),
+                    caller,
+                )
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err();
                 assert!(error.to_string().contains("timed out"));
             }
             assert!(entry.gate.try_lock().is_err());
@@ -3392,10 +3473,13 @@ mod tests {
                 worker.shutdown_store_writers().await;
             }));
             assert_eq!(
-                tokio::time::timeout(Duration::from_secs(5), pending_rx)
-                    .await
-                    .unwrap()
-                    .unwrap(),
+                tokio::time::timeout(
+                    intentd_test_support::test_timeout(Duration::from_secs(5)),
+                    pending_rx
+                )
+                .await
+                .unwrap()
+                .unwrap(),
                 "settings-tasks"
             );
             assert!(
@@ -3405,10 +3489,13 @@ mod tests {
                 .await
             );
             release.send(()).unwrap();
-            tokio::time::timeout(Duration::from_secs(5), drain)
-                .await
-                .unwrap()
-                .unwrap();
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                drain,
+            )
+            .await
+            .unwrap()
+            .unwrap();
             assert!(entry.gate.try_lock().is_ok());
             assert_eq!(entry.secrets.mutation_counts_for_test(), (0, 1));
             for key in &keys {
@@ -3671,9 +3758,12 @@ mod tests {
             "cancelled RPC cannot release a live write's lease"
         );
         release_tx.send(()).unwrap();
-        let _settled = tokio::time::timeout(Duration::from_secs(5), gate.lock())
-            .await
-            .unwrap();
+        let _settled = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            gate.lock(),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             FileSecretStore::with_path(tmp.path().join("isolated.json"))
                 .load(ACCOUNT)

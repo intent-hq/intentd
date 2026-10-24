@@ -23,10 +23,12 @@ use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
+use crate::activity;
 use crate::cli::Channel;
 use crate::manifest::{self, ChannelManifest, ManifestError, PlatformEntry, TARGET_TRIPLE};
 use crate::paths::{SitterPaths, DAEMON_BIN_NAME};
-use crate::state;
+use crate::state::{self, SitterState};
+use crate::telemetry::{self, CheckParams, CheckTrigger, UpdateEndpoint};
 
 /// TCP connect timeout for all requests (fail fast when offline).
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -103,6 +105,10 @@ pub enum UpdateError {
     NoBaseUrls,
     #[error("invalid exact update: {0}")]
     ExactVersion(String),
+    #[error("update endpoint {url} was not redirected to an official GitHub manifest (ended at {final_url})")]
+    UnverifiedSource { url: String, final_url: String },
+    #[error("invalid update endpoint URL {0}")]
+    InvalidEndpoint(String),
 }
 
 /// The update engine. Holds the resolved sitter paths and an HTTP client
@@ -113,6 +119,9 @@ pub struct Updater {
     /// constructors). The manifest fetch tries each in order.
     base_urls: Vec<String>,
     client: reqwest::blocking::Client,
+    /// Update-check endpoint tried before `base_urls` unless telemetry is
+    /// opted out at check time. `None` with an explicit base override.
+    endpoint: Option<UpdateEndpoint>,
 }
 
 impl Updater {
@@ -245,13 +254,23 @@ impl Updater {
         }
         let client = reqwest::blocking::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
+            .user_agent(telemetry::user_agent())
             .build()
             .map_err(UpdateError::Client)?;
         Ok(Self {
             paths,
             base_urls,
             client,
+            endpoint: None,
         })
+    }
+
+    /// Fetch manifests through `endpoint` first (unless opted out when a
+    /// check runs), falling back to the base URLs on any failure.
+    #[must_use]
+    pub fn with_update_endpoint(mut self, endpoint: Option<UpdateEndpoint>) -> Self {
+        self.endpoint = endpoint;
+        self
     }
 
     /// Run one update check for `channel`: fetch the manifest and, when it
@@ -261,8 +280,12 @@ impl Updater {
     /// # Errors
     ///
     /// Returns an [`UpdateError`] when the manifest cannot be fetched or parsed, or the download/verify/install sequence fails.
-    pub fn check_and_install(&self, channel: Channel) -> Result<UpdateOutcome, UpdateError> {
-        self.install_from_manifest(channel, false)
+    pub fn check_and_install(
+        &self,
+        channel: Channel,
+        trigger: CheckTrigger,
+    ) -> Result<UpdateOutcome, UpdateError> {
+        self.install_from_manifest(channel, trigger, false)
     }
 
     /// Fetch the channel manifest and install its version unconditionally,
@@ -275,8 +298,12 @@ impl Updater {
     /// # Errors
     ///
     /// Returns an [`UpdateError`] when the manifest cannot be fetched or parsed, or the download/verify/install sequence fails.
-    pub fn force_install(&self, channel: Channel) -> Result<UpdateOutcome, UpdateError> {
-        self.install_from_manifest(channel, true)
+    pub fn force_install(
+        &self,
+        channel: Channel,
+        trigger: CheckTrigger,
+    ) -> Result<UpdateOutcome, UpdateError> {
+        self.install_from_manifest(channel, trigger, true)
     }
 
     /// Dry-run: fetch the channel manifest and report installed vs latest
@@ -287,8 +314,12 @@ impl Updater {
     /// # Errors
     ///
     /// Returns an [`UpdateError`] when the manifest cannot be fetched or parsed, or its version string is invalid.
-    pub fn check_only(&self, channel: Channel) -> Result<UpdateCheck, UpdateError> {
-        let manifest = self.fetch_manifest(channel)?;
+    pub fn check_only(
+        &self,
+        channel: Channel,
+        trigger: CheckTrigger,
+    ) -> Result<UpdateCheck, UpdateError> {
+        let manifest = self.fetch_manifest(channel, trigger)?;
         semver::Version::parse(&manifest.version).map_err(|source| {
             UpdateError::InvalidManifestVersion {
                 version: manifest.version.clone(),
@@ -317,9 +348,10 @@ impl Updater {
     fn install_from_manifest(
         &self,
         channel: Channel,
+        trigger: CheckTrigger,
         force: bool,
     ) -> Result<UpdateOutcome, UpdateError> {
-        let manifest = self.fetch_manifest(channel)?;
+        let manifest = self.fetch_manifest(channel, trigger)?;
         // The manifest version becomes a directory name under `versions/` and
         // the persisted `current_version`; reject anything that is not valid
         // semver before it touches the filesystem (also covers the fresh
@@ -471,7 +503,25 @@ impl Updater {
     /// URL in order. Any failure — network error, HTTP status, unparseable
     /// body — advances to the next base; when every base fails, the last
     /// error is returned.
-    fn fetch_manifest(&self, channel: Channel) -> Result<ChannelManifest, UpdateError> {
+    fn fetch_manifest(
+        &self,
+        channel: Channel,
+        trigger: CheckTrigger,
+    ) -> Result<ChannelManifest, UpdateError> {
+        // An opt-out (re-read on every check) goes straight to GitHub.
+        let endpoint = self.endpoint.as_ref().filter(|_| {
+            !telemetry::opted_out(|name| std::env::var_os(name), &self.paths.config_path)
+        });
+        if let Some(endpoint) = endpoint {
+            match self.fetch_via_endpoint(endpoint, channel, trigger) {
+                Ok(manifest) => return Ok(manifest),
+                Err(e) => eprintln!(
+                    "intentd-sitter: update check via {} failed ({e}); \
+                     falling back to GitHub",
+                    endpoint.base_url
+                ),
+            }
+        }
         let mut last_err = None;
         for (i, base_url) in self.base_urls.iter().enumerate() {
             let url = manifest::manifest_url(base_url, channel);
@@ -494,6 +544,129 @@ impl Updater {
             }
         }
         Err(last_err.unwrap_or(UpdateError::NoBaseUrls))
+    }
+
+    /// One manifest fetch through the update-check endpoint, with the
+    /// redirect allowlist ([`telemetry::check_redirect`]) on a dedicated
+    /// client. Advances the stored day/week/month once the check succeeds
+    /// ([`activity`]).
+    fn fetch_via_endpoint(
+        &self,
+        endpoint: &UpdateEndpoint,
+        channel: Channel,
+        trigger: CheckTrigger,
+    ) -> Result<ChannelManifest, UpdateError> {
+        self.with_activity(time::OffsetDateTime::now_utc, |flags| {
+            Self::send_endpoint_check(endpoint, channel, trigger, flags)
+        })
+    }
+
+    /// One read → send → record activity transaction under
+    /// [`state::activity_lock`]: concurrent checks (e.g. startup plus
+    /// `intentd update`) observe each other's recorded success instead of
+    /// both sending the first-of-period and install flags. The clock is
+    /// read once the lock is held, and that request time — not completion
+    /// time — is recorded, so a check straddling midnight counts toward
+    /// the period it reported. The request is bounded by the endpoint
+    /// timeout; a lock that cannot be taken degrades to an unserialized
+    /// check rather than blocking updates.
+    fn with_activity<T>(
+        &self,
+        clock: impl FnOnce() -> time::OffsetDateTime,
+        send: impl FnOnce(activity::Activity) -> Result<T, UpdateError>,
+    ) -> Result<T, UpdateError> {
+        let _transaction = state::activity_lock(&self.paths.state_path)
+            .map_err(|e| eprintln!("intentd-sitter: failed to lock activity state: {e}"))
+            .ok();
+        let now = clock();
+        let flags = activity::activity(&self.resolve_first_seen(now), now);
+        let result = send(flags)?;
+        if flags.needs_record() {
+            self.update_state(|state| {
+                activity::record_success(state, now);
+                true
+            });
+        }
+        Ok(result)
+    }
+
+    fn send_endpoint_check(
+        endpoint: &UpdateEndpoint,
+        channel: Channel,
+        trigger: CheckTrigger,
+        flags: activity::Activity,
+    ) -> Result<ChannelManifest, UpdateError> {
+        let url = telemetry::update_check_url(
+            &endpoint.base_url,
+            channel,
+            &CheckParams {
+                platform: TARGET_TRIPLE,
+                version: telemetry::SITTER_VERSION,
+                source: endpoint.install_source,
+                trigger,
+                activity: flags,
+            },
+        )
+        .map_err(|e| UpdateError::InvalidEndpoint(format!("{}: {e}", endpoint.base_url)))?;
+        let client = reqwest::blocking::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .user_agent(telemetry::user_agent())
+            .redirect(telemetry::redirect_policy(channel))
+            .build()
+            .map_err(UpdateError::Client)?;
+        let network = |source| UpdateError::Network {
+            url: url.to_string(),
+            source,
+        };
+        let resp = client
+            .get(url.clone())
+            .timeout(endpoint.timeout)
+            .send()
+            .map_err(network)?;
+        if !telemetry::is_allowed_final_url(resp.url(), channel) {
+            return Err(UpdateError::UnverifiedSource {
+                url: url.to_string(),
+                final_url: resp.url().to_string(),
+            });
+        }
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(UpdateError::HttpStatus {
+                url: resp.url().to_string(),
+                status,
+            });
+        }
+        Ok(manifest::parse(&resp.bytes().map_err(network)?)?)
+    }
+
+    /// Record the first-seen date on the first endpoint check (before the
+    /// request, so a failed first check still counts as fresh next time)
+    /// and return the state the flags are computed from.
+    fn resolve_first_seen(&self, now: time::OffsetDateTime) -> SitterState {
+        let prior = |state: &SitterState| {
+            activity::state_shows_prior_install(state) || dir_has_entries(&self.paths.versions_dir)
+        };
+        self.update_state(|state| {
+            let has_prior_install = prior(state);
+            activity::resolve_first_seen(state, now, has_prior_install, || {
+                activity::estimate_first_seen(&self.paths.sitter_dir)
+            })
+        })
+        .unwrap_or_else(|| state::load(&self.paths.state_path))
+    }
+
+    /// Best-effort read-modify-write of `state.json` under the state lock;
+    /// `apply` returns whether it changed anything worth saving. Returns
+    /// the resulting state, or `None` when the lock cannot be taken.
+    fn update_state(&self, apply: impl FnOnce(&mut SitterState) -> bool) -> Option<SitterState> {
+        let _lock = state::lock(&self.paths.state_path).ok()?;
+        let mut state = state::load(&self.paths.state_path);
+        if apply(&mut state) {
+            if let Err(e) = state::save(&self.paths.state_path, &state) {
+                eprintln!("intentd-sitter: failed to persist state.json: {e}");
+            }
+        }
+        Some(state)
     }
 
     fn fetch(&self, url: &str, timeout: Duration) -> Result<Vec<u8>, UpdateError> {
@@ -859,9 +1032,127 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
     }
 }
 
+/// Whether `dir` exists and has at least one entry.
+fn dir_has_entries(dir: &Path) -> bool {
+    fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_some())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whether another process (here: another open file
+    /// description/handle) could take the activity transaction lock now.
+    fn activity_lock_is_free(paths: &SitterPaths) -> bool {
+        state::try_activity_lock(&paths.state_path)
+            .unwrap()
+            .is_some()
+    }
+
+    /// Regression: concurrent update checks (startup plus `intentd
+    /// update`) both read unset week/month dates and sent `i=1&w=1&m=1`,
+    /// counting one install twice. The flags must be read, sent and
+    /// recorded under one cross-process lock, with the clock read after
+    /// it is acquired.
+    #[test]
+    fn activity_flags_are_read_sent_and_recorded_under_the_transaction_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = SitterPaths::from_data_dir(dir.path());
+        let updater = Updater::with_base_url(paths.clone(), "http://127.0.0.1:1").unwrap();
+        let now = time::macros::datetime!(2026-05-20 12:00 UTC);
+        let first = updater
+            .with_activity(
+                || {
+                    assert!(!activity_lock_is_free(&paths), "clock read before locking");
+                    now
+                },
+                |flags| {
+                    assert!(!activity_lock_is_free(&paths), "request sent unlocked");
+                    Ok(flags)
+                },
+            )
+            .unwrap();
+        assert!(activity_lock_is_free(&paths), "lock leaked past the check");
+        assert!(first.install && first.first_of_week && first.first_of_month);
+        // A check queued behind the first observes its recorded success.
+        let second = updater.with_activity(|| now, Ok).unwrap();
+        assert!(!second.needs_record(), "second check recounted: {second:?}");
+    }
+
+    #[test]
+    fn concurrent_checks_wait_for_the_in_flight_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = SitterPaths::from_data_dir(dir.path());
+        let now = time::macros::datetime!(2026-05-20 12:00 UTC);
+        let (in_flight_tx, in_flight_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let first = {
+            let paths = paths.clone();
+            std::thread::spawn(move || {
+                let updater = Updater::with_base_url(paths, "http://127.0.0.1:1").unwrap();
+                updater
+                    .with_activity(
+                        || now,
+                        |flags| {
+                            in_flight_tx.send(()).unwrap();
+                            release_rx.recv().unwrap();
+                            Ok(flags)
+                        },
+                    )
+                    .unwrap()
+            })
+        };
+        in_flight_rx.recv().unwrap();
+        let second = {
+            let paths = paths.clone();
+            std::thread::spawn(move || {
+                let updater = Updater::with_base_url(paths, "http://127.0.0.1:1").unwrap();
+                updater.with_activity(|| now, Ok).unwrap()
+            })
+        };
+        // Deterministic: while the first request is in flight its
+        // transaction lock is held, so the second check cannot have read
+        // the (still unrecorded) flags yet.
+        assert!(!activity_lock_is_free(&paths));
+        release_tx.send(()).unwrap();
+        let first = first.join().unwrap();
+        let second = second.join().unwrap();
+        assert!(first.install && first.first_of_week && first.first_of_month);
+        assert!(!second.needs_record(), "second check recounted: {second:?}");
+    }
+
+    /// A check sent just before midnight that completes after it records
+    /// the day/week/month it reported (request time), and the next
+    /// period's first check still carries its flags.
+    #[test]
+    fn check_straddling_midnight_records_the_request_period() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = SitterPaths::from_data_dir(dir.path());
+        let updater = Updater::with_base_url(paths.clone(), "http://127.0.0.1:1").unwrap();
+        // Sunday 2026-05-31: the last day of ISO week 22 and of May.
+        let request = time::macros::datetime!(2026-05-31 23:59:59 UTC);
+        let next_period = time::macros::datetime!(2026-06-01 00:00:01 UTC);
+        let mut clock_reads = 0;
+        updater
+            .with_activity(
+                || {
+                    clock_reads += 1;
+                    request
+                },
+                // The response lands after midnight; the transaction must
+                // not re-read the clock to record it.
+                Ok,
+            )
+            .unwrap();
+        assert_eq!(clock_reads, 1);
+        let state = state::load(&paths.state_path);
+        assert_eq!(state.last_check_day.as_deref(), Some("2026-05-31"));
+        assert_eq!(state.last_week.as_deref(), Some("2026-W22"));
+        assert_eq!(state.last_month.as_deref(), Some("2026-05"));
+        let next = updater.with_activity(|| next_period, Ok).unwrap();
+        assert!(next.first_of_day && next.first_of_week && next.first_of_month);
+        assert!(!next.install);
+    }
 
     #[test]
     fn install_version_preserves_binary_and_payload_contents() {

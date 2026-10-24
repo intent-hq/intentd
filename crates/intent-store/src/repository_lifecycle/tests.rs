@@ -841,7 +841,9 @@ async fn queued_sqlite_write_outlives_last_owner_without_resetting_admission() {
                 if let Some(blocked) = blocked.take() {
                     notify.notify_one();
                     blocked
-                        .recv_timeout(std::time::Duration::from_secs(20))
+                        .recv_timeout(intentd_test_support::test_timeout(
+                            std::time::Duration::from_secs(20),
+                        ))
                         .unwrap();
                 }
             }
@@ -1189,7 +1191,9 @@ async fn precise_canceled_delete(installed: bool) {
                 if let Some(blocked) = blocked.take() {
                     notify.notify_one();
                     blocked
-                        .recv_timeout(std::time::Duration::from_secs(20))
+                        .recv_timeout(intentd_test_support::test_timeout(
+                            std::time::Duration::from_secs(20),
+                        ))
                         .unwrap();
                 }
             }
@@ -1197,9 +1201,12 @@ async fn precise_canceled_delete(installed: bool) {
     drop(connection);
     let id = root.id.clone();
     let worker = tokio::spawn(async move { store.delete_workspace_git_root(&id).await });
-    tokio::time::timeout(std::time::Duration::from_secs(10), started.notified())
-        .await
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(10)),
+        started.notified(),
+    )
+    .await
+    .unwrap();
     worker.abort();
     assert!(worker.await.unwrap_err().is_cancelled());
     release.send(()).unwrap();

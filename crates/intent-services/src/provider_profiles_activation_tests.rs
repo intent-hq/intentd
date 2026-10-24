@@ -68,7 +68,7 @@ impl Fixture {
         };
         fx.set(
             "providers.paths",
-            json!({ "codex": "/bin/sh", "claude-code": "/bin/sh" }),
+            crate::test_support::provider_installed::paths_json(&["codex", "claude-code"]),
         );
         fx
     }
@@ -199,10 +199,13 @@ fn value_of<'a>(profile: &'a intent_acp::ProfileEnv, key: &str) -> Option<&'a st
 async fn collect(sub: &mut Subscription, want: usize, agents: usize) -> (Vec<Value>, Vec<Value>) {
     let (mut profiles, mut updated) = (Vec::new(), Vec::new());
     while profiles.len() < want || updated.len() < agents {
-        let batch = tokio::time::timeout(Duration::from_secs(5), sub.recv())
-            .await
-            .unwrap_or_else(|_| panic!("events: {profiles:?} {updated:?}"))
-            .expect("subscription open");
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            sub.recv(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("events: {profiles:?} {updated:?}"))
+        .expect("subscription open");
         for event in batch {
             let ev = serde_json::to_value(&event).unwrap();
             if ev["type"] == intent_core::events::PROVIDERS_PROFILES_CHANGED {

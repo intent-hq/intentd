@@ -3,7 +3,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use intent_core::AgentId;
 use intent_store::Store;
@@ -146,7 +146,11 @@ impl Fixture {
     fn preflight(&self) {
         let mut probe = self.command(&std::env::current_exe().unwrap());
         probe
-            .args(["--exact", "diagnostic_fixture_is_isolated", "--nocapture"])
+            .args([
+                "--exact",
+                &common::exact_test_name(module_path!(), "diagnostic_fixture_is_isolated"),
+                "--nocapture",
+            ])
             .env(ISOLATION_PROBE, self.root.path());
         self.run(probe, "isolation");
     }
@@ -584,14 +588,17 @@ async fn dangling_database_alias_is_rejected_before_mutation() {
 async fn assert_released(db: &Path) {
     // Dropping a SQLx pool signals asynchronous worker shutdown. Observe the
     // actual release, rather than assuming the signal has already closed SQLite.
-    let owner = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if let Ok(owner) = Store::open_for_daemon(db).await {
-                break owner;
+    let owner = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                if let Ok(owner) = Store::open_for_daemon(db).await {
+                    break owner;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
-    })
+        },
+    )
     .await
     .expect("last connection/options drop must eventually release ownership");
     assert!(full_body_matches(&owner, STAGED).await);
@@ -778,9 +785,11 @@ async fn cancelled_query_ownership(renewed_read_pool: Option<bool>) {
             started_tx.send(()).unwrap();
             let (flag, changed) = &*worker_release;
             let _ = changed
-                .wait_timeout_while(flag.lock().unwrap(), Duration::from_secs(20), |released| {
-                    !*released
-                })
+                .wait_timeout_while(
+                    flag.lock().unwrap(),
+                    intentd_test_support::test_timeout(Duration::from_secs(20)),
+                    |released| !*released,
+                )
                 .unwrap();
             left.cmp(right)
         })
@@ -791,10 +800,13 @@ async fn cancelled_query_ownership(renewed_read_pool: Option<bool>) {
             .await
             .unwrap();
     });
-    tokio::time::timeout(Duration::from_secs(10), started_rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        started_rx.recv(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     drop(owner);
     query.abort();
     assert!(query.await.unwrap_err().is_cancelled());
@@ -825,11 +837,14 @@ async fn pending_pool_close_retains_ownership_until_connections_release() {
     let closing = tokio::spawn(async move {
         closing_pool.close().await;
     });
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while !pool.is_closed() {
-            tokio::task::yield_now().await;
-        }
-    })
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            while !pool.is_closed() {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
     .await
     .unwrap();
     assert!(
@@ -875,16 +890,19 @@ async fn cancelled_startup_keeps_ownership_during_initialization() {
     let start_path = db.clone();
     let startup = tokio::spawn(async move { Store::open_for_daemon(&start_path).await });
     let lock_path = fixture.data_dir().join("intentd.db.daemon.lock");
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if let Ok(file) = OpenOptions::new().read(true).write(true).open(&lock_path) {
-                if Flock::lock(file, FlockArg::LockExclusiveNonblock).is_err() {
-                    break;
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                if let Ok(file) = OpenOptions::new().read(true).write(true).open(&lock_path) {
+                    if Flock::lock(file, FlockArg::LockExclusiveNonblock).is_err() {
+                        break;
+                    }
                 }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
-    })
+        },
+    )
     .await
     .unwrap();
     startup.abort();
@@ -901,11 +919,14 @@ async fn cancelled_startup_keeps_ownership_during_initialization() {
 async fn retire_pool_connections(pool: &intent_store::StorePool) {
     // Reads can have opened multiple connections; wait for returns and retire
     // every original connection, not just the first available idle one.
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while pool.num_idle() != pool.size() as usize {
-            tokio::task::yield_now().await;
-        }
-    })
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            while pool.num_idle() != pool.size() as usize {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
     .await
     .unwrap();
     let mut connections = Vec::new();
@@ -1070,17 +1091,19 @@ async fn renewal_initialization_ownership(read: bool) {
         .unwrap();
     let prior: Vec<_> = sqlite_workers().into_iter().map(|(path, _)| path).collect();
     let acquisition = tokio::spawn(async move { pool.acquire().await });
-    let worker = tokio::time::timeout(Duration::from_secs(4), async {
-        loop {
-            if let Some((path, _)) = sqlite_workers()
-                .into_iter()
-                .find(|(path, wait)| !prior.contains(path) && wait.contains("hrtimer_nanosleep"))
-            {
-                break path;
+    let worker = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(4)),
+        async {
+            loop {
+                if let Some((path, _)) = sqlite_workers().into_iter().find(|(path, wait)| {
+                    !prior.contains(path) && wait.contains("hrtimer_nanosleep")
+                }) {
+                    break path;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
-    })
+        },
+    )
     .await
     .expect("renewal must reach SQLite initialization busy wait");
     assert!(!database_lock_available(&db));

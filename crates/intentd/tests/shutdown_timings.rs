@@ -1,7 +1,7 @@
 //! Disposable-store barriers prove shutdown logs precede waits, not just returns.
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::future::{poll_fn, Future};
 use std::io::{self, Write};

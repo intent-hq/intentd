@@ -63,10 +63,15 @@ def fail():
     sys.exit(1)
 save()
 if tool == "curl":
-    assert args == ["--fail", "--silent", "--show-error", "--location", "--max-time", "60",
-                    "--retry", "2", state["registry"]], args
-    if state.get("registry_error"): fail()
-    print(state.get("registry_raw", json.dumps(state["manifest"])))
+    assert args[:-1] == ["--fail", "--silent", "--show-error", "--location", "--max-time", "60",
+                         "--retry", "2"], args
+    if args[-1] == state["registry"]:
+        if state.get("registry_error"): fail()
+        print(state.get("registry_raw", json.dumps(state["manifest"])))
+    else:
+        assert args[-1] in state.get("runtime_registry", {}), args
+        if state.get("runtime_error"): fail()
+        print(json.dumps(state["runtime_registry"][args[-1]]))
 elif tool == "git":
     if args[:1] == ["fetch"] and args[-1] == "refs/heads/main":
         state["main_fetches"] += 1
@@ -891,7 +896,64 @@ class ClaudeAgentAcpPinTests(PinAutomationTests):
         "test_hold_release_disarms_even_when_npm_latest_is_unguarded",
         "test_reformatted_macro_pin_is_still_bumped_in_place",
         "test_codex_rolling_pr_is_never_touched",
+        "test_runtime_mapping_snapshots_the_sdk_cli_version",
+        "test_runtime_lookup_failures_refuse_before_publication",
     }
+
+    SDK_URL = "https://registry.npmjs.org/%40anthropic-ai%2Fclaude-agent-sdk/0.3.300"
+
+    def map_runtime(self):
+        """Commit the production runtime mapping and an exact SDK dependency."""
+        self.metadata["claude-code"].update(runtimePackage="@anthropic-ai/claude-agent-sdk",
+                                            runtimeVersionField="claudeCodeVersion")
+        (self.repo / METADATA).write_text(json.dumps(self.metadata))
+        self.git("commit", "-qam", "chore: map runtime")
+        self.git("push", "-q", "origin", "main")
+        self.base = self.git("rev-parse", "HEAD")
+        self.state["manifest"]["dependencies"] = {self.CLI_DEPENDENCY: "0.3.300"}
+        self.state["runtime_registry"] = {self.SDK_URL: {
+            "name": self.CLI_DEPENDENCY, "version": "0.3.300", "claudeCodeVersion": "2.1.300",
+            "scripts": {"postinstall": "not copied"}}}
+
+    def test_runtime_mapping_snapshots_the_sdk_cli_version(self):
+        self.map_runtime()
+        self.invoke()
+        head = self.head()
+        metadata = json.loads(self.git("show", f"{head}:{METADATA}"))
+        self.assertEqual(metadata["claude-code"]["runtime"], {
+            "name": self.CLI_DEPENDENCY, "version": "0.3.300", "claudeCodeVersion": "2.1.300"})
+        self.assertIn(["curl", "--fail", "--silent", "--show-error", "--location", "--max-time",
+                       "60", "--retry", "2", self.SDK_URL], self.state["calls"])
+        # The generated runtime snapshot is recognized as the bot's own on repeat.
+        self.clear_calls()
+        self.invoke()
+        self.assert_no_publication()
+        self.assertEqual(self.head(), head)
+
+    def test_runtime_lookup_failures_refuse_before_publication(self):
+        cases = (
+            ("runtime_error", True),
+            ("dependency", "^0.3.300"),
+            ("runtime_name", "@anthropic-ai/other"),
+            ("cli_version", "^2.1.0"),
+        )
+        for flag, value in cases:
+            with self.subTest(flag=flag):
+                self.setUp()
+                self.map_runtime()
+                runtime = self.state["runtime_registry"][self.SDK_URL]
+                if flag == "runtime_error":
+                    self.state["runtime_error"] = True
+                elif flag == "dependency":
+                    self.state["manifest"]["dependencies"] = {self.CLI_DEPENDENCY: value}
+                elif flag == "runtime_name":
+                    runtime["name"] = value
+                else:
+                    runtime["claudeCodeVersion"] = value
+                self.invoke(ok=False)
+                self.assert_no_publication()
+                self.assert_no_merge_calls()
+                self.assertIsNone(self.head())
 
     def test_claude_generated_text_names_its_own_adapter(self):
         self.invoke()

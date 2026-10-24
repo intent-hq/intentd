@@ -25,13 +25,18 @@ ROOT = Path(__file__).resolve().parents[1]
 RESULTS = ("success", "skipped", "failure", "cancelled")
 ALWAYS_REQUIRED = {"route"}
 RUNTIME = {"deb-packaging", "release-scripts", "pi-session-paths"}
-# Windows validation is post-merge only: it never runs on pull_request or
-# merge_group, and the push CI Gate (which auto-cut-alpha reads on the main
-# tip before cutting) requires all of it.
+# Windows lint (native check + target-gated Clippy) runs in the merge queue,
+# so a Windows-only compile or lint error cannot reach main (intentd#2574's
+# unix-only test helper broke main's push gate that way). The slower Windows
+# runtime proofs and release build stay post-merge: they never run on
+# pull_request or merge_group, and the push CI Gate (which auto-cut-alpha
+# reads on the main tip before cutting) requires all of them. No Windows
+# runner is ever requested on pull_request.
+WINDOWS_QUEUE_JOBS = {"windows-lint"}
 WINDOWS_JOBS = {"windows", "install-ps1"}
 REQUIRED = {
     "pull_request": ALWAYS_REQUIRED | {"pr-static", "monorepo-consumer-checks", "check", "coverage-changed", "release-scripts"},
-    "merge_group": ALWAYS_REQUIRED | RUNTIME | {"cache-smoke", "daemon-lifecycle", "check", "build", "macos-services-runtime", "coverage-e2e", "coverage-all", "coverage-changed", "monorepo-consumer-checks"},
+    "merge_group": ALWAYS_REQUIRED | RUNTIME | WINDOWS_QUEUE_JOBS | {"cache-smoke", "daemon-lifecycle", "check", "build", "macos-services-runtime", "coverage-e2e", "coverage-all", "coverage-changed", "monorepo-consumer-checks"},
     "push": ALWAYS_REQUIRED | RUNTIME | WINDOWS_JOBS | {"build"},
 }
 PR_METADATA = {"pr-title", "conflict-markers"}
@@ -50,10 +55,13 @@ NATIVE_STEPS = (
     "Codex focused diagnostics (macOS runtime)",
     "Retained workspace CoW fixtures (macOS runtime)",
 )
-# Every Windows proof, in order, in the push-only `windows` job.
-WINDOWS_STEPS = {
+# The Windows lint, in order, in the queue-only `windows-lint` job.
+WINDOWS_LINT_STEPS = {
     "Check (native production configuration)": "cargo check --workspace --target ${{ matrix.target }}",
     "Clippy (target-gated code)": "cargo clippy --workspace --all-targets --target ${{ matrix.target }} -- -D warnings",
+}
+# Every Windows runtime proof, in order, in the push-only `windows` job.
+WINDOWS_STEPS = {
     "Headless workspace setup (Windows runtime)": None,
     "Codex diagnostic process ownership (Windows runtime)": None,
     "Native lifecycle runtime proof (Windows)": "python3 -I -B scripts/test-daemon-lifecycle.py",
@@ -71,10 +79,14 @@ def native_step_job(name):
 
 
 GITLAB_STEP = "GitLab auth, invitations and checkout over real sockets with explicit test transports"
+# e2e_wss_gitlab_auth is a standalone target; the invitation and checkout
+# files are modules of suite targets, selected by their module filter.
 GITLAB_COMMAND = (
     "cargo test --locked -p intentd --features repository-test-fixtures "
-    "--test e2e_wss_gitlab_auth --test e2e_wss_invite_join_gitlab "
-    "--test e2e_repository_resource_read -- --test-threads=2"
+    "--test e2e_wss_gitlab_auth -- --test-threads=2\n"
+    "cargo test --locked -p intentd --features repository-test-fixtures "
+    "--test suite_wss_g_r --test suite_wss_repo -- --test-threads=2 "
+    "e2e_wss_invite_join_gitlab:: e2e_repository_resource_read::\n"
 )
 
 
@@ -219,6 +231,8 @@ def routing_errors(workflow):
                 errors.append(f"{event}: missing native fallback for route={route}")
             if event == "push" and jobs["windows"] != "success":
                 errors.append(f"{event}: missing Windows fallback for route={route}")
+            if event == "merge_group" and jobs["windows-lint"] != "success":
+                errors.append(f"{event}: missing Windows lint fallback for route={route}")
     return errors
 
 
@@ -257,9 +271,10 @@ def windows_legs(workflow, event):
 
 def windows_errors(workflow):
     errors = []
-    for event in ("pull_request", "merge_group"):
-        if windows_legs(workflow, event):
-            errors.append(f"{event}: Windows runner requested by {sorted(windows_legs(workflow, event))}")
+    if windows_legs(workflow, "pull_request"):
+        errors.append(f"pull_request: Windows runner requested by {sorted(windows_legs(workflow, 'pull_request'))}")
+    if windows_legs(workflow, "merge_group") != WINDOWS_QUEUE_JOBS:
+        errors.append(f"merge_group: Windows legs changed {sorted(windows_legs(workflow, 'merge_group'))}")
     if windows_legs(workflow, "push") != WINDOWS_JOBS | {"pi-session-paths"}:
         errors.append(f"push: Windows legs changed {sorted(windows_legs(workflow, 'push'))}")
     pi = workflow["jobs"]["pi-session-paths"]["strategy"]["matrix"]["os"]
@@ -267,31 +282,45 @@ def windows_errors(workflow):
         expected = ["ubuntu-24.04", "windows-2025"] if event == "push" else ["ubuntu-24.04"]
         if matrix_values(pi, event) != expected:
             errors.append(f"pi-session-paths: wrong platforms on {event}")
-    job = workflow["jobs"].get("windows")
+    errors += windows_job_errors(workflow, "windows-lint", "merge_group", WINDOWS_LINT_STEPS)
+    errors += windows_job_errors(workflow, "windows", "push", WINDOWS_STEPS)
+    # Moved, not duplicated: main's tree is one the queue just linted. Match
+    # the cargo subcommand too, so a renamed copy is still caught.
+    for step in workflow["jobs"].get("windows", {}).get("steps", []):
+        run = str(step.get("run", ""))
+        if step.get("name") in WINDOWS_LINT_STEPS or re.search(r"\bcargo\s+(?:\+\S+\s+)?(?:check|clippy)\b", run):
+            errors.append("windows: lint steps belong to the queue-only windows-lint job")
+            break
+    return errors
+
+
+def windows_job_errors(workflow, name, event, proofs):
+    """One routed Windows job: required, runs only on `event`, every proof in order."""
+    errors = []
+    job = workflow["jobs"].get(name)
     if not job:
-        return errors + ["windows: missing post-merge job"]
+        return [f"{name}: missing {event} job"]
     if job.get("continue-on-error") or job.get("strategy", {}).get("fail-fast") is True:
-        errors.append("windows: job must stay required")
+        errors.append(f"{name}: job must stay required")
     rows = job["strategy"]["matrix"]["include"]
     if [row.get("target") for row in rows] != [WINDOWS_TARGET] or job["runs-on"] != "${{ matrix.os }}":
-        errors.append("windows: single Windows target routed through matrix.os")
+        errors.append(f"{name}: single Windows target routed through matrix.os")
     for route, cancelled in (("success", False), ("failure", False), ("skipped", False), ("success", True)):
-        for event in REQUIRED:
-            runs = condition(job["if"], {**context(event), "needs.route.result": route},
+        for candidate in REQUIRED:
+            runs = condition(job["if"], {**context(candidate), "needs.route.result": route},
                              success=route == "success", cancelled=cancelled)
-            if runs != (event == "push" and not cancelled):
-                errors.append(f"windows: wrong selection for {event}/route={route}/cancelled={cancelled}")
+            if runs != (candidate == event and not cancelled):
+                errors.append(f"{name}: wrong selection for {candidate}/route={route}/cancelled={cancelled}")
     steps = job["steps"]
-    names = [step.get("name") for step in steps]
-    found = [name for name in names if name in WINDOWS_STEPS]
-    if found != list(WINDOWS_STEPS):
-        errors.append(f"windows: proofs missing or reordered {found}")
-    for name, command in WINDOWS_STEPS.items():
-        step = next((s for s in steps if s.get("name") == name), None)
+    found = [step.get("name") for step in steps if step.get("name") in proofs]
+    if found != list(proofs):
+        errors.append(f"{name}: proofs missing or reordered {found}")
+    for proof, command in proofs.items():
+        step = next((s for s in steps if s.get("name") == proof), None)
         if not step or not step.get("run") or step.get("continue-on-error") or "if" in step:
-            errors.append(f"{name}: missing required Windows proof")
+            errors.append(f"{proof}: missing required Windows proof in {name}")
         elif command is not None and step["run"] != command:
-            errors.append(f"{name}: Windows command changed")
+            errors.append(f"{proof}: Windows command changed in {name}")
     return errors
 
 
@@ -430,17 +459,21 @@ const github = {
 const core = { info: message => logs.push(message), setOutput: (name, value) => { outputs[name] = value; } };
 const context = { repo: { owner: 'intent-hq', repo: 'intentd' }, runId: 99, eventName: fixture.eventName || 'push', payload: fixture.payload || {} };
 process.env.THRESHOLD = '2';
+process.env.XL_THRESHOLD = fixture.xlThreshold || '';
 process.env.LINUX_SIZE = '16';
 process.env.WINDOWS_RUNNER_DISABLED = fixture.windowsDisabled || '';
 process.env.MACOS_RUNNER_DISABLED = fixture.macosDisabled || '';
 process.env.LINUX_RUNNER_DISABLED = fixture.linuxDisabled || '';
+process.env.SLOT_JOBS = fixture.slotJobs || '';
+// Most cases check the GitHub fallback; the WarpBuild cases turn WarpBuild on.
 const AsyncFunction = Object.getPrototypeOf(async function() {}).constructor;
 new AsyncFunction('github', 'core', 'context', script)(github, core, context)
   .then(() => process.stdout.write(JSON.stringify({ outputs, calls, logs })))
   .catch(error => { console.error(error); process.exitCode = 1; });
 """
     result = subprocess.run(["node", "-e", harness],
-                            input=json.dumps({"script": step["with"]["script"], "fixture": fixture}),
+                            input=json.dumps({"script": step["with"]["script"],
+                                              "fixture": {"slotJobs": step["env"].get("SLOT_JOBS", ""), **fixture}}),
                             env={k: v for k, v in os.environ.items() if k != "NODE_OPTIONS"},
                             capture_output=True, text=True, timeout=10, check=True)
     return json.loads(result.stdout)
@@ -482,6 +515,9 @@ def matrix_labels(value, outputs):
     """Evaluate only the actual matrix's output-or-JSON-fallback expression."""
     if isinstance(value, list):
         return value
+    slot = re.fullmatch(r"\$\{\{ fromJSON\(needs\.route\.outputs\.slots \|\| '\{\}'\)\['([\w-]+)'\] \|\| fromJSON\('([^']+)'\) \}\}", value)
+    if slot:
+        return json.loads(outputs.get("slots", "") or "{}").get(slot[1]) or json.loads(slot[2])
     match = re.fullmatch(r"\$\{\{ fromJSON\(needs\.route\.outputs\.(\w+) \|\| '([^']+)'\) \}\}", value)
     if not match:
         raise ValueError(f"unsupported runner expression: {value}")
@@ -497,10 +533,15 @@ def runner(platform="macOS", arch="ARM64", *, status="online", busy=False, extra
 # routed Linux jobs ask for exactly these labels.
 CACHE = ["self-hosted", "linux", "x64", "intent-cache"]
 SMALL = ["self-hosted", "linux", "x64", "intent-cache-small"]
+XL = ["self-hosted", "linux", "x64", "intent-cache-xl"]
 
 
 def slot(**kwargs):
     return runner("Linux", "X64", extra=("intent-cache",), **kwargs)
+
+
+def xl_slot(**kwargs):
+    return runner("Linux", "X64", extra=("intent-cache-xl",), **kwargs)
 
 
 def small_slot(**kwargs):
@@ -516,7 +557,7 @@ class RunnerAvailabilityTests(unittest.TestCase):
         result = run_route(self.workflow, **fixture)
         outputs = route_outputs(self.workflow, result["outputs"])
         self.assertEqual(json.loads(outputs.get("macos_labels", "null")), expected)
-        self.assertEqual(outputs.get("macos_burst"), str(expected == ["macos-26-xlarge"]).lower())
+        self.assertEqual(outputs.get("macos_burst"), str(expected == ["warp-macos-26-arm64-12x"]).lower())
         for job_id, field, value in (("build", "target", "aarch64-apple-darwin"),
                                      ("daemon-lifecycle", "platform", "macos")):
             job = self.workflow["jobs"][job_id]
@@ -536,7 +577,7 @@ class RunnerAvailabilityTests(unittest.TestCase):
                       [{**runner(), "labels": [{"name": "macOS"}, {"name": "ARM64"}]}],
                       [runner(busy=True), runner(status="offline"), runner(arch="X64")]):
             with self.subTest(fleet=fleet):
-                self.assert_mac_route({"org": fleet}, ["macos-26-xlarge"])
+                self.assert_mac_route({"org": fleet}, ["warp-macos-26-arm64-12x"])
         for fleet in ([runner()], [runner(platform="MACos", arch="arm64")],
                       [{**runner(), "labels": [{"name": n} for n in ("SELF-HOSTED", "macos", "arm64")]}],
                       [runner(busy=True), runner(status="offline"), runner(), runner(arch="X64")]):
@@ -544,15 +585,15 @@ class RunnerAvailabilityTests(unittest.TestCase):
                 self.assert_mac_route({"org": fleet}, ["self-hosted", "macOS", "ARM64"])
 
     def test_org_lookup_and_repo_fallback_are_shared_and_fail_to_hosted(self):
-        cases = [({}, ["macos-26-xlarge"], ["org"]),
+        cases = [({}, ["warp-macos-26-arm64-12x"], ["org"]),
                  ({"orgError": "403 missing permission", "repo": [runner()]},
                   ["self-hosted", "macOS", "ARM64"], ["org", "repo"]),
-                 ({"orgError": "403", "repo": [runner(busy=True)]}, ["macos-26-xlarge"], ["org", "repo"]),
-                 ({"orgError": "403", "repo": []}, ["macos-26-xlarge"], ["org", "repo"]),
-                 ({"orgError": "403", "repoError": "403 missing permission"}, ["macos-26-xlarge"], ["org", "repo"]),
-                 ({"orgError": "network timeout", "repoError": "503 unavailable"}, ["macos-26-xlarge"], ["org", "repo"]),
-                 ({"org": {"unexpected": "response"}}, ["macos-26-xlarge"], ["org"]),
-                 ({"org": [], "repo": [runner()]}, ["macos-26-xlarge"], ["org"])]
+                 ({"orgError": "403", "repo": [runner(busy=True)]}, ["warp-macos-26-arm64-12x"], ["org", "repo"]),
+                 ({"orgError": "403", "repo": []}, ["warp-macos-26-arm64-12x"], ["org", "repo"]),
+                 ({"orgError": "403", "repoError": "403 missing permission"}, ["warp-macos-26-arm64-12x"], ["org", "repo"]),
+                 ({"orgError": "network timeout", "repoError": "503 unavailable"}, ["warp-macos-26-arm64-12x"], ["org", "repo"]),
+                 ({"org": {"unexpected": "response"}}, ["warp-macos-26-arm64-12x"], ["org"]),
+                 ({"org": [], "repo": [runner()]}, ["warp-macos-26-arm64-12x"], ["org"])]
         for fixture, expected, endpoints in cases:
             with self.subTest(fixture=fixture):
                 result = self.assert_mac_route(fixture, expected)
@@ -572,21 +613,21 @@ class RunnerAvailabilityTests(unittest.TestCase):
                 # Jobs still asking for the generic self-hosted Linux fleet never occupy a slot.
                 jobs += [{"status": "in_progress", "labels": ["self-hosted", "Linux", "X64"]}] * 5
                 result = self.assert_mac_route({"org": fleet, "jobs": jobs, "queueErrors": queue_errors},
-                                              ["macos-26-xlarge"] if queue_errors else ["self-hosted", "macOS", "ARM64"])
+                                              ["warp-macos-26-arm64-12x"] if queue_errors else ["self-hosted", "macOS", "ARM64"])
                 outputs = result["outputs"]
-                self.assertEqual(json.loads(outputs["linux_labels"]), ["gh-linux-16x"] if linux_burst else CACHE)
-                self.assertEqual(json.loads(outputs["check_labels"]), ["gh-linux-8x"] if linux_burst else CACHE)
+                self.assertEqual(json.loads(outputs["linux_labels"]), ["warp-ubuntu-2404-x64-16x"] if linux_burst else CACHE)
+                self.assertEqual(json.loads(outputs["check_labels"]), ["warp-ubuntu-2404-x64-8x"] if linux_burst else CACHE)
                 self.assertEqual(outputs["linux_burst"], str(linux_burst).lower())
-                self.assertEqual(json.loads(outputs["windows_labels"]), ["gh-windows-16x"] if queue_errors else ["self-hosted", "Windows", "X64"])
+                self.assertEqual(json.loads(outputs["windows_labels"]), ["warp-windows-2022-x64-16x"] if queue_errors else ["self-hosted", "Windows", "X64"])
                 self.assertEqual(outputs["windows_burst"], str(bool(queue_errors)).lower())
         for fixture in ({}, {"orgError": "403", "repoError": "403"},
                         {"org": [slot(status="offline"), runner("Windows", "X64", status="offline")]},
                         {"org": [runner("Linux", "X64"), runner("Linux", "X64")]}):
             with self.subTest(fixture=fixture):
                 outputs = run_route(self.workflow, **fixture)["outputs"]
-                self.assertEqual(json.loads(outputs["linux_labels"]), ["gh-linux-16x"])
-                self.assertEqual(json.loads(outputs["check_labels"]), ["gh-linux-8x"])
-                self.assertEqual(json.loads(outputs["windows_labels"]), ["gh-windows-16x"])
+                self.assertEqual(json.loads(outputs["linux_labels"]), ["warp-ubuntu-2404-x64-16x"])
+                self.assertEqual(json.loads(outputs["check_labels"]), ["warp-ubuntu-2404-x64-8x"])
+                self.assertEqual(json.loads(outputs["windows_labels"]), ["warp-windows-2022-x64-16x"])
                 self.assertEqual(outputs["linux_burst"], "true")
                 self.assertEqual(outputs["windows_burst"], "true")
 
@@ -603,32 +644,145 @@ class RunnerAvailabilityTests(unittest.TestCase):
                                        payload=same_repo if event == "pull_request" else {})
                     outputs = route_outputs(self.workflow, result["outputs"], event)
                     hosted = event == "merge_group" or not idle
+                    slots = json.loads(outputs["slots"])
+                    # The one free heavy slot goes to `coverage-changed` on a PR (it ranks
+                    # above check); the queue lists no heavy job. check bursts to its 16x WarpBuild runner.
+                    self.assertEqual(slots["check"], ["warp-ubuntu-2404-x64-16x"])
+                    self.assertEqual(slots["coverage-changed"], CACHE if event == "pull_request" and idle else ["warp-ubuntu-2404-x64-16x"])
+                    # Free standard labels never take a self-hosted slot, even an idle one.
+                    self.assertEqual(slots["release-scripts"], ["ubuntu-24.04"])
+                    # Unlisted heavy jobs only get a slot that is still free after the listed ones.
+                    unlisted = hosted or event == "pull_request"
                     self.assertEqual(json.loads(outputs["linux_labels"]),
-                                     ["gh-linux-16x"] if hosted else CACHE)
+                                     ["warp-ubuntu-2404-x64-16x"] if unlisted else CACHE)
                     self.assertEqual(json.loads(outputs["check_labels"]),
-                                     ["gh-linux-8x"] if hosted else CACHE)
-                    self.assertEqual(outputs["linux_burst"], str(hosted).lower())
-                    # Light jobs ask for the standard label, which the fast pool serves.
-                    self.assertEqual(json.loads(outputs["runners"])["ubuntu-24.04"],
-                                     SMALL if idle else ["ubuntu-24.04"])
+                                     ["warp-ubuntu-2404-x64-8x"] if unlisted else CACHE)
+                    self.assertEqual(outputs["linux_burst"], str(unlisted).lower())
+                    self.assertEqual(json.loads(outputs["runners"])["ubuntu-24.04"], ["ubuntu-24.04"])
                     if idle:
                         self.assertEqual(json.loads(outputs["windows_labels"]), ["self-hosted", "Windows", "X64"])
                         self.assertEqual(json.loads(outputs["macos_labels"]), ["self-hosted", "macOS", "ARM64"])
-                    logged = "merge queue keeps heavy" in run_heavy(self.workflow, result["outputs"], event)[1]
+                    logged = "merge queue: the shared linux_labels mapping takes the burst runner" in run_heavy(self.workflow, result["outputs"], event)[1]
                     self.assertEqual(logged, event == "merge_group")
-        heavy = {"check": "check_labels", "coverage-e2e": "linux_labels",
-                 "coverage-all": "linux_labels", "coverage-changed": "linux_labels"}
-        for job_id, output in heavy.items():
+        # The queue-only coverage suites read their own merge_group slots (the
+        # slot hosts raise the inotify limit to 32768).
+        # Their fallback, if the route job failed, is the listed size's WarpBuild runner.
+        for job_id, label in {"check": "warp-ubuntu-2404-x64-16x", "coverage-changed": "warp-ubuntu-2404-x64-16x",
+                              "coverage-e2e": "warp-ubuntu-2404-x64-16x", "coverage-all": "warp-ubuntu-2404-x64-16x"}.items():
             with self.subTest(job=job_id):
                 self.assertEqual(self.workflow["jobs"][job_id]["runs-on"],
-                                 "${{ fromJSON(needs.route.outputs.%s) }}" % output)
+                                 "${{ fromJSON(needs.route.outputs.slots || '{}')['%s'] || fromJSON('[\"%s\"]') }}" % (job_id, label))
         lifecycle = self.workflow["jobs"]["daemon-lifecycle"]["strategy"]["matrix"]["include"]
         linux = next(row for row in lifecycle if row["platform"] == "linux")
-        self.assertEqual(matrix_labels(linux["os"], {"linux_labels": '["gh-linux-16x"]'}), ["gh-linux-16x"])
-        self.assertIn("needs.route.outputs.linux_labels", linux["os"])
+        # The Linux leg reads its own slot: hosted unless the probe granted one.
+        self.assertEqual(matrix_labels(linux["os"], {"slots": '{"daemon-lifecycle-linux":["gh-linux-16x"]}'}), ["gh-linux-16x"])
+        self.assertEqual(matrix_labels(linux["os"], {"slots": json.dumps({"daemon-lifecycle-linux": CACHE})}), CACHE)
+        self.assertNotIn("linux_labels", linux["os"])
         for job_id in ("release-scripts", "deb-packaging"):
             with self.subTest(job=job_id):
-                self.assertIn("needs.route.outputs.runners", self.workflow["jobs"][job_id]["runs-on"])
+                self.assertIn("needs.route.outputs.slots", self.workflow["jobs"][job_id]["runs-on"])
+
+    def test_free_label_jobs_stay_on_github_with_idle_small_slots(self):
+        # Standard GitHub runners are free for this public repository, so the fast
+        # jobs and both Linux pi-session-paths legs keep their GitHub label.
+        result = run_route(self.workflow, org=[small_slot()] * 3, eventName="merge_group")
+        slots = json.loads(result["outputs"]["slots"])
+        self.assertNotIn(SMALL, slots.values())
+        for key in ("release-scripts", "deb-packaging", "pi-session-paths-22", "pi-session-paths-24"):
+            self.assertEqual(slots[key], ["ubuntu-24.04"])
+        self.assertEqual(json.loads(result["outputs"]["runners"])["ubuntu-24.04"], ["ubuntu-24.04"])
+        runs_on = self.workflow["jobs"]["pi-session-paths"]["runs-on"]
+        self.assertIn("format('pi-session-paths-{0}', matrix.node)", runs_on)
+        self.assertTrue(runs_on.startswith("${{ matrix.os == 'ubuntu-24.04' && fromJSON(needs.route.outputs.slots"))
+
+    def test_bursts_go_to_warpbuild(self):
+        same_repo = {"pull_request": {"head": {"repo": {"full_name": "intent-hq/intentd"}}}}
+        warp = {"linux_labels": ["warp-ubuntu-2404-x64-16x"], "check_labels": ["warp-ubuntu-2404-x64-8x"],
+                "windows_labels": ["warp-windows-2022-x64-16x"], "macos_labels": ["warp-macos-26-arm64-12x"]}
+        for event in ("pull_request", "push", "merge_group"):
+            with self.subTest(event=event):
+                result = run_route(self.workflow, org=[], eventName=event, warpbuildDisabled="",
+                                   payload=same_repo if event == "pull_request" else {})
+                outputs = route_outputs(self.workflow, result["outputs"], event)
+                for key, labels in warp.items():
+                    self.assertEqual(json.loads(outputs[key]), labels, key)
+                slots = json.loads(outputs["slots"])
+                self.assertEqual(slots["check"], ["warp-ubuntu-2404-x64-16x"])
+                self.assertEqual(slots["coverage-changed"], ["warp-ubuntu-2404-x64-16x"])
+                self.assertEqual(slots["release-scripts"], ["ubuntu-24.04"])
+                cloud = json.loads(outputs["cloud"])
+                self.assertEqual(cloud["gh-linux-16x"], ["warp-ubuntu-2404-x64-16x"])
+                self.assertEqual(cloud["ubuntu-24.04"], ["ubuntu-24.04"])
+        # In the merge queue the shared linux_labels mapping takes WarpBuild, not an idle slot.
+        idle = [slot(), slot(), runner("Windows", "X64"), runner()]
+        result = run_route(self.workflow, org=idle, eventName="merge_group", warpbuildDisabled="")
+        outputs, logs = run_heavy(self.workflow, result["outputs"], "merge_group")
+        self.assertEqual(json.loads(outputs["linux_labels"]), ["warp-ubuntu-2404-x64-16x"])
+        self.assertEqual(json.loads(outputs["check_labels"]), ["warp-ubuntu-2404-x64-8x"])
+        self.assertEqual(outputs["linux_burst"], "true")
+        self.assertIn("merge queue: the shared linux_labels mapping takes the burst runner", logs)
+        # Idle native runners still win over WarpBuild.
+        outputs = route_outputs(self.workflow, result["outputs"], "merge_group")
+        self.assertEqual(json.loads(outputs["windows_labels"]), ["self-hosted", "Windows", "X64"])
+        self.assertEqual(json.loads(outputs["macos_labels"]), ["self-hosted", "macOS", "ARM64"])
+        # An empty or unreadable cloud map falls back to the same WarpBuild labels.
+        for cloud in ("", "not json", "{}"):
+            with self.subTest(cloud=cloud):
+                outputs, _ = run_heavy(self.workflow, {**result["outputs"], "cloud": cloud}, "merge_group")
+                self.assertEqual(json.loads(outputs["linux_labels"]), ["warp-ubuntu-2404-x64-16x"])
+                self.assertEqual(json.loads(outputs["check_labels"]), ["warp-ubuntu-2404-x64-8x"])
+
+    def test_release_linux_legs_take_the_burst_runner(self):
+        for name, job, key in (("release-cache.yml", "daemon", "matrix.runner"),
+                               ("release-sitter.yml", "build", "matrix.os"),
+                               ("v-release.yml", "build-local-artifacts", "matrix.runner")):
+            with self.subTest(workflow=name):
+                runs_on = yaml.safe_load((ROOT / ".github/workflows" / name).read_text())["jobs"][job]["runs-on"]
+                self.assertIn("(fromJSON(needs.runner-route.outputs.cloud || '{}')[%s] || %s)" % (key, key), runs_on)
+
+    def test_pr_fits_heavy_rust_jobs_to_free_slots(self):
+        same_repo = {"pull_request": {"head": {"repo": {"full_name": "intent-hq/intentd"}}}}
+        busy = {"status": "in_progress", "labels": CACHE, "created_at": "2099-01-01T00:00:00Z"}
+        # coverage-changed ranks above check, so a single free slot goes to it.
+        for free, expected in ((2, ["check", "coverage-changed"]), (1, ["coverage-changed"]), (0, [])):
+            with self.subTest(free=free):
+                result = run_route(self.workflow, org=[slot(), slot()], eventName="pull_request",
+                                   payload=same_repo, jobs=[busy] * (2 - free))
+                slots = json.loads(result["outputs"]["slots"])
+                self.assertEqual(sorted(k for k, v in slots.items() if v == CACHE), expected)
+        result = run_route(self.workflow, org=[slot(), slot()], eventName="pull_request",
+                           payload=same_repo, linuxDisabled="true")
+        # The kill switch sends every listed job to its hosted label.
+        slots = json.loads(result["outputs"]["slots"])
+        self.assertEqual(slots["check"], ["warp-ubuntu-2404-x64-16x"])
+        self.assertNotIn(CACHE, slots.values())
+        self.assertNotIn(SMALL, slots.values())
+
+    def test_pr_check_takes_an_xl_slot_only_after_coverage_changed(self):
+        # Two xl slots (intent-ci1 and intent-ci2) and two heavy slots online.
+        # coverage-changed (15.5 min on xl, ~33 on heavy) always picks first;
+        # check takes what is left: xl, then heavy, then a 16x burst.
+        same_repo = {"pull_request": {"head": {"repo": {"full_name": "intent-hq/intentd"}}}}
+        fleet = [xl_slot(), xl_slot(), slot(), slot()]
+        def busy(labels):
+            return {"status": "in_progress", "labels": labels, "created_at": "2099-01-01T00:00:00Z"}
+        for xl_free, heavy_free, coverage, check in (
+                (2, 2, XL, XL),
+                (1, 2, XL, CACHE),
+                (0, 2, CACHE, CACHE),
+                # Both xl slots busy, one heavy slot free: coverage-changed takes
+                # the heavy slot and check bursts.
+                (0, 1, CACHE, ["warp-ubuntu-2404-x64-16x"]),
+                (0, 0, ["warp-ubuntu-2404-x64-16x"], ["warp-ubuntu-2404-x64-16x"])):
+            with self.subTest(xl_free=xl_free, heavy_free=heavy_free):
+                jobs = [busy(XL)] * (2 - xl_free) + [busy(CACHE)] * (2 - heavy_free)
+                result = run_route(self.workflow, org=fleet, eventName="pull_request", payload=same_repo,
+                                   jobs=jobs, xlThreshold="2")
+                slots = json.loads(result["outputs"]["slots"])
+                self.assertEqual((slots["coverage-changed"], slots["check"]), (coverage, check))
+        # In the merge queue check is unlisted for the event and bursts at 16x.
+        result = run_route(self.workflow, org=fleet, eventName="merge_group", xlThreshold="2")
+        self.assertEqual(json.loads(result["outputs"]["slots"])["check"], ["warp-ubuntu-2404-x64-16x"])
 
     def test_windows_bursts_without_explicit_idle_capacity(self):
         missing_busy = runner("Windows", "X64")
@@ -640,7 +794,7 @@ class RunnerAvailabilityTests(unittest.TestCase):
                       [runner("Windows", "X64", status="offline")]):
             with self.subTest(fleet=fleet):
                 outputs = run_route(self.workflow, org=fleet)["outputs"]
-                self.assertEqual(json.loads(outputs["windows_labels"]), ["gh-windows-16x"])
+                self.assertEqual(json.loads(outputs["windows_labels"]), ["warp-windows-2022-x64-16x"])
                 self.assertEqual(outputs["windows_burst"], "true")
         outputs = run_route(self.workflow, org=[runner("Windows", "X64", busy=True),
                                                runner("Windows", "X64")])["outputs"]
@@ -654,7 +808,7 @@ class RunnerAvailabilityTests(unittest.TestCase):
             with self.subTest(disabled=disabled):
                 outputs = run_route(self.workflow, org=fleet, windowsDisabled=disabled)["outputs"]
                 self.assertEqual(json.loads(outputs["windows_labels"]),
-                                 ["gh-windows-16x"] if disabled == "true" else ["self-hosted", "Windows", "X64"])
+                                 ["warp-windows-2022-x64-16x"] if disabled == "true" else ["self-hosted", "Windows", "X64"])
                 self.assertEqual(outputs["windows_burst"], str(disabled == "true").lower())
                 self.assertEqual(json.loads(outputs["linux_labels"]), CACHE)
                 self.assertEqual(json.loads(outputs["macos_labels"]), ["self-hosted", "macOS", "ARM64"])
@@ -665,9 +819,9 @@ class RunnerAvailabilityTests(unittest.TestCase):
             with self.subTest(disabled=disabled):
                 outputs = run_route(self.workflow, org=fleet, linuxDisabled=disabled)["outputs"]
                 self.assertEqual(json.loads(outputs["linux_labels"]),
-                                 ["gh-linux-16x"] if disabled == "true" else CACHE)
+                                 ["warp-ubuntu-2404-x64-16x"] if disabled == "true" else CACHE)
                 self.assertEqual(json.loads(outputs["check_labels"]),
-                                 ["gh-linux-8x"] if disabled == "true" else CACHE)
+                                 ["warp-ubuntu-2404-x64-8x"] if disabled == "true" else CACHE)
                 self.assertEqual(outputs["linux_burst"], str(disabled == "true").lower())
                 self.assertEqual(json.loads(outputs["macos_labels"]), ["self-hosted", "macOS", "ARM64"])
                 self.assertEqual(json.loads(outputs["windows_labels"]), ["self-hosted", "Windows", "X64"])
@@ -680,7 +834,7 @@ class RunnerAvailabilityTests(unittest.TestCase):
             with self.subTest(disabled=disabled):
                 outputs = run_route(self.workflow, org=fleet, macosDisabled=disabled)["outputs"]
                 self.assertEqual(json.loads(outputs["macos_labels"]),
-                                 ["macos-26-xlarge"] if disabled == "true" else ["self-hosted", "macOS", "ARM64"])
+                                 ["warp-macos-26-arm64-12x"] if disabled == "true" else ["self-hosted", "macOS", "ARM64"])
                 self.assertEqual(outputs["macos_burst"], str(disabled == "true").lower())
                 self.assertEqual(json.loads(outputs["linux_labels"]), CACHE)
                 self.assertEqual(json.loads(outputs["windows_labels"]), ["self-hosted", "Windows", "X64"])
@@ -690,8 +844,8 @@ class RunnerAvailabilityTests(unittest.TestCase):
     def test_empty_outputs_use_hosted_macos_in_both_matrices(self):
         for job_id in ("build", "windows", "daemon-lifecycle", "macos-services-runtime"):
             for row in self.workflow["jobs"][job_id]["strategy"]["matrix"]["include"]:
-                expected = ["macos-26-xlarge"] if row.get("target") == "aarch64-apple-darwin" or row.get("platform") == "macos" else (
-                    ["gh-linux-16x"] if row.get("platform") == "linux" else ["gh-windows-16x"])
+                expected = ["warp-macos-26-arm64-12x"] if row.get("target") == "aarch64-apple-darwin" or row.get("platform") == "macos" else (
+                    ["warp-ubuntu-2404-x64-16x"] if row.get("platform") == "linux" else ["warp-windows-2022-x64-16x"])
                 for outputs in ({}, {"macos_labels": "", "windows_labels": "", "linux_labels": ""}):
                     with self.subTest(job=job_id, row=row, outputs=outputs):
                         self.assertEqual(matrix_labels(row["os"], outputs), expected)
@@ -701,7 +855,7 @@ class RunnerAvailabilityTests(unittest.TestCase):
 
     def test_hosted_macos_skips_persistent_cleanup_and_uses_cache(self):
         steps = {s.get("name"): s for s in self.workflow["jobs"]["build"]["steps"]}
-        for labels in (["macos-26-xlarge"], ["self-hosted", "macOS", "ARM64"]):
+        for labels in (["warp-macos-26-arm64-12x"], ["self-hosted", "macOS", "ARM64"]):
             for fast_path in ("", "true"):
                 values = {**context("merge_group", fast_path=fast_path), "matrix.os": labels}
                 for name in ("Ensure macOS CI disk headroom", "Point CARGO_TARGET_DIR outside the work dir (self-hosted)"):
@@ -722,12 +876,14 @@ class LifecycleCacheTests(unittest.TestCase):
 
     def test_windows_shell_is_ready_before_cache_setup(self):
         jobs = yaml.safe_load((ROOT / '.github/workflows/ci.yml').read_text())['jobs']
-        steps = jobs['windows']['steps']
-        setup = next(i for i, step in enumerate(steps) if step.get('name') == 'Configure the self-hosted compiler cache')
-        git_bash = next(i for i, step in enumerate(steps) if step.get('name') == 'Put Git Bash first on PATH (Windows)')
-        self.assertLess(git_bash, setup)
-        self.assertNotIn('if', steps[git_bash])
-        self.assertTrue(all(not step.get('run') for step in steps[:git_bash]))
+        for job in ('windows', 'windows-lint'):
+            with self.subTest(job=job):
+                steps = jobs[job]['steps']
+                setup = next(i for i, step in enumerate(steps) if step.get('name') == 'Configure the self-hosted compiler cache')
+                git_bash = next(i for i, step in enumerate(steps) if step.get('name') == 'Put Git Bash first on PATH (Windows)')
+                self.assertLess(git_bash, setup)
+                self.assertNotIn('if', steps[git_bash])
+                self.assertTrue(all(not step.get('run') for step in steps[:git_bash]))
         for name in ('build', 'daemon-lifecycle'):
             self.assertFalse(any(step.get('name') == 'Put Git Bash first on PATH (Windows)' for step in jobs[name]['steps']), name)
 
@@ -792,13 +948,15 @@ class LifecycleCacheTests(unittest.TestCase):
     def test_macos_and_windows_keep_native_persistent_paths(self):
         step = self.step("Point lifecycle target outside checkout (macOS)")
         self.assertEqual(step["shell"], "bash")
-        windows = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())["jobs"]["windows"]
-        target = next(s for s in windows["steps"] if s.get("name") == "Point CARGO_TARGET_DIR outside the work dir (self-hosted)")
+        jobs = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())["jobs"]
+        # windows-lint shares the push job's dir so the single-slot runner stays warm.
+        targets = {job: next(s for s in jobs[job]["steps"] if s.get("name") == "Point CARGO_TARGET_DIR outside the work dir (self-hosted)")
+                   for job in ("windows", "windows-lint")}
         for platform, body, profile, expected in (
                 ("macos", step["run"].replace("${{ matrix.platform }}", "macos"), "",
                  os.environ["HOME"] + "/ci-target/intentd/daemon-lifecycle-macos"),
-                ("windows", target["run"].replace("${{ matrix.target }}", WINDOWS_TARGET), "C:\\Users\\CI User",
-                 "C:\\Users\\CI User/ci-target/intentd/build-" + WINDOWS_TARGET)):
+                *((job, target["run"].replace("${{ matrix.target }}", WINDOWS_TARGET), "C:\\Users\\CI User",
+                   "C:\\Users\\CI User/ci-target/intentd/build-" + WINDOWS_TARGET) for job, target in targets.items())):
             with self.subTest(platform=platform), tempfile.TemporaryDirectory() as tmp:
                 envfile = Path(tmp) / "env"
                 result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", body], cwd=ROOT,
@@ -840,14 +998,23 @@ class NativeRoutingTests(unittest.TestCase):
     def test_native_proofs_and_push_release_builds(self):
         self.assertEqual(native_errors(self.workflow), [])
 
-    def test_windows_runs_only_after_merge_and_is_push_required(self):
+    def test_windows_lints_in_queue_and_runs_runtime_proofs_after_merge(self):
         self.assertEqual(windows_errors(self.workflow), [])
         self.assertEqual(windows_legs(self.workflow, "pull_request"), set())
-        self.assertEqual(windows_legs(self.workflow, "merge_group"), set())
+        self.assertEqual(windows_legs(self.workflow, "merge_group"), {"windows-lint"})
         self.assertEqual(windows_legs(self.workflow, "push"), {"windows", "install-ps1", "pi-session-paths"})
 
-    def test_mutations_cannot_return_windows_to_prs_or_queue(self):
+    def test_mutations_cannot_move_windows_jobs_between_events(self):
         cases = {
+            "lint-pr": lambda w: w["jobs"]["windows-lint"].__setitem__("if", "github.event_name != 'push'"),
+            "lint-push": lambda w: w["jobs"]["windows-lint"].__setitem__("if", "github.event_name != 'pull_request'"),
+            "lint-dropped": lambda w: w["jobs"]["windows-lint"].__setitem__("if", "github.event_name == 'push'"),
+            "lint-duplicated": lambda w: w["jobs"]["windows"]["steps"].insert(
+                0, copy.deepcopy(next(s for s in w["jobs"]["windows-lint"]["steps"] if s.get("name") == "Clippy (target-gated code)"))),
+            "lint-renamed": lambda w: w["jobs"]["windows"]["steps"].insert(
+                0, {"name": "Clippy (Windows)", "run": "cargo clippy --workspace --all-targets -- -D warnings"}),
+            "check-renamed": lambda w: w["jobs"]["windows"]["steps"].insert(
+                0, {"name": "Typecheck", "run": "rustup run stable cargo check --workspace"}),
             "job-queue": lambda w: w["jobs"]["windows"].__setitem__("if", "github.event_name == 'merge_group' || github.event_name == 'push'"),
             "job-pr": lambda w: w["jobs"]["windows"].__setitem__("if", "github.event_name != 'merge_group'"),
             "installer-queue": lambda w: w["jobs"]["install-ps1"].__setitem__("if", "github.event_name == 'merge_group' || github.event_name == 'push'"),
@@ -864,11 +1031,12 @@ class NativeRoutingTests(unittest.TestCase):
                 self.assertTrue(windows_errors(workflow) + native_errors(workflow))
 
     def test_mutations_cannot_drop_windows_proofs(self):
-        for name in WINDOWS_STEPS:
+        proofs = [("windows-lint", name) for name in WINDOWS_LINT_STEPS] + [("windows", name) for name in WINDOWS_STEPS]
+        for job, name in proofs:
             for mutation in ("remove", "skip", "queue-only", "optional", "empty"):
-                with self.subTest(step=name, mutation=mutation):
+                with self.subTest(job=job, step=name, mutation=mutation):
                     workflow = copy.deepcopy(self.workflow)
-                    steps = workflow["jobs"]["windows"]["steps"]
+                    steps = workflow["jobs"][job]["steps"]
                     step = next(s for s in steps if s.get("name") == name)
                     if mutation == "remove":
                         steps.remove(step)
@@ -881,17 +1049,18 @@ class NativeRoutingTests(unittest.TestCase):
                     else:
                         step["run"] = ""
                     self.assertTrue(any(name in error for error in windows_errors(workflow)))
-        workflow = copy.deepcopy(self.workflow)
-        workflow["jobs"]["windows"]["continue-on-error"] = True
-        self.assertIn("windows: job must stay required", windows_errors(workflow))
+        for job in ("windows", "windows-lint"):
+            workflow = copy.deepcopy(self.workflow)
+            workflow["jobs"][job]["continue-on-error"] = True
+            self.assertIn(f"{job}: job must stay required", windows_errors(workflow))
 
-    def test_push_gate_requires_windows(self):
-        for job in WINDOWS_JOBS:
-            with self.subTest(job=job):
+    def test_gates_require_windows(self):
+        for event, job in [("push", job) for job in WINDOWS_JOBS] + [("merge_group", job) for job in WINDOWS_QUEUE_JOBS]:
+            with self.subTest(event=event, job=job):
                 workflow = copy.deepcopy(self.workflow)
                 step = next(s for s in workflow["jobs"]["gate"]["steps"] if s.get("name") == "Check results")
                 step["run"] = step["run"].replace("${{ needs.%s.result }}" % job, "success")
-                self.assertIn(f"push: {job}=skipped", gate_errors(workflow))
+                self.assertIn(f"{event}: {job}=skipped", gate_errors(workflow))
                 workflow["jobs"]["gate"]["needs"].remove(job)
                 self.assertIn("gate dependencies changed", gate_errors(workflow))
 
@@ -915,7 +1084,7 @@ class NativeRoutingTests(unittest.TestCase):
                 elif mutation == "caller":
                     step["env"]["INTENTD_ASSERT_BOUND_CALLER"] = "0"
                 else:
-                    removed = {"feature": "--features repository-test-fixtures", "target": "--test e2e_repository_resource_read", "threads": "--test-threads=2"}[mutation]
+                    removed = {"feature": "--features repository-test-fixtures", "target": " e2e_repository_resource_read::", "threads": "--test-threads=2"}[mutation]
                     step["run"] = step["run"].replace(removed, "")
                 self.assertTrue(gitlab_errors(workflow))
 

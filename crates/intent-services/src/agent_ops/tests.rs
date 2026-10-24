@@ -82,8 +82,16 @@ pub(super) fn test_registry_with_default_provider(tmp: &TempDb) -> Arc<crate::Se
 /// `agent.setModel`'s cross-provider gate) pass without the real binary on the
 /// test host. Merges into the `providers.paths` map seeded by
 /// [`test_registry_with_default_provider`] rather than replacing it, so
-/// auggie's override survives.
+/// auggie's override survives. npx-only providers (Codex, Claude Code, pi)
+/// ignore path overrides: mark those with
+/// `test_support::provider_installed::mark_on` instead.
 pub(super) fn seed_provider_path(svc: &Services, provider_id: &str) {
+    assert!(
+        intent_providers::provider_config(provider_id)
+            .npx_only_package
+            .is_none(),
+        "{provider_id} ignores providers.paths; use test_support::provider_installed"
+    );
     let mut paths = svc.effective_settings().providers.paths;
     paths.insert(provider_id.to_string(), "/bin/sh".to_string());
     svc.settings_registry()
@@ -137,6 +145,7 @@ pub(super) fn workspace(id: &WorkspaceId) -> Workspace {
         pull_requests_total: None,
         display_status: None,
         waiting: false,
+        scripts_running: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
@@ -229,10 +238,13 @@ async fn delete_emits_agent_deleted_scoped_to_workspace() {
     let r = svc.agent_delete_op(id.clone(), None).await.expect("delete");
     assert_eq!(r["success"], json!(true));
 
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     assert_eq!(batch.len(), 1);
     assert_eq!(batch[0].event_type, AGENT_DELETED);
     assert_eq!(batch[0].workspace_id, ws);
@@ -258,7 +270,11 @@ async fn delete_skips_emit_when_session_already_gone() {
     assert_eq!(r["success"], json!(true));
 
     // Nothing was emitted: the subscription stays empty within the window.
-    let res = timeout(Duration::from_millis(300), sub.recv()).await;
+    let res = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await;
     assert!(
         res.is_err(),
         "expected no agent:deleted emit for a missing session"
@@ -285,10 +301,13 @@ async fn retire_sets_mark_emits_event_and_preserves_the_row() {
     assert_eq!(r["success"], json!(true));
     let retired_at = r["retiredAt"].as_str().expect("retiredAt").to_string();
 
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     assert_eq!(batch.len(), 1);
     assert_eq!(batch[0].event_type, AGENT_RETIRED);
     assert_eq!(batch[0].data["agentId"].as_str(), Some(id.0.as_str()));
@@ -367,10 +386,13 @@ async fn retired_agents_are_inert_until_restored() {
         .await
         .expect("restore");
     assert_eq!(r["restored"], json!(true));
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     assert_eq!(batch[0].event_type, AGENT_RESTORED);
     assert_eq!(batch[0].data["agentId"].as_str(), Some(id.0.as_str()));
 
@@ -982,10 +1004,13 @@ async fn retire_cascades_to_settled_descendants() {
     // descendants (cascade reason naming the parent).
     let mut events = Vec::new();
     while events.len() < 3 {
-        let batch = timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("recv timed out")
-            .expect("subscription closed");
+        let batch = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
         events.extend(batch);
     }
     let reason_of = |id: &AgentId| {
@@ -1033,9 +1058,12 @@ async fn retire_cascades_to_settled_descendants() {
         .expect("re-retire");
     assert_eq!(r2["alreadyRetired"], json!(true));
     assert!(
-        timeout(Duration::from_millis(300), sub.recv())
-            .await
-            .is_err(),
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            sub.recv()
+        )
+        .await
+        .is_err(),
         "no re-emit on the idempotent retire"
     );
 }
@@ -1429,7 +1457,8 @@ async fn group_rehydration_prunes_groups_for_retired_or_missing_parent() {
             svc.enroll_child_in_group(&gid, &child);
         }
         // Wait for both group rows to persist (the upsert is spawned).
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let deadline =
+            std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(2));
         loop {
             let rows = svc
                 .store()
@@ -2490,10 +2519,13 @@ async fn cross_workspace_chief_watch_delivers_wake_in_parent_home_workspace() {
 
     // `agent:subscriptions-changed` is published in the PARENT's home
     // workspace (`__chief__`), not the child's.
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     assert_eq!(batch.len(), 1);
     assert_eq!(batch[0].workspace_id, chief_ws);
     assert_eq!(batch[0].data["agentId"].as_str(), Some(parent.0.as_str()));
@@ -2609,7 +2641,8 @@ async fn chief_anchored_group_fires_aggregated_wake_to_chief_parent() {
 
     // The group persists under its anchor workspace (`__chief__`), so a
     // restart rehydrates it from the chief workspace, not the children's.
-    let seal_deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let seal_deadline =
+        std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(2));
     loop {
         let rows = svc
             .store()
@@ -3028,7 +3061,8 @@ async fn app_agents_wait_after_all_survives_restart_and_fires_on_rehydration() {
 
         // Wait for the group row to persist under the chief anchor (the
         // upsert is spawned; completion recording below awaits persistence).
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let deadline =
+            std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(2));
         loop {
             let rows = svc
                 .store()
@@ -3092,7 +3126,8 @@ async fn app_agents_wait_after_all_survives_restart_and_fires_on_rehydration() {
 /// Poll until the persisted `completion_watch` table reaches `expected` rows
 /// (registration/removal persistence is spawned, not awaited).
 async fn wait_for_persisted_watches(svc: &Services, expected: usize) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let deadline =
+        std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(2));
     loop {
         let rows = svc
             .store()
@@ -3115,7 +3150,8 @@ async fn wait_for_persisted_watches(svc: &Services, expected: usize) {
 /// reach `expected` (group persistence and sweeps are spawned, not awaited —
 /// intent#4460).
 async fn wait_for_persisted_groups(svc: &Services, ws: &WorkspaceId, expected: usize) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let deadline =
+        std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(2));
     loop {
         let rows = svc
             .store()
@@ -4334,7 +4370,8 @@ async fn restart_reconcile_delivers_terminal_after_progress_once() {
             .await
             .expect("re-arm");
         wait_for_persisted_watches(&svc, 1).await;
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let deadline =
+            std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(2));
         loop {
             let rows = svc
                 .store()
@@ -5632,11 +5669,14 @@ async fn strict_ask_registration_is_durable_before_in_memory_visibility() {
         .await
         .expect("release writer lock");
     drop(blocker);
-    timeout(Duration::from_secs(10), registration)
-        .await
-        .expect("registration unblocked")
-        .expect("registration task")
-        .expect("registration succeeds");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        registration,
+    )
+    .await
+    .expect("registration unblocked")
+    .expect("registration task")
+    .expect("registration succeeds");
     assert_eq!(svc.list_watches_for_parent(&chief).len(), 1);
     assert_eq!(
         svc.store()
@@ -6150,9 +6190,12 @@ async fn report_to_parent_keeps_waiting_projection_and_subscription_quiet() {
         .expect("report");
 
     assert!(
-        timeout(Duration::from_millis(100), sub.recv())
-            .await
-            .is_err(),
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(100)),
+            sub.recv()
+        )
+        .await
+        .is_err(),
         "progress report must not publish a subscription-state change"
     );
     let snapshot = serde_json::to_value(
@@ -6441,6 +6484,20 @@ fn live_preview_derivation_clips_trailing_partial_line() {
         last_response_and_digest_from_blocks(&blocks(&["First done\nfinal line no newline"]));
     assert_eq!(resp.as_deref(), Some("final line no newline"));
     assert_eq!(digest, None);
+}
+
+/// A reply that copied the HTML-escaped prompts block from an XML-escaped
+/// history replay must not surface `--&gt;` (or a prompt line) as the
+/// agent's last response; the literal block is stripped as before.
+#[test]
+fn last_response_strips_escaped_suggested_prompts_block() {
+    for text in [
+        "Report back when ready.\n\n&lt;!-- suggested-prompts\nRaise Type Check &amp; Lint's timeout.\n--&gt;",
+        "Report back when ready.\n\n<!-- suggested-prompts\nRaise the timeout.\n-->",
+    ] {
+        let (resp, _) = last_response_and_digest_from_blocks(&[text.to_owned()]);
+        assert_eq!(resp.as_deref(), Some("Report back when ready."), "{text}");
+    }
 }
 
 /// Live-turn overlay fallback: a slot whose blocks carry no text yet (early
@@ -9636,11 +9693,14 @@ async fn set_model_normalizes_legacy_provider_aliases() {
 async fn set_model_bare_model_with_explicit_provider_id() {
     let (tmp, svc, ws) = setup().await;
     // The cross-provider switch below runs the availability gate against the
-    // target, so pin claude-code to a deterministic executable rather than
-    // depending on whether the test host happens to have it installed.
-    seed_provider_path(&svc, "claude-code");
+    // target, so mark claude-code installed rather than depending on whether
+    // the test host happens to have npx and the claude CLI.
+    crate::test_support::provider_installed::mark_on(&svc, &["claude-code"]);
     #[cfg(unix)]
-    let _cli_env = crate::test_support::installed_cli_env(tmp.path.parent().unwrap(), "claude");
+    let _cli_env = crate::test_support::installed_cli_env(
+        tmp.path.parent().unwrap(),
+        intent_providers::installed_cli::InstalledCli::Claude,
+    );
     #[cfg(not(unix))]
     let _fixture_owner = tmp;
     // Warm caches: claude-code claims `haiku`, auggie's catalog lacks it.
@@ -10566,30 +10626,39 @@ async fn create_rename_set_model_emit_agent_events() {
     });
 
     let id = create_agent(&svc, &ws, "Evented").await;
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("created recv")
-        .expect("sub closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("created recv")
+    .expect("sub closed");
     assert_eq!(batch[0].event_type, AGENT_CREATED);
     assert_eq!(batch[0].data["agentId"].as_str(), Some(id.0.as_str()));
 
     svc.agent_rename_op(id.clone(), "Renamed".into(), false)
         .await
         .expect("rename");
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("renamed recv")
-        .expect("sub closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("renamed recv")
+    .expect("sub closed");
     assert_eq!(batch[0].event_type, AGENT_RENAMED);
     assert_eq!(batch[0].data["name"], "Renamed");
 
     svc.agent_set_model_op(id.clone(), "auggie:opus4.7".into(), None)
         .await
         .expect("setModel");
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("updated recv")
-        .expect("sub closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("updated recv")
+    .expect("sub closed");
     assert_eq!(batch[0].event_type, AGENT_UPDATED);
     assert_eq!(batch[0].data["modelId"], "auggie:opus4.7");
 }
@@ -10609,9 +10678,12 @@ async fn skipped_rename_emits_no_event() {
         .expect("skip");
     assert_eq!(r["skipped"], json!(true));
     assert!(
-        timeout(Duration::from_millis(300), sub.recv())
-            .await
-            .is_err(),
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            sub.recv()
+        )
+        .await
+        .is_err(),
         "no agent:renamed expected for a skipped rename"
     );
 }
@@ -11830,7 +11902,8 @@ async fn report_to_parent_debounce_expiry_flushes_wake() {
 
     // The 1s hold expires; the release timer clears the hold marker so the
     // entry becomes a normal ready-to-send wake.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(5));
     loop {
         let snapshot = svc.queue_snapshot(&parent);
         assert_eq!(snapshot.len(), 1, "parked wake stays queued: {snapshot:?}");
@@ -11920,16 +11993,19 @@ async fn report_to_parent_debounce_send_failure_restores_held_entry_for_retry() 
         .execute(svc.store().write_pool())
         .await
         .expect("remove failure trigger");
-    timeout(Duration::from_secs(2), async {
-        loop {
-            if parent_message_count(&svc, &parent).await == baseline + 1
-                && svc.find_watches_for_child(&child).is_empty()
-            {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        async {
+            loop {
+                if parent_message_count(&svc, &parent).await == baseline + 1
+                    && svc.find_watches_for_child(&child).is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("retry delivers the combined wake");
     assert!(
@@ -11960,7 +12036,8 @@ async fn report_to_parent_debounce_send_failure_restores_held_entry_for_retry() 
 /// of its debounce hold (hold marker cleared, entry still undelivered).
 /// Returns the flushed entry's id.
 async fn wait_for_report_hold_flush(svc: &Services, parent: &AgentId) -> String {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(5));
     loop {
         let snapshot = svc.queue_snapshot(parent);
         assert_eq!(snapshot.len(), 1, "parked wake stays queued: {snapshot:?}");
@@ -12137,16 +12214,19 @@ async fn flushed_report_send_failure_restores_entry_for_retry() {
         .execute(svc.store().write_pool())
         .await
         .expect("remove failure trigger");
-    timeout(Duration::from_secs(2), async {
-        loop {
-            if parent_message_count(&svc, &parent).await == baseline + 1
-                && svc.find_watches_for_child(&child).is_empty()
-            {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        async {
+            loop {
+                if parent_message_count(&svc, &parent).await == baseline + 1
+                    && svc.find_watches_for_child(&child).is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("retry delivers the combined wake");
     let remaining = svc.queue_snapshot(&parent);
@@ -12513,16 +12593,19 @@ async fn failed_terminal_wake_retries_without_another_event() {
         .execute(svc.store().write_pool())
         .await
         .expect("remove failure trigger");
-    timeout(Duration::from_secs(2), async {
-        loop {
-            if parent_message_count(&svc, &parent).await == 1
-                && svc.find_watches_for_child(&child).is_empty()
-            {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        async {
+            loop {
+                if parent_message_count(&svc, &parent).await == 1
+                    && svc.find_watches_for_child(&child).is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("retry delivers and retires without another event");
 
@@ -12599,17 +12682,20 @@ async fn failed_aggregated_wake_retries_without_another_event() {
         .execute(svc.store().write_pool())
         .await
         .expect("remove failure trigger");
-    timeout(Duration::from_secs(2), async {
-        loop {
-            if parent_message_count(&svc, &parent).await == 1
-                && svc.delegation_group_for_parent(&parent).is_none()
-                && svc.list_watches_for_parent(&parent).is_empty()
-            {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        async {
+            loop {
+                if parent_message_count(&svc, &parent).await == 1
+                    && svc.delegation_group_for_parent(&parent).is_none()
+                    && svc.list_watches_for_parent(&parent).is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("group retry delivers and settles without another event");
 
@@ -12699,22 +12785,25 @@ async fn multi_watch_wake_failure_coalesces_one_retry_per_child() {
         .execute(svc.store().write_pool())
         .await
         .expect("remove failure trigger");
-    timeout(Duration::from_secs(5), async {
-        loop {
-            if parent_message_count(&svc, &parent_a).await == 1
-                && parent_message_count(&svc, &parent_b).await == 1
-                && svc.find_watches_for_child(&child).is_empty()
-                && svc
-                    .completion_delivery_retries
-                    .lock()
-                    .expect("retries registry")
-                    .is_empty()
-            {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            loop {
+                if parent_message_count(&svc, &parent_a).await == 1
+                    && parent_message_count(&svc, &parent_b).await == 1
+                    && svc.find_watches_for_child(&child).is_empty()
+                    && svc
+                        .completion_delivery_retries
+                        .lock()
+                        .expect("retries registry")
+                        .is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("coalesced retry delivers every watch and clears its registry entry");
 
@@ -12804,19 +12893,22 @@ async fn clean_interim_retry_pass_stops_polling() {
         .await
         .expect("remove failure trigger");
 
-    timeout(Duration::from_secs(5), async {
-        loop {
-            if svc
-                .completion_delivery_retries
-                .lock()
-                .expect("retries registry")
-                .is_empty()
-            {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            loop {
+                if svc
+                    .completion_delivery_retries
+                    .lock()
+                    .expect("retries registry")
+                    .is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("clean interim pass retires the retry task instead of polling until retirement");
     assert_eq!(
@@ -13706,10 +13798,13 @@ async fn queue_message_emits_queue_updated_with_snapshot() {
         .expect("queue");
     let mid = added["queuedMessage"]["id"].as_str().unwrap().to_string();
 
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     assert!(!batch.is_empty(), "expected at least one event");
     let evt = batch
         .iter()
@@ -13819,7 +13914,12 @@ async fn queue_reads_and_queue_updated_carry_resolved_author() {
     // The last `agent:queue:updated` (post agent-sent enqueue) lists both
     // entries with the same projection.
     let mut last_queue = None;
-    while let Ok(Some(batch)) = timeout(Duration::from_secs(2), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    {
         for evt in batch
             .iter()
             .filter(|e| e.event_type == intent_core::events::AGENT_QUEUE_UPDATED)
@@ -14422,9 +14522,12 @@ async fn queue_mutations_recheck_ownership_against_the_entry_at_mutation_time() 
                 }
             }))
         };
-        timeout(Duration::from_secs(10), park.entered.notified())
-            .await
-            .unwrap_or_else(|_| panic!("{op}: the guest op never reached the mutation window"));
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            park.entered.notified(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{op}: the guest op never reached the mutation window"));
 
         // The owner's send loses its slot (or its persist fails): the entry
         // is restored at the front of the live queue and leaves the overlay.
@@ -14432,10 +14535,13 @@ async fn queue_mutations_recheck_ownership_against_the_entry_at_mutation_time() 
         drop(draining);
         park.release.notify_one();
 
-        let result = timeout(Duration::from_secs(10), guest_op)
-            .await
-            .unwrap_or_else(|_| panic!("{op}: the guest op never completed"))
-            .expect("guest op task");
+        let result = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            guest_op,
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{op}: the guest op never completed"))
+        .expect("guest op task");
         let err = match result {
             Ok(v) => panic!(
                 "{op}: a guest mutation of the restored foreign entry must be refused, got {v}"
@@ -14616,7 +14722,12 @@ async fn stamped_entries_stay_shared_when_the_principal_lookup_fails() {
     .await
     .expect("agent-sent queueMessage");
     let mut event_queue = None;
-    while let Ok(Some(batch)) = timeout(Duration::from_secs(5), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        sub.recv(),
+    )
+    .await
+    {
         for evt in batch
             .iter()
             .filter(|e| e.event_type == intent_core::events::AGENT_QUEUE_UPDATED)
@@ -14824,7 +14935,12 @@ async fn unstamped_human_entries_fail_closed_when_the_fallback_lookup_fails() {
     .await
     .expect("agent-sent queueMessage");
     let mut event_queue = None;
-    while let Ok(Some(batch)) = timeout(Duration::from_secs(5), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        sub.recv(),
+    )
+    .await
+    {
         for evt in batch
             .iter()
             .filter(|e| e.event_type == intent_core::events::AGENT_QUEUE_UPDATED)
@@ -14867,7 +14983,12 @@ async fn unstamped_human_entries_fail_closed_when_the_fallback_lookup_fails() {
     svc.publish_queue_processing(&id, &ws, std::slice::from_ref(&legacy))
         .await;
     let mut processing_event = None;
-    while let Ok(Some(batch)) = timeout(Duration::from_secs(5), processing.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        processing.recv(),
+    )
+    .await
+    {
         for evt in batch
             .iter()
             .filter(|e| e.event_type == intent_core::events::AGENT_QUEUE_PROCESSING)
@@ -15102,17 +15223,24 @@ async fn remove_queued_message_emits_queue_updated_only_when_present() {
         .await
         .expect("idempotent remove");
     assert_eq!(r["success"], true);
-    let none = timeout(Duration::from_millis(200), sub.recv()).await;
+    let none = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(200)),
+        sub.recv(),
+    )
+    .await;
     assert!(none.is_err(), "no event when nothing was removed");
 
     // Real remove emits with the empty snapshot.
     svc.agent_remove_queued_message_op(id.clone(), mid)
         .await
         .expect("remove");
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     let evt = batch
         .iter()
         .find(|e| e.event_type == intent_core::events::AGENT_QUEUE_UPDATED)
@@ -15198,10 +15326,13 @@ async fn clearing_editing_flag_emits_queue_updated() {
     svc.agent_edit_queued_message_op(id.clone(), mid.clone(), "draft".into(), Some(true))
         .await
         .expect("mark editing");
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     let evt = batch
         .iter()
         .find(|e| e.event_type == intent_core::events::AGENT_QUEUE_UPDATED)
@@ -15212,10 +15343,13 @@ async fn clearing_editing_flag_emits_queue_updated() {
     svc.agent_edit_queued_message_op(id.clone(), mid.clone(), "saved".into(), Some(false))
         .await
         .expect("save edit");
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     let evt = batch
         .iter()
         .find(|e| e.event_type == intent_core::events::AGENT_QUEUE_UPDATED)
@@ -15721,6 +15855,12 @@ async fn principal_stamp_overwrites_client_value_on_every_user_origin_entry_poin
     // agent.create: the wire stores `initialMessage` on the session and
     // appends NO transcript row — the kickoff arrives through
     // `agent.sendMessage` (stamped above), so no unstamped row can exist.
+    // Only the creation arm needs Manager access; the messaging arms above
+    // deliberately exercise the ordinary Participant role.
+    svc.store()
+        .set_workspace_member_role(&ws, &alice, intent_core::WorkspaceRole::Manager)
+        .await
+        .expect("promote creator to Manager");
     let created = with_caller(wire(&alice), async {
         svc.agent_create(
             ws.clone(),
@@ -16877,9 +17017,12 @@ async fn edit_queued_message_restamp_rejection_leaves_entry_untouched() {
         .expect("entry still queued");
     assert_eq!(after, before, "rejected edit mutated the entry: {after}");
     assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(200), sub.recv())
-            .await
-            .is_err(),
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_millis(200)),
+            sub.recv()
+        )
+        .await
+        .is_err(),
         "a rejected edit publishes no queue update"
     );
 
@@ -16973,9 +17116,12 @@ async fn assert_self_send_rejected(
         "no queue entry may be created for a self-targeted send"
     );
     assert!(
-        timeout(Duration::from_millis(200), sub.recv())
-            .await
-            .is_err(),
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            sub.recv()
+        )
+        .await
+        .is_err(),
         "no event may be published for a self-targeted send"
     );
 }
@@ -17154,9 +17300,12 @@ async fn queue_message_op_rejects_unknown_agent() {
         "no phantom queue entry may be created for an unknown agent"
     );
     assert!(
-        timeout(Duration::from_millis(200), sub.recv())
-            .await
-            .is_err(),
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            sub.recv()
+        )
+        .await
+        .is_err(),
         "no agent:queue:updated event may be published for an unknown agent"
     );
 }
@@ -17902,7 +18051,7 @@ async fn persist_agent_create_tolerates_provider_demotion_after_the_plan() {
         .await
         .expect("plan while auggie is enabled and authenticated");
     assert_eq!(plan.model.as_deref(), Some("sonnet4.5"));
-    assert_eq!(plan.provider.as_deref(), Some("auggie"));
+    assert_eq!(plan.provider, "auggie");
     assert_eq!(plan.reasoning_effort.as_deref(), Some("high"));
 
     // Demote the planned provider on both create-seam gates between plan and
@@ -19679,7 +19828,8 @@ async fn event_subscription_delivers_batched_wake_to_subscriber() {
 
     // Wait for the batch window + delivery to land on the subscriber session
     // (generous deadline: the 2s batch window plus load-tolerant slack).
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(30));
     loop {
         let session = svc
             .store()
@@ -19780,6 +19930,79 @@ async fn event_subscription_excludes_self_and_unsubscribe_stops_delivery() {
     );
 }
 
+#[intent_test_macros::daemon_test]
+async fn discussion_rehydrated_agent_subscription_excludes_human_events() {
+    let (_tmp, svc, ws, bus) = setup_with_bus().await;
+    let subscriber = create_agent(&svc, &ws, "Watcher").await;
+    // An old row can name human discussions even though new admissions reject
+    // them. Exercise the actual startup rehydration and wake-delivery path.
+    let id = "legacy-discussion-subscription";
+    svc.store
+        .upsert_event_subscription(&intent_store::PersistedEventSubscription {
+            id: id.into(),
+            workspace_id: ws.clone(),
+            subscriber_agent_id: subscriber.clone(),
+            event_types: vec!["discussion:*".into(), "file:*".into()],
+            exclude_self: true,
+            batch_window_ms: 1,
+            created_at: now_iso(),
+        })
+        .await
+        .unwrap();
+    let subscribers = bus.subscriber_count();
+    assert_eq!(svc.heal_event_subscriptions_on_startup().await.unwrap(), 1);
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            while bus.subscriber_count() <= subscribers {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
+    .await
+    .expect("rehydrated subscription attached");
+    for (kind, data) in [
+        ("discussion:message", json!({"body":"human-secret"})),
+        ("file:changed", json!({"path":"sentinel.rs"})),
+    ] {
+        let _ = bus.publish_transient(&NewEvent {
+            workspace_id: ws.clone(),
+            timestamp: now_iso(),
+            event_type: kind.into(),
+            actor: EventActor {
+                actor_type: ActorType::User,
+                id: Some("human".into()),
+                ..Default::default()
+            },
+            session_id: None,
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            data,
+        });
+    }
+    let messages = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            loop {
+                let session = svc.store.get_agent_session(&subscriber).await.unwrap();
+                if !session.messages.is_empty() {
+                    break session.messages;
+                }
+                tokio::task::yield_now().await;
+            }
+        },
+    )
+    .await
+    .expect("allowed sentinel delivered");
+    let text = serde_json::to_string(&messages).unwrap();
+    assert!(text.contains("file:changed"));
+    assert!(!text.contains("human-secret"));
+    assert!(!text.contains("discussion:message"));
+    assert_eq!(messages.len(), 1);
+    svc.remove_event_subscription(id).await;
+}
+
 /// monorepo#937: agent-owned subscriptions persist and rehydrate on startup;
 /// rows whose subscriber agent is gone are pruned.
 #[intent_test_macros::daemon_test]
@@ -19806,7 +20029,8 @@ async fn event_subscriptions_survive_restart_and_prune_orphans() {
             .await
             .expect("subscribe");
         // The write-through persist is async; wait for the row to appear.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_secs(3));
         loop {
             let rows = svc
                 .store()
@@ -19861,7 +20085,8 @@ async fn event_subscriptions_survive_restart_and_prune_orphans() {
     })
     .await
     .expect("publish");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(3));
     loop {
         let session = svc
             .store()
@@ -19919,7 +20144,8 @@ async fn event_subscriptions_reject_and_prune_retired_subscribers() {
         .await
         .expect("subscribe while live");
         // The write-through persist is async; wait for the row.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_secs(3));
         loop {
             let rows = svc
                 .store()
@@ -21643,7 +21869,8 @@ async fn cancel_subscriptions_clears_watches_and_groups_idempotently() {
         .expect("delegate");
     // Wait for the group's spawned write-through persist so the delete sweep
     // below provably removes the row (no upsert/delete race).
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let deadline =
+        std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(2));
     while svc
         .store()
         .list_undelivered_groups(&ws)
@@ -21673,7 +21900,8 @@ async fn cancel_subscriptions_clears_watches_and_groups_idempotently() {
 
     // The persisted delegation_group row is swept too (the delete is spawned
     // — poll) so the cancelled group can't rehydrate on restart.
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let deadline =
+        std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(2));
     while !svc
         .store()
         .list_undelivered_groups(&ws)
@@ -21731,10 +21959,13 @@ async fn scoped_cancel_by_subscription_id_leaves_group_intact() {
         .expect("scoped cancel");
     assert_eq!(cancel, json!({ "success": true }));
 
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("subscriptions-changed after scoped cancel")
-        .expect("batch");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("subscriptions-changed after scoped cancel")
+    .expect("batch");
     let ev = batch.last().expect("event");
     assert_eq!(ev.data["agentId"], json!(parent.0));
     assert_eq!(ev.data["isWaitingForOtherAgents"], json!(true));
@@ -21771,7 +22002,8 @@ async fn scoped_cancel_by_group_id_leaves_ungrouped_intact() {
     wait_for_persisted_watches(&svc, 2).await;
     // The group's write-through persist is spawned; wait for the row so the
     // awaited scoped delete provably removes it (no upsert/delete race).
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let deadline =
+        std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(2));
     while svc
         .store()
         .list_undelivered_groups(&ws)
@@ -25102,10 +25334,13 @@ async fn deletion_wake_keeps_child_agent_label_after_session_purge() {
         .expect("delete child");
     let mut handled = 0;
     while handled < 2 {
-        let batch = timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("recv timed out")
-            .expect("subscription closed");
+        let batch = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
         for event in batch {
             svc.handle_completion_event(&event).await;
             handled += 1;
@@ -25299,20 +25534,23 @@ async fn failed_advisory_wake_retries_without_another_event() {
         .execute(svc.store().write_pool())
         .await
         .expect("remove failure trigger");
-    timeout(Duration::from_secs(2), async {
-        loop {
-            if parent_message_count(&svc, &parent).await == 1
-                && svc
-                    .store()
-                    .has_advisory_wake_delivery(&parent, &child)
-                    .await
-                    .expect("marker read")
-            {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        async {
+            loop {
+                if parent_message_count(&svc, &parent).await == 1
+                    && svc
+                        .store()
+                        .has_advisory_wake_delivery(&parent, &child)
+                        .await
+                        .expect("marker read")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("retry delivers the advisory and persists the marker without another event");
 
@@ -26760,9 +26998,12 @@ async fn unwatch_in_classify_mark_window_still_settles_watcher() {
         let event = completion_event(&ws, AGENT_IDLE, &b, json!({ "agentId": b.0 }));
         async move { svc.handle_completion_event(&event).await }
     });
-    timeout(Duration::from_secs(2), park.entered.notified())
-        .await
-        .expect("delivery parked in the classify→mark window");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        park.entered.notified(),
+    )
+    .await
+    .expect("delivery parked in the classify→mark window");
 
     // Concurrent unwatch inside the window: removes B's last outgoing watch;
     // its backstop redelivery no-ops (no marker exists yet).
@@ -26779,14 +27020,20 @@ async fn unwatch_in_classify_mark_window_still_settles_watcher() {
     // snapshot, then the tail re-probe observes the emptied watch set and
     // hands off to the redelivery — whose synthetic pass parks once more.
     park.release.notify_one();
-    timeout(Duration::from_secs(2), park.entered.notified())
-        .await
-        .expect("synthetic redelivery pass parked");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        park.entered.notified(),
+    )
+    .await
+    .expect("synthetic redelivery pass parked");
     park.release.notify_one();
-    timeout(Duration::from_secs(5), delivery)
-        .await
-        .expect("delivery completes")
-        .expect("delivery task");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        delivery,
+    )
+    .await
+    .expect("delivery completes")
+    .expect("delivery task");
 
     assert_eq!(
         parent_message_count(&svc, &a).await,
@@ -26826,9 +27073,12 @@ async fn concurrent_completion_passes_deliver_one_terminal_wake() {
         let event = completion_event(&ws, AGENT_IDLE, &b, json!({ "agentId": b.0 }));
         async move { svc.handle_completion_event(&event).await }
     });
-    timeout(Duration::from_secs(2), park.entered.notified())
-        .await
-        .expect("first pass parked in the claim→send window");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        park.entered.notified(),
+    )
+    .await
+    .expect("first pass parked in the claim→send window");
 
     // Second pass for the same completion inside the window: the watch is
     // claimed, so it must neither wake A nor retire the watch.
@@ -26851,10 +27101,13 @@ async fn concurrent_completion_passes_deliver_one_terminal_wake() {
     );
 
     park.release.notify_one();
-    timeout(Duration::from_secs(5), first)
-        .await
-        .expect("first pass completes")
-        .expect("first pass task");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        first,
+    )
+    .await
+    .expect("first pass completes")
+    .expect("first pass task");
     assert_eq!(
         parent_message_count(&svc, &a).await,
         1,
@@ -26874,14 +27127,20 @@ async fn concurrent_completion_passes_deliver_one_terminal_wake() {
         let event = completion_event(&ws, AGENT_IDLE, &b, json!({ "agentId": b.0 }));
         async move { svc.handle_completion_event(&event).await }
     });
-    timeout(Duration::from_secs(2), park.entered.notified())
-        .await
-        .expect("re-armed delivery claims the new watch");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        park.entered.notified(),
+    )
+    .await
+    .expect("re-armed delivery claims the new watch");
     park.release.notify_one();
-    timeout(Duration::from_secs(5), second)
-        .await
-        .expect("re-armed delivery completes")
-        .expect("re-armed delivery task");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        second,
+    )
+    .await
+    .expect("re-armed delivery completes")
+    .expect("re-armed delivery task");
     assert_eq!(parent_message_count(&svc, &a).await, 2);
 }
 
@@ -26932,9 +27191,12 @@ async fn concurrent_completion_passes_share_flipped_triggers_across_parents() {
         let event = completion_event(&ws, AGENT_IDLE, &b, json!({ "agentId": b.0 }));
         async move { svc.handle_completion_event(&event).await }
     });
-    timeout(Duration::from_secs(2), park.entered.notified())
-        .await
-        .expect("first pass parked on its claimed watch");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        park.entered.notified(),
+    )
+    .await
+    .expect("first pass parked on its claimed watch");
     // Pass 2 skips the claimed watch, claims the other one, and parks too:
     // the snapshot is now split between the two passes.
     let second = tokio::spawn({
@@ -26942,16 +27204,22 @@ async fn concurrent_completion_passes_share_flipped_triggers_across_parents() {
         let event = completion_event(&ws, AGENT_IDLE, &b, json!({ "agentId": b.0 }));
         async move { svc.handle_completion_event(&event).await }
     });
-    timeout(Duration::from_secs(2), park.entered.notified())
-        .await
-        .expect("second pass parked on the other claimed watch");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        park.entered.notified(),
+    )
+    .await
+    .expect("second pass parked on the other claimed watch");
 
     // Release pass 1 alone: it consumes the child's flips from the store and
     // parks before publishing them.
     park.release.notify_one();
-    timeout(Duration::from_secs(2), flip_park.entered.notified())
-        .await
-        .expect("first pass parked between its flip take and the publish");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        flip_park.entered.notified(),
+    )
+    .await
+    .expect("first pass parked between its flip take and the publish");
     // Release pass 2 while pass 1 holds that window: it reaches the flip
     // take with the store already drained and must await pass 1's result
     // rather than take (and stamp) an empty set.
@@ -26962,14 +27230,20 @@ async fn concurrent_completion_passes_share_flipped_triggers_across_parents() {
         "second pass must not settle its wake before the flips are published"
     );
     flip_park.release.notify_one();
-    timeout(Duration::from_secs(5), first)
-        .await
-        .expect("first pass completes")
-        .expect("first pass task");
-    timeout(Duration::from_secs(5), second)
-        .await
-        .expect("second pass completes")
-        .expect("second pass task");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        first,
+    )
+    .await
+    .expect("first pass completes")
+    .expect("first pass task");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        second,
+    )
+    .await
+    .expect("second pass completes")
+    .expect("second pass task");
 
     for parent in [&a, &c] {
         let session = svc
@@ -27706,7 +27980,8 @@ async fn group_rehydration_skips_agent_waiting_idle_child() {
             .expect("B watches C");
         wait_for_persisted_watches(&svc, 2).await;
         // Wait for the group row to persist (the upsert is spawned).
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let deadline =
+            std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(2));
         loop {
             let rows = svc
                 .store()
@@ -29077,7 +29352,8 @@ async fn group_rehydration_records_report_idle_child_despite_active_monitor() {
         .expect("waitFor after_all");
         wait_for_persisted_watches(&svc, 1).await;
         // Wait for the group row to persist (the upsert is spawned).
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let deadline =
+            std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(2));
         loop {
             let rows = svc
                 .store()
@@ -29225,7 +29501,8 @@ async fn watch_after_progress_adopts_armed_watch_and_fires_terminal_idle() {
         !watches[0].report_delivered,
         "adopted watch remains terminal-ready"
     );
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let deadline =
+        std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(2));
     loop {
         let rows = svc
             .store()
@@ -30026,7 +30303,8 @@ async fn sender_auto_subscribe_after_report_rearms_watch_and_fires_next_idle() {
         !watches[0].report_delivered,
         "sender reuse keeps the watch terminal-ready"
     );
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let deadline =
+        std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(2));
     loop {
         let rows = svc
             .store()
@@ -30154,10 +30432,13 @@ async fn watch_set_changes_emit_subscriptions_changed() {
     });
 
     let c1 = delegate_after_all(&svc, &ws, &parent).await;
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("subscriptions-changed after delegate")
-        .expect("batch");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("subscriptions-changed after delegate")
+    .expect("batch");
     assert_eq!(batch[0].event_type, AGENT_SUBSCRIPTIONS_CHANGED);
     assert_eq!(batch[0].data["agentId"], json!(parent.0));
     assert_eq!(batch[0].data["isWaitingForOtherAgents"], json!(true));
@@ -30179,10 +30460,13 @@ async fn watch_set_changes_emit_subscriptions_changed() {
         json!({ "agentId": parent.0 }),
     ))
     .await;
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("subscriptions-changed after group clear")
-        .expect("batch");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("subscriptions-changed after group clear")
+    .expect("batch");
     let last = batch.last().expect("event");
     assert_eq!(last.data["agentId"], json!(parent.0));
     assert_eq!(last.data["isWaitingForOtherAgents"], json!(false));
@@ -30199,6 +30483,7 @@ fn subscribe_display_status(bus: &EventBus, ws: &WorkspaceId) -> crate::Subscrip
 }
 
 async fn assert_display_status_silent(sub: &mut crate::Subscription) {
+    // fixed-deadline: allow — stays under the 3s WORKSPACE_IDLE_DEBOUNCE_MS idle demotion, which legitimately changes displayStatus
     let res = timeout(Duration::from_millis(300), sub.recv()).await;
     assert!(res.is_err(), "expected no displayStatus event: {res:?}");
 }
@@ -30892,10 +31177,13 @@ async fn attention_requested_event_carries_parent_agent_id_for_delegated_child()
     .await
     .expect("request attention");
 
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     assert_eq!(batch.len(), 1);
     let data = &batch[0].data;
     assert_eq!(data["agentId"].as_str(), Some(child.0.as_str()));
@@ -30926,10 +31214,13 @@ async fn attention_requested_event_omits_parent_agent_id_for_non_delegated() {
     .await
     .expect("request attention");
 
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     assert_eq!(batch.len(), 1);
     let data = &batch[0].data;
     assert_eq!(data["agentId"].as_str(), Some(agent.0.as_str()));
@@ -30977,9 +31268,12 @@ async fn request_attention_mid_turn_defers_surfacing_until_flush() {
         assert_eq!(session.attention_request_kind.as_deref(), Some(kind));
         // …but nothing user-facing surfaces mid-turn: no events, no notice.
         assert!(
-            timeout(Duration::from_millis(300), sub.recv())
-                .await
-                .is_err(),
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(300)),
+                sub.recv()
+            )
+            .await
+            .is_err(),
             "no surfacing events while the turn is in flight ({kind})"
         );
         assert!(
@@ -30991,7 +31285,12 @@ async fn request_attention_mid_turn_defers_surfacing_until_flush() {
         svc.set_test_busy(&agent, false);
         svc.flush_deferred_attention(&agent, &ws).await;
         let mut events = Vec::new();
-        while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        while let Ok(Some(batch)) = timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            sub.recv(),
+        )
+        .await
+        {
             events.extend(batch);
         }
         let attention = events
@@ -31027,9 +31326,12 @@ async fn request_attention_mid_turn_defers_surfacing_until_flush() {
         // The flush consumed the marker — a second flush is a no-op.
         svc.flush_deferred_attention(&agent, &ws).await;
         assert!(
-            timeout(Duration::from_millis(200), sub.recv())
-                .await
-                .is_err(),
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(200)),
+                sub.recv()
+            )
+            .await
+            .is_err(),
             "second flush surfaces nothing ({kind})"
         );
     }
@@ -31074,9 +31376,12 @@ async fn request_attention_cleared_before_idle_flushes_nothing() {
     svc.set_test_busy(&agent, false);
     svc.flush_deferred_attention(&agent, &ws).await;
     assert!(
-        timeout(Duration::from_millis(300), sub.recv())
-            .await
-            .is_err(),
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            sub.recv()
+        )
+        .await
+        .is_err(),
         "cleared-before-idle raise surfaces nothing"
     );
     let session = svc.store().get_agent_session(&agent).await.expect("sess");
@@ -31099,9 +31404,12 @@ async fn request_attention_cleared_before_idle_flushes_nothing() {
     );
     svc.flush_deferred_attention(&agent, &ws).await;
     assert!(
-        timeout(Duration::from_millis(200), sub.recv())
-            .await
-            .is_err(),
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            sub.recv()
+        )
+        .await
+        .is_err(),
         "stale marker over cleared fields retires silently"
     );
 }
@@ -31126,10 +31434,13 @@ async fn request_attention_idle_agent_surfaces_immediately() {
     )
     .await
     .expect("request attention");
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("immediate surfacing for an idle raise")
-        .expect("open");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("immediate surfacing for an idle raise")
+    .expect("open");
     assert_eq!(batch[0].data["kind"], json!("blocker"));
     assert!(
         svc.take_deferred_attention(&agent).is_empty(),
@@ -31172,10 +31483,13 @@ async fn deferred_attention_flush_carries_parent_agent_id() {
     });
     svc.set_test_busy(&child, false);
     svc.flush_deferred_attention(&child, &ws).await;
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("flush surfaces")
-        .expect("open");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("flush surfaces")
+    .expect("open");
     assert_eq!(
         batch[0].data["parentAgentId"].as_str(),
         Some(parent.0.as_str()),
@@ -31226,7 +31540,12 @@ async fn multiple_mid_turn_raises_each_surface_at_flush() {
     svc.set_test_busy(&agent, false);
     svc.flush_deferred_attention(&agent, &ws).await;
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let attention: Vec<_> = events
@@ -31262,9 +31581,12 @@ async fn multiple_mid_turn_raises_each_surface_at_flush() {
     // The flush consumed the queue — a second flush is a no-op.
     svc.flush_deferred_attention(&agent, &ws).await;
     assert!(
-        timeout(Duration::from_millis(200), sub.recv())
-            .await
-            .is_err(),
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            sub.recv()
+        )
+        .await
+        .is_err(),
         "second flush surfaces nothing"
     );
 }
@@ -31344,10 +31666,13 @@ async fn agent_failed_event_carries_parent_agent_id_for_delegated_child() {
     )
     .await;
 
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     assert_eq!(batch.len(), 1);
     let data = &batch[0].data;
     assert_eq!(data["error"].as_str(), Some("boom"));
@@ -31389,10 +31714,13 @@ async fn agent_failed_event_omits_parent_agent_id_for_parentless_agent() {
     )
     .await;
 
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     assert_eq!(batch.len(), 1);
     let data = &batch[0].data;
     assert!(
@@ -31408,11 +31736,14 @@ async fn agent_failed_event_omits_parent_agent_id_for_parentless_agent() {
 /// Poll until the completion-delivery worker's broadcast receiver is live so a
 /// published event never races ahead of the subscription.
 async fn wait_for_subscriber(bus: &EventBus) {
-    timeout(Duration::from_secs(2), async {
-        while bus.subscriber_count() == 0 {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        async {
+            while bus.subscriber_count() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        },
+    )
     .await
     .expect("delivery worker subscribed");
 }
@@ -31447,14 +31778,17 @@ async fn publish_completion(
 /// Poll until the parent transcript reaches expected messages (the worker wakes
 /// the parent asynchronously through the spawned delivery task).
 async fn wait_for_message_count(svc: &Services, parent: &AgentId, expected: usize) {
-    timeout(Duration::from_secs(2), async {
-        loop {
-            if parent_message_count(svc, parent).await >= expected {
-                return;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        async {
+            loop {
+                if parent_message_count(svc, parent).await >= expected {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
+        },
+    )
     .await
     .unwrap_or_else(|_| panic!("parent did not reach {expected} messages in time"));
 }
@@ -31468,38 +31802,47 @@ async fn wait_for_group_children(
     parent: &AgentId,
     n: usize,
 ) {
-    timeout(Duration::from_secs(2), async {
-        loop {
-            if let Some(g) = svc.delegation_group_for_parent(parent) {
-                if g.completed_agent_ids.len() + g.deleted_agent_ids.len() >= n {
-                    return;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        async {
+            loop {
+                if let Some(g) = svc.delegation_group_for_parent(parent) {
+                    if g.completed_agent_ids.len() + g.deleted_agent_ids.len() >= n {
+                        return;
+                    }
                 }
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("delegation group recorded child completions");
 }
 
 async fn wait_for_child_watch_cleanup(svc: &Services, child: &AgentId) {
-    timeout(Duration::from_secs(2), async {
-        while !svc.find_watches_for_child(child).is_empty() {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        async {
+            while !svc.find_watches_for_child(child).is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        },
+    )
     .await
     .expect("terminal child completion retired its watches");
 }
 
 async fn wait_for_group_cleanup(svc: &Services, parent: &AgentId) {
-    timeout(Duration::from_secs(2), async {
-        while svc.delegation_group_for_parent(parent).is_some()
-            || !svc.list_watches_for_parent(parent).is_empty()
-        {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        async {
+            while svc.delegation_group_for_parent(parent).is_some()
+                || !svc.list_watches_for_parent(parent).is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        },
+    )
     .await
     .expect("terminal group settlement retired the group and watches");
 }
@@ -32147,10 +32490,13 @@ async fn session_stats_emits_only_on_change() {
     };
     svc.cache_and_emit_session_stats(&session, &stats).await;
 
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     assert_eq!(batch.len(), 1);
     assert_eq!(batch[0].event_type, AGENT_SESSION_STATS_CHANGED);
     assert_eq!(batch[0].workspace_id, ws);
@@ -32162,7 +32508,11 @@ async fn session_stats_emits_only_on_change() {
 
     // Identical snapshot -> no second emit within the window.
     svc.cache_and_emit_session_stats(&session, &stats).await;
-    let res = timeout(Duration::from_millis(300), sub.recv()).await;
+    let res = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await;
     assert!(res.is_err(), "identical stats must not re-emit");
 
     // A moved rollup -> a fresh emit.
@@ -32172,10 +32522,13 @@ async fn session_stats_emits_only_on_change() {
         tool_count: 2,
     };
     svc.cache_and_emit_session_stats(&session, &moved).await;
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     assert_eq!(batch.len(), 1);
     assert_eq!(batch[0].data["stats"]["messageCount"], json!(6));
 }
@@ -32286,10 +32639,13 @@ async fn agent_update_patches_listed_fields_and_emits_updated() {
     // Name (unmutated) survives.
     assert_eq!(session.name, "Patch");
 
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv")
-        .expect("open");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv")
+    .expect("open");
     assert!(batch.iter().any(
         |e| e.event_type == AGENT_UPDATED && e.data["agentId"].as_str() == Some(id.0.as_str())
     ));
@@ -32317,10 +32673,13 @@ async fn agent_update_notifications_muted_preserves_activity_timestamp() {
             .expect("toggle notifications");
         assert_eq!(response["agent"]["notificationsMuted"], muted);
         assert_eq!(response["agent"]["updatedAt"], old);
-        let batch = timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("event arrives")
-            .expect("subscription open");
+        let batch = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("event arrives")
+        .expect("subscription open");
         let event = batch
             .iter()
             .find(|e| e.event_type == AGENT_UPDATED)
@@ -32365,10 +32724,13 @@ async fn agent_update_notifications_muted_mixed_edits_advance_activity_timestamp
         let stored = svc.agent_get_session_op(id.clone()).await.unwrap();
         assert!(stored.updated_at.as_str() > old, "{changes}");
         assert_eq!(response["agent"]["updatedAt"], stored.updated_at);
-        let batch = timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let batch = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         let event = batch.iter().find(|e| e.data["agentId"] == id.0).unwrap();
         for (key, value) in changes.as_object().unwrap() {
             assert_eq!(&event.data[key], value);
@@ -32404,10 +32766,13 @@ async fn agent_update_name_only_emits_agent_renamed() {
     assert_eq!(session.name, "NewName");
     assert!(session.name_explicitly_set);
 
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv")
-        .expect("open");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv")
+    .expect("open");
     assert!(batch.iter().any(|e| e.event_type == AGENT_RENAMED));
 }
 
@@ -32600,10 +32965,13 @@ async fn agent_append_message_persists_and_emits() {
     let session = svc.agent_get_session_op(id.clone()).await.expect("get");
     assert_eq!(session.messages.len(), 1);
 
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv")
-        .expect("open");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv")
+    .expect("open");
     assert!(batch.iter().any(|e| e.event_type == AGENT_MESSAGE));
 }
 
@@ -32762,18 +33130,21 @@ async fn agent_edit_truncate_drops_edited_message_and_tail() {
     // truncate summary. An unbatched subscription delivers those as separate
     // batches, so wait for the event this assertion owns instead of assuming
     // it is in the first batch.
-    timeout(Duration::from_secs(2), async {
-        loop {
-            let batch = sub.recv().await.expect("open");
-            if batch.iter().any(|e| {
-                e.event_type == AGENT_UPDATED
-                    && e.data["truncatedCount"] == json!(2)
-                    && e.data["remainingCount"] == json!(2)
-            }) {
-                break;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        async {
+            loop {
+                let batch = sub.recv().await.expect("open");
+                if batch.iter().any(|e| {
+                    e.event_type == AGENT_UPDATED
+                        && e.data["truncatedCount"] == json!(2)
+                        && e.data["remainingCount"] == json!(2)
+                }) {
+                    break;
+                }
             }
-        }
-    })
+        },
+    )
     .await
     .expect("truncate summary event");
 }
@@ -34123,7 +34494,8 @@ async fn delete_workspace_terminates_agent_sessions_and_clears_in_memory_state()
     }
 
     // Collect one full event window (batch may fan out across recvs).
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let deadline =
+        std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(2));
     let mut deleted_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut saw_workspace_deleted = false;
     while std::time::Instant::now() < deadline && (deleted_ids.len() < 3 || !saw_workspace_deleted)
@@ -34202,7 +34574,8 @@ async fn delete_workspace_consumes_chief_ungrouped_watch_without_bus() {
     assert_eq!(parent_session.messages.len(), 1);
 
     // The persisted completion_watch row is swept (delete is spawned; poll).
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let deadline =
+        std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(2));
     loop {
         let rows = svc
             .store()
@@ -34308,10 +34681,13 @@ async fn delete_workspace_backstop_sweep_emits_subscriptions_changed() {
     // The grouped watch survived the direct delivery (group settlement owns
     // its lifecycle) and was removed by the backstop sweep, which publishes
     // the parent's refreshed (now empty) waiting flags.
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("subscriptions-changed after backstop sweep")
-        .expect("batch");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("subscriptions-changed after backstop sweep")
+    .expect("batch");
     let last = batch.last().expect("event");
     assert_eq!(last.event_type, AGENT_SUBSCRIPTIONS_CHANGED);
     assert_eq!(last.data["agentId"], json!(parent.0));
@@ -34525,10 +34901,13 @@ async fn agent_send_message_emits_agent_message_event() {
     let response_message_id = r["messageId"].as_str().unwrap();
 
     // Verify the event was published with the correct messageId.
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv")
-        .expect("open");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv")
+    .expect("open");
     let event = batch
         .iter()
         .find(|e| e.event_type == AGENT_MESSAGE)
@@ -34570,10 +34949,13 @@ async fn agent_send_queued_message_now_emits_agent_message_event() {
     assert_eq!(response_message_id, queued_id, "entry id is the row id");
 
     // Verify the event was published with the correct messageId.
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv")
-        .expect("open");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv")
+    .expect("open");
     let event = batch
         .iter()
         .find(|e| e.event_type == AGENT_MESSAGE)
@@ -34618,7 +35000,12 @@ async fn agent_send_queued_message_now_publishes_shrunk_queue_after_row_persist(
     assert_eq!(r["success"], json!(true));
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let row_echo_at = events
@@ -34734,10 +35121,13 @@ async fn requeued_after_failure_marker_surfaces_in_queue_snapshot() {
     );
 
     // Verify agent:queue:updated event carries the marker
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     let evt = batch
         .iter()
         .find(|e| e.event_type == intent_core::events::AGENT_QUEUE_UPDATED)
@@ -34785,10 +35175,13 @@ async fn queued_message_metadata_surfaces_in_queue_snapshot() {
     assert_eq!(snapshot[0]["messageMetadata"], metadata);
 
     // agent:queue:updated event carries the same shape.
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     let evt = batch
         .iter()
         .find(|e| e.event_type == intent_core::events::AGENT_QUEUE_UPDATED)
@@ -34914,17 +35307,20 @@ async fn group_settle_with_failed_child_reestablishes_parent_watch() {
     // try_fire_group swaps the watches before the wake-delivery await, but the
     // transcript write we synchronized on above is a separate async step, so
     // poll until the registry reaches its settled state.
-    let watches = timeout(Duration::from_secs(2), async {
-        loop {
-            let watches = svc.list_watches_for_parent(&parent);
-            let settled = watches.iter().all(|w| w.group_id.is_none())
-                && watches.iter().any(|w| w.child_agent_id == child_b);
-            if settled {
-                return watches;
+    let watches = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        async {
+            loop {
+                let watches = svc.list_watches_for_parent(&parent);
+                let settled = watches.iter().all(|w| w.group_id.is_none())
+                    && watches.iter().any(|w| w.child_agent_id == child_b);
+                if settled {
+                    return watches;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
+        },
+    )
     .await
     .expect("failed-child watch re-established after group settlement");
     assert!(
@@ -35564,7 +35960,8 @@ async fn hold_timer_flush_makes_entry_ready() {
 
     // Wait for the spawned timer to flush the hold: the marker clears in
     // the queue snapshot. The deadline is a liveness bound only.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(3));
     loop {
         let snapshot = svc.queue_snapshot(&id);
         let entry = snapshot
@@ -35705,7 +36102,8 @@ async fn rehydrate_flushes_expired_and_rearms_unexpired_holds() {
     assert_eq!(rehydrated, 2);
 
     // The expired hold's re-armed timer fires immediately and flushes it.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(3));
     while !restarted.has_ready_to_send(&id) {
         assert!(
             tokio::time::Instant::now() < deadline,
@@ -35852,16 +36250,22 @@ async fn migrate_queue_preserves_order_resets_flags_and_gcs_poisoned() {
 
     // agent:queue:updated names the TARGET with the migrated snapshot;
     // agent:deleted names the poisoned session.
-    let batch = timeout(Duration::from_secs(2), queue_sub.recv())
-        .await
-        .expect("queue event timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        queue_sub.recv(),
+    )
+    .await
+    .expect("queue event timed out")
+    .expect("subscription closed");
     assert_eq!(batch[0].data["agentId"].as_str(), Some(target.0.as_str()));
     assert_eq!(batch[0].data["queue"].as_array().unwrap().len(), 3);
-    let batch = timeout(Duration::from_secs(2), deleted_sub.recv())
-        .await
-        .expect("deleted event timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        deleted_sub.recv(),
+    )
+    .await
+    .expect("deleted event timed out")
+    .expect("subscription closed");
     assert_eq!(batch[0].data["agentId"].as_str(), Some(poisoned.0.as_str()));
 }
 
@@ -35886,9 +36290,12 @@ async fn migrate_queue_empty_queue_still_gcs_poisoned_session() {
     ));
     // No entries moved → no agent:queue:updated noise for the target.
     assert!(
-        timeout(Duration::from_millis(300), queue_sub.recv())
-            .await
-            .is_err(),
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            queue_sub.recv()
+        )
+        .await
+        .is_err(),
         "expected no queue event for an empty migration"
     );
 }
@@ -36048,7 +36455,8 @@ async fn migrate_queue_rearms_hold_timers_for_target() {
 
     // ...and the re-armed timer flushes it on the TARGET at the deadline —
     // no manual release, no unrelated queue event.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(3));
     loop {
         let snapshot = svc.queue_snapshot(&target);
         let entry = snapshot
@@ -36249,9 +36657,12 @@ async fn suspend_self_heal_refuses_late_schedule() {
 async fn suspend_idle_self_heal_stops_without_claiming() {
     let (_tmp, svc, _, aid, bus) = suspend_shutdown_fixture().await;
     assert!(svc.schedule_suspend_self_heal(Duration::from_secs(3600)));
-    timeout(Duration::from_secs(5), svc.shutdown_store_writers())
-        .await
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        svc.shutdown_store_writers(),
+    )
+    .await
+    .unwrap();
     assert!(svc
         .store
         .get_interrupted_agent(&aid)
@@ -36279,9 +36690,12 @@ async fn assert_suspend_claim_shutdown(reset: bool) {
     let owner = svc.clone();
     let caller =
         intent_core::spawn_daemon(async move { owner.resume_suspend_interrupted_agents().await });
-    timeout(Duration::from_secs(5), park.entered.notified())
-        .await
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        park.entered.notified(),
+    )
+    .await
+    .unwrap();
     assert!(
         svc.store
             .get_interrupted_agent(&aid)
@@ -36299,20 +36713,26 @@ async fn assert_suspend_claim_shutdown(reset: bool) {
     *svc.secrets.writer_drain_pending.lock().unwrap() = Some(entered);
     let owner = svc.clone();
     let mut drain = intent_core::spawn_daemon(async move { owner.shutdown_store_writers().await });
-    let pending = timeout(Duration::from_secs(5), async {
-        tokio::select! {
-            point = entering => { assert_eq!(point.unwrap(), "settings-tasks"); true }
-            result = &mut drain => { result.unwrap(); false }
-        }
-    })
+    let pending = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            tokio::select! {
+                point = entering => { assert_eq!(point.unwrap(), "settings-tasks"); true }
+                result = &mut drain => { result.unwrap(); false }
+            }
+        },
+    )
     .await
     .unwrap();
     park.release.notify_one();
     if pending {
-        timeout(Duration::from_secs(5), drain)
-            .await
-            .unwrap()
-            .unwrap();
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            drain,
+        )
+        .await
+        .unwrap()
+        .unwrap();
     }
     assert!(pending, "shutdown discarded a claimed suspend resume");
     if let Some(manager) = &manager {
@@ -36538,10 +36958,13 @@ async fn resume_watch_reregistration_publishes_subscriptions_changed() {
 
     svc.resume_interrupted_agent(&child).await.expect("resume");
 
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("subscriptions-changed after resume re-registration")
-        .expect("batch");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("subscriptions-changed after resume re-registration")
+    .expect("batch");
     assert_eq!(batch.len(), 1, "exactly one event: {batch:?}");
     assert_eq!(batch[0].event_type, AGENT_SUBSCRIPTIONS_CHANGED);
     assert_eq!(
@@ -36552,9 +36975,12 @@ async fn resume_watch_reregistration_publishes_subscriptions_changed() {
     assert_eq!(batch[0].data["isWaitingForOtherAgents"], json!(true));
     assert_eq!(batch[0].data["waitingForAgentIds"], json!([child.0]));
     assert!(
-        timeout(Duration::from_millis(300), sub.recv())
-            .await
-            .is_err(),
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            sub.recv()
+        )
+        .await
+        .is_err(),
         "resume must publish subscriptions-changed exactly once"
     );
 
@@ -36589,10 +37015,13 @@ async fn resume_grouped_watch_reregistration_publishes_subscriptions_changed() {
 
     svc.resume_interrupted_agent(&child).await.expect("resume");
 
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("subscriptions-changed after grouped re-registration")
-        .expect("batch");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("subscriptions-changed after grouped re-registration")
+    .expect("batch");
     assert_eq!(batch.len(), 1, "exactly one event: {batch:?}");
     assert_eq!(batch[0].data["agentId"], json!(parent.0));
     assert_eq!(batch[0].data["isWaitingForOtherAgents"], json!(true));
@@ -36626,10 +37055,13 @@ async fn resume_existing_watch_refresh_publishes_snapshot_without_display_status
 
     svc.resume_interrupted_agent(&child).await.expect("resume");
 
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("subscriptions-changed after watch refresh")
-        .expect("batch");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("subscriptions-changed after watch refresh")
+    .expect("batch");
     assert_eq!(batch.len(), 1, "exactly one event: {batch:?}");
     assert_eq!(batch[0].data["agentId"], json!(parent.0));
     assert_eq!(batch[0].data["isWaitingForOtherAgents"], json!(true));
@@ -36678,9 +37110,12 @@ async fn resume_watch_rejection_publishes_no_subscriptions_changed() {
         .expect("resume succeeds despite the rejected watch");
 
     assert!(
-        timeout(Duration::from_millis(300), sub.recv())
-            .await
-            .is_err(),
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            sub.recv()
+        )
+        .await
+        .is_err(),
         "rejected re-registration must not publish subscriptions-changed"
     );
     assert!(svc.list_watches_for_parent(&parent).is_empty());
@@ -37719,33 +38154,45 @@ async fn assert_cow_provision_shutdown(target: u8) {
         .await;
         let _ = done.send(());
     }));
-    timeout(Duration::from_secs(5), entering)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        entering,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert!(svc.sandbox_provisioning.lock().unwrap().contains_key(&aid));
     let (entered, entering) = tokio::sync::oneshot::channel();
     *svc.secrets.writer_drain_pending.lock().unwrap() = Some(entered);
     let owner = svc.clone();
     let mut drain = intent_core::spawn_daemon(async move { owner.shutdown_store_writers().await });
-    let pending = timeout(Duration::from_secs(5), async {
-        tokio::select! {
-            point = entering => { assert_eq!(point.unwrap(), "store-tasks"); true }
-            result = &mut drain => { result.unwrap(); false }
-        }
-    })
+    let pending = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            tokio::select! {
+                point = entering => { assert_eq!(point.unwrap(), "store-tasks"); true }
+                result = &mut drain => { result.unwrap(); false }
+            }
+        },
+    )
     .await
     .unwrap();
     drop(connection);
-    timeout(Duration::from_secs(5), finished)
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        finished,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    if pending {
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            drain,
+        )
         .await
         .unwrap()
         .unwrap();
-    if pending {
-        timeout(Duration::from_secs(5), drain)
-            .await
-            .unwrap()
-            .unwrap();
     }
     assert!(pending, "shutdown discarded admitted CoW settlement");
     assert!(!svc.sandbox_provisioning.lock().unwrap().contains_key(&aid));
@@ -37820,9 +38267,12 @@ async fn cow_provision_refusal_leaves_no_wait_gate() {
     );
     assert!(observed.await.is_err());
     assert!(!svc.sandbox_provisioning.lock().unwrap().contains_key(&aid));
-    timeout(Duration::from_secs(1), svc.await_sandbox_provisioning(&aid))
-        .await
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(1)),
+        svc.await_sandbox_provisioning(&aid),
+    )
+    .await
+    .unwrap();
     store.close().await;
 }
 
@@ -37895,7 +38345,11 @@ async fn settle_provisioned_sandbox_discards_when_session_missing() {
             .is_none(),
         "sandbox record must be removed"
     );
-    let res = timeout(Duration::from_millis(300), sub.recv()).await;
+    let res = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await;
     assert!(
         res.is_err(),
         "expected no sandbox:cow:created emit for a deleted agent"
@@ -38855,7 +39309,8 @@ async fn stall_annotation_applies_to_rehydration_synthesized_completion() {
         .await
         .expect("waitFor after_all");
         // Wait for the group row to persist (the upsert is spawned).
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let deadline =
+            std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(2));
         loop {
             let rows = svc
                 .store()
@@ -39438,10 +39893,13 @@ async fn record_pending_proposals_persists_and_emits_agent_updated() {
     assert_eq!(lite.metadata.pending_proposals, pending);
 
     // `agent:updated` emitted, scoped to the workspace, carrying the list.
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     assert_eq!(batch.len(), 1);
     assert_eq!(batch[0].event_type, AGENT_UPDATED);
     assert_eq!(batch[0].workspace_id, ws);
@@ -40016,10 +40474,13 @@ async fn resolve_proposal_applied_persists_notifies_and_emits() {
     );
 
     // `agent:updated` carries the emptied list and the resolutions map.
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     assert_eq!(batch.len(), 1);
     assert_eq!(batch[0].event_type, AGENT_UPDATED);
     assert_eq!(batch[0].workspace_id, ws);
@@ -40222,10 +40683,13 @@ async fn resolve_proposal_repeat_resolution_is_idempotent() {
         resolution_events[0].data["proposalResolutions"],
         json!({"tc-1": "applied"})
     );
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("live resolution event timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("live resolution event timed out")
+    .expect("subscription closed");
     assert_eq!(batch.len(), 1);
     assert_eq!(batch[0].id, resolution_events[0].id);
 }
@@ -40819,10 +41283,13 @@ async fn dismiss_questions_persists_marker_and_emits_agent_updated() {
     );
 
     // `agent:updated` emitted, scoped to the workspace, carrying the marker.
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     assert_eq!(batch.len(), 1);
     assert_eq!(batch[0].event_type, AGENT_UPDATED);
     assert_eq!(batch[0].workspace_id, ws);
@@ -40870,10 +41337,13 @@ async fn dismiss_questions_event_omits_pending_marker_when_never_written() {
         .await
         .expect("dismiss");
 
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     assert_eq!(batch.len(), 1);
     assert_eq!(
         batch[0].data["dismissedQuestionsMessageId"].as_str(),
@@ -40927,7 +41397,8 @@ async fn dismiss_questions_event_reflects_concurrent_marker_clear() {
     };
     // The dismissal marker persists BEFORE the lock acquisition: poll for it
     // to know the op is parked at the gate.
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let deadline =
+        std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(2));
     loop {
         let session = svc
             .store()
@@ -40963,10 +41434,13 @@ async fn dismiss_questions_event_reflects_concurrent_marker_clear() {
     drop(guard);
     dismissing.await.expect("join").expect("dismiss");
 
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     assert_eq!(batch.len(), 1);
     assert_eq!(
         batch[0].data["dismissedQuestionsMessageId"].as_str(),
@@ -41244,10 +41718,13 @@ async fn pending_marker_projects_on_list_get_and_update_events() {
         .await
         .expect("append question");
     let asked_id = asked["message"]["id"].as_str().expect("id").to_string();
-    let set_event = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("set event timed out")
-        .expect("subscription closed");
+    let set_event = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("set event timed out")
+    .expect("subscription closed");
     assert_eq!(set_event[0].data["pendingQuestionsMessageId"], asked_id);
 
     let set_get = svc.agent_get_op(id.clone(), None).await.expect("set get");
@@ -41269,10 +41746,13 @@ async fn pending_marker_projects_on_list_get_and_update_events() {
     )
     .await
     .expect("append answer");
-    let clear_event = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("clear event timed out")
-        .expect("subscription closed");
+    let clear_event = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("clear event timed out")
+    .expect("subscription closed");
     assert_eq!(clear_event[0].data["pendingQuestionsMessageId"], "");
 
     let cleared_get = svc
@@ -41592,10 +42072,13 @@ async fn mark_seen_persists_marker_and_emits_agent_updated() {
     );
 
     // `agent:updated` emitted, scoped to the workspace, carrying the marker.
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     assert_eq!(batch.len(), 1);
     assert_eq!(batch[0].event_type, AGENT_UPDATED);
     assert_eq!(batch[0].workspace_id, ws);
@@ -41645,10 +42128,13 @@ async fn mark_seen_is_monotonic_and_idempotent() {
         .await
         .expect("mark second");
     assert_eq!(r["lastSeenMessageId"], json!(second.id));
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     assert_eq!(batch.len(), 1);
 
     // Older message: no-op returning the CURRENT marker, no write, no event.
@@ -41668,9 +42154,12 @@ async fn mark_seen_is_monotonic_and_idempotent() {
         .expect("re-mark");
     assert_eq!(r["lastSeenMessageId"], json!(second.id));
     assert!(
-        timeout(Duration::from_millis(300), sub.recv())
-            .await
-            .is_err(),
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            sub.recv()
+        )
+        .await
+        .is_err(),
         "no agent:updated for the older-message no-op or the idempotent re-mark"
     );
 
@@ -41690,10 +42179,13 @@ async fn mark_seen_is_monotonic_and_idempotent() {
         .await
         .expect("mark third");
     assert_eq!(r["lastSeenMessageId"], json!(third.id));
-    let batch = timeout(Duration::from_secs(2), sub.recv())
-        .await
-        .expect("recv timed out")
-        .expect("subscription closed");
+    let batch = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("recv timed out")
+    .expect("subscription closed");
     assert_eq!(
         batch[0].data["lastSeenMessageId"].as_str(),
         Some(third.id.as_str())
@@ -43123,10 +43615,13 @@ async fn retire_cascade_reaches_cross_workspace_descendants() {
     // CHILD's own workspace.
     let mut events = Vec::new();
     while events.len() < 2 {
-        let batch = timeout(Duration::from_secs(2), sub.recv())
-            .await
-            .expect("recv timed out")
-            .expect("subscription closed");
+        let batch = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("recv timed out")
+        .expect("subscription closed");
         events.extend(batch);
     }
     let child_event = events
@@ -43317,7 +43812,8 @@ async fn group_rehydration_settles_retired_child() {
         // exists after the first (no members yet), so wait for the second —
         // the row carrying the enrolled child — or the restarted instance
         // rehydrates a memberless group that can never be complete.
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let deadline =
+            std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(2));
         loop {
             let rows = svc
                 .store()
@@ -46937,6 +47433,11 @@ mod resume_tail_recap {
              responding, and your restored session may predate the exchange below \
              — it is repeated here (parts of it may or may not already be in your \
              context).\n\n\
+             Note on escaping: text quoted inside the XML tags of this message is XML-escaped \
+             only so it can be quoted (&lt; &gt; &amp; &quot; stand for < > & \"). The \
+             original messages used the literal characters. Write your own replies with \
+             literal characters too: for example <!-- and -->, never &lt;!-- and \
+             --&gt;.\n\n\
              The user's message, delivered before the interruption:\n\
              <interrupted_user_message>\nbuild a simple local webapp\n</interrupted_user_message>\n\n\
              Your partial response before the cut-off (it did NOT complete; anything \
@@ -46944,6 +47445,26 @@ mod resume_tail_recap {
              <interrupted_partial_response>\nDelegating board webapp...\n</interrupted_partial_response>\n\n\
              </supervisor>"
         );
+    }
+
+    /// The recapped text is XML-escaped, so the recap carries the note that
+    /// the escaping is transport-only and replies use literal characters.
+    #[test]
+    fn recap_says_escaping_is_transport_only() {
+        let messages = vec![
+            user("fix <b> & ship"),
+            interrupted_assistant("Done.\n\n<!-- suggested-prompts\nShip it.\n-->"),
+        ];
+        let recap = build_resume_tail_recap(&messages).expect("recap");
+        assert!(
+            recap
+                .text
+                .contains(crate::history_xml::REPLAY_ESCAPING_NOTE),
+            "{}",
+            recap.text
+        );
+        assert!(recap.text.contains("fix &lt;b&gt; &amp; ship"));
+        assert!(recap.text.contains("&lt;!-- suggested-prompts"));
     }
 
     /// A SECOND restart mid-continuation: the tail now holds the original
@@ -47225,8 +47746,12 @@ mod resume_tail_recap {
 /// and the never-fail fallback (`resume_continuation_text`).
 mod resume_continuation {
     use crate::agent_ops::{
-        humanize_outage_duration, resume_continuation_text, RESUME_CONTINUATION_FALLBACK_TEXT,
+        humanize_outage_duration, resume_continuation_text, InterruptedCapture,
+        ABANDON_NOTICE_TEXT, ABANDON_WORKERS_MID_TURN_NOTICE_TEXT, ABANDON_WORKERS_NOTICE_TEXT,
+        RESUME_CONTINUATION_FALLBACK_TEXT, RESUME_MARKER_TEXT, RESUME_WORKERS_LOST_NOTE,
+        RESUME_WORKERS_MARKER_TEXT, RESUME_WORKERS_MID_TURN_MARKER_TEXT,
     };
+    use crate::agent_workers::INTERRUPTED_WITH_WORKERS_REASON;
     use time::format_description::well_known::Rfc3339;
     use time::OffsetDateTime;
 
@@ -47249,6 +47774,100 @@ mod resume_continuation {
         assert_eq!(humanize_outage_duration(2 * 86_400 - 1), "47 hours");
         assert_eq!(humanize_outage_duration(2 * 86_400), "2 days");
         assert_eq!(humanize_outage_duration(3 * 86_400 + 5), "3 days");
+    }
+
+    /// intent-hq/intent#7658: rows are classified by their reason tag and
+    /// recorded status. Untagged rows (and other reasons) are mid-turn
+    /// whatever their status; a tagged row is mid-turn only when its status
+    /// is an in-flight one.
+    #[test]
+    fn interrupted_capture_classifies_by_reason_and_status() {
+        let tag = Some(INTERRUPTED_WITH_WORKERS_REASON);
+        for status in ["active", "idle", "Idle", "error"] {
+            assert_eq!(
+                InterruptedCapture::of(None, status),
+                InterruptedCapture::MidTurn
+            );
+            assert_eq!(
+                InterruptedCapture::of(Some("system_suspend"), status),
+                InterruptedCapture::MidTurn
+            );
+        }
+        for status in ["active", "Processing", "Waiting"] {
+            assert_eq!(
+                InterruptedCapture::of(tag, status),
+                InterruptedCapture::MidTurnWithWorkers,
+                "{status}"
+            );
+        }
+        for status in ["idle", "Idle", "error", "not-a-status"] {
+            assert_eq!(
+                InterruptedCapture::of(tag, status),
+                InterruptedCapture::IdleWithWorkers,
+                "{status}"
+            );
+        }
+    }
+
+    /// Each capture's marker, continuation, abandon notice and tail replay:
+    /// tagged rows get the lost-task note after the duration wording, an idle
+    /// capture replays no tail (a turn the user stopped stays stopped), and
+    /// untagged rows keep today's wording.
+    #[test]
+    fn interrupted_capture_wording_and_tail_replay() {
+        let now = parse("2026-08-15T12:00:15Z");
+        let at = "2026-08-15T12:00:00Z";
+        let base = resume_continuation_text(at, now);
+        assert!(base.starts_with("You were interrupted for about 15 seconds"));
+        let noted = format!("{base} {RESUME_WORKERS_LOST_NOTE}");
+        let cases = [
+            (
+                InterruptedCapture::MidTurn,
+                RESUME_MARKER_TEXT,
+                base.clone(),
+                ABANDON_NOTICE_TEXT,
+                true,
+            ),
+            (
+                InterruptedCapture::MidTurnWithWorkers,
+                RESUME_WORKERS_MID_TURN_MARKER_TEXT,
+                noted.clone(),
+                ABANDON_WORKERS_MID_TURN_NOTICE_TEXT,
+                true,
+            ),
+            (
+                InterruptedCapture::IdleWithWorkers,
+                RESUME_WORKERS_MARKER_TEXT,
+                noted,
+                ABANDON_WORKERS_NOTICE_TEXT,
+                false,
+            ),
+        ];
+        for (capture, marker, continuation, abandon, replays) in cases {
+            assert_eq!(
+                capture.resume_marker_and_continuation(at, now),
+                (marker, continuation),
+                "{capture:?}"
+            );
+            assert_eq!(capture.abandon_notice(), abandon, "{capture:?}");
+            assert_eq!(capture.replays_tail(), replays, "{capture:?}");
+        }
+        assert!(RESUME_WORKERS_LOST_NOTE.contains("will not report back"));
+        assert_eq!(
+            RESUME_MARKER_TEXT,
+            "The previous turn was interrupted because the harness shut down. Continuing below."
+        );
+        assert_eq!(
+            ABANDON_NOTICE_TEXT,
+            "This conversation was interrupted because intentd restarted. The agent's \
+             in-flight work was terminated."
+        );
+        assert_eq!(
+            InterruptedCapture::IdleWithWorkers
+                .resume_marker_and_continuation("not-a-timestamp", now)
+                .1,
+            format!("{RESUME_CONTINUATION_FALLBACK_TEXT} {RESUME_WORKERS_LOST_NOTE}")
+        );
     }
 
     /// The delivered wording embeds the duration.
@@ -47878,9 +48497,12 @@ async fn startup_resume_listing_never_exposes_a_stale_successful_candidate() {
     let mut listing = svc.clone();
     listing.interrupted_list_park = Some(park.clone());
     let (result, ()) = tokio::join!(listing.agent_list_interrupted(), async {
-        timeout(Duration::from_secs(5), park.entered.notified())
-            .await
-            .unwrap();
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            park.entered.notified(),
+        )
+        .await
+        .unwrap();
         svc.resume_startup_candidate(&reservations, &id)
             .await
             .unwrap();
@@ -48124,20 +48746,23 @@ async fn completion_startup_reconciliation_does_not_consume_new_watches() {
                 .execute(restarted.store().write_pool())
                 .await
                 .unwrap();
-            timeout(Duration::from_secs(5), async {
-                loop {
-                    if restarted
-                        .completion_delivery_retries
-                        .lock()
-                        .unwrap()
-                        .is_empty()
-                    {
-                        break;
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                async {
+                    loop {
+                        if restarted
+                            .completion_delivery_retries
+                            .lock()
+                            .unwrap()
+                            .is_empty()
+                        {
+                            break;
+                        }
+                        // timing-guard: observe completion of scoped startup retries
+                        tokio::time::sleep(Duration::from_millis(10)).await;
                     }
-                    // timing-guard: observe completion of scoped startup retries
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            })
+                },
+            )
             .await
             .expect("startup retry settles");
         }
@@ -48229,9 +48854,12 @@ async fn completion_startup_stop_drains_claimed_wake_and_skips_next_child() {
                 .await;
         }
     });
-    timeout(Duration::from_secs(5), park.entered.notified())
-        .await
-        .expect("recovery claimed first wake");
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        park.entered.notified(),
+    )
+    .await
+    .expect("recovery claimed first wake");
     // Live completion racing deferred boot delivery yields to its existing claim.
     restarted
         .handle_completion_event(&completion_event(
@@ -48244,10 +48872,13 @@ async fn completion_startup_stop_drains_claimed_wake_and_skips_next_child() {
     stop.send(true).unwrap();
     assert!(!worker.is_finished(), "an admitted wake must drain");
     park.release.notify_one();
-    timeout(Duration::from_secs(5), worker)
-        .await
-        .unwrap()
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        worker,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!(parent_message_count(&restarted, &parent).await, 1);
     assert!(restarted.find_watches_for_child(&children[0]).is_empty());
     assert_eq!(restarted.find_watches_for_child(&children[1]).len(), 1);
@@ -48363,15 +48994,18 @@ async fn completion_startup_and_live_retries_keep_distinct_payloads_and_scopes()
             svc.schedule_completion_delivery_retry(child.clone(), boot, Some(&scope));
         }
         assert_eq!(svc.completion_delivery_retries.lock().unwrap().len(), 1);
-        timeout(Duration::from_secs(5), async {
-            loop {
-                if svc.completion_delivery_retries.lock().unwrap().is_empty() {
-                    break;
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            async {
+                loop {
+                    if svc.completion_delivery_retries.lock().unwrap().is_empty() {
+                        break;
+                    }
+                    // timing-guard: observe both coalesced retry attempts settling
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                // timing-guard: observe both coalesced retry attempts settling
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
+            },
+        )
         .await
         .expect("coalesced retry worker completes");
         assert_eq!(parent_message_count(&svc, &original).await, 1);
@@ -48507,9 +49141,12 @@ async fn shutdown_claimed_resume_at_barrier(inside_send: bool) {
     let resume = intent_core::spawn_daemon(async move {
         resuming.resume_startup_candidate(&candidates, &id).await
     });
-    timeout(Duration::from_secs(5), park.entered.notified())
-        .await
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        park.entered.notified(),
+    )
+    .await
+    .unwrap();
     assert!(
         svc.store
             .get_interrupted_agent(&agent)
@@ -48526,10 +49163,13 @@ async fn shutdown_claimed_resume_at_barrier(inside_send: bool) {
     manager.checkpoint_shutdown().await;
     svc.shutdown_agent_deliveries().await;
     park.release.notify_one();
-    let outcome = timeout(Duration::from_secs(5), resume)
-        .await
-        .unwrap()
-        .unwrap();
+    let outcome = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        resume,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     manager.shutdown().await;
     assert!(
         outcome.is_err(),
@@ -48745,9 +49385,12 @@ async fn script_monitor_waiting_advisory_and_after_all_retire_on_silent_cancel()
             }
         });
         if !grouped {
-            timeout(Duration::from_secs(5), park.entered.notified())
-                .await
-                .expect("cancellation redelivery claims the watch");
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                park.entered.notified(),
+            )
+            .await
+            .expect("cancellation redelivery claims the watch");
             // The competing idle pass must yield to the existing delivery;
             // its return does not promise that the winner has retired yet.
             svc.handle_completion_event(&completion_event(
@@ -48761,13 +49404,27 @@ async fn script_monitor_waiting_advisory_and_after_all_retire_on_silent_cancel()
             assert_eq!(parent_message_count(&svc, &parent).await, 1);
             park.release.notify_one();
         }
-        timeout(Duration::from_secs(5), cancellation)
-            .await
-            .unwrap()
-            .unwrap();
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            cancellation,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         // Cancellation and commit_monitor's spawned redelivery race for the
-        // same claim. Await durable retirement by the winner, preserving the
-        // exact final assertions for both individual and after_all watches.
+        // same claim. The winner commits durable retirement before removing
+        // the in-memory watch, so observing the database alone is not a fence
+        // for both states. Await memory cleanup and then durable retirement.
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            async {
+                while !svc.find_watches_for_child(&child).is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            },
+        )
+        .await
+        .expect("cancellation redelivery retires the in-memory watch");
         wait_for_persisted_watches(&svc, 0).await;
         assert!(svc.find_watches_for_child(&child).is_empty());
         assert_eq!(parent_message_count(&svc, &parent).await, 2);

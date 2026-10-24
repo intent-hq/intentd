@@ -106,6 +106,7 @@ fn workspace_with_repo(id: &WorkspaceId, repo: &GitRepo) -> Workspace {
         pull_requests_total: None,
         display_status: None,
         waiting: false,
+        scripts_running: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
@@ -1105,7 +1106,7 @@ async fn large_prompt_to_non_reading_cli_still_times_out_and_cools_down() {
     // anyway, the fallback subject lands. The outer deadline is what fails
     // when the write happens before the timed region.
     tokio::time::timeout(
-        std::time::Duration::from_secs(10),
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(10)),
         svc.handle_agent_idle_auto_commit(&idle_event(&ws_id, "agent-c4", "end_turn")),
     )
     .await
@@ -1268,11 +1269,14 @@ async fn auto_commit_attribution_survives_receiver_abort() {
     attribute_dirty_change(&svc, &ws, "agent-tail").await;
     let (rx, release) = hold(&svc, "git");
     let task = svc.spawn_auto_commit_loop();
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while bus.subscriber_count() == 0 {
-            tokio::task::yield_now().await;
-        }
-    })
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+        async {
+            while bus.subscriber_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
     .await
     .unwrap();
     let e = idle_event(&ws, "agent-tail", "end_turn");
@@ -1374,4 +1378,127 @@ async fn agent_commit_captures_polling_caller_before_owned_handoff() {
     assert!(matches!(result, Err(Error::NotFound(_))), "{result:?}");
     assert_eq!(intent_git::history::history(&repo.dir, 5).unwrap().len(), 2);
     svc.shutdown_store_writers().await;
+}
+
+/// Captured `(level, message)` pairs for the missing-checkout tests.
+///
+/// Unix-only like its only caller: on Windows it would be dead code and
+/// fail `cargo clippy -D warnings`.
+#[cfg(unix)]
+#[derive(Clone, Default)]
+struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>);
+
+#[cfg(unix)]
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LogCapture {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        struct Message(String);
+        impl tracing::field::Visit for Message {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = format!("{value:?}");
+                }
+            }
+        }
+        let mut message = Message(String::new());
+        event.record(&mut message);
+        self.0
+            .lock()
+            .unwrap()
+            .push((*event.metadata().level(), message.0));
+    }
+}
+
+#[cfg(unix)]
+impl LogCapture {
+    fn count(&self, level: tracing::Level, needle: &str) -> usize {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(l, m)| *l == level && m.contains(needle))
+            .count()
+    }
+}
+
+/// intent-hq/intent#7183: a workspace whose checkout folder is gone (deleted
+/// or on an unmounted volume) must not attempt auto-commit on every idle.
+/// Repeated idles skip before message generation and `git_agent_commit`,
+/// log exactly one warning, and the first idle after the folder returns
+/// commits normally with one recovery info line.
+#[cfg(unix)]
+#[intent_test_macros::daemon_test]
+async fn missing_checkout_skips_auto_commit_with_one_warning_and_resumes() {
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let capture = LogCapture::default();
+    let _guard = crate::test_tracing::set_capture_default(
+        tracing_subscriber::registry().with(capture.clone()),
+    );
+    let repo = init_git_repo();
+    let (_tmp, svc, ws_id) = setup_dirty_workspace(&repo).await;
+    let (bin_dir, bin) = fake_auggie(
+        "missing-checkout",
+        r#"calls="$(dirname "$0")/calls"
+n=$(cat "$calls" 2>/dev/null || echo 0)
+echo $((n+1)) > "$calls"
+printf '{"subject": "feat: committed after remount"}'"#,
+    );
+    let (_config_dir, registry) = auggie_active_registry();
+    let svc = svc.with_auggie_bin(bin).with_settings_registry(registry);
+    let agent = session("agent-m1", &ws_id, None, false, "Builder", true);
+    svc.store().insert_agent_session(&agent).await.unwrap();
+    attribute_dirty_change(&svc, &ws_id, "agent-m1").await;
+    let head_before = intent_git::history::history(&repo.dir, 1).unwrap()[0]
+        .hash
+        .clone();
+
+    let away = repo.dir.with_extension("unmounted");
+    std::fs::rename(&repo.dir, &away).expect("move checkout away");
+    for _ in 0..3 {
+        svc.handle_agent_idle_auto_commit(&idle_event(&ws_id, "agent-m1", "end_turn"))
+            .await;
+    }
+    assert_eq!(
+        fake_auggie_calls(&bin_dir),
+        0,
+        "generation ran for a missing checkout"
+    );
+    assert_eq!(
+        capture.count(tracing::Level::WARN, "workspace checkout missing"),
+        1,
+        "exactly one transition warning across repeated idles"
+    );
+    assert_eq!(
+        capture.count(tracing::Level::WARN, "auto-commit failed"),
+        0,
+        "no per-idle auto-commit failure warnings"
+    );
+    assert!(svc.worktree_presence().is_missing(&ws_id));
+
+    std::fs::rename(&away, &repo.dir).expect("move checkout back");
+    svc.handle_agent_idle_auto_commit(&idle_event(&ws_id, "agent-m1", "end_turn"))
+        .await;
+    assert!(!svc.worktree_presence().is_missing(&ws_id));
+    assert_eq!(
+        capture.count(tracing::Level::INFO, "workspace checkout is back"),
+        1
+    );
+    let (agent_id, _l, message) = last_commit_trailers(&repo.dir);
+    assert_eq!(agent_id.as_deref(), Some("agent-m1"));
+    assert!(
+        message.starts_with("feat: committed after remount"),
+        "got: {message}"
+    );
+    let head_after = intent_git::history::history(&repo.dir, 1).unwrap()[0]
+        .hash
+        .clone();
+    assert_ne!(head_before, head_after, "auto-commit must resume");
+    assert_eq!(
+        capture.count(tracing::Level::WARN, "workspace checkout missing"),
+        1
+    );
 }

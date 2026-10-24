@@ -53,14 +53,12 @@ impl Fixture {
             svc,
             ws,
         };
-        // Deterministic availability for both bases (no provider process is
-        // launched — Services has no agent manager). Codex and Claude Code
-        // are npx-only and ignore executable overrides, so the test-only
-        // marker keeps availability independent of the host's Node/npx.
-        let runnable = crate::agent_ops::TEST_RUNNABLE_PATH;
+        // Deterministic availability for both bases, independent of the
+        // host's Node/npx and provider CLIs (no provider process is
+        // launched — Services has no agent manager).
         fx.set(
             "providers.paths",
-            json!({ "codex": runnable, "claude-code": runnable }),
+            crate::test_support::provider_installed::paths_json(&["codex", "claude-code"]),
         );
         fx
     }
@@ -199,7 +197,10 @@ async fn catalog_offers_profiles_and_rename_changes_only_the_label() {
     for p in profiles {
         let mut keys: Vec<&String> = p.as_object().unwrap().keys().collect();
         keys.sort();
-        assert_eq!(keys, ["baseProviderId", "id", "name", "providerRef"]);
+        assert_eq!(
+            keys,
+            ["backup", "baseProviderId", "id", "name", "providerRef"]
+        );
     }
     let rendered = catalog.to_string();
     assert!(!rendered.contains("PROFILE_ROUTING_TOKEN"), "{rendered}");

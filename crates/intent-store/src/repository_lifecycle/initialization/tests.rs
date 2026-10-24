@@ -718,7 +718,9 @@ async fn canceled_commit_worker_and_last_store_drop_cannot_reset_unknown_initial
             if let Some(blocked) = blocked.take() {
                 signal.notify_one();
                 blocked
-                    .recv_timeout(std::time::Duration::from_secs(20))
+                    .recv_timeout(intentd_test_support::test_timeout(
+                        std::time::Duration::from_secs(20),
+                    ))
                     .unwrap();
             }
             true
@@ -1728,7 +1730,9 @@ async fn compatible_canceled_commit_worker_preserves_unknown_owner_after_reopen(
                 if let Some(blocked) = blocked.take() {
                     signal.notify_one();
                     blocked
-                        .recv_timeout(std::time::Duration::from_secs(20))
+                        .recv_timeout(intentd_test_support::test_timeout(
+                            std::time::Duration::from_secs(20),
+                        ))
                         .unwrap();
                 }
                 true
@@ -2102,7 +2106,9 @@ mod mixed_lifecycle {
                 if let Some(blocked) = blocked.take() {
                     signal.notify_one();
                     blocked
-                        .recv_timeout(std::time::Duration::from_secs(20))
+                        .recv_timeout(intentd_test_support::test_timeout(
+                            std::time::Duration::from_secs(20),
+                        ))
                         .unwrap();
                 }
                 true

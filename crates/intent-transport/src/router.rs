@@ -17,7 +17,6 @@
 //! service authorizes its actual owner. In particular, source export follow-ups
 //! retain their exportId/seq/archiveSource semantics without a workspace lookup.
 
-use futures_util::future::BoxFuture;
 use intent_core::{
     AgentCreateExtra, AgentDelegateInput, AgentId, AgentWakeCreateOptions, AgentWakeOrCreateInput,
     ClientId, ContextItem, Error, EventQueryParams, MessageOrigin, NoteAddInput, NoteCreate,
@@ -25,7 +24,7 @@ use intent_core::{
     ScriptMode, TaskAgentLink, WorkspaceApi, WorkspaceCreate, WorkspaceGitRootId, WorkspaceId,
     WorkspaceUpdate,
 };
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{json, Map, Value};
 use std::time::Instant;
 use tracing::Instrument;
@@ -94,26 +93,58 @@ fn not_found(message: impl Into<String>) -> RpcErr {
     }
 }
 
+/// An integral JSON number at or above `min`, accepting integral floats
+/// (`10.0`) like the reference `Number.isInteger`; anything else is `None`.
+fn json_integer_at_least(value: &Value, min: u64) -> Option<u64> {
+    let n = value.as_u64().or_else(|| {
+        let f = value.as_f64()?;
+        // Integral, non-negative and below 2^53 → exact in u64.
+        #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let n =
+            (f.fract() == 0.0 && (0.0..9_007_199_254_740_992.0).contains(&f)).then_some(f as u64);
+        n
+    })?;
+    (n >= min).then_some(n)
+}
+
+/// `maxContentBytes` on `note.get` / `note.subscribe` (truncated note reads):
+/// absent or `null` → `None` (the unbounded read, byte-identical); a positive
+/// integer → the UTF-8 byte limit; anything else → the documented `-32602`.
+pub(crate) fn max_content_bytes_param(
+    params: &Map<String, Value>,
+) -> std::result::Result<Option<usize>, &'static str> {
+    match params.get("maxContentBytes") {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => json_integer_at_least(v, 1)
+            .map(|n| Some(usize::try_from(n).unwrap_or(usize::MAX)))
+            .ok_or("maxContentBytes must be a positive integer"),
+    }
+}
+
+fn parse_max_content_bytes(
+    params: &Map<String, Value>,
+) -> std::result::Result<Option<usize>, RpcErr> {
+    max_content_bytes_param(params).map_err(invalid_params)
+}
+
+/// `baseContentBytes` on whole-content note writes (truncated-read write
+/// guard): absent or `null` → unguarded; a non-negative integer → the
+/// writer's base size; anything else → the documented `-32602`.
+fn parse_base_content_bytes(
+    params: &Map<String, Value>,
+) -> std::result::Result<Option<u64>, RpcErr> {
+    match params.get("baseContentBytes") {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => json_integer_at_least(v, 0)
+            .map(Some)
+            .ok_or_else(|| invalid_params("baseContentBytes must be a non-negative integer")),
+    }
+}
+
 /// Map a domain [`Error`] to its JSON-RPC representation (§9). Internal errors
 /// surface as `-32603 "Internal error"` carrying the original cause in `data`.
 fn domain_to_rpc(e: Error) -> RpcErr {
     match e {
-        Error::NoteDelete(kind) => RpcErr {
-            code: kind.rpc_code(),
-            message: "Note deletion unavailable".into(),
-            data: Some(json!({"code":kind.wire_code()})),
-        },
-        Error::NotePage(kind) => {
-            let mut data = json!({"code":kind.wire_code()});
-            if kind == intent_core::note_page::NotePageError::Preparing {
-                data["retryAfterMs"] = json!(1000);
-            }
-            RpcErr {
-                code: Error::NotePage(kind).code(),
-                message: "Note page unavailable".into(),
-                data: Some(data),
-            }
-        }
         Error::ExecutionAuthorization {
             source,
             authorization,
@@ -156,6 +187,21 @@ fn domain_to_rpc(e: Error) -> RpcErr {
             code: e.code(),
             message: e.to_string(),
             data: Some(json!({ "code": "base-ref-unresolvable", "baseRef": base_ref })),
+        },
+        // Guarded whole-content note write whose base size did not match the
+        // resolved base (or the base is unknown): -32602 with the documented
+        // machine-readable data, no write ("Truncated note reads").
+        ref e @ Error::ContentBaseMismatch {
+            base_content_bytes,
+            resolved_base_bytes,
+        } => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({
+                "code": "content-base-mismatch",
+                "baseContentBytes": base_content_bytes,
+                "resolvedBaseBytes": resolved_base_bytes,
+            })),
         },
         // Provider profile failure (§5.54): -32602 (or -32603 for an
         // unreadable profile file) with the service-built `data` verbatim —
@@ -314,6 +360,11 @@ fn domain_to_rpc(e: Error) -> RpcErr {
             message: e.to_string(),
             data: Some(json!({ "code": "rate-limited" })),
         },
+        ref e @ Error::ProviderRequest(_) => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({ "code": "provider-error" })),
+        },
         other => RpcErr {
             code: other.code(),
             message: other.to_string(),
@@ -450,28 +501,6 @@ pub(crate) async fn prepare_message(
         }
     };
 
-    // Receipt lookup has a stricter envelope budget, including malformed
-    // requests. Validate before cloning params or echoing a caller-controlled ID.
-    let annotation = value
-        .get("params")
-        .and_then(Value::as_object)
-        .and_then(|params| annotation_method(value.get("method").and_then(Value::as_str)?, params));
-    if annotation.is_some() {
-        if value.get("id").is_some_and(|id| !valid_note_page_id(id)) {
-            return Some(invalid_note_page_id());
-        }
-        if message.len() > 65_536 {
-            return value.get("id").map(|id| {
-                prepared_error(
-                    id,
-                    INVALID_PARAMS,
-                    "Note page unavailable",
-                    Some(json!({"code":"note-page-budget"})),
-                )
-            });
-        }
-    }
-
     // Envelope validation (-32600). Answered even for notification-shaped
     // frames: notification status is not trusted until the envelope is valid.
     let (echo_id, method, is_notification) = match check_envelope(&value) {
@@ -532,11 +561,6 @@ pub(crate) async fn prepare_message(
         }
     };
 
-    // Never echo an unbounded ID from an opt-in page request.
-    if method == "note.get" && params.contains_key("page") && !valid_note_page_id(&echo_id) {
-        return Some(invalid_note_page_id());
-    }
-
     // Keep one span alive through dispatch AND response encoding. The writer
     // queue consumes the returned frame later, so queue latency is deliberately
     // excluded from `encode_elapsed_ms`. `request_shape` is recorded by the
@@ -555,13 +579,7 @@ pub(crate) async fn prepare_message(
     );
     let profile_span = span.clone();
     async move {
-        let result = if let Some(annotation) = annotation {
-            Box::pin(dispatch_annotation_page(api, annotation, &params, &echo_id)).await
-        } else if method == "note.get" && params.contains_key("page") {
-            Box::pin(dispatch_note_page(api, &params, &echo_id, message.len())).await
-        } else {
-            dispatch(api, method, &params).await
-        };
+        let result = dispatch(api, method, &params).await;
         let kind = if result.is_ok() {
             intent_core::repository_request::RepositoryReadReplyKind::Result
         } else {
@@ -573,17 +591,7 @@ pub(crate) async fn prepare_message(
             method,
             is_notification,
             result,
-            if annotation.is_some() {
-                params
-                    .get("page")
-                    .and_then(|page| page.get("maxWireBytes"))
-                    .and_then(Value::as_u64)
-                    .and_then(|bytes| usize::try_from(bytes).ok())
-                    .unwrap_or(65_536)
-                    .clamp(4096, 65_536)
-            } else {
-                crate::MAX_OUTBOUND_MESSAGE_BYTES
-            },
+            crate::MAX_OUTBOUND_MESSAGE_BYTES,
         );
         let encode_elapsed_ms = if is_notification {
             0
@@ -667,165 +675,35 @@ fn encode_dispatch_result(
     }
 }
 
-fn valid_note_page_id(id: &Value) -> bool {
-    match id {
-        Value::String(s) => s.len() <= 64,
-        Value::Number(n) => n
-            .as_i64()
-            .is_some_and(|v| v.unsigned_abs() <= 9_007_199_254_740_991),
-        _ => false,
-    }
-}
-
-fn invalid_note_page_id() -> PreparedReply {
-    prepared_error(
-        &Value::Null,
-        INVALID_PARAMS,
-        "Invalid note page request",
-        Some(json!({"code":"invalid-params"})),
-    )
-}
-
-// Select the opt-in variant before decoding. Malformed annotation requests
-// must not fall through to the legacy full-comment or source-context paths.
-fn annotation_method(
-    method: &str,
+fn discussion_optional_id(
     params: &Map<String, Value>,
-) -> Option<intent_core::note_annotation::AnnotationMethod> {
-    use intent_core::note_annotation::AnnotationMethod;
-    match method {
-        "note.lineAttribution.load" if params.contains_key("page") => {
-            Some(AnnotationMethod::Attribution)
-        }
-        "comment.list" if params.contains_key("page") => Some(AnnotationMethod::Comments),
-        "comment.getThread" if params.contains_key("page") => Some(AnnotationMethod::Replies),
-        "note.get"
-            if params.contains_key("commentRevision")
-                || params.contains_key("attributionGeneration")
-                || params
-                    .get("page")
-                    .and_then(|page| page.get("contextRef"))
-                    .and_then(Value::as_str)
-                    .is_some_and(|reference| reference.starts_with("na1")) =>
-        {
-            Some(AnnotationMethod::Context)
-        }
-        _ => None,
-    }
-}
-
-async fn dispatch_annotation_page(
-    api: &dyn WorkspaceApi,
-    method: intent_core::note_annotation::AnnotationMethod,
-    params: &Map<String, Value>,
-    id: &Value,
-) -> std::result::Result<Value, RpcErr> {
-    if !valid_note_page_id(id)
-        || params.values().any(Value::is_null)
-        || params
-            .get("page")
-            .and_then(Value::as_object)
-            .is_none_or(|page| page.values().any(Value::is_null))
-    {
-        return Err(invalid_params("Invalid annotation page request"));
-    }
-    let request: intent_core::note_annotation::AnnotationReadRequest =
-        serde_json::from_value(Value::Object(params.clone()))
-            .map_err(|_| invalid_params("Invalid annotation page request"))?;
-    request
-        .validate(method)
-        .map_err(|_| invalid_params("Invalid annotation page request"))?;
-    api.get_note_annotation_page(method, request, id.clone())
-        .await
-        .map_err(|error| match error {
-            Error::NotePage(_) => domain_to_rpc(error),
-            Error::InvalidParams(_) => invalid_params("Invalid annotation page request"),
-            Error::NotFound(_) => not_found("Annotation page not found"),
-            Error::Forbidden(_) => {
-                domain_to_rpc(Error::Forbidden("Annotation page unavailable".into()))
-            }
-            Error::Unsupported(_) => {
-                domain_to_rpc(Error::Unsupported("Annotation page unavailable".into()))
-            }
-            _ => rpc(-32603, "Annotation page unavailable"),
+    key: &str,
+) -> std::result::Result<Option<String>, RpcErr> {
+    params
+        .get(key)
+        .map(|v| {
+            v.as_str()
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .ok_or_else(|| invalid_params(format!("{key} must be a non-empty string")))
         })
+        .transpose()
+}
+fn discussion_limit(params: &Map<String, Value>) -> std::result::Result<u32, RpcErr> {
+    params
+        .get("limit")
+        .map(|v| {
+            v.as_u64()
+                .filter(|n| (1..=100).contains(n))
+                .and_then(|n| u32::try_from(n).ok())
+                .ok_or_else(|| invalid_params("limit must be an integer from 1 to 100"))
+        })
+        .transpose()
+        .map(|v| v.unwrap_or(50))
 }
 
 /// Dispatch a validated request to the injected [`WorkspaceApi`].
-async fn dispatch_note_page(
-    api: &dyn WorkspaceApi,
-    params: &Map<String, Value>,
-    id: &Value,
-    request_bytes: usize,
-) -> std::result::Result<Value, RpcErr> {
-    if request_bytes > 65_536 || !valid_note_page_id(id) {
-        return Err(domain_to_rpc(Error::NotePage(
-            intent_core::note_page::NotePageError::Budget,
-        )));
-    }
-    let page = params.get("page").expect("page present");
-    if page
-        .as_object()
-        .is_none_or(|m| m.values().any(Value::is_null))
-    {
-        return Err(invalid_params("Invalid note page request"));
-    }
-    let request = intent_core::note_page::NotePageRequest::deserialize(page)
-        .map_err(|_| invalid_params("Invalid note page request"))?;
-    let ws = require_ws_note(params)?;
-    let note = require_note_id(params)?;
-    if ws.0.len() > 256 || note.0.len() > 256 {
-        return Err(invalid_params("Invalid note page request"));
-    }
-    api.get_note_page(ws, note, request, id.clone())
-        .await
-        .map_err(domain_to_rpc)
-}
-
-// Keep workspace provisioning off the large general dispatch poll frame. Its
-// service call may perform TLS before the first note write; paging must not
-// exhaust the default thread stack on that legacy path.
-fn dispatch<'a>(
-    api: &'a dyn WorkspaceApi,
-    method: &'a str,
-    params: &'a Map<String, Value>,
-) -> BoxFuture<'a, Result<Value, RpcErr>> {
-    match method {
-        "workspace.create" => Box::pin(dispatch_workspace_create(api, params)),
-        _ => Box::pin(dispatch_other(api, method, params)),
-    }
-}
-
-async fn dispatch_workspace_create(
-    api: &dyn WorkspaceApi,
-    params: &Map<String, Value>,
-) -> Result<Value, RpcErr> {
-    // Agent ids are server-assigned: reject stale clients that still
-    // send `initialAgent.agentId` before any provisioning runs.
-    if params
-        .get("initialAgent")
-        .and_then(|a| a.get("agentId"))
-        .is_some_and(|v| !v.is_null())
-    {
-        return Err(invalid_params(
-            "initialAgent.agentId: agent IDs are server-assigned and the field must be omitted",
-        ));
-    }
-    let idempotency_key = opt_str(params, "idempotencyKey");
-    let input: WorkspaceCreate = serde_json::from_value(Value::Object(params.clone()))
-        .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
-    let res = api
-        .create_workspace(input, idempotency_key)
-        .await
-        .map_err(workspace_err)?;
-    let mut result = json!({ "workspace": res.workspace });
-    if let Some(agent) = res.initial_agent {
-        result["initialAgent"] = agent;
-    }
-    Ok(result)
-}
-
-async fn dispatch_other(
+async fn dispatch(
     api: &dyn WorkspaceApi,
     method: &str,
     params: &Map<String, Value>,
@@ -880,6 +758,70 @@ async fn dispatch_other(
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(json!(r))
+        }
+        "sourceControl.gitlab.childGit.get" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .gitlab_child_git_policy_get(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
+        "sourceControl.gitlab.childGit.set" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .gitlab_child_git_policy_set(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
+        "sourceControl.read.resolveKnownRepository" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .repository_resource_resolve_known(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
+        "sourceControl.read.captureScoped" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .repository_resource_capture_scoped(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
+        "sourceControl.read.detailScoped" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .repository_resource_detail_scoped(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
+        "sourceControl.read.releaseScoped" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .repository_resource_release_scoped(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
+        "sourceControl.read.list" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .repository_resource_list(input)
+                .await
+                .map_err(domain_to_rpc)?))
+        }
+        "sourceControl.read.discussions" => {
+            let input = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            Ok(json!(api
+                .repository_resource_discussions(input)
+                .await
+                .map_err(domain_to_rpc)?))
         }
         "sourceControl.read.capture" => {
             let input = serde_json::from_value(Value::Object(params.clone()))
@@ -955,6 +897,31 @@ async fn dispatch_other(
             let id = require_workspace_id(params)?;
             let ws = api.get_workspace(id).await.map_err(workspace_err)?;
             Ok(json!({ "workspace": ws }))
+        }
+        "workspace.create" => {
+            // Agent ids are server-assigned: reject stale clients that still
+            // send `initialAgent.agentId` before any provisioning runs.
+            if params
+                .get("initialAgent")
+                .and_then(|a| a.get("agentId"))
+                .is_some_and(|v| !v.is_null())
+            {
+                return Err(invalid_params(
+                    "initialAgent.agentId: agent IDs are server-assigned and the field must be omitted",
+                ));
+            }
+            let idempotency_key = opt_str(params, "idempotencyKey");
+            let input: WorkspaceCreate = serde_json::from_value(Value::Object(params.clone()))
+                .map_err(|e| invalid_params(format!("invalid params: {e}")))?;
+            let res = api
+                .create_workspace(input, idempotency_key)
+                .await
+                .map_err(workspace_err)?;
+            let mut result = json!({ "workspace": res.workspace });
+            if let Some(agent) = res.initial_agent {
+                result["initialAgent"] = agent;
+            }
+            Ok(result)
         }
         "workspace.update" => {
             let id = require_workspace_id(params)?;
@@ -1098,6 +1065,170 @@ async fn dispatch_other(
             let ws = api.mark_seen(id).await.map_err(workspace_err)?;
             Ok(json!({ "workspace": ws }))
         }
+        "discussion.conversations" | "discussion.recipients" => {
+            let id = require_workspace_id(params)?;
+            let limit = discussion_limit(params)?;
+            if method == "discussion.conversations" {
+                api.discussion_conversations(id, discussion_optional_id(params, "beforeId")?, limit)
+                    .await
+                    .map_err(domain_to_rpc)
+            } else {
+                let query = match params.get("query") {
+                    None => String::new(),
+                    Some(v) => v
+                        .as_str()
+                        .ok_or_else(|| invalid_params("query must be a string"))?
+                        .to_string(),
+                };
+                api.discussion_recipients(
+                    id,
+                    query,
+                    discussion_optional_id(params, "afterPrincipalId")?,
+                    limit,
+                )
+                .await
+                .map_err(domain_to_rpc)
+            }
+        }
+        "discussion.list" => {
+            let id = require_workspace_id(params)?;
+            let before = params
+                .get("beforeSequence")
+                .map(|v| {
+                    v.as_i64()
+                        .filter(|n| *n > 0)
+                        .ok_or_else(|| invalid_params("beforeSequence must be a positive integer"))
+                })
+                .transpose()?;
+            let after = params
+                .get("afterSequence")
+                .map(|v| {
+                    v.as_i64().filter(|n| *n >= 0).ok_or_else(|| {
+                        invalid_params("afterSequence must be a nonnegative integer")
+                    })
+                })
+                .transpose()?;
+            if before.is_some() && after.is_some() {
+                return Err(invalid_params(
+                    "beforeSequence and afterSequence are mutually exclusive",
+                ));
+            }
+            let limit = params
+                .get("limit")
+                .map(|v| {
+                    v.as_u64()
+                        .filter(|n| (1..=100).contains(n))
+                        .and_then(|n| u32::try_from(n).ok())
+                        .ok_or_else(|| invalid_params("limit must be an integer from 1 to 100"))
+                })
+                .transpose()?
+                .unwrap_or(intent_core::discussion::DISCUSSION_PAGE_DEFAULT);
+            let page = api
+                .discussion_list(
+                    id,
+                    discussion_optional_id(params, "conversationId")?
+                        .unwrap_or_else(|| "default".into()),
+                    before,
+                    after,
+                    limit,
+                )
+                .await
+                .map_err(domain_to_rpc)?;
+            to_result_value(&page)
+        }
+        "discussion.react" => {
+            let id = require_workspace_id(params)?;
+            let message_id = require_str_param(params, "messageId")?;
+            let reaction = require_str_param(params, "reaction")?;
+            let active = params
+                .get("active")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| invalid_params("active must be a boolean"))?;
+            let result = api
+                .discussion_react(
+                    id,
+                    discussion_optional_id(params, "conversationId")?
+                        .unwrap_or_else(|| "default".into()),
+                    message_id,
+                    reaction,
+                    active,
+                )
+                .await
+                .map_err(domain_to_rpc)?;
+            to_result_value(&result)
+        }
+        "discussion.stopAgent" | "discussion.retryAgent" => {
+            let request: intent_core::discussion::DiscussionAgentControl =
+                serde_json::from_value(Value::Object(params.clone())).map_err(|_| {
+                    invalid_params("expected workspaceId, messageId, agentId and positive attempt")
+                })?;
+            if request.attempt == 0
+                || request.message_id.trim().is_empty()
+                || request.agent_id.as_str().is_empty()
+            {
+                return Err(invalid_params("invalid discussion invocation"));
+            }
+            api.discussion_control_agent(request, method == "discussion.retryAgent")
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "discussion.send" => {
+            let id = require_workspace_id(params)?;
+            let message_id = require_str_param(params, "messageId")?;
+            let body = require_str_param(params, "body")?;
+            let conversation_id = discussion_optional_id(params, "conversationId")?;
+            let recipient_principal_ids = params
+                .get("recipientPrincipalIds")
+                .map(|v| {
+                    v.as_array()
+                        .ok_or_else(|| invalid_params("recipientPrincipalIds must be an array"))?
+                        .iter()
+                        .map(|p| {
+                            p.as_str()
+                                .filter(|s| !s.is_empty())
+                                .map(intent_core::PrincipalId::from)
+                                .ok_or_else(|| {
+                                    invalid_params(
+                                        "recipientPrincipalIds must contain nonempty strings",
+                                    )
+                                })
+                        })
+                        .collect::<std::result::Result<Vec<_>, _>>()
+                })
+                .transpose()?;
+            let recipient_agent_ids = params
+                .get("recipientAgentIds")
+                .map(|value| {
+                    serde_json::from_value::<Vec<intent_core::AgentId>>(value.clone()).map_err(
+                        |_| invalid_params("recipientAgentIds must be an array of strings"),
+                    )
+                })
+                .transpose()?
+                .unwrap_or_default();
+            let result = api
+                .discussion_send(
+                    id,
+                    message_id,
+                    body,
+                    intent_core::discussion::DiscussionTarget {
+                        agent_mentions: params
+                            .get("agentMentions")
+                            .map(|v| {
+                                serde_json::from_value(v.clone())
+                                    .map_err(|_| invalid_params("invalid agentMentions"))
+                            })
+                            .transpose()?
+                            .unwrap_or_default(),
+                        recipient_agent_ids,
+                        conversation_id,
+                        recipient_principal_ids,
+                        reply_to_message_id: discussion_optional_id(params, "replyToMessageId")?,
+                    },
+                )
+                .await
+                .map_err(domain_to_rpc)?;
+            to_result_value(&result)
+        }
         // `workspace.members.*` (multiplayer w3): membership roster of one
         // workspace. Member+ may list; add / removal are Owner-only in the
         // service layer (`-32003` for a collaborator, `-32602` for a
@@ -1121,6 +1252,18 @@ async fn dispatch_other(
                 .await
                 .map_err(workspace_err)?;
             Ok(r)
+        }
+        "workspace.members.setRole" => {
+            let id = require_workspace_id(params)?;
+            let principal_id = require_str_param(params, "principalId")?;
+            let role = match require_str_param(params, "role")?.as_str() {
+                "collaborator" => intent_core::WorkspaceRole::Collaborator,
+                "manager" => intent_core::WorkspaceRole::Manager,
+                _ => return Err(invalid_params("role must be collaborator or manager")),
+            };
+            api.workspace_members_set_role(id, intent_core::PrincipalId::from(principal_id), role)
+                .await
+                .map_err(workspace_err)
         }
         "workspace.members.remove" => {
             let id = require_workspace_id(params)?;
@@ -1411,8 +1554,14 @@ async fn dispatch_other(
         "note.get" => {
             let ws = require_ws_note(params)?;
             let note_id = require_note_id(params)?;
+            let max_content_bytes = parse_max_content_bytes(params)?;
             match api.get_note(ws, note_id).await {
-                Ok(note) => Ok(json!({ "note": note })),
+                Ok(note) => match max_content_bytes {
+                    Some(limit) => {
+                        Ok(json!({ "note": intent_core::note_bounded_row(note, limit) }))
+                    }
+                    None => Ok(json!({ "note": note })),
+                },
                 Err(Error::NotFound(_)) => Err(not_found("Note not found")),
                 Err(e) => Err(domain_to_rpc(e)),
             }
@@ -1446,6 +1595,7 @@ async fn dispatch_other(
                 title: opt_str(params, "title"),
                 tags: opt_tags(params, "tags"),
                 expected_version: opt_int(params, "expectedVersion"),
+                base_content_bytes: parse_base_content_bytes(params)?,
             };
             let note = api
                 .update_note(ws, note_id, input)
@@ -1507,8 +1657,17 @@ async fn dispatch_other(
             let content = require_str_param(params, "content")?;
             let confirm = parse_confirm(params);
             let expected_version = opt_int(params, "expectedVersion");
+            let base_content_bytes = parse_base_content_bytes(params)?;
             let result = api
-                .set_note_content(ws, note_id, content, confirm, expected_version, None)
+                .set_note_content_guarded(
+                    ws,
+                    note_id,
+                    content,
+                    confirm,
+                    expected_version,
+                    base_content_bytes,
+                    None,
+                )
                 .await
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
@@ -1524,87 +1683,6 @@ async fn dispatch_other(
                 .await
                 .map_err(domain_to_rpc)?;
             to_result_value(&result)
-        }
-        "note.deleteSchedule" => {
-            let request: intent_core::note_delete::NoteDeleteSchedule =
-                serde_json::from_value(Value::Object(params.clone())).map_err(|_| {
-                    domain_to_rpc(Error::NoteDelete(
-                        intent_core::note_delete::NoteDeleteError::Invalid,
-                    ))
-                })?;
-            let response = api
-                .schedule_note_delete(request)
-                .await
-                .map_err(domain_to_rpc)?;
-            let value = to_result_value(&response)?;
-            if serde_json::to_vec(&value)
-                .map_err(|_| {
-                    domain_to_rpc(Error::NoteDelete(
-                        intent_core::note_delete::NoteDeleteError::Unavailable,
-                    ))
-                })?
-                .len()
-                > intent_core::note_delete::MAX_RESULT_BYTES
-            {
-                return Err(domain_to_rpc(Error::NoteDelete(
-                    intent_core::note_delete::NoteDeleteError::Unavailable,
-                )));
-            }
-            Ok(value)
-        }
-        "note.deleteCancel" => {
-            let request: intent_core::note_delete::NoteDeleteCancel =
-                serde_json::from_value(Value::Object(params.clone())).map_err(|_| {
-                    domain_to_rpc(Error::NoteDelete(
-                        intent_core::note_delete::NoteDeleteError::Invalid,
-                    ))
-                })?;
-            let response = api
-                .cancel_note_delete(request)
-                .await
-                .map_err(domain_to_rpc)?;
-            let value = to_result_value(&response)?;
-            if serde_json::to_vec(&value)
-                .map_err(|_| {
-                    domain_to_rpc(Error::NoteDelete(
-                        intent_core::note_delete::NoteDeleteError::Unavailable,
-                    ))
-                })?
-                .len()
-                > intent_core::note_delete::MAX_RESULT_BYTES
-            {
-                return Err(domain_to_rpc(Error::NoteDelete(
-                    intent_core::note_delete::NoteDeleteError::Unavailable,
-                )));
-            }
-            Ok(value)
-        }
-        "note.deleteStatus" => {
-            let request: intent_core::note_delete::NoteDeleteStatus =
-                serde_json::from_value(Value::Object(params.clone())).map_err(|_| {
-                    domain_to_rpc(Error::NoteDelete(
-                        intent_core::note_delete::NoteDeleteError::Invalid,
-                    ))
-                })?;
-            let response = api
-                .note_delete_status(request)
-                .await
-                .map_err(domain_to_rpc)?;
-            let value = to_result_value(&response)?;
-            if serde_json::to_vec(&value)
-                .map_err(|_| {
-                    domain_to_rpc(Error::NoteDelete(
-                        intent_core::note_delete::NoteDeleteError::Unavailable,
-                    ))
-                })?
-                .len()
-                > intent_core::note_delete::MAX_RESULT_BYTES
-            {
-                return Err(domain_to_rpc(Error::NoteDelete(
-                    intent_core::note_delete::NoteDeleteError::Unavailable,
-                )));
-            }
-            Ok(value)
         }
         "note.delete" => {
             let ws = require_ws_note(params)?;
@@ -2539,6 +2617,22 @@ async fn dispatch_other(
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(result)
+        }
+        "agent.workers.list" => {
+            let ws = WorkspaceId::from(require_wire_id(params, "workspaceId")?);
+            let agent = AgentId::from(require_wire_id(params, "agentId")?.as_str());
+            api.agent_workers_list(ws, agent)
+                .await
+                .map_err(domain_to_rpc)
+        }
+        "agent.workers.stop" => {
+            let ws = WorkspaceId::from(require_wire_id(params, "workspaceId")?);
+            let agent = AgentId::from(require_wire_id(params, "agentId")?.as_str());
+            let generation = require_wire_id(params, "connectionGeneration")?;
+            let task = require_wire_id(params, "asyncTaskId")?;
+            api.agent_workers_stop(ws, agent, generation, task)
+                .await
+                .map_err(domain_to_rpc)
         }
         "agent.stop" => {
             let agent_id = require_agent_id(params)?;
@@ -4336,6 +4430,14 @@ async fn dispatch_other(
                 .await
                 .map_err(domain_to_rpc)
         }
+        "providers.profiles.reorder" => api
+            .provider_profiles_reorder(Value::Object(params.clone()))
+            .await
+            .map_err(domain_to_rpc),
+        "providers.profiles.updateDefault" => api
+            .provider_profiles_update_default(Value::Object(params.clone()))
+            .await
+            .map_err(domain_to_rpc),
         "unsloth.status" => {
             // Observe the daemon-managed singleton Unsloth server
             // (monorepo#878); no workspaceId — the server is daemon-global.
@@ -4879,16 +4981,58 @@ async fn dispatch_other(
                 .map_err(domain_to_rpc)
         }
         "script.start" => {
+            if matches!(
+                intent_core::current_caller(),
+                Some(intent_core::Caller::Wire {
+                    host_role: intent_core::HostRole::Guest,
+                    ..
+                })
+            ) && params
+                .keys()
+                .any(|k| !["workspaceId", "scriptId"].contains(&k.as_str()))
+            {
+                return Err(invalid_params(
+                    "saved script operations accept only workspaceId and scriptId",
+                ));
+            }
             let ws = require_ws_note(params)?;
             let script_id = require_str_param(params, "scriptId")?;
             api.script_start(ws, script_id).await.map_err(domain_to_rpc)
         }
         "script.stop" => {
+            if matches!(
+                intent_core::current_caller(),
+                Some(intent_core::Caller::Wire {
+                    host_role: intent_core::HostRole::Guest,
+                    ..
+                })
+            ) && params
+                .keys()
+                .any(|k| !["workspaceId", "scriptId"].contains(&k.as_str()))
+            {
+                return Err(invalid_params(
+                    "saved script operations accept only workspaceId and scriptId",
+                ));
+            }
             let ws = require_ws_note(params)?;
             let script_id = require_str_param(params, "scriptId")?;
             api.script_stop(ws, script_id).await.map_err(domain_to_rpc)
         }
         "script.restart" => {
+            if matches!(
+                intent_core::current_caller(),
+                Some(intent_core::Caller::Wire {
+                    host_role: intent_core::HostRole::Guest,
+                    ..
+                })
+            ) && params
+                .keys()
+                .any(|k| !["workspaceId", "scriptId"].contains(&k.as_str()))
+            {
+                return Err(invalid_params(
+                    "saved script operations accept only workspaceId and scriptId",
+                ));
+            }
             let ws = require_ws_note(params)?;
             let script_id = require_str_param(params, "scriptId")?;
             api.script_restart(ws, script_id)
@@ -4913,6 +5057,26 @@ async fn dispatch_other(
                 .map_err(domain_to_rpc)
         }
         "script.run" => {
+            if matches!(
+                intent_core::current_caller(),
+                Some(intent_core::Caller::Wire {
+                    host_role: intent_core::HostRole::Guest,
+                    ..
+                })
+            ) && params.keys().any(|k| {
+                ![
+                    "workspaceId",
+                    "scriptId",
+                    "maxLines",
+                    "timeoutSeconds",
+                    "timeout",
+                ]
+                .contains(&k.as_str())
+            }) {
+                return Err(invalid_params(
+                    "saved script run accepts only IDs and output/timeout options",
+                ));
+            }
             let ws = require_ws_note(params)?;
             let script_id = require_str_param(params, "scriptId")?;
             let max_lines = opt_int(params, "maxLines");
@@ -5311,6 +5475,25 @@ fn merge_user_app_message_id(
 }
 
 /// Require a string param, mirroring TS `requireParam` (undefined/null → error).
+/// The §5.5b wire-ID rule: a nonempty string of at most 256 UTF-8 bytes
+/// without ASCII control characters.
+pub(crate) fn wire_id(params: &Map<String, Value>, name: &str) -> Option<String> {
+    match params.get(name) {
+        Some(Value::String(s)) if intent_services::is_wire_id(s) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// Require a §5.5b wire ID (`-32602` `invalid-params` otherwise).
+fn require_wire_id(params: &Map<String, Value>, name: &str) -> Result<String, RpcErr> {
+    match wire_id(params, name) {
+        Some(s) => Ok(s),
+        _ => Err(invalid_params(format!(
+            "{name} must be a nonempty string of at most 256 bytes without control characters"
+        ))),
+    }
+}
+
 fn require_str_param(params: &Map<String, Value>, name: &str) -> Result<String, RpcErr> {
     match params.get(name) {
         Some(Value::String(s)) => Ok(s.clone()),

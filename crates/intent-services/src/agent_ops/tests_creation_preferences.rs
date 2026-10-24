@@ -522,9 +522,12 @@ async fn creation_preferences_mixed_mute_failure_rolls_back_all_changes() {
         json!({"specialistId":"implementor"})
     );
     assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(50), sub.recv())
-            .await
-            .is_err(),
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_millis(50)),
+            sub.recv()
+        )
+        .await
+        .is_err(),
         "failed update must not publish a success event"
     );
     sqlx::query("DROP TRIGGER fail_preferences_mute")
@@ -544,9 +547,12 @@ async fn creation_preferences_mixed_mute_failure_rolls_back_all_changes() {
             .unwrap(),
         json!({"specialistId":null})
     );
-    let event = tokio::time::timeout(std::time::Duration::from_secs(2), sub.recv())
-        .await
-        .expect("successful mixed update event");
+    let event = tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("successful mixed update event");
     assert!(event.is_some());
     svc.store.update_agent_session(&ws, &before).await.unwrap();
     assert!(

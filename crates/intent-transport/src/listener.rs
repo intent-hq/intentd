@@ -761,11 +761,14 @@ mod tests {
             Arc::new(crate::context::ReadConnectionOwners::default()),
         ));
         let mut lines = BufReader::new(output).lines();
-        let line = tokio::time::timeout(std::time::Duration::from_secs(5), lines.next_line())
-            .await
-            .unwrap()
-            .unwrap()
-            .expect("orderly input EOF must drain its admitted reply");
+        let line = tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+            lines.next_line(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .expect("orderly input EOF must drain its admitted reply");
         let reply: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(reply["id"], 7);
         assert!(reply["result"]["subscriptionId"].is_string());
@@ -839,7 +842,7 @@ mod tests {
         ));
         input.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"settings.get\",\"params\":{\"path\":\"private\"}}\n").await.unwrap();
         tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
             handler.entered.notified(),
         )
         .await
@@ -847,37 +850,52 @@ mod tests {
         let original = api.connections.lock().unwrap()[0].clone();
         assert!(!original.is_closed());
         input.write_all(b"invalid-json\n").await.unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(5), failed.notified())
-            .await
-            .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while !original.is_closed() || !original.captured_are_retired() {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+            failed.notified(),
+        )
         .await
         .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while !task.is_finished() {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+            async {
+                while !original.is_closed() || !original.captured_are_retired() {
+                    tokio::task::yield_now().await;
+                }
+            },
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+            async {
+                while !task.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            },
+        )
         .await
         .expect("writer failure must cancel the physical connection");
         handler.release.notify_one();
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while limiter.try_acquire().is_err() {
-                tokio::task::yield_now().await;
-            }
-        })
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+            async {
+                while limiter.try_acquire().is_err() {
+                    tokio::task::yield_now().await;
+                }
+            },
+        )
         .await
         .unwrap();
         drop(input);
-        tokio::time::timeout(std::time::Duration::from_secs(5), task)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+            task,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     }
 
     #[tokio::test]
@@ -912,7 +930,7 @@ mod tests {
             listener.0.clone(),
         ));
         tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
             primary.entered.notified(),
         )
         .await
@@ -927,11 +945,14 @@ mod tests {
                 .write_all(format!("{request}\n").as_bytes())
                 .await
                 .unwrap();
-            let line = tokio::time::timeout(std::time::Duration::from_secs(5), lines.next_line())
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap();
+            let line = tokio::time::timeout(
+                intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+                lines.next_line(),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
             let result: serde_json::Value = serde_json::from_str(&line).unwrap();
             assert_eq!(result.get("result").is_some(), path == "ordinary");
         }
@@ -939,10 +960,13 @@ mod tests {
         assert!(original.is_closed());
         assert!(original.captured_are_retired());
         drop(input);
-        tokio::time::timeout(std::time::Duration::from_secs(5), task)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+            task,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     }
 }

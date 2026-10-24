@@ -37,7 +37,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::path::Path;
 use std::process::{Child, Stdio};
@@ -196,9 +196,12 @@ where
         .await
         .expect("send rpc frame");
     loop {
-        let next = timeout(Duration::from_secs(15), ws.next())
-            .await
-            .expect("wss rpc timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(15)),
+            ws.next(),
+        )
+        .await
+        .expect("wss rpc timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -223,9 +226,12 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     loop {
-        let next = timeout(Duration::from_secs(secs), ws.next())
-            .await
-            .expect("wss event timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(secs)),
+            ws.next(),
+        )
+        .await
+        .expect("wss event timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -491,14 +497,15 @@ async fn workspace_initial_agent_effort_reaches_first_prompt_over_wss() {
             json!({ "workspaceId": ws_id, "agentId": agent_id }),
         )
         .await;
+        // Every session carries a concrete level: one created on Auto is
+        // pinned after its first turn to the level the provider confirmed.
         assert_eq!(
             got["agent"]["reasoningEffort"].as_str(),
-            expected,
+            Some(expected.unwrap_or(applied)),
             "persisted: {got}"
         );
         if expected.is_none() {
             assert!(agent.get("reasoningEffort").is_none(), "{created}");
-            assert!(got["agent"].get("reasoningEffort").is_none(), "{got}");
         }
     }
 }

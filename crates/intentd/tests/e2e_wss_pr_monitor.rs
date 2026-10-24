@@ -15,7 +15,7 @@
 mod adaptive;
 #[path = "e2e_wss_pr_monitor/ancestry.rs"]
 mod ancestry;
-mod common;
+use crate::common;
 #[path = "../../intent-sourcecontrol/tests/support/qwen.rs"]
 mod qwen;
 #[path = "e2e_wss_pr_monitor/registration_visibility.rs"]
@@ -34,7 +34,7 @@ use intent_core::{
 use intent_services::{EventBus, Services};
 use intent_sourcecontrol::{
     AuthStatus, Branch, BranchRules, CheckRun, CheckState, Comment, CommentAnchor, Issue,
-    IssueQuery, MergeMethod, MergeOptions, MergeOutcome, MergeQueueRemoval,
+    IssueQuery, MergeMethod, MergeOptions, MergeOutcome, MergeQueueEntry, MergeQueueRemoval,
     MergeRequirementSignals, Mergeability, NewPullRequest, Page, PageParams, PrPatch, PrQuery,
     PrState, PullRequest, RateLimitStatus, Repo, RepoRef, Result as ScResult, Review,
     ReviewComment, ReviewDecision, ReviewThread, ReviewVerdict, RollupCheck, RollupCheckKind,
@@ -161,6 +161,9 @@ struct ForgeState {
     in_merge_queue: Option<bool>,
     /// The latest merge-queue removal event served by `merge_requirements`.
     merge_queue_removal: Option<MergeQueueRemoval>,
+    /// The merge-queue entry (position, estimate) served by
+    /// `merge_requirements`.
+    merge_queue_entry: Option<MergeQueueEntry>,
     /// When set, `get_review_threads` fails with a non-rate-limit API error so
     /// the requirements probe takes the REST review-comments fallback (no
     /// per-thread resolution state).
@@ -185,6 +188,7 @@ impl Default for ForgeState {
             review_decision: ReviewDecision::ReviewRequired,
             in_merge_queue: None,
             merge_queue_removal: None,
+            merge_queue_entry: None,
             review_threads_unreadable: false,
             rate_limit_get_pr: false,
             rate_limit_remaining: None,
@@ -346,13 +350,14 @@ impl SourceControl for StubForge {
         Ok(Vec::new())
     }
     async fn merge_requirements(&self, _: &RepoRef, _: u64) -> ScResult<MergeRequirementSignals> {
-        let (checks, review_decision, in_merge_queue, merge_queue_removal) = {
+        let (checks, review_decision, in_merge_queue, merge_queue_removal, merge_queue_entry) = {
             let s = self.state.lock().unwrap();
             (
                 s.checks.clone(),
                 s.review_decision,
                 s.in_merge_queue,
                 s.merge_queue_removal.clone(),
+                s.merge_queue_entry.clone(),
             )
         };
         Ok(MergeRequirementSignals {
@@ -371,6 +376,7 @@ impl SourceControl for StubForge {
                 .collect(),
             checks_head_sha: None,
             checks_known: true,
+            head_committed_at: None,
             branch_rules: Some(BranchRules {
                 required_approving_review_count: Some(1),
                 required_conversation_resolution: Some(true),
@@ -382,6 +388,7 @@ impl SourceControl for StubForge {
             }),
             is_in_merge_queue: in_merge_queue,
             merge_queue_removal,
+            merge_queue_entry,
         })
     }
     async fn list_comments(&self, _: &RepoRef, _: u64) -> ScResult<Vec<Comment>> {
@@ -519,6 +526,7 @@ fn workspace(id: &WorkspaceId) -> Workspace {
         pull_requests_total: None,
         display_status: None,
         waiting: false,
+        scripts_running: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
@@ -732,50 +740,56 @@ async fn wss_rpc(ws: &mut TlsWs, id: i64, method: &str, params: Value) -> Value 
 
 /// Wait for the next `events.event` notification whose `type` matches.
 async fn next_event(ws: &mut TlsWs, event_type: &str) -> Value {
-    timeout(Duration::from_secs(10), async {
-        loop {
-            match ws.next().await.unwrap().unwrap() {
-                Message::Text(text) => {
-                    let v: Value = serde_json::from_str(&text).unwrap();
-                    if v["method"] == json!("events.event")
-                        && v["params"]["event"]["type"] == json!(event_type)
-                    {
-                        assert_eq!(v["jsonrpc"], "2.0");
-                        assert!(v.get("id").is_none(), "events are notifications: {v}");
-                        return v["params"]["event"].clone();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                match ws.next().await.unwrap().unwrap() {
+                    Message::Text(text) => {
+                        let v: Value = serde_json::from_str(&text).unwrap();
+                        if v["method"] == json!("events.event")
+                            && v["params"]["event"]["type"] == json!(event_type)
+                        {
+                            assert_eq!(v["jsonrpc"], "2.0");
+                            assert!(v.get("id").is_none(), "events are notifications: {v}");
+                            return v["params"]["event"].clone();
+                        }
                     }
+                    Message::Ping(p) => {
+                        let _ = ws.send(Message::Pong(p)).await;
+                    }
+                    _ => {}
                 }
-                Message::Ping(p) => {
-                    let _ = ws.send(Message::Pong(p)).await;
-                }
-                _ => {}
             }
-        }
-    })
+        },
+    )
     .await
     .unwrap_or_else(|_| panic!("timed out waiting for {event_type}"))
 }
 
 /// Assert no `event_type` notification arrives within a short quiet window.
 async fn assert_no_event(ws: &mut TlsWs, event_type: &str) {
-    let quiet = timeout(Duration::from_millis(500), async {
-        loop {
-            match ws.next().await.unwrap().unwrap() {
-                Message::Text(text) => {
-                    let v: Value = serde_json::from_str(&text).unwrap();
-                    if v["method"] == json!("events.event")
-                        && v["params"]["event"]["type"] == json!(event_type)
-                    {
-                        return v["params"]["event"].clone();
+    let quiet = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(500)),
+        async {
+            loop {
+                match ws.next().await.unwrap().unwrap() {
+                    Message::Text(text) => {
+                        let v: Value = serde_json::from_str(&text).unwrap();
+                        if v["method"] == json!("events.event")
+                            && v["params"]["event"]["type"] == json!(event_type)
+                        {
+                            return v["params"]["event"].clone();
+                        }
                     }
+                    Message::Ping(p) => {
+                        let _ = ws.send(Message::Pong(p)).await;
+                    }
+                    _ => {}
                 }
-                Message::Ping(p) => {
-                    let _ = ws.send(Message::Pong(p)).await;
-                }
-                _ => {}
             }
-        }
-    })
+        },
+    )
     .await;
     assert!(quiet.is_err(), "expected no {event_type} event: {quiet:?}");
 }
@@ -996,6 +1010,128 @@ async fn pr_monitor_list_carries_is_in_merge_queue_over_wss() {
         row["lastSnapshot"]["isInMergeQueue"],
         json!(true),
         "queued: the flag is present and true: {row}"
+    );
+}
+
+/// `mergeQueue` over the wire (PROTOCOL §5.42 additive-field convention):
+/// omitted from `prMonitor.list`'s `lastSnapshot` while not queued, present
+/// as `{ position, queueSize, state, enqueuedAt, estimatedTimeToMerge }`
+/// once queued, refreshed as the queue moves — and queue movement alone is
+/// informational: no `prMonitor:changed` line, nothing pending, no wake;
+/// only the UI-only `prMonitor:refreshed` re-read hint fires.
+#[intent_test_macros::daemon_test]
+async fn pr_monitor_list_carries_merge_queue_position_without_waking_over_wss() {
+    let fx = boot().await;
+    let monitor = fx
+        .services
+        .pr_monitor_register(&fx.ws_id, &fx.agent_id, "o", "r", 42)
+        .await
+        .expect("register")
+        .0;
+    let entry = |position: u32, estimate: u64| MergeQueueEntry {
+        position,
+        queue_size: Some(3),
+        state: Some("queued".into()),
+        enqueued_at: Some("2026-10-20T03:50:26Z".into()),
+        estimated_time_to_merge: Some(estimate),
+    };
+
+    let mut rpc = connect(fx.port, fx.cfg.clone()).await;
+    let list = json!({ "workspaceId": fx.ws_id.as_str() });
+    let listed = wss_rpc(&mut rpc, 1, "prMonitor.list", list.clone()).await;
+    assert!(
+        listed["monitors"][0]["lastSnapshot"]
+            .get("mergeQueue")
+            .is_none(),
+        "not queued: the key is omitted: {listed}"
+    );
+
+    // Enter the queue at position 3: the entry rides the snapshot.
+    fx.forge.edit(|s| {
+        s.in_merge_queue = Some(true);
+        s.merge_queue_entry = Some(entry(3, 2254));
+    });
+    fx.services.poll_pr_monitors().await;
+    let listed = wss_rpc(&mut rpc, 2, "prMonitor.list", list.clone()).await;
+    assert_eq!(
+        listed["monitors"][0]["lastSnapshot"]["mergeQueue"],
+        json!({
+            "position": 3,
+            "queueSize": 3,
+            "state": "queued",
+            "enqueuedAt": "2026-10-20T03:50:26Z",
+            "estimatedTimeToMerge": 2254
+        }),
+        "queued: {listed}"
+    );
+    // Flush the queue-entry wake so only queue movement is left to observe.
+    wss_rpc(
+        &mut rpc,
+        3,
+        "prMonitor.flush",
+        json!({ "workspaceId": fx.ws_id.as_str(), "monitorId": monitor.monitor_id.as_str() }),
+    )
+    .await;
+    let before = owner_messages(&fx).await;
+
+    // Move up the queue: the snapshot refreshes, nothing is pending, no
+    // changed event fires and the owner gets no new message.
+    let mut sub = connect(fx.port, fx.cfg.clone()).await;
+    let sub_res = wss_rpc(
+        &mut sub,
+        4,
+        "events.subscribe",
+        json!({ "eventTypes": ["prMonitor:changed"], "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert!(sub_res["subscriptionId"].is_string(), "sub id: {sub_res}");
+    // The UI-only re-read hint, on its own front-door subscription.
+    let mut hint = connect(fx.port, fx.cfg.clone()).await;
+    let hint_res = wss_rpc(
+        &mut hint,
+        5,
+        "events.subscribe",
+        json!({ "eventTypes": ["prMonitor:refreshed"], "workspaceId": fx.ws_id.as_str() }),
+    )
+    .await;
+    assert!(
+        hint_res["subscriptionId"].is_string(),
+        "hint sub id: {hint_res}"
+    );
+    fx.forge.edit(|s| s.merge_queue_entry = Some(entry(1, 600)));
+    fx.services.poll_pr_monitors().await;
+    let refreshed = next_event(&mut hint, "prMonitor:refreshed").await;
+    assert_eq!(refreshed["data"]["monitorId"], monitor.monitor_id.as_str());
+    assert!(
+        refreshed["data"].get("changes").is_none(),
+        "the hint carries no change lines: {refreshed}"
+    );
+    assert_no_event(&mut sub, "prMonitor:changed").await;
+
+    // An unchanged queue entry sends no hint.
+    fx.services.poll_pr_monitors().await;
+    assert_no_event(&mut hint, "prMonitor:refreshed").await;
+    let listed = wss_rpc(&mut rpc, 6, "prMonitor.list", list).await;
+    let row = &listed["monitors"][0];
+    assert_eq!(
+        row["lastSnapshot"]["mergeQueue"]["position"],
+        json!(1),
+        "{row}"
+    );
+    assert_eq!(
+        row["lastSnapshot"]["mergeQueue"]["estimatedTimeToMerge"],
+        json!(600),
+        "{row}"
+    );
+    assert_eq!(
+        row["pendingChanges"],
+        json!([]),
+        "queue movement is not a change: {row}"
+    );
+    assert_eq!(
+        owner_messages(&fx).await,
+        before,
+        "no wake for queue movement"
     );
 }
 

@@ -447,10 +447,13 @@ async fn prune_recomputes_and_publishes_metrics() {
     });
 
     assert_eq!(prune_confirmed(&svc, &ws).await, 1);
-    let events = tokio::time::timeout(std::time::Duration::from_secs(5), sub.recv())
-        .await
-        .expect("metrics event")
-        .expect("subscription open");
+    let events = tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+        sub.recv(),
+    )
+    .await
+    .expect("metrics event")
+    .expect("subscription open");
     let event = events.first().expect("one event");
     assert_eq!(event.data["metrics"]["filesChanged"], serde_json::json!(1));
     let stored = svc
@@ -460,4 +463,28 @@ async fn prune_recomputes_and_publishes_metrics() {
         .unwrap()
         .unwrap();
     assert_eq!(stored.files_changed, 1);
+}
+
+/// intent-hq/intent#7183: a workspace whose checkout folder is missing is
+/// skipped (nothing marked or deleted) and recorded in the shared presence
+/// map; once the folder returns the sweep resumes for it.
+#[tokio::test]
+async fn sweep_skips_missing_checkout_and_resumes_when_it_returns() {
+    let repo = init_repo();
+    let (_t, svc, ws) = svc_for(Some(&repo.dir)).await;
+    track(&svc, &ws, "gone.rs", "unstaged").await;
+
+    let away = repo.dir.with_extension("unmounted");
+    std::fs::rename(&repo.dir, &away).unwrap();
+    let outcome = svc
+        .prune_stale_tracked_changes(&ws, &CleanRows::new())
+        .await
+        .unwrap();
+    assert!(outcome.clean.is_empty() && outcome.deleted == 0);
+    assert!(svc.worktree_presence().is_missing(&ws));
+
+    std::fs::rename(&away, &repo.dir).unwrap();
+    assert_eq!(prune_confirmed(&svc, &ws).await, 1);
+    assert!(!svc.worktree_presence().is_missing(&ws));
+    assert!(paths(&svc, &ws).await.is_empty());
 }

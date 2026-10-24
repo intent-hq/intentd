@@ -10,6 +10,8 @@ use intent_git::checkpoint::{self as git, CaptureOptions, Snapshot};
 use serde::{Deserialize, Serialize};
 
 pub mod session;
+mod submodules;
+pub(crate) use submodules::checkpoint_submodules;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -214,7 +216,7 @@ pub fn capture_repositories(
     root: &Path,
     inputs: &[RepositoryInput],
 ) -> Result<Vec<RepositoryEntry>> {
-    let discovered = crate::transfer_submodules::checkpoint_submodules(root)?;
+    let discovered = checkpoint_submodules(root)?;
     let mut paths = vec![".".to_string()];
     paths.extend(discovered.iter().map(|s| s.path.clone()));
     if inputs.len() != paths.len() || inputs.iter().zip(&paths).any(|(i, p)| &i.path != p) {
@@ -249,7 +251,7 @@ pub fn capture_repositories(
         });
     }
     validate_repositories(&entries)?;
-    if crate::transfer_submodules::checkpoint_submodules(root)? != discovered {
+    if checkpoint_submodules(root)? != discovered {
         return Err(invalid("submodules changed during capture"));
     }
     for ((input, entry), before) in inputs.iter().zip(&entries).zip(index_before) {

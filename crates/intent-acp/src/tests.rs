@@ -353,6 +353,7 @@ async fn routes_requests_and_notifications() {
     let hooks = ConnectionHooks {
         requests: Some(req_tx),
         notifications: Some(note_tx),
+        workers: None,
         auth_error_patterns: Vec::new(),
         stderr_log_dir: None,
         auth_required_stdout_marker: None,
@@ -374,17 +375,23 @@ async fn routes_requests_and_notifications() {
         .unwrap();
     a2c_agent.flush().await.unwrap();
 
-    let req = tokio::time::timeout(Duration::from_secs(2), req_rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    let req = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        req_rx.recv(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!(req.method, "fs/read_text_file");
     assert_eq!(req.id, json!("p1"));
 
-    let note = tokio::time::timeout(Duration::from_secs(2), note_rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    let note = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        note_rx.recv(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!(note.method, "session/update");
     let _ = conn;
 }
@@ -1046,10 +1053,13 @@ async fn spawn_provider_real_npx_ignores_matching_ancestor_workspaces_and_siblin
         // The previous launch dir is still alive (`alive`), so npm now sees two
         // same-named sentinels under the matching glob.
         let mut agent = spawn_provider(&opts, ConnectionHooks::default()).expect("spawn real npx");
-        let status = tokio::time::timeout(Duration::from_secs(120), agent.child_mut().wait())
-            .await
-            .unwrap_or_else(|_| panic!("{label} real npx launch did not exit"))
-            .expect("wait real npx");
+        let status = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(120)),
+            agent.child_mut().wait(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{label} real npx launch did not exit"))
+        .expect("wait real npx");
         assert!(
             status.success(),
             "{label} launch: real npx must start the adapter despite the matching ancestor \
@@ -1168,10 +1178,13 @@ async fn spawn_provider_real_npx_ignores_inherited_npm_workspace_selectors() {
     assert!(opts.via_npx());
 
     let mut agent = spawn_provider(&opts, ConnectionHooks::default()).expect("spawn real npx");
-    let status = tokio::time::timeout(Duration::from_secs(120), agent.child_mut().wait())
-        .await
-        .expect("real npx launch did not exit")
-        .expect("wait real npx");
+    let status = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(120)),
+        agent.child_mut().wait(),
+    )
+    .await
+    .expect("real npx launch did not exit")
+    .expect("wait real npx");
     assert!(
         status.success(),
         "real npx must start the adapter despite an inherited npm_config_workspace selector \
@@ -3907,18 +3920,24 @@ mod client_served_tests {
             .await
             .unwrap();
         writer.flush().await.unwrap();
-        tokio::time::timeout(Duration::from_secs(2), req_rx.recv())
-            .await
-            .unwrap()
-            .unwrap()
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            req_rx.recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
     }
 
     async fn read_frame(reader: &mut BufReader<DuplexStream>) -> Value {
         let mut line = String::new();
-        tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut line))
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            reader.read_line(&mut line),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         serde_json::from_str(line.trim()).unwrap()
     }
 
@@ -5342,10 +5361,13 @@ mod mcp_bridge_tests {
 
     async fn read_next_line(reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>) -> String {
         let mut buf = String::new();
-        timeout(Duration::from_secs(2), reader.read_line(&mut buf))
-            .await
-            .expect("read_line timed out")
-            .expect("read_line ok");
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            reader.read_line(&mut buf),
+        )
+        .await
+        .expect("read_line timed out")
+        .expect("read_line ok");
         buf
     }
 
@@ -5378,10 +5400,13 @@ mod mcp_bridge_tests {
         write.flush().await.unwrap();
 
         let mut line = String::new();
-        timeout(Duration::from_secs(2), reader.read_line(&mut line))
-            .await
-            .unwrap()
-            .unwrap();
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            reader.read_line(&mut line),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         let resp: Value = serde_json::from_str(line.trim()).unwrap();
         assert_eq!(resp["id"], json!(1));
         assert_eq!(resp["result"]["protocolVersion"], json!("2024-11-05"));
@@ -5449,7 +5474,8 @@ mod mcp_bridge_tests {
         // ephemeral port is freed, a concurrent test binding 127.0.0.1:0 can
         // be handed the same port, making connects succeed against an
         // unrelated listener.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_secs(5));
         while !accept_loop.is_finished() {
             assert!(
                 tokio::time::Instant::now() < deadline,
@@ -5503,7 +5529,8 @@ mod mcp_bridge_tests {
             }
 
             async fn wait_started(&self, id: i64) {
-                let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+                let deadline = tokio::time::Instant::now()
+                    + intentd_test_support::test_timeout(Duration::from_secs(2));
                 while !self.started.lock().unwrap().contains(&id) {
                     assert!(
                         tokio::time::Instant::now() < deadline,
@@ -5580,10 +5607,13 @@ mod mcp_bridge_tests {
 
         async fn read_response(reader: &mut BufReader<OwnedReadHalf>) -> Value {
             let mut buf = String::new();
-            timeout(Duration::from_secs(2), reader.read_line(&mut buf))
-                .await
-                .expect("read_line timed out")
-                .expect("read_line ok");
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(2)),
+                reader.read_line(&mut buf),
+            )
+            .await
+            .expect("read_line timed out")
+            .expect("read_line ok");
             serde_json::from_str(buf.trim()).expect("response line must be whole JSON")
         }
 
@@ -5688,7 +5718,8 @@ mod mcp_bridge_tests {
             dispatch.wait_started(1).await;
             drop(write);
             drop(reader);
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            let deadline = tokio::time::Instant::now()
+                + intentd_test_support::test_timeout(Duration::from_secs(2));
             while dispatch.cancelled.load(Ordering::SeqCst) == 0 {
                 assert!(
                     tokio::time::Instant::now() < deadline,
@@ -5791,15 +5822,19 @@ mod mcp_bridge_tests {
 
         async fn read_response(reader: &mut BufReader<OwnedReadHalf>) -> Value {
             let mut buf = String::new();
-            timeout(Duration::from_secs(2), reader.read_line(&mut buf))
-                .await
-                .expect("read_line timed out")
-                .expect("read_line ok");
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(2)),
+                reader.read_line(&mut buf),
+            )
+            .await
+            .expect("read_line timed out")
+            .expect("read_line ok");
             serde_json::from_str(buf.trim()).expect("response line must be whole JSON")
         }
 
         async fn wait_cancelled(dispatch: &WedgeDispatch, n: usize) {
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            let deadline = tokio::time::Instant::now()
+                + intentd_test_support::test_timeout(Duration::from_secs(2));
             while dispatch.cancelled.load(Ordering::SeqCst) < n {
                 assert!(
                     tokio::time::Instant::now() < deadline,
@@ -6025,10 +6060,13 @@ mod mcp_bridge_tests {
 
             async fn read_response(&mut self) -> Value {
                 let mut line = String::new();
-                timeout(Duration::from_secs(5), self.stdout.read_line(&mut line))
-                    .await
-                    .expect("bridge stdout read timed out")
-                    .expect("bridge stdout read failed");
+                timeout(
+                    intentd_test_support::test_timeout(Duration::from_secs(5)),
+                    self.stdout.read_line(&mut line),
+                )
+                .await
+                .expect("bridge stdout read timed out")
+                .expect("bridge stdout read failed");
                 serde_json::from_str(line.trim()).expect("bridge stdout line is JSON")
             }
         }
@@ -6080,10 +6118,13 @@ mod mcp_bridge_tests {
             // Bind only after the bridge has started (and failed) connecting.
             sleep(Duration::from_millis(50)).await;
             let listener = TcpListener::bind(addr).await.unwrap();
-            let (conn, _) = timeout(Duration::from_secs(5), listener.accept())
-                .await
-                .expect("bridge never retried the connect")
-                .unwrap();
+            let (conn, _) = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                listener.accept(),
+            )
+            .await
+            .expect("bridge never retried the connect")
+            .unwrap();
             tokio::spawn(answer_requests(conn));
 
             bridge.send_request(1).await;
@@ -6106,10 +6147,13 @@ mod mcp_bridge_tests {
             // Let the bridge burn a couple of backoff cycles first.
             sleep(Duration::from_millis(50)).await;
             let listener = TcpListener::bind(addr).await.unwrap();
-            let (conn, _) = timeout(Duration::from_secs(5), listener.accept())
-                .await
-                .expect("bridge never retried the connect")
-                .unwrap();
+            let (conn, _) = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                listener.accept(),
+            )
+            .await
+            .expect("bridge never retried the connect")
+            .unwrap();
             tokio::spawn(answer_requests(conn));
             // The FIRST line on stdout is the real response for id 1; a
             // pre-fix bridge writes the -32001 reject here instead.
@@ -6135,10 +6179,13 @@ mod mcp_bridge_tests {
             let mut bridge = spawn_bridge(addr, cfg);
             bridge.send_request(7).await;
             // The bounded retry gives up with the connect error.
-            let result = timeout(Duration::from_secs(5), bridge.handle)
-                .await
-                .expect("bridge did not give up in time")
-                .unwrap();
+            let result = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                bridge.handle,
+            )
+            .await
+            .expect("bridge did not give up in time")
+            .unwrap();
             assert!(
                 result.is_err(),
                 "initial-connect give-up must surface an error"
@@ -6146,7 +6193,7 @@ mod mcp_bridge_tests {
             // Nothing was written to stdout for the buffered request.
             let mut leftover = String::new();
             timeout(
-                Duration::from_secs(5),
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
                 bridge.stdout.read_to_string(&mut leftover),
             )
             .await
@@ -6209,19 +6256,25 @@ mod mcp_bridge_tests {
             bridge.send_request(9).await;
             sleep(Duration::from_millis(50)).await;
             let listener = TcpListener::bind(addr).await.unwrap();
-            let (conn, _) = timeout(Duration::from_secs(5), listener.accept())
-                .await
-                .expect("bridge never connected")
-                .unwrap();
+            let (conn, _) = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                listener.accept(),
+            )
+            .await
+            .expect("bridge never connected")
+            .unwrap();
             // Read the flushed request, then drop the connection without
             // answering it.
             let (read, write) = conn.into_split();
             let mut lines = BufReader::new(read).lines();
-            let line = timeout(Duration::from_secs(5), lines.next_line())
-                .await
-                .expect("buffered request never flushed to the connection")
-                .unwrap()
-                .unwrap();
+            let line = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                lines.next_line(),
+            )
+            .await
+            .expect("buffered request never flushed to the connection")
+            .unwrap()
+            .unwrap();
             let msg: Value = serde_json::from_str(&line).unwrap();
             assert_eq!(msg["id"], json!(9), "buffered line is flushed in order");
             drop(write);
@@ -6237,18 +6290,24 @@ mod mcp_bridge_tests {
             let mut bridge = spawn_bridge(addr, fast_cfg());
 
             // First connection answers one request, then the server drops it.
-            let (conn1, _) = timeout(Duration::from_secs(5), listener.accept())
-                .await
-                .unwrap()
-                .unwrap();
+            let (conn1, _) = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                listener.accept(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
             let (read1, mut write1) = conn1.into_split();
             bridge.send_request(1).await;
             let mut lines1 = BufReader::new(read1).lines();
-            let line = timeout(Duration::from_secs(5), lines1.next_line())
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap();
+            let line = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                lines1.next_line(),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
             let msg: Value = serde_json::from_str(&line).unwrap();
             let resp = json!({"jsonrpc":"2.0","id":msg["id"],"result":{"ok":true}});
             write1
@@ -6262,10 +6321,13 @@ mod mcp_bridge_tests {
 
             // The bridge reconnects to the same addr; the second connection
             // serves the follow-up request and stdio never closed in between.
-            let (conn2, _) = timeout(Duration::from_secs(5), listener.accept())
-                .await
-                .expect("bridge never reconnected")
-                .unwrap();
+            let (conn2, _) = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                listener.accept(),
+            )
+            .await
+            .expect("bridge never reconnected")
+            .unwrap();
             tokio::spawn(answer_requests(conn2));
             bridge.send_request(2).await;
             let resp = bridge.read_response().await;
@@ -6303,18 +6365,24 @@ mod mcp_bridge_tests {
             let mut bridge = spawn_bridge_with_connector(addr, fast_cfg(), connect);
 
             // Session 1: answer one request cleanly, then drop the TCP side.
-            let (conn1, _) = timeout(Duration::from_secs(5), listener.accept())
-                .await
-                .unwrap()
-                .unwrap();
+            let (conn1, _) = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                listener.accept(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
             let (read1, mut write1) = conn1.into_split();
             bridge.send_request(1).await;
             let mut lines1 = BufReader::new(read1).lines();
-            let line = timeout(Duration::from_secs(5), lines1.next_line())
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap();
+            let line = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                lines1.next_line(),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
             let msg: Value = serde_json::from_str(&line).unwrap();
             let resp = json!({"jsonrpc":"2.0","id":msg["id"],"result":{"ok":true}});
             write1
@@ -6327,11 +6395,14 @@ mod mcp_bridge_tests {
             drop(lines1);
 
             // Wait until reconnect attempt 2 is in flight (parked on the gate).
-            timeout(Duration::from_secs(5), async {
-                while attempts.load(Ordering::SeqCst) < 2 {
-                    sleep(Duration::from_millis(5)).await;
-                }
-            })
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                async {
+                    while attempts.load(Ordering::SeqCst) < 2 {
+                        sleep(Duration::from_millis(5)).await;
+                    }
+                },
+            )
             .await
             .expect("bridge never started the reconnect attempt");
 
@@ -6342,6 +6413,7 @@ mod mcp_bridge_tests {
             // the line before the gate opens, so the race is exercised).
             bridge.send_request(2).await;
             let mut peek = String::new();
+            // fixed-deadline: allow — stays under fast_cfg()'s 2s reconnect_window, after which the bridge may legitimately reject
             let silent = timeout(
                 Duration::from_millis(200),
                 bridge.stdout.read_line(&mut peek),
@@ -6353,10 +6425,13 @@ mod mcp_bridge_tests {
             );
             gate.notify_one();
 
-            let (conn2, _) = timeout(Duration::from_secs(5), listener.accept())
-                .await
-                .expect("bridge never completed the reconnect")
-                .unwrap();
+            let (conn2, _) = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                listener.accept(),
+            )
+            .await
+            .expect("bridge never completed the reconnect")
+            .unwrap();
             tokio::spawn(answer_requests(conn2));
 
             let resp = bridge.read_response().await;
@@ -6400,18 +6475,24 @@ mod mcp_bridge_tests {
             let mut bridge = spawn_bridge_with_connector(addr, fast_cfg(), connect);
 
             // Session 1: answer one request cleanly, then drop the TCP side.
-            let (conn1, _) = timeout(Duration::from_secs(5), listener.accept())
-                .await
-                .unwrap()
-                .unwrap();
+            let (conn1, _) = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                listener.accept(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
             let (read1, mut write1) = conn1.into_split();
             bridge.send_request(1).await;
             let mut lines1 = BufReader::new(read1).lines();
-            let line = timeout(Duration::from_secs(5), lines1.next_line())
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap();
+            let line = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                lines1.next_line(),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
             let msg: Value = serde_json::from_str(&line).unwrap();
             let resp = json!({"jsonrpc":"2.0","id":msg["id"],"result":{"ok":true}});
             write1
@@ -6423,11 +6504,14 @@ mod mcp_bridge_tests {
             drop(write1);
             drop(lines1);
 
-            timeout(Duration::from_secs(5), async {
-                while attempts.load(Ordering::SeqCst) < 2 {
-                    sleep(Duration::from_millis(5)).await;
-                }
-            })
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                async {
+                    while attempts.load(Ordering::SeqCst) < 2 {
+                        sleep(Duration::from_millis(5)).await;
+                    }
+                },
+            )
             .await
             .expect("bridge never started the reconnect attempt");
 
@@ -6436,6 +6520,7 @@ mod mcp_bridge_tests {
             // to consume the line before the gate opens).
             bridge.send_request(2).await;
             let mut peek = String::new();
+            // fixed-deadline: allow — stays under fast_cfg()'s 2s reconnect_window, after which the bridge may legitimately reject
             let silent = timeout(
                 Duration::from_millis(200),
                 bridge.stdout.read_line(&mut peek),
@@ -6461,20 +6546,26 @@ mod mcp_bridge_tests {
             let addr = listener.local_addr().unwrap();
             let mut bridge = spawn_bridge(addr, fast_cfg());
 
-            let (conn1, _) = timeout(Duration::from_secs(5), listener.accept())
-                .await
-                .unwrap()
-                .unwrap();
+            let (conn1, _) = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                listener.accept(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
             let (read1, write1) = conn1.into_split();
             // Forwarded but never answered: the server reads the request and
             // then drops the connection.
             bridge.send_request(9).await;
             let mut lines1 = BufReader::new(read1).lines();
-            timeout(Duration::from_secs(5), lines1.next_line())
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap();
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                lines1.next_line(),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
             drop(write1);
             drop(lines1);
 
@@ -6543,7 +6634,7 @@ mod mcp_bridge_tests {
                 json!({"jsonrpc":"2.0","id":2,"method":"tools/call"}).to_string(),
             ];
             let end = timeout(
-                Duration::from_secs(5),
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
                 pump_session(
                     tokio::io::empty(),
                     tcp_write,
@@ -6585,7 +6676,7 @@ mod mcp_bridge_tests {
             // The empty TCP read side yields EOF right after the flush, so
             // the session ends as TcpDropped with both lines delivered.
             let end = timeout(
-                Duration::from_secs(5),
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
                 pump_session(
                     tokio::io::empty(),
                     tcp_write,
@@ -6616,10 +6707,13 @@ mod mcp_bridge_tests {
             };
             let mut bridge = spawn_bridge(addr, cfg);
 
-            let (conn1, _) = timeout(Duration::from_secs(5), listener.accept())
-                .await
-                .unwrap()
-                .unwrap();
+            let (conn1, _) = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                listener.accept(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
             // Kill the connection and the listener: the daemon is gone for good.
             drop(conn1);
             drop(listener);
@@ -6645,10 +6739,13 @@ mod mcp_bridge_tests {
             }
 
             // Once the reconnect window is exhausted the bridge exits cleanly.
-            let result = timeout(Duration::from_secs(5), bridge.handle)
-                .await
-                .expect("bridge did not exit after reconnect window")
-                .unwrap();
+            let result = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                bridge.handle,
+            )
+            .await
+            .expect("bridge did not exit after reconnect window")
+            .unwrap();
             assert!(
                 result.is_ok(),
                 "reconnect give-up must exit cleanly: {result:?}"
@@ -6660,16 +6757,22 @@ mod mcp_bridge_tests {
             let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
             let addr = listener.local_addr().unwrap();
             let bridge = spawn_bridge(addr, fast_cfg());
-            let (conn, _) = timeout(Duration::from_secs(5), listener.accept())
-                .await
-                .unwrap()
-                .unwrap();
+            let (conn, _) = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                listener.accept(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
             tokio::spawn(answer_requests(conn));
             drop(bridge.stdin);
-            let result = timeout(Duration::from_secs(5), bridge.handle)
-                .await
-                .expect("bridge did not exit on stdin EOF")
-                .unwrap();
+            let result = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                bridge.handle,
+            )
+            .await
+            .expect("bridge did not exit on stdin EOF")
+            .unwrap();
             assert!(result.is_ok(), "stdin EOF must exit cleanly: {result:?}");
         }
     }
@@ -7046,6 +7149,7 @@ mod workspace_api_tool_tests {
                 pull_requests_total: None,
                 display_status: None,
                 waiting: false,
+                scripts_running: false,
                 checkout_mode: None,
                 disk_usage: None,
                 pending_delete_at: None,
@@ -7714,7 +7818,7 @@ mod workspace_api_tool_tests {
         let srv =
             server("amber-forest", None).with_workspace_api_timeout(Duration::from_millis(250));
         let resp = tokio::time::timeout(
-            Duration::from_secs(5),
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
             call_workspace_api(&srv, "while (true) {}"),
         )
         .await
@@ -12087,7 +12191,7 @@ mod wsapi4_bindings_tests {
         let guard = hold.lock().await;
 
         let resp = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
             call(
                 &srv,
                 "return await ws.agent.send('agent-target', 'hello', 'queue');",
@@ -12139,7 +12243,7 @@ mod wsapi4_bindings_tests {
         let guard = hold.lock().await;
 
         let resp = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
             call(
                 &srv,
                 "return await ws.agent.sendToTask('tn-1', 'hello', 'queue');",
@@ -12178,7 +12282,7 @@ mod wsapi4_bindings_tests {
         let guard = hold.lock().await;
 
         let resp = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
             call(
                 &srv,
                 "return await ws.agent.send('agent-target', 'hello', 'queue');",
@@ -12199,7 +12303,7 @@ mod wsapi4_bindings_tests {
 
         drop(guard);
         tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
             api.agent_send_landed.notified(),
         )
         .await
@@ -12230,7 +12334,7 @@ mod wsapi4_bindings_tests {
         let guard = hold.lock().await;
 
         let resp = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
             call(
                 &srv,
                 "return await ws.agent.send('agent-target', 'hello', 'queue');",
@@ -12251,7 +12355,7 @@ mod wsapi4_bindings_tests {
 
         drop(guard);
         tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
             api.agent_send_landed.notified(),
         )
         .await
@@ -12323,7 +12427,7 @@ mod wsapi4_bindings_tests {
         };
         let (resp, ()) = tokio::join!(
             tokio::time::timeout(
-                std::time::Duration::from_secs(8),
+                intentd_test_support::test_timeout(std::time::Duration::from_secs(8)),
                 call(
                     &srv,
                     "await ws.agent.getQueue('agent-target'); \
@@ -12346,7 +12450,7 @@ mod wsapi4_bindings_tests {
 
         drop(send_guard);
         tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
             api.agent_send_landed.notified(),
         )
         .await
@@ -12375,7 +12479,7 @@ mod wsapi4_bindings_tests {
         let guard = hold.lock().await;
 
         let resp = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
             call(
                 &srv,
                 "return await ws.agent.send('agent-target', 'hello', 'queue');",
@@ -12399,7 +12503,7 @@ mod wsapi4_bindings_tests {
 
         drop(guard);
         tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
             api.agent_send_landed.notified(),
         )
         .await
@@ -12451,9 +12555,12 @@ mod wsapi4_bindings_tests {
             op,
             |_| "in flight".to_string(),
         ));
-        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
-            .await
-            .expect("the send op must start behind the hold");
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+            entered.notified(),
+        )
+        .await
+        .expect("the send op must start behind the hold");
         caller.abort();
         assert!(caller.await.unwrap_err().is_cancelled());
         assert!(capture.lines().is_empty(), "nothing to log while held");
@@ -12496,7 +12603,7 @@ mod wsapi4_bindings_tests {
         let guard = hold.lock().await;
 
         let resp = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
             call(
                 &srv,
                 "return await ws.agent.send('agent-target', 'hello', 'queue');",
@@ -13735,6 +13842,7 @@ mod workspace_api_output_limit_tests {
                     pull_requests_total: None,
                     display_status: None,
                     waiting: false,
+                    scripts_running: false,
                     checkout_mode: None,
                     disk_usage: None,
                     pending_delete_at: None,
@@ -14062,6 +14170,7 @@ mod workspace_apply_proposal_tests {
             browser_client_id: None,
             display_status: None,
             waiting: false,
+            scripts_running: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,

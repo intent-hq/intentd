@@ -87,7 +87,10 @@ fn store_issue(cache: &IssueCache, key: IssueKey, issue: Issue) {
 /// read [`ISSUE_CACHE_MAX_IDLE`] ago or earlier are dropped, then the rest
 /// are bounded by [`ISSUE_CACHE_MAX_ENTRIES`], evicting the oldest
 /// `fetched_at` first.
-fn retain_issue_cache(cache: &mut CacheMap<IssueKey, IssueCacheEntry, Issue>, now: Instant) {
+pub(crate) fn retain_issue_cache(
+    cache: &mut CacheMap<IssueKey, IssueCacheEntry, Issue>,
+    now: Instant,
+) {
     qualified_cache::retain(
         cache,
         |entry| Some(entry.fetched_at),
@@ -142,9 +145,56 @@ where
 
 /// Managed issue reads retain the provider's opaque response evidence until
 /// the existing slot is borrowed and the original caller/response guards run.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "retained cache control without denial observer")
+)]
 pub(crate) async fn read_managed_issue<F, Fut>(
     cache: &IssueCache,
     request: &qualified_cache::ManagedCacheRequest<'_>,
+    max_age: Duration,
+    read: F,
+) -> std::result::Result<CacheRead<Issue>, CacheFailure>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = crate::repository_credentials::read::RepositoryProviderRead<Issue>>,
+{
+    read_managed_issue_access(
+        cache,
+        request,
+        qualified_cache::DetailAccess::Managed(request),
+        max_age,
+        read,
+    )
+    .await
+}
+
+/// Same issue cache path with response-guarded denial notification for R.
+pub(crate) async fn read_managed_issue_observed<F, Fut>(
+    cache: &IssueCache,
+    request: &qualified_cache::ManagedCacheRequest<'_>,
+    observer: &qualified_cache::CacheDenialObserver<'_>,
+    max_age: Duration,
+    read: F,
+) -> std::result::Result<CacheRead<Issue>, CacheFailure>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = crate::repository_credentials::read::RepositoryProviderRead<Issue>>,
+{
+    read_managed_issue_access(
+        cache,
+        request,
+        qualified_cache::DetailAccess::Observed(request, observer),
+        max_age,
+        read,
+    )
+    .await
+}
+
+async fn read_managed_issue_access<F, Fut>(
+    cache: &IssueCache,
+    request: &qualified_cache::ManagedCacheRequest<'_>,
+    access: qualified_cache::DetailAccess<'_, '_>,
     max_age: Duration,
     read: F,
 ) -> std::result::Result<CacheRead<Issue>, CacheFailure>
@@ -158,7 +208,6 @@ where
             intent_sourcecontrol::RateLimitStatus::default(),
         ));
     }
-    let access = qualified_cache::DetailAccess::Managed(request);
     let ticket = match qualified_cache::start_access(cache, access, max_age, |c| {
         retain_issue_cache(c, Instant::now());
     })? {

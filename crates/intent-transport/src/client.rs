@@ -121,7 +121,7 @@ pub(crate) fn server_json(
         "osArch": format!("{os}/{arch}"),
         "version": version,
         "protocolVersion": PROTOCOL_VERSION,
-        "capabilities": { "liveState": true, "eventStreamRecovery": 1, "antigravitySetup": 1, "collaborationIdentity": 1, "hostMembership": 1, "workspaceMembershipEvents": 1, "invitationAccountSearch": 1, "personalPairing": 1, "authenticatedDevices": 1, "agentRetire": 1, "scriptLifecycle": 1, "scriptMonitors": 2, "scriptActiveLists": 1, "repositoryContext": 1, "repositorySelection": 1, "nativeReview": 1, "nativeReviewCompanion": 1, "repositoryResourceRead": 1, "gitlabCheckout": 1, "gitlabCheckoutRepoConfig": 1, "gitlabCheckoutOwnerAvatar": 1, "submissionCorrelation": 1, "prWorkspaceLookup": 1 },
+        "capabilities": { "discussionConversations": 1, "discussionMessageActions": 1, "discussionReactions": 1, "discussionAgentMessaging": 1, "discussionAgentActivity": 1, "liveState": true, "eventStreamRecovery": 1, "antigravitySetup": 1, "collaborationIdentity": 1, "hostMembership": 1, "workspaceMembershipEvents": 1, "workspaceGuestRoles": 1, "invitationAccountSearch": 1, "personalPairing": 1, "authenticatedDevices": 1, "agentRetire": 1, "scriptLifecycle": 1, "scriptMonitors": 2, "scriptActiveLists": 1, "repositoryContext": 1, "repositorySelection": 1, "nativeReview": 1, "nativeReviewCompanion": 1, "repositoryResourceRead": 1, "repositoryResourcePages": 1, "gitlabChildGitPolicy": 1, "gitlabCheckout": 1, "gitlabCheckoutRepoConfig": 1, "gitlabCheckoutOwnerAvatar": 1, "submissionCorrelation": 1, "prWorkspaceLookup": 1, "agentWorkers": 1, "noteTruncatedRead": 1 },
     });
     if let Some(build_commit) = build_commit {
         server
@@ -281,15 +281,7 @@ pub(crate) async fn handle(
         };
     }
     *client_id = Some(resolved.clone());
-    let mut server = connection_server_json(is_local, version);
-    if api.supports_note_delete_grace() {
-        server["capabilities"]["noteDeleteGrace"] = json!(1);
-    }
-    if let Some(backend_id) = api.note_paging_backend_id() {
-        server["capabilities"]["notePagingRead"] = json!(1);
-        server["capabilities"]["notePagingBackendId"] = json!(backend_id);
-        server["capabilities"]["noteAnnotations"] = json!(1);
-    }
+    let server = connection_server_json(is_local, version);
     HelloOutcome {
         frame: frame(
             req.id_present,

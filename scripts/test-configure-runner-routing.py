@@ -42,10 +42,11 @@ jobs:
         self.assertLess(result.index('uses: actions/setup-python@'), result.index('- run: python3'))
         self.assertEqual(result, routing.configure(result))
 
-    def test_privileged_build_keeps_hosted_linux_legs(self):
+    def test_privileged_build_sends_linux_legs_to_the_burst_runner(self):
         source = 'name: Release\njobs:\n  build-local-artifacts:\n    runs-on: ${{ matrix.runner }}\n  host:\n    runs-on: ${{ matrix.runner }}\n'
         result = routing.configure(source)
-        self.assertIn("    runs-on: ${{ (contains(matrix.runner, 'ubuntu') || contains(matrix.runner, 'linux')) && matrix.runner || fromJSON(needs.runner-route.outputs.runners || '{}')[matrix.runner] || matrix.runner }}\n  host:", result)
+        # Linux legs need sudo, so they skip the intent-cache slots and read `cloud` (WarpBuild or GitHub).
+        self.assertIn("    runs-on: ${{ (contains(matrix.runner, 'ubuntu') || contains(matrix.runner, 'linux')) && (fromJSON(needs.runner-route.outputs.cloud || '{}')[matrix.runner] || matrix.runner) || fromJSON(needs.runner-route.outputs.runners || '{}')[matrix.runner] || matrix.runner }}\n  host:", result)
         self.assertIn("  host:\n    needs: [runner-route]\n    runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')[matrix.runner] || matrix.runner }}", result)
         self.assertEqual(result, routing.configure(result))
         self.assertTrue(result.startswith('name: Release\njobs:\n'), result)

@@ -9,7 +9,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::net::Ipv4Addr;
 use std::sync::Arc;
@@ -207,7 +207,8 @@ async fn agent_subscribe_delivers_batched_wake_over_wss() {
     .await;
 
     // Await the batched wake landing in the subscriber's conversation.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(10));
     let mut req_id = 6;
     loop {
         let text = conversation_text(&mut rpc, req_id, &ws_id, &subscriber).await;

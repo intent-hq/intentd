@@ -326,7 +326,7 @@ async fn native_wire_pending_root_change_and_private_retirement_cursor() {
         )])
         .unwrap();
     let event = tokio::time::timeout(
-        Duration::from_secs(2),
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
         s.receiver.get_mut().unwrap().as_mut().unwrap().next(),
     )
     .await
@@ -500,20 +500,23 @@ async fn native_wire_bounds_overflow_expiry_and_same_id_foreign_caller() {
     }))
     .await;
     assert!(s.read(&f, &c).await.is_ok());
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while Arc::strong_count(
-            connection
-                .state
-                .lock()
-                .unwrap()
-                .leases
-                .get(&c.lifetime_id)
-                .unwrap(),
-        ) != 1
-        {
-            tokio::task::yield_now().await;
-        }
-    })
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            while Arc::strong_count(
+                connection
+                    .state
+                    .lock()
+                    .unwrap()
+                    .leases
+                    .get(&c.lifetime_id)
+                    .unwrap(),
+            ) != 1
+            {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
     .await
     .unwrap();
     {
@@ -660,7 +663,9 @@ async fn native_wire_final_transfer_joins_writer_and_keeps_completed_effect() {
                                     entered.take().unwrap().send(()).unwrap();
                                     held.lock()
                                         .unwrap()
-                                        .recv_timeout(Duration::from_secs(5))
+                                        .recv_timeout(intentd_test_support::test_timeout(
+                                            Duration::from_secs(5),
+                                        ))
                                         .unwrap();
                                     Ok(())
                                 })
@@ -703,7 +708,7 @@ impl BlockingHold {
             .wake
             .wait_timeout_while(
                 self.released.lock().unwrap(),
-                Duration::from_secs(15),
+                intentd_test_support::test_timeout(Duration::from_secs(15)),
                 |released| !*released,
             )
             .unwrap();
@@ -741,9 +746,12 @@ async fn native_wire_cancelled_blocking_job_keeps_actual_worktree_lock_until_exi
             })
             .await;
     });
-    tokio::time::timeout(Duration::from_secs(5), hold.entered.notified())
-        .await
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        hold.entered.notified(),
+    )
+    .await
+    .unwrap();
     scope.retire();
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
@@ -755,17 +763,20 @@ async fn native_wire_cancelled_blocking_job_keeps_actual_worktree_lock_until_exi
         .await
         .is_none());
     hold.release();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let changed = connection.jobs_changed.notified();
-            tokio::pin!(changed);
-            changed.as_mut().enable();
-            if connection.active_jobs.load(Ordering::Acquire) == 0 {
-                break;
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            loop {
+                let changed = connection.jobs_changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if connection.active_jobs.load(Ordering::Acquire) == 0 {
+                    break;
+                }
+                changed.await;
             }
-            changed.await;
-        }
-    })
+        },
+    )
     .await
     .unwrap();
     assert!(f
@@ -816,18 +827,24 @@ async fn native_wire_queued_worktree_cancellation_closes_without_waiting_for_loc
             })
             .await;
     });
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while connection.active_jobs.load(Ordering::Acquire) == 0 {
-            tokio::task::yield_now().await;
-        }
-    })
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            while connection.active_jobs.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
     .await
     .unwrap();
     scope.retire();
-    tokio::time::timeout(Duration::from_secs(2), read)
-        .await
-        .unwrap()
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        read,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!(connection.active_jobs.load(Ordering::Acquire), 0);
     release.send(()).unwrap();
     holder.await.unwrap();
@@ -839,19 +856,12 @@ async fn native_wire_saved_selection_historical_and_exact_root_incarnation() {
         ReviewSelectionOutcome, ReviewSelectionRequiredReason, SavedReviewSelection,
     };
     use intent_store::{RepositorySelectionChange, RepositorySelectionWriteResult};
-    let mut f = Fixture::new().await;
-    f.services
-        .store
-        .delete_workspace(&f.git.workspace.id)
-        .await
-        .unwrap();
-    f.git.workspace.repository_owner = Some("historical".into());
-    f.git.workspace.repository_name = Some("old".into());
-    f.services
-        .store
-        .insert_workspace(&f.git.workspace)
-        .await
-        .unwrap();
+    let f = Fixture::new().await;
+    crate::repository_admission_source_tests::fixtures::Fixture::seed_unresolved_history(
+        &f.services.store,
+        &f.git.workspace.id,
+    )
+    .await;
     f.git.git(
         &f.git.path,
         &["remote", "add", "origin", "https://github.com/team/one.git"],
@@ -1375,7 +1385,7 @@ async fn native_wire_actual_event_receiver_gap_closes_only_original_feed() {
         let _ = bus.publish_transient(&event);
     }
     let notice = tokio::time::timeout(
-        Duration::from_secs(3),
+        intentd_test_support::test_timeout(Duration::from_secs(3)),
         socket.receiver.get_mut().unwrap().as_mut().unwrap().next(),
     )
     .await
@@ -1538,11 +1548,14 @@ async fn native_wire_cancelled_acquisition_closes_before_late_metadata_returns()
             })))
             .await;
     });
-    tokio::time::timeout(Duration::from_secs(3), async {
-        while connection.active_jobs.load(Ordering::Acquire) == 0 {
-            tokio::task::yield_now().await;
-        }
-    })
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(3)),
+        async {
+            while connection.active_jobs.load(Ordering::Acquire) == 0 {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
     .await
     .unwrap();
     scope.retire();
@@ -1553,11 +1566,14 @@ async fn native_wire_cancelled_acquisition_closes_before_late_metadata_returns()
     assert_eq!(connection.active_jobs.load(Ordering::Acquire), 1);
     hold.release();
     writer.await.unwrap();
-    tokio::time::timeout(Duration::from_secs(3), async {
-        while connection.active_jobs.load(Ordering::Acquire) != 0 {
-            tokio::task::yield_now().await;
-        }
-    })
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(3)),
+        async {
+            while connection.active_jobs.load(Ordering::Acquire) != 0 {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
     .await
     .unwrap();
     assert!(connection.state.lock().unwrap().leases.is_empty());
@@ -1597,7 +1613,7 @@ async fn native_wire_queued_frame_expires_without_slot_or_service_entry() {
     .await;
     let request = request.unwrap();
     tokio::time::timeout(
-        FRAME_TTL + Duration::from_secs(2),
+        frame_ttl() + intentd_test_support::test_timeout(Duration::from_secs(2)),
         request
             .lifetime
             .as_ref()
@@ -2771,4 +2787,43 @@ async fn native_wire_sidebar_member_exact_projection_and_unattested_facts() {
         Some(fixture.server.descriptor.instance().as_str()),
     );
     assert_eq!(fixture.server.control.requests.lock().unwrap().len(), calls);
+}
+
+// Production keeps the 5s acquire, 10s read and 15s frame bounds; tests stretch
+// them like every other test budget, so coverage CI's
+// INTENTD_TEST_TIMEOUT_MULTIPLIER=3 cannot refuse a slow but healthy request,
+// up to x4 so they still elapse before the fixed timers they race.
+#[test]
+fn native_request_waits_keep_production_bounds_and_stretch_with_the_test_multiplier() {
+    assert_eq!(ACQUIRE_BASE, Duration::from_secs(5));
+    assert_eq!(READ_TIMEOUT_BASE, Duration::from_secs(10));
+    assert_eq!(FRAME_TTL_BASE, Duration::from_secs(15));
+    let setting = std::env::var(intentd_test_support::TIMEOUT_MULTIPLIER_ENV).ok();
+    for (wait, base) in [
+        (acquire_wait(), ACQUIRE_BASE),
+        (read_timeout(), READ_TIMEOUT_BASE),
+        (frame_ttl(), FRAME_TTL_BASE),
+    ] {
+        assert_eq!(wait, stretched_request_wait(base, setting.as_deref()));
+    }
+    // The 10s read, work and admission limits stretch by the same factor, so
+    // tests keep production's order: acquire (5s) < limit (10s) < frame (15s).
+    assert!(acquire_wait() < read_timeout() && read_timeout() < frame_ttl());
+    // Unset, the base; coverage CI's x3 stretches in full; the supported x20
+    // stops at x4, so the acquire wait stays under the GitLab client's fixed
+    // 30s request timeout and the frame wait under STAGE_TTL (120s), LEASE_TTL
+    // (300s) and nextest's 180s kill.
+    assert_eq!(stretched_request_wait(ACQUIRE_BASE, None), ACQUIRE_BASE);
+    assert_eq!(
+        stretched_request_wait(FRAME_TTL_BASE, Some("3")),
+        Duration::from_secs(45)
+    );
+    assert_eq!(
+        stretched_request_wait(ACQUIRE_BASE, Some("20")),
+        Duration::from_secs(20)
+    );
+    assert_eq!(
+        stretched_request_wait(FRAME_TTL_BASE, Some("20")),
+        Duration::from_secs(60)
+    );
 }

@@ -185,7 +185,7 @@ async fn incremental_delete_refuses_new_agents_after_session_snapshot() {
     let (ws, _) = h.workspace("deleting", 3).await;
     let (reached, _) = h.svc.workspace_delete_test_gate.arm(ws.clone());
     let mut deleting = h.svc.delete_workspace(ws.clone());
-    tokio::time::timeout(Duration::from_secs(30), async {
+    tokio::time::timeout(intentd_test_support::test_timeout(Duration::from_secs(30)), async {
         tokio::select! {
             result = &mut deleting => panic!("delete finished before partial observation: {result:?}"),
             () = reached.notified() => {}
@@ -213,7 +213,7 @@ async fn incremental_delete_refuses_messages_after_runtime_sweep() {
     let (ws, agents) = h.workspace("deleting", 3).await;
     let (reached, resume) = h.svc.workspace_delete_test_gate.arm(ws.clone());
     let mut deleting = h.svc.delete_workspace(ws.clone());
-    tokio::time::timeout(Duration::from_secs(30), async {
+    tokio::time::timeout(intentd_test_support::test_timeout(Duration::from_secs(30)), async {
         tokio::select! {
             result = &mut deleting => panic!("delete finished before partial observation: {result:?}"),
             () = reached.notified() => {}
@@ -236,7 +236,7 @@ async fn incremental_delete_refuses_new_producers_after_cleanup_sweeps() {
     let (ws, agents) = h.workspace("deleting", 3).await;
     let (reached, resume) = h.svc.workspace_delete_test_gate.arm(ws.clone());
     let mut deleting = h.svc.delete_workspace(ws.clone());
-    tokio::time::timeout(Duration::from_secs(30), async {
+    tokio::time::timeout(intentd_test_support::test_timeout(Duration::from_secs(30)), async {
         tokio::select! {
             result = &mut deleting => panic!("delete finished before partial observation: {result:?}"),
             () = reached.notified() => {}
@@ -376,9 +376,10 @@ async fn loaded_deletions_allow_unrelated_writes_and_persisted_events_before_com
         }
         ids
     };
-    let ((one, two), probes) = tokio::time::timeout(Duration::from_secs(30), async {
-        tokio::join!(deletes, probes)
-    })
+    let ((one, two), probes) = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async { tokio::join!(deletes, probes) },
+    )
     .await
     .unwrap();
     one.unwrap();
@@ -425,12 +426,15 @@ async fn partial_failure_does_not_publish_success_or_block_independent_delete_an
         WHEN OLD.seq > 500 AND OLD.agent_id IN (SELECT id FROM agent_session WHERE workspace_id='failed') \
         BEGIN SELECT RAISE(ABORT, 'injected partial cleanup failure'); END")
         .execute(h.store.write_pool()).await.unwrap();
-    let (failed_result, other_result) = tokio::time::timeout(Duration::from_secs(30), async {
-        tokio::join!(
-            h.svc.delete_workspace(failed.clone()),
-            h.svc.delete_workspace(other.clone())
-        )
-    })
+    let (failed_result, other_result) = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async {
+            tokio::join!(
+                h.svc.delete_workspace(failed.clone()),
+                h.svc.delete_workspace(other.clone())
+            )
+        },
+    )
     .await
     .unwrap();
     let err = failed_result.unwrap_err();
@@ -464,12 +468,15 @@ async fn partial_failure_does_not_publish_success_or_block_independent_delete_an
         .unwrap();
     // Duplicate requests must both succeed, but only one root removal and
     // terminal event may occur. A later retry remains idempotent too.
-    let (one, two) = tokio::time::timeout(Duration::from_secs(30), async {
-        tokio::join!(
-            h.svc.delete_workspace(failed.clone()),
-            h.svc.delete_workspace(failed.clone())
-        )
-    })
+    let (one, two) = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async {
+            tokio::join!(
+                h.svc.delete_workspace(failed.clone()),
+                h.svc.delete_workspace(failed.clone())
+            )
+        },
+    )
     .await
     .unwrap();
     one.unwrap();
@@ -498,9 +505,12 @@ async fn cancelled_partial_delete_releases_admission_and_retries() {
     let svc = h.svc.clone();
     let id = ws.clone();
     let deleting = intent_core::spawn_daemon(async move { svc.delete_workspace(id).await });
-    tokio::time::timeout(Duration::from_secs(30), h.partial(&ws, 3 * ROWS))
-        .await
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        h.partial(&ws, 3 * ROWS),
+    )
+    .await
+    .unwrap();
     deleting.abort();
     assert!(deleting.await.unwrap_err().is_cancelled());
     h.store
@@ -544,9 +554,12 @@ async fn completion_watch_persistence_keeps_admission_until_its_async_write_fini
         "deletion cannot sweep ahead of a delayed watch write"
     );
     writer.rollback().await.unwrap();
-    let permit = tokio::time::timeout(Duration::from_secs(30), deletion)
-        .await
-        .unwrap();
+    let permit = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        deletion,
+    )
+    .await
+    .unwrap();
     drop(permit);
     sqlx::query(
         "CREATE TRIGGER fail_watch_sweep BEFORE DELETE ON completion_watch \
@@ -608,26 +621,29 @@ async fn admitted_chief_wait_finishes_registration_before_queued_target_deletion
         vec!["child-a".into(), "child-b".into()],
         Some("after_all".into()),
     );
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            assert!(
-                std::future::poll_fn(|cx| std::task::Poll::Ready(waiting.as_mut().poll(cx)))
-                    .await
-                    .is_pending()
-            );
-            if h.svc
-                .agent_subscriptions
-                .lock()
-                .unwrap()
-                .subscriptions
-                .len()
-                == 1
-            {
-                break;
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                assert!(std::future::poll_fn(|cx| std::task::Poll::Ready(
+                    waiting.as_mut().poll(cx)
+                ))
+                .await
+                .is_pending());
+                if h.svc
+                    .agent_subscriptions
+                    .lock()
+                    .unwrap()
+                    .subscriptions
+                    .len()
+                    == 1
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
-    })
+        },
+    )
     .await
     .unwrap();
     let mut deleting = h.svc.delete_workspace(WorkspaceId::from("child-b-ws"));
@@ -637,9 +653,12 @@ async fn admitted_chief_wait_finishes_registration_before_queued_target_deletion
             .is_pending()
     );
     drop(writer);
-    let result = tokio::time::timeout(Duration::from_secs(10), waiting)
-        .await
-        .unwrap();
+    let result = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        waiting,
+    )
+    .await
+    .unwrap();
     deleting.await.unwrap();
     h.svc
         .delete_workspace(WorkspaceId::from("child-a-ws"))
@@ -731,7 +750,9 @@ async fn task_materialization_cannot_recreate_history_after_version_sweep() {
             {
                 if let Some(blocked) = blocked.take() {
                     reached.notify_one();
-                    blocked.recv_timeout(Duration::from_secs(10)).unwrap();
+                    blocked
+                        .recv_timeout(intentd_test_support::test_timeout(Duration::from_secs(10)))
+                        .unwrap();
                 }
             }
         });
@@ -869,7 +890,9 @@ async fn admitted_delegation_finishes_create_assign_watch_and_send_before_delete
             {
                 if let Some(blocked) = blocked.take() {
                     reached.notify_one();
-                    blocked.recv_timeout(Duration::from_secs(10)).unwrap();
+                    blocked
+                        .recv_timeout(intentd_test_support::test_timeout(Duration::from_secs(10)))
+                        .unwrap();
                 }
             }
         });
@@ -893,10 +916,13 @@ async fn admitted_delegation_finishes_create_assign_watch_and_send_before_delete
             .is_pending()
     );
     release.send(()).unwrap();
-    let result = tokio::time::timeout(Duration::from_secs(10), delegate)
-        .await
-        .unwrap()
-        .unwrap();
+    let result = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        delegate,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     let child = AgentId::from(result["agentId"].as_str().unwrap());
     assert!(h
         .store
@@ -993,7 +1019,9 @@ async fn admitted_task_update_keeps_ownership_through_linked_status_materializat
             if update.table == "note" && update.operation == sqlx::sqlite::SqliteOperation::Update {
                 if let Some(blocked) = blocked.take() {
                     reached.notify_one();
-                    blocked.recv_timeout(Duration::from_secs(10)).unwrap();
+                    blocked
+                        .recv_timeout(intentd_test_support::test_timeout(Duration::from_secs(10)))
+                        .unwrap();
                 }
             }
         });
@@ -1068,7 +1096,9 @@ async fn transcript_mutation_cannot_refill_completed_sweep(mutation: TranscriptM
             {
                 if let Some(blocked) = blocked.take() {
                     reached.notify_one();
-                    blocked.recv_timeout(Duration::from_secs(30)).unwrap();
+                    blocked
+                        .recv_timeout(intentd_test_support::test_timeout(Duration::from_secs(30)))
+                        .unwrap();
                 }
             }
         });
@@ -1127,9 +1157,10 @@ async fn transcript_mutation_cannot_refill_completed_sweep(mutation: TranscriptM
     };
     // Both futures must progress after releasing the SQLite worker. Awaiting
     // the writer alone can deadlock behind a connection still owned by delete.
-    let (deleted, result, unrelated) = tokio::time::timeout(Duration::from_secs(30), async {
-        tokio::join!(deleting, finish_write, unrelated)
-    })
+    let (deleted, result, unrelated) = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async { tokio::join!(deleting, finish_write, unrelated) },
+    )
     .await
     .unwrap();
     {
@@ -1189,7 +1220,9 @@ async fn admitted_transcript_finishes_before_delete(mutation: TranscriptMutation
             {
                 if let Some(blocked) = blocked.take() {
                     reached.notify_one();
-                    blocked.recv_timeout(Duration::from_secs(30)).unwrap();
+                    blocked
+                        .recv_timeout(intentd_test_support::test_timeout(Duration::from_secs(30)))
+                        .unwrap();
                 }
             }
         });
@@ -1247,9 +1280,10 @@ async fn admitted_transcript_finishes_before_delete(mutation: TranscriptMutation
         resume.notify_one();
         deleting.await.unwrap();
     };
-    tokio::time::timeout(Duration::from_secs(30), async {
-        tokio::join!(write, delete)
-    })
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async { tokio::join!(write, delete) },
+    )
     .await
     .unwrap();
     let mut conn = h.store.write_pool().acquire().await.unwrap();
@@ -1299,9 +1333,10 @@ async fn transcript_mutations_reuse_live_admission_behind_queued_delete() {
         resume.send(()).unwrap();
         deleting.await.unwrap();
     };
-    tokio::time::timeout(Duration::from_secs(30), async {
-        tokio::join!(writing, deleting)
-    })
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async { tokio::join!(writing, deleting) },
+    )
     .await
     .unwrap();
 }
@@ -1320,7 +1355,7 @@ async fn transcript_mutation_errors_release_admission_for_retry() {
             "{error}"
         );
         let deletion = tokio::time::timeout(
-            Duration::from_secs(10),
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
             h.svc.workspace_mutations.delete(&ws),
         )
         .await
@@ -1350,31 +1385,36 @@ async fn cancelled_transcript_mutations_release_admission_for_delete_retry() {
         // Detect the operation's live permit by polling a deletion request.
         // An acquired permit is dropped immediately; a queued one proves the
         // write was admitted and is now parked on the database connection.
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                assert!(std::future::poll_fn(|cx| std::task::Poll::Ready(
-                    writing.as_mut().poll(cx)
-                ))
-                .await
-                .is_pending());
-                let mut exclusive = Box::pin(h.svc.workspace_mutations.delete(&ws));
-                match std::future::poll_fn(|cx| std::task::Poll::Ready(exclusive.as_mut().poll(cx)))
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                loop {
+                    assert!(std::future::poll_fn(|cx| std::task::Poll::Ready(
+                        writing.as_mut().poll(cx)
+                    ))
                     .await
-                {
-                    std::task::Poll::Pending => break,
-                    std::task::Poll::Ready(permit) => drop(permit),
+                    .is_pending());
+                    let mut exclusive = Box::pin(h.svc.workspace_mutations.delete(&ws));
+                    match std::future::poll_fn(|cx| {
+                        std::task::Poll::Ready(exclusive.as_mut().poll(cx))
+                    })
+                    .await
+                    {
+                        std::task::Poll::Pending => break,
+                        std::task::Poll::Ready(permit) => drop(permit),
+                    }
+                    sqlx::query("SELECT 1")
+                        .execute(h.store.read_pool())
+                        .await
+                        .unwrap();
                 }
-                sqlx::query("SELECT 1")
-                    .execute(h.store.read_pool())
-                    .await
-                    .unwrap();
-            }
-        })
+            },
+        )
         .await
         .expect("transcript mutation must acquire admission before its write");
         drop(writing);
         let exclusive = tokio::time::timeout(
-            Duration::from_secs(10),
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
             h.svc.workspace_mutations.delete(&ws),
         )
         .await

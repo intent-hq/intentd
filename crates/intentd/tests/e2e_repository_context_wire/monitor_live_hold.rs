@@ -73,22 +73,27 @@ pub(super) async fn exercise(
         json!({"private":frame,"laterPublic":doc.notices,"socketUsable":true})
     } else {
         let mut received = Vec::new();
-        timeout(Duration::from_secs(15), async {
-            match &mut doc.socket {
-                Socket::Uds(stream) => {
-                    stream.read_to_end(&mut received).await.unwrap();
-                }
-                Socket::Ws(socket) => {
-                    while let Some(frame) = socket.next().await {
-                        match frame {
-                            Ok(Message::Text(text)) => received.extend_from_slice(text.as_bytes()),
-                            Ok(Message::Close(_)) | Err(_) => break,
-                            _ => {}
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(15)),
+            async {
+                match &mut doc.socket {
+                    Socket::Uds(stream) => {
+                        stream.read_to_end(&mut received).await.unwrap();
+                    }
+                    Socket::Ws(socket) => {
+                        while let Some(frame) = socket.next().await {
+                            match frame {
+                                Ok(Message::Text(text)) => {
+                                    received.extend_from_slice(text.as_bytes())
+                                }
+                                Ok(Message::Close(_)) | Err(_) => break,
+                                _ => {}
+                            }
                         }
                     }
                 }
-            }
-        })
+            },
+        )
         .await
         .unwrap();
         assert!(

@@ -12,7 +12,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::path::Path;
 use std::process::{Child, Stdio};
@@ -279,7 +279,7 @@ async fn next_tab_event(ws: &mut TlsWs, dur: Duration) -> Option<Value> {
 /// Close `ws` (draining the server's close handshake) and drop it.
 async fn close_ws(mut ws: TlsWs) {
     let _ = ws.close(None).await;
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(2));
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {

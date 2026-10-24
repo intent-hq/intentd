@@ -15,7 +15,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -239,11 +239,14 @@ async fn spawn_fixture(script: &str, args: &[&str], required_auth: Option<&str>)
         .expect("spawn mock fixture");
     let stdout = child.stdout.take().expect("fixture stdout");
     let mut lines = BufReader::new(stdout).lines();
-    let line = timeout(Duration::from_secs(10), lines.next_line())
-        .await
-        .expect("timed out waiting for fixture PORT line")
-        .expect("read fixture stdout")
-        .expect("fixture exited before announcing PORT");
+    let line = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        lines.next_line(),
+    )
+    .await
+    .expect("timed out waiting for fixture PORT line")
+    .expect("read fixture stdout")
+    .expect("fixture exited before announcing PORT");
     let port = line
         .strip_prefix("PORT=")
         .expect("fixture PORT line")
@@ -259,11 +262,14 @@ async fn spawn_fixture(script: &str, args: &[&str], required_auth: Option<&str>)
 impl Fixture {
     /// Read the next observability line off the fixture's stdout.
     async fn next_line(&mut self) -> String {
-        timeout(Duration::from_secs(10), self.lines.next_line())
-            .await
-            .expect("timed out waiting for fixture output line")
-            .expect("read fixture stdout")
-            .expect("fixture exited unexpectedly")
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            self.lines.next_line(),
+        )
+        .await
+        .expect("timed out waiting for fixture output line")
+        .expect("read fixture stdout")
+        .expect("fixture exited unexpectedly")
     }
 }
 

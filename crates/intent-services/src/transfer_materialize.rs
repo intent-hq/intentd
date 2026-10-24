@@ -1066,6 +1066,7 @@ mod tests {
             pull_requests_total: None,
             display_status: None,
             waiting: false,
+            scripts_running: false,
             checkout_mode: None,
             disk_usage: None,
             membership: None,
@@ -1467,7 +1468,7 @@ mod tests {
 
     // -- submodule hydration ------------------------------------------------
 
-    use crate::transfer_submodules::test_fixture::{
+    use crate::test_support::submodule_fixture::{
         git as fgit, init_repo as finit_repo, local_commit,
         nested_unpublished_under_published_parent as nested_fixture, superproject_with_submodule,
         NestedFixture,

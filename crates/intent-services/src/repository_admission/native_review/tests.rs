@@ -29,7 +29,7 @@ async fn refused_stage_response(after_commit: bool, expire_queue: bool) {
         op.progress.lock().unwrap().started = true;
         let create = create_lock(&connection, &op).unwrap();
         let held = create.clone().lock_owned().await;
-        let deadline = Instant::now() + FRAME_TTL;
+        let deadline = Instant::now() + QUEUE_DEADLINE;
         let work = async {
             let _capacity = capacity;
             let _finish = Completion(op.clone());
@@ -46,7 +46,7 @@ async fn refused_stage_response(after_commit: bool, expire_queue: bool) {
             usize::from(after_commit)
         );
         let metadata_holder = if expire_queue {
-            tokio::time::advance(FRAME_TTL).await;
+            tokio::time::advance(QUEUE_DEADLINE).await;
             None
         } else {
             // The real worker has passed preflight and is waiting for its
@@ -139,6 +139,14 @@ async fn native_review_refused_later_stage_retains_actual_commit_in_original_his
 
 // Keep paused time from auto-advancing while the real SQLite/provider workers
 // run. Tests advance only the deadline under examination, without wall sleeps.
+// Queue-isolation tests hand `run` their own queue deadline and cross it on a
+// paused clock; no production frame timer is involved, so they keep the
+// production 15s rather than the stretched `frame_ttl()`, which would only move
+// the advance closer to the fixed `STAGE_TTL` (120s) and `LEASE_TTL` (300s)
+// they must stay under. `native_review_frame_wait_stretches_with_the_test_timeout_multiplier`
+// covers the stretched frame wait itself.
+const QUEUE_DEADLINE: Duration = super::super::FRAME_TTL_BASE;
+
 async fn with_review_clock<T>(work: impl Future<Output = T>) -> T {
     tokio::time::pause();
     let result = tokio::select! {
@@ -173,7 +181,7 @@ async fn native_review_queue_deadline_does_not_retire_admitted_commit_or_next_st
             .begin_with("BEGIN IMMEDIATE")
             .await
             .unwrap();
-        let deadline = Instant::now() + FRAME_TTL;
+        let deadline = Instant::now() + QUEUE_DEADLINE;
         let work = async {
             let _capacity = capacity;
             let _finish = Completion(op.clone());
@@ -185,7 +193,7 @@ async fn native_review_queue_deadline_does_not_retire_admitted_commit_or_next_st
             () = wait_until(|| !op.progress.lock().unwrap().effects.is_empty()
                 && f.services.store.write_pool().num_idle() == 0) => {},
         }
-        tokio::time::advance(FRAME_TTL + Duration::from_secs(1)).await;
+        tokio::time::advance(QUEUE_DEADLINE + Duration::from_secs(1)).await;
         // Poll the actual sole owner after the deadline while its real worker
         // is still held. This makes the old queue timeout branch deterministic.
         std::future::poll_fn(|cx| {
@@ -255,7 +263,7 @@ async fn native_review_queue_expiry_drops_unentered_work_before_capacity_and_loc
         f.services
             .worktree_locks
             .with_lock(&f.git.path, || async {
-                let deadline = Instant::now() + FRAME_TTL;
+                let deadline = Instant::now() + QUEUE_DEADLINE;
                 let work = async {
                     let _capacity = capacity;
                     let _finish = Completion(op.clone());
@@ -269,7 +277,7 @@ async fn native_review_queue_expiry_drops_unentered_work_before_capacity_and_loc
                 .await;
                 // Tokio rounds timer deadlines up to a millisecond tick. Cross
                 // that tick while leaving the production deadline unchanged.
-                tokio::time::advance(FRAME_TTL + Duration::from_millis(1)).await;
+                tokio::time::advance(QUEUE_DEADLINE + Duration::from_millis(1)).await;
                 assert!(work.await.is_err());
                 assert_eq!(c.review.workers.available_permits(), WORKERS);
                 assert_eq!(
@@ -314,7 +322,7 @@ async fn native_review_queue_deadline_wins_ready_first_claim_after_observation()
         op.progress.lock().unwrap().started = true;
         let create = create_lock(&c, &op).unwrap();
         let held = create.clone().lock_owned().await;
-        let deadline = Instant::now() + FRAME_TTL;
+        let deadline = Instant::now() + QUEUE_DEADLINE;
         let work = async {
             let _capacity = capacity;
             let _finish = Completion(op.clone());
@@ -332,7 +340,7 @@ async fn native_review_queue_deadline_wins_ready_first_claim_after_observation()
             .try_with_lock(&f.git.path, || async {})
             .await
             .is_none());
-        tokio::time::advance(FRAME_TTL).await;
+        tokio::time::advance(QUEUE_DEADLINE).await;
         // Both expiry and the real blocking worker can now progress. Even if
         // that worker wins scheduling, its first consuming claim is too late.
         drop(held);
@@ -357,6 +365,49 @@ async fn native_review_queue_deadline_wins_ready_first_claim_after_observation()
     }))
     .await;
     assert_eq!(f.server.control.posts.load(Ordering::SeqCst), 0);
+}
+
+// The request-frame admission check, run inside the captured frame's scope.
+async fn frame_check(frame: &dyn RepositoryReadRequestScope) -> Result<()> {
+    let mut checked = None;
+    frame
+        .scope(Box::pin(async {
+            checked = Some(REVIEW_REQUEST.with(|r| r.check()));
+        }))
+        .await;
+    checked.expect("frame scope ran")
+}
+
+// Coverage CI stretches test budgets with INTENTD_TEST_TIMEOUT_MULTIPLIER; an
+// unstarted frame must stay admitted for the stretched 15s, not the fixed one,
+// or a slow runner refuses it as "Repository review unavailable". The stretch
+// stops at x4 (60s), below the fixed STAGE_TTL and LEASE_TTL it races.
+#[intent_test_macros::daemon_test]
+async fn native_review_frame_wait_stretches_with_the_test_timeout_multiplier() {
+    let f = Fixture::new().await;
+    let s = f.socket().await;
+    let stretched =
+        intentd_test_support::test_timeout(Duration::from_secs(15)).min(Duration::from_secs(60));
+    with_review_clock(s.entered(async {
+        let frame = s
+            .owner
+            .capture_review(&Frame::Prepare(f.query(Stage::Commit)))
+            .unwrap();
+        frame_check(&*frame).await.unwrap();
+        tokio::time::advance(stretched.checked_sub(Duration::from_millis(1)).unwrap()).await;
+        assert!(
+            frame_check(&*frame).await.is_ok(),
+            "unstarted frame refused before the stretched {stretched:?} frame wait"
+        );
+        // Tokio rounds timer deadlines up to a millisecond tick; cross it.
+        tokio::time::advance(Duration::from_millis(2)).await;
+        assert!(
+            frame_check(&*frame).await.is_err(),
+            "unstarted frame still admitted after the stretched {stretched:?} frame wait"
+        );
+        frame.retire();
+    }))
+    .await;
 }
 
 #[intent_test_macros::daemon_test]
@@ -393,7 +444,7 @@ async fn native_review_member_boundary_refusal_preserves_failed_history_without_
                 let work = async {
                     let _capacity = capacity;
                     let _finish = Completion(operation.clone());
-                    run(&connection, &operation, &command, fixed_time + FRAME_TTL).await
+                    run(&connection, &operation, &command, fixed_time + QUEUE_DEADLINE).await
                 };
                 tokio::pin!(work);
                 tokio::select! {
@@ -655,7 +706,7 @@ async fn native_review_queue_stage_wall_retains_owned_work_receipt_and_stops_nex
             .begin_with("BEGIN IMMEDIATE")
             .await
             .unwrap();
-        let deadline = Instant::now() + FRAME_TTL;
+        let deadline = Instant::now() + QUEUE_DEADLINE;
         let work = async {
             let _capacity = capacity;
             let _finish = Completion(op.clone());
@@ -1186,11 +1237,14 @@ impl Socket {
     }
 }
 async fn wait_until(check: impl Fn() -> bool) {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !check() {
-            tokio::task::yield_now().await;
-        }
-    })
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            while !check() {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
     .await
     .unwrap();
 }
@@ -1666,7 +1720,7 @@ async fn native_review_concurrent_registered_roots_coordinate_complete_branch_pa
         tokio::spawn(async move { s.request(&f.services, Frame::Execute(first)).await })
     };
     tokio::time::timeout(
-        Duration::from_secs(5),
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
         f.server.control.post_entered.notified(),
     )
     .await
@@ -1810,7 +1864,7 @@ async fn native_review_virtual_bounds_and_checked_cursor_never_revive_original()
         .entered(async { s.owner.capture_review(&Frame::Execute(q.clone())).unwrap() })
         .await;
     tokio::time::pause();
-    tokio::time::advance(FRAME_TTL + Duration::from_secs(1)).await;
+    tokio::time::advance(frame_ttl() + Duration::from_secs(1)).await;
     tokio::time::resume();
     frame.retire();
     assert_eq!(
@@ -3007,7 +3061,7 @@ async fn native_review_companion_duplicate_capacity_and_unpolled_capture_do_not_
                 _ => None,
             };
             if scenario == 1 {
-                tokio::time::advance(FRAME_TTL).await;
+                tokio::time::advance(frame_ttl()).await;
             }
             if scenario == 2 {
                 first.retire();
@@ -3960,17 +4014,20 @@ async fn diagnostic_case<F: Future<Output = ()>>(
     drop(process);
     // Original Request cancellation owners may still be unwinding their own task.
     // This wait observes diagnostics only; worker/lock assertions are separate.
-    let finished = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if companion_observation::read(&observer.lines())
-                .incomplete
-                .is_empty()
-            {
-                break;
+    let finished = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            loop {
+                if companion_observation::read(&observer.lines())
+                    .incomplete
+                    .is_empty()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
-    })
+        },
+    )
     .await;
     let report = observer.finish();
     diagnostic_checkpoint(
@@ -4108,7 +4165,7 @@ impl Group4MetadataHolder {
         // This independent real-time watchdog remains runnable when the test's
         // Tokio clock is fixed or the original caller needs the held mutex.
         let watchdog = std::thread::spawn(move || {
-            let reason = match requested.recv_timeout(ACQUIRE) {
+            let reason = match requested.recv_timeout(acquire_wait()) {
                 Ok(()) => "requested",
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => "watchdog",
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => "disconnected",
@@ -4173,7 +4230,7 @@ impl Group4ProviderRelease {
         let started = std::time::Instant::now();
         // This wall-clock containment bound is independent of the paused test
         // clock and the original body. A watchdog release fails qualification.
-        let deadline = started + ACQUIRE;
+        let deadline = started + acquire_wait();
         let watcher = std::thread::spawn(move || {
             let reason = match requested
                 .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
@@ -4204,7 +4261,7 @@ impl Group4ProviderRelease {
             Some(Ok((reason, elapsed))) => (true, reason, Some(elapsed.as_nanos().to_string())),
             _ => (false, "unobserved", None),
         };
-        let result = json!({"requested":requested,"releaseReason":reason,"watcherJoined":watcher_joined,"signalled":self.signalled.load(Ordering::Acquire),"wallElapsedNanos":elapsed,"wallBoundNanos":ACQUIRE.as_nanos().to_string(),"unwinding":std::thread::panicking(),"workerCompletionClaim":false});
+        let result = json!({"requested":requested,"releaseReason":reason,"watcherJoined":watcher_joined,"signalled":self.signalled.load(Ordering::Acquire),"wallElapsedNanos":elapsed,"wallBoundNanos":acquire_wait().as_nanos().to_string(),"unwinding":std::thread::panicking(),"workerCompletionClaim":false});
         diagnostic_checkpoint(&self.observer, "g4-provider-release-join", result.clone());
         result
     }
@@ -4417,9 +4474,9 @@ async fn companion_diagnostic_group4_acquisition_deadline() {
                     let held=tokio::select!{result=&mut call=>{early=Some(result);false},()=provider.control.entered.notified()=>true};
                     diagnostic_checkpoint(&observer,"g4-original-project-hold",json!({"entered":held,"capture":original.capture,"earlyBody":early.as_ref().map(diagnostic_reply),"workers":original.connection.review.workers.available_permits()}));
                     let before=Instant::now();
-                    if held{tokio::time::advance(ACQUIRE).await;}
+                    if held{tokio::time::advance(acquire_wait()).await;}
                     let nominal=before.elapsed();
-                    diagnostic_checkpoint(&observer,"g4-original-deadline-advanced",json!({"capture":original.capture,"advancedNanos":nominal.as_nanos().to_string(),"boundNanos":ACQUIRE.as_nanos().to_string(),"clock":"original fixed Tokio Instant; compare only this request stream"}));
+                    diagnostic_checkpoint(&observer,"g4-original-deadline-advanced",json!({"capture":original.capture,"advancedNanos":nominal.as_nanos().to_string(),"boundNanos":acquire_wait().as_nanos().to_string(),"clock":"original fixed Tokio Instant; compare only this request stream"}));
                     let mut crossing=Duration::ZERO;
                     let mut polled_pending=None;
                     if early.is_none() {
@@ -4431,7 +4488,7 @@ async fn companion_diagnostic_group4_acquisition_deadline() {
                             std::task::Poll::Pending=>{
                                 // Pinned Tokio1.53.1 rounds the deadline upward
                                 // to a millisecond tick. Cross at most one tick;
-                                // the original ACQUIRE and future stay unchanged.
+                                // the original acquire wait and future stay unchanged.
                                 crossing=Duration::from_millis(1);
                                 tokio::time::advance(crossing).await;
                                 diagnostic_checkpoint(&observer,"g4-original-one-tick-crossing",json!({"capture":original.capture,"crossingNanos":crossing.as_nanos().to_string(),"elapsedNanos":before.elapsed().as_nanos().to_string(),"providerReleased":provider.signalled.load(Ordering::Acquire)}));
@@ -4454,16 +4511,16 @@ async fn companion_diagnostic_group4_acquisition_deadline() {
         }).await;
         original.completed(&observer,1).await;
         let frames=group4_frames(&observer,&original.capture);
-        assert!(checks.0);assert_eq!(checks.1,ACQUIRE);
+        assert!(checks.0);assert_eq!(checks.1,acquire_wait());
         assert_eq!(checks.2,if checks.4==Some(true){Duration::from_millis(1)}else{Duration::ZERO});
-        assert!(checks.4.is_some());assert_eq!(checks.3,ACQUIRE+checks.2);
+        assert!(checks.4.is_some());assert_eq!(checks.3,acquire_wait()+checks.2);
         assert!(checks.5);assert!(checks.6);assert_eq!(checks.7,1);
         assert_eq!(release["requested"],true);assert_eq!(release["releaseReason"],"requested");assert_eq!(release["watcherJoined"],true);assert_eq!(release["signalled"],true);
         let wait=frames.iter().find(|f|f.phase==Phase::AcquireWait&&f.outcome==Outcome::Enter).unwrap();
         let elapsed=frames.iter().find(|f|f.phase==Phase::AcquireWait&&f.outcome==Outcome::Error).unwrap();
         assert_eq!(wait.domain,elapsed.domain);assert_eq!(wait.span,elapsed.span);
         let duration=u128::from(elapsed.elapsed_ns-wait.elapsed_ns);
-        assert!((ACQUIRE.as_nanos()..=(ACQUIRE+Duration::from_millis(1)).as_nanos()).contains(&duration));
+        assert!((acquire_wait().as_nanos()..=(acquire_wait()+Duration::from_millis(1)).as_nanos()).contains(&duration));
         assert!(group4_has(&frames,Phase::Project,Outcome::Ok));
         assert!(group4_has(&frames,Phase::Branch,Outcome::Error));
         assert!(!frames.iter().any(|f|matches!(f.phase,Phase::SourceDeadline|Phase::FrameDeadline|Phase::ProtectedResult)));

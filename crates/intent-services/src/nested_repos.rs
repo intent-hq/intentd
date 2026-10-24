@@ -41,7 +41,11 @@ fn status_path(bytes: &[u8]) -> PathBuf {
 /// that also carries index bits (e.g. a tracked submodule staged for removal
 /// while its checkout remains on disk, `INDEX_DELETED | WT_NEW`) is real dirt
 /// whose staged side must travel.
-pub(crate) fn is_dirty(repo: &git2::Repository) -> Result<bool> {
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn is_dirty(repo: &git2::Repository) -> Result<bool> {
     let mut opts = git2::StatusOptions::new();
     opts.include_untracked(true)
         .recurse_untracked_dirs(true)
@@ -104,7 +108,11 @@ pub(crate) fn untracked_nested_repo_dirs(repo: &git2::Repository) -> Result<Vec<
 /// disk. Returns the skipped workdir-relative paths so callers can log a
 /// context-appropriate warning. Does not write the index; callers decide
 /// when to persist it.
-pub(crate) fn stage_all_skipping_nested(
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn stage_all_skipping_nested(
     repo: &git2::Repository,
     index: &mut git2::Index,
 ) -> Result<Vec<PathBuf>> {
@@ -127,7 +135,11 @@ pub(crate) fn stage_all_skipping_nested(
 /// for the transfer plan's pre-flight warning (display strings; lossy for
 /// non-UTF-8 names). Degrades to an empty list when the repository cannot be
 /// read — a plan must not fail on this.
-pub(crate) fn nested_repo_dirs(repo_path: &Path) -> Vec<String> {
+#[expect(
+    clippy::must_use_candidate,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn nested_repo_dirs(repo_path: &Path) -> Vec<String> {
     git2::Repository::open(repo_path)
         .ok()
         .and_then(|repo| untracked_nested_repo_dirs(&repo).ok())

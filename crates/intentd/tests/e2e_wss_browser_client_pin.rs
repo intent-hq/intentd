@@ -12,7 +12,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 #[path = "e2e_wss_browser_client_pin/identity_isolation.rs"]
 mod identity_isolation;
@@ -290,7 +290,7 @@ async fn await_event(ws: &mut TlsWs, event_type: &str, dur: Duration) -> Value {
 /// `client:disconnected` event that proves the daemon deregistered it.
 async fn close(mut ws: TlsWs) {
     let _ = ws.close(None).await;
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(2));
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {

@@ -41,19 +41,13 @@ pub(crate) fn qualified_review_snapshot(
         .then(|| MergeRequirementsChecks::from_items(rollup_items(&signals.checks), true));
     let checks_json = checks.as_ref().map_or_else(
         || {
-            json!({"total":null,"passed":null,"failed":null,"pending":null,
+            json!({"total":null,"passed":null,"failed":null,"pending":null,"skipped":null,
             "items":null,"failingRequired":null,"pendingRequired":null,"requiredKnown":false})
         },
         |checks| json!(checks),
     );
-    let failed_names = checks.as_ref().map(|checks| {
-        checks
-            .items
-            .iter()
-            .filter(|c| c.status == "failed")
-            .map(|c| c.name.as_str())
-            .collect::<Vec<_>>()
-    });
+    let failed_names = checks.as_ref().map(|checks| checks.names_with("failed"));
+    let skipped_names = checks.as_ref().map(|checks| checks.names_with("skipped"));
     let aggregate = observation.reviews.as_deref().map(aggregate_reviews);
     // The legacy decision helper infers approved/none from aggregates. Qualified
     // results retain only a positively supplied provider decision.
@@ -137,11 +131,15 @@ pub(crate) fn qualified_review_snapshot(
     if let Some(queued) = signals.is_in_merge_queue {
         requirements["isInMergeQueue"] = json!(queued);
     }
-    if let Some(removal) = &signals.merge_queue_removal {
-        requirements["mergeQueueEjection"] = json!(super::MergeQueueEjection {
-            at: removal.at.clone(),
-            reason: removal.reason.clone(),
-        });
+    if let Some(entry) = super::queued_merge_queue_entry(signals) {
+        requirements["mergeQueue"] = json!(entry);
+    }
+    if let Some(ejection) = signals
+        .merge_queue_removal
+        .as_ref()
+        .and_then(|removal| super::MergeQueueEjection::from_removal(removal, state))
+    {
+        requirements["mergeQueueEjection"] = json!(ejection);
     }
     Ok(json!({
         "repo":target.repository.project_path,"prNumber":observation.details.review.number,
@@ -152,7 +150,8 @@ pub(crate) fn qualified_review_snapshot(
         "mergeableState":details.mergeable_state,"mergeBlockedReason":blocked,
         "checks":{"total":checks.as_ref().map(|c| c.total),"passed":checks.as_ref().map(|c| c.passed),
             "failed":checks.as_ref().map(|c| c.failed),"pending":checks.as_ref().map(|c| c.pending),
-            "failedNames":failed_names},
+            "skipped":checks.as_ref().map(|c| c.skipped),
+            "failedNames":failed_names,"skippedNames":skipped_names},
         "reviews":{"decision":decision,"approvals":aggregate.as_ref().map(|a| a.approval_count),
             "changesRequested":aggregate.as_ref().map(|a| a.changes_requested_count)},
         "comments":comments,"requirements":requirements,

@@ -4,7 +4,7 @@
 //! No npm downloads, account credentials or paid prompts occur in this test.
 //! The only package-dispatch shim selects those unchanged adapter entrypoints.
 #![cfg(unix)]
-mod common;
+use crate::common;
 use futures_util::{SinkExt, StreamExt};
 use intentd_test_support::GuardedChild;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -458,7 +458,7 @@ exit 97
     drop(ws);
     daemon.signal(nix::sys::signal::Signal::SIGTERM).unwrap();
     assert!(daemon
-        .wait_with_timeout(Duration::from_secs(30))
+        .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(30)))
         .unwrap()
         .expect("graceful shutdown")
         .success());

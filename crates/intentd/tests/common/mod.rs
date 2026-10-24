@@ -20,6 +20,19 @@ use std::sync::{Arc, Mutex, Once};
 use std::thread::ThreadId;
 use std::time::Duration;
 
+/// The libtest name of test `name` declared in the module whose
+/// `module_path!()` is `module_path`: that path below the crate root, then
+/// `name`. A test re-executing its own binary with `--exact` must pass this,
+/// not the bare function name: a test file built as a module of a suite target
+/// (`tests/suite_*.rs`) names its tests `<file>::<test>`, and an `--exact`
+/// filter matching nothing makes libtest exit 0 having run no test at all.
+pub fn exact_test_name(module_path: &str, name: &str) -> String {
+    match module_path.split_once("::") {
+        Some((_, below_root)) => format!("{below_root}::{name}"),
+        None => name.to_owned(),
+    }
+}
+
 /// The four repository retirement feeds share the response connection. Their
 /// typed, nonsecret envelopes are notifications, never an RPC acknowledgment.
 pub fn is_repository_retirement_notification(value: &serde_json::Value) -> bool {
@@ -90,16 +103,11 @@ fn force_hermetic_root_guard() {
 }
 
 /// Apply the timeout multiplier from the environment for coverage
-/// instrumentation. Reads `INTENTD_TEST_TIMEOUT_MULTIPLIER` (defaults to 1.0;
-/// non-finite values are ignored and values below 1.0 are clamped so budgets
-/// can only be extended; overflow saturates to `Duration::MAX`).
+/// instrumentation: delegates to [`intentd_test_support::test_timeout`]
+/// (`INTENTD_TEST_TIMEOUT_MULTIPLIER`, defaults to 1.0, never below 1.0,
+/// capped at 20x, saturating to `Duration::MAX`).
 pub fn test_timeout(base: Duration) -> Duration {
-    let multiplier = std::env::var("INTENTD_TEST_TIMEOUT_MULTIPLIER")
-        .ok()
-        .and_then(|s| s.parse::<f64>().ok())
-        .filter(|m| m.is_finite())
-        .unwrap_or(1.0);
-    Duration::try_from_secs_f64(base.as_secs_f64() * multiplier.max(1.0)).unwrap_or(Duration::MAX)
+    intentd_test_support::test_timeout(base)
 }
 
 /// Shared budget for waiting on daemon startup (UDS/socket ready): 60s base,
@@ -1172,6 +1180,34 @@ pub fn fingerprint_diff(before: &[serde_json::Value], after: &[serde_json::Value
     out
 }
 
+#[cfg(test)]
+mod exact_test_name_tests {
+    use super::exact_test_name;
+
+    #[test]
+    fn standalone_target_root_keeps_the_bare_name() {
+        assert_eq!(exact_test_name("e2e_x", "probe"), "probe");
+    }
+
+    #[test]
+    fn suite_module_and_nested_modules_are_prefixed_below_the_root() {
+        assert_eq!(exact_test_name("suite_e2e::e2e_x", "probe"), "e2e_x::probe");
+        assert_eq!(
+            exact_test_name("suite_e2e::e2e_x::inner", "probe"),
+            "e2e_x::inner::probe"
+        );
+        assert_eq!(exact_test_name("e2e_x::inner", "probe"), "inner::probe");
+    }
+
+    /// The name this module computes for itself is the one libtest lists, so
+    /// `--exact` re-execs of it select exactly this test.
+    #[test]
+    fn computed_name_matches_the_running_test() {
+        let name = exact_test_name(module_path!(), "computed_name_matches_the_running_test");
+        assert_eq!(std::thread::current().name(), Some(name.as_str()));
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -1259,11 +1295,11 @@ mod tests {
                     caught_panic();
                     ready_tx.send((original, retained, owner)).expect("ready");
                     release_rx
-                        .recv_timeout(Duration::from_secs(5))
+                        .recv_timeout(intentd_test_support::test_timeout(Duration::from_secs(5)))
                         .expect("release");
                 });
                 let (failed_original, failed_retained, failed_owner) = ready_rx
-                    .recv_timeout(Duration::from_secs(5))
+                    .recv_timeout(intentd_test_support::test_timeout(Duration::from_secs(5)))
                     .expect("retained");
                 // KEEP_TMP intentionally leaves the original occupied, so name
                 // reuse only applies to the ordinary rename-on-panic policy.

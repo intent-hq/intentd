@@ -235,6 +235,26 @@ impl tokio::io::AsyncWrite for PeerWriter {
     }
 }
 
+/// The frozen da577fff callback adapter. Only the monorepo gate runner
+/// (`make test`, `make test-select`) sets the variable, from its verified
+/// offline cache; raw `cargo nextest` leaves it unset.
+fn callback_adapter_fixture() -> std::path::PathBuf {
+    const HINT: &str = "run these tests with make test-select E='<nextest filterset>' (or make \
+        test), which set it from the verified offline cache; raw cargo nextest does not. Setup: \
+        the monorepo's CONTRIBUTING.md#linux-x64-callback-gates";
+    let value = std::env::var_os("INTENT_ACP_CALLBACK_ADAPTER_FIXTURE")
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| {
+            panic!("INTENT_ACP_CALLBACK_ADAPTER_FIXTURE (the frozen da577fff adapter fixture) is unset: {HINT}")
+        });
+    std::fs::canonicalize(&value).unwrap_or_else(|error| {
+        panic!(
+            "INTENT_ACP_CALLBACK_ADAPTER_FIXTURE={} is not a usable fixture ({error}): {HINT}",
+            std::path::Path::new(&value).display()
+        )
+    })
+}
+
 struct NodePeer {
     child: tokio::process::Child,
     connection: Arc<Connection>,
@@ -249,11 +269,7 @@ impl NodePeer {
     }
 
     fn with_original_repository(repository: Option<&std::path::Path>) -> Self {
-        let adapter = std::fs::canonicalize(
-            std::env::var("INTENT_ACP_CALLBACK_ADAPTER_FIXTURE")
-                .expect("explicit frozen da577fff adapter fixture"),
-        )
-        .unwrap();
+        let adapter = callback_adapter_fixture();
         let dependencies = std::fs::canonicalize(adapter.join("node_modules")).unwrap();
         let scratch = crate::test_support::test_tempdir("manager-callback-node");
         let base =
@@ -7999,7 +8015,7 @@ mod normal_launch {
                         let mut byte = [0];
                         assert!(
                             tokio::time::timeout(
-                                std::time::Duration::from_millis(30),
+                                intentd_test_support::test_timeout(std::time::Duration::from_millis(30)),
                                 tokio::io::AsyncReadExt::read(&mut foreign_reader, &mut byte)
                             )
                             .await
@@ -8189,8 +8205,11 @@ if(frame.method==='session/prompt' && promptErrors.length) {
         };
         executable("node", format!("#!/bin/sh\nexec {} \"$@\"\n", quoted(node)));
         executable("claude", format!(
-            "#!/bin/sh\n[ \"$#\" = 1 ] && [ \"$1\" = --version ] || exit 91\nprintf 'version\\n' >> {record}\nprintf 'fixture-claude 1.2.3\\n'\n",
+            "#!/bin/sh\n[ \"$#\" = 1 ] && [ \"$1\" = --version ] || exit 91\nprintf 'version\\n' >> {record}\nprintf '%s\\n' '{current}'\n",
             record = quoted(&scratch.join("cli-versions")),
+            current = intent_providers::test_support::current_cli_version(
+                intent_providers::installed_cli::InstalledCli::Claude
+            ),
         ));
         executable("npx", format!(
             "#!/bin/sh\nif [ \"$#\" = 1 ] && [ \"$1\" = --version ]; then printf '11.19.0\\n'; exit 0; fi\n[ \"$#\" = 3 ] && [ \"$1\" = --workspaces=false ] && [ \"$2\" = -y ] && [ \"$3\" = {package} ] || exit 92\n[ \"$CLAUDE_CODE_EXECUTABLE\" = {runtime} ] || exit 93\nprintf '%s\\n' \"$PWD\" >> {record}\nexec {launcher}\n",
@@ -8210,10 +8229,7 @@ if(frame.method==='session/prompt' && promptErrors.length) {
         async fn new(stamp: Option<&str>, options: Value) -> Self {
             let scratch = crate::test_support::test_tempdir("normal-callback-launch");
             std::fs::write(scratch.path().join("controls.json"), options.to_string()).unwrap();
-            let adapter = std::fs::canonicalize(
-                std::env::var("INTENT_ACP_CALLBACK_ADAPTER_FIXTURE").unwrap(),
-            )
-            .unwrap();
+            let adapter = super::callback_adapter_fixture();
             let node = std::fs::canonicalize(
                 intent_providers::find_node().expect("installed Node fixture prerequisite"),
             )
@@ -8657,13 +8673,20 @@ if(frame.method==='session/prompt' && promptErrors.length) {
                 .unwrap();
             let observed = h.rpc("fixture/inspect", json!({})).await;
             assert_eq!(count_requests(&observed, METHOD), 0);
-            assert!(observed["requests"]
+            // No callback or monitoring offer; the only client `_meta` is
+            // the §5.5b worker request claude-code always makes.
+            let meta = &observed["requests"]
                 .as_array()
                 .unwrap()
                 .iter()
                 .find(|r| r["method"] == "initialize")
-                .unwrap()["params"]["clientCapabilities"]["_meta"]
-                .is_null());
+                .unwrap()["params"]["clientCapabilities"]["_meta"];
+            assert_eq!(
+                meta.as_object()
+                    .map(|m| m.keys().cloned().collect::<Vec<_>>()),
+                Some(vec!["jetbrains".to_string()]),
+                "{meta}"
+            );
             assert!(!h.prompts().await[0].to_string().contains(FACTS));
             h.finish().await;
         }
@@ -8717,7 +8740,16 @@ if(frame.method==='session/prompt' && promptErrors.length) {
                 assert_eq!(h.f.writes().await, 0);
             } else {
                 let s = started.unwrap();
-                assert!(s.turn.prompt.is_none());
+                let prompt_only = matches!(mode, "absent" | "wrong" | "malformed");
+                if prompt_only {
+                    let prompt = s.turn.prompt.as_ref().expect("original 3.2 prompt capture");
+                    assert!(!prompt.binding.requires_callback_ack);
+                    assert!(!prompt.binding.acknowledged.load(Ordering::SeqCst));
+                } else {
+                    // A negotiated Query that fails registration cannot fall
+                    // back to prompt-only ownership or acknowledge monitoring.
+                    assert!(s.turn.prompt.is_none());
+                }
                 h.dispatch(
                     &s.session_id,
                     s.turn,
@@ -8725,7 +8757,11 @@ if(frame.method==='session/prompt' && promptErrors.length) {
                 )
                 .await
                 .unwrap();
-                assert!(!h.prompts().await[0].to_string().contains(FACTS));
+                assert_eq!(
+                    h.prompts().await[0].to_string().matches(FACTS).count(),
+                    usize::from(prompt_only),
+                    "{mode}: guidance does not acknowledge callback registration"
+                );
                 let observed = h.rpc("fixture/inspect", json!({})).await;
                 assert_eq!(
                     count_requests(&observed, METHOD),

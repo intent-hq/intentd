@@ -1,0 +1,5 @@
+# Grandfathered fixed test deadlines per file: `<path> <count>`, sorted by path.
+# Checked by `cargo test -p intent-core --test fixed_deadline_lint`. The list is empty and
+# should stay that way: wrap a hang guard in `intentd_test_support::test_timeout(..)`, or
+# mark an observation window that must stay under a fixed production timer with
+# `// fixed-deadline: allow — stays under <timer>`. Entries only ratchet down.

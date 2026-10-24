@@ -5,7 +5,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 #[path = "e2e_wss_runtime_control/independent_installations.rs"]
 mod independent_installations;
@@ -1964,16 +1964,19 @@ async fn wss_exact_update_validates_reports_failure_and_restarts_without_channel
         r,
         json!({"jsonrpc":"2.0", "id":85, "result":{"ok":true,"targetVersion":"98.0.0"}})
     );
-    let failed = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let r = wss_rpc(&mut ws, 86, "system.status", json!({})).await;
-            if r["result"]["targetUpdate"]["state"] == "failed" {
-                break r;
+    let failed = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                let r = wss_rpc(&mut ws, 86, "system.status", json!({})).await;
+                if r["result"]["targetUpdate"]["state"] == "failed" {
+                    break r;
+                }
+                // timing-guard: bounded polling of observable update state / sitter exit.
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            // timing-guard: bounded polling of observable update state / sitter exit.
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
+        },
+    )
     .await
     .unwrap();
     assert_eq!(failed["result"]["targetUpdate"]["targetVersion"], "98.0.0");
@@ -2012,15 +2015,18 @@ async fn wss_exact_update_validates_reports_failure_and_restarts_without_channel
         r,
         json!({"jsonrpc":"2.0", "id":87, "result":{"ok":true,"targetVersion":"100.0.0"}})
     );
-    let exit = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if let Some(exit) = daemon.child.try_wait().unwrap() {
-                break exit;
+    let exit = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        async {
+            loop {
+                if let Some(exit) = daemon.child.try_wait().unwrap() {
+                    break exit;
+                }
+                // timing-guard: bounded polling of observable update state / sitter exit.
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            // timing-guard: bounded polling of observable update state / sitter exit.
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
+        },
+    )
     .await
     .unwrap();
     assert_eq!(
@@ -2039,7 +2045,9 @@ fn occupied_fixed_wss_port_fails_daemon_boot() {
     let config = format!("[server.wsApi]\nenabled = true\nport = {port}\n");
     std::fs::write(dir.path().join("config.toml"), &config).unwrap();
     let mut child = spawn_serve_fixed_port(dir.path(), "uds", &[("INTENTD_AUTH_TOKEN", TOKEN)]);
-    let exit = child.wait_with_timeout(Duration::from_secs(30)).unwrap();
+    let exit = child
+        .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(30)))
+        .unwrap();
     let log = std::fs::read_to_string(dir.path().join("daemon.log")).unwrap();
     assert!(
         exit.is_some(),

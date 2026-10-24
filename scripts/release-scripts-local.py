@@ -16,9 +16,10 @@ are not run. Suites that need CI-only tooling are skipped with
 - a step whose `if:`, `env:` or shell needs CI context is skipped.
 
 Each command runs as CI runs it: the step's shell flags (`shell: bash` adds
-pipefail), its working-directory, and its literal job/step env. A test step that
-mixes test lines with shell the runner cannot reproduce line by line (loops,
-conditionals, cd, ...) is a setup error rather than a silent divergence.
+pipefail), its working-directory, and its literal job/step env, plus
+PYTHONDONTWRITEBYTECODE=1 so no suite leaves __pycache__ in the worktree. A test
+step that mixes test lines with shell the runner cannot reproduce line by line
+(loops, conditionals, cd, ...) is a setup error rather than a silent divergence.
 
 Exit 0 when nothing failed (skips allowed, but a skipped suite is unverified), 1
 when a suite failed, 2 on a setup error. `--list` prints the plan without
@@ -45,6 +46,11 @@ TEST_COMMAND = re.compile(r'^(?:python3(?:\s+-[A-Za-z]+)*\s+)?(?:\.{1,2}/)*scrip
 SETUP_LINE = re.compile(r'^(?:[A-Za-z_]\w*=|python3 -m pip install\s|curl\s|rustup\s|'
                         r'python3 scripts/setup-|echo\s.*>>\s*"?\$GITHUB_(?:ENV|PATH)"?$)')
 VERSION = re.compile(r'(\d+(?:\.\d+)+)')
+
+
+# Leave the caller's worktree as found: a suite importing a sibling module
+# would otherwise write scripts/__pycache__ (git-ignored, but left on disk).
+SUITE_ENV = {'PYTHONDONTWRITEBYTECODE': '1'}
 
 
 class SetupError(Exception):
@@ -99,25 +105,9 @@ def sccache_rule(root):
     return f'sccache >= {pinned}', check
 
 
-def preload_rule(root):
-    preload = Path(os.environ.get('RELEASE_SCRIPTS_LOCAL_PRELOAD_FILE', '/etc/ld.so.preload'))
-
-    def check():
-        if os.environ.get('LD_PRELOAD'):
-            return 'LD_PRELOAD is set'
-        try:
-            if preload.read_text().strip():
-                return f'{preload} is not empty'
-        except OSError:
-            pass
-        return None
-    return 'a host without a global library preload, which writes files into TMPDIR', check
-
-
 # Suites that depend on the host itself rather than on a tool CI installs.
 HOST_RULES = {
     'test-release-cache-smoke.py': sccache_rule,
-    'test-changed-tests-stdin.py': preload_rule,
 }
 
 
@@ -275,7 +265,7 @@ def main(argv=None):
         # GitHub's default `bash -e {0}`; `shell: bash` is `bash --noprofile --norc -eo pipefail {0}`.
         shell = ['bash', '--noprofile', '--norc', '-eo', 'pipefail'] if entry['shell'] == 'bash' else ['bash', '-e']
         status = subprocess.run([*shell, '-c', command], cwd=entry['cwd'],
-                                env={**os.environ, **entry['env']}).returncode
+                                env={**os.environ, **SUITE_ENV, **entry['env']}).returncode
         results.append(('pass' if status == 0 else 'fail', suite, f'exit {status}'))
         print(f'{"PASS" if status == 0 else "FAIL"} {suite} (exit {status})', flush=True)
     if args.list:

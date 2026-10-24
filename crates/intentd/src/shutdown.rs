@@ -155,11 +155,15 @@ mod tests {
                 let _ = released.recv();
             });
         });
-        started.recv_timeout(Duration::from_secs(10)).unwrap();
+        started
+            .recv_timeout(intentd_test_support::test_timeout(Duration::from_secs(10)))
+            .unwrap();
         let thread = std::thread::spawn(move || {
             tracing::subscriber::with_default(subscriber, || drop_runtime(runtime));
         });
-        let start = observed.recv_timeout(Duration::from_secs(10)).unwrap();
+        let start = observed
+            .recv_timeout(intentd_test_support::test_timeout(Duration::from_secs(10)))
+            .unwrap();
         assert!(
             start.contains("phase=\"runtime_drop\" state=\"started\""),
             "{start}"
@@ -175,7 +179,9 @@ mod tests {
             Err(mpsc::TryRecvError::Empty)
         ));
         release.send(()).unwrap();
-        let end = observed.recv_timeout(Duration::from_secs(10)).unwrap();
+        let end = observed
+            .recv_timeout(intentd_test_support::test_timeout(Duration::from_secs(10)))
+            .unwrap();
         assert!(
             end.contains("phase=\"runtime_drop\" state=\"completed\""),
             "{end}"

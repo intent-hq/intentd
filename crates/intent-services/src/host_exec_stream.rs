@@ -701,10 +701,13 @@ mod tests {
             () = std::future::ready(()) => {}
         }
         drop(held);
-        tokio::time::timeout(Duration::from_secs(10), shutdown)
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            shutdown,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         bus.shutdown().await.unwrap();
         let rows = store
             .query_events(&intent_store::EventQuery::default())
@@ -753,9 +756,12 @@ mod tests {
         assert!(registry().is_empty());
         registry().shutdown().await.unwrap();
         drop(readers);
-        let result = tokio::time::timeout(Duration::from_secs(5), start)
-            .await
-            .unwrap();
+        let result = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            start,
+        )
+        .await
+        .unwrap();
         // Reap a baseline late spawn before reporting the failed refusal.
         registry().shutdown().await.unwrap();
         assert!(
@@ -807,16 +813,19 @@ mod tests {
         })))
         .unwrap();
         start_stream(&services, bus.clone(), args).await.unwrap();
-        let pid: i32 = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if let Ok(contents) = std::fs::read_to_string(&pid_path) {
-                    if let Ok(pid) = contents.trim().parse() {
-                        break pid;
+        let pid: i32 = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            async {
+                loop {
+                    if let Ok(contents) = std::fs::read_to_string(&pid_path) {
+                        if let Ok(pid) = contents.trim().parse() {
+                            break pid;
+                        }
                     }
+                    tokio::task::yield_now().await;
                 }
-                tokio::task::yield_now().await;
-            }
-        })
+            },
+        )
         .await
         .unwrap();
         struct Cleanup(i32);
@@ -854,10 +863,13 @@ mod tests {
         if duplicate.is_ok() {
             original_cancel.store(true, Ordering::SeqCst);
         }
-        tokio::time::timeout(Duration::from_secs(5), registry().shutdown())
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            registry().shutdown(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(
             duplicate.is_err(),
             "duplicate live id spawned: {duplicate:?}"

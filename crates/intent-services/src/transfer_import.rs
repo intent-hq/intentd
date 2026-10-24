@@ -31,17 +31,15 @@ use intent_core::{clock::now_iso, AgentId, Error, Result, Workspace, WorkspaceId
 use intent_store::{Sandbox, SandboxStatus};
 use sha2::Digest as _;
 
+use crate::capability::gated_collaborator_caller;
 use crate::transfer_git::TransferRefsManifest;
 use crate::transfer_model_selection::{resolve_imported_selection, ImportedSelection};
 use crate::{publish_event, workspace_created_event, workspace_setup_completed_event, Services};
 
-/// Maximum DECODED bytes per `workspace.import.chunk` call. Base64 inflates
-/// this by 4/3 on the wire (~21.4 MiB), keeping the full JSON-RPC frame
-/// comfortably under the 40 MiB inbound cap (PROTOCOL §1.3).
-pub(crate) const IMPORT_MAX_CHUNK_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) use crate::feature_ports::IMPORT_MAX_CHUNK_BYTES;
 
 /// One in-flight staged import: everything `chunk`/`commit`/`abort` need
-/// between calls. Lives in [`Services::transfer_imports`]; in-memory only.
+/// between calls. Lives in [`crate::transfer::TransferFeature::imports`]; in-memory only.
 pub(crate) struct ImportSession {
     pub initiator: Option<intent_core::PrincipalId>,
     pub manifest: TransferManifest,
@@ -75,6 +73,27 @@ fn chunk_file_name(seq: u64) -> String {
 }
 
 impl Services {
+    /// Chunk/session handles never confer another authenticated person's
+    /// transfer authority. Reconnects retain access through the same principal.
+    pub(crate) async fn require_import_actor(&self, id: &str, what: &str) -> Result<()> {
+        self.require_host_execution(what).await?;
+        let Some(principal) = gated_collaborator_caller(what)? else {
+            return Ok(());
+        };
+        let imports = self
+            .transfer_state()
+            .imports
+            .lock()
+            .expect("transfer import registry poisoned");
+        if imports
+            .get(id)
+            .is_some_and(|s| s.initiator.as_ref() != Some(&principal))
+        {
+            return Err(Error::NotFound(format!("import {id}")));
+        }
+        Ok(())
+    }
+
     /// Root directory staged imports live under. Sibling of the workspace
     /// checkouts so the final asset/worktree moves stay on one filesystem.
     fn import_staging_root(&self) -> PathBuf {
@@ -140,7 +159,8 @@ impl Services {
         // import's directory as an orphan.
         {
             let mut imports = self
-                .transfer_imports
+                .transfer_state()
+                .imports
                 .lock()
                 .expect("transfer import registry poisoned");
             if imports
@@ -171,7 +191,8 @@ impl Services {
         self.sweep_orphaned_staging_dirs().await;
 
         if let Err(e) = tokio::fs::create_dir_all(&staging_dir).await {
-            self.transfer_imports
+            self.transfer_state()
+                .imports
                 .lock()
                 .expect("transfer import registry poisoned")
                 .remove(&import_id);
@@ -201,7 +222,8 @@ impl Services {
         while let Ok(Some(entry)) = entries.next_entry().await {
             let name = entry.file_name().to_string_lossy().to_string();
             let live = self
-                .transfer_imports
+                .transfer_state()
+                .imports
                 .lock()
                 .expect("transfer import registry poisoned")
                 .contains_key(&name);
@@ -258,7 +280,8 @@ impl Services {
         // both pass the check and push the total past the declared size.
         let (staging_dir, prior_this_seq, received) = {
             let mut imports = self
-                .transfer_imports
+                .transfer_state()
+                .imports
                 .lock()
                 .expect("transfer import registry poisoned");
             let session = imports
@@ -287,7 +310,8 @@ impl Services {
         if let Err(e) = tokio::fs::write(&path, &bytes).await {
             // Roll the reservation back so a retry accounts correctly.
             let mut imports = self
-                .transfer_imports
+                .transfer_state()
+                .imports
                 .lock()
                 .expect("transfer import registry poisoned");
             if let Some(session) = imports.get_mut(&import_id) {
@@ -315,7 +339,8 @@ impl Services {
     ) -> Result<serde_json::Value> {
         let session = {
             let mut imports = self
-                .transfer_imports
+                .transfer_state()
+                .imports
                 .lock()
                 .expect("transfer import registry poisoned");
             if imports.get(&import_id).is_some_and(|s| s.committing) {
@@ -352,7 +377,8 @@ impl Services {
         // gaps) never touch a flag another commit owns.
         let claim = {
             let mut imports = self
-                .transfer_imports
+                .transfer_state()
+                .imports
                 .lock()
                 .expect("transfer import registry poisoned");
             let session = imports
@@ -394,7 +420,8 @@ impl Services {
         let result = self.workspace_import_commit_body(&import_id, claim).await;
         if result.is_err() {
             if let Some(session) = self
-                .transfer_imports
+                .transfer_state()
+                .imports
                 .lock()
                 .expect("transfer import registry poisoned")
                 .get_mut(&import_id)
@@ -556,7 +583,8 @@ impl Services {
         let rehydrated = self.rehydrate_after_import().await;
 
         // Session retired; staging deleted.
-        self.transfer_imports
+        self.transfer_state()
+            .imports
             .lock()
             .expect("transfer import registry poisoned")
             .remove(import_id);
@@ -1142,6 +1170,7 @@ fn workspace_for_materialize(workspace_id: &WorkspaceId, row: &serde_json::Value
         pull_requests_total: None,
         display_status: None,
         waiting: false,
+        scripts_running: false,
         checkout_mode: None,
         disk_usage: None,
         membership: None,
@@ -1293,6 +1322,16 @@ pub(crate) struct TransformOutcome {
     pub interrupted_agent_ids: Vec<String>,
 }
 
+fn has_discussion_reference(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(map) => {
+            map.contains_key("discussionMessageId") || map.values().any(has_discussion_reference)
+        }
+        serde_json::Value::Array(items) => items.iter().any(has_discussion_reference),
+        _ => false,
+    }
+}
+
 /// Agent statuses that count as in-flight at export time — the same set
 /// [`crate::is_stale_in_flight_status`] heals after a daemon restart, in
 /// their persisted DB spellings (serde wire forms of `Active` / `Processing`
@@ -1328,6 +1367,9 @@ const IN_FLIGHT_STATUSES: &[&str] = &["active", "Processing", "Waiting"];
 /// - **sandbox**: `path` rewritten under the target root.
 /// - **script**: absolute `cwd` rewritten under the target root.
 /// - **draft**: dropped — drafts FK onto `client`, which never transfers.
+/// - **`workspace_discussion_message`**: keep the immutable author snapshot;
+///   clear the private retry principal so a destination identity collision
+///   cannot consume an imported message as a new send's retry.
 /// - **`interrupted_agent`**: exported pending rows are kept; synthesized rows
 ///   for newly-interrupted agents are added unless the agent already has one.
 fn transform_rows(
@@ -1343,7 +1385,32 @@ fn transform_rows(
 
     for (table, mut objects) in rows {
         match table.as_str() {
-            "draft" => continue,
+            "draft"
+            | "discussion_agent_grant"
+            | "discussion_agent_delivery"
+            | "discussion_agent_activity" => continue,
+            "agent_queue" => {
+                // Also fence archives produced before the source-side filter,
+                // including discussion references nested in combined retry groups.
+                objects.retain(|row| {
+                    !row.get("payload")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|p| serde_json::from_str::<serde_json::Value>(p).ok())
+                        .is_some_and(|payload| has_discussion_reference(&payload))
+                });
+            }
+            "workspace_discussion_message" | "discussion_participant" | "discussion_reaction" => {
+                for object in &mut objects {
+                    let map = expect_object(&table, object)?;
+                    map.insert("principal_id".into(), serde_json::Value::Null);
+                    if table == "workspace_discussion_message" || table == "discussion_reaction" {
+                        map.insert("agent_id".into(), serde_json::Value::Null);
+                    }
+                    if table == "workspace_discussion_message" {
+                        map.insert("agent_activity_json".into(), serde_json::json!("[]"));
+                    }
+                }
+            }
             "interrupted_agent" => {
                 existing_interrupted = objects;
                 continue;
@@ -1679,6 +1746,254 @@ mod tests {
         let row = &find(&outcome, "workspace")[0];
         assert!(row.get("owner_principal_id").is_none());
         assert!(row.get("legacy_author_principal_id").is_none());
+    }
+
+    #[test]
+    fn discussion_agent_import_clears_retry_identity_grants_and_nested_queue_references() {
+        let author = serde_json::json!({"principalId":null,"agentId":"source-agent","displayName":"Source helper","login":null,"avatarUrl":null});
+        let rows = vec![
+            (
+                "workspace_discussion_message".into(),
+                vec![
+                    serde_json::json!({"principal_id":null,"agent_id":"source-agent","author_json":author.to_string()}),
+                ],
+            ),
+            (
+                "discussion_reaction".into(),
+                vec![
+                    serde_json::json!({"principal_id":null,"agent_id":"source-agent","author_json":author.to_string()}),
+                ],
+            ),
+            (
+                "discussion_agent_grant".into(),
+                vec![serde_json::json!({"agent_id":"source-agent"})],
+            ),
+            (
+                "discussion_agent_delivery".into(),
+                vec![serde_json::json!({"agent_id":"source-agent"})],
+            ),
+            (
+                "agent_queue".into(),
+                vec![
+                    serde_json::json!({"payload":serde_json::json!({"deliveryGroups":[{"messageMetadata":{"discussionMessageId":"source-message"}}]}).to_string()}),
+                    serde_json::json!({"payload":"{}"}),
+                ],
+            ),
+        ];
+        let transformed = transform_rows(rows, &ws(), &root(), "now").unwrap();
+        assert!(!transformed.rows.iter().any(
+            |(name, _)| name == "discussion_agent_grant" || name == "discussion_agent_delivery"
+        ));
+        let message = &transformed
+            .rows
+            .iter()
+            .find(|(name, _)| name == "workspace_discussion_message")
+            .unwrap()
+            .1[0];
+        let reaction = &transformed
+            .rows
+            .iter()
+            .find(|(name, _)| name == "discussion_reaction")
+            .unwrap()
+            .1[0];
+        assert!(reaction["agent_id"].is_null() && reaction["principal_id"].is_null());
+        assert_eq!(reaction["author_json"], author.to_string());
+        assert!(message["agent_id"].is_null());
+        assert_eq!(message["author_json"], author.to_string());
+        assert_eq!(
+            transformed
+                .rows
+                .iter()
+                .find(|(name, _)| name == "agent_queue")
+                .unwrap()
+                .1
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn discussion_transfer_does_not_rebind_colliding_human_or_retry_identity() {
+        use crate::tests::{workspace, TempDb};
+        use intent_core::discussion::DiscussionAuthor;
+        use intent_core::{with_caller, Caller, HostRole};
+
+        let source_db = TempDb::new();
+        let source = Store::open(&source_db.path).await.unwrap();
+        let target_db = TempDb::new();
+        let target = Store::open(&target_db.path).await.unwrap();
+        let mut local = target.get_primary_principal().await.unwrap();
+        local.login = Some("destination-human".into());
+        local.display_name = Some("Destination Human".into());
+        local.avatar_url = Some("https://example.test/destination.png".into());
+        target.upsert_principal(&local).await.unwrap();
+        source.insert_workspace(&workspace(&ws())).await.unwrap();
+        // The source author deliberately collides with a different destination
+        // profile; historic labels must remain a snapshot, never a live lookup.
+        let author = DiscussionAuthor {
+            agent_id: None,
+            principal_id: Some(local.id.clone()),
+            login: Some("source-human".into()),
+            display_name: Some("Source Human".into()),
+            avatar_url: Some("https://example.test/source.png".into()),
+        };
+        let mut source_owner = local.clone();
+        source_owner.is_primary =
+            source.get_primary_principal().await.unwrap().id == source_owner.id;
+        source_owner.login = author.login.clone();
+        source.upsert_principal(&source_owner).await.unwrap();
+        source
+            .add_workspace_member(
+                &ws(),
+                &source_owner.id,
+                intent_core::WorkspaceRole::Collaborator,
+            )
+            .await
+            .unwrap();
+        let (mut original, _) = source
+            .insert_discussion_message(&ws(), "same-key", "source history", &author)
+            .await
+            .unwrap();
+        source
+            .set_discussion_reaction(&ws(), "default", &original.id, &source_owner.id, "👍", true)
+            .await
+            .unwrap();
+        original = source
+            .list_discussion_messages(&ws(), None, None, 50)
+            .await
+            .unwrap()
+            .messages
+            .remove(0);
+        let (reply, _) = source
+            .send_discussion_message(
+                &ws(),
+                "source-reply",
+                "Quoted response",
+                &author,
+                &intent_core::discussion::DiscussionTarget {
+                    reply_to_message_id: Some(original.id.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let mut peer = source_owner.clone();
+        peer.id = intent_core::PrincipalId::new();
+        peer.is_primary = false;
+        source.upsert_principal(&peer).await.unwrap();
+        source
+            .add_workspace_member(&ws(), &peer.id, intent_core::WorkspaceRole::Collaborator)
+            .await
+            .unwrap();
+        let (private, _) = source
+            .send_discussion_message(
+                &ws(),
+                "private-key",
+                "private history",
+                &author,
+                &intent_core::discussion::DiscussionTarget {
+                    conversation_id: None,
+                    recipient_principal_ids: Some(vec![peer.id]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let rows = source.transfer_export_rows(&ws()).await.unwrap();
+        validate_row_scope(&rows, &ws()).unwrap();
+        let transformed = transform_rows(rows, &ws(), &root(), "now").unwrap();
+        target
+            .transfer_import_rows(&transformed.rows)
+            .await
+            .unwrap();
+        let service = Services::new(target);
+        let caller = Caller::Wire {
+            principal_id: local.id.clone(),
+            host_role: HostRole::Owner,
+        };
+        assert!(!service
+            .store
+            .discussion_is_participant(&ws(), &private.conversation.id, &local.id)
+            .await
+            .unwrap());
+        assert!(with_caller(
+            caller.clone(),
+            service.discussion_history_op(&ws(), &private.conversation.id, None, None, 50)
+        )
+        .await
+        .is_err());
+        let archived = service
+            .store
+            .discussion_conversation(&ws(), &private.conversation.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            archived, private.conversation,
+            "source snapshots survive without destination grants"
+        );
+        let history = with_caller(
+            caller.clone(),
+            service.discussion_list_op(&ws(), None, None, 50),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            history.messages,
+            vec![original.clone(), reply.message.clone()]
+        );
+        assert_eq!(
+            history.messages[1].reply_to.as_ref().unwrap().author,
+            author
+        );
+        let inert = service
+            .store
+            .discussion_reaction_state(&ws(), "default", &original.id, &local.id)
+            .await
+            .unwrap();
+        assert_eq!(inert.reactions[0].reactors, original.reactions[0].reactors);
+        assert_eq!(inert.reactions[0].count, 1);
+        assert!(!inert.reactions[0].reacted);
+        let (removed, changed) = service
+            .store
+            .set_discussion_reaction(&ws(), "default", &original.id, &local.id, "👍", false)
+            .await
+            .unwrap();
+        assert!(!changed);
+        assert_eq!(removed, inert);
+        let (added, changed) = service
+            .store
+            .set_discussion_reaction(&ws(), "default", &original.id, &local.id, "👍", true)
+            .await
+            .unwrap();
+        assert!(changed);
+        assert_eq!(added.reactions[0].reactors.len(), 2);
+        assert_eq!(
+            added.reactions[0].reactors[0],
+            inert.reactions[0].reactors[0]
+        );
+        assert_eq!(added.reactions[0].count, 2);
+        assert!(added.reactions[0].reacted);
+        assert_eq!(added.reaction_version, 2);
+        let next = with_caller(
+            caller.clone(),
+            service.discussion_send_op(&ws(), "same-key", "destination message"),
+        )
+        .await
+        .unwrap();
+        assert_ne!(next.id, original.id);
+        assert_eq!(next.sequence, 3);
+        assert_eq!(next.body, "destination message");
+        assert_eq!(next.author.principal_id, Some(local.id));
+        assert_eq!(next.author.login, local.login);
+        assert_eq!(next.author.display_name, local.display_name);
+        assert_eq!(next.author.avatar_url, local.avatar_url);
+        let retry = with_caller(
+            caller,
+            service.discussion_send_op(&ws(), "same-key", "destination message"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(retry, next);
     }
 
     /// Relative / null path values are left untouched by the rewrite.
@@ -4258,7 +4573,8 @@ mod tests {
             .await
             .expect("chunk");
         // Simulate an in-flight first commit holding the claim.
-        svc.transfer_imports
+        svc.transfer_state()
+            .imports
             .lock()
             .unwrap()
             .get_mut(&import_id)
@@ -4273,7 +4589,8 @@ mod tests {
         // The rejection did not release the first commit's claim: the flag
         // is still set, and chunk/abort remain rejected.
         assert!(
-            svc.transfer_imports
+            svc.transfer_state()
+                .imports
                 .lock()
                 .unwrap()
                 .get(&import_id)
@@ -4294,7 +4611,8 @@ mod tests {
 
         // Release the claim (as the first commit's failure path would) and
         // the retry path works end to end.
-        svc.transfer_imports
+        svc.transfer_state()
+            .imports
             .lock()
             .unwrap()
             .get_mut(&import_id)
@@ -4324,7 +4642,7 @@ mod tests {
         // Register `import-live` directly (as a begin racing the sweep
         // would), so it is live in the registry but absent from any snapshot
         // taken before its directory existed.
-        svc.transfer_imports.lock().unwrap().insert(
+        svc.transfer_state().imports.lock().unwrap().insert(
             "import-live".to_string(),
             super::ImportSession {
                 initiator: None,

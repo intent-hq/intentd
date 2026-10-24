@@ -1294,34 +1294,6 @@ impl Services {
         by_agent
     }
 
-    /// Whether the workspace owns any ACTIVE (`scheduled`/`running`) hook —
-    /// a `Workspace.waiting` signal (§5.1, via
-    /// [`Services::workspace_is_waiting`]): an idle agent still watching via
-    /// a background hook reads as waiting, without promoting the
-    /// `displayStatus` rollup. SQL-side count-only aggregate — no row
-    /// hydration and no dependence on how many terminal rows the workspace
-    /// accumulated. Best-effort: a store read failure is logged
-    /// and fails open to `false` (mirrors
-    /// [`Services::workspace_attention_signals`]) so list/get emission is
-    /// never wedged and activity is never fabricated.
-    pub(crate) async fn workspace_has_active_hooks(&self, workspace_id: &WorkspaceId) -> bool {
-        match self
-            .store
-            .count_active_hooks_by_workspace(workspace_id)
-            .await
-        {
-            Ok(n) => n > 0,
-            Err(e) => {
-                tracing::warn!(
-                    workspace = %workspace_id.0,
-                    error = %e,
-                    "active-hooks displayStatus lookup failed; reads as none"
-                );
-                false
-            }
-        }
-    }
-
     /// Stamp `waitingOnHooks` onto an `agent:idle`-style event `data` object
     /// when `agent_id` owns at least one active hook (the field is omitted —
     /// never `[]` — otherwise, and an existing stamp is left untouched).
@@ -2526,6 +2498,7 @@ mod tests {
             pull_requests_total: None,
             display_status: None,
             waiting: false,
+            scripts_running: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
@@ -2795,7 +2768,9 @@ mod tests {
                 .stdout(log.try_clone().unwrap())
                 .stderr(log);
             let mut child = intentd_test_support::GuardedChild::spawn(&mut command).unwrap();
-            let status = child.wait_with_timeout(Duration::from_secs(30)).unwrap();
+            let status = child
+                .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(30)))
+                .unwrap();
             assert!(
                 status.is_some_and(|s| s.success()),
                 "{mode} worker failed ({status:?}): {}",
@@ -3001,9 +2976,12 @@ mod tests {
         let mut shutdown = tokio::spawn(async move {
             shutdown_svc.shutdown_agent_deliveries().await;
         });
-        let timely = tokio::time::timeout(Duration::from_secs(1), &mut shutdown)
-            .await
-            .is_ok();
+        let timely = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(1)),
+            &mut shutdown,
+        )
+        .await
+        .is_ok();
         if !timely {
             tokio::time::timeout(POLL_DEADLINE, shutdown)
                 .await
@@ -3045,19 +3023,22 @@ mod tests {
         });
         // Poll independent work on the SAME task while the nested evaluation
         // is suspended. A process-wide or thread-local depth leaks here.
-        tokio::time::timeout(Duration::from_secs(10), async {
-            tokio::select! {
-                result = &mut pending => panic!("pending validation completed: {result:?}"),
-                () = async {
-                    loop {
-                        if svc.store.get_workspace(&ws).await.unwrap().status_message.as_deref()
-                            == Some("validation entered") { break; }
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                    }
-                    svc.hook_schedule_op(&ws, &other, &ordinary_nested).await.unwrap();
-                } => {}
-            }
-        })
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                tokio::select! {
+                    result = &mut pending => panic!("pending validation completed: {result:?}"),
+                    () = async {
+                        loop {
+                            if svc.store.get_workspace(&ws).await.unwrap().status_message.as_deref()
+                                == Some("validation entered") { break; }
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                        svc.hook_schedule_op(&ws, &other, &ordinary_nested).await.unwrap();
+                    } => {}
+                }
+            },
+        )
         .await
         .unwrap();
         drop(pending);
@@ -4389,9 +4370,12 @@ mod tests {
         let mut shutdown = tokio::spawn(async move {
             shutdown_mgr.shutdown().await;
         });
-        let timely = tokio::time::timeout(Duration::from_secs(2), &mut shutdown)
-            .await
-            .is_ok();
+        let timely = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            &mut shutdown,
+        )
+        .await
+        .is_ok();
         // Always release the fixture before asserting the expected baseline failure.
         park.release.notify_one();
         if !timely {
@@ -5492,7 +5476,7 @@ mod tests {
     #[tokio::test]
     async fn active_hook_sets_waiting_without_promoting_display_status() {
         let (_tmp, _root, svc, ws, owner) = setup().await;
-        assert!(!svc.workspace_has_active_hooks(&ws).await);
+        assert!(!svc.workspace_has_active_hooks_or_script_monitors(&ws).await);
         let out = svc
             .hook_schedule_op(
                 &ws,
@@ -5506,7 +5490,7 @@ mod tests {
             .await
             .expect("schedule");
         let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
-        assert!(svc.workspace_has_active_hooks(&ws).await);
+        assert!(svc.workspace_has_active_hooks_or_script_monitors(&ws).await);
         let mut row = svc.store().get_workspace(&ws).await.unwrap();
         svc.enrich_workspace_aggregates(&mut row).await;
         assert!(
@@ -5523,7 +5507,7 @@ mod tests {
         svc.hook_cancel_op(&ws, &hook.hook_id, Some(&owner))
             .await
             .expect("cancel");
-        assert!(!svc.workspace_has_active_hooks(&ws).await);
+        assert!(!svc.workspace_has_active_hooks_or_script_monitors(&ws).await);
         let mut row = svc.store().get_workspace(&ws).await.unwrap();
         svc.enrich_workspace_aggregates(&mut row).await;
         assert!(!row.waiting, "terminal hooks never read waiting");
@@ -6661,7 +6645,8 @@ mod tests {
         owner: &AgentId,
         want: usize,
     ) -> Vec<intent_core::AgentMessage> {
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let deadline =
+            std::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(30));
         loop {
             let messages = svc
                 .store()

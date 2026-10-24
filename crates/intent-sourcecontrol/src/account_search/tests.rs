@@ -135,11 +135,12 @@ async fn never_follows_redirect_or_forwards_credentials() {
         ));
         request.await.unwrap();
     }
-    assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(20), destination.accept())
-            .await
-            .is_err()
-    );
+    assert!(tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_millis(20)),
+        destination.accept()
+    )
+    .await
+    .is_err());
 }
 
 #[tokio::test]

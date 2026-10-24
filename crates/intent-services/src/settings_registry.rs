@@ -121,6 +121,8 @@ pub(crate) const KNOWN_PATHS: &[&str] = &[
     "agents.toolPayloadRetentionDays",
     "agents.resumeInterruptedOnStart",
     "events.streamRetentionHours",
+    "scripts.outputRetentionHours",
+    "scripts.outputMaxBytesPerRun",
     "workspaceApi.maxOutputChars",
     "workspaceApi.toonOutput",
     "agentFeatures.backgroundHooks",

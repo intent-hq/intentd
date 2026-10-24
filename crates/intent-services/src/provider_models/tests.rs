@@ -2222,7 +2222,8 @@ async fn opencode_cli_timeout_kills_child_and_reports_timeout() {
         .parse()
         .expect("pid");
     let pid = nix::unistd::Pid::from_raw(pid);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now()
+        + intentd_test_support::test_timeout(std::time::Duration::from_secs(5));
     while nix::sys::signal::kill(pid, None).is_ok() {
         assert!(
             std::time::Instant::now() < deadline,

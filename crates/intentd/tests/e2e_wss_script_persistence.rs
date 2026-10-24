@@ -6,7 +6,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -295,7 +295,8 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     F: FnMut(&Value) -> bool,
 {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(120));
     let mut id = id_base;
     loop {
         let st = wss_rpc(
@@ -1080,12 +1081,15 @@ async fn durable_command_evidence_survives_daemon_restart_over_wss() {
         json!({"workspaceId":workspace,"scriptId":"durable"}),
     )
     .await;
-    timeout(Duration::from_secs(30), async {
-        while !ready.exists() {
-            // timing-guard: wait until the independently supervised child is running
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async {
+            while !ready.exists() {
+                // timing-guard: wait until the independently supervised child is running
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        },
+    )
     .await
     .expect("command ready");
     drop(ws);
@@ -1105,12 +1109,15 @@ async fn durable_command_evidence_survives_daemon_restart_over_wss() {
     assert_lost_command_state(&state, "wrapper caller was lost");
     assert!(!evidence_root.join("wss-run/result.json").exists());
     std::fs::write(release, "release").unwrap();
-    timeout(Duration::from_secs(30), async {
-        while !evidence_root.join("wss-run/result.json").exists() {
-            // timing-guard: wait for atomic publication of OS exit evidence
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        async {
+            while !evidence_root.join("wss-run/result.json").exists() {
+                // timing-guard: wait for atomic publication of OS exit evidence
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        },
+    )
     .await
     .expect("durable exit receipt");
     let output = Command::new(env!("CARGO_BIN_EXE_intentd"))

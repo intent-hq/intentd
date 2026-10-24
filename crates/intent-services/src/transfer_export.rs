@@ -46,20 +46,48 @@ use intent_core::{
 use intent_store::NewEvent;
 use sha2::Digest as _;
 
+use crate::capability::gated_collaborator_caller;
 use crate::transfer_git::{create_transfer_bundle, unwind_wip, TransferBundle};
 use crate::{git_ops, publish_event, system_actor, Services};
 
 /// Maximum bytes per `workspace.export.read` chunk BEFORE base64 encoding.
-/// Matches [`crate::transfer_import::IMPORT_MAX_CHUNK_BYTES`] so the FE can
+/// Matches [`crate::feature_ports::IMPORT_MAX_CHUNK_BYTES`] so the FE can
 /// pipe downloaded chunks straight into `workspace.import.chunk`; the ~21.4
 /// MiB encoded frame stays comfortably under the 40 MiB cap (PROTOCOL §1.3).
-pub(crate) const EXPORT_MAX_CHUNK_BYTES: usize = crate::transfer_import::IMPORT_MAX_CHUNK_BYTES;
+pub(crate) const EXPORT_MAX_CHUNK_BYTES: usize = crate::feature_ports::IMPORT_MAX_CHUNK_BYTES;
+
+/// Test-only export build failpoint (see
+/// [`crate::transfer::TransferFeature::export_build_failpoint`]): given the
+/// name of the stage about to run, returning `Some(error)` fails the build
+/// there.
+pub(crate) type ExportBuildFailpoint = std::sync::Arc<dyn Fn(&str) -> Option<Error> + Send + Sync>;
 
 #[cfg(test)]
 pub(crate) type MonitorExportBarrier = (
     std::sync::Arc<tokio::sync::Notify>,
     std::sync::Arc<tokio::sync::Notify>,
 );
+
+fn private_discussion_export_error() -> Error {
+    Error::Unsupported(
+        "This workspace contains private discussions that cannot be transferred".into(),
+    )
+}
+
+fn reject_private_discussion_export(rows: &[(String, Vec<serde_json::Value>)]) -> Result<()> {
+    if rows.iter().any(|(table, objects)| {
+        (table == "discussion_conversation" && !objects.is_empty())
+            || (table == "workspace_discussion_message"
+                && objects.iter().any(|row| {
+                    row["conversation_id"]
+                        .as_str()
+                        .is_some_and(|id| id != "default")
+                }))
+    }) {
+        return Err(private_discussion_export_error());
+    }
+    Ok(())
+}
 
 fn reject_private_monitor_export(rows: &[(String, Vec<serde_json::Value>)]) -> Result<()> {
     fn parsed(row: &serde_json::Value, key: &str) -> serde_json::Value {
@@ -116,7 +144,7 @@ pub(crate) enum ExportState {
 }
 
 /// One in-flight export: everything `read`/`finalize`/`abort` need between
-/// calls. Lives in `Services::transfer_exports`; in-memory only — a daemon
+/// calls. Lives in [`crate::transfer::TransferFeature::exports`]; in-memory only — a daemon
 /// restart drops sessions and the boot sweep clears their staging dirs.
 pub(crate) struct ExportSession {
     pub initiator: Option<intent_core::PrincipalId>,
@@ -141,6 +169,42 @@ impl ExportSession {
 }
 
 impl Services {
+    /// Test-only: fail the export archive build mid-flight. The closure is
+    /// consulted with the name of each build stage about to run; returning
+    /// `Some(error)` fails the build there, exercising the
+    /// `workspace:transfer:failed` cleanup path.
+    #[cfg(test)]
+    pub(crate) fn with_export_build_failpoint(self, failpoint: ExportBuildFailpoint) -> Self {
+        *self
+            .transfer_state()
+            .export_build_failpoint
+            .lock()
+            .expect("export failpoint") = Some(failpoint);
+        self
+    }
+
+    pub(crate) async fn require_export_actor(&self, id: &str, what: &str) -> Result<()> {
+        let Some(principal) = gated_collaborator_caller(what)? else {
+            return Ok(());
+        };
+        let session = self
+            .transfer_state()
+            .exports
+            .lock()
+            .expect("transfer export registry poisoned")
+            .get(id)
+            .map(|s| (s.workspace_id.clone(), s.initiator.clone()));
+        let Some((workspace, initiator)) = session else {
+            self.require_host_execution(what).await?;
+            return Ok(());
+        };
+        self.require_workspace_manager(&workspace, what).await?;
+        if initiator.as_ref() != Some(&principal) {
+            return Err(Error::NotFound(format!("export {id}")));
+        }
+        Ok(())
+    }
+
     /// Root directory staged exports live under (sibling of the import
     /// staging root, same filesystem reasoning).
     fn export_staging_root(&self) -> PathBuf {
@@ -168,10 +232,18 @@ impl Services {
             ));
         }
         let ws = self.store.get_workspace(&id).await?;
+        if self.store.has_private_discussions(&id).await? {
+            return Err(private_discussion_export_error());
+        }
         reject_private_monitor_export(&self.store.transfer_monitor_rows(&id).await?)?;
         #[cfg(test)]
         {
-            let barrier = self.test_export_monitor_preflight.lock().unwrap().take();
+            let barrier = self
+                .transfer_state()
+                .test_export_monitor_preflight
+                .lock()
+                .unwrap()
+                .take();
             if let Some((entered, release)) = barrier {
                 entered.notify_one();
                 release.notified().await;
@@ -182,7 +254,8 @@ impl Services {
         {
             let _monitor_lane = self.script_locks.monitor_lane.lock().await;
             let mut exports = self
-                .transfer_exports
+                .transfer_state()
+                .exports
                 .lock()
                 .expect("transfer export registry poisoned");
             if let Some((other, _)) = exports.iter().find(|(_, s)| s.workspace_id == id) {
@@ -208,7 +281,8 @@ impl Services {
         // from a prior daemon run. Best-effort; never fails start.
         self.sweep_stale_export_staging_dirs().await;
         if let Err(e) = tokio::fs::create_dir_all(&staging_dir).await {
-            self.transfer_exports
+            self.transfer_state()
+                .exports
                 .lock()
                 .expect("transfer export registry poisoned")
                 .remove(&export_id);
@@ -251,7 +325,8 @@ impl Services {
                 // `:ready` and `read` share one source of truth.
                 let event_data = {
                     let mut exports = self
-                        .transfer_exports
+                        .transfer_state()
+                        .exports
                         .lock()
                         .expect("transfer export registry poisoned");
                     match exports.get_mut(&export_id) {
@@ -327,7 +402,8 @@ impl Services {
         let id = ws.id.clone();
         let staging_dir = {
             let exports = self
-                .transfer_exports
+                .transfer_state()
+                .exports
                 .lock()
                 .expect("transfer export registry poisoned");
             match exports.get(export_id) {
@@ -408,6 +484,7 @@ impl Services {
         // Preflight is advisory against races. Refuse the exact immutable row
         // snapshot that would enter the archive, before any bytes are sealed.
         reject_private_monitor_export(&rows)?;
+        reject_private_discussion_export(&rows)?;
         // Pin the source's effective default provider into the exported
         // session rows (archive copy only; the table is never written), so
         // a session that inherited `model.defaultProvider` here keeps that
@@ -498,7 +575,8 @@ impl Services {
             }
             {
                 let mut exports = self
-                    .transfer_exports
+                    .transfer_state()
+                    .exports
                     .lock()
                     .expect("transfer export registry poisoned");
                 if let Some(session) = exports.get_mut(export_id) {
@@ -555,7 +633,8 @@ impl Services {
     ) -> Result<serde_json::Value> {
         let (archive_path, size_bytes, max_chunk, total_chunks) = {
             let exports = self
-                .transfer_exports
+                .transfer_state()
+                .exports
                 .lock()
                 .expect("transfer export registry poisoned");
             let session = exports
@@ -618,7 +697,8 @@ impl Services {
     ) -> Result<serde_json::Value> {
         let workspace_id = {
             let exports = self
-                .transfer_exports
+                .transfer_state()
+                .exports
                 .lock()
                 .expect("transfer export registry poisoned");
             let session = exports
@@ -665,7 +745,8 @@ impl Services {
     ) -> Result<serde_json::Value> {
         let building = {
             let mut exports = self
-                .transfer_exports
+                .transfer_state()
+                .exports
                 .lock()
                 .expect("transfer export registry poisoned");
             match exports.get_mut(&export_id) {
@@ -698,7 +779,13 @@ impl Services {
     /// `workspace:transfer:failed` path. Always `Ok(())` in production
     /// wiring (the seam is `None`).
     fn check_export_failpoint(&self, stage: &str) -> Result<()> {
-        match self.export_build_failpoint.as_ref().and_then(|f| f(stage)) {
+        let failpoint = self
+            .transfer_state()
+            .export_build_failpoint
+            .lock()
+            .expect("export failpoint")
+            .clone();
+        match failpoint.and_then(|f| f(stage)) {
             Some(e) => Err(e),
             None => Ok(()),
         }
@@ -708,7 +795,8 @@ impl Services {
     /// gate).
     fn export_aborted(&self, export_id: &str) -> bool {
         let exports = self
-            .transfer_exports
+            .transfer_state()
+            .exports
             .lock()
             .expect("transfer export registry poisoned");
         match exports.get(export_id) {
@@ -721,7 +809,8 @@ impl Services {
     /// delete the staging dir. Idempotent and best-effort throughout.
     async fn cleanup_export(&self, export_id: &str) {
         let session = self
-            .transfer_exports
+            .transfer_state()
+            .exports
             .lock()
             .expect("transfer export registry poisoned")
             .remove(export_id);
@@ -758,7 +847,8 @@ impl Services {
         while let Ok(Some(entry)) = entries.next_entry().await {
             let name = entry.file_name().to_string_lossy().to_string();
             let live = self
-                .transfer_exports
+                .transfer_state()
+                .exports
                 .lock()
                 .expect("transfer export registry poisoned")
                 .contains_key(&name);
@@ -1150,7 +1240,7 @@ mod tests {
             let export_id = started["exportId"].as_str().unwrap();
             if wait_ready(&svc, export_id).await {
                 let path = {
-                    let exports = svc.transfer_exports.lock().unwrap();
+                    let exports = svc.transfer_state().exports.lock().unwrap();
                     match &exports.get(export_id).unwrap().state {
                         ExportState::Ready(archive) => archive.archive_path.clone(),
                         ExportState::Building { .. } => unreachable!(),
@@ -1178,7 +1268,7 @@ mod tests {
             result.is_err(),
             "private monitor transfer must fail before export admission"
         );
-        assert!(svc.transfer_exports.lock().unwrap().is_empty());
+        assert!(svc.transfer_state().exports.lock().unwrap().is_empty());
         assert!(!svc.export_staging_root().exists());
         assert_eq!(svc.store.get_agent_session(&agent).await.unwrap(), before);
         let messages = svc.store.get_agent_messages(&agent, None).await.unwrap();
@@ -1240,8 +1330,10 @@ mod tests {
         seed_workspace(&svc, &assets, &workspaces.join("checkout"), &id).await;
         let entered = std::sync::Arc::new(tokio::sync::Notify::new());
         let release = std::sync::Arc::new(tokio::sync::Notify::new());
-        *svc.test_export_monitor_preflight.lock().unwrap() =
-            Some((entered.clone(), release.clone()));
+        *svc.transfer_state()
+            .test_export_monitor_preflight
+            .lock()
+            .unwrap() = Some((entered.clone(), release.clone()));
         let mut failed_events = bus.subscribe(crate::SubscriptionFilter {
             event_types: vec![WORKSPACE_TRANSFER_FAILED.to_string()],
             workspace_id: Some(id.0.clone()),
@@ -1266,16 +1358,19 @@ mod tests {
             .is_err());
         // Registry removal precedes asynchronous staging cleanup. The existing
         // terminal event is published only after that cleanup has completed.
-        let batch = tokio::time::timeout(std::time::Duration::from_secs(10), failed_events.recv())
-            .await
-            .expect("failed export cleanup completes")
-            .expect("failure subscription remains open");
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(10)),
+            failed_events.recv(),
+        )
+        .await
+        .expect("failed export cleanup completes")
+        .expect("failure subscription remains open");
         let failed = batch
             .iter()
             .find(|event| event.event_type == WORKSPACE_TRANSFER_FAILED)
             .expect("failed export event");
         assert_eq!(failed.data["exportId"], export_id);
-        assert!(svc.transfer_exports.lock().unwrap().is_empty());
+        assert!(svc.transfer_state().exports.lock().unwrap().is_empty());
         assert!(!svc.export_staging_root().join(export_id).exists());
         assert_eq!(
             svc.store
@@ -1285,6 +1380,67 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[intent_test_macros::daemon_test]
+    async fn discussion_export_rechecks_first_conversation_after_preflight() {
+        let root = crate::test_support::test_tempdir("private-discussion-export-race");
+        let assets = root.path().join("assets");
+        let workspaces = root.path().join("workspaces");
+        let (_db, svc) = fresh_services(&workspaces, &assets).await;
+        let bus = crate::EventBus::new(svc.store.clone());
+        let svc = svc.with_event_bus(bus.clone());
+        let id = WorkspaceId::new();
+        seed_workspace(&svc, &assets, &workspaces.join("checkout"), &id).await;
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        *svc.transfer_state()
+            .test_export_monitor_preflight
+            .lock()
+            .unwrap() = Some((entered.clone(), release.clone()));
+        let mut failed_events = bus.subscribe(crate::SubscriptionFilter {
+            event_types: vec![WORKSPACE_TRANSFER_FAILED.to_string()],
+            workspace_id: Some(id.0.clone()),
+            ..Default::default()
+        });
+        let id_for_insert = id.clone();
+        let exporting = svc.clone();
+        let start = tokio::spawn(async move { exporting.workspace_export_start_op(id).await });
+        entered.notified().await;
+        sqlx::query("INSERT INTO discussion_conversation(id,workspace_id,kind,participants_json,created_at) VALUES('private-race',?,'direct','[]',?)")
+            .bind(&id_for_insert.0).bind(now_iso()).execute(svc.store.write_pool()).await.unwrap();
+        release.notify_one();
+        let started = start.await.unwrap().unwrap();
+        let export_id = started["exportId"].as_str().unwrap();
+        assert!(
+            !wait_ready(&svc, export_id).await,
+            "racing private history cannot be sealed"
+        );
+        assert!(svc
+            .workspace_export_read_op(export_id.to_owned(), 0)
+            .await
+            .is_err());
+        // Registry removal precedes asynchronous staging cleanup. The existing
+        // terminal event is published only after that cleanup has completed.
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(10)),
+            failed_events.recv(),
+        )
+        .await
+        .expect("failed export cleanup completes")
+        .expect("failure subscription remains open");
+        let failed = batch
+            .iter()
+            .find(|event| event.event_type == WORKSPACE_TRANSFER_FAILED)
+            .expect("failed export event");
+        assert_eq!(failed.data["exportId"], export_id);
+        assert!(svc.transfer_state().exports.lock().unwrap().is_empty());
+        assert!(!svc.export_staging_root().join(export_id).exists());
+        assert!(svc
+            .store
+            .has_private_discussions(&id_for_insert)
+            .await
+            .unwrap());
     }
 
     #[intent_test_macros::daemon_test]
@@ -1309,9 +1465,12 @@ mod tests {
         };
         drop(held);
         if !returned_early {
-            tokio::time::timeout(std::time::Duration::from_secs(10), &mut shutdown)
-                .await
-                .unwrap();
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(std::time::Duration::from_secs(10)),
+                &mut shutdown,
+            )
+            .await
+            .unwrap();
         }
         assert!(
             !returned_early,
@@ -1342,7 +1501,7 @@ mod tests {
     async fn wait_ready(svc: &Services, export_id: &str) -> bool {
         for _ in 0..200 {
             {
-                let exports = svc.transfer_exports.lock().unwrap();
+                let exports = svc.transfer_state().exports.lock().unwrap();
                 match exports.get(export_id) {
                     Some(s) if matches!(s.state, ExportState::Ready(_)) => return true,
                     Some(_) => {}
@@ -1355,7 +1514,7 @@ mod tests {
     }
 
     fn ready_meta(svc: &Services, export_id: &str) -> (u64, String) {
-        let exports = svc.transfer_exports.lock().unwrap();
+        let exports = svc.transfer_state().exports.lock().unwrap();
         match &exports.get(export_id).expect("session").state {
             ExportState::Ready(r) => (r.size_bytes, r.sha256.clone()),
             ExportState::Building { .. } => panic!("session not ready"),
@@ -1442,7 +1601,7 @@ mod tests {
         let export_id = started["exportId"].as_str().expect("exportId").to_string();
         assert!(wait_ready(&svc, &export_id).await, "build must succeed");
         let archive_path = {
-            let exports = svc.transfer_exports.lock().unwrap();
+            let exports = svc.transfer_state().exports.lock().unwrap();
             match &exports.get(&export_id).expect("session").state {
                 ExportState::Ready(r) => r.archive_path.clone(),
                 ExportState::Building { .. } => panic!("session not ready"),
@@ -1526,7 +1685,7 @@ mod tests {
 
         // Reading while shrinking the chunk budget exercises multi-chunk.
         {
-            let mut exports = svc.transfer_exports.lock().unwrap();
+            let mut exports = svc.transfer_state().exports.lock().unwrap();
             exports.get_mut(&export_id).unwrap().max_chunk_bytes = 256;
         }
         let (size, sha) = ready_meta(&svc, &export_id);
@@ -1643,7 +1802,7 @@ mod tests {
         assert_eq!(ws.status, WorkspaceStatus::Archived);
         assert_eq!(ws.status_message.as_deref(), Some("Transferred elsewhere"));
         assert!(!staging.exists());
-        assert!(svc.transfer_exports.lock().unwrap().is_empty());
+        assert!(svc.transfer_state().exports.lock().unwrap().is_empty());
         // Read after finalize: session gone.
         assert!(matches!(
             svc.workspace_export_read_op(export_id, 0).await,
@@ -1724,7 +1883,7 @@ mod tests {
         // session back to Building deterministically, assert, restore.
         assert!(wait_ready(&svc, &export_id).await);
         let prior = {
-            let mut exports = svc.transfer_exports.lock().unwrap();
+            let mut exports = svc.transfer_state().exports.lock().unwrap();
             let session = exports.get_mut(&export_id).unwrap();
             std::mem::replace(&mut session.state, ExportState::Building { aborted: false })
         };
@@ -1734,7 +1893,7 @@ mod tests {
             .expect_err("finalize while building");
         assert!(err.to_string().contains("still building"));
         {
-            let mut exports = svc.transfer_exports.lock().unwrap();
+            let mut exports = svc.transfer_state().exports.lock().unwrap();
             exports.get_mut(&export_id).unwrap().state = prior;
         }
         let finalized = svc
@@ -1818,7 +1977,7 @@ mod tests {
 
         // The archive carries the git payload.
         {
-            let mut exports = svc.transfer_exports.lock().unwrap();
+            let mut exports = svc.transfer_state().exports.lock().unwrap();
             let session = exports.get_mut(&export_id).unwrap();
             assert_eq!(session.wip_paths, vec![repo_path.clone()]);
         }
@@ -1886,7 +2045,7 @@ mod tests {
     /// bundle files are gone from staging once the archive is sealed.
     #[tokio::test]
     async fn export_archive_carries_submodule_bundles() {
-        use crate::transfer_submodules::test_fixture::{
+        use crate::test_support::submodule_fixture::{
             git, local_commit, superproject_with_submodule,
         };
         let ws_root = TempDir::new("export-ws-root");
@@ -1913,7 +2072,7 @@ mod tests {
         assert!(wait_ready(&svc, &export_id).await, "build must succeed");
 
         let staging_dir = {
-            let exports = svc.transfer_exports.lock().unwrap();
+            let exports = svc.transfer_state().exports.lock().unwrap();
             exports.get(&export_id).unwrap().staging_dir.clone()
         };
         assert!(
@@ -2096,10 +2255,13 @@ mod tests {
 
         // The failed event is published AFTER cleanup, so receiving it means
         // the failure path has fully settled.
-        let batch = tokio::time::timeout(std::time::Duration::from_secs(10), sub.recv())
-            .await
-            .expect("failed event delivered")
-            .expect("subscription open");
+        let batch = tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_secs(10)),
+            sub.recv(),
+        )
+        .await
+        .expect("failed event delivered")
+        .expect("subscription open");
         let failed = batch
             .iter()
             .find(|e| e.event_type == WORKSPACE_TRANSFER_FAILED)
@@ -2125,7 +2287,7 @@ mod tests {
         );
 
         // No session left registered; staging is gone.
-        assert!(svc.transfer_exports.lock().unwrap().is_empty());
+        assert!(svc.transfer_state().exports.lock().unwrap().is_empty());
         assert!(!svc.export_staging_root().join(&export_id).exists());
 
         // The WIP snapshot (bundling had already run when the build failed)
@@ -2170,7 +2332,8 @@ mod tests {
         let root = svc.export_staging_root();
         std::fs::create_dir_all(root.join("export-stale")).expect("stale dir");
         std::fs::create_dir_all(root.join("export-live")).expect("live dir");
-        svc.transfer_exports
+        svc.transfer_state()
+            .exports
             .lock()
             .expect("transfer export registry poisoned")
             .insert(
@@ -2189,7 +2352,8 @@ mod tests {
         assert!(root.join("export-live").exists());
         // Boot sweep (registry empty again, as after a restart) removes
         // everything.
-        svc.transfer_exports
+        svc.transfer_state()
+            .exports
             .lock()
             .expect("transfer export registry poisoned")
             .clear();

@@ -35,9 +35,7 @@ pub use fence::FenceHandle;
 use fence::FenceRequest;
 pub(crate) use fence::RawBus;
 
-mod invalidation;
 mod task_push;
-pub use invalidation::InvalidationSubscription;
 
 /// Capacity of the broadcast channel that fans published events out to every
 /// subscriber's delivery task. Slow subscribers that fall this far behind are

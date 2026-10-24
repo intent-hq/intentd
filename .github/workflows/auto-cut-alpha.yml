@@ -54,8 +54,8 @@
 #   for up to 2 min per episode) — the next scheduled run retries. Never
 #   bypasses a failed guard. Metadata-only releases use the CI identity’s
 #   existing queue exemption; other diffs retain the ordinary queue path.
-# - Post-merge gate: the latest push-event ci.yml run on the Release PR's
-#   base (the main tip being released) must have succeeded. That push run
+# - Post-merge gate: the latest push-event ci.yml run on main's live tip
+#   (the main commit being released) must have succeeded. That push run
 #   is where ALL Windows validation runs (never on PRs or in the merge
 #   queue), plus the release builds and packaging its CI Gate requires.
 #   Still running → wait within the CI budget, then the next cron retries;
@@ -67,6 +67,12 @@
 #   the ruleset's strict up-to-date requirement gets satisfied. A branch
 #   that is behind main is just skipped (push runs: retried within the
 #   polling budget) until release-plz catches it up.
+# - Every run (cron, dispatch and push) reads main's live tip right before
+#   merging and requires the Release PR head to contain it. GitHub's
+#   baseRefOid / mergeStateStatus are the PR's last-synced view of main and
+#   can lag a push (v0.11.10 shipped one commit behind main), and --admin
+#   bypasses the ruleset's strict up-to-date rule. Behind or unreadable is
+#   transient: push runs retry within their budget, others skip.
 #
 # Token split: all read-only queries (PR discovery, labels, mergeability,
 # CI Gate via statusCheckRollup, review threads, tag reads for the
@@ -177,7 +183,6 @@ jobs:
           DRY_RUN: ${{ inputs.dry_run == true }}
           EVENT_NAME: ${{ github.event_name }}
           AUTO_CUT_CI_WAIT_MINUTES: '25'
-          PUSH_SHA: ${{ github.sha }}
           # Push events only; used to recognize the cut's own merge push.
           HEAD_COMMIT_MSG: ${{ github.event.head_commit.message || '' }}
         run: |
@@ -434,7 +439,7 @@ jobs:
             fi
 
             if ! detail=$(gh pr view "$number" --repo "$GITHUB_REPOSITORY" \
-              --json isDraft,mergeable,mergeStateStatus,statusCheckRollup,headRefOid,baseRefOid,baseRefName,reviewDecision); then
+              --json isDraft,mergeable,mergeStateStatus,statusCheckRollup,headRefOid,baseRefName,reviewDecision); then
               transient api-error "gh pr view failed for Release PR #$number (transient API error?)"
               sleep 30; continue
             fi
@@ -565,61 +570,79 @@ jobs:
               sleep 30; continue
             fi
             head_sha=$(jq -r '.headRefOid' <<<"$detail")
-            base_sha=$(jq -r '.baseRefOid' <<<"$detail")
-            if [[ ! "$head_sha" =~ ^[0-9a-f]{40}$ || ! "$base_sha" =~ ^[0-9a-f]{40}$ ]]; then
-              transient api-error "Release PR #$number has unreadable head/base commits"
+            if [[ ! "$head_sha" =~ ^[0-9a-f]{40}$ ]]; then
+              transient api-error "Release PR #$number has an unreadable head commit"
               sleep 30; continue
             fi
 
-            # Chained-cut freshness gate (push runs only): the Release PR
-            # head must already contain the pushed commit — otherwise
-            # release-plz has not refreshed the PR since the push, and
-            # merging now would cut a release WITHOUT the change that
-            # triggered this run. Compare status "ahead"/"identical" means
-            # the PR head's history contains PUSH_SHA. Read failures are
-            # treated as not-yet-refreshed (retried within the budget).
-            if [[ "$EVENT_NAME" == "push" ]]; then
-              cmp_status=$(gh api "repos/$GITHUB_REPOSITORY/compare/$PUSH_SHA...$head_sha" \
-                --jq '.status' 2>/dev/null) || cmp_status=""
-              if [[ "$cmp_status" != "ahead" && "$cmp_status" != "identical" ]]; then
-                transient pr-stale "Release PR #$number head does not contain the pushed commit yet (compare: ${cmp_status:-unreadable})"
-                sleep 30; continue
-              fi
+            # Live-main freshness gate (every event): the Release PR head
+            # must contain main's tip as of now — on push runs that also
+            # covers the pushed commit (main only fast-forwards), so a
+            # chained cut never ships without the change that triggered it.
+            # GitHub's baseRefOid and mergeStateStatus are the PR's
+            # last-synced view of main, not main itself: cron run
+            # 39234998462 saw baseRefOid b4349bb0 and CLEAN while main was
+            # already at 2d7c7bb0, and merged intentd#2506 (v0.11.10) one
+            # commit behind main. A feature landing in that window would
+            # ship without its changelog entry or version bump, and --admin bypasses the ruleset's strict
+            # up-to-date rule. Behind or unreadable is transient — never
+            # fails open: push runs retry within their budget; cron and
+            # dispatch skip, since the push run for the newer main commit is
+            # queued behind this one (same concurrency group) and owns the
+            # wait. Accepted residual race: main can still move in the
+            # seconds between this read and the merge (--match-head-commit
+            # pins only the head; GitHub offers no base pin).
+            main_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" \
+              --jq '.object.sha' 2>/dev/null) || main_sha=""
+            if [[ ! "$main_sha" =~ ^[0-9a-f]{40}$ ]]; then
+              transient api-error "Could not read main's live tip for Release PR #$number"
+              sleep 30; continue
+            fi
+            tip_cmp=$(gh api "repos/$GITHUB_REPOSITORY/compare/$main_sha...$head_sha" \
+              --jq '.status' 2>/dev/null) || tip_cmp=""
+            # Only "ahead": a head identical to main carries no release commit.
+            if [[ "$tip_cmp" == "diverged" ]]; then
+              echo "::warning::Release PR #$number head has diverged from main's live tip ${main_sha:0:12}; a release-plz refresh rebuilds it on main"
+            fi
+            if [[ "$tip_cmp" != "ahead" ]]; then
+              transient pr-stale "Release PR #$number head is behind main's live tip ${main_sha:0:12} (compare: ${tip_cmp:-unreadable}; release-plz refreshes it)"
+              sleep 30; continue
             fi
 
             # Post-merge gate: Windows validation never runs on PRs or in the
             # merge queue — it runs in ci.yml's push run on main, whose CI
-            # Gate also requires the release builds and packaging. The
-            # Release PR's base is the main tip it will release, so the
-            # latest push-event ci.yml run on that commit must have
-            # succeeded. Pending waits within the CI budget (not started at
+            # Gate also requires the release builds and packaging. main's
+            # live tip (which the head was just proven to contain, so it is
+            # the main commit being released — never the PR's possibly
+            # stale baseRefOid) needs a successful latest push-event ci.yml
+            # run. Pending waits within the CI budget (not started at
             # all: the short grace); any other conclusion — failure,
             # cancelled (e.g. superseded), timed out — blocks the cut until a
             # fix or re-run turns it green. A human merging the Release PR by
             # hand is the deliberate override.
-            if ! main_ci=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$base_sha&event=push&per_page=100" \
+            if ! main_ci=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$main_sha&event=push&per_page=100" \
               --jq '([.workflow_runs[]?] | max_by(.id)) as $r
                 | if $r == null then "missing"
                   else [($r.status // "pending"), ($r.conclusion // "none"), ($r.html_url // "no-url")] | join(" ")
                   end'); then
-              transient api-error "main's post-merge CI lookup failed for $base_sha (transient API error?)"
+              transient api-error "main's post-merge CI lookup failed for $main_sha (transient API error?)"
               sleep 30; continue
             fi
             read -r main_status main_conclusion main_url <<<"$main_ci"
             if [[ "$main_status" == "missing" ]]; then
-              ci_pending main-ci-pending "main's post-merge CI has not started on $base_sha yet" "$missing_deadline"
+              ci_pending main-ci-pending "main's post-merge CI has not started on $main_sha yet" "$missing_deadline"
               sleep 30; continue
             fi
             if [[ "$main_status" != "completed" ]]; then
-              ci_pending main-ci-pending "main's post-merge CI is still $main_status on $base_sha ($main_url)"
+              ci_pending main-ci-pending "main's post-merge CI is still $main_status on $main_sha ($main_url)"
               sleep 30; continue
             fi
             if [[ "$main_conclusion" != "success" ]]; then
-              msg="main's post-merge CI concluded $main_conclusion on $base_sha ($main_url); not cutting an alpha until it is green — re-run the failed jobs or land a fix."
+              msg="main's post-merge CI concluded $main_conclusion on $main_sha ($main_url); not cutting an alpha until it is green — re-run the failed jobs or land a fix."
               echo "::notice::$msg"
               decide skip main-ci-failed "$msg"
             fi
-            echo "main's post-merge CI passed on $base_sha ($main_url)."
+            echo "main's post-merge CI passed on $main_sha ($main_url)."
 
             # Re-check the throttle at merge time: a push run may have spent
             # minutes polling, and the previous cut's tag may only have been
@@ -637,14 +660,16 @@ jobs:
             # Fetch immutable objects only. Never check out or run PR code.
             # Fetch/classifier failures conservatively keep the queue path.
             direct=false
-            if git fetch --no-tags origin "$base_sha" "$head_sha"; then
-              # The admin route must not bypass freshness, even if GitHub's
-              # cached mergeStateStatus has not caught up with main yet.
-              if ! git merge-base --is-ancestor "$base_sha" "$head_sha"; then
-                transient pr-stale "Release PR #$number does not contain its current main base"
+            if git fetch --no-tags origin "$main_sha" "$head_sha"; then
+              # Re-prove the live-main gate on the fetched objects before the
+              # admin route, and classify the diff against main's live tip
+              # (never the PR's stale base, which would count main-only
+              # commits as part of the release diff).
+              if ! git merge-base --is-ancestor "$main_sha" "$head_sha"; then
+                transient pr-stale "Release PR #$number does not contain main's live tip"
                 sleep 30; continue
               fi
-              shape=$(bash scripts/release-pr-fast-path.sh "$base_sha" "$head_sha") || shape="fast_path=false"
+              shape=$(bash scripts/release-pr-fast-path.sh "$main_sha" "$head_sha") || shape="fast_path=false"
               [[ "$shape" != "fast_path=true" ]] || direct=true
             fi
             merge_args=(--squash --match-head-commit "$head_sha")

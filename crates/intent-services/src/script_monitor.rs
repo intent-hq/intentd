@@ -89,11 +89,9 @@ impl Services {
         let Some(md) = metadata.filter(|md| monitor_id(Some(md)).is_some()) else {
             return false;
         };
-        self.transfer_exports
-            .lock()
-            .expect("export registry")
-            .values()
-            .any(|session| md["workspaceId"].as_str() == Some(session.workspace_id.as_str()))
+        md["workspaceId"]
+            .as_str()
+            .is_some_and(|workspace| self.ports.transfer().export_in_progress(workspace))
     }
 
     pub(crate) fn defer_script_monitor_for_export(
@@ -118,7 +116,11 @@ impl Services {
         );
         true
     }
-    pub(crate) fn start_script_monitor_maintenance(&self) {
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub fn start_script_monitor_maintenance(&self) {
         if self
             .script_locks
             .monitor_maintenance
@@ -130,7 +132,13 @@ impl Services {
         intent_core::spawn_daemon(async move {
             let mut sweep = tokio::time::interval(std::time::Duration::from_secs(1));
             loop {
-                sweep.tick().await;
+                // Shutdown closes the settings task group before the store
+                // closes; stop here so no tick writes to a closing store.
+                tokio::select! {
+                    biased;
+                    () = services.settings_tasks.closed() => break,
+                    _ = sweep.tick() => {}
+                }
                 let completions = services
                     .script_locks
                     .monitor_completions
@@ -180,6 +188,10 @@ impl Services {
                     }
                 }
             }
+            services
+                .script_locks
+                .monitor_maintenance
+                .store(false, std::sync::atomic::Ordering::SeqCst);
         });
     }
 

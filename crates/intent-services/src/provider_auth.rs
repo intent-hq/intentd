@@ -809,6 +809,14 @@ fn auth_cache_key(provider_id: &str) -> Option<&'static str> {
     Some(intent_providers::provider_config(provider_id).id)
 }
 
+/// Whether `provider_id` is a base provider whose Default configuration can
+/// carry saved environment overrides (PROTOCOL §5.54), so its auth status
+/// and test prompt run through the services layer with that overlay.
+#[must_use]
+pub fn supports_default_overrides(provider_id: &str) -> bool {
+    crate::provider_profiles::is_default_config_ref(provider_id)
+}
+
 /// Read-only view of one provider's *fresh* cached auth verdict:
 /// `Some(false)` only when a still-fresh cache entry holds an explicit
 /// not-authenticated probe outcome; `Some(true)` for a fresh authenticated
@@ -882,8 +890,8 @@ pub(crate) fn promote_auth_verdict(provider_id: &str) {
 /// Test seam: plant a verdict in the process-wide auth cache so gate tests
 /// are deterministic without spawning probes. Seed `None` to restore the
 /// permissive cached-unknown state.
-#[cfg(test)]
-pub(crate) fn seed_auth_verdict_for_tests(provider_id: &'static str, value: Option<bool>) {
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn seed_auth_verdict_for_tests(provider_id: &'static str, value: Option<bool>) {
     cache().store(provider_id, AuthVerdict::plain(value));
 }
 
@@ -980,19 +988,21 @@ pub(crate) async fn profile_auth_status(
     let cached = if force { None } else { cache().fresh(&key) };
     let verdict = match cached {
         Some(cached) => cached,
-        None => match crate::provider_profiles::parse_profile_ref(&reference)
-            .map(|(base, _)| base)
-            .and_then(|base| {
-                resolve_probe_binary(base, override_path.as_deref()).map(|bin| (base, bin))
-            }) {
-            Some((base, program)) => {
-                resolve_cached(&key, async {
-                    probe_provider(base, program, override_path.as_deref(), Some(profile)).await
-                })
-                .await
+        None => {
+            match intent_providers::find_provider(intent_providers::base_provider_id(&reference))
+                .map(|provider| provider.id)
+                .and_then(|base| {
+                    resolve_probe_binary(base, override_path.as_deref()).map(|bin| (base, bin))
+                }) {
+                Some((base, program)) => {
+                    resolve_cached(&key, async {
+                        probe_provider(base, program, override_path.as_deref(), Some(profile)).await
+                    })
+                    .await
+                }
+                None => AuthVerdict::default(),
             }
-            None => AuthVerdict::default(),
-        },
+        }
     };
     auth_status_entry(&reference, &verdict)
 }
@@ -1453,11 +1463,16 @@ case "$*" in
   --version)
     [ "$CLAUDE_CODE_EXECUTABLE" = "$0" ] || exit 91
     printf 'version\n' >> "$HOME/cli-calls"
-    printf '2.1.0 (Claude Code)\n' ;;
+    printf '%s\n' '@CURRENT@' ;;
   *) exit 92 ;;
 esac
 "#
-                .to_owned(),
+                .replace(
+                    "@CURRENT@",
+                    &intent_providers::test_support::current_cli_version(
+                        intent_providers::installed_cli::InstalledCli::Claude,
+                    ),
+                ),
             ),
             (
                 "npx",
@@ -1506,7 +1521,7 @@ while IFS= read -r unexpected; do exit 95; done
             .stderr(Stdio::from(log));
         let mut child = intentd_test_support::GuardedChild::spawn(&mut command).unwrap();
         let status = child
-            .wait_with_timeout(Duration::from_secs(60))
+            .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(60)))
             .unwrap()
             .expect("isolated auth wiring test timed out");
         assert!(

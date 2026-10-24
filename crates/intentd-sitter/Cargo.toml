@@ -1,6 +1,6 @@
 [package]
 name = "intentd-sitter"
-version = "0.1.28"
+version = "0.1.32"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -34,6 +34,7 @@ toml.workspace = true
 nix = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
+intentd-test-support = { path = "../intentd-test-support" }
 flate2 = "1.1.9"
 liblzma = "0.4.7"
 serde_json.workspace = true
@@ -41,11 +42,8 @@ sha2 = "0.11.0"
 tar = "0.4.46"
 tempfile = "3"
 
-[target."cfg(unix)".dev-dependencies]
-intentd-test-support = { path = "../intentd-test-support" }
-
 [target."cfg(windows)".dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading", "Win32_System_JobObjects"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Threading", "Win32_System_JobObjects"] }
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 [lints]

@@ -6,14 +6,14 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::path::Path;
 use std::sync::Arc;
 
 use intent_core::{
-    now_iso, NoteAddInput, NoteCreate, NoteEditInput, NoteEditLinesInput, Workspace,
-    WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
+    now_iso, NoteAddInput, NoteCreate, NoteEditInput, NoteEditLinesInput, NoteId, TaskStatus,
+    Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
 };
 use intent_services::{EventBus, Services};
 use intent_store::Store;
@@ -63,6 +63,7 @@ fn workspace(id: &WorkspaceId, path: &Path) -> Workspace {
         pull_requests_total: None,
         display_status: None,
         waiting: false,
+        scripts_running: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
@@ -255,4 +256,369 @@ async fn note_update_metadata() {
 
     // Cleanup
     drop(services); // Drop store handles before DB cleanup
+}
+
+/// Parallel writers per concurrency test. The issue (intent-hq/intent#7184)
+/// saw 2–3 of 8 parallel `ws.note.edit` calls fail; more writers than the
+/// 5-attempt retry bound makes the pre-fix failure deterministic.
+const WRITERS: usize = 16;
+
+/// Upper bound (before the slow-runner multiplier) for one concurrency
+/// test, so a lock-ordering bug fails fast instead of hanging the suite.
+const CONCURRENCY_TIMEOUT_SECS: u64 = 60;
+
+async fn create_note_with(services: &Services, ws: &WorkspaceId, content: String) -> NoteId {
+    services
+        .create_note(
+            ws.clone(),
+            NoteCreate {
+                title: "Shared Spec".to_string(),
+                content: Some(content),
+                tags: None,
+                parent_id: None,
+            },
+            None,
+            None,
+        )
+        .await
+        .expect("create note")
+        .note
+        .id
+}
+
+/// Run `count` writers released together by a barrier and return each
+/// writer's result in index order.
+async fn run_together<T, F, Fut>(count: usize, writer: F) -> Vec<T>
+where
+    T: Send + 'static,
+    F: Fn(usize) -> Fut,
+    Fut: std::future::Future<Output = T> + Send + 'static,
+{
+    let barrier = Arc::new(tokio::sync::Barrier::new(count));
+    let handles: Vec<_> = (0..count)
+        .map(|i| {
+            let barrier = Arc::clone(&barrier);
+            let fut = writer(i);
+            intent_core::spawn_daemon(async move {
+                barrier.wait().await;
+                fut.await
+            })
+        })
+        .collect();
+    let budget = intentd_test_support::test_timeout(std::time::Duration::from_secs(
+        CONCURRENCY_TIMEOUT_SECS,
+    ));
+    let joined = tokio::time::timeout(budget, async {
+        let mut out = Vec::with_capacity(handles.len());
+        for h in handles {
+            out.push(h.await.expect("writer task panicked"));
+        }
+        out
+    })
+    .await;
+    joined.expect("concurrent writers did not finish (deadlock?)")
+}
+
+fn failures<T, E: std::fmt::Display>(results: &[Result<T, E>]) -> Vec<String> {
+    results
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| r.as_ref().err().map(|e| format!("writer {i}: {e}")))
+        .collect()
+}
+
+/// Regression for intent-hq/intent#7184: parallel exact-match `note.edit`
+/// calls on different lines of one note must all apply — none may surface
+/// `conflict: version mismatch`.
+#[intent_test_macros::daemon_test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_edits_on_different_lines_all_apply() {
+    let (services, ws, _tmp) = setup().await;
+    let content = (0..WRITERS)
+        .map(|i| format!("line {i}: todo"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let note_id = create_note_with(&services, &ws, content).await;
+
+    let results = run_together(WRITERS, |i| {
+        let (services, ws, note_id) = (Arc::clone(&services), ws.clone(), note_id.clone());
+        async move {
+            services
+                .edit_note(
+                    ws,
+                    note_id,
+                    NoteEditInput {
+                        old: format!("line {i}: todo"),
+                        new: format!("line {i}: done"),
+                    },
+                    None,
+                )
+                .await
+        }
+    })
+    .await;
+    assert_eq!(failures(&results), Vec::<String>::new());
+
+    let note = services
+        .get_note(ws.clone(), note_id)
+        .await
+        .expect("get note");
+    for i in 0..WRITERS {
+        assert!(
+            note.content.contains(&format!("line {i}: done")),
+            "edit {i} missing from final content:\n{}",
+            note.content
+        );
+    }
+    assert!(!note.content.contains("todo"), "{}", note.content);
+}
+
+/// Parallel `note.add` calls on one note must all land.
+#[intent_test_macros::daemon_test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_adds_all_apply() {
+    let (services, ws, _tmp) = setup().await;
+    let note_id = create_note_with(&services, &ws, "# Log".to_string()).await;
+
+    let results = run_together(WRITERS, |i| {
+        let (services, ws, note_id) = (Arc::clone(&services), ws.clone(), note_id.clone());
+        async move {
+            services
+                .add_to_note(
+                    ws,
+                    note_id,
+                    NoteAddInput {
+                        content: format!("entry {i} from writer"),
+                        heading: None,
+                        position: Some("end".to_string()),
+                    },
+                    None,
+                )
+                .await
+        }
+    })
+    .await;
+    assert_eq!(failures(&results), Vec::<String>::new());
+
+    let note = services
+        .get_note(ws.clone(), note_id)
+        .await
+        .expect("get note");
+    for i in 0..WRITERS {
+        assert!(
+            note.content.contains(&format!("entry {i} from writer")),
+            "add {i} missing from final content:\n{}",
+            note.content
+        );
+    }
+}
+
+/// Parallel `task.updateStatus` calls on different checkboxes of one note
+/// must all apply.
+#[intent_test_macros::daemon_test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_task_status_updates_all_apply() {
+    let (services, ws, _tmp) = setup().await;
+    let content = std::iter::once("# Tasks".to_string())
+        .chain((0..WRITERS).map(|i| format!("- [ ] Step {i:02}")))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let note_id = create_note_with(&services, &ws, content).await;
+
+    let results = run_together(WRITERS, |i| {
+        let (services, ws, note_id) = (Arc::clone(&services), ws.clone(), note_id.clone());
+        async move {
+            services
+                .task_update_status(
+                    ws,
+                    note_id,
+                    format!("Step {i:02}"),
+                    "done".to_string(),
+                    None,
+                )
+                .await
+        }
+    })
+    .await;
+    assert_eq!(failures(&results), Vec::<String>::new());
+
+    let tasks = services
+        .list_note_tasks(ws.clone(), note_id)
+        .await
+        .expect("list tasks");
+    assert_eq!(tasks.len(), WRITERS);
+    for task in &tasks {
+        assert_eq!(task.status, "done", "{} not done", task.text);
+    }
+}
+
+/// Two parallel edits anchored on the SAME text: the first to run applies,
+/// the second re-reads the note, finds its `old` text gone, and fails with
+/// "Text not found" — never a silent double-apply or merged mash-up.
+#[intent_test_macros::daemon_test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_edits_on_same_text_apply_once() {
+    let (services, ws, _tmp) = setup().await;
+    let note_id = create_note_with(
+        &services,
+        &ws,
+        "header\nStatus: pending\nfooter".to_string(),
+    )
+    .await;
+
+    let results = run_together(2, |i| {
+        let (services, ws, note_id) = (Arc::clone(&services), ws.clone(), note_id.clone());
+        async move {
+            services
+                .edit_note(
+                    ws,
+                    note_id,
+                    NoteEditInput {
+                        old: "Status: pending".to_string(),
+                        new: format!("Status: claimed by writer {i}"),
+                    },
+                    None,
+                )
+                .await
+        }
+    })
+    .await;
+
+    let ok: Vec<usize> = (0..2).filter(|&i| results[i].is_ok()).collect();
+    assert_eq!(
+        ok.len(),
+        1,
+        "exactly one edit must apply: {:?}",
+        failures(&results)
+    );
+    let loser = 1 - ok[0];
+    let err = results[loser]
+        .as_ref()
+        .expect_err("loser must fail")
+        .to_string();
+    assert!(err.contains("Text not found"), "unexpected error: {err}");
+
+    let note = services
+        .get_note(ws.clone(), note_id)
+        .await
+        .expect("get note");
+    assert_eq!(
+        note.content,
+        format!("header\nStatus: claimed by writer {}\nfooter", ok[0])
+    );
+}
+
+/// Writers on two different notes run side by side and all apply: the
+/// per-note serialization never couples unrelated notes.
+#[intent_test_macros::daemon_test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_edits_across_two_notes_all_apply() {
+    let (services, ws, _tmp) = setup().await;
+    let content = (0..WRITERS / 2)
+        .map(|i| format!("item {i}: open"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let notes = [
+        create_note_with(&services, &ws, content.clone()).await,
+        create_note_with(&services, &ws, content).await,
+    ];
+
+    let results = run_together(WRITERS, |i| {
+        let (services, ws) = (Arc::clone(&services), ws.clone());
+        let note_id = notes[i % 2].clone();
+        async move {
+            services
+                .edit_note(
+                    ws,
+                    note_id,
+                    NoteEditInput {
+                        old: format!("item {}: open", i / 2),
+                        new: format!("item {}: closed", i / 2),
+                    },
+                    None,
+                )
+                .await
+        }
+    })
+    .await;
+    assert_eq!(failures(&results), Vec::<String>::new());
+
+    for note_id in notes {
+        let note = services
+            .get_note(ws.clone(), note_id)
+            .await
+            .expect("get note");
+        assert!(!note.content.contains("open"), "{}", note.content);
+    }
+}
+
+/// Parallel `task.updateStatus` calls on LINKED checkbox lines of one note:
+/// each redirects to its task note and then rewrites its own line in the
+/// shared parent (materialization). Every task must end `complete` and every
+/// line must show `[x]` — no projection may be dropped after losing races
+/// against the other parent rewrites.
+#[intent_test_macros::daemon_test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_linked_task_status_updates_all_materialize() {
+    let (services, ws, _tmp) = setup().await;
+    let content = std::iter::once("# Plan".to_string())
+        .chain((0..WRITERS).map(|i| format!("@@@task\n# Linked step {i:02}\nDo step {i}.\n@@@")))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let note_id = create_note_with(&services, &ws, content).await;
+    let before = services
+        .list_note_tasks(ws.clone(), note_id.clone())
+        .await
+        .expect("list tasks");
+    assert_eq!(
+        before.len(),
+        WRITERS,
+        "task blocks converted to linked lines"
+    );
+
+    let results = run_together(WRITERS, |i| {
+        let (services, ws, note_id) = (Arc::clone(&services), ws.clone(), note_id.clone());
+        async move {
+            services
+                .task_update_status(
+                    ws,
+                    note_id,
+                    format!("Linked step {i:02}"),
+                    "done".to_string(),
+                    None,
+                )
+                .await
+        }
+    })
+    .await;
+    assert_eq!(failures(&results), Vec::<String>::new());
+
+    let after = services
+        .list_note_tasks(ws.clone(), note_id.clone())
+        .await
+        .expect("list tasks");
+    let stale: Vec<&str> = after
+        .iter()
+        .filter(|t| t.status != "done")
+        .map(|t| t.text.as_str())
+        .collect();
+    let note = services
+        .get_note(ws.clone(), note_id)
+        .await
+        .expect("get note");
+    assert!(
+        stale.is_empty(),
+        "lines not materialized to [x]: {stale:?}\n{}",
+        note.content
+    );
+    for task in &after {
+        let id = task
+            .task_note_id
+            .clone()
+            .expect("linked line carries its task note id");
+        let task_note = services
+            .get_note(ws.clone(), NoteId::from(id.as_str()))
+            .await
+            .expect("get task note");
+        assert_eq!(
+            task_note.metadata.task.as_ref().map(|t| t.status),
+            Some(TaskStatus::Complete),
+            "{}",
+            task.text
+        );
+    }
 }

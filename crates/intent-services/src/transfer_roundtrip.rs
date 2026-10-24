@@ -528,7 +528,7 @@ fn is_untracked(repo_path: &Path, file: &str) -> bool {
 async fn wait_ready(svc: &Services, export_id: &str) -> bool {
     for _ in 0..400 {
         {
-            let exports = svc.transfer_exports.lock().unwrap();
+            let exports = svc.transfer_state().exports.lock().unwrap();
             match exports.get(export_id) {
                 Some(s) if matches!(s.state, ExportState::Ready(_)) => return true,
                 Some(_) => {}
@@ -542,7 +542,7 @@ async fn wait_ready(svc: &Services, export_id: &str) -> bool {
 
 /// Pull the sealed archive metadata off a Ready session: (size, sha, manifest).
 fn ready_meta(svc: &Services, export_id: &str) -> (u64, String, TransferManifest) {
-    let exports = svc.transfer_exports.lock().unwrap();
+    let exports = svc.transfer_state().exports.lock().unwrap();
     match &exports.get(export_id).expect("session").state {
         ExportState::Ready(r) => (r.size_bytes, r.sha256.clone(), r.manifest.clone()),
         ExportState::Building { .. } => panic!("session not ready"),
@@ -1010,7 +1010,9 @@ exit 91
         .stderr(log);
     let mut child = GuardedChild::spawn(&mut command).unwrap();
     drop(env_lock);
-    let status = child.wait_with_timeout(Duration::from_secs(120)).unwrap();
+    let status = child
+        .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(120)))
+        .unwrap();
     drop(child); // Kill/reap a timed-out worker before inspecting or removing its files.
     let worker_log = std::fs::read_to_string(&log_path).unwrap();
     let shell_receipt = std::fs::read_to_string(root.path().join("shell-captured"));
@@ -1159,7 +1161,7 @@ async fn transfer_round_trip_between_two_stacks() {
 
     // Multi-chunk relay with a tiny archive: shrink the chunk budget.
     {
-        let mut exports = source.transfer_exports.lock().unwrap();
+        let mut exports = source.transfer_state().exports.lock().unwrap();
         exports.get_mut(&export_id).unwrap().max_chunk_bytes = 4096;
     }
     let (size, sha, manifest) = ready_meta(&source, &export_id);
@@ -1430,7 +1432,7 @@ async fn transfer_abort_mid_relay_cleans_both_sides() {
     let export_id = started["exportId"].as_str().expect("exportId").to_string();
     assert!(wait_ready(&source, &export_id).await, "build must succeed");
     {
-        let mut exports = source.transfer_exports.lock().unwrap();
+        let mut exports = source.transfer_state().exports.lock().unwrap();
         exports.get_mut(&export_id).unwrap().max_chunk_bytes = 4096;
     }
     let (size, sha, manifest) = ready_meta(&source, &export_id);

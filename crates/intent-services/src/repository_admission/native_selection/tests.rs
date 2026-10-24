@@ -411,11 +411,14 @@ impl WorkerGate {
     }
 }
 async fn until(mut ready: impl FnMut() -> bool) {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !ready() {
-            tokio::task::yield_now().await;
-        }
-    })
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            while !ready() {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
     .await
     .unwrap();
 }
@@ -574,9 +577,12 @@ async fn native_selection_observed_commit_survives_waiter_cancel_before_retentio
             .save(&worker_f, &worker_edit, Choice::Automatic {})
             .await
     });
-    tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
-        .await
-        .unwrap();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        gate.entered.notified(),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         f.services
             .store
@@ -813,7 +819,7 @@ async fn native_selection_virtual_deadlines_retire_unclaimed_frame_and_receipt()
         .entered(async { s.owner.capture_selection(&Frame::Save(q)).unwrap() })
         .await;
     tokio::time::pause();
-    tokio::time::advance(FRAME_TTL + Duration::from_secs(1)).await;
+    tokio::time::advance(frame_ttl() + Duration::from_secs(1)).await;
     tokio::time::resume();
     scope.retire();
     assert_eq!(
@@ -876,9 +882,12 @@ async fn native_selection_record_and_worker_limits_charge_original_completion() 
         tasks.push(tokio::spawn(async move {
             s.save(&f, &edit, Choice::Automatic {}).await
         }));
-        tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
-            .await
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            gate.entered.notified(),
+        )
+        .await
+        .unwrap();
     }
     assert_eq!(
         f.services

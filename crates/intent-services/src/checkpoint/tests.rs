@@ -1,5 +1,5 @@
 use super::*;
-use crate::transfer_submodules::test_fixture::{
+use crate::test_support::submodule_fixture::{
     git as run_git, init_repo, local_commit, superproject_with_submodule,
 };
 use std::fs;
@@ -7,7 +7,7 @@ use std::fs;
 fn inputs(root: &Path) -> Vec<RepositoryInput> {
     let mut paths = vec![".".to_string()];
     paths.extend(
-        crate::transfer_submodules::checkpoint_submodules(root)
+        crate::checkpoint::checkpoint_submodules(root)
             .unwrap()
             .into_iter()
             .map(|s| s.path),

@@ -26,6 +26,9 @@ pub(crate) struct InstalledContext {
     /// The selected named profile, already applied to `env`. Kept so catalog
     /// keys, redaction and re-discovery use the same profile.
     profile: Option<Arc<ProfileEnv>>,
+    /// The confirmed-too-old host CLI this context replaced with Intent's
+    /// bundled copy (`runtime`). Re-discovery checks the host again.
+    host: Option<InstalledCliRuntime>,
 }
 
 fn private_hash(value: &impl Hash) -> u64 {
@@ -73,6 +76,7 @@ impl InstalledContext {
             context_key: None,
             names: names.clone(),
             profile: None,
+            host: None,
         })
     }
 
@@ -224,6 +228,13 @@ impl InstalledContext {
                 command.env_remove(k);
             }
         }
+        self.apply_selection(command);
+    }
+
+    /// Enforce only the selected executable and Intent's Codex policy on an
+    /// already prepared (`apply`d or `apply_isolated`) command, leaving the
+    /// rest of its environment untouched.
+    pub fn apply_selection(&self, command: &mut Command) {
         let keys: Vec<_> = command
             .as_std()
             .get_envs()
@@ -248,12 +259,120 @@ impl InstalledContext {
         }
     }
 
+    fn provider_id(&self) -> &'static str {
+        self.runtime.cli().provider_id()
+    }
+
     pub fn validate_launch_version(&self, version: &str) -> Result<(), String> {
-        let provider = match self.runtime.cli() {
-            InstalledCli::Codex => "codex",
-            InstalledCli::Claude => "claude-code",
+        intent_providers::adapter_cli::validate_launch_version(self.provider_id(), version)
+    }
+
+    /// The host CLI this context replaced with Intent's bundled copy, if any.
+    pub fn replaced_host(&self) -> Option<&InstalledCliRuntime> {
+        self.host.as_ref()
+    }
+
+    /// The same environment and profile with `runtime` as the launched CLI.
+    /// The original runtime is remembered as the replaced host CLI.
+    async fn with_bundled(&self, runtime: InstalledCliRuntime) -> Result<Self, String> {
+        let mut next = self.clone();
+        next.host = Some(self.host.clone().unwrap_or_else(|| self.runtime.clone()));
+        next.env.insert(
+            runtime.cli().path_env().into(),
+            runtime.path().as_os_str().to_owned(),
+        );
+        next.runtime = runtime;
+        if next.context_key.is_some() {
+            return next.with_catalog_fingerprint().await;
+        }
+        Ok(next)
+    }
+
+    /// Observe the selected CLI with the prepared `launch` command and enforce
+    /// the launch minimum. A host CLI confirmed below it is replaced by
+    /// Intent's bundled copy (installed on first use): `self` switches to it,
+    /// and it is observed and validated instead. Unknown versions keep the
+    /// host CLI. Returns the identity and version of what will be launched.
+    /// Callers must then call [`Self::apply_selection`] on `launch` so the
+    /// adapter receives the selected executable.
+    ///
+    /// The bundled copy lives under the launch environment's home, so a
+    /// profile or fixture home selects its own managed directory.
+    pub async fn select_launch(
+        &mut self,
+        launch: &Command,
+        dependency: Option<ProbeDependency>,
+    ) -> Result<(InstalledCliIdentity, String), LaunchSelectionError> {
+        use LaunchSelectionError::{BelowMinimum, BundledUnavailable, Unverified};
+        let observed = self
+            .observe_with_dependency(launch, dependency.clone())
+            .await
+            .map_err(Unverified)?;
+        if self.host.is_some() {
+            self.validate_launch_version(&observed.1)
+                .map_err(BelowMinimum)?;
+            return Ok(observed);
+        }
+        let provider = self.provider_id();
+        let Some(bundled) = intent_providers::adapter_cli::bundled_fallback(provider, &observed.1)
+        else {
+            self.validate_launch_version(&observed.1)
+                .map_err(BelowMinimum)?;
+            return Ok(observed);
         };
-        intent_providers::adapter_cli::validate_launch_version(provider, version)
+        let reason = self
+            .validate_launch_version(&observed.1)
+            .err()
+            .unwrap_or_default();
+        let cli = self.runtime.cli();
+        let root = self.home().as_deref().and_then(crate::bundled_cli::root_in);
+        let installed = match &root {
+            Some(root) => crate::bundled_cli::ensure(root, cli, &bundled).await,
+            None => Err("the launch environment has no absolute home directory".to_owned()),
+        };
+        let runtime = match installed {
+            Ok(runtime) => runtime,
+            // Claude had no launch minimum before the bundled fallback; when
+            // it cannot be installed (offline, no npm) keep launching the
+            // installed Claude rather than blocking every session.
+            Err(error) if cli == InstalledCli::Claude => {
+                tracing::warn!(
+                    installed = %observed.1,
+                    bundled = %bundled.spec(),
+                    %error,
+                    "could not install Intent's bundled Claude Code CLI; launching the installed CLI"
+                );
+                return Ok(observed);
+            }
+            Err(error) => {
+                return Err(BundledUnavailable(format!(
+                    "{reason} Intent could not install its bundled {} instead: {error}",
+                    bundled.spec()
+                )))
+            }
+        };
+        warn_bundled_once(cli, &observed.1, &bundled);
+        *self = self.with_bundled(runtime).await.map_err(Unverified)?;
+        // Probe with the launch's environment and cwd, selecting the bundled
+        // executable exactly as the launch will.
+        let mut probe = Command::new(self.runtime.path());
+        for (key, value) in launch.as_std().get_envs() {
+            match value {
+                Some(value) => probe.env(key, value),
+                None => probe.env_remove(key),
+            };
+        }
+        if let Some(cwd) = launch.as_std().get_current_dir() {
+            probe.current_dir(cwd);
+        }
+        self.apply_selection(&mut probe);
+        let observed = self
+            .observe_with_dependency(&probe, dependency)
+            .await
+            .map_err(Unverified)?;
+        self.validate_launch_version(&observed.1)
+            .map_err(BelowMinimum)?;
+        Ok(observed)
     }
 
     pub fn key(&self, identity: &InstalledCliIdentity) -> Option<String> {
@@ -279,9 +398,31 @@ impl InstalledContext {
         let Ok(current) = Self::discover_for(self.runtime.cli(), self.profile.clone()).await else {
             return false;
         };
-        let Ok(current) = current.with_catalog_fingerprint().await else {
+        let Ok(mut current) = current.with_catalog_fingerprint().await else {
             return false;
         };
+        if let Some(host) = &self.host {
+            // The bundled copy stays current only while the same host CLI is
+            // still confirmed too old; upgrading it switches back.
+            if current.runtime != *host {
+                return false;
+            }
+            let Ok((_, version)) = current
+                .observe_with_dependency(command, Some(dependency.clone()))
+                .await
+            else {
+                return false;
+            };
+            if intent_providers::adapter_cli::bundled_fallback(self.provider_id(), &version)
+                .is_none()
+            {
+                return false;
+            }
+            let Ok(bundled) = current.with_bundled(self.runtime.clone()).await else {
+                return false;
+            };
+            current = bundled;
+        }
         if current.runtime != self.runtime || current.context_key != self.context_key {
             return false;
         }
@@ -330,6 +471,55 @@ impl InstalledContext {
             .map_err(|_| "installed CLI identity task failed")?
             .map_err(|_| "installed CLI changed or disappeared")?;
         Ok((identity, version))
+    }
+}
+
+/// Why a launch could not select a runnable CLI.
+#[derive(Debug)]
+pub(crate) enum LaunchSelectionError {
+    /// The CLI that would be launched is confirmed below the minimum.
+    BelowMinimum(String),
+    /// The installed CLI is too old and Intent's bundled copy could not be
+    /// installed; the message names both.
+    BundledUnavailable(String),
+    /// A version or identity probe failed.
+    Unverified(String),
+}
+
+impl std::fmt::Display for LaunchSelectionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (Self::BelowMinimum(reason)
+        | Self::BundledUnavailable(reason)
+        | Self::Unverified(reason)) = self;
+        f.write_str(reason)
+    }
+}
+
+impl From<LaunchSelectionError> for String {
+    fn from(error: LaunchSelectionError) -> Self {
+        error.to_string()
+    }
+}
+
+fn warn_bundled_once(
+    cli: InstalledCli,
+    version: &str,
+    bundled: &intent_providers::adapter_cli::BundledCli,
+) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static CODEX: AtomicBool = AtomicBool::new(false);
+    static CLAUDE: AtomicBool = AtomicBool::new(false);
+    let warned = match cli {
+        InstalledCli::Codex => &CODEX,
+        InstalledCli::Claude => &CLAUDE,
+    };
+    if !warned.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            cli = cli.command(),
+            installed = version,
+            bundled = %bundled.spec(),
+            "installed CLI is below the adapter minimum; launching Intent's bundled CLI until it is upgraded"
+        );
     }
 }
 

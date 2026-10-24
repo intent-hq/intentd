@@ -811,7 +811,7 @@ mod tests {
         // timeout so a regression fails fast instead of hanging the test.
         assert!(trash.exists());
         let acquired = tokio::time::timeout(
-            Duration::from_secs(5),
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
             locks.with_lock(&repo_path, || async { true }),
         )
         .await

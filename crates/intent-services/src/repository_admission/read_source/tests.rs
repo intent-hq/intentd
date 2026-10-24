@@ -78,8 +78,19 @@ impl ActualRead {
         Self::from_auth(server, auth).await
     }
 
-    async fn from_auth(server: &ReadServer, mut auth: Fixture) -> Self {
-        let mut git = GitFixture::new().await;
+    /// As [`Self::new`], but the primary selection is retained, unproved
+    /// historical intent.
+    async fn with_unresolved_history(server: &ReadServer) -> Self {
+        let f = Self::new(server).await;
+        GitFixture::seed_unresolved_history(&f.auth.service.store, &f.git.workspace.id).await;
+        f
+    }
+
+    async fn from_auth(server: &ReadServer, auth: Fixture) -> Self {
+        Self::from_auth_with(server, auth, GitFixture::new().await).await
+    }
+
+    async fn from_auth_with(server: &ReadServer, mut auth: Fixture, mut git: GitFixture) -> Self {
         auth.service = Arc::new(
             auth.service
                 .as_ref()
@@ -1331,6 +1342,232 @@ async fn positive_github_control_discovery_needs_no_private_anchor_or_gitlab_acc
     .await;
 }
 
+/// intent-hq/intent#7449: a GitHub workspace inserted with repository
+/// metadata has no saved choice, so a repo-less read resolves its own GitHub
+/// fetch remote through Automatic, while ambiguous, unmappable and missing
+/// remotes keep refusing.
+#[intent_test_macros::daemon_test]
+async fn implicit_github_read_of_metadata_workspace_resolves_automatic_selection() {
+    let git = GitFixture::with_repository_metadata("actual", "repository").await;
+    let services = Services::new(git.store.clone());
+    let root = git.root();
+    intent_core::caller::with_caller(Caller::Daemon, async {
+        assert_eq!(
+            SelectionFacts::read(&services, &root)
+                .await
+                .ok()
+                .and_then(|facts| facts.saved().ok()),
+            Some(SavedReviewSelection::Automatic)
+        );
+        let read = || async {
+            CapturedReview::capture(&services, git.workspace.id.clone(), 4)
+                .read(&services)
+                .await
+        };
+        assert!(read().await.is_err(), "no remote");
+        git.git(
+            &git.path,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/Actual/Repository.git",
+            ],
+        );
+        let Ok(ReadOutcome::Github(repo)) = read().await else {
+            panic!("repo-less read of a GitHub workspace must use its fetch remote");
+        };
+        assert_eq!(repo.owner, "actual");
+        assert_eq!(repo.name, "repository");
+        git.git(
+            &git.path,
+            &[
+                "remote",
+                "add",
+                "other",
+                "https://github.com/private/other.git",
+            ],
+        );
+        assert!(read().await.is_err(), "ambiguous GitHub remotes");
+        git.git(&git.path, &["remote", "remove", "other"]);
+        git.git(
+            &git.path,
+            &[
+                "remote",
+                "add",
+                "unmapped",
+                "https://unknown.test/private/repo.git",
+            ],
+        );
+        assert!(read().await.is_err(), "unmappable remote");
+    })
+    .await;
+}
+
+/// Retained, unproved historical intent never heals from current remotes on
+/// any reader: a repo-less read refuses even over a single GitHub fetch remote,
+/// until an explicit choice is saved.
+#[intent_test_macros::daemon_test]
+async fn implicit_github_read_refuses_unresolved_historical_selection() {
+    let git = GitFixture::new().await;
+    GitFixture::seed_unresolved_history(&git.store, &git.workspace.id).await;
+    git.git(
+        &git.path,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/Actual/Repository.git",
+        ],
+    );
+    let services = Services::new(git.store.clone());
+    intent_core::caller::with_caller(Caller::Daemon, async {
+        assert!(matches!(
+            SelectionFacts::read(&services, &git.root())
+                .await
+                .ok()
+                .and_then(|facts| facts.saved().ok()),
+            Some(SavedReviewSelection::UnresolvedHistorical { .. })
+        ));
+        let read = || async {
+            CapturedReview::capture(&services, git.workspace.id.clone(), 4)
+                .read(&services)
+                .await
+        };
+        assert!(matches!(read().await, Err(AdmissionError::Unavailable)));
+        let unresolved = git
+            .store
+            .repository_selection_snapshot(&git.root())
+            .await
+            .unwrap();
+        git.store
+            .write_repository_selection(
+                &unresolved,
+                intent_store::RepositorySelectionChange::Automatic,
+            )
+            .await
+            .result
+            .unwrap();
+        let Ok(ReadOutcome::Github(repo)) = read().await else {
+            panic!("the same root and remote resolve once Automatic is saved");
+        };
+        assert_eq!(repo.owner, "actual");
+        assert_eq!(repo.name, "repository");
+    })
+    .await;
+}
+
+/// intent-hq/intent#7449: the agent-facing refusal is deliberately generic,
+/// so the daemon log must name the failing stage and admission reason. A
+/// repo-less snapshot and monitor start over unresolved historical selection
+/// return the unchanged Forbidden refusal and log exactly one record each,
+/// without the remote URL.
+#[intent_test_macros::daemon_test]
+async fn unresolved_history_refusal_logs_stage_and_reason() {
+    let warnings = crate::test_tracing::Warnings::default();
+    let _guard = warnings.install();
+    let git = GitFixture::new().await;
+    GitFixture::seed_unresolved_history(&git.store, &git.workspace.id).await;
+    git.git(
+        &git.path,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/Actual/Repository.git",
+        ],
+    );
+    let services = Services::new(git.store.clone());
+    let agent = AgentId::new();
+    let session: AgentSession = serde_json::from_value(json!({
+        "id":agent,"workspaceId":git.workspace.id,"name":"refusal-log",
+        "status":"active","createdAt":"2026-10-22T00:00:00Z","updatedAt":"2026-10-22T00:00:00Z"
+    }))
+    .unwrap();
+    git.store.insert_agent_session(&session).await.unwrap();
+
+    for operation in ["pr.snapshot", "pr.monitor"] {
+        let result = if operation == "pr.snapshot" {
+            services.pr_state(git.workspace.id.clone(), 4, None).await
+        } else {
+            services
+                .pr_monitor_start(git.workspace.id.clone(), agent.clone(), 4, None)
+                .await
+        };
+        let Err(intent_core::Error::Forbidden(message)) = result else {
+            panic!("{operation}: expected the generic refusal, got {result:?}");
+        };
+        assert_eq!(message, REFUSAL, "{operation}");
+        let records: Vec<_> = warnings
+            .containing("repository read refused")
+            .into_iter()
+            .filter(|line| line.contains(&format!("operation=\"{operation}\"")))
+            .collect();
+        assert_eq!(records.len(), 1, "{operation}: {records:?}");
+        let record = &records[0];
+        for needle in [
+            format!("operation=\"{operation}\""),
+            "stage=TargetSelection".to_string(),
+            "error=Unavailable".to_string(),
+            format!("workspace_id={}", git.workspace.id),
+        ] {
+            assert!(
+                record.contains(&needle),
+                "{operation}: {needle} in {record}"
+            );
+        }
+        let lower = record.to_ascii_lowercase();
+        assert!(
+            !lower.contains("github.com") && !lower.contains("actual/repository"),
+            "{operation}: remote leaked into {record}"
+        );
+    }
+    assert_eq!(
+        warnings.containing("repository read refused").len(),
+        2,
+        "one record per refused call"
+    );
+    assert!(git
+        .store
+        .list_pr_monitors_by_agent(&agent)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+/// Unresolved historical intent over a mappable GitLab remote keeps the strict
+/// refusal for snapshot and monitor, without any provider traffic or monitor
+/// registration.
+#[intent_test_macros::daemon_test]
+async fn unresolved_history_never_reaches_gitlab() {
+    let server = ReadServer::new().await;
+    let f = ActualRead::with_unresolved_history(&server).await;
+    assert!(matches!(
+        SelectionFacts::read(&f.auth.service, &f.git.root())
+            .await
+            .ok()
+            .and_then(|facts| facts.saved().ok()),
+        Some(SavedReviewSelection::UnresolvedHistorical { .. })
+    ));
+    for call in ["ws.pr.snapshot(4)", "ws.mr.snapshot(4)", "ws.pr.monitor(4)"] {
+        let reply = run(
+            &f.server(),
+            &format!("try {{ return await {call}; }} catch(e) {{ return e.message; }}"),
+        )
+        .await;
+        assert!(reply.to_string().contains(REFUSAL), "{call}: {reply}");
+    }
+    assert_eq!(server.count(), 0);
+    assert!(f
+        .auth
+        .service
+        .store
+        .list_pr_monitors_by_agent(&f.agent)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
 #[intent_test_macros::daemon_test]
 async fn live_request_retirement_while_real_http_is_held_denies_later_private_delivery() {
     let server = ReadServer::new().await;
@@ -1629,7 +1866,12 @@ async fn detached_actual_file_read_cancellation_keeps_lease_and_never_dispatches
     assert!(task.await.unwrap_err().is_cancelled());
     let gate = f.auth.service.gitlab_credential_gate.lock();
     tokio::pin!(gate);
-    assert!(timeout(Duration::from_millis(40), &mut gate).await.is_err());
+    assert!(timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(40)),
+        &mut gate
+    )
+    .await
+    .is_err());
     file.resume();
     drop(timeout(BUDGET, gate).await.unwrap());
     assert_eq!(http.count(), 0);

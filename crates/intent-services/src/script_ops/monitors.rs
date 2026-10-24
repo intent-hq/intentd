@@ -257,6 +257,11 @@ impl ScriptManager {
             ),
         )
         .await;
+        // Active script monitors are a `Workspace.waiting` signal (§5.1):
+        // registration and every terminal transition go through here.
+        if let Some(services) = &self.owner_services {
+            services.maybe_emit_waiting_changed(&row.workspace_id).await;
+        }
     }
 
     async fn commit_monitor(&self, row: &ScriptMonitor) -> Result<()> {
@@ -411,7 +416,12 @@ impl ScriptManager {
         Ok(owners)
     }
 
-    pub(crate) async fn recover_monitors(&self) -> Result<()> {
+    #[expect(
+        clippy::missing_errors_doc,
+        clippy::missing_panics_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub async fn recover_monitors(&self) -> Result<()> {
         let _lane = self.locks.monitor_lane.lock().await;
         let pending_runs = self.store.pending_script_runs().await?;
         for (mut row, cancel_intent) in self.store.pending_script_monitors().await? {
@@ -693,6 +703,16 @@ impl ScriptManager {
             .is_none_or(|m| m.generation != generation || m.stopped_by_user)
         {
             return Err(Error::InvalidParams("script launch was cancelled".into()));
+        }
+        let mut spec = spec;
+        let run = self
+            .scripts
+            .lock()
+            .unwrap()
+            .get(&(ws.clone(), id.into()))
+            .and_then(|m| m.state.run_id.clone());
+        if let Some(run) = run {
+            spec.output_sink = self.open_output_sink(ws, id, &run).await;
         }
         let pty = self.pty.spawn(spec)?;
         if let Some(m) = self

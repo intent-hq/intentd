@@ -22,7 +22,6 @@ use tokio::sync::{mpsc, OwnedSemaphorePermit};
 use tokio::task::JoinHandle;
 use tracing::Instrument;
 
-mod page_state;
 mod presence_focus;
 pub(crate) mod recovery;
 
@@ -315,6 +314,10 @@ pub(crate) struct ConnSubs {
     /// `note.presence` lease — declared after `subs` so the forwarders'
     /// lease guards drop first.
     presence: presence::PresenceConn,
+    /// IDs of `agent.workers.subscribe` subscriptions (§5.5b), for the
+    /// per-connection cap; entries torn down via `events.unsubscribe` are
+    /// pruned against `subs` before counting.
+    worker_subs: HashSet<String>,
 }
 
 impl Drop for ConnSubs {
@@ -398,6 +401,20 @@ impl ConnSubs {
                 .await;
         }
         true
+    }
+
+    /// Drop `agent.workers.subscribe` entries whose forwarder has ended,
+    /// from both the registry and the per-connection worker cap (§5.5b).
+    fn reclaim_finished_workers(&mut self) {
+        let subs = &mut self.subs;
+        self.worker_subs.retain(|id| match subs.get(id) {
+            Some(live) if !live.handle.is_finished() => true,
+            Some(_) => {
+                subs.remove(id);
+                false
+            }
+            None => false,
+        });
     }
 
     /// Whether a registered forwarder has exited on its own (`None` for an
@@ -484,7 +501,11 @@ pub(crate) fn process_frame<'a>(
     let context = crate::context::CapturedFrame::capture();
     async move {
         context
-            .run(process_captured_frame(
+            // Boxed: `run` nests task-local scopes that each move the body
+            // by value, and debug builds give every scope a stack copy of
+            // this large per-frame future (WSS e2e tests overflowed the
+            // 2 MiB test-thread stack without it).
+            .run(Box::pin(process_captured_frame(
                 &context,
                 raw,
                 api,
@@ -498,7 +519,7 @@ pub(crate) fn process_frame<'a>(
                 client_id,
                 is_local,
                 limiter,
-            ))
+            )))
             .await
     }
 }
@@ -546,24 +567,6 @@ async fn process_captured_frame(
                 };
                 return out_tx.send_priority(frame).await.is_ok();
             }
-        }
-        // Admit opt-in state subscriptions before classifiers clone params/id.
-        if matches!(
-            value["method"].as_str(),
-            Some("note.subscribe" | "comment.subscribe")
-        ) && value["params"]["projection"] == "pageState"
-            && (raw.len() > 65_536 || !page_state::valid_id(value.get("id")))
-        {
-            let id = value.get("id").filter(|id| page_state::valid_id(Some(id)));
-            return send_fast_path_error(
-                events::IdInfo {
-                    present: value.get("id").is_some(),
-                    echo: id.cloned().unwrap_or(Value::Null),
-                },
-                "Invalid pageState subscription",
-                out_tx,
-            )
-            .await;
         }
         // A reply to a daemon-initiated reverse request (FE-served intents such
         // as `host.openExternal`, §12.4) — route it to the awaiting caller and
@@ -615,6 +618,25 @@ async fn process_captured_frame(
                 control::classify(value).filter(|req| control.services().admits(&req.method))
             {
                 let is_uds = !crate::context::is_tcp_connection();
+                if is_uds {
+                    if let Some(query) = control::gitlab_credential_query(&req) {
+                        let Ok(slot) = out_tx.reserve_priority().await else {
+                            return false;
+                        };
+                        finish_prepared_rpc(
+                            context,
+                            None,
+                            panic_guard::guard_prepared(
+                                &method,
+                                rpc_id.clone(),
+                                control::prepare_gitlab_credential(req, query, api.as_ref()),
+                            ),
+                            slot,
+                        )
+                        .await;
+                        return true;
+                    }
+                }
                 // A collaborator only ever reaches `system.status` here (the
                 // allowlist above refused the rest) and gets its guest-safe
                 // projection; the administrator keeps the full snapshot.
@@ -1031,6 +1053,15 @@ async fn process_captured_frame(
             )
             .await;
         }
+        if let Some(req) = crate::agent_workers::classify(value) {
+            return panic_guard::guard_send(
+                &method,
+                rpc_id.clone(),
+                out_tx,
+                handle_workers_subscribe(req, api, bus, out_tx, subs),
+            )
+            .await;
+        }
         if let Some(fast_path) = events::classify(value) {
             return panic_guard::guard_send(
                 &method,
@@ -1298,6 +1329,144 @@ async fn refuse_forbidden(method: &str, rpc_id: Option<Value>, out_tx: &Outbound
     }
 }
 
+/// `agent.workers.subscribe` (§5.5b): authorize via the list read, admit
+/// within the per-connection cap, ack, push the seq-0 snapshot, then one
+/// complete snapshot per change. The bus subscription is taken BEFORE the
+/// seq-0 read so no change is missed, and every later push re-reads the
+/// projection instead of forwarding event data, so a push is never older than
+/// one already sent. Returns `false` when the outbound channel is closed.
+pub(crate) async fn handle_workers_subscribe(
+    req: crate::agent_workers::WorkersSubscribe,
+    api: &Arc<dyn WorkspaceApi>,
+    bus: &EventBus,
+    out_tx: &OutboundSender,
+    subs: &mut ConnSubs,
+) -> bool {
+    let crate::agent_workers::WorkersSubscribe { id, params } = req;
+    let reply = |code: i32, message: &str, data_code: &str| {
+        events::error_frame_with_data(&id.echo, code, message, &json!({ "code": data_code }))
+    };
+    let ids = crate::router::wire_id(&params, "workspaceId")
+        .zip(crate::router::wire_id(&params, "agentId"));
+    let Some((workspace_id, agent_id)) = ids else {
+        let frame = reply(
+            -32602,
+            "workspaceId and agentId must be nonempty strings of at most 256 bytes without control characters",
+            "invalid-params",
+        );
+        return !id.present || out_tx.send_priority(frame).await.is_ok();
+    };
+    let (workspace_id, agent_id) = (
+        WorkspaceId::from(workspace_id),
+        AgentId::from(agent_id.as_str()),
+    );
+    // `workspace:updated` carries membership changes: each one re-checks the
+    // caller's access so a revoked member's subscription ends promptly even
+    // when the agent's workers are quiet.
+    let subscription = bus.subscribe(SubscriptionFilter {
+        event_types: vec![
+            intent_core::events::AGENT_WORKERS_CHANGED.to_string(),
+            WORKSPACE_UPDATED.to_string(),
+        ],
+        workspace_id: Some(workspace_id.0.clone()),
+        batch_window: None,
+        collaborator_only: crate::context::is_non_administrator_caller(),
+        ..Default::default()
+    });
+    let snapshot = match api
+        .agent_workers_list(workspace_id.clone(), agent_id.clone())
+        .await
+    {
+        Ok(snapshot) => snapshot,
+        Err(e) => {
+            let frame = match e {
+                intent_core::Error::InvalidParams(m) | intent_core::Error::InvalidInput(m) => {
+                    reply(-32602, &m, "invalid-params")
+                }
+                intent_core::Error::NotFound(_) | intent_core::Error::Forbidden(_) => {
+                    reply(-32602, "Agent not found", "not-found")
+                }
+                other => events::error_frame(&id.echo, -32603, &other.to_string()),
+            };
+            return !id.present || out_tx.send_priority(frame).await.is_ok();
+        }
+    };
+    // Reclaim every worker subscription whose forwarder ended (agent gone,
+    // access lost): its registry entry and its capacity slot. The registry
+    // therefore never holds more than the cap of ended worker entries.
+    subs.reclaim_finished_workers();
+    if subs.worker_subs.len() >= crate::agent_workers::MAX_WORKER_SUBSCRIPTIONS {
+        let frame = reply(
+            -32602,
+            "Too many agent.workers subscriptions on this connection",
+            "capacity",
+        );
+        return !id.present || out_tx.send_priority(frame).await.is_ok();
+    }
+    let subscription_id = events::next_subscription_id();
+    if id.present {
+        let ack = events::success_frame(&id.echo, &json!({ "subscriptionId": subscription_id }));
+        if out_tx.send_priority(ack).await.is_err() {
+            return false;
+        }
+    }
+    let initial = subscriptions::build_snapshot_push(&subscription_id, 0, &snapshot);
+    if out_tx.send_bulk(initial).await.is_err() {
+        return false;
+    }
+    let handle = spawn_forwarder(forward_workers(
+        subscription,
+        Arc::clone(api),
+        workspace_id,
+        agent_id,
+        subscription_id.clone(),
+        out_tx.clone(),
+    ));
+    subs.insert(subscription_id.clone(), handle, None, None);
+    subs.worker_subs.insert(subscription_id);
+    true
+}
+
+/// Push a fresh complete snapshot whenever the selected agent's projection
+/// changes. Ends when the connection closes or the read is refused (the agent
+/// is gone or the caller lost access).
+async fn forward_workers(
+    mut subscription: Subscription,
+    api: Arc<dyn WorkspaceApi>,
+    workspace_id: WorkspaceId,
+    agent_id: AgentId,
+    subscription_id: String,
+    out_tx: OutboundSender,
+) {
+    let mut seq = 0_u64;
+    while let Some(batch) = subscription.recv().await {
+        let changed = batch.iter().any(|e| {
+            e.event_type == intent_core::events::AGENT_WORKERS_CHANGED
+                && e.data.get("agentId").and_then(Value::as_str) == Some(agent_id.0.as_str())
+        });
+        let membership = batch.iter().any(|e| e.event_type == WORKSPACE_UPDATED);
+        if !changed && !membership {
+            continue;
+        }
+        let Ok(snapshot) = api
+            .agent_workers_list(workspace_id.clone(), agent_id.clone())
+            .await
+        else {
+            // Access lost or agent gone: end the stream. The per-connection
+            // cap does not count a finished forwarder.
+            return;
+        };
+        if !changed {
+            continue;
+        }
+        seq += 1;
+        let frame = subscriptions::build_snapshot_push(&subscription_id, seq, &snapshot);
+        if out_tx.send_bulk(frame).await.is_err() {
+            return;
+        }
+    }
+}
+
 /// Handle a classified `events.subscribe` / `events.unsubscribe` request,
 /// mirroring `handleSubscribe` / `handleUnsubscribe`. Returns `false` when the
 /// outbound channel is closed. `pub(crate)` for the conn-level collaborator
@@ -1396,6 +1565,7 @@ pub(crate) async fn handle_fast_path(
                     fences.push(membership.fence_handle());
                 }
                 let handle = spawn_forwarder(recovery::forward(
+                    Arc::clone(api),
                     subscription,
                     gate.map(|gate| (gate, membership_events.expect("paired with gate"))),
                     scoped_workspace,
@@ -1461,38 +1631,6 @@ pub(crate) async fn handle_sub_fast_path(
     out_tx: &OutboundSender,
     subs: &mut ConnSubs,
 ) -> bool {
-    let sub = match sub {
-        SubFastPath::Subscribe {
-            id,
-            channel,
-            params,
-        } if matches!(channel, Channel::Note | Channel::Comment) => {
-            let kind = if channel == Channel::Note {
-                crate::annotation_subscription::PageStateChannel::Note
-            } else {
-                crate::annotation_subscription::PageStateChannel::Comment
-            };
-            let value = Value::Object(params);
-            match crate::annotation_subscription::parse_page_state_subscription(kind, &value) {
-                Ok(Some(request)) => {
-                    return page_state::subscribe(id, channel, request, api, bus, out_tx, subs)
-                        .await
-                }
-                Ok(None) => {
-                    let Value::Object(params) = value else {
-                        unreachable!()
-                    };
-                    SubFastPath::Subscribe {
-                        id,
-                        channel,
-                        params,
-                    }
-                }
-                Err(message) => return send_fast_path_error(id, &message, out_tx).await,
-            }
-        }
-        other => other,
-    };
     match sub {
         SubFastPath::Subscribe {
             id,
@@ -1509,6 +1647,7 @@ pub(crate) async fn handle_sub_fast_path(
                     workspace_id,
                     replace_group,
                     projection,
+                    max_content_bytes,
                 } = p;
                 // Time the request-to-snapshot interval (intent-hq/intent#3707):
                 // the fast-path never enters the `rpc_dispatch` span, so this
@@ -1552,6 +1691,7 @@ pub(crate) async fn handle_sub_fast_path(
                     api.clone(),
                     WorkspaceId::from(workspace_id),
                     projection,
+                    max_content_bytes,
                     subscription,
                     membership,
                     subscription_id.clone(),
@@ -1968,6 +2108,7 @@ async fn forward_note_subscription(
     api: Arc<dyn WorkspaceApi>,
     workspace_id: WorkspaceId,
     projection: Option<intent_core::NoteListProjection>,
+    max_content_bytes: Option<usize>,
     mut subscription: Subscription,
     mut membership: Option<ChannelMembership>,
     subscription_id: String,
@@ -1982,7 +2123,15 @@ async fn forward_note_subscription(
                     .map(intent_core::note_list_slim_row)
                     .collect(),
             ),
-            None => serde_json::to_value(notes).unwrap_or_else(|_| Value::Array(Vec::new())),
+            None => match max_content_bytes {
+                Some(limit) => Value::Array(
+                    notes
+                        .into_iter()
+                        .map(|note| intent_core::note_bounded_row(note, limit))
+                        .collect(),
+                ),
+                None => serde_json::to_value(notes).unwrap_or_else(|_| Value::Array(Vec::new())),
+            },
         },
         Err(_) => Value::Array(Vec::new()),
     };
@@ -1994,8 +2143,14 @@ async fn forward_note_subscription(
     let mut seq: u64 = 1;
     while let Some(batch) = recv_visible(&mut subscription, &mut membership).await {
         for event in batch {
-            if let Some(delta) =
-                subscriptions::note_delta(api.as_ref(), &workspace_id, &event, projection).await
+            if let Some(delta) = subscriptions::note_delta(
+                api.as_ref(),
+                &workspace_id,
+                &event,
+                projection,
+                max_content_bytes,
+            )
+            .await
             {
                 let frame = subscriptions::build_delta_push(&subscription_id, seq, &delta);
                 if out_tx.send_bulk(frame).await.is_err() {
@@ -2925,9 +3080,12 @@ mod tests {
             )
             .await
         );
-        tokio::time::timeout(Duration::from_secs(10), writer.entered.notified())
-            .await
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            writer.entered.notified(),
+        )
+        .await
+        .unwrap();
         limiter.begin_shutdown();
         assert!(
             !process_frame(
@@ -2954,9 +3112,12 @@ mod tests {
             () = std::future::ready(()) => {}
         }
         writer.release.notify_one();
-        tokio::time::timeout(Duration::from_secs(10), drained)
-            .await
-            .unwrap();
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            drained,
+        )
+        .await
+        .unwrap();
         assert_eq!(writer.calls.load(Ordering::SeqCst), 1);
         assert_eq!(
             store.get_setting("test.admitted").await.unwrap().as_deref(),
@@ -3040,7 +3201,8 @@ mod tests {
             }));
         }
         // Both permits come free while the writer is still stalled.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now()
+            + intentd_test_support::test_timeout(std::time::Duration::from_secs(5));
         while limiter.available_permits() != Some(2) {
             assert!(
                 std::time::Instant::now() < deadline,

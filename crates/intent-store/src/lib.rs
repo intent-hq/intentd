@@ -7,10 +7,11 @@
 use std::path::Path;
 use std::time::Duration;
 
-use sqlx::sqlite::{SqliteAutoVacuum, SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 
 pub use intent_core::{Error, Result};
+
 mod advisory_wake_delivery_repo;
 mod agent_flipped_completion_repo;
 mod agent_queue_repo;
@@ -27,6 +28,11 @@ mod diagnostics;
 mod store_pool;
 pub use store_pool::{StorePool, StorePoolOptions};
 mod diffs_repo;
+mod discussion_activity_repo;
+mod discussion_agent_repo;
+mod discussion_conversation_repo;
+mod discussion_reaction_repo;
+mod discussion_repo;
 mod draft_repo;
 mod event_repo;
 mod event_subscription_repo;
@@ -39,14 +45,8 @@ mod message_payload;
 mod message_thumbnails;
 mod metrics_repo;
 mod node_repo;
-pub mod note_annotation_repo;
-pub mod note_delete_repo;
-mod note_index_budget;
-mod note_index_job;
 mod note_line_attribution_repo;
-mod note_page_html;
-mod note_page_index;
-mod note_page_repo;
+pub mod note_paging_cleanup;
 mod note_repo;
 mod note_search_repo;
 mod note_version_repo;
@@ -74,7 +74,6 @@ mod transfer_authorship;
 mod transfer_repo;
 mod usage_rate_repo;
 mod usage_stats_repo;
-mod workspace_annotation_cleanup;
 mod workspace_context_repo;
 mod workspace_git_root_repo;
 mod workspace_mcp_repo;
@@ -99,13 +98,15 @@ pub use agent_repo::{
     MessageFtsMatch, MonitorMessageProvenance, PreparedMonitorMessage, PrunedToolField,
     PrunedToolPayload, ReplaceMessage, ReviewContextEnrollment, ReviewContextEnrollmentIntent,
     ReviewContextOwnerKey, SessionMessageProjection, UsageMessageOrigin, UserMessageIndexItem,
-    PROJECTION_TEXT_BLOCK_CAP,
+    MANUAL_CHOICE_METADATA_KEY, PROJECTION_TEXT_BLOCK_CAP, PROVIDER_RETURN_METADATA_KEY,
 };
 pub use attachment_repo::{AttachmentIdempotencyBinding, AttachmentRecord};
 pub use completion_watch_repo::PersistedCompletionWatch;
 pub use delegation_group_repo::PersistedDelegationGroup;
 pub use diagnostics::DiagnosticStore;
 pub use diffs_repo::NewDiff;
+pub use discussion_activity_repo::DiscussionActivityReceipt;
+pub use discussion_agent_repo::DiscussionDelivery;
 pub use event_repo::{EventQuery, NewEvent};
 pub use event_subscription_repo::PersistedEventSubscription;
 pub use hook_repo::ActiveHookMetadata;
@@ -398,11 +399,8 @@ pub struct Store {
     /// Process-local `displayed` overlay of the browser tab registry; see
     /// `browser_tab_repo::DisplayedOverlay`.
     browser_tab_displayed: browser_tab_repo::DisplayedOverlay,
-    note_pages: std::sync::Arc<note_page_repo::Runtime>,
     task_event_baselines: std::sync::Arc<TaskEventBaselines>,
     task_events_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    note_index_jobs: std::sync::Arc<note_index_job::Coordinator>,
-    note_index_owner: std::sync::Arc<note_index_job::Owner>,
     #[cfg(test)]
     export_author_barrier: std::sync::Arc<
         std::sync::Mutex<Option<std::sync::Arc<transfer_authorship::ExportAuthorBarrier>>>,
@@ -467,22 +465,13 @@ impl Store {
             )),
             _ => Error::Internal(format!("migrations failed: {e}")),
         })?;
-        let write_pool = StorePool::new(write_pool, owner.is_some());
-        let read_pool = StorePool::new(read_pool, owner.is_some());
-        // Profiles/readiness are checked only for a demanded note. Opening the
-        // database must never hydrate or convert the stale note backlog.
-        let note_pages = std::sync::Arc::new(note_page_repo::Runtime::open(&write_pool).await?);
-        let note_index_jobs = note_index_job::domain_for(db_path)?;
         lifecycle.settle_after_retirement().await?;
         Ok(Self {
             repository_lifecycle,
-            note_pages,
             task_event_baselines: std::sync::Arc::default(),
             task_events_enabled: std::sync::Arc::default(),
-            note_index_jobs,
-            note_index_owner: std::sync::Arc::default(),
-            write_pool,
-            read_pool,
+            write_pool: StorePool::new(write_pool, owner.is_some()),
+            read_pool: StorePool::new(read_pool, owner.is_some()),
             _daemon_owner: owner,
             browser_tab_displayed: browser_tab_repo::DisplayedOverlay::default(),
             #[cfg(test)]
@@ -612,17 +601,13 @@ impl Store {
     /// Number of pages on the database freelist (`PRAGMA freelist_count`):
     /// pages emptied by deletes that have not yet been reclaimed. On an
     /// incremental-auto-vacuum database these are the pages
-    /// [`Self::incremental_vacuum`] can release back to the filesystem.
+    /// [`Self::incremental_vacuum_chunk`] can release back to the filesystem.
     ///
     /// # Errors
     ///
     /// Returns `Error::Internal` if the database operation fails.
     pub async fn freelist_count(&self) -> Result<i64> {
-        sqlx::query("PRAGMA freelist_count")
-            .fetch_one(&self.write_pool)
-            .await
-            .map(|row| row.get::<i64, _>(0))
-            .map_err(|e| Error::Internal(format!("freelist_count failed: {e}")))
+        freelist_count_on(&self.write_pool).await
     }
 
     /// Total number of pages in the database file (`PRAGMA page_count`).
@@ -637,11 +622,11 @@ impl Store {
     /// One-time activation of incremental auto-vacuum on a legacy database
     /// (monorepo#720 finding 1). New databases are created with
     /// `auto_vacuum = INCREMENTAL` (see [`connect_write`]), but on a database
-    /// created before that pragma existed the setting is recorded yet inert
-    /// until a full `VACUUM` rebuilds the file. This method checks
-    /// `PRAGMA auto_vacuum`; when it reports NONE it runs `VACUUM` on the
-    /// write pool so the recorded incremental setting takes effect and
-    /// [`Self::incremental_vacuum`] can release freelist pages from then on.
+    /// created before that pragma existed the mode stays NONE until a full
+    /// `VACUUM` rebuilds the file. This method checks `PRAGMA auto_vacuum`;
+    /// when it reports NONE it sets `auto_vacuum = INCREMENTAL` and runs
+    /// `VACUUM` on one write connection so the incremental mode takes effect and
+    /// [`Self::incremental_vacuum_chunk`] can release freelist pages from then on.
     ///
     /// Intended to run once during daemon startup, after [`Store::open`] and
     /// before any listener serves: at that point the single write connection
@@ -664,10 +649,19 @@ impl Store {
         }
         let pages_before = self.page_count().await?;
         let started = std::time::Instant::now();
-        sqlx::query("VACUUM")
-            .execute(&self.write_pool)
-            .await
-            .map_err(|e| Error::Internal(format!("activation VACUUM failed: {e}")))?;
+        {
+            // Write connections no longer set `auto_vacuum` on connect, so
+            // record it on the connection that runs the rebuild.
+            let mut conn = self
+                .write_pool
+                .acquire()
+                .await
+                .map_err(|e| Error::Internal(format!("activation acquire failed: {e}")))?;
+            sqlx::query("PRAGMA auto_vacuum = INCREMENTAL; VACUUM")
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| Error::Internal(format!("activation VACUUM failed: {e}")))?;
+        }
         // The full VACUUM may renumber `agent_message`'s implicit rowids
         // (TEXT primary key), which key the rowid-mapped `agent_message_fts`
         // index (0074) — rebuild it so the mapping stays correct.
@@ -683,25 +677,60 @@ impl Store {
         })
     }
 
-    /// Release up to `max_pages` freelist pages back to the filesystem via
-    /// `PRAGMA incremental_vacuum(N)`. Only effective when the database has
-    /// `auto_vacuum = INCREMENTAL` (a no-op otherwise — see [`connect_write`]
-    /// for the activation story). Bounded `N` keeps each call short so the
-    /// single-connection write pool is never held for long; call it
-    /// periodically (e.g. after retention sweeps) to reclaim space
-    /// incrementally. Returns the number of pages actually freed.
+    /// Database page size in bytes (`PRAGMA page_size`), read on the read
+    /// pool so it never queues behind the writer. Used to express freelist
+    /// backlogs in bytes.
     ///
     /// # Errors
     ///
     /// Returns `Error::Internal` if the database operation fails.
-    pub async fn incremental_vacuum(&self, max_pages: u32) -> Result<u64> {
-        let before = self.freelist_count().await?;
-        sqlx::query(&format!("PRAGMA incremental_vacuum({max_pages})"))
-            .execute(&self.write_pool)
+    pub async fn page_size(&self) -> Result<i64> {
+        sqlx::query("PRAGMA page_size")
+            .fetch_one(&self.read_pool)
+            .await
+            .map(|row| row.get::<i64, _>(0))
+            .map_err(|e| Error::Internal(format!("page_size failed: {e}")))
+    }
+
+    /// One bounded `PRAGMA incremental_vacuum(N)` step, run with the
+    /// freelist reads on a single acquired write connection (one pool
+    /// acquisition per chunk), which is returned to the pool before this
+    /// method returns so queued writers can run between chunks. Only
+    /// effective when the database has `auto_vacuum = INCREMENTAL` (a no-op
+    /// otherwise — see [`connect_write`] for the activation story).
+    ///
+    /// `max_pages` is clamped to `1..=i32::MAX`: `SQLite` reads `N <= 0` (and
+    /// an `N` that does not fit an `i32`) as "release the whole freelist",
+    /// which on a large database holds the single-connection write pool for
+    /// hours. Even a bounded `N` does not bound the hold — the per-page cost
+    /// grows with the database (4–7 ms/page on a 33 GB file,
+    /// intent-hq/intent#7448) — so periodic callers size `N` from the
+    /// measured `elapsed` (see `intent_services::retention`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the acquisition or any statement fails.
+    pub async fn incremental_vacuum_chunk(&self, max_pages: u32) -> Result<VacuumChunk> {
+        let pages = max_pages.clamp(1, i32::MAX.cast_unsigned());
+        let mut conn = self
+            .write_pool
+            .acquire()
+            .await
+            .map_err(|e| Error::Internal(format!("incremental_vacuum acquire failed: {e}")))?;
+        let before = freelist_count_on(&mut *conn).await?;
+        let started = std::time::Instant::now();
+        sqlx::query(&format!("PRAGMA incremental_vacuum({pages})"))
+            .execute(&mut *conn)
             .await
             .map_err(|e| Error::Internal(format!("incremental_vacuum failed: {e}")))?;
-        let after = self.freelist_count().await?;
-        Ok((before - after).max(0).cast_unsigned())
+        let elapsed = started.elapsed();
+        let after = freelist_count_on(&mut *conn).await?;
+        drop(conn);
+        Ok(VacuumChunk {
+            pages_freed: (before - after).max(0).cast_unsigned(),
+            freelist_remaining: after.max(0).cast_unsigned(),
+            elapsed,
+        })
     }
 
     /// Run `PRAGMA optimize` on the write connection. Cheap when called
@@ -726,7 +755,6 @@ impl Store {
     /// This ensures WAL changes are visible to subsequent daemon instances
     /// (regression: persisted settings must survive app relaunches in sidecar mode).
     pub async fn close(&self) {
-        self.note_index_jobs.close(&self.note_index_owner).await;
         let started = std::time::Instant::now();
         self.log_close_phase("wal_checkpoint", "started", 0);
         // Best-effort WAL checkpoint before closing the pools (via write pool).
@@ -782,6 +810,28 @@ impl Store {
     }
 }
 
+/// `PRAGMA freelist_count` on any executor — the pool for
+/// [`Store::freelist_count`], or the connection a vacuum chunk already holds.
+async fn freelist_count_on<'e>(executor: impl sqlx::SqliteExecutor<'e>) -> Result<i64> {
+    sqlx::query("PRAGMA freelist_count")
+        .fetch_one(executor)
+        .await
+        .map(|row| row.get::<i64, _>(0))
+        .map_err(|e| Error::Internal(format!("freelist_count failed: {e}")))
+}
+
+/// Outcome of one [`Store::incremental_vacuum_chunk`] step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VacuumChunk {
+    /// Freelist pages released back to the filesystem by this step.
+    pub pages_freed: u64,
+    /// Freelist pages still waiting after this step.
+    pub freelist_remaining: u64,
+    /// Wall time of the `PRAGMA incremental_vacuum` statement alone — the
+    /// span the single write connection was busy vacuuming.
+    pub elapsed: std::time::Duration,
+}
+
 /// Outcome of [`Store::activate_incremental_vacuum`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AutoVacuumActivation {
@@ -833,11 +883,14 @@ impl MigrationStatus {
 ///
 /// **`auto_vacuum` = INCREMENTAL**: without `auto_vacuum`, pages emptied by
 /// deletes (retention sweeps) accumulate on the freelist forever and the file
-/// only ever grows. sqlx applies the `auto_vacuum` pragma before
-/// `journal_mode`, so a **new** database is created in incremental mode and
-/// [`Store::incremental_vacuum`] can release freelist pages in bounded slices.
-/// On an **existing** database created without `auto_vacuum` the pragma is
-/// recorded but inert until a one-time `VACUUM` rebuilds the file. The daemon
+/// only ever grows. A **new** database is created in incremental mode (then
+/// switched to WAL) by a standalone connection before the pool exists — see
+/// `create_database_file` — so [`Store::incremental_vacuum_chunk`] can release
+/// freelist pages in bounded slices. Pool connections never set the pragma:
+/// it is a file property, and setting it rewrites the header in a full-sync
+/// write transaction on every connect, inside the acquire timeout.
+/// An **existing** database created without `auto_vacuum` stays NONE until a
+/// one-time `VACUUM` rebuilds the file. The daemon
 /// performs that activation automatically at startup — `intentd serve` calls
 /// [`Store::activate_incremental_vacuum`] right after [`Store::open`], before
 /// any listener serves, so no client is blocked by the rebuild (monorepo#720
@@ -877,20 +930,25 @@ async fn connect_write_owned(
     acquire_timeout: Duration,
     owner: Option<std::sync::Arc<daemon_ownership::DaemonOwnership>>,
 ) -> Result<SqlitePool> {
+    create_database_file(db_path, owner.clone()).await?;
+    // No `auto_vacuum` here: `create_database_file` establishes it, and the
+    // pragma rewrites the header in an fsynced write transaction on every
+    // connect even when the mode is unchanged — inside `acquire_timeout`.
+    // Nor `create_if_missing`: a file missing here was removed after
+    // `create_database_file`, and recreating it would skip `auto_vacuum`.
     let opts = SqliteConnectOptions::new()
         .filename(db_path)
-        .create_if_missing(true)
+        .create_if_missing(false)
         .foreign_keys(true)
         .busy_timeout(Duration::from_secs(5));
     let opts = if owner.is_none() {
-        opts.auto_vacuum(SqliteAutoVacuum::Incremental)
-            .journal_mode(SqliteJournalMode::Wal)
+        opts.journal_mode(SqliteJournalMode::Wal)
             .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
     } else {
         opts
     };
 
-    retain_pool_owner(SqlitePoolOptions::new(), owner.clone(), true)
+    retain_pool_owner(SqlitePoolOptions::new(), owner.clone())
         .max_connections(1)
         .acquire_timeout(acquire_timeout)
         .connect_with(retain_owner(opts, owner))
@@ -901,6 +959,60 @@ async fn connect_write_owned(
             }
             _ => Error::Internal(format!("failed to open write pool: {e}")),
         })
+}
+
+/// Create a missing (or empty) database file in its final on-disk form —
+/// `auto_vacuum = INCREMENTAL` and WAL — on a standalone connection, before
+/// the write pool exists.
+///
+/// Creation commits about six fsyncs (the file, the WAL switch and the header
+/// all land before `synchronous = NORMAL` applies). Inside the pool's first
+/// connect they spent the acquire deadline meant for waiting on a contended
+/// writer: one fsync stalled behind a busy disk failed `Store::open` with
+/// "write pool exhausted" (`tests/store_open_fsync_stall.rs`). Here they run
+/// with no deadline and keep `SQLite`'s default full-sync durability.
+///
+/// Owned opens attach the ownership collation first and run the
+/// file-establishing PRAGMAs only afterwards, as [`retain_pool_owner`] does.
+/// Concurrent creators are safe: `SQLite` serializes them on the file lock
+/// and a second WAL switch or `auto_vacuum` on an empty file is a no-op.
+async fn create_database_file(
+    db_path: &Path,
+    owner: Option<std::sync::Arc<daemon_ownership::DaemonOwnership>>,
+) -> Result<()> {
+    use sqlx::{ConnectOptions, Connection};
+
+    match tokio::fs::metadata(db_path).await {
+        Ok(meta) if meta.len() > 0 => return Ok(()),
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(Error::Internal(format!(
+                "failed to inspect database file: {e}"
+            )))
+        }
+    }
+    let opts = retain_owner(
+        SqliteConnectOptions::new()
+            .filename(db_path)
+            .create_if_missing(true)
+            .busy_timeout(Duration::from_secs(5)),
+        owner,
+    );
+    let mut conn = opts
+        .connect()
+        .await
+        .map_err(|e| Error::Internal(format!("failed to create database: {e}")))?;
+    let created = sqlx::query("PRAGMA auto_vacuum = INCREMENTAL; PRAGMA journal_mode = WAL")
+        .execute(&mut conn)
+        .await
+        .map(|_| ())
+        .map_err(|e| Error::Internal(format!("failed to initialize database: {e}")));
+    let closed = conn
+        .close()
+        .await
+        .map_err(|e| Error::Internal(format!("failed to close new database: {e}")));
+    created.and(closed)
 }
 
 /// Open a WAL-mode `SQLite` **read pool** with `max_connections=32` (§9.4).
@@ -914,7 +1026,7 @@ async fn connect_write_owned(
 /// database file, established at creation by [`connect_write`] ([`Store::open`]
 /// opens the write pool first) or by the startup activation VACUUM
 /// ([`Store::activate_incremental_vacuum`]), and only
-/// [`Store::incremental_vacuum`] (write pool) ever acts on it. Setting it per
+/// [`Store::incremental_vacuum_chunk`] (write pool) ever acts on it. Setting it per
 /// read connection re-executed `PRAGMA auto_vacuum = INCREMENTAL` on every
 /// fresh pool connection, which surfaced as slow-statement WARNs inside hot
 /// read RPCs under load and amplified write-pool contention
@@ -959,7 +1071,7 @@ async fn connect_read_owned_timeout(
         opts
     };
 
-    retain_pool_owner(SqlitePoolOptions::new(), owner.clone(), false)
+    retain_pool_owner(SqlitePoolOptions::new(), owner.clone())
         .max_connections(32)
         .acquire_timeout(acquire_timeout)
         .connect_with(retain_owner(opts, owner))
@@ -979,7 +1091,6 @@ async fn connect_read_owned_timeout(
 fn retain_pool_owner(
     options: SqlitePoolOptions,
     owner: Option<std::sync::Arc<daemon_ownership::DaemonOwnership>>,
-    write: bool,
 ) -> SqlitePoolOptions {
     match owner {
         Some(owner) => options.after_connect(move |connection, _metadata| {
@@ -992,12 +1103,13 @@ fn retain_pool_owner(
                         left.cmp(right)
                     },
                 )?;
-                let pragmas = if write {
-                    "PRAGMA auto_vacuum=INCREMENTAL; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL"
-                } else {
-                    "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL"
-                };
-                sqlx::query(pragmas).execute(connection).await?;
+                // Neither pool sets `auto_vacuum`: `create_database_file`
+                // establishes it once (see `connect_write_owned`).
+                // Spaced like sqlx's own batch so intentd's rpc_profile
+                // marker (`PRAGMA journal_mode = `) recognizes it as setup.
+                sqlx::query("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL")
+                    .execute(connection)
+                    .await?;
                 Ok(())
             })
         }),
@@ -1022,36 +1134,6 @@ fn retain_owner(
         }),
         None => options,
     }
-}
-
-/// Legacy test helper: builds a single pool (`max_connections=20`) for tests
-/// that predate the write/read pool split. New tests should use `Store::open`.
-///
-/// # Errors
-///
-/// Returns `Error::Internal` if the pool cannot be opened (or the acquire timeout is exceeded).
-#[cfg(test)]
-pub async fn connect(db_path: &Path) -> Result<SqlitePool> {
-    let opts = SqliteConnectOptions::new()
-        .filename(db_path)
-        .create_if_missing(true)
-        .auto_vacuum(SqliteAutoVacuum::Incremental)
-        .journal_mode(SqliteJournalMode::Wal)
-        .foreign_keys(true)
-        .busy_timeout(Duration::from_secs(5))
-        .synchronous(sqlx::sqlite::SqliteSynchronous::Normal);
-
-    SqlitePoolOptions::new()
-        .max_connections(20)
-        .acquire_timeout(Duration::from_secs(10))
-        .connect_with(opts)
-        .await
-        .map_err(|e| match e {
-            sqlx::Error::PoolTimedOut => {
-                Error::Internal("database pool exhausted (acquire timeout exceeded)".to_string())
-            }
-            _ => Error::Internal(format!("failed to open database: {e}")),
-        })
 }
 
 /// Encode tags as a JSON-array TEXT column.

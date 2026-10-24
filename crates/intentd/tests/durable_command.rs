@@ -1,7 +1,7 @@
 //! The opt-in saved-command wrapper retains OS evidence independently of a PTY.
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -44,7 +44,7 @@ fn result(root: &Path, id: &str) -> Value {
 }
 
 fn wait_file(path: &Path) {
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(15));
     while !path.exists() {
         assert!(Instant::now() < deadline, "missing {}", path.display());
         // timing-guard: polling an explicit child/receipt barrier
@@ -62,7 +62,7 @@ fn durable_command_records_real_zero_nonzero_and_signal() {
     ] {
         let mut child = run(root.path(), id, shell, "10");
         let status = child
-            .wait_with_timeout(Duration::from_secs(15))
+            .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(15)))
             .unwrap()
             .expect("wrapper exit");
         assert_eq!(status.success(), code == Some(0));
@@ -100,7 +100,7 @@ fn durable_command_survives_owner_loss_and_refuses_reuse() {
     assert_eq!(evidence["exitCode"], 37);
     let mut duplicate = run(root.path(), "run-one", "exit 0", "10");
     assert!(!duplicate
-        .wait_with_timeout(Duration::from_secs(10))
+        .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(10)))
         .unwrap()
         .unwrap()
         .success());
@@ -112,7 +112,7 @@ fn durable_command_timeout_and_untrustworthy_records_never_pass() {
     let root = common::test_tempdir("durable-invalid");
     let mut child = run(root.path(), "timeout", "while :; do :; done", "1");
     assert!(!child
-        .wait_with_timeout(Duration::from_secs(10))
+        .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(10)))
         .unwrap()
         .unwrap()
         .success());
@@ -132,7 +132,7 @@ fn durable_command_rejects_stale_same_id_and_reports_spawn_failure() {
     let root = common::test_tempdir("durable-stale");
     let mut child = run(root.path(), "original", "exit 0", "10");
     assert!(child
-        .wait_with_timeout(Duration::from_secs(10))
+        .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(10)))
         .unwrap()
         .unwrap()
         .success());
@@ -192,7 +192,7 @@ fn durable_command_explicit_stop_settles_child_and_cleanup_preserves_tombstone()
     assert_eq!(evidence["outcome"], "stopped");
     assert_eq!(evidence["signal"], 9);
     assert!(!owner
-        .wait_with_timeout(Duration::from_secs(10))
+        .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(10)))
         .unwrap()
         .unwrap()
         .success());
@@ -203,7 +203,7 @@ fn durable_command_explicit_stop_settles_child_and_cleanup_preserves_tombstone()
     assert_eq!(result(root.path(), "stop-me")["outcome"], "unknown");
     let mut duplicate = run(root.path(), "stop-me", "exit 0", "10");
     assert!(!duplicate
-        .wait_with_timeout(Duration::from_secs(10))
+        .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(10)))
         .unwrap()
         .unwrap()
         .success());

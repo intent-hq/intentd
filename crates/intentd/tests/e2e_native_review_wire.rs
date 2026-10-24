@@ -2,7 +2,7 @@
 //! This is not a normal spawned-daemon or production provider-TLS positive.
 //! No hosted provider, user account, adapter, model or installed daemon.
 #![cfg(unix)]
-mod common;
+use crate::common;
 use futures_util::{SinkExt, StreamExt};
 use intent_core::WorkspaceApi;
 use intent_core::{
@@ -653,11 +653,14 @@ impl Harness {
         if let Some(shutdown) = self.shutdown.take() {
             shutdown.send(()).unwrap();
         }
-        timeout(Duration::from_secs(5), self.listener.take().unwrap())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            self.listener.take().unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
         assert_eq!(self.ws.bound_port().await, None);
         assert!(UnixStream::connect(self.dir.path().join("intentd.sock"))
             .await
@@ -804,7 +807,11 @@ async fn run_in_tls_process(name: &str) -> bool {
     make_fixture_certificate(directory.path());
     let mut command = std::process::Command::new(std::env::current_exe().unwrap());
     command
-        .args(["--exact", name, "--nocapture"])
+        .args([
+            "--exact",
+            &common::exact_test_name(module_path!(), name),
+            "--nocapture",
+        ])
         .env("INTENT_REVIEW_TLS_TEST", name)
         .env("INTENT_REVIEW_TLS_FIXTURE", directory.path())
         .env("SSL_CERT_FILE", directory.path().join("ca.pem"))
@@ -815,7 +822,9 @@ async fn run_in_tls_process(name: &str) -> bool {
         .stderr(Stdio::inherit());
     let mut child = GuardedChild::spawn(&mut command).unwrap();
     let result = tokio::task::spawn_blocking(move || {
-        child.wait_with_timeout(Duration::from_secs(60)).unwrap()
+        child
+            .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(60)))
+            .unwrap()
     })
     .await
     .unwrap()
@@ -894,12 +903,15 @@ async fn remote_fixture(
     startup_milestones::allocated(child.id());
     let startup_endpoints = startup_milestones::begin(startup_milestones::Phase::ProviderEndpoints);
     let endpoint = dir.join("endpoints.json");
-    timeout(Duration::from_secs(5), async {
-        while !endpoint.exists() {
-            // timing-guard: owned fixture readiness file
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            while !endpoint.exists() {
+                // timing-guard: owned fixture readiness file
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        },
+    )
     .await
     .unwrap();
     let data: Value = serde_json::from_slice(&std::fs::read(endpoint).unwrap()).unwrap();
@@ -1897,17 +1909,21 @@ async fn driver_action(
                     driver_completed(stopping.as_ref().unwrap(), envelopes)?;
                     let mut result = Vec::new();
                     for host in hosts {
-                        let state = timeout(Duration::from_secs(5), async {
-                            loop {
-                                let state =
-                                    driver_provider(host, json!({"command":"snapshot"})).await?;
-                                if state["active"] == 0 {
-                                    break Ok::<_, anyhow::Error>(state);
+                        let state = timeout(
+                            intentd_test_support::test_timeout(Duration::from_secs(5)),
+                            async {
+                                loop {
+                                    let state =
+                                        driver_provider(host, json!({"command":"snapshot"}))
+                                            .await?;
+                                    if state["active"] == 0 {
+                                        break Ok::<_, anyhow::Error>(state);
+                                    }
+                                    // timing-guard: wait for this fixture's actual handler completion
+                                    tokio::time::sleep(Duration::from_millis(10)).await;
                                 }
-                                // timing-guard: wait for this fixture's actual handler completion
-                                tokio::time::sleep(Duration::from_millis(10)).await;
-                            }
-                        })
+                            },
+                        )
                         .await??;
                         anyhow::ensure!(
                             state["active"] == 0
@@ -1987,7 +2003,11 @@ async fn driver_loop(descriptor: &DriverDescriptor) -> DriverResult<()> {
             let (connection, _) = listener.accept().await?;
             let mut stream = BufReader::new(connection);
             let raw: Value = serde_json::from_slice(
-                &timeout(Duration::from_secs(5), driver_frame(&mut stream)).await??,
+                &timeout(
+                    intentd_test_support::test_timeout(Duration::from_secs(5)),
+                    driver_frame(&mut stream),
+                )
+                .await??,
             )?;
             let request: DriverRequest = serde_json::from_value(raw.clone())?;
             anyhow::ensure!(request.run_id == descriptor.run_id, "foreign run");
@@ -2024,6 +2044,7 @@ async fn driver_loop(descriptor: &DriverDescriptor) -> DriverResult<()> {
         }
         Ok::<(), anyhow::Error>(())
     };
+    // fixed-deadline: allow — stays under the review descriptor's server-set lifetime_seconds, after which the daemon revokes it
     let outcome = timeout(
         Duration::from_secs(descriptor.lifetime_seconds.saturating_sub(10))
             .saturating_sub(started.elapsed()),
@@ -2059,6 +2080,12 @@ async fn driver_loop(descriptor: &DriverDescriptor) -> DriverResult<()> {
         "identity":driver_identity(),"terminal":terminal,"cleanup":exits,"success":true}),
     )?;
     Ok(())
+}
+
+/// The `--exact` name of [`native_review_fixture_driver`], computed in its module.
+#[cfg(target_os = "linux")]
+fn fixture_driver_test_name() -> String {
+    common::exact_test_name(module_path!(), "native_review_fixture_driver")
 }
 
 #[test]
@@ -2172,7 +2199,11 @@ async fn driver_shutdown(mut host: Harness) -> DriverResult<Value> {
         let _ = shutdown.send(());
     }
     if let Some(listener) = host.listener.take() {
-        timeout(Duration::from_secs(5), listener).await???;
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            listener,
+        )
+        .await???;
     }
     anyhow::ensure!(host.ws.bound_port().await.is_none(), "WSS did not stop");
     host.fixture.kill()?;
@@ -2225,7 +2256,7 @@ impl DriverTest {
             .args([
                 "--ignored",
                 "--exact",
-                "native_review_fixture_driver",
+                &fixture_driver_test_name(),
                 "--nocapture",
                 "--test-threads=1",
             ])
@@ -2289,16 +2320,19 @@ impl DriverTest {
         // Close only our original lifetime pipe. The existing supervisor owns all
         // signaling/reaping; a deadline is never permission to kill that owner.
         self.child.close();
-        let observed = timeout(Duration::from_secs(2), async {
-            loop {
-                match self.child.poll() {
-                    Ok(None) => {}
-                    terminal => break terminal,
+        let observed = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            async {
+                loop {
+                    match self.child.poll() {
+                        Ok(None) => {}
+                        terminal => break terminal,
+                    }
+                    // timing-guard: bounded observation of original supervisor completion
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                // timing-guard: bounded observation of original supervisor completion
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
+            },
+        )
         .await
         .unwrap_or(Ok(None));
         let mut evidence = startup_failure_evidence::capture(
@@ -2338,10 +2372,13 @@ impl DriverTest {
         );
         driver_write(&mut stream, &request).await.unwrap();
         serde_json::from_slice(
-            &timeout(Duration::from_secs(10), driver_frame(&mut stream))
-                .await
-                .unwrap()
-                .unwrap(),
+            &timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(10)),
+                driver_frame(&mut stream),
+            )
+            .await
+            .unwrap()
+            .unwrap(),
         )
         .unwrap()
     }
@@ -2383,15 +2420,18 @@ impl DriverTest {
             .await;
         self.record("finish-response.json", &finish);
         assert!(finish.get("error").is_none(), "{finish}");
-        let status = timeout(Duration::from_secs(10), async {
-            loop {
-                if let Some(status) = self.child.poll().unwrap() {
-                    break status;
+        let status = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                loop {
+                    if let Some(status) = self.child.poll().unwrap() {
+                        break status;
+                    }
+                    // timing-guard: reap this original driver's observed child exit
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                // timing-guard: reap this original driver's observed child exit
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
+            },
+        )
         .await
         .unwrap();
         self.record(
@@ -2498,19 +2538,22 @@ impl DriverWire {
         if let Some(index) = self.buffered.iter().position(|v| v["id"] == id) {
             return self.buffered.remove(index);
         }
-        timeout(Duration::from_secs(15), async {
-            loop {
-                let value = self.replies.recv().await.expect("original response reader");
-                if value["id"] == id {
-                    return value;
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(15)),
+            async {
+                loop {
+                    let value = self.replies.recv().await.expect("original response reader");
+                    if value["id"] == id {
+                        return value;
+                    }
+                    assert!(
+                        self.buffered.len() < 64,
+                        "original response observation overflow"
+                    );
+                    self.buffered.push(value);
                 }
-                assert!(
-                    self.buffered.len() < 64,
-                    "original response observation overflow"
-                );
-                self.buffered.push(value);
-            }
-        })
+            },
+        )
         .await
         .unwrap()
     }
@@ -2520,10 +2563,13 @@ impl DriverWire {
     }
     async fn close(mut self) {
         self.writer.send(Message::Close(None)).await.unwrap();
-        timeout(Duration::from_secs(5), self.reader)
-            .await
-            .unwrap()
-            .unwrap();
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            self.reader,
+        )
+        .await
+        .unwrap()
+        .unwrap();
     }
 }
 
@@ -2714,23 +2760,26 @@ async fn native_review_driver_stop_with_admitted_response() {
     assert!(arm.get("error").is_none(), "{arm}");
     let execute = wire.send("accept-changes.execute",json!({"workspaceId":workspace,"action":"create-pr","review":{"root":operation["root"],"operationId":operation["operationId"]},"prTitle":"existing ready MR","prBody":"fixture"})).await;
     let state = {
-        let arrived = timeout(Duration::from_secs(10), async {
-            loop {
-                let state = driver
-                    .control(json!({"command":"barrierStatus","host":0}))
-                    .await;
-                if state["result"]["barriers"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|b| b["entered"] == true)
-                {
-                    break state;
+        let arrived = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                loop {
+                    let state = driver
+                        .control(json!({"command":"barrierStatus","host":0}))
+                        .await;
+                    if state["result"]["barriers"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|b| b["entered"] == true)
+                    {
+                        break state;
+                    }
+                    // timing-guard: actual owned authenticated provider request entry
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                // timing-guard: actual owned authenticated provider request entry
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        });
+            },
+        );
         tokio::pin!(arrived);
         tokio::select! {
             response = wire.response(execute) => { driver.record("unexpected-execute.json",&response); let effects=driver.control(json!({"command":"snapshot","host":0})).await;driver.record("unexpected-effects.json",&effects); panic!("original request did not reach admitted barrier: {response}"); },
@@ -2800,7 +2849,8 @@ mod driver_ownership {
     use std::process::{ChildStdin, Command, ExitStatus};
     use std::time::Instant;
 
-    const ENTRY: &str = "native_review_fixture_driver";
+    static ENTRY: std::sync::LazyLock<String> =
+        std::sync::LazyLock::new(super::fixture_driver_test_name);
     const OBSERVE: WaitPidFlag =
         WaitPidFlag::from_bits_retain(libc::WEXITED | libc::WNOHANG | libc::WNOWAIT);
 
@@ -3039,7 +3089,7 @@ mod driver_ownership {
         let expected = [
             "--ignored",
             "--exact",
-            ENTRY,
+            ENTRY.as_str(),
             "--nocapture",
             "--test-threads=1",
         ];
@@ -3067,6 +3117,7 @@ mod driver_ownership {
             matches!(waitid(Id::PIDFd(own.as_fd()), OBSERVE), Err(Errno::ECHILD)),
             "pidfd wait support"
         );
+        // process-global: allow — runs only in the isolated `--exact` re-exec preflight() checks
         nix::sys::prctl::set_child_subreaper(true)?;
         anyhow::ensure!(
             nix::sys::prctl::get_child_subreaper()?,
@@ -3278,7 +3329,7 @@ mod driver_ownership {
             .args([
                 "--ignored",
                 "--exact",
-                ENTRY,
+                ENTRY.as_str(),
                 "--nocapture",
                 "--test-threads=1",
             ])
@@ -3467,7 +3518,7 @@ while True:signal.pause()
             .args([
                 "--ignored",
                 "--exact",
-                ENTRY,
+                ENTRY.as_str(),
                 "--nocapture",
                 "--test-threads=1",
             ])
@@ -3910,17 +3961,20 @@ async fn prerequisite_harness() -> (tempfile::TempDir, Harness) {
 }
 
 async fn prerequisite_snapshot(h: &Harness) -> Value {
-    let provider = timeout(Duration::from_secs(5), async {
-        loop {
-            let snapshot = driver_provider(h, json!({"command":"snapshot"}))
-                .await
-                .unwrap();
-            if snapshot["active"] == 0 {
-                break snapshot;
+    let provider = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        async {
+            loop {
+                let snapshot = driver_provider(h, json!({"command":"snapshot"}))
+                    .await
+                    .unwrap();
+                if snapshot["active"] == 0 {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
-    })
+        },
+    )
     .await
     .expect("owned provider requests finish");
     driver_snapshot(h, &provider)
@@ -4459,11 +4513,14 @@ async fn native_fixture_metadata_unsupported_matches_absent() {
     .catch_unwind()
     .await;
     stop.send(()).unwrap();
-    timeout(Duration::from_secs(5), listener)
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        listener,
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
     absent.stop().await;
     assert!(absent.bound_port().await.is_none());
     assert!(UnixStream::connect(&socket).await.is_err());
@@ -5449,10 +5506,13 @@ async fn startup_test_control(descriptor: &DriverDescriptor, phase: &str) -> Val
     .await
     .unwrap();
     serde_json::from_slice(
-        &timeout(Duration::from_secs(5), driver_frame(&mut connection))
-            .await
-            .unwrap()
-            .unwrap(),
+        &timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            driver_frame(&mut connection),
+        )
+        .await
+        .unwrap()
+        .unwrap(),
     )
     .unwrap()
 }
@@ -5491,7 +5551,7 @@ fn native_startup_milestones_actual_startup() {
         // Retaining the original future unpolled is the only hold. The prefix
         // identifies observed calls, not an internal mutex/timer wait instruction.
         let control=async {
-            let ready=timeout(Duration::from_secs(25),async {
+            let ready=timeout(intentd_test_support::test_timeout(Duration::from_secs(25)),async {
                 loop {
                     if let Ok(bytes)=std::fs::read(directory.path().join("ready.json")) {break serde_json::from_slice::<Value>(&bytes).unwrap();}
                     // timing-guard: original atomic publication of this owned source control

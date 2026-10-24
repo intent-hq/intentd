@@ -9,7 +9,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::path::Path;
 use std::process::{Child, Stdio};
@@ -215,23 +215,26 @@ async fn wss_event_opt(
     ws: &mut WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
     deadline_secs: u64,
 ) -> Option<Value> {
-    timeout(Duration::from_secs(deadline_secs), async {
-        loop {
-            match ws.next().await {
-                Some(Ok(Message::Text(txt))) => {
-                    let v: Value = serde_json::from_str(&txt).ok()?;
-                    if v.get("method").and_then(|m| m.as_str()) == Some("events.event") {
-                        return Some(v);
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(deadline_secs)),
+        async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(txt))) => {
+                        let v: Value = serde_json::from_str(&txt).ok()?;
+                        if v.get("method").and_then(|m| m.as_str()) == Some("events.event") {
+                            return Some(v);
+                        }
                     }
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = ws.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(_)) => {}
+                    _ => return None,
                 }
-                Some(Ok(Message::Ping(p))) => {
-                    let _ = ws.send(Message::Pong(p)).await;
-                }
-                Some(Ok(_)) => {}
-                _ => return None,
             }
-        }
-    })
+        },
+    )
     .await
     .ok()
     .flatten()
