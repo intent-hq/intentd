@@ -7322,7 +7322,7 @@ impl AgentManager {
         // claim so a retirement teardown (whose `stop_many` releases slots)
         // can neither clear this admission nor interleave before the revive.
         let fence = if auto_unarchive {
-            self.services.turn_start_archive_fence(workspace_id).await
+            boxed_await(|| self.services.turn_start_archive_fence(workspace_id)).await
         } else {
             None
         };
@@ -7330,9 +7330,10 @@ impl AgentManager {
             Ok::<(), std::convert::Infallible>(())
         }) {
             Ok(((), admission)) => {
-                if self
-                    .begin_turn_side_effects(agent_id, workspace_id, auto_unarchive, fence)
-                    .await
+                if boxed_await(|| {
+                    self.begin_turn_side_effects(agent_id, workspace_id, auto_unarchive, fence)
+                })
+                .await
                 {
                     TryBeginOutcome::Started(admission)
                 } else {
@@ -7369,7 +7370,7 @@ impl AgentManager {
     ) -> Option<((QueuedMessage, DrainingGuard), TurnAdmission)> {
         let gate = self.turn_start_gates.for_agent(agent_id);
         let _starting = gate.lock().await;
-        let fence = self.services.turn_start_archive_fence(workspace_id).await;
+        let fence = boxed_await(|| self.services.turn_start_archive_fence(workspace_id)).await;
         let claimed = self.claim_slot_sync(agent_id, workspace_id, || {
             match self.services.claim_parked_recovery_send(agent_id) {
                 RecoverySendClaim::Drained(popped) => Ok(*popped),
@@ -7379,8 +7380,7 @@ impl AgentManager {
         });
         match claimed {
             Ok(popped) => {
-                if self
-                    .begin_turn_side_effects(agent_id, workspace_id, true, fence)
+                if boxed_await(|| self.begin_turn_side_effects(agent_id, workspace_id, true, fence))
                     .await
                 {
                     Some(popped)
@@ -7555,10 +7555,14 @@ impl AgentManager {
             // the worker's raced re-claim, whose own post-claim archived
             // re-check parks instead of un-archiving (monorepo#2513).
             let outcome = if auto_unarchive {
-                match self
-                    .services
-                    .auto_unarchive_on_turn_start_fenced(workspace_id, agent_id, archive_fence)
-                    .await
+                match boxed_await(|| {
+                    self.services.auto_unarchive_on_turn_start_fenced(
+                        workspace_id,
+                        agent_id,
+                        archive_fence,
+                    )
+                })
+                .await
                 {
                     Ok(outcome) => outcome,
                     // A RETIRED workspace whose revive failed has no
@@ -7577,12 +7581,14 @@ impl AgentManager {
             // never block the turn.
             match outcome {
                 Some(crate::UnarchiveOutcome::Unarchived) => {
-                    self.persist_auto_unarchive_notice(
-                        agent_id,
-                        workspace_id,
-                        AUTO_UNARCHIVE_NOTICE_TEXT,
-                        "auto_unarchived",
-                    )
+                    boxed_await(|| {
+                        self.persist_auto_unarchive_notice(
+                            agent_id,
+                            workspace_id,
+                            AUTO_UNARCHIVE_NOTICE_TEXT,
+                            "auto_unarchived",
+                        )
+                    })
                     .await;
                     self.arm_auto_unarchive_flag_if_slot_held(
                         agent_id,
@@ -7593,12 +7599,14 @@ impl AgentManager {
                     previous_branch,
                     branch,
                 }) => {
-                    self.persist_auto_unarchive_notice(
-                        agent_id,
-                        workspace_id,
-                        WORKSPACE_REVIVED_NOTICE_TEXT,
-                        "workspace_revived",
-                    )
+                    boxed_await(|| {
+                        self.persist_auto_unarchive_notice(
+                            agent_id,
+                            workspace_id,
+                            WORKSPACE_REVIVED_NOTICE_TEXT,
+                            "workspace_revived",
+                        )
+                    })
                     .await;
                     self.arm_auto_unarchive_flag_if_slot_held(
                         agent_id,
