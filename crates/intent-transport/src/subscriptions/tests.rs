@@ -3031,16 +3031,20 @@ mod workspace_retired_opt_in {
         assert_eq!(d["updated"][0]["id"], "ws-live", "{d}");
     }
 
-    /// `workspace.subscribe { includeRetired }` is an optional strict bool.
+    /// `workspace.subscribe { includeRetired }` is an optional strict bool:
+    /// only omission means `false`; any supplied non-boolean, `null`
+    /// included, is rejected (PROTOCOL §5.1).
     #[test]
     fn subscribe_params_parse_include_retired() {
         let parse = |v: Value| parse_workspace_subscribe_params(v.as_object().unwrap());
         assert!(!parse(json!({})).unwrap().include_retired);
         assert!(
-            !parse(json!({ "includeRetired": null }))
+            !parse(json!({ "includeRetired": false }))
                 .unwrap()
                 .include_retired
         );
+        assert!(parse(json!({ "includeRetired": null })).is_err());
+        assert!(parse(json!({ "includeRetired": 1 })).is_err());
         assert!(
             parse(json!({ "includeRetired": true }))
                 .unwrap()

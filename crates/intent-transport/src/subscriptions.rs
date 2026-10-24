@@ -288,13 +288,14 @@ pub(crate) fn parse_note_subscribe_params(
 }
 
 /// Validate `workspace.subscribe` params. The channel is global, so only the
-/// optional `replaceGroup` and `includeRetired` (strict boolean; a
-/// non-boolean is `-32602`) are read (§6.2).
+/// optional `replaceGroup` and `includeRetired` (strict boolean: only
+/// omission means `false`; `null` or any non-boolean is `-32602`) are read
+/// (§6.2).
 pub(crate) fn parse_workspace_subscribe_params(
     params: &Map<String, Value>,
 ) -> Result<WorkspaceSubscribeParams, String> {
     let include_retired = match params.get("includeRetired") {
-        None | Some(Value::Null) => false,
+        None => false,
         Some(Value::Bool(b)) => *b,
         Some(_) => return Err("includeRetired must be a boolean".to_string()),
     };

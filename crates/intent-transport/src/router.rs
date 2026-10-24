@@ -905,7 +905,7 @@ async fn dispatch(
                 .unwrap_or(false);
             // Retired rows are opt-in only (§5.1): `includeArchived` alone
             // never returns them.
-            let include_retired = opt_bool_strict(params, "includeRetired")?.unwrap_or(false);
+            let include_retired = opt_bool_if_present(params, "includeRetired")?.unwrap_or(false);
             let workspaces = api
                 .list_workspaces(intent_core::WorkspaceListFilter::new(
                     include_archived,
@@ -920,7 +920,7 @@ async fn dispatch(
                 .get("url")
                 .and_then(Value::as_str)
                 .ok_or_else(|| invalid_params("Missing required parameter: url"))?;
-            let include_retired = opt_bool_strict(params, "includeRetired")?.unwrap_or(false);
+            let include_retired = opt_bool_if_present(params, "includeRetired")?.unwrap_or(false);
             let workspaces = api
                 .find_workspaces_by_pull_request(url.to_string(), include_retired)
                 .await
@@ -4936,7 +4936,7 @@ async fn dispatch(
         }
         "crossWorkspace.listSiblings" => {
             let ws = require_ws_note(params)?;
-            let include_retired = opt_bool_strict(params, "includeRetired")?.unwrap_or(false);
+            let include_retired = opt_bool_if_present(params, "includeRetired")?.unwrap_or(false);
             api.cross_workspace_list_siblings(ws, include_retired)
                 .await
                 .map_err(domain_to_rpc)
@@ -5829,6 +5829,17 @@ fn opt_bool(params: &Map<String, Value>, name: &str) -> Option<bool> {
 fn opt_bool_strict(params: &Map<String, Value>, name: &str) -> Result<Option<bool>, RpcErr> {
     match params.get(name) {
         None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(b)) => Ok(Some(*b)),
+        Some(_) => Err(invalid_params(format!("{name} must be a boolean"))),
+    }
+}
+
+/// Stricter than [`opt_bool_strict`]: only an ABSENT key is `None`; a
+/// supplied `null` or any other non-boolean is `-32602`. Used for
+/// `includeRetired` (PROTOCOL §5.1), where only omission means `false`.
+fn opt_bool_if_present(params: &Map<String, Value>, name: &str) -> Result<Option<bool>, RpcErr> {
+    match params.get(name) {
+        None => Ok(None),
         Some(Value::Bool(b)) => Ok(Some(*b)),
         Some(_) => Err(invalid_params(format!("{name} must be a boolean"))),
     }

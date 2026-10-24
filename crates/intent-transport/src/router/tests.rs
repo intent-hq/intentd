@@ -3465,6 +3465,35 @@ async fn find_by_pull_request_and_list_siblings_include_retired_is_opt_in() {
     assert_eq!(v["result"][0]["includeRetired"], true, "{v}");
 }
 
+/// Every raw-RPC `includeRetired` surface treats only omission as `false`:
+/// any supplied non-boolean — `null` included — is `-32602`
+/// `invalid-params` (PROTOCOL §5.1).
+#[tokio::test]
+async fn include_retired_rejects_null_and_non_booleans_on_every_rpc_surface() {
+    let pr = "https://github.com/o/r/pull/7";
+    for bad in ["null", r#""true""#, "1"] {
+        for (method, base) in [
+            ("workspace.list", String::new()),
+            ("workspace.findByPullRequest", format!(r#""url":"{pr}","#)),
+            (
+                "crossWorkspace.listSiblings",
+                r#""workspaceId":"ws-1","#.to_string(),
+            ),
+        ] {
+            let v = call(&format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{{{base}"includeRetired":{bad}}}}}"#
+            ))
+            .await
+            .unwrap();
+            assert_eq!(err_code(&v), -32602, "{method} {bad}: {v}");
+            assert_eq!(
+                v["error"]["data"]["code"], "invalid-params",
+                "{method} {bad}: {v}"
+            );
+        }
+    }
+}
+
 /// `workspace.retire` returns the updated `workspace` record, and an
 /// unknown id is the standard `not-found`.
 #[tokio::test]
