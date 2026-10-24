@@ -37,39 +37,6 @@ impl Services {
             .map(|m| m.monitor_id)
             .collect())
     }
-
-    /// Before an explicit `ws.script.monitor`, silently retire the monitor
-    /// `ws.script.start` armed by default when `agent` owns it, so the
-    /// agent's own options (TTL, output pattern, line count) apply instead
-    /// of being swallowed by the one-monitor-per-script dedupe. Another
-    /// owner's request leaves it alone (and is refused as already-monitored).
-    pub(crate) async fn replace_auto_start_monitor(
-        &self,
-        workspace_id: &WorkspaceId,
-        agent: &AgentId,
-        script_id: &str,
-    ) -> Result<()> {
-        let key = (workspace_id.clone(), script_id.to_owned());
-        let Some(auto_id) = self.auto_start_monitors.lock().unwrap().get(&key).cloned() else {
-            return Ok(());
-        };
-        let owned = match self.store.script_monitor(workspace_id, &auto_id).await {
-            Ok(row) => &row.agent_id == agent,
-            Err(intent_core::Error::InvalidParams(_)) => true,
-            Err(error) => return Err(error),
-        };
-        if !owned {
-            return Ok(());
-        }
-        self.script_manager()
-            .cancel_monitor(workspace_id, &auto_id, Some(agent), false)
-            .await?;
-        let mut autos = self.auto_start_monitors.lock().unwrap();
-        if autos.get(&key) == Some(&auto_id) {
-            autos.remove(&key);
-        }
-        Ok(())
-    }
     pub(crate) fn track_script_monitor_worker(&self, agent: &AgentId, metadata: Option<&Value>) {
         let mut workers = self
             .script_locks

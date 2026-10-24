@@ -21161,11 +21161,29 @@ impl WorkspaceApi for Services {
             let _archive = self.archive_fence.acquire(&workspace_id).await;
             let retirement = self.agent_retirement_gates.for_agent(&agent_id);
             let _retirement = retirement.lock().await;
-            self.replace_auto_start_monitor(&workspace_id, &agent_id, &script_id)
+            let key = (workspace_id.clone(), script_id.clone());
+            let auto = self.auto_start_monitors.lock().unwrap().get(&key).cloned();
+            let reply = self
+                .script_manager()
+                .monitor_replacing(
+                    &workspace_id,
+                    &agent_id,
+                    &script_id,
+                    options,
+                    auto.as_deref(),
+                )
                 .await?;
-            self.script_manager()
-                .monitor(&workspace_id, &agent_id, &script_id, options)
-                .await
+            // Once replaced, the default is gone; a stale marker (its monitor
+            // already settled) never matches an active row and is harmless.
+            if let Some(auto) = auto {
+                if reply["ok"] == true && reply["monitor"]["monitorId"].as_str() != Some(&auto) {
+                    let mut autos = self.auto_start_monitors.lock().unwrap();
+                    if autos.get(&key) == Some(&auto) {
+                        autos.remove(&key);
+                    }
+                }
+            }
+            Ok(reply)
         })
     }
     fn script_monitor_list(

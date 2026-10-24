@@ -147,3 +147,128 @@ async fn start_monitor_reports_another_owners_monitor_without_duplicating() {
     assert_eq!(monitors_for(&h, &id).await.len(), 1);
     h.services.script_stop(h.ws.clone(), id).await.unwrap();
 }
+
+#[intent_test_macros::daemon_test]
+async fn rejected_explicit_monitor_keeps_the_auto_monitor() {
+    let h = harness().await;
+    let agent = monitor_owner(&h, "builder").await;
+    let id = create_simple(&h, "kept build", "sleep 30", ScriptMode::Command).await;
+    let (run, armed) = agent_start_armed(&h, &agent, &id).await;
+    for options in [
+        json!({"ttlMs": 0, "runId": run}),
+        json!({"ttlMs": 60000, "runId": run, "outputPattern": "("}),
+        json!({"ttlMs": 60000, "runId": "not-this-run"}),
+    ] {
+        let rejected = h
+            .services
+            .script_monitor(h.ws.clone(), agent.clone(), id.clone(), options.clone())
+            .await;
+        assert!(rejected.is_err(), "{options}: {rejected:?}");
+        let active = monitors_for(&h, &id).await;
+        assert_eq!(active.len(), 1, "{options}: {active:?}");
+        assert_eq!(
+            json!(active[0].monitor_id),
+            armed["monitor"]["monitorId"],
+            "{options}: the default wake survives a rejected replacement"
+        );
+    }
+    h.services.script_stop(h.ws.clone(), id).await.unwrap();
+}
+
+#[intent_test_macros::daemon_test]
+async fn explicit_monitor_after_unmonitored_auto_monitor_registers() {
+    let h = harness().await;
+    let agent = monitor_owner(&h, "builder").await;
+    let id = create_simple(&h, "unwatched build", "sleep 30", ScriptMode::Command).await;
+    let (run, armed) = agent_start_armed(&h, &agent, &id).await;
+    let auto_id = armed["monitor"]["monitorId"].as_str().unwrap().to_owned();
+    h.services
+        .script_monitor_cancel(h.ws.clone(), auto_id.clone(), Some(agent.clone()), false)
+        .await
+        .unwrap();
+    let explicit = h
+        .services
+        .script_monitor(
+            h.ws.clone(),
+            agent.clone(),
+            id.clone(),
+            json!({"ttlMs": 60000, "runId": run}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(explicit["ok"], true, "a stale default marker is ignored: {explicit}");
+    assert_ne!(explicit["monitor"]["monitorId"], json!(auto_id));
+    assert_eq!(monitors_for(&h, &id).await.len(), 1);
+    h.services.script_stop(h.ws.clone(), id).await.unwrap();
+}
+
+#[intent_test_macros::daemon_test]
+async fn start_and_explicit_monitor_after_completed_auto_monitor() {
+    let h = harness().await;
+    let agent = monitor_owner(&h, "builder").await;
+    let gate = tempfile::tempdir().unwrap();
+    let gate_path = gate.path().join("go");
+    let command = format!(
+        "while [ ! -e '{}' ]; do sleep 0.05; done",
+        gate_path.display()
+    );
+    let id = create_simple(&h, "rerun build", &command, ScriptMode::Command).await;
+    let (_, first) = agent_start_armed(&h, &agent, &id).await;
+    std::fs::write(&gate_path, b"").unwrap();
+    monitor_row(&h, first["monitor"]["monitorId"].as_str().unwrap(), "completed").await;
+    std::fs::remove_file(&gate_path).unwrap();
+    wait_until_not_live(&h, &id).await;
+
+    let (run, second) = agent_start_armed(&h, &agent, &id).await;
+    assert_eq!(second["ok"], true, "rearm after a settled default: {second}");
+    let explicit = h
+        .services
+        .script_monitor(
+            h.ws.clone(),
+            agent.clone(),
+            id.clone(),
+            json!({"ttlMs": 60000, "runId": run, "lineCount": 1}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(explicit["ok"], true, "{explicit}");
+    assert_eq!(explicit["monitor"]["lineCount"], 1);
+    assert_eq!(monitors_for(&h, &id).await.len(), 1);
+    h.services.script_stop(h.ws.clone(), id).await.unwrap();
+}
+
+#[intent_test_macros::daemon_test]
+async fn restart_moves_the_auto_monitor_to_the_new_run() {
+    let h = harness().await;
+    let agent = monitor_owner(&h, "builder").await;
+    let id = create_simple(&h, "restarted build", "sleep 30", ScriptMode::Command).await;
+    let (first_run, _) = agent_start_armed(&h, &agent, &id).await;
+    let reply = h.services.script_restart(h.ws.clone(), id.clone()).await.unwrap();
+    let run = reply["runId"].as_str().expect("restart runId").to_owned();
+    assert_ne!(run, first_run);
+    let armed = h
+        .services
+        .script_start_monitor(h.ws.clone(), agent.clone(), id.clone(), run.clone())
+        .await
+        .unwrap();
+    assert_eq!(armed["ok"], true, "{armed}");
+    assert_eq!(armed["monitor"]["runId"], json!(run));
+    let active = monitors_for(&h, &id).await;
+    assert_eq!(active.len(), 1, "{active:?}");
+    assert_eq!(active[0].run_id, run);
+    h.services.script_stop(h.ws.clone(), id).await.unwrap();
+}
+
+async fn wait_until_not_live(h: &Harness, id: &str) {
+    tokio::time::timeout(LIVENESS, async {
+        loop {
+            let status = h.services.script_status(h.ws.clone(), id.into()).await.unwrap();
+            if status["status"] != "running" && status["status"] != "starting" {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("run ends");
+}
