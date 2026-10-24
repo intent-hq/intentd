@@ -257,6 +257,11 @@ impl ScriptManager {
             ),
         )
         .await;
+        // Active script monitors are a `Workspace.waiting` signal (§5.1):
+        // registration and every terminal transition go through here.
+        if let Some(services) = &self.owner_services {
+            services.maybe_emit_waiting_changed(&row.workspace_id).await;
+        }
     }
 
     async fn commit_monitor(&self, row: &ScriptMonitor) -> Result<()> {

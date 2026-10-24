@@ -43,12 +43,25 @@ pub(crate) type QuotaFailoverChains = Arc<Mutex<HashMap<AgentId, QuotaFailoverCh
 pub(crate) struct QuotaFailoverChain {
     /// References already tried for this message.
     tried: Vec<String>,
-    /// The identity the current attempt started with: its canonical
-    /// selection and the session's `model` column as read at turn start.
-    /// A failure is only failed over while the session still carries exactly
-    /// this identity — a user switch of provider OR model during the attempt
-    /// always wins.
-    attempt: Option<(String, Option<String>)>,
+    /// The identity the current attempt started with. A failure is only
+    /// failed over while the session still carries exactly this identity — a
+    /// user switch of provider OR model during the attempt always wins.
+    attempt: Option<FailoverAttempt>,
+}
+
+/// One attempt of the message in flight.
+#[derive(Clone, Debug)]
+struct FailoverAttempt {
+    /// Canonical selection the attempt runs on.
+    selection: String,
+    /// The session's `model` column as read at turn start.
+    model: Option<String>,
+    /// When the attempt started: the shared quota cache only clears an
+    /// exhausted mark recorded before this (see
+    /// [`crate::provider_quota_cache::ProviderQuotaCache::mark_working`]).
+    started_at: chrono::DateTime<chrono::Utc>,
+    /// Whether this attempt already reported working to the shared cache.
+    working_noted: bool,
 }
 
 /// Agents whose current message is a turn a quota failover cut short (set
@@ -93,6 +106,7 @@ pub(crate) fn next_backup(
 /// Profiles that no longer exist are not in `profiles`, so a backup is
 /// skipped by construction; a profile home that no longer exists is skipped
 /// too.
+#[cfg(test)]
 pub(crate) fn next_candidate(
     current: &str,
     home: Option<&str>,
@@ -100,14 +114,69 @@ pub(crate) fn next_candidate(
     profiles: &[ProfileMeta],
     enabled: Option<&BTreeMap<String, bool>>,
 ) -> Option<String> {
+    next_candidate_avoiding(current, home, tried, &[], profiles, enabled)
+}
+
+/// [`next_candidate`], preferring configurations the shared quota cache does
+/// not mark exhausted: the walk takes the first eligible candidate not in
+/// `exhausted`, and only when every eligible candidate is marked falls back
+/// to the first of them — a mark is advisory, so a turn still tries every
+/// candidate once.
+pub(crate) fn next_candidate_avoiding(
+    current: &str,
+    home: Option<&str>,
+    tried: &[String],
+    exhausted: &[String],
+    profiles: &[ProfileMeta],
+    enabled: Option<&BTreeMap<String, bool>>,
+) -> Option<String> {
+    let mut eligible = candidate_walk(current, home, tried, profiles, enabled).into_iter();
+    let first = eligible.next()?;
+    if !exhausted.contains(&first) {
+        return Some(first);
+    }
+    eligible
+        .find(|candidate| !exhausted.contains(candidate))
+        .or(Some(first))
+}
+
+/// The first candidate of `current`'s rotation (see [`next_candidate`])
+/// that the shared quota cache does not mark exhausted, with nothing tried
+/// yet: where a turn starts instead of a configuration already known to be
+/// out of quota. `None` when every candidate is marked (the turn then still
+/// tries its current configuration) or there is none.
+pub(crate) fn first_unmarked_candidate(
+    current: &str,
+    home: Option<&str>,
+    exhausted: &[String],
+    profiles: &[ProfileMeta],
+    enabled: Option<&BTreeMap<String, bool>>,
+) -> Option<String> {
+    candidate_walk(current, home, &[], profiles, enabled)
+        .into_iter()
+        .find(|candidate| !exhausted.contains(candidate))
+}
+
+/// The eligible candidates of `current`'s rotation in walk order (see
+/// [`next_candidate`]), `current` and `tried` excluded.
+fn candidate_walk(
+    current: &str,
+    home: Option<&str>,
+    tried: &[String],
+    profiles: &[ProfileMeta],
+    enabled: Option<&BTreeMap<String, bool>>,
+) -> Vec<String> {
     let current = provider_profiles::canonical_selection(current);
     let base = if provider_profiles::is_qualified_ref(&current) {
-        provider_profiles::parse_profile_ref(&current)?.0.to_owned()
+        let Some((base, _)) = provider_profiles::parse_profile_ref(&current) else {
+            return Vec::new();
+        };
+        base.to_owned()
     } else {
         current.clone()
     };
     if crate::agent_ops::provider_is_disabled(&base, enabled) {
-        return None;
+        return Vec::new();
     }
     let mut rotation: Vec<String> = profiles
         .iter()
@@ -128,8 +197,9 @@ pub(crate) fn next_candidate(
         .map_or(0, |index| index + 1);
     (0..rotation.len())
         .map(|offset| &rotation[(start + offset) % rotation.len()])
-        .find(|candidate| **candidate != current && !tried.contains(candidate))
+        .filter(|candidate| **candidate != current && !tried.contains(candidate))
         .cloned()
+        .collect()
 }
 
 impl Services {
@@ -157,11 +227,52 @@ impl Services {
         model: Option<&str>,
     ) {
         if let Some(chain) = self.quota_failover_chains.lock().unwrap().get_mut(agent_id) {
-            chain.attempt = Some((
-                provider_profiles::canonical_selection(selection),
-                model.map(str::to_owned),
-            ));
+            chain.attempt = Some(FailoverAttempt {
+                selection: provider_profiles::canonical_selection(selection),
+                model: model.map(str::to_owned),
+                started_at: chrono::Utc::now(),
+                working_noted: false,
+            });
         }
+    }
+
+    /// The armed attempt produced output (or completed without any): its
+    /// configuration has quota right now, so the shared cache marks it
+    /// working for every conversation (see
+    /// [`crate::provider_quota_cache`]). Once per attempt; a no-op when no
+    /// worker armed a chain or the attempt identity is not recorded yet.
+    pub(crate) fn note_provider_working(&self, agent_id: &AgentId) {
+        let noted = {
+            let mut chains = self.quota_failover_chains.lock().unwrap();
+            let Some(attempt) = chains.get_mut(agent_id).and_then(|c| c.attempt.as_mut()) else {
+                return;
+            };
+            if attempt.working_noted {
+                return;
+            }
+            attempt.working_noted = true;
+            (attempt.selection.clone(), attempt.started_at)
+        };
+        self.provider_quota_cache
+            .mark_working(&noted.0, noted.1, chrono::Utc::now());
+    }
+
+    /// Record a quota failure on `selection` in the shared cache, so every
+    /// other conversation skips it until `reported` (the error's reset time,
+    /// when usable) or the default mark duration.
+    fn note_provider_exhausted(
+        &self,
+        selection: &str,
+        reported: Option<chrono::DateTime<chrono::Utc>>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) {
+        self.provider_quota_cache
+            .mark_exhausted(selection, reported, now);
+    }
+
+    /// Configurations the shared cache marks exhausted right now.
+    pub(crate) fn exhausted_providers(&self) -> Vec<String> {
+        self.provider_quota_cache.exhausted(chrono::Utc::now())
     }
 
     /// The session-open fill of a turn that started on the provider default
@@ -172,9 +283,9 @@ impl Services {
     /// could pick up a user's concurrent change.
     pub(crate) fn note_quota_failover_filled_model(&self, agent_id: &AgentId, filled: &str) {
         if let Some(chain) = self.quota_failover_chains.lock().unwrap().get_mut(agent_id) {
-            if let Some((_, model)) = chain.attempt.as_mut() {
-                if model.is_none() {
-                    *model = Some(filled.to_owned());
+            if let Some(attempt) = chain.attempt.as_mut() {
+                if attempt.model.is_none() {
+                    attempt.model = Some(filled.to_owned());
                 }
             }
         }
@@ -197,7 +308,9 @@ impl Services {
             .unwrap()
             .get(agent_id)
             .cloned()?;
-        let (selection, model) = chain.attempt?;
+        let FailoverAttempt {
+            selection, model, ..
+        } = chain.attempt?;
         let current = failed_attempt_selection(session.provider.as_deref(), Some(&selection))?;
         if let Some(failed) = failed_provider {
             if provider_profiles::canonical_selection(failed) != current {
@@ -249,10 +362,11 @@ impl Services {
         };
         let settings = self.effective_settings();
         let home = crate::provider_return::read_state(&session).map(|s| s.home);
-        next_candidate(
+        next_candidate_avoiding(
             &from,
             home.as_deref(),
             &tried,
+            &self.exhausted_providers(),
             &profiles,
             settings.providers.enabled.as_ref(),
         )
@@ -290,12 +404,28 @@ impl Services {
                 return false;
             }
         };
+        let now = chrono::Utc::now();
+        let reported = crate::provider_return::parse_reset_time(error_text, now);
+        // Every other conversation learns of the spent quota now, whether or
+        // not this one can fail over. The failed attempt's own provider
+        // record is authoritative; without one, the session's provider is
+        // only used once the identity check below proves it is the one that
+        // failed (never a configuration the user switched to meanwhile).
+        let recorded = failed_provider.filter(|p| !p.trim().is_empty());
+        if let Some(failed) = recorded {
+            self.note_provider_exhausted(failed, reported, now);
+        }
         if self
             .chain_for_failed_attempt(agent_id, &session, failed_provider)
             .is_none()
         {
             tracing::info!(agent = %agent_id, "no armed attempt, or provider/model changed since the failed attempt; quota failover skipped");
             return false;
+        }
+        if recorded.is_none() {
+            if let Some(failed) = session.provider.as_deref().filter(|p| !p.trim().is_empty()) {
+                self.note_provider_exhausted(failed, reported, now);
+            }
         }
         let Some(from) = session.provider.clone() else {
             return false;
@@ -311,6 +441,7 @@ impl Services {
         let from_selection = provider_profiles::canonical_selection(&from);
         let return_state = crate::provider_return::read_state(&session);
         let home = return_state.as_ref().map(|s| s.home.clone());
+        let exhausted = self.exhausted_providers();
         let target = {
             let mut chains = self.quota_failover_chains.lock().unwrap();
             let Some(chain) = chains.get_mut(agent_id) else {
@@ -320,10 +451,11 @@ impl Services {
             if !tried.contains(&from_selection) {
                 tried.push(from_selection.clone());
             }
-            let target = next_candidate(
+            let target = next_candidate_avoiding(
                 &from_selection,
                 home.as_deref(),
                 tried,
+                &exhausted,
                 &profiles,
                 settings.providers.enabled.as_ref(),
             );
@@ -332,8 +464,6 @@ impl Services {
             }
             target
         };
-        let now = chrono::Utc::now();
-        let reported = crate::provider_return::parse_reset_time(error_text, now);
         let Some(target) = target else {
             // Nothing left to try. When this was home rejecting a return
             // before any output, it still counts as a failed return: the
@@ -348,19 +478,74 @@ impl Services {
                     &from,
                     session.model.as_deref(),
                     &failed,
+                    false,
                 )
                 .await;
             }
             return false;
         };
-        let model = session.model.clone().filter(|m| !m.is_empty());
-        let next_state = crate::provider_return::on_switch(
-            return_state,
-            &from_selection,
+        self.switch_provider_for_quota(
+            workspace_id,
+            agent_id,
+            &session,
             &target,
+            return_state,
             reported,
-            now,
-        );
+            &profiles,
+            true,
+        )
+        .await
+    }
+
+    /// Move the agent from its current configuration (`session.provider`)
+    /// onto `target` because the current one is out of quota, and announce
+    /// it: the shared tail of a failover after a failed attempt
+    /// ([`Self::try_quota_failover`]) and of a switch ahead of a turn whose
+    /// configuration the shared cache marks exhausted
+    /// ([`Self::avoid_exhausted_provider`]). `reported` is the reset time
+    /// feeding the return timer. `after_failed_attempt` is set for a
+    /// failover: the message is a turn the failure interrupted (its redrive
+    /// continues the partial work) and leaving home counts as a failed
+    /// return. A switch ahead of the turn has neither: the backup receives
+    /// the original message, and the return state follows
+    /// [`crate::provider_return::on_skip`]. Returns whether the switch
+    /// landed (a concurrent provider or model change wins the
+    /// compare-and-set).
+    ///
+    /// The switch persists the target as the agent's provider with the same
+    /// model and the return state in one statement, emits `agent:updated`,
+    /// and persists one `provider_failover` system row (emitting
+    /// `agent:message`).
+    #[expect(clippy::too_many_arguments, reason = "one switch's full context")]
+    pub(crate) async fn switch_provider_for_quota(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        session: &intent_core::AgentSession,
+        target: &str,
+        return_state: Option<crate::provider_return::ProviderReturnState>,
+        reported: Option<chrono::DateTime<chrono::Utc>>,
+        profiles: &[ProfileMeta],
+        after_failed_attempt: bool,
+    ) -> bool {
+        let Some(from) = session.provider.clone() else {
+            return false;
+        };
+        let from_selection = provider_profiles::canonical_selection(&from);
+        let now = chrono::Utc::now();
+        let model = session.model.clone().filter(|m| !m.is_empty());
+        let next_state = match reported.filter(|_| !after_failed_attempt) {
+            Some(until) => {
+                crate::provider_return::on_skip(return_state, &from_selection, target, until, now)
+            }
+            None => crate::provider_return::on_switch(
+                return_state,
+                &from_selection,
+                target,
+                reported,
+                now,
+            ),
+        };
         let next_state_json = json!(next_state).to_string();
         // The move and its return bookkeeping land in one statement, so a
         // concurrent `agent.setModel` (which clears the state) either wins
@@ -372,11 +557,14 @@ impl Services {
                 agent_id,
                 &from,
                 session.model.as_deref(),
-                &target,
+                target,
                 Some((
                     crate::provider_return::PROVIDER_RETURN_METADATA_KEY,
                     &next_state_json,
                 )),
+                // A switch ahead of the turn yields to a manual choice
+                // saved since the caller's read (PROTOCOL §5.54).
+                !after_failed_attempt,
                 &now_iso(),
             )
             .await
@@ -395,12 +583,15 @@ impl Services {
             agent = %agent_id,
             from_provider = %from_selection,
             to_provider = %target,
+            after_failed_attempt,
             "provider quota exhausted; switching to backup profile"
         );
-        self.quota_failover_replays
-            .lock()
-            .unwrap()
-            .insert(agent_id.clone());
+        if after_failed_attempt {
+            self.quota_failover_replays
+                .lock()
+                .unwrap()
+                .insert(agent_id.clone());
+        }
         // Leaving the configuration this message started on: a timed return
         // home that has not produced output yet is not announced. A rotation
         // that reaches home is a return attempt of its own: home's first
@@ -422,9 +613,9 @@ impl Services {
             workspace_id,
             agent_id,
             &from_selection,
-            &target,
+            target,
             model.as_deref(),
-            &profiles,
+            profiles,
         )
         .await;
         true

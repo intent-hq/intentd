@@ -731,7 +731,7 @@ async fn checkout_original_tls_wire_direct_cached_exact_head_and_private_account
         });
         let log=directory.path().join("child.log");let output=std::fs::File::create(&log).unwrap();
         let mut command=Command::new(std::env::current_exe().unwrap());
-        command.args(["--exact","checkout::native::checkout_original_tls_wire_direct_cached_exact_head_and_private_account_replacement","--nocapture","--test-threads=1"])
+        command.args(["--exact",&common::exact_test_name(module_path!(),"checkout_original_tls_wire_direct_cached_exact_head_and_private_account_replacement"),"--nocapture","--test-threads=1"])
             .env(CHILD,"1").env("INTENT_CHECKOUT_INSTANCE",instance).env("INTENT_CHECKOUT_SHA",sha)
             .env("INTENT_CHECKOUT_ROOT",directory.path())
             .env("SSL_CERT_FILE",directory.path().join("ca.pem")).env("SSL_CERT_DIR",directory.path())

@@ -782,7 +782,9 @@ async fn frozen_sitter_preserves_new_daemon_startup() {
     ]);
     let mut child = GuardedChild::spawn(&mut command).unwrap();
     assert!(child
-        .wait_with_timeout(Duration::from_millis(millis * 4) + Duration::from_secs(90))
+        .wait_with_timeout(intentd_test_support::test_timeout(
+            Duration::from_millis(millis * 4) + Duration::from_secs(90),
+        ))
         .unwrap()
         .unwrap()
         .success());

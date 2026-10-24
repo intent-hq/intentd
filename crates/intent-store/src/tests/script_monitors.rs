@@ -1003,3 +1003,69 @@ async fn monitor_continuation_queue_copy_failure_rolls_back_receipt() {
     assert_eq!(recovered[0].turn_id, "receipt-only-turn");
     assert_eq!(recovered[0].payload["content"], "receipt-only warning");
 }
+
+#[tokio::test]
+async fn hook_or_script_monitor_waiting_lookup_is_one_union_over_both_tables() {
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.unwrap();
+    let (hooked, hook_agent) = seed(&store, "hooked").await;
+    let (monitored, monitor_agent) = seed(&store, "monitored").await;
+    let (settled, settled_agent) = seed(&store, "settled").await;
+    let (both, both_agent) = seed(&store, "both").await;
+    let (idle, _) = seed(&store, "idle").await;
+    store
+        .insert_hook(&sample_hook(
+            &HookId("hook-hooked".into()),
+            &hooked,
+            &hook_agent,
+            "h",
+        ))
+        .await
+        .unwrap();
+    store
+        .insert_hook(&sample_hook(
+            &HookId("hook-both".into()),
+            &both,
+            &both_agent,
+            "h",
+        ))
+        .await
+        .unwrap();
+    store
+        .insert_script_monitor(&monitor(&monitored, &monitor_agent, "active"))
+        .await
+        .unwrap();
+    store
+        .insert_script_monitor(&monitor(&both, &both_agent, "both-active"))
+        .await
+        .unwrap();
+    let done = monitor(&settled, &settled_agent, "done");
+    store.insert_script_monitor(&done).await.unwrap();
+    store
+        .settle_script_monitor(&triggered(&done))
+        .await
+        .unwrap();
+
+    let ids = [
+        hooked.clone(),
+        monitored.clone(),
+        settled.clone(),
+        both.clone(),
+        idle.clone(),
+    ];
+    let waiting = store
+        .workspaces_with_active_hooks_or_script_monitors(&ids)
+        .await
+        .unwrap();
+    assert_eq!(
+        waiting,
+        [hooked, monitored, both]
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>()
+    );
+    assert!(store
+        .workspaces_with_active_hooks_or_script_monitors(&[])
+        .await
+        .unwrap()
+        .is_empty());
+}

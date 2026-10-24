@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Offline tests for the network handling of scripts/test-optional-intel-dist.py.
+"""Offline tests for scripts/fetch-locked-crates.py, shared by the Release
+build-global-artifacts and host jobs and scripts/test-optional-intel-dist.py.
 
 The real dist test fetches crates once, with retries, and then runs every dist
 call offline. These tests stub `cargo` and `dist` on PATH, so they need neither
@@ -20,6 +21,9 @@ ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('dist_test', ROOT / 'scripts/test-optional-intel-dist.py')
 dist_test = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(dist_test)
+fetch_spec = importlib.util.spec_from_file_location('fetch_locked_crates', ROOT / 'scripts/fetch-locked-crates.py')
+fetch_mod = importlib.util.module_from_spec(fetch_spec)
+fetch_spec.loader.exec_module(fetch_mod)
 
 # Records its argv and the cargo network env, then fails (or, with STUB_HANG,
 # hangs) until the call count exceeds STUB_FAILURES.
@@ -61,11 +65,11 @@ class Network(unittest.TestCase):
 
     def fetch(self, failures, attempts=4, **limits):
         self.env['STUB_FAILURES'] = str(failures)
-        return dist_test.fetch_dependencies(self.dir, self.env, attempts=attempts, sleep=self.sleeps.append, **limits)
+        return fetch_mod.fetch_dependencies(self.dir, self.env, attempts=attempts, sleep=self.sleeps.append, **limits)
 
     def test_worst_case_fits_the_job_budget(self):
-        attempts, timeout, deadline = (dist_test.FETCH_ATTEMPTS, dist_test.FETCH_ATTEMPT_TIMEOUT,
-                                       dist_test.FETCH_DEADLINE)
+        attempts, timeout, deadline = (fetch_mod.FETCH_ATTEMPTS, fetch_mod.FETCH_ATTEMPT_TIMEOUT,
+                                       fetch_mod.FETCH_DEADLINE)
         backoff = sum(5 * 2 ** n for n in range(attempts - 1))
         self.assertLessEqual(deadline, 8 * 60, 'leaves the 15-minute job room for its other steps')
         self.assertLess(timeout, deadline)
@@ -119,15 +123,38 @@ class Network(unittest.TestCase):
         self.assertIn('4 attempts', message)
         self.assertIn('cargo fetch --locked', message)
 
+    def test_failure_message_does_not_blame_the_network_unconditionally(self):
+        with self.assertRaises(SystemExit) as raised:
+            self.fetch(failures=10, attempts=2)
+        message = str(raised.exception.code)
+        self.assertIn('otherwise fix the reported cause', message)
+        with self.assertRaises(SystemExit) as raised:
+            fetch_mod.fetch_dependencies(self.dir, self.env, attempts=1, sleep=self.sleeps.append, hint=' HINT')
+        self.assertTrue(str(raised.exception.code).endswith(' HINT'))
+
+    def test_toolchain_install_retries_without_a_timeout(self):
+        self.env['STUB_FAILURES'] = '1'
+        fetch_mod.install_toolchain(self.dir, self.env, sleep=self.sleeps.append)
+        self.assertEqual([c['argv'] for c in self.calls()], [['--version'], ['--version']])
+        self.assertEqual(len(self.sleeps), 1)
+        self.env['STUB_FAILURES'] = '10'
+        with self.assertRaises(SystemExit) as raised:
+            fetch_mod.install_toolchain(self.dir, self.env, attempts=2, sleep=self.sleeps.append)
+        self.assertIn('toolchain', str(raised.exception.code))
+
+    def test_release_limits_allow_slow_attempts(self):
+        self.assertGreater(fetch_mod.RELEASE_ATTEMPT_TIMEOUT, fetch_mod.FETCH_ATTEMPT_TIMEOUT)
+        self.assertGreaterEqual(fetch_mod.RELEASE_DEADLINE, 2 * fetch_mod.RELEASE_ATTEMPT_TIMEOUT)
+
     def test_dist_runs_offline(self):
-        result = dist_test.run_dist(self.dir, dist_test.offline_env(self.env), 'build', '--artifacts=lies')
+        result = dist_test.run_dist(self.dir, fetch_mod.offline_env(self.env), 'build', '--artifacts=lies')
         self.assertEqual(result, {'artifacts': {}})
         (call,) = self.calls()
         self.assertEqual(call['argv'], ['build', '--artifacts=lies', '--output-format=json'])
         self.assertEqual(call['env']['CARGO_NET_OFFLINE'], 'true')
 
     def test_offline_env_does_not_mutate_input(self):
-        offline = dist_test.offline_env(self.env)
+        offline = fetch_mod.offline_env(self.env)
         self.assertEqual(offline['CARGO_NET_OFFLINE'], 'true')
         self.assertNotIn('CARGO_NET_OFFLINE', self.env)
 

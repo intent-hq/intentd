@@ -12,7 +12,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
@@ -183,6 +183,7 @@ fn seed_workspace(title: &str, worktree_path: Option<String>, skip_worktree: boo
         diff_summary: None,
         display_status: None,
         waiting: false,
+        scripts_running: false,
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,

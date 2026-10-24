@@ -6413,6 +6413,7 @@ mod mcp_bridge_tests {
             // the line before the gate opens, so the race is exercised).
             bridge.send_request(2).await;
             let mut peek = String::new();
+            // fixed-deadline: allow — stays under fast_cfg()'s 2s reconnect_window, after which the bridge may legitimately reject
             let silent = timeout(
                 Duration::from_millis(200),
                 bridge.stdout.read_line(&mut peek),
@@ -6519,6 +6520,7 @@ mod mcp_bridge_tests {
             // to consume the line before the gate opens).
             bridge.send_request(2).await;
             let mut peek = String::new();
+            // fixed-deadline: allow — stays under fast_cfg()'s 2s reconnect_window, after which the bridge may legitimately reject
             let silent = timeout(
                 Duration::from_millis(200),
                 bridge.stdout.read_line(&mut peek),
@@ -7147,6 +7149,7 @@ mod workspace_api_tool_tests {
                 pull_requests_total: None,
                 display_status: None,
                 waiting: false,
+                scripts_running: false,
                 checkout_mode: None,
                 disk_usage: None,
                 pending_delete_at: None,
@@ -13839,6 +13842,7 @@ mod workspace_api_output_limit_tests {
                     pull_requests_total: None,
                     display_status: None,
                     waiting: false,
+                    scripts_running: false,
                     checkout_mode: None,
                     disk_usage: None,
                     pending_delete_at: None,
@@ -14166,6 +14170,7 @@ mod workspace_apply_proposal_tests {
             browser_client_id: None,
             display_status: None,
             waiting: false,
+            scripts_running: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,

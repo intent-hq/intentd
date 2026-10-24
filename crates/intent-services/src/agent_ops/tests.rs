@@ -145,6 +145,7 @@ pub(super) fn workspace(id: &WorkspaceId) -> Workspace {
         pull_requests_total: None,
         display_status: None,
         waiting: false,
+        scripts_running: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
@@ -269,7 +270,11 @@ async fn delete_skips_emit_when_session_already_gone() {
     assert_eq!(r["success"], json!(true));
 
     // Nothing was emitted: the subscription stays empty within the window.
-    let res = timeout(Duration::from_millis(300), sub.recv()).await;
+    let res = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await;
     assert!(
         res.is_err(),
         "expected no agent:deleted emit for a missing session"
@@ -1053,9 +1058,12 @@ async fn retire_cascades_to_settled_descendants() {
         .expect("re-retire");
     assert_eq!(r2["alreadyRetired"], json!(true));
     assert!(
-        timeout(Duration::from_millis(300), sub.recv())
-            .await
-            .is_err(),
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            sub.recv()
+        )
+        .await
+        .is_err(),
         "no re-emit on the idempotent retire"
     );
 }
@@ -6182,9 +6190,12 @@ async fn report_to_parent_keeps_waiting_projection_and_subscription_quiet() {
         .expect("report");
 
     assert!(
-        timeout(Duration::from_millis(100), sub.recv())
-            .await
-            .is_err(),
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(100)),
+            sub.recv()
+        )
+        .await
+        .is_err(),
         "progress report must not publish a subscription-state change"
     );
     let snapshot = serde_json::to_value(
@@ -6473,6 +6484,20 @@ fn live_preview_derivation_clips_trailing_partial_line() {
         last_response_and_digest_from_blocks(&blocks(&["First done\nfinal line no newline"]));
     assert_eq!(resp.as_deref(), Some("final line no newline"));
     assert_eq!(digest, None);
+}
+
+/// A reply that copied the HTML-escaped prompts block from an XML-escaped
+/// history replay must not surface `--&gt;` (or a prompt line) as the
+/// agent's last response; the literal block is stripped as before.
+#[test]
+fn last_response_strips_escaped_suggested_prompts_block() {
+    for text in [
+        "Report back when ready.\n\n&lt;!-- suggested-prompts\nRaise Type Check &amp; Lint's timeout.\n--&gt;",
+        "Report back when ready.\n\n<!-- suggested-prompts\nRaise the timeout.\n-->",
+    ] {
+        let (resp, _) = last_response_and_digest_from_blocks(&[text.to_owned()]);
+        assert_eq!(resp.as_deref(), Some("Report back when ready."), "{text}");
+    }
 }
 
 /// Live-turn overlay fallback: a slot whose blocks carry no text yet (early
@@ -10653,9 +10678,12 @@ async fn skipped_rename_emits_no_event() {
         .expect("skip");
     assert_eq!(r["skipped"], json!(true));
     assert!(
-        timeout(Duration::from_millis(300), sub.recv())
-            .await
-            .is_err(),
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            sub.recv()
+        )
+        .await
+        .is_err(),
         "no agent:renamed expected for a skipped rename"
     );
 }
@@ -15195,7 +15223,11 @@ async fn remove_queued_message_emits_queue_updated_only_when_present() {
         .await
         .expect("idempotent remove");
     assert_eq!(r["success"], true);
-    let none = timeout(Duration::from_millis(200), sub.recv()).await;
+    let none = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(200)),
+        sub.recv(),
+    )
+    .await;
     assert!(none.is_err(), "no event when nothing was removed");
 
     // Real remove emits with the empty snapshot.
@@ -16985,9 +17017,12 @@ async fn edit_queued_message_restamp_rejection_leaves_entry_untouched() {
         .expect("entry still queued");
     assert_eq!(after, before, "rejected edit mutated the entry: {after}");
     assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(200), sub.recv())
-            .await
-            .is_err(),
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_millis(200)),
+            sub.recv()
+        )
+        .await
+        .is_err(),
         "a rejected edit publishes no queue update"
     );
 
@@ -17081,9 +17116,12 @@ async fn assert_self_send_rejected(
         "no queue entry may be created for a self-targeted send"
     );
     assert!(
-        timeout(Duration::from_millis(200), sub.recv())
-            .await
-            .is_err(),
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            sub.recv()
+        )
+        .await
+        .is_err(),
         "no event may be published for a self-targeted send"
     );
 }
@@ -17262,9 +17300,12 @@ async fn queue_message_op_rejects_unknown_agent() {
         "no phantom queue entry may be created for an unknown agent"
     );
     assert!(
-        timeout(Duration::from_millis(200), sub.recv())
-            .await
-            .is_err(),
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            sub.recv()
+        )
+        .await
+        .is_err(),
         "no agent:queue:updated event may be published for an unknown agent"
     );
 }
@@ -30442,6 +30483,7 @@ fn subscribe_display_status(bus: &EventBus, ws: &WorkspaceId) -> crate::Subscrip
 }
 
 async fn assert_display_status_silent(sub: &mut crate::Subscription) {
+    // fixed-deadline: allow — stays under the 3s WORKSPACE_IDLE_DEBOUNCE_MS idle demotion, which legitimately changes displayStatus
     let res = timeout(Duration::from_millis(300), sub.recv()).await;
     assert!(res.is_err(), "expected no displayStatus event: {res:?}");
 }
@@ -31226,9 +31268,12 @@ async fn request_attention_mid_turn_defers_surfacing_until_flush() {
         assert_eq!(session.attention_request_kind.as_deref(), Some(kind));
         // …but nothing user-facing surfaces mid-turn: no events, no notice.
         assert!(
-            timeout(Duration::from_millis(300), sub.recv())
-                .await
-                .is_err(),
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(300)),
+                sub.recv()
+            )
+            .await
+            .is_err(),
             "no surfacing events while the turn is in flight ({kind})"
         );
         assert!(
@@ -31240,7 +31285,12 @@ async fn request_attention_mid_turn_defers_surfacing_until_flush() {
         svc.set_test_busy(&agent, false);
         svc.flush_deferred_attention(&agent, &ws).await;
         let mut events = Vec::new();
-        while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        while let Ok(Some(batch)) = timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            sub.recv(),
+        )
+        .await
+        {
             events.extend(batch);
         }
         let attention = events
@@ -31276,9 +31326,12 @@ async fn request_attention_mid_turn_defers_surfacing_until_flush() {
         // The flush consumed the marker — a second flush is a no-op.
         svc.flush_deferred_attention(&agent, &ws).await;
         assert!(
-            timeout(Duration::from_millis(200), sub.recv())
-                .await
-                .is_err(),
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(200)),
+                sub.recv()
+            )
+            .await
+            .is_err(),
             "second flush surfaces nothing ({kind})"
         );
     }
@@ -31323,9 +31376,12 @@ async fn request_attention_cleared_before_idle_flushes_nothing() {
     svc.set_test_busy(&agent, false);
     svc.flush_deferred_attention(&agent, &ws).await;
     assert!(
-        timeout(Duration::from_millis(300), sub.recv())
-            .await
-            .is_err(),
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            sub.recv()
+        )
+        .await
+        .is_err(),
         "cleared-before-idle raise surfaces nothing"
     );
     let session = svc.store().get_agent_session(&agent).await.expect("sess");
@@ -31348,9 +31404,12 @@ async fn request_attention_cleared_before_idle_flushes_nothing() {
     );
     svc.flush_deferred_attention(&agent, &ws).await;
     assert!(
-        timeout(Duration::from_millis(200), sub.recv())
-            .await
-            .is_err(),
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            sub.recv()
+        )
+        .await
+        .is_err(),
         "stale marker over cleared fields retires silently"
     );
 }
@@ -31481,7 +31540,12 @@ async fn multiple_mid_turn_raises_each_surface_at_flush() {
     svc.set_test_busy(&agent, false);
     svc.flush_deferred_attention(&agent, &ws).await;
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let attention: Vec<_> = events
@@ -31517,9 +31581,12 @@ async fn multiple_mid_turn_raises_each_surface_at_flush() {
     // The flush consumed the queue — a second flush is a no-op.
     svc.flush_deferred_attention(&agent, &ws).await;
     assert!(
-        timeout(Duration::from_millis(200), sub.recv())
-            .await
-            .is_err(),
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            sub.recv()
+        )
+        .await
+        .is_err(),
         "second flush surfaces nothing"
     );
 }
@@ -32441,7 +32508,11 @@ async fn session_stats_emits_only_on_change() {
 
     // Identical snapshot -> no second emit within the window.
     svc.cache_and_emit_session_stats(&session, &stats).await;
-    let res = timeout(Duration::from_millis(300), sub.recv()).await;
+    let res = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await;
     assert!(res.is_err(), "identical stats must not re-emit");
 
     // A moved rollup -> a fresh emit.
@@ -34929,7 +35000,12 @@ async fn agent_send_queued_message_now_publishes_shrunk_queue_after_row_persist(
     assert_eq!(r["success"], json!(true));
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let row_echo_at = events
@@ -36214,9 +36290,12 @@ async fn migrate_queue_empty_queue_still_gcs_poisoned_session() {
     ));
     // No entries moved → no agent:queue:updated noise for the target.
     assert!(
-        timeout(Duration::from_millis(300), queue_sub.recv())
-            .await
-            .is_err(),
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            queue_sub.recv()
+        )
+        .await
+        .is_err(),
         "expected no queue event for an empty migration"
     );
 }
@@ -36896,9 +36975,12 @@ async fn resume_watch_reregistration_publishes_subscriptions_changed() {
     assert_eq!(batch[0].data["isWaitingForOtherAgents"], json!(true));
     assert_eq!(batch[0].data["waitingForAgentIds"], json!([child.0]));
     assert!(
-        timeout(Duration::from_millis(300), sub.recv())
-            .await
-            .is_err(),
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            sub.recv()
+        )
+        .await
+        .is_err(),
         "resume must publish subscriptions-changed exactly once"
     );
 
@@ -37028,9 +37110,12 @@ async fn resume_watch_rejection_publishes_no_subscriptions_changed() {
         .expect("resume succeeds despite the rejected watch");
 
     assert!(
-        timeout(Duration::from_millis(300), sub.recv())
-            .await
-            .is_err(),
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            sub.recv()
+        )
+        .await
+        .is_err(),
         "rejected re-registration must not publish subscriptions-changed"
     );
     assert!(svc.list_watches_for_parent(&parent).is_empty());
@@ -38260,7 +38345,11 @@ async fn settle_provisioned_sandbox_discards_when_session_missing() {
             .is_none(),
         "sandbox record must be removed"
     );
-    let res = timeout(Duration::from_millis(300), sub.recv()).await;
+    let res = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await;
     assert!(
         res.is_err(),
         "expected no sandbox:cow:created emit for a deleted agent"
@@ -42065,9 +42154,12 @@ async fn mark_seen_is_monotonic_and_idempotent() {
         .expect("re-mark");
     assert_eq!(r["lastSeenMessageId"], json!(second.id));
     assert!(
-        timeout(Duration::from_millis(300), sub.recv())
-            .await
-            .is_err(),
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            sub.recv()
+        )
+        .await
+        .is_err(),
         "no agent:updated for the older-message no-op or the idempotent re-mark"
     );
 
@@ -47341,6 +47433,11 @@ mod resume_tail_recap {
              responding, and your restored session may predate the exchange below \
              — it is repeated here (parts of it may or may not already be in your \
              context).\n\n\
+             Note on escaping: text quoted inside the XML tags of this message is XML-escaped \
+             only so it can be quoted (&lt; &gt; &amp; &quot; stand for < > & \"). The \
+             original messages used the literal characters. Write your own replies with \
+             literal characters too: for example <!-- and -->, never &lt;!-- and \
+             --&gt;.\n\n\
              The user's message, delivered before the interruption:\n\
              <interrupted_user_message>\nbuild a simple local webapp\n</interrupted_user_message>\n\n\
              Your partial response before the cut-off (it did NOT complete; anything \
@@ -47348,6 +47445,26 @@ mod resume_tail_recap {
              <interrupted_partial_response>\nDelegating board webapp...\n</interrupted_partial_response>\n\n\
              </supervisor>"
         );
+    }
+
+    /// The recapped text is XML-escaped, so the recap carries the note that
+    /// the escaping is transport-only and replies use literal characters.
+    #[test]
+    fn recap_says_escaping_is_transport_only() {
+        let messages = vec![
+            user("fix <b> & ship"),
+            interrupted_assistant("Done.\n\n<!-- suggested-prompts\nShip it.\n-->"),
+        ];
+        let recap = build_resume_tail_recap(&messages).expect("recap");
+        assert!(
+            recap
+                .text
+                .contains(crate::history_xml::REPLAY_ESCAPING_NOTE),
+            "{}",
+            recap.text
+        );
+        assert!(recap.text.contains("fix &lt;b&gt; &amp; ship"));
+        assert!(recap.text.contains("&lt;!-- suggested-prompts"));
     }
 
     /// A SECOND restart mid-continuation: the tail now holds the original
@@ -47629,8 +47746,12 @@ mod resume_tail_recap {
 /// and the never-fail fallback (`resume_continuation_text`).
 mod resume_continuation {
     use crate::agent_ops::{
-        humanize_outage_duration, resume_continuation_text, RESUME_CONTINUATION_FALLBACK_TEXT,
+        humanize_outage_duration, resume_continuation_text, InterruptedCapture,
+        ABANDON_NOTICE_TEXT, ABANDON_WORKERS_MID_TURN_NOTICE_TEXT, ABANDON_WORKERS_NOTICE_TEXT,
+        RESUME_CONTINUATION_FALLBACK_TEXT, RESUME_MARKER_TEXT, RESUME_WORKERS_LOST_NOTE,
+        RESUME_WORKERS_MARKER_TEXT, RESUME_WORKERS_MID_TURN_MARKER_TEXT,
     };
+    use crate::agent_workers::INTERRUPTED_WITH_WORKERS_REASON;
     use time::format_description::well_known::Rfc3339;
     use time::OffsetDateTime;
 
@@ -47653,6 +47774,100 @@ mod resume_continuation {
         assert_eq!(humanize_outage_duration(2 * 86_400 - 1), "47 hours");
         assert_eq!(humanize_outage_duration(2 * 86_400), "2 days");
         assert_eq!(humanize_outage_duration(3 * 86_400 + 5), "3 days");
+    }
+
+    /// intent-hq/intent#7658: rows are classified by their reason tag and
+    /// recorded status. Untagged rows (and other reasons) are mid-turn
+    /// whatever their status; a tagged row is mid-turn only when its status
+    /// is an in-flight one.
+    #[test]
+    fn interrupted_capture_classifies_by_reason_and_status() {
+        let tag = Some(INTERRUPTED_WITH_WORKERS_REASON);
+        for status in ["active", "idle", "Idle", "error"] {
+            assert_eq!(
+                InterruptedCapture::of(None, status),
+                InterruptedCapture::MidTurn
+            );
+            assert_eq!(
+                InterruptedCapture::of(Some("system_suspend"), status),
+                InterruptedCapture::MidTurn
+            );
+        }
+        for status in ["active", "Processing", "Waiting"] {
+            assert_eq!(
+                InterruptedCapture::of(tag, status),
+                InterruptedCapture::MidTurnWithWorkers,
+                "{status}"
+            );
+        }
+        for status in ["idle", "Idle", "error", "not-a-status"] {
+            assert_eq!(
+                InterruptedCapture::of(tag, status),
+                InterruptedCapture::IdleWithWorkers,
+                "{status}"
+            );
+        }
+    }
+
+    /// Each capture's marker, continuation, abandon notice and tail replay:
+    /// tagged rows get the lost-task note after the duration wording, an idle
+    /// capture replays no tail (a turn the user stopped stays stopped), and
+    /// untagged rows keep today's wording.
+    #[test]
+    fn interrupted_capture_wording_and_tail_replay() {
+        let now = parse("2026-08-15T12:00:15Z");
+        let at = "2026-08-15T12:00:00Z";
+        let base = resume_continuation_text(at, now);
+        assert!(base.starts_with("You were interrupted for about 15 seconds"));
+        let noted = format!("{base} {RESUME_WORKERS_LOST_NOTE}");
+        let cases = [
+            (
+                InterruptedCapture::MidTurn,
+                RESUME_MARKER_TEXT,
+                base.clone(),
+                ABANDON_NOTICE_TEXT,
+                true,
+            ),
+            (
+                InterruptedCapture::MidTurnWithWorkers,
+                RESUME_WORKERS_MID_TURN_MARKER_TEXT,
+                noted.clone(),
+                ABANDON_WORKERS_MID_TURN_NOTICE_TEXT,
+                true,
+            ),
+            (
+                InterruptedCapture::IdleWithWorkers,
+                RESUME_WORKERS_MARKER_TEXT,
+                noted,
+                ABANDON_WORKERS_NOTICE_TEXT,
+                false,
+            ),
+        ];
+        for (capture, marker, continuation, abandon, replays) in cases {
+            assert_eq!(
+                capture.resume_marker_and_continuation(at, now),
+                (marker, continuation),
+                "{capture:?}"
+            );
+            assert_eq!(capture.abandon_notice(), abandon, "{capture:?}");
+            assert_eq!(capture.replays_tail(), replays, "{capture:?}");
+        }
+        assert!(RESUME_WORKERS_LOST_NOTE.contains("will not report back"));
+        assert_eq!(
+            RESUME_MARKER_TEXT,
+            "The previous turn was interrupted because the harness shut down. Continuing below."
+        );
+        assert_eq!(
+            ABANDON_NOTICE_TEXT,
+            "This conversation was interrupted because intentd restarted. The agent's \
+             in-flight work was terminated."
+        );
+        assert_eq!(
+            InterruptedCapture::IdleWithWorkers
+                .resume_marker_and_continuation("not-a-timestamp", now)
+                .1,
+            format!("{RESUME_CONTINUATION_FALLBACK_TEXT} {RESUME_WORKERS_LOST_NOTE}")
+        );
     }
 
     /// The delivered wording embeds the duration.

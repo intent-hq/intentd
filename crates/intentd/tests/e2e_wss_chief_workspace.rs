@@ -40,7 +40,7 @@
 
 #[path = "e2e_wss_chief_workspace/chat_management.rs"]
 mod chat_management;
-mod common;
+use crate::common;
 #[path = "e2e_wss_chief_workspace/mcp_configuration.rs"]
 mod mcp_configuration;
 
@@ -253,7 +253,8 @@ async fn wss_event<S>(ws: &mut WebSocketStream<S>, secs: u64) -> Value
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(secs));
     loop {
         let next = timeout_at(deadline, ws.next())
             .await

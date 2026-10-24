@@ -293,3 +293,33 @@ fn version_dirs_are_plain_relative_names() {
         Path::new("/r/anthropic-ai_claude-code/2.1.280")
     );
 }
+
+/// Regression: the bundled-CLI `npm install` (the heaviest disk user an
+/// agent launch triggers) ran at the daemon's own priority.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn npm_install_runs_at_reduced_priority() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("root");
+    let record = temp.path().join("npm.nice");
+    let npm = fake_npm(
+        temp.path(),
+        &format!("cut -d' ' -f19 /proc/$$/stat > '{}'", record.display()),
+    );
+    let pin = bundled("0.160.1");
+    ensure_in(&root, &npm, &path_env(), InstalledCli::Codex, &pin, TIMEOUT)
+        .await
+        .unwrap();
+    let nice: i32 = std::fs::read_to_string(&record)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let expected = intent_acp::AgentPriority::from_env()
+        .expected_nice()
+        .unwrap();
+    assert!(
+        nice >= expected,
+        "npm ran at nice {nice}, expected {expected}"
+    );
+}

@@ -10,7 +10,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 #[path = "e2e_wss_server_pairing/personal_pairing.rs"]
 mod personal_pairing;
 

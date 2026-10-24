@@ -24,7 +24,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -238,9 +238,12 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     loop {
-        let next = timeout(Duration::from_secs(secs), ws.next())
-            .await
-            .expect("wss event timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(secs)),
+            ws.next(),
+        )
+        .await
+        .expect("wss event timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -362,6 +365,7 @@ async fn seed_workspace_only(data_dir: &Path, repository_path: Option<&Path>) ->
             pull_requests_total: None,
             display_status: None,
             waiting: false,
+            scripts_running: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,

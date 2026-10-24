@@ -9,7 +9,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::path::Path;
 use std::process::{Child, Stdio};
@@ -254,29 +254,32 @@ async fn drain_extra<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    timeout(Duration::from_millis(window_ms), async {
-        loop {
-            match ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let v: Value = match serde_json::from_str(&text) {
-                        Ok(x) => x,
-                        Err(_) => continue,
-                    };
-                    if v["method"] == json!("events.event")
-                        && v["params"]["event"]["type"] == json!(event_type)
-                    {
-                        return v;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(window_ms)),
+        async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = match serde_json::from_str(&text) {
+                            Ok(x) => x,
+                            Err(_) => continue,
+                        };
+                        if v["method"] == json!("events.event")
+                            && v["params"]["event"]["type"] == json!(event_type)
+                        {
+                            return v;
+                        }
                     }
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = ws.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => panic!("subscription socket errored during drain: {e:?}"),
+                    None => panic!("subscription socket closed during drain"),
                 }
-                Some(Ok(Message::Ping(p))) => {
-                    let _ = ws.send(Message::Pong(p)).await;
-                }
-                Some(Ok(_)) => {}
-                Some(Err(e)) => panic!("subscription socket errored during drain: {e:?}"),
-                None => panic!("subscription socket closed during drain"),
             }
-        }
-    })
+        },
+    )
     .await
     .ok()
 }
@@ -493,9 +496,8 @@ async fn workspace_created_after_serve_gains_watching_and_deletion_stops_it() {
     // the socket stays quiet so leftovers cannot pollute the post-delete
     // silence assertion (window comfortably beyond the 500ms debounce and
     // scaled like the other waits, so a load-delayed debounce cannot slip
-    // past the drain).
-    let drain_window_ms =
-        u64::try_from(common::test_timeout(Duration::from_secs(1)).as_millis()).unwrap_or(u64::MAX);
+    // past the drain — `drain_extra` applies the stretch).
+    let drain_window_ms = 1_000;
     while drain_extra(&mut sub, "specialists:changed", drain_window_ms)
         .await
         .is_some()

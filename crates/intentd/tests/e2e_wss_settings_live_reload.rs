@@ -25,7 +25,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
@@ -254,7 +254,8 @@ async fn next_settings_event(ws: &mut Wss) -> Value {
 /// within `secs` (bounded negative wait; covers the 300ms watcher debounce
 /// with a wide margin).
 async fn assert_no_settings_event(ws: &mut Wss, secs: u64) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(secs));
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         match timeout(remaining, ws.next()).await {

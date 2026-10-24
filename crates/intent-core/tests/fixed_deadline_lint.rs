@@ -13,9 +13,20 @@
 //! goes through the shared helper nor carries a justified marker, and is not
 //! grandfathered by the committed baseline.
 //!
-//! - **Fix:** wrap the budget in `intentd_test_support::test_timeout(…)` (or
-//!   a crate-local helper that delegates to it: `common::test_timeout`,
-//!   `test_support::fixture_timeout`, …).
+//! - **Fix — decide what the wait brackets:**
+//!   - a **hang guard** waits for something that should happen (a reply, an
+//!     event, a task finishing, a polled condition): wrap the budget in
+//!     `intentd_test_support::test_timeout(…)` (or a crate-local helper that
+//!     delegates to it: `common::test_timeout`,
+//!     `test_support::fixture_timeout`, …). A "nothing arrives" check with no
+//!     production timer behind it is a hang guard too — a longer window only
+//!     makes it stricter.
+//!   - an **observation window** proves nothing happens and must stay shorter
+//!     than a fixed production timer or debounce (an 800 ms silence limit, a
+//!     100 ms idle debounce, a 10 s handshake): keep it fixed and mark it with
+//!     the marker below, naming that timer. Stretching it lets the timer fire
+//!     inside the window — three intent-services tests failed only at 3x for
+//!     that reason (intentd#2568, intentd#2576 reviews).
 //! - **What is test code:** every file under `crates/*/tests/`, and inside
 //!   `crates/*/src/`: files named `tests.rs` / `*_tests.rs`, anything under a
 //!   `tests/` directory, files reached through a `#[cfg(test)] mod name;`
@@ -33,9 +44,10 @@
 //!   `Instant::now() + …` / `Instant::now().checked_add(…)` deadline.
 //! - **Marker:** a standalone `// fixed-deadline: allow — <reason>` on the
 //!   line above the hit, or above the first line of its statement, exempts it
-//!   — for a deliberately short "nothing should happen" window whose length
-//!   is the thing under test. A marker without a reason never exempts and is
-//!   itself reported.
+//!   — for an observation window; write the reason as
+//!   `stays under <timer or constant>` so a reader can check the
+//!   relationship. A marker without a reason never exempts and is itself
+//!   reported.
 //! - **Baseline** (`tests/fixed_deadline_baseline.txt`): one `<path> <count>`
 //!   line per file that still has unmarked fixed deadlines, sorted by path. It
 //!   only ratchets down: a file over its entry (or absent) fails naming every
@@ -601,7 +613,8 @@ fn report(
         for d in found.iter().filter(|d| d.marker_malformed) {
             out.push(format!(
                 "{path}:{}: {}\n  fixed-deadline marker is malformed: expected \
-                 `// {TAG}: allow — <reason>` on its own line; the reason is required.",
+                 `// {TAG}: allow — <reason>` on its own line; the reason is required and \
+                 should name the fixed timer the window stays under.",
                 d.line, d.text
             ));
         }
@@ -630,10 +643,18 @@ fn report(
                     out.push(format!("  {path}:{}: {}", d.line, d.text));
                 }
                 out.push(format!(
-                    "  fix: wrap the budget in `intentd_test_support::test_timeout(…)` (or the \
-                     crate's helper that delegates to it) so INTENTD_TEST_TIMEOUT_MULTIPLIER \
-                     stretches it on slow coverage runners; for a deliberately short window, put \
-                     `// {TAG}: allow — <reason>` on the line above."
+                    "  fix: decide what each wait brackets.\n  \
+                     - hang guard (the wait is for something that should happen): wrap the budget \
+                     in `intentd_test_support::test_timeout(…)` (or the crate's helper that \
+                     delegates to it) so INTENTD_TEST_TIMEOUT_MULTIPLIER stretches it on slow \
+                     coverage runners. A \"nothing arrives\" check with no production timer \
+                     behind it is a hang guard too: a longer window only makes it stricter.\n  \
+                     - observation window (the wait proves nothing happens and must stay shorter \
+                     than a fixed production timer or debounce): keep it fixed and put \
+                     `// {TAG}: allow — stays under <timer>` on the line above, naming the timer \
+                     or constant. Stretching it would let that timer fire inside the window and \
+                     break the test on slow runners — never stretch an observation window by \
+                     reflex."
                 ));
             }
         }
@@ -946,7 +967,12 @@ fn report_follows_the_ratchet() {
         "  crates/a/tests/new.rs:7: timeout(Duration::from_secs(5), f);",
         "crates/a/tests/over.rs: 2 fixed test deadline(s), the baseline allows 1:",
         "  crates/a/tests/over.rs:9: timeout(Duration::from_secs(5), f);",
-        "wrap the budget in `intentd_test_support::test_timeout(…)`",
+        "hang guard (the wait is for something that should happen): wrap the budget in \
+         `intentd_test_support::test_timeout(…)`",
+        "observation window (the wait proves nothing happens and must stay shorter than a \
+         fixed production timer or debounce): keep it fixed and put \
+         `// fixed-deadline: allow — stays under <timer>` on the line above",
+        "never stretch an observation window",
         "replace its line in crates/intent-core/tests/fixed_deadline_baseline.txt with: `crates/a/tests/under.rs 1`",
         "remove its line from crates/intent-core/tests/fixed_deadline_baseline.txt: `crates/a/tests/fixed.rs 1`",
         "crates/a/tests/gone.rs: no longer exists",

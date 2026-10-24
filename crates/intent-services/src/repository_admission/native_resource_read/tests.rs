@@ -123,14 +123,14 @@ impl Server {
             .insert(route.into(), headers.into());
     }
     async fn entered(&self) {
-        tokio::time::timeout(ACQUIRE, self.state.entered.notified())
+        tokio::time::timeout(acquire_wait(), self.state.entered.notified())
             .await
             .unwrap();
     }
     async fn finish(mut self) {
         self.state.release.notify_waiters();
         self.stop.take().unwrap().send(()).unwrap();
-        tokio::time::timeout(ACQUIRE, self.task.take().unwrap())
+        tokio::time::timeout(acquire_wait(), self.task.take().unwrap())
             .await
             .unwrap()
             .unwrap();
@@ -676,7 +676,7 @@ async fn scoped_page_reads_list_denial_fans_out_without_retiring_detail() {
         })
         .is_err());
     assert_eq!(transfers, 0);
-    let event = tokio::time::timeout(ACQUIRE, s.retirements.next_event())
+    let event = tokio::time::timeout(acquire_wait(), s.retirements.next_event())
         .await
         .unwrap()
         .unwrap();
@@ -822,7 +822,7 @@ async fn scoped_page_reads_fresh_denial_wins_over_held_older_success() {
         old_result.is_err(),
         "held older success cannot clear a fresh denial"
     );
-    let notice = tokio::time::timeout(ACQUIRE, s.retirements.next_event())
+    let notice = tokio::time::timeout(acquire_wait(), s.retirements.next_event())
         .await
         .unwrap()
         .unwrap();
@@ -1011,7 +1011,7 @@ async fn scoped_page_reads_connection_rejection_keeps_response_and_retires_sibli
         json!({"kind":"failure","code":"authentication","status":401})
     );
     assert_eq!(rejected["quota"]["remaining"], "17");
-    let event = tokio::time::timeout(ACQUIRE, s.retirements.next_event())
+    let event = tokio::time::timeout(acquire_wait(), s.retirements.next_event())
         .await
         .unwrap()
         .unwrap();
@@ -1906,7 +1906,7 @@ async fn resource_release_cancels_original_provider_future_and_joins() {
         )
         .await
         .unwrap();
-        let (scope, body) = tokio::time::timeout(ACQUIRE, read).await.unwrap();
+        let (scope, body) = tokio::time::timeout(acquire_wait(), read).await.unwrap();
         eprintln!("released original request {body:?}");
         assert!(body.is_err());
         scope.retire();
@@ -2027,7 +2027,7 @@ async fn resource_release_authority_wait_has_a_fixed_bound() {
         assert!(entered.is_pending());
         // Cross the original timer's millisecond tick, without increasing its
         // production deadline or inferring an internal wait from Pending.
-        tokio::time::advance(ACQUIRE + Duration::from_millis(1)).await;
+        tokio::time::advance(acquire_wait() + Duration::from_millis(1)).await;
         tokio::task::yield_now().await;
         let returned =
             std::future::poll_fn(|cx| std::task::Poll::Ready(original.as_mut().poll(cx))).await;
@@ -2042,7 +2042,7 @@ async fn resource_release_authority_wait_has_a_fixed_bound() {
         drop(original);
         eprintln!("release original bounded body={body:?}");
         assert!(matches!(&body, Err(Error::Forbidden(_))));
-        assert_eq!(start.elapsed(), ACQUIRE + Duration::from_millis(1));
+        assert_eq!(start.elapsed(), acquire_wait() + Duration::from_millis(1));
         let (sent, callbacks) = s.transfer(&scope, &body).await;
         eprintln!("release sanitized error transfer={sent:?} callbacks={callbacks}");
         assert!(sent.is_ok());

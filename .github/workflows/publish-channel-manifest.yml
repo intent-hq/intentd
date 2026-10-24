@@ -95,6 +95,9 @@ jobs:
           TAG: ${{ steps.meta.outputs.tag }}
         run: |
           ./scripts/make-channel-manifest.sh "$TAG" alpha alpha.json
+      # Safe to re-run for an older release: the publisher skips (with a
+      # warning) when alpha.json already names a newer version, here and on
+      # the mirror below, so alpha never moves backwards (intent#7639).
       - name: Publish manifest to channel release
         shell: bash
         run: |

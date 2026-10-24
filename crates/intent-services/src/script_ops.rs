@@ -172,19 +172,36 @@ pub(crate) fn command_activity(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .values()
-        .filter(|m| {
-            m.def.mode == ScriptMode::Command
-                && (m.run_id.is_some()
-                    || matches!(
-                        m.state.status,
-                        ScriptStatus::Starting | ScriptStatus::Running | ScriptStatus::Restarting
-                    ))
-        })
+        .filter(|m| command_in_flight(m))
         .count();
     CommandScriptActivity {
         in_flight,
         last_settled_at: locks.command_settled_at(),
     }
+}
+
+/// A command-mode run is admitted and not yet durably settled, or its
+/// process is live. Service-mode scripts never count.
+fn command_in_flight(m: &ManagedScript) -> bool {
+    m.def.mode == ScriptMode::Command
+        && (m.run_id.is_some()
+            || matches!(
+                m.state.status,
+                ScriptStatus::Starting | ScriptStatus::Running | ScriptStatus::Restarting
+            ))
+}
+
+/// Whether `workspace_id` has a command run in flight ([`command_in_flight`]),
+/// the `Workspace.scriptsRunning` derivation (§5.1). One registry lock.
+pub(crate) fn workspace_command_running(
+    registry: &ScriptRegistry,
+    workspace_id: &WorkspaceId,
+) -> bool {
+    registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .any(|((ws, _), m)| ws == workspace_id && command_in_flight(m))
 }
 
 /// Shared async locks for workspace bootstrap and script definition updates.
@@ -1014,6 +1031,7 @@ impl ScriptManager {
             && def.purpose == intent_core::ScriptPurpose::OneOff;
         let change = if old.is_some() { "updated" } else { "created" };
         drop(publishing);
+        self.refresh_scripts_running(workspace_id).await;
         if let Some(mut old) = old {
             // As with upsert, removal fences the supervisor's generation.
             // Await it so a PTY still being registered is also reaped.
@@ -1419,6 +1437,7 @@ impl ScriptManager {
             return Err(Error::NotFound(format!("script {script_id}")));
         };
         drop(publishing);
+        self.refresh_scripts_running(workspace_id).await;
         // Cooperative teardown (monorepo#1180): kill the recorded PTY, then
         // *await* the supervisor instead of aborting it. An abort could land
         // in the pre-registration window (after `pty.spawn`, before
@@ -2940,6 +2959,15 @@ impl ScriptManager {
             )
             .await;
         }
+        self.refresh_scripts_running(ws).await;
+    }
+
+    /// Recompute `Workspace.scriptsRunning` after a lifecycle publication
+    /// (§5.1); a no-op without the owning services handle (unit harnesses).
+    async fn refresh_scripts_running(&self, ws: &WorkspaceId) {
+        if let Some(services) = &self.owner_services {
+            services.maybe_emit_scripts_running_changed(ws).await;
+        }
     }
 
     async fn emit_state_locked(
@@ -2953,6 +2981,7 @@ impl ScriptManager {
             map.insert("scriptId".to_string(), json!(script_id));
         }
         publish_event(self.bus.as_ref(), script_event(ws, SCRIPT_STATE, data)).await;
+        self.refresh_scripts_running(ws).await;
     }
 
     /// Stream a synthetic separator line (e.g. restart notices) as `script:output`.
@@ -3226,6 +3255,7 @@ mod tests {
     include!("script_ops/snapshot_tests.rs");
     include!("script_ops/output_tests.rs");
     include!("script_ops/cleanup_tests.rs");
+    include!("script_ops/workspace_flags_tests.rs");
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -3701,6 +3731,7 @@ mod tests {
             pull_requests_total: None,
             display_status: None,
             waiting: false,
+            scripts_running: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
@@ -3871,7 +3902,11 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::NotFound(_)), "got: {err:?}");
-        let live = tokio::time::timeout(Duration::from_millis(100), sub.recv()).await;
+        let live = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(100)),
+            sub.recv(),
+        )
+        .await;
         assert!(
             live.is_err(),
             "failed remove must not emit an event: {live:?}"
@@ -5474,7 +5509,8 @@ mod tests {
         assert_eq!(v["ok"], true);
         assert_eq!(v["scriptId"], id);
         // Drain a short window — there must be no SECOND `running` state transition.
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_millis(300));
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
@@ -5902,7 +5938,11 @@ mod tests {
         let pid = running["data"]["pid"].as_i64().expect("running pid");
         // Nothing but the second launch's `running` may follow: a stale first
         // supervisor would publish a second `running` with a different pid.
-        let next = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
+        let next = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            sub.recv(),
+        )
+        .await;
         assert!(
             next.is_err(),
             "no further transition after the single running: {next:?}"
@@ -7027,7 +7067,7 @@ mod tests {
             );
             // One poll reserves the run (synchronously, before the first
             // await) and parks the future inside the reservation window.
-            let pending = tokio::time::timeout(Duration::from_millis(0), &mut fut).await;
+            let pending = tokio::time::timeout(Duration::ZERO, &mut fut).await;
             assert!(pending.is_err(), "run should still be in flight");
             // A concurrent entry inside the window warn-and-returns.
             let out = h

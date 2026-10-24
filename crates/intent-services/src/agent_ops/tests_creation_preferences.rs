@@ -522,9 +522,12 @@ async fn creation_preferences_mixed_mute_failure_rolls_back_all_changes() {
         json!({"specialistId":"implementor"})
     );
     assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(50), sub.recv())
-            .await
-            .is_err(),
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_millis(50)),
+            sub.recv()
+        )
+        .await
+        .is_err(),
         "failed update must not publish a success event"
     );
     sqlx::query("DROP TRIGGER fail_preferences_mute")

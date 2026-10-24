@@ -40,7 +40,7 @@ fail() {
   exit 1
 }
 
-for command in bash dirname mktemp rm sort python3; do
+for command in bash dirname grep mktemp rm sort python3; do
   ln -s "$(command -v "$command")" "$bin_dir/$command"
 done
 
@@ -91,7 +91,11 @@ g() {
 
 # Fixture workspace: alpha has a lib and two integration tests with shared
 # helpers, beta is a binary-only crate, gamma mirrors alpha's smoke test name,
-# intentd carries the auggie_context_e2e binary the instrumented run excludes.
+# intentd carries suite targets (tests/suite_*.rs roots declaring file
+# modules, like the real crate): suite_e2e holds the auggie_context_e2e module
+# the instrumented run excludes, e2e_core (with a module directory) and
+# e2e_shared (whose directory another target #[path]-includes); suite_wss
+# holds e2e_wss_x; e2e_wss_agent_lifecycle stays a standalone target.
 write() {
   mkdir -p "$repo/$(dirname "$1")"
   printf '%s\n' "${2:-$1}" >"$repo/$1"
@@ -122,7 +126,15 @@ write crates/gamma/tests/smoke.rs
 write crates/intentd/Cargo.toml
 write crates/intentd/src/main.rs
 write crates/intentd/tests/auggie_context_e2e.rs
-write crates/intentd/tests/e2e_wss_agent_lifecycle.rs
+write crates/intentd/tests/e2e_core.rs
+write crates/intentd/tests/e2e_core/inner.rs
+write crates/intentd/tests/e2e_shared.rs
+write crates/intentd/tests/e2e_shared/helper.rs
+write crates/intentd/tests/e2e_wss_x.rs
+write crates/intentd/tests/suite_e2e.rs $'//! fixture suite\nmod common;\n\nmod auggie_context_e2e;\nmod e2e_core;\nmod e2e_shared;'
+write crates/intentd/tests/suite_wss.rs $'mod common;\nmod e2e_wss_x;'
+write crates/intentd/tests/common/mod.rs
+write crates/intentd/tests/e2e_wss_agent_lifecycle.rs $'mod common;\n#[path = "e2e_shared/helper.rs"]\nmod helper;'
 write README.md
 write docs/guide.md
 write scripts/tool.sh
@@ -188,7 +200,7 @@ expect_cargo() {
 expect_cov() {
   local expected="" line
   for line in "$@"; do
-    expected+="$repo: INTENTD_TEST_TIMEOUT_MULTIPLIER=3 llvm-cov --no-report nextest $line -E not binary(auggie_context_e2e)"$'\n'
+    expected+="$repo: INTENTD_TEST_TIMEOUT_MULTIPLIER=3 llvm-cov --no-report nextest $line -E not test(/^auggie_context_e2e::/)"$'\n'
   done
   [[ "$cargo_log" == "${expected%$'\n'}" ]] || fail "$case_name: cargo argv was"$'\n'"$cargo_log"$'\n'"expected"$'\n'"${expected%$'\n'}"
 }
@@ -204,7 +216,7 @@ expect_plan() {
 expect_cov_plan() {
   local line
   for line in "$@"; do
-    [[ "$stdout" == *"[coverage-changed] INTENTD_TEST_TIMEOUT_MULTIPLIER=3 cargo llvm-cov --no-report nextest $line -E 'not binary(auggie_context_e2e)'"* ]] || fail "$case_name: plan is missing '$line':"$'\n'"$stdout"
+    [[ "$stdout" == *"[coverage-changed] INTENTD_TEST_TIMEOUT_MULTIPLIER=3 cargo llvm-cov --no-report nextest $line -E 'not test(/^auggie_context_e2e::/)'"* ]] || fail "$case_name: plan is missing '$line':"$'\n'"$stdout"
   done
   [[ "$(grep -c '^\[coverage-changed\] INTENTD_TEST_TIMEOUT_MULTIPLIER=3 cargo llvm-cov ' <<<"$stdout")" -eq $# ]] || fail "$case_name: expected $# plan line(s):"$'\n'"$stdout"
 }
@@ -701,7 +713,7 @@ reset_repo
 edit crates/alpha/tests/one.rs
 CARGO_STUB_EXIT=100 run_script --instrumented
 [[ "$status" -eq 100 ]] || fail "$case_name exited $status (expected 100): $stderr"
-[[ "$stderr" == "[coverage-changed] INTENTD_TEST_TIMEOUT_MULTIPLIER=3 cargo llvm-cov --no-report nextest -p alpha --test one -E 'not binary(auggie_context_e2e)' exited 100" ]] || fail "$case_name stderr: $stderr"
+[[ "$stderr" == "[coverage-changed] INTENTD_TEST_TIMEOUT_MULTIPLIER=3 cargo llvm-cov --no-report nextest -p alpha --test one -E 'not test(/^auggie_context_e2e::/)' exited 100" ]] || fail "$case_name stderr: $stderr"
 
 case_name="instrumented storage observer preserves scopes, stdin, policy and failure"
 reset_repo
@@ -778,7 +790,7 @@ expect_ok
 [[ -z "$cargo_log" ]] || fail "$case_name invoked cargo: $cargo_log"
 
 # The instrumented filterset excludes auggie_context_e2e, so a plan naming
-# only that binary would select nothing; the plain run still names it.
+# only that module would select nothing; the plain run still names it.
 case_name="instrumented run skips auggie_context_e2e, plain run keeps it"
 reset_repo
 edit crates/intentd/tests/auggie_context_e2e.rs
@@ -793,7 +805,75 @@ expect_cov "-p intentd --test e2e_wss_agent_lifecycle"
 : >"$temp_dir/cargo.log"
 run_script
 expect_ok
-expect_cargo "-p intentd --test auggie_context_e2e --test e2e_wss_agent_lifecycle"
+expect_cargo "-p intentd --test e2e_wss_agent_lifecycle --test suite_e2e -E binary_id(=intentd::e2e_wss_agent_lifecycle)|(binary_id(=intentd::suite_e2e)&test(/^(auggie_context_e2e)::/))"
+
+# Suite targets: a file module (or its directory) selects its suite narrowed
+# to that module's tests; nextest ORs repeated -E flags, so each plan carries
+# exactly one filterset, with standalone targets ORed in by binary_id.
+case_name="suite module file selects its suite filtered to the module"
+reset_repo
+edit crates/intentd/tests/e2e_core.rs
+run_script
+expect_ok
+expect_cargo "-p intentd --test suite_e2e -E (binary_id(=intentd::suite_e2e)&test(/^(e2e_core)::/))"
+[[ "$stdout" == *"[test-changed] cargo nextest run -p intentd --test suite_e2e -E '(binary_id(=intentd::suite_e2e)&test(/^(e2e_core)::/))'"* ]] ||
+  fail "$case_name plan line is not a pasteable command: $stdout"
+
+case_name="suite module directory selects its module"
+reset_repo
+edit crates/intentd/tests/e2e_core/inner.rs
+run_script
+expect_ok
+expect_cargo "-p intentd --test suite_e2e -E (binary_id(=intentd::suite_e2e)&test(/^(e2e_core)::/))"
+
+case_name="module directory another target includes selects every test"
+reset_repo
+edit crates/intentd/tests/e2e_shared/helper.rs
+run_script
+expect_ok
+expect_cargo "-p intentd --tests"
+
+case_name="modules of two suites and a standalone target share one filterset"
+reset_repo
+edit crates/intentd/tests/e2e_wss_x.rs
+edit crates/intentd/tests/e2e_shared.rs
+edit crates/intentd/tests/e2e_core.rs
+edit crates/intentd/tests/e2e_wss_agent_lifecycle.rs
+BUILD_JOBS=3 run_script
+expect_ok
+expect_cargo "-p intentd --test e2e_wss_agent_lifecycle --test suite_e2e --test suite_wss --build-jobs 3 -E binary_id(=intentd::e2e_wss_agent_lifecycle)|(binary_id(=intentd::suite_e2e)&test(/^(e2e_core|e2e_shared)::/))|(binary_id(=intentd::suite_wss)&test(/^(e2e_wss_x)::/))"
+
+case_name="editing a suite root runs the whole suite"
+reset_repo
+edit crates/intentd/tests/suite_wss.rs
+run_script
+expect_ok
+expect_cargo "-p intentd --test suite_wss"
+
+case_name="deleted suite module selects every test"
+reset_repo
+rm "$repo/crates/intentd/tests/e2e_wss_x.rs"
+run_script
+expect_ok
+expect_cargo "-p intentd --tests"
+
+case_name="instrumented suite module ANDs the exclusion into its filterset"
+reset_repo
+edit crates/intentd/tests/e2e_core.rs
+TEST_THREADS=2 run_script --instrumented
+expect_ok
+cov_expected="$repo: INTENTD_TEST_TIMEOUT_MULTIPLIER=3 llvm-cov --no-report nextest -p intentd --test suite_e2e --test-threads 2 -E ((binary_id(=intentd::suite_e2e)&test(/^(e2e_core)::/))) and (not test(/^auggie_context_e2e::/))"
+[[ "$cargo_log" == "$cov_expected" ]] || fail "$case_name: cargo argv was"$'\n'"$cargo_log"$'\n'"expected"$'\n'"$cov_expected"
+[[ "$stdout" == *"nextest -p intentd --test suite_e2e --test-threads 2 -E '((binary_id(=intentd::suite_e2e)&test(/^(e2e_core)::/))) and (not test(/^auggie_context_e2e::/))'"* ]] ||
+  fail "$case_name plan: $stdout"
+
+case_name="runner receives a suite plan's filterset as one plan word"
+reset_repo
+edit crates/intentd/tests/e2e_wss_x.rs
+NEXTEST_RUNNER=runner run_script
+expect_ok
+[[ "$runner_log" == *$'\n--plan\n-p intentd --test suite_wss -E (binary_id(=intentd::suite_wss)&test(/^(e2e_wss_x)::/))\n'* ]] ||
+  fail "$case_name runner argv: $runner_log"
 
 # Structured export must describe the same argv without changing execution.
 case_name="structured plan export preserves execution and empty selections"

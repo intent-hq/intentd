@@ -750,7 +750,7 @@ fn state(value: &str) -> CheckState {
         "success" => CheckState::Success,
         "failed" => CheckState::Failure,
         "canceled" => CheckState::Cancelled,
-        "skipped" => CheckState::Neutral,
+        "skipped" => CheckState::Skipped,
         _ => CheckState::Pending,
     }
 }
@@ -1465,4 +1465,19 @@ fn unsupported_write<T>() -> Result<T> {
     Err(Error::Unsupported(
         "GitLab write operation outside same-project creation".into(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skipped_jobs_map_to_the_skipped_state() {
+        assert_eq!(state("skipped"), CheckState::Skipped);
+        assert_eq!(state("success"), CheckState::Success);
+        let job = json!({"name": "coverage-all", "status": "skipped", "allow_failure": false});
+        assert_eq!(job_state(&job).unwrap(), CheckState::Skipped);
+        let optional = json!({"name": "lint", "status": "failed", "allow_failure": true});
+        assert_eq!(job_state(&optional).unwrap(), CheckState::Neutral);
+    }
 }

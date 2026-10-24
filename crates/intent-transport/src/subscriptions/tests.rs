@@ -895,6 +895,7 @@ fn channel_event_types_full_matrix() {
         "workspace:attention-changed",
         "workspace:displayStatus-changed",
         "workspace:waiting-changed",
+        "workspace:scriptsRunning-changed",
         "pr:linked",
         "pr:updated",
         "pr:unlinked",
@@ -905,7 +906,7 @@ fn channel_event_types_full_matrix() {
     ] {
         assert!(ws.iter().any(|s| s == t), "workspace missing {t}");
     }
-    assert_eq!(ws.len(), 21);
+    assert_eq!(ws.len(), 22);
     // Comment channel — creation and deletion refresh the affected thread.
     assert_eq!(
         channel_event_types(Channel::Comment),
@@ -5754,8 +5755,11 @@ mod channel_membership {
     /// Every `subscription.push` delta on the bulk lane until it stays quiet.
     async fn deltas(rx: &mut OutboundReceiver) -> Vec<Value> {
         let mut out = Vec::new();
-        while let Ok(Some(frame)) =
-            tokio::time::timeout(Duration::from_millis(300), rx.bulk.recv()).await
+        while let Ok(Some(frame)) = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            rx.bulk.recv(),
+        )
+        .await
         {
             let v: Value = serde_json::from_str(&frame).unwrap();
             assert_eq!(v["method"], "subscription.push");

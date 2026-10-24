@@ -143,9 +143,12 @@ async fn workspace_change_is_rejected_without_events_or_row_changes() {
     assert_eq!(tab_id_of(&updated[0]), "t-1");
     assert_eq!(updated[0].data["changes"], json!({ "title": "after" }));
     assert!(
-        tokio::time::timeout(Duration::from_millis(200), sub_b.recv())
-            .await
-            .is_err(),
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            sub_b.recv()
+        )
+        .await
+        .is_err(),
         "workspace b received an event for a rejected report"
     );
 }

@@ -426,6 +426,9 @@ mod tests_catalog_default_model;
 #[cfg(test)]
 mod tests_unknown_model;
 
+#[cfg(test)]
+mod tests_suggested_prompts_contract;
+
 /// Resolve the default model from settings when no explicit model is supplied
 /// at agent creation time. Precedence chain (the per-workspace override tier
 /// was removed in monorepo#1000; the background-agent tier was removed in
@@ -1031,7 +1034,11 @@ fn resolve_delegate_provider(
     match crate::agent_session::derived_default_provider(&settings) {
         Some(derived) => {
             services.ensure_selectable_provider("agent.delegate", &derived)?;
-            ensure_provider_available("agent.delegate", &derived, &settings.providers)?;
+            services.ensure_provider_available_for(
+                "agent.delegate",
+                &derived,
+                &settings.providers,
+            )?;
             Ok(Some(derived))
         }
         None => Err(crate::agent_session::no_default_provider_error(
@@ -1057,7 +1064,11 @@ fn resolve_specialist_provider(
     });
     if let Some(provider) = provider.as_deref() {
         services.ensure_selectable_provider(method, provider)?;
-        ensure_provider_available(method, provider, &services.effective_settings().providers)?;
+        services.ensure_provider_available_for(
+            method,
+            provider,
+            &services.effective_settings().providers,
+        )?;
     }
     Ok(provider)
 }
@@ -1159,7 +1170,9 @@ pub(crate) fn resolve_disabled_provider_rehome(
     method: &str,
 ) -> Option<DisabledProviderRehome> {
     let provider = crate::agent_session::derived_default_provider(settings)?;
-    ensure_provider_available(method, &provider, &settings.providers).ok()?;
+    services
+        .ensure_provider_available_for(method, &provider, &settings.providers)
+        .ok()?;
     // Create-seam parity: a settings-chain model that provably belongs to
     // another provider is dropped to the CLI default, never an error the
     // user did not ask for (see `plan_agent_create`).
@@ -1197,17 +1210,33 @@ pub(crate) fn resolve_disabled_provider_rehome(
 /// the real `codex` / `claude` CLI resolves too (`requires_secondary_binary`);
 /// a `providers.paths` override changes neither. Tests mark a provider
 /// installed with `test_support::provider_installed`, never with an override.
+#[cfg(test)]
 pub(crate) fn ensure_provider_available(
     method: &str,
     provider_id: &str,
     providers: &intent_core::settings_file::ProvidersSettings,
 ) -> Result<()> {
+    ensure_provider_available_checked(method, provider_id, providers, true)
+}
+
+/// [`ensure_provider_available`] with the bare auth-verdict gate optional:
+/// a Default configuration with saved environment overrides (PROTOCOL §5.54)
+/// runs under other settings than the bare installation the base sweep
+/// probes, so, like a profile, its bare verdict must not refuse it.
+pub(crate) fn ensure_provider_available_checked(
+    method: &str,
+    provider_id: &str,
+    providers: &intent_core::settings_file::ProvidersSettings,
+    check_bare_verdict: bool,
+) -> Result<()> {
     ensure_provider_enabled(method, provider_id, providers.enabled.as_ref())?;
-    ensure_provider_authenticated(
-        method,
-        provider_id,
-        crate::provider_auth::cached_auth_verdict(provider_id),
-    )?;
+    if check_bare_verdict {
+        ensure_provider_authenticated(
+            method,
+            provider_id,
+            crate::provider_auth::cached_auth_verdict(provider_id),
+        )?;
+    }
     // A profile shares its base provider's installation and paths.
     let availability = intent_providers::provider_availability_for(
         intent_providers::base_provider_id(provider_id),
@@ -2146,6 +2175,127 @@ fn strip_spans(s: &str, start: &str, end: &str) -> String {
     out
 }
 
+/// Opener of a suggested-prompts block that ends `line`, mirroring the
+/// desktop's `(<|&lt;)!--[ \t]*suggested-prompts[ \t]*$`: its byte offset and
+/// whether it is the HTML-escaped spelling.
+fn prompt_opener_at(line: &str) -> Option<(usize, bool)> {
+    let line = line.trim_end_matches([' ', '\t', '\r']);
+    [("<!--", false), ("&lt;!--", true)]
+        .into_iter()
+        .find_map(|(marker, escaped)| {
+            let pos = line.rfind(marker)?;
+            let rest = line[pos + marker.len()..].trim_start_matches([' ', '\t']);
+            (rest == "suggested-prompts").then_some((pos, escaped))
+        })
+}
+
+/// A line that closes a block: the closer alone, or ending a final prompt
+/// (the desktop's fused-closer rule). A line holding a comment opener of its
+/// own (`<!-- note -->`) never closes a block, so the preview errs on hiding.
+fn is_prompt_closer(line: &str, escaped: bool) -> bool {
+    let closer = if escaped { "--&gt;" } else { "-->" };
+    let line = line.trim_end_matches([' ', '\t', '\r']);
+    if line.trim_start_matches([' ', '\t']) == closer {
+        return true;
+    }
+    line.strip_suffix(closer).is_some_and(|rest| {
+        !rest.trim().is_empty() && !rest.contains("<!--") && !rest.contains("&lt;!--")
+    })
+}
+
+/// Remove suggested-prompts markup in one pass over the original text, taking
+/// each opener of either spelling in order:
+/// - A block opener (a line ending in an opener, like the desktop's
+///   `scanSuggestedPrompts`) closes on a later closer line of the same
+///   spelling: the closer alone, or fused with the final prompt. An embedded
+///   arrow such as `A --> B` never ends it early.
+/// - A block reopened by another block opener before any closer is hidden up
+///   to that opener, which then starts its own block.
+/// - An unclosed block (still streaming, or cut off) hides the rest of the text.
+/// - Any other opener (an inline mention, or text after the opener on its
+///   line) keeps the old first-closer rule, but stops at the next block opener
+///   so it never swallows a later block or the reply after it.
+///
+/// The preview errs on hiding: no prompt line or block markup reaches it.
+/// Code fences are deliberately not tracked: persisted previews keep only a
+/// text block's tail, which can start inside a fence and invert fence state.
+/// Shared cases: monorepo `docs/protocol/suggested-prompts.md`.
+fn strip_prompt_blocks(s: &str) -> String {
+    const INLINE: [(&str, &str); 2] = [
+        ("<!-- suggested-prompts", "-->"),
+        ("&lt;!-- suggested-prompts", "--&gt;"),
+    ];
+    if !s.contains("suggested-prompts") {
+        return s.to_owned();
+    }
+    let mut lines = Vec::new();
+    let mut offset = 0;
+    for line in s.split('\n') {
+        lines.push((offset, line));
+        offset += line.len() + 1;
+    }
+    // Block openers in text order: (byte offset, line index, escaped).
+    let blocks: Vec<(usize, usize, bool)> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &(start, line))| {
+            prompt_opener_at(line).map(|(pos, escaped)| (start + pos, i, escaped))
+        })
+        .collect();
+    let mut out = String::with_capacity(s.len());
+    // Every search moves forward only, so the scan stays linear in the text
+    // however many blocks or markers it holds (it reruns on each streamed
+    // preview frame): `bi` is the first block opener at or after `at`, and
+    // `marks` caches each spelling's next marker (`None` once none is left).
+    let mut at = 0;
+    let mut bi = 0;
+    let mut marks = INLINE.map(|(marker, _)| s.find(marker));
+    while at < s.len() {
+        while blocks.get(bi).is_some_and(|b| b.0 < at) {
+            bi += 1;
+        }
+        for (mark, (marker, _)) in marks.iter_mut().zip(INLINE) {
+            if mark.is_some_and(|m| m < at) {
+                *mark = s[at..].find(marker).map(|i| at + i);
+            }
+        }
+        let inline = marks
+            .iter()
+            .zip(INLINE)
+            .filter_map(|(mark, (marker, closer))| mark.map(|m| (m, marker, closer)))
+            .min_by_key(|m| m.0);
+        let block = blocks.get(bi).copied();
+        match (block, inline) {
+            (Some((pos, line, escaped)), inline) if inline.is_none_or(|m| pos <= m.0) => {
+                out.push_str(&s[at..pos]);
+                let next = blocks.get(bi + 1);
+                let limit = next.map_or(lines.len(), |next| next.1);
+                let close = (line + 1..limit).find(|&j| is_prompt_closer(lines[j].1, escaped));
+                at = match (close, next) {
+                    (Some(j), _) => lines[j].0 + lines[j].1.len(),
+                    (None, Some(next)) => next.0,
+                    (None, None) => s.len(),
+                };
+            }
+            (next, Some((pos, marker, closer))) => {
+                // Here any next block opener lies after `pos`; the span ends
+                // at the first closer before it, else at it (or the end).
+                out.push_str(&s[at..pos]);
+                let from = pos + marker.len();
+                let limit = next.map_or(s.len(), |b| b.0).max(from);
+                at = s[from..limit]
+                    .find(closer)
+                    .map_or(limit, |j| from + j + closer.len());
+            }
+            (_, None) => {
+                out.push_str(&s[at..]);
+                at = s.len();
+            }
+        }
+    }
+    out
+}
+
 /// Drop `<group:…>` / `</group…>` tags (the streamed response group markers).
 fn strip_group_tags(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -2169,10 +2319,14 @@ fn strip_group_tags(s: &str) -> String {
 
 /// Clean an assistant text block of digest/suggested-prompts/group markers,
 /// mirroring the TS `agent.list` cleaning before the last-line extraction.
+/// Both prompts spellings ([`strip_prompt_blocks`]): the HTML-escaped one is
+/// what a model can copy from an XML-escaped history replay (see
+/// `history_xml::REPLAY_ESCAPING_NOTE`).
 fn clean_response_text(text: &str) -> String {
     let mut cleaned = strip_spans(text, "<agent_digest>", "</agent_digest>");
-    cleaned = strip_spans(&cleaned, "<!-- suggested-prompts", "-->");
+    // Group tags go first so one on an opener or closer line cannot break it.
     cleaned = strip_group_tags(&cleaned);
+    cleaned = strip_prompt_blocks(&cleaned);
     cleaned.trim().to_string()
 }
 
@@ -2498,15 +2652,18 @@ const AUGGIE_MODELS_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// `.mjs` shim's `#!/usr/bin/env node` resolves in a packaged-app
 /// environment.
 async fn auggie_output(auggie: &std::path::Path, args: &[&str]) -> Option<std::process::Output> {
-    tokio::time::timeout(
-        AUGGIE_MODELS_TIMEOUT,
-        tokio::process::Command::new(auggie)
+    tokio::time::timeout(AUGGIE_MODELS_TIMEOUT, {
+        let mut command = tokio::process::Command::new(auggie);
+        command
             .args(args)
             .env("PATH", intent_context::discovery::exec_path(auggie))
             .stdin(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .output(),
-    )
+            .kill_on_drop(true);
+        // The Auggie CLI is an agent process like any other: keep it from
+        // starving the daemon while it lists models.
+        intent_acp::AgentPriority::from_env().apply(&mut command);
+        command.output()
+    })
     .await
     .ok()?
     .ok()
@@ -4901,13 +5058,9 @@ impl Services {
             )?;
             // A profile is gated on its own saved settings' verdict, never
             // the base provider's Default verdict.
-            let verdict = if crate::provider_profiles::is_qualified_ref(p) {
-                Box::pin(self.resolve_profile_env(p))
-                    .await?
-                    .and_then(|profile| crate::provider_auth::cached_profile_auth_verdict(&profile))
-            } else {
-                crate::provider_auth::cached_auth_verdict(p)
-            };
+            // A profile, or a Default with saved overrides, is gated on the
+            // verdict of its own saved settings, never the bare installation's.
+            let verdict = Box::pin(self.selection_auth_verdict(p)).await?;
             ensure_provider_authenticated(method, p, verdict)?;
         }
         // A bare model that provably belongs to a different provider (cached
@@ -5759,7 +5912,7 @@ impl Services {
                 }
             };
             if current_effective.as_deref() != Some(pid.as_str()) {
-                ensure_provider_available(
+                self.ensure_provider_available_for(
                     "agent.setModel",
                     &pid,
                     &self.effective_settings().providers,
@@ -5807,12 +5960,17 @@ impl Services {
         // `session/new`, and replays history as `<supervisor>` XML.
         let provider = model_provider;
         let workspace_id = session.workspace_id;
+        // A fresh token marks this write as a manual choice, in the same
+        // statement as the selection (PROTOCOL §5.54 shared quota state):
+        // the first turn that reads it tries the choice even when marked.
+        let manual_choice = uuid::Uuid::now_v7().to_string();
         self.store
-            .set_agent_session_model(
+            .set_agent_session_model_choice(
                 &workspace_id,
                 &agent_id,
                 &model_id,
                 provider.as_deref(),
+                Some(&manual_choice),
                 &now_iso(),
             )
             .await?;
@@ -7357,8 +7515,17 @@ impl Services {
         let resolved = if intent_providers::installed_cli::InstalledCli::for_provider(&provider_id)
             .is_some()
         {
+            // A Default configuration's saved overrides select its catalog;
+            // the installed key folds in their fingerprint.
+            let overlay = if crate::provider_profiles::is_default_config_ref(&provider_id) {
+                Box::pin(self.resolve_profile_env(&provider_id))
+                    .await?
+                    .map(std::sync::Arc::new)
+            } else {
+                None
+            };
             self.models_catalog
-                .resolve_installed(&provider_id, force_refresh)
+                .resolve_installed_for(&provider_id, overlay, force_refresh)
                 .await
         } else {
             crate::model_catalog::resolve_with_cache(
@@ -11198,7 +11365,7 @@ impl Services {
                 }
                 let delegate_provider = if let Some(provider_param) = provider_param_in.as_deref() {
                     services.ensure_selectable_provider("agent.delegate", provider_param)?;
-                    ensure_provider_available(
+                    services.ensure_provider_available_for(
                         "agent.delegate",
                         provider_param,
                         &services.effective_settings().providers,
@@ -11713,7 +11880,7 @@ impl Services {
         // with the other per-entry options.
         if let Some(provider_param) = input.provider.as_deref() {
             self.ensure_selectable_provider("agent.delegate", provider_param)?;
-            ensure_provider_available(
+            self.ensure_provider_available_for(
                 "agent.delegate",
                 provider_param,
                 &self.effective_settings().providers,
@@ -18257,6 +18424,108 @@ fn resume_continuation_text(interrupted_at: &str, now: time::OffsetDateTime) -> 
     )
 }
 
+/// Restart-resume transcript marker for a row captured mid-turn.
+pub(crate) const RESUME_MARKER_TEXT: &str =
+    "The previous turn was interrupted because the harness shut down. Continuing below.";
+
+/// Restart-resume transcript marker for a mid-turn row tagged
+/// [`crate::agent_workers::INTERRUPTED_WITH_WORKERS_REASON`].
+pub(crate) const RESUME_WORKERS_MID_TURN_MARKER_TEXT: &str = "The previous turn was \
+     interrupted because the harness shut down, which also stopped running background tasks. \
+     Continuing below.";
+
+/// Restart-resume transcript marker for an idle agent captured only because
+/// its background tasks were running (no turn was interrupted).
+pub(crate) const RESUME_WORKERS_MARKER_TEXT: &str = "The harness shut down while background \
+     tasks were running, which stopped them. Continuing below.";
+
+/// Appended to the restart-resume continuation when the row carries
+/// [`crate::agent_workers::INTERRUPTED_WITH_WORKERS_REASON`]
+/// (intent-hq/intent#7658): the shutdown killed the provider and its
+/// background workers, so their completion reports will never arrive.
+pub(crate) const RESUME_WORKERS_LOST_NOTE: &str = "Background tasks you started before the \
+     shutdown (such as commands run in the background) were stopped by it and will not report \
+     back. Check what they completed, and restart any you still need.";
+
+/// Abandon notice for a row captured mid-turn (the historical wording).
+pub(crate) const ABANDON_NOTICE_TEXT: &str = "This conversation was interrupted because intentd \
+     restarted. The agent's in-flight work was terminated.";
+
+/// Abandon notice for a mid-turn row whose background tasks also stopped.
+pub(crate) const ABANDON_WORKERS_MID_TURN_NOTICE_TEXT: &str = "This conversation was \
+     interrupted because intentd restarted. The agent's in-flight work and running background \
+     tasks were terminated.";
+
+/// Abandon notice for an idle agent captured only for its background tasks.
+pub(crate) const ABANDON_WORKERS_NOTICE_TEXT: &str =
+    "intentd restarted, which terminated the agent's running background tasks.";
+
+/// How a claimed `interrupted_agent` row was captured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InterruptedCapture {
+    /// Mid-turn, no background tasks known lost (every untagged row).
+    MidTurn,
+    /// Mid-turn, and its background tasks were stopped too.
+    MidTurnWithWorkers,
+    /// Idle (no turn in flight); only its background tasks were stopped.
+    IdleWithWorkers,
+}
+
+impl InterruptedCapture {
+    /// Classify a row by its `reason` tag and `prev_status`. A tagged row is
+    /// idle when its recorded status is not an in-flight one: graceful
+    /// shutdown records in-flight statuses only for busy agents.
+    pub(crate) fn of(reason: Option<&str>, prev_status: &str) -> Self {
+        if reason != Some(crate::agent_workers::INTERRUPTED_WITH_WORKERS_REASON) {
+            return Self::MidTurn;
+        }
+        let in_flight = serde_json::from_value::<intent_core::AgentStatus>(Value::String(
+            prev_status.to_owned(),
+        ))
+        .is_ok_and(crate::is_stale_in_flight_status);
+        if in_flight {
+            Self::MidTurnWithWorkers
+        } else {
+            Self::IdleWithWorkers
+        }
+    }
+
+    /// Whether a resume replays the transcript tail. An idle capture had no
+    /// interrupted turn: its tail (for example a turn the user stopped) is
+    /// already settled and must not be re-driven.
+    pub(crate) fn replays_tail(self) -> bool {
+        self != Self::IdleWithWorkers
+    }
+
+    pub(crate) fn abandon_notice(self) -> &'static str {
+        match self {
+            Self::MidTurn => ABANDON_NOTICE_TEXT,
+            Self::MidTurnWithWorkers => ABANDON_WORKERS_MID_TURN_NOTICE_TEXT,
+            Self::IdleWithWorkers => ABANDON_WORKERS_NOTICE_TEXT,
+        }
+    }
+
+    /// The marker and continuation a restart resume delivers.
+    pub(crate) fn resume_marker_and_continuation(
+        self,
+        interrupted_at: &str,
+        now: time::OffsetDateTime,
+    ) -> (&'static str, String) {
+        let continuation = resume_continuation_text(interrupted_at, now);
+        match self {
+            Self::MidTurn => (RESUME_MARKER_TEXT, continuation),
+            Self::MidTurnWithWorkers => (
+                RESUME_WORKERS_MID_TURN_MARKER_TEXT,
+                format!("{continuation} {RESUME_WORKERS_LOST_NOTE}"),
+            ),
+            Self::IdleWithWorkers => (
+                RESUME_WORKERS_MARKER_TEXT,
+                format!("{continuation} {RESUME_WORKERS_LOST_NOTE}"),
+            ),
+        }
+    }
+}
+
 /// The rebuilt interrupted-turn tail for a restart resume: the prompt-only
 /// recap text plus any attachment blocks the replayed user rows carried.
 /// Persisted user rows keep their image/file blocks (STAB-133), and dropping
@@ -18396,8 +18665,7 @@ fn build_resume_tail_recap(messages: &[AgentMessage]) -> Option<ResumeTailRecap>
         .any(|s| matches!(s, TailSegment::Partial(_)));
     // Segments render first so the preamble can learn whether any of them
     // was middle-truncated (the hint is emitted only when something was
-    // actually abbreviated; untruncated, unelided recaps are byte-identical
-    // to before).
+    // actually abbreviated; untruncated, unelided recaps carry no hint).
     let mut body = String::new();
     let mut segment_groups = Vec::new();
     let mut truncated_any = false;
@@ -18441,6 +18709,7 @@ fn build_resume_tail_recap(messages: &[AgentMessage]) -> Option<ResumeTailRecap>
          — it is repeated here (parts of it may or may not already be in your \
          context).\n\n",
     );
+    recap.push_str(crate::history_xml::REPLAY_ESCAPING_NOTE);
     if truncated_any || elided > 0 {
         recap.push_str(RESUME_RECAP_TRUNCATION_HINT);
     }
@@ -18889,8 +19158,12 @@ impl Services {
         // is already the transcript tail — skip the duplicate append. A failed
         // append is treated like a failed continuation delivery: reset the row
         // to pending and surface the error.
-        let marker_text =
-            "The previous turn was interrupted because the harness shut down. Continuing below.";
+        let capture =
+            InterruptedCapture::of(interrupted.reason.as_deref(), &interrupted.prev_status);
+        let (marker_text, continuation) = capture.resume_marker_and_continuation(
+            &interrupted.interrupted_at,
+            time::OffsetDateTime::now_utc(),
+        );
         let marker_content = json!([{
             "type": "text",
             "text": marker_text,
@@ -18927,12 +19200,11 @@ impl Services {
         }
 
         // Deliver continuation message (with the humanized outage duration
-        // when the claimed row's `interrupted_at` yields one). The metadata
+        // when the claimed row's `interrupted_at` yields one, and the lost
+        // background-task note for a `background_workers` row). The metadata
         // tag persists on the user row so a later restart's recap can
         // identify the continuation without matching its text (an ordinary
         // user request opening with the same wording must still be replayed).
-        let continuation =
-            resume_continuation_text(&interrupted.interrupted_at, time::OffsetDateTime::now_utc());
         let continuation_metadata = json!({
             "type": RESUME_CONTINUATION_METADATA_TYPE,
             "source": "system",
@@ -18954,8 +19226,14 @@ impl Services {
         // ATTACHMENTS still ride (the history XML is text-only), so the tail
         // reaches the agent exactly once on either branch. The recap is
         // built from the pre-marker `session` snapshot, so the just-appended
-        // interruption marker never leaks into it.
-        let recap = build_resume_tail_recap(&session.messages);
+        // interruption marker never leaks into it. An idle background-task
+        // capture interrupted no turn, so its tail is already settled and is
+        // not replayed ([`InterruptedCapture::replays_tail`]).
+        let recap = if capture.replays_tail() {
+            build_resume_tail_recap(&session.messages)
+        } else {
+            None
+        };
 
         // Use the send-message machinery to deliver the continuation (lazily
         // respawns the provider and resumes via ACP `session/load`).
@@ -19059,7 +19337,8 @@ impl Services {
             )));
         }
 
-        let text = "This conversation was interrupted because intentd restarted. The agent's in-flight work was terminated.";
+        let text = InterruptedCapture::of(interrupted.reason.as_deref(), &interrupted.prev_status)
+            .abandon_notice();
         let content = json!([{
             "type": "text",
             "text": text,

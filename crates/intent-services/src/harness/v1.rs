@@ -191,7 +191,7 @@ fn plural(n: i64) -> &'static str {
 /// name's required flag, independently of uncertainty for other check names.
 ///
 /// Normal success transitions are suppressed: a check going `pending` →
-/// `passed`, or appearing already green, is expected progress rather than a
+/// `passed` or `skipped`, or appearing already green or skipped, is expected progress rather than a
 /// reportable change — the suite-completion summary in
 /// [`V1::pr_diff_lines`] covers the "everything finished" moment. A
 /// `failed` → `passed` recovery IS reported, since it resolves a previously
@@ -214,13 +214,14 @@ fn diff_checks(old: &PrMonitorSnapshot, new: &PrMonitorSnapshot) -> Vec<String> 
     for check in &n.items {
         match before.get(&check.name) {
             None => {
-                if check.status != "passed" {
+                if !matches!(check.status.as_str(), "passed" | "skipped") {
                     changes.push(format!("check started: {} ({})", check.name, check.status));
                 }
             }
             Some(prev) => {
                 if prev.status != check.status
-                    && !(check.status == "passed" && prev.status == "pending")
+                    && !(matches!(check.status.as_str(), "passed" | "skipped")
+                        && prev.status == "pending")
                 {
                     changes.push(format!(
                         "check {}: {} → {}",
@@ -1074,14 +1075,35 @@ impl Harness for V1 {
             && n.checks.pending == 0
             && n.checks.total > 0
         {
-            changes.push(if n.checks.failed == 0 {
-                format!("all checks passed ({})", n.checks.total)
-            } else {
-                format!(
-                    "all checks completed: {} passed, {} failed",
-                    n.checks.passed, n.checks.failed
-                )
-            });
+            changes.push(super::review_wake::checks_completed(
+                n.checks.total,
+                n.checks.passed,
+                n.checks.failed,
+                &n.checks.names_with("skipped"),
+            ));
+        }
+
+        // CI never started on the head (intentd#2531): reported once per
+        // head, keyed on the flagged SHA. Its clearing is silent — arriving
+        // checks, a new head or conflicts report themselves.
+        if let Some(stall) = &n.checks_not_started {
+            let flagged_before = o
+                .checks_not_started
+                .as_ref()
+                .is_some_and(|s| s.head_sha == stall.head_sha)
+                || [old, new].iter().any(|s| {
+                    s.checks_not_started_delivered.as_deref() == Some(stall.head_sha.as_str())
+                });
+            if !flagged_before {
+                let short: String = stall.head_sha.chars().take(8).collect();
+                changes.push(format!(
+                    "no checks reported for head {short} after {}+ min — CI may never have \
+                     started; push again (e.g. an empty commit) or rebase to trigger it \
+                     (expected only if the required checks are path-filtered or run only in \
+                     the merge queue)",
+                    stall.threshold_minutes
+                ));
+            }
         }
 
         // Mergeability + residual signals. `unknown` is a transient GitHub

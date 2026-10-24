@@ -18,7 +18,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::time::timeout;
 
-mod common;
+use crate::common;
 use common::DaemonGuard;
 
 /// Short data dir so `data_dir/intentd.sock` stays under `SUN_LEN`.
@@ -89,7 +89,10 @@ fn fixture_startup_preserves_inherited_secrets_file() {
     let out = std::process::Command::new(std::env::current_exe().expect("test executable"))
         .args([
             "--exact",
-            "env_pins_beat_file_and_reject_wire_mutation",
+            &common::exact_test_name(
+                module_path!(),
+                "env_pins_beat_file_and_reject_wire_mutation",
+            ),
             "--nocapture",
         ])
         .env("INTENTD_SECRETS_FILE", &secrets_file)

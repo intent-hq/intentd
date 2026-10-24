@@ -125,6 +125,9 @@ pub enum CheckState {
     Failure,
     Neutral,
     Cancelled,
+    /// The check was skipped without running (GitHub conclusion / GitLab job
+    /// status `skipped`). Distinct from [`CheckState::Neutral`], which ran.
+    Skipped,
 }
 
 /// A pull/merge/change request, normalized across hosts.
@@ -622,6 +625,13 @@ pub struct MergeRequirementSignals {
     /// This is adapter bookkeeping, not an addition to the public wire payload.
     #[serde(skip)]
     pub checks_head_sha: Option<String>,
+    /// When the PR head commit was committed (GitHub GraphQL
+    /// `Commit.committedDate`, RFC 3339) — the clock anchor for flagging a
+    /// head on which CI never started. The host exposes no push time, so the
+    /// commit time is the closest available evidence. `None` when the host
+    /// does not report it (GitLab, REST-only reads).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_committed_at: Option<String>,
     /// Base-branch rules, or `None` when they are unreadable (missing scope,
     /// unsupported endpoint) — a degraded but non-fatal probe. Quota
     /// exhaustion on that read is never folded into `None`; it fails the

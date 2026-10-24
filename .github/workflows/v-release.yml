@@ -378,8 +378,15 @@ jobs:
           pattern: artifacts-*
           path: target/distrib/
           merge-multiple: true
+      # LOCAL CUSTOMIZATION: fetch crates with retries so the global `dist build`
+      # can run its cargo metadata offline. After `dist generate`, run
+      # python3 scripts/configure-release-host-network.py (source of this block).
+      - name: Fetch locked crates (retrying)
+        run: python3 -I -B scripts/fetch-locked-crates.py
       - id: cargo-dist
         shell: bash
+        env:
+          CARGO_NET_OFFLINE: "true"
         run: |
           targets=$(python3 scripts/optional-intel-release.py targets target/distrib)
           dist build ${{ needs.plan.outputs.tag-flag }} $targets --output-format=json "--artifacts=global" > dist-manifest.json
@@ -429,8 +436,15 @@ jobs:
           pattern: artifacts-*
           path: target/distrib/
           merge-multiple: true
+      # LOCAL CUSTOMIZATION: fetch crates with retries so `dist host` can run
+      # its cargo metadata offline. After `dist generate`, run
+      # python3 scripts/configure-release-host-network.py (source of this block).
+      - name: Fetch locked crates (retrying)
+        run: python3 -I -B scripts/fetch-locked-crates.py
       - id: host
         shell: bash
+        env:
+          CARGO_NET_OFFLINE: "true"
         run: |
           targets=$(python3 scripts/optional-intel-release.py targets target/distrib)
           dist host ${{ needs.plan.outputs.tag-flag }} $targets --steps=upload --steps=release --output-format=json > dist-manifest.json

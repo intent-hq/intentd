@@ -18,7 +18,7 @@ use tokio::net::UnixStream;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
 
-mod common;
+use crate::common;
 
 struct TempDb {
     _dir: tempfile::TempDir,

@@ -273,7 +273,8 @@ async fn wss_handler_panics_yield_internal_error_and_connection_survives() {
     // trail the final response. Loop for the full window, skipping Ping/Pong,
     // so a heartbeat can't mask a trailing Text frame. `timeout_at` keeps the
     // fixed deadline without computing a (potentially negative) remainder.
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+    let deadline = tokio::time::Instant::now()
+        + intentd_test_support::test_timeout(Duration::from_millis(300));
     loop {
         match tokio::time::timeout_at(deadline, ws.next()).await {
             Err(_) => break,
