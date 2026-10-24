@@ -116,7 +116,11 @@ impl Services {
         );
         true
     }
-    pub(crate) fn start_script_monitor_maintenance(&self) {
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub fn start_script_monitor_maintenance(&self) {
         if self
             .script_locks
             .monitor_maintenance

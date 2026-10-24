@@ -23,7 +23,7 @@ use crate::Services;
 /// `workspace.export.read`). Base64 inflates this by 4/3 on the wire
 /// (~21.4 MiB), keeping the full JSON-RPC frame comfortably under the
 /// 40 MiB inbound cap (PROTOCOL §1.3). Core's file reads share the cap.
-pub(crate) const IMPORT_MAX_CHUNK_BYTES: usize = 16 * 1024 * 1024;
+pub const IMPORT_MAX_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 
 /// The workspace transfer feature (`workspace.transferPlan`,
 /// `workspace.import.*`, `workspace.export.*`). Each method performs the
@@ -97,6 +97,26 @@ pub trait TransferPort: Send + Sync + 'static {
     /// True while an export of `workspace_id` is in flight (between
     /// `workspace.export.start` and `finalize`/`abort`/a failed build).
     fn export_in_progress(&self, workspace_id: &str) -> bool;
+
+    /// Test seam: register an export of `workspace_id` whose archive is
+    /// still building, owned by `initiator`, under `export_id`. Core tests
+    /// use it to hold an export open without running a build.
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn park_building_export_for_test(
+        &self,
+        export_id: &str,
+        workspace_id: &WorkspaceId,
+        initiator: Option<intent_core::PrincipalId>,
+        staging_dir: std::path::PathBuf,
+    );
+
+    /// Test seam: drop the export registered under `export_id`, if any.
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn remove_export_for_test(&self, export_id: &str);
+
+    /// Test seam: how many exports are registered.
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn export_count_for_test(&self) -> usize;
 }
 
 /// The registered ports. Cloned with `Services`; every clone shares the
