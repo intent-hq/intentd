@@ -49,6 +49,11 @@ const AUTO_RESTART_MAX_RETRIES: u32 = 5;
 /// [`Services::with_script_too_fast_ms`](crate::Services) so the decision is
 /// load-independent (monorepo#514).
 pub(crate) const TOO_FAST_MS: u128 = 2000;
+
+/// TTL of the monitor an agent's `ws.script.start` / `ws.script.restart`
+/// arms by default (see `WorkspaceApi::script_start_monitor`). Long enough for
+/// a slow gate on a loaded host; on expiry the agent is still woken.
+pub(crate) const AUTO_START_MONITOR_TTL_MS: i64 = 6 * 60 * 60 * 1000;
 /// How often the streamer polls for a natural process exit (mirrors `terminal_ops`).
 const EXIT_POLL: Duration = Duration::from_millis(25);
 /// Cap on output chunks drained after the exit poll has ended a run: the
@@ -3252,6 +3257,7 @@ mod tests {
     include!("script_ops/lifecycle_tests.rs");
     include!("script_ops/retirement_tests.rs");
     include!("script_ops/monitor_tests.rs");
+    include!("script_ops/start_monitor_tests.rs");
     include!("script_ops/snapshot_tests.rs");
     include!("script_ops/output_tests.rs");
     include!("script_ops/cleanup_tests.rs");
