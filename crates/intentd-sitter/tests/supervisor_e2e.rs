@@ -3713,6 +3713,11 @@ case "$1" in
         --invalid) echo 'invalid option' >&2; exit 2 ;;
       esac
     done
+    if [ "${FAKE_PARK_BEFORE_PID:-}" = 1 ]; then
+      echo "$$" > "$INTENTD_DATA_DIR/daemon-parked"
+      # // timing-guard: parked before recording its PID until the sitter kills it
+      while :; do sleep 0.05; done
+    fi
     echo "$$" > "$INTENTD_DATA_DIR/daemon-pid"
     printf '%s\n' "$@" >> "$FAKE_DAEMON_LOG"
     echo "spawn $$" >> "$FAKE_DAEMON_LOG"
@@ -4128,37 +4133,90 @@ fn background_start_help_invalid_options_and_timeout_leave_no_supervisor() {
     assert!(!invalid.status.success(), "{invalid:?}");
     assert!(String::from_utf8_lossy(&invalid.stderr).contains("start.log"));
     assert!(!fixture.paths.pid_path.exists());
-    // 1 ms forces the loaded-runner ordering (intent-hq/intent#7703): the
-    // readiness budget expires before the fake daemon records its PID.
-    for readiness_ms in ["1", "500"] {
-        let dir = tempfile::tempdir().unwrap();
-        let fixture = background_fixture(dir.path());
-        let mut cmd = sitter_command(dir.path(), &base);
-        cmd.arg("start")
-            .env("FAKE_NO_READY", "1")
-            .env(intentd_sitter::readiness::TIMEOUT_ENV, readiness_ms)
-            .env(KILL_TIMEOUT_ENV, "200");
-        let mut child = spawn_guarded(&mut cmd);
-        assert!(!child
-            .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(10)))
-            .unwrap()
-            .unwrap()
-            .success());
-        assert!(!fixture.paths.pid_path.exists());
-        // Prove nothing survived whether or not the daemon got far enough to
-        // record its PID: the supervisor, the fake daemon and its children all
-        // inherit this test's unique data dir.
-        #[cfg(target_os = "linux")]
-        wait_until(
-            "no live process from the timed-out start",
-            intentd_test_support::test_timeout(Duration::from_secs(5)),
-            || live_processes_with_data_dir(dir.path()).is_empty(),
-        );
-        // A missing record means the daemon was stopped before its first line.
-        if let Ok(pid) = fs::read_to_string(dir.path().join("daemon-pid")) {
-            let daemon_pid: i32 = pid.trim().parse().unwrap();
-            assert_eq!(kill(Pid::from_raw(daemon_pid), None), Err(Errno::ESRCH));
-        }
+    let mut cmd = sitter_command(dir.path(), &base);
+    cmd.arg("start")
+        .env("FAKE_NO_READY", "1")
+        .env(intentd_sitter::readiness::TIMEOUT_ENV, "500")
+        .env(KILL_TIMEOUT_ENV, "200");
+    let mut child = spawn_guarded(&mut cmd);
+    assert!(!child
+        .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(10)))
+        .unwrap()
+        .unwrap()
+        .success());
+    assert!(!fixture.paths.pid_path.exists());
+    // On a loaded runner the 500 ms budget can expire before the supervisor
+    // launches or before the fake daemon records its PID (intent-hq/intent#7703),
+    // so the record is optional; the survivor check covers every ordering.
+    assert_no_survivors(dir.path(), recorded_pid(&dir.path().join("daemon-pid")));
+}
+
+/// Deterministic form of the loaded-runner ordering in intent-hq/intent#7703:
+/// the supervisor launches the daemon, but the readiness budget expires before
+/// the daemon records its PID. Timeout cleanup must still kill it.
+#[test]
+fn background_start_timeout_kills_a_daemon_that_never_recorded_its_pid() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = background_fixture(dir.path());
+    let mut cmd = sitter_command(dir.path(), &dead_url());
+    cmd.arg("start")
+        .env("FAKE_PARK_BEFORE_PID", "1")
+        .env(intentd_sitter::readiness::TIMEOUT_ENV, "5000")
+        .env(KILL_TIMEOUT_ENV, "200");
+    let mut child = spawn_guarded(&mut cmd);
+    let parked_path = dir.path().join("daemon-parked");
+    wait_until(
+        "parked daemon launch",
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        || recorded_pid(&parked_path).is_some(),
+    );
+    let parked = recorded_pid(&parked_path).unwrap();
+    // Positive control: the scan sees what the sitter launched, so the
+    // survivor check below cannot pass vacuously.
+    #[cfg(target_os = "linux")]
+    assert!(
+        live_processes_with_data_dir(dir.path()).contains(&parked.as_raw().cast_unsigned()),
+        "the scan must see the parked daemon"
+    );
+    assert!(!child
+        .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(15)))
+        .unwrap()
+        .unwrap()
+        .success());
+    assert!(!fixture.paths.pid_path.exists());
+    assert!(!dir.path().join("daemon-pid").exists());
+    assert_no_survivors(dir.path(), Some(parked));
+}
+
+/// PID recorded in a fake-daemon file; `None` while it is missing or partly
+/// written (a kill can land between the shell truncating and writing it).
+fn recorded_pid(path: &Path) -> Option<Pid> {
+    fs::read_to_string(path)
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+        .map(Pid::from_raw)
+}
+
+/// After a failed `start`, wait until nothing it launched for `data_dir` is
+/// alive. Linux scans every process carrying the data dir, recorded or not;
+/// signal 0 still succeeds on an unreaped zombie, so there the scan alone is
+/// authoritative. Elsewhere only a recorded `daemon` can be checked.
+fn assert_no_survivors(
+    #[cfg_attr(not(target_os = "linux"), expect(unused_variables))] data_dir: &Path,
+    #[cfg_attr(target_os = "linux", expect(unused_variables))] daemon: Option<Pid>,
+) {
+    let timeout = intentd_test_support::test_timeout(Duration::from_secs(5));
+    #[cfg(target_os = "linux")]
+    wait_until("no live process from the timed-out start", timeout, || {
+        live_processes_with_data_dir(data_dir).is_empty()
+    });
+    #[cfg(not(target_os = "linux"))]
+    if let Some(daemon) = daemon {
+        wait_until("recorded daemon exit", timeout, || {
+            kill(daemon, None) == Err(Errno::ESRCH)
+        });
     }
 }
 
@@ -4175,38 +4233,11 @@ fn live_processes_with_data_dir(data_dir: &Path) -> Vec<u32> {
     fs::read_dir("/proc")
         .unwrap()
         .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<u32>().ok())
-        .filter(|pid| *pid != std::process::id())
         .filter(|pid| {
             fs::read(format!("/proc/{pid}/environ"))
                 .is_ok_and(|environ| environ.split(|byte| *byte == 0).any(|var| var == marker))
         })
         .collect()
-}
-
-/// The scan must find a live process carrying the marker, or the "nothing
-/// survived" assertion above would pass vacuously.
-#[cfg(target_os = "linux")]
-#[test]
-fn live_processes_with_data_dir_finds_and_forgets_a_marked_process() {
-    let dir = tempfile::tempdir().unwrap();
-    // `cat` lives until its stdin closes, which dropping `Child` also does if
-    // an assertion panics first.
-    let mut sentinel = Command::new("cat")
-        .env(DATA_DIR_ENV, dir.path())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .spawn()
-        .unwrap();
-    wait_until(
-        "marked sentinel visible",
-        intentd_test_support::test_timeout(Duration::from_secs(5)),
-        || live_processes_with_data_dir(dir.path()) == [sentinel.id()],
-    );
-    let other = tempfile::tempdir().unwrap();
-    assert!(live_processes_with_data_dir(other.path()).is_empty());
-    drop(sentinel.stdin.take());
-    assert!(sentinel.wait().unwrap().success());
-    assert!(live_processes_with_data_dir(dir.path()).is_empty());
 }
 
 #[test]
