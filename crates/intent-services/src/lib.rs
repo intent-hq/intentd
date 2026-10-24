@@ -2728,7 +2728,8 @@ impl Services {
     /// Take `note_id`'s content-write lane (see `note_content_writes`).
     /// Hold the guard from the read a write derives from through its gated
     /// persist, and drop it before any follow-up that may write a note
-    /// (auto-conversion, task-status redirects, materialization).
+    /// (auto-conversion, task-status redirects, materialization — which takes
+    /// the lane itself).
     async fn lock_note_content(
         &self,
         workspace_id: &WorkspaceId,
@@ -14119,7 +14120,13 @@ impl Services {
     /// racing with this one — including a later transition of the same task
     /// — is merged into rather than overwritten. A parent that already carries
     /// the marker (or lost its link) after the fresh read is left untouched,
-    /// as is one whose task note is gone or no longer a task.
+    /// as is one whose task note is gone or no longer a task. The read→write
+    /// window holds the parent's content-write lane (`note_content_writes`),
+    /// so N parallel task transitions linked from one note rewrite it one
+    /// after another instead of exhausting the bounded retry against each
+    /// other and the laned client writers (intent-hq/intent#7184). Callers
+    /// must not hold a lane: every laned writer releases its lane before the
+    /// task-status write that leads here.
     async fn materialize_linked_checkbox_in_note(
         &self,
         workspace_id: &WorkspaceId,
@@ -14127,6 +14134,7 @@ impl Services {
         note_id: &NoteId,
     ) {
         const MAX_ATTEMPTS: usize = 3;
+        let write_lane = self.lock_note_content(workspace_id, note_id).await;
         for attempt in 1..=MAX_ATTEMPTS {
             let mut note = match self.store.get_note(workspace_id, note_id).await {
                 Ok(note) => note,
@@ -14164,6 +14172,7 @@ impl Services {
                     return;
                 }
             }
+            drop(write_lane);
             self.schedule_line_attribution_recompute(workspace_id, &note.id);
             publish_event(
                 self.event_bus.as_ref(),
@@ -26970,9 +26979,8 @@ impl WorkspaceApi for Services {
                 None => None,
             };
             if let Some((task_id, task)) = linked {
-                // The redirect is a task-note write plus parent-line
-                // materialization, not a content write of this note: hold
-                // the lane only for the direct content write below.
+                // The redirect's materialization takes this note's lane
+                // itself: release it before the task write.
                 drop(write_lane);
                 // The line links a task note: the task's metadata status is
                 // the source of truth and the char is its projection, so the
@@ -27242,8 +27250,8 @@ impl WorkspaceApi for Services {
                     Err(e) => return Err(e),
                 }
             };
-            // The lane covers the parent content write only; the redirect's
-            // task write and materialization run after it.
+            // Release before the redirect: its materialization takes this
+            // note's lane itself.
             drop(write_lane);
             if write_parent {
                 publish_event(
