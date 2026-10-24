@@ -5813,12 +5813,17 @@ impl Services {
         // `session/new`, and replays history as `<supervisor>` XML.
         let provider = model_provider;
         let workspace_id = session.workspace_id;
+        // A fresh token marks this write as a manual choice, in the same
+        // statement as the selection (PROTOCOL §5.54 shared quota state):
+        // the first turn that reads it tries the choice even when marked.
+        let manual_choice = uuid::Uuid::now_v7().to_string();
         self.store
-            .set_agent_session_model(
+            .set_agent_session_model_choice(
                 &workspace_id,
                 &agent_id,
                 &model_id,
                 provider.as_deref(),
+                Some(&manual_choice),
                 &now_iso(),
             )
             .await?;

@@ -480,6 +480,9 @@ struct Transcript {
     /// Image references examined for the pending buffer (cap, see
     /// [`MAX_IMAGE_REFS_PER_BLOCK`]).
     media_refs_seen: usize,
+    /// Whether this turn's first provider output was already reported to
+    /// the shared quota cache (once per turn, off the per-chunk path).
+    provider_output_seen: bool,
 }
 
 /// Cap on Markdown image references examined per text block — bounds both
@@ -521,6 +524,7 @@ impl Transcript {
             pending_media: BTreeMap::new(),
             media_scan_pos: 0,
             media_refs_seen: 0,
+            provider_output_seen: false,
         }
     }
 
@@ -6293,11 +6297,16 @@ impl Services {
             return false;
         };
         // A timed return home is announced at home's first output, ahead of
-        // it (PROTOCOL §5.54 backup failover).
+        // it, and the output proves the configuration's quota to every
+        // conversation (PROTOCOL §5.54 backup failover).
         if matches!(
             mapped,
             MappedUpdate::Chunk { .. } | MappedUpdate::ToolCall(_)
         ) {
+            if !transcript.provider_output_seen {
+                transcript.provider_output_seen = true;
+                self.note_provider_working(agent_id);
+            }
             Box::pin(self.announce_provider_return_if_pending(workspace_id, agent_id)).await;
         }
         let message_id = transcript.message_id.clone();

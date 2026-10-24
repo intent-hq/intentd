@@ -617,3 +617,131 @@ fn home_is_the_only_candidate_when_no_backups_are_flagged() {
         None
     );
 }
+
+#[test]
+fn the_rotation_prefers_candidates_the_shared_cache_does_not_mark() {
+    let profiles = saved();
+    // pb1 is marked out of quota by another conversation: pb2 first.
+    assert_eq!(
+        next_candidate_avoiding(
+            "claude-code",
+            None,
+            &[],
+            &tried(&["claude-code@pb1"]),
+            &profiles,
+            None
+        )
+        .as_deref(),
+        Some("claude-code@pb2")
+    );
+    // Away on pb1, both backups marked: home is the first unmarked one.
+    assert_eq!(
+        next_candidate_avoiding(
+            "claude-code@pb1",
+            Some("claude-code"),
+            &[],
+            &tried(&["claude-code@pb2"]),
+            &profiles,
+            None
+        )
+        .as_deref(),
+        Some("claude-code")
+    );
+}
+
+#[test]
+fn every_candidate_marked_still_walks_the_rotation_in_order() {
+    let profiles = saved();
+    let marked = tried(&["claude-code", "claude-code@pb1", "claude-code@pb2"]);
+    assert_eq!(
+        next_candidate_avoiding("claude-code", None, &[], &marked, &profiles, None).as_deref(),
+        Some("claude-code@pb1"),
+        "a mark is advisory: the first untried candidate is still tried"
+    );
+    assert_eq!(
+        next_candidate_avoiding(
+            "claude-code@pb1",
+            None,
+            &tried(&["claude-code", "claude-code@pb1"]),
+            &marked,
+            &profiles,
+            None
+        )
+        .as_deref(),
+        Some("claude-code@pb2")
+    );
+    assert_eq!(
+        next_candidate_avoiding(
+            "claude-code@pb2",
+            None,
+            &tried(&["claude-code", "claude-code@pb1", "claude-code@pb2"]),
+            &marked,
+            &profiles,
+            None
+        ),
+        None,
+        "each candidate still at most once per turn"
+    );
+}
+
+#[test]
+fn a_mark_on_another_base_never_matters() {
+    assert_eq!(
+        next_candidate_avoiding(
+            "claude-code",
+            None,
+            &[],
+            &tried(&["codex@pcx1", "codex"]),
+            &saved(),
+            None
+        )
+        .as_deref(),
+        Some("claude-code@pb1")
+    );
+}
+
+#[test]
+fn the_first_unmarked_candidate_skips_marked_ones_and_never_falls_back() {
+    let profiles = saved();
+    assert_eq!(
+        first_unmarked_candidate(
+            "claude-code",
+            None,
+            &tried(&["claude-code", "claude-code@pb1"]),
+            &profiles,
+            None
+        )
+        .as_deref(),
+        Some("claude-code@pb2")
+    );
+    // Away on pb1 (marked) with home Default unmarked: pb2 is marked too,
+    // so home.
+    assert_eq!(
+        first_unmarked_candidate(
+            "claude-code@pb1",
+            Some("claude-code"),
+            &tried(&["claude-code@pb1", "claude-code@pb2"]),
+            &profiles,
+            None
+        )
+        .as_deref(),
+        Some("claude-code")
+    );
+    // Everything marked: nothing, so the turn tries its current one.
+    assert_eq!(
+        first_unmarked_candidate(
+            "claude-code",
+            None,
+            &tried(&["claude-code", "claude-code@pb1", "claude-code@pb2"]),
+            &profiles,
+            None
+        ),
+        None
+    );
+    // A disabled base has no candidate at all.
+    let enabled = BTreeMap::from([("claude-code".to_owned(), false)]);
+    assert_eq!(
+        first_unmarked_candidate("claude-code", None, &[], &profiles, Some(&enabled)),
+        None
+    );
+}

@@ -203,8 +203,11 @@ model, and a chat notice shows the switch; the conversation then stays there. Af
 the quota reset time (or 5 hours when none is reported), the next turn goes back to
 the configuration it used before its first automatic switch, with a "back on …"
 notice; if that one is still out of quota, Intent tries again later with growing
-waits. Choosing a model or profile yourself makes that the new starting point. When
-every option is out of quota, the usual quota message appears.
+waits. Conversations share what they learn: once one finds a configuration out of
+quota, others skip it on their next turn (until its reset time, or 5 hours), and once
+one succeeds on it again, conversations that left it go back on their next turn.
+Choosing a model or profile yourself makes that the new starting point. When every
+option is out of quota, Intent still tries them, and the usual quota message appears.
 
 Switching a conversation to another profile, even with the same model, applies on
 the next message: a turn in progress finishes first, then a fresh provider session

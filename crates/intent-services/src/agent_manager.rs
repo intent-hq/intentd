@@ -14409,6 +14409,12 @@ async fn run_message_worker(
                         // streak (monorepo#840): the session is provably not
                         // poisoned.
                         mgr.services.clear_failure_streak(&agent_id);
+                        // A turn the provider completed proves its quota to
+                        // every conversation (PROTOCOL §5.54 shared quota
+                        // state); a user stop proves nothing.
+                        if stop_reason != StopReason::Cancelled {
+                            mgr.services.note_provider_working(&agent_id);
+                        }
                         // A turn that went back to the home provider and
                         // completed there is home (PROTOCOL §5.54).
                         boxed_await(|| {

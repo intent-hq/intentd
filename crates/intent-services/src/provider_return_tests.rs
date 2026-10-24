@@ -241,3 +241,35 @@ fn a_failed_return_with_nothing_left_still_moves_the_timer() {
     let reported = on_failed_return(state, Some(utc("2026-10-22T10:20:00Z")), now);
     assert_eq!(reported.return_after, "2026-10-22T10:20:00Z");
 }
+
+#[test]
+fn skipping_a_marked_configuration_ahead_of_a_turn() {
+    let now = utc("2026-10-23T10:00:00Z");
+    let until = now + Duration::hours(5);
+    // On home with no state: leaving it records home and the mark's expiry.
+    let fresh = on_skip(None, "claude-code", "claude-code@pb1", until, now);
+    assert_eq!(fresh.home, "claude-code");
+    assert_eq!(fresh.away_on, "claude-code@pb1");
+    assert_eq!(fresh.return_after, "2026-10-23T15:00:00Z");
+    assert_eq!(fresh.backoff_step, 0);
+    // Back on home with the state still set: leaving a marked home it never
+    // tried is not a failed return — backoff and timer unchanged.
+    let mut on_home = on_switch(None, "claude-code", "claude-code@pb1", None, now);
+    on_home.backoff_step = 2;
+    on_home.returning = Some(ReturnMode::Timer);
+    let skipped = on_skip(
+        Some(on_home.clone()),
+        "claude-code",
+        "claude-code@pb2",
+        until,
+        now,
+    );
+    assert_eq!(skipped.backoff_step, 2);
+    assert_eq!(skipped.return_after, on_home.return_after);
+    assert_eq!(skipped.away_on, "claude-code@pb2");
+    assert_eq!(skipped.returning, None);
+    // A hop that reaches home behaves as on_switch: a return in progress.
+    let away = on_switch(None, "claude-code", "claude-code@pb1", None, now);
+    let back = on_skip(Some(away), "claude-code@pb1", "claude-code", until, now);
+    assert_eq!(back.returning, Some(ReturnMode::Rotation));
+}
