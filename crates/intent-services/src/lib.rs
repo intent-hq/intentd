@@ -100,6 +100,8 @@ mod enhance_ops;
 mod event_ops;
 mod event_subscriptions;
 pub mod events;
+#[doc(hidden)]
+pub mod feature_api;
 mod feature_ports;
 mod file_ops;
 mod git_diff_singleflight;
@@ -293,8 +295,9 @@ mod periodic_shutdown_tests;
 #[cfg(all(test, unix))]
 #[path = "tests/repository_pending_delete.rs"]
 mod repository_pending_delete_tests;
-#[cfg(test)]
-mod test_support;
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+pub mod test_support;
 #[cfg(test)]
 mod test_tracing;
 
@@ -374,7 +377,11 @@ pub(crate) use pr_ops::{fetch_merge_requirements, MergeRequirements};
 /// persisted in one of these statuses is "stale": it has no worker but the FE
 /// would still render a "Thinking" spinner. The heal sweep rewrites them to
 /// [`intent_core::AgentStatus::RuntimeIdle`].
-fn is_stale_in_flight_status(status: intent_core::AgentStatus) -> bool {
+#[expect(
+    clippy::must_use_candidate,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn is_stale_in_flight_status(status: intent_core::AgentStatus) -> bool {
     matches!(
         status,
         intent_core::AgentStatus::Active
@@ -2148,7 +2155,11 @@ impl Services {
     /// for internal readers. Falls back to the schema defaults when no
     /// registry is wired (read-only / unit-test wiring), which matches the
     /// legacy per-key fallback values.
-    pub(crate) fn effective_settings(&self) -> intent_core::settings_file::SettingsFile {
+    #[expect(
+        clippy::must_use_candidate,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub fn effective_settings(&self) -> intent_core::settings_file::SettingsFile {
         self.settings_registry
             .as_ref()
             .map(|r| r.snapshot().effective.clone())
@@ -2534,7 +2545,11 @@ impl Services {
 
     /// Build a [`ScriptManager`](script_ops::ScriptManager) view over the shared
     /// PTY host, event bus, store, script registry, and bootstrap locks for one `script.*` call.
-    fn script_manager(&self) -> script_ops::ScriptManager {
+    #[expect(
+        clippy::must_use_candidate,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub fn script_manager(&self) -> script_ops::ScriptManager {
         script_ops::ScriptManager::new(
             self.pty.clone(),
             self.event_bus.clone(),
@@ -4577,7 +4592,7 @@ impl Services {
 
     /// Upgrade the attached [`AgentManager`], or `None` when unattached or the
     /// manager has been dropped (read-only/test wiring).
-    pub(crate) fn agent_manager(&self) -> Option<Arc<AgentManager>> {
+    pub fn agent_manager(&self) -> Option<Arc<AgentManager>> {
         self.agent_manager.get().and_then(Weak::upgrade)
     }
 
@@ -12851,7 +12866,11 @@ fn fresh_task_metadata(status: TaskStatus, now: &str, peer_order: Option<i64>) -
 /// Mirrors the TS fallback `{ type: 'system', id: 'system', name: 'System' }`
 /// used by `createWorkspaceEvent` when no provenance actor is present; agent
 /// provenance attribution is wired in a later milestone.
-pub(crate) fn system_actor() -> intent_core::EventActor {
+#[expect(
+    clippy::must_use_candidate,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn system_actor() -> intent_core::EventActor {
     intent_core::EventActor {
         actor_type: ActorType::System,
         id: Some("system".to_string()),
@@ -12891,7 +12910,11 @@ static REPO_REGISTRY_SYNCED: std::sync::atomic::AtomicBool =
 /// Resolve a known-repo display name from an optional explicit name plus the
 /// repo path, mirroring TS `repositoryName || path.split('/').pop() || 'Unknown'`
 /// (an empty explicit name falls through to the basename).
-pub(crate) fn known_repo_name(explicit: Option<&str>, path: &str) -> String {
+#[expect(
+    clippy::must_use_candidate,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn known_repo_name(explicit: Option<&str>, path: &str) -> String {
     if let Some(n) = explicit {
         if !n.is_empty() {
             return n.to_string();
@@ -13029,7 +13052,7 @@ fn workspace_dir_candidates(
 /// `cargo test` can never leak workspace dirs into the developer's real
 /// `~/intent/workspaces` (crate unit tests panic unconditionally; the intentd
 /// binary panics only when spawned with `INTENTD_ASSERT_HERMETIC_ROOT=1`).
-fn default_workspaces_root() -> PathBuf {
+pub fn default_workspaces_root() -> PathBuf {
     if let Some(dir) = std::env::var_os("INTENTD_WORKSPACES_DIR") {
         return PathBuf::from(dir);
     }
@@ -13183,7 +13206,7 @@ fn write_workspace_metadata_file(root: &Path, ws: &Workspace) -> Result<()> {
 /// `WorkspaceConfigConstants.slugify` + `generateWorktreeFolderName`:
 /// lowercase, non-alphanumeric runs collapse to `-`, trimmed, ≤50 chars,
 /// `"repo"` fallback.
-pub(crate) fn worktree_folder_slug(repo_name: &str) -> String {
+pub fn worktree_folder_slug(repo_name: &str) -> String {
     let mut slug = String::new();
     // repo-slug-fold: allow — folder-name slugifier, not repo identity
     for c in repo_name.chars().flat_map(char::to_lowercase) {
@@ -14664,7 +14687,11 @@ fn comment_resolved_event(
 /// Build a `workspace:created` event for a freshly inserted workspace row
 /// (§6.5). Self-sufficient payload `{ workspaceId, workspace }` (§6.7) so a
 /// client can render the new workspace without a follow-up read.
-fn workspace_created_event(ws: &Workspace) -> NewEvent {
+#[expect(
+    clippy::must_use_candidate,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn workspace_created_event(ws: &Workspace) -> NewEvent {
     workspace_created_event_with_origin(ws, None)
 }
 
@@ -14717,7 +14744,11 @@ fn workspace_setup_started_event(workspace_id: &WorkspaceId) -> NewEvent {
 /// terminal actually spawned; `exit_code` is present only when the script ran
 /// to exit and its status was observable. `exitCode` is omitted (not null)
 /// when unavailable so the payload stays self-sufficient.
-pub(crate) fn workspace_setup_completed_event(
+#[expect(
+    clippy::must_use_candidate,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn workspace_setup_completed_event(
     workspace_id: &WorkspaceId,
     ran_script: bool,
     exit_code: Option<u32>,
@@ -14800,7 +14831,7 @@ pub(crate) fn record_setup_pending(states: &WorkspaceSetupStates, workspace_id: 
 /// effective script, `skipWorktree`, duplicate, transfer import, legacy
 /// import). Pairs with the immediate
 /// `workspace:setup:completed { ranScript: false }` publish.
-pub(crate) fn record_setup_skipped(states: &WorkspaceSetupStates, workspace_id: &WorkspaceId) {
+pub fn record_setup_skipped(states: &WorkspaceSetupStates, workspace_id: &WorkspaceId) {
     let mut record = WorkspaceSetupStatus::new(WorkspaceSetupState::Skipped);
     record.finished_at = Some(now_iso());
     states.lock().insert(workspace_id.clone(), record);
@@ -15779,7 +15810,7 @@ impl MergeSweepSummary {
 
 /// Publish a change event onto the bus when one is wired, logging (not failing)
 /// on error — the durable mutation has already succeeded by this point.
-pub(crate) async fn publish_event(bus: Option<&EventBus>, event: NewEvent) {
+pub async fn publish_event(bus: Option<&EventBus>, event: NewEvent) {
     let Some(bus) = bus else {
         return;
     };

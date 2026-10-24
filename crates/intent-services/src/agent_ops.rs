@@ -488,7 +488,7 @@ fn resolve_default_model_from_settings(
 /// companion to the settings default *model*, so it applies only when the
 /// model itself came from [`Settings`](DefaultModelSource::Settings).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DefaultModelSource {
+pub enum DefaultModelSource {
     /// Step 1 — a caller-supplied `model`. Never returned by the resolver
     /// (which only runs when the caller supplied none); stamped by the create
     /// seam so the effort resolution can tell a pinned model apart.
@@ -653,7 +653,11 @@ pub(crate) fn resolve_agent_default_model(
 /// [`resolve_agent_default_model`] plus the [`DefaultModelSource`] rung that
 /// produced the value, for callers that must distinguish a settings-chain
 /// default from a specialist pin (creation-time effort resolution).
-pub(crate) fn resolve_agent_default_model_with_source(
+#[expect(
+    clippy::must_use_candidate,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn resolve_agent_default_model_with_source(
     services: &Services,
     specialist: Option<&str>,
     workspace_path: Option<&Path>,
@@ -783,7 +787,11 @@ impl Services {
     /// ([`Services::ensure_provider_ref_selectable`]) and fails with
     /// `provider-profile-replacement-required` otherwise — never falling back
     /// to the bare base (PROTOCOL §5.54).
-    pub(crate) fn ensure_selectable_provider(&self, method: &str, provider_id: &str) -> Result<()> {
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub fn ensure_selectable_provider(&self, method: &str, provider_id: &str) -> Result<()> {
         if crate::provider_profiles::is_qualified_ref(provider_id) {
             return self.ensure_provider_ref_selectable(provider_id);
         }
@@ -897,7 +905,11 @@ pub(crate) fn ensure_model_offered_by_provider(
 /// passes through unvalidated, since providers own the effort vocabulary
 /// (PROTOCOL §5.5). Matching is case-insensitive; the stored value is the
 /// caller's spelling.
-pub(crate) fn ensure_effort_supported_by_model(
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn ensure_effort_supported_by_model(
     method: &str,
     cache: &crate::model_catalog::ModelCatalogReader<'_>,
     model_id: Option<&str>,
@@ -931,7 +943,7 @@ pub(crate) fn ensure_effort_supported_by_model(
 /// is dropped with a warn, never a `-32602` — only caller-supplied efforts
 /// reject. With no cached evidence the level passes through, matching
 /// [`ensure_effort_supported_by_model`].
-pub(crate) fn resolve_settings_default_reasoning_effort(
+pub fn resolve_settings_default_reasoning_effort(
     services: &Services,
     model_source: DefaultModelSource,
     resolved_model: Option<&str>,
@@ -1434,7 +1446,7 @@ fn merge_queue_metadata(existing: &mut Option<Value>, incoming: Option<Value>) {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct RecoverySource {
+pub struct RecoverySource {
     pub message_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub submission_ids: Option<Vec<String>>,
@@ -1443,7 +1455,7 @@ pub(crate) struct RecoverySource {
 }
 
 impl RecoverySource {
-    pub(crate) fn normalize(sources: impl IntoIterator<Item = Self>) -> Vec<Self> {
+    pub fn normalize(sources: impl IntoIterator<Item = Self>) -> Vec<Self> {
         let mut result: Vec<Self> = Vec::new();
         for source in sources {
             if let Some(existing) = result.iter_mut().find(|existing| {
@@ -1491,7 +1503,7 @@ impl RecoverySource {
 #[expect(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct QueuedMessage {
+pub struct QueuedMessage {
     /// An original current-runtime owner. It is never a serialized payload or
     /// restored permission; unsupported queue projections withhold this entry.
     #[serde(skip)]
@@ -1970,7 +1982,11 @@ impl QueuedMessage {
     /// The ready-to-send predicate shared by every drain path and idle gate
     /// (PROTOCOL §5.5/§6.5): not under edit, held, or awaiting a destination
     /// owner's explicit authorization for an imported human instruction.
-    pub(crate) fn ready_to_send(&self) -> bool {
+    #[expect(
+        clippy::must_use_candidate,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub fn ready_to_send(&self) -> bool {
         !self.editing
             && !self.is_held()
             && !intent_core::human_author::is_unbound_historical_human(
@@ -2050,7 +2066,7 @@ pub(crate) struct QueuedPrepend {
 /// the containing queue row retains its existing identity and permissions.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct QueuedDeliveryGroup {
+pub struct QueuedDeliveryGroup {
     /// Durable source identity, private to queue persistence and carry-over.
     /// Legacy groups have no identity; equal payloads never supply one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3486,7 +3502,11 @@ pub(crate) fn is_qualified_monitor_message(message: &AgentMessage) -> bool {
     is_qualified_monitor_envelope(&message.content, message.metadata.as_ref())
 }
 
-pub(crate) fn is_qualified_monitor_envelope(content: &Value, metadata: Option<&Value>) -> bool {
+#[expect(
+    clippy::must_use_candidate,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn is_qualified_monitor_envelope(content: &Value, metadata: Option<&Value>) -> bool {
     is_qualified_monitor_metadata(metadata)
         || content.as_array().is_some_and(|blocks| {
             blocks
@@ -6628,7 +6648,11 @@ impl Services {
     /// the FE-side agent-backend-handler retirement (C1d/C1e) so a `loadAgent`
     /// caller can rehydrate the full session shape from the daemon. Emits no
     /// events (a pure read). `NotFound` when the session is unknown.
-    pub(crate) async fn agent_get_session_op(&self, agent_id: AgentId) -> Result<AgentSession> {
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub async fn agent_get_session_op(&self, agent_id: AgentId) -> Result<AgentSession> {
         let mut session = self.store.get_agent_session(&agent_id).await?;
         // monorepo#940: derived on emit (never persisted); see
         // `project_lite_with_flags`.
@@ -7937,7 +7961,12 @@ impl Services {
 
     /// The live entry `message_id` of `agent_id`, cloned, or `None` when it
     /// is not in the live queue (absent, or provisionally popped for drain).
-    pub(crate) fn find_queued_message(
+    #[expect(
+        clippy::missing_panics_doc,
+        clippy::must_use_candidate,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub fn find_queued_message(
         &self,
         agent_id: &AgentId,
         message_id: &str,
@@ -16741,7 +16770,12 @@ impl Services {
     /// unexpired debounce hold — are skipped (left in place) so the agent stays
     /// idle only when *every* remaining entry is under edit or held
     /// (PROTOCOL §5.5/§6.5 invariant).
-    pub(crate) fn dequeue_message(&self, agent_id: &AgentId) -> Option<QueuedMessage> {
+    #[expect(
+        clippy::missing_panics_doc,
+        clippy::must_use_candidate,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub fn dequeue_message(&self, agent_id: &AgentId) -> Option<QueuedMessage> {
         let mut guard = self
             .agent_queues
             .lock()

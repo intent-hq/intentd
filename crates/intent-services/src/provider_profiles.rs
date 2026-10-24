@@ -1830,7 +1830,11 @@ impl Services {
     /// [`crate::agent_ops::ensure_provider_available`] for a selection: a
     /// Default configuration with saved overrides is not refused on the bare
     /// installation's verdict (its own verdict is keyed by its overlay).
-    pub(crate) fn ensure_provider_available_for(
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub fn ensure_provider_available_for(
         &self,
         method: &str,
         provider_id: &str,

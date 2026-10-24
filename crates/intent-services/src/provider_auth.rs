@@ -890,8 +890,8 @@ pub(crate) fn promote_auth_verdict(provider_id: &str) {
 /// Test seam: plant a verdict in the process-wide auth cache so gate tests
 /// are deterministic without spawning probes. Seed `None` to restore the
 /// permissive cached-unknown state.
-#[cfg(test)]
-pub(crate) fn seed_auth_verdict_for_tests(provider_id: &'static str, value: Option<bool>) {
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn seed_auth_verdict_for_tests(provider_id: &'static str, value: Option<bool>) {
     cache().store(provider_id, AuthVerdict::plain(value));
 }
 

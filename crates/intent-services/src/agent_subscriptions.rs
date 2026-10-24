@@ -1485,7 +1485,7 @@ impl Services {
             .get_or_init(|| GroupPersistLane::new(self.store.clone()))
     }
 
-    pub(crate) async fn shutdown_group_persistence(&self) {
+    pub async fn shutdown_group_persistence(&self) {
         // Initialize even an unused lane so later calls cannot reopen admission.
         self.group_persist_lane().shutdown().await;
     }

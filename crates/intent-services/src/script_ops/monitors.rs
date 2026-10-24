@@ -416,7 +416,12 @@ impl ScriptManager {
         Ok(owners)
     }
 
-    pub(crate) async fn recover_monitors(&self) -> Result<()> {
+    #[expect(
+        clippy::missing_errors_doc,
+        clippy::missing_panics_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub async fn recover_monitors(&self) -> Result<()> {
         let _lane = self.locks.monitor_lane.lock().await;
         let pending_runs = self.store.pending_script_runs().await?;
         for (mut row, cancel_intent) in self.store.pending_script_monitors().await? {

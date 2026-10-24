@@ -9,7 +9,7 @@ use tokio::{
 };
 
 #[derive(Default)]
-pub(crate) struct DeliveryTasks(
+pub struct DeliveryTasks(
     Mutex<State>,
     tokio::sync::Notify,
     std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -34,7 +34,11 @@ impl DeliveryTasks {
         self.2.clone()
     }
 
-    pub(crate) fn is_closed(&self) -> bool {
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub fn is_closed(&self) -> bool {
         self.0.lock().unwrap().closed
     }
 
@@ -47,7 +51,7 @@ impl DeliveryTasks {
 
     /// A committed hook outcome must finish queueing its wake. Its scheduler
     /// observes closure between runs instead of being aborted mid-commit.
-    pub(crate) fn spawn_draining<T: Send + 'static>(
+    pub fn spawn_draining<T: Send + 'static>(
         &self,
         future: impl Future<Output = T> + Send + 'static,
     ) -> Option<JoinHandle<T>> {

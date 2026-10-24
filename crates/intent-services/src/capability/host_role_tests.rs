@@ -1700,22 +1700,16 @@ async fn member_import_handles_remain_owned_by_the_authenticated_initiator() {
 
 #[tokio::test]
 async fn member_export_handles_remain_owned_by_the_authenticated_initiator() {
-    use crate::transfer_export::{ExportSession, ExportState};
     let tmp = TempDb::new();
     let (svc, _, member) = fixture(&tmp).await;
     let ws = WorkspaceId::new();
     svc.store.insert_workspace(&workspace(&ws)).await.unwrap();
     let export_id = "member-export".to_string();
-    svc.transfer_state().exports.lock().unwrap().insert(
-        export_id.clone(),
-        ExportSession {
-            initiator: Some(member.clone()),
-            workspace_id: ws,
-            staging_dir: tmp.path.with_extension("export"),
-            state: ExportState::Building { aborted: false },
-            wip_paths: vec![],
-            max_chunk_bytes: 16,
-        },
+    svc.feature_transfer_port().park_building_export_for_test(
+        &export_id,
+        &ws,
+        Some(member.clone()),
+        tmp.path.with_extension("export"),
     );
     let mut other = svc.store.get_principal(&member).await.unwrap();
     other.id = PrincipalId::new();

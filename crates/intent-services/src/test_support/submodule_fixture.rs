@@ -4,7 +4,11 @@
 use std::path::{Path, PathBuf};
 
 /// Run `git` in `dir` with a fixed identity; panics on failure.
-pub(crate) fn git(dir: &Path, args: &[&str]) -> String {
+#[expect(
+    clippy::must_use_candidate,
+    reason = "test fixture for feature-crate tests, not a public library API"
+)]
+pub fn git(dir: &Path, args: &[&str]) -> String {
     let out = std::process::Command::new("git")
         .arg("-C")
         .arg(dir)
@@ -27,7 +31,7 @@ pub(crate) fn git(dir: &Path, args: &[&str]) -> String {
 }
 
 /// A repository with one seed commit on `main`.
-pub(crate) fn init_repo(dir: &Path) {
+pub fn init_repo(dir: &Path) {
     std::fs::create_dir_all(dir).expect("mkdir");
     git(dir, &["init", "-q", "-b", "main"]);
     std::fs::write(dir.join("README.md"), "hello\n").expect("write");
@@ -39,7 +43,11 @@ pub(crate) fn init_repo(dir: &Path) {
 /// bare `origin.git` (seeded from `sub-src/`). Returns
 /// `(superproject, bare_origin)`; the submodule checkout at
 /// `super/sub` has `origin/main` pointing at the seed commit.
-pub(crate) fn superproject_with_submodule(root: &Path) -> (PathBuf, PathBuf) {
+#[expect(
+    clippy::must_use_candidate,
+    reason = "test fixture for feature-crate tests, not a public library API"
+)]
+pub fn superproject_with_submodule(root: &Path) -> (PathBuf, PathBuf) {
     let sub_src = root.join("sub-src");
     init_repo(&sub_src);
     let origin = root.join("origin.git");
@@ -55,7 +63,11 @@ pub(crate) fn superproject_with_submodule(root: &Path) -> (PathBuf, PathBuf) {
 }
 
 /// Commit a new file inside the checkout at `dir`; returns the SHA.
-pub(crate) fn local_commit(dir: &Path, file: &str) -> String {
+#[expect(
+    clippy::must_use_candidate,
+    reason = "test fixture for feature-crate tests, not a public library API"
+)]
+pub fn local_commit(dir: &Path, file: &str) -> String {
     std::fs::write(dir.join(file), format!("{file}\n")).expect("write");
     git(dir, &["add", file]);
     git(dir, &["commit", "-q", "-m", &format!("local {file}")]);
@@ -63,7 +75,7 @@ pub(crate) fn local_commit(dir: &Path, file: &str) -> String {
 }
 
 /// The nested-under-published-parent scenario (monorepo#4219 follow-up).
-pub(crate) struct NestedFixture {
+pub struct NestedFixture {
     pub sup: PathBuf,
     pub sub_origin: PathBuf,
     pub inner_origin: PathBuf,
@@ -78,7 +90,11 @@ pub(crate) struct NestedFixture {
 /// to `origin.git`) → nested `sub/inner` on `feat/x` at an UNPUBLISHED
 /// commit (`deep.txt`). The superproject's gitlink for `sub` is stale
 /// (`M sub`), as a WIP snapshot would carry it.
-pub(crate) fn nested_unpublished_under_published_parent(root: &Path) -> NestedFixture {
+#[expect(
+    clippy::must_use_candidate,
+    reason = "test fixture for feature-crate tests, not a public library API"
+)]
+pub fn nested_unpublished_under_published_parent(root: &Path) -> NestedFixture {
     let inner_src = root.join("inner-src");
     init_repo(&inner_src);
     git(root, &["clone", "-q", "--bare", "inner-src", "inner.git"]);
