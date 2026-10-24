@@ -579,8 +579,10 @@ fn read_or_empty(path: &Path) -> String {
     fs::read_to_string(path).unwrap_or_default()
 }
 
-/// Poll `cond` up to `timeout`; panic with `what` when it never holds.
+/// Poll `cond` up to `timeout` stretched by `INTENTD_TEST_TIMEOUT_MULTIPLIER`
+/// (every call is a hang guard); panic with `what` when it never holds.
 fn wait_until(what: &str, timeout: Duration, mut cond: impl FnMut() -> bool) {
+    let timeout = intentd_test_support::test_timeout(timeout);
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if cond() {
@@ -592,9 +594,11 @@ fn wait_until(what: &str, timeout: Duration, mut cond: impl FnMut() -> bool) {
     panic!("timed out after {timeout:?} waiting for {what}");
 }
 
-/// Wait for the sitter to exit, force-killing it on timeout so a broken
+/// Wait for the sitter to exit within `timeout` stretched by
+/// `INTENTD_TEST_TIMEOUT_MULTIPLIER`, force-killing it on timeout so a broken
 /// build never wedges the test run.
 fn wait_exit(child: &mut Child, timeout: Duration) -> ExitStatus {
+    let timeout = intentd_test_support::test_timeout(timeout);
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if let Some(status) = child.try_wait().unwrap() {
@@ -606,6 +610,56 @@ fn wait_exit(child: &mut Child, timeout: Duration) -> ExitStatus {
     let _ = child.kill();
     let _ = child.wait();
     panic!("sitter did not exit within {timeout:?}");
+}
+
+/// Set only on the child run spawned by
+/// `wait_helpers_stretch_with_the_timeout_multiplier`; the probe below is a
+/// no-op without it.
+const SCALE_PROBE_ENV: &str = "SUPERVISOR_E2E_SCALE_PROBE";
+
+/// Runs inside a child test process with `INTENTD_TEST_TIMEOUT_MULTIPLIER`
+/// set: each helper gets a budget half as long as the event it waits for, so
+/// it only succeeds when the helper stretches that budget.
+#[test]
+fn wait_helpers_scale_probe() {
+    if std::env::var_os(SCALE_PROBE_ENV).is_none() {
+        return;
+    }
+    let base = Duration::from_millis(200);
+    let started = Instant::now();
+    wait_until("the probe condition", base, || {
+        started.elapsed() >= base * 2
+    });
+    let mut child = Command::new("sh")
+        // timing-guard: child exits after twice the base budget
+        .args(["-c", "sleep 0.4"])
+        .spawn()
+        .unwrap();
+    assert!(wait_exit(&mut child, base).success());
+}
+
+/// Regression for intent-hq/intent#7704: `wait_until` / `wait_exit` take
+/// their budget as a parameter, which the fixed-deadline lint cannot see, and
+/// a raw 5s "owner indexing" wait timed out under coverage CI's 3x
+/// multiplier. Re-run the probe in a child process with the multiplier at its
+/// cap so both helpers must stretch to pass.
+#[test]
+fn wait_helpers_stretch_with_the_timeout_multiplier() {
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "wait_helpers_scale_probe", "--nocapture"])
+        .env(SCALE_PROBE_ENV, "1")
+        .env(
+            intentd_test_support::TIMEOUT_MULTIPLIER_ENV,
+            intentd_test_support::MAX_TIMEOUT_MULTIPLIER.to_string(),
+        )
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "probe failed: {stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn send_signal(child: &Child, signal: &str) {
