@@ -29,7 +29,7 @@ use crate::provider_profiles;
 use crate::Services;
 
 /// Session `metadata` key holding [`ProviderReturnState`].
-pub(crate) const PROVIDER_RETURN_METADATA_KEY: &str = "providerReturn";
+pub(crate) const PROVIDER_RETURN_METADATA_KEY: &str = intent_store::PROVIDER_RETURN_METADATA_KEY;
 
 /// `metadata.type` of the notice persisted when a conversation is back home.
 pub(crate) const PROVIDER_RETURNED_NOTICE_TYPE: &str = "provider_returned";
@@ -101,12 +101,25 @@ pub(crate) fn read_state(session: &AgentSession) -> Option<ProviderReturnState> 
     read_state_from(session.metadata.as_ref())
 }
 
-/// Remove the return state from a session about to leave the daemon
-/// (`agent.getSession`): it is internal bookkeeping, kept in storage only.
+/// Remove the return state and manual-choice token from a session about to
+/// leave the daemon (`agent.getSession`): internal bookkeeping, kept in
+/// storage only.
 pub(crate) fn strip_internal_metadata(session: &mut AgentSession) {
     if let Some(Value::Object(metadata)) = session.metadata.as_mut() {
         metadata.remove(PROVIDER_RETURN_METADATA_KEY);
+        metadata.remove(intent_store::MANUAL_CHOICE_METADATA_KEY);
     }
+}
+
+/// The pending manual-choice token of `session`, written with its current
+/// selection by `agent.setModel` (PROTOCOL §5.54 shared quota state).
+pub(crate) fn manual_choice_token(session: &AgentSession) -> Option<String> {
+    session
+        .metadata
+        .as_ref()?
+        .get(intent_store::MANUAL_CHOICE_METADATA_KEY)?
+        .as_str()
+        .map(str::to_owned)
 }
 
 /// [`read_state`] on a raw session `metadata` value.
@@ -115,6 +128,15 @@ pub(crate) fn read_state_from(metadata: Option<&Value>) -> Option<ProviderReturn
         .get(PROVIDER_RETURN_METADATA_KEY)
         .filter(|v| !v.is_null())
         .and_then(|v| serde_json::from_value(v.clone()).ok())
+}
+
+/// `reported` when it is a usable reset time at `now`: in the future and no
+/// further out than [`MAX_REPORTED_HORIZON`] (a misparse otherwise).
+pub(crate) fn usable_reset(
+    reported: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    reported.filter(|t| *t > now && *t <= now + MAX_REPORTED_HORIZON)
 }
 
 /// The backoff after the `step`-th failed return (1-based): 1h, 2h, 4h, …
@@ -144,7 +166,7 @@ pub(crate) fn on_switch(
 ) -> ProviderReturnState {
     let from = provider_profiles::canonical_selection(from);
     let to = provider_profiles::canonical_selection(to);
-    let reported = reported.filter(|t| *t > now && *t <= now + MAX_REPORTED_HORIZON);
+    let reported = usable_reset(reported, now);
     let Some(mut state) = state else {
         return ProviderReturnState {
             home: from,
@@ -168,6 +190,30 @@ pub(crate) fn on_switch(
     state
 }
 
+/// The state after a switch `from` → `to` made at the start of a turn,
+/// without an attempt, because the shared quota cache marks `from`
+/// exhausted until `until`: [`on_switch`], except that leaving a marked home
+/// is not a failed return (home was not tried), so the backoff and
+/// return-after time stay as they are.
+pub(crate) fn on_skip(
+    state: Option<ProviderReturnState>,
+    from: &str,
+    to: &str,
+    until: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> ProviderReturnState {
+    let from_selection = provider_profiles::canonical_selection(from);
+    let to_selection = provider_profiles::canonical_selection(to);
+    match state {
+        Some(mut state) if from_selection == state.home && to_selection != state.home => {
+            state.away_on = to_selection;
+            state.returning = None;
+            state
+        }
+        state => on_switch(state, from, to, Some(until), now),
+    }
+}
+
 /// Home rejected a return before producing any output: one more failed
 /// return. The next return-after is the reported reset (when usable), else
 /// the next backoff step. The return mode is kept: when nothing else was
@@ -178,7 +224,7 @@ pub(crate) fn on_failed_return(
     reported: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
 ) -> ProviderReturnState {
-    let reported = reported.filter(|t| *t > now && *t <= now + MAX_REPORTED_HORIZON);
+    let reported = usable_reset(reported, now);
     state.backoff_step = state.backoff_step.saturating_add(1);
     state.return_after = rfc3339(reported.unwrap_or(now + backoff_delay(state.backoff_step)));
     state
@@ -340,7 +386,10 @@ impl Services {
     /// Persist `state` only while the session still carries the provider
     /// and model it was derived from (see
     /// `Store::set_agent_session_metadata_key_json_if_identity`), so stale
-    /// bookkeeping never lands after a concurrent manual choice.
+    /// bookkeeping never lands after a concurrent manual choice. With
+    /// `yield_to_manual_choice` it also yields to a pending manual choice
+    /// token, for a caller whose read may predate a choice of the same
+    /// selection.
     pub(crate) async fn persist_provider_return_state_if_identity(
         &self,
         workspace_id: &WorkspaceId,
@@ -348,6 +397,7 @@ impl Services {
         expected_provider: &str,
         expected_model: Option<&str>,
         state: &ProviderReturnState,
+        yield_to_manual_choice: bool,
     ) -> bool {
         match self
             .store
@@ -358,6 +408,7 @@ impl Services {
                 expected_model,
                 PROVIDER_RETURN_METADATA_KEY,
                 &json!(state).to_string(),
+                yield_to_manual_choice,
                 &now_iso(),
             )
             .await
@@ -399,18 +450,52 @@ impl Services {
         }
     }
 
-    /// At the start of a user message: when the conversation is away and its
-    /// return-after passed, start this message on home. A home that can no
-    /// longer run (profile removed, base disabled) is given up — the current
-    /// configuration becomes home. A concurrent provider change wins.
+    /// At the start of a new turn, pick where it starts: back home when due
+    /// ([`Self::return_home_if_due`]), then away from a configuration the
+    /// shared quota cache marks exhausted
+    /// ([`Self::avoid_exhausted_provider`]) — except on the first turn after
+    /// a manual provider or model choice, which tries that choice.
     pub(crate) async fn begin_provider_return(
         &self,
         workspace_id: &WorkspaceId,
         agent_id: &AgentId,
     ) {
+        self.return_home_if_due(workspace_id, agent_id).await;
+        self.avoid_exhausted_provider(workspace_id, agent_id).await;
+    }
+
+    /// When the conversation is away and its return-after passed, start this
+    /// turn on home. The shared quota cache overrides the timer both ways:
+    /// a home another conversation has since seen working is returned to at
+    /// once, and a due return to a home marked exhausted waits. A home that
+    /// can no longer run (profile removed, base disabled) is given up — the
+    /// current configuration becomes home. A concurrent provider change
+    /// wins.
+    ///
+    /// Every write yields to a pending manual choice token (PROTOCOL §5.54):
+    /// the session read can predate a manual choice, even one of the same
+    /// selection, and that choice's first turn tries it.
+    pub(crate) async fn return_home_if_due(&self, workspace_id: &WorkspaceId, agent_id: &AgentId) {
         let Ok(session) = self.store.get_agent_session(agent_id).await else {
             return;
         };
+        self.return_home_if_due_from(workspace_id, agent_id, session)
+            .await;
+    }
+
+    /// [`Self::return_home_if_due`] on a session snapshot already read,
+    /// which may be stale by now.
+    pub(crate) async fn return_home_if_due_from(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        session: AgentSession,
+    ) {
+        // A pending manual choice in the snapshot itself: its first turn
+        // tries it (the avoid step consumes the token).
+        if manual_choice_token(&session).is_some() {
+            return;
+        }
         let Some(mut state) = read_state(&session) else {
             return;
         };
@@ -438,6 +523,7 @@ impl Services {
                         current,
                         session.model.as_deref(),
                         &state,
+                        true,
                     )
                     .await
                 {
@@ -446,8 +532,15 @@ impl Services {
                 return;
             }
         }
-        if !return_due(&state, Utc::now()) {
-            return;
+        let now = Utc::now();
+        if !self.provider_quota_cache.is_known_working(&state.home) {
+            if !return_due(&state, now) {
+                return;
+            }
+            if self.provider_quota_cache.is_exhausted(&state.home, now) {
+                tracing::info!(agent = %agent_id, home = %state.home, "return due but home is still marked out of quota; staying on the current provider");
+                return;
+            }
         }
         let settings = self.effective_settings();
         if self
@@ -470,7 +563,8 @@ impl Services {
         state.away_on = current_selection;
         state.returning = Some(ReturnMode::Timer);
         // The move home and its bookkeeping are one statement (see
-        // `try_quota_failover`): a concurrent manual choice wins.
+        // `try_quota_failover`): a concurrent manual choice wins, including
+        // one of the same selection saved since this read (its token).
         let landed = self
             .store
             .failover_agent_session_provider(
@@ -480,6 +574,7 @@ impl Services {
                 session.model.as_deref(),
                 &state.home,
                 Some((PROVIDER_RETURN_METADATA_KEY, &json!(state).to_string())),
+                true,
                 &now_iso(),
             )
             .await
@@ -502,6 +597,85 @@ impl Services {
         if landed {
             self.arm_provider_return_announcement(agent_id);
         }
+    }
+
+    /// When the configuration this turn would start on is marked exhausted
+    /// by the shared quota cache, switch to the first candidate of its
+    /// rotation that is not marked, before any attempt — announced like a
+    /// failover after a failed attempt. The skipped configuration is not
+    /// counted as tried, so if the turn exhausts every other candidate it is
+    /// still tried once. When every candidate is marked, nothing moves and
+    /// the turn tries its current configuration. A concurrent provider
+    /// change wins.
+    pub(crate) async fn avoid_exhausted_provider(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+    ) {
+        let Ok(session) = self.store.get_agent_session(agent_id).await else {
+            return;
+        };
+        self.avoid_exhausted_provider_from(workspace_id, agent_id, &session)
+            .await;
+    }
+
+    /// [`Self::avoid_exhausted_provider`] on a session snapshot already
+    /// read, which may be stale by now: every write it makes is a
+    /// compare-and-set against that snapshot.
+    pub(crate) async fn avoid_exhausted_provider_from(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        session: &AgentSession,
+    ) {
+        let now = Utc::now();
+        let Some(current) = session.provider.as_deref().filter(|p| !p.trim().is_empty()) else {
+            return;
+        };
+        // The first turn on a manual choice tries it. The token was written
+        // with the selection just read, so it belongs to exactly that
+        // choice; clearing it is a compare-and-clear, so a newer choice
+        // (another token) stays for the turn that reads it. A choice saved
+        // after this read is protected by the switch below yielding to it.
+        if let Some(token) = manual_choice_token(session) {
+            if let Err(e) = self
+                .store
+                .take_agent_session_manual_choice(workspace_id, agent_id, &token)
+                .await
+            {
+                tracing::warn!(agent = %agent_id, error = %e, "clear manual choice token failed");
+            }
+            return;
+        }
+        let Some(until) = self.provider_quota_cache.exhausted_until(current, now) else {
+            return;
+        };
+        let Ok(profiles) = self.provider_profiles.profiles() else {
+            return;
+        };
+        let settings = self.effective_settings();
+        let return_state = read_state(session);
+        let Some(target) = crate::quota_failover::first_unmarked_candidate(
+            current,
+            return_state.as_ref().map(|s| s.home.as_str()),
+            &self.provider_quota_cache.exhausted(now),
+            &profiles,
+            settings.providers.enabled.as_ref(),
+        ) else {
+            tracing::debug!(agent = %agent_id, provider = %current, "provider marked out of quota but no unmarked candidate; trying it anyway");
+            return;
+        };
+        self.switch_provider_for_quota(
+            workspace_id,
+            agent_id,
+            session,
+            &target,
+            return_state,
+            Some(until),
+            &profiles,
+            false,
+        )
+        .await;
     }
 
     /// Re-arm the first-output acceptance of a return attempt already

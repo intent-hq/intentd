@@ -162,16 +162,22 @@ impl GitMetadataWatcher {
         })
     }
 
-    /// Await every shared watch relevant to this workspace actually being
-    /// established (the root/gitdir subscription, plus the common-dir one for
-    /// linked worktrees). Registration is deferred off the caller's thread
-    /// (monorepo#1572), so tests must wait for it before mutating `.git`.
+    /// Await every shared watch relevant to this workspace being LIVE (the
+    /// root/gitdir subscription, plus the common-dir one for linked
+    /// worktrees). Registration is deferred off the caller's thread
+    /// (monorepo#1572), so tests must wait for it before mutating `.git`; and
+    /// a registration settled as failed during a watcher-creation retry
+    /// (inotify instance exhaustion, intent-hq/intent#6128) is not yet a
+    /// watch, so this rides out the retry and panics with a diagnosis on a
+    /// dead watch instead of letting the test mutate an unwatched tree.
     #[cfg(test)]
     #[expect(clippy::used_underscore_binding)] // RAII field; underscore documents production lifetime-only intent
     async fn wait_established(&self, timeout: std::time::Duration) {
-        self._sub.wait_established(timeout).await;
+        let deadline = tokio::time::Instant::now() + timeout;
+        self._sub.probe().wait_live(timeout).await;
         if let Some(common) = &self._common {
-            common.sub.wait_established(timeout).await;
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            common.sub.probe().wait_live(remaining).await;
         }
     }
 }
@@ -841,7 +847,7 @@ mod tests {
             &wt_path.clone(),
         )
         .expect("linked worktree workspace must gain a metadata watch");
-        watcher.wait_established(Duration::from_secs(10)).await;
+        watcher.wait_established(crate::events::LIVENESS).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         // External `git checkout`-style HEAD rewrite in the worktree's own
@@ -958,7 +964,7 @@ mod tests {
             &checkout.clone(),
         )
         .expect("separate-git-dir checkout must gain a metadata watch");
-        watcher.wait_established(Duration::from_secs(10)).await;
+        watcher.wait_established(crate::events::LIVENESS).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         let inodes = inotify_watched_inodes();
@@ -1052,8 +1058,9 @@ mod tests {
             1,
             "one shared watch per canonical common dir"
         );
-        watcher_a.wait_established(Duration::from_secs(10)).await;
-        watcher_b.wait_established(Duration::from_secs(10)).await;
+        let budget = crate::events::TestBudget::liveness();
+        watcher_a.wait_established(budget.remaining()).await;
+        watcher_b.wait_established(budget.remaining()).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         // External ref churn in the SHARED repo (`<main>/.git/refs/heads/…`),

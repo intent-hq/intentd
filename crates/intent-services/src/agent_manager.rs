@@ -3916,6 +3916,16 @@ impl AgentManager {
                 )
                 .await
             }
+            // A Default configuration with no saved overrides is tracked
+            // too, so a later edit reports it as running on earlier settings.
+            None if crate::provider_profiles::is_default_config_ref(opts.provider.id) => {
+                Box::pin(self.services.register_default_process(
+                    &workspace_id,
+                    &agent_id,
+                    opts.provider.id,
+                ))
+                .await
+            }
             None => None,
         };
         let handle = AgentHandle {
@@ -11745,7 +11755,7 @@ impl AgentManager {
         // A named profile's saved overlay, read fresh for this new process
         // (it re-checks the profile still exists and its base is enabled).
         // Boxed: keeps this turn-start future's stack frame unchanged.
-        let profile_env = if crate::provider_profiles::is_qualified_ref(&resolved.selection) {
+        let profile_env = if crate::provider_profiles::may_have_overlay(&resolved.selection) {
             boxed_await(|| self.services.resolve_selected_profile(&resolved.selection)).await?
         } else {
             None
@@ -14522,6 +14532,12 @@ async fn run_message_worker(
                         // streak (monorepo#840): the session is provably not
                         // poisoned.
                         mgr.services.clear_failure_streak(&agent_id);
+                        // A turn the provider completed proves its quota to
+                        // every conversation (PROTOCOL §5.54 shared quota
+                        // state); a user stop proves nothing.
+                        if stop_reason != StopReason::Cancelled {
+                            mgr.services.note_provider_working(&agent_id);
+                        }
                         // A turn that went back to the home provider and
                         // completed there is home (PROTOCOL §5.54).
                         boxed_await(|| {
@@ -23671,17 +23687,22 @@ mod agent_retry_tests {
     }
 
     fn park_monitor_export(mgr: &AgentManager, ws: &WorkspaceId) {
-        mgr.services.transfer_exports.lock().unwrap().insert(
-            "monitor-worker-export".into(),
-            crate::transfer_export::ExportSession {
-                initiator: None,
-                workspace_id: ws.clone(),
-                staging_dir: std::env::temp_dir(),
-                state: crate::transfer_export::ExportState::Building { aborted: false },
-                wip_paths: vec![],
-                max_chunk_bytes: 100,
-            },
-        );
+        mgr.services
+            .transfer_state()
+            .exports
+            .lock()
+            .unwrap()
+            .insert(
+                "monitor-worker-export".into(),
+                crate::transfer_export::ExportSession {
+                    initiator: None,
+                    workspace_id: ws.clone(),
+                    staging_dir: std::env::temp_dir(),
+                    state: crate::transfer_export::ExportState::Building { aborted: false },
+                    wip_paths: vec![],
+                    max_chunk_bytes: 100,
+                },
+            );
     }
 
     async fn monitor_worker_exit_releases_slot(exporting: bool) {

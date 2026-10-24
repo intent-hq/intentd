@@ -1151,7 +1151,7 @@ async fn linked_worktree_exclude_watch_adds_no_descriptor_outside_the_root() {
     // What the git metadata watcher holds for this worktree in production.
     let hub = SharedWatchHub::new();
     let (common_sub, _common_rx, _) = hub.subscribe_git_dir(&common);
-    common_sub.wait_established(LIVENESS).await;
+    common_sub.probe().wait_live(LIVENESS).await;
     tokio::time::sleep(Duration::from_millis(250)).await;
     let before = inotify_watched_inodes();
     assert!(

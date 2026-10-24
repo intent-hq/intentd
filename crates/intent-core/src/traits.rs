@@ -6718,6 +6718,37 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `providers.profiles.updateDefault` (PROTOCOL §5.54 "Default
+    /// configuration overrides"): `baseProviderId`, optional `name` and
+    /// `env`; returns `{ defaultConfig, revision, activation }` and emits
+    /// `providers:profiles-changed` (`change: "default-updated"`).
+    fn provider_profiles_update_default(
+        &self,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = params;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::provider_profiles_update_default not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `host.providerAuthStatus` entries for Default configurations with
+    /// saved environment overrides (PROTOCOL §5.54): one
+    /// `{ id: baseProviderId, authenticated, identity? }` per such Default,
+    /// probed with its saved overlay; they replace the base sweep's rows.
+    /// `Some(id)` limits it to one base provider. Returns a JSON array
+    /// (empty when no Default has overrides).
+    fn provider_default_auth_status(
+        &self,
+        provider_id: Option<String>,
+        force: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (provider_id, force);
+        Box::pin(async { Ok(serde_json::Value::Array(Vec::new())) })
+    }
+
     /// `host.providerAuthStatus` entries for named profiles (PROTOCOL §5.54):
     /// one `{ id: providerRef, authenticated, identity? }` per profile, probed
     /// with that profile's saved environment. `Some(ref)` checks one profile

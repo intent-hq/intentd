@@ -247,10 +247,10 @@ pub(crate) fn read(root: &str, path: &str) -> Result<Value> {
 }
 
 /// Maximum bytes served per `file.readChunk` call BEFORE base64 encoding.
-/// Matches the transfer chunk cap ([`crate::transfer_import::IMPORT_MAX_CHUNK_BYTES`])
+/// Matches the transfer chunk cap ([`crate::feature_ports::IMPORT_MAX_CHUNK_BYTES`])
 /// so the ~21.4 MiB encoded frame stays comfortably under the 40 MiB
 /// outbound cap (PROTOCOL §1.3).
-pub(crate) const READ_CHUNK_MAX_BYTES: usize = crate::transfer_import::IMPORT_MAX_CHUNK_BYTES;
+pub(crate) const READ_CHUNK_MAX_BYTES: usize = crate::feature_ports::IMPORT_MAX_CHUNK_BYTES;
 
 /// `file.readChunk` → `{ content (base64), bytesRead, size }` — one
 /// offset-windowed slice of a workspace file's raw bytes, the FE-ward

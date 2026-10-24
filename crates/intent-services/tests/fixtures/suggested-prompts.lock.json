@@ -1,0 +1,7 @@
+{
+  "lockVersion": 1,
+  "sourceRepository": "intent-hq/intent",
+  "sourcePath": "docs/protocol/fixtures/suggested-prompts/v1",
+  "sourceCommit": "148d3fa8dbd3ce2420a3d8eb40fcc31d96e4c3ed",
+  "casesSha256": "b94dda8fd436b11e17a7d80f8cc8a0e7159111e3f1bf2ff83c54989d203a4046"
+}

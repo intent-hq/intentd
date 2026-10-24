@@ -1706,7 +1706,7 @@ async fn member_export_handles_remain_owned_by_the_authenticated_initiator() {
     let ws = WorkspaceId::new();
     svc.store.insert_workspace(&workspace(&ws)).await.unwrap();
     let export_id = "member-export".to_string();
-    svc.transfer_exports.lock().unwrap().insert(
+    svc.transfer_state().exports.lock().unwrap().insert(
         export_id.clone(),
         ExportSession {
             initiator: Some(member.clone()),

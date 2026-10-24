@@ -17,6 +17,9 @@ use crate::{Services, SettingsRegistry};
 
 const SECRET: &str = "sk-very-secret-value-1234";
 
+#[path = "provider_profiles_default_tests.rs"]
+mod default_overrides;
+
 struct Fixture {
     _db: TempDb,
     root: tempfile::TempDir,
@@ -523,7 +526,8 @@ async fn create_reports_every_field_error_and_writes_nothing() {
     );
     assert!(!fx.profiles_file().exists());
     let list = fx.svc.provider_profiles_list_impl(None).await.unwrap();
-    assert_eq!(list, json!({ "profiles": [], "revision": 0 }));
+    assert_eq!(list["profiles"], json!([]));
+    assert_eq!(list["revision"], 0);
 
     fx.create("codex", "Work", json!([])).await;
     let dup = fx

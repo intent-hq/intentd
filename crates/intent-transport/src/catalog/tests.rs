@@ -196,6 +196,7 @@ fn extract_fastpath_methods() -> HashSet<String> {
 // Human workspace discussions: +5 router methods; PR workspace lookup: +1.
 // Named provider profiles (§5.54): +4 router methods.
 // Provider profile order (§5.54 `providers.profiles.reorder`): +1 router method.
+// Default configuration overrides (§5.54 `providers.profiles.updateDefault`): +1 router method.
 // Generic event recovery adds the events.fence fast path.
 // Correlated discussion controls: +2 router methods.
 // Persisted guest roles: +1 owner-only role assignment method.
@@ -212,7 +213,7 @@ const EXPECTED_TOTAL_METHODS: usize = 458;
 /// Protocol 13.10 adds three cancellable note deletion controls.
 /// Five discussion methods and one PR workspace lookup method are additive.
 /// Named provider profiles (§5.54) add the four `providers.profiles.*` methods,
-/// then `providers.profiles.reorder`.
+/// then `providers.profiles.reorder` and `providers.profiles.updateDefault`.
 /// Correlated discussion controls add `discussion.stopAgent` and `discussion.retryAgent`.
 /// Persisted guest roles add `workspace.members.setRole`.
 /// Scoped repository pages and child Git policy add eight router methods.
@@ -811,6 +812,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "providers.profiles.list",
     "providers.profiles.reorder",
     "providers.profiles.update",
+    "providers.profiles.updateDefault",
     "providers.setup.cancel",
     "providers.setup.login",
     "providers.setup.start",
@@ -1382,6 +1384,7 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "providers.profiles.list",
     "providers.profiles.reorder",
     "providers.profiles.update",
+    "providers.profiles.updateDefault",
     "providers.setup.cancel",
     "providers.setup.login",
     "providers.setup.start",
@@ -2065,6 +2068,10 @@ mod unbound_owner_only_methods {
                 "providers.profiles.update",
                 json!({ "profileId": "p1", "name": "n" }),
             ),
+            (
+                "providers.profiles.updateDefault",
+                json!({ "baseProviderId": "codex", "name": "n" }),
+            ),
             ("sentry.assignIssue", json!({ "id": "i" })),
             ("sentry.authStatus", json!({})),
             ("sentry.getIssue", json!({ "id": "i" })),
@@ -2618,6 +2625,7 @@ fn member_methods_and_administrator_remainder_are_classified() {
         "providers.profiles.list",
         "providers.profiles.reorder",
         "providers.profiles.update",
+        "providers.profiles.updateDefault",
         "providers.setup.cancel",
         "providers.setup.login",
         "providers.setup.start",
