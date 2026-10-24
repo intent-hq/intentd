@@ -40,6 +40,7 @@ intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.11.41", 
 intent-core = { path = "../intent-core", version = "0.11.41" }
 intent-store = { path = "../intent-store", version = "0.11.41" }
 intent-services = { path = "../intent-services", version = "0.11.41" }
+intent-svc-transfer = { path = "../intent-svc-transfer", version = "0.11.41" }
 intent-acp = { path = "../intent-acp", version = "0.11.41" }
 intent-providers = { path = "../intent-providers", version = "0.11.41" }
 intent-git = { path = "../intent-git", version = "0.11.41" }
