@@ -98,6 +98,7 @@ mod enhance_ops;
 mod event_ops;
 mod event_subscriptions;
 pub mod events;
+mod feature_ports;
 mod file_ops;
 mod git_diff_singleflight;
 mod git_ops;
@@ -237,6 +238,7 @@ mod provider_images;
 pub mod provider_models;
 mod provider_preparation;
 mod provider_profiles;
+mod provider_quota_cache;
 mod provider_return;
 pub mod provider_test_prompt;
 mod quota_failover;
@@ -256,6 +258,7 @@ mod sentry_ops;
 mod settings;
 mod settings_registry;
 mod shell;
+mod stack_frame;
 pub(crate) mod stack_sample;
 mod task_effort;
 mod terminal_ops;
@@ -512,7 +515,8 @@ struct WorkspaceAggregateSnapshot {
     task_stats: Option<HashMap<WorkspaceId, WorkspaceTaskStats>>,
     sessions: Option<HashMap<WorkspaceId, Vec<AgentSession>>>,
     unread: Option<HashSet<WorkspaceId>>,
-    active_hooks: HashSet<WorkspaceId>,
+    /// Workspaces owning an active hook or script monitor (one UNION read).
+    active_hooks_or_script_monitors: HashSet<WorkspaceId>,
     active_pr_monitors: HashSet<WorkspaceId>,
     /// Each workspace's displayStatus-relevant PR monitor rows from the
     /// list's ONE bulk monitor read; folded per row during enrichment,
@@ -1106,6 +1110,9 @@ pub struct Services {
     /// Pending `provider_returned` announcements (PROTOCOL §5.54): see
     /// [`provider_return::ProviderReturnAnnouncements`].
     provider_return_announcements: provider_return::ProviderReturnAnnouncements,
+    /// Daemon-wide quota health per provider configuration (PROTOCOL §5.54):
+    /// see [`provider_quota_cache::ProviderQuotaCache`].
+    provider_quota_cache: provider_quota_cache::ProviderQuotaCache,
     /// One-shot truncation auto-redrive handoff flags
     /// (intent-hq/monorepo#2863): see
     /// [`agent_session::PendingTruncationRedrives`]. Shared across clones so
@@ -1192,6 +1199,10 @@ pub struct Services {
     /// `workspace_status` module. Shared across clones so every service
     /// handle compares against the same last-emitted value.
     last_waiting_statuses: Arc<workspace_status::WaitingStatusCache>,
+    /// `Workspace.scriptsRunning` recompute state (§5.1): the transition
+    /// baseline, per-workspace ordering gates and test seam, behind one `Arc`
+    /// to keep `Services` (and every future holding a clone) small.
+    scripts_running_state: Arc<workspace_status::ScriptsRunningState>,
     /// REV-1 agent-initiated reverse-dispatch seam: when an agent calls
     /// `ws.browser.exec` via the MCP front door there is no ambient client
     /// connection to reverse-dispatch on, so [`WorkspaceApi::browser_exec`]
@@ -1498,8 +1509,6 @@ pub struct Services {
     test_review_monitoring_recipient: bool,
     #[cfg(test)]
     test_review_monitor_write_ready: Arc<Mutex<Option<Arc<tokio::sync::Notify>>>>,
-    #[cfg(test)]
-    test_export_monitor_preflight: Arc<Mutex<Option<transfer_export::MonitorExportBarrier>>>,
     /// Upper bound on one shared forge fetch within a PR-monitor sweep (60 s
     /// in production) — defense in depth above the client-level network
     /// timeouts, so a hung connection can never wedge the sweep loop. Tests
@@ -1547,13 +1556,6 @@ pub struct Services {
     /// every pending deletion. Shared across clones so every front door
     /// observes one set.
     pending_agent_deletes: delete_grace::OwnedPendingDeletes,
-    /// In-flight staged workspace imports (`workspace.import.*`, keyed by
-    /// `importId`): manifest + staging paths + chunk cursor between `begin`
-    /// and `commit`/`abort`. Shared across clones so chunks arriving over any
-    /// connection append to the same staging file. In-memory only — a daemon
-    /// restart drops pending imports (staging dirs are swept lazily by the
-    /// next `begin`), and the FE simply restarts the upload.
-    transfer_imports: Arc<Mutex<HashMap<String, transfer_import::ImportSession>>>,
     /// Coalesced safe-context invalidations and bounded provider verdicts.
     execution_invalidation: Arc<tokio::sync::Notify>,
     execution_readiness: Arc<Mutex<HashMap<String, Option<bool>>>>,
@@ -1575,24 +1577,11 @@ pub struct Services {
     /// [`with_idempotency`]: same-key first-use callers serialize on the
     /// key so one runs the operation and the rest replay its stored result.
     idempotency_inflight: Arc<IdempotencyInflight>,
-    /// In-flight source-side exports (`workspace.export.*`, keyed by
-    /// `exportId`): build state + sealed archive + WIP bookkeeping between
-    /// `start` and `finalize`/`abort`. In-memory only — a daemon restart
-    /// drops sessions (staging dirs are swept at boot and lazily by the next
-    /// `start`), and the FE simply restarts the export.
-    transfer_exports: Arc<Mutex<HashMap<String, transfer_export::ExportSession>>>,
-    /// Test seam: when set, consulted between export archive build stages
-    /// with the name of the stage about to run; returning an error fails the
-    /// build at that point, exercising the `workspace:transfer:failed`
-    /// cleanup path. Production wiring keeps `None`; tests inject via the
-    /// `#[cfg(test)]`-only `with_export_build_failpoint`.
-    export_build_failpoint: Option<ExportBuildFailpoint>,
+    /// Registered feature ports (see [`feature_ports`]). Feature state such
+    /// as in-flight transfer sessions lives in the port implementations;
+    /// shared across clones.
+    ports: feature_ports::FeaturePorts,
 }
-
-/// Test-only export build failpoint (see
-/// [`Services::export_build_failpoint`]): given the name of the stage about
-/// to run, returning `Some(error)` fails the build there.
-pub(crate) type ExportBuildFailpoint = Arc<dyn Fn(&str) -> Option<Error> + Send + Sync>;
 
 /// Pause inserted between per-workspace iterations of the background sweeps
 /// ([`Services::refresh_all_workspace_prs`] / [`Services::scan_all_token_usage`])
@@ -1784,6 +1773,7 @@ impl Services {
             quota_failover_chains: Arc::new(Mutex::new(HashMap::new())),
             quota_failover_replays: Arc::new(Mutex::new(HashSet::new())),
             provider_return_announcements: Arc::new(Mutex::new(HashSet::new())),
+            provider_quota_cache: provider_quota_cache::ProviderQuotaCache::default(),
             pending_truncation_redrive: Arc::new(Mutex::new(HashSet::new())),
             test_busy: Arc::new(Mutex::new(HashSet::new())),
             deferred_attention: Arc::new(Mutex::new(HashMap::new())),
@@ -1795,6 +1785,7 @@ impl Services {
             idle_debounce_gen: Arc::new(Mutex::new(0)),
             last_display_statuses: Arc::new(workspace_status::DisplayStatusCache::default()),
             last_waiting_statuses: Arc::new(workspace_status::WaitingStatusCache::default()),
+            scripts_running_state: Arc::new(workspace_status::ScriptsRunningState::default()),
             reverse_dispatch: None,
             server_control: Arc::new(OnceLock::new()),
             invite_links: Arc::new(OnceLock::new()),
@@ -1885,8 +1876,6 @@ impl Services {
             test_review_monitoring_recipient: false,
             #[cfg(test)]
             test_review_monitor_write_ready: Arc::new(Mutex::new(None)),
-            #[cfg(test)]
-            test_export_monitor_preflight: Arc::default(),
             pr_monitor_fetch_timeout: pr_monitor::PR_MONITOR_FETCH_TIMEOUT,
             pr_refresh_fetch_timeout: PR_REFRESH_FETCH_TIMEOUT,
             sweep_rate_limit: Arc::new(rate_limit::RateLimitGate::default()),
@@ -1904,12 +1893,10 @@ impl Services {
             pending_agent_deletes: pending_deletes,
             execution_invalidation: Arc::new(tokio::sync::Notify::new()),
             execution_readiness: Arc::new(Mutex::new(HashMap::new())),
-            transfer_imports: Arc::new(Mutex::new(HashMap::new())),
             attachment_uploads: Arc::new(Mutex::new(HashMap::new())),
             attachment_idempotency_inflight: Arc::new(Mutex::new(HashMap::new())),
             idempotency_inflight: Arc::new(IdempotencyInflight::default()),
-            transfer_exports: Arc::new(Mutex::new(HashMap::new())),
-            export_build_failpoint: None,
+            ports: feature_ports::FeaturePorts::new(Arc::new(transfer::TransferFeature::default())),
         };
         services
             .gitlab_credential_gate
@@ -3034,6 +3021,13 @@ impl Services {
         script_ops::command_activity(&self.scripts, &self.script_locks)
     }
 
+    /// Whether `workspace_id` has a command-mode script run in flight — the
+    /// [`Self::command_script_activity`] predicate scoped to one workspace,
+    /// backing `Workspace.scriptsRunning` (§5.1). One registry lock, no I/O.
+    pub(crate) fn workspace_scripts_running(&self, workspace_id: &WorkspaceId) -> bool {
+        script_ops::workspace_command_running(&self.scripts, workspace_id)
+    }
+
     /// Clean daemon shutdown (monorepo#1526): flag every managed script with
     /// user-stop semantics (so no auto-restart races the teardown), kill every
     /// PTY session the host tracks — scripts and terminals alike — in one
@@ -3429,8 +3423,9 @@ impl Services {
                 .workspaces_with_unread_top_level_sessions_by_workspace(workspace_ids),
             self.compute_cow_supported(),
         );
-        let (active_hooks, monitors, legacy_question_tails, git_roots) = tokio::join!(
-            self.store.workspaces_with_active_hooks(workspace_ids),
+        let (active_hooks_or_script_monitors, monitors, legacy_question_tails, git_roots) = tokio::join!(
+            self.store
+                .workspaces_with_active_hooks_or_script_monitors(workspace_ids),
             self.store
                 .list_display_status_pr_monitors_by_workspaces(workspace_ids),
             self.store
@@ -3569,7 +3564,7 @@ impl Services {
             task_stats,
             sessions,
             unread: unread.ok(),
-            active_hooks: active_hooks.unwrap_or_default(),
+            active_hooks_or_script_monitors: active_hooks_or_script_monitors.unwrap_or_default(),
             active_pr_monitors,
             monitor_rows,
             git_root_prs,
@@ -3637,7 +3632,7 @@ impl Services {
         }
         ws.cow_supported = snapshot.cow_supported;
         let unread = snapshot.unread.as_ref().map(|ids| ids.contains(&ws.id));
-        let waiting = snapshot.active_hooks.contains(&ws.id)
+        let waiting = snapshot.active_hooks_or_script_monitors.contains(&ws.id)
             || snapshot.active_pr_monitors.contains(&ws.id)
             || sessions.is_some_and(|sessions| {
                 self.workspace_has_waiting_agent_subscriptions_in_sessions(&ws.id, sessions)
@@ -4663,7 +4658,17 @@ impl Services {
                 .to_string();
 
             // Insert interrupted_agent row (idempotent: second restart is a no-op).
-            if let Err(e) = self
+            // A pending row that graceful shutdown tagged with lost background
+            // workers (intent-hq/intent#7658) is the better record of this
+            // interruption: re-upserting would clear its tag (and prev_status).
+            let tagged = matches!(
+                self.store.get_interrupted_agent(&session.id).await,
+                Ok(Some(row)) if row.reason.as_deref()
+                    == Some(crate::agent_workers::INTERRUPTED_WITH_WORKERS_REASON)
+            );
+            if tagged {
+                tracing::debug!(agent_id = %session.id, "heal: keeping the background-workers interrupted_agent row");
+            } else if let Err(e) = self
                 .store
                 .insert_interrupted_agent(&session.id, &session.workspace_id, &prev_str, &now)
                 .await
@@ -4849,16 +4854,6 @@ impl Services {
     #[must_use]
     pub fn with_workspaces_root(mut self, root: PathBuf) -> Self {
         self.workspaces_root = Some(root);
-        self
-    }
-
-    /// Test-only: fail the export archive build mid-flight. The closure is
-    /// consulted with the name of each build stage about to run; returning
-    /// `Some(error)` fails the build there, exercising the
-    /// `workspace:transfer:failed` cleanup path.
-    #[cfg(test)]
-    pub(crate) fn with_export_build_failpoint(mut self, failpoint: ExportBuildFailpoint) -> Self {
-        self.export_build_failpoint = Some(failpoint);
         self
     }
 
@@ -21479,11 +21474,7 @@ impl WorkspaceApi for Services {
         &self,
         id: WorkspaceId,
     ) -> BoxFuture<'_, Result<intent_core::transfer::TransferPlan>> {
-        Box::pin(async move {
-            self.require_workspace_manager(&id, "workspace.transferPlan")
-                .await?;
-            self.workspace_transfer_plan_op(id).await
-        })
+        self.ports.transfer().transfer_plan(self, id)
     }
 
     fn workspace_import_begin(
@@ -21492,11 +21483,9 @@ impl WorkspaceApi for Services {
         archive_size_bytes: u64,
         archive_sha256: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move {
-            self.require_host_execution("workspace.importBegin").await?;
-            self.workspace_import_begin_op(manifest, archive_size_bytes, archive_sha256)
-                .await
-        })
+        self.ports
+            .transfer()
+            .import_begin(self, manifest, archive_size_bytes, archive_sha256)
     }
 
     fn workspace_import_chunk(
@@ -21505,41 +21494,27 @@ impl WorkspaceApi for Services {
         seq: u64,
         data: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move {
-            self.require_import_actor(&import_id, "workspace.importChunk")
-                .await?;
-            self.workspace_import_chunk_op(import_id, seq, data).await
-        })
+        self.ports
+            .transfer()
+            .import_chunk(self, import_id, seq, data)
     }
 
     fn workspace_import_commit(
         &self,
         import_id: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move {
-            self.require_import_actor(&import_id, "workspace.importCommit")
-                .await?;
-            self.workspace_import_commit_op(import_id).await
-        })
+        self.ports.transfer().import_commit(self, import_id)
     }
 
     fn workspace_import_abort(
         &self,
         import_id: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move {
-            self.require_import_actor(&import_id, "workspace.importAbort")
-                .await?;
-            self.workspace_import_abort_op(import_id).await
-        })
+        self.ports.transfer().import_abort(self, import_id)
     }
 
     fn workspace_export_start(&self, id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move {
-            self.require_workspace_manager(&id, "workspace.export.start")
-                .await?;
-            self.workspace_export_start_op(id).await
-        })
+        self.ports.transfer().export_start(self, id)
     }
 
     fn workspace_export_read(
@@ -21547,11 +21522,7 @@ impl WorkspaceApi for Services {
         export_id: String,
         seq: u64,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move {
-            self.require_export_actor(&export_id, "workspace.export.read")
-                .await?;
-            self.workspace_export_read_op(export_id, seq).await
-        })
+        self.ports.transfer().export_read(self, export_id, seq)
     }
 
     fn workspace_export_finalize(
@@ -21560,23 +21531,16 @@ impl WorkspaceApi for Services {
         archive_source: bool,
         final_status_message: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move {
-            self.require_export_actor(&export_id, "workspace.export.finalize")
-                .await?;
-            self.workspace_export_finalize_op(export_id, archive_source, final_status_message)
-                .await
-        })
+        self.ports
+            .transfer()
+            .export_finalize(self, export_id, archive_source, final_status_message)
     }
 
     fn workspace_export_abort(
         &self,
         export_id: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move {
-            self.require_export_actor(&export_id, "workspace.export.abort")
-                .await?;
-            self.workspace_export_abort_op(export_id).await
-        })
+        self.ports.transfer().export_abort(self, export_id)
     }
 
     fn create_workspace(
@@ -22626,6 +22590,7 @@ impl WorkspaceApi for Services {
                         pull_requests_total: None,
                         display_status: None,
                         waiting: false,
+                        scripts_running: false,
                         checkout_mode: None,
                         disk_usage: None,
                         pending_delete_at: None,
@@ -24623,6 +24588,7 @@ impl WorkspaceApi for Services {
                 pull_requests_total: None,
                 display_status: None,
                 waiting: false,
+                scripts_running: false,
                 checkout_mode: None,
                 disk_usage: None,
                 pending_delete_at: None,

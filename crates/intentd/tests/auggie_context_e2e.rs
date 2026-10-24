@@ -13,7 +13,7 @@
 //!
 //! ```sh
 //! # from packages/intentd
-//! INTENTD_AUGGIE_E2E=1 cargo test -p intentd --test auggie_context_e2e -- --nocapture
+//! INTENTD_AUGGIE_E2E=1 cargo test -p intentd --test suite_e2e auggie_context_e2e:: -- --nocapture
 //! ```
 //!
 //! Requirements for the test to actually exercise the path (rather than skip):
@@ -27,7 +27,7 @@
 //! fails. This is the realistic "best-effort/local" form: CI does not provision
 //! auggie credentials, so the gated path simply does not run there.
 
-mod common;
+use crate::common;
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -193,6 +193,7 @@ fn workspace(id: &WorkspaceId, worktree: &Path) -> Workspace {
         pull_requests_total: None,
         display_status: None,
         waiting: false,
+        scripts_running: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,

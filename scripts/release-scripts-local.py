@@ -49,7 +49,7 @@ VERSION = re.compile(r'(\d+(?:\.\d+)+)')
 
 
 # Leave the caller's worktree as found: a suite importing a sibling module
-# would otherwise write scripts/__pycache__, which nothing git-ignores there.
+# would otherwise write scripts/__pycache__ (git-ignored, but left on disk).
 SUITE_ENV = {'PYTHONDONTWRITEBYTECODE': '1'}
 
 

@@ -90,14 +90,20 @@ jobs:
           # coverage-all, coverage-e2e and the Linux daemon-lifecycle leg run
           # only in the queue and take a free xl or heavy slot there (longest
           # first, so coverage-all gets the xl slot), or burst to WarpBuild.
-          # check takes an 8-CPU heavy slot (never the xl slot coverage-changed
-          # needs) but bursts as gh-linux-16x: WarpBuild measured it at p90 97%
-          # of 8 CPUs and 19.7 GB, so its merge-queue and overflow runs use 16.
+          # check asks for gh-linux-16x (WarpBuild measured it at p90 97% of 8
+          # CPUs and 19.7 GB), so it takes an xl slot when one is left after
+          # coverage-changed, else a heavy slot, else a 16x burst. Its minutes
+          # stay below coverage-changed's so coverage-changed (15.5 min on xl,
+          # ~33 on heavy) always picks first within a run. Two corners: with
+          # no xl slot and one heavy slot free, coverage-changed takes the
+          # heavy slot and check bursts; and the ranking is per run, so a
+          # concurrent PR's check can take the last xl slot before this run's
+          # coverage-changed asks, leaving it a heavy slot.
           # Minutes are typical PR / merge-queue durations. release-fast-path
           # (release branches only) and the gate keep the `runners` mapping.
           SLOT_JOBS: >-
             [
-            {"key":"check","label":"gh-linux-8x","burst":"gh-linux-16x","rust":true,"minutes":15,"events":["pull_request"]},
+            {"key":"check","label":"gh-linux-16x","rust":true,"minutes":12,"events":["pull_request"]},
             {"key":"coverage-changed","label":"gh-linux-16x","rust":true,"minutes":13,"events":["pull_request"]},
             {"key":"release-scripts","label":"ubuntu-24.04","minutes":6},
             {"key":"pr-static","label":"ubuntu-24.04","minutes":1,"events":["pull_request"]},
@@ -395,7 +401,7 @@ jobs:
     # Every other PR still runs it, and the merge queue always does.
     if: ${{ !cancelled() && needs.route.result == 'success' && (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && needs.release-fast-path.outputs.fast_path != 'true')) }}
     needs: [route, release-fast-path]
-    runs-on: ${{ fromJSON(needs.route.outputs.slots || '{}')['check'] || fromJSON('["warp-ubuntu-2404-x64-8x"]') }}
+    runs-on: ${{ fromJSON(needs.route.outputs.slots || '{}')['check'] || fromJSON('["warp-ubuntu-2404-x64-16x"]') }}
     # The cold-cache check job exhausted its 20-minute budget after its tests
     # passed in run 37305697722. Allow completion/cache margin without changing
     # individual test timeouts.
@@ -503,7 +509,11 @@ jobs:
         if: github.event_name == 'merge_group'
         env:
           INTENTD_ASSERT_BOUND_CALLER: "1"
-        run: cargo test --locked -p intentd --features repository-test-fixtures --test e2e_wss_gitlab_auth --test e2e_wss_invite_join_gitlab --test e2e_repository_resource_read -- --test-threads=2
+        # The invitation and checkout files are modules of suite targets
+        # (tests/suite_*.rs); the module filter keeps the run to their tests.
+        run: |
+          cargo test --locked -p intentd --features repository-test-fixtures --test e2e_wss_gitlab_auth -- --test-threads=2
+          cargo test --locked -p intentd --features repository-test-fixtures --test suite_wss_g_r --test suite_wss_repo -- --test-threads=2 e2e_wss_invite_join_gitlab:: e2e_repository_resource_read::
 
       - uses: taiki-e/install-action@cargo-shear
       # Blocking unused-dependency gate: fails when any crate declares a
@@ -817,12 +827,12 @@ jobs:
                   "tunnel::tests::connect_reset_preserves_error_before_deadline",
                   "tunnel::tests::connect_success_before_deadline_relays",
               ]),
-              (["-p", "intentd", "--test", "e2e_wss_tunnel"], [
-                  "tunnel_open_echo_eof_close_lifecycle",
-                  "tunnel_open_err_for_closed_port_keeps_connection_alive",
-                  "tunnel_close_tears_down_and_frees_stream_id",
-                  "tunnel_connections_counted_in_health_and_stopped",
-                  "tunnel_unauthenticated_upgrade_rejected",
+              (["-p", "intentd", "--test", "suite_wss_s_z"], [
+                  "e2e_wss_tunnel::tunnel_open_echo_eof_close_lifecycle",
+                  "e2e_wss_tunnel::tunnel_open_err_for_closed_port_keeps_connection_alive",
+                  "e2e_wss_tunnel::tunnel_close_tears_down_and_frees_stream_id",
+                  "e2e_wss_tunnel::tunnel_connections_counted_in_health_and_stopped",
+                  "e2e_wss_tunnel::tunnel_unauthenticated_upgrade_rejected",
               ]),
           ]
 
@@ -1040,7 +1050,7 @@ jobs:
           INTENTD_SETUP_TOOLCHAIN: ${{ steps.toolchain.outputs.channel }}
         run: |
           rustup run "$INTENTD_SETUP_TOOLCHAIN" cargo test --locked -p intent-pty --lib --target ${{ matrix.target }} conpty_startup::tests -- --nocapture
-          rustup run "$INTENTD_SETUP_TOOLCHAIN" cargo test -p intentd --test e2e_wss_setup_headless --target ${{ matrix.target }} -- --nocapture
+          rustup run "$INTENTD_SETUP_TOOLCHAIN" cargo test -p intentd --test suite_wss_s_z --target ${{ matrix.target }} e2e_wss_setup_headless:: -- --nocapture
       - uses: actions/upload-artifact@v7
         if: always()
         with:
@@ -1141,13 +1151,13 @@ jobs:
             exit 1
           fi
           rustup run "$INTENTD_DIAGNOSTIC_TOOLCHAIN" cargo test -p intent-services --lib --target ${{ matrix.target }} "$filter" -- --nocapture
-          listed=$(rustup run "$INTENTD_DIAGNOSTIC_TOOLCHAIN" cargo test -p intentd --test e2e_doctor_codex --target ${{ matrix.target }} -- --list)
+          listed=$(rustup run "$INTENTD_DIAGNOSTIC_TOOLCHAIN" cargo test -p intentd --test suite_e2e --target ${{ matrix.target }} e2e_doctor_codex:: -- --list)
           printf '%s\n' "$listed"
           if ! grep -F 'macos_catalog_rejection_precedes_npm_authentication_and_probe_state: test' <<< "$listed" > /dev/null; then
             echo '::error::macOS doctor command regression was not selected.'
             exit 1
           fi
-          rustup run "$INTENTD_DIAGNOSTIC_TOOLCHAIN" cargo test -p intentd --test e2e_doctor_codex --target ${{ matrix.target }} -- --nocapture
+          rustup run "$INTENTD_DIAGNOSTIC_TOOLCHAIN" cargo test -p intentd --test suite_e2e --target ${{ matrix.target }} e2e_doctor_codex:: -- --nocapture
       # These retained workspace fixtures used to skip on Linux before reaching
       # their unbound caller. Require native CoW operations and original oracles.
       - name: Retained workspace CoW fixtures (macOS runtime)
@@ -1927,8 +1937,9 @@ jobs:
   # --instrumented llvm-cov form; intent-hq/intentd#1947), and the stub-root
   # harness for the repo-root Makefile (every gate target forwards to the
   # monorepo root make with its command-line variables; a standalone clone or
-  # an unrelated parent Makefile gets the exit-2 refusal). Seconds-long like
-  # the other utility jobs, it uses the shared self-hosted-first route.
+  # an unrelated parent Makefile gets the exit-2 refusal). It also rejects
+  # tracked Python bytecode (scripts/check-no-python-cache.sh). Seconds-long
+  # like the other utility jobs, it uses the shared self-hosted-first route.
   release-scripts:
     needs: [route]
     runs-on: ${{ fromJSON(needs.route.outputs.slots || '{}')['release-scripts'] || fromJSON('["ubuntu-24.04"]') }}
@@ -1948,6 +1959,12 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.11'
+      # .gitignore covers new caches, but `git add -f` bypasses it; this job
+      # also runs in the merge queue and on main, unlike pr-static.
+      - name: Reject tracked Python bytecode
+        run: ./scripts/check-no-python-cache.sh
+      - name: Test the tracked Python bytecode check
+        run: ./scripts/test-check-no-python-cache.sh
       - name: Test release metadata and auto-cut guards (offline)
         run: |
           python3 -S scripts/test-release-pr-fast-path.py

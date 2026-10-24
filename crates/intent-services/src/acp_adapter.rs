@@ -242,6 +242,10 @@ impl AcpAdapterCommand {
         }
         #[cfg(unix)]
         command.process_group(0);
+        // An ephemeral adapter chain (npx → adapter → provider CLI) competes
+        // for CPU and disk like a session agent does, so it starts at the
+        // same reduced priority and can never starve the daemon.
+        intent_acp::AgentPriority::from_env().apply(&mut command);
 
         command
     }
@@ -873,6 +877,8 @@ fn spawn_admitted_adapter(
     let mut child = command
         .spawn()
         .map_err(|e| format!("{}: {e}", cmd.program.display()))?;
+    intent_acp::AgentPriority::from_env()
+        .warn_on_shortfall(child.id(), &cmd.program.display().to_string());
     let spawn_pid = child
         .id()
         .ok_or_else(|| format!("{}: spawned child has no pid", cmd.program.display()))?;
@@ -1328,6 +1334,37 @@ mod reap_tests {
     // Table-walk unit tests for the sweep live with the shared helper in
     // `intent_acp::descendant_sweep`; this module keeps the adapter-level
     // integration regression.
+
+    /// Ephemeral adapter runs (model probe, one-shot completion) start at
+    /// the same reduced CPU + IO priority as session agents: before this,
+    /// `command_in` spawned them at the daemon's own priority.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_in_starts_adapter_at_reduced_priority() {
+        let cmd = AcpAdapterCommand::binary(
+            PathBuf::from("sh"),
+            vec!["-c".into(), "exec sleep 30".into()],
+        );
+        let mut command = cmd.command_in(&std::env::temp_dir());
+        let child = command.spawn().expect("spawn sh");
+        let pid = child.id().expect("child pid");
+        let priority = intent_acp::AgentPriority::from_env();
+        assert_eq!(priority.shortfall(pid), None);
+        if priority.nice_increment > 0 {
+            // SAFETY: plain syscall wrappers with no pointer arguments.
+            let (own, got) = unsafe {
+                (
+                    libc::getpriority(libc::PRIO_PROCESS, 0),
+                    libc::getpriority(libc::PRIO_PROCESS, pid as libc::id_t),
+                )
+            };
+            assert!(
+                got > own || own >= 19,
+                "adapter child nice {got} not below daemon nice {own}"
+            );
+        }
+        drop(child);
+    }
 
     #[expect(clippy::similar_names)] // pid/pgid are the POSIX terms
     /// Regression for the live escape: an MCP-server-style grandchild that

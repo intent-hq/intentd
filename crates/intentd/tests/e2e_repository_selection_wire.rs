@@ -1,7 +1,7 @@
 //! Original-socket selection intent through actual cold UDS/authenticated WSS.
 //! Disposable databases, empty roots and credentials; no Git or provider action.
 #![cfg(unix)]
-mod common;
+use crate::common;
 use futures_util::{SinkExt, StreamExt};
 use intent_core::{
     now_iso, Principal, PrincipalId, WorkspaceGitRootId, WorkspaceId, WorkspaceRole,

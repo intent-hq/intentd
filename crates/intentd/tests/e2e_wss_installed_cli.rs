@@ -4,7 +4,7 @@
 //! No npm downloads, account credentials or paid prompts occur in this test.
 //! The only package-dispatch shim selects those unchanged adapter entrypoints.
 #![cfg(unix)]
-mod common;
+use crate::common;
 use futures_util::{SinkExt, StreamExt};
 use intentd_test_support::GuardedChild;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};

@@ -1,7 +1,7 @@
 //! Cold ordinary repository-context reads over actual UDS and authenticated WSS.
 //! All stores, Git roots, credentials and TLS endpoints belong to this fixture.
 #![cfg(unix)]
-mod common;
+use crate::common;
 #[path = "e2e_repository_context_wire/monitor_attachment.rs"]
 mod monitor_attachment;
 #[cfg(feature = "repository-test-fixtures")]

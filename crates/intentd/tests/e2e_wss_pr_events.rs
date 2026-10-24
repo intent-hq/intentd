@@ -9,7 +9,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
@@ -404,6 +404,7 @@ async fn boot_seeded(
         pull_requests_total: None,
         display_status: None,
         waiting: false,
+        scripts_running: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,

@@ -1,7 +1,7 @@
 //! Original listeners, private Store membership and managed cache on real UDS/WSS.
 //! Controlled provider only; checkout controls also use disposable Git and TLS peers.
 #![cfg(unix)]
-mod common;
+use crate::common;
 use futures_util::{SinkExt, StreamExt};
 use intent_core::{now_iso, Principal, PrincipalId, WorkspaceApi, WorkspaceId, WorkspaceRole};
 use intent_services::{EventBus, Services, SettingsRegistry};

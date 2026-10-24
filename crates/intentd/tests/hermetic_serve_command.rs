@@ -1,5 +1,5 @@
 //! Command-only identity contract: never spawn a daemon or inspect host credentials.
-mod common;
+use crate::common;
 
 use std::ffi::OsStr;
 use std::path::Path;

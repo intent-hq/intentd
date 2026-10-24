@@ -1432,7 +1432,7 @@ async fn monitor_export_defers_delivery_and_queue_drain_until_abort() {
     row.reason = Some("ttl-expired".into());
     row.settled_at = Some(now_iso());
     h.services.store.settle_script_monitor(&row).await.unwrap();
-    h.services.transfer_exports.lock().unwrap().insert(
+    h.services.transfer_state().exports.lock().unwrap().insert(
         "export-test".into(),
         crate::transfer_export::ExportSession {
             initiator: None,
@@ -1458,7 +1458,7 @@ async fn monitor_export_defers_delivery_and_queue_drain_until_abort() {
     assert!(!h.services.has_ready_to_send(&owner));
     assert!(h.services.dequeue_message(&owner).is_none());
     h.services
-        .transfer_exports
+        .transfer_state().exports
         .lock()
         .unwrap()
         .remove("export-test");

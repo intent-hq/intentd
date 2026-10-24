@@ -895,6 +895,7 @@ fn channel_event_types_full_matrix() {
         "workspace:attention-changed",
         "workspace:displayStatus-changed",
         "workspace:waiting-changed",
+        "workspace:scriptsRunning-changed",
         "pr:linked",
         "pr:updated",
         "pr:unlinked",
@@ -905,7 +906,7 @@ fn channel_event_types_full_matrix() {
     ] {
         assert!(ws.iter().any(|s| s == t), "workspace missing {t}");
     }
-    assert_eq!(ws.len(), 21);
+    assert_eq!(ws.len(), 22);
     // Comment channel — creation and deletion refresh the affected thread.
     assert_eq!(
         channel_event_types(Channel::Comment),

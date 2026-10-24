@@ -19,7 +19,7 @@ use intent_store::{RepositoryHostAuthoritySnapshot, RepositoryLifecycleKey};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::{Duration, Instant};
 
-use super::{Connection, Services};
+use super::{frame_ttl, request_wait, Connection, Services};
 use crate::repository_admission::lifecycle::{RepositorySourceLifetime, RepositorySubscription};
 use crate::repository_admission::AdmissionError;
 use crate::source_control_auth_ops::checkout::CheckoutAuthority;
@@ -28,8 +28,12 @@ use crate::source_control_auth_ops::repository_owner::{
     GitlabChildPolicyExpected, GitlabChildPolicyReceipt,
 };
 
-const FRAME_TTL: Duration = Duration::from_secs(15);
-const WORK_LIMIT: Duration = Duration::from_secs(10);
+const WORK_LIMIT_BASE: Duration = Duration::from_secs(10);
+/// Bound on one child Git operation; stretched in unit tests like every native
+/// request wait.
+fn work_limit() -> Duration {
+    request_wait(WORK_LIMIT_BASE)
+}
 fn unavailable() -> Error {
     Error::Forbidden("Child Git unavailable".into())
 }
@@ -212,7 +216,7 @@ pub(super) fn capture_frame(c: &Connection, frame: Frame) -> Arc<dyn RepositoryR
             _permits: (local, global),
             authority: Mutex::new(None),
             authorized: AtomicBool::new(false),
-            deadline: Instant::now() + FRAME_TTL,
+            deadline: Instant::now() + frame_ttl(),
         });
         // This is intentionally before queue admission and the first permission
         // await. No later account may replace this original captured producer.
@@ -340,7 +344,7 @@ impl RepositoryReadRequestScope for Request {
             }
             self.check()?;
             let anchor = self.anchor.as_ref().ok_or_else(unavailable)?;
-            tokio::time::timeout(WORK_LIMIT, async {
+            tokio::time::timeout(work_limit(), async {
                 let _legacy = self
                     .connection
                     .caller
@@ -395,7 +399,7 @@ pub(crate) fn credential(
     let captured = Request::current(services, &Frame::Credential(q.clone()));
     Box::pin(async move {
         let r = captured?;
-        let result = tokio::time::timeout(WORK_LIMIT, async {
+        let result = tokio::time::timeout(work_limit(), async {
             if !r.connection.caller.is_admitted_local() {
                 return Err(unavailable());
             }
@@ -459,7 +463,7 @@ async fn policy_reply(
     update: Option<GitlabChildGitPolicySet>,
 ) -> Result<GitlabChildGitPolicy> {
     let r = captured?;
-    let result = tokio::time::timeout(WORK_LIMIT, async {
+    let result = tokio::time::timeout(work_limit(), async {
         let _legacy = r.connection.caller.legacy_lease().await.map_err(denied)?;
         let anchor = r.anchor.clone().ok_or_else(unavailable)?;
         anchor.authorize().await?;
