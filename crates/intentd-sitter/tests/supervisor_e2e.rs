@@ -3715,8 +3715,11 @@ case "$1" in
     done
     if [ "${FAKE_PARK_BEFORE_PID:-}" = 1 ]; then
       echo "$$" > "$INTENTD_DATA_DIR/daemon-parked"
+      # The ~2 min bound outlasts every test wait; it only stops a failed test leaking this loop.
+      i=0
       # // timing-guard: parked before recording its PID until the sitter kills it
-      while :; do sleep 0.05; done
+      while [ "$i" -lt 2400 ]; do sleep 0.05; i=$((i + 1)); done
+      exit 1
     fi
     echo "$$" > "$INTENTD_DATA_DIR/daemon-pid"
     printf '%s\n' "$@" >> "$FAKE_DAEMON_LOG"
@@ -4136,7 +4139,7 @@ fn background_start_help_invalid_options_and_timeout_leave_no_supervisor() {
     let mut cmd = sitter_command(dir.path(), &base);
     cmd.arg("start")
         .env("FAKE_NO_READY", "1")
-        .env(intentd_sitter::readiness::TIMEOUT_ENV, "500")
+        .env(intentd_sitter::readiness::TIMEOUT_ENV, scaled_ms(500))
         .env(KILL_TIMEOUT_ENV, "200");
     let mut child = spawn_guarded(&mut cmd);
     assert!(!child
@@ -4145,9 +4148,10 @@ fn background_start_help_invalid_options_and_timeout_leave_no_supervisor() {
         .unwrap()
         .success());
     assert!(!fixture.paths.pid_path.exists());
-    // On a loaded runner the 500 ms budget can expire before the supervisor
+    // On a loaded runner the short budget can expire before the supervisor
     // launches or before the fake daemon records its PID (intent-hq/intent#7703),
-    // so the record is optional; the survivor check covers every ordering.
+    // so the record is optional; the survivor check covers every ordering and
+    // the next test forces the unrecorded one.
     assert_no_survivors(dir.path(), recorded_pid(&dir.path().join("daemon-pid")));
 }
 
@@ -4161,7 +4165,7 @@ fn background_start_timeout_kills_a_daemon_that_never_recorded_its_pid() {
     let mut cmd = sitter_command(dir.path(), &dead_url());
     cmd.arg("start")
         .env("FAKE_PARK_BEFORE_PID", "1")
-        .env(intentd_sitter::readiness::TIMEOUT_ENV, "5000")
+        .env(intentd_sitter::readiness::TIMEOUT_ENV, scaled_ms(5000))
         .env(KILL_TIMEOUT_ENV, "200");
     let mut child = spawn_guarded(&mut cmd);
     let parked_path = dir.path().join("daemon-parked");
@@ -4175,7 +4179,7 @@ fn background_start_timeout_kills_a_daemon_that_never_recorded_its_pid() {
     // survivor check below cannot pass vacuously.
     #[cfg(target_os = "linux")]
     assert!(
-        live_processes_with_data_dir(dir.path()).contains(&parked.as_raw().cast_unsigned()),
+        live_processes_with_data_dir(dir.path()).contains(&parked),
         "the scan must see the parked daemon"
     );
     assert!(!child
@@ -4188,36 +4192,57 @@ fn background_start_timeout_kills_a_daemon_that_never_recorded_its_pid() {
     assert_no_survivors(dir.path(), Some(parked));
 }
 
-/// PID recorded in a fake-daemon file; `None` while it is missing or partly
-/// written (a kill can land between the shell truncating and writing it).
-fn recorded_pid(path: &Path) -> Option<Pid> {
-    fs::read_to_string(path)
-        .ok()?
-        .trim()
-        .parse()
-        .ok()
-        .map(Pid::from_raw)
+/// `ms` scaled like every other test wait, as a sitter `*_MS` env value.
+fn scaled_ms(ms: u64) -> String {
+    intentd_test_support::test_timeout(Duration::from_millis(ms))
+        .as_millis()
+        .to_string()
 }
 
-/// After a failed `start`, wait until nothing it launched for `data_dir` is
-/// alive. Linux scans every process carrying the data dir, recorded or not;
-/// signal 0 still succeeds on an unreaped zombie, so there the scan alone is
-/// authoritative. Elsewhere only a recorded `daemon` can be checked.
-fn assert_no_survivors(
-    #[cfg_attr(not(target_os = "linux"), expect(unused_variables))] data_dir: &Path,
-    #[cfg_attr(target_os = "linux", expect(unused_variables))] daemon: Option<Pid>,
-) {
-    let timeout = intentd_test_support::test_timeout(Duration::from_secs(5));
+/// PID recorded in a fake-daemon file; `None` while it is missing or partly
+/// written (a kill can land between the shell truncating and writing it).
+fn recorded_pid(path: &Path) -> Option<u32> {
+    fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// Whether `pid` has exited. An unreaped zombie still answers signal 0, so
+/// Linux reads its state instead; elsewhere the caller's wait outlasts the reap.
+fn exited(pid: u32) -> bool {
     #[cfg(target_os = "linux")]
-    wait_until("no live process from the timed-out start", timeout, || {
-        live_processes_with_data_dir(data_dir).is_empty()
-    });
-    #[cfg(not(target_os = "linux"))]
-    if let Some(daemon) = daemon {
-        wait_until("recorded daemon exit", timeout, || {
-            kill(daemon, None) == Err(Errno::ESRCH)
-        });
+    {
+        match fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Err(_) => true,
+            Ok(stat) => stat
+                .rsplit_once(") ")
+                .is_some_and(|(_, fields)| fields.starts_with(['Z', 'X'])),
+        }
     }
+    #[cfg(not(target_os = "linux"))]
+    {
+        !alive(pid)
+    }
+}
+
+/// After a failed `start`, wait until the recorded daemon (if any) has exited
+/// and, on Linux, no live process carries `data_dir` — which also covers a
+/// daemon that never recorded its PID, and the supervisor.
+fn assert_no_survivors(data_dir: &Path, daemon: Option<u32>) {
+    wait_until(
+        "no live process from the timed-out start",
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        || daemon.is_none_or(exited) && no_live_process_with_data_dir(data_dir),
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn no_live_process_with_data_dir(data_dir: &Path) -> bool {
+    live_processes_with_data_dir(data_dir).is_empty()
+}
+
+/// Without `/proc`, only a recorded PID can be checked.
+#[cfg(not(target_os = "linux"))]
+fn no_live_process_with_data_dir(_data_dir: &Path) -> bool {
+    true
 }
 
 /// PIDs of live processes whose environment carries `DATA_DIR_ENV=<data_dir>`,
