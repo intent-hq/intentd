@@ -258,6 +258,7 @@ mod sentry_ops;
 mod settings;
 mod settings_registry;
 mod shell;
+mod stack_frame;
 pub(crate) mod stack_sample;
 mod task_effort;
 mod terminal_ops;
@@ -515,7 +516,8 @@ struct WorkspaceAggregateSnapshot {
     task_stats: Option<HashMap<WorkspaceId, WorkspaceTaskStats>>,
     sessions: Option<HashMap<WorkspaceId, Vec<AgentSession>>>,
     unread: Option<HashSet<WorkspaceId>>,
-    active_hooks: HashSet<WorkspaceId>,
+    /// Workspaces owning an active hook or script monitor (one UNION read).
+    active_hooks_or_script_monitors: HashSet<WorkspaceId>,
     active_pr_monitors: HashSet<WorkspaceId>,
     /// Each workspace's displayStatus-relevant PR monitor rows from the
     /// list's ONE bulk monitor read; folded per row during enrichment,
@@ -1194,6 +1196,10 @@ pub struct Services {
     /// `workspace_status` module. Shared across clones so every service
     /// handle compares against the same last-emitted value.
     last_waiting_statuses: Arc<workspace_status::WaitingStatusCache>,
+    /// `Workspace.scriptsRunning` recompute state (§5.1): the transition
+    /// baseline, per-workspace ordering gates and test seam, behind one `Arc`
+    /// to keep `Services` (and every future holding a clone) small.
+    scripts_running_state: Arc<workspace_status::ScriptsRunningState>,
     /// REV-1 agent-initiated reverse-dispatch seam: when an agent calls
     /// `ws.browser.exec` via the MCP front door there is no ambient client
     /// connection to reverse-dispatch on, so [`WorkspaceApi::browser_exec`]
@@ -1796,6 +1802,7 @@ impl Services {
             idle_debounce_gen: Arc::new(Mutex::new(0)),
             last_display_statuses: Arc::new(workspace_status::DisplayStatusCache::default()),
             last_waiting_statuses: Arc::new(workspace_status::WaitingStatusCache::default()),
+            scripts_running_state: Arc::new(workspace_status::ScriptsRunningState::default()),
             reverse_dispatch: None,
             server_control: Arc::new(OnceLock::new()),
             invite_links: Arc::new(OnceLock::new()),
@@ -3035,6 +3042,13 @@ impl Services {
         script_ops::command_activity(&self.scripts, &self.script_locks)
     }
 
+    /// Whether `workspace_id` has a command-mode script run in flight — the
+    /// [`Self::command_script_activity`] predicate scoped to one workspace,
+    /// backing `Workspace.scriptsRunning` (§5.1). One registry lock, no I/O.
+    pub(crate) fn workspace_scripts_running(&self, workspace_id: &WorkspaceId) -> bool {
+        script_ops::workspace_command_running(&self.scripts, workspace_id)
+    }
+
     /// Clean daemon shutdown (monorepo#1526): flag every managed script with
     /// user-stop semantics (so no auto-restart races the teardown), kill every
     /// PTY session the host tracks — scripts and terminals alike — in one
@@ -3430,8 +3444,9 @@ impl Services {
                 .workspaces_with_unread_top_level_sessions_by_workspace(workspace_ids),
             self.compute_cow_supported(),
         );
-        let (active_hooks, monitors, legacy_question_tails, git_roots) = tokio::join!(
-            self.store.workspaces_with_active_hooks(workspace_ids),
+        let (active_hooks_or_script_monitors, monitors, legacy_question_tails, git_roots) = tokio::join!(
+            self.store
+                .workspaces_with_active_hooks_or_script_monitors(workspace_ids),
             self.store
                 .list_display_status_pr_monitors_by_workspaces(workspace_ids),
             self.store
@@ -3570,7 +3585,7 @@ impl Services {
             task_stats,
             sessions,
             unread: unread.ok(),
-            active_hooks: active_hooks.unwrap_or_default(),
+            active_hooks_or_script_monitors: active_hooks_or_script_monitors.unwrap_or_default(),
             active_pr_monitors,
             monitor_rows,
             git_root_prs,
@@ -3638,7 +3653,7 @@ impl Services {
         }
         ws.cow_supported = snapshot.cow_supported;
         let unread = snapshot.unread.as_ref().map(|ids| ids.contains(&ws.id));
-        let waiting = snapshot.active_hooks.contains(&ws.id)
+        let waiting = snapshot.active_hooks_or_script_monitors.contains(&ws.id)
             || snapshot.active_pr_monitors.contains(&ws.id)
             || sessions.is_some_and(|sessions| {
                 self.workspace_has_waiting_agent_subscriptions_in_sessions(&ws.id, sessions)
@@ -4668,7 +4683,17 @@ impl Services {
                 .to_string();
 
             // Insert interrupted_agent row (idempotent: second restart is a no-op).
-            if let Err(e) = self
+            // A pending row that graceful shutdown tagged with lost background
+            // workers (intent-hq/intent#7658) is the better record of this
+            // interruption: re-upserting would clear its tag (and prev_status).
+            let tagged = matches!(
+                self.store.get_interrupted_agent(&session.id).await,
+                Ok(Some(row)) if row.reason.as_deref()
+                    == Some(crate::agent_workers::INTERRUPTED_WITH_WORKERS_REASON)
+            );
+            if tagged {
+                tracing::debug!(agent_id = %session.id, "heal: keeping the background-workers interrupted_agent row");
+            } else if let Err(e) = self
                 .store
                 .insert_interrupted_agent(&session.id, &session.workspace_id, &prev_str, &now)
                 .await
@@ -22665,6 +22690,7 @@ impl WorkspaceApi for Services {
                         pull_requests_total: None,
                         display_status: None,
                         waiting: false,
+                        scripts_running: false,
                         checkout_mode: None,
                         disk_usage: None,
                         pending_delete_at: None,
@@ -24697,6 +24723,7 @@ impl WorkspaceApi for Services {
                 pull_requests_total: None,
                 display_status: None,
                 waiting: false,
+                scripts_running: false,
                 checkout_mode: None,
                 disk_usage: None,
                 pending_delete_at: None,

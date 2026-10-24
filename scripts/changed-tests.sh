@@ -24,7 +24,9 @@
 # queue's coverage-e2e / coverage-all jobs use, with the same env and the same
 # auggie_context_e2e exclusion (see scripts/coverage-e2e.sh):
 #   INTENTD_TEST_TIMEOUT_MULTIPLIER=3 cargo llvm-cov --no-report nextest <plan>
-#       [--build-jobs N] [--test-threads N] -E 'not binary(auggie_context_e2e)'
+#       [--build-jobs N] [--test-threads N] -E 'not test(/^auggie_context_e2e::/)'
+# (a plan that carries its own -E has the exclusion ANDed into it, since
+# nextest ORs repeated -E flags).
 # No `cargo llvm-cov clean`, no report: the point is executing the changed
 # tests under instrumentation (intent-hq/intentd#1947), not a coverage number.
 # --instrumented cannot be combined with --runner (usage error).
@@ -33,6 +35,10 @@
 # (committed, staged and unstaged edits) plus the untracked files from
 # `git ls-files --others`. Paths map to per-crate nextest selections:
 #   crates/<c>/tests/<t>.rs          -p <c> --test <t>   (--tests once deleted)
+#   crates/<c>/tests/<m>.rs, or      -p <c> --test <s> -E 'binary_id(=<c>::<s>)&test(/^(<m>)::/)'
+#     crates/<c>/tests/<m>/**        when tests/<s>.rs is a suite root (suite_*.rs)
+#                                    declaring `mod <m>;` and no other test file
+#                                    #[path]-includes tests/<m>/ (else --tests)
 #   crates/<c>/tests/<dir>/**        -p <c> --tests
 #   crates/<c>/src/**                -p <c> --lib --bins --tests
 #                                    (--lib only when src/lib.rs exists)
@@ -44,6 +50,9 @@
 #   outside crates/, anything else   full suite (exit 3) -- tests read repo
 #                                    files such as scripts/install.sh via
 #                                    CARGO_MANIFEST_DIR, so fail closed
+# Suite modules of one crate share a single -E (standalone --test targets of the
+# same plan are ORed in as binary_id(=<c>::<t>)), so only the changed files'
+# tests run, not every module of the suite.
 # A broader selection subsumes narrower ones for the same crate. Cargo applies
 # target flags to every -p package on one command line, so crates with
 # different selections run as separate `cargo nextest run` invocations and
@@ -168,10 +177,41 @@ is_fallback() {
   ! is_inert "$1"
 }
 
+# Prints the suite target (tests/suite_*.rs stem) of crate $1 declaring the
+# test module $2 (`mod <m>;` on a line of its own), or nothing.
+suite_of() {
+  local root line
+  for root in "crates/$1/tests"/suite_*.rs; do
+    [[ -f "$root" ]] || continue
+    while IFS= read -r line; do
+      if [[ "$line" == "mod $2;" ]]; then
+        root=${root##*/}
+        printf '%s\n' "${root%.rs}"
+        return 0
+      fi
+    done <"$root"
+  done
+}
+
+# True when a test file of crate $1 other than tests/$2.rs and tests/$2/**
+# #[path]-includes something under tests/$2/: such a directory is shared, so
+# a change in it cannot be narrowed to module $2.
+dir_shared() {
+  local crate=$1 module=$2 file
+  while IFS= read -r file; do
+    case "$file" in
+      "crates/$crate/tests/$module.rs" | "crates/$crate/tests/$module"/*) ;;
+      *) return 0 ;;
+    esac
+  done < <(grep -rlE --include='*.rs' "#\[path = \"([^\"]*/)?$module/" "crates/$crate/tests" 2>/dev/null || true)
+  return 1
+}
+
 # Prints "<crate>\t<kind>[\t<test>]" for a path under crates/, kinds ranked
-# test < tests < src < all; prints nothing for ignored paths.
+# test|module < tests < src < all; prints nothing for ignored paths. A module
+# record's third field is "<suite>:<module>".
 map_path() {
-  local path=$1 rest crate sub name
+  local path=$1 rest crate sub name suite
   [[ "$path" == crates/*/* ]] || return 0
   rest=${path#crates/}
   crate=${rest%%/*}
@@ -180,10 +220,18 @@ map_path() {
     tests/*)
       name=${sub#tests/}
       if [[ "$name" == *.rs && "$name" != */* && -f "$path" ]]; then
+        name=${name%.rs}
+        suite=$(suite_of "$crate" "$name")
+        if [[ -z "$suite" ]]; then
+          printf '%s\ttest\t%s\n' "$crate" "$name"
         # The instrumented run excludes auggie_context_e2e like coverage-e2e
-        # does, so a plan naming only that binary would select nothing.
-        [[ -n "$instrumented" && "$crate" == intentd && "$name" == auggie_context_e2e.rs ]] ||
-          printf '%s\ttest\t%s\n' "$crate" "${name%.rs}"
+        # does, so a plan naming only that module would select nothing.
+        elif [[ -z "$instrumented" || "$crate" != intentd || "$name" != auggie_context_e2e ]]; then
+          printf '%s\tmodule\t%s:%s\n' "$crate" "$suite" "$name"
+        fi
+      elif [[ "$name" == */* ]] && suite=$(suite_of "$crate" "${name%%/*}") &&
+        [[ -n "$suite" ]] && ! dir_shared "$crate" "${name%%/*}"; then
+        printf '%s\tmodule\t%s:%s\n' "$crate" "$suite" "${name%%/*}"
       else
         printf '%s\ttests\n' "$crate"
       fi
@@ -253,8 +301,10 @@ if [[ -z "$crates" ]]; then
 fi
 
 # Sets crate_filter to the target flags for one crate ("" = every test target).
+# Suite modules add their suite as a --test target and one -E naming the
+# changed modules; standalone targets of the same plan are ORed into that -E.
 crate_selection() {
-  local crate=$1 best=test tests="" c kind test
+  local crate=$1 best=test tests="" modules="" c kind test
   while IFS=$'\t' read -r c kind test; do
     [[ "$c" == "$crate" ]] || continue
     case "$kind" in
@@ -262,6 +312,7 @@ crate_selection() {
       src) [[ "$best" == all ]] || best=src ;;
       tests) [[ "$best" == all || "$best" == src ]] || best=tests ;;
       test) tests+="$test"$'\n' ;;
+      module) modules+="$test"$'\n' ;;
     esac
   done <<<"$mapped"
   case "$best" in
@@ -274,9 +325,26 @@ crate_selection() {
     tests) crate_filter="--tests" ;;
     test)
       crate_filter=""
+      local expr="" suite module names
+      tests=$(printf '%s' "$tests" | sort -u)
       while IFS= read -r test; do
+        [[ -n "$test" ]] || continue
         crate_filter+="${crate_filter:+ }--test $test"
-      done <<<"$(printf '%s' "$tests" | sort -u)"
+        expr+="${expr:+|}binary_id(=$crate::$test)"
+      done <<<"$tests"
+      if [[ -n "$modules" ]]; then
+        modules=$(printf '%s' "$modules" | sort -u)
+        while IFS= read -r suite; do
+          [[ -n "$suite" ]] || continue
+          names=""
+          while IFS=: read -r c module; do
+            [[ "$c" == "$suite" ]] && names+="${names:+|}$module"
+          done <<<"$modules"
+          crate_filter+="${crate_filter:+ }--test $suite"
+          expr+="${expr:+|}(binary_id(=$crate::$suite)&test(/^($names)::/))"
+        done <<<"$(while IFS= read -r module; do printf '%s\n' "${module%%:*}"; done <<<"$modules" | sort -u)"
+        crate_filter+=" -E $expr"
+      fi
       ;;
   esac
 }
@@ -312,12 +380,42 @@ extra=""
 # The instrumented form mirrors scripts/coverage-e2e.sh: same env, same
 # auggie_context_e2e exclusion (it needs a real auggie binary).
 cov_env="INTENTD_TEST_TIMEOUT_MULTIPLIER=3"
-cov_filter="not binary(auggie_context_e2e)"
-describe() {
+cov_filter="not test(/^auggie_context_e2e::/)"
+
+# Splits plan $1 (flags assembled above: no quoting, no glob characters) into
+# plan_args and its filterset plan_expr. Under --instrumented plan_expr also
+# carries the coverage exclusion, ANDed into the plan's own -E (nextest ORs
+# repeated -E flags, which would re-admit every excluded test).
+plan_words() {
+  local word expect_expr=""
+  plan_args=()
+  plan_expr=""
+  # shellcheck disable=SC2086
+  for word in $1; do
+    if [[ -n "$expect_expr" ]]; then
+      plan_expr=$word
+      expect_expr=""
+    elif [[ "$word" == -E ]]; then
+      expect_expr=1
+    else
+      plan_args+=("$word")
+    fi
+  done
   if [[ -n "$instrumented" ]]; then
-    echo "$cov_env cargo llvm-cov --no-report nextest ${1% }$extra -E '$cov_filter'"
+    plan_expr=${plan_expr:+($plan_expr) and ($cov_filter)}
+    plan_expr=${plan_expr:-$cov_filter}
+  fi
+}
+
+# The plan as a pasteable command line: the filterset goes last, quoted.
+describe() {
+  plan_words "${1% }"
+  local tail=""
+  [[ -z "$plan_expr" ]] || tail=" -E '$plan_expr'"
+  if [[ -n "$instrumented" ]]; then
+    echo "$cov_env cargo llvm-cov --no-report nextest ${plan_args[*]}$extra$tail"
   else
-    echo "cargo nextest run ${1% }$extra"
+    echo "cargo nextest run ${plan_args[*]}$extra$tail"
   fi
 }
 
@@ -349,13 +447,15 @@ fi
 scope_index=0
 while IFS= read -r -u 3 plan; do
   [[ -n "$plan" ]] || continue
-  # $plan and $extra hold only the flags assembled above; split them on purpose.
+  # $extra holds only the flags assembled above; split it on purpose.
+  plan_words "$plan"
   # shellcheck disable=SC2086
-  set -- $plan $extra
+  set -- "${plan_args[@]}" $extra
+  [[ -z "$plan_expr" ]] || set -- "$@" -E "$plan_expr"
   scope_index=$((scope_index + 1))
   set +e
   if [[ -n "$instrumented" ]]; then
-    command=("$BASH" "$test_policy" cargo llvm-cov --no-report nextest "$@" -E "$cov_filter")
+    command=("$BASH" "$test_policy" cargo llvm-cov --no-report nextest "$@")
     if [[ -n "${COVERAGE_STORAGE_DIR:-}" ]]; then
       command=(python3 -I -B "$repo_root/scripts/coverage-storage.py" run
         --output "$COVERAGE_STORAGE_DIR" --stage "scope-$scope_index" -- "${command[@]}")

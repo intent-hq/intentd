@@ -79,10 +79,14 @@ def native_step_job(name):
 
 
 GITLAB_STEP = "GitLab auth, invitations and checkout over real sockets with explicit test transports"
+# e2e_wss_gitlab_auth is a standalone target; the invitation and checkout
+# files are modules of suite targets, selected by their module filter.
 GITLAB_COMMAND = (
     "cargo test --locked -p intentd --features repository-test-fixtures "
-    "--test e2e_wss_gitlab_auth --test e2e_wss_invite_join_gitlab "
-    "--test e2e_repository_resource_read -- --test-threads=2"
+    "--test e2e_wss_gitlab_auth -- --test-threads=2\n"
+    "cargo test --locked -p intentd --features repository-test-fixtures "
+    "--test suite_wss_g_r --test suite_wss_repo -- --test-threads=2 "
+    "e2e_wss_invite_join_gitlab:: e2e_repository_resource_read::\n"
 )
 
 
@@ -461,7 +465,6 @@ process.env.MACOS_RUNNER_DISABLED = fixture.macosDisabled || '';
 process.env.LINUX_RUNNER_DISABLED = fixture.linuxDisabled || '';
 process.env.SLOT_JOBS = fixture.slotJobs || '';
 // Most cases check the GitHub fallback; the WarpBuild cases turn WarpBuild on.
-process.env.WARPBUILD_DISABLED = fixture.warpbuildDisabled ?? 'true';
 const AsyncFunction = Object.getPrototypeOf(async function() {}).constructor;
 new AsyncFunction('github', 'core', 'context', script)(github, core, context)
   .then(() => process.stdout.write(JSON.stringify({ outputs, calls, logs })))
@@ -548,7 +551,7 @@ class RunnerAvailabilityTests(unittest.TestCase):
         result = run_route(self.workflow, **fixture)
         outputs = route_outputs(self.workflow, result["outputs"])
         self.assertEqual(json.loads(outputs.get("macos_labels", "null")), expected)
-        self.assertEqual(outputs.get("macos_burst"), str(expected == ["macos-26-xlarge"]).lower())
+        self.assertEqual(outputs.get("macos_burst"), str(expected == ["warp-macos-26-arm64-12x"]).lower())
         for job_id, field, value in (("build", "target", "aarch64-apple-darwin"),
                                      ("daemon-lifecycle", "platform", "macos")):
             job = self.workflow["jobs"][job_id]
@@ -568,7 +571,7 @@ class RunnerAvailabilityTests(unittest.TestCase):
                       [{**runner(), "labels": [{"name": "macOS"}, {"name": "ARM64"}]}],
                       [runner(busy=True), runner(status="offline"), runner(arch="X64")]):
             with self.subTest(fleet=fleet):
-                self.assert_mac_route({"org": fleet}, ["macos-26-xlarge"])
+                self.assert_mac_route({"org": fleet}, ["warp-macos-26-arm64-12x"])
         for fleet in ([runner()], [runner(platform="MACos", arch="arm64")],
                       [{**runner(), "labels": [{"name": n} for n in ("SELF-HOSTED", "macos", "arm64")]}],
                       [runner(busy=True), runner(status="offline"), runner(), runner(arch="X64")]):
@@ -576,15 +579,15 @@ class RunnerAvailabilityTests(unittest.TestCase):
                 self.assert_mac_route({"org": fleet}, ["self-hosted", "macOS", "ARM64"])
 
     def test_org_lookup_and_repo_fallback_are_shared_and_fail_to_hosted(self):
-        cases = [({}, ["macos-26-xlarge"], ["org"]),
+        cases = [({}, ["warp-macos-26-arm64-12x"], ["org"]),
                  ({"orgError": "403 missing permission", "repo": [runner()]},
                   ["self-hosted", "macOS", "ARM64"], ["org", "repo"]),
-                 ({"orgError": "403", "repo": [runner(busy=True)]}, ["macos-26-xlarge"], ["org", "repo"]),
-                 ({"orgError": "403", "repo": []}, ["macos-26-xlarge"], ["org", "repo"]),
-                 ({"orgError": "403", "repoError": "403 missing permission"}, ["macos-26-xlarge"], ["org", "repo"]),
-                 ({"orgError": "network timeout", "repoError": "503 unavailable"}, ["macos-26-xlarge"], ["org", "repo"]),
-                 ({"org": {"unexpected": "response"}}, ["macos-26-xlarge"], ["org"]),
-                 ({"org": [], "repo": [runner()]}, ["macos-26-xlarge"], ["org"])]
+                 ({"orgError": "403", "repo": [runner(busy=True)]}, ["warp-macos-26-arm64-12x"], ["org", "repo"]),
+                 ({"orgError": "403", "repo": []}, ["warp-macos-26-arm64-12x"], ["org", "repo"]),
+                 ({"orgError": "403", "repoError": "403 missing permission"}, ["warp-macos-26-arm64-12x"], ["org", "repo"]),
+                 ({"orgError": "network timeout", "repoError": "503 unavailable"}, ["warp-macos-26-arm64-12x"], ["org", "repo"]),
+                 ({"org": {"unexpected": "response"}}, ["warp-macos-26-arm64-12x"], ["org"]),
+                 ({"org": [], "repo": [runner()]}, ["warp-macos-26-arm64-12x"], ["org"])]
         for fixture, expected, endpoints in cases:
             with self.subTest(fixture=fixture):
                 result = self.assert_mac_route(fixture, expected)
@@ -604,21 +607,21 @@ class RunnerAvailabilityTests(unittest.TestCase):
                 # Jobs still asking for the generic self-hosted Linux fleet never occupy a slot.
                 jobs += [{"status": "in_progress", "labels": ["self-hosted", "Linux", "X64"]}] * 5
                 result = self.assert_mac_route({"org": fleet, "jobs": jobs, "queueErrors": queue_errors},
-                                              ["macos-26-xlarge"] if queue_errors else ["self-hosted", "macOS", "ARM64"])
+                                              ["warp-macos-26-arm64-12x"] if queue_errors else ["self-hosted", "macOS", "ARM64"])
                 outputs = result["outputs"]
-                self.assertEqual(json.loads(outputs["linux_labels"]), ["gh-linux-16x"] if linux_burst else CACHE)
-                self.assertEqual(json.loads(outputs["check_labels"]), ["gh-linux-8x"] if linux_burst else CACHE)
+                self.assertEqual(json.loads(outputs["linux_labels"]), ["warp-ubuntu-2404-x64-16x"] if linux_burst else CACHE)
+                self.assertEqual(json.loads(outputs["check_labels"]), ["warp-ubuntu-2404-x64-8x"] if linux_burst else CACHE)
                 self.assertEqual(outputs["linux_burst"], str(linux_burst).lower())
-                self.assertEqual(json.loads(outputs["windows_labels"]), ["gh-windows-16x"] if queue_errors else ["self-hosted", "Windows", "X64"])
+                self.assertEqual(json.loads(outputs["windows_labels"]), ["warp-windows-2022-x64-16x"] if queue_errors else ["self-hosted", "Windows", "X64"])
                 self.assertEqual(outputs["windows_burst"], str(bool(queue_errors)).lower())
         for fixture in ({}, {"orgError": "403", "repoError": "403"},
                         {"org": [slot(status="offline"), runner("Windows", "X64", status="offline")]},
                         {"org": [runner("Linux", "X64"), runner("Linux", "X64")]}):
             with self.subTest(fixture=fixture):
                 outputs = run_route(self.workflow, **fixture)["outputs"]
-                self.assertEqual(json.loads(outputs["linux_labels"]), ["gh-linux-16x"])
-                self.assertEqual(json.loads(outputs["check_labels"]), ["gh-linux-8x"])
-                self.assertEqual(json.loads(outputs["windows_labels"]), ["gh-windows-16x"])
+                self.assertEqual(json.loads(outputs["linux_labels"]), ["warp-ubuntu-2404-x64-16x"])
+                self.assertEqual(json.loads(outputs["check_labels"]), ["warp-ubuntu-2404-x64-8x"])
+                self.assertEqual(json.loads(outputs["windows_labels"]), ["warp-windows-2022-x64-16x"])
                 self.assertEqual(outputs["linux_burst"], "true")
                 self.assertEqual(outputs["windows_burst"], "true")
 
@@ -638,16 +641,16 @@ class RunnerAvailabilityTests(unittest.TestCase):
                     slots = json.loads(outputs["slots"])
                     # The one free heavy slot goes to `check` on a PR; the queue lists no heavy job.
                     # Without a slot, check bursts as gh-linux-16x (CPU-bound on 8 CPUs).
-                    self.assertEqual(slots["check"], CACHE if event == "pull_request" and idle else ["gh-linux-16x"])
-                    self.assertEqual(slots["coverage-changed"], ["gh-linux-16x"])
+                    self.assertEqual(slots["check"], CACHE if event == "pull_request" and idle else ["warp-ubuntu-2404-x64-16x"])
+                    self.assertEqual(slots["coverage-changed"], ["warp-ubuntu-2404-x64-16x"])
                     # Free standard labels never take a self-hosted slot, even an idle one.
                     self.assertEqual(slots["release-scripts"], ["ubuntu-24.04"])
                     # Unlisted heavy jobs only get a slot that is still free after the listed ones.
                     unlisted = hosted or event == "pull_request"
                     self.assertEqual(json.loads(outputs["linux_labels"]),
-                                     ["gh-linux-16x"] if unlisted else CACHE)
+                                     ["warp-ubuntu-2404-x64-16x"] if unlisted else CACHE)
                     self.assertEqual(json.loads(outputs["check_labels"]),
-                                     ["gh-linux-8x"] if unlisted else CACHE)
+                                     ["warp-ubuntu-2404-x64-8x"] if unlisted else CACHE)
                     self.assertEqual(outputs["linux_burst"], str(unlisted).lower())
                     self.assertEqual(json.loads(outputs["runners"])["ubuntu-24.04"], ["ubuntu-24.04"])
                     if idle:
@@ -657,8 +660,9 @@ class RunnerAvailabilityTests(unittest.TestCase):
                     self.assertEqual(logged, event == "merge_group")
         # The queue-only coverage suites read their own merge_group slots (the
         # slot hosts raise the inotify limit to 32768).
-        for job_id, label in {"check": "gh-linux-8x", "coverage-changed": "gh-linux-16x",
-                              "coverage-e2e": "gh-linux-16x", "coverage-all": "gh-linux-16x"}.items():
+        # Their fallback, if the route job failed, is the listed size's WarpBuild runner.
+        for job_id, label in {"check": "warp-ubuntu-2404-x64-8x", "coverage-changed": "warp-ubuntu-2404-x64-16x",
+                              "coverage-e2e": "warp-ubuntu-2404-x64-16x", "coverage-all": "warp-ubuntu-2404-x64-16x"}.items():
             with self.subTest(job=job_id):
                 self.assertEqual(self.workflow["jobs"][job_id]["runs-on"],
                                  "${{ fromJSON(needs.route.outputs.slots || '{}')['%s'] || fromJSON('[\"%s\"]') }}" % (job_id, label))
@@ -715,12 +719,12 @@ class RunnerAvailabilityTests(unittest.TestCase):
         outputs = route_outputs(self.workflow, result["outputs"], "merge_group")
         self.assertEqual(json.loads(outputs["windows_labels"]), ["self-hosted", "Windows", "X64"])
         self.assertEqual(json.loads(outputs["macos_labels"]), ["self-hosted", "macOS", "ARM64"])
-        # An empty or unreadable cloud map falls back to the GitHub labels.
+        # An empty or unreadable cloud map falls back to the same WarpBuild labels.
         for cloud in ("", "not json", "{}"):
             with self.subTest(cloud=cloud):
                 outputs, _ = run_heavy(self.workflow, {**result["outputs"], "cloud": cloud}, "merge_group")
-                self.assertEqual(json.loads(outputs["linux_labels"]), ["gh-linux-16x"])
-                self.assertEqual(json.loads(outputs["check_labels"]), ["gh-linux-8x"])
+                self.assertEqual(json.loads(outputs["linux_labels"]), ["warp-ubuntu-2404-x64-16x"])
+                self.assertEqual(json.loads(outputs["check_labels"]), ["warp-ubuntu-2404-x64-8x"])
 
     def test_release_linux_legs_take_the_burst_runner(self):
         for name, job, key in (("release-cache.yml", "daemon", "matrix.runner"),
@@ -743,7 +747,7 @@ class RunnerAvailabilityTests(unittest.TestCase):
                            payload=same_repo, linuxDisabled="true")
         # The kill switch sends every listed job to its hosted label.
         slots = json.loads(result["outputs"]["slots"])
-        self.assertEqual(slots["check"], ["gh-linux-16x"])
+        self.assertEqual(slots["check"], ["warp-ubuntu-2404-x64-16x"])
         self.assertNotIn(CACHE, slots.values())
         self.assertNotIn(SMALL, slots.values())
 
@@ -757,7 +761,7 @@ class RunnerAvailabilityTests(unittest.TestCase):
                       [runner("Windows", "X64", status="offline")]):
             with self.subTest(fleet=fleet):
                 outputs = run_route(self.workflow, org=fleet)["outputs"]
-                self.assertEqual(json.loads(outputs["windows_labels"]), ["gh-windows-16x"])
+                self.assertEqual(json.loads(outputs["windows_labels"]), ["warp-windows-2022-x64-16x"])
                 self.assertEqual(outputs["windows_burst"], "true")
         outputs = run_route(self.workflow, org=[runner("Windows", "X64", busy=True),
                                                runner("Windows", "X64")])["outputs"]
@@ -771,7 +775,7 @@ class RunnerAvailabilityTests(unittest.TestCase):
             with self.subTest(disabled=disabled):
                 outputs = run_route(self.workflow, org=fleet, windowsDisabled=disabled)["outputs"]
                 self.assertEqual(json.loads(outputs["windows_labels"]),
-                                 ["gh-windows-16x"] if disabled == "true" else ["self-hosted", "Windows", "X64"])
+                                 ["warp-windows-2022-x64-16x"] if disabled == "true" else ["self-hosted", "Windows", "X64"])
                 self.assertEqual(outputs["windows_burst"], str(disabled == "true").lower())
                 self.assertEqual(json.loads(outputs["linux_labels"]), CACHE)
                 self.assertEqual(json.loads(outputs["macos_labels"]), ["self-hosted", "macOS", "ARM64"])
@@ -782,9 +786,9 @@ class RunnerAvailabilityTests(unittest.TestCase):
             with self.subTest(disabled=disabled):
                 outputs = run_route(self.workflow, org=fleet, linuxDisabled=disabled)["outputs"]
                 self.assertEqual(json.loads(outputs["linux_labels"]),
-                                 ["gh-linux-16x"] if disabled == "true" else CACHE)
+                                 ["warp-ubuntu-2404-x64-16x"] if disabled == "true" else CACHE)
                 self.assertEqual(json.loads(outputs["check_labels"]),
-                                 ["gh-linux-8x"] if disabled == "true" else CACHE)
+                                 ["warp-ubuntu-2404-x64-8x"] if disabled == "true" else CACHE)
                 self.assertEqual(outputs["linux_burst"], str(disabled == "true").lower())
                 self.assertEqual(json.loads(outputs["macos_labels"]), ["self-hosted", "macOS", "ARM64"])
                 self.assertEqual(json.loads(outputs["windows_labels"]), ["self-hosted", "Windows", "X64"])
@@ -797,7 +801,7 @@ class RunnerAvailabilityTests(unittest.TestCase):
             with self.subTest(disabled=disabled):
                 outputs = run_route(self.workflow, org=fleet, macosDisabled=disabled)["outputs"]
                 self.assertEqual(json.loads(outputs["macos_labels"]),
-                                 ["macos-26-xlarge"] if disabled == "true" else ["self-hosted", "macOS", "ARM64"])
+                                 ["warp-macos-26-arm64-12x"] if disabled == "true" else ["self-hosted", "macOS", "ARM64"])
                 self.assertEqual(outputs["macos_burst"], str(disabled == "true").lower())
                 self.assertEqual(json.loads(outputs["linux_labels"]), CACHE)
                 self.assertEqual(json.loads(outputs["windows_labels"]), ["self-hosted", "Windows", "X64"])
@@ -807,8 +811,8 @@ class RunnerAvailabilityTests(unittest.TestCase):
     def test_empty_outputs_use_hosted_macos_in_both_matrices(self):
         for job_id in ("build", "windows", "daemon-lifecycle", "macos-services-runtime"):
             for row in self.workflow["jobs"][job_id]["strategy"]["matrix"]["include"]:
-                expected = ["macos-26-xlarge"] if row.get("target") == "aarch64-apple-darwin" or row.get("platform") == "macos" else (
-                    ["gh-linux-16x"] if row.get("platform") == "linux" else ["gh-windows-16x"])
+                expected = ["warp-macos-26-arm64-12x"] if row.get("target") == "aarch64-apple-darwin" or row.get("platform") == "macos" else (
+                    ["warp-ubuntu-2404-x64-16x"] if row.get("platform") == "linux" else ["warp-windows-2022-x64-16x"])
                 for outputs in ({}, {"macos_labels": "", "windows_labels": "", "linux_labels": ""}):
                     with self.subTest(job=job_id, row=row, outputs=outputs):
                         self.assertEqual(matrix_labels(row["os"], outputs), expected)
@@ -818,7 +822,7 @@ class RunnerAvailabilityTests(unittest.TestCase):
 
     def test_hosted_macos_skips_persistent_cleanup_and_uses_cache(self):
         steps = {s.get("name"): s for s in self.workflow["jobs"]["build"]["steps"]}
-        for labels in (["macos-26-xlarge"], ["self-hosted", "macOS", "ARM64"]):
+        for labels in (["warp-macos-26-arm64-12x"], ["self-hosted", "macOS", "ARM64"]):
             for fast_path in ("", "true"):
                 values = {**context("merge_group", fast_path=fast_path), "matrix.os": labels}
                 for name in ("Ensure macOS CI disk headroom", "Point CARGO_TARGET_DIR outside the work dir (self-hosted)"):
@@ -1047,7 +1051,7 @@ class NativeRoutingTests(unittest.TestCase):
                 elif mutation == "caller":
                     step["env"]["INTENTD_ASSERT_BOUND_CALLER"] = "0"
                 else:
-                    removed = {"feature": "--features repository-test-fixtures", "target": "--test e2e_repository_resource_read", "threads": "--test-threads=2"}[mutation]
+                    removed = {"feature": "--features repository-test-fixtures", "target": " e2e_repository_resource_read::", "threads": "--test-threads=2"}[mutation]
                     step["run"] = step["run"].replace(removed, "")
                 self.assertTrue(gitlab_errors(workflow))
 

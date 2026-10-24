@@ -502,7 +502,7 @@ including their optional dependencies. Set `INTENTD_TEST_CODEX_ADAPTER` and
 `INTENTD_TEST_CLAUDE_ADAPTER` to their package directories (containing `package.json`), then:
 
 ```bash
-cargo nextest run -p intentd --test e2e_wss_installed_cli --run-ignored all --test-threads 1
+cargo nextest run -p intentd --test suite_wss_g_r -E 'test(/^e2e_wss_installed_cli::/)' --run-ignored all --test-threads 1
 ```
 
 This Unix fixture requires Node and Python 3. It excludes host tracing only for its
@@ -901,11 +901,12 @@ The design docs live in the monorepo under `docs/`:
 ### CI runners and compiler cache
 
 Routed jobs prefer the free self-hosted fleet and burst to the matching WarpBuild
-runner (or the GitHub label itself when `CI_WARPBUILD_DISABLED` is `true`) when
-the fleet is unavailable or busy. `check` takes an 8-CPU heavy slot but bursts as
+runner when the fleet is unavailable or busy. GitHub's larger runners are off, so
+a paid size never runs on GitHub: a job whose route job failed falls back to the
+WarpBuild label, and fork pull requests (auto-closed) get free standard runners. `check` takes an 8-CPU heavy slot but bursts as
 `gh-linux-16x` (WarpBuild 16x), as do coverage and release compilation; Windows
 uses `gh-windows-16x` (WarpBuild 16x) and Apple Silicon uses `macos-26-xlarge`
-(WarpBuild 12x). The larger runners' group must allow public repositories. Physical-host pruning remains scheduled.
+(WarpBuild 12x). Physical-host pruning remains scheduled.
 To bypass self-hosted runners during maintenance, set the repository variable
 `CI_LINUX_RUNNER_DISABLED=true`, `CI_WINDOWS_RUNNER_DISABLED=true`, or
 `CI_MACOS_RUNNER_DISABLED=true`.

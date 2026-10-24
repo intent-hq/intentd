@@ -16,7 +16,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -188,6 +188,7 @@ fn seed_workspace(idx: usize) -> Workspace {
         diff_summary: None,
         display_status: None,
         waiting: false,
+        scripts_running: false,
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,

@@ -2980,7 +2980,7 @@ impl Services {
     /// rows so the hot list/get enrichment cost is O(active monitors),
     /// never O(all monitor history in the workspace). Best-effort: a store
     /// read failure is logged and fails open to `false` (mirrors
-    /// [`Services::workspace_has_active_hooks`]) so list/get emission is
+    /// [`Services::workspace_has_active_hooks_or_script_monitors`]) so list/get emission is
     /// never wedged and activity is never fabricated.
     pub(crate) async fn workspace_has_active_pr_monitors(
         &self,
@@ -5667,6 +5667,7 @@ mod tests {
             pull_requests_total: None,
             display_status: None,
             waiting: false,
+            scripts_running: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,

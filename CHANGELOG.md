@@ -2,6 +2,43 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.38] - 2026-10-23
+
+### 🐛 Bug Fixes
+
+- *(agents)* Interrupt idle agents whose background workers a restart kills ([#2638](https://github.com/intent-hq/intentd/pull/2638))
+
+
+## [0.11.37] - 2026-10-23
+
+### 🚀 Features
+
+- *(acp)* Lower agent IO priority and demote ephemeral adapter runs ([#2634](https://github.com/intent-hq/intentd/pull/2634))
+
+
+## [0.11.36] - 2026-10-23
+
+### 📚 Documentation
+
+- *(guide)* Mention the in-app agent-finished notification ([#2629](https://github.com/intent-hq/intentd/pull/2629))
+
+### 🧪 Testing
+
+- Scale native request acquire and frame waits with the test timeout multiplier ([#2626](https://github.com/intent-hq/intentd/pull/2626))
+
+
+## [0.11.35] - 2026-10-23
+
+### 🐛 Bug Fixes
+
+- Report skipped PR checks separately from passed ([#2623](https://github.com/intent-hq/intentd/pull/2623))
+- *(store)* Create the database file before the write pool connects ([#2633](https://github.com/intent-hq/intentd/pull/2633))
+
+### 📚 Documentation
+
+- *(guide)* Drop the removed Collapse tool activity setting ([#2628](https://github.com/intent-hq/intentd/pull/2628))
+
+
 ## [0.11.34] - 2026-10-23
 
 ### 🐛 Bug Fixes

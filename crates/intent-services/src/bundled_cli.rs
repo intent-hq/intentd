@@ -192,6 +192,9 @@ pub async fn ensure_in(
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    // A full CLI install is the heaviest disk user an agent launch triggers:
+    // keep it below the daemon like the agent it installs.
+    intent_acp::AgentPriority::from_env().apply(&mut command);
     let output = match tokio::time::timeout(timeout, command.output()).await {
         Err(_) => {
             return Err(format!(
@@ -243,6 +246,8 @@ async fn verify_version(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    // The short version check stays at the daemon's priority (unlike the
+    // install above): starving it could fail a good install on its budget.
     let output = match tokio::time::timeout(VERIFY_TIMEOUT, command.output()).await {
         Err(_) => {
             return Err(format!(

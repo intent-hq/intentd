@@ -1,6 +1,6 @@
 //! Original native socket review ownership. No public ID or read/selection lease
 //! supplies a write grant. Completed effects outlive admission, not disclosure.
-use super::{Connection, Services};
+use super::{acquire_wait, frame_ttl, Connection, Services};
 use crate::repository_admission::lifecycle::{RepositorySourceLifetime, RepositorySubscription};
 use crate::repository_admission::{
     self as engine, AdmissionError, AdmissionResult, OriginalRepositoryCaller,
@@ -829,8 +829,6 @@ const GLOBAL_WORKERS: usize = 8;
 const NOTICES: usize = 64;
 const OBSERVATIONS: usize = 64;
 const COMMAND_BYTES: usize = 65_536;
-const ACQUIRE: Duration = Duration::from_secs(5);
-const FRAME_TTL: Duration = Duration::from_secs(15);
 const LEASE_TTL: Duration = Duration::from_secs(300);
 const RECEIPT_TTL: Duration = Duration::from_secs(600);
 const STAGE_TTL: Duration = Duration::from_secs(120);
@@ -1408,7 +1406,7 @@ impl Request {
         self.connection.entered().map_err(denied)?;
         self.connection.review.check()?;
         if self.completed.load(Ordering::Acquire)
-            || (Instant::now() >= self.created + FRAME_TTL && !self.started())
+            || (Instant::now() >= self.created + frame_ttl() && !self.started())
         {
             return Err(unavailable());
         }
@@ -1644,7 +1642,7 @@ pub(super) fn capture_frame(c: &Connection, frame: Frame) -> Arc<dyn RepositoryR
         let deadline = r
             .predecessor
             .as_ref()
-            .map(|parent| (r.created + FRAME_TTL).min(parent.created + LEASE_TTL));
+            .map(|parent| (r.created + frame_ttl()).min(parent.created + LEASE_TTL));
         #[cfg(any(test, feature = "repository-test-fixtures"))]
         let observation = r.probe.clone();
         // caller-binding: allow — only finishes an unentered request lifetime; no service capability calls
@@ -1653,7 +1651,7 @@ pub(super) fn capture_frame(c: &Connection, frame: Frame) -> Arc<dyn RepositoryR
                 if let Some(deadline) = deadline {
                     tokio::time::sleep_until(deadline).await;
                 } else {
-                    tokio::time::sleep(FRAME_TTL).await;
+                    tokio::time::sleep(frame_ttl()).await;
                 }
             };
             tokio::select! {()=retirement.native_cancelled()=>{},()=timeout=>{companion_link!(observation, FrameDeadline);}}
@@ -2195,7 +2193,7 @@ pub(crate) fn prepare(s: &Services, q: Prepare) -> BoxFuture<'_, Result<Value>> 
             companion_observe!(
                 observation,
                 AcquireWait,
-                tokio::time::timeout(ACQUIRE, rx).await
+                tokio::time::timeout(acquire_wait(), rx).await
             )
             .map_err(denied)?
             .map_err(denied)?
@@ -2343,7 +2341,7 @@ async fn acquire(r: Arc<Request>, q: Prepare) -> Result<Value> {
             companion_link!(r.probe, SourceCancelled);
             if acquired.load(Ordering::Acquire) { read.await } else { Err(AdmissionError::Retired) }
         },
-        () = tokio::time::sleep(ACQUIRE) => {
+        () = tokio::time::sleep(acquire_wait()) => {
             companion_link!(r.probe, SourceDeadline);
             retirement.end_scope();
             if acquired.load(Ordering::Acquire) { read.await } else { Err(AdmissionError::Retired) }
@@ -2490,7 +2488,7 @@ async fn acquire(r: Arc<Request>, q: Prepare) -> Result<Value> {
         c.services
             .gitlab_repository_secret_reader()
             .map_err(denied)?,
-        ACQUIRE,
+        acquire_wait(),
     )
     .map_err(denied)?
     .into_provider()
@@ -2811,7 +2809,7 @@ pub(crate) fn execute(s: &Services, q: Execute) -> BoxFuture<'_, Result<Value>> 
                 }
                 let c = r.connection.clone();
                 let owned = op.clone();
-                let queue_deadline = r.created + FRAME_TTL;
+                let queue_deadline = r.created + frame_ttl();
                 // caller-binding: allow — binds the original caller and wire credential in this future
                 tokio::spawn(with_caller(
                     c.caller.caller().clone(),
@@ -3228,7 +3226,7 @@ async fn run_stages(
         };
         let _create = if let Some(lock) = create_lock {
             Some(
-                tokio::time::timeout(FRAME_TTL, lock.lock_owned())
+                tokio::time::timeout(frame_ttl(), lock.lock_owned())
                     .await
                     .map_err(denied)?,
             )
@@ -3448,7 +3446,7 @@ async fn run_stages(
                     c.services
                         .gitlab_repository_secret_reader()
                         .map_err(denied)?,
-                    ACQUIRE,
+                    acquire_wait(),
                 )
                 .map_err(denied)?
                 .into_provider()
@@ -3698,7 +3696,7 @@ async fn final_prepare_lock(c: Arc<Connection>, op: Arc<Operation>) -> Result<Fi
                 tokio::select! {
                     result=&mut work=>result,
                     ()=retired.native_cancelled()=>{ if observation_entered.load(Ordering::Acquire) {work.await} else {Err(AdmissionError::Retired)} },
-                    ()=tokio::time::sleep(ACQUIRE)=>{ if observation_entered.load(Ordering::Acquire) {work.await} else {Err(AdmissionError::Retired)} },
+                    ()=tokio::time::sleep(acquire_wait())=>{ if observation_entered.load(Ordering::Acquire) {work.await} else {Err(AdmissionError::Retired)} },
                 }
             };
             if let Some(tx) = tx.take() {

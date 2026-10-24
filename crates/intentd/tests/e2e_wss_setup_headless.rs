@@ -2,7 +2,7 @@
 //! cursor query. Run on Windows for the native regression; Unix is a control.
 //! Export `setup-headless-evidence.json` with `INTENTD_SETUP_EVIDENCE_DIR`.
 
-mod common;
+use crate::common;
 
 use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};

@@ -432,6 +432,14 @@ pub struct Workspace {
     /// when no wait signal is live.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub waiting: bool,
+    /// Daemon-owned orthogonal script flag (PROTOCOL §5.1): `true` while the
+    /// workspace has a command-mode script run in flight (service-mode
+    /// scripts never count). Read live from the in-memory script registry on
+    /// the same emit path as `waiting`; never persisted; omitted (not
+    /// `false`) when nothing runs. Feeds neither `activity` nor
+    /// `displayStatus`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub scripts_running: bool,
     /// Durable token/credit usage accounting (§5.23 / §19.1), materialized by the
     /// daemon-internal periodic scan job and surfaced by `workspace.getTokenUsage`.
     /// Omitted (not `null`) until the first scan writes a snapshot.
@@ -882,6 +890,7 @@ pub fn chief_workspace() -> Workspace {
         diff_summary: None,
         display_status: None,
         waiting: false,
+        scripts_running: false,
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
@@ -7628,6 +7637,7 @@ mod tests {
             diff_summary: None,
             display_status: None,
             waiting: false,
+            scripts_running: false,
             token_usage: None,
             cow_supported: None,
             browser_client_id: None,
@@ -7667,6 +7677,18 @@ mod tests {
         assert_eq!(v["waiting"], serde_json::json!(true));
         let back: Workspace = serde_json::from_value(v).unwrap();
         assert_eq!(back, waiting_ws);
+
+        // Presence-detected `scriptsRunning`: omitted when false.
+        assert!(serde_json::to_value(&ws)
+            .unwrap()
+            .get("scriptsRunning")
+            .is_none());
+        let mut running_ws = ws.clone();
+        running_ws.scripts_running = true;
+        let v = serde_json::to_value(&running_ws).unwrap();
+        assert_eq!(v["scriptsRunning"], serde_json::json!(true));
+        let back: Workspace = serde_json::from_value(v).unwrap();
+        assert_eq!(back, running_ws);
     }
 
     /// The card aggregates serialize with the exact nested field names + casing

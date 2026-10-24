@@ -40,7 +40,7 @@
 
 #[path = "e2e_wss_chief_workspace/chat_management.rs"]
 mod chat_management;
-mod common;
+use crate::common;
 #[path = "e2e_wss_chief_workspace/mcp_configuration.rs"]
 mod mcp_configuration;
 

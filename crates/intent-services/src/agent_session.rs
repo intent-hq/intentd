@@ -41,6 +41,7 @@ use crate::image_dimensions::{self, ProbeContext};
 use crate::repository_admission::lifecycle::physical_owner::{
     RepositoryCreationOwner, RepositoryPhysicalOwner,
 };
+use crate::stack_frame::boxed_await;
 use crate::{file_ops, token_usage, usage_stats, Services};
 
 /// Preserve live provider diagnostics without adding assistant content or
@@ -3382,13 +3383,14 @@ impl Services {
         cwd: impl Into<PathBuf>,
         mcp_servers: Vec<McpServer>,
     ) -> Result<Option<AcpSessionOpened>> {
+        // `prepare_acp_load` boxes its body; its own future is pointer-sized.
         let Some(prepared) = self
             .prepare_acp_load(conn, None, init, agent_id, cwd, mcp_servers)
             .await?
         else {
             return Ok(None);
         };
-        Ok(Some(self.finish_acp_load(prepared).await))
+        Ok(Some(boxed_await(|| self.finish_acp_load(prepared)).await))
     }
 
     pub(crate) async fn resume_repository_acp_session(
@@ -3464,15 +3466,17 @@ impl Services {
         cwd: impl Into<PathBuf>,
         mcp_servers: Vec<McpServer>,
     ) -> Result<Option<PreparedAcpLoad>> {
-        self.prepare_acp_load_with_review(
-            conn,
-            callbacks,
-            init,
-            agent_id,
-            cwd.into(),
-            mcp_servers,
-            None,
-        )
+        boxed_await(|| {
+            self.prepare_acp_load_with_review(
+                conn,
+                callbacks,
+                init,
+                agent_id,
+                cwd.into(),
+                mcp_servers,
+                None,
+            )
+        })
         .await
     }
 
@@ -3493,17 +3497,18 @@ impl Services {
             &crate::repository_admission::lifecycle::native_allocation::NativeAllocation,
         )>,
     ) -> Result<Option<PreparedAcpLoad>> {
-        let stored = self.store.get_agent_session(agent_id).await?;
+        let stored = boxed_await(|| self.store.get_agent_session(agent_id)).await?;
         let workspace_id = stored.workspace_id.clone();
         let Some(acp_session_id) = stored.acp_session_id.clone() else {
             return Ok(None);
         };
         if review.is_none()
-            && self
-                .store
-                .get_review_context_enrollment(&workspace_id, agent_id, &acp_session_id)
-                .await?
-                .is_some()
+            && boxed_await(|| {
+                self.store
+                    .get_review_context_enrollment(&workspace_id, agent_id, &acp_session_id)
+            })
+            .await?
+            .is_some()
         {
             return Err(Error::Unsupported(
                 "Private native history requires original admission".into(),
@@ -3543,10 +3548,11 @@ impl Services {
         // id here may be a legacy default alias (`acp`/`augment`/`default`)
         // from a persisted row — an alias spawns the same default binary, so
         // it must not read as a provider change.
-        let (_, last_turn_provider) = self
-            .store
-            .get_agent_session_last_turn_model(&workspace_id, agent_id)
-            .await?;
+        let (_, last_turn_provider) = boxed_await(|| {
+            self.store
+                .get_agent_session_last_turn_model(&workspace_id, agent_id)
+        })
+        .await?;
         if let Some(owner) = last_turn_provider {
             // A profile reference is its own owner: a native session never
             // crosses profiles or a profile and Default (PROTOCOL §5.54).
@@ -3572,7 +3578,7 @@ impl Services {
         // opened under: after an edit takes effect (account or home may
         // differ) recreate with Intent history instead of loading it.
         if let Some(fingerprint) =
-            Box::pin(self.profile_process_fingerprint(agent_id, &provider_id)).await
+            boxed_await(|| self.profile_process_fingerprint(agent_id, &provider_id)).await
         {
             if !Self::native_session_bound_to(&stored, &fingerprint) {
                 tracing::info!(
@@ -3583,26 +3589,27 @@ impl Services {
                 return Ok(None);
             }
         }
-        let owner = self.auth_owner(&provider_id).await;
+        let owner = boxed_await(|| self.auth_owner(&provider_id)).await;
         let provider_id = intent_providers::base_provider_id(&provider_id).to_owned();
         // Resume path: no `sessionTitle` — the durable thread already has its
         // title and `session/load` behavior must stay unchanged (monorepo#3151).
-        let is_orchestrator = self
-            .resolve_session_is_orchestrator(&provider_id, &stored)
-            .await;
+        let is_orchestrator =
+            boxed_await(|| self.resolve_session_is_orchestrator(&provider_id, &stored)).await;
         let meta = build_session_meta(
             &provider_id,
             stored.system_prompt.as_deref(),
             None,
             is_orchestrator,
         );
-        self.publish_status_event(
-            &workspace_id,
-            agent_id,
-            "session-load",
-            "Resuming session\u{2026}",
-            "info",
-        )
+        boxed_await(|| {
+            self.publish_status_event(
+                &workspace_id,
+                agent_id,
+                "session-load",
+                "Resuming session\u{2026}",
+                "info",
+            )
+        })
         .await;
         let opened = if let Some((bootstrap, native)) = review {
             let unavailable =
@@ -3616,33 +3623,27 @@ impl Services {
             bootstrap
                 .with_current(|| Ok(()))
                 .map_err(|_| unavailable())?;
-            let prepared = callbacks
-                .prepare_review_history(&acp_session_id, native.context().clone())
-                .await
-                .map_err(|_| unavailable())?;
+            let prepared = boxed_await(|| {
+                callbacks.prepare_review_history(&acp_session_id, native.context().clone())
+            })
+            .await
+            .map_err(|_| unavailable())?;
             let target = prepared
                 .load_target(cwd.clone(), mcp_servers.clone(), meta.clone())
                 .map_err(|_| unavailable())?;
-            let verified = bootstrap
-                .verify_history(prepared.messages())
+            let verified = boxed_await(|| bootstrap.verify_history(prepared.messages()))
                 .await
                 .map_err(|_| unavailable())?;
-            let admitted = verified
-                .admit(Arc::new(self.clone()))
+            let admitted = boxed_await(|| verified.admit(Arc::new(self.clone())))
                 .await
                 .map_err(|_| unavailable())?;
             admitted
                 .retain_native_context()
                 .map_err(|_| unavailable())?;
-            let opened = prepared
-                .load(
-                    callbacks,
-                    cwd,
-                    mcp_servers,
-                    meta,
-                    admitted.bind_load(target),
-                )
-                .await;
+            let opened = boxed_await(|| {
+                prepared.load(callbacks, cwd, mcp_servers, meta, admitted.bind_load(target))
+            })
+            .await;
             if let Ok(opened) = &opened {
                 if native.is_retired()
                     || !opened
@@ -3651,7 +3652,7 @@ impl Services {
                         .and_then(intent_acp::callback_registration::CallbackQuery::pending_review_monitoring)
                         .is_some_and(|receipt| receipt.matches_context(native.context()))
                 {
-                    native.join().await.map_err(|_| {
+                    boxed_await(|| native.join()).await.map_err(|_| {
                         Error::Internal("Private native retirement unconfirmed".into())
                     })?;
                     return Err(unavailable());
@@ -3659,11 +3660,10 @@ impl Services {
             }
             opened
         } else if let Some(callbacks) = callbacks {
-            callbacks
-                .load_session(&acp_session_id, cwd, mcp_servers, meta)
+            boxed_await(|| callbacks.load_session(&acp_session_id, cwd, mcp_servers, meta))
                 .await
         } else {
-            session::load_session(conn, &acp_session_id, cwd, mcp_servers, meta)
+            boxed_await(|| session::load_session(conn, &acp_session_id, cwd, mcp_servers, meta))
                 .await
                 .map(
                     |response| intent_acp::callback_registration::CallbackSession {
@@ -3674,12 +3674,14 @@ impl Services {
         }
         .map_err(|e| map_acp_session_error_for("session/load", &e, &owner))?;
         if provider_id == "codex" {
-            crate::codex_session_title::confirm(
-                conn,
-                &acp_session_id,
-                &stored.name,
-                std::time::Duration::from_secs(20),
-            )
+            boxed_await(|| {
+                crate::codex_session_title::confirm(
+                    conn,
+                    &acp_session_id,
+                    &stored.name,
+                    std::time::Duration::from_secs(20),
+                )
+            })
             .await
             .map_err(|e| map_acp_session_error_for("Codex title setup", &e, &owner))?;
         }

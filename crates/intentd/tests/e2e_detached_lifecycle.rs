@@ -1,5 +1,5 @@
 //! Real detached launcher/daemon lifecycle, including authenticated WSS.
-mod common;
+use crate::common;
 use futures_util::{SinkExt, StreamExt};
 #[cfg(unix)]
 use intentd_test_support::GuardedChild;
@@ -93,7 +93,11 @@ fn lifecycle_output_fixture() {
             // must finish capture without EOF from the inherited pipe.
             drop(
                 Command::new(std::env::current_exe().unwrap())
-                    .args(["--exact", "lifecycle_output_fixture", "--nocapture"])
+                    .args([
+                        "--exact",
+                        &common::exact_test_name(module_path!(), "lifecycle_output_fixture"),
+                        "--nocapture",
+                    ])
                     .env("INTENTD_LIFECYCLE_OUTPUT_FIXTURE", "descendant")
                     .spawn()
                     .unwrap(),
@@ -111,7 +115,11 @@ fn lifecycle_output_fixture() {
 fn lifecycle_capture_drains_output_before_waiting_for_exit() {
     let mut command = Command::new(std::env::current_exe().unwrap());
     command
-        .args(["--exact", "lifecycle_output_fixture", "--nocapture"])
+        .args([
+            "--exact",
+            &common::exact_test_name(module_path!(), "lifecycle_output_fixture"),
+            "--nocapture",
+        ])
         .env("INTENTD_LIFECYCLE_OUTPUT_FIXTURE", "chatty");
     let output = captured_command(&mut command, Duration::from_secs(3)).unwrap();
     assert!(output.status.success());
@@ -130,7 +138,11 @@ fn lifecycle_capture_does_not_wait_for_inherited_output_eof() {
     let release = dir.path().join("release");
     let mut command = Command::new(std::env::current_exe().unwrap());
     command
-        .args(["--exact", "lifecycle_output_fixture", "--nocapture"])
+        .args([
+            "--exact",
+            &common::exact_test_name(module_path!(), "lifecycle_output_fixture"),
+            "--nocapture",
+        ])
         .env("INTENTD_LIFECYCLE_OUTPUT_FIXTURE", "spawn")
         .env("INTENTD_LIFECYCLE_RELEASE", &release);
     let started = std::time::Instant::now();
@@ -154,7 +166,11 @@ fn lifecycle_capture_does_not_wait_for_inherited_output_eof() {
 fn lifecycle_capture_bounds_hung_commands_with_diagnostics() {
     let mut command = Command::new(std::env::current_exe().unwrap());
     command
-        .args(["--exact", "lifecycle_output_fixture", "--nocapture"])
+        .args([
+            "--exact",
+            &common::exact_test_name(module_path!(), "lifecycle_output_fixture"),
+            "--nocapture",
+        ])
         .env("INTENTD_LIFECYCLE_OUTPUT_FIXTURE", "hang");
     let started = std::time::Instant::now();
     let error = captured_command(&mut command, Duration::from_secs(1)).unwrap_err();
@@ -881,7 +897,10 @@ async fn windows_stop_bounds_hung_rpc_and_only_terminates_owned_process() {
         let pid_path = dir.path().join("intentd.pid");
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
-            .args(["--exact", "windows_hung_fixture"])
+            .args([
+                "--exact",
+                &common::exact_test_name(module_path!(), "windows_hung_fixture"),
+            ])
             .env("INTENTD_LIFECYCLE_HUNG_FIXTURE", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::null())

@@ -23,7 +23,7 @@
 //! exhaustion the bridge exits non-zero without ever writing a `-32001` for
 //! the buffered requests.
 
-mod common;
+use crate::common;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -88,6 +88,7 @@ fn workspace(id: &WorkspaceId, path: Option<std::path::PathBuf>) -> Workspace {
         membership: None,
         display_status: None,
         waiting: false,
+        scripts_running: false,
     }
 }
 

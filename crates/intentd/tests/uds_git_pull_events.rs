@@ -9,7 +9,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -124,6 +124,7 @@ fn workspace_row(id: &WorkspaceId, worktree: &Path, branch: &str) -> Workspace {
         pull_requests_total: None,
         display_status: None,
         waiting: false,
+        scripts_running: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,

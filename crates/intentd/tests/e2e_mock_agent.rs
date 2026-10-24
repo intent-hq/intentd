@@ -11,7 +11,7 @@
 //! Gated by `MOCK_AGENT_SCRIPT_PATH` (the CI ACP gate); skips cleanly when the
 //! script or `node` is absent.
 
-mod common;
+use crate::common;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -74,6 +74,7 @@ fn workspace(id: &WorkspaceId) -> Workspace {
         pull_requests_total: None,
         display_status: None,
         waiting: false,
+        scripts_running: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,

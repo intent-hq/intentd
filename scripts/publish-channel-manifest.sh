@@ -8,8 +8,23 @@
 # the `channel-<channel>` release (created with --latest=false so it never shadows
 # real releases). [repo] defaults to GITHUB_REPOSITORY; pass it explicitly to
 # publish to another repo (e.g. the public intent-hq/intentd-releases mirror).
-# Requires: gh (authenticated via GH_TOKEN) and an explicit repo — no default,
-# so a local run can never push a manifest to the upstream repo by accident.
+# Requires: gh (authenticated via GH_TOKEN), jq, GNU sort -V, and an explicit
+# repo — no default, so a local run can never push a manifest to the upstream
+# repo by accident.
+#
+# Alpha never moves backwards: when the live alpha manifest names a newer
+# version than the one being published, the upload is skipped with a warning
+# and the script exits 0, so re-running an older release (e.g. to recover a
+# failed publish after a newer one shipped, intent-hq/intent#7639) cannot
+# roll alpha users back. Equal versions re-upload (idempotent re-runs). A live
+# manifest that cannot be read fails the publish rather than risk a downgrade.
+# To roll alpha back deliberately, delete the alpha.json asset from
+# channel-alpha (on the source repo and the mirror), then re-run the publish.
+# The check and the upload are not atomic: the guard relies on every alpha
+# writer running inside the release workflow's intentd-release-writers
+# concurrency group (v-release.yml), so publishes never interleave.
+# Beta and stable are not guarded: re-promoting an older release there is the
+# supported rollback.
 set -euo pipefail
 
 usage="usage: publish-channel-manifest.sh <channel> <manifest-file> [repo]"
@@ -50,6 +65,26 @@ lookup_release() {
   fi
 }
 
+# make-channel-manifest.sh accepts [v]X.Y.Z[-<prerelease>]; allow build
+# metadata too, but only characters that are safe to echo into the log.
+semver_re='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.+-]+)?$'
+# True when $1 is strictly older than $2. Same ordering as cloudlands-fe's
+# auto-pin-intentd.yml: sort -V alone puts 0.7.0-beta.1 AFTER 0.7.0, so map
+# '-' to '~' (Debian-style precedence) to sort a prerelease before its release.
+version_older() {
+  local a=${1//-/\~} b=${2//-/\~}
+  [[ "$a" != "$b" ]] || return 1
+  [[ "$(printf '%s\n%s\n' "$a" "$b" | LC_ALL=C sort -V | head -n 1)" == "$a" ]]
+}
+
+if [[ "$CHANNEL" == alpha ]]; then
+  new_version=$(jq -r '.version // empty' "$MANIFEST")
+  if [[ ! "$new_version" =~ $semver_re ]]; then
+    echo "error: $MANIFEST has no valid X.Y.Z[-prerelease] .version" >&2
+    exit 1
+  fi
+fi
+
 lookup_release
 if [[ "$release_found" != true ]]; then
   if ! gh release create "$channel_tag" \
@@ -71,6 +106,40 @@ if [[ "$release_found" != true ]]; then
     fi
   fi
 fi
+asset_name=$(basename "$MANIFEST")
+# Checked after the release exists, so a lost create race (another publish
+# created it and may have uploaded a newer manifest) is checked too.
+if [[ "$CHANNEL" == alpha ]]; then
+  # gh release view/download also resolve a draft channel release. First line:
+  # whether the release is a draft; then one asset name per line.
+  if ! live_assets=$(gh release view "$channel_tag" --repo "$REPO" --json isDraft,assets --jq '.isDraft, .assets[].name'); then
+    echo "error: could not list assets of $channel_tag on $REPO; refusing to publish without the version check" >&2
+    exit 1
+  fi
+  live_draft=$(head -n 1 <<<"$live_assets")
+  if tail -n +2 <<<"$live_assets" | grep -Fx -- "$asset_name" >/dev/null; then
+    if ! live_json=$(gh release download "$channel_tag" --repo "$REPO" --pattern "$asset_name" --output -); then
+      echo "error: could not download the live $asset_name from $channel_tag on $REPO; refusing to publish without the version check" >&2
+      exit 1
+    fi
+    live_version=$(jq -r '.version // empty' <<<"$live_json" 2>/dev/null) || live_version=""
+    if [[ ! "$live_version" =~ $semver_re ]]; then
+      echo "error: the live $asset_name on $channel_tag ($REPO) has no readable X.Y.Z[-prerelease] version; fix or delete that asset, then re-run" >&2
+      exit 1
+    fi
+    if version_older "$new_version" "$live_version"; then
+      echo "::warning::Not publishing $CHANNEL $new_version to $REPO: the $CHANNEL channel already points at newer $live_version. Re-running an older release never rolls the channel back; to roll back on purpose, delete $asset_name from $channel_tag and re-run."
+      # Still repair a channel release an earlier failed refresh left in
+      # DRAFT (invisible to consumers); the refresher re-publishes it.
+      if [[ "$live_draft" == true ]]; then
+        "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/refresh-release-published-at.sh" "$channel_tag" "$REPO"
+      fi
+      exit 0
+    fi
+    echo "live $CHANNEL manifest on $REPO is $live_version; publishing $new_version" >&2
+  fi
+fi
+
 gh release upload "$channel_tag" \
   "$MANIFEST" \
   --repo "$REPO" \

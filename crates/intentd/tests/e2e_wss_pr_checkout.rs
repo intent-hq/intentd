@@ -1,7 +1,7 @@
 //! PR checkout correctness over the real WebSocket router and local bare Git.
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use async_trait::async_trait;
 use intent_sourcecontrol::{

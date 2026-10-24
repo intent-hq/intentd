@@ -177,6 +177,45 @@ async fn installed_cli_version_uses_final_environment_and_cwd() {
     assert_eq!(context.observe(&cmd).await.unwrap().1, version);
 }
 
+/// The installed-CLI `--version` check stays at the daemon's priority: a
+/// demoted 3s check can time out on a busy machine, and a failed check
+/// blocks the agent launch.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn installed_cli_version_check_runs_at_daemon_priority() {
+    let version = current(InstalledCli::Claude);
+    let record = tempfile::tempdir().unwrap();
+    let nice_file = record.path().join("cli.nice");
+    let (root, context) = fixture(
+        InstalledCli::Claude,
+        &format!(
+            "#!/bin/sh\ncut -d' ' -f19 /proc/$$/stat > '{}'\nprintf '{version}\\n'\n",
+            nice_file.display()
+        ),
+    );
+    assert_eq!(
+        context
+            .observe(&launch(&context, root.path()))
+            .await
+            .unwrap()
+            .1,
+        version
+    );
+    let nice: i32 = std::fs::read_to_string(&nice_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    // The daemon's own nice: the expectation with no increment.
+    let own = intent_acp::AgentPriority {
+        nice_increment: 0,
+        ..intent_acp::AgentPriority::from_env()
+    }
+    .expected_nice()
+    .unwrap();
+    assert_eq!(nice, own, "CLI version check must not be demoted");
+}
+
 #[test]
 fn installed_cli_env_namespace_custom_credentials_os_values_and_policy_precedence() {
     let (root, context) = fixture(InstalledCli::Codex, "#!/bin/sh\nexit 0\n");

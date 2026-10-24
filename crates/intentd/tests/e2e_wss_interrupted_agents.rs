@@ -13,7 +13,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -1379,6 +1379,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         pull_requests_total: None,
         display_status: None,
         waiting: false,
+        scripts_running: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
