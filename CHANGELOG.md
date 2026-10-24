@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.40] - 2026-10-24
+
+### 🚀 Features
+
+- *(profiles)* Name and environment overrides for the Codex/Claude Code Default configuration ([#2640](https://github.com/intent-hq/intentd/pull/2640))
+
+### 🐛 Bug Fixes
+
+- Keep embedded arrows from ending a previewed prompts block ([#2625](https://github.com/intent-hq/intentd/pull/2625))
+
+### 🧪 Testing
+
+- *(intent-services)* Wait for live watches through a creation retry ([#2648](https://github.com/intent-hq/intentd/pull/2648))
+
+
 ## [0.11.39] - 2026-10-24
 
 ### 🚀 Features

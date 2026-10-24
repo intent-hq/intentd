@@ -727,6 +727,7 @@ impl ModelCatalogCache {
             .map(|s| s.key.clone())
     }
 
+    #[cfg(test)]
     pub(crate) async fn resolve_installed(
         self: &Arc<Self>,
         provider: &str,

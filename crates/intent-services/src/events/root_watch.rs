@@ -623,7 +623,7 @@ mod tests {
         // A recursive co-subscriber widens the ancestor's OS watch and leaves;
         // the hub keeps the root recursive for the ancestor watch's lifetime.
         let (sub_wide, _rx_wide, _) = hub.subscribe(&dir.path);
-        sub_wide.wait_established(LIVENESS).await;
+        sub_wide.probe().wait_live(LIVENESS).await;
         drop(sub_wide);
 
         std::fs::create_dir_all(&root).expect("create root");
