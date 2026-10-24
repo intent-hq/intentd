@@ -12293,20 +12293,19 @@ fn decorate_specialist_resolved(
 /// `primitive` to the note, persist it, emit `note:updated`, and return the TS
 /// `appendPrimitiveBlock` response `{ ok, primitiveId, noteId, content }`. A
 /// missing note surfaces as `Error::Internal` (→ `-32603`), matching the TS
-/// builder which throws `Note <id> not found`. `lanes` is
-/// `Services::note_content_writes`: the read→persist window holds the note's
-/// lane like every other client content write.
+/// builder which throws `Note <id> not found`. The read→persist window holds
+/// the note's content-write lane like every other client content write.
 async fn append_primitive(
-    store: &Store,
-    lanes: &KeyedInflight<(WorkspaceId, NoteId)>,
-    bus: Option<&EventBus>,
+    services: &Services,
     workspace_id: &WorkspaceId,
     note_id: &NoteId,
     primitive: &serde_json::Value,
     block_type: &str,
     primitive_id: &str,
 ) -> Result<serde_json::Value> {
-    let lane = lanes.lock((workspace_id.clone(), note_id.clone())).await;
+    let store = &services.store;
+    let bus = services.event_bus.as_ref();
+    let write_lane = services.lock_note_content(workspace_id, note_id).await;
     let note = fetch_note_peer(store, workspace_id, note_id).await?;
     let incoming = primitive_ops::append_block(&note.content, primitive, block_type);
     let read_rev = note.rev;
@@ -12330,7 +12329,7 @@ async fn append_primitive(
         },
     )
     .await?;
-    drop(lane);
+    drop(write_lane);
     publish_event(
         bus,
         note_change_event(
@@ -16876,7 +16875,7 @@ impl Services {
     ) -> Result<TaskConvertBlocksResult> {
         let store = &self.store;
         let author = resolve_note_version_author(store, caller_agent_id).await;
-        let lane = self.lock_note_content(&workspace_id, &note_id).await;
+        let write_lane = self.lock_note_content(&workspace_id, &note_id).await;
         let mut attempt = 0;
         let (note, parsed, mut warnings, created, block_note_ids) = loop {
             attempt += 1;
@@ -17019,7 +17018,7 @@ impl Services {
                 Err(e) => return Err(e),
             }
         };
-        drop(lane);
+        drop(write_lane);
         let mut created_note_ids: Vec<String> = Vec::with_capacity(created.len());
         let mut created_tasks: Vec<CreatedTaskEntry> = Vec::with_capacity(created.len());
         for (child, entry) in created {
@@ -20794,8 +20793,6 @@ impl WorkspaceApi for Services {
         description: String,
         snapshot: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let store = self.store.clone();
-        let bus = self.event_bus.clone();
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
             let id = new_uuid();
@@ -20807,17 +20804,7 @@ impl WorkspaceApi for Services {
                 &description,
                 snapshot.as_deref(),
             );
-            append_primitive(
-                &store,
-                &self.note_content_writes,
-                bus.as_ref(),
-                &workspace_id,
-                &note_id,
-                &primitive,
-                "reference",
-                &id,
-            )
-            .await
+            append_primitive(self, &workspace_id, &note_id, &primitive, "reference", &id).await
         })
     }
 
@@ -20829,8 +20816,6 @@ impl WorkspaceApi for Services {
         description: String,
         working_directory: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let store = self.store.clone();
-        let bus = self.event_bus.clone();
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
             let id = new_uuid();
@@ -20842,17 +20827,7 @@ impl WorkspaceApi for Services {
                 &description,
                 working_directory.as_deref(),
             );
-            append_primitive(
-                &store,
-                &self.note_content_writes,
-                bus.as_ref(),
-                &workspace_id,
-                &note_id,
-                &primitive,
-                "cli",
-                &id,
-            )
-            .await
+            append_primitive(self, &workspace_id, &note_id, &primitive, "cli", &id).await
         })
     }
 
@@ -20864,24 +20839,12 @@ impl WorkspaceApi for Services {
         diff: String,
         description: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let store = self.store.clone();
-        let bus = self.event_bus.clone();
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
             let id = new_uuid();
             let created_at = now_iso();
             let primitive = primitive_ops::patch(&id, &created_at, &file_path, &diff, &description);
-            append_primitive(
-                &store,
-                &self.note_content_writes,
-                bus.as_ref(),
-                &workspace_id,
-                &note_id,
-                &primitive,
-                "patch",
-                &id,
-            )
-            .await
+            append_primitive(self, &workspace_id, &note_id, &primitive, "patch", &id).await
         })
     }
 
@@ -20893,8 +20856,6 @@ impl WorkspaceApi for Services {
         goal: String,
         description: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let store = self.store.clone();
-        let bus = self.event_bus.clone();
         Box::pin(async move {
             // The write lands on `workspace_id`/`note_id`: that workspace is
             // the authorization scope; the referenced agent is checked too.
@@ -20906,9 +20867,7 @@ impl WorkspaceApi for Services {
             let primitive =
                 primitive_ops::agent_action(&id, &created_at, &agent_id, &goal, &description);
             append_primitive(
-                &store,
-                &self.note_content_writes,
-                bus.as_ref(),
+                self,
                 &workspace_id,
                 &note_id,
                 &primitive,
@@ -26191,7 +26150,7 @@ impl WorkspaceApi for Services {
             let _mutation = self.workspace_mutations.enter(&workspace_id)?;
             self.require_member(&workspace_id).await?;
             note_ops::reject_numbered_read_presentation(&input.content)?;
-            let lane = self.lock_note_content(&workspace_id, &note_id).await;
+            let write_lane = self.lock_note_content(&workspace_id, &note_id).await;
             let note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
             let (incoming, position) = note_ops::apply_add(
                 &note.content,
@@ -26221,7 +26180,7 @@ impl WorkspaceApi for Services {
                 },
             )
             .await?;
-            drop(lane);
+            drop(write_lane);
             services
                 .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
             let outcome = services
@@ -26288,7 +26247,7 @@ impl WorkspaceApi for Services {
                 ));
             }
             note_ops::reject_numbered_read_presentation(&input.new)?;
-            let lane = self.lock_note_content(&workspace_id, &note_id).await;
+            let write_lane = self.lock_note_content(&workspace_id, &note_id).await;
             let note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
             let (incoming, match_position, was_empty) =
                 note_ops::apply_edit(&note.content, &input.old, &input.new)?;
@@ -26314,7 +26273,7 @@ impl WorkspaceApi for Services {
                 },
             )
             .await?;
-            drop(lane);
+            drop(write_lane);
             services
                 .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
             let outcome = services
@@ -26379,7 +26338,7 @@ impl WorkspaceApi for Services {
             let _mutation = self.workspace_mutations.enter(&workspace_id)?;
             self.require_member(&workspace_id).await?;
             note_ops::reject_numbered_read_presentation(&input.content)?;
-            let lane = self.lock_note_content(&workspace_id, &note_id).await;
+            let write_lane = self.lock_note_content(&workspace_id, &note_id).await;
             let note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
             let incoming =
                 note_ops::apply_edit_lines(&note.content, input.start, input.end, &input.content)?;
@@ -26405,7 +26364,7 @@ impl WorkspaceApi for Services {
                 },
             )
             .await?;
-            drop(lane);
+            drop(write_lane);
             let total_lines_before = old_content.split('\n').count();
             services
                 .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
@@ -26495,7 +26454,7 @@ impl WorkspaceApi for Services {
             // store nor the merge state.
             note_ops::reject_numbered_read_presentation(&content)?;
             let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
-            let lane = self.lock_note_content(&workspace_id, &note_id).await;
+            let write_lane = self.lock_note_content(&workspace_id, &note_id).await;
             let MergedContentWrite {
                 note,
                 old_content,
@@ -26519,7 +26478,7 @@ impl WorkspaceApi for Services {
                 },
             )
             .await?;
-            drop(lane);
+            drop(write_lane);
             let previous_title = note.title.clone();
             services
                 .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
@@ -26998,7 +26957,7 @@ impl WorkspaceApi for Services {
             let checkbox = note_ops::checkbox_for(&status).ok_or_else(|| {
                 Error::Internal("Status must be 'done', 'todo', or 'in-progress'".to_string())
             })?;
-            let lane = self.lock_note_content(&workspace_id, &note_id).await;
+            let write_lane = self.lock_note_content(&workspace_id, &note_id).await;
             let note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
             let normalized = task_text.trim().to_string();
             let linked = match note_ops::linked_task_for_text(&note.content, &normalized) {
@@ -27008,7 +26967,7 @@ impl WorkspaceApi for Services {
             if let Some((task_id, task)) = linked {
                 // The redirect writes the task and materializes its parent
                 // lines (possibly in this note): release the lane first.
-                drop(lane);
+                drop(write_lane);
                 // The line links a task note: the task's metadata status is
                 // the source of truth and the char is its projection, so the
                 // write goes to the task (events, ready-task recompute) and
@@ -27059,7 +27018,7 @@ impl WorkspaceApi for Services {
                 },
             )
             .await?;
-            drop(lane);
+            drop(write_lane);
             services
                 .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
             publish_event(
@@ -27148,7 +27107,7 @@ impl WorkspaceApi for Services {
             // with the stale marker into `[x ]` — no longer a checkbox, so
             // nothing could heal it (intent-hq/intentd#1857). Unlinked lines
             // carry no projection and keep the merging write.
-            let lane = self.lock_note_content(&workspace_id, &note_id).await;
+            let write_lane = self.lock_note_content(&workspace_id, &note_id).await;
             let mut attempt = 0;
             let (note, update, redirect, write_parent) = loop {
                 attempt += 1;
@@ -27278,7 +27237,7 @@ impl WorkspaceApi for Services {
                 }
             };
             // Release before the redirect's task write materializes parents.
-            drop(lane);
+            drop(write_lane);
             if write_parent {
                 publish_event(
                     bus.as_ref(),
@@ -28129,7 +28088,7 @@ impl WorkspaceApi for Services {
                     // (`Conflict`) is re-read and re-anchored on the next
                     // attempt instead of overwritten; the last attempt's
                     // `Conflict` propagates unchanged, like `note.setContent`.
-                    let lane = services.lock_note_content(&workspace_id, &note_id).await;
+                    let write_lane = services.lock_note_content(&workspace_id, &note_id).await;
                     let mut attempt = 0;
                     let (note, line, anchored_text, note_rev) = loop {
                     attempt += 1;
@@ -28254,7 +28213,7 @@ impl WorkspaceApi for Services {
                         Err(e) => return Err(e),
                     }
                     };
-                    drop(lane);
+                    drop(write_lane);
                     services.schedule_line_attribution_recompute(
                         &note.workspace_id.clone(),
                         &note.id.clone(),
