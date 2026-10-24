@@ -46,15 +46,18 @@ use intent_core::{
 use intent_store::NewEvent;
 use sha2::Digest as _;
 
-use crate::capability::gated_collaborator_caller;
+use crate::transfer::TransferPlanExt;
+use crate::transfer::TransferStateExt;
 use crate::transfer_git::{create_transfer_bundle, unwind_wip, TransferBundle};
-use crate::{git_ops, publish_event, system_actor, Services};
+use intent_services::feature_api::capability::gated_collaborator_caller;
+use intent_services::feature_api::{git_ops, publish_event, system_actor, Services};
 
 /// Maximum bytes per `workspace.export.read` chunk BEFORE base64 encoding.
-/// Matches [`crate::feature_ports::IMPORT_MAX_CHUNK_BYTES`] so the FE can
+/// Matches [`intent_services::feature_api::feature_ports::IMPORT_MAX_CHUNK_BYTES`] so the FE can
 /// pipe downloaded chunks straight into `workspace.import.chunk`; the ~21.4
 /// MiB encoded frame stays comfortably under the 40 MiB cap (PROTOCOL §1.3).
-pub(crate) const EXPORT_MAX_CHUNK_BYTES: usize = crate::feature_ports::IMPORT_MAX_CHUNK_BYTES;
+pub(crate) const EXPORT_MAX_CHUNK_BYTES: usize =
+    intent_services::feature_api::feature_ports::IMPORT_MAX_CHUNK_BYTES;
 
 /// Test-only export build failpoint (see
 /// [`crate::transfer::TransferFeature::export_build_failpoint`]): given the
@@ -98,10 +101,12 @@ fn reject_private_monitor_export(rows: &[(String, Vec<serde_json::Value>)]) -> R
     }
     let private = rows.iter().any(|(table, objects)| {
         objects.iter().any(|row| match table.as_str() {
-            "agent_message" => crate::agent_ops::is_qualified_monitor_envelope(
-                &parsed(row, "content"),
-                Some(&parsed(row, "metadata")),
-            ),
+            "agent_message" => {
+                intent_services::feature_api::agent_ops::is_qualified_monitor_envelope(
+                    &parsed(row, "content"),
+                    Some(&parsed(row, "metadata")),
+                )
+            }
             "pr_monitor" => {
                 row["target_provenance"] == "captured-request"
                     || ["last_snapshot", "baseline_snapshot"].iter().any(|key| {
@@ -168,13 +173,52 @@ impl ExportSession {
     }
 }
 
-impl Services {
+/// Source-side export (`workspace.export.*`) on [`Services`].
+pub(crate) trait TransferExportExt {
+    #[cfg(test)]
+    fn with_export_build_failpoint(self, failpoint: ExportBuildFailpoint) -> Self;
+    async fn require_export_actor(&self, id: &str, what: &str) -> Result<()>;
+    fn export_staging_root(&self) -> PathBuf;
+    async fn workspace_export_start_op(&self, id: WorkspaceId) -> Result<serde_json::Value>;
+    async fn run_export_build(&self, export_id: String, ws: Workspace);
+    async fn build_export_archive(
+        &self,
+        export_id: &str,
+        ws: Workspace,
+    ) -> Result<Option<ReadyArchive>>;
+    async fn workspace_export_read_op(
+        &self,
+        export_id: String,
+        seq: u64,
+    ) -> Result<serde_json::Value>;
+    async fn workspace_export_finalize_op(
+        &self,
+        export_id: String,
+        archive_source: bool,
+        final_status_message: Option<String>,
+    ) -> Result<serde_json::Value>;
+    async fn workspace_export_abort_op(&self, export_id: String) -> Result<serde_json::Value>;
+    fn check_export_failpoint(&self, stage: &str) -> Result<()>;
+    fn export_aborted(&self, export_id: &str) -> bool;
+    async fn cleanup_export(&self, export_id: &str);
+    async fn sweep_stale_export_staging_dirs(&self);
+    async fn sweep_stale_export_staging(&self);
+    async fn emit_export_progress(
+        &self,
+        workspace_id: &WorkspaceId,
+        export_id: &str,
+        stage: &str,
+        bytes_written: Option<u64>,
+    );
+}
+
+impl TransferExportExt for Services {
     /// Test-only: fail the export archive build mid-flight. The closure is
     /// consulted with the name of each build stage about to run; returning
     /// `Some(error)` fails the build there, exercising the
     /// `workspace:transfer:failed` cleanup path.
     #[cfg(test)]
-    pub(crate) fn with_export_build_failpoint(self, failpoint: ExportBuildFailpoint) -> Self {
+    fn with_export_build_failpoint(self, failpoint: ExportBuildFailpoint) -> Self {
         *self
             .transfer_state()
             .export_build_failpoint
@@ -183,7 +227,7 @@ impl Services {
         self
     }
 
-    pub(crate) async fn require_export_actor(&self, id: &str, what: &str) -> Result<()> {
+    async fn require_export_actor(&self, id: &str, what: &str) -> Result<()> {
         let Some(principal) = gated_collaborator_caller(what)? else {
             return Ok(());
         };
@@ -208,9 +252,11 @@ impl Services {
     /// Root directory staged exports live under (sibling of the import
     /// staging root, same filesystem reasoning).
     fn export_staging_root(&self) -> PathBuf {
-        self.workspaces_root
-            .clone()
-            .unwrap_or_else(crate::default_workspaces_root)
+        self.feature_workspaces_root()
+            .map_or_else(
+                intent_services::feature_api::default_workspaces_root,
+                std::path::Path::to_path_buf,
+            )
             .join(".export-staging")
     }
 
@@ -219,11 +265,8 @@ impl Services {
     /// immediately; progress/outcome travel on `workspace:transfer:*` events.
     /// Rejects the chief workspace, unknown ids, and a second concurrent
     /// export of the same workspace.
-    pub(crate) async fn workspace_export_start_op(
-        &self,
-        id: WorkspaceId,
-    ) -> Result<serde_json::Value> {
-        if self.store_tasks.is_closed() {
+    async fn workspace_export_start_op(&self, id: WorkspaceId) -> Result<serde_json::Value> {
+        if self.feature_store_tasks().is_closed() {
             return Err(Error::Internal("daemon is shutting down".into()));
         }
         if id.is_chief() {
@@ -231,11 +274,11 @@ impl Services {
                 "The chief workspace cannot be exported".to_string(),
             ));
         }
-        let ws = self.store.get_workspace(&id).await?;
-        if self.store.has_private_discussions(&id).await? {
+        let ws = self.store().get_workspace(&id).await?;
+        if self.store().has_private_discussions(&id).await? {
             return Err(private_discussion_export_error());
         }
-        reject_private_monitor_export(&self.store.transfer_monitor_rows(&id).await?)?;
+        reject_private_monitor_export(&self.store().transfer_monitor_rows(&id).await?)?;
         #[cfg(test)]
         {
             let barrier = self
@@ -252,7 +295,7 @@ impl Services {
         let export_id = format!("export-{}", uuid::Uuid::new_v4());
         let staging_dir = self.export_staging_root().join(&export_id);
         {
-            let _monitor_lane = self.script_locks.monitor_lane.lock().await;
+            let _monitor_lane = self.feature_script_monitor_lane().lock().await;
             let mut exports = self
                 .transfer_state()
                 .exports
@@ -293,7 +336,7 @@ impl Services {
         let svc = self.clone();
         let export_id_for_task = export_id.clone();
         if self
-            .store_tasks
+            .feature_store_tasks()
             .spawn_draining(async move {
                 // This owner includes every awaited local blocking stage, agent
                 // capture and terminal publication. Dropping a response must not
@@ -356,7 +399,7 @@ impl Services {
                     return;
                 };
                 publish_event(
-                    self.event_bus.as_ref(),
+                    self.feature_event_bus(),
                     transfer_event(&workspace_id, WORKSPACE_TRANSFER_READY, event_data),
                 )
                 .await;
@@ -374,7 +417,7 @@ impl Services {
                 );
                 self.cleanup_export(&export_id).await;
                 publish_event(
-                    self.event_bus.as_ref(),
+                    self.feature_event_bus(),
                     transfer_event(
                         &workspace_id,
                         WORKSPACE_TRANSFER_FAILED,
@@ -421,7 +464,7 @@ impl Services {
         // untouched (stop_many never clears `agent_queue`).
         self.emit_export_progress(&id, export_id, "stopping-agents", None)
             .await;
-        let sessions = self.store.list_agent_session_summaries(&id).await?;
+        let sessions = self.store().list_agent_session_summaries(&id).await?;
         let manager = self.agent_manager();
         let busy: std::collections::HashSet<AgentId> = manager
             .as_ref()
@@ -450,7 +493,7 @@ impl Services {
                 _ => "active".to_string(),
             };
             if let Err(e) = self
-                .store
+                .store()
                 .insert_interrupted_agent(&session.id, &id, &prev, &now)
                 .await
             {
@@ -480,7 +523,7 @@ impl Services {
         self.emit_export_progress(&id, export_id, "exporting-rows", None)
             .await;
         let manifest = self.workspace_transfer_plan_op(id.clone()).await?.manifest;
-        let mut rows = self.store.transfer_export_rows(&id).await?;
+        let mut rows = self.store().transfer_export_rows(&id).await?;
         // Preflight is advisory against races. Refuse the exact immutable row
         // snapshot that would enter the archive, before any bytes are sealed.
         reject_private_monitor_export(&rows)?;
@@ -492,7 +535,10 @@ impl Services {
         // default next to a foreign model id (intent-hq/intent#5815).
         let pinned = crate::transfer_model_selection::pin_source_selection(
             &mut rows,
-            crate::agent_session::derived_default_provider(&self.effective_settings()).as_deref(),
+            intent_services::feature_api::agent_session::derived_default_provider(
+                &self.effective_settings(),
+            )
+            .as_deref(),
         );
         if pinned > 0 {
             tracing::info!(
@@ -507,11 +553,11 @@ impl Services {
         // file is already gone carry no entry — deleted-is-deleted transfers
         // as a row without a file and must never fail the export.
         let attachment_sources: Vec<(String, PathBuf)> = {
-            let root = crate::file_ops::workspace_root(&ws);
+            let root = intent_services::feature_api::file_ops::workspace_root(&ws);
             if root.is_empty() || manifest.attachments.iter().all(|a| !a.exists) {
                 Vec::new()
             } else {
-                let records = self.store.list_attachments(&id).await?;
+                let records = self.store().list_attachments(&id).await?;
                 manifest
                     .attachments
                     .iter()
@@ -519,8 +565,11 @@ impl Services {
                     .filter_map(|a| {
                         let record = records.iter().find(|r| r.id == a.id)?;
                         let path =
-                            crate::file_ops::resolve_attachment_source(&root, &record.stored_path)
-                                .ok()?;
+                            intent_services::feature_api::file_ops::resolve_attachment_source(
+                                &root,
+                                &record.stored_path,
+                            )
+                            .ok()?;
                         Some((a.id.clone(), path))
                     })
                     .collect()
@@ -538,7 +587,7 @@ impl Services {
         let git_payload = if manifest.git.has_repository {
             self.emit_export_progress(&id, export_id, "bundling-git", None)
                 .await;
-            let sandboxes = self.store.list_sandboxes(&id).await?;
+            let sandboxes = self.store().list_sandboxes(&id).await?;
             let live: Vec<intent_store::Sandbox> = sandboxes
                 .into_iter()
                 .filter(|s| {
@@ -568,7 +617,7 @@ impl Services {
             for sb in &bundle.refs.sandboxes {
                 if sb.wip_commit_sha.is_some() {
                     // Sandbox paths were validated to exist by the bundler.
-                    if let Some(path) = sandbox_path_for(&self.store, &id, &sb.agent_id).await {
+                    if let Some(path) = sandbox_path_for(self.store(), &id, &sb.agent_id).await {
                         wip_paths.push(path);
                     }
                 }
@@ -596,7 +645,7 @@ impl Services {
         // Stage 4: write + seal the zip archive, hashing as it goes.
         self.emit_export_progress(&id, export_id, "writing-archive", None)
             .await;
-        let assets_dir = self.assets_root.clone().map(|root| root.join(&id.0));
+        let assets_dir = self.feature_assets_root().map(|root| root.join(&id.0));
         let manifest_for_zip = manifest.clone();
         let archive_staging = staging_dir.clone();
         let (archive_path, size_bytes, sha256) = tokio::task::spawn_blocking(move || {
@@ -626,7 +675,7 @@ impl Services {
     /// archive as base64. Idempotent — any seq may be re-requested in any
     /// order. Rejects unknown ids, still-building sessions, and out-of-range
     /// seqs. Returns `{ exportId, seq, totalChunks, data }`.
-    pub(crate) async fn workspace_export_read_op(
+    async fn workspace_export_read_op(
         &self,
         export_id: String,
         seq: u64,
@@ -689,7 +738,7 @@ impl Services {
     /// a failed mutation leaves the export intact and finalize can be
     /// retried. Only valid on a Ready session. Returns
     /// `{ exportId, finalized: true, workspace }`.
-    pub(crate) async fn workspace_export_finalize_op(
+    async fn workspace_export_finalize_op(
         &self,
         export_id: String,
         archive_source: bool,
@@ -724,7 +773,7 @@ impl Services {
         let ws = if archive_source {
             self.archive_workspace(workspace_id.clone(), None).await?
         } else {
-            self.store.get_workspace(&workspace_id).await?
+            self.store().get_workspace(&workspace_id).await?
         };
         self.cleanup_export(&export_id).await;
         Ok(serde_json::json!({
@@ -739,10 +788,7 @@ impl Services {
     /// session is cleaned up inline (WIP snapshots unwound, staging
     /// deleted). Idempotent — unknown ids return `{ aborted: false }`. The
     /// workspace stays usable; agents stay stopped (the user restarts them).
-    pub(crate) async fn workspace_export_abort_op(
-        &self,
-        export_id: String,
-    ) -> Result<serde_json::Value> {
+    async fn workspace_export_abort_op(&self, export_id: String) -> Result<serde_json::Value> {
         let building = {
             let mut exports = self
                 .transfer_state()
@@ -838,7 +884,7 @@ impl Services {
     /// per directory entry at deletion time, so a session registered while
     /// the sweep walks the root (a concurrent `start`) keeps its staging
     /// dir. Best-effort.
-    pub(crate) async fn sweep_stale_export_staging_dirs(&self) {
+    async fn sweep_stale_export_staging_dirs(&self) {
         let root = self.export_staging_root();
         let Ok(mut entries) = tokio::fs::read_dir(&root).await else {
             // no staging root yet — nothing to sweep
@@ -864,7 +910,7 @@ impl Services {
 
     /// Boot entry point for the orphan sweep: no sessions are live after a
     /// restart, so every leftover export staging dir is removed.
-    pub async fn sweep_stale_export_staging(&self) {
+    async fn sweep_stale_export_staging(&self) {
         self.sweep_stale_export_staging_dirs().await;
     }
 
@@ -886,7 +932,7 @@ impl Services {
                 .insert("bytesWritten".to_string(), serde_json::json!(bytes));
         }
         publish_event(
-            self.event_bus.as_ref(),
+            self.feature_event_bus(),
             transfer_event(workspace_id, WORKSPACE_TRANSFER_PROGRESS, data),
         )
         .await;
@@ -1155,7 +1201,7 @@ mod tests {
         workspaces_root: &Path,
         assets_root: &Path,
     ) -> (tempfile::TempDir, Services) {
-        let db_dir = crate::test_support::test_tempdir("export-test-");
+        let db_dir = intent_services::feature_api::test_support::test_tempdir("export-test-");
         let db = db_dir.path().join("store.db");
         let store = Store::open(&db).await.expect("open store");
         let svc = Services::new(store)
@@ -1169,15 +1215,15 @@ mod tests {
     /// one whose stored file exists under the workspace's (non-git)
     /// worktree dir, one whose file was deleted out-of-band.
     async fn seed_workspace(svc: &Services, assets_root: &Path, ws_dir: &Path, id: &WorkspaceId) {
-        let mut ws = crate::tests::workspace(id);
+        let mut ws = intent_services::feature_api::tests::workspace(id);
         std::fs::create_dir_all(ws_dir).expect("ws dir");
         ws.worktree_path = Some(ws_dir.to_string_lossy().to_string());
-        svc.store.insert_workspace(&ws).await.expect("workspace");
+        svc.store().insert_workspace(&ws).await.expect("workspace");
         let att_dir = ws_dir.join(".intent/attachments");
         std::fs::create_dir_all(&att_dir).expect("attachments dir");
         std::fs::write(att_dir.join("doc.pdf"), b"attachment-bytes").expect("attachment");
         for (att_id, name) in [("att-live", "doc.pdf"), ("att-gone", "gone.txt")] {
-            svc.store
+            svc.store()
                 .insert_attachment(&intent_store::AttachmentRecord {
                     id: att_id.to_string(),
                     workspace_id: id.clone(),
@@ -1191,7 +1237,7 @@ mod tests {
                 .expect("attachment row");
         }
         let agent = AgentId("agent-exp".to_string());
-        svc.store
+        svc.store()
             .insert_agent_session(&session(&agent, id, AgentStatus::Active))
             .await
             .expect("session");
@@ -1212,7 +1258,7 @@ mod tests {
             rev: 0,
             updated_at: now_iso(),
         };
-        svc.store.insert_note(&note).await.expect("note");
+        svc.store().insert_note(&note).await.expect("note");
         let dir = assets_root.join(&id.0);
         std::fs::create_dir_all(&dir).expect("assets dir");
         std::fs::write(dir.join("img.png"), b"asset-bytes").expect("asset");
@@ -1220,7 +1266,8 @@ mod tests {
 
     #[intent_test_macros::daemon_test]
     async fn qualified_monitor_export_refuses_before_source_side_effects() {
-        let root = crate::test_support::test_tempdir("private-monitor-export");
+        let root =
+            intent_services::feature_api::test_support::test_tempdir("private-monitor-export");
         let assets = root.path().join("assets");
         let workspaces = root.path().join("workspaces");
         let (_db, svc) = fresh_services(&workspaces, &assets).await;
@@ -1233,8 +1280,8 @@ mod tests {
         let content = serde_json::json!([{"type":"text","text":"private-export-regression-sentinel","messageMetadata":metadata}]);
         sqlx::query("INSERT INTO agent_message(id,agent_id,seq,role,content,metadata,created_at) VALUES ('retained-private',?,0,'user',?,?,?)")
             .bind(&agent.0).bind(content.to_string()).bind(metadata.to_string()).bind(now_iso())
-            .execute(svc.store.write_pool()).await.unwrap();
-        let before = svc.store.get_agent_session(&agent).await.unwrap();
+            .execute(svc.store().write_pool()).await.unwrap();
+        let before = svc.store().get_agent_session(&agent).await.unwrap();
         let result = svc.workspace_export_start_op(id).await;
         if let Ok(started) = &result {
             let export_id = started["exportId"].as_str().unwrap();
@@ -1270,8 +1317,8 @@ mod tests {
         );
         assert!(svc.transfer_state().exports.lock().unwrap().is_empty());
         assert!(!svc.export_staging_root().exists());
-        assert_eq!(svc.store.get_agent_session(&agent).await.unwrap(), before);
-        let messages = svc.store.get_agent_messages(&agent, None).await.unwrap();
+        assert_eq!(svc.store().get_agent_session(&agent).await.unwrap(), before);
+        let messages = svc.store().get_agent_messages(&agent, None).await.unwrap();
         assert_eq!(messages[0].content, content);
         assert_eq!(messages[0].metadata.as_ref(), Some(&metadata));
     }
@@ -1320,11 +1367,12 @@ mod tests {
 
     #[intent_test_macros::daemon_test]
     async fn qualified_monitor_export_rechecks_insert_after_preflight() {
-        let root = crate::test_support::test_tempdir("private-monitor-export-race");
+        let root =
+            intent_services::feature_api::test_support::test_tempdir("private-monitor-export-race");
         let assets = root.path().join("assets");
         let workspaces = root.path().join("workspaces");
         let (_db, svc) = fresh_services(&workspaces, &assets).await;
-        let bus = crate::EventBus::new(svc.store.clone());
+        let bus = intent_services::feature_api::EventBus::new(svc.store().clone());
         let svc = svc.with_event_bus(bus.clone());
         let id = WorkspaceId::new();
         seed_workspace(&svc, &assets, &workspaces.join("checkout"), &id).await;
@@ -1334,7 +1382,7 @@ mod tests {
             .test_export_monitor_preflight
             .lock()
             .unwrap() = Some((entered.clone(), release.clone()));
-        let mut failed_events = bus.subscribe(crate::SubscriptionFilter {
+        let mut failed_events = bus.subscribe(intent_services::feature_api::SubscriptionFilter {
             event_types: vec![WORKSPACE_TRANSFER_FAILED.to_string()],
             workspace_id: Some(id.0.clone()),
             ..Default::default()
@@ -1344,7 +1392,7 @@ mod tests {
         entered.notified().await;
         sqlx::query("INSERT INTO agent_message(id,agent_id,seq,role,content,metadata,created_at) VALUES ('private-race','agent-exp',0,'user','[]',?,?)")
             .bind(r#"{"type":"pr_monitor_wake","resource":{}}"#).bind(now_iso())
-            .execute(svc.store.write_pool()).await.unwrap();
+            .execute(svc.store().write_pool()).await.unwrap();
         release.notify_one();
         let started = start.await.unwrap().unwrap();
         let export_id = started["exportId"].as_str().unwrap();
@@ -1373,7 +1421,7 @@ mod tests {
         assert!(svc.transfer_state().exports.lock().unwrap().is_empty());
         assert!(!svc.export_staging_root().join(export_id).exists());
         assert_eq!(
-            svc.store
+            svc.store()
                 .get_agent_messages(&AgentId("agent-exp".into()), None)
                 .await
                 .unwrap()
@@ -1384,11 +1432,13 @@ mod tests {
 
     #[intent_test_macros::daemon_test]
     async fn discussion_export_rechecks_first_conversation_after_preflight() {
-        let root = crate::test_support::test_tempdir("private-discussion-export-race");
+        let root = intent_services::feature_api::test_support::test_tempdir(
+            "private-discussion-export-race",
+        );
         let assets = root.path().join("assets");
         let workspaces = root.path().join("workspaces");
         let (_db, svc) = fresh_services(&workspaces, &assets).await;
-        let bus = crate::EventBus::new(svc.store.clone());
+        let bus = intent_services::feature_api::EventBus::new(svc.store().clone());
         let svc = svc.with_event_bus(bus.clone());
         let id = WorkspaceId::new();
         seed_workspace(&svc, &assets, &workspaces.join("checkout"), &id).await;
@@ -1398,7 +1448,7 @@ mod tests {
             .test_export_monitor_preflight
             .lock()
             .unwrap() = Some((entered.clone(), release.clone()));
-        let mut failed_events = bus.subscribe(crate::SubscriptionFilter {
+        let mut failed_events = bus.subscribe(intent_services::feature_api::SubscriptionFilter {
             event_types: vec![WORKSPACE_TRANSFER_FAILED.to_string()],
             workspace_id: Some(id.0.clone()),
             ..Default::default()
@@ -1408,7 +1458,7 @@ mod tests {
         let start = tokio::spawn(async move { exporting.workspace_export_start_op(id).await });
         entered.notified().await;
         sqlx::query("INSERT INTO discussion_conversation(id,workspace_id,kind,participants_json,created_at) VALUES('private-race',?,'direct','[]',?)")
-            .bind(&id_for_insert.0).bind(now_iso()).execute(svc.store.write_pool()).await.unwrap();
+            .bind(&id_for_insert.0).bind(now_iso()).execute(svc.store().write_pool()).await.unwrap();
         release.notify_one();
         let started = start.await.unwrap().unwrap();
         let export_id = started["exportId"].as_str().unwrap();
@@ -1437,7 +1487,7 @@ mod tests {
         assert!(svc.transfer_state().exports.lock().unwrap().is_empty());
         assert!(!svc.export_staging_root().join(export_id).exists());
         assert!(svc
-            .store
+            .store()
             .has_private_discussions(&id_for_insert)
             .await
             .unwrap());
@@ -1445,16 +1495,16 @@ mod tests {
 
     #[intent_test_macros::daemon_test]
     async fn shutdown_retains_export_capture_and_terminal_event() {
-        let root = crate::test_support::test_tempdir("export-shutdown");
+        let root = intent_services::feature_api::test_support::test_tempdir("export-shutdown");
         let assets = root.path().join("assets");
         let workspaces = root.path().join("workspaces");
         let (db, svc) = fresh_services(&workspaces, &assets).await;
-        let bus = crate::EventBus::new(svc.store.clone());
+        let bus = intent_services::feature_api::EventBus::new(svc.store().clone());
         let svc = svc.with_event_bus(bus.clone());
         let id = WorkspaceId::new();
         seed_workspace(&svc, &assets, &workspaces.join("checkout"), &id).await;
         svc.shutdown_group_persistence().await;
-        let held = svc.store.write_pool().acquire().await.unwrap();
+        let held = svc.store().write_pool().acquire().await.unwrap();
         let export = svc.workspace_export_start_op(id.clone()).await.unwrap();
         let shutdown = svc.shutdown_store_writers();
         tokio::pin!(shutdown);
@@ -1477,7 +1527,7 @@ mod tests {
             "shutdown abandoned the admitted export builder"
         );
         bus.shutdown().await.unwrap();
-        svc.store.close().await;
+        svc.store().close().await;
         let reopened = Store::open(&db.path().join("store.db")).await.unwrap();
         assert!(reopened
             .list_interrupted_agents()
@@ -1535,7 +1585,8 @@ mod tests {
             .await
             .expect("open store");
         let registry = std::sync::Arc::new(
-            crate::SettingsRegistry::load(ws_root.0.join("config.toml")).expect("load registry"),
+            intent_services::feature_api::SettingsRegistry::load(ws_root.0.join("config.toml"))
+                .expect("load registry"),
         );
         // Current settings defaults must not replace an existing Auto
         // choice or a concrete model/effort pinned at creation time.
@@ -1564,11 +1615,11 @@ mod tests {
             .with_assets_root(assets_root.0.clone())
             .with_settings_registry(registry);
         let id = WorkspaceId("ws-export-pin".to_string());
-        let mut ws = crate::tests::workspace(&id);
+        let mut ws = intent_services::feature_api::tests::workspace(&id);
         let ws_dir = ws_root.0.join("checkout");
         std::fs::create_dir_all(&ws_dir).expect("ws dir");
         ws.worktree_path = Some(ws_dir.to_string_lossy().to_string());
-        svc.store.insert_workspace(&ws).await.expect("workspace");
+        svc.store().insert_workspace(&ws).await.expect("workspace");
 
         // Inherited: provider unset, explicit model + effort, one committed
         // turn under the source default.
@@ -1576,8 +1627,11 @@ mod tests {
         let mut s = session(&inherited, &id, AgentStatus::RuntimeIdle);
         s.model = Some("gpt6-astra".to_string());
         s.reasoning_effort = Some("high".to_string());
-        svc.store.insert_agent_session(&s).await.expect("inherited");
-        svc.store
+        svc.store()
+            .insert_agent_session(&s)
+            .await
+            .expect("inherited");
+        svc.store()
             .set_agent_session_last_turn_model(&id, &inherited, Some("gpt6-astra"), "auggie")
             .await
             .expect("last turn");
@@ -1586,10 +1640,13 @@ mod tests {
         let mut s = session(&explicit, &id, AgentStatus::RuntimeIdle);
         s.provider = Some("claude-code".to_string());
         s.model = Some("claude-fable-5".to_string());
-        svc.store.insert_agent_session(&s).await.expect("explicit");
+        svc.store()
+            .insert_agent_session(&s)
+            .await
+            .expect("explicit");
         // Auto: nothing chosen at all.
         let auto = AgentId("agent-auto".to_string());
-        svc.store
+        svc.store()
             .insert_agent_session(&session(&auto, &id, AgentStatus::RuntimeIdle))
             .await
             .expect("auto");
@@ -1646,11 +1703,15 @@ mod tests {
         assert_eq!(row["reasoning_effort"], serde_json::Value::Null);
 
         // The source table is never written by the export.
-        let src = svc.store.get_agent_session(&inherited).await.expect("src");
+        let src = svc
+            .store()
+            .get_agent_session(&inherited)
+            .await
+            .expect("src");
         assert_eq!(src.provider, None);
         assert_eq!(src.model.as_deref(), Some("gpt6-astra"));
         assert_eq!(src.reasoning_effort.as_deref(), Some("high"));
-        let src = svc.store.get_agent_session(&auto).await.expect("src");
+        let src = svc.store().get_agent_session(&auto).await.expect("src");
         assert_eq!(src.provider, None);
         assert_eq!(src.model, None);
 
@@ -1777,7 +1838,7 @@ mod tests {
         // The in-flight agent was captured as a pending interrupted row —
         // it rides the archive and covers the source on abort.
         let interrupted = svc
-            .store
+            .store()
             .list_interrupted_agents()
             .await
             .expect("interrupted");
@@ -1798,7 +1859,7 @@ mod tests {
             .await
             .expect("finalize");
         assert_eq!(finalized["finalized"], true);
-        let ws = svc.store.get_workspace(&id).await.expect("workspace");
+        let ws = svc.store().get_workspace(&id).await.expect("workspace");
         assert_eq!(ws.status, WorkspaceStatus::Archived);
         assert_eq!(ws.status_message.as_deref(), Some("Transferred elsewhere"));
         assert!(!staging.exists());
@@ -1860,7 +1921,7 @@ mod tests {
             .expect("abort again");
         assert_eq!(again["aborted"], false);
         // The workspace is intact and a fresh export can start.
-        assert!(svc.store.get_workspace(&id).await.is_ok());
+        assert!(svc.store().get_workspace(&id).await.is_ok());
         svc.workspace_export_start_op(id).await.expect("restart");
     }
 
@@ -1901,7 +1962,7 @@ mod tests {
             .await
             .expect("finalize");
         assert_eq!(finalized["finalized"], true);
-        let ws = svc.store.get_workspace(&id).await.expect("workspace");
+        let ws = svc.store().get_workspace(&id).await.expect("workspace");
         assert_eq!(ws.status, WorkspaceStatus::Active);
         assert!(ws.status_message.is_none());
 
@@ -1947,9 +2008,9 @@ mod tests {
         }
         std::fs::write(repo_path.join("dirty.txt"), "uncommitted\n").expect("dirty");
 
-        let mut ws = crate::tests::workspace(&id);
+        let mut ws = intent_services::feature_api::tests::workspace(&id);
         ws.repository_path = Some(repo_path.to_string_lossy().to_string());
-        svc.store.insert_workspace(&ws).await.expect("workspace");
+        svc.store().insert_workspace(&ws).await.expect("workspace");
 
         let started = svc
             .workspace_export_start_op(id.clone())
@@ -2045,7 +2106,7 @@ mod tests {
     /// bundle files are gone from staging once the archive is sealed.
     #[tokio::test]
     async fn export_archive_carries_submodule_bundles() {
-        use crate::test_support::submodule_fixture::{
+        use intent_services::feature_api::test_support::submodule_fixture::{
             git, local_commit, superproject_with_submodule,
         };
         let ws_root = TempDir::new("export-ws-root");
@@ -2060,9 +2121,9 @@ mod tests {
         git(&sub, &["checkout", "-q", "main"]);
         let sha = local_commit(&sub, "wip.txt");
 
-        let mut ws = crate::tests::workspace(&id);
+        let mut ws = intent_services::feature_api::tests::workspace(&id);
         ws.repository_path = Some(sup.to_string_lossy().to_string());
-        svc.store.insert_workspace(&ws).await.expect("workspace");
+        svc.store().insert_workspace(&ws).await.expect("workspace");
 
         let started = svc
             .workspace_export_start_op(id.clone())
@@ -2174,10 +2235,10 @@ mod tests {
 
         let ws_root = TempDir::new("export-ws-root");
         let assets_root = TempDir::new("export-assets-root");
-        let db_dir = crate::test_support::test_tempdir("export-test-");
+        let db_dir = intent_services::feature_api::test_support::test_tempdir("export-test-");
         let db = db_dir.path().join("store.db");
         let store = Store::open(&db).await.expect("open store");
-        let bus = crate::EventBus::new(store.clone());
+        let bus = intent_services::feature_api::EventBus::new(store.clone());
         let id = WorkspaceId("ws-fail".to_string());
         let repo_path = ws_root.0.join(&id.0).join("repo");
         let armed = Arc::new(AtomicBool::new(true));
@@ -2237,11 +2298,11 @@ mod tests {
         let before = status_fingerprint(&repo_path);
         assert_eq!(before.len(), 3, "three dirty entries seeded: {before:?}");
 
-        let mut ws = crate::tests::workspace(&id);
+        let mut ws = intent_services::feature_api::tests::workspace(&id);
         ws.repository_path = Some(repo_path.to_string_lossy().to_string());
-        svc.store.insert_workspace(&ws).await.expect("workspace");
+        svc.store().insert_workspace(&ws).await.expect("workspace");
 
-        let mut sub = bus.subscribe(crate::SubscriptionFilter {
+        let mut sub = bus.subscribe(intent_services::feature_api::SubscriptionFilter {
             event_types: vec![WORKSPACE_TRANSFER_FAILED.to_string()],
             workspace_id: Some(id.0.clone()),
             ..Default::default()

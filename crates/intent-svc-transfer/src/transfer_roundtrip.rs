@@ -16,9 +16,13 @@ use intent_core::{
 };
 use intent_store::{AgentQueueRow, PersistedEventSubscription, Sandbox, SandboxStatus, Store};
 
-use crate::test_support::test_tempdir;
+use crate::transfer::TransferPlanExt;
+use crate::transfer::TransferStateExt;
 use crate::transfer_export::ExportState;
-use crate::Services;
+use crate::transfer_export::TransferExportExt;
+use crate::transfer_import::TransferImportExt;
+use intent_services::feature_api::test_support::test_tempdir;
+use intent_services::feature_api::Services;
 
 #[intent_test_macros::daemon_test]
 async fn transfer_human_authors_survive_member_export_and_return_without_grants() {
@@ -30,14 +34,14 @@ async fn transfer_human_authors_survive_member_export_and_return_without_grants(
     let b = TempDir::new("author-b");
     let source = fresh_services(&a.0, &a.0.join("workspaces"), &a.0.join("assets")).await;
     let target = fresh_services(&b.0, &b.0.join("workspaces"), &b.0.join("assets")).await;
-    let mut owner_a = source.store.get_primary_principal().await.unwrap();
+    let mut owner_a = source.store().get_primary_principal().await.unwrap();
     owner_a.login = Some("panghy".into());
     owner_a.identity = Some(PrincipalIdentity::github(7));
-    source.store.upsert_principal(&owner_a).await.unwrap();
-    let mut owner_b = target.store.get_primary_principal().await.unwrap();
+    source.store().upsert_principal(&owner_a).await.unwrap();
+    let mut owner_b = target.store().get_primary_principal().await.unwrap();
     owner_b.login = Some("shared-instance-github-handle".into());
     owner_b.identity = Some(PrincipalIdentity::github(8));
-    target.store.upsert_principal(&owner_b).await.unwrap();
+    target.store().upsert_principal(&owner_b).await.unwrap();
     let contributor = Principal {
         id: PrincipalId::new(),
         github_user_id: None,
@@ -53,27 +57,27 @@ async fn transfer_human_authors_survive_member_export_and_return_without_grants(
         created_at: now_iso(),
         updated_at: now_iso(),
     };
-    source.store.upsert_principal(&contributor).await.unwrap();
+    source.store().upsert_principal(&contributor).await.unwrap();
     source
-        .store
+        .store()
         .insert_principal_credential(&contributor.id, "member-credential")
         .await
         .unwrap();
     sqlx::query("INSERT INTO host_member(principal_id, added_at) VALUES (?,?)")
         .bind(contributor.id.as_str())
         .bind(now_iso())
-        .execute(source.store.write_pool())
+        .execute(source.store().write_pool())
         .await
         .unwrap();
     let ws = WorkspaceId::new();
     source
-        .store
-        .insert_workspace(&crate::tests::workspace(&ws))
+        .store()
+        .insert_workspace(&intent_services::feature_api::tests::workspace(&ws))
         .await
         .unwrap();
     let agent = AgentId::new();
     source
-        .store
+        .store()
         .insert_agent_session(&session(&agent, &ws, AgentStatus::RuntimeIdle))
         .await
         .unwrap();
@@ -90,7 +94,7 @@ async fn transfer_human_authors_survive_member_export_and_return_without_grants(
         ),
     ] {
         source
-            .store
+            .store()
             .append_agent_message_with_id(
                 &agent,
                 id,
@@ -102,12 +106,12 @@ async fn transfer_human_authors_survive_member_export_and_return_without_grants(
             .await
             .unwrap();
     }
-    let originals = crate::human_attribution_tests::legacy_metadata_values();
+    let originals = intent_services::feature_api::human_attribution_tests::legacy_metadata_values();
     let mut queued = Vec::new();
     for (i, metadata) in originals.iter().enumerate() {
         for role in ["user", "assistant"] {
             source
-                .store
+                .store()
                 .append_agent_message_with_id(
                     &agent,
                     &format!("legacy-{role}-{i}"),
@@ -134,12 +138,12 @@ async fn transfer_human_authors_survive_member_export_and_return_without_grants(
         });
     }
     source
-        .store
+        .store()
         .replace_agent_queue(&agent, &queued)
         .await
         .unwrap();
     source
-        .store
+        .store()
         .append_agent_message_with_id(
             &agent,
             "assistant",
@@ -243,9 +247,9 @@ async fn transfer_human_authors_survive_member_export_and_return_without_grants(
         .unwrap()
         .get("author")
         .is_none());
-    assert!(target.store.get_principal(&contributor.id).await.is_err());
+    assert!(target.store().get_principal(&contributor.id).await.is_err());
     assert!(target
-        .store
+        .store()
         .list_workspace_members(&ws)
         .await
         .unwrap()
@@ -254,7 +258,7 @@ async fn transfer_human_authors_survive_member_export_and_return_without_grants(
     assert_eq!(manifest.format_version, 2);
 
     target
-        .store
+        .store()
         .append_agent_message_with_id(
             &agent,
             "new-b",
@@ -266,7 +270,7 @@ async fn transfer_human_authors_survive_member_export_and_return_without_grants(
         .await
         .unwrap();
     target
-        .store
+        .store()
         .append_agent_message_with_id(
             &agent,
             "new-b-array",
@@ -281,7 +285,7 @@ async fn transfer_human_authors_survive_member_export_and_return_without_grants(
         .workspace_export_abort_op(export.to_string())
         .await
         .unwrap();
-    source.store.delete_workspace(&ws).await.unwrap();
+    source.store().delete_workspace(&ws).await.unwrap();
     let exported = target.workspace_export_start_op(ws.clone()).await.unwrap();
     let export = exported["exportId"].as_str().unwrap();
     assert!(wait_ready(&target, export).await);
@@ -368,7 +372,8 @@ async fn fresh_services_with_default_provider(
     default_provider: &str,
 ) -> Services {
     let registry = std::sync::Arc::new(
-        crate::SettingsRegistry::load(db_root.join("config.toml")).expect("load registry"),
+        intent_services::feature_api::SettingsRegistry::load(db_root.join("config.toml"))
+            .expect("load registry"),
     );
     registry
         .apply(&[
@@ -618,16 +623,16 @@ async fn seed_source(
     let sandbox_tip = commit_file(&sandbox, "sb.txt", "sandbox work\n", "feat: sandbox commit");
     std::fs::write(sandbox.join("sb-dirty.txt"), "sandbox wip\n").unwrap();
 
-    let mut ws = crate::tests::workspace(id);
+    let mut ws = intent_services::feature_api::tests::workspace(id);
     ws.repository_path = Some(repo.to_string_lossy().into_owned());
     ws.repository_name = Some("test-repo".to_string());
-    svc.store.insert_workspace(&ws).await.expect("workspace");
+    svc.store().insert_workspace(&ws).await.expect("workspace");
 
-    svc.store
+    svc.store()
         .insert_note(&note(id, "note-spec", "the spec"))
         .await
         .expect("note 1");
-    svc.store
+    svc.store()
         .insert_note(&note(id, "note-progress", "progress log"))
         .await
         .expect("note 2");
@@ -638,7 +643,7 @@ async fn seed_source(
     let mut live_session = session(&live, id, AgentStatus::Active);
     live_session.acp_session_id = Some("acp-live".to_string());
     live_session.backend_session_id = Some(AgentId::from("backend-live"));
-    svc.store
+    svc.store()
         .insert_agent_session(&live_session)
         .await
         .expect("live session");
@@ -650,11 +655,11 @@ async fn seed_source(
     let mut idle_session = session(&idle, id, AgentStatus::RuntimeIdle);
     idle_session.model = Some(SOURCE_MODEL.to_string());
     idle_session.reasoning_effort = Some("high".to_string());
-    svc.store
+    svc.store()
         .insert_agent_session(&idle_session)
         .await
         .expect("idle session");
-    svc.store
+    svc.store()
         .set_agent_session_last_turn_model(id, &idle, Some(SOURCE_MODEL), SOURCE_DEFAULT_PROVIDER)
         .await
         .expect("idle last turn");
@@ -662,7 +667,7 @@ async fn seed_source(
     let mut sb_session = session(&sb_agent, id, AgentStatus::RuntimeIdle);
     sb_session.provider = Some("claude-code".to_string());
     sb_session.model = Some("claude-fable-5".to_string());
-    svc.store
+    svc.store()
         .insert_agent_session(&sb_session)
         .await
         .expect("sb session");
@@ -674,7 +679,7 @@ async fn seed_source(
         (&idle, "assistant", "hi there"),
         (&live, "user", "do the thing"),
     ] {
-        svc.store
+        svc.store()
             .append_agent_message(
                 agent,
                 role,
@@ -684,7 +689,7 @@ async fn seed_source(
             .await
             .expect("message");
     }
-    svc.store
+    svc.store()
         .replace_agent_queue(
             &live,
             &[AgentQueueRow {
@@ -703,7 +708,7 @@ async fn seed_source(
         .expect("queue");
 
     // Hook (scheduled, far-future expiry so target rehydration resumes it).
-    svc.store
+    svc.store()
         .insert_hook(&Hook {
             hook_id: HookId::from("hook-rt"),
             workspace_id: id.clone(),
@@ -729,7 +734,7 @@ async fn seed_source(
         .expect("hook");
 
     // Event subscription + PR monitor + script (absolute cwd → rewritten).
-    svc.store
+    svc.store()
         .upsert_event_subscription(&PersistedEventSubscription {
             id: "sub-rt".to_string(),
             workspace_id: id.clone(),
@@ -741,7 +746,7 @@ async fn seed_source(
         })
         .await
         .expect("subscription");
-    svc.store
+    svc.store()
         .insert_pr_monitor(&PrMonitor {
             monitor_id: PrMonitorId::from("prmon-rt"),
             workspace_id: id.clone(),
@@ -762,7 +767,7 @@ async fn seed_source(
         })
         .await
         .expect("pr monitor");
-    svc.store
+    svc.store()
         .upsert_script(&Script {
             purpose: intent_core::ScriptPurpose::Saved,
             archived_at: None,
@@ -784,7 +789,7 @@ async fn seed_source(
         .expect("script");
 
     // Sandbox row for the clone above.
-    svc.store
+    svc.store()
         .insert_sandbox(&Sandbox {
             id: "sb-rt".to_string(),
             workspace_id: id.clone(),
@@ -803,11 +808,11 @@ async fn seed_source(
 
     // Draft (FKs onto client; dropped by the import transform).
     let client = ClientId::from("client-rt");
-    svc.store
+    svc.store()
         .upsert_client(&client, None, None, &ClientHostInfo::default())
         .await
         .expect("client");
-    svc.store
+    svc.store()
         .upsert_draft(id, &live, &client, "half-typed message", None)
         .await
         .expect("draft");
@@ -825,7 +830,7 @@ async fn seed_source(
     std::fs::write(att_dir.join(".gitignore"), "*\n").expect("marker");
     std::fs::write(att_dir.join("doc.pdf"), b"attachment-bytes").expect("attachment");
     for (att_id, name) in [("att-live", "doc.pdf"), ("att-gone", "gone.txt")] {
-        svc.store
+        svc.store()
             .insert_attachment(&intent_store::AttachmentRecord {
                 id: att_id.to_string(),
                 workspace_id: id.clone(),
@@ -839,12 +844,12 @@ async fn seed_source(
             .expect("attachment row");
     }
     for i in 0..3 {
-        svc.store
+        svc.store()
             .insert_event(&intent_store::NewEvent {
                 workspace_id: id.clone(),
                 timestamp: t.clone(),
                 event_type: format!("note:updated:{i}"),
-                actor: crate::system_actor(),
+                actor: intent_services::feature_api::system_actor(),
                 session_id: None,
                 correlation_id: None,
                 parent_event_id: None,
@@ -986,7 +991,7 @@ exit 91
     let log = std::fs::File::create(&log_path).unwrap();
     // Coordinate the inherited PATH snapshot with existing env-mutating tests,
     // but change only the child environment, never the parent or other tests.
-    let env_lock = crate::agent_manager::tests::EnvGuard::apply(&[]);
+    let env_lock = intent_services::feature_api::agent_manager::tests::EnvGuard::apply(&[]);
     let mut paths = vec![bin];
     paths.extend(std::env::split_paths(
         &std::env::var_os("PATH").unwrap_or_default(),
@@ -1180,7 +1185,11 @@ async fn transfer_round_trip_between_two_stacks() {
     let committed = relay(&source, &target, &export_id, &manifest, size, &sha).await;
 
     // ---- target row counts --------------------------------------------------
-    let stats = target.store.transfer_table_stats(&id).await.expect("stats");
+    let stats = target
+        .store()
+        .transfer_table_stats(&id)
+        .await
+        .expect("stats");
     let rows = |n: &str| {
         stats
             .iter()
@@ -1200,7 +1209,7 @@ async fn transfer_round_trip_between_two_stacks() {
     assert_eq!(rows("draft"), 0, "drafts never transfer");
     // Event history stays on the source.
     let events = target
-        .store
+        .store()
         .query_events(&intent_store::EventQuery {
             workspace_id: Some(id.clone()),
             event_type_prefix: Some("note:".to_string()),
@@ -1216,7 +1225,7 @@ async fn transfer_round_trip_between_two_stacks() {
         serde_json::json!([AGENT_LIVE])
     );
     let live = target
-        .store
+        .store()
         .get_agent_session(&AgentId::from(AGENT_LIVE))
         .await
         .expect("live session on target");
@@ -1233,7 +1242,7 @@ async fn transfer_round_trip_between_two_stacks() {
         .unwrap_or_default()
         .contains("transferred"));
     let interrupted = target
-        .store
+        .store()
         .list_interrupted_agents()
         .await
         .expect("interrupted");
@@ -1252,7 +1261,7 @@ async fn transfer_round_trip_between_two_stacks() {
     assert_eq!(live.model, None, "Auto model stays Auto");
     assert_eq!(live.reasoning_effort, None);
     let idle = target
-        .store
+        .store()
         .get_agent_session(&AgentId::from(AGENT_IDLE))
         .await
         .expect("idle session on target");
@@ -1261,7 +1270,7 @@ async fn transfer_round_trip_between_two_stacks() {
     assert_eq!(idle.reasoning_effort.as_deref(), Some("high"));
     assert_eq!(
         target
-            .store
+            .store()
             .get_agent_session_last_turn_model(&id, &AgentId::from(AGENT_IDLE))
             .await
             .expect("idle last turn on target"),
@@ -1272,7 +1281,7 @@ async fn transfer_round_trip_between_two_stacks() {
         "last-turn history rides separately from the selection"
     );
     let sb = target
-        .store
+        .store()
         .get_agent_session(&AgentId::from(AGENT_SB))
         .await
         .expect("sb session on target");
@@ -1281,7 +1290,7 @@ async fn transfer_round_trip_between_two_stacks() {
     assert_eq!(sb.reasoning_effort, None);
     // The source rows were never written by the export.
     let src_idle = source
-        .store
+        .store()
         .get_agent_session(&AgentId::from(AGENT_IDLE))
         .await
         .expect("idle session on source");
@@ -1289,7 +1298,7 @@ async fn transfer_round_trip_between_two_stacks() {
     assert_eq!(src_idle.model.as_deref(), Some(SOURCE_MODEL));
 
     // ---- path rewrites + git materialization ---------------------------------
-    let imported = target.store.get_workspace(&id).await.expect("workspace");
+    let imported = target.store().get_workspace(&id).await.expect("workspace");
     let checkout = dst_ws_root.0.join(&id.0).join("test-repo");
     assert_eq!(
         imported.repository_path.as_deref(),
@@ -1314,7 +1323,7 @@ async fn transfer_round_trip_between_two_stacks() {
     );
 
     // Sandbox: row rewritten, clone materialized with its commit + dirty file.
-    let sandboxes = target.store.list_sandboxes(&id).await.expect("sandboxes");
+    let sandboxes = target.store().list_sandboxes(&id).await.expect("sandboxes");
     assert_eq!(sandboxes.len(), 1);
     let expected_sb = dst_ws_root
         .0
@@ -1330,7 +1339,7 @@ async fn transfer_round_trip_between_two_stacks() {
     );
 
     // Script cwd re-rooted under the target workspace dir.
-    let scripts = target.store.list_all_scripts().await.expect("scripts");
+    let scripts = target.store().list_all_scripts().await.expect("scripts");
     let script = scripts
         .iter()
         .find(|s| s.id == "script-rt")
@@ -1348,7 +1357,7 @@ async fn transfer_round_trip_between_two_stacks() {
     // the re-rooted checkout's git-ignored store (with the ignore-all
     // marker), the deleted one imported as a row without a file.
     let atts = target
-        .store
+        .store()
         .list_attachments(&id)
         .await
         .expect("attachments");
@@ -1380,7 +1389,7 @@ async fn transfer_round_trip_between_two_stacks() {
         .await
         .expect("finalize");
     assert_eq!(finalized["finalized"], true);
-    let src_ws = source.store.get_workspace(&id).await.expect("source ws");
+    let src_ws = source.store().get_workspace(&id).await.expect("source ws");
     assert_eq!(src_ws.status, WorkspaceStatus::Archived);
     assert_eq!(
         src_ws.status_message.as_deref(),
@@ -1474,7 +1483,7 @@ async fn transfer_abort_mid_relay_cleans_both_sides() {
     assert_eq!(aborted["aborted"], true);
     assert!(!target_staging.exists(), "target staging cleaned");
     assert!(matches!(
-        target.store.get_workspace(&id).await,
+        target.store().get_workspace(&id).await,
         Err(Error::NotFound(_))
     ));
 
@@ -1489,7 +1498,7 @@ async fn transfer_abort_mid_relay_cleans_both_sides() {
 
     // Source intact: workspace still active, WIP snapshots unwound so the
     // dirty state is exactly as seeded.
-    let src_ws = source.store.get_workspace(&id).await.expect("source ws");
+    let src_ws = source.store().get_workspace(&id).await.expect("source ws");
     assert_eq!(src_ws.status, WorkspaceStatus::Active);
     assert_eq!(repo_head(&seeded.repo), seeded.main_tip);
     assert!(is_untracked(&seeded.repo, "dirty.txt"));

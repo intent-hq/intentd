@@ -2456,6 +2456,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "intent-svc-transfer"
+version = "0.11.40"
+dependencies = [
+ "base64 0.23.1",
+ "git2",
+ "intent-core",
+ "intent-git",
+ "intent-providers",
+ "intent-services",
+ "intent-sourcecontrol",
+ "intent-store",
+ "intent-test-macros",
+ "intentd-test-support",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+ "zip",
+]
+
+[[package]]
 name = "intent-test-macros"
 version = "0.9.55"
 dependencies = [
@@ -2538,6 +2564,7 @@ dependencies = [
  "intent-services",
  "intent-sourcecontrol",
  "intent-store",
+ "intent-svc-transfer",
  "intent-test-macros",
  "intent-transport",
  "intent-voice",

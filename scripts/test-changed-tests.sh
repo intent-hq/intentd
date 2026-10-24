@@ -123,6 +123,11 @@ write crates/beta/migrations/001.sql
 write crates/gamma/Cargo.toml
 write crates/gamma/src/lib.rs
 write crates/gamma/tests/smoke.rs
+write crates/intent-services/Cargo.toml
+write crates/intent-services/src/lib.rs
+write crates/intent-services/tests/smoke.rs
+write crates/intent-svc-transfer/Cargo.toml
+write crates/intent-svc-transfer/src/lib.rs
 write crates/intentd/Cargo.toml
 write crates/intentd/src/main.rs
 write crates/intentd/tests/auggie_context_e2e.rs
@@ -341,6 +346,30 @@ expect_plan "-p alpha --lib --bins --tests"
 expect_cargo "-p alpha --lib --bins --tests"
 [[ "$stdout" == *"[test-changed] note: crates/alpha/src changed; only alpha's own tests run (downstream crates are not selected)"* ]] || fail "$case_name: no src note: $stdout"
 [[ "$(grep -c 'note:' <<<"$stdout")" -eq 1 ]] || fail "$case_name: note printed more than once: $stdout"
+
+case_name="intent-services src change also selects the feature crates above it"
+reset_repo
+edit crates/intent-services/src/lib.rs
+run_script
+expect_ok
+expect_plan "-p intent-services -p intent-svc-transfer --lib --bins --tests"
+expect_cargo "-p intent-services -p intent-svc-transfer --lib --bins --tests"
+[[ "$stdout" == *"[test-changed] note: crates/intent-services/src changed; its feature crates (intent-svc-transfer) run too, other downstream crates are not selected"* ]] || fail "$case_name: no src note: $stdout"
+[[ "$(grep -c 'note:' <<<"$stdout")" -eq 1 ]] || fail "$case_name: expected one note: $stdout"
+
+case_name="intent-services test-only change does not select the feature crates"
+reset_repo
+edit crates/intent-services/tests/smoke.rs
+run_script
+expect_ok
+expect_cargo "-p intent-services --test smoke"
+
+case_name="feature crate src change does not select intent-services"
+reset_repo
+edit crates/intent-svc-transfer/src/lib.rs
+run_script
+expect_ok
+expect_cargo "-p intent-svc-transfer --lib --bins --tests"
 
 case_name="src change in a crate without a lib drops --lib"
 reset_repo

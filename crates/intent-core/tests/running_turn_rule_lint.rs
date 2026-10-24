@@ -541,7 +541,7 @@ fn is_running_turn(status: AgentStatus) -> bool {
 }
 ";
 
-/// The transfer export warning in `crates/intent-services/src/transfer.rs`
+/// The transfer export warning in `crates/intent-svc-transfer/src/transfer.rs`
 /// before #2058: inline, inside a closure block, in a different order.
 const TRANSFER_RUNNING_PRE_2058: &str = r"
         let running = sessions
