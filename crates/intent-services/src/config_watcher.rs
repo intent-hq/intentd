@@ -1424,9 +1424,9 @@ mod tests {
         let hub = SharedWatchHub::with_watch_fault(&fault);
         let (sub_ancestor, _rx_ancestor, _) =
             hub.subscribe_with(&ancestor, RecursiveMode::NonRecursive);
-        sub_ancestor.wait_established(LIVENESS).await;
+        sub_ancestor.probe().wait_live(LIVENESS).await;
         let (sub_wide, _rx_wide, _) = hub.subscribe_with(&ancestor, RecursiveMode::Recursive);
-        sub_wide.wait_established(LIVENESS).await;
+        sub_wide.probe().wait_live(LIVENESS).await;
         drop(sub_wide);
 
         let (tx, mut rx) = mpsc::unbounded_channel::<SettingsChanged>();
@@ -1511,9 +1511,9 @@ mod tests {
         let hub = SharedWatchHub::with_watch_fault(&fault);
         let (sub_ancestor, _rx_ancestor, _) =
             hub.subscribe_with(&ancestor, RecursiveMode::NonRecursive);
-        sub_ancestor.wait_established(LIVENESS).await;
+        sub_ancestor.probe().wait_live(LIVENESS).await;
         let (sub_wide, _rx_wide, _) = hub.subscribe_with(&ancestor, RecursiveMode::Recursive);
-        sub_wide.wait_established(LIVENESS).await;
+        sub_wide.probe().wait_live(LIVENESS).await;
         drop(sub_wide);
 
         let (tx, mut rx) = mpsc::unbounded_channel::<SettingsChanged>();
