@@ -4247,7 +4247,9 @@ impl AgentManager {
         provider: &ProviderConfig,
     ) -> Result<StartedSession> {
         // Boxed: keeps the caller's session-open future frame unchanged.
-        let started = Box::pin(self.start_session_opened(agent_id, cwd, provider)).await?;
+        let started = self
+            .start_session_opened_boxed(agent_id, cwd, provider)
+            .await?;
         let workers = self.services.agent_workers();
         if let Some(generation) = started
             .turn
@@ -4301,6 +4303,18 @@ impl AgentManager {
                 services.publish_workers_snapshot(snapshot);
             }
         });
+    }
+
+    /// Boxes [`Self::start_session_opened`] from its own frame; see
+    /// [`retry_spawn_owned_boxed`].
+    #[inline(never)]
+    fn start_session_opened_boxed<'a>(
+        &'a self,
+        agent_id: &'a AgentId,
+        cwd: PathBuf,
+        provider: &'a ProviderConfig,
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<StartedSession>> + 'a>> {
+        Box::pin(self.start_session_opened(agent_id, cwd, provider))
     }
 
     async fn start_session_opened(
@@ -11281,6 +11295,17 @@ impl AgentManager {
             .map(|started| started.session_id)
     }
 
+    /// Boxes [`Self::ensure_started_owned`] from its own frame; see
+    /// [`retry_spawn_owned_boxed`].
+    #[inline(never)]
+    fn ensure_started_owned_boxed<'a>(
+        &'a self,
+        agent_id: &'a AgentId,
+        workspace_id: &'a WorkspaceId,
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<StartedSession>> + 'a>> {
+        Box::pin(self.ensure_started_owned(agent_id, workspace_id))
+    }
+
     async fn ensure_started_owned(
         &self,
         agent_id: &AgentId,
@@ -14105,7 +14130,7 @@ async fn run_message_worker(
         }
         // Keep the large session-start future off the worker's inline state;
         // it is still polled and cancelled by this same worker.
-        match Box::pin(retry_spawn_owned(&mgr, &agent_id, &workspace_id)).await {
+        match retry_spawn_owned_boxed(&mgr, &agent_id, &workspace_id).await {
             Ok(StartedSession {
                 session_id: acp_session_id,
                 turn,
@@ -15965,6 +15990,19 @@ async fn retry_spawn(
         .map(|started| started.session_id)
 }
 
+/// Boxes [`retry_spawn_owned`] from its own frame. An inline `Box::pin(f())`
+/// still reserves the whole future in the caller's poll frame in unoptimized
+/// builds, and the worker's session-start chain runs on the 2 MiB test-thread
+/// stack; building the box here keeps only the pointer in the worker's frame.
+#[inline(never)]
+fn retry_spawn_owned_boxed<'a>(
+    mgr: &'a AgentManager,
+    agent_id: &'a AgentId,
+    workspace_id: &'a WorkspaceId,
+) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<StartedSession>> + 'a>> {
+    Box::pin(retry_spawn_owned(mgr, agent_id, workspace_id))
+}
+
 async fn retry_spawn_owned(
     mgr: &AgentManager,
     agent_id: &AgentId,
@@ -15976,7 +16014,7 @@ async fn retry_spawn_owned(
         // Boxed: the turn-start future (spawn, session open, identity
         // repairs) is large; inlining it into the turn worker's future
         // overflows the stack on deep send/interrupt paths.
-        match Box::pin(mgr.ensure_started_owned(agent_id, workspace_id)).await {
+        match mgr.ensure_started_owned_boxed(agent_id, workspace_id).await {
             Ok(session_id) => return Ok(session_id),
             Err(e) => {
                 let retryable = is_retryable_spawn_error(&e);
