@@ -2547,21 +2547,30 @@ mod tests {
         let nested = outer.join("nested");
         std::fs::create_dir_all(&nested).expect("mk nested");
 
+        let budget = crate::events::TestBudget::liveness();
         let hub = SharedWatchHub::new();
         let (sub_nested, mut rx_nested, root_nested) = hub.subscribe(&nested);
         let (sub_outer, _rx_outer, _) = hub.subscribe(&outer);
-        hub.wait_all_established(2, LIVENESS).await;
+        // Live, not merely settled: a creation retry settles both as failed
+        // at once (intent-hq/intent#6128).
+        sub_nested.probe().wait_live(budget.remaining()).await;
+        sub_outer.probe().wait_live(budget.remaining()).await;
 
         // Retiring the outer root recursively unwatches the nested root too
         // when both ride one watcher; the drop path must re-register it.
         drop(sub_outer);
-        sub_nested.wait_established(LIVENESS).await;
+        sub_nested.probe().wait_live(budget.remaining()).await;
 
         std::fs::write(root_nested.join("still-covered.txt"), b"x").expect("write");
         assert!(
-            next_for(&mut rx_nested, &root_nested, "still-covered.txt", LIVENESS)
-                .await
-                .is_some(),
+            next_for(
+                &mut rx_nested,
+                &root_nested,
+                "still-covered.txt",
+                budget.remaining()
+            )
+            .await
+            .is_some(),
             "the nested root must keep delivering after its outer co-tenant retires"
         );
     }
@@ -2616,7 +2625,10 @@ mod tests {
                 let (so, ro, po) = hub.subscribe(&outer);
                 (so, ro, po, sn, rn, pn)
             };
-        hub.wait_all_established(2, LIVENESS).await;
+        // Live, not merely settled: a creation retry settles both as failed
+        // at once (intent-hq/intent#6128).
+        sub_outer.probe().wait_live(LIVENESS).await;
+        sub_nested.probe().wait_live(LIVENESS).await;
 
         // A directory created under the shallow root must still be picked up
         // by the recursive outer root, and its contents delivered there.
@@ -2653,7 +2665,7 @@ mod tests {
         // Retiring the shallow root must leave the outer root's descriptors
         // for that subtree in place.
         drop(sub_nested);
-        sub_outer.wait_established(LIVENESS).await;
+        sub_outer.probe().wait_live(LIVENESS).await;
         std::fs::create_dir(root_nested.join("after-retire")).expect("mk after-retire");
         assert!(
             touch_until_seen(
