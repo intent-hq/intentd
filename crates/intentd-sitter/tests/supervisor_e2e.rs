@@ -3713,7 +3713,16 @@ case "$1" in
         --invalid) echo 'invalid option' >&2; exit 2 ;;
       esac
     done
-    echo "$$" > "$INTENTD_DATA_DIR/daemon-pid"
+    # Report on the inherited liveness token before the PID record, so a
+    # recorded PID proves this daemon held the token. Open it by path: dash
+    # rejects `>&N` for N >= 10.
+    if [ -n "${FAKE_LIVENESS_FD:-}" ]; then echo "$$" >> "/dev/fd/$FAKE_LIVENESS_FD"; fi
+    # // timing-guard: regression hook holds the PID record past the readiness deadline
+    if [ -n "${FAKE_PID_DELAY:-}" ]; then sleep "$FAKE_PID_DELAY"; fi
+    # Publish by rename: a kill between `>`'s truncate and its write must
+    # never leave an empty record behind.
+    echo "$$" > "$INTENTD_DATA_DIR/daemon-pid.tmp"
+    mv "$INTENTD_DATA_DIR/daemon-pid.tmp" "$INTENTD_DATA_DIR/daemon-pid"
     printf '%s\n' "$@" >> "$FAKE_DAEMON_LOG"
     echo "spawn $$" >> "$FAKE_DAEMON_LOG"
     trap 'rm -f "$INTENTD_DATA_DIR/ready"; exit 0' TERM INT
@@ -4128,24 +4137,119 @@ fn background_start_help_invalid_options_and_timeout_leave_no_supervisor() {
     assert!(!invalid.status.success(), "{invalid:?}");
     assert!(String::from_utf8_lossy(&invalid.stderr).contains("start.log"));
     assert!(!fixture.paths.pid_path.exists());
-    let mut cmd = sitter_command(dir.path(), &base);
+    assert_start_timeout_leaves_no_process(dir.path(), &fixture, &base, None);
+}
+
+/// Regression for the merge-queue flake: the readiness deadline can kill the
+/// fake daemon before it records its PID (or before it is even spawned).
+/// Holding the record past the deadline makes that interleaving the norm.
+#[test]
+fn background_start_timeout_before_daemon_pid_leaves_no_process() {
+    // Positive control: at least one launch must reach the daemon, or the
+    // token proves nothing about it. Whether the supervisor spawns the daemon
+    // inside the 500 ms budget is timing-dependent, so allow a few launches;
+    // every launch must still leave no process behind.
+    for _ in 0..3 {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = background_fixture(dir.path());
+        let reported =
+            assert_start_timeout_leaves_no_process(dir.path(), &fixture, &dead_url(), Some("2"));
+        if !reported.is_empty() {
+            return;
+        }
+    }
+    panic!("no launch spawned the fake daemon before the readiness deadline");
+}
+
+/// A never-ready background start must time out and leave neither its
+/// supervisor nor any daemon process behind, however far the launch got.
+/// Returns the PIDs of the fake daemons that reported on the liveness token.
+///
+/// The readiness deadline can fire before the fake daemon records its PID, or
+/// before the supervisor spawns it at all, so a missing `daemon-pid` proves
+/// nothing either way. Instead every process the start launches inherits the
+/// write end of a liveness token: EOF on the read end means all of them have
+/// exited (zombies included, so a child-subreaper test process that never
+/// reaps an adopted daemon cannot fail this).
+fn assert_start_timeout_leaves_no_process(
+    dir: &Path,
+    fixture: &BackgroundFixture,
+    base: &str,
+    pid_delay: Option<&str>,
+) -> Vec<String> {
+    use nix::fcntl::{fcntl, FcntlArg, FdFlag, OFlag};
+    use std::io::Read as _;
+    use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd};
+    use std::os::unix::process::CommandExt as _;
+
+    // Close-on-exec in this process, so concurrently spawned processes of
+    // other tests never keep the token open past their exec.
+    let (mut token, writer) = std::io::pipe().unwrap();
+    fcntl(token.as_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).unwrap();
+    let writer_fd = writer.as_raw_fd();
+    let mut cmd = sitter_command(dir, base);
     cmd.arg("start")
         .env("FAKE_NO_READY", "1")
+        .env("FAKE_LIVENESS_FD", writer_fd.to_string())
         .env(intentd_sitter::readiness::TIMEOUT_ENV, "500")
         .env(KILL_TIMEOUT_ENV, "200");
+    if let Some(delay) = pid_delay {
+        cmd.env("FAKE_PID_DELAY", delay);
+    }
+    // SAFETY: `writer` outlives the spawn, so the descriptor is open in the
+    // forked child; fcntl is async-signal-safe and only clears close-on-exec
+    // on the child's copy, letting the start caller pass the token on.
+    unsafe {
+        cmd.pre_exec(move || {
+            fcntl(
+                BorrowedFd::borrow_raw(writer_fd),
+                FcntlArg::F_SETFD(FdFlag::empty()),
+            )?;
+            Ok(())
+        });
+    }
     let mut child = spawn_guarded(&mut cmd);
+    drop(writer);
     assert!(!child
         .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(10)))
         .unwrap()
         .unwrap()
         .success());
     assert!(!fixture.paths.pid_path.exists());
-    let daemon_pid: i32 = fs::read_to_string(dir.path().join("daemon-pid"))
+    let mut reported = Vec::new();
+    wait_until(
+        "liveness token EOF (every process the failed start launched has exited)",
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        || {
+            let mut chunk = [0; 256];
+            match token.read(&mut chunk) {
+                Ok(0) => true,
+                Ok(n) => {
+                    reported.extend_from_slice(&chunk[..n]);
+                    false
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => false,
+                Err(error) => panic!("liveness token read: {error}"),
+            }
+        },
+    );
+    let reported: Vec<String> = String::from_utf8(reported)
         .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
-    assert_eq!(kill(Pid::from_raw(daemon_pid), None), Err(Errno::ESRCH));
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    match fs::read_to_string(dir.join("daemon-pid")) {
+        // The daemon reports on the token before recording its PID, so a
+        // recorded PID proves the token reached the daemon, and EOF then
+        // proves the recorded daemon has exited.
+        Ok(recorded) => assert!(
+            reported.iter().any(|pid| pid == recorded.trim()),
+            "daemon {} never held the liveness token: {reported:?}",
+            recorded.trim()
+        ),
+        Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::NotFound),
+    }
+    reported
 }
 
 #[test]
