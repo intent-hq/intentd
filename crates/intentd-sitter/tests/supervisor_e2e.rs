@@ -627,34 +627,48 @@ fn wait_exit_within(child: &mut Child, window: Duration) -> ExitStatus {
 }
 
 /// Runs only as a child of `wait_helpers_stretch_with_the_timeout_multiplier`,
-/// which sets `INTENTD_TEST_TIMEOUT_MULTIPLIER` to its cap: each helper gets a
-/// budget half as long as the event it waits for, so it only succeeds when
-/// the helper stretches that budget.
+/// which sets `INTENTD_TEST_TIMEOUT_MULTIPLIER` to its cap: every helper gets
+/// a budget half as long as the event it waits for, so the stretching
+/// helpers must succeed and the fixed-window `_within` helpers must time out.
 #[test]
 #[ignore = "run by wait_helpers_stretch_with_the_timeout_multiplier at the maximum multiplier"]
 fn wait_helpers_scale_probe() {
-    assert!(
-        intentd_test_support::test_timeout_multiplier() >= 4.0,
-        "run this probe through wait_helpers_stretch_with_the_timeout_multiplier"
-    );
+    if intentd_test_support::test_timeout_multiplier() < 4.0 {
+        eprintln!("skipped: run through wait_helpers_stretch_with_the_timeout_multiplier");
+        return;
+    }
     let base = Duration::from_millis(200);
+    let sleep_twice_base = || {
+        spawn_guarded(
+            Command::new("sh")
+                // timing-guard: child exits after twice the base budget
+                .args(["-c", "sleep 0.4"]),
+        )
+    };
+
     let started = Instant::now();
     wait_until("the probe condition", base, || {
         started.elapsed() >= base * 2
     });
-    let mut child = Command::new("sh")
-        // timing-guard: child exits after twice the base budget
-        .args(["-c", "sleep 0.4"])
-        .spawn()
-        .unwrap();
-    assert!(wait_exit(&mut child, base).success());
+    assert!(wait_exit(&mut sleep_twice_base(), base).success());
+
+    let started = Instant::now();
+    let fixed = panic::catch_unwind(AssertUnwindSafe(|| {
+        wait_until_within("the fixed window", base, || started.elapsed() >= base * 2);
+    }));
+    assert!(fixed.is_err(), "wait_until_within must not stretch");
+    let fixed = panic::catch_unwind(AssertUnwindSafe(|| {
+        wait_exit_within(&mut sleep_twice_base(), base);
+    }));
+    assert!(fixed.is_err(), "wait_exit_within must not stretch");
 }
 
 /// Regression for intent-hq/intent#7704: `wait_until` / `wait_exit` take
 /// their budget as a parameter, which the fixed-deadline lint cannot see, and
 /// a raw 5s "owner indexing" wait timed out under coverage CI's 3x
 /// multiplier. Re-run the probe in a child test process with the multiplier
-/// at its cap so both helpers must stretch to pass.
+/// at its cap: the hang-guard helpers must stretch, and the `_within` timing
+/// proofs must not.
 #[test]
 fn wait_helpers_stretch_with_the_timeout_multiplier() {
     let dir = tempfile::tempdir().unwrap();
@@ -663,7 +677,7 @@ fn wait_helpers_stretch_with_the_timeout_multiplier() {
     let mut probe = spawn_guarded(
         Command::new(std::env::current_exe().unwrap())
             .args(["--ignored", "--exact", "wait_helpers_scale_probe"])
-            .args(["--format", "pretty", "--test-threads", "1", "--nocapture"])
+            .args(["--format", "pretty", "--test-threads", "1"])
             .env(
                 intentd_test_support::TIMEOUT_MULTIPLIER_ENV,
                 intentd_test_support::MAX_TIMEOUT_MULTIPLIER.to_string(),
@@ -3588,8 +3602,9 @@ fn shutdown_during_startup_check_releases_ownership_without_spawning() {
                 sitter.id().to_string()
             );
             send_signal(&sitter, signal);
+            // fixed-deadline: allow — stays under the 30s updater::MANIFEST_TIMEOUT of the held startup check
             assert_eq!(
-                wait_exit(&mut sitter, Duration::from_secs(3)).code(),
+                wait_exit_within(&mut sitter, Duration::from_secs(3)).code(),
                 Some(code)
             );
             assert!(
