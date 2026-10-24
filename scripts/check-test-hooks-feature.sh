@@ -35,8 +35,12 @@ for package in "${packages[@]}"; do
   args+=(-p "$package")
 done
 
-if ! tree=$(cargo tree "${flags[@]}" --manifest-path "$manifest" "${args[@]}" \
-  -e normal,build,features --target all --prefix none); then
+# Run from the manifest's directory: cargo reads .cargo/config.toml from the
+# invocation directory upward, and another workspace's config (patches,
+# sources) must not leak into this graph.
+if ! tree=$(cd "$(dirname "$manifest")" 2>/dev/null &&
+  cargo tree "${flags[@]}" --manifest-path "$manifest" "${args[@]}" \
+    -e normal,build,features --target all --prefix none); then
   echo "error: cannot read the production feature graph of ${packages[*]}" >&2
   exit 2
 fi
