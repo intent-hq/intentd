@@ -94,6 +94,8 @@ fn only_exact_known_stamps_are_eligible() {
     assert!(eligible_harness_version(Some("3.0")));
     assert!(eligible_harness_version(Some("3.1")));
     assert!(eligible_harness_version(Some("3.2")));
+    assert!(eligible_harness_version(Some("3.3")));
+    assert!(eligible_harness_version(Some("3.4")));
     for version in [
         None,
         Some(""),
@@ -115,7 +117,7 @@ fn only_exact_known_stamps_are_eligible() {
         Some("3.0\n"),
         Some(" 3.0"),
         Some("3.0\0"),
-        Some("3.3"),
+        Some("3.5"),
         Some("99.0"),
         Some("unknown"),
     ] {
@@ -558,7 +560,7 @@ fn over_budget_inventory_keeps_complete_rows_and_reports_omitted_selection() {
 #[test]
 fn monitor_guidance_preserves_old_stamps_and_features() {
     let context = context();
-    for version in ["3.0", "3.1", "3.2"] {
+    for version in ["3.0", "3.1", "3.2", "3.3", "3.4"] {
         let mut owner = session(Some(version));
         owner.harness_features = Some(json!({"prMonitor":false,"stateSnapshot":false}));
         let before = owner.clone();
@@ -573,7 +575,7 @@ fn monitor_guidance_preserves_old_stamps_and_features() {
         let policy = output.text.split_once(FACTS_HEADER).unwrap().0;
         assert_eq!(
             policy,
-            if version == "3.2" {
+            if matches!(version, "3.2" | "3.3" | "3.4") {
                 MONITOR_POLICY
             } else {
                 POLICY

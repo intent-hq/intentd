@@ -209,7 +209,7 @@ fn immutable_session_gating_does_not_consult_features_or_parent_stamp() {
         Some(" 3.0"),
         Some("3.0\n"),
         Some("unknown"),
-        Some("3.3"),
+        Some("3.5"),
     ] {
         assert!(
             GuidanceBinding::new(
@@ -222,40 +222,45 @@ fn immutable_session_gating_does_not_consult_features_or_parent_stamp() {
             "{version:?}"
         );
     }
-    for features in [
-        None,
-        Some(json!({"stateSnapshot":false})),
-        Some(json!({"stateSnapshot":true})),
-    ] {
-        let mut session = session(Some("3.0"));
-        session.harness_features = features;
-        session.parent_agent_id = Some("old-parent".into());
-        assert!(GuidanceBinding::new(
-            &session,
-            &workspace,
-            Some(&caller),
-            Arc::new(InertSource::default())
-        )
-        .is_some());
-        assert!(
-            GuidanceBinding::new(&session, &workspace, None, Arc::new(InertSource::default()))
-                .is_none()
-        );
-        assert!(GuidanceBinding::new(
-            &session,
-            &WorkspaceId::from("foreign"),
-            Some(&caller),
-            Arc::new(InertSource::default())
-        )
-        .is_none());
-        session.retired_at = Some("retired".into());
-        assert!(GuidanceBinding::new(
-            &session,
-            &workspace,
-            Some(&caller),
-            Arc::new(InertSource::default())
-        )
-        .is_none());
+    for version in ["3.0", "3.1", "3.2", "3.3", "3.4"] {
+        for features in [
+            None,
+            Some(json!({"stateSnapshot":false})),
+            Some(json!({"stateSnapshot":true})),
+        ] {
+            let mut session = session(Some(version));
+            session.harness_features = features;
+            session.parent_agent_id = Some("old-parent".into());
+            assert!(GuidanceBinding::new(
+                &session,
+                &workspace,
+                Some(&caller),
+                Arc::new(InertSource::default())
+            )
+            .is_some());
+            assert!(GuidanceBinding::new(
+                &session,
+                &workspace,
+                None,
+                Arc::new(InertSource::default())
+            )
+            .is_none());
+            assert!(GuidanceBinding::new(
+                &session,
+                &WorkspaceId::from("foreign"),
+                Some(&caller),
+                Arc::new(InertSource::default())
+            )
+            .is_none());
+            session.retired_at = Some("retired".into());
+            assert!(GuidanceBinding::new(
+                &session,
+                &workspace,
+                Some(&caller),
+                Arc::new(InertSource::default())
+            )
+            .is_none());
+        }
     }
 }
 

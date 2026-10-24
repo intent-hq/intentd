@@ -67,6 +67,8 @@ async fn app_file_links_in_assembled_prompts_are_session_pinned() {
     );
     let mut previous = current.clone();
     previous.harness_version = "2.9".into();
+    let mut file_links = current.clone();
+    file_links.harness_version = "2.10".into();
 
     for rich_chat_blocks in [true, false] {
         let features = AgentFeaturesSettings {
@@ -75,7 +77,7 @@ async fn app_file_links_in_assembled_prompts_are_session_pinned() {
         };
         for agent_type in ["interactive", "workspace", "task-loop"] {
             let mut prompts = Vec::new();
-            for session in [Some(&current), None, Some(&previous)] {
+            for session in [Some(&current), None, Some(&previous), Some(&file_links)] {
                 prompts.push(
                     crate::rules::assemble_system_prompt(
                         svc.store(),
@@ -97,10 +99,14 @@ async fn app_file_links_in_assembled_prompts_are_session_pinned() {
             assert_eq!(prompts[0], prompts[1], "new session uses latest doctrine");
             assert!(prompts[0].contains(PDF_LINK), "new {agent_type} prompt must teach app file links with richChatBlocks={rich_chat_blocks}");
             assert!(!prompts[2].contains(PDF_LINK), "v2.9 stays frozen");
+            assert!(
+                prompts[3].contains(PDF_LINK),
+                "v2.10 retains app file-link guidance"
+            );
             assert_eq!(
-                prompts[0].replacen(app_file_links_section(), "", 1),
+                prompts[3].replacen(app_file_links_section(), "", 1),
                 prompts[2],
-                "assembled old/new prompts differ only in app file-link teaching"
+                "assembled v2.9/v2.10 prompts differ only in app file-link teaching"
             );
             for guidance in [
                 "For any workspace file",
