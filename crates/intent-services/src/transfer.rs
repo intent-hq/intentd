@@ -191,6 +191,40 @@ impl TransferPort for TransferFeature {
             .values()
             .any(|session| session.workspace_id.as_str() == workspace_id)
     }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn park_building_export_for_test(
+        &self,
+        export_id: &str,
+        workspace_id: &WorkspaceId,
+        initiator: Option<intent_core::PrincipalId>,
+        staging_dir: PathBuf,
+    ) {
+        self.exports.lock().expect("export registry").insert(
+            export_id.to_string(),
+            crate::transfer_export::ExportSession {
+                initiator,
+                workspace_id: workspace_id.clone(),
+                staging_dir,
+                state: crate::transfer_export::ExportState::Building { aborted: false },
+                wip_paths: vec![],
+                max_chunk_bytes: crate::transfer_export::EXPORT_MAX_CHUNK_BYTES,
+            },
+        );
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn remove_export_for_test(&self, export_id: &str) {
+        self.exports
+            .lock()
+            .expect("export registry")
+            .remove(export_id);
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn export_count_for_test(&self) -> usize {
+        self.exports.lock().expect("export registry").len()
+    }
 }
 
 impl Services {

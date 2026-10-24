@@ -10,6 +10,11 @@ description = "Shared business-logic surface invoked by every transport and the 
 [features]
 # Explicit disposable repository sources for integration-test composition only.
 repository-test-fixtures = []
+# Test seams and fixtures (`test_support`, `#[cfg(any(test, feature =
+# "test-hooks"))]` items) for the tests of feature crates. Enable it only from
+# a dev-dependency: scripts/check-test-hooks-feature.sh fails CI when the
+# production feature graph of intentd turns it on.
+test-hooks = []
 
 [dependencies]
 intent-core = { path = "../intent-core", version = "0.11.40" }

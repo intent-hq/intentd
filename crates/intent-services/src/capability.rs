@@ -72,7 +72,11 @@ pub const ASSERT_BOUND_CALLER_ENV: &str = "INTENTD_ASSERT_BOUND_CALLER";
 /// request is refused: `Forbidden`, logged once per `gate` per process so a
 /// missed spawn binding shows up in the daemon log — and, under
 /// [`ASSERT_BOUND_CALLER_ENV`], fatal to the process.
-pub(crate) fn gated_collaborator_caller(gate: &str) -> Result<Option<PrincipalId>> {
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn gated_collaborator_caller(gate: &str) -> Result<Option<PrincipalId>> {
     match current_caller() {
         Some(Caller::Wire {
             principal_id,
@@ -198,7 +202,11 @@ impl Services {
 
     /// Shared host execution and safe host reads. The current durable role,
     /// not a repository identity or the role cached at admission, grants it.
-    pub(crate) async fn require_host_execution(&self, what: &str) -> Result<()> {
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub async fn require_host_execution(&self, what: &str) -> Result<()> {
         let Some(principal_id) = gated_collaborator_caller(what)? else {
             return Ok(());
         };
@@ -211,7 +219,11 @@ impl Services {
     /// Workspace management is independent of daemon administration. Keep
     /// the existing explicit workspace-owner path; inherited host membership
     /// applies only to ordinary workspaces and overrides retained guest rows.
-    pub(crate) async fn require_workspace_manager(
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub async fn require_workspace_manager(
         &self,
         workspace_id: &WorkspaceId,
         what: &str,

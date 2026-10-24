@@ -316,7 +316,7 @@ impl ScriptLocks {
 /// the store (for workspace-root resolution), the script registry, and bootstrap locks.
 /// Cheap to clone (all handles); the supervisor task owns its own clone.
 #[derive(Clone)]
-pub(crate) struct ScriptManager {
+pub struct ScriptManager {
     owner_services: Option<crate::Services>,
     pty: Arc<PtyHost>,
     bus: Option<EventBus>,
@@ -980,7 +980,12 @@ impl ScriptManager {
 
     /// Reconcile one committed import without rewriting its persisted definition
     /// or touching scripts absent from the archive. Imported scripts stay idle.
-    pub(crate) async fn refresh_imported(
+    #[expect(
+        clippy::missing_errors_doc,
+        clippy::missing_panics_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub async fn refresh_imported(
         &self,
         workspace_id: &WorkspaceId,
         script_id: &str,
