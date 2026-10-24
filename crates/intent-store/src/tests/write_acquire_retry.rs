@@ -259,3 +259,85 @@ async fn retired_note_paging_cleanup_retries_a_failed_step() {
     assert_eq!(outcome.rows_removed, 51);
     assert_eq!(outcome.tables_dropped, 2);
 }
+
+/// Seed a workspace owning one agent with a short transcript, so a delete
+/// runs the recovery, payload, message and session sweeps.
+async fn seed_workspace_with_agent(store: &Store) -> (WorkspaceId, AgentId) {
+    let ws_id = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws_id, "WS", false))
+        .await
+        .expect("insert ws");
+    let agent_id = AgentId::from("agent-77050000-0000-0000-0000-000000000000");
+    store
+        .insert_agent_session(&sample_agent_session(&agent_id, &ws_id))
+        .await
+        .expect("insert session");
+    let ts = now_iso();
+    for n in 0..3 {
+        store
+            .append_agent_message(
+                &agent_id,
+                "user",
+                &serde_json::json!([{"type": "text", "text": format!("message {n}")}]),
+                &ts,
+            )
+            .await
+            .expect("append message");
+    }
+    (ws_id, agent_id)
+}
+
+/// intent-hq/intent#7705: the workspace delete sweep ran each bounded batch
+/// on the write pool without the busy-retry window, so one saturated acquire
+/// ("batched cascade delete failed: pool timed out ...") failed the whole
+/// delete. It must wait out the transient timeout like the final commit does.
+#[tokio::test]
+async fn workspace_delete_survives_write_pool_acquire_timeout() {
+    let tmp = TempDb::new();
+    let store = short_acquire_store(&tmp).await;
+    let (ws_id, agent_id) = seed_workspace_with_agent(&store).await;
+
+    run_while_writer_held(&store, store.delete_workspace(&ws_id))
+        .await
+        .expect("workspace delete must retry through the write-pool acquire timeout");
+
+    assert!(
+        matches!(store.get_workspace(&ws_id).await, Err(Error::NotFound(_))),
+        "workspace row removed"
+    );
+    assert!(
+        matches!(
+            store.get_agent_session(&agent_id).await,
+            Err(Error::NotFound(_))
+        ),
+        "agent session removed"
+    );
+}
+
+/// intent-hq/intent#7705: a standalone agent delete runs the same bounded
+/// sweeps plus its own existence check and session delete; all must absorb a
+/// transient write-pool acquire timeout.
+#[tokio::test]
+async fn agent_session_delete_survives_write_pool_acquire_timeout() {
+    let tmp = TempDb::new();
+    let store = short_acquire_store(&tmp).await;
+    let (ws_id, agent_id) = seed_workspace_with_agent(&store).await;
+
+    let deleted = run_while_writer_held(&store, store.delete_agent_session(&ws_id, &agent_id))
+        .await
+        .expect("agent delete must retry through the write-pool acquire timeout");
+
+    assert!(deleted, "the session existed and was deleted");
+    assert!(
+        matches!(
+            store.get_agent_session(&agent_id).await,
+            Err(Error::NotFound(_))
+        ),
+        "agent session removed"
+    );
+    store
+        .get_workspace(&ws_id)
+        .await
+        .expect("an agent delete leaves its workspace");
+}
