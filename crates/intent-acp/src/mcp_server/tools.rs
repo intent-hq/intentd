@@ -189,6 +189,7 @@ API:
   ws.note.add(id, { content, heading?, position? }) → { ... }  // Safest way to add information without losing existing content. Prefer this when asked to "add", "put", "document", or "include" something.
     `position` can be `"end"` (default), `"start"`, or `"after:## Heading"` such as `"after:## Phase 1"`.
   ws.note.edit(id, { old, new }) → { ... }  // Surgical text replacement. `old` must match EXACTLY, including whitespace and line breaks; only the first occurrence is replaced. If there is no exact match, `old` is matched against the text with comment anchor markers (`<!--anchor:…-->`) ignored, and anchors inside the replaced text stay attached when their text survives in `new`.
+    Parallel `add` / `edit` / `editLines` / `setContent` calls on one note apply one at a time against the latest text, as do checkbox and linked-task status updates (`ws.task.updateStatus` / `ws.task.update`), so agents can update a shared note concurrently. An `edit` whose `old` text an earlier writer already changed fails with "Text not found". If a write returns `conflict: version mismatch` (-32005), nothing was written: re-read the note and retry.
   ws.note.editLines(id, { start, end, content }) → { ... }  // Line-based replace/delete/insert. `start` and `end` are 1-based and INCLUSIVE. To delete lines, pass `content: ""`. To insert after a line, set `start` and `end` to the same line and include both the original line and new lines in `content`.
   ws.note.updateMetadata(id, { title?, tags? }) → { ... }  // Safest way to change only title/tags; content is untouched. The spec note title is always `Spec` and cannot be changed.
   ws.note.delete(id) → { ok, noteId, deleted }  // Permanently removes a note.
@@ -489,6 +490,7 @@ API:
   ws.note.add(id, { content, heading?, position? }) → { ... }  // Safest way to add information without losing existing content. Prefer this when asked to "add", "put", "document", or "include" something.
     `position` can be `"end"` (default), `"start"`, or `"after:## Heading"` such as `"after:## Phase 1"`.
   ws.note.edit(id, { old, new }) → { ... }  // Surgical text replacement. `old` must match EXACTLY, including whitespace and line breaks; only the first occurrence is replaced. If there is no exact match, `old` is matched against the text with comment anchor markers (`<!--anchor:…-->`) ignored, and anchors inside the replaced text stay attached when their text survives in `new`.
+    Parallel `add` / `edit` / `editLines` / `setContent` calls on one note apply one at a time against the latest text, as do checkbox and linked-task status updates (`ws.task.updateStatus` / `ws.task.update`), so agents can update a shared note concurrently. An `edit` whose `old` text an earlier writer already changed fails with "Text not found". If a write returns `conflict: version mismatch` (-32005), nothing was written: re-read the note and retry.
   ws.note.editLines(id, { start, end, content }) → { ... }  // Line-based replace/delete/insert. `start` and `end` are 1-based and INCLUSIVE. To delete lines, pass `content: ""`. To insert after a line, set `start` and `end` to the same line and include both the original line and new lines in `content`.
   ws.note.updateMetadata(id, { title?, tags? }) → { ... }  // Safest way to change only title/tags; content is untouched. The spec note title is always `Spec` and cannot be changed.
   ws.note.delete(id) → { ok, noteId, deleted }  // Permanently removes a note.
@@ -2360,6 +2362,29 @@ mod tests {
             help_docs.trim_start().starts_with("ws.help(namespace?)"),
             "help(help) should return the ws.help entry, got: {help_docs}"
         );
+    }
+
+    // intent-hq/intent#7184: `ws.help("note")` tells agents that parallel
+    // writes to one note apply one at a time, and how to recover from a
+    // remaining `-32005`, in both variants.
+    #[test]
+    fn help_note_documents_concurrent_writes_and_conflict_retry() {
+        let features = all_gates_open();
+        for is_chief in [false, true] {
+            let docs = help_namespace(is_chief, &features, false, "note").unwrap();
+            for needle in [
+                "Parallel `add` / `edit` / `editLines` / `setContent` calls on one note",
+                "apply one at a time against the latest text",
+                "linked-task status updates",
+                "conflict: version mismatch",
+                "re-read the note and retry",
+            ] {
+                assert!(
+                    docs.contains(needle),
+                    "chief={is_chief}: help(note) is missing {needle:?}:\n{docs}"
+                );
+            }
+        }
     }
 
     // Gated-off namespaces error naming the disabling toggle; unknown

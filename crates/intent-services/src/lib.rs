@@ -1483,6 +1483,16 @@ pub struct Services {
     /// Serialize quota admission through persistence per owner, including
     /// adoption; unrelated owners never wait on each other's forge reads.
     pr_monitor_registration: Arc<KeyedInflight<AgentId>>,
+    /// Per-note content-write lane (intent-hq/intent#7184): the client
+    /// surgical and whole-content writers (`note.add` / `note.edit` /
+    /// `note.editLines` / `note.setContent`, `task.updateStatus`,
+    /// `task.update`, `task.convertBlocks`, `comment.add`, primitive appends)
+    /// hold their note's lane from the read their transform derives from
+    /// until the gated persist lands, so N parallel writers to one note apply
+    /// one after another against the latest text instead of racing the
+    /// bounded `Conflict` retry loop. Held for one read→persist window only
+    /// and never across another note write, so lanes never nest.
+    note_content_writes: Arc<KeyedInflight<(WorkspaceId, NoteId)>>,
     /// Original qualified registration lifetimes, never rebuilt from stored IDs.
     review_monitor_authorities: Arc<
         Mutex<HashMap<intent_core::PrMonitorId, Arc<repository_read_source::MonitorAuthority>>>,
@@ -1859,6 +1869,7 @@ impl Services {
             pr_monitor_debounce_seconds: None,
             pr_monitors_max_per_agent: None,
             pr_monitor_registration: Arc::default(),
+            note_content_writes: Arc::default(),
             review_monitor_authorities: Arc::default(),
             review_monitor_poll_lane: Arc::default(),
             review_monitor_controls: Arc::default(),
@@ -2714,6 +2725,21 @@ impl Services {
     ) -> Self {
         self.queue_mutation_gate_park = Some(park);
         self
+    }
+
+    /// Take `note_id`'s content-write lane (see `note_content_writes`).
+    /// Hold the guard from the read a write derives from through its gated
+    /// persist, and drop it before any follow-up that may write a note
+    /// (auto-conversion, task-status redirects, materialization — which takes
+    /// the lane itself).
+    async fn lock_note_content(
+        &self,
+        workspace_id: &WorkspaceId,
+        note_id: &NoteId,
+    ) -> KeyedInflightGuard<'_, (WorkspaceId, NoteId)> {
+        self.note_content_writes
+            .lock((workspace_id.clone(), note_id.clone()))
+            .await
     }
 
     /// Park the first `task.update` attempt before its parent write when the
@@ -12270,16 +12296,19 @@ fn decorate_specialist_resolved(
 /// `primitive` to the note, persist it, emit `note:updated`, and return the TS
 /// `appendPrimitiveBlock` response `{ ok, primitiveId, noteId, content }`. A
 /// missing note surfaces as `Error::Internal` (→ `-32603`), matching the TS
-/// builder which throws `Note <id> not found`.
+/// builder which throws `Note <id> not found`. The read→persist window holds
+/// the note's content-write lane like every other client content write.
 async fn append_primitive(
-    store: &Store,
-    bus: Option<&EventBus>,
+    services: &Services,
     workspace_id: &WorkspaceId,
     note_id: &NoteId,
     primitive: &serde_json::Value,
     block_type: &str,
     primitive_id: &str,
 ) -> Result<serde_json::Value> {
+    let store = &services.store;
+    let bus = services.event_bus.as_ref();
+    let write_lane = services.lock_note_content(workspace_id, note_id).await;
     let note = fetch_note_peer(store, workspace_id, note_id).await?;
     let incoming = primitive_ops::append_block(&note.content, primitive, block_type);
     let read_rev = note.rev;
@@ -12303,6 +12332,7 @@ async fn append_primitive(
         },
     )
     .await?;
+    drop(write_lane);
     publish_event(
         bus,
         note_change_event(
@@ -14100,7 +14130,13 @@ impl Services {
     /// racing with this one — including a later transition of the same task
     /// — is merged into rather than overwritten. A parent that already carries
     /// the marker (or lost its link) after the fresh read is left untouched,
-    /// as is one whose task note is gone or no longer a task.
+    /// as is one whose task note is gone or no longer a task. The read→write
+    /// window holds the parent's content-write lane (`note_content_writes`),
+    /// so N parallel task transitions linked from one note rewrite it one
+    /// after another instead of exhausting the bounded retry against each
+    /// other and the laned client writers (intent-hq/intent#7184). Callers
+    /// must not hold a lane: every laned writer releases its lane before the
+    /// task-status write that leads here.
     async fn materialize_linked_checkbox_in_note(
         &self,
         workspace_id: &WorkspaceId,
@@ -14108,6 +14144,7 @@ impl Services {
         note_id: &NoteId,
     ) {
         const MAX_ATTEMPTS: usize = 3;
+        let write_lane = self.lock_note_content(workspace_id, note_id).await;
         for attempt in 1..=MAX_ATTEMPTS {
             let mut note = match self.store.get_note(workspace_id, note_id).await {
                 Ok(note) => note,
@@ -14145,6 +14182,7 @@ impl Services {
                     return;
                 }
             }
+            drop(write_lane);
             self.schedule_line_attribution_recompute(workspace_id, &note.id);
             publish_event(
                 self.event_bus.as_ref(),
@@ -15903,6 +15941,24 @@ impl<K: std::hash::Hash + Eq + Clone> KeyedInflight<K> {
         }
     }
 
+    /// Take `key`'s lock and hold it until the returned guard drops (the
+    /// owned form of `enter` + `acquire`, for holds that span a whole
+    /// read→write window).
+    async fn lock(&self, key: K) -> KeyedInflightGuard<'_, K> {
+        let slot = self.enter(key);
+        let guard = Arc::clone(
+            slot.lock
+                .as_ref()
+                .expect("keyed inflight slot lock is taken only on drop"),
+        )
+        .lock_owned()
+        .await;
+        KeyedInflightGuard {
+            _guard: guard,
+            _slot: slot,
+        }
+    }
+
     /// Callers currently holding or waiting on `key`.
     #[cfg(test)]
     pub(crate) fn holders(&self, key: &K) -> usize {
@@ -15921,6 +15977,13 @@ impl<K: std::hash::Hash + Eq + Clone> KeyedInflight<K> {
             .expect("keyed inflight registry poisoned")
             .is_empty()
     }
+}
+
+/// A held [`KeyedInflight`] key (see `lock`). Field order matters: the
+/// mutex guard (and its `Arc` ref) drops before the slot's prune check.
+struct KeyedInflightGuard<'a, K: std::hash::Hash + Eq> {
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+    _slot: KeyedInflightSlot<'a, K>,
 }
 
 /// One caller's hold on a [`KeyedInflight`] entry (see `enter`).
@@ -16839,6 +16902,7 @@ impl Services {
     ) -> Result<TaskConvertBlocksResult> {
         let store = &self.store;
         let author = resolve_note_version_author(store, caller_agent_id).await;
+        let write_lane = self.lock_note_content(&workspace_id, &note_id).await;
         let mut attempt = 0;
         let (note, parsed, mut warnings, created, block_note_ids) = loop {
             attempt += 1;
@@ -16981,6 +17045,7 @@ impl Services {
                 Err(e) => return Err(e),
             }
         };
+        drop(write_lane);
         let mut created_note_ids: Vec<String> = Vec::with_capacity(created.len());
         let mut created_tasks: Vec<CreatedTaskEntry> = Vec::with_capacity(created.len());
         for (child, entry) in created {
@@ -20774,8 +20839,6 @@ impl WorkspaceApi for Services {
         description: String,
         snapshot: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let store = self.store.clone();
-        let bus = self.event_bus.clone();
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
             let id = new_uuid();
@@ -20787,16 +20850,7 @@ impl WorkspaceApi for Services {
                 &description,
                 snapshot.as_deref(),
             );
-            append_primitive(
-                &store,
-                bus.as_ref(),
-                &workspace_id,
-                &note_id,
-                &primitive,
-                "reference",
-                &id,
-            )
-            .await
+            append_primitive(self, &workspace_id, &note_id, &primitive, "reference", &id).await
         })
     }
 
@@ -20808,8 +20862,6 @@ impl WorkspaceApi for Services {
         description: String,
         working_directory: Option<String>,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let store = self.store.clone();
-        let bus = self.event_bus.clone();
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
             let id = new_uuid();
@@ -20821,16 +20873,7 @@ impl WorkspaceApi for Services {
                 &description,
                 working_directory.as_deref(),
             );
-            append_primitive(
-                &store,
-                bus.as_ref(),
-                &workspace_id,
-                &note_id,
-                &primitive,
-                "cli",
-                &id,
-            )
-            .await
+            append_primitive(self, &workspace_id, &note_id, &primitive, "cli", &id).await
         })
     }
 
@@ -20842,23 +20885,12 @@ impl WorkspaceApi for Services {
         diff: String,
         description: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let store = self.store.clone();
-        let bus = self.event_bus.clone();
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
             let id = new_uuid();
             let created_at = now_iso();
             let primitive = primitive_ops::patch(&id, &created_at, &file_path, &diff, &description);
-            append_primitive(
-                &store,
-                bus.as_ref(),
-                &workspace_id,
-                &note_id,
-                &primitive,
-                "patch",
-                &id,
-            )
-            .await
+            append_primitive(self, &workspace_id, &note_id, &primitive, "patch", &id).await
         })
     }
 
@@ -20870,8 +20902,6 @@ impl WorkspaceApi for Services {
         goal: String,
         description: String,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let store = self.store.clone();
-        let bus = self.event_bus.clone();
         Box::pin(async move {
             // The write lands on `workspace_id`/`note_id`: that workspace is
             // the authorization scope; the referenced agent is checked too.
@@ -20883,8 +20913,7 @@ impl WorkspaceApi for Services {
             let primitive =
                 primitive_ops::agent_action(&id, &created_at, &agent_id, &goal, &description);
             append_primitive(
-                &store,
-                bus.as_ref(),
+                self,
                 &workspace_id,
                 &note_id,
                 &primitive,
@@ -26167,6 +26196,9 @@ impl WorkspaceApi for Services {
             let _mutation = self.workspace_mutations.enter(&workspace_id)?;
             self.require_member(&workspace_id).await?;
             note_ops::reject_numbered_read_presentation(&input.content)?;
+            // Resolved before taking the lane: it does not depend on the note.
+            let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
+            let write_lane = self.lock_note_content(&workspace_id, &note_id).await;
             let note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
             let (incoming, position) = note_ops::apply_add(
                 &note.content,
@@ -26174,7 +26206,6 @@ impl WorkspaceApi for Services {
                 input.heading.as_deref(),
                 input.position.as_deref(),
             )?;
-            let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
             let read_rev = note.rev;
             let MergedContentWrite {
                 note,
@@ -26196,6 +26227,7 @@ impl WorkspaceApi for Services {
                 },
             )
             .await?;
+            drop(write_lane);
             services
                 .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
             let outcome = services
@@ -26262,10 +26294,12 @@ impl WorkspaceApi for Services {
                 ));
             }
             note_ops::reject_numbered_read_presentation(&input.new)?;
+            // Resolved before taking the lane: it does not depend on the note.
+            let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
+            let write_lane = self.lock_note_content(&workspace_id, &note_id).await;
             let note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
             let (incoming, match_position, was_empty) =
                 note_ops::apply_edit(&note.content, &input.old, &input.new)?;
-            let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
             let read_rev = note.rev;
             let MergedContentWrite {
                 note,
@@ -26287,6 +26321,7 @@ impl WorkspaceApi for Services {
                 },
             )
             .await?;
+            drop(write_lane);
             services
                 .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
             let outcome = services
@@ -26351,10 +26386,12 @@ impl WorkspaceApi for Services {
             let _mutation = self.workspace_mutations.enter(&workspace_id)?;
             self.require_member(&workspace_id).await?;
             note_ops::reject_numbered_read_presentation(&input.content)?;
+            // Resolved before taking the lane: it does not depend on the note.
+            let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
+            let write_lane = self.lock_note_content(&workspace_id, &note_id).await;
             let note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
             let incoming =
                 note_ops::apply_edit_lines(&note.content, input.start, input.end, &input.content)?;
-            let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
             let read_rev = note.rev;
             let MergedContentWrite {
                 note,
@@ -26376,6 +26413,7 @@ impl WorkspaceApi for Services {
                 },
             )
             .await?;
+            drop(write_lane);
             let total_lines_before = old_content.split('\n').count();
             services
                 .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
@@ -26465,6 +26503,7 @@ impl WorkspaceApi for Services {
             // store nor the merge state.
             note_ops::reject_numbered_read_presentation(&content)?;
             let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
+            let write_lane = self.lock_note_content(&workspace_id, &note_id).await;
             let MergedContentWrite {
                 note,
                 old_content,
@@ -26488,6 +26527,7 @@ impl WorkspaceApi for Services {
                 },
             )
             .await?;
+            drop(write_lane);
             let previous_title = note.title.clone();
             services
                 .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
@@ -26966,6 +27006,9 @@ impl WorkspaceApi for Services {
             let checkbox = note_ops::checkbox_for(&status).ok_or_else(|| {
                 Error::Internal("Status must be 'done', 'todo', or 'in-progress'".to_string())
             })?;
+            // Resolved before taking the lane: it does not depend on the note.
+            let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
+            let write_lane = self.lock_note_content(&workspace_id, &note_id).await;
             let note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
             let normalized = task_text.trim().to_string();
             let linked = match note_ops::linked_task_for_text(&note.content, &normalized) {
@@ -26973,6 +27016,9 @@ impl WorkspaceApi for Services {
                 None => None,
             };
             if let Some((task_id, task)) = linked {
+                // The redirect's materialization takes this note's lane
+                // itself: release it before the task write.
+                drop(write_lane);
                 // The line links a task note: the task's metadata status is
                 // the source of truth and the char is its projection, so the
                 // write goes to the task (events, ready-task recompute) and
@@ -27006,7 +27052,6 @@ impl WorkspaceApi for Services {
                 });
             }
             let updated = note_ops::apply_task_status(&note.content, &normalized, checkbox)?;
-            let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
             let read_rev = note.rev;
             let MergedContentWrite { note, .. } = persist_merged_content(
                 &store,
@@ -27023,6 +27068,7 @@ impl WorkspaceApi for Services {
                 },
             )
             .await?;
+            drop(write_lane);
             services
                 .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
             publish_event(
@@ -27111,6 +27157,9 @@ impl WorkspaceApi for Services {
             // with the stale marker into `[x ]` — no longer a checkbox, so
             // nothing could heal it (intent-hq/intentd#1857). Unlinked lines
             // carry no projection and keep the merging write.
+            // Resolved before taking the lane: it does not depend on the note.
+            let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
+            let write_lane = self.lock_note_content(&workspace_id, &note_id).await;
             let mut attempt = 0;
             let (note, update, redirect, write_parent) = loop {
                 attempt += 1;
@@ -27197,7 +27246,6 @@ impl WorkspaceApi for Services {
                     break (note, update, redirect, false);
                 }
                 services.park_task_update_projection(attempt).await;
-                let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
                 let read_rev = note.rev;
                 if redirect.is_none() {
                     let merged = persist_merged_content(
@@ -27239,6 +27287,9 @@ impl WorkspaceApi for Services {
                     Err(e) => return Err(e),
                 }
             };
+            // Release before the redirect: its materialization takes this
+            // note's lane itself.
+            drop(write_lane);
             if write_parent {
                 publish_event(
                     bus.as_ref(),
@@ -28089,6 +28140,7 @@ impl WorkspaceApi for Services {
                     // (`Conflict`) is re-read and re-anchored on the next
                     // attempt instead of overwritten; the last attempt's
                     // `Conflict` propagates unchanged, like `note.setContent`.
+                    let write_lane = services.lock_note_content(&workspace_id, &note_id).await;
                     let mut attempt = 0;
                     let (note, line, anchored_text, note_rev) = loop {
                     attempt += 1;
@@ -28213,6 +28265,7 @@ impl WorkspaceApi for Services {
                         Err(e) => return Err(e),
                     }
                     };
+                    drop(write_lane);
                     services.schedule_line_attribution_recompute(
                         &note.workspace_id.clone(),
                         &note.id.clone(),
