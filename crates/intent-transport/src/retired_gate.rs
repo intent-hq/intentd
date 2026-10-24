@@ -334,6 +334,7 @@ pub(crate) const RETIRED_UNGATED_METHODS: &[&str] = &[
     "providers.profiles.list",
     "providers.profiles.reorder",
     "providers.profiles.update",
+    "providers.profiles.updateDefault",
     "repo.list",
     "repo.remove",
     "repo.warmCache",
