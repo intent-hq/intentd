@@ -3896,6 +3896,16 @@ impl AgentManager {
                 )
                 .await
             }
+            // A Default configuration with no saved overrides is tracked
+            // too, so a later edit reports it as running on earlier settings.
+            None if crate::provider_profiles::is_default_config_ref(opts.provider.id) => {
+                Box::pin(self.services.register_default_process(
+                    &workspace_id,
+                    &agent_id,
+                    opts.provider.id,
+                ))
+                .await
+            }
             None => None,
         };
         let handle = AgentHandle {
@@ -11635,7 +11645,7 @@ impl AgentManager {
         // A named profile's saved overlay, read fresh for this new process
         // (it re-checks the profile still exists and its base is enabled).
         // Boxed: keeps this turn-start future's stack frame unchanged.
-        let profile_env = if crate::provider_profiles::is_qualified_ref(&resolved.selection) {
+        let profile_env = if crate::provider_profiles::may_have_overlay(&resolved.selection) {
             boxed_await(|| self.services.resolve_selected_profile(&resolved.selection)).await?
         } else {
             None

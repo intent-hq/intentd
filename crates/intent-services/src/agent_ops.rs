@@ -1035,7 +1035,11 @@ fn resolve_delegate_provider(
     match crate::agent_session::derived_default_provider(&settings) {
         Some(derived) => {
             services.ensure_selectable_provider("agent.delegate", &derived)?;
-            ensure_provider_available("agent.delegate", &derived, &settings.providers)?;
+            services.ensure_provider_available_for(
+                "agent.delegate",
+                &derived,
+                &settings.providers,
+            )?;
             Ok(Some(derived))
         }
         None => Err(crate::agent_session::no_default_provider_error(
@@ -1061,7 +1065,11 @@ fn resolve_specialist_provider(
     });
     if let Some(provider) = provider.as_deref() {
         services.ensure_selectable_provider(method, provider)?;
-        ensure_provider_available(method, provider, &services.effective_settings().providers)?;
+        services.ensure_provider_available_for(
+            method,
+            provider,
+            &services.effective_settings().providers,
+        )?;
     }
     Ok(provider)
 }
@@ -1163,7 +1171,9 @@ pub(crate) fn resolve_disabled_provider_rehome(
     method: &str,
 ) -> Option<DisabledProviderRehome> {
     let provider = crate::agent_session::derived_default_provider(settings)?;
-    ensure_provider_available(method, &provider, &settings.providers).ok()?;
+    services
+        .ensure_provider_available_for(method, &provider, &settings.providers)
+        .ok()?;
     // Create-seam parity: a settings-chain model that provably belongs to
     // another provider is dropped to the CLI default, never an error the
     // user did not ask for (see `plan_agent_create`).
@@ -1201,17 +1211,33 @@ pub(crate) fn resolve_disabled_provider_rehome(
 /// the real `codex` / `claude` CLI resolves too (`requires_secondary_binary`);
 /// a `providers.paths` override changes neither. Tests mark a provider
 /// installed with `test_support::provider_installed`, never with an override.
+#[cfg(test)]
 pub(crate) fn ensure_provider_available(
     method: &str,
     provider_id: &str,
     providers: &intent_core::settings_file::ProvidersSettings,
 ) -> Result<()> {
+    ensure_provider_available_checked(method, provider_id, providers, true)
+}
+
+/// [`ensure_provider_available`] with the bare auth-verdict gate optional:
+/// a Default configuration with saved environment overrides (PROTOCOL §5.54)
+/// runs under other settings than the bare installation the base sweep
+/// probes, so, like a profile, its bare verdict must not refuse it.
+pub(crate) fn ensure_provider_available_checked(
+    method: &str,
+    provider_id: &str,
+    providers: &intent_core::settings_file::ProvidersSettings,
+    check_bare_verdict: bool,
+) -> Result<()> {
     ensure_provider_enabled(method, provider_id, providers.enabled.as_ref())?;
-    ensure_provider_authenticated(
-        method,
-        provider_id,
-        crate::provider_auth::cached_auth_verdict(provider_id),
-    )?;
+    if check_bare_verdict {
+        ensure_provider_authenticated(
+            method,
+            provider_id,
+            crate::provider_auth::cached_auth_verdict(provider_id),
+        )?;
+    }
     // A profile shares its base provider's installation and paths.
     let availability = intent_providers::provider_availability_for(
         intent_providers::base_provider_id(provider_id),
@@ -4911,13 +4937,9 @@ impl Services {
             )?;
             // A profile is gated on its own saved settings' verdict, never
             // the base provider's Default verdict.
-            let verdict = if crate::provider_profiles::is_qualified_ref(p) {
-                Box::pin(self.resolve_profile_env(p))
-                    .await?
-                    .and_then(|profile| crate::provider_auth::cached_profile_auth_verdict(&profile))
-            } else {
-                crate::provider_auth::cached_auth_verdict(p)
-            };
+            // A profile, or a Default with saved overrides, is gated on the
+            // verdict of its own saved settings, never the bare installation's.
+            let verdict = Box::pin(self.selection_auth_verdict(p)).await?;
             ensure_provider_authenticated(method, p, verdict)?;
         }
         // A bare model that provably belongs to a different provider (cached
@@ -5769,7 +5791,7 @@ impl Services {
                 }
             };
             if current_effective.as_deref() != Some(pid.as_str()) {
-                ensure_provider_available(
+                self.ensure_provider_available_for(
                     "agent.setModel",
                     &pid,
                     &self.effective_settings().providers,
@@ -7374,8 +7396,17 @@ impl Services {
         let resolved = if intent_providers::installed_cli::InstalledCli::for_provider(&provider_id)
             .is_some()
         {
+            // A Default configuration's saved overrides select its catalog;
+            // the installed key folds in their fingerprint.
+            let overlay = if crate::provider_profiles::is_default_config_ref(&provider_id) {
+                Box::pin(self.resolve_profile_env(&provider_id))
+                    .await?
+                    .map(std::sync::Arc::new)
+            } else {
+                None
+            };
             self.models_catalog
-                .resolve_installed(&provider_id, force_refresh)
+                .resolve_installed_for(&provider_id, overlay, force_refresh)
                 .await
         } else {
             crate::model_catalog::resolve_with_cache(
@@ -11216,7 +11247,7 @@ impl Services {
                 }
                 let delegate_provider = if let Some(provider_param) = provider_param_in.as_deref() {
                     services.ensure_selectable_provider("agent.delegate", provider_param)?;
-                    ensure_provider_available(
+                    services.ensure_provider_available_for(
                         "agent.delegate",
                         provider_param,
                         &services.effective_settings().providers,
@@ -11731,7 +11762,7 @@ impl Services {
         // with the other per-entry options.
         if let Some(provider_param) = input.provider.as_deref() {
             self.ensure_selectable_provider("agent.delegate", provider_param)?;
-            ensure_provider_available(
+            self.ensure_provider_available_for(
                 "agent.delegate",
                 provider_param,
                 &self.effective_settings().providers,
