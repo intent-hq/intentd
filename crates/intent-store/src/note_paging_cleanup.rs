@@ -299,20 +299,24 @@ impl Store {
                  (SELECT rowid FROM {table} WHERE workspace_id = ? LIMIT ?)"
             );
             loop {
-                let removed = match sqlx::query(&sql)
-                    .bind(workspace_id)
-                    .bind(batch)
-                    .execute(self.write_pool())
-                    .await
-                {
-                    Ok(done) => done.rows_affected(),
-                    Err(e) if is_missing_table(&e) => break,
-                    Err(e) => {
-                        return Err(Error::Internal(format!(
+                // Busy-retry window: a saturated single writer must not fail
+                // the workspace delete sweep (intent-hq/intent#7705).
+                let removed = crate::with_write_txn_retry(|| async {
+                    match sqlx::query(&sql)
+                        .bind(workspace_id)
+                        .bind(batch)
+                        .execute(self.write_pool())
+                        .await
+                    {
+                        Ok(done) => Ok(Some(done.rows_affected())),
+                        Err(e) if is_missing_table(&e) => Ok(None),
+                        Err(e) => Err(Error::Internal(format!(
                             "delete workspace retired {table} rows: {e}"
-                        )))
+                        ))),
                     }
-                };
+                })
+                .await?;
+                let Some(removed) = removed else { break };
                 statements.push(removed);
                 if removed < batch.unsigned_abs() {
                     break;
