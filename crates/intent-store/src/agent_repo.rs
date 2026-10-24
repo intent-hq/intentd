@@ -4748,19 +4748,17 @@ impl Store {
         // Confirm the session exists under THIS workspace before touching any
         // children — the pre-delete statements are keyed by agent id alone, so
         // a mismatched workspace id must remain a no-op exactly like before.
-        // Each single-statement step below runs in the busy-retry window: a
-        // saturated single-writer pool must not fail the delete on its first
-        // `PoolTimedOut` (intent-hq/intent#7705). A timed-out acquire ran
-        // nothing and a busy statement rolled back, so retrying is safe.
-        let exists: Option<i64> = crate::with_write_txn_retry(|| async {
+        // Not retried: this runs under lifecycle serialization, and a failure
+        // here has no side effects. The sweep steps after
+        // `release_serialization` run in the busy-retry window instead, so a
+        // saturated writer cannot fail the delete half-way (intent-hq/intent#7705).
+        let exists: Option<i64> =
             sqlx::query_scalar("SELECT 1 FROM agent_session WHERE id = ? AND workspace_id = ?")
                 .bind(&id.0)
                 .bind(&workspace_id.0)
                 .fetch_optional(self.write_pool())
                 .await
-                .map_err(|e| Error::Internal(format!("delete agent session check failed: {e}")))
-        })
-        .await?;
+                .map_err(|e| Error::Internal(format!("delete agent session check failed: {e}")))?;
         if exists.is_none() {
             return Ok(false);
         }
