@@ -355,7 +355,10 @@ async fn concurrent_edits_on_different_lines_all_apply() {
     .await;
     assert_eq!(failures(&results), Vec::<String>::new());
 
-    let note = services.get_note(ws.clone(), note_id).await.expect("get note");
+    let note = services
+        .get_note(ws.clone(), note_id)
+        .await
+        .expect("get note");
     for i in 0..WRITERS {
         assert!(
             note.content.contains(&format!("line {i}: done")),
@@ -392,7 +395,10 @@ async fn concurrent_adds_all_apply() {
     .await;
     assert_eq!(failures(&results), Vec::<String>::new());
 
-    let note = services.get_note(ws.clone(), note_id).await.expect("get note");
+    let note = services
+        .get_note(ws.clone(), note_id)
+        .await
+        .expect("get note");
     for i in 0..WRITERS {
         assert!(
             note.content.contains(&format!("entry {i} from writer")),
@@ -446,8 +452,12 @@ async fn concurrent_task_status_updates_all_apply() {
 #[intent_test_macros::daemon_test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_edits_on_same_text_apply_once() {
     let (services, ws, _tmp) = setup().await;
-    let note_id =
-        create_note_with(&services, &ws, "header\nStatus: pending\nfooter".to_string()).await;
+    let note_id = create_note_with(
+        &services,
+        &ws,
+        "header\nStatus: pending\nfooter".to_string(),
+    )
+    .await;
 
     let results = run_together(2, |i| {
         let (services, ws, note_id) = (Arc::clone(&services), ws.clone(), note_id.clone());
@@ -468,12 +478,23 @@ async fn concurrent_edits_on_same_text_apply_once() {
     .await;
 
     let ok: Vec<usize> = (0..2).filter(|&i| results[i].is_ok()).collect();
-    assert_eq!(ok.len(), 1, "exactly one edit must apply: {:?}", failures(&results));
+    assert_eq!(
+        ok.len(),
+        1,
+        "exactly one edit must apply: {:?}",
+        failures(&results)
+    );
     let loser = 1 - ok[0];
-    let err = results[loser].as_ref().expect_err("loser must fail").to_string();
+    let err = results[loser]
+        .as_ref()
+        .expect_err("loser must fail")
+        .to_string();
     assert!(err.contains("Text not found"), "unexpected error: {err}");
 
-    let note = services.get_note(ws.clone(), note_id).await.expect("get note");
+    let note = services
+        .get_note(ws.clone(), note_id)
+        .await
+        .expect("get note");
     assert_eq!(
         note.content,
         format!("header\nStatus: claimed by writer {}\nfooter", ok[0])
@@ -515,7 +536,10 @@ async fn concurrent_edits_across_two_notes_all_apply() {
     assert_eq!(failures(&results), Vec::<String>::new());
 
     for note_id in notes {
-        let note = services.get_note(ws.clone(), note_id).await.expect("get note");
+        let note = services
+            .get_note(ws.clone(), note_id)
+            .await
+            .expect("get note");
         assert!(!note.content.contains("open"), "{}", note.content);
     }
 }

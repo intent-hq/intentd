@@ -2364,6 +2364,28 @@ mod tests {
         );
     }
 
+    // intent-hq/intent#7184: `ws.help("note")` tells agents that parallel
+    // writes to one note apply one at a time, and how to recover from a
+    // remaining `-32005`, in both variants.
+    #[test]
+    fn help_note_documents_concurrent_writes_and_conflict_retry() {
+        let features = all_gates_open();
+        for is_chief in [false, true] {
+            let docs = help_namespace(is_chief, &features, false, "note").unwrap();
+            for needle in [
+                "Parallel writes to one note",
+                "apply one at a time against the latest text",
+                "conflict: version mismatch",
+                "re-read the note and retry",
+            ] {
+                assert!(
+                    docs.contains(needle),
+                    "chief={is_chief}: help(note) is missing {needle:?}:\n{docs}"
+                );
+            }
+        }
+    }
+
     // Gated-off namespaces error naming the disabling toggle; unknown
     // namespaces error listing what is available.
     #[test]
