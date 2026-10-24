@@ -524,6 +524,7 @@ impl Services {
         let Ok(ws) = self.store.get_workspace(workspace_id).await else {
             return;
         };
+        self.maybe_emit_attention_reminder_changed(&ws).await;
         let Ok(notes) = self.store.list_notes(workspace_id).await else {
             return;
         };
@@ -636,6 +637,9 @@ impl Services {
     pub(crate) fn evict_display_status_baseline(&self, workspace_id: &WorkspaceId) {
         self.last_display_statuses.evict(workspace_id);
         self.last_waiting_statuses.evict(workspace_id);
+        if let Ok(mut cache) = self.last_attention_reminder_reasons.lock() {
+            cache.remove(workspace_id);
+        }
         self.scripts_running_state.evict(workspace_id);
     }
 

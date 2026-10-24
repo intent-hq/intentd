@@ -160,7 +160,7 @@ recover a chat after deletion has completed.
 
 ## Choose a model or change agent behavior
 
-<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/initializer/InitialAgentPicker.svelte; packages/cloudlands-fe/src/lib/components/settings/{SettingsSidebarNav,ProviderSelector,ProviderProfiles,ProviderProfileDialog}.svelte; packages/cloudlands-fe/src/lib/components/chat/input/ModelPicker.svelte; packages/cloudlands-fe/src/shared/app-ui-targets.ts; packages/intentd/crates/intent-services/src/{provider_profiles,profile_activation,quota_failover,provider_return}.rs; packages/cloudlands-fe/src/lib/components/chat/ProviderFailoverNotice.svelte. -->
+<!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/initializer/InitialAgentPicker.svelte; packages/cloudlands-fe/src/lib/components/settings/{SettingsSidebarNav,ProviderSelector,ProviderProfiles,ProviderProfileDialog}.svelte; packages/cloudlands-fe/src/lib/components/chat/input/ModelPicker.svelte; packages/cloudlands-fe/src/store/renderer/slices/user-preferences/user-preferences-slice.ts; packages/cloudlands-fe/src/shared/app-ui-targets.ts; packages/intentd/crates/intent-services/src/{provider_profiles,profile_activation,quota_failover,provider_return}.rs. -->
 
 For the default model, open **Settings → Providers → Default model**
 (`/settings?tab=providers#utility-default-model`). For new work, choose a model in
@@ -174,7 +174,11 @@ existing specialist to edit its behavior. Global defaults and a specialist's
 instructions are different scopes. Some agent feature changes apply only to newly
 created sessions; do not promise they alter running conversations.
 
-**Provider profiles (Codex and Claude Code only).** A profile runs the installed
+**Provider profiles (Codex and Claude Code only).** Availability depends on the app
+version. In apps where profiles remain in Labs, discuss them only when asked and
+label them experimental; use **Enable experimental provider profiles** in the
+command menu first. **Disable experimental provider profiles** hides profile
+management again. A profile runs the installed
 CLI with its own environment variables, for example a work and a personal account
 or a different endpoint. In **Settings → Providers**, open the ⋯ menu on Codex or
 Claude Code and choose **Add profile**: enter a name and environment variables
@@ -193,12 +197,16 @@ the original configuration is **Codex · Default**. Each profile has its own **F
 mode** (Claude Code) or **Service Tier** (Codex) in its ⋯ menu; it starts off and
 never follows the Default setting. Delegated agents follow their
 explicit, specialist, or default selection, never the parent's profile.
-To rename the original configuration or give it its own environment variables
-(same rules as a profile, without the backup switch), choose **Environment
-variables** in the Codex or Claude Code ⋯ menu; a blank name restores **Default**.
+When the app offers **Environment variables** in the Codex or Claude Code ⋯
+menu, use it to rename the original configuration or give it its own environment
+variables (same rules as a profile, without the backup switch); a blank name
+restores **Default**. Older app versions may not offer this control.
 
-**Backup profiles.** Drag a profile in **Settings → Providers**, or focus its
-handle and use the Up and Down arrow keys, to set its order. Turn on **Use as backup
+**Backup profiles.** These controls require matching app and daemon support.
+Older apps may support provider profiles without profile ordering or backup
+controls; check availability before directing users to them. In supporting apps,
+drag a profile in **Settings → Providers**, or focus its handle and use the Up and
+Down arrow keys, to set its order. Turn on **Use as backup
 provider** in the profile dialog; backup profiles show a **Backup** badge. When a
 conversation's current Codex or Claude Code configuration runs out of quota, the turn
 continues on the next backup of the same provider in saved order, with the same
@@ -295,6 +303,24 @@ directories. Workspaces already stored in the daemon remain available.
 
 <!-- Sources: packages/intentd/crates/intentd/src/main.rs; packages/cloudlands-fe/src/routes/(app)/settings/+page.svelte. -->
 
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage.svelte,HomeWorkspaceBoard.svelte,HomeWorkspaceSettings.svelte,home-model.ts,home-workspace-status-groups.ts}; src/lib/components/workspace/WorkspaceCard.svelte; src/shared/utils/workspace-attention-reminder.ts; messages/en.json. -->
+
+In **Home → Workspaces**, **PR ready** groups workspaces whose pull requests are
+ready to merge, separately from **Needs you**. Use the **PR ready** status filter
+to find them. Questions, review requests, blockers, and failures take priority over
+a ready PR. In **Board view** with **Group by → Activity**, the **PR ready** column
+appears only while matching workspaces remain visible under the current filters.
+In **List view**, **Group by → Status** shows detailed work stages.
+
+Use **Dismiss for now** in a workspace’s Home or sidebar actions menu to hide its current
+**Needs you** reminder for yourself. It stays dismissed across refreshes and
+restarts, while a new question or request brings it back. Pending questions and
+paused work stay available; dismissal does not answer, resume, complete, or merge
+anything. A dismissed reminder shows **Running** if work is running, otherwise
+**Waiting**. Blocked and failed work keeps its status.
+
+<!-- Daemon sources: crates/intent-services/src/workspace_attention_reminders.rs; crates/intent-services/src/workspace_status.rs; crates/intent-transport/src/router.rs. -->
+
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceBoard,HomeWorkspaceDetail,HomeWorkspacePullBadge}.svelte; src/features/home/home-model.ts; src/features/home/home.css. -->
 
 In **Home → Workspaces**, list rows and board cards show organization/repository
@@ -304,12 +330,12 @@ workspace's preview header shows its repository. Local repositories show their n
 or path. Long labels truncate; hover to read the full name. Repository-specific
 views identify the repository in the page heading.
 
-Grouped by status, Home sorts workspaces into **Needs you**, **Running**, **Waiting**,
-and **Done & idle**, in that priority order. **Running** covers an agent at work or a
-running command script such as a build or test; a dev server or other service script
-alone does not count. **Waiting** covers workspaces watching something external: a
-monitored PR, a background hook, a delegated agent, a script run monitor, or a PR in
-the merge queue. The **Waiting** filter shows the same workspaces.
+In Home versions with a **Waiting** filter, status grouping separates running work
+from external waits. **Running** covers an agent at work or a running command script
+such as a build or test; a dev server or other service script alone does not count.
+**Waiting** covers workspaces watching something external: a monitored PR, a background
+hook, a delegated agent, a script run monitor, or a PR in the merge queue. The
+**Waiting** filter shows the same workspaces; older apps may not offer that filter.
 
 The PR badge in list and board views prioritizes draft PRs, then open PRs
 (including conflicted or queued PRs), then merged and closed PRs. Within the same
@@ -505,18 +531,21 @@ until Intent sees them again.
 
 ## Home Workspaces
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceSettings,HomeWorkspaceBoard}.svelte; src/features/home/{home-workspace-opening,home-workspace-status-groups,home-workspaces-persistence}.ts. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceSettings,HomeWorkspaceBoard}.svelte; src/features/home/{home-workspace-opening,home-workspace-status-groups,home-workspaces-persistence}.ts; src/shared/utils/workspace-attention-reminder.ts. -->
 
 In **Home → Workspaces**, click a list row or board card to select it and show its
 preview. Double-click it, or Cmd-click (Ctrl-click on Windows and Linux), to open the
 workspace directly.
 
 Open **View options → Group by** in either list or board
-view. **Activity** keeps the broad **Needs you**, **Running**, and **Done & idle**
-groups. In list view, **Status** groups workspace statuses in this order:
+view. **Activity** keeps the broad **Needs you**, **PR ready**, **Running**, and
+**Done & idle** groups. The **PR ready** board column appears only when matching
+workspaces remain visible. In list view, **Status** groups workspace statuses in
+this order:
 **Needs attention** (failed, blocked, or needing attention), **Not started**,
-**In progress**, **PR open**, **PR mergeable**, **PR queued**, **PR merged**, then
-**Done & idle** (idle or complete).
+**In progress**, **Waiting** (when a reminder is personally dismissed),
+**PR open**, **PR mergeable**, **PR queued**, **PR merged**, then **Done & idle**
+(idle or complete).
 **Repository** groups by repository; **None** removes grouping.
 
 The board uses **Activity** while the list is grouped by **Status**. Switching back
@@ -532,7 +561,7 @@ grouping choices keep their behavior.
 
 ## Home workspace status icons
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomeWorkspaceStatus.svelte,home-attention.ts,home-model.ts}; src/lib/components/workspace/utils/workspace-status-presentation.ts; messages/en.json. Backend source: packages/intentd/crates/intent-services/src/workspace_status.rs (workspace_is_waiting). -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomeWorkspaceStatus.svelte,home-attention.ts,home-model.ts}; src/lib/components/workspace/utils/workspace-status-presentation.ts; src/shared/utils/workspace-attention-reminder.ts; messages/en.json. Backend source: packages/intentd/crates/intent-services/src/workspace_status.rs (workspace_is_waiting). -->
 
 In **Home → Workspaces**, the status icon in list and board views describes the
 workspace's current status. Hover over it for an explanation:
@@ -548,9 +577,9 @@ Questions, review requests, failures, and blockers can take precedence over PR
 icons. **PR Mergeable** does not grant permission to merge: agents still need the
 user's explicit authorization and must check the current merge requirements.
 
-A muted hourglass indicates waiting on external events or delegated work in the
-workspace; it does not mean every agent is waiting. It replaces an otherwise idle
-dot or appears beside a PR, merged, or complete status. **PR Queued** keeps one
+A muted hourglass indicates waiting on external events, delegated work, or a
+reminder you dismissed for now; it does not mean every agent is waiting. It
+replaces an otherwise idle dot or appears beside a PR, merged, or complete status. **PR Queued** keeps one
 hourglass, with additional waiting explained in its tooltip. Waiting is also
 included in accessible status text. The waiting indicator is hidden when the main
 status shows active work, unread updates, a question, a review request, a failure,

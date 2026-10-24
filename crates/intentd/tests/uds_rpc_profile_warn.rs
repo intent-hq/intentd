@@ -661,19 +661,14 @@ async fn transfer_plan_stays_within_statement_budget() {
 /// blowing the 1s duration budget at ~120-agent scale. The enrichment now
 /// reads the note MAX aggregate + counting query, passes its one summaries
 /// fetch through to the attention probe, and decides written markers inline.
-/// With 10 answered-question sessions the pre-fix `workspace.get` shape
-/// executed 15+ statements; the fixed shape stays at ~6. A statement
-/// threshold of 10 pinned that; the first (cache-seeding) read now executes
-/// 12 statements — #1884 folds the secondary git-root PRs into
-/// `displayStatus` (10, intermittently 11 on main), and the caller's
-/// membership / role enrichment on the workspace payload adds one — so the
-/// threshold is the observed maximum, 12. Folding the membership lookup into
-/// the `workspace.get` query is a recorded follow-up.
+/// Ten answered-question sessions must fit within 13 statements, including
+/// caller membership and one batched reminder-state read. This still catches
+/// per-session attention probes or repeated session reads.
 #[tokio::test]
 async fn workspace_get_enrichment_stays_within_statement_budget() {
     let (_daemon, socket, log_path) = spawn_daemon(
         "itdp-wsget",
-        &[("INTENTD_RPC_STATEMENT_WARN_THRESHOLD", "12")],
+        &[("INTENTD_RPC_STATEMENT_WARN_THRESHOLD", "13")],
     );
     assert!(await_socket(&socket).await, "daemon did not start");
 
@@ -749,7 +744,8 @@ async fn workspace_get_enrichment_stays_within_statement_budget() {
     // Drive the enrichment twice: the first read may seed caches (waiting
     // baseline, CoW probe), the second is the steady-state shape the FE
     // polls. Both must stay within the lowered budget.
-    for _ in 0..2 {
+    let mut observed = Vec::new();
+    for read in ["cold", "steady"] {
         let resp = rpc_with_params(
             &socket,
             "workspace.get",
@@ -761,6 +757,15 @@ async fn workspace_get_enrichment_stays_within_statement_budget() {
             Some(workspace_id.as_str()),
             "resp: {resp}"
         );
+        let workspace = &resp["result"]["workspace"];
+        let reminder = &workspace["attentionReminder"];
+        assert!(
+            reminder["reasons"].as_array().is_some_and(Vec::is_empty),
+            "answered questions must not leave reminders: {resp}"
+        );
+        assert_eq!(reminder["dismissed"], json!(false));
+        assert_eq!(reminder["displayStatus"], workspace["displayStatus"]);
+        observed.push(json!({"read": read, "reminder": reminder}));
     }
 
     // The WARN (were it wrongly emitted) lands on stderr before the response
@@ -773,6 +778,10 @@ async fn workspace_get_enrichment_stays_within_statement_budget() {
         ),
         0,
         "workspace.get enrichment exceeded the lowered statement budget, log:\n{log}"
+    );
+    eprintln!(
+        "workspace get cost evidence: {}",
+        json!({"maxStatements": 13, "reads": observed})
     );
 }
 

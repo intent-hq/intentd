@@ -991,6 +991,7 @@ async fn seed_workspace_with_path(data_dir: &Path, root: &Path) -> String {
         browser_client_id: None,
         pull_requests_total: None,
         display_status: None,
+        attention_reminder: None,
         waiting: false,
         scripts_running: false,
         checkout_mode: None,

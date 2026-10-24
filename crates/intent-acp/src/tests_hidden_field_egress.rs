@@ -257,6 +257,7 @@ fn stub_workspace(id: &str) -> Workspace {
         cow_supported: None,
         browser_client_id: None,
         display_status: None,
+        attention_reminder: None,
         waiting: false,
         scripts_running: false,
         checkout_mode: None,

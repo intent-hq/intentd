@@ -48,6 +48,7 @@ pub fn workspace(id: &WorkspaceId) -> Workspace {
         status_image_asset_id: None,
         activity: WorkspaceActivity::Idle,
         attention: WorkspaceAttention::None,
+        attention_reminder: None,
         created_at: ts.clone(),
         updated_at: ts,
         last_activity: None,
