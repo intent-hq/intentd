@@ -1040,6 +1040,8 @@ pub struct AgentFeaturesSettings {
     /// `agentFeatures.browserAutomation` — expose browser automation
     /// (`ws.browser.*`) to agents.
     pub browser_automation: bool,
+    /// `agentFeatures.desktopControl` — desktop consent and actions for new sessions.
+    pub desktop_control: bool,
     /// `agentFeatures.richChatBlocks` — include rich chat block guidance
     /// (mermaid, ws-block, nav-link) in agent prompts.
     pub rich_chat_blocks: bool,
@@ -1088,6 +1090,7 @@ impl Default for AgentFeaturesSettings {
             scripts: true,
             terminal_access: true,
             browser_automation: true,
+            desktop_control: true,
             rich_chat_blocks: true,
             structured_questions: true,
             attention_requests: true,
@@ -2084,6 +2087,8 @@ scripts = true
 terminalAccess = true
 # Browser automation -- expose browser automation (ws.browser.*) to agents.
 browserAutomation = true
+# Desktop control -- consent-based primary desktop control (ws.desktop.*).
+desktopControl = true
 # Rich chat blocks -- include rich chat block guidance (mermaid, ws-block,
 # nav-link) in agent prompts.
 richChatBlocks = true
@@ -2283,6 +2288,7 @@ mod tests {
         assert!(d.agent_features.scripts);
         assert!(d.agent_features.terminal_access);
         assert!(d.agent_features.browser_automation);
+        assert!(d.agent_features.desktop_control);
         assert!(d.agent_features.rich_chat_blocks);
         assert!(d.agent_features.structured_questions);
         assert!(d.agent_features.attention_requests);
@@ -2318,6 +2324,7 @@ mod tests {
         assert!(parsed.agent_features.scripts);
         assert!(parsed.agent_features.terminal_access);
         assert!(parsed.agent_features.browser_automation);
+        assert!(parsed.agent_features.desktop_control);
         assert!(parsed.agent_features.structured_questions);
         assert!(parsed.agent_features.attention_requests);
         assert!(parsed.agent_features.state_snapshot);

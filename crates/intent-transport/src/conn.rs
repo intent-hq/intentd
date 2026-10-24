@@ -1998,11 +1998,12 @@ where
     let is_tcp = crate::context::is_tcp_connection();
     let caller = crate::context::current_caller();
     let credential = intent_core::caller::current_wire_credential();
+    let desktop = intent_core::desktop::current_connection();
     // Heap-pin before composing task-local scopes: large chat forwarders would
     // otherwise be copied through each wrapper on the subscribing task's stack.
     let forwarder = Box::pin(forwarder);
     tokio::spawn(crate::context::with_credential_context(
-        is_tcp, caller, credential, forwarder,
+        is_tcp, caller, credential, desktop, forwarder,
     ))
 }
 

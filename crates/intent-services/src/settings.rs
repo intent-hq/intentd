@@ -2495,6 +2495,14 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
         )
         .with_token_impact("~50 tokens/session"),
         boolean(
+            "agentFeatures.desktopControl",
+            "Desktop control",
+            "Expose consent-based desktop control (ws.desktop.*) to agents; applies to new sessions only",
+            "agentFeatures",
+            true,
+        )
+        .with_token_impact("~50 tokens/session"),
+        boolean(
             "agentFeatures.richChatBlocks",
             "Rich chat blocks",
             "Include rich chat block guidance (mermaid, ws-block, nav-link) in agent prompts; applies to new sessions only",
@@ -7229,6 +7237,7 @@ mod tests {
             ("agentFeatures.scripts", true),
             ("agentFeatures.terminalAccess", true),
             ("agentFeatures.browserAutomation", true),
+            ("agentFeatures.desktopControl", true),
             ("agentFeatures.richChatBlocks", true),
             ("agentFeatures.structuredQuestions", true),
             ("agentFeatures.attentionRequests", true),
@@ -7331,6 +7340,7 @@ mod tests {
             ("agentFeatures.scripts", "~240 tokens/session"),
             ("agentFeatures.terminalAccess", "~50 tokens/session"),
             ("agentFeatures.browserAutomation", "~50 tokens/session"),
+            ("agentFeatures.desktopControl", "~50 tokens/session"),
             ("agentFeatures.richChatBlocks", "~310 tokens/session"),
             ("agentFeatures.structuredQuestions", "~180 tokens/session"),
             ("agentFeatures.attentionRequests", "~340 tokens/session"),

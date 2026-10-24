@@ -46,6 +46,8 @@ async fn short_acquire_store(tmp: &TempDb) -> Store {
             .into(),
         browser_tab_displayed: crate::browser_tab_repo::DisplayedOverlay::default(),
         export_author_barrier: Arc::default(),
+        desktop_writes: crate::desktop_repo::DesktopWrites::default(),
+        desktop_delete_barrier: Arc::default(),
         repository_lifecycle: crate::repository_lifecycle::domain_for(&tmp.path).unwrap(),
     }
 }

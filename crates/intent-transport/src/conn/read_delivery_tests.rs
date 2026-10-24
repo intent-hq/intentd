@@ -605,6 +605,7 @@ impl Harness {
             true,
             Some(caller.clone()),
             Some(credential.clone()),
+            None,
             async { ReadConnectionGuard::bind(api.as_ref(), RepositoryWireEntry::Bearer) },
         )
         .await;
@@ -632,6 +633,7 @@ impl Harness {
             true,
             Some(self.caller.clone()),
             Some(self.credential.clone()),
+            None,
             self.connection.run(async move {
                 let reverse = ReverseChannel::new(tx.priority_sender());
                 let registry = Arc::new(PrimaryReverseRegistry::new());
@@ -772,6 +774,7 @@ async fn unpolled_frame_and_pending_permission_drop_retire_escaped_original_scop
         true,
         Some(h.caller.clone()),
         Some(h.credential.clone()),
+        None,
         h.connection.run(async {
             let raw = request("private");
             let mut subs = ConnSubs::default();
@@ -863,6 +866,7 @@ async fn final_future_abort_releases_original_packet_permit_and_request() {
         true,
         Some(h.caller.clone()),
         Some(h.credential.clone()),
+        None,
         h.connection
             .run(async { crate::context::CapturedFrame::capture() }),
     )

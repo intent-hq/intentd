@@ -24,6 +24,7 @@ mod completion_wake_delivery_repo;
 mod completion_watch_repo;
 mod daemon_ownership;
 mod delegation_group_repo;
+mod desktop_repo;
 mod diagnostics;
 mod store_pool;
 pub use store_pool::{StorePool, StorePoolOptions};
@@ -399,6 +400,10 @@ pub struct Store {
     /// Process-local `displayed` overlay of the browser tab registry; see
     /// `browser_tab_repo::DisplayedOverlay`.
     browser_tab_displayed: browser_tab_repo::DisplayedOverlay,
+    desktop_writes: desktop_repo::DesktopWrites,
+    #[cfg(test)]
+    desktop_delete_barrier:
+        std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<desktop_repo::DeleteBarrier>>>>,
     task_event_baselines: std::sync::Arc<TaskEventBaselines>,
     task_events_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
@@ -474,6 +479,9 @@ impl Store {
             read_pool: StorePool::new(read_pool, owner.is_some()),
             _daemon_owner: owner,
             browser_tab_displayed: browser_tab_repo::DisplayedOverlay::default(),
+            desktop_writes: desktop_repo::DesktopWrites::default(),
+            #[cfg(test)]
+            desktop_delete_barrier: std::sync::Arc::default(),
             #[cfg(test)]
             export_author_barrier: std::sync::Arc::default(),
         })
