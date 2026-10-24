@@ -1353,6 +1353,8 @@ async fn retire_and_revive_refuse_a_dotdot_escape() {
 
 /// `<root>/<id>` is a symlink to an outside folder holding a registered
 /// checkout: the path is lexically owned, canonically outside — refused.
+/// Unix-only: it builds the escape with `std::os::unix::fs::symlink`.
+#[cfg(unix)]
 #[intent_test_macros::daemon_test]
 async fn retire_and_revive_refuse_a_symlinked_ancestor_escape() {
     let f = fixture().await;
@@ -1371,6 +1373,8 @@ async fn retire_and_revive_refuse_a_symlinked_ancestor_escape() {
 /// A missing checkout whose `<id>` parent resolves outside the root (via a
 /// symlinked directory under the root) is refused: no sweep removes the
 /// outside parent folder.
+/// Unix-only: it builds the escape with `std::os::unix::fs::symlink`.
+#[cfg(unix)]
 #[intent_test_macros::daemon_test]
 async fn retire_refuses_a_missing_checkout_whose_parent_is_outside() {
     let f = fixture().await;
