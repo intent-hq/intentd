@@ -193,6 +193,9 @@ the original configuration is **Codex · Default**. Each profile has its own **F
 mode** (Claude Code) or **Service Tier** (Codex) in its ⋯ menu; it starts off and
 never follows the Default setting. Delegated agents follow their
 explicit, specialist, or default selection, never the parent's profile.
+To rename the original configuration or give it its own environment variables
+(same rules as a profile, without the backup switch), choose **Environment
+variables** in the Codex or Claude Code ⋯ menu; a blank name restores **Default**.
 
 **Backup profiles.** Drag a profile in **Settings → Providers**, or focus its
 handle and use the Up and Down arrow keys, to set its order. Turn on **Use as backup
