@@ -357,7 +357,7 @@ impl TempDir {
 async fn fresh_services(db_root: &Path, workspaces_root: &Path, assets_root: &Path) -> Services {
     let db = db_root.join("roundtrip.db");
     let store = Store::open(&db).await.expect("open store");
-    Services::new(store)
+    crate::register(Services::new(store))
         .with_workspaces_root(workspaces_root.to_path_buf())
         .with_assets_root(assets_root.to_path_buf())
 }

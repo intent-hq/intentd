@@ -863,7 +863,7 @@ mod tests {
                 .expect("attachment row");
         }
 
-        let svc = Services::new(store).with_assets_root(assets_root.0.clone());
+        let svc = crate::register(Services::new(store)).with_assets_root(assets_root.0.clone());
         let plan = svc
             .workspace_transfer_plan_op(ws.clone())
             .await
@@ -947,7 +947,7 @@ mod tests {
         w.worktree_path = Some(repo.0.to_string_lossy().to_string());
         store.insert_workspace(&w).await.expect("ws");
 
-        let svc = Services::new(store);
+        let svc = crate::register(Services::new(store));
         let plan = svc
             .workspace_transfer_plan_op(ws.clone())
             .await
@@ -992,7 +992,7 @@ mod tests {
         let mut w = workspace(&ws);
         w.worktree_path = Some(sup.to_string_lossy().to_string());
         store.insert_workspace(&w).await.expect("ws");
-        let svc = Services::new(store);
+        let svc = crate::register(Services::new(store));
 
         let clean = svc
             .workspace_transfer_plan_op(ws.clone())
@@ -1087,7 +1087,7 @@ mod tests {
         let mut w = workspace(&ws);
         w.worktree_path = Some(sup.to_string_lossy().to_string());
         store.insert_workspace(&w).await.expect("ws");
-        let svc = Services::new(store);
+        let svc = crate::register(Services::new(store));
         let plan = svc.workspace_transfer_plan_op(ws).await.expect("plan");
 
         let warns: Vec<_> = plan
@@ -1178,7 +1178,7 @@ mod tests {
             })
             .await
             .expect("sandbox");
-        let svc = Services::new(store);
+        let svc = crate::register(Services::new(store));
 
         let plan = svc
             .workspace_transfer_plan_op(ws.clone())
@@ -1323,7 +1323,7 @@ mod tests {
             .await
             .expect("session");
 
-        let svc = Services::new(store);
+        let svc = crate::register(Services::new(store));
         let plan = svc
             .workspace_transfer_plan_op(ws.clone())
             .await
@@ -1342,7 +1342,7 @@ mod tests {
     async fn transfer_plan_rejects_missing_and_chief() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
-        let svc = Services::new(store);
+        let svc = crate::register(Services::new(store));
 
         let missing = svc.workspace_transfer_plan_op(WorkspaceId::new()).await;
         assert!(matches!(missing, Err(intent_core::Error::NotFound(_))));
@@ -1364,7 +1364,7 @@ mod tests {
             .await
             .expect("note");
 
-        let svc = Services::new(store);
+        let svc = crate::register(Services::new(store));
         let first = svc.workspace_transfer_plan_op(ws.clone()).await.expect("1");
         let second = svc.workspace_transfer_plan_op(ws).await.expect("2");
         assert_eq!(first.manifest.tables, second.manifest.tables);

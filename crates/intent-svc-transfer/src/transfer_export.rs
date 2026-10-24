@@ -1204,7 +1204,7 @@ mod tests {
         let db_dir = intent_services::feature_api::test_support::test_tempdir("export-test-");
         let db = db_dir.path().join("store.db");
         let store = Store::open(&db).await.expect("open store");
-        let svc = Services::new(store)
+        let svc = crate::register(Services::new(store))
             .with_workspaces_root(workspaces_root.to_path_buf())
             .with_assets_root(assets_root.to_path_buf());
         (db_dir, svc)
@@ -1610,7 +1610,7 @@ mod tests {
                 ),
             ])
             .expect("apply settings");
-        let svc = Services::new(store)
+        let svc = crate::register(Services::new(store))
             .with_workspaces_root(ws_root.0.clone())
             .with_assets_root(assets_root.0.clone())
             .with_settings_registry(registry);
@@ -2250,7 +2250,7 @@ mod tests {
         let head_at_failure = Arc::new(std::sync::Mutex::new(None::<String>));
         let head_probe = head_at_failure.clone();
         let probe_repo = repo_path.clone();
-        let svc = Services::new(store)
+        let svc = crate::register(Services::new(store))
             .with_workspaces_root(ws_root.0.clone())
             .with_assets_root(assets_root.0.clone())
             .with_event_bus(bus.clone())

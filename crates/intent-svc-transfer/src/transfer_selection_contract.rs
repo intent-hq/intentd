@@ -206,7 +206,7 @@ async fn import_case(
             ),
         ])
         .unwrap();
-    let services = Services::new(store.clone())
+    let services = crate::register(Services::new(store.clone()))
         .with_settings_registry(registry)
         .with_models_cache_dir(root)
         .with_workspaces_root(root.join("workspaces"))
