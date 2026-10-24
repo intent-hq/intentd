@@ -3809,6 +3809,14 @@ case "$1" in
         --invalid) echo 'invalid option' >&2; exit 2 ;;
       esac
     done
+    if [ "${FAKE_PARK_BEFORE_PID:-}" = 1 ]; then
+      echo "$$" > "$INTENTD_DATA_DIR/daemon-parked"
+      # The ~2 min bound outlasts every test wait; it only stops a failed test leaking this loop.
+      i=0
+      # // timing-guard: parked before recording its PID until the sitter kills it
+      while [ "$i" -lt 2400 ]; do sleep 0.05; i=$((i + 1)); done
+      exit 1
+    fi
     echo "$$" > "$INTENTD_DATA_DIR/daemon-pid"
     printf '%s\n' "$@" >> "$FAKE_DAEMON_LOG"
     echo "spawn $$" >> "$FAKE_DAEMON_LOG"
@@ -4227,7 +4235,7 @@ fn background_start_help_invalid_options_and_timeout_leave_no_supervisor() {
     let mut cmd = sitter_command(dir.path(), &base);
     cmd.arg("start")
         .env("FAKE_NO_READY", "1")
-        .env(intentd_sitter::readiness::TIMEOUT_ENV, "500")
+        .env(intentd_sitter::readiness::TIMEOUT_ENV, scaled_ms(500))
         .env(KILL_TIMEOUT_ENV, "200");
     let mut child = spawn_guarded(&mut cmd);
     assert!(!child
@@ -4236,12 +4244,121 @@ fn background_start_help_invalid_options_and_timeout_leave_no_supervisor() {
         .unwrap()
         .success());
     assert!(!fixture.paths.pid_path.exists());
-    let daemon_pid: i32 = fs::read_to_string(dir.path().join("daemon-pid"))
+    // On a loaded runner the short budget can expire before the supervisor
+    // launches or before the fake daemon records its PID (intent-hq/intent#7703),
+    // so the record is optional; the survivor check covers every ordering and
+    // the next test forces the unrecorded one.
+    assert_no_survivors(dir.path(), recorded_pid(&dir.path().join("daemon-pid")));
+}
+
+/// Deterministic form of the loaded-runner ordering in intent-hq/intent#7703:
+/// the supervisor launches the daemon, but the readiness budget expires before
+/// the daemon records its PID. Timeout cleanup must still kill it.
+#[test]
+fn background_start_timeout_kills_a_daemon_that_never_recorded_its_pid() {
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = background_fixture(dir.path());
+    let mut cmd = sitter_command(dir.path(), &dead_url());
+    cmd.arg("start")
+        .env("FAKE_PARK_BEFORE_PID", "1")
+        .env(intentd_sitter::readiness::TIMEOUT_ENV, scaled_ms(5000))
+        .env(KILL_TIMEOUT_ENV, "200");
+    let mut child = spawn_guarded(&mut cmd);
+    let parked_path = dir.path().join("daemon-parked");
+    wait_until(
+        "parked daemon launch",
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        || recorded_pid(&parked_path).is_some(),
+    );
+    let parked = recorded_pid(&parked_path).unwrap();
+    // Positive control: the scan sees what the sitter launched, so the
+    // survivor check below cannot pass vacuously.
+    #[cfg(target_os = "linux")]
+    assert!(
+        live_processes_with_data_dir(dir.path()).contains(&parked),
+        "the scan must see the parked daemon"
+    );
+    assert!(!child
+        .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(15)))
         .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
-    assert_eq!(kill(Pid::from_raw(daemon_pid), None), Err(Errno::ESRCH));
+        .unwrap()
+        .success());
+    assert!(!fixture.paths.pid_path.exists());
+    assert!(!dir.path().join("daemon-pid").exists());
+    assert_no_survivors(dir.path(), Some(parked));
+}
+
+/// `ms` scaled like every other test wait, as a sitter `*_MS` env value.
+fn scaled_ms(ms: u64) -> String {
+    intentd_test_support::test_timeout(Duration::from_millis(ms))
+        .as_millis()
+        .to_string()
+}
+
+/// PID recorded in a fake-daemon file; `None` while it is missing or partly
+/// written (a kill can land between the shell truncating and writing it).
+fn recorded_pid(path: &Path) -> Option<u32> {
+    fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// Whether `pid` has exited. An unreaped zombie still answers signal 0, so
+/// Linux reads its state instead; elsewhere the caller's wait outlasts the reap.
+fn exited(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        match fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Err(_) => true,
+            Ok(stat) => stat
+                .rsplit_once(") ")
+                .is_some_and(|(_, fields)| fields.starts_with(['Z', 'X'])),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        !alive(pid)
+    }
+}
+
+/// After a failed `start`, wait until the recorded daemon (if any) has exited
+/// and, on Linux, no live process carries `data_dir` — which also covers a
+/// daemon that never recorded its PID, and the supervisor.
+fn assert_no_survivors(data_dir: &Path, daemon: Option<u32>) {
+    wait_until(
+        "no live process from the timed-out start",
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        || daemon.is_none_or(exited) && no_live_process_with_data_dir(data_dir),
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn no_live_process_with_data_dir(data_dir: &Path) -> bool {
+    live_processes_with_data_dir(data_dir).is_empty()
+}
+
+/// Without `/proc`, only a recorded PID can be checked.
+#[cfg(not(target_os = "linux"))]
+fn no_live_process_with_data_dir(_data_dir: &Path) -> bool {
+    true
+}
+
+/// PIDs of live processes whose environment carries `DATA_DIR_ENV=<data_dir>`,
+/// which every process a sitter launches for that data dir inherits. Zombies
+/// expose an empty environ, so exited-but-unreaped processes do not count;
+/// vanished and unreadable PIDs are skipped. Unlike reaping with
+/// `waitpid(-1)`, this never steals another in-process test's child status.
+#[cfg(target_os = "linux")]
+fn live_processes_with_data_dir(data_dir: &Path) -> Vec<u32> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut marker = format!("{DATA_DIR_ENV}=").into_bytes();
+    marker.extend_from_slice(data_dir.as_os_str().as_bytes());
+    fs::read_dir("/proc")
+        .unwrap()
+        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| {
+            fs::read(format!("/proc/{pid}/environ"))
+                .is_ok_and(|environ| environ.split(|byte| *byte == 0).any(|var| var == marker))
+        })
+        .collect()
 }
 
 #[test]
