@@ -19043,6 +19043,10 @@ impl WorkspaceApi for Services {
             // (PROTOCOL §5.54); `providers` stays one row per provider type.
             let mut catalog = provider_catalog::build_providers_catalog();
             catalog["profiles"] = serde_json::Value::Array(self.provider_profile_summaries());
+            // Renamed Default configurations (§5.54); omitted when none is.
+            if let Some(names) = self.provider_default_names() {
+                catalog["defaultNames"] = names;
+            }
             Ok(catalog)
         })
     }
@@ -19089,6 +19093,21 @@ impl WorkspaceApi for Services {
         force: bool,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(self.provider_profiles_auth_status_impl(provider_ref, force))
+    }
+
+    fn provider_profiles_update_default(
+        &self,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.provider_profiles_update_default_impl(params))
+    }
+
+    fn provider_default_auth_status(
+        &self,
+        provider_id: Option<String>,
+        force: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(self.provider_default_auth_status_impl(provider_id, force))
     }
 
     fn provider_profiles_test_prompt(
