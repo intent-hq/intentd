@@ -3822,7 +3822,10 @@ fn background_start_stop_exits_cleanly_after_forced_child_cleanup() {
 case "$1" in
 serve)
   trap '' TERM
-  echo "$$" > "$INTENTD_DATA_DIR/owned-daemon"
+  # Publish by rename: the test waits for the file to exist, then reads it,
+  # so it must never observe `>`'s truncated, still-empty record.
+  echo "$$" > "$INTENTD_DATA_DIR/owned-daemon.tmp"
+  mv "$INTENTD_DATA_DIR/owned-daemon.tmp" "$INTENTD_DATA_DIR/owned-daemon"
   # // timing-guard: force the supervisor to exercise its bounded child-kill fallback
   while :; do sleep 0.05; done
   ;;
@@ -3865,8 +3868,12 @@ fn background_start_stop_reports_supervisor_crash_with_live_daemon() {
         r#"#!/bin/sh
 case "$1" in
 serve)
-  echo "$$" > "$INTENTD_DATA_DIR/owned-daemon"
+  # The record is the readiness signal the test stops on, so arm the trap
+  # first. Publish by rename: the test waits for the file to exist, then
+  # reads it, so it must never observe `>`'s truncated, still-empty record.
   trap 'echo stopping > "$INTENTD_DATA_DIR/stop-seen"' TERM
+  echo "$$" > "$INTENTD_DATA_DIR/owned-daemon.tmp"
+  mv "$INTENTD_DATA_DIR/owned-daemon.tmp" "$INTENTD_DATA_DIR/owned-daemon"
   # // timing-guard: fixture remains alive after TERM until its owned group is killed
   while :; do sleep 0.05; done
   ;;
