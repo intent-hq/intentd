@@ -4128,24 +4128,85 @@ fn background_start_help_invalid_options_and_timeout_leave_no_supervisor() {
     assert!(!invalid.status.success(), "{invalid:?}");
     assert!(String::from_utf8_lossy(&invalid.stderr).contains("start.log"));
     assert!(!fixture.paths.pid_path.exists());
-    let mut cmd = sitter_command(dir.path(), &base);
-    cmd.arg("start")
-        .env("FAKE_NO_READY", "1")
-        .env(intentd_sitter::readiness::TIMEOUT_ENV, "500")
-        .env(KILL_TIMEOUT_ENV, "200");
-    let mut child = spawn_guarded(&mut cmd);
-    assert!(!child
-        .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(10)))
+    // 1 ms forces the loaded-runner ordering (intent-hq/intent#7703): the
+    // readiness budget expires before the fake daemon records its PID.
+    for readiness_ms in ["1", "500"] {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = background_fixture(dir.path());
+        let mut cmd = sitter_command(dir.path(), &base);
+        cmd.arg("start")
+            .env("FAKE_NO_READY", "1")
+            .env(intentd_sitter::readiness::TIMEOUT_ENV, readiness_ms)
+            .env(KILL_TIMEOUT_ENV, "200");
+        let mut child = spawn_guarded(&mut cmd);
+        assert!(!child
+            .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(10)))
+            .unwrap()
+            .unwrap()
+            .success());
+        assert!(!fixture.paths.pid_path.exists());
+        // Prove nothing survived whether or not the daemon got far enough to
+        // record its PID: the supervisor, the fake daemon and its children all
+        // inherit this test's unique data dir.
+        #[cfg(target_os = "linux")]
+        wait_until(
+            "no live process from the timed-out start",
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            || live_processes_with_data_dir(dir.path()).is_empty(),
+        );
+        // A missing record means the daemon was stopped before its first line.
+        if let Ok(pid) = fs::read_to_string(dir.path().join("daemon-pid")) {
+            let daemon_pid: i32 = pid.trim().parse().unwrap();
+            assert_eq!(kill(Pid::from_raw(daemon_pid), None), Err(Errno::ESRCH));
+        }
+    }
+}
+
+/// PIDs of live processes whose environment carries `DATA_DIR_ENV=<data_dir>`,
+/// which every process a sitter launches for that data dir inherits. Zombies
+/// expose an empty environ, so exited-but-unreaped processes do not count;
+/// vanished and unreadable PIDs are skipped. Unlike reaping with
+/// `waitpid(-1)`, this never steals another in-process test's child status.
+#[cfg(target_os = "linux")]
+fn live_processes_with_data_dir(data_dir: &Path) -> Vec<u32> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut marker = format!("{DATA_DIR_ENV}=").into_bytes();
+    marker.extend_from_slice(data_dir.as_os_str().as_bytes());
+    fs::read_dir("/proc")
         .unwrap()
-        .unwrap()
-        .success());
-    assert!(!fixture.paths.pid_path.exists());
-    let daemon_pid: i32 = fs::read_to_string(dir.path().join("daemon-pid"))
-        .unwrap()
-        .trim()
-        .parse()
+        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| *pid != std::process::id())
+        .filter(|pid| {
+            fs::read(format!("/proc/{pid}/environ"))
+                .is_ok_and(|environ| environ.split(|byte| *byte == 0).any(|var| var == marker))
+        })
+        .collect()
+}
+
+/// The scan must find a live process carrying the marker, or the "nothing
+/// survived" assertion above would pass vacuously.
+#[cfg(target_os = "linux")]
+#[test]
+fn live_processes_with_data_dir_finds_and_forgets_a_marked_process() {
+    let dir = tempfile::tempdir().unwrap();
+    // `cat` lives until its stdin closes, which dropping `Child` also does if
+    // an assertion panics first.
+    let mut sentinel = Command::new("cat")
+        .env(DATA_DIR_ENV, dir.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
         .unwrap();
-    assert_eq!(kill(Pid::from_raw(daemon_pid), None), Err(Errno::ESRCH));
+    wait_until(
+        "marked sentinel visible",
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        || live_processes_with_data_dir(dir.path()) == [sentinel.id()],
+    );
+    let other = tempfile::tempdir().unwrap();
+    assert!(live_processes_with_data_dir(other.path()).is_empty());
+    drop(sentinel.stdin.take());
+    assert!(sentinel.wait().unwrap().success());
+    assert!(live_processes_with_data_dir(dir.path()).is_empty());
 }
 
 #[test]
