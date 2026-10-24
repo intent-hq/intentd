@@ -50,8 +50,8 @@ use intent_store::normalize_compound_model;
 use serde_json::{Map, Value};
 
 use crate::agent_ops::{
-    ensure_effort_supported_by_model, ensure_provider_available,
-    resolve_agent_default_model_with_source, resolve_settings_default_reasoning_effort,
+    ensure_effort_supported_by_model, resolve_agent_default_model_with_source,
+    resolve_settings_default_reasoning_effort,
 };
 
 const IMPORT_METHOD: &str = "workspace.import.commit";
@@ -135,7 +135,11 @@ impl crate::Services {
                 .or_insert_with(|| {
                     self.ensure_selectable_provider(IMPORT_METHOD, provider)
                         .and_then(|()| {
-                            ensure_provider_available(IMPORT_METHOD, provider, &settings.providers)
+                            self.ensure_provider_available_for(
+                                IMPORT_METHOD,
+                                provider,
+                                &settings.providers,
+                            )
                         })
                         .map_err(|e| e.to_string())
                 })

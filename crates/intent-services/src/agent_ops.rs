@@ -426,6 +426,9 @@ mod tests_catalog_default_model;
 #[cfg(test)]
 mod tests_unknown_model;
 
+#[cfg(test)]
+mod tests_suggested_prompts_contract;
+
 /// Resolve the default model from settings when no explicit model is supplied
 /// at agent creation time. Precedence chain (the per-workspace override tier
 /// was removed in monorepo#1000; the background-agent tier was removed in
@@ -1031,7 +1034,11 @@ fn resolve_delegate_provider(
     match crate::agent_session::derived_default_provider(&settings) {
         Some(derived) => {
             services.ensure_selectable_provider("agent.delegate", &derived)?;
-            ensure_provider_available("agent.delegate", &derived, &settings.providers)?;
+            services.ensure_provider_available_for(
+                "agent.delegate",
+                &derived,
+                &settings.providers,
+            )?;
             Ok(Some(derived))
         }
         None => Err(crate::agent_session::no_default_provider_error(
@@ -1057,7 +1064,11 @@ fn resolve_specialist_provider(
     });
     if let Some(provider) = provider.as_deref() {
         services.ensure_selectable_provider(method, provider)?;
-        ensure_provider_available(method, provider, &services.effective_settings().providers)?;
+        services.ensure_provider_available_for(
+            method,
+            provider,
+            &services.effective_settings().providers,
+        )?;
     }
     Ok(provider)
 }
@@ -1159,7 +1170,9 @@ pub(crate) fn resolve_disabled_provider_rehome(
     method: &str,
 ) -> Option<DisabledProviderRehome> {
     let provider = crate::agent_session::derived_default_provider(settings)?;
-    ensure_provider_available(method, &provider, &settings.providers).ok()?;
+    services
+        .ensure_provider_available_for(method, &provider, &settings.providers)
+        .ok()?;
     // Create-seam parity: a settings-chain model that provably belongs to
     // another provider is dropped to the CLI default, never an error the
     // user did not ask for (see `plan_agent_create`).
@@ -1197,17 +1210,33 @@ pub(crate) fn resolve_disabled_provider_rehome(
 /// the real `codex` / `claude` CLI resolves too (`requires_secondary_binary`);
 /// a `providers.paths` override changes neither. Tests mark a provider
 /// installed with `test_support::provider_installed`, never with an override.
+#[cfg(test)]
 pub(crate) fn ensure_provider_available(
     method: &str,
     provider_id: &str,
     providers: &intent_core::settings_file::ProvidersSettings,
 ) -> Result<()> {
+    ensure_provider_available_checked(method, provider_id, providers, true)
+}
+
+/// [`ensure_provider_available`] with the bare auth-verdict gate optional:
+/// a Default configuration with saved environment overrides (PROTOCOL §5.54)
+/// runs under other settings than the bare installation the base sweep
+/// probes, so, like a profile, its bare verdict must not refuse it.
+pub(crate) fn ensure_provider_available_checked(
+    method: &str,
+    provider_id: &str,
+    providers: &intent_core::settings_file::ProvidersSettings,
+    check_bare_verdict: bool,
+) -> Result<()> {
     ensure_provider_enabled(method, provider_id, providers.enabled.as_ref())?;
-    ensure_provider_authenticated(
-        method,
-        provider_id,
-        crate::provider_auth::cached_auth_verdict(provider_id),
-    )?;
+    if check_bare_verdict {
+        ensure_provider_authenticated(
+            method,
+            provider_id,
+            crate::provider_auth::cached_auth_verdict(provider_id),
+        )?;
+    }
     // A profile shares its base provider's installation and paths.
     let availability = intent_providers::provider_availability_for(
         intent_providers::base_provider_id(provider_id),
@@ -2146,6 +2175,127 @@ fn strip_spans(s: &str, start: &str, end: &str) -> String {
     out
 }
 
+/// Opener of a suggested-prompts block that ends `line`, mirroring the
+/// desktop's `(<|&lt;)!--[ \t]*suggested-prompts[ \t]*$`: its byte offset and
+/// whether it is the HTML-escaped spelling.
+fn prompt_opener_at(line: &str) -> Option<(usize, bool)> {
+    let line = line.trim_end_matches([' ', '\t', '\r']);
+    [("<!--", false), ("&lt;!--", true)]
+        .into_iter()
+        .find_map(|(marker, escaped)| {
+            let pos = line.rfind(marker)?;
+            let rest = line[pos + marker.len()..].trim_start_matches([' ', '\t']);
+            (rest == "suggested-prompts").then_some((pos, escaped))
+        })
+}
+
+/// A line that closes a block: the closer alone, or ending a final prompt
+/// (the desktop's fused-closer rule). A line holding a comment opener of its
+/// own (`<!-- note -->`) never closes a block, so the preview errs on hiding.
+fn is_prompt_closer(line: &str, escaped: bool) -> bool {
+    let closer = if escaped { "--&gt;" } else { "-->" };
+    let line = line.trim_end_matches([' ', '\t', '\r']);
+    if line.trim_start_matches([' ', '\t']) == closer {
+        return true;
+    }
+    line.strip_suffix(closer).is_some_and(|rest| {
+        !rest.trim().is_empty() && !rest.contains("<!--") && !rest.contains("&lt;!--")
+    })
+}
+
+/// Remove suggested-prompts markup in one pass over the original text, taking
+/// each opener of either spelling in order:
+/// - A block opener (a line ending in an opener, like the desktop's
+///   `scanSuggestedPrompts`) closes on a later closer line of the same
+///   spelling: the closer alone, or fused with the final prompt. An embedded
+///   arrow such as `A --> B` never ends it early.
+/// - A block reopened by another block opener before any closer is hidden up
+///   to that opener, which then starts its own block.
+/// - An unclosed block (still streaming, or cut off) hides the rest of the text.
+/// - Any other opener (an inline mention, or text after the opener on its
+///   line) keeps the old first-closer rule, but stops at the next block opener
+///   so it never swallows a later block or the reply after it.
+///
+/// The preview errs on hiding: no prompt line or block markup reaches it.
+/// Code fences are deliberately not tracked: persisted previews keep only a
+/// text block's tail, which can start inside a fence and invert fence state.
+/// Shared cases: monorepo `docs/protocol/suggested-prompts.md`.
+fn strip_prompt_blocks(s: &str) -> String {
+    const INLINE: [(&str, &str); 2] = [
+        ("<!-- suggested-prompts", "-->"),
+        ("&lt;!-- suggested-prompts", "--&gt;"),
+    ];
+    if !s.contains("suggested-prompts") {
+        return s.to_owned();
+    }
+    let mut lines = Vec::new();
+    let mut offset = 0;
+    for line in s.split('\n') {
+        lines.push((offset, line));
+        offset += line.len() + 1;
+    }
+    // Block openers in text order: (byte offset, line index, escaped).
+    let blocks: Vec<(usize, usize, bool)> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &(start, line))| {
+            prompt_opener_at(line).map(|(pos, escaped)| (start + pos, i, escaped))
+        })
+        .collect();
+    let mut out = String::with_capacity(s.len());
+    // Every search moves forward only, so the scan stays linear in the text
+    // however many blocks or markers it holds (it reruns on each streamed
+    // preview frame): `bi` is the first block opener at or after `at`, and
+    // `marks` caches each spelling's next marker (`None` once none is left).
+    let mut at = 0;
+    let mut bi = 0;
+    let mut marks = INLINE.map(|(marker, _)| s.find(marker));
+    while at < s.len() {
+        while blocks.get(bi).is_some_and(|b| b.0 < at) {
+            bi += 1;
+        }
+        for (mark, (marker, _)) in marks.iter_mut().zip(INLINE) {
+            if mark.is_some_and(|m| m < at) {
+                *mark = s[at..].find(marker).map(|i| at + i);
+            }
+        }
+        let inline = marks
+            .iter()
+            .zip(INLINE)
+            .filter_map(|(mark, (marker, closer))| mark.map(|m| (m, marker, closer)))
+            .min_by_key(|m| m.0);
+        let block = blocks.get(bi).copied();
+        match (block, inline) {
+            (Some((pos, line, escaped)), inline) if inline.is_none_or(|m| pos <= m.0) => {
+                out.push_str(&s[at..pos]);
+                let next = blocks.get(bi + 1);
+                let limit = next.map_or(lines.len(), |next| next.1);
+                let close = (line + 1..limit).find(|&j| is_prompt_closer(lines[j].1, escaped));
+                at = match (close, next) {
+                    (Some(j), _) => lines[j].0 + lines[j].1.len(),
+                    (None, Some(next)) => next.0,
+                    (None, None) => s.len(),
+                };
+            }
+            (next, Some((pos, marker, closer))) => {
+                // Here any next block opener lies after `pos`; the span ends
+                // at the first closer before it, else at it (or the end).
+                out.push_str(&s[at..pos]);
+                let from = pos + marker.len();
+                let limit = next.map_or(s.len(), |b| b.0).max(from);
+                at = s[from..limit]
+                    .find(closer)
+                    .map_or(limit, |j| from + j + closer.len());
+            }
+            (_, None) => {
+                out.push_str(&s[at..]);
+                at = s.len();
+            }
+        }
+    }
+    out
+}
+
 /// Drop `<group:…>` / `</group…>` tags (the streamed response group markers).
 fn strip_group_tags(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -2169,13 +2319,14 @@ fn strip_group_tags(s: &str) -> String {
 
 /// Clean an assistant text block of digest/suggested-prompts/group markers,
 /// mirroring the TS `agent.list` cleaning before the last-line extraction.
+/// Both prompts spellings ([`strip_prompt_blocks`]): the HTML-escaped one is
+/// what a model can copy from an XML-escaped history replay (see
+/// `history_xml::REPLAY_ESCAPING_NOTE`).
 fn clean_response_text(text: &str) -> String {
     let mut cleaned = strip_spans(text, "<agent_digest>", "</agent_digest>");
-    cleaned = strip_spans(&cleaned, "<!-- suggested-prompts", "-->");
-    // The HTML-escaped spelling a model can copy from an XML-escaped history
-    // replay (see `history_xml::REPLAY_ESCAPING_NOTE`).
-    cleaned = strip_spans(&cleaned, "&lt;!-- suggested-prompts", "--&gt;");
+    // Group tags go first so one on an opener or closer line cannot break it.
     cleaned = strip_group_tags(&cleaned);
+    cleaned = strip_prompt_blocks(&cleaned);
     cleaned.trim().to_string()
 }
 
@@ -4907,13 +5058,9 @@ impl Services {
             )?;
             // A profile is gated on its own saved settings' verdict, never
             // the base provider's Default verdict.
-            let verdict = if crate::provider_profiles::is_qualified_ref(p) {
-                Box::pin(self.resolve_profile_env(p))
-                    .await?
-                    .and_then(|profile| crate::provider_auth::cached_profile_auth_verdict(&profile))
-            } else {
-                crate::provider_auth::cached_auth_verdict(p)
-            };
+            // A profile, or a Default with saved overrides, is gated on the
+            // verdict of its own saved settings, never the bare installation's.
+            let verdict = Box::pin(self.selection_auth_verdict(p)).await?;
             ensure_provider_authenticated(method, p, verdict)?;
         }
         // A bare model that provably belongs to a different provider (cached
@@ -5765,7 +5912,7 @@ impl Services {
                 }
             };
             if current_effective.as_deref() != Some(pid.as_str()) {
-                ensure_provider_available(
+                self.ensure_provider_available_for(
                     "agent.setModel",
                     &pid,
                     &self.effective_settings().providers,
@@ -7368,8 +7515,17 @@ impl Services {
         let resolved = if intent_providers::installed_cli::InstalledCli::for_provider(&provider_id)
             .is_some()
         {
+            // A Default configuration's saved overrides select its catalog;
+            // the installed key folds in their fingerprint.
+            let overlay = if crate::provider_profiles::is_default_config_ref(&provider_id) {
+                Box::pin(self.resolve_profile_env(&provider_id))
+                    .await?
+                    .map(std::sync::Arc::new)
+            } else {
+                None
+            };
             self.models_catalog
-                .resolve_installed(&provider_id, force_refresh)
+                .resolve_installed_for(&provider_id, overlay, force_refresh)
                 .await
         } else {
             crate::model_catalog::resolve_with_cache(
@@ -11209,7 +11365,7 @@ impl Services {
                 }
                 let delegate_provider = if let Some(provider_param) = provider_param_in.as_deref() {
                     services.ensure_selectable_provider("agent.delegate", provider_param)?;
-                    ensure_provider_available(
+                    services.ensure_provider_available_for(
                         "agent.delegate",
                         provider_param,
                         &services.effective_settings().providers,
@@ -11724,7 +11880,7 @@ impl Services {
         // with the other per-entry options.
         if let Some(provider_param) = input.provider.as_deref() {
             self.ensure_selectable_provider("agent.delegate", provider_param)?;
-            ensure_provider_available(
+            self.ensure_provider_available_for(
                 "agent.delegate",
                 provider_param,
                 &self.effective_settings().providers,
