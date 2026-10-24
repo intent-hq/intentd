@@ -126,9 +126,17 @@ pub(crate) async fn dispatch(
         "restore" => archive(api, ws, args, false).await,
         "create" => create(api, ws, args).await,
         "remove" => remove(api, ws, args).await,
-        "start" => start(api, ws, args).await,
+        "start" => {
+            let mut reply = start(api, ws, args).await?;
+            arm_start_monitor(api, ws, caller, args, &mut reply).await;
+            Ok(reply)
+        }
         "stop" => stop(api, ws, args).await,
-        "restart" => restart(api, ws, args).await,
+        "restart" => {
+            let mut reply = restart(api, ws, args).await?;
+            arm_start_monitor(api, ws, caller, args, &mut reply).await;
+            Ok(reply)
+        }
         "output" => output(api, ws, args).await,
         "status" => status(api, ws, args).await,
         "run" => run(api, ws, budget, args).await,
@@ -143,6 +151,40 @@ fn page_options(args: &Value) -> Result<Value, String> {
     let mut options = args.clone();
     options["view"] = Value::String("summary".into());
     Ok(options)
+}
+
+/// Default-on completion wake: an agent that starts or restarts a
+/// command-mode script gets the same monitor `ws.script.monitor` would arm,
+/// reported under `autoMonitor` (the `script.monitor` reply: `{ ok, monitor }`
+/// or a refusal). Agents ended turns "waiting for the build" with nothing
+/// armed and stalled until someone noticed. Best-effort: a failed arm never
+/// fails the start the agent asked for; it is reported as `autoMonitorError`.
+async fn arm_start_monitor(
+    api: &Arc<dyn WorkspaceApi>,
+    ws: &WorkspaceId,
+    caller: Option<&AgentId>,
+    args: &Value,
+    reply: &mut Value,
+) {
+    let (Some(agent), Ok(script_id), Some(run_id)) = (
+        caller,
+        req_str(args, "scriptId"),
+        reply
+            .get("runId")
+            .and_then(Value::as_str)
+            .filter(|r| !r.is_empty())
+            .map(str::to_owned),
+    ) else {
+        return;
+    };
+    match api
+        .script_start_monitor(ws.clone(), agent.clone(), script_id, run_id)
+        .await
+    {
+        Ok(Value::Null) => {}
+        Ok(monitor) => reply["autoMonitor"] = monitor,
+        Err(error) => reply["autoMonitorError"] = Value::String(error.to_string()),
+    }
 }
 
 fn monitor_owner(caller: Option<&AgentId>) -> Result<AgentId, String> {
