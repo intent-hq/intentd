@@ -1182,6 +1182,127 @@ async fn auto_retire_op_does_not_stop_scripts_of_a_workspace_unarchived_while_wa
     assert!(std::path::Path::new(ws.worktree_path.as_deref().unwrap()).is_dir());
 }
 
+/// Review regression (intentd#2605): a manual `workspace.retire` that waits
+/// on the archive fence while an unarchive commits must refuse BEFORE any
+/// teardown. Its resumed scripts are never closed (`close_workspace` would
+/// enter the park and the call would never return), and the workspace stays
+/// Active with its checkout.
+#[intent_test_macros::daemon_test]
+async fn manual_retire_does_not_stop_scripts_of_a_workspace_unarchived_while_waiting() {
+    let f = fixture().await;
+    let park = std::sync::Arc::new(crate::script_ops::SupervisePark::default());
+    let svc = f
+        .svc
+        .clone()
+        .with_script_workspace_closed_park(park.clone());
+    let ws = create_workspace(&f).await;
+    svc.archive_workspace(ws.id.clone(), None)
+        .await
+        .expect("archive");
+
+    let guard = svc.archive_fence.acquire(&ws.id).await;
+    let op = intent_core::spawn_daemon({
+        let svc = svc.clone();
+        let id = ws.id.clone();
+        async move { svc.retire_workspace(id, None).await }
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!op.is_finished(), "retire waits on the held fence");
+    assert!(f
+        .store
+        .unarchive_workspace_if_archived(&ws.id, &crate::now_iso())
+        .await
+        .expect("unarchive flip"));
+    drop(guard);
+
+    let err = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        op,
+    )
+    .await
+    .expect("retire must not park in the script stop")
+    .expect("join")
+    .unwrap_err();
+    assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
+    assert!(
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(100)),
+            park.entered.notified(),
+        )
+        .await
+        .is_err(),
+        "scripts must not be closed for a workspace that was unarchived"
+    );
+    let row = f.store.get_workspace(&ws.id).await.unwrap();
+    assert!(!row.archived && !row.is_retired());
+    assert!(std::path::Path::new(ws.worktree_path.as_deref().unwrap()).is_dir());
+}
+
+/// Review regression (intentd#2605): a script launch that passed the RPC
+/// retired check while the workspace was still Archived, and resumes only
+/// after `workspace.retire` returned (its closing mark dropped), is refused
+/// at admission: no run row is written for the removed checkout. Driven
+/// through the script manager directly — the code behind the front-door
+/// gate — for `start`, `restart` and `run`.
+#[intent_test_macros::daemon_test]
+async fn script_admission_after_retire_returns_is_refused() {
+    let f = fixture().await;
+    let ws = create_workspace(&f).await;
+    let mut ids = Vec::new();
+    for (name, mode) in [
+        ("svc", intent_core::ScriptMode::Service),
+        ("cmd", intent_core::ScriptMode::Command),
+    ] {
+        let v = f
+            .svc
+            .script_create(
+                ws.id.clone(),
+                intent_core::ScriptCreateParams {
+                    name: name.to_string(),
+                    command: "echo hi".to_string(),
+                    mode,
+                    purpose: Some(intent_core::ScriptPurpose::Saved),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create");
+        ids.push(v["id"].as_str().expect("script id").to_string());
+    }
+    f.svc
+        .retire_workspace(ws.id.clone(), None)
+        .await
+        .expect("retire");
+    let mgr = f.svc.script_manager();
+
+    let (svc_id, cmd_id) = (&ids[0], &ids[1]);
+    let start = mgr.start(&ws.id, svc_id).await;
+    assert!(
+        matches!(start, Err(Error::WorkspaceRetired { .. })),
+        "{start:?}"
+    );
+    let restart = mgr.restart(&ws.id, svc_id).await;
+    assert!(
+        matches!(restart, Err(Error::WorkspaceRetired { .. })),
+        "{restart:?}"
+    );
+    let run = mgr.run(&ws.id, cmd_id, None, Some(5)).await;
+    assert!(
+        matches!(run, Err(Error::WorkspaceRetired { .. })),
+        "{run:?}"
+    );
+    for id in &ids {
+        assert!(
+            f.store
+                .latest_script_run(&ws.id, id)
+                .await
+                .unwrap()
+                .is_none(),
+            "no run row written for {id}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Ownership: `Retired` is entered only through workspace.retire, and revive
 // never detaches a folder the daemon cannot prove it owns.

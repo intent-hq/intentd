@@ -176,6 +176,13 @@ impl Services {
         if archived_before.is_some() && !still_due(&fresh) {
             return Ok(None);
         }
+        // Manual retire: an unarchive that won the fence makes the workspace
+        // live again — refuse before stopping its resumed scripts.
+        if !fresh.archived && !fresh.is_retired() {
+            return Err(Error::InvalidInput(format!(
+                "workspace {id} was unarchived while it was being retired"
+            )));
+        }
         // Ownership is re-proved on the fresh row under the fence: a
         // `worktreePath` written after the first check must not steer the
         // destructive tail at a folder the daemon cannot prove it owns.

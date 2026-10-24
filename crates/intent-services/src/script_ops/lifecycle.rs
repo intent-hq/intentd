@@ -57,6 +57,19 @@ impl ScriptManager {
         if self.locks.is_closing(ws) {
             return Err(Error::NotFound(format!("workspace {ws}")));
         }
+        // A request admitted at the front door while the workspace was still
+        // Archived can resume after `workspace.retire` returned and dropped
+        // its closing mark. Retire flips the row while holding that mark, so
+        // re-reading the row here under the definition lock refuses it
+        // before any durable run write.
+        if self
+            .store
+            .get_workspace(ws)
+            .await
+            .is_ok_and(|row| row.is_retired())
+        {
+            return Err(crate::retire::retired_error(ws));
+        }
         self.require_admission(ws, id).await?;
         if self
             .scripts
