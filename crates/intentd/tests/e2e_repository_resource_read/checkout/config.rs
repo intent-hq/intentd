@@ -104,7 +104,12 @@ async fn checkout_config_real_transports_valid_absent_and_tolerant_present() {
             .iter()
             .filter(|(_, path)| path.starts_with(FILE))
             .all(|(method, path)| method == "GET" && path == &format!("{FILE}?ref={SHA}")));
-        assert!(h.store.list_workspaces(true).await.unwrap().is_empty());
+        assert!(h
+            .store
+            .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .unwrap()
+            .is_empty());
         client.close().await;
         h.finish().await;
     }

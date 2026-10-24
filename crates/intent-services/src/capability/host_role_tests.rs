@@ -84,8 +84,12 @@ async fn scoped_owner_projection_matches_service_rights_and_role_loss() {
         };
         assert_owner(&svc.get_workspace(owned.clone()).await.unwrap());
         for rows in [
-            svc.list_workspaces(true).await.unwrap(),
-            svc.list_workspaces_lite(true).await.unwrap(),
+            svc.list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+                .await
+                .unwrap(),
+            svc.list_workspaces_lite(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+                .await
+                .unwrap(),
         ] {
             assert_eq!(rows.len(), 1);
             assert_owner(&rows[0]);
@@ -137,7 +141,11 @@ async fn scoped_owner_projection_matches_service_rights_and_role_loss() {
             svc.get_workspace(owned.clone()).await,
             Err(Error::NotFound(_))
         ));
-        assert!(svc.list_workspaces_lite(true).await.unwrap().is_empty());
+        assert!(svc
+            .list_workspaces_lite(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .unwrap()
+            .is_empty());
     })
     .await;
 }
@@ -454,7 +462,11 @@ async fn host_member_reads_current_and_future_workspaces_without_direct_grants()
     let tmp = TempDb::new();
     let (svc, owner, member) = fixture(&tmp).await;
     with_caller(caller(&member), async {
-        assert!(svc.list_workspaces(true).await.unwrap().is_empty());
+        assert!(svc
+            .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .unwrap()
+            .is_empty());
         for id in ["existing", "future"] {
             let ws = workspace(&WorkspaceId::from(id));
             svc.store.insert_workspace(&ws).await.unwrap();
@@ -464,8 +476,12 @@ async fn host_member_reads_current_and_future_workspaces_without_direct_grants()
             assert_eq!(got["canManage"], true);
         }
         for rows in [
-            svc.list_workspaces(true).await.unwrap(),
-            svc.list_workspaces_lite(true).await.unwrap(),
+            svc.list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+                .await
+                .unwrap(),
+            svc.list_workspaces_lite(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+                .await
+                .unwrap(),
         ] {
             assert_eq!(rows.len(), 2);
             for row in rows {
@@ -566,8 +582,18 @@ async fn host_member_lifecycle_uses_existing_archive_and_incremental_delete() {
             .unwrap();
         assert!(archived.archived);
         assert!(archived.membership.unwrap().can_manage);
-        assert!(svc.list_workspaces(false).await.unwrap().is_empty());
-        assert_eq!(svc.list_workspaces(true).await.unwrap().len(), 1);
+        assert!(svc
+            .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            svc.list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
         let restored = svc.unarchive_workspace(created.id.clone()).await.unwrap();
         assert!(!restored.archived);
         assert!(restored.membership.unwrap().can_manage);
@@ -626,7 +652,10 @@ async fn workspace_guests_unknown_and_unbound_cannot_gain_host_capabilities() {
     // Deliberately retain the old admitted member role: only durable grants count.
     with_caller(caller(&member), async {
         assert_execution_reads_refused(&svc).await;
-        let rows = svc.list_workspaces(true).await.unwrap();
+        let rows = svc
+            .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, shared);
         assert!(!rows[0].membership.as_ref().unwrap().can_manage);
@@ -662,7 +691,10 @@ async fn workspace_guests_unknown_and_unbound_cannot_gain_host_capabilities() {
     .await;
     with_caller(caller(&PrincipalId::new()), async {
         assert_execution_reads_refused(&svc).await;
-        assert!(svc.list_workspaces(true).await.is_err());
+        assert!(svc
+            .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .is_err());
         assert!(svc.principal_me().await.is_err());
         assert!(svc
             .require_workspace_creator("workspace.create")
@@ -724,7 +756,11 @@ async fn removed_member_cannot_reuse_admitted_role_or_reconnect_credential() {
                 .can_manage
         );
         svc.store.remove_host_member(&member).await.unwrap();
-        assert!(svc.list_workspaces(true).await.unwrap().is_empty());
+        assert!(svc
+            .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .unwrap()
+            .is_empty());
         assert!(matches!(
             svc.get_workspace(ws.clone()).await,
             Err(Error::NotFound(_))
@@ -828,9 +864,13 @@ async fn host_member_list_authority_cost_does_not_grow_per_workspace() {
     // would otherwise enter a later measured span.
     crate::test_tracing::warm_sqlx_pool(svc.store.read_pool()).await;
     with_caller(caller(&member), async {
-        svc.list_workspaces_lite(true).await.unwrap();
-        let (first, small) =
-            crate::test_tracing::count_sqlx_statements(svc.list_workspaces_lite(true)).await;
+        svc.list_workspaces_lite(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .unwrap();
+        let (first, small) = crate::test_tracing::count_sqlx_statements(
+            svc.list_workspaces_lite(intent_core::WorkspaceListFilter::WITH_ARCHIVED),
+        )
+        .await;
         assert_eq!(first.unwrap().len(), 1);
         for i in 0..40 {
             svc.store
@@ -838,9 +878,13 @@ async fn host_member_list_authority_cost_does_not_grow_per_workspace() {
                 .await
                 .unwrap();
         }
-        svc.list_workspaces_lite(true).await.unwrap();
-        let (many, large) =
-            crate::test_tracing::count_sqlx_statements(svc.list_workspaces_lite(true)).await;
+        svc.list_workspaces_lite(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .unwrap();
+        let (many, large) = crate::test_tracing::count_sqlx_statements(
+            svc.list_workspaces_lite(intent_core::WorkspaceListFilter::WITH_ARCHIVED),
+        )
+        .await;
         let many = many.unwrap();
         assert_eq!(many.len(), 41);
         assert!(many

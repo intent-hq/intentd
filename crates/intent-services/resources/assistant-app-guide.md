@@ -530,6 +530,28 @@ The grouping choice is remembered with Home's settings for the current signed-in
 user and connected backend. **Activity** remains the default; existing saved
 grouping choices keep their behavior.
 
+## Retire and restore workspaces
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{home-workspace-menu.ts,HomeWorkspaceControls.svelte}; src/lib/components/workspace/RetiredWorkspaceBanner.svelte; src/lib/components/settings/GitWorkspaceSettings.svelte; messages/en.json. Daemon: workspace.retire, packages/intentd/crates/intent-services/src/{retire,auto_retire}.rs. -->
+
+Retiring frees disk space: it deletes the workspace's folder, including uncommitted
+changes and untracked files, but keeps its conversations, notes, tasks, and git
+branch. In **Home → Workspaces**, right-click a workspace and choose **Retire**, then
+confirm. An active workspace is archived first. Workspaces whose folder is the
+repository itself (not a separate checkout) and remote workspaces cannot be retired.
+
+Retired workspaces appear only under the **Retired** filter in Home. Opening one
+shows its history read-only. To keep working, choose **Restore as blank workspace**
+from its menu or banner, or send it a message: Intent recreates it from a fresh
+checkout of the default branch on a new branch. The old branch still holds the
+earlier work.
+
+To retire archived workspaces automatically, turn on **Workspace setup →
+Automatically retire archived workspaces** (`/settings?tab=setup#git-workspace`) and
+set **Retire after (days)** (7 when first turned on). Intent checks about once an
+hour. It is off by default, and it skips remote, shared, and non-retirable
+workspaces.
+
 ## Home workspace status icons
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomeWorkspaceStatus.svelte,home-attention.ts,home-model.ts}; src/lib/components/workspace/utils/workspace-status-presentation.ts; messages/en.json. Backend source: packages/intentd/crates/intent-services/src/workspace_status.rs (workspace_is_waiting). -->

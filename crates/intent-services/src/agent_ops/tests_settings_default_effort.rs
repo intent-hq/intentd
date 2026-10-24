@@ -245,7 +245,12 @@ async fn workspace_initial_agent_invalid_effort_precedes_provisioning() {
     seed_catalog(&svc);
     // Read rows directly: workspace.list prewarms a CoW probe that may create
     // the root independently of the workspace.create request under test.
-    let before = svc.store().list_workspaces(true).await.unwrap().len();
+    let before = svc
+        .store()
+        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await
+        .unwrap()
+        .len();
     let err = svc
         .create_workspace(
             serde_json::from_value(json!({
@@ -264,7 +269,11 @@ async fn workspace_initial_agent_invalid_effort_precedes_provisioning() {
         "{err}"
     );
     assert_eq!(
-        svc.store().list_workspaces(true).await.unwrap().len(),
+        svc.store()
+            .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .unwrap()
+            .len(),
         before
     );
     assert!(svc.store().list_all_notes().await.unwrap().is_empty());

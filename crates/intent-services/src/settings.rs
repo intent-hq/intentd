@@ -1291,10 +1291,17 @@ impl SettingDefinition {
                     ))
                 }
             },
+            // A nullable number (no default) accepts `null` as "unset".
+            SettingType::Number { .. } if value.is_null() && self.default_value.is_none() => {}
             SettingType::Number { min, max } => {
                 let Some(n) = value.as_f64() else {
                     return invalid(format!("{}: expected a number", self.path));
                 };
+                if self.path == AUTO_RETIRE_ARCHIVED_AFTER_DAYS_PATH
+                    && (n.fract() != 0.0 || n > f64::from(u32::MAX))
+                {
+                    return invalid(format!("{}: expected a whole number of days", self.path));
+                }
                 if let Some(min) = min {
                     if n < min {
                         return invalid(format!("{}: must be >= {min}", self.path));
@@ -1831,6 +1838,21 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "workspace",
             false,
         ),
+        // Optional positive integer; the absent key (no default) is off.
+        SettingDefinition {
+            path: AUTO_RETIRE_ARCHIVED_AFTER_DAYS_PATH,
+            label: "Auto-retire archived workspaces (days)",
+            description: "Retire workspaces archived longer than this many days: their checkout folders are deleted to free disk space while conversations, notes and history are kept (absent = off)",
+            category: "workspace",
+            ty: SettingType::Number {
+                min: Some(1.0),
+                max: None,
+            },
+            default_value: None,
+            sensitive: false,
+            read_only: false,
+            token_impact: None,
+        },
         // --- Group A: MCP ----------------------------------------------------
         boolean(
             "mcp.enableUserServers",
@@ -2726,6 +2748,21 @@ pub fn report_to_parent_debounce_seconds(settings: &SettingsFile) -> u32 {
 #[must_use]
 pub fn history_replay_tool_content_chars(settings: &SettingsFile) -> usize {
     settings.agents.history_replay_tool_content_chars as usize
+}
+
+/// Settings path of the auto-retire window (PROTOCOL §5.12).
+pub(crate) const AUTO_RETIRE_ARCHIVED_AFTER_DAYS_PATH: &str =
+    "workspace.autoRetireArchivedAfterDays";
+
+/// The effective `workspace.autoRetireArchivedAfterDays` setting: `Some(days)`
+/// when the automatic retire sweep is on, `None` when the key is absent (or a
+/// hand-edited `0`) — read live from the settings snapshot at each sweep.
+#[must_use]
+pub fn auto_retire_archived_after_days(settings: &SettingsFile) -> Option<u32> {
+    settings
+        .workspace
+        .auto_retire_archived_after_days
+        .filter(|days| *days > 0)
 }
 
 /// The effective `agents.toolPayloadRetentionDays` setting: `Some(days)` when
@@ -6966,6 +7003,124 @@ mod tests {
             .await
             .expect("get");
         assert_eq!(got["origin"], json!("default"));
+
+        let _ = std::fs::remove_file(&config_path);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                tmp.display()
+            )));
+        }
+    }
+
+    /// `workspace.autoRetireArchivedAfterDays` (PROTOCOL §5.12) is a
+    /// TOML-backed optional positive integer: absent (`null`) means off and
+    /// has no implicit default; zero, negative and non-integer values reject.
+    #[test]
+    fn auto_retire_catalog_entry_is_an_optional_positive_integer() {
+        let def = find_definition("workspace.autoRetireArchivedAfterDays")
+            .expect("workspace.autoRetireArchivedAfterDays missing from catalog");
+        assert!(!def.sensitive);
+        assert!(!def.read_only);
+        assert_eq!(def.category, "workspace");
+        assert!(matches!(def.ty, SettingType::Number { min: Some(1.0), .. }));
+        assert_eq!(def.default_value, None, "absent = off; no implicit value");
+        assert!(KNOWN_PATHS.contains(&"workspace.autoRetireArchivedAfterDays"));
+        def.validate(&json!(7)).expect("7 days is legal");
+        def.validate(&json!(1)).expect("1 day is legal");
+        def.validate(&json!(7.0))
+            .expect("a whole float is an integer");
+        def.validate(&Value::Null).expect("null turns it off");
+        for bad in [json!(0), json!(-1), json!(1.5), json!("7"), json!(true)] {
+            assert!(def.validate(&bad).is_err(), "{bad} must reject");
+        }
+        assert!(def.definition_json().get("defaultValue").is_none());
+
+        let mut settings = SettingsFile::default();
+        assert_eq!(auto_retire_archived_after_days(&settings), None);
+        settings.workspace.auto_retire_archived_after_days = Some(7);
+        assert_eq!(auto_retire_archived_after_days(&settings), Some(7));
+        // A hand-edited 0 in config.toml reads as off, never "retire now".
+        settings.workspace.auto_retire_archived_after_days = Some(0);
+        assert_eq!(auto_retire_archived_after_days(&settings), None);
+    }
+
+    /// The auto-retire setting round-trips through the registry-wired
+    /// service: absent reads `null` with `default` origin, `settings.update`
+    /// persists to config.toml, invalid values reject with `-32602` naming
+    /// the key and keep the prior value, `null` turns it off by removing the
+    /// key, and `settings.reset` removes it too.
+    #[tokio::test]
+    async fn auto_retire_setting_round_trips_via_registry() {
+        let tag = uuid::Uuid::new_v4();
+        let tmp = std::env::temp_dir().join(format!("intentd-settings-autoretire-{tag}.db"));
+        let store = Store::open(&tmp).await.expect("open store");
+        let config_path =
+            std::env::temp_dir().join(format!("intentd-settings-autoretire-{tag}.toml"));
+        std::fs::write(&config_path, "").expect("write empty config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+        let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
+        let secrets = AsyncSecretStore::new(secrets);
+        let svc = SettingsService::new(&store, &secrets, Some(&registry));
+        let path = "workspace.autoRetireArchivedAfterDays";
+
+        let got = svc.get(path).await.expect("get");
+        assert_eq!(got["value"], Value::Null);
+        assert_eq!(got["origin"], json!("default"));
+
+        svc.update(&json!([{ "path": path, "value": 7 }]))
+            .await
+            .expect("update");
+        let got = svc.get(path).await.expect("get");
+        assert_eq!(got["value"], json!(7.0));
+        assert_eq!(got["origin"], json!("file"));
+        let text = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(text.contains("autoRetireArchivedAfterDays = 7"), "{text}");
+        assert_eq!(
+            auto_retire_archived_after_days(&registry.snapshot().effective),
+            Some(7)
+        );
+
+        for value in [json!(0), json!(-3), json!(2.5)] {
+            let err = svc
+                .update(&json!([{ "path": path, "value": value }]))
+                .await
+                .expect_err("invalid value must reject");
+            assert!(
+                matches!(err, Error::InvalidParams(ref msg) if msg.contains(path)),
+                "expected InvalidParams naming {path} for {value}, got {err:?}"
+            );
+        }
+        assert_eq!(
+            auto_retire_archived_after_days(&registry.snapshot().effective),
+            Some(7)
+        );
+
+        svc.update(&json!([{ "path": path, "value": null }]))
+            .await
+            .expect("null turns auto-retire off");
+        assert_eq!(
+            auto_retire_archived_after_days(&registry.snapshot().effective),
+            None
+        );
+        let text = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(
+            !text
+                .lines()
+                .any(|l| l.trim_start().starts_with("autoRetireArchivedAfterDays")),
+            "{text}"
+        );
+
+        svc.update(&json!([{ "path": path, "value": 30 }]))
+            .await
+            .expect("update");
+        let reset = svc.reset(path).await.expect("reset");
+        assert_eq!(reset["value"], Value::Null);
+        assert_eq!(reset["origin"], json!("default"));
+        assert_eq!(
+            auto_retire_archived_after_days(&registry.snapshot().effective),
+            None
+        );
 
         let _ = std::fs::remove_file(&config_path);
         for suffix in ["", "-wal", "-shm"] {

@@ -75,6 +75,7 @@ pub mod pairing;
 mod panic_guard;
 mod presence;
 mod private_output;
+mod retired_gate;
 pub use private_output::OutboundFrame;
 mod protocol;
 mod provider_setup;

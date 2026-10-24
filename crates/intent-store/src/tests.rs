@@ -23,6 +23,7 @@ mod script_initialization;
 mod script_monitors;
 mod sharing;
 mod workspace_delete;
+mod workspace_retired;
 
 mod metadata_key_json;
 mod note_line_attribution;
@@ -127,6 +128,7 @@ fn sample_workspace(id: &WorkspaceId, title: &str, archived: bool) -> Workspace 
         context_links: None,
         archived,
         archived_at: if archived { Some(now_iso()) } else { None },
+        retired_at: None,
         task_stats: None,
         agent_summary: None,
         diff_summary: None,
@@ -364,10 +366,16 @@ async fn workspace_round_trip_and_archive_filter() {
         .await
         .expect("insert archived");
 
-    let all = store.list_workspaces(true).await.expect("list all");
+    let all = store
+        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await
+        .expect("list all");
     assert_eq!(all.len(), 2);
 
-    let visible = store.list_workspaces(false).await.expect("list visible");
+    let visible = store
+        .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+        .await
+        .expect("list visible");
     assert_eq!(visible.len(), 1);
     assert_eq!(visible[0].id, active_id);
 
@@ -6588,6 +6596,7 @@ async fn concurrent_writes_no_sqlite_busy() {
                     context_links: None,
                     archived: false,
                     archived_at: None,
+                    retired_at: None,
                     task_stats: None,
                     agent_summary: None,
                     diff_summary: None,
@@ -6617,7 +6626,10 @@ async fn concurrent_writes_no_sqlite_busy() {
             let store = store.clone();
             let started = std::time::Instant::now();
             tokio::spawn(async move {
-                let result = store.list_workspaces(false).await.map(|ws| ws.len());
+                let result = store
+                    .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+                    .await
+                    .map(|ws| ws.len());
                 (result, started.elapsed())
             })
         })
@@ -6652,7 +6664,10 @@ async fn concurrent_writes_no_sqlite_busy() {
     );
 
     // Verify all 50 workspaces were written
-    let all_workspaces = store.list_workspaces(false).await.unwrap();
+    let all_workspaces = store
+        .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+        .await
+        .unwrap();
     assert_eq!(
         all_workspaces.len(),
         50,
@@ -6690,7 +6705,10 @@ async fn periodic_wal_checkpoint_runs_and_stops() {
     // Verify the store still works after aborting the checkpoint task
     let ws = sample_workspace(&WorkspaceId::new(), "Test", false);
     store.insert_workspace(&ws).await.unwrap();
-    let loaded = store.list_workspaces(false).await.unwrap();
+    let loaded = store
+        .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+        .await
+        .unwrap();
     assert_eq!(loaded.len(), 1);
 }
 

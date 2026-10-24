@@ -5657,6 +5657,7 @@ mod tests {
             context_links: None,
             archived: false,
             archived_at: None,
+            retired_at: None,
             task_stats: None,
             agent_summary: None,
             diff_summary: None,
@@ -15052,7 +15053,10 @@ mod tests {
             Some(intent_core::WorkspaceDisplayStatus::PrMerged),
             "the fresh terminal fold outranks the monitor's stale open snapshot"
         );
-        let list = svc.list_workspaces(false).await.unwrap();
+        let list = svc
+            .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+            .await
+            .unwrap();
         assert_eq!(
             list.iter().find(|w| w.id == ws).unwrap().display_status,
             Some(intent_core::WorkspaceDisplayStatus::PrMerged),
@@ -15530,6 +15534,48 @@ mod tests {
             waiting_events(&svc, &ws).await,
             vec![true, false, true, false]
         );
+    }
+
+    /// `workspace.retire` on an Active workspace runs the archive teardown
+    /// first, so every ACTIVE PR monitor is cancelled as on archive.
+    #[intent_test_macros::daemon_test]
+    async fn workspace_retire_from_active_cancels_active_pr_monitors() {
+        use intent_core::WorkspaceApi;
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        forge.edit(|s| s.pr_state = PrState::Open);
+        let (active, _) = svc
+            .pr_monitor_register(&ws, &owner, "o", "r", 7)
+            .await
+            .expect("register");
+        assert!(svc.workspace_has_active_pr_monitors(&ws).await);
+        // Retire only admits a git worktree checkout: give the row one.
+        let scratch = crate::test_support::test_tempdir("intentd-retire-wt-");
+        let mut row = svc.store().get_workspace(&ws).await.unwrap();
+        row.repository_path = Some(scratch.path().join("repo").to_string_lossy().into_owned());
+        row.worktree_path = Some(
+            svc.workspaces_root
+                .clone()
+                .expect("test workspaces root")
+                .join(ws.as_str())
+                .join("wt")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        row.checkout_mode = Some(intent_core::CheckoutMode::Worktree);
+        svc.store().update_workspace(&row).await.unwrap();
+
+        let retired = svc
+            .retire_workspace(ws.clone(), None)
+            .await
+            .expect("retire");
+        assert_eq!(retired.status, intent_core::WorkspaceStatus::Retired);
+        let row = svc
+            .store()
+            .get_pr_monitor(&active.monitor_id)
+            .await
+            .unwrap();
+        assert_eq!(row.state, PrMonitorState::Cancelled);
+        assert!(!svc.workspace_has_active_pr_monitors(&ws).await);
     }
 
     /// Regression for intent-hq/monorepo#1828: `workspace.archive` cancels

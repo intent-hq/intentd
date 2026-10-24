@@ -69,6 +69,7 @@ pub(crate) const KNOWN_PATHS: &[&str] = &[
     "workspace.sshKeyPath",
     "workspace.defaultShell",
     "workspace.cowIsolation",
+    "workspace.autoRetireArchivedAfterDays",
     "git.autoCommit",
     "mcp.enableUserServers",
     "mcp.disabledServers",
