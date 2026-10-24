@@ -580,10 +580,18 @@ fn read_or_empty(path: &Path) -> String {
 }
 
 /// Poll `cond` up to `timeout` stretched by `INTENTD_TEST_TIMEOUT_MULTIPLIER`
-/// (every call is a hang guard); panic with `what` when it never holds.
-fn wait_until(what: &str, timeout: Duration, mut cond: impl FnMut() -> bool) {
-    let timeout = intentd_test_support::test_timeout(timeout);
-    let deadline = Instant::now() + timeout;
+/// — a hang guard; panic with `what` when it never holds. A window that must
+/// stay under a fixed production timer uses [`wait_until_within`] instead.
+fn wait_until(what: &str, timeout: Duration, cond: impl FnMut() -> bool) {
+    wait_until_within(what, intentd_test_support::test_timeout(timeout), cond);
+}
+
+/// Poll `cond` for exactly `window`, never stretched: for a timing proof
+/// that must stay under a fixed production timer (a 30s crash backoff, the
+/// 30s manifest timeout). Mark each call site
+/// `// fixed-deadline: allow — stays under <timer>`.
+fn wait_until_within(what: &str, window: Duration, mut cond: impl FnMut() -> bool) {
+    let deadline = Instant::now() + window;
     while Instant::now() < deadline {
         if cond() {
             return;
@@ -591,15 +599,21 @@ fn wait_until(what: &str, timeout: Duration, mut cond: impl FnMut() -> bool) {
         // timing-guard: poll interval
         thread::sleep(Duration::from_millis(20));
     }
-    panic!("timed out after {timeout:?} waiting for {what}");
+    panic!("timed out after {window:?} waiting for {what}");
 }
 
 /// Wait for the sitter to exit within `timeout` stretched by
-/// `INTENTD_TEST_TIMEOUT_MULTIPLIER`, force-killing it on timeout so a broken
-/// build never wedges the test run.
+/// `INTENTD_TEST_TIMEOUT_MULTIPLIER` — a hang guard — force-killing it on
+/// timeout so a broken build never wedges the test run. A window that must
+/// stay under a fixed production timer uses [`wait_exit_within`] instead.
 fn wait_exit(child: &mut Child, timeout: Duration) -> ExitStatus {
-    let timeout = intentd_test_support::test_timeout(timeout);
-    let deadline = Instant::now() + timeout;
+    wait_exit_within(child, intentd_test_support::test_timeout(timeout))
+}
+
+/// [`wait_exit`] for exactly `window`, never stretched; see
+/// [`wait_until_within`].
+fn wait_exit_within(child: &mut Child, window: Duration) -> ExitStatus {
+    let deadline = Instant::now() + window;
     while Instant::now() < deadline {
         if let Some(status) = child.try_wait().unwrap() {
             return status;
@@ -609,22 +623,20 @@ fn wait_exit(child: &mut Child, timeout: Duration) -> ExitStatus {
     }
     let _ = child.kill();
     let _ = child.wait();
-    panic!("sitter did not exit within {timeout:?}");
+    panic!("sitter did not exit within {window:?}");
 }
 
-/// Set only on the child run spawned by
-/// `wait_helpers_stretch_with_the_timeout_multiplier`; the probe below is a
-/// no-op without it.
-const SCALE_PROBE_ENV: &str = "SUPERVISOR_E2E_SCALE_PROBE";
-
-/// Runs inside a child test process with `INTENTD_TEST_TIMEOUT_MULTIPLIER`
-/// set: each helper gets a budget half as long as the event it waits for, so
-/// it only succeeds when the helper stretches that budget.
+/// Runs only as a child of `wait_helpers_stretch_with_the_timeout_multiplier`,
+/// which sets `INTENTD_TEST_TIMEOUT_MULTIPLIER` to its cap: each helper gets a
+/// budget half as long as the event it waits for, so it only succeeds when
+/// the helper stretches that budget.
 #[test]
+#[ignore = "run by wait_helpers_stretch_with_the_timeout_multiplier at the maximum multiplier"]
 fn wait_helpers_scale_probe() {
-    if std::env::var_os(SCALE_PROBE_ENV).is_none() {
-        return;
-    }
+    assert!(
+        intentd_test_support::test_timeout_multiplier() >= 4.0,
+        "run this probe through wait_helpers_stretch_with_the_timeout_multiplier"
+    );
     let base = Duration::from_millis(200);
     let started = Instant::now();
     wait_until("the probe condition", base, || {
@@ -641,24 +653,32 @@ fn wait_helpers_scale_probe() {
 /// Regression for intent-hq/intent#7704: `wait_until` / `wait_exit` take
 /// their budget as a parameter, which the fixed-deadline lint cannot see, and
 /// a raw 5s "owner indexing" wait timed out under coverage CI's 3x
-/// multiplier. Re-run the probe in a child process with the multiplier at its
-/// cap so both helpers must stretch to pass.
+/// multiplier. Re-run the probe in a child test process with the multiplier
+/// at its cap so both helpers must stretch to pass.
 #[test]
 fn wait_helpers_stretch_with_the_timeout_multiplier() {
-    let output = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "wait_helpers_scale_probe", "--nocapture"])
-        .env(SCALE_PROBE_ENV, "1")
-        .env(
-            intentd_test_support::TIMEOUT_MULTIPLIER_ENV,
-            intentd_test_support::MAX_TIMEOUT_MULTIPLIER.to_string(),
-        )
-        .output()
+    let dir = tempfile::tempdir().unwrap();
+    let out_path = dir.path().join("probe.out");
+    let out = fs::File::create(&out_path).unwrap();
+    let mut probe = spawn_guarded(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", "wait_helpers_scale_probe"])
+            .args(["--format", "pretty", "--test-threads", "1", "--nocapture"])
+            .env(
+                intentd_test_support::TIMEOUT_MULTIPLIER_ENV,
+                intentd_test_support::MAX_TIMEOUT_MULTIPLIER.to_string(),
+            )
+            .stdout(out.try_clone().unwrap())
+            .stderr(out),
+    );
+    let status = probe
+        .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(30)))
         .unwrap();
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let output = read_or_empty(&out_path);
     assert!(
-        output.status.success() && stdout.contains("1 passed"),
-        "probe failed: {stdout}\n{}",
-        String::from_utf8_lossy(&output.stderr)
+        status.is_some_and(|status| status.success())
+            && output.contains("test wait_helpers_scale_probe ... ok"),
+        "probe failed ({status:?}):\n{output}"
     );
 }
 
@@ -1911,7 +1931,8 @@ fn sighup_during_crash_backoff_respawns_the_state_json_version() {
     send_signal(&sitter, "HUP");
     // Well under the 30s backoff: the SIGHUP must cut the sleep short AND
     // re-resolve the version from state.json, not respawn crashing 0.1.0.
-    wait_until("daemon 0.2.0 to start", Duration::from_secs(10), || {
+    // fixed-deadline: allow — stays under the 30s BACKOFF_INITIAL_ENV crash backoff
+    wait_until_within("daemon 0.2.0 to start", Duration::from_secs(10), || {
         read_or_empty(&log_path).contains("start 0.2.0")
     });
     assert!(
@@ -2108,7 +2129,8 @@ fn sigterm_during_a_stalled_sigusr1_check_still_shuts_down() {
     // (well under the stalled check's own timeout), forwarding the signal
     // to the daemon and exiting with its status as usual.
     send_signal(&sitter, "TERM");
-    let status = wait_exit(&mut sitter, Duration::from_secs(10));
+    // fixed-deadline: allow — stays under the 30s updater::MANIFEST_TIMEOUT of the stalled check
+    let status = wait_exit_within(&mut sitter, Duration::from_secs(10));
     assert_eq!(
         status.code(),
         Some(0),
@@ -2172,7 +2194,8 @@ fn sigusr1_during_crash_backoff_checks_and_respawns_the_fix() {
     send_signal(&sitter, "USR1");
     // Well under the 30s backoff: the SIGUSR1 must cut the sleep short,
     // check, install 0.2.0, and respawn it.
-    wait_until("daemon 0.2.0 to start", Duration::from_secs(10), || {
+    // fixed-deadline: allow — stays under the 30s BACKOFF_INITIAL_ENV crash backoff
+    wait_until_within("daemon 0.2.0 to start", Duration::from_secs(10), || {
         read_or_empty(&log_path).contains("start 0.2.0")
     });
     assert!(
@@ -2280,7 +2303,8 @@ fn sigusr2_stages_update_and_respawns_when_daemon_exits_for_restart() {
     // Release the daemon: it exits with the restart-for-update code, and —
     // well under the 30s backoff — the staged version must respawn at once.
     release.release();
-    wait_until("daemon 0.2.0 to start", Duration::from_secs(10), || {
+    // fixed-deadline: allow — stays under the 30s BACKOFF_INITIAL_ENV crash backoff
+    wait_until_within("daemon 0.2.0 to start", Duration::from_secs(10), || {
         read_or_empty(&log_path).contains("start 0.2.0")
     });
     assert!(
@@ -2602,7 +2626,8 @@ fn restart_for_update_exit_with_unchanged_state_respawns_same_version_unmarked()
     assert!(sitter.try_wait().unwrap().is_none());
 
     release.release();
-    wait_until(
+    // fixed-deadline: allow — stays under the 30s BACKOFF_INITIAL_ENV crash backoff
+    wait_until_within(
         "daemon 0.1.0 to be respawned",
         Duration::from_secs(10),
         || read_or_empty(&log_path).lines().count() >= 2,
@@ -3000,7 +3025,8 @@ fn stable_sigusr2_when_not_due_skips_the_network_but_applies_a_staged_version() 
         || read_or_empty(&log_path).contains("usr2 0.1.0"),
     );
     release.release();
-    wait_until("daemon 0.2.0 to start", Duration::from_secs(10), || {
+    // fixed-deadline: allow — stays under the 30s BACKOFF_INITIAL_ENV crash backoff
+    wait_until_within("daemon 0.2.0 to start", Duration::from_secs(10), || {
         read_or_empty(&log_path).contains("start 0.2.0")
     });
 
@@ -3099,7 +3125,8 @@ fn stable_daily_check_stages_the_update_and_restarts_when_idle() {
     );
 
     release.release();
-    wait_until("daemon 0.2.0 to start", Duration::from_secs(10), || {
+    // fixed-deadline: allow — stays under the 30s BACKOFF_INITIAL_ENV crash backoff
+    wait_until_within("daemon 0.2.0 to start", Duration::from_secs(10), || {
         read_or_empty(&log_path).contains("start 0.2.0")
     });
     send_signal(&sitter, "TERM");
