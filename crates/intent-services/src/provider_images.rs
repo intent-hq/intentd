@@ -19,7 +19,6 @@ const MAX_PROMPT_BASE64: usize = 8 * 1024 * 1024;
 const MAX_PIXELS: u32 = 40_000_000;
 const MAX_DECODE_ALLOC: u64 = 256 * 1024 * 1024;
 const MAX_EDGE: u32 = 2000;
-const RESIZE_ATTEMPTS: usize = 6;
 
 static IMAGE_WORKERS: Semaphore = Semaphore::const_new(2);
 
@@ -90,24 +89,51 @@ pub(crate) async fn prepare_prompt_images(prompt: Vec<ContentBlock>) -> Result<V
 
 fn prepare_images(mut prompt: Vec<ContentBlock>) -> Result<Vec<ContentBlock>> {
     let mut image_index = 0;
-    let mut base64_bytes = 0;
+    let mut image_sizes = Vec::new();
     for block in &mut prompt {
         let ContentBlock::Image(image) = block else {
             continue;
         };
         image_index += 1;
-        if let Some((data, mime_type)) = prepare_image(&image.data, &image.mime_type, image_index)?
+        if let Some((data, mime_type)) =
+            prepare_image(&image.data, &image.mime_type, image_index, MAX_IMAGE_BYTES)?
         {
             image.data = data;
             image.mime_type = mime_type.into();
         }
-        // Each individual result is <= 4 MiB, and the running total is <= 8 MiB.
-        base64_bytes += image.data.len();
-        if base64_bytes > MAX_PROMPT_BASE64 {
-            return Err(invalid_image(
-                image_index,
-                "the prepared images together exceed the 8 MiB base64 prompt budget",
-            ));
+        image_sizes.push(image.data.len());
+    }
+    if image_sizes.iter().sum::<usize>() <= MAX_PROMPT_BASE64 {
+        return Ok(prompt);
+    }
+
+    image_sizes.sort_unstable();
+    let mut remaining = MAX_PROMPT_BASE64;
+    let mut max_image_bytes = MAX_IMAGE_BYTES;
+    for (position, size) in image_sizes.iter().enumerate() {
+        // Keep small images unchanged and share the remaining budget among larger ones.
+        let share = remaining / (image_sizes.len() - position) / 4 * 4;
+        if *size > share {
+            max_image_bytes = share / 4 * 3;
+            break;
+        }
+        remaining -= size;
+    }
+
+    image_index = 0;
+    for block in &mut prompt {
+        let ContentBlock::Image(image) = block else {
+            continue;
+        };
+        image_index += 1;
+        if image.data.len() <= max_image_bytes / 3 * 4 {
+            continue;
+        }
+        if let Some((data, mime_type)) =
+            prepare_image(&image.data, &image.mime_type, image_index, max_image_bytes)?
+        {
+            image.data = data;
+            image.mime_type = mime_type.into();
         }
     }
     Ok(prompt)
@@ -117,6 +143,7 @@ fn prepare_image(
     data: &str,
     mime_type: &str,
     index: usize,
+    max_image_bytes: usize,
 ) -> Result<Option<(String, &'static str)>> {
     if data.len() > MAX_INPUT_BASE64 {
         return Err(invalid_image(
@@ -181,7 +208,7 @@ fn prepare_image(
     decoder
         .set_limits(limits)
         .map_err(|error| decode_error(index, &error))?;
-    let oversized = bytes.len() > MAX_IMAGE_BYTES || width > MAX_EDGE || height > MAX_EDGE;
+    let oversized = bytes.len() > max_image_bytes || width > MAX_EDGE || height > MAX_EDGE;
     let orientation = if oversized {
         Some(
             decoder
@@ -200,12 +227,12 @@ fn prepare_image(
     drop(bytes);
     // Decide before resizing: averaging may round a near-opaque alpha to fully opaque.
     let transparent = has_transparency(&source_image);
-    let mut resized = source_image.thumbnail(MAX_EDGE, MAX_EDGE);
+    let mut resized = source_image.thumbnail(width.min(MAX_EDGE), height.min(MAX_EDGE));
     drop(source_image);
     if let Some(orientation) = orientation {
         resized.apply_orientation(orientation);
     }
-    let (data, mime_type) = encode_with_budget(resized, transparent, index)?;
+    let (data, mime_type) = encode_with_budget(resized, transparent, index, max_image_bytes)?;
     Ok(Some((general_purpose::STANDARD.encode(data), mime_type)))
 }
 
@@ -222,14 +249,15 @@ fn encode_with_budget(
     mut image: DynamicImage,
     transparent: bool,
     index: usize,
+    max_image_bytes: usize,
 ) -> Result<(Vec<u8>, &'static str)> {
-    for _ in 0..RESIZE_ATTEMPTS {
+    loop {
         let mut png = Cursor::new(Vec::new());
         image
             .write_to(&mut png, ImageFormat::Png)
             .map_err(|_| invalid_image(index, "the image could not be encoded as PNG"))?;
         let png = png.into_inner();
-        if png.len() <= MAX_IMAGE_BYTES {
+        if png.len() <= max_image_bytes {
             return Ok((png, "image/png"));
         }
         drop(png);
@@ -241,7 +269,7 @@ fn encode_with_budget(
                 image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, quality)
                     .encode_image(&rgb)
                     .map_err(|_| invalid_image(index, "the image could not be encoded as JPEG"))?;
-                if jpeg.len() <= MAX_IMAGE_BYTES {
+                if jpeg.len() <= max_image_bytes {
                     return Ok((jpeg, "image/jpeg"));
                 }
             }
@@ -254,7 +282,7 @@ fn encode_with_budget(
     }
     Err(invalid_image(
         index,
-        "the image could not be reduced below 3 MiB without discarding transparency",
+        "the image could not be reduced to fit the delivery budget without discarding transparency",
     ))
 }
 

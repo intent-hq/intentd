@@ -211,7 +211,7 @@ async fn compressible_images_obey_the_dimension_cap_without_changing_in_budget_i
 }
 
 #[tokio::test]
-async fn aggregate_budget_accepts_fitting_images_and_rejects_the_first_excess() {
+async fn aggregate_budget_reduces_images_only_when_the_batch_needs_it() {
     let image = png_block(&noise(800, 800, false));
     let ContentBlock::Image(source) = &image else {
         unreachable!()
@@ -225,13 +225,79 @@ async fn aggregate_budget_accepts_fitting_images_and_rejects_the_first_excess() 
         prepare_prompt_images(accepted.clone()).await.unwrap(),
         accepted
     );
-    let mut rejected = accepted;
-    rejected.insert(0, ContentBlock::from("does not count as an image"));
-    rejected.push(image);
+    let small = png_block(&noise(8, 8, false));
+    let mut batch = accepted;
+    batch.insert(0, ContentBlock::from("before"));
+    batch.insert(2, small.clone());
+    batch.push(image);
+    let prepared = prepare_prompt_images(batch.clone()).await.unwrap();
+    assert_eq!(prepared.len(), batch.len());
+    assert_eq!(prepared[0], batch[0]);
+    assert_eq!(prepared[2], small, "small images retain their exact bytes");
+    let mut total = 0;
+    for (original, output) in batch.iter().zip(&prepared) {
+        let ContentBlock::Image(output) = output else {
+            continue;
+        };
+        total += output.data.len();
+        let ContentBlock::Image(original) = original else {
+            unreachable!()
+        };
+        assert_eq!(output.uri, original.uri);
+        assert_eq!(output.annotations, original.annotations);
+        assert_eq!(output.meta, original.meta);
+        assert!(output.data.len() <= original.data.len());
+    }
+    assert!(total <= 8 * 1024 * 1024, "aggregate provider budget");
+    for position in [1, 3, 4, 5] {
+        let decoded = decoded_output(&prepared[position]);
+        assert!(decoded.width() <= 800 && decoded.height() <= 800);
+        assert_eq!(decoded.width(), decoded.height());
+    }
+}
+
+#[tokio::test]
+async fn fourteen_images_fit_together_and_transparency_is_preserved() {
+    for transparent in [false, true] {
+        let original = png_block(&noise(400, 400, transparent));
+        let ContentBlock::Image(source) = &original else {
+            unreachable!()
+        };
+        assert!(source.data.len() * 14 > 8 * 1024 * 1024);
+        let prepared = prepare_prompt_images(vec![original.clone(); 14])
+            .await
+            .unwrap();
+        assert_eq!(prepared.len(), 14);
+        let mut total = 0;
+        for block in &prepared {
+            let decoded = decoded_output(block);
+            assert_eq!(decoded.width(), decoded.height());
+            assert!(decoded.width() <= 400);
+            if transparent {
+                assert!(decoded.has_alpha());
+                assert!(decoded
+                    .pixels()
+                    .all(|(_, _, pixel)| pixel.0[3].abs_diff(128) <= 1));
+            }
+            let ContentBlock::Image(output) = block else {
+                unreachable!()
+            };
+            total += output.data.len();
+            assert_ne!(output.data, source.data);
+        }
+        assert!(total <= 8 * 1024 * 1024, "aggregate provider budget");
+    }
+}
+
+#[tokio::test]
+async fn corrupt_image_after_an_oversized_batch_still_fails_atomically() {
+    let original = png_block(&noise(400, 400, false));
+    let mut prompt = vec![original; 14];
+    prompt.push(image_block("private-invalid-base64!", "image/png"));
     assert_invalid(
-        prepare_prompt_images(rejected).await.unwrap_err(),
-        4,
-        "8 MiB",
+        prepare_prompt_images(prompt).await.unwrap_err(),
+        15,
+        "base64",
     );
 }
 
