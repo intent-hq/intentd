@@ -1130,3 +1130,80 @@ async fn discussion_management_atomic_creation_permissions_events_and_legacy_ove
     owner.close().await;
     srv.ws.stop().await;
 }
+
+#[tokio::test]
+async fn discussion_management_retired_workspace_refuses_writes_and_preserves_history_over_wss() {
+    let srv = start(WsOptions::default()).await;
+    let ws = WorkspaceId::new();
+    let mut workspace = fixture_workspace(&ws);
+    srv.store.insert_workspace(&workspace).await.unwrap();
+    let mut owner = PresenceClient::open(srv.port, srv.cfg.clone(), TOKEN).await;
+    let made = owner
+        .call(
+            1,
+            "discussion.send",
+            json!({
+                "workspaceId": ws, "messageId": "retirement-history",
+                "body": "Keep this history", "createConversation": true
+            }),
+        )
+        .await;
+    let id = made["result"]["conversation"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let renamed = owner
+        .call(
+            2,
+            "discussion.rename",
+            json!({
+                "workspaceId": ws, "conversationId": id, "name": "Preserved title"
+            }),
+        )
+        .await;
+    assert!(renamed.get("error").is_none(), "{renamed}");
+    let before = owner
+        .call(
+            3,
+            "discussion.list",
+            json!({
+                "workspaceId": ws, "conversationId": id
+            }),
+        )
+        .await;
+    assert_eq!(before["result"]["conversation"]["name"], "Preserved title");
+    assert_eq!(before["result"]["messages"].as_array().unwrap().len(), 1);
+
+    workspace.status = intent_core::WorkspaceStatus::Retired;
+    workspace.archived = true;
+    workspace.retired_at = Some("2026-10-25T00:00:00Z".into());
+    srv.store.update_workspace(&workspace).await.unwrap();
+    for (request_id, method) in [(4, "discussion.rename"), (5, "discussion.delete")] {
+        let denied = owner
+            .call(
+                request_id,
+                method,
+                json!({
+                    "workspaceId": ws, "conversationId": id, "name": "Must not change"
+                }),
+            )
+            .await;
+        assert_eq!(denied["jsonrpc"], "2.0");
+        assert_eq!(denied["id"], request_id);
+        assert_eq!(denied["error"]["code"], -32602, "{denied}");
+        assert_eq!(denied["error"]["data"]["code"], "workspace-retired");
+        assert_eq!(denied["error"]["data"]["workspaceId"], ws.as_str());
+        let after = owner
+            .call(
+                6,
+                "discussion.list",
+                json!({
+                    "workspaceId": ws, "conversationId": id
+                }),
+            )
+            .await;
+        assert_eq!(after["result"], before["result"]);
+    }
+    owner.close().await;
+    srv.ws.stop().await;
+}

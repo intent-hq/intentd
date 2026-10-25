@@ -40,6 +40,8 @@ Workspace owners and managers can rename discussions; only workspace owners can
 delete them, including the default discussion. Open the discussion, then use the
 discussion panel's **…** menu for **Rename discussion** or **Delete discussion**.
 These controls require discussion-management support from the connected daemon.
+Retired workspaces keep discussions read-only; restore the workspace before renaming
+or deleting a discussion.
 Existing private history remains
 visible only to its original participants and is read-only; new private discussions
 are unavailable. Discussions support reactions 👍 👎 👀 ✅ 🙈. The emoji picker has no tooltips;
@@ -80,7 +82,7 @@ without moving the messages or monitor cards.
 
 <!-- Sources: packages/cloudlands-fe/src/features/presence/components/{WorkspacePeopleRoster,WorkspacePeopleActivity,PresenceTypingIndicator}.svelte; packages/cloudlands-fe/src/store/renderer/slices/{presence/presence-selectors,workspace-share/workspace-share-selectors}.ts; packages/cloudlands-fe/src/lib/components/chat/ChatPanel.svelte. -->
 
-<!-- Sources: packages/intentd/crates/intent-core/src/discussion.rs; packages/intentd/crates/intent-services/src/discussion_ops.rs; packages/intentd/crates/intent-store/src/discussion_management_repo.rs; packages/intentd/crates/intent-acp/src/mcp_server/bindings/discussion.rs; packages/cloudlands-fe/src/features/discussions/components/{DiscussionThread,DiscussionMessageView,DiscussionMentionPicker,DiscussionUnreadBadge}.svelte; packages/cloudlands-fe/src/features/discussions/discussion-reference-navigation.ts; packages/cloudlands-fe/src/features/layout/tab-types/DiscussionTabType.svelte; packages/cloudlands-fe/src/store/renderer/slices/notifications/sagas/notifications-saga.ts; packages/cloudlands-fe/src/store/renderer/slices/workspace-discussion/workspace-discussion-selectors.ts. -->
+<!-- Sources: packages/intentd/crates/intent-core/src/discussion.rs; packages/intentd/crates/intent-services/src/discussion_ops.rs; packages/intentd/crates/intent-transport/src/retired_gate.rs; packages/intentd/crates/intent-store/src/discussion_management_repo.rs; packages/intentd/crates/intent-acp/src/mcp_server/bindings/discussion.rs; packages/cloudlands-fe/src/features/discussions/components/{DiscussionThread,DiscussionMessageView,DiscussionMentionPicker,DiscussionUnreadBadge}.svelte; packages/cloudlands-fe/src/features/discussions/discussion-reference-navigation.ts; packages/cloudlands-fe/src/features/layout/tab-types/DiscussionTabType.svelte; packages/cloudlands-fe/src/store/renderer/slices/notifications/sagas/notifications-saga.ts; packages/cloudlands-fe/src/store/renderer/slices/workspace-discussion/workspace-discussion-selectors.ts. -->
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/settings/MobileSettings.svelte; src/features/devices/{PersonalDevicesPanel.svelte,personal-devices-selectors.ts}; src/store/renderer/slices/principal/principal-selectors.ts; src/store/renderer/slices/websocket-api/sagas/websocket-api-saga.ts; messages/en.json. -->
 
