@@ -12,7 +12,7 @@
 //! Hermetic setup (shared with the npx isolation suite): the daemon child's
 //! `PATH` starts with a scratch `bin/` holding a fake `node`, a fake `npx`
 //! that execs the deterministic mock ACP fixture, and a version-only `claude`
-//! CLI. The mock answers `initialize` with the reviewed claude-agent-acp
+//! CLI. The mock answers `initialize` with the pinned claude-agent-acp
 //! identity (`agentInfo`), records the client capabilities it was offered
 //! (`MOCK_AGENT_INIT_LOG`) and every stop request (`MOCK_AGENT_STOP_LOG`).
 //! Nothing is downloaded. Gated on `node`, `git` and the mock script.

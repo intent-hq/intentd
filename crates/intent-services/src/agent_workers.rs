@@ -35,7 +35,7 @@ const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
 const SUBAGENT_TASK_TYPES: [&str; 2] = ["agent", "local_agent"];
 const TERMINAL: [&str; 3] = ["completed", "failed", "stopped"];
 
-/// One reviewed adapter pin.
+/// One supported adapter, at the version the daemon pins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Adapter {
     /// Base provider ID (profiles `id@name` share it).
@@ -48,20 +48,46 @@ pub(crate) struct Adapter {
     pub source: &'static str,
 }
 
-/// The reviewed adapter allowlist (§5.5b table). Any other provider or version
-/// is unsupported until reviewed; `claude_allowlist_tracks_the_pinned_adapter`
-/// fails when the Claude adapter pin moves without a review here.
+/// Split a pinned npm package spec (`@scope/name@1.2.3`) into its name and
+/// version at the last `@`; a spec without a version fails the build.
+const fn split_package_spec(spec: &'static str) -> (&'static str, &'static str) {
+    let bytes = spec.as_bytes();
+    let mut at = bytes.len();
+    while at > 1 {
+        at -= 1;
+        if bytes[at] == b'@' {
+            let (name, rest) = bytes.split_at(at);
+            let (_, version) = rest.split_at(1);
+            if version.is_empty() {
+                break;
+            }
+            return match (std::str::from_utf8(name), std::str::from_utf8(version)) {
+                (Ok(name), Ok(version)) => (name, version),
+                _ => panic!("adapter package spec is not UTF-8"),
+            };
+        }
+    }
+    panic!("adapter package spec has no `@<version>`");
+}
+
+const CODEX_PIN: (&str, &str) = split_package_spec(intent_providers::CODEX_ACP_NPX_PACKAGE);
+const CLAUDE_PIN: (&str, &str) = split_package_spec(intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE);
+
+/// The supported adapters (§5.5b table), each at the version the daemon pins,
+/// so an adapter pin bump moves worker support with it. A session whose
+/// adapter reports any other name or version is `adapter-version` unsupported;
+/// other providers stay unsupported until reviewed and listed here.
 pub(crate) const SUPPORTED_ADAPTERS: [Adapter; 2] = [
     Adapter {
         provider: "codex",
-        name: "@agentclientprotocol/codex-acp",
-        version: "2.2.2",
+        name: CODEX_PIN.0,
+        version: CODEX_PIN.1,
         source: "codex-air",
     },
     Adapter {
         provider: "claude-code",
-        name: "@agentclientprotocol/claude-agent-acp",
-        version: "0.81.1",
+        name: CLAUDE_PIN.0,
+        version: CLAUDE_PIN.1,
         source: "claude-air",
     },
 ];

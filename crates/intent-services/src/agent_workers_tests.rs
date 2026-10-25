@@ -317,7 +317,12 @@ fn support_reasons_follow_the_documented_order() {
         name: Some("@agentclientprotocol/claude-agent-acp".into()),
         version: Some("2.2.2".into()),
     };
+    let claude_off_pin = AdapterIdentity {
+        version: Some("0.0.0".into()),
+        ..identity("claude-code")
+    };
     for (provider, ident, negotiated, reason) in [
+        ("claude-code", claude_off_pin, true, "adapter-version"),
         ("auggie", identity("codex"), true, "provider"),
         ("claude", identity("claude-code"), true, "provider"),
         ("codex", bad_version, true, "adapter-version"),
@@ -502,25 +507,39 @@ fn registry_fences_every_operation_to_the_current_generation() {
 }
 
 #[test]
-fn claude_allowlist_tracks_the_pinned_adapter() {
-    // Moving the Claude adapter pin requires reviewing its worker reports
-    // (PROTOCOL §5.5b) and updating SUPPORTED_ADAPTERS with it.
+fn supported_adapters_follow_the_adapter_pins() {
+    // PROTOCOL §5.5b: worker support moves with each adapter pin bump.
     let claude = adapter_for("claude-code").unwrap();
-    assert_eq!(
-        claude.version,
-        intent_providers::CLAUDE_AGENT_ACP_VERSION,
-        "claude-agent-acp pin moved: review its async-task reports, then update the §5.5b allowlist"
-    );
+    assert_eq!(claude.name, "@agentclientprotocol/claude-agent-acp");
+    assert_eq!(claude.version, intent_providers::CLAUDE_AGENT_ACP_VERSION);
     assert_eq!(
         format!("{}@{}", claude.name, claude.version),
         intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE
     );
     let codex = adapter_for("codex").unwrap();
+    assert_eq!(codex.name, "@agentclientprotocol/codex-acp");
     assert_eq!(
         format!("{}@{}", codex.name, codex.version),
-        intent_providers::CODEX_ACP_NPX_PACKAGE,
-        "codex-acp pin moved: review its async-task reports, then update the §5.5b allowlist"
+        intent_providers::CODEX_ACP_NPX_PACKAGE
     );
+}
+
+#[test]
+fn package_specs_split_at_the_version_separator() {
+    assert_eq!(
+        split_package_spec("@scope/adapter@1.2.3"),
+        ("@scope/adapter", "1.2.3")
+    );
+    assert_eq!(
+        split_package_spec("adapter@0.1.0-rc.1"),
+        ("adapter", "0.1.0-rc.1")
+    );
+}
+
+#[test]
+#[should_panic(expected = "has no `@<version>`")]
+fn package_spec_without_a_version_is_rejected() {
+    split_package_spec("@scope/adapter");
 }
 
 #[test]
