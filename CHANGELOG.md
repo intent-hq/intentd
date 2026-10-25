@@ -2,6 +2,32 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.47] - 2026-10-25
+
+### 🚀 Features
+
+- Add consented desktop control sessions and agent API ([#2245](https://github.com/intent-hq/intentd/pull/2245))
+
+### 🐛 Bug Fixes
+
+- *(workspace-api)* Keep large-note reads and committed writes within the script heap ([#2685](https://github.com/intent-hq/intentd/pull/2685))
+
+
+## [0.11.46] - 2026-10-25
+
+### 🚀 Features
+
+- Add the Retired workspace state and workspace.retire ([#2605](https://github.com/intent-hq/intentd/pull/2605))
+
+### 🔧 Refactor
+
+- *(services)* Add a feature port registry and startup check ([#2682](https://github.com/intent-hq/intentd/pull/2682))
+
+### 🧪 Testing
+
+- *(intent-services)* Put every 64-record budget control on one load-proof script budget ([#2686](https://github.com/intent-hq/intentd/pull/2686))
+
+
 ## [0.11.45] - 2026-10-25
 
 ### 🐛 Bug Fixes

@@ -361,6 +361,9 @@ impl Forwarder {
         }
     }
     async fn allowed(&mut self, event: &Event) -> Option<bool> {
+        if !intent_core::desktop::event_visible(event) {
+            return Some(false);
+        }
         loop {
             let Some(gate) = &mut self.gate else {
                 return Some(true);

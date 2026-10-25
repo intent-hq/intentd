@@ -15,6 +15,13 @@ use crate::agent_repo::{
 };
 use crate::{enum_from_db, enum_to_db, tags_from_db, tags_to_db, AgentUsageRow, Store};
 
+#[cfg(test)]
+tokio::task_local! {
+    /// Test-only seam: entered just before the workspace desktop cleanup
+    /// transaction, so a test can saturate the writer at exactly that step.
+    pub(crate) static DESKTOP_CLEANUP_ENTRY: std::sync::Arc<crate::desktop_repo::DeleteBarrier>;
+}
+
 const WORKSPACE_COLUMNS: &str = "id, title, branch, base_ref, base_commit_sha, status, \
     status_message, status_image_asset_id, attention, path, repository_path, repository_owner, \
     repository_name, worktree_path, scope, skip_worktree, is_remote, default_model, pr_number, \
@@ -1033,6 +1040,11 @@ impl Store {
         disposition: &mut RepositoryWorkspaceDeleteDisposition,
         committed: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<()> {
+        // Hold through every bounded sweep and final commit/failure. All private
+        // desktop producers use this same Store-level admission gate.
+        // Wait before taking database-wide lifecycle serialization: another
+        // deletion holding this guard needs that serialization for agent cleanup.
+        let _desktop_deletion = self.desktop_writes.delete(id).await;
         let mut lifecycle = self.repository_lifecycle_write().await?;
         // In particular, a missing workspace must not delete opaque draft
         // keys. The final transaction also checks existence for racing deletes.
@@ -1067,6 +1079,43 @@ impl Store {
             DELETE_CASCADE_BATCH,
         )
         .await?;
+
+        // Runtime writers are stopped. Revoke/drain private desktop state once
+        // before deleting any agent, just like the recovery sweep above. A
+        // failure leaves all sessions intact; a later failure may revoke grants
+        // early but cannot leave authority attached to a deleted agent.
+        #[cfg(test)]
+        if let Ok(barrier) = DESKTOP_CLEANUP_ENTRY.try_with(std::sync::Arc::clone) {
+            barrier.entered.notify_one();
+            barrier.release.notified().await;
+        }
+        // A busy or saturated writer retries the whole idempotent cleanup
+        // transaction, so it cannot fail the delete half-way (intent-hq/intent#7705).
+        crate::with_write_txn_retry(|| async {
+            let mut desktop_tx =
+                self.write_pool().begin().await.map_err(|e| {
+                    Error::Internal(format!("begin workspace desktop cleanup: {e}"))
+                })?;
+            crate::desktop_repo::delete_desktop_scope(&mut desktop_tx, id, None).await?;
+            desktop_tx
+                .commit()
+                .await
+                .map_err(|e| Error::Internal(format!("commit workspace desktop cleanup: {e}")))
+        })
+        .await?;
+
+        #[cfg(test)]
+        {
+            let barrier = self
+                .desktop_delete_barrier
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some(barrier) = barrier {
+                barrier.entered.notify_one();
+                barrier.release.notified().await;
+            }
+        }
 
         // IDs only: never hydrate sessions or their transcripts. Each session
         // uses the same bounded payload/message cleanup as agent.delete.
@@ -1237,6 +1286,7 @@ impl Store {
                 .execute(&mut *tx)
                 .await
                 .map_err(|e| Error::Internal(format!("delete workspace drafts failed: {e}")))?;
+            crate::desktop_repo::delete_desktop_scope(&mut tx, id, None).await?;
             sqlx::query("DELETE FROM settings WHERE key = ?")
                 .bind(crate::settings_repo::agent_creation_preferences_key(id))
                 .execute(&mut *tx)
