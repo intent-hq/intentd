@@ -47,14 +47,13 @@ use tokio_tungstenite::WebSocketStream;
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
 /// Pure-liveness deadline for positive event-driven waits (monorepo#1849,
-/// mirroring the `liveness()` pattern from intent-hq/intentd#1030/#1043): the
+/// mirroring the `LIVENESS` pattern from intent-hq/intentd#1030/#1043): the
 /// waits below return as soon as the awaited event arrives, so this bound
 /// only has to outlast a genuine wedge (fs-event registration/delivery
 /// stalls under full-suite parallel load), never a passing run. Negative
 /// assertions keep their short bounds.
-fn liveness() -> Duration {
-    intentd_test_support::test_timeout(Duration::from_secs(300))
-}
+// fixed-deadline: allow — stays fixed: already past nextest's 180 s kill, so scaling it would change nothing; clamping it below the kill is a separate change
+const LIVENESS: Duration = Duration::from_secs(300);
 
 struct Daemon {
     child: Child,
@@ -225,10 +224,10 @@ async fn wss_rpc(ws: &mut Wss, id: i64, method: &str, params: Value) -> Value {
 }
 
 /// Pump the dedicated subscriber connection until a `settings:changed`
-/// `events.event` frame arrives (or [`liveness()`] elapses). Returns the full
+/// `events.event` frame arrives (or [`LIVENESS`] elapses). Returns the full
 /// frame. Pure-liveness positive wait: returns as soon as the event lands.
 async fn next_settings_event(ws: &mut Wss) -> Value {
-    let deadline = tokio::time::Instant::now() + liveness();
+    let deadline = tokio::time::Instant::now() + LIVENESS;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         let next = timeout(remaining, ws.next())
@@ -293,11 +292,11 @@ fn atomic_write(path: &Path, content: &str) {
 /// watcher registers in a background task (monorepo#1581), so a fast test
 /// can otherwise hand-edit config.toml before the `FSEvents` watch exists and
 /// the edit is missed entirely — no wait on `settings:changed`, however
-/// long, can recover it (monorepo#1849). Bounded by [`liveness()`]; fails
+/// long, can recover it (monorepo#1849). Bounded by [`LIVENESS`]; fails
 /// fast if the daemon reports the watcher failed to start.
 async fn await_config_watcher_ready(data_dir: &Path) {
     let log_path = data_dir.join("daemon.log");
-    let deadline = tokio::time::Instant::now() + liveness();
+    let deadline = tokio::time::Instant::now() + LIVENESS;
     loop {
         let log = std::fs::read_to_string(&log_path).unwrap_or_default();
         if log.contains("config.toml live-reload watcher ready") {
@@ -309,9 +308,8 @@ async fn await_config_watcher_ready(data_dir: &Path) {
         );
         assert!(
             tokio::time::Instant::now() < deadline,
-            "config.toml live-reload watcher never became ready within {:?}\n\
-             --- daemon log ---\n{log}",
-            liveness()
+            "config.toml live-reload watcher never became ready within {LIVENESS:?}\n\
+             --- daemon log ---\n{log}"
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
@@ -340,7 +338,7 @@ async fn config_watcher_readiness_marker_waits_for_a_live_watch() {
     assert!(await_uds(&socket).await, "daemon did not start");
 
     let log_path = data_dir.join("daemon.log");
-    let deadline = tokio::time::Instant::now() + liveness();
+    let deadline = tokio::time::Instant::now() + LIVENESS;
     loop {
         let log = std::fs::read_to_string(&log_path).unwrap_or_default();
         assert!(
@@ -353,9 +351,8 @@ async fn config_watcher_readiness_marker_waits_for_a_live_watch() {
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "the daemon never reported the config watcher failing to start within {:?}\n\
-             --- daemon log ---\n{log}",
-            liveness()
+            "the daemon never reported the config watcher failing to start within {LIVENESS:?}\n\
+             --- daemon log ---\n{log}"
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }

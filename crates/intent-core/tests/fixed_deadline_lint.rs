@@ -46,11 +46,12 @@
 //!   second argument, …; a `fn timeout(` definition is not a call), or (b) the operand of an
 //!   `Instant::now() + …` / `Instant::now().checked_add(…)` deadline.
 //!   The same positions also count a bare name bound in test code to exactly
-//!   such a literal: `const` / `static NAME: Duration = Duration::from_*(…);`
+//!   such a literal: `const` / `static NAME: Duration = Duration::from_*(…)…;`
 //!   (visible throughout its enclosing `{…}` block or file) or
-//!   `let [mut] name[: Duration] = Duration::from_*(…);` (visible after its
+//!   `let [mut] name[: Duration] = Duration::from_*(…)…;` (visible after its
 //!   statement, inside its block, until a later `let` of that name shadows
-//!   it), unless the use is scaled (`WAIT * m`, `WAIT.mul_f64(m)`) — intentd#2649
+//!   it; a `let mut` assigned again in its block is not followed) — the
+//!   initializer counts as it would at the call — unless the use is scaled (`WAIT * m`, `WAIT.mul_f64(m)`) — intentd#2649
 //!   passed with `const LIMIT: Duration = Duration::from_secs(60)`. The
 //!   report names the binding (`[budget: const WAIT (line 21)]`). A const
 //!   cannot call the helper, so a hang-guard constant becomes a helper fn
@@ -74,8 +75,9 @@
 //!   imported from another file (`use super::WAIT`) or reached by path
 //!   (`Self::WAIT`, `super::WAIT`), a production constant used by a test, an
 //!   alias chain (`let b = WAIT;`), a field or a function parameter is not
-//!   seen, and a closure parameter that reuses a fixed `let`'s name is
-//!   mistaken for it; a call is matched by name only, so a method also called
+//!   seen, and a name rebound by a pattern (a closure or nested-fn parameter,
+//!   `for`, `if let` / `while let`, a `match` arm) that reuses a fixed
+//!   `let`'s name is mistaken for it — mark that use; a call is matched by name only, so a method also called
 //!   `timeout` (a client builder's) counts too — wrap or mark it; and a
 //!   `#[cfg(test)] mod x;` nested inside an inline `mod a { … }` resolves as
 //!   if declared at file level.
@@ -322,8 +324,12 @@ struct Binding {
     name: String,
     /// Char offset of the keyword.
     offset: usize,
-    /// Its initializer is exactly a fixed `Duration` literal.
+    /// Its initializer starts with a fixed `Duration` literal (counted as
+    /// the same expression would be at the call), and a `let mut` is never
+    /// assigned again in its scope.
     literal: bool,
+    /// A `let mut` / `static mut`.
+    mutable: bool,
     /// The `{…}` block (or whole file) the name is visible in.
     scope: (usize, usize),
     /// A `let` is visible after its statement; an item in its whole scope.
@@ -379,8 +385,9 @@ fn enclosing_blocks(chars: &[char], offsets: &[usize]) -> Vec<(usize, usize)> {
 
 /// Every `const NAME: T = …;`, `static [mut] NAME: T = …;` and
 /// `let [mut] NAME[: T] = …;` in blanked `chars` (destructuring patterns and
-/// `const fn` are skipped), marking those whose initializer is exactly an
-/// unscaled `Duration::from_*(…)` literal.
+/// `const fn` are skipped), marking those whose initializer starts with an
+/// unscaled `Duration::from_*(…)` literal — the rule a budget written at the
+/// call follows, so `let d = Duration::from_secs(5) * 2;` is fixed too.
 fn bindings(chars: &[char]) -> Vec<Binding> {
     let mut found = Vec::new();
     let mut i = 0;
@@ -404,7 +411,8 @@ fn bindings(chars: &[char]) -> Vec<Binding> {
         };
         let mut j = skip_whitespace(chars, end);
         let mut name = ident_at(chars, j);
-        if kind != "const" && name.as_ref().is_some_and(|(w, _)| w == "mut") {
+        let mutable = kind != "const" && name.as_ref().is_some_and(|(w, _)| w == "mut");
+        if mutable {
             j = skip_whitespace(chars, name.as_ref().map_or(j, |(_, e)| *e));
             name = ident_at(chars, j);
         }
@@ -431,15 +439,18 @@ fn bindings(chars: &[char]) -> Vec<Binding> {
             i = end;
             continue;
         };
-        let literal_end = duration_literal_end(chars, init).and_then(|e| expect(chars, e, ";"));
-        let semi = literal_end.map_or_else(|| statement_end(chars, init), |e| e - 1);
         found.push(Binding {
             kind,
             name,
             offset: i,
-            literal: literal_end.is_some(),
+            literal: is_duration_literal(chars, init),
+            mutable,
             scope: (0, 0),
-            visible_from: if kind == "let" { semi } else { 0 },
+            visible_from: if kind == "let" {
+                statement_end(chars, init)
+            } else {
+                0
+            },
         });
         i = end;
     }
@@ -449,8 +460,40 @@ fn bindings(chars: &[char]) -> Vec<Binding> {
         if binding.kind != "let" {
             binding.visible_from = scope.0;
         }
+        if binding.literal && binding.mutable {
+            binding.literal = !is_assigned(chars, &binding.name, binding.visible_from, scope.1);
+        }
     }
     found
+}
+
+/// Whether `name` is assigned (`name = …`, `name *= …`, …) anywhere in
+/// `chars[from..to]`: a reassigned `let mut` budget may no longer be fixed.
+fn is_assigned(chars: &[char], name: &str, from: usize, to: usize) -> bool {
+    let mut i = from;
+    while i < to.min(chars.len()) {
+        let at_word = is_ident(chars[i]) && (i == 0 || !is_ident(chars[i - 1]));
+        let Some((word, end)) = at_word.then(|| ident_at(chars, i)).flatten() else {
+            i += 1;
+            continue;
+        };
+        if word == name
+            && !matches!(
+                chars[..i].iter().rev().find(|c| !c.is_whitespace()),
+                Some('.' | ':')
+            )
+        {
+            let k = skip_whitespace(chars, end);
+            let op = chars.get(k..k + 2).unwrap_or(&[]);
+            let compound = matches!(op, ['+' | '-' | '*' | '/', '=']);
+            let plain = op.first() == Some(&'=') && !matches!(op.get(1), Some('=' | '>'));
+            if compound || plain {
+                return true;
+            }
+        }
+        i = end;
+    }
+    false
 }
 
 /// The binding `name` refers to at `offset`: among bindings of that name
@@ -1531,5 +1574,33 @@ fn the_report_names_the_binding_behind_a_budget() {
     assert!(
         report.contains("fn wait() -> Duration"),
         "the fix text explains how to scale a constant budget:\n{report}"
+    );
+}
+
+#[test]
+fn a_binding_counts_like_the_same_expression_at_the_call_unless_reassigned() {
+    let src = "\
+async fn t() {
+    let doubled = Duration::from_secs(5) * 2;
+    timeout(doubled, f);
+    timeout(Duration::from_secs(5) * 2, f);
+    let mut grown = Duration::from_secs(1);
+    grown = test_timeout(grown);
+    timeout(grown, f);
+    let mut stretched = Duration::from_secs(1);
+    stretched *= m;
+    timeout(stretched, f);
+    let mut compared = Duration::from_secs(1);
+    assert!(compared == other);
+    timeout(compared, f);
+}
+";
+    assert_eq!(
+        hits_in(src, true),
+        vec![
+            (3, Some("let doubled (line 2)".to_string())),
+            (4, None),
+            (13, Some("let compared (line 11)".to_string())),
+        ]
     );
 }

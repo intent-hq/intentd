@@ -892,9 +892,8 @@ mod tests {
     /// Extra-generous deadline for awaiting a child's natural exit under
     /// full-suite load (monorepo#573): it bounds only how long a *failure*
     /// takes to surface, never how long a passing run waits.
-    fn long_timeout() -> Duration {
-        intentd_test_support::test_timeout(Duration::from_secs(60))
-    }
+    // fixed-deadline: allow — stays under nextest's unscaled 180 s slow-timeout kill: a 60 s base scaled ×3 would reach it (.config/nextest.toml), so a stall still panics naming its step
+    const LONG_TIMEOUT: Duration = Duration::from_secs(60);
 
     /// A temp `SQLite` path cleaned up on drop (mirrors `events::bus_tests`).
     struct TempDb {
@@ -1370,7 +1369,7 @@ mod tests {
                 let bytes = pty.scrollback(id).ok()?;
                 contains_sub(&bytes, b"scan-complete").then_some(bytes)
             },
-            long_timeout(),
+            LONG_TIMEOUT,
         )
         .await
         .expect("blank suffix reaches scrollback");
@@ -2473,7 +2472,7 @@ mod tests {
         marker: &str,
     ) -> String {
         let pty_id = PtyId::parse(id).expect("wire id parses");
-        let deadline = Instant::now() + long_timeout();
+        let deadline = Instant::now() + LONG_TIMEOUT;
         let output = loop {
             let info = adapter.output(id.to_string()).await.unwrap();
             if info.output.contains(marker) {
@@ -2489,7 +2488,7 @@ mod tests {
 
         pty.write(pty_id, b"\x04").unwrap();
 
-        let exit = tokio::time::timeout(long_timeout(), adapter.wait_for_exit(id.to_string()))
+        let exit = tokio::time::timeout(LONG_TIMEOUT, adapter.wait_for_exit(id.to_string()))
             .await
             .expect("child exits within the generous deadline")
             .unwrap();
