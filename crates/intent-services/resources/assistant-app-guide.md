@@ -538,10 +538,12 @@ preview. Double-click it, or Cmd-click (Ctrl-click on Windows and Linux), to ope
 workspace directly.
 
 Open **View options → Group by** in either list or board
-view. **Activity** keeps the broad **Needs you**, **PR ready**, **Running**, and
-**Done & idle** groups. The **PR ready** board column appears only when matching
-workspaces remain visible. In list view, **Status** groups workspace statuses in
-this order:
+view. **Activity** groups work as **Needs you**, **PR ready**, **Running**, and
+**Done & idle**. In apps that support the **Waiting** group, it follows **Running**
+and collects work waiting on external events or reminders you personally dismissed.
+Higher-priority attention and active work keep their groups. The **PR ready** board
+column appears only when matching workspaces remain visible. In list view, **Status**
+groups workspace statuses in this order:
 **Needs attention** (failed, blocked, or needing attention), **Not started**,
 **In progress**, **Waiting** (when a reminder is personally dismissed),
 **PR open**, **PR mergeable**, **PR queued**, **PR merged**, then **Done & idle**
