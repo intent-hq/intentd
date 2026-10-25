@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.45] - 2026-10-25
+
+### 🐛 Bug Fixes
+
+- *(notes)* Serialize metadata writes on the note write lane ([#2683](https://github.com/intent-hq/intentd/pull/2683))
+
+### 🧪 Testing
+
+- *(intent-services)* Give the 64-record quota controls a load-proof script budget ([#2669](https://github.com/intent-hq/intentd/pull/2669))
+
+
 ## [0.11.44] - 2026-10-25
 
 ### 🚀 Features
