@@ -29,6 +29,7 @@ mod note_line_attribution;
 mod note_paging_removal;
 mod note_search;
 mod pull_request_workspace;
+mod workspace_pr_settled;
 mod write_acquire_retry;
 
 #[tokio::test]

@@ -17861,6 +17861,7 @@ pub(crate) mod pr {
     mod accept_member;
     mod automatic_refresh;
     mod discovery_http;
+    mod idle_refresh;
 
     use std::path::PathBuf;
     use std::sync::Arc;
