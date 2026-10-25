@@ -62,51 +62,55 @@ pub(crate) type DisplayStatusCache = LastObservedCache<WorkspaceDisplayStatus>;
 /// Last-observed orthogonal `waiting` flag per workspace (PROTOCOL §5.1).
 pub(crate) type WaitingStatusCache = LastObservedCache<bool>;
 
-/// All `Workspace.scriptsRunning` (and, in `background_tasks`,
-/// `Workspace.backgroundTasksRunning`) recompute state, behind ONE `Arc` on
-/// `Services` (every extra `Services` field is copied into each future that
-/// captures a services clone, and deep agent-turn futures sit near the test
-/// thread's stack limit):
+/// All recompute state for the orthogonal in-memory running flags
+/// `Workspace.scriptsRunning` and `Workspace.backgroundTasksRunning`, behind
+/// ONE `Arc` on `Services` (every extra `Services` field is copied into each
+/// future that captures a services clone, and deep agent-turn futures sit
+/// near the test thread's stack limit):
 ///
-/// - `cache`: the last-observed value per workspace, the transition baseline
-///   for `workspace:scriptsRunning-changed`;
-/// - `locks`: the per-workspace ordering gate. The registry read, baseline
-///   record and publication run under it, so recomputes triggered by
-///   different scripts of one workspace (each holding only its own
-///   publication lock) cannot publish out of order. Different workspaces
-///   never contend;
-/// - `background_tasks`: the same baseline + gate pair for
-///   `Workspace.backgroundTasksRunning`, whose recomputes are spawned from
-///   the worker-snapshot publication and so can also race per workspace;
+/// - `scripts` / `background_tasks`: one [`RunningFlagGate`] per flag;
 /// - `park` (tests only): see [`ScriptsRunningPark`].
 #[derive(Default)]
 pub(crate) struct ScriptsRunningState {
-    cache: WaitingStatusCache,
-    locks: Mutex<HashMap<WorkspaceId, Arc<tokio::sync::Mutex<()>>>>,
+    scripts: RunningFlagGate,
     background_tasks: RunningFlagGate,
     #[cfg(test)]
     park: Mutex<Option<Arc<ScriptsRunningPark>>>,
 }
 
 impl ScriptsRunningState {
-    fn lock_for(&self, workspace_id: &WorkspaceId) -> Arc<tokio::sync::Mutex<()>> {
-        gate_for(&self.locks, workspace_id)
+    fn gate(&self, flag: RunningFlag) -> &RunningFlagGate {
+        match flag {
+            RunningFlag::Scripts => &self.scripts,
+            RunningFlag::BackgroundTasks => &self.background_tasks,
+        }
     }
 
-    /// Drop a deleted workspace's baselines and gates; a gate holder keeps
-    /// its own `Arc`.
+    /// Drop a deleted workspace's baselines and gates.
     fn evict(&self, workspace_id: &WorkspaceId) {
-        self.cache.evict(workspace_id);
-        self.locks
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(workspace_id);
+        self.scripts.evict(workspace_id);
         self.background_tasks.evict(workspace_id);
     }
 }
 
-/// Transition baseline plus per-workspace ordering gate for one orthogonal
-/// in-memory running flag (`Workspace.backgroundTasksRunning`).
+/// One orthogonal in-memory running flag (PROTOCOL §5.1).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RunningFlag {
+    /// `Workspace.scriptsRunning`: a command-mode script run in flight.
+    Scripts,
+    /// `Workspace.backgroundTasksRunning`: a §5.5b worker still running.
+    BackgroundTasks,
+}
+
+/// The state behind one [`RunningFlag`]:
+///
+/// - `cache`: the last-observed value per workspace, the transition baseline
+///   for the flag's change event;
+/// - `locks`: the per-workspace ordering gate. The live read, baseline
+///   record and publication run under it, so concurrent recomputes for one
+///   workspace (two scripts, each holding only its own publication lock, or
+///   recomputes spawned from successive worker snapshots) cannot publish out
+///   of order. Different workspaces never contend.
 #[derive(Default)]
 struct RunningFlagGate {
     cache: WaitingStatusCache,
@@ -115,9 +119,16 @@ struct RunningFlagGate {
 
 impl RunningFlagGate {
     fn lock_for(&self, workspace_id: &WorkspaceId) -> Arc<tokio::sync::Mutex<()>> {
-        gate_for(&self.locks, workspace_id)
+        self.locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(workspace_id.clone())
+            .or_default()
+            .clone()
     }
 
+    /// Drop a deleted workspace's baseline and gate; a gate holder keeps its
+    /// own `Arc`.
     fn evict(&self, workspace_id: &WorkspaceId) {
         self.cache.evict(workspace_id);
         self.locks
@@ -125,18 +136,6 @@ impl RunningFlagGate {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(workspace_id);
     }
-}
-
-fn gate_for(
-    locks: &Mutex<HashMap<WorkspaceId, Arc<tokio::sync::Mutex<()>>>>,
-    workspace_id: &WorkspaceId,
-) -> Arc<tokio::sync::Mutex<()>> {
-    locks
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .entry(workspace_id.clone())
-        .or_default()
-        .clone()
 }
 
 /// Test seam: parks the next `scriptsRunning` recompute that observed a
@@ -374,19 +373,10 @@ impl Services {
         // `scriptsRunning` reads the in-memory script registry directly (no
         // store I/O), so the served value is always live; the read also seeds
         // the `workspace:scriptsRunning-changed` baseline.
-        let scripts_generation = self.scripts_running_state.cache.generation();
-        ws.scripts_running = self.workspace_scripts_running(&ws.id);
-        self.scripts_running_state
-            .cache
-            .seed(&ws.id, ws.scripts_running, scripts_generation);
+        ws.scripts_running = self.seed_running_flag(&ws.id, RunningFlag::Scripts);
         // `backgroundTasksRunning` likewise reads the in-memory worker
         // projections (§5.5b) and seeds its own transition baseline.
-        let background = &self.scripts_running_state.background_tasks;
-        let background_generation = background.cache.generation();
-        ws.background_tasks_running = self.agent_workers().workspace_has_running_workers(&ws.id);
-        background
-            .cache
-            .seed(&ws.id, ws.background_tasks_running, background_generation);
+        ws.background_tasks_running = self.seed_running_flag(&ws.id, RunningFlag::BackgroundTasks);
         // Pre-read generation snapshot: a `workspace.delete` eviction racing
         // the awaits below must not have this seed resurrect the baseline.
         let generation = self.last_display_statuses.generation();
@@ -708,65 +698,37 @@ impl Services {
         }
     }
 
+    /// The live value of `flag` for `workspace_id`: one in-memory read, no
+    /// store I/O.
+    fn read_running_flag(&self, workspace_id: &WorkspaceId, flag: RunningFlag) -> bool {
+        match flag {
+            RunningFlag::Scripts => self.workspace_scripts_running(workspace_id),
+            RunningFlag::BackgroundTasks => self
+                .agent_workers()
+                .workspace_has_running_workers(workspace_id),
+        }
+    }
+
+    /// Read `flag` live for an emit-path enrichment and seed its transition
+    /// baseline (a seed never emits).
+    fn seed_running_flag(&self, workspace_id: &WorkspaceId, flag: RunningFlag) -> bool {
+        let cache = &self.scripts_running_state.gate(flag).cache;
+        let generation = cache.generation();
+        let running = self.read_running_flag(workspace_id, flag);
+        cache.seed(workspace_id, running, generation);
+        running
+    }
+
     /// Recompute `Workspace.scriptsRunning` and publish
     /// `workspace:scriptsRunning-changed` iff it transitioned (PROTOCOL §5.1 /
     /// §6.5). Called from the script lifecycle choke points (every
     /// `script:state` / `script:changed` publication and definition
-    /// removal). The derivation is one in-memory registry read; an unchanged
-    /// value returns before any store I/O. A missing baseline reads as
-    /// `false` — nothing runs before the daemon's first script start — so the
-    /// first run after a restart still emits. Best-effort like
-    /// [`Services::maybe_emit_waiting_changed`].
+    /// removal). A missing baseline reads as `false` — nothing runs before
+    /// the daemon's first script start — so the first run after a restart
+    /// still emits. Best-effort like [`Services::maybe_emit_waiting_changed`].
     pub(crate) async fn maybe_emit_scripts_running_changed(&self, workspace_id: &WorkspaceId) {
-        if workspace_id.is_chief() {
-            return;
-        }
-        // Callers hold only their own script's publication lock, so two
-        // scripts of one workspace can recompute concurrently. Serialize the
-        // read → record → publish sequence per workspace, and re-read the
-        // registry after the store await below, so a recompute that observed
-        // an older state can never publish (or record) it after a newer one.
-        let gate = self.scripts_running_state.lock_for(workspace_id);
-        let _serialized = gate.lock().await;
-        let generation = self.scripts_running_state.cache.generation();
-        let running = self.workspace_scripts_running(workspace_id);
-        if self
-            .scripts_running_state
-            .cache
-            .get(workspace_id)
-            .unwrap_or(false)
-            == running
-        {
-            self.scripts_running_state
-                .cache
-                .seed(workspace_id, running, generation);
-            return;
-        }
-        #[cfg(test)]
-        self.park_scripts_running_recompute().await;
-        // Deleted-workspace guard: never publish for (or seed a baseline of)
-        // a workspace whose row is gone.
-        if self.store.get_workspace(workspace_id).await.is_err() {
-            return;
-        }
-        let running = self.workspace_scripts_running(workspace_id);
-        self.scripts_running_state
-            .cache
-            .seed(workspace_id, false, generation);
-        let Some(transitioned) =
-            self.scripts_running_state
-                .cache
-                .record(workspace_id, running, generation)
-        else {
-            return;
-        };
-        if transitioned {
-            publish_event(
-                self.event_bus.as_ref(),
-                scripts_running_changed_event(workspace_id, running),
-            )
+        self.maybe_emit_running_flag_changed(workspace_id, RunningFlag::Scripts)
             .await;
-        }
     }
 
     /// Recompute `Workspace.backgroundTasksRunning` and publish
@@ -774,47 +736,56 @@ impl Services {
     /// (PROTOCOL §5.1 / §6.5). Called after every changed `WorkerSnapshot`
     /// publication ([`Services::publish_workers_snapshot`]: generation
     /// start, negotiation, session bind, accepted frame, disconnect and
-    /// release). The derivation is one in-memory projection read; an
-    /// unchanged value returns before any store I/O. A missing baseline
-    /// reads as `false` (no worker survives a daemon restart). Best-effort
-    /// like [`Services::maybe_emit_scripts_running_changed`], with the same
-    /// per-workspace ordering gate and post-await re-read.
+    /// release). A missing baseline reads as `false` (no worker survives a
+    /// daemon restart).
     pub(crate) async fn maybe_emit_background_tasks_running_changed(
         &self,
         workspace_id: &WorkspaceId,
     ) {
+        self.maybe_emit_running_flag_changed(workspace_id, RunningFlag::BackgroundTasks)
+            .await;
+    }
+
+    /// Shared recompute-and-compare for one [`RunningFlag`]. The derivation
+    /// is one in-memory read; an unchanged value returns before any store
+    /// I/O. Serialize the read → record → publish sequence per workspace,
+    /// and re-read after the store await below, so a recompute that observed
+    /// an older state can never publish (or record) it after a newer one.
+    async fn maybe_emit_running_flag_changed(&self, workspace_id: &WorkspaceId, flag: RunningFlag) {
         if workspace_id.is_chief() {
             return;
         }
-        let state = &self.scripts_running_state.background_tasks;
+        let state = self.scripts_running_state.gate(flag);
         let gate = state.lock_for(workspace_id);
         let _serialized = gate.lock().await;
         let generation = state.cache.generation();
-        let running = self
-            .agent_workers()
-            .workspace_has_running_workers(workspace_id);
+        let running = self.read_running_flag(workspace_id, flag);
         if state.cache.get(workspace_id).unwrap_or(false) == running {
             state.cache.seed(workspace_id, running, generation);
             return;
+        }
+        #[cfg(test)]
+        if flag == RunningFlag::Scripts {
+            self.park_scripts_running_recompute().await;
         }
         // Deleted-workspace guard: never publish for (or seed a baseline of)
         // a workspace whose row is gone.
         if self.store.get_workspace(workspace_id).await.is_err() {
             return;
         }
-        let running = self
-            .agent_workers()
-            .workspace_has_running_workers(workspace_id);
+        let running = self.read_running_flag(workspace_id, flag);
         state.cache.seed(workspace_id, false, generation);
         let Some(transitioned) = state.cache.record(workspace_id, running, generation) else {
             return;
         };
         if transitioned {
-            publish_event(
-                self.event_bus.as_ref(),
-                background_tasks_running_changed_event(workspace_id, running),
-            )
-            .await;
+            let event = match flag {
+                RunningFlag::Scripts => scripts_running_changed_event(workspace_id, running),
+                RunningFlag::BackgroundTasks => {
+                    background_tasks_running_changed_event(workspace_id, running)
+                }
+            };
+            publish_event(self.event_bus.as_ref(), event).await;
         }
     }
 
@@ -6104,18 +6075,26 @@ mod background_tasks_running_events {
         await_flag_events(&h, &[true]).await;
         assert!(served(&h).await, "background shell running");
 
-        // A second running row and a no-op recompute both stay silent.
+        // A second running row and a direct (awaited) recompute leave the
+        // flag raised and stay silent.
         ingest(&h, "gen-1", spawn("task-2"));
+        ingest(&h, "gen-1", ended("task-2", "completed"));
         h.services
             .maybe_emit_background_tasks_running_changed(&h.ws)
             .await;
-        ingest(&h, "gen-1", ended("task-2", "completed"));
-        tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(flag_events(&h).await, vec![true]);
         assert!(served(&h).await, "task-1 still runs");
 
+        // Every recompute reads the live projections under the per-workspace
+        // gate, so the ones spawned for task-2 can only observe `true`
+        // (before task-1 ends) or match the `false` baseline (after): the
+        // exact final sequence proves no spurious transition was published.
         ingest(&h, "gen-1", ended("task-1", "stopped"));
         await_flag_events(&h, &[true, false]).await;
+        h.services
+            .maybe_emit_background_tasks_running_changed(&h.ws)
+            .await;
+        assert_eq!(flag_events(&h).await, vec![true, false]);
         assert!(!served(&h).await, "every row ended");
     }
 
