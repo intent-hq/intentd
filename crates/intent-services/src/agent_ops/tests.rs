@@ -136,6 +136,7 @@ pub(super) fn workspace(id: &WorkspaceId) -> Workspace {
         context_links: None,
         archived: false,
         archived_at: None,
+        retired_at: None,
         task_stats: None,
         agent_summary: None,
         diff_summary: None,
@@ -17625,7 +17626,11 @@ async fn file_blocks_inline_data_rejected_on_every_seam() {
     // spec note and no `workspace:created` event is left behind (both the
     // top-level `initialAgent.fileBlocks` and its `metadata.fileBlocks`
     // mirror).
-    let workspaces_before = svc.list_workspaces(true).await.expect("list").len();
+    let workspaces_before = svc
+        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await
+        .expect("list")
+        .len();
     let notes_before = svc.store().list_all_notes().await.expect("notes").len();
     let created_events = || async {
         svc.store()
@@ -17665,7 +17670,10 @@ async fn file_blocks_inline_data_rejected_on_every_seam() {
         expect_rejected("workspace.create", err);
     }
     assert_eq!(
-        svc.list_workspaces(true).await.expect("list").len(),
+        svc.list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .expect("list")
+            .len(),
         workspaces_before,
         "workspace.create rejection must precede the workspace row"
     );
@@ -17929,7 +17937,11 @@ async fn workspace_create_rejects_every_invalid_input_before_side_effects() {
         ),
     ];
 
-    let workspaces_before = svc.list_workspaces(true).await.expect("list").len();
+    let workspaces_before = svc
+        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await
+        .expect("list")
+        .len();
     let notes_before = svc.store().list_all_notes().await.expect("notes").len();
     let created_events = || async {
         svc.store()
@@ -17967,7 +17979,10 @@ async fn workspace_create_rejects_every_invalid_input_before_side_effects() {
             "{name}: rejection must come from this arm's validator; got: {msg}"
         );
         assert_eq!(
-            svc.list_workspaces(true).await.expect("list").len(),
+            svc.list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+                .await
+                .expect("list")
+                .len(),
             workspaces_before,
             "{name}: workspace.create rejection must precede the workspace row"
         );
@@ -18268,7 +18283,11 @@ async fn specialist_acceptance_is_decided_by_the_plan_root_on_both_seams() {
 
     // `workspace.create` adopting root A: root A decides.
     let sessions_before = sessions().await;
-    let workspaces_before = svc.list_workspaces(true).await.expect("list").len();
+    let workspaces_before = svc
+        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await
+        .expect("list")
+        .len();
     let notes_before = svc.store().list_all_notes().await.expect("notes").len();
     let created_events = || async {
         svc.store()
@@ -18299,7 +18318,10 @@ async fn specialist_acceptance_is_decided_by_the_plan_root_on_both_seams() {
         "rejection must persist no session"
     );
     assert_eq!(
-        svc.list_workspaces(true).await.expect("list").len(),
+        svc.list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .expect("list")
+            .len(),
         workspaces_before,
         "rejection must precede the workspace row"
     );
@@ -32788,6 +32810,64 @@ async fn agent_update_name_only_emits_agent_renamed() {
         .expect("agent:renamed in batch");
     assert_eq!(renamed.data["name"], "NewName");
     assert_eq!(renamed.data["nameExplicitlySet"], json!(true));
+}
+
+/// An `agent:updated` carrying `name` also carries the session's persisted
+/// `nameExplicitlySet` after the write (§6.5), overriding any request-echoed
+/// value: a mixed update reports `true`, and `{ name, nameExplicitlySet }`
+/// reports the stored flag in either key order.
+#[tokio::test]
+async fn agent_update_with_name_reports_persisted_name_explicitly_set() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let cases = [
+        json!({ "name": "Mixed", "systemPrompt": "be brief" }),
+        serde_json::from_str::<serde_json::Value>(
+            r#"{ "nameExplicitlySet": false, "name": "FlagFirst" }"#,
+        )
+        .unwrap(),
+        serde_json::from_str::<serde_json::Value>(
+            r#"{ "name": "NameFirst", "nameExplicitlySet": false }"#,
+        )
+        .unwrap(),
+    ];
+    for (changes, stored) in cases.into_iter().zip([true, true, false]) {
+        let id = create_agent(&svc, &ws, "Before").await;
+        let mut sub = bus.subscribe(SubscriptionFilter {
+            event_types: vec![AGENT_UPDATED.to_string()],
+            ..Default::default()
+        });
+        svc.agent_update_op(id.clone(), changes.clone())
+            .await
+            .expect("update");
+        let session = svc.agent_get_session_op(id.clone()).await.expect("get");
+        // Pins today's store semantics: the last of `name` (sets `true`) and
+        // `nameExplicitlySet` in request order wins.
+        assert_eq!(
+            session.name_explicitly_set, stored,
+            "stored flag for {changes}"
+        );
+        let batch = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("recv")
+        .expect("open");
+        let updated = batch
+            .iter()
+            .find(|e| {
+                e.event_type == AGENT_UPDATED
+                    && e.data["agentId"] == json!(id.0)
+                    && e.data.get("name").is_some()
+            })
+            .expect("agent:updated in batch");
+        assert_eq!(updated.data["name"], json!(session.name), "{changes}");
+        assert_eq!(
+            updated.data["nameExplicitlySet"],
+            json!(session.name_explicitly_set),
+            "event flag must equal the persisted flag for {changes}"
+        );
+    }
 }
 
 /// `agent.update` runs the same registry validation on the `imageBlocks`
@@ -48224,7 +48304,11 @@ async fn wire_agent_wake_or_create_rejects_compound_model() {
 #[intent_test_macros::daemon_test]
 async fn wire_create_workspace_rejects_compound_initial_agent_model() {
     let (_t, svc, _ws) = setup().await;
-    let before = svc.list_workspaces(true).await.expect("list").len();
+    let before = svc
+        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await
+        .expect("list")
+        .len();
     for bad in ["mock:default", ":default"] {
         let err = WorkspaceApi::create_workspace(
             &svc,
@@ -48242,7 +48326,11 @@ async fn wire_create_workspace_rejects_compound_initial_agent_model() {
         .expect_err("compound initialAgent.model must reject");
         assert_compound_model_rejection(err, "initialAgent.model");
     }
-    let after = svc.list_workspaces(true).await.expect("list").len();
+    let after = svc
+        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await
+        .expect("list")
+        .len();
     assert_eq!(after, before, "rejection must precede any side effect");
 }
 
@@ -49456,7 +49544,15 @@ async fn task_push_assignment_cleanup_publishes_complete_metadata() {
     let stale = AgentId::from("stale-assignment");
     let mut note = svc.store().get_note(&ws, &note_id).await.unwrap();
     note.metadata.task.as_mut().unwrap().assigned_agent_ids = vec![stale.clone()];
-    svc.store().update_note_metadata(&note).await.unwrap();
+    svc.store()
+        .update_note_metadata(
+            &svc.store()
+                .lock_note_content(&note.workspace_id, &note.id)
+                .await,
+            &note,
+        )
+        .await
+        .unwrap();
     let bus = EventBus::new(svc.store().clone());
     let svc = svc.with_event_bus(bus.clone());
     svc.remove_agent_ids_from_workspace_tasks(&ws, &[stale])

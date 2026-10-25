@@ -100,10 +100,15 @@ pub(crate) struct NoteSubscribeParams {
 }
 
 /// Parsed `workspace.subscribe` params (§6.1). The workspace channel is global
-/// (per-user, no `workspaceId` scope); only `replaceGroup` is honored.
+/// (per-user, no `workspaceId` scope); `replaceGroup` and `includeRetired`
+/// are honored.
 #[derive(Debug)]
 pub(crate) struct WorkspaceSubscribeParams {
     pub replace_group: Option<String>,
+    /// `includeRetired` (default `false`): retired workspaces appear in the
+    /// seq-0 snapshot and deltas only when the subscriber opts in; without
+    /// it a retire transition is delivered as a `removedIds` removal.
+    pub include_retired: bool,
 }
 
 /// Parsed `comment.subscribe` params (§6.1). The comment channel is per-resource:
@@ -283,13 +288,20 @@ pub(crate) fn parse_note_subscribe_params(
 }
 
 /// Validate `workspace.subscribe` params. The channel is global, so only the
-/// optional `replaceGroup` is read (§6.2).
-#[expect(clippy::unnecessary_wraps)] // params parser; keeps the uniform Result shape of its siblings
+/// optional `replaceGroup` and `includeRetired` (strict boolean: only
+/// omission means `false`; `null` or any non-boolean is `-32602`) are read
+/// (§6.2).
 pub(crate) fn parse_workspace_subscribe_params(
     params: &Map<String, Value>,
 ) -> Result<WorkspaceSubscribeParams, String> {
+    let include_retired = match params.get("includeRetired") {
+        None => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return Err("includeRetired must be a boolean".to_string()),
+    };
     Ok(WorkspaceSubscribeParams {
         replace_group: replace_group(params),
+        include_retired,
     })
 }
 
@@ -933,10 +945,10 @@ pub(crate) async fn channel_snapshot(
         // Lite list: cheap status aggregates (taskStats/displayStatus/
         // cowSupported) only — no notes/sessions enrichment. Full list was
         // multi-MB.
-        Channel::Workspace => match api.list_workspaces_lite(true).await {
-            Ok(workspaces) => serde_json::to_value(workspaces).unwrap_or_else(|_| empty()),
-            Err(_) => empty(),
-        },
+        // Retired workspaces are opt-in: the generic path never includes
+        // them; `workspace.subscribe { includeRetired: true }` routes
+        // through [`workspace_snapshot`] directly.
+        Channel::Workspace => workspace_snapshot(api, false).await,
         Channel::Comment => match note_id {
             Some(note_id) => match api
                 .comment_list(
@@ -960,6 +972,20 @@ pub(crate) async fn channel_snapshot(
         // note-presence channel's snapshot is the join's return value
         // (`note_presence_join`, served by `forward_note_presence_subscription`).
         Channel::Chat | Channel::NotePresence | Channel::PresenceFocus => empty(),
+    }
+}
+
+/// The `workspace` channel's seq-0 snapshot: the lite list with archived
+/// rows (clients filter by `status`, intent-hq/monorepo#775) and retired rows
+/// only when the subscriber passed `includeRetired: true`. On a read error
+/// the snapshot degrades to the empty array.
+pub(crate) async fn workspace_snapshot(api: &dyn WorkspaceApi, include_retired: bool) -> Value {
+    let filter = intent_core::WorkspaceListFilter::new(true, include_retired);
+    match api.list_workspaces_lite(filter).await {
+        Ok(workspaces) => {
+            serde_json::to_value(workspaces).unwrap_or_else(|_| Value::Array(Vec::new()))
+        }
+        Err(_) => Value::Array(Vec::new()),
     }
 }
 
@@ -2109,7 +2135,7 @@ pub(crate) async fn channel_delta(
         // The workspace channel's tombstone scoping is stateful (the
         // forwarder threads the subscriber's visible-id set); this generic
         // arm is the unscoped administrator form.
-        Channel::Workspace => workspace_delta(api, event, None).await,
+        Channel::Workspace => workspace_delta(api, event, None, false).await,
         Channel::Comment => comment_delta(api, workspace_id, note_id?, event).await,
         // The task channel uses the stateful [`task_delta`] mapper directly in
         // the forwarder: it tracks the spec's task-link set across deltas so a
@@ -2415,10 +2441,17 @@ pub(crate) fn visible_workspace_ids(snapshot: &Value) -> HashSet<String> {
 /// succeeds for a previously invisible workspace: it upserts as an
 /// `updated` delta (the channel's documented upsert semantics), which is
 /// how a connected guest's list gains the workspace without a reconnect.
+///
+/// Retired workspaces are opt-in (`include_retired`, from
+/// `workspace.subscribe { includeRetired }`): for a subscriber that did not
+/// opt in, a re-read that finds the workspace `Retired` is delivered as a
+/// `removedIds` removal (retire = removal for them), and no later event
+/// re-adds it.
 pub(crate) async fn workspace_delta(
     api: &dyn WorkspaceApi,
     event: &Event,
     visible: Option<&mut HashSet<String>>,
+    include_retired: bool,
 ) -> Option<Value> {
     let workspace_id = WorkspaceId::from(
         event
@@ -2441,6 +2474,9 @@ pub(crate) async fn workspace_delta(
         }
         WORKSPACE_CREATED => {
             let ws = api.get_workspace(workspace_id.clone()).await.ok()?;
+            if ws.is_retired() && !include_retired {
+                return None;
+            }
             if let Some(visible) = visible {
                 visible.insert(workspace_id.as_str().to_string());
             }
@@ -2486,6 +2522,18 @@ pub(crate) async fn workspace_delta(
                 return Some(json!({ "removedIds": [workspace_id.as_str()] }));
             }
             let ws = api.get_workspace(workspace_id.clone()).await.ok()?;
+            if ws.is_retired() && !include_retired {
+                // Retire = removal for a subscriber that did not opt in. A
+                // non-administrator only gets the tombstone for a workspace
+                // it was shown; the administrator path emits it like
+                // `workspace:deleted` does.
+                if let Some(visible) = visible {
+                    if !visible.remove(workspace_id.as_str()) {
+                        return None;
+                    }
+                }
+                return Some(json!({ "removedIds": [workspace_id.as_str()] }));
+            }
             if let Some(visible) = visible {
                 visible.insert(workspace_id.as_str().to_string());
             }

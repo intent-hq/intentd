@@ -744,6 +744,48 @@ impl Services {
         }
     }
 
+    /// Refuse an upload continuation that writes (`chunk` / `commit`) when
+    /// the upload's workspace is retired (PROTOCOL §5.1 "Read-only while
+    /// retired"): the RPC gate cannot resolve an `uploadId`-only call to its
+    /// workspace, so the session's workspace is checked here. An unknown
+    /// upload id is left to the caller's own lookup.
+    pub(crate) async fn refuse_upload_if_retired(&self, upload_id: &str) -> Result<()> {
+        let workspace_id = self
+            .attachment_uploads
+            .lock()
+            .expect("attachment upload registry poisoned")
+            .get(upload_id)
+            .map(|s| s.workspace_id.clone());
+        match workspace_id {
+            Some(workspace_id) => self.refuse_if_retired(&workspace_id).await,
+            None => Ok(()),
+        }
+    }
+
+    /// Drop every in-flight upload session of `workspace_id` and delete its
+    /// staging directory (`workspace.retire`): a retired workspace accepts
+    /// no further chunks or commits. A session mid-commit is dropped too;
+    /// its commit re-checks the retired state before placing anything.
+    pub(crate) async fn abort_workspace_attachment_uploads(&self, workspace_id: &WorkspaceId) {
+        let dirs: Vec<PathBuf> = {
+            let mut uploads = self
+                .attachment_uploads
+                .lock()
+                .expect("attachment upload registry poisoned");
+            let ids: Vec<String> = uploads
+                .iter()
+                .filter(|(_, s)| &s.workspace_id == workspace_id)
+                .map(|(id, _)| id.clone())
+                .collect();
+            ids.iter()
+                .filter_map(|id| uploads.remove(id).map(|s| s.staging_dir))
+                .collect()
+        };
+        for dir in dirs {
+            let _ = tokio::fs::remove_dir_all(&dir).await;
+        }
+    }
+
     /// `file.attachmentUpload.chunk`: stage one seq-numbered slice of the
     /// payload. `data` is base64; the decoded slice is written to its own
     /// `chunk-<seq>` file, so retrying a seq is idempotent (same bytes land
@@ -1001,6 +1043,13 @@ impl Services {
             )),
             sha256: Some(declared_sha.clone()),
         });
+        // A retire that landed while the payload was assembling: the
+        // folder is gone, so nothing may be placed into it. The archive
+        // fence (held by retire from its row flip through the folder sweep)
+        // spans the check AND the placement, so a retire cannot start
+        // between them and the placement can never recreate a swept folder.
+        let fence = self.archive_fence.acquire(&workspace_id).await;
+        self.refuse_if_retired(&workspace_id).await?;
         let result = self
             .place_attachment_registered(
                 workspace_id.clone(),
@@ -1020,6 +1069,7 @@ impl Services {
                 );
                 e
             })?;
+        drop(fence);
 
         // Session retired; staging deleted.
         self.attachment_uploads

@@ -4,7 +4,6 @@
 //! written, snapshotted, or bundled here (the export archive itself is built
 //! by the transfer orchestrator, a separate surface).
 
-use std::any::Any;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -26,7 +25,7 @@ use intent_services::feature_api::feature_ports::TransferPort;
 use intent_services::feature_api::{file_ops, git_ops, Services};
 
 /// The in-crate [`TransferPort`] implementation: owns every in-flight
-/// transfer session. One instance is registered by [`Services::new`] and
+/// transfer session. One instance is registered by [`crate::register`] and
 /// shared by all `Services` clones, so chunks arriving over any connection
 /// reach the same session.
 #[derive(Default)]
@@ -62,18 +61,12 @@ pub(crate) trait TransferStateExt {
 impl TransferStateExt for Services {
     /// The registered transfer feature and its session state.
     fn transfer_state(&self) -> &TransferFeature {
-        self.feature_transfer_port()
-            .as_any()
-            .downcast_ref::<TransferFeature>()
+        self.feature::<TransferFeature>()
             .expect("the in-crate transfer feature is registered")
     }
 }
 
 impl TransferPort for TransferFeature {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn transfer_plan<'a>(
         &'a self,
         svc: &'a Services,

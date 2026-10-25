@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """Offline metadata classifier regressions using real git diffs."""
+import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -15,6 +17,10 @@ class Fixture(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.repo = Path(tmp.name)
         self.git('init', '-q')
+        # No background maintenance: git >= 2.47 detaches it after commit and
+        # fetch, and it races TemporaryDirectory.cleanup on .git/objects.
+        for key, value in [('maintenance.auto', 'false'), ('gc.auto', '0'), ('fetch.writeCommitGraph', 'false')]:
+            self.git('config', key, value)
         self.git('config', 'user.name', 'Fixture')
         self.git('config', 'user.email', 'fixture@example.invalid')
         self.write('Cargo.toml', '[workspace]\nmembers = ["crates/*"]\n')
@@ -177,6 +183,35 @@ class MetadataTests(Fixture):
     def test_notes_only_rejected(self):
         self.write('CHANGELOG.md', 'Notes\n')
         self.classify(False)
+
+
+class FixtureHygieneTests(Fixture):
+    def test_git_never_spawns_background_maintenance(self):
+        # git >= 2.47 detaches `maintenance run --auto` after commit/fetch; it
+        # kept writing .git/objects while TemporaryDirectory.cleanup ran,
+        # failing CI with "Directory not empty: 'objects'". Force every
+        # maintenance task due via a global config so only the fixture's
+        # repo-local settings can keep git from spawning it.
+        tmp = tempfile.TemporaryDirectory(prefix='release-metadata-trace-')
+        self.addCleanup(tmp.cleanup)
+        scratch = Path(tmp.name)
+        (scratch / 'gitconfig').write_text(
+            '[gc]\n\tauto = 1\n'
+            '[maintenance "geometric-repack"]\n\tauto = -1\n'
+            '[maintenance "commit-graph"]\n\tauto = -1\n'
+            '[fetch]\n\twriteCommitGraph = true\n')
+        trace = scratch / 'trace.json'
+        env = {**os.environ, 'GIT_CONFIG_GLOBAL': str(scratch / 'gitconfig'), 'GIT_TRACE2_EVENT': str(trace)}
+        for key in [k for k in env if k.startswith('GIT_CONFIG_') and k != 'GIT_CONFIG_GLOBAL']:
+            env.pop(key)
+        self.write('CHANGELOG.md', '# Changelog\nMore\n')
+        self.git('remote', 'add', 'origin', str(self.repo))
+        for args in (['commit', '-qam', 'more'], ['fetch', '-q', '--no-tags', 'origin', 'HEAD'], ['gc', '--auto']):
+            subprocess.run(['git', *args], cwd=self.repo, env=env, check=True, capture_output=True)
+        spawned = [event['argv'] for event in map(json.loads, trace.read_text().splitlines())
+                   if event.get('event') == 'child_start' and 'argv' in event]
+        background = [argv for argv in spawned if {'maintenance', 'gc', 'commit-graph', 'repack'} & set(argv)]
+        self.assertEqual(background, [])
 
 
 if __name__ == '__main__':

@@ -14038,6 +14038,7 @@ fn fixture_workspace(id: &WorkspaceId) -> Workspace {
         context_links: None,
         archived: false,
         archived_at: None,
+        retired_at: None,
         task_stats: None,
         agent_summary: None,
         diff_summary: None,
@@ -23627,7 +23628,15 @@ async fn wss_explicit_blocker_recovery_scope_generation_and_task_states() {
             .await
             .unwrap();
         note.metadata.task.as_mut().unwrap().assigned_agent_ids = vec![agent.clone()];
-        srv.store.update_note_metadata(&note).await.unwrap();
+        srv.store
+            .update_note_metadata(
+                &srv.store
+                    .lock_note_content(&note.workspace_id, &note.id)
+                    .await,
+                &note,
+            )
+            .await
+            .unwrap();
         let mut session = srv.store.get_agent_session(&agent).await.unwrap();
         session.task_note_id = Some(intent_core::NoteId(note_id.into()));
         srv.store.update_agent_session(&ws, &session).await.unwrap();
@@ -23718,7 +23727,15 @@ async fn wss_explicit_blocker_recovery_relink_rejects_prepared_task_write() {
         assert!(marked.get("error").is_none(), "{marked}");
         let mut task = srv.store.get_note(&ws, &note).await.unwrap();
         task.metadata.task.as_mut().unwrap().assigned_agent_ids = vec![agent.clone()];
-        srv.store.update_note_metadata(&task).await.unwrap();
+        srv.store
+            .update_note_metadata(
+                &srv.store
+                    .lock_note_content(&task.workspace_id, &task.id)
+                    .await,
+                &task,
+            )
+            .await
+            .unwrap();
         notes.push(note);
     }
     let old = &notes[0];
@@ -23783,7 +23800,14 @@ async fn wss_explicit_blocker_recovery_relink_rejects_prepared_task_write() {
     );
     let rejected = srv
         .store
-        .update_note_metadata_if_agent_linked(&prepared, before_note.rev, &agent)
+        .update_note_metadata_if_agent_linked(
+            &srv.store
+                .lock_note_content(&prepared.workspace_id, &prepared.id)
+                .await,
+            &prepared,
+            before_note.rev,
+            &agent,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -23825,13 +23849,27 @@ async fn wss_explicit_blocker_recovery_relink_rejects_prepared_task_write() {
     valid.metadata.task.as_mut().unwrap().status = intent_core::TaskStatus::InProgress;
     let accepted = srv
         .store
-        .update_note_metadata_if_agent_linked(&valid, current.rev, &agent)
+        .update_note_metadata_if_agent_linked(
+            &srv.store
+                .lock_note_content(&valid.workspace_id, &valid.id)
+                .await,
+            &valid,
+            current.rev,
+            &agent,
+        )
         .await
         .unwrap();
     assert_eq!(accepted, Some(current.rev + 1));
     assert_eq!(
         srv.store
-            .update_note_metadata_if_agent_linked(&current, current.rev, &agent)
+            .update_note_metadata_if_agent_linked(
+                &srv.store
+                    .lock_note_content(&current.workspace_id, &current.id)
+                    .await,
+                &current,
+                current.rev,
+                &agent
+            )
             .await
             .unwrap(),
         None

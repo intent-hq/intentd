@@ -6841,6 +6841,7 @@ mod _dead_workspace_metadata_tool_tests {
                 pull_requests: None,
                 archived: false,
                 archived_at: None,
+                retired_at: None,
                 task_stats: None,
                 agent_summary: None,
                 diff_summary: None,
@@ -7140,6 +7141,7 @@ mod workspace_api_tool_tests {
                 context_links: None,
                 archived: false,
                 archived_at: None,
+                retired_at: None,
                 task_stats: None,
                 agent_summary: None,
                 diff_summary: None,
@@ -9997,6 +9999,7 @@ mod wsapi6_bindings_tests {
     struct FakeApi {
         pr_snapshot_calls: Mutex<Vec<PrSnapshotCall>>,
         cross_list_siblings_calls: Mutex<u32>,
+        cross_list_siblings_include_retired: Mutex<Vec<bool>>,
         cross_read_note_calls: Mutex<Vec<CrossReadCall>>,
         cross_list_notes_calls: Mutex<Vec<String>>,
         browser_exec_calls: Mutex<Vec<BrowserExecCall>>,
@@ -10047,8 +10050,16 @@ mod wsapi6_bindings_tests {
             })
         }
 
-        fn cross_workspace_list_siblings(&self, _ws: WorkspaceId) -> BoxFuture<'_, Result<Value>> {
+        fn cross_workspace_list_siblings(
+            &self,
+            _ws: WorkspaceId,
+            include_retired: bool,
+        ) -> BoxFuture<'_, Result<Value>> {
             *self.cross_list_siblings_calls.lock().unwrap() += 1;
+            self.cross_list_siblings_include_retired
+                .lock()
+                .unwrap()
+                .push(include_retired);
             Box::pin(async {
                 Ok(json!([
                     { "id": "sibling-1", "title": "Sib One", "branch": "b/1", "status": "active" },
@@ -10192,6 +10203,56 @@ mod wsapi6_bindings_tests {
         assert!(v.is_array());
         assert_eq!(v[0]["id"], json!("sibling-1"));
         assert_eq!(*api.cross_list_siblings_calls.lock().unwrap(), 1);
+    }
+
+    /// `includeRetired` is strictly boolean: omission and explicit `false`
+    /// list live siblings, `true` opts in, and any other value (`"true"`,
+    /// `null`, a number, an object) is an invalid-params error that never
+    /// reaches the service.
+    #[tokio::test]
+    async fn cross_workspace_list_siblings_rejects_a_non_boolean_include_retired() {
+        let (srv, api) = server();
+        for (arg, want) in [
+            ("", false),
+            ("{ includeRetired: false }", false),
+            ("{ includeRetired: true }", true),
+        ] {
+            let resp = call(
+                &srv,
+                &format!("return await ws.crossWorkspace.listSiblings({arg});"),
+            )
+            .await;
+            assert_eq!(resp["result"]["isError"], json!(false), "{arg}: {resp}");
+            assert_eq!(
+                api.cross_list_siblings_include_retired
+                    .lock()
+                    .unwrap()
+                    .last(),
+                Some(&want),
+                "{arg}"
+            );
+        }
+        for bad in ["'true'", "null", "1", "{}"] {
+            let resp = call(
+                &srv,
+                &format!(
+                    "return await ws.crossWorkspace.listSiblings({{ includeRetired: {bad} }});"
+                ),
+            )
+            .await;
+            let text = resp.to_string();
+            assert_eq!(resp["result"]["isError"], json!(true), "{bad}: {text}");
+            assert!(
+                text.contains("includeRetired must be a boolean")
+                    || text.contains("`includeRetired` must be a boolean"),
+                "{bad}: {text}"
+            );
+        }
+        assert_eq!(
+            *api.cross_list_siblings_calls.lock().unwrap(),
+            3,
+            "bad values never reach the api"
+        );
     }
 
     #[tokio::test]
@@ -13833,6 +13894,7 @@ mod workspace_api_output_limit_tests {
                     context_links: None,
                     archived: false,
                     archived_at: None,
+                    retired_at: None,
                     task_stats: None,
                     agent_summary: None,
                     diff_summary: None,
@@ -14162,6 +14224,7 @@ mod workspace_apply_proposal_tests {
             context_links: None,
             archived: false,
             archived_at: None,
+            retired_at: None,
             task_stats: None,
             agent_summary: None,
             diff_summary: None,
