@@ -3932,13 +3932,11 @@ esac
             command.env(intentd_sitter::startup::STARTING_ENV, "1");
         }
         let mut owner = spawn_guarded(&mut command);
-        wait_until("owned daemon", Duration::from_secs(10), || {
-            dir.path().join("owned-daemon").exists()
-        });
-        let daemon_pid = read_or_empty(&dir.path().join("owned-daemon"))
-            .trim()
-            .parse()
-            .unwrap();
+        let daemon_pid = wait_for_recorded_pid(
+            "owned daemon",
+            Duration::from_secs(10),
+            &dir.path().join("owned-daemon"),
+        );
         let out = background_call(dir.path(), &base, &["stop"]);
         assert!(out.status.success(), "{out:?}");
         assert!(owner.wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(1))).unwrap().unwrap().success(),
@@ -3960,8 +3958,10 @@ fn background_start_stop_reports_supervisor_crash_with_live_daemon() {
         r#"#!/bin/sh
 case "$1" in
 serve)
-  echo "$$" > "$INTENTD_DATA_DIR/owned-daemon"
+  # The record is the readiness signal the test stops on, so arm the trap
+  # first: a forwarded stop must never land before it exists.
   trap 'echo stopping > "$INTENTD_DATA_DIR/stop-seen"' TERM
+  echo "$$" > "$INTENTD_DATA_DIR/owned-daemon"
   # // timing-guard: fixture remains alive after TERM until its owned group is killed
   while :; do sleep 0.05; done
   ;;
@@ -3975,13 +3975,11 @@ esac
             .env(KILL_TIMEOUT_ENV, "30000")
             .arg("serve"),
     );
-    wait_until("owned daemon", Duration::from_secs(10), || {
-        dir.path().join("owned-daemon").exists()
-    });
-    let daemon_pid = read_or_empty(&dir.path().join("owned-daemon"))
-        .trim()
-        .parse()
-        .unwrap();
+    let daemon_pid = wait_for_recorded_pid(
+        "owned daemon",
+        Duration::from_secs(10),
+        &dir.path().join("owned-daemon"),
+    );
     let mut stop = spawn_guarded(
         sitter_command(dir.path(), &base)
             .env(KILL_TIMEOUT_ENV, "500")
@@ -4152,7 +4150,8 @@ fn background_start_detaches_preserves_options_and_supports_restart_stop() {
         .status
         .success());
     wait_until("replacement daemon", Duration::from_secs(5), || {
-        fs::read_to_string(dir.path().join("daemon-pid")).is_ok_and(|pid| pid != first)
+        recorded_pid(&dir.path().join("daemon-pid"))
+            .is_some_and(|pid| pid.to_string() != first.trim())
             && dir.path().join("ready").exists()
     });
     assert_eq!(
@@ -4299,6 +4298,18 @@ fn scaled_ms(ms: u64) -> String {
 /// written (a kill can land between the shell truncating and writing it).
 fn recorded_pid(path: &Path) -> Option<u32> {
     fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// Wait for a fake daemon's PID record and return the PID that was read.
+/// Waiting for the file to exist is not enough: `>` truncates before it
+/// writes, so an existing record can still be empty.
+fn wait_for_recorded_pid(what: &str, timeout: Duration, path: &Path) -> u32 {
+    let mut pid = None;
+    wait_until(what, timeout, || {
+        pid = recorded_pid(path);
+        pid.is_some()
+    });
+    pid.expect("wait_until returns only once the record parsed")
 }
 
 /// Whether `pid` has exited. An unreaped zombie still answers signal 0, so
@@ -4487,17 +4498,13 @@ fn supervisor_death_during_startup(ready: bool) {
         .env(intentd_sitter::readiness::TIMEOUT_ENV, "5000")
         .env(KILL_TIMEOUT_ENV, "100");
     let mut caller = spawn_guarded(&mut command);
-    wait_until("owned daemon launch", Duration::from_secs(5), || {
-        dir.path().join("daemon-pid").exists()
-    });
-    caller.signal(Signal::SIGSTOP).unwrap();
-    let daemon = Pid::from_raw(
-        fs::read_to_string(dir.path().join("daemon-pid"))
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap(),
+    let daemon = wait_for_recorded_pid(
+        "owned daemon launch",
+        Duration::from_secs(5),
+        &dir.path().join("daemon-pid"),
     );
+    caller.signal(Signal::SIGSTOP).unwrap();
+    let daemon = Pid::from_raw(daemon.cast_signed());
     let supervisor = intentd_sitter::supervisor::read_live_pid(&fixture.paths.pid_path).unwrap();
     kill(supervisor, Signal::SIGKILL).unwrap();
     wait_until("orphan adoption", Duration::from_secs(5), || {
