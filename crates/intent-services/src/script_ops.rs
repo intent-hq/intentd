@@ -226,6 +226,13 @@ pub(crate) struct ScriptLocks {
     /// Workspaces being deleted: launch admission, service auto-restart and
     /// output logs are refused until the deletion finishes or fails.
     closing: Arc<Mutex<HashSet<WorkspaceId>>>,
+    /// Per-workspace `script.create` admission: creates hold it shared from
+    /// before their retired/closing check until their definition is
+    /// committed; [`ScriptManager::close_workspace`] takes it exclusively
+    /// right after setting the closing mark, so a create admitted earlier is
+    /// committed (and in the registry snapshot) before the close proceeds,
+    /// and a later one sees the mark.
+    create_admission: Arc<Mutex<HashMap<WorkspaceId, Arc<tokio::sync::RwLock<()>>>>>,
     /// When the most recent command run settled, registry-wide: kept here
     /// rather than on the entry so removing or recreating a finished script
     /// cannot erase it (and so skip the idle update grace).
@@ -241,6 +248,15 @@ impl ScriptLocks {
     /// Whether `workspace_id` is being deleted.
     pub(crate) fn is_closing(&self, workspace_id: &WorkspaceId) -> bool {
         self.closing.lock().unwrap().contains(workspace_id)
+    }
+
+    fn create_admission(&self, workspace_id: &WorkspaceId) -> Arc<tokio::sync::RwLock<()>> {
+        self.create_admission
+            .lock()
+            .unwrap()
+            .entry(workspace_id.clone())
+            .or_default()
+            .clone()
     }
 
     fn set_closing(&self, workspace_id: &WorkspaceId, closing: bool) {
@@ -381,6 +397,9 @@ pub(crate) struct ScriptParks {
     /// Parks workspace deletion after its scripts stop, before the output
     /// folder is deleted.
     pub(crate) workspace_closed: Option<Arc<SupervisePark>>,
+    /// Parks `script.create` after its retired/closing checks, before it
+    /// persists the definition.
+    pub(crate) create_admitted: Option<Arc<SupervisePark>>,
 }
 
 /// Holds a workspace's closing mark (see [`ScriptManager::close_workspace`]);
@@ -389,6 +408,17 @@ pub(crate) struct ScriptParks {
 pub(crate) struct WorkspaceClosing {
     locks: ScriptLocks,
     workspace_id: WorkspaceId,
+    /// Scripts still live or holding an unsettled admitted run after the
+    /// close's stop attempt (a failed stop, or a result that could not be
+    /// persisted).
+    unsettled: Vec<String>,
+}
+
+impl WorkspaceClosing {
+    /// Script ids the close could not fully stop and settle.
+    pub(crate) fn unsettled(&self) -> &[String] {
+        &self.unsettled
+    }
 }
 
 impl Drop for WorkspaceClosing {
@@ -559,6 +589,35 @@ impl ScriptManager {
         Ok(())
     }
 
+    /// Caller holds the definition lock, before any durable write: a
+    /// mutation that passed the front-door retired gate while the workspace
+    /// was still Archived can resume after `workspace.retire` returned and
+    /// dropped its closing mark. Retire flips the row while holding that
+    /// mark, so this re-read refuses it with `workspace-retired` and nothing
+    /// is restored, settled, stopped or persisted (PROTOCOL §5.1 "Read-only
+    /// while retired").
+    pub(super) async fn refuse_if_retired_locked(&self, ws: &WorkspaceId) -> Result<()> {
+        if self
+            .store
+            .get_workspace(ws)
+            .await
+            .is_ok_and(|row| row.is_retired())
+        {
+            return Err(crate::retire::retired_error(ws));
+        }
+        Ok(())
+    }
+
+    /// [`Self::refuse_if_retired_locked`] for launches, which are also
+    /// refused while the workspace is closing (deletion, or a retire still
+    /// tearing down before its row flip).
+    pub(super) async fn require_launch_open_locked(&self, ws: &WorkspaceId) -> Result<()> {
+        if self.locks.is_closing(ws) {
+            return Err(Error::NotFound(format!("workspace {ws}")));
+        }
+        self.refuse_if_retired_locked(ws).await
+    }
+
     /// Full-authority runtime reads keep their existing nonblocking behavior.
     /// Restricted guest reads fence replacement while capturing their response.
     pub(crate) async fn scoped_read_guard(
@@ -625,8 +684,15 @@ impl ScriptManager {
         // lock is shared by scoped and owner/internal calls, so a later
         // successful update cannot be overwritten only in the live registry
         // while this call awaits its predecessor's supervisor.
+        let admission = self.locks.create_admission(&workspace_id);
+        let _admitted = admission.read().await;
         let lock = self.locks.definition_lock(&id);
         let _guard = lock.lock().await;
+        self.require_launch_open_locked(&workspace_id).await?;
+        if let Some(park) = &self.parks.create_admitted {
+            park.entered.notify_one();
+            park.release.notified().await;
+        }
         if scoped
             && self
                 .store
@@ -1421,6 +1487,7 @@ impl ScriptManager {
     ) -> Result<Value> {
         let lock = self.locks.definition_lock(script_id);
         let _guard = lock.lock().await;
+        self.refuse_if_retired_locked(workspace_id).await?;
         if scoped && self.store.script_workspace(script_id).await?.as_ref() != Some(workspace_id) {
             return Err(Error::NotFound(format!("script {script_id}")));
         }
@@ -1525,10 +1592,14 @@ impl ScriptManager {
     /// stop. The mark lasts until the returned guard is dropped.
     pub(crate) async fn close_workspace(&self, workspace_id: &WorkspaceId) -> WorkspaceClosing {
         self.locks.set_closing(workspace_id, true);
-        let closing = WorkspaceClosing {
+        let mut closing = WorkspaceClosing {
             locks: self.locks.clone(),
             workspace_id: workspace_id.clone(),
+            unsettled: Vec::new(),
         };
+        // Wait out every `script.create` admitted before the mark: its new
+        // id is committed and registered before the snapshot below.
+        drop(self.locks.create_admission(workspace_id).write().await);
         let ids: Vec<String> = self
             .scripts
             .lock()
@@ -1554,6 +1625,17 @@ impl ScriptManager {
                 .await
             {
                 tracing::warn!(workspace = %workspace_id, script = %id, error = %e, "script stop during workspace delete failed");
+            }
+            // Still under this script's lock: a failed stop, or a result
+            // that could not be persisted, leaves it live or admitted.
+            if self
+                .scripts
+                .lock()
+                .unwrap()
+                .get(&(workspace_id.clone(), id.clone()))
+                .is_some_and(|m| self.entry_is_live_or_admitted(m))
+            {
+                closing.unsettled.push(id);
             }
         }
         if let Some(park) = &self.parks.workspace_closed {
@@ -1713,6 +1795,7 @@ impl ScriptManager {
         let lock = self.locks.definition_lock(script_id);
         let _guard = lock.lock().await;
         self.require_admission(workspace_id, script_id).await?;
+        self.require_launch_open_locked(workspace_id).await?;
         if self.is_live(workspace_id, script_id)? {
             return Ok(self.start_reply(workspace_id, script_id));
         }
@@ -1806,6 +1889,21 @@ impl ScriptManager {
             let lock = mgr.locks.definition_lock(&id);
             let _guard = lock.lock().await;
             mgr.require_admission(&ws, &id).await?;
+            // A live or admitted script cannot belong to a retired
+            // workspace: retirement stops every one under its closing mark
+            // (and this lock) before the row flips, and launches are refused
+            // from the mark on. Only an idle entry needs the row read, which
+            // keeps a stop racing a launch window free of an extra store
+            // round trip before it raises the stop flag.
+            let live = mgr
+                .scripts
+                .lock()
+                .unwrap()
+                .get(&(ws.clone(), id.clone()))
+                .is_some_and(|m| mgr.entry_is_live(m) && m.pending_result.is_none());
+            if !live {
+                mgr.refuse_if_retired_locked(&ws).await?;
+            }
             mgr.ensure_known_locked(&ws, &id).await?;
             mgr.stop_inner(&ws, &id, true).await
         })
@@ -2074,6 +2172,7 @@ impl ScriptManager {
         let lock = self.locks.definition_lock(script_id);
         let _guard = lock.lock().await;
         self.require_admission(workspace_id, script_id).await?;
+        self.require_launch_open_locked(workspace_id).await?;
         self.ensure_known_locked(workspace_id, script_id).await?;
         // Admission survives teardown, but its predecessor cannot report an
         // outcome for the successor token while shutdown is draining it.
@@ -2133,6 +2232,28 @@ impl ScriptManager {
         let id = script_id.to_owned();
         let admission = self
             .spawn_admission(async move {
+                // Retired / closing refusal before any write below (prior
+                // settlement, archive restoration) and before the
+                // service-mode warning: a delayed run writes nothing. The
+                // row read is skipped when neither a write nor the warning
+                // can follow (a settled, unarchived command): that run's only
+                // durable write is the run row, which `prepare_launch`
+                // already refuses for a retired workspace, and the skip keeps
+                // the common admission free of an extra store round trip.
+                let may_write_or_warn = mgr
+                    .scripts
+                    .lock()
+                    .unwrap()
+                    .get(&(ws.clone(), id.clone()))
+                    .is_some_and(|m| {
+                        m.def.mode == ScriptMode::Service
+                            || m.def.archived_at.is_some()
+                            || m.run_id.is_some()
+                            || m.pending_result.is_some()
+                    });
+                if may_write_or_warn || mgr.locks.is_closing(&ws) {
+                    mgr.require_launch_open_locked(&ws).await?;
+                }
                 mgr.finish_previous_locked(&ws, &id).await;
                 // Publish restoration before reserving running in memory: a
                 // cancelled pre-spawn reservation is intentionally silent.
@@ -3802,6 +3923,7 @@ mod tests {
             context_links: None,
             archived: false,
             archived_at: None,
+            retired_at: None,
             task_stats: None,
             agent_summary: None,
             diff_summary: None,
@@ -7192,6 +7314,66 @@ mod tests {
             .expect("fresh run");
         assert_eq!(out["timedOut"], true, "fresh run executed: {out:?}");
         assert!(out.get("warning").is_none(), "no warning: {out:?}");
+    }
+
+    /// Review regression (intentd#2605): a delayed `script.run` resuming
+    /// after its workspace was retired, on a command whose previous run still
+    /// holds an unsettled result, is refused with `workspace-retired` before
+    /// `finish_previous_locked` settles it: the pending result stays
+    /// unsettled, no run row is written and no `script:*` event is published.
+    #[intent_test_macros::daemon_test]
+    async fn script_run_on_retired_workspace_does_not_settle_a_pending_result() {
+        let h = harness().await;
+        let id = create_simple(&h, "pending", "echo hi", ScriptMode::Command).await;
+        let mgr = h.services.script_manager();
+        let pending = intent_core::ScriptLastRun {
+            run_id: Some("prior-run".to_string()),
+            outcome: intent_core::ScriptRunOutcome::Succeeded,
+            exit_code: Some(0),
+            started_at: Some(now_iso()),
+            stopped_at: now_iso(),
+            error: None,
+        };
+        {
+            let mut scripts = mgr.scripts.lock().unwrap();
+            let m = scripts.get_mut(&(h.ws.clone(), id.clone())).expect("entry");
+            m.pending_result = Some(pending.clone());
+        }
+        let store = h.services.store();
+        store
+            .archive_workspace_detaching_guests(&h.ws, &now_iso())
+            .await
+            .unwrap();
+        assert!(store
+            .retire_workspace_if_archived(&h.ws, &now_iso())
+            .await
+            .unwrap());
+        let mut sub = subscribe(&h);
+
+        let out = mgr.run(&h.ws, &id, None, Some(5)).await;
+        assert!(
+            matches!(out, Err(Error::WorkspaceRetired { .. })),
+            "{out:?}"
+        );
+        assert_eq!(
+            mgr.scripts
+                .lock()
+                .unwrap()
+                .get(&(h.ws.clone(), id.clone()))
+                .and_then(|m| m.pending_result.clone()),
+            Some(pending),
+            "pending result left unsettled"
+        );
+        assert!(store.latest_script_run(&h.ws, &id).await.unwrap().is_none());
+        assert!(
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(300)),
+                sub.recv(),
+            )
+            .await
+            .is_err(),
+            "no script:* event"
+        );
     }
 
     #[intent_test_macros::daemon_test]

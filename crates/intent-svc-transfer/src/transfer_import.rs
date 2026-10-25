@@ -1205,6 +1205,7 @@ fn workspace_for_materialize(workspace_id: &WorkspaceId, row: &serde_json::Value
         context_links: None,
         archived: false,
         archived_at: None,
+        retired_at: None,
         pending_delete_at: None,
         task_stats: None,
         agent_summary: None,
@@ -1480,6 +1481,18 @@ fn transform_rows(
                         if map.contains_key(key) {
                             map.insert(key.into(), serde_json::Value::Null);
                         }
+                    }
+                    // A retired source workspace lands as Archived: the
+                    // import provisions a checkout on this host, so the
+                    // "folder deleted" state does not carry over. Archives
+                    // exported before `retired_at` existed lack the column
+                    // and simply keep NULL.
+                    if map.get("status").and_then(serde_json::Value::as_str) == Some("Retired") {
+                        map.insert("status".into(), serde_json::json!("Archived"));
+                        map.insert("archived".into(), serde_json::json!(1));
+                    }
+                    if map.contains_key("retired_at") {
+                        map.insert("retired_at".into(), serde_json::Value::Null);
                     }
                 }
             }

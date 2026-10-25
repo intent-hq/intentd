@@ -1913,6 +1913,7 @@ pub(crate) async fn handle_sub_fast_path(
                     workspace_id,
                     note_id,
                     replace_group,
+                    include_retired,
                 }) => {
                     // Time the request-to-snapshot interval (intent-hq/intent#3707),
                     // started before the replace-group cleanup so a costly
@@ -1964,6 +1965,7 @@ pub(crate) async fn handle_sub_fast_path(
                         subscription_id.clone(),
                         out_tx.clone(),
                         timer,
+                        include_retired,
                     ));
                     subs.insert(subscription_id, handle, replace_group, None);
                     true
@@ -2797,6 +2799,8 @@ struct ChannelParams {
     workspace_id: Option<String>,
     note_id: Option<String>,
     replace_group: Option<String>,
+    /// `workspace.subscribe { includeRetired }`; always `false` elsewhere.
+    include_retired: bool,
 }
 
 /// Parse a TB-5 channel's subscribe params into the common [`ChannelParams`]
@@ -2812,6 +2816,7 @@ fn parse_channel_params(
                 workspace_id: None,
                 note_id: None,
                 replace_group: p.replace_group,
+                include_retired: p.include_retired,
             })
         }
         Channel::Comment => {
@@ -2820,6 +2825,7 @@ fn parse_channel_params(
                 workspace_id: Some(p.workspace_id),
                 note_id: Some(p.note_id),
                 replace_group: p.replace_group,
+                include_retired: false,
             })
         }
         // `note`/`task`/`agent` are all workspace-scoped collections.
@@ -2829,6 +2835,7 @@ fn parse_channel_params(
                 workspace_id: Some(p.workspace_id),
                 note_id: None,
                 replace_group: p.replace_group,
+                include_retired: false,
             })
         }
     }
@@ -2892,6 +2899,7 @@ async fn forward_channel_subscription(
     subscription_id: String,
     out_tx: OutboundSender,
     timer: subscriptions::SnapshotTimer,
+    include_retired: bool,
 ) {
     // The task channel's delta mapper is stateful: it tracks the spec's
     // task-link set so a spec-body edit can re-emit the rows whose
@@ -2917,7 +2925,7 @@ async fn forward_channel_subscription(
             oversized_replacement = tracing::field::Empty,
             encode_failed = tracing::field::Empty,
         );
-        subscriptions::channel_snapshot(api.as_ref(), channel, &workspace_id, note_id.as_ref())
+        subscriptions::workspace_snapshot(api.as_ref(), include_retired)
             .instrument(span)
             .await
     } else {
@@ -2942,7 +2950,13 @@ async fn forward_channel_subscription(
             if channel == Channel::Workspace
                 && event.event_type == intent_core::events::HOST_MEMBERS_CHANGED
             {
-                let Ok(rows) = api.list_workspaces_lite(true).await else {
+                let Ok(rows) = api
+                    .list_workspaces_lite(intent_core::WorkspaceListFilter::new(
+                        true,
+                        include_retired,
+                    ))
+                    .await
+                else {
                     continue;
                 };
                 let snapshot = serde_json::to_value(rows).unwrap_or_else(|_| json!([]));
@@ -2984,8 +2998,14 @@ async fn forward_channel_subscription(
             let delta = if channel == Channel::Task {
                 subscriptions::task_delta(api.as_ref(), &workspace_id, &event, &mut spec_links)
                     .await
-            } else if let Some(visible) = visible_workspaces.as_mut() {
-                subscriptions::workspace_delta(api.as_ref(), &event, Some(visible)).await
+            } else if channel == Channel::Workspace {
+                subscriptions::workspace_delta(
+                    api.as_ref(),
+                    &event,
+                    visible_workspaces.as_mut(),
+                    include_retired,
+                )
+                .await
             } else {
                 subscriptions::channel_delta(
                     api.as_ref(),
@@ -3031,7 +3051,7 @@ mod tests {
         impl WorkspaceApi for HeldWriter {
             fn list_workspaces(
                 &self,
-                _: bool,
+                _: intent_core::WorkspaceListFilter,
             ) -> intent_core::BoxFuture<'_, intent_core::Result<Vec<intent_core::Workspace>>>
             {
                 Box::pin(async {

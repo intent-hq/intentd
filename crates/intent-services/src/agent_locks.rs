@@ -318,7 +318,11 @@ impl Services {
                     }
                 }
                 if all_workspaces {
-                    if let Ok(list) = services.store().list_workspaces(false).await {
+                    if let Ok(list) = services
+                        .store()
+                        .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+                        .await
+                    {
                         dirty.extend(list.into_iter().map(|w| w.id.as_str().to_string()));
                     }
                 }

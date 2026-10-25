@@ -201,7 +201,10 @@ impl WatcherRegistry {
         // instead of being skipped until the next daemon restart.
         let mut initial: Vec<(WorkspaceId, PathBuf)> = Vec::new();
         let mut missing: HashMap<WorkspaceId, PathBuf> = HashMap::new();
-        match services.list_workspaces(false).await {
+        match services
+            .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+            .await
+        {
             Ok(list) => {
                 for ws in list {
                     let Some(root) = ws.effective_path() else {
@@ -940,7 +943,7 @@ mod tests {
     impl WorkspaceApi for FakeApi {
         fn list_workspaces(
             &self,
-            _include_archived: bool,
+            _filter: intent_core::WorkspaceListFilter,
         ) -> BoxFuture<'_, Result<Vec<Workspace>>> {
             let ws = self.workspaces.lock().unwrap().clone();
             Box::pin(async move { Ok(ws) })

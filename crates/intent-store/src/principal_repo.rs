@@ -1657,6 +1657,16 @@ impl Store {
             let archived: Option<bool> = sqlx::query_scalar("SELECT archived FROM workspace WHERE id=?")
                 .bind(&id.0).fetch_optional(&mut *conn).await
                 .map_err(|e| Error::Internal(format!("read archive binding failed: {e}")))?;
+            // Read under the same IMMEDIATE transaction as the flip below, so a
+            // concurrent `workspace.retire` cannot land between this check and
+            // the write: a retired row is never flipped back to Archived.
+            let retired: Option<bool> = sqlx::query_scalar("SELECT status = ? FROM workspace WHERE id=?")
+                .bind(enum_to_db(&WorkspaceStatus::Retired)?)
+                .bind(&id.0).fetch_optional(&mut *conn).await
+                .map_err(|e| Error::Internal(format!("read archive status failed: {e}")))?;
+            if retired == Some(true) {
+                return Err(Error::WorkspaceRetired { workspace_id: id.0.clone() });
+            }
             if archived == Some(false) {
                 lifecycle.begin(&[crate::RepositoryLifecycleKey::Workspace(id.clone())])?;
             }
