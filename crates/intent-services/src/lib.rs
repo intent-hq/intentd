@@ -1578,10 +1578,12 @@ pub struct Services {
     /// [`with_idempotency`]: same-key first-use callers serialize on the
     /// key so one runs the operation and the rest replay its stored result.
     idempotency_inflight: Arc<IdempotencyInflight>,
-    /// Registered feature ports (see [`feature_ports`]). Feature state such
-    /// as in-flight transfer sessions lives in the port implementations;
-    /// shared across clones.
+    /// Registered feature ports (see [`feature_ports`]); shared across
+    /// clones.
     ports: feature_ports::FeaturePorts,
+    /// Feature state objects, such as the in-flight transfer sessions, keyed
+    /// by type; shared across clones.
+    features: feature_ports::FeatureSet,
 }
 
 /// Pause inserted between per-workspace iterations of the background sweeps
@@ -1899,6 +1901,7 @@ impl Services {
             attachment_idempotency_inflight: Arc::new(Mutex::new(HashMap::new())),
             idempotency_inflight: Arc::new(IdempotencyInflight::default()),
             ports: feature_ports::FeaturePorts::default(),
+            features: feature_ports::FeatureSet::default(),
         };
         services
             .gitlab_credential_gate
@@ -21543,77 +21546,35 @@ impl WorkspaceApi for Services {
         })
     }
 
-    fn workspace_transfer_plan(
-        &self,
-        id: WorkspaceId,
-    ) -> BoxFuture<'_, Result<intent_core::transfer::TransferPlan>> {
-        self.ports.transfer().transfer_plan(self, id)
-    }
-
-    fn workspace_import_begin(
-        &self,
-        manifest: serde_json::Value,
-        archive_size_bytes: u64,
-        archive_sha256: String,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        self.ports
-            .transfer()
-            .import_begin(self, manifest, archive_size_bytes, archive_sha256)
-    }
-
-    fn workspace_import_chunk(
-        &self,
-        import_id: String,
-        seq: u64,
-        data: String,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        self.ports
-            .transfer()
-            .import_chunk(self, import_id, seq, data)
-    }
-
-    fn workspace_import_commit(
-        &self,
-        import_id: String,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        self.ports.transfer().import_commit(self, import_id)
-    }
-
-    fn workspace_import_abort(
-        &self,
-        import_id: String,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        self.ports.transfer().import_abort(self, import_id)
-    }
-
-    fn workspace_export_start(&self, id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
-        self.ports.transfer().export_start(self, id)
-    }
-
-    fn workspace_export_read(
-        &self,
-        export_id: String,
-        seq: u64,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        self.ports.transfer().export_read(self, export_id, seq)
-    }
-
-    fn workspace_export_finalize(
-        &self,
-        export_id: String,
-        archive_source: bool,
-        final_status_message: Option<String>,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        self.ports
-            .transfer()
-            .export_finalize(self, export_id, archive_source, final_status_message)
-    }
-
-    fn workspace_export_abort(
-        &self,
-        export_id: String,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        self.ports.transfer().export_abort(self, export_id)
+    feature_ports::port_forwarders! {
+        transfer {
+            fn workspace_transfer_plan(&self, id: WorkspaceId)
+                -> BoxFuture<'_, Result<intent_core::transfer::TransferPlan>> => transfer_plan;
+            fn workspace_import_begin(
+                &self,
+                manifest: serde_json::Value,
+                archive_size_bytes: u64,
+                archive_sha256: String,
+            ) -> BoxFuture<'_, Result<serde_json::Value>> => import_begin;
+            fn workspace_import_chunk(&self, import_id: String, seq: u64, data: String)
+                -> BoxFuture<'_, Result<serde_json::Value>> => import_chunk;
+            fn workspace_import_commit(&self, import_id: String)
+                -> BoxFuture<'_, Result<serde_json::Value>> => import_commit;
+            fn workspace_import_abort(&self, import_id: String)
+                -> BoxFuture<'_, Result<serde_json::Value>> => import_abort;
+            fn workspace_export_start(&self, id: WorkspaceId)
+                -> BoxFuture<'_, Result<serde_json::Value>> => export_start;
+            fn workspace_export_read(&self, export_id: String, seq: u64)
+                -> BoxFuture<'_, Result<serde_json::Value>> => export_read;
+            fn workspace_export_finalize(
+                &self,
+                export_id: String,
+                archive_source: bool,
+                final_status_message: Option<String>,
+            ) -> BoxFuture<'_, Result<serde_json::Value>> => export_finalize;
+            fn workspace_export_abort(&self, export_id: String)
+                -> BoxFuture<'_, Result<serde_json::Value>> => export_abort;
+        }
     }
 
     fn create_workspace(

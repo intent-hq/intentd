@@ -20,14 +20,36 @@ use intent_services::Services;
 /// its integration tests.
 pub use intent_svc_transfer as transfer;
 
-/// Register every feature crate on `services`.
+/// Register every feature crate on `services`, then run the startup check.
 ///
 /// Call this on the freshly built core services, before the daemon hands
-/// them out: an unregistered feature port answers every call with its
-/// "unavailable" error.
+/// them out.
+///
+/// # Panics
+///
+/// If a feature port declared in core is still unregistered (see
+/// [`assert_feature_ports_registered`]): the daemon fails at boot instead of
+/// answering that feature's calls with its "unavailable" error.
 #[must_use]
 pub fn compose(services: Services) -> Services {
-    intent_svc_transfer::register(services)
+    let services = intent_svc_transfer::register(services);
+    assert_feature_ports_registered(&services);
+    services
+}
+
+/// The startup check [`compose`] runs: every feature port core declares has
+/// a registered implementation.
+///
+/// # Panics
+///
+/// Naming the unregistered ports, if any.
+pub fn assert_feature_ports_registered(services: &Services) {
+    let missing = services.unregistered_feature_ports();
+    assert!(
+        missing.is_empty(),
+        "intent_app::compose: feature ports not registered: {}",
+        missing.join(", ")
+    );
 }
 
 /// Feature-owned entry points the daemon calls on [`Services`] at startup.

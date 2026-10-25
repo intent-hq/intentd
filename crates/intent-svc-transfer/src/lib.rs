@@ -41,7 +41,10 @@ mod fixture_cleanup_tests;
 /// the same session.
 #[must_use]
 pub fn register(services: Services) -> Services {
-    services.with_transfer_port(Arc::new(transfer::TransferFeature::default()))
+    let feature = Arc::new(transfer::TransferFeature::default());
+    services
+        .with_feature(Arc::clone(&feature))
+        .with_transfer_port(feature)
 }
 
 /// Transfer entry points the daemon calls on [`Services`] directly.
