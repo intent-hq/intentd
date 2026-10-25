@@ -8362,7 +8362,7 @@ async fn oversized_request_head_rejected_over_wss() {
     // upgrade success; it either drops silently or returns a non-101 status.
     let mut buf = [0u8; 1024];
     let mut total = Vec::new();
-    let deadline = Duration::from_secs(2);
+    let deadline = common::test_timeout(Duration::from_secs(2));
     loop {
         match timeout(deadline, tls.read(&mut buf)).await {
             Ok(Ok(0) | Err(_)) | Err(_) => break,

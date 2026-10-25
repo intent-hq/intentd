@@ -1,19 +1,28 @@
 //! Qualified polling keeps private binding evidence out of public snapshots.
 use super::qualified_cache::CacheError;
-use super::{Arc, PrMonitorState, Services, Value};
+use super::{polled_within, Arc, PrMonitorState, Services, SweepScope, Value};
 use crate::repository_admission::{AdmissionError, AdmissionResult};
 use crate::repository_read_source::MonitorAuthority;
 use intent_store::{MonitorTargetProvenance, PersistedMonitorTarget, QualifiedPrMonitor};
 
 impl Services {
-    pub(super) async fn sweep_qualified_pr_monitors(&self, skip_fresh: bool) {
-        self.sweep_qualified_pr_monitors_at(skip_fresh, time::OffsetDateTime::now_utc())
-            .await;
-    }
-
+    #[cfg(test)]
     pub(crate) async fn sweep_qualified_pr_monitors_at(
         &self,
         skip_fresh: bool,
+        now: time::OffsetDateTime,
+    ) {
+        let scope = if skip_fresh {
+            SweepScope::Due
+        } else {
+            SweepScope::All
+        };
+        self.sweep_qualified_pr_monitors_scoped(&scope, now).await;
+    }
+
+    pub(super) async fn sweep_qualified_pr_monitors_scoped(
+        &self,
+        scope: &SweepScope,
         now: time::OffsetDateTime,
     ) {
         let Ok(_lane) = self.review_monitor_poll_lane.clone().try_lock_owned() else {
@@ -32,7 +41,7 @@ impl Services {
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
-        let intervals = if skip_fresh {
+        let intervals = if matches!(scope, SweepScope::Due) {
             match self
                 .workspace_automatic_check_intervals(&workspace_ids, now)
                 .await
@@ -44,6 +53,11 @@ impl Services {
             std::collections::HashMap::default()
         };
         for row in rows {
+            if let SweepScope::Nudge { workspace_id, .. } = scope {
+                if &row.monitor().workspace_id != workspace_id {
+                    continue;
+                }
+            }
             if !matches!(
                 row.target(),
                 PersistedMonitorTarget::Resolved {
@@ -94,20 +108,17 @@ impl Services {
             if authority.requires_explicit_recovery() {
                 continue;
             }
-            if skip_fresh
-                && monitor
-                    .last_polled_at
-                    .as_deref()
-                    .and_then(intent_core::parse_iso)
-                    .is_some_and(|at| {
-                        now - at
-                            < time::Duration::seconds(
-                                i64::try_from(self.pr_monitor_poll_interval().as_secs().max(
-                                    intervals.get(&monitor.workspace_id).copied().unwrap_or(0),
-                                ))
-                                .unwrap_or(i64::MAX),
-                            )
-                    })
+            let fresh_secs = match scope {
+                SweepScope::All => None,
+                SweepScope::Due => Some(
+                    self.pr_monitor_poll_interval()
+                        .as_secs()
+                        .max(intervals.get(&monitor.workspace_id).copied().unwrap_or(0)),
+                ),
+                SweepScope::Nudge { min_age_secs, .. } => Some(*min_age_secs),
+            };
+            if fresh_secs
+                .is_some_and(|secs| polled_within(monitor.last_polled_at.as_deref(), secs, now))
             {
                 continue;
             }

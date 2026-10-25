@@ -2654,14 +2654,16 @@ mod tests {
     /// under a loaded host (e.g. a parallel `cargo build`) persistence can
     /// lag far behind the happy path, and a short deadline fails
     /// otherwise-passing tests (intent-hq/monorepo#1358).
-    const POLL_DEADLINE: Duration = Duration::from_secs(10);
+    fn poll_deadline() -> Duration {
+        intentd_test_support::test_timeout(Duration::from_secs(10))
+    }
 
     /// Poll the persisted hook until `pred` holds or the timeout elapses.
     async fn wait_for_hook<F>(svc: &Services, id: &HookId, pred: F) -> Hook
     where
         F: Fn(&Hook) -> bool,
     {
-        let deadline = std::time::Instant::now() + POLL_DEADLINE;
+        let deadline = std::time::Instant::now() + poll_deadline();
         loop {
             let hook = svc.store().get_hook(id).await.expect("get hook");
             if pred(&hook) {
@@ -2680,7 +2682,7 @@ mod tests {
     /// terminal state persists BEFORE the loop exits, so asserting
     /// `!hook_task_alive` right after a state wait races the teardown.
     async fn wait_for_task_exit(svc: &Services, id: &HookId) {
-        let deadline = std::time::Instant::now() + POLL_DEADLINE;
+        let deadline = std::time::Instant::now() + poll_deadline();
         while svc.hook_task_alive(id) {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -2694,7 +2696,7 @@ mod tests {
     /// `needle`, returning the serialized messages. The wake lands after the
     /// terminal state persists, so a plain read can race it.
     async fn wait_for_wake(svc: &Services, owner: &AgentId, needle: &str) -> String {
-        let deadline = std::time::Instant::now() + POLL_DEADLINE;
+        let deadline = std::time::Instant::now() + poll_deadline();
         loop {
             let session = svc.store().get_agent_session(owner).await.unwrap();
             let text = serde_json::to_string(&session.messages).unwrap();
@@ -2715,7 +2717,7 @@ mod tests {
     /// helper polls until all are present (on deadline it returns whatever
     /// was seen — the caller's asserts then report the shortfall).
     async fn hook_event_types(svc: &Services, ws: &WorkspaceId, expected: &[&str]) -> Vec<String> {
-        let deadline = std::time::Instant::now() + POLL_DEADLINE;
+        let deadline = std::time::Instant::now() + poll_deadline();
         loop {
             let mut evs = svc
                 .store()
@@ -2954,7 +2956,7 @@ mod tests {
             .unwrap();
         let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
         svc.hook_run_now_op(&ws, &hook.hook_id).await.unwrap();
-        tokio::time::timeout(POLL_DEADLINE, async {
+        tokio::time::timeout(poll_deadline(), async {
             loop {
                 if svc
                     .store
@@ -2984,7 +2986,7 @@ mod tests {
         .await
         .is_ok();
         if !timely {
-            tokio::time::timeout(POLL_DEADLINE, shutdown)
+            tokio::time::timeout(poll_deadline(), shutdown)
                 .await
                 .unwrap()
                 .unwrap();
@@ -3840,7 +3842,7 @@ mod tests {
         assert!(types.contains(&HOOK_DISPATCHED.to_string()), "{types:?}");
         assert!(types.contains(&HOOK_EXPIRED.to_string()), "{types:?}");
         // Task deregistered after the terminal outcome.
-        let deadline = std::time::Instant::now() + POLL_DEADLINE;
+        let deadline = std::time::Instant::now() + poll_deadline();
         while svc.hook_task_alive(&hook.hook_id) {
             assert!(std::time::Instant::now() < deadline, "task not removed");
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -4087,7 +4089,7 @@ mod tests {
         );
         assert!(text.contains(r#""hookStillActive":false"#), "{text}");
         // Task deregistered after the terminal outcome.
-        let deadline = std::time::Instant::now() + POLL_DEADLINE;
+        let deadline = std::time::Instant::now() + poll_deadline();
         while svc.hook_task_alive(&hook.hook_id) {
             assert!(std::time::Instant::now() < deadline, "task not removed");
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -4146,7 +4148,7 @@ mod tests {
         probe.content = "go".into();
         svc.store.update_note(&probe).await.unwrap();
         svc.hook_run_now_op(&ws, &parent.hook_id).await.unwrap();
-        tokio::time::timeout(POLL_DEADLINE, park.entered.notified())
+        tokio::time::timeout(poll_deadline(), park.entered.notified())
             .await
             .unwrap();
         let child = svc
@@ -4173,12 +4175,12 @@ mod tests {
         park.release.notify_one();
         if expired_perpetual {
             // Expired perpetual validation sends a dispatch and an expiry notice.
-            tokio::time::timeout(POLL_DEADLINE, park.entered.notified())
+            tokio::time::timeout(poll_deadline(), park.entered.notified())
                 .await
                 .unwrap();
             park.release.notify_one();
         }
-        tokio::time::timeout(POLL_DEADLINE, shutdown)
+        tokio::time::timeout(poll_deadline(), shutdown)
             .await
             .unwrap()
             .unwrap();
@@ -4239,7 +4241,7 @@ mod tests {
         probe.content = "go".into();
         svc.store().update_note(&probe).await.unwrap();
         svc.hook_run_now_op(&ws, &hook.hook_id).await.unwrap();
-        tokio::time::timeout(POLL_DEADLINE, park.entered.notified())
+        tokio::time::timeout(poll_deadline(), park.entered.notified())
             .await
             .unwrap();
         assert_eq!(
@@ -4269,7 +4271,7 @@ mod tests {
         mgr.begin_shutdown();
         // A committed tail may still be waiting on event publication. Recovery
         // must already be durable before shutdown awaits that tail.
-        tokio::time::timeout(POLL_DEADLINE, mgr.checkpoint_shutdown())
+        tokio::time::timeout(poll_deadline(), mgr.checkpoint_shutdown())
             .await
             .unwrap();
         assert!(svc
@@ -4293,7 +4295,7 @@ mod tests {
             tokio::task::yield_now().await;
         }
         park.release.notify_one();
-        tokio::time::timeout(POLL_DEADLINE, shutdown)
+        tokio::time::timeout(poll_deadline(), shutdown)
             .await
             .unwrap()
             .unwrap();
@@ -4344,7 +4346,7 @@ mod tests {
             .unwrap();
         let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
         svc.hook_run_now_op(&ws, &hook.hook_id).await.unwrap();
-        tokio::time::timeout(POLL_DEADLINE, park.entered.notified())
+        tokio::time::timeout(poll_deadline(), park.entered.notified())
             .await
             .unwrap();
         assert!(mgr.try_begin_turn(&owner, &ws).await.is_some());
@@ -4380,7 +4382,7 @@ mod tests {
         // Always release the fixture before asserting the expected baseline failure.
         park.release.notify_one();
         if !timely {
-            tokio::time::timeout(POLL_DEADLINE, shutdown)
+            tokio::time::timeout(poll_deadline(), shutdown)
                 .await
                 .unwrap()
                 .unwrap();
@@ -4643,7 +4645,7 @@ mod tests {
     /// (the wake lands after the state a test gated on), then return the
     /// count so the caller can assert it is exactly `n`.
     async fn wait_for_wake_count(svc: &Services, owner: &AgentId, needle: &str, n: usize) -> usize {
-        let deadline = std::time::Instant::now() + POLL_DEADLINE;
+        let deadline = std::time::Instant::now() + poll_deadline();
         loop {
             let count = wake_count(svc, owner, needle).await;
             if count >= n || std::time::Instant::now() >= deadline {
@@ -5371,7 +5373,7 @@ mod tests {
             .expect("runNow");
 
         // The archive lands in the store...
-        let deadline = std::time::Instant::now() + POLL_DEADLINE;
+        let deadline = std::time::Instant::now() + poll_deadline();
         loop {
             let row = svc.store().get_workspace(&ws).await.expect("get workspace");
             if row.archived {
@@ -5386,7 +5388,7 @@ mod tests {
         }
 
         // ...and the §6.5 delta is published exactly once, in full.
-        let deadline = std::time::Instant::now() + POLL_DEADLINE;
+        let deadline = std::time::Instant::now() + poll_deadline();
         let deltas = loop {
             let deltas = archive_delta_events(&svc, &ws).await;
             if !deltas.is_empty() {
@@ -5613,7 +5615,7 @@ mod tests {
         wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Dispatched).await;
         // The settled dispatch drops the waiting flag without any
         // displayStatus transition.
-        let deadline = std::time::Instant::now() + POLL_DEADLINE;
+        let deadline = std::time::Instant::now() + poll_deadline();
         loop {
             if !svc.workspace_is_waiting(&ws).await {
                 break;
@@ -5723,7 +5725,7 @@ mod tests {
             .await
             .expect("runNow");
         wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Expired).await;
-        let deadline = std::time::Instant::now() + POLL_DEADLINE;
+        let deadline = std::time::Instant::now() + poll_deadline();
         loop {
             if waiting_events(&svc, &ws).await == vec![true, false] {
                 break;
@@ -6639,7 +6641,7 @@ mod tests {
 
     /// Poll the persisted transcript until it holds `want` assistant rows and
     /// the manager reports the owner idle (the mock ACP turn is a real child
-    /// process, so allow well past `POLL_DEADLINE`).
+    /// process, so allow well past `poll_deadline()`).
     async fn wait_for_assistant_rows(
         svc: &Services,
         mgr: &crate::agent_manager::AgentManager,
@@ -7242,7 +7244,7 @@ mod tests {
         assert!(!text.contains("retired"), "{text}");
         assert!(!text.contains("hookStillActive"), "{text}");
         // Task deregistered after the terminal outcome.
-        let deadline = std::time::Instant::now() + POLL_DEADLINE;
+        let deadline = std::time::Instant::now() + poll_deadline();
         while svc.hook_task_alive(&hook.hook_id) {
             assert!(std::time::Instant::now() < deadline, "task not removed");
             tokio::time::sleep(Duration::from_millis(10)).await;

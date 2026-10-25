@@ -198,6 +198,7 @@ async fn connect_ws(port: u16, cfg: Arc<ClientConfig>) -> TlsWs {
 /// Daemon startup and every poll/event wait below is clamped to this deadline,
 /// and each RPC round-trip is separately capped by [`rpc_read_budget`], so a
 /// stall always panics naming its own step with headroom before the kill.
+// fixed-deadline: allow — stays under nextest's unscaled 180 s slow-timeout kill (.config/nextest.toml) so a stall panics naming its step
 const TEST_BUDGET: Duration = Duration::from_secs(150);
 
 /// Per-test deadline clamp, started at the top of each test — before the daemon

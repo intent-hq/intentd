@@ -29,6 +29,7 @@ mod note_line_attribution;
 mod note_paging_removal;
 mod note_search;
 mod pull_request_workspace;
+mod workspace_pr_settled;
 mod write_acquire_retry;
 
 #[tokio::test]
@@ -7361,7 +7362,9 @@ async fn append_agent_message_survives_write_pool_acquire_timeout() {
     // Upper bound on how long the holder keeps the connection if the append
     // never reports a timeout; the test then fails on the observer assertion
     // instead of hanging. Also bounds the pool-open retries below.
-    const WATCHDOG: Duration = Duration::from_secs(15);
+    fn watchdog() -> Duration {
+        intentd_test_support::test_timeout(Duration::from_secs(15))
+    }
     let tmp = TempDb::new();
     // Migrate with the ordinary store, then reopen with a short acquire
     // timeout on the write pool. sqlx opens the pool's first connection
@@ -7370,7 +7373,7 @@ async fn append_agent_message_survives_write_pool_acquire_timeout() {
     // until the watchdog deadline; once it succeeds the connection stays idle
     // in the pool and the hold below reuses it without a fresh open.
     drop(Store::open(&tmp.path).await.expect("open store"));
-    let open_deadline = tokio::time::Instant::now() + WATCHDOG;
+    let open_deadline = tokio::time::Instant::now() + watchdog();
     let write_pool = loop {
         match crate::connect_write_with_acquire_timeout(&tmp.path, ACQUIRE_TIMEOUT).await {
             Ok(pool) => break pool,
@@ -7418,7 +7421,7 @@ async fn append_agent_message_survives_write_pool_acquire_timeout() {
     let holder = {
         let observed = Arc::clone(&observed);
         tokio::spawn(async move {
-            let deadline = tokio::time::Instant::now() + WATCHDOG;
+            let deadline = tokio::time::Instant::now() + watchdog();
             while observed.load(Ordering::SeqCst) == 0 && tokio::time::Instant::now() < deadline {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }

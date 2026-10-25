@@ -24,7 +24,9 @@ use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
 
 const CHILD_URL: &str = "INTENT_GIT_TLS_TEST_URL";
-const TIMEOUT: Duration = Duration::from_secs(20);
+fn tls_limit() -> Duration {
+    intentd_test_support::test_timeout(Duration::from_secs(20))
+}
 
 // Public libgit2 API present in both the old and repaired dependency, but not
 // exposed by git2 0.21's Version wrapper. No additional native library is linked.
@@ -135,7 +137,7 @@ impl Drop for Server {
 impl Server {
     fn start(listener: TcpListener, config: Arc<rustls::ServerConfig>) -> Self {
         Self(tokio::spawn(async move {
-            timeout(TIMEOUT, async move {
+            timeout(tls_limit(), async move {
                 let (socket, _) = listener.accept().await.expect("accept loopback client");
                 let mut request = Vec::new();
                 if let Ok(mut tls) = TlsAcceptor::from(config).accept(socket).await {
@@ -237,7 +239,7 @@ async fn run_case(name: &str, host: &str, san: &str, expected: Expected) {
     }
     let mut child = GuardedChild::spawn(&mut command).expect("spawn isolated git2 client");
     let status = child
-        .wait_with_timeout(TIMEOUT)
+        .wait_with_timeout(tls_limit())
         .unwrap()
         .expect("git2 client timed out");
     let request = (&mut server.0).await.expect("join TLS server");

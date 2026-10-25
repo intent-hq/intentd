@@ -41,6 +41,7 @@ impl TempDb {
 /// stall can exceed several seconds (monorepo#601: the old fixed 2s windows
 /// tripped exactly there), so the deadline only bounds how long a genuinely
 /// broken run takes to fail — it never delays a passing run.
+// fixed-deadline: allow — stays under nextest's unscaled 180 s slow-timeout kill: a 60 s base scaled ×3 would reach it (.config/nextest.toml), so a stall still panics naming its step
 const DEADLINE: Duration = Duration::from_secs(60);
 
 async fn connect_retry(socket: &PathBuf) -> UnixStream {

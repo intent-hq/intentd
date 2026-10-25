@@ -8,11 +8,18 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::Services;
 
+/// Floor for a settled workspace (every known PR merged or closed) once it
+/// has been idle for [`SETTLED_IDLE_SECS`]. It still relinks a new PR, later.
+const SETTLED_INTERVAL_SECS: u64 = 900;
+const SETTLED_IDLE_SECS: i64 = 3_600;
+
 /// The configured active interval remains a floor for every idle tier.
 /// Missing content uses creation time. An absent, malformed, or future clock
 /// conservatively uses the active interval rather than delaying unknown work.
+/// A running agent always polls at the active interval, settled or not.
 pub(crate) fn workspace_check_interval_secs(
     running: bool,
+    settled: bool,
     content: Option<&str>,
     created: Option<&str>,
     now: OffsetDateTime,
@@ -28,13 +35,18 @@ pub(crate) fn workspace_check_interval_secs(
         return active_secs;
     };
     let idle_secs = (now - at).whole_seconds();
-    let tier = match idle_secs {
+    let mut tier = match idle_secs {
+        604_800.. => 3_600,
+        259_200.. => 1_800,
         86_400.. => 900,
         21_600.. => 600,
         3_600.. => 300,
         900.. => 120,
         _ => active_secs,
     };
+    if settled && idle_secs >= SETTLED_IDLE_SECS {
+        tier = tier.max(SETTLED_INTERVAL_SECS);
+    }
     active_secs.max(tier)
 }
 
@@ -47,6 +59,10 @@ impl Services {
         now: OffsetDateTime,
     ) -> Result<HashMap<WorkspaceId, u64>> {
         let rows = self.store.workspace_content_clocks(workspace_ids).await?;
+        let settled = self
+            .store
+            .workspaces_with_settled_pull_requests(workspace_ids)
+            .await?;
         let active_secs = self.pr_monitor_poll_interval().as_secs();
         Ok(workspace_ids
             .iter()
@@ -54,6 +70,7 @@ impl Services {
                 let clock = rows.get(id);
                 let seconds = workspace_check_interval_secs(
                     self.workspace_activity(id) == WorkspaceActivity::AgentRunning,
+                    settled.contains(id),
                     clock.and_then(|c| c.last_content_activity.as_deref()),
                     clock.map(|c| c.created_at.as_str()),
                     now,
@@ -69,6 +86,12 @@ impl Services {
 mod tests {
     use super::*;
 
+    fn ago(now: OffsetDateTime, seconds: i64) -> String {
+        (now - time::Duration::seconds(seconds))
+            .format(&Rfc3339)
+            .unwrap()
+    }
+
     #[test]
     fn idle_tier_boundaries_and_running_work() {
         let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
@@ -82,35 +105,85 @@ mod tests {
             (21600, 600),
             (86399, 600),
             (86400, 900),
-            (864_000, 900),
+            (259_199, 900),
+            (259_200, 1800),
+            (604_799, 1800),
+            (604_800, 3600),
+            (8_640_000, 3600),
         ] {
-            let stamp = (now - time::Duration::seconds(age))
-                .format(&Rfc3339)
-                .unwrap();
+            let stamp = ago(now, age);
             assert_eq!(
-                workspace_check_interval_secs(false, Some(&stamp), None, now, 60),
+                workspace_check_interval_secs(false, false, Some(&stamp), None, now, 60),
                 seconds,
                 "age {age}"
             );
+            for settled in [false, true] {
+                assert_eq!(
+                    workspace_check_interval_secs(true, settled, Some(&stamp), None, now, 60),
+                    60,
+                    "running, age {age}, settled {settled}"
+                );
+            }
             assert_eq!(
-                workspace_check_interval_secs(true, Some(&stamp), None, now, 60),
-                60
-            );
-            assert_eq!(
-                workspace_check_interval_secs(false, Some(&stamp), None, now, 1800),
-                1800
+                workspace_check_interval_secs(false, false, Some(&stamp), None, now, 7200),
+                7200
             );
         }
         assert_eq!(
-            workspace_check_interval_secs(false, None, None, now, 30),
+            workspace_check_interval_secs(false, false, None, None, now, 30),
             30
         );
     }
 
     #[test]
+    fn settled_tier_applies_after_an_idle_hour() {
+        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        for (age, unsettled, settled) in [
+            (0, 60, 60),
+            (3599, 120, 120),
+            (3600, 300, 900),
+            (21600, 600, 900),
+            (86400, 900, 900),
+            (259_200, 1800, 1800),
+            (604_800, 3600, 3600),
+        ] {
+            let stamp = ago(now, age);
+            assert_eq!(
+                workspace_check_interval_secs(false, false, Some(&stamp), None, now, 60),
+                unsettled,
+                "unsettled, age {age}"
+            );
+            assert_eq!(
+                workspace_check_interval_secs(false, true, Some(&stamp), None, now, 60),
+                settled,
+                "settled, age {age}"
+            );
+        }
+        let old = ago(now, 86_400);
+        assert_eq!(
+            workspace_check_interval_secs(false, true, Some(&old), None, now, 1200),
+            1200,
+            "active interval stays the floor"
+        );
+        // New content resumes the active cadence even when settled.
+        let fresh = ago(now, 0);
+        assert_eq!(
+            workspace_check_interval_secs(false, true, Some(&fresh), Some(&old), now, 60),
+            60
+        );
+        for (content, created) in [(Some("bad"), Some(old.as_str())), (None, None)] {
+            assert_eq!(
+                workspace_check_interval_secs(false, true, content, created, now, 60),
+                60,
+                "unknown clock, content {content:?}"
+            );
+        }
+    }
+
+    #[test]
     fn content_clock_precedence_and_conservative_fallbacks() {
         let now = OffsetDateTime::parse("2026-10-04T12:00:00Z", &Rfc3339).unwrap();
-        let old = "2026-10-01T12:00:00Z";
+        let old = "2026-10-02T12:00:00Z";
         let recent = "2026-10-04T12:00:00Z";
         for (content, created, expected) in [
             (None, Some(old), 900),
@@ -124,7 +197,7 @@ mod tests {
             (Some("2026-10-04T12:45:00+01:00"), Some(old), 120),
         ] {
             assert_eq!(
-                workspace_check_interval_secs(false, content, created, now, 60),
+                workspace_check_interval_secs(false, false, content, created, now, 60),
                 expected,
                 "content {content:?}, created {created:?}"
             );
