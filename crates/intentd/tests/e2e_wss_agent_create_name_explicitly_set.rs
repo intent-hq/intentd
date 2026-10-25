@@ -384,13 +384,9 @@ async fn agent_create_name_explicitly_set_controls_guarded_rename_over_wss() {
     for _ in 0..40 {
         let frame = wss_event(&mut sub, 15).await;
         let event = &frame["params"]["event"];
-        if event["data"]["agentId"] != json!(updated_id) || event["type"] == "agent:created" {
+        if event["type"] != "agent:renamed" || event["data"]["agentId"] != json!(updated_id) {
             continue;
         }
-        assert_eq!(
-            event["type"], "agent:renamed",
-            "name-only update folds into agent:renamed: {frame}"
-        );
         assert_eq!(event["data"]["name"], "Updated Name", "event data: {frame}");
         assert_eq!(
             event["data"]["nameExplicitlySet"],

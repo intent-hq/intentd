@@ -5820,7 +5820,7 @@ impl Services {
     /// explicitly set, the rename is a no-op returning the existing name with
     /// `skipped: true` (the FE `renameAgent` semantics). An applied rename
     /// emits `agent:renamed` with `{ agentId, name, nameExplicitlySet }`, the
-    /// flag read back from the persisted session (§6.5).
+    /// flag as written to the session row (§6.5).
     pub(crate) async fn agent_rename_op(
         &self,
         agent_id: AgentId,
