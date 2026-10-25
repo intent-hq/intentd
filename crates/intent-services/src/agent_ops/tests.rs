@@ -32205,7 +32205,15 @@ async fn diagnostics_task_filter_matches_session_side_only() {
     );
     task.assigned_agent_ids.clear();
     note.metadata.task = Some(task);
-    svc.store.update_note(&note).await.expect("update note");
+    svc.store
+        .update_note(
+            &svc.store
+                .lock_note_content(&note.workspace_id, &note.id)
+                .await,
+            &note,
+        )
+        .await
+        .expect("update note");
 
     let result = svc
         .agent_diagnostics_op(ws.clone(), None, Some(note_id.clone()), None)

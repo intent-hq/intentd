@@ -8,8 +8,17 @@ license.workspace = true
 description = "SQLite + file-tree persistence (repositories, migrations, locking)"
 
 [package.metadata.cargo-shear]
-# Compiled separately by tests/store_pool_api.rs to assert rejected pool APIs.
-ignored-paths = ["tests/ui/store_pool_*.rs"]
+# Compiled separately by tests/store_pool_api.rs and tests/note_write_lock_api.rs
+# to assert rejected pool and note-write-lock APIs.
+ignored-paths = ["tests/ui/store_pool_*.rs", "tests/ui/note_write_lock_*.rs"]
+
+[features]
+# Note write-lock observation seams (`Store::note_content_lock_users` /
+# `note_content_locks_idle`) for other crates' tests. Enable only from
+# `[dev-dependencies]`: Cargo then turns it on for builds that also compile
+# test targets (`cargo test`, `--all-targets`), never for release/packaging
+# builds of the daemon.
+test-support = []
 
 [dependencies]
 intent-core = { path = "../intent-core", version = "0.11.43" }
