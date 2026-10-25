@@ -112,7 +112,7 @@ fn kill_tree_kills_child_and_grandchild_before_reaping() {
 fn kill_tree_after_reap_returns_the_exit_status() {
     let mut guard = GuardedChild::spawn(&mut sh("exit 3")).unwrap();
     let status = guard
-        .wait_with_timeout(BOUND)
+        .wait_with_timeout(bound())
         .unwrap()
         .expect("`exit 3` exits within the bound");
     assert_eq!(guard.kill_tree().unwrap(), status);
@@ -335,12 +335,12 @@ fn barrier_release_and_entered() {
     assert_eq!(status.code(), Some(0));
 }
 
-/// Wait for a guarded script to exit within [`BOUND`]; panic naming `what`.
+/// Wait for a guarded script to exit within [`bound()`]; panic naming `what`.
 fn exit_code_within_bound(guard: &mut GuardedChild, what: &str) -> Option<i32> {
     guard
-        .wait_with_timeout(BOUND)
+        .wait_with_timeout(bound())
         .unwrap()
-        .unwrap_or_else(|| panic!("{what} did not exit within {BOUND:?}"))
+        .unwrap_or_else(|| panic!("{what} did not exit within {:?}", bound()))
         .code()
 }
 

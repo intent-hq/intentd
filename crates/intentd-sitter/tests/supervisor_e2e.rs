@@ -567,6 +567,21 @@ fn alive(pid: u32) -> bool {
     }
 }
 
+/// Whether an orphaned fake daemon `pid` is gone for good. Like [`alive`]
+/// but a zombie counts as gone: once a test in this binary has made the test
+/// process a child subreaper (plain `cargo test` runs every test in one
+/// process), a killed orphan is re-parented to it and stays a zombie nobody
+/// else reaps — so reap it here if it is ours.
+fn gone(pid: u32) -> bool {
+    use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+    match waitpid(Pid::from_raw(pid.cast_signed()), Some(WaitPidFlag::WNOHANG)) {
+        Ok(WaitStatus::StillAlive) => false,
+        Ok(_) => true,
+        Err(Errno::ECHILD) => !alive(pid),
+        Err(e) => panic!("waitpid({pid}): {e}"),
+    }
+}
+
 fn daemon_log_path(data_dir: &Path) -> std::path::PathBuf {
     data_dir.join("fake-daemon.log")
 }
@@ -696,7 +711,7 @@ fn wait_exit_giving_up_kills_the_fake_daemon_too() {
     }));
     let survived = panic::catch_unwind(|| {
         wait_until("the daemon to be gone", Duration::from_secs(5), || {
-            !alive(daemon)
+            gone(daemon)
         });
     });
     if survived.is_err() {
@@ -2814,7 +2829,7 @@ fn panic_mid_test_leaves_no_sitter_or_daemon_behind() {
     wait_until(
         "sitter and fake daemon to be gone after unwinding",
         Duration::from_secs(5),
-        || !alive(sitter_pid) && !alive(daemon_pid),
+        || gone(sitter_pid) && gone(daemon_pid),
     );
     assert!(
         !release.path().exists(),
@@ -4093,7 +4108,7 @@ esac
     wait_until(
         "the surviving daemon to be swept",
         Duration::from_secs(5),
-        || !alive(daemon_pid),
+        || gone(daemon_pid),
     );
 }
 
