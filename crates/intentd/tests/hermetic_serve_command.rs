@@ -382,15 +382,35 @@ fn identity_reset_after_env_clear_restores_resume_off() {
 }
 
 #[test]
-fn pty_wrapper_pins_resume_off_and_keeps_an_opt_in() {
-    let dir = common::test_tempdir("pty-resume-contract-");
-    let mut pinned = portable_pty::CommandBuilder::new("never-executed");
-    pinned.env_remove(RESUME);
-    common::hermetic_pty_fixture_identity(&mut pinned, dir.path());
-    assert_eq!(pinned.get_env(RESUME), Some(OsStr::new("off")));
+fn identity_reset_repins_resume_after_an_explicit_removal() {
+    let dir = common::test_tempdir("serve-contract-resume-removed-");
+    let mut cmd = fixture_command(dir.path(), false);
+    cmd.env_remove(RESUME);
+    common::hermetic_fixture_identity(&mut cmd, dir.path());
+    assert_eq!(
+        explicit_env(&cmd, RESUME),
+        EnvSetting::Set(OsStr::new("off"))
+    );
+}
 
-    let mut opted = portable_pty::CommandBuilder::new("never-executed");
-    opted.env(RESUME, "on");
-    common::hermetic_pty_fixture_identity(&mut opted, dir.path());
-    assert_eq!(opted.get_env(RESUME), Some(OsStr::new("on")));
+#[test]
+fn harness_and_daemon_share_the_resume_seam_name() {
+    assert_eq!(
+        RESUME,
+        intent_core::settings_file::RESUME_ON_START_TEST_DEFAULT_ENV
+    );
+}
+
+#[test]
+fn pty_wrapper_always_pins_resume_off() {
+    let dir = common::test_tempdir("pty-resume-contract-");
+    for preset in [None, Some("auto"), Some("on")] {
+        let mut cmd = portable_pty::CommandBuilder::new("never-executed");
+        match preset {
+            Some(value) => cmd.env(RESUME, value),
+            None => cmd.env_remove(RESUME),
+        }
+        common::hermetic_pty_fixture_identity(&mut cmd, dir.path());
+        assert_eq!(cmd.get_env(RESUME), Some(OsStr::new("off")), "{preset:?}");
+    }
 }

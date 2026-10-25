@@ -662,14 +662,15 @@ pub fn hermetic_serve_command_fixed_port(data_dir: &Path) -> std::process::Comma
 /// Intentional identity tests can layer private mock configuration afterwards.
 ///
 /// Also pins startup resume off ([`RESUME_ON_START_TEST_DEFAULT_ENV`] =
-/// `off`) unless the command already carries an explicit entry for it (an
-/// [`opt_into_resume_on_start`] opt-in survives a later reset). Every daemon
-/// fixture passes through here — `serve_spawn_lint.rs` requires it — so no
-/// restart can quietly resume an interrupted turn on a headless CI runner.
+/// `off`) unless the command already sets a value for it (an
+/// [`opt_into_resume_on_start`] opt-in survives a later reset; an
+/// `env_remove` or an inherited host value does not). Every daemon fixture
+/// passes through here — `serve_spawn_lint.rs` requires it — so no restart
+/// can quietly resume an interrupted turn on a headless CI runner.
 pub fn hermetic_fixture_identity(cmd: &mut std::process::Command, data_dir: &Path) {
-    let resume_is_caller_owned = cmd
-        .get_envs()
-        .any(|(key, _)| key == std::ffi::OsStr::new(RESUME_ON_START_TEST_DEFAULT_ENV));
+    let resume_is_caller_owned = cmd.get_envs().any(|(key, value)| {
+        key == std::ffi::OsStr::new(RESUME_ON_START_TEST_DEFAULT_ENV) && value.is_some()
+    });
     if !resume_is_caller_owned {
         cmd.env(RESUME_ON_START_TEST_DEFAULT_ENV, "off");
     }
@@ -750,16 +751,12 @@ pub fn mock_github_token(cmd: &mut std::process::Command, data_dir: &Path, token
 /// The PTY driver execs the daemon through bash. Copy the supported constructor's
 /// complete environment, including explicit removals, into its wrapper command.
 /// `portable_pty` snapshots the environment at construction; `env_remove` deletes
-/// inherited entries from that snapshot as well as explicit overrides. A
-/// resume-on-start entry already on `cmd` (an opt-in) is kept, matching
-/// [`hermetic_fixture_identity`].
+/// inherited entries from that snapshot as well as explicit overrides. The
+/// snapshot cannot tell an inherited resume-on-start value from an explicit
+/// one, so PTY daemons always take the constructor's `off` pin.
 pub fn hermetic_pty_fixture_identity(cmd: &mut portable_pty::CommandBuilder, data_dir: &Path) {
     let isolated = hermetic_serve_command(data_dir);
-    let resume_is_caller_owned = cmd.get_env(RESUME_ON_START_TEST_DEFAULT_ENV).is_some();
     for (key, value) in isolated.get_envs() {
-        if resume_is_caller_owned && key == std::ffi::OsStr::new(RESUME_ON_START_TEST_DEFAULT_ENV) {
-            continue;
-        }
         match value {
             Some(value) => cmd.env(key, value),
             None => cmd.env_remove(key),
@@ -842,14 +839,17 @@ pub fn seed_default_provider(data_dir: &std::path::Path) {
     std::fs::write(&path, text).expect("seed config.toml with model.defaultProvider");
 }
 
-/// Daemon env seam (read in `intentd` `main.rs`) that replaces the
-/// `agents.resumeInterruptedOnStart` schema default when `config.toml` does
-/// not set the key. [`hermetic_fixture_identity`] pins it to `off` for every
-/// fixture daemon: the production default `auto` resumes interrupted agents
-/// only on headless hosts, so restart suites used to pick up an extra agent
-/// turn on CI runners alone (intent-hq/intent#6058, intent-hq/intent#7706).
-/// An explicit file value, `--resume-all`, and update restarts still win.
-pub const RESUME_ON_START_TEST_DEFAULT_ENV: &str = "INTENTD_TEST_RESUME_ON_START_DEFAULT";
+/// Daemon env seam (defined in `intent_core`, read in `intentd` `main.rs`;
+/// an invalid value fails daemon startup) that resolves an
+/// `agents.resumeInterruptedOnStart` of `auto` — the schema default, also
+/// written by the generated config template on a fresh data dir — while an
+/// explicit `on` / `off`, `--resume-all`, and update restarts still win.
+/// [`hermetic_fixture_identity`] pins it to `off` for every fixture daemon:
+/// `auto` resumes interrupted agents only on headless hosts, so restart
+/// suites used to pick up an extra agent turn on CI runners alone
+/// (intent-hq/intent#6058, intent-hq/intent#7706).
+pub const RESUME_ON_START_TEST_DEFAULT_ENV: &str =
+    intent_core::settings_file::RESUME_ON_START_TEST_DEFAULT_ENV;
 
 /// Opt a fixture daemon back into startup resume of interrupted agents.
 /// Sets `on` (not the production `auto`) so recovery tests resume on every
