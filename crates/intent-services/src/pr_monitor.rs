@@ -3497,7 +3497,10 @@ impl Services {
 
     /// The `agent:idle` nudge: poll the workspace's active monitors whose
     /// `lastPolledAt` is at least `min_age_secs` old (or missing) through
-    /// the due-sweep lanes, skipping fresher ones. The shared rate-limit
+    /// the due-sweep lanes, skipping fresher ones. Freshness is per PR: a PR
+    /// any workspace's monitor polled within `min_age_secs` is skipped, and a
+    /// nudged PR's fetch also refreshes other workspaces' stale monitors on
+    /// it (legacy lane). The shared rate-limit
     /// gate, the quota-share deferral, and the debounced wake delivery all
     /// apply exactly as on a loop tick; only the idle-tier cadence and the
     /// per-tick fetch cap are replaced by the minimum age, because the
@@ -3796,15 +3799,27 @@ impl Services {
             .max()
             .map(|at| u64::try_from((now - at).whole_seconds()).unwrap_or(0));
         let (monitors, intervals) = if let Some((workspace_id, min_age_secs)) = nudge {
-            // The minimum age is a hard floor per monitor, applied before PR
-            // grouping, and no fresh monitor's catch-up marker can win the
-            // nudge's fetch.
+            // The minimum age is a hard floor per PR across workspaces: a PR
+            // any sibling monitor polled inside it is skipped (every stamp
+            // kept), and a nudged PR carries EVERY sibling monitor — all
+            // stale by construction — so the shared fetch leaves aligned
+            // stamps and neither the next due sweep nor another workspace's
+            // nudge fetches the PR again within the floor. No catch-up
+            // marker can win the nudge's fetch.
+            let fresh_prs: HashSet<PrKey> = monitors
+                .iter()
+                .filter(|m| polled_within(m.last_polled_at.as_deref(), min_age_secs, now))
+                .map(pr_key)
+                .collect();
+            let nudged_prs: HashSet<PrKey> = monitors
+                .iter()
+                .filter(|m| &m.workspace_id == workspace_id)
+                .map(pr_key)
+                .filter(|key| !fresh_prs.contains(key))
+                .collect();
             let monitors: Vec<_> = monitors
                 .into_iter()
-                .filter(|m| {
-                    &m.workspace_id == workspace_id
-                        && !polled_within(m.last_polled_at.as_deref(), min_age_secs, now)
-                })
+                .filter(|m| nudged_prs.contains(&pr_key(m)))
                 .collect();
             let intervals = HashMap::from([(workspace_id.clone(), min_age_secs)]);
             (monitors, intervals)
@@ -11031,7 +11046,7 @@ mod tests {
 
     /// An `agent:idle` nudge polls the workspace's monitors whose last poll
     /// is at least 60 s old even when the idle tier would wait, skips
-    /// fresher ones, other workspaces, and a rate-limit pause.
+    /// fresher ones, other workspaces' PRs, and a rate-limit pause.
     #[tokio::test]
     async fn idle_nudge_polls_only_stale_monitors_in_the_workspace() {
         let (_db, _root, svc, forge, ws, owner) = setup().await;
@@ -11046,7 +11061,10 @@ mod tests {
             .insert_agent_session(&agent(&other_ws, "agent-other"))
             .await
             .unwrap();
-        let other = register(&svc, &other_ws, &AgentId::from("agent-other")).await;
+        let (other, _) = svc
+            .pr_monitor_register(&other_ws, &AgentId::from("agent-other"), "o", "r", 7)
+            .await
+            .expect("register");
         make_workspace_idle(&svc, &ws).await;
         make_workspace_idle(&svc, &other_ws).await;
         let stamp = |id: PrMonitorId| {
@@ -11083,7 +11101,7 @@ mod tests {
         assert_eq!(
             stamp(other.monitor_id.clone()).await,
             other_before,
-            "another workspace's monitor is untouched"
+            "another workspace's PR is untouched"
         );
         svc.nudge_workspace_pr_monitors(&ws, 60).await;
         assert!(forge.take_fetched_numbers().is_empty(), "just polled");
@@ -11199,6 +11217,113 @@ mod tests {
             polled(caught_up.monitor_id.clone()).await.as_deref(),
             Some(fresh.as_str()),
             "a fresh catch-up monitor is not nudged"
+        );
+    }
+
+    /// Two workspaces watching one PR share its freshness: nudging A polls
+    /// the PR once and stamps B's stale sibling too, so neither the next due
+    /// sweep nor B's own nudge fetches the PR again within the 60 s floor.
+    #[tokio::test]
+    async fn idle_nudge_shares_pr_freshness_across_workspaces() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let svc = svc.with_pr_monitor_poll_seconds(60);
+        let a = register(&svc, &ws, &owner).await;
+        let other_ws = WorkspaceId::new();
+        svc.store()
+            .insert_workspace(&workspace(&other_ws))
+            .await
+            .unwrap();
+        svc.store()
+            .insert_agent_session(&agent(&other_ws, "agent-other"))
+            .await
+            .unwrap();
+        let b = register(&svc, &other_ws, &AgentId::from("agent-other")).await;
+        make_workspace_idle(&svc, &ws).await;
+        let stamp = |id: PrMonitorId| {
+            let svc = svc.clone();
+            async move {
+                svc.store()
+                    .get_pr_monitor(&id)
+                    .await
+                    .unwrap()
+                    .last_polled_at
+            }
+        };
+        age_all(&svc, 120).await;
+        forge.take_fetched_numbers();
+        let b_before = stamp(b.monitor_id.clone()).await;
+
+        svc.nudge_workspace_pr_monitors(&ws, 60).await;
+        assert_eq!(forge.take_fetched_numbers(), vec![42], "one shared fetch");
+        assert_ne!(
+            stamp(b.monitor_id.clone()).await,
+            b_before,
+            "the stale sibling shares the fetch"
+        );
+        assert!(polled_within(
+            stamp(a.monitor_id.clone()).await.as_deref(),
+            60,
+            time::OffsetDateTime::now_utc()
+        ));
+
+        svc.poll_due_pr_monitors().await;
+        assert!(
+            forge.take_fetched_numbers().is_empty(),
+            "the due sweep sees the PR as fresh"
+        );
+        svc.nudge_workspace_pr_monitors(&other_ws, 60).await;
+        assert!(
+            forge.take_fetched_numbers().is_empty(),
+            "B's nudge sees the PR as fresh"
+        );
+    }
+
+    /// The 60 s floor is per PR: a sibling polled inside it keeps A's nudge
+    /// from fetching the PR, and both monitors keep their timestamps.
+    #[tokio::test]
+    async fn idle_nudge_skips_a_pr_with_a_fresh_sibling() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let svc = svc.with_pr_monitor_poll_seconds(60);
+        let a = register(&svc, &ws, &owner).await;
+        let other_ws = WorkspaceId::new();
+        svc.store()
+            .insert_workspace(&workspace(&other_ws))
+            .await
+            .unwrap();
+        svc.store()
+            .insert_agent_session(&agent(&other_ws, "agent-other"))
+            .await
+            .unwrap();
+        let b = register(&svc, &other_ws, &AgentId::from("agent-other")).await;
+        let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
+        let stale = intent_core::iso_from_unix_secs(now_unix - 120);
+        let fresh = intent_core::iso_from_unix_secs(now_unix - 30);
+        backdate(&svc, &a.monitor_id, &stale).await;
+        backdate(&svc, &b.monitor_id, &fresh).await;
+        forge.take_fetched_numbers();
+
+        svc.nudge_workspace_pr_monitors(&ws, 60).await;
+        assert!(
+            forge.take_fetched_numbers().is_empty(),
+            "PR polled 30 s ago"
+        );
+        let polled = |id: PrMonitorId| {
+            let svc = svc.clone();
+            async move {
+                svc.store()
+                    .get_pr_monitor(&id)
+                    .await
+                    .unwrap()
+                    .last_polled_at
+            }
+        };
+        assert_eq!(
+            polled(a.monitor_id.clone()).await.as_deref(),
+            Some(stale.as_str())
+        );
+        assert_eq!(
+            polled(b.monitor_id.clone()).await.as_deref(),
+            Some(fresh.as_str())
         );
     }
 
