@@ -554,6 +554,35 @@ impl ScriptManager {
         Ok(())
     }
 
+    /// Caller holds the definition lock, before any durable write: a
+    /// mutation that passed the front-door retired gate while the workspace
+    /// was still Archived can resume after `workspace.retire` returned and
+    /// dropped its closing mark. Retire flips the row while holding that
+    /// mark, so this re-read refuses it with `workspace-retired` and nothing
+    /// is restored, settled, stopped or persisted (PROTOCOL §5.1 "Read-only
+    /// while retired").
+    pub(super) async fn refuse_if_retired_locked(&self, ws: &WorkspaceId) -> Result<()> {
+        if self
+            .store
+            .get_workspace(ws)
+            .await
+            .is_ok_and(|row| row.is_retired())
+        {
+            return Err(crate::retire::retired_error(ws));
+        }
+        Ok(())
+    }
+
+    /// [`Self::refuse_if_retired_locked`] for launches, which are also
+    /// refused while the workspace is closing (deletion, or a retire still
+    /// tearing down before its row flip).
+    pub(super) async fn require_launch_open_locked(&self, ws: &WorkspaceId) -> Result<()> {
+        if self.locks.is_closing(ws) {
+            return Err(Error::NotFound(format!("workspace {ws}")));
+        }
+        self.refuse_if_retired_locked(ws).await
+    }
+
     /// Full-authority runtime reads keep their existing nonblocking behavior.
     /// Restricted guest reads fence replacement while capturing their response.
     pub(crate) async fn scoped_read_guard(
@@ -622,6 +651,7 @@ impl ScriptManager {
         // while this call awaits its predecessor's supervisor.
         let lock = self.locks.definition_lock(&id);
         let _guard = lock.lock().await;
+        self.refuse_if_retired_locked(&workspace_id).await?;
         if scoped
             && self
                 .store
@@ -1395,6 +1425,7 @@ impl ScriptManager {
     ) -> Result<Value> {
         let lock = self.locks.definition_lock(script_id);
         let _guard = lock.lock().await;
+        self.refuse_if_retired_locked(workspace_id).await?;
         if scoped && self.store.script_workspace(script_id).await?.as_ref() != Some(workspace_id) {
             return Err(Error::NotFound(format!("script {script_id}")));
         }
@@ -1687,6 +1718,7 @@ impl ScriptManager {
         let lock = self.locks.definition_lock(script_id);
         let _guard = lock.lock().await;
         self.require_admission(workspace_id, script_id).await?;
+        self.require_launch_open_locked(workspace_id).await?;
         if self.is_live(workspace_id, script_id)? {
             return Ok(self.start_reply(workspace_id, script_id));
         }
@@ -1780,6 +1812,7 @@ impl ScriptManager {
             let lock = mgr.locks.definition_lock(&id);
             let _guard = lock.lock().await;
             mgr.require_admission(&ws, &id).await?;
+            mgr.refuse_if_retired_locked(&ws).await?;
             mgr.ensure_known_locked(&ws, &id).await?;
             mgr.stop_inner(&ws, &id, true).await
         })
@@ -2048,6 +2081,7 @@ impl ScriptManager {
         let lock = self.locks.definition_lock(script_id);
         let _guard = lock.lock().await;
         self.require_admission(workspace_id, script_id).await?;
+        self.require_launch_open_locked(workspace_id).await?;
         self.ensure_known_locked(workspace_id, script_id).await?;
         // Admission survives teardown, but its predecessor cannot report an
         // outcome for the successor token while shutdown is draining it.
@@ -2097,6 +2131,7 @@ impl ScriptManager {
         let lock = self.locks.definition_lock(script_id);
         let admission = lock.lock_owned().await;
         self.require_admission(workspace_id, script_id).await?;
+        self.require_launch_open_locked(workspace_id).await?;
         if self.is_live(workspace_id, script_id)? {
             return Ok(
                 json!({"output": "", "warning": "Script is already running; wait for it to finish or use script.stop."}),

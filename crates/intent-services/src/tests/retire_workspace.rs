@@ -1238,14 +1238,18 @@ async fn manual_retire_does_not_stop_scripts_of_a_workspace_unarchived_while_wai
     assert!(std::path::Path::new(ws.worktree_path.as_deref().unwrap()).is_dir());
 }
 
-/// Review regression (intentd#2605): a script launch that passed the RPC
+/// Review regression (intentd#2605): a script mutation that passed the RPC
 /// retired check while the workspace was still Archived, and resumes only
 /// after `workspace.retire` returned (its closing mark dropped), is refused
-/// at admission: no run row is written for the removed checkout. Driven
-/// through the script manager directly — the code behind the front-door
-/// gate — for `start`, `restart` and `run`.
+/// under the definition lock BEFORE any durable write. Driven through the
+/// script manager directly — the code behind the front-door gate — for
+/// every gated script mutation: `run` of an archived command (no
+/// `archivedAt` restoration, no `script:changed`) and of a service (the
+/// "use script.start" warning must not bypass the refusal), `start`,
+/// `restart`, `stop`, `remove`, restore and `create`. Nothing is written:
+/// no run row, no definition change, no event.
 #[intent_test_macros::daemon_test]
-async fn script_admission_after_retire_returns_is_refused() {
+async fn script_mutations_after_retire_returns_are_refused_and_write_nothing() {
     let f = fixture().await;
     let ws = create_workspace(&f).await;
     let mut ids = Vec::new();
@@ -1269,28 +1273,80 @@ async fn script_admission_after_retire_returns_is_refused() {
             .expect("create");
         ids.push(v["id"].as_str().expect("script id").to_string());
     }
+    let (svc_id, cmd_id) = (ids[0].clone(), ids[1].clone());
+    let mgr = f.svc.script_manager();
+    mgr.archive(&ws.id, vec![cmd_id.clone()], true)
+        .await
+        .expect("archive the command definition");
+    let archived_at = f
+        .store
+        .get_script_in_workspace(&ws.id, &cmd_id)
+        .await
+        .unwrap()
+        .expect("cmd row")
+        .archived_at;
+    assert!(archived_at.is_some(), "command definition archived");
     f.svc
         .retire_workspace(ws.id.clone(), None)
         .await
         .expect("retire");
-    let mgr = f.svc.script_manager();
+    let mut sub = f.bus.subscribe(crate::SubscriptionFilter {
+        event_types: vec![intent_core::events::SCRIPT_CHANGED.to_string()],
+        workspace_id: Some(ws.id.0.clone()),
+        ..Default::default()
+    });
 
-    let (svc_id, cmd_id) = (&ids[0], &ids[1]);
-    let start = mgr.start(&ws.id, svc_id).await;
-    assert!(
-        matches!(start, Err(Error::WorkspaceRetired { .. })),
-        "{start:?}"
-    );
-    let restart = mgr.restart(&ws.id, svc_id).await;
-    assert!(
-        matches!(restart, Err(Error::WorkspaceRetired { .. })),
-        "{restart:?}"
-    );
-    let run = mgr.run(&ws.id, cmd_id, None, Some(5)).await;
-    assert!(
-        matches!(run, Err(Error::WorkspaceRetired { .. })),
-        "{run:?}"
-    );
+    let retired = |r: &intent_core::Result<serde_json::Value>| {
+        matches!(r, Err(Error::WorkspaceRetired { .. }))
+    };
+    let run_cmd = mgr.run(&ws.id, &cmd_id, None, Some(5)).await;
+    assert!(retired(&run_cmd), "run archived command: {run_cmd:?}");
+    let run_svc = mgr.run(&ws.id, &svc_id, None, Some(5)).await;
+    assert!(retired(&run_svc), "run service: {run_svc:?}");
+    let start = mgr.start(&ws.id, &svc_id).await;
+    assert!(retired(&start), "start: {start:?}");
+    let restart = mgr.restart(&ws.id, &svc_id).await;
+    assert!(retired(&restart), "restart: {restart:?}");
+    let stop = mgr.stop(&ws.id, &svc_id).await;
+    assert!(retired(&stop), "stop: {stop:?}");
+    let remove = mgr.remove(&ws.id, &cmd_id).await;
+    assert!(retired(&remove), "remove: {remove:?}");
+    let restore = mgr.archive(&ws.id, vec![cmd_id.clone()], false).await;
+    assert!(retired(&restore), "restore: {restore:?}");
+    let created = mgr
+        .create(
+            ws.id.clone(),
+            intent_core::ScriptCreateParams {
+                name: "late".to_string(),
+                command: "echo late".to_string(),
+                mode: intent_core::ScriptMode::Command,
+                purpose: Some(intent_core::ScriptPurpose::Saved),
+                script_id: Some("late-script".to_string()),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(retired(&created), "create: {created:?}");
+
+    let cmd_row = f
+        .store
+        .get_script_in_workspace(&ws.id, &cmd_id)
+        .await
+        .unwrap()
+        .expect("cmd definition kept");
+    assert_eq!(cmd_row.archived_at, archived_at, "archivedAt unchanged");
+    assert!(f
+        .store
+        .get_script_in_workspace(&ws.id, &svc_id)
+        .await
+        .unwrap()
+        .is_some());
+    assert!(f
+        .store
+        .get_script_in_workspace(&ws.id, "late-script")
+        .await
+        .unwrap()
+        .is_none());
     for id in &ids {
         assert!(
             f.store
@@ -1301,6 +1357,15 @@ async fn script_admission_after_retire_returns_is_refused() {
             "no run row written for {id}"
         );
     }
+    assert!(
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            sub.recv(),
+        )
+        .await
+        .is_err(),
+        "no script:changed event"
+    );
 }
 
 // ---------------------------------------------------------------------------
