@@ -1,7 +1,7 @@
 //! Per-note content-write lock (intent-hq/intent#7184).
 //!
-//! Every [`Store`] method that rewrites a note's text takes a
-//! [`NoteWriteLock`] for that note, and the only way to get one is
+//! Every [`Store`] method that rewrites a note's text — or bumps its `rev`
+//! with a metadata-only write — takes a [`NoteWriteLock`] for that note, and the only way to get one is
 //! [`Store::lock_note_content`], so a writer that never took the note's lock
 //! does not compile. A writer holds it from the read its new text derives
 //! from through the gated persist, so N parallel writers to one note apply one
@@ -150,7 +150,7 @@ impl NoteWriteLock {
 
 impl Store {
     /// Take `note_id`'s content-write lock, waiting for the current holder.
-    /// Every method that rewrites a note's text requires it. Hold it from
+    /// Every method that rewrites a note's text or metadata requires it. Hold it from
     /// the read a write derives from through its persist, and drop it before
     /// any follow-up that may write a note (locks never nest).
     pub async fn lock_note_content(

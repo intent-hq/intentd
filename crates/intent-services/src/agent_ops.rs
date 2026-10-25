@@ -15876,31 +15876,19 @@ impl Services {
     }
 
     /// Daemon-side equivalent of the FE `task.removeAgentFromAllTasks`: strip
-    /// the given agent ids from every task note in the workspace. Silent on
-    /// notes/tasks that never referenced the ids so it is safe to call with an
-    /// empty or partially-stale list.
+    /// the given agent ids from every task note in the workspace and emit
+    /// `note:updated` for each note it rewrites. Silent on notes/tasks that
+    /// never referenced the ids so it is safe to call with an empty or
+    /// partially-stale list.
     async fn remove_agent_ids_from_workspace_tasks(
         &self,
         workspace_id: &WorkspaceId,
         stale: &[AgentId],
     ) -> Result<()> {
-        if stale.is_empty() {
-            return Ok(());
-        }
-        let notes = self.store.list_notes(workspace_id).await?;
-        for mut note in notes {
-            let Some(mut task) = note.metadata.task.clone() else {
-                continue;
-            };
-            let before = task.assigned_agent_ids.len();
-            task.assigned_agent_ids.retain(|a| !stale.contains(a));
-            if task.assigned_agent_ids.len() == before {
-                continue;
-            }
-            let now = now_iso();
-            note.metadata.task = Some(task);
-            note.updated_at = now;
-            self.store.update_note_metadata(&note).await?;
+        for note in self
+            .strip_agents_from_workspace_tasks(workspace_id, stale)
+            .await?
+        {
             crate::publish_event(
                 self.event_bus.as_ref(),
                 crate::note_change_event(
@@ -15914,6 +15902,50 @@ impl Services {
             .await;
         }
         Ok(())
+    }
+
+    /// Remove `stale` from `assignedAgentIds` on every task note listing any
+    /// of them, returning the notes rewritten (bodies not loaded). The list
+    /// only picks candidates: each note is re-read under its write lane and
+    /// rewritten from that read, so a metadata write that landed since the
+    /// list is kept rather than reverted from the listed copy.
+    pub(crate) async fn strip_agents_from_workspace_tasks(
+        &self,
+        workspace_id: &WorkspaceId,
+        stale: &[AgentId],
+    ) -> Result<Vec<intent_core::Note>> {
+        let mut updated = Vec::new();
+        if stale.is_empty() {
+            return Ok(updated);
+        }
+        let lists_stale = |note: &intent_core::Note| {
+            note.metadata
+                .task
+                .as_ref()
+                .is_some_and(|t| t.assigned_agent_ids.iter().any(|a| stale.contains(a)))
+        };
+        for listed in self.store.list_notes(workspace_id).await? {
+            if !lists_stale(&listed) {
+                continue;
+            }
+            let write_lane = self.lock_note_content(workspace_id, &listed.id).await;
+            let mut note = match self.store.get_note_metadata(workspace_id, &listed.id).await {
+                Ok(note) => note,
+                Err(intent_core::Error::NotFound(_)) => continue,
+                Err(e) => return Err(e),
+            };
+            if !lists_stale(&note) {
+                continue;
+            }
+            if let Some(task) = note.metadata.task.as_mut() {
+                task.assigned_agent_ids.retain(|a| !stale.contains(a));
+            }
+            note.updated_at = now_iso();
+            self.store.update_note_metadata(&write_lane, &note).await?;
+            drop(write_lane);
+            updated.push(note);
+        }
+        Ok(updated)
     }
 
     /// Load a session, mapping `NotFound` to `-32603` for the methods whose TS

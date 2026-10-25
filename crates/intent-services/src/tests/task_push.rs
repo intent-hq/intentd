@@ -67,7 +67,15 @@ async fn task_push_has_complete_rows_and_changed_only_statistics() {
     assert!(data["note"]["rev"].as_i64().unwrap() > 0);
     let mut updated = store.get_note(&ws, &task.id).await.unwrap();
     updated.title = "Renamed".into();
-    store.update_note_metadata(&updated).await.unwrap();
+    store
+        .update_note_metadata(
+            &store
+                .lock_note_content(&updated.workspace_id, &updated.id)
+                .await,
+            &updated,
+        )
+        .await
+        .unwrap();
     bus.publish(&note_change_event(
         &ws,
         &task.id,
