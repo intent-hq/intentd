@@ -10648,6 +10648,7 @@ async fn create_rename_set_model_emit_agent_events() {
     .expect("sub closed");
     assert_eq!(batch[0].event_type, AGENT_RENAMED);
     assert_eq!(batch[0].data["name"], "Renamed");
+    assert_eq!(batch[0].data["nameExplicitlySet"], json!(true));
 
     svc.agent_set_model_op(id.clone(), "auggie:opus4.7".into(), None)
         .await
@@ -32773,7 +32774,12 @@ async fn agent_update_name_only_emits_agent_renamed() {
     .await
     .expect("recv")
     .expect("open");
-    assert!(batch.iter().any(|e| e.event_type == AGENT_RENAMED));
+    let renamed = batch
+        .iter()
+        .find(|e| e.event_type == AGENT_RENAMED)
+        .expect("agent:renamed in batch");
+    assert_eq!(renamed.data["name"], "NewName");
+    assert_eq!(renamed.data["nameExplicitlySet"], json!(true));
 }
 
 /// `agent.update` runs the same registry validation on the `imageBlocks`
