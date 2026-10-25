@@ -22,6 +22,21 @@ pub(crate) fn monitor_id(metadata: Option<&Value>) -> Option<&str> {
 }
 
 impl Services {
+    /// Ids of the active monitors on `script_id` (any owner).
+    pub(crate) async fn active_script_monitor_ids(
+        &self,
+        workspace_id: &WorkspaceId,
+        script_id: &str,
+    ) -> Result<Vec<String>> {
+        Ok(self
+            .store
+            .script_monitors(workspace_id, None)
+            .await?
+            .into_iter()
+            .filter(|m| m.script_id == script_id && m.state == "active")
+            .map(|m| m.monitor_id)
+            .collect())
+    }
     pub(crate) fn track_script_monitor_worker(&self, agent: &AgentId, metadata: Option<&Value>) {
         let mut workers = self
             .script_locks
@@ -116,7 +131,11 @@ impl Services {
         );
         true
     }
-    pub(crate) fn start_script_monitor_maintenance(&self) {
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub fn start_script_monitor_maintenance(&self) {
         if self
             .script_locks
             .monitor_maintenance

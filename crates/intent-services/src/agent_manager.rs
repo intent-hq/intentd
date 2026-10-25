@@ -2747,7 +2747,7 @@ type Handles = Arc<Mutex<HashMap<AgentId, AgentHandle>>>;
 /// it — after which the rows are gone and a spawn attempt fails `NotFound`
 /// on its own store read.
 #[must_use = "dropping the fence immediately re-opens the lazy-spawn paths"]
-pub(crate) struct TeardownFence {
+pub struct TeardownFence {
     stopping: Arc<Mutex<HashSet<AgentId>>>,
     ids: Vec<AgentId>,
 }
@@ -3891,6 +3891,16 @@ impl AgentManager {
                     self.services
                         .register_profile_process(&workspace_id, &agent_id, profile),
                 )
+                .await
+            }
+            // A Default configuration with no saved overrides is tracked
+            // too, so a later edit reports it as running on earlier settings.
+            None if crate::provider_profiles::is_default_config_ref(opts.provider.id) => {
+                Box::pin(self.services.register_default_process(
+                    &workspace_id,
+                    &agent_id,
+                    opts.provider.id,
+                ))
                 .await
             }
             None => None,
@@ -5355,7 +5365,11 @@ impl AgentManager {
     /// Legacy Codex slash ids retain their existing parsing. Bracket ids
     /// split only for recognized catalog effort levels; arbitrary/malformed
     /// brackets must reach the adapter unchanged and be rejected there.
-    pub(crate) fn split_codex_model_effort(model: &str) -> (&str, Option<&str>) {
+    #[expect(
+        clippy::must_use_candidate,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub fn split_codex_model_effort(model: &str) -> (&str, Option<&str>) {
         if let Some((base, effort)) = model.split_once('/') {
             return (base, Some(effort));
         }
@@ -5375,7 +5389,7 @@ impl AgentManager {
     /// The explicit field is canonical. Embedded legacy Codex effort is a
     /// fallback only when that field is absent/empty, both at startup and
     /// when reusing a child; otherwise reuse would reset suffix-only effort.
-    pub(crate) fn session_model_effort(
+    pub fn session_model_effort(
         provider: &ProviderConfig,
         model: Option<&str>,
         explicit: Option<&str>,
@@ -6403,7 +6417,11 @@ impl AgentManager {
     /// concurrent `agent.sendMessage` racing the teardown cannot respawn a
     /// child that would outlive its deleted session as a ghost process.
     #[must_use = "hold the fence until the swept agents' session rows are deleted"]
-    pub(crate) async fn stop_many(&self, agent_ids: &[AgentId]) -> TeardownFence {
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub async fn stop_many(&self, agent_ids: &[AgentId]) -> TeardownFence {
         // Arm the fence BEFORE the first detach: from here on, every lazy
         // spawn for a swept agent is refused (`ensure_started` fast-fail +
         // the `create_agent` install fence), so no replacement child can
@@ -11632,7 +11650,7 @@ impl AgentManager {
         // A named profile's saved overlay, read fresh for this new process
         // (it re-checks the profile still exists and its base is enabled).
         // Boxed: keeps this turn-start future's stack frame unchanged.
-        let profile_env = if crate::provider_profiles::is_qualified_ref(&resolved.selection) {
+        let profile_env = if crate::provider_profiles::may_have_overlay(&resolved.selection) {
             boxed_await(|| self.services.resolve_selected_profile(&resolved.selection)).await?
         } else {
             None
@@ -13419,8 +13437,13 @@ struct ResolvedSpawn {
 }
 
 /// Exercise the real first-turn resolver without starting a provider process.
-#[cfg(test)]
-pub(crate) fn imported_spawn_selection_for_test(
+#[cfg(any(test, feature = "test-hooks"))]
+#[expect(
+    clippy::missing_panics_doc,
+    clippy::must_use_candidate,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn imported_spawn_selection_for_test(
     session: &AgentSession,
     settings: &intent_core::settings_file::SettingsFile,
 ) -> (String, Option<String>, Option<String>) {
@@ -23563,21 +23586,8 @@ mod agent_retry_tests {
 
     fn park_monitor_export(mgr: &AgentManager, ws: &WorkspaceId) {
         mgr.services
-            .transfer_state()
-            .exports
-            .lock()
-            .unwrap()
-            .insert(
-                "monitor-worker-export".into(),
-                crate::transfer_export::ExportSession {
-                    initiator: None,
-                    workspace_id: ws.clone(),
-                    staging_dir: std::env::temp_dir(),
-                    state: crate::transfer_export::ExportState::Building { aborted: false },
-                    wip_paths: vec![],
-                    max_chunk_bytes: 100,
-                },
-            );
+            .feature_transfer_port()
+            .park_building_export_for_test("monitor-worker-export", ws, None, std::env::temp_dir());
     }
 
     async fn monitor_worker_exit_releases_slot(exporting: bool) {

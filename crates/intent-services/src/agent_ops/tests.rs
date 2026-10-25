@@ -10648,6 +10648,7 @@ async fn create_rename_set_model_emit_agent_events() {
     .expect("sub closed");
     assert_eq!(batch[0].event_type, AGENT_RENAMED);
     assert_eq!(batch[0].data["name"], "Renamed");
+    assert_eq!(batch[0].data["nameExplicitlySet"], json!(true));
 
     svc.agent_set_model_op(id.clone(), "auggie:opus4.7".into(), None)
         .await
@@ -32204,7 +32205,15 @@ async fn diagnostics_task_filter_matches_session_side_only() {
     );
     task.assigned_agent_ids.clear();
     note.metadata.task = Some(task);
-    svc.store.update_note(&note).await.expect("update note");
+    svc.store
+        .update_note(
+            &svc.store
+                .lock_note_content(&note.workspace_id, &note.id)
+                .await,
+            &note,
+        )
+        .await
+        .expect("update note");
 
     let result = svc
         .agent_diagnostics_op(ws.clone(), None, Some(note_id.clone()), None)
@@ -32773,7 +32782,12 @@ async fn agent_update_name_only_emits_agent_renamed() {
     .await
     .expect("recv")
     .expect("open");
-    assert!(batch.iter().any(|e| e.event_type == AGENT_RENAMED));
+    let renamed = batch
+        .iter()
+        .find(|e| e.event_type == AGENT_RENAMED)
+        .expect("agent:renamed in batch");
+    assert_eq!(renamed.data["name"], "NewName");
+    assert_eq!(renamed.data["nameExplicitlySet"], json!(true));
 }
 
 /// `agent.update` runs the same registry validation on the `imageBlocks`

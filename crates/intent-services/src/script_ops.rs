@@ -49,6 +49,11 @@ const AUTO_RESTART_MAX_RETRIES: u32 = 5;
 /// [`Services::with_script_too_fast_ms`](crate::Services) so the decision is
 /// load-independent (monorepo#514).
 pub(crate) const TOO_FAST_MS: u128 = 2000;
+
+/// TTL of the monitor an agent's `ws.script.start` / `ws.script.restart`
+/// arms by default (see `WorkspaceApi::script_start_monitor`). Long enough for
+/// a slow gate on a loaded host; on expiry the agent is still woken.
+pub(crate) const AUTO_START_MONITOR_TTL_MS: i64 = 6 * 60 * 60 * 1000;
 /// How often the streamer polls for a natural process exit (mirrors `terminal_ops`).
 const EXIT_POLL: Duration = Duration::from_millis(25);
 /// Cap on output chunks drained after the exit poll has ended a run: the
@@ -316,7 +321,7 @@ impl ScriptLocks {
 /// the store (for workspace-root resolution), the script registry, and bootstrap locks.
 /// Cheap to clone (all handles); the supervisor task owns its own clone.
 #[derive(Clone)]
-pub(crate) struct ScriptManager {
+pub struct ScriptManager {
     owner_services: Option<crate::Services>,
     pty: Arc<PtyHost>,
     bus: Option<EventBus>,
@@ -980,7 +985,12 @@ impl ScriptManager {
 
     /// Reconcile one committed import without rewriting its persisted definition
     /// or touching scripts absent from the archive. Imported scripts stay idle.
-    pub(crate) async fn refresh_imported(
+    #[expect(
+        clippy::missing_errors_doc,
+        clippy::missing_panics_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub async fn refresh_imported(
         &self,
         workspace_id: &WorkspaceId,
         script_id: &str,
@@ -1075,6 +1085,27 @@ impl ScriptManager {
         self.emit_changed_locked(workspace_id, script_id, change)
             .await;
         Ok(())
+    }
+
+    /// Test seam: [`Self::list`] for feature-crate tests.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub async fn list_for_test(&self, workspace_id: &WorkspaceId) -> Result<Value> {
+        self.list(workspace_id).await
+    }
+
+    /// Test seam: [`Self::run`] for feature-crate tests.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub async fn run_for_test(
+        &self,
+        workspace_id: &WorkspaceId,
+        script_id: &str,
+        max_lines: Option<i64>,
+        timeout_seconds: Option<i64>,
+    ) -> Result<Value> {
+        self.run(workspace_id, script_id, max_lines, timeout_seconds)
+            .await
     }
 
     /// `script.list`: the workspace's scripts with merged runtime state.
@@ -3252,6 +3283,7 @@ mod tests {
     include!("script_ops/lifecycle_tests.rs");
     include!("script_ops/retirement_tests.rs");
     include!("script_ops/monitor_tests.rs");
+    include!("script_ops/start_monitor_tests.rs");
     include!("script_ops/snapshot_tests.rs");
     include!("script_ops/output_tests.rs");
     include!("script_ops/cleanup_tests.rs");
@@ -3284,6 +3316,7 @@ mod tests {
     /// children had to be reaped by hand. `LIVENESS + TEARDOWN_MARGIN` must
     /// stay under that budget; `liveness_deadline_fits_inside_nextest_terminate_budget`
     /// reads the real config and pins the ordering.
+    // fixed-deadline: allow — stays under nextest's 180 s slow-timeout kill with TEARDOWN_MARGIN to spare; liveness_deadline_fits_inside_nextest_terminate_budget pins it
     const LIVENESS: Duration = Duration::from_secs(150);
     /// Headroom between a `LIVENESS` expiry and nextest's kill so the failing
     /// wait's diagnostic and process teardown complete before the SIGKILL.
@@ -6611,7 +6644,7 @@ mod tests {
         // SIGTERM→grace→SIGKILL escalation, then the `exited` write — well
         // under this deadline even on a loaded host, while the old per-chunk
         // sleep never fired at all under the ~1ms noise.
-        let bound = Duration::from_secs(20);
+        let bound = intentd_test_support::test_timeout(Duration::from_secs(20));
         let deadline = tokio::time::Instant::now() + bound;
         let st = loop {
             let st = h

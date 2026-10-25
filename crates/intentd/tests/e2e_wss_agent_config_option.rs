@@ -263,6 +263,47 @@ where
     panic!("no agent:stream:end for {agent_id}");
 }
 
+/// Wait for the agent's idle status to be persisted. `agent:stream:end` and
+/// `agent:idle` both precede the post-turn `RuntimeIdle` write, whose
+/// `agent:status-changed` publishes only after the store commit. A SIGKILL
+/// before that write leaves an active status, so startup recovery records an
+/// interrupted turn (and, before hermetic daemons pinned resume-on-start off,
+/// resumed it with an extra prompt on headless CI: intent-hq/intent#6058,
+/// intent-hq/intent#7706). Call before killing the daemon. Fails fast, naming `context`, if the turn fails instead.
+async fn await_persisted_idle<S>(sub: &mut WebSocketStream<S>, agent_id: &str, context: &str)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let wait = async {
+        loop {
+            // The outer deadline fires first, so a timeout names `context`.
+            let frame = wss_event(sub, 60).await;
+            let event = &frame["params"]["event"];
+            if event["data"]["agentId"] != agent_id {
+                continue;
+            }
+            let status_changed = event["type"] == "agent:status-changed";
+            if status_changed
+                && event["data"]["status"] == "idle"
+                && event["data"]["isActive"] == false
+            {
+                return;
+            }
+            if event["type"] == "agent:failed"
+                || (status_changed && event["data"]["status"] == "error")
+            {
+                panic!("{context}: turn failed instead of settling: {event}");
+            }
+        }
+    };
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        wait,
+    )
+    .await
+    .unwrap_or_else(|_| panic!("{context}: no persisted idle status for {agent_id}"));
+}
+
 /// Follow ordinary id-only message notifications to the persisted rows,
 /// matching the live client's conversation refresh path.
 async fn effort_notices_until_end<S>(
@@ -935,6 +976,13 @@ async fn assert_effective_codex_model_selection(
         )
         .await;
         await_stream_end(&mut sub, agent_id).await;
+        // Settle before agent.setModel and the restart below (intent-hq/intent#7706).
+        await_persisted_idle(
+            &mut sub,
+            agent_id,
+            "control turn must settle before restart",
+        )
+        .await;
         let control = wss_rpc(
             &mut rpc,
             12,
@@ -1013,12 +1061,14 @@ async fn assert_effective_codex_model_selection(
     .await;
     await_stream_end(&mut sub, agent_id).await;
     let prompts = read_config_log(&prompt_log);
-    assert_eq!(prompts.len(), if resume { 3 } else { 2 });
+    assert_eq!(prompts.len(), if resume { 3 } else { 2 }, "{prompts:?}");
     for prompt in prompts.iter().rev().take(2) {
         assert_eq!(prompt["effectiveModel"], expected, "{prompt}");
         assert_eq!(prompt["effectiveEffort"], effort, "{prompt}");
     }
     if resume {
+        // Settle before agent.setModel and the restart below (intent-hq/intent#7706).
+        await_persisted_idle(&mut sub, agent_id, "reuse turn must settle before restart").await;
         // Return to the initial model on another loaded child. The new
         // accepted-state record distinguishes switch-back from earlier output.
         wss_rpc(
@@ -1060,7 +1110,7 @@ async fn assert_effective_codex_model_selection(
         .await;
         await_stream_end(&mut sub, agent_id).await;
         let prompts = read_config_log(&prompt_log);
-        assert_eq!(prompts.len(), 4);
+        assert_eq!(prompts.len(), 4, "{prompts:?}");
         assert_eq!(prompts[3]["effectiveModel"], "gpt-5.6-luna");
         assert_eq!(
             prompts[3]["effectiveEffort"],
@@ -2096,22 +2146,13 @@ async fn assert_model_specific_thinking_options(load_session: bool) {
         )
         .await;
         await_stream_end(&mut sub, agent_id).await;
-        // Both stream:end and agent:idle precede the final status write. Wait for
-        // persisted idle so startup recovery cannot add a turn after restart.
-        let mut idle = false;
-        for _ in 0..120 {
-            let frame = wss_event(&mut sub, 30).await;
-            let event = &frame["params"]["event"];
-            if event["type"] == "agent:status-changed"
-                && event["data"]["agentId"] == agent_id
-                && event["data"]["status"] == "idle"
-                && event["data"]["isActive"] == false
-            {
-                idle = true;
-                break;
-            }
-        }
-        assert!(idle, "turn must settle before changing model or effort");
+        // Wait for persisted idle so startup recovery cannot add a turn after restart.
+        await_persisted_idle(
+            &mut sub,
+            agent_id,
+            "turn must settle before changing model or effort",
+        )
+        .await;
         let prompts = read_config_log(&prompt_log);
         assert_eq!(prompts.len(), turn + 1, "{prompts:?}");
         assert_eq!(prompts[turn]["effectiveModel"], model);
@@ -2537,22 +2578,14 @@ async fn effort_notice_restart_case(load: bool) {
     );
     assert_eq!(read_config_log(&prompt_log)[1]["effectiveEffort"], "low");
 
-    // Both stream:end and agent:idle precede the final status write. Wait for
-    // the persisted idle status so startup recovery cannot add a turn (#6058).
-    let mut idle = false;
-    for _ in 0..120 {
-        let frame = wss_event(&mut sub, 30).await;
-        let event = &frame["params"]["event"];
-        if event["type"] == "agent:status-changed"
-            && event["data"]["agentId"] == agent_id
-            && event["data"]["status"] == "idle"
-            && event["data"]["isActive"] == false
-        {
-            idle = true;
-            break;
-        }
-    }
-    assert!(idle, "effort turn must settle before restarting the daemon");
+    // Wait for the persisted idle status so startup recovery cannot add a turn
+    // (intent-hq/intent#6058).
+    await_persisted_idle(
+        &mut sub,
+        agent_id,
+        "effort turn must settle before restarting the daemon",
+    )
+    .await;
 
     daemon.child.kill().unwrap();
     daemon.child.wait().unwrap();

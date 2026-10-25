@@ -64,6 +64,7 @@ changelog_include = [
     "intent-services",
     "intent-sourcecontrol",
     "intent-store",
+    "intent-svc-transfer",
     "intent-transport",
 ]
 version_group = "intentd"
@@ -153,6 +154,12 @@ version_group = "intentd"
 
 [[package]]
 name = "intent-store"
+release = true
+git_only = true
+version_group = "intentd"
+
+[[package]]
+name = "intent-svc-transfer"
 release = true
 git_only = true
 version_group = "intentd"

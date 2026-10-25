@@ -52,6 +52,7 @@ const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefe
 /// only has to outlast a genuine wedge (fs-event registration/delivery
 /// stalls under full-suite parallel load), never a passing run. Negative
 /// assertions keep their short bounds.
+// fixed-deadline: allow — stays fixed: already past nextest's 180 s kill, so scaling it would change nothing; clamping it below the kill is a separate change
 const LIVENESS: Duration = Duration::from_secs(300);
 
 struct Daemon {

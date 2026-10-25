@@ -77,7 +77,7 @@ async fn queued_write(operation: Operation, retirement: Option<bool>) {
         )
         .await
     });
-    timeout(BUDGET, ready.notified())
+    timeout(budget(), ready.notified())
         .await
         .expect("operation reached admitted SQL write");
     assert!(
@@ -97,7 +97,7 @@ async fn queued_write(operation: Operation, retirement: Option<bool>) {
         }
     }
     drop(writer);
-    let reply = timeout(BUDGET, task).await.unwrap().unwrap();
+    let reply = timeout(budget(), task).await.unwrap().unwrap();
     let after = rows().await;
     if retirement.is_some() {
         assert_eq!(
@@ -208,7 +208,7 @@ async fn commit_boundary(drop_caller: bool, abort_commit: bool) {
         .set_commit_hook(move || {
             if let Some(wait) = wait.take() {
                 signal.notify_one();
-                wait.recv_timeout(BUDGET).unwrap();
+                wait.recv_timeout(budget()).unwrap();
             }
             !abort_commit
         });
@@ -217,7 +217,7 @@ async fn commit_boundary(drop_caller: bool, abort_commit: bool) {
     let task = intent_core::caller::spawn_with_current_caller(async move {
         run(&endpoint, "return await ws.mr.monitor(4);").await
     });
-    timeout(BUDGET, entered.notified())
+    timeout(budget(), entered.notified())
         .await
         .expect("SQL reached actual commit");
     if drop_caller {
@@ -242,7 +242,7 @@ async fn commit_boundary(drop_caller: bool, abort_commit: bool) {
                 .unwrap();
         });
     });
-    timeout(BUDGET, async {
+    timeout(budget(), async {
         while !probe.detached_for_test() {
             tokio::task::yield_now().await;
         }
@@ -263,15 +263,15 @@ async fn commit_boundary(drop_caller: bool, abort_commit: bool) {
         .unwrap()
         .is_empty());
     release.send(()).unwrap();
-    timeout(BUDGET, retired).await.unwrap().unwrap();
-    let reply = timeout(BUDGET, task).await.unwrap();
+    timeout(budget(), retired).await.unwrap().unwrap();
+    let reply = timeout(budget(), task).await.unwrap();
     if drop_caller {
         assert!(reply.unwrap_err().is_cancelled());
     } else {
         assert_eq!(reply.unwrap()["result"]["isError"], true);
     }
     // Acquisition joins the original SQL worker even after its caller vanished.
-    let mut writer = timeout(BUDGET, pool.acquire()).await.unwrap().unwrap();
+    let mut writer = timeout(budget(), pool.acquire()).await.unwrap().unwrap();
     writer.lock_handle().await.unwrap().remove_commit_hook();
     drop(writer);
     let rows = f
@@ -322,12 +322,12 @@ async fn review_monitor_sql_dropped_waiter_before_writer_acquisition_has_no_effe
     let task = intent_core::caller::spawn_with_current_caller(async move {
         run(&endpoint, "return await ws.mr.monitor(4);").await
     });
-    timeout(BUDGET, ready.notified()).await.unwrap();
+    timeout(budget(), ready.notified()).await.unwrap();
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
     f.owner.retirement().retire();
     drop(writer);
-    drop(timeout(BUDGET, pool.acquire()).await.unwrap().unwrap());
+    drop(timeout(budget(), pool.acquire()).await.unwrap().unwrap());
     assert!(f
         .auth
         .service

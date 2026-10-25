@@ -96,6 +96,10 @@ g() {
 # the instrumented run excludes, e2e_core (with a module directory) and
 # e2e_shared (whose directory another target #[path]-includes); suite_wss
 # holds e2e_wss_x; e2e_wss_agent_lifecycle stays a standalone target.
+# delta's src files are named by .config/e2e-test-map.txt, which maps them to
+# intentd end-to-end modules: a nested module (e2e_core::inner), a #[path]
+# module of a non-root file (e2e_shared::helper), a #[path] module of a
+# standalone target (helper) and a whole binary (suite_wss).
 write() {
   mkdir -p "$repo/$(dirname "$1")"
   printf '%s\n' "${2:-$1}" >"$repo/$1"
@@ -123,18 +127,35 @@ write crates/beta/migrations/001.sql
 write crates/gamma/Cargo.toml
 write crates/gamma/src/lib.rs
 write crates/gamma/tests/smoke.rs
+write crates/intent-services/Cargo.toml
+write crates/intent-services/src/lib.rs
+write crates/intent-services/tests/smoke.rs
+write crates/intent-svc-transfer/Cargo.toml
+write crates/intent-svc-transfer/src/lib.rs
 write crates/intentd/Cargo.toml
 write crates/intentd/src/main.rs
 write crates/intentd/tests/auggie_context_e2e.rs
-write crates/intentd/tests/e2e_core.rs
+write crates/intentd/tests/e2e_core.rs $'//! fixture module\n\nmod inner;'
 write crates/intentd/tests/e2e_core/inner.rs
-write crates/intentd/tests/e2e_shared.rs
+write crates/intentd/tests/e2e_shared.rs $'#[path = "e2e_shared/helper.rs"]\n#[allow(dead_code)]\npub(crate) mod helper;'
 write crates/intentd/tests/e2e_shared/helper.rs
 write crates/intentd/tests/e2e_wss_x.rs
 write crates/intentd/tests/suite_e2e.rs $'//! fixture suite\nmod common;\n\nmod auggie_context_e2e;\nmod e2e_core;\nmod e2e_shared;'
 write crates/intentd/tests/suite_wss.rs $'mod common;\nmod e2e_wss_x;'
 write crates/intentd/tests/common/mod.rs
 write crates/intentd/tests/e2e_wss_agent_lifecycle.rs $'mod common;\n#[path = "e2e_shared/helper.rs"]\nmod helper;'
+write crates/delta/Cargo.toml
+write crates/delta/src/lib.rs
+write crates/delta/src/script.rs
+write crates/delta/src/monitor.rs
+write crates/delta/src/whole.rs
+write .config/e2e-test-map.txt '# Fixture end-to-end map.
+# <source glob>              <crate>::<test binary>            [<module path>]
+
+crates/delta/src/script.rs   intentd::suite_e2e                e2e_core::inner
+crates/delta/src/script.rs   intentd::e2e_wss_agent_lifecycle  helper
+crates/delta/src/monitor*.rs intentd::suite_e2e                e2e_shared::helper
+crates/delta/src/whole.rs    intentd::suite_wss'
 write README.md
 write docs/guide.md
 write scripts/tool.sh
@@ -341,6 +362,30 @@ expect_plan "-p alpha --lib --bins --tests"
 expect_cargo "-p alpha --lib --bins --tests"
 [[ "$stdout" == *"[test-changed] note: crates/alpha/src changed; only alpha's own tests run (downstream crates are not selected)"* ]] || fail "$case_name: no src note: $stdout"
 [[ "$(grep -c 'note:' <<<"$stdout")" -eq 1 ]] || fail "$case_name: note printed more than once: $stdout"
+
+case_name="intent-services src change also selects the feature crates above it"
+reset_repo
+edit crates/intent-services/src/lib.rs
+run_script
+expect_ok
+expect_plan "-p intent-services -p intent-svc-transfer --lib --bins --tests"
+expect_cargo "-p intent-services -p intent-svc-transfer --lib --bins --tests"
+[[ "$stdout" == *"[test-changed] note: crates/intent-services/src changed; its feature crates (intent-svc-transfer) run too, other downstream crates are not selected"* ]] || fail "$case_name: no src note: $stdout"
+[[ "$(grep -c 'note:' <<<"$stdout")" -eq 1 ]] || fail "$case_name: expected one note: $stdout"
+
+case_name="intent-services test-only change does not select the feature crates"
+reset_repo
+edit crates/intent-services/tests/smoke.rs
+run_script
+expect_ok
+expect_cargo "-p intent-services --test smoke"
+
+case_name="feature crate src change does not select intent-services"
+reset_repo
+edit crates/intent-svc-transfer/src/lib.rs
+run_script
+expect_ok
+expect_cargo "-p intent-svc-transfer --lib --bins --tests"
 
 case_name="src change in a crate without a lib drops --lib"
 reset_repo
@@ -899,6 +944,228 @@ assert json.load(open(sys.argv[1]))["plans"] == []
 PYTHON
 run_script --instrumented --plan-json "$temp_dir/absent/plans.json"
 [[ "$status" -ne 0 && -z "$cargo_log" ]] || fail "$case_name ignored export failure"
+
+# .config/e2e-test-map.txt: a changed source the map names also selects the
+# end-to-end modules it maps to (intentd#2617: a script-binding change broke an
+# end-to-end test only the merge queue ran), in the suite-module filter shape.
+e2e_script_plan="-p intentd --test e2e_wss_agent_lifecycle --test suite_e2e -E (binary_id(=intentd::e2e_wss_agent_lifecycle)&test(/^(helper)::/))|(binary_id(=intentd::suite_e2e)&test(/^(e2e_core::inner)::/))"
+
+case_name="mapped source selects its end-to-end modules"
+reset_repo
+edit crates/delta/src/script.rs
+run_script
+expect_ok
+expect_cargo "-p delta --lib --bins --tests" "$e2e_script_plan"
+[[ "$stdout" == *"[test-changed] note: crates/delta/src/script.rs is mapped to end-to-end tests in .config/e2e-test-map.txt"* ]] ||
+  fail "$case_name: no mapping note: $stdout"
+[[ "$stdout" == *"[test-changed] cargo nextest run -p intentd --test e2e_wss_agent_lifecycle --test suite_e2e -E '(binary_id(=intentd::e2e_wss_agent_lifecycle)&test(/^(helper)::/))|(binary_id(=intentd::suite_e2e)&test(/^(e2e_core::inner)::/))'"* ]] ||
+  fail "$case_name plan line is not a pasteable command: $stdout"
+
+case_name="instrumented mapped source selects its end-to-end modules"
+reset_repo
+edit crates/delta/src/script.rs
+run_script --instrumented
+expect_ok
+cov_expected="$repo: INTENTD_TEST_TIMEOUT_MULTIPLIER=3 llvm-cov --no-report nextest -p delta --lib --bins --tests -E not test(/^auggie_context_e2e::/)"$'\n'"$repo: INTENTD_TEST_TIMEOUT_MULTIPLIER=3 llvm-cov --no-report nextest -p intentd --test e2e_wss_agent_lifecycle --test suite_e2e -E ((binary_id(=intentd::e2e_wss_agent_lifecycle)&test(/^(helper)::/))|(binary_id(=intentd::suite_e2e)&test(/^(e2e_core::inner)::/))) and (not test(/^auggie_context_e2e::/))"
+[[ "$cargo_log" == "$cov_expected" ]] || fail "$case_name: cargo argv was"$'\n'"$cargo_log"$'\n'"expected"$'\n'"$cov_expected"
+
+case_name="mapped glob matches a new untracked source"
+reset_repo
+write crates/delta/src/monitor_v2.rs
+run_script
+expect_ok
+expect_cargo "-p delta --lib --bins --tests" "-p intentd --test suite_e2e -E (binary_id(=intentd::suite_e2e)&test(/^(e2e_shared::helper)::/))"
+
+case_name="map entry without a module selects the whole binary"
+reset_repo
+edit crates/delta/src/whole.rs
+run_script
+expect_ok
+expect_cargo "-p delta --lib --bins --tests" "-p intentd --test suite_wss"
+
+case_name="unmapped source in a mapped crate selects no end-to-end tests"
+reset_repo
+edit crates/delta/src/lib.rs
+run_script
+expect_ok
+expect_cargo "-p delta --lib --bins --tests"
+[[ "$stdout" != *"end-to-end"* ]] || fail "$case_name printed a mapping note: $stdout"
+
+case_name="a broader selection of the mapped crate subsumes its end-to-end modules"
+reset_repo
+edit crates/delta/src/script.rs
+edit crates/intentd/src/main.rs
+run_script
+expect_ok
+expect_cargo "-p delta --lib --bins --tests" "-p intentd --bins --tests"
+
+case_name="a mapped binary that also changed as a whole is named once"
+reset_repo
+edit crates/delta/src/script.rs
+edit crates/intentd/tests/e2e_wss_agent_lifecycle.rs
+run_script
+expect_ok
+expect_cargo "-p delta --lib --bins --tests" "-p intentd --test e2e_wss_agent_lifecycle --test suite_e2e -E binary_id(=intentd::e2e_wss_agent_lifecycle)|(binary_id(=intentd::suite_e2e)&test(/^(e2e_core::inner)::/))"
+
+case_name="mapped modules join a changed module of the same suite"
+reset_repo
+edit crates/delta/src/monitor.rs
+edit crates/intentd/tests/e2e_core.rs
+run_script
+expect_ok
+expect_cargo "-p delta --lib --bins --tests" "-p intentd --test suite_e2e -E (binary_id(=intentd::suite_e2e)&test(/^(e2e_core|e2e_shared::helper)::/))"
+
+case_name="editing the map selects every mapped end-to-end module, not the full suite"
+reset_repo
+echo "# a new comment" >>"$repo/.config/e2e-test-map.txt"
+run_script
+expect_ok
+expect_cargo "-p intentd --test suite_wss --test e2e_wss_agent_lifecycle --test suite_e2e -E binary_id(=intentd::suite_wss)|(binary_id(=intentd::e2e_wss_agent_lifecycle)&test(/^(helper)::/))|(binary_id(=intentd::suite_e2e)&test(/^(e2e_core::inner|e2e_shared::helper)::/))"
+[[ "$stdout" == *"[test-changed] note: .config/e2e-test-map.txt changed; every mapped end-to-end module runs"* ]] ||
+  fail "$case_name: no map note: $stdout"
+
+case_name="a checkout without the map keeps the per-crate selection"
+reset_repo
+g rm -q .config/e2e-test-map.txt
+commit_all "no map"
+edit crates/delta/src/script.rs
+run_script --base HEAD
+expect_ok
+expect_cargo "-p delta --lib --bins --tests"
+
+# Map validation: every invocation (and --check-map alone) rejects an entry
+# whose source glob, test binary or module no longer exists, naming the line.
+case_name="check-map accepts a valid map"
+reset_repo
+run_script --check-map
+expect_ok
+[[ "$stdout" == "[check-map] .config/e2e-test-map.txt: 4 entries valid" ]] || fail "$case_name printed '$stdout'"
+[[ -z "$cargo_log" ]] || fail "$case_name invoked cargo: $cargo_log"
+
+# expect_map_error <expected stderr line>...: both a selection run and
+# --check-map exit 2 naming every problem, without running cargo.
+expect_map_error() {
+  local mode line
+  for mode in run check; do
+    if [[ "$mode" == check ]]; then
+      run_script --check-map
+    else
+      edit crates/alpha/tests/one.rs
+      run_script
+    fi
+    [[ "$status" -eq 2 ]] || fail "$case_name ($mode) exited $status (expected 2): $stderr"
+    for line in "$@"; do
+      [[ "$stderr" == *"$line"* ]] || fail "$case_name ($mode): stderr is missing '$line':"$'\n'"$stderr"
+    done
+    [[ "$(grep -c '\.config/e2e-test-map\.txt:[0-9]*:' <<<"$stderr")" -eq $# ]] || fail "$case_name ($mode): expected $# problem line(s):"$'\n'"$stderr"
+    [[ "$stderr" == *"invalid end-to-end test map"* ]] || fail "$case_name ($mode): no summary: $stderr"
+    [[ -z "$cargo_log" ]] || fail "$case_name ($mode) invoked cargo: $cargo_log"
+  done
+}
+
+case_name="map naming a removed module segment"
+reset_repo
+write crates/intentd/tests/e2e_core.rs '//! inner was removed'
+expect_map_error ".config/e2e-test-map.txt:4: intentd::suite_e2e module e2e_core::inner: crates/intentd/tests/e2e_core.rs declares no 'mod inner;'"
+
+case_name="map naming a module whose #[path] file is gone"
+reset_repo
+rm "$repo/crates/intentd/tests/e2e_shared/helper.rs"
+expect_map_error ".config/e2e-test-map.txt:5: intentd::e2e_wss_agent_lifecycle module helper: crates/intentd/tests/e2e_shared/helper.rs does not exist" \
+  ".config/e2e-test-map.txt:6: intentd::suite_e2e module e2e_shared::helper: crates/intentd/tests/e2e_shared/helper.rs does not exist"
+
+case_name="map naming a removed module file"
+reset_repo
+rm "$repo/crates/intentd/tests/e2e_core/inner.rs"
+expect_map_error ".config/e2e-test-map.txt:4: intentd::suite_e2e module e2e_core::inner: crates/intentd/tests/e2e_core/inner.rs does not exist"
+
+case_name="map naming a removed test binary"
+reset_repo
+echo "crates/delta/src/lib.rs intentd::suite_gone e2e_core" >>"$repo/.config/e2e-test-map.txt"
+expect_map_error ".config/e2e-test-map.txt:8: intentd::suite_gone: crates/intentd/tests/suite_gone.rs does not exist"
+
+case_name="map source glob matching no file"
+reset_repo
+rm "$repo/crates/delta/src/whole.rs"
+echo "crates/delta/src/gone*.rs intentd::suite_wss" >>"$repo/.config/e2e-test-map.txt"
+expect_map_error ".config/e2e-test-map.txt:7: source glob 'crates/delta/src/whole.rs' matches no file" \
+  ".config/e2e-test-map.txt:8: source glob 'crates/delta/src/gone*.rs' matches no file"
+
+case_name="malformed map lines"
+reset_repo
+printf '%s\n' "crates/delta/src/lib.rs intentd" "crates/delta/src/lib.rs intentd::suite_e2e e2e_core extra" \
+  "crates/delta/src/lib.rs intentd::suite_e2e e2e_core::" >>"$repo/.config/e2e-test-map.txt"
+expect_map_error ".config/e2e-test-map.txt:8: expected '<source glob> <crate>::<test binary> [<module path>]'" \
+  ".config/e2e-test-map.txt:9: expected '<source glob> <crate>::<test binary> [<module path>]'" \
+  ".config/e2e-test-map.txt:10: intentd::suite_e2e module e2e_core::: empty segment"
+
+case_name="check-map requires the map"
+reset_repo
+rm "$repo/.config/e2e-test-map.txt"
+run_script --check-map
+[[ "$status" -eq 2 ]] || fail "$case_name exited $status (expected 2): $stderr"
+[[ "$stderr" == "[check-map] .config/e2e-test-map.txt does not exist" ]] || fail "$case_name stderr: $stderr"
+
+case_name="map naming a test file that is not a test target"
+reset_repo
+write crates/intentd/Cargo.toml $'[package]\nname = "intentd"\nautotests = false\n\n[[test]]\nname = "suite_e2e"\n\n[[test]]\nname = "suite_wss"\n\n[[test]]\nname = "e2e_wss_agent_lifecycle"\n\n[dev-dependencies]\nname = "e2e_core"'
+echo "crates/delta/src/lib.rs intentd::e2e_core inner" >>"$repo/.config/e2e-test-map.txt"
+expect_map_error ".config/e2e-test-map.txt:8: intentd::e2e_core: crates/intentd/Cargo.toml sets autotests = false and declares no [[test]] named e2e_core"
+
+case_name="autotests = false map with registered targets is valid"
+reset_repo
+write crates/intentd/Cargo.toml $'[package]\nname = "intentd"\nautotests = false\n\n[[test]]\nname = "suite_e2e"\n\n[[test]]\nname = "suite_wss"\n\n[[test]]\nname = "e2e_wss_agent_lifecycle"'
+run_script --check-map
+expect_ok
+[[ "$stdout" == "[check-map] .config/e2e-test-map.txt: 4 entries valid" ]] || fail "$case_name printed '$stdout'"
+
+# rustc resolves the children of a #[path]-loaded file in that file's own
+# directory, as for a mod.rs file.
+case_name="map module below a #[path]-loaded file"
+reset_repo
+write crates/intentd/tests/e2e_shared/helper.rs 'mod deep;'
+write crates/intentd/tests/e2e_shared/deep.rs
+echo "crates/delta/src/lib.rs intentd::suite_e2e e2e_shared::helper::deep" >>"$repo/.config/e2e-test-map.txt"
+run_script --check-map
+expect_ok
+[[ "$stdout" == "[check-map] .config/e2e-test-map.txt: 5 entries valid" ]] || fail "$case_name printed '$stdout'"
+
+case_name="map declarations: comments, attribute spacing, one-line attributes, inline modules"
+reset_repo
+write crates/intentd/tests/suite_lex.rs $'//! lex suite\n#[path = "lex/a.rs"]\n\n// a comment between the attribute and the module\nmod a;\n#[path="lex/b.rs"]\n#[cfg(unix)]\npub(crate) mod b;\n#[cfg(unix)] mod c;\n#[path = "lex/d.rs"] pub mod d;\nmod e {\n    mod f {}\n}\nmod g; // trailing'
+write crates/intentd/tests/lex/a.rs
+write crates/intentd/tests/lex/b.rs
+write crates/intentd/tests/c.rs
+write crates/intentd/tests/lex/d.rs
+write crates/intentd/tests/g/mod.rs
+printf '%s\n' "crates/delta/src/lib.rs intentd::suite_lex a" "crates/delta/src/lib.rs intentd::suite_lex b" \
+  "crates/delta/src/lib.rs intentd::suite_lex c" "crates/delta/src/lib.rs intentd::suite_lex d" \
+  "crates/delta/src/lib.rs intentd::suite_lex e::f" "crates/delta/src/lib.rs intentd::suite_lex g" >>"$repo/.config/e2e-test-map.txt"
+run_script --check-map
+expect_ok
+[[ "$stdout" == "[check-map] .config/e2e-test-map.txt: 10 entries valid" ]] || fail "$case_name printed '$stdout'"
+
+case_name="deleting the map needs the full suite"
+reset_repo
+g rm -q .config/e2e-test-map.txt
+edit crates/delta/src/script.rs
+run_script
+[[ "$status" -eq 3 ]] || fail "$case_name exited $status (expected 3): $stderr"
+[[ "$stderr" == *"  .config/e2e-test-map.txt"* ]] || fail "$case_name stderr: $stderr"
+[[ -z "$cargo_log" ]] || fail "$case_name invoked cargo: $cargo_log"
+
+case_name="instrumented run skips a mapped auggie_context_e2e module"
+reset_repo
+echo "crates/delta/src/lib.rs intentd::suite_e2e auggie_context_e2e" >>"$repo/.config/e2e-test-map.txt"
+commit_all
+edit crates/delta/src/lib.rs
+run_script --instrumented --base HEAD
+expect_ok
+expect_cov "-p delta --lib --bins --tests"
+: >"$temp_dir/cargo.log"
+run_script --base HEAD
+expect_ok
+expect_cargo "-p delta --lib --bins --tests" "-p intentd --test suite_e2e -E (binary_id(=intentd::suite_e2e)&test(/^(auggie_context_e2e)::/))"
 
 echo "changed-tests tests passed under $("$script_bash" -c 'echo "bash $BASH_VERSION"')"
 [[ -z "${CHANGED_TESTS_TEST_BASH:-}" ]] || exit 0

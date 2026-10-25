@@ -90,7 +90,7 @@ pub(crate) const MODELS_BACKGROUND_REFRESH_CONCURRENCY: usize = 2;
 /// (CLI unavailable / nothing parseable) and the caller may fall back;
 /// `warning` carries a human-readable reason either way.
 #[derive(Clone)]
-pub(crate) struct ModelFetchResult {
+pub struct ModelFetchResult {
     /// The fetched wire `ModelInfo` rows, or `None` on probe failure.
     pub models: Option<Vec<Value>>,
     /// Human-readable degradation reason, when applicable.
@@ -99,7 +99,7 @@ pub(crate) struct ModelFetchResult {
 
 /// One registered provider model source: how to probe it and which version
 /// key its cache entries are pinned to.
-pub(crate) struct ModelSource {
+pub struct ModelSource {
     /// Provider id (`auggie`, `cortex`, …).
     pub provider_id: &'static str,
     /// Cache version key (adapter pin such as `CLAUDE_AGENT_ACP_VERSION`
@@ -348,7 +348,14 @@ static SOURCES: &[ModelSource] = &[
 ];
 
 /// Look up the registered source for a provider id.
-pub(crate) fn source_for(provider_id: &str) -> Option<&'static ModelSource> {
+#[cfg_attr(
+    any(test, feature = "test-hooks"),
+    expect(
+        clippy::must_use_candidate,
+        reason = "exported only for tests, through the doc-hidden feature API"
+    )
+)]
+pub fn source_for(provider_id: &str) -> Option<&'static ModelSource> {
     SOURCES.iter().find(|s| s.provider_id == provider_id)
 }
 
@@ -390,7 +397,7 @@ type InflightCell = Arc<OnceCell<ModelFetchResult>>;
 /// The generic per-provider model cache: in-memory entries, optionally
 /// mirrored to a JSON file in the daemon data dir so a restart keeps the
 /// last-good lists. Shared across [`crate::Services`] clones via `Arc`.
-pub(crate) struct ModelCatalogCache {
+pub struct ModelCatalogCache {
     entries: Mutex<HashMap<String, CacheEntry>>,
     persist_path: Option<PathBuf>,
     /// Per-provider negative entries (probe failures); in-memory only.
@@ -418,13 +425,17 @@ pub(crate) struct CachedModelRow {
 }
 
 /// A probe-free catalog view using a snapshot of the effective provider settings.
-pub(crate) struct ModelCatalogReader<'a> {
+pub struct ModelCatalogReader<'a> {
     cache: &'a ModelCatalogCache,
     antigravity_path: Option<String>,
 }
 
 impl crate::Services {
-    pub(crate) fn cached_models(&self) -> ModelCatalogReader<'_> {
+    #[expect(
+        clippy::must_use_candidate,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub fn cached_models(&self) -> ModelCatalogReader<'_> {
         self.models_catalog.reader(
             self.effective_settings()
                 .providers
@@ -442,12 +453,13 @@ impl ModelCatalogReader<'_> {
             self.cache
                 .installed_key(source.provider_id)
                 .unwrap_or_else(|| {
-                    // Test-only synthetic seeding retains registry-based fixtures.
-                    #[cfg(test)]
+                    // Test-only synthetic seeding retains registry-based
+                    // fixtures, including for feature-crate tests (test-hooks).
+                    #[cfg(any(test, feature = "test-hooks"))]
                     {
                         (source.version_key)()
                     }
-                    #[cfg(not(test))]
+                    #[cfg(not(any(test, feature = "test-hooks")))]
                     {
                         "installed-unobserved".to_owned()
                     }
@@ -463,7 +475,11 @@ impl ModelCatalogReader<'_> {
     /// ownership guards, an aged last-good list or a failed refresh must not
     /// prove that a transferred model/effort has disappeared. Cache-only:
     /// import never starts a provider or makes a model request.
-    pub(crate) fn fresh_catalog(&self, provider_id: &str) -> Option<Vec<Value>> {
+    #[expect(
+        clippy::must_use_candidate,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub fn fresh_catalog(&self, provider_id: &str) -> Option<Vec<Value>> {
         let source = source_for(provider_id)?;
         let version = self.version_key(source);
         let now = ModelCatalogCache::now_ms();
@@ -492,7 +508,12 @@ impl ModelCatalogReader<'_> {
     /// ages past [`MODELS_STALE_AFTER`] and a `models.list` read — or a
     /// forced refresh — replaces it); a stale entry is repaired by the next
     /// catalog refresh, so callers are never wedged for good.
-    pub(crate) fn cached_catalog_claims(&self, provider_id: &str, bare_id: &str) -> Option<bool> {
+    #[expect(
+        clippy::missing_panics_doc,
+        clippy::must_use_candidate,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub fn cached_catalog_claims(&self, provider_id: &str, bare_id: &str) -> Option<bool> {
         let source = source_for(provider_id)?;
         let version_key = self.version_key(source);
         let entries = self
@@ -727,6 +748,7 @@ impl ModelCatalogCache {
             .map(|s| s.key.clone())
     }
 
+    #[cfg(test)]
     pub(crate) async fn resolve_installed(
         self: &Arc<Self>,
         provider: &str,
@@ -847,7 +869,7 @@ impl ModelCatalogCache {
 
     /// Build the cache, seeding from `persist_path` when it holds a readable
     /// current-version snapshot (corrupt/old files are ignored, not errors).
-    pub(crate) fn new(persist_path: Option<PathBuf>) -> Self {
+    pub fn new(persist_path: Option<PathBuf>) -> Self {
         let entries = persist_path
             .as_deref()
             .and_then(load_persisted)
@@ -864,7 +886,14 @@ impl ModelCatalogCache {
     }
 
     /// Current unix time in milliseconds (the cache clock).
-    pub(crate) fn now_ms() -> u64 {
+    #[cfg_attr(
+        any(test, feature = "test-hooks"),
+        expect(
+            clippy::must_use_candidate,
+            reason = "exported only for tests, through the doc-hidden feature API"
+        )
+    )]
+    pub fn now_ms() -> u64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
@@ -899,8 +928,8 @@ impl ModelCatalogCache {
     /// Seed a cache entry from tests in other modules (the real
     /// [`Self::store`] is module-private). No persistence side effects: the
     /// snapshot write is skipped when no `persist_path` is configured.
-    #[cfg(test)]
-    pub(crate) fn store_for_test(&self, provider_id: &str, version_key: &str, models: Vec<Value>) {
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn store_for_test(&self, provider_id: &str, version_key: &str, models: Vec<Value>) {
         self.store(provider_id, version_key, models, Self::now_ms());
     }
 
@@ -1021,8 +1050,8 @@ impl ModelCatalogCache {
     /// Test-only cache seeding: production code must go through
     /// [`resolve_with_cache`] so the negative-window / single-flight
     /// invariants hold.
-    #[cfg(test)]
-    pub(crate) fn test_store(
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_store(
         &self,
         provider_id: &str,
         version_key: &str,
@@ -1099,7 +1128,7 @@ fn drop_stale_pseudo_row(models: &mut Vec<Value>) {
 /// Outcome of [`resolve_with_cache`]: the rows to serve (or `None` when the
 /// provider has nothing — probe failed and no last-good list), whether they
 /// are stale (last-good served after a failed probe), and any warning.
-pub(crate) struct ResolvedModels {
+pub struct ResolvedModels {
     /// Rows to serve, or `None` when the caller must fall back.
     pub models: Option<Vec<Value>>,
     /// `true` when `models` is the last-good list after a failed probe.
@@ -1143,7 +1172,7 @@ pub(crate) struct ResolvedModels {
 /// env-var check (cortex/droid gating; unsloth converts empty to failure);
 /// a future source with a costly probe that can return empty success would
 /// need its own guard (e.g. converting empty to failure like unsloth does).
-pub(crate) async fn resolve_with_cache<F>(
+pub async fn resolve_with_cache<F>(
     cache: &Arc<ModelCatalogCache>,
     provider_id: &str,
     version_key: &str,

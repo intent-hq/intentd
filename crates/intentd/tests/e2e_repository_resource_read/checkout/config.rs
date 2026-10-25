@@ -215,7 +215,7 @@ async fn checkout_config_rejects_branch_project_and_authority_changes_during_rea
             client.close().await;
             response
         });
-        tokio::time::timeout(ACQUIRE, server.state.entered.notified())
+        tokio::time::timeout(acquire(), server.state.entered.notified())
             .await
             .unwrap();
         match change {
@@ -250,7 +250,7 @@ async fn checkout_config_rejects_branch_project_and_authority_changes_during_rea
             _ => unreachable!(),
         }
         server.state.release.notify_one();
-        let response = tokio::time::timeout(ACQUIRE, pending)
+        let response = tokio::time::timeout(acquire(), pending)
             .await
             .unwrap()
             .unwrap();

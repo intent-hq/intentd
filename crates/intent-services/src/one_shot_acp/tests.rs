@@ -653,6 +653,7 @@ async fn phase_resolves_on_budget_while_a_response_send_is_pending_on_writer_cap
     )
     .await;
 
+    // fixed-deadline: allow — stays fixed: it is the phase clock under test, and `elapsed` is asserted against it
     let budget = Duration::from_millis(300);
     let margin = Duration::from_secs(2);
     let started = std::time::Instant::now();

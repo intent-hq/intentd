@@ -211,7 +211,7 @@ async fn task_list_projection_preserves_semantics() {
             let mut spec = note(&ws, "spec", content);
             spec.metadata.task = Some(TaskMetadata { status: TaskStatus::Complete, ..Default::default() });
             if store.note_exists(&ws, &NoteId::from("spec")).await.unwrap() {
-                store.update_note(&spec).await.unwrap();
+                store.update_note(&store.lock_note_content(&spec.workspace_id, &spec.id).await, &spec).await.unwrap();
             } else {
                 store.insert_note(&spec).await.unwrap();
             }

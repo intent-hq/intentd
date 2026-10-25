@@ -558,6 +558,29 @@ pub(crate) async fn handle_with_host_environment(
             .await
             {
                 Ok(mut result) => {
+                    // A Default configuration with saved environment
+                    // overrides (§5.54) reports the verdict of those
+                    // settings, not of the bare installation.
+                    match api
+                        .provider_default_auth_status(provider_id.clone(), force)
+                        .await
+                    {
+                        Ok(Value::Array(entries)) => {
+                            if let Some(rows) = result["providers"].as_array_mut() {
+                                for entry in entries {
+                                    if let Some(row) =
+                                        rows.iter_mut().find(|row| row["id"] == entry["id"])
+                                    {
+                                        *row = entry;
+                                    }
+                                }
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!(error = %e, "Default configuration auth check failed");
+                        }
+                    }
                     let _ = api.observe_execution_readiness(result.clone()).await;
                     if include_profiles && provider_id.is_none() {
                         match api.provider_profiles_auth_status(None, force).await {
@@ -617,7 +640,11 @@ pub(crate) async fn handle_with_host_environment(
             let node_max_old_space_mb = read_setting_u32(api, "agents.acpNodeMaxOldSpaceMb").await;
             // A named profile reference (PROTOCOL §5.54) runs under that
             // profile's saved environment and touches only its verdict.
-            if provider_id.contains('@') {
+            // So does a Default configuration that can carry saved
+            // environment overrides (it runs bare when none is saved).
+            if provider_id.contains('@')
+                || intent_services::provider_auth::supports_default_overrides(&provider_id)
+            {
                 return Some(
                     match api
                         .provider_profiles_test_prompt(provider_id, model, node_max_old_space_mb)

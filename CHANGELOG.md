@@ -2,6 +2,58 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.43] - 2026-10-25
+
+### 🐛 Bug Fixes
+
+- *(store)* Retry write-pool acquire timeouts in delete sweeps ([#2658](https://github.com/intent-hq/intentd/pull/2658))
+
+
+## [0.11.42] - 2026-10-25
+
+### 🚀 Features
+
+- *(scripts)* Arm a completion monitor when an agent starts a script ([#2617](https://github.com/intent-hq/intentd/pull/2617))
+
+### 📚 Documentation
+
+- *(guide)* Finished-agent toast skips the chat you're viewing ([#2654](https://github.com/intent-hq/intentd/pull/2654))
+
+### 🧪 Testing
+
+- *(intentd)* Wait for persisted idle before SIGKILL in codex effort e2e ([#2652](https://github.com/intent-hq/intentd/pull/2652))
+
+
+## [0.11.41] - 2026-10-24
+
+### 🐛 Bug Fixes
+
+- *(notes)* Serialize content writes per note so parallel edits stop conflicting ([#2649](https://github.com/intent-hq/intentd/pull/2649))
+
+### 🔧 Refactor
+
+- *(services)* Expose a feature API and test-hooks feature ([#2650](https://github.com/intent-hq/intentd/pull/2650))
+
+### 🧪 Testing
+
+- *(intent-services)* Share the liveness budget with git-metadata event waits ([#2655](https://github.com/intent-hq/intentd/pull/2655))
+
+
+## [0.11.40] - 2026-10-24
+
+### 🚀 Features
+
+- *(profiles)* Name and environment overrides for the Codex/Claude Code Default configuration ([#2640](https://github.com/intent-hq/intentd/pull/2640))
+
+### 🐛 Bug Fixes
+
+- Keep embedded arrows from ending a previewed prompts block ([#2625](https://github.com/intent-hq/intentd/pull/2625))
+
+### 🧪 Testing
+
+- *(intent-services)* Wait for live watches through a creation retry ([#2648](https://github.com/intent-hq/intentd/pull/2648))
+
+
 ## [0.11.39] - 2026-10-24
 
 ### 🚀 Features

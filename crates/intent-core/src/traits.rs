@@ -2079,7 +2079,8 @@ pub trait WorkspaceApi: Send + Sync {
     /// a `changes` object (PROTOCOL §5.5). Only the listed fields are touched;
     /// omitted fields are preserved. Write-once (`acpSessionId`) and immutable
     /// (`provider`) invariants are enforced by the store. Emits `agent:updated`
-    /// (or `agent:renamed` when `name` is the only mutated field). Returns
+    /// (or `agent:renamed` with `{ agentId, name, nameExplicitlySet }` when
+    /// `name` is the only mutated field). Returns
     /// `{ success: true, agent: AgentLite }` on success. `NotFound` when the
     /// session is unknown; `InvalidParams` when `changes` carries an unknown
     /// field or a malformed value.
@@ -6674,6 +6675,37 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `providers.profiles.updateDefault` (PROTOCOL §5.54 "Default
+    /// configuration overrides"): `baseProviderId`, optional `name` and
+    /// `env`; returns `{ defaultConfig, revision, activation }` and emits
+    /// `providers:profiles-changed` (`change: "default-updated"`).
+    fn provider_profiles_update_default(
+        &self,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = params;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::provider_profiles_update_default not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `host.providerAuthStatus` entries for Default configurations with
+    /// saved environment overrides (PROTOCOL §5.54): one
+    /// `{ id: baseProviderId, authenticated, identity? }` per such Default,
+    /// probed with its saved overlay; they replace the base sweep's rows.
+    /// `Some(id)` limits it to one base provider. Returns a JSON array
+    /// (empty when no Default has overrides).
+    fn provider_default_auth_status(
+        &self,
+        provider_id: Option<String>,
+        force: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (provider_id, force);
+        Box::pin(async { Ok(serde_json::Value::Array(Vec::new())) })
+    }
+
     /// `host.providerAuthStatus` entries for named profiles (PROTOCOL §5.54):
     /// one `{ id: providerRef, authenticated, identity? }` per profile, probed
     /// with that profile's saved environment. `Some(ref)` checks one profile
@@ -7739,6 +7771,25 @@ pub trait WorkspaceApi: Send + Sync {
                 "WorkspaceApi::script_start not implemented".to_string(),
             ))
         })
+    }
+
+    /// Default-on completion wake for an agent-started run: after
+    /// `ws.script.start` / `ws.script.restart` by `agent_id` accepts run
+    /// `run_id`, register the same monitor `ws.script.monitor` would (owned by
+    /// the agent) so the agent is woken when a command-mode run finishes even
+    /// if it ends its turn without arming anything. Returns the
+    /// `script.monitor` reply (`{ ok, monitor }` or a refusal), or `null` when
+    /// the script is not command-mode (services keep running by design). The
+    /// default implementation arms nothing.
+    fn script_start_monitor(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        script_id: String,
+        run_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id, script_id, run_id);
+        Box::pin(async { Ok(serde_json::Value::Null) })
     }
 
     /// `script.stop`: stop a running script (cancels pending auto-restart);

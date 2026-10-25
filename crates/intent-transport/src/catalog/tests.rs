@@ -196,6 +196,7 @@ fn extract_fastpath_methods() -> HashSet<String> {
 // Human workspace discussions: +5 router methods; PR workspace lookup: +1.
 // Named provider profiles (§5.54): +4 router methods.
 // Provider profile order (§5.54 `providers.profiles.reorder`): +1 router method.
+// Default configuration overrides (§5.54 `providers.profiles.updateDefault`): +1 router method.
 // Generic event recovery adds the events.fence fast path.
 // Correlated discussion controls: +2 router methods.
 // Persisted guest roles: +1 owner-only role assignment method.
@@ -203,7 +204,7 @@ fn extract_fastpath_methods() -> HashSet<String> {
 // Scoped repository pages and child Git policy (15.1): +8 router methods.
 // Provider worker observations (§5.5b, `agentWorkers: 1`): +2 router, +1 fast path.
 // Note paging removal: -3 router methods (cancellable note deletion).
-const EXPECTED_TOTAL_METHODS: usize = 457;
+const EXPECTED_TOTAL_METHODS: usize = 458;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// Protocol 12.0 removes five router methods, three fast paths and two aliases.
@@ -212,13 +213,13 @@ const EXPECTED_TOTAL_METHODS: usize = 457;
 /// Protocol 13.10 adds three cancellable note deletion controls.
 /// Five discussion methods and one PR workspace lookup method are additive.
 /// Named provider profiles (§5.54) add the four `providers.profiles.*` methods,
-/// then `providers.profiles.reorder`.
+/// then `providers.profiles.reorder` and `providers.profiles.updateDefault`.
 /// Correlated discussion controls add `discussion.stopAgent` and `discussion.retryAgent`.
 /// Persisted guest roles add `workspace.members.setRole`.
 /// Scoped repository pages and child Git policy add eight router methods.
 /// Provider worker observations (§5.5b) add `agent.workers.list` / `.stop`.
 /// Removing note paging drops the three cancellable note deletion controls.
-const EXPECTED_ROUTER_METHODS: usize = 399;
+const EXPECTED_ROUTER_METHODS: usize = 400;
 
 /// Golden count: fast-path methods (intercepted before router).
 /// `agent.workers.subscribe` (§5.5b) holds per-connection subscription state.
@@ -811,6 +812,7 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "providers.profiles.list",
     "providers.profiles.reorder",
     "providers.profiles.update",
+    "providers.profiles.updateDefault",
     "providers.setup.cancel",
     "providers.setup.login",
     "providers.setup.start",
@@ -1381,6 +1383,7 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "providers.profiles.list",
     "providers.profiles.reorder",
     "providers.profiles.update",
+    "providers.profiles.updateDefault",
     "providers.setup.cancel",
     "providers.setup.login",
     "providers.setup.start",
@@ -1808,7 +1811,7 @@ mod unbound_owner_only_methods {
             })
             .await
             .expect("insert workspace");
-        let services = Services::new(store)
+        let services = intent_svc_transfer::register(Services::new(store))
             .with_workspaces_root(dir.path().join("workspaces"))
             .with_assets_root(dir.path().join("assets"));
         Fixture { services, ws, dir }
@@ -2062,6 +2065,10 @@ mod unbound_owner_only_methods {
             (
                 "providers.profiles.update",
                 json!({ "profileId": "p1", "name": "n" }),
+            ),
+            (
+                "providers.profiles.updateDefault",
+                json!({ "baseProviderId": "codex", "name": "n" }),
             ),
             ("sentry.assignIssue", json!({ "id": "i" })),
             ("sentry.authStatus", json!({})),
@@ -2615,6 +2622,7 @@ fn member_methods_and_administrator_remainder_are_classified() {
         "providers.profiles.list",
         "providers.profiles.reorder",
         "providers.profiles.update",
+        "providers.profiles.updateDefault",
         "providers.setup.cancel",
         "providers.setup.login",
         "providers.setup.start",

@@ -15,14 +15,16 @@ const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(1);
 /// Upper bound on how long the holder keeps the connection if the operation
 /// never reports a timeout; the test then fails on the observer assertion
 /// instead of hanging. Also bounds the pool-open retries.
-const WATCHDOG: Duration = Duration::from_secs(15);
+fn watchdog() -> Duration {
+    intentd_test_support::test_timeout(Duration::from_secs(15))
+}
 
 /// Open a migrated store whose write pool uses [`ACQUIRE_TIMEOUT`]. sqlx opens
 /// the first connection eagerly under that timeout, so retry the open on a
-/// loaded host until [`WATCHDOG`].
+/// loaded host until [`watchdog()`].
 async fn short_acquire_store(tmp: &TempDb) -> Store {
     drop(Store::open(&tmp.path).await.expect("open store"));
-    let open_deadline = tokio::time::Instant::now() + WATCHDOG;
+    let open_deadline = tokio::time::Instant::now() + watchdog();
     let write_pool = loop {
         match crate::connect_write_with_acquire_timeout(&tmp.path, ACQUIRE_TIMEOUT).await {
             Ok(pool) => break pool,
@@ -38,6 +40,7 @@ async fn short_acquire_store(tmp: &TempDb) -> Store {
     Store {
         task_event_baselines: Arc::default(),
         task_events_enabled: Arc::default(),
+        note_write_lanes: std::sync::Arc::default(),
         _daemon_owner: None,
         write_pool: write_pool.into(),
         read_pool: crate::connect_read(&tmp.path)
@@ -67,7 +70,7 @@ async fn run_while_writer_held<T>(
     let holder = {
         let observed = Arc::clone(&observed);
         tokio::spawn(async move {
-            let deadline = tokio::time::Instant::now() + WATCHDOG;
+            let deadline = tokio::time::Instant::now() + watchdog();
             while observed.load(Ordering::SeqCst) == 0 && tokio::time::Instant::now() < deadline {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -130,7 +133,13 @@ async fn note_write_survives_write_pool_acquire_timeout() {
     note.content = "edited".to_string();
     let (rev, v) = run_while_writer_held(
         &store,
-        store.update_note_with_version(&note, Some(0), &author, &ts),
+        store.update_note_with_version(
+            &store.lock_note_content(&note.workspace_id, &note.id).await,
+            &note,
+            Some(0),
+            &author,
+            &ts,
+        ),
     )
     .await
     .expect("note edit must retry through the write-pool acquire timeout");
@@ -182,7 +191,13 @@ async fn note_write_gives_up_within_budget_under_continuous_saturation() {
     note.content = "edited".to_string();
     let started = std::time::Instant::now();
     let result = store
-        .update_note_with_version(&note, Some(0), &author, &ts)
+        .update_note_with_version(
+            &store.lock_note_content(&note.workspace_id, &note.id).await,
+            &note,
+            Some(0),
+            &author,
+            &ts,
+        )
         .await;
     let elapsed = started.elapsed();
     let err = result.expect_err("a saturated writer must fail the edit, not commit it late");
@@ -258,4 +273,124 @@ async fn retired_note_paging_cleanup_retries_a_failed_step() {
     assert!(outcome.failed_steps >= 1, "{outcome:?}");
     assert_eq!(outcome.rows_removed, 51);
     assert_eq!(outcome.tables_dropped, 2);
+}
+
+/// Seed a workspace owning one agent with a short transcript, so a delete
+/// runs the recovery, payload, message and session sweeps.
+async fn seed_workspace_with_agent(store: &Store) -> (WorkspaceId, AgentId) {
+    let ws_id = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&ws_id, "WS", false))
+        .await
+        .expect("insert ws");
+    let agent_id = AgentId::from("agent-77050000-0000-0000-0000-000000000000");
+    store
+        .insert_agent_session(&sample_agent_session(&agent_id, &ws_id))
+        .await
+        .expect("insert session");
+    let ts = now_iso();
+    for n in 0..3 {
+        store
+            .append_agent_message(
+                &agent_id,
+                "user",
+                &serde_json::json!([{"type": "text", "text": format!("message {n}")}]),
+                &ts,
+            )
+            .await
+            .expect("append message");
+    }
+    (ws_id, agent_id)
+}
+
+/// intent-hq/intent#7705: the workspace delete sweep ran each bounded batch
+/// on the write pool without the busy-retry window, so one saturated acquire
+/// ("batched cascade delete failed: pool timed out ...") failed the whole
+/// delete. It must wait out the transient timeout like the final commit does.
+#[tokio::test]
+async fn workspace_delete_survives_write_pool_acquire_timeout() {
+    let tmp = TempDb::new();
+    let store = short_acquire_store(&tmp).await;
+    let (ws_id, agent_id) = seed_workspace_with_agent(&store).await;
+
+    run_while_writer_held(&store, store.delete_workspace(&ws_id))
+        .await
+        .expect("workspace delete must retry through the write-pool acquire timeout");
+
+    assert!(
+        matches!(store.get_workspace(&ws_id).await, Err(Error::NotFound(_))),
+        "workspace row removed"
+    );
+    assert!(
+        matches!(
+            store.get_agent_session(&agent_id).await,
+            Err(Error::NotFound(_))
+        ),
+        "agent session removed"
+    );
+}
+
+/// intent-hq/intent#7705: every bounded sweep batch (agent and workspace
+/// delete) shares `delete_in_bounded_batches`; a batch that meets a
+/// saturated writer must wait it out and the sweep must still drain every
+/// row, batch by batch.
+#[tokio::test]
+async fn bounded_batch_delete_survives_write_pool_acquire_timeout() {
+    let tmp = TempDb::new();
+    let store = short_acquire_store(&tmp).await;
+    let (_ws_id, agent_id) = seed_workspace_with_agent(&store).await;
+
+    let batches = run_while_writer_held(
+        &store,
+        crate::agent_repo::delete_in_bounded_batches(
+            store.write_pool(),
+            "DELETE FROM agent_message WHERE rowid IN \
+             (SELECT rowid FROM agent_message WHERE agent_id = ? LIMIT ?)",
+            &agent_id.0,
+            2,
+        ),
+    )
+    .await
+    .expect("a bounded batch must retry through the write-pool acquire timeout");
+
+    assert_eq!(batches, 2, "3 messages drain in batches of 2");
+    let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_message WHERE agent_id = ?")
+        .bind(&agent_id.0)
+        .fetch_one(store.read_pool())
+        .await
+        .expect("count messages");
+    assert_eq!(left, 0);
+}
+
+/// intent-hq/intent#7705: the workspace delete's retired note-paging sweep
+/// keeps its own bounded loop; it must absorb a write-pool acquire timeout
+/// like the shared batch helper does.
+#[tokio::test]
+async fn retired_note_paging_delete_survives_write_pool_acquire_timeout() {
+    let tmp = TempDb::new();
+    let store = short_acquire_store(&tmp).await;
+    sqlx::raw_sql(
+        r"
+        INSERT INTO workspace(id,title,branch,created_at,updated_at) VALUES ('ws','W','main','c','u');
+        INSERT INTO note(id,workspace_id,title,content,rev,created_at,updated_at)
+          VALUES ('n','ws','Spec','body',1,'c','u');
+        INSERT INTO note_page_head(workspace_id,note_id,instance_id,current_rev,generation)
+          VALUES ('ws','n','instance',1,'generation');
+        WITH RECURSIVE seq(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM seq WHERE i+1 < 50)
+        INSERT INTO note_page_entry(workspace_id,note_id,collection,position,value)
+          SELECT 'ws','n','blocks',i,'entry' FROM seq;
+        ",
+    )
+    .execute(store.write_pool())
+    .await
+    .expect("seed retired index");
+
+    let statements = run_while_writer_held(
+        &store,
+        store.delete_workspace_retired_note_paging_in_batches("ws", 20),
+    )
+    .await
+    .expect("the retired note-paging sweep must retry through the write-pool acquire timeout");
+
+    assert_eq!(statements.iter().sum::<u64>(), 51, "{statements:?}");
 }

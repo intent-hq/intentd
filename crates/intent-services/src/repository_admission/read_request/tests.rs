@@ -160,7 +160,9 @@ impl OptionalFixture {
     }
 }
 
-const OPTIONAL_TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+fn optional_test_budget() -> std::time::Duration {
+    intentd_test_support::test_timeout(std::time::Duration::from_secs(10))
+}
 
 #[tokio::test]
 async fn optional_local_key_retires_only_its_prepared_owner_and_required_coverage_stays_required() {
@@ -521,11 +523,11 @@ async fn optional_busy_or_poisoned_local_fence_omits_without_waiting_or_poisonin
             let thread = std::thread::spawn(move || {
                 held.dispatch(|| {
                     entered_tx.send(()).unwrap();
-                    release_rx.recv_timeout(OPTIONAL_TEST_BUDGET).unwrap();
+                    release_rx.recv_timeout(optional_test_budget()).unwrap();
                     Ok(())
                 })
             });
-            entered_rx.recv_timeout(OPTIONAL_TEST_BUDGET).unwrap();
+            entered_rx.recv_timeout(optional_test_budget()).unwrap();
             // Transfer must finish before releasing the optional-only fence.
             assert_eq!(
                 read.child()
@@ -581,11 +583,11 @@ async fn optional_parent_retirement_joins_every_concurrent_retire_before_scope_c
             let action = std::thread::spawn(move || {
                 held.dispatch(|| {
                     entered_tx.send(()).unwrap();
-                    release_rx.recv_timeout(OPTIONAL_TEST_BUDGET).unwrap();
+                    release_rx.recv_timeout(optional_test_budget()).unwrap();
                     Ok(())
                 })
             });
-            entered_rx.recv_timeout(OPTIONAL_TEST_BUDGET).unwrap();
+            entered_rx.recv_timeout(optional_test_budget()).unwrap();
             let (done_tx, done_rx) = std::sync::mpsc::channel();
             let mut waiters = Vec::new();
             for _ in 0..2 {
@@ -596,7 +598,7 @@ async fn optional_parent_retirement_joins_every_concurrent_retire_before_scope_c
                     done.send(()).unwrap();
                 }));
             }
-            tokio::time::timeout(OPTIONAL_TEST_BUDGET, local.cancelled())
+            tokio::time::timeout(optional_test_budget(), local.cancelled())
                 .await
                 .unwrap();
             assert!(done_rx.try_recv().is_err());
@@ -612,8 +614,8 @@ async fn optional_parent_retirement_joins_every_concurrent_retire_before_scope_c
             for waiter in waiters {
                 waiter.join().unwrap();
             }
-            done_rx.recv_timeout(OPTIONAL_TEST_BUDGET).unwrap();
-            done_rx.recv_timeout(OPTIONAL_TEST_BUDGET).unwrap();
+            done_rx.recv_timeout(optional_test_budget()).unwrap();
+            done_rx.recv_timeout(optional_test_budget()).unwrap();
             assert_eq!(read.child().err(), Some(AdmissionError::Retired));
             assert_eq!(
                 ready.metadata().check_current(),
@@ -647,7 +649,7 @@ async fn optional_parent_signal_drops_inline_future_but_never_claims_to_stop_a_d
             let lease = Arc::new(());
             let weak = Arc::downgrade(&lease);
             let worker = tokio::task::spawn_blocking(move || {
-                release_rx.recv_timeout(OPTIONAL_TEST_BUDGET).unwrap();
+                release_rx.recv_timeout(optional_test_budget()).unwrap();
                 drop(lease);
                 19
             });
@@ -664,7 +666,7 @@ async fn optional_parent_signal_drops_inline_future_but_never_claims_to_stop_a_d
             .await;
             f.physical.interrupt_requests();
             assert!(matches!(
-                tokio::time::timeout(OPTIONAL_TEST_BUDGET, future)
+                tokio::time::timeout(optional_test_budget(), future)
                     .await
                     .unwrap(),
                 Err(AdmissionError::Retired)
@@ -735,18 +737,18 @@ async fn optional_shared_required_fence_waits_and_retirement_wins_before_later_t
             let action = std::thread::spawn(move || {
                 held.dispatch(|| {
                     entered_tx.send(()).unwrap();
-                    release_rx.recv_timeout(OPTIONAL_TEST_BUDGET).unwrap();
+                    release_rx.recv_timeout(optional_test_budget()).unwrap();
                     Ok(())
                 })
             });
-            entered_rx.recv_timeout(OPTIONAL_TEST_BUDGET).unwrap();
+            entered_rx.recv_timeout(optional_test_budget()).unwrap();
             let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
             let retiring = parent.clone();
             let waiter = std::thread::spawn(move || {
                 retiring.retire();
                 done_tx.send(()).unwrap();
             });
-            tokio::time::timeout(OPTIONAL_TEST_BUDGET, parent.cancelled())
+            tokio::time::timeout(optional_test_budget(), parent.cancelled())
                 .await
                 .unwrap();
             assert!(done_rx.try_recv().is_err());
@@ -1170,17 +1172,17 @@ async fn manager_prompt_drop_joins_original_consuming_fence_and_retires_escaped_
     let action = std::thread::spawn(move || {
         held.dispatch(|| {
             entered_tx.send(()).unwrap();
-            release_rx.recv_timeout(OPTIONAL_TEST_BUDGET).unwrap();
+            release_rx.recv_timeout(optional_test_budget()).unwrap();
             Ok(())
         })
     });
-    entered_rx.recv_timeout(OPTIONAL_TEST_BUDGET).unwrap();
+    entered_rx.recv_timeout(optional_test_budget()).unwrap();
     let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
     let retiring = std::thread::spawn(move || {
         drop(prompt);
         done_tx.send(()).unwrap();
     });
-    tokio::time::timeout(OPTIONAL_TEST_BUDGET, parent.cancelled())
+    tokio::time::timeout(optional_test_budget(), parent.cancelled())
         .await
         .unwrap();
     assert!(done_rx.try_recv().is_err());

@@ -13,7 +13,8 @@ fn keep_tmp() -> bool {
 /// Create a temp dir with a recognizable `prefix` under the system temp root.
 /// The returned guard removes the dir on drop (including on panic); set
 /// `INTENTD_TEST_KEEP_TMP` (non-empty) to keep it around for debugging.
-pub(crate) fn test_tempdir(prefix: &str) -> tempfile::TempDir {
+#[must_use = "dropping the guard deletes the directory"]
+pub fn test_tempdir(prefix: &str) -> tempfile::TempDir {
     let mut dir = tempfile::Builder::new()
         .prefix(prefix)
         .tempdir()
@@ -28,7 +29,8 @@ pub(crate) fn test_tempdir(prefix: &str) -> tempfile::TempDir {
 /// root. Use with `"/tmp"` when the dir must stay short enough for a UDS
 /// socket path (macOS caps them at ~104 bytes; `temp_dir()` resolves to a
 /// long `/var/folders/...` path).
-pub(crate) fn test_tempdir_in(base: &str, prefix: &str) -> tempfile::TempDir {
+#[must_use = "dropping the guard deletes the directory"]
+pub fn test_tempdir_in(base: &str, prefix: &str) -> tempfile::TempDir {
     let mut dir = tempfile::Builder::new()
         .prefix(prefix)
         .tempdir_in(base)

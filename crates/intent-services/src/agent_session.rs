@@ -1562,7 +1562,11 @@ pub(crate) fn agent_actor(agent_id: &AgentId) -> EventActor {
 /// The deprecated `providers.active` is deliberately NOT consulted — the
 /// boot migration ([`crate::settings::migrate_active_provider_setting`])
 /// carries a legacy value into `model.defaultProvider` once at startup.
-pub(crate) fn derived_default_provider(
+#[expect(
+    clippy::must_use_candidate,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn derived_default_provider(
     settings: &intent_core::settings_file::SettingsFile,
 ) -> Option<String> {
     settings.model.default_provider.as_deref().and_then(|id| {
@@ -1594,7 +1598,7 @@ pub(crate) fn derived_default_provider(
 /// that may not be installed. Spawn-adjacent callers surface
 /// [`no_default_provider_error`] instead; stats-attribution callers (which
 /// pass `configured_default: None`) fall to their existing `"unknown"` tail.
-pub(crate) fn resolve_provider_id(
+pub fn resolve_provider_id(
     provider: Option<&str>,
     configured_default: Option<&str>,
 ) -> Option<String> {
@@ -1805,6 +1809,9 @@ fn map_acp_session_error(context: &str, e: &AcpError, provider_id: &str) -> Erro
 pub(crate) struct AuthOwner {
     selection: String,
     profile: Option<intent_acp::ProfileEnv>,
+    /// The selection may run with an overlay that could not be read: its
+    /// verdict is unknown, so nothing is demoted (never the bare Default).
+    unresolved: bool,
 }
 
 impl AuthOwner {
@@ -1813,10 +1820,14 @@ impl AuthOwner {
         Self {
             selection: provider_id.to_owned(),
             profile: None,
+            unresolved: false,
         }
     }
 
-    fn demote(&self) {
+    pub(crate) fn demote(&self) {
+        if self.unresolved {
+            return;
+        }
         match &self.profile {
             Some(profile) => crate::provider_auth::demote_profile_auth_verdict(profile),
             None => crate::provider_auth::demote_auth_verdict(&self.selection),
@@ -1825,20 +1836,34 @@ impl AuthOwner {
 }
 
 impl Services {
-    /// The [`AuthOwner`] of a resolved selection. A profile whose saved
-    /// settings cannot be read demotes nothing (and never the Default).
-    pub(crate) async fn auth_owner(&self, selection: &str) -> AuthOwner {
-        let profile = if crate::provider_profiles::is_qualified_ref(selection) {
-            Box::pin(self.resolve_profile_env(selection))
-                .await
-                .ok()
-                .flatten()
+    /// The [`AuthOwner`] of `agent_id`'s resolved selection. A profile (or
+    /// overridden Default) whose saved settings cannot be read demotes
+    /// nothing. Neither does a live process still running with earlier
+    /// settings (PROTOCOL §5.54 activation): its failure says nothing about
+    /// the saved account, which a newer process would use, nor about the
+    /// bare installation once overrides are cleared.
+    pub(crate) async fn auth_owner(&self, agent_id: &AgentId, selection: &str) -> AuthOwner {
+        let (profile, mut unresolved) = if crate::provider_profiles::may_have_overlay(selection) {
+            match Box::pin(self.resolve_profile_env(selection)).await {
+                Ok(profile) => (profile, false),
+                Err(_) => (None, true),
+            }
         } else {
-            None
+            (None, false)
         };
+        if let Some(live) = self
+            .profile_activation()
+            .live_fingerprint(agent_id, selection)
+        {
+            let saved = profile
+                .as_ref()
+                .map_or("", |p: &intent_acp::ProfileEnv| p.fingerprint());
+            unresolved |= live != saved;
+        }
         AuthOwner {
             selection: selection.to_owned(),
             profile,
+            unresolved,
         }
     }
 }
@@ -3079,7 +3104,7 @@ impl Services {
         // Protocol shaping keys on the base; auth failures belong to the
         // selection (a profile never demotes the Default verdict).
         let provider_id = intent_providers::base_provider_id(&selection).to_owned();
-        let owner = self.auth_owner(&selection).await;
+        let owner = self.auth_owner(agent_id, &selection).await;
         let is_orchestrator = self
             .resolve_session_is_orchestrator(&provider_id, &stored)
             .await;
@@ -3319,8 +3344,12 @@ impl Services {
             .profile_process_fingerprint(&stored.id, &selection)
             .await
         {
-            self.bind_native_session_settings(&stored.workspace_id, &stored.id, &fingerprint)
-                .await;
+            // An unbound session already reads as the empty Default
+            // fingerprint, so a Default without overrides writes nothing.
+            if Self::native_session_binding_differs(stored, &fingerprint) {
+                self.bind_native_session_settings(&stored.workspace_id, &stored.id, &fingerprint)
+                    .await;
+            }
         }
     }
 
@@ -3593,7 +3622,7 @@ impl Services {
                 return Ok(None);
             }
         }
-        let owner = boxed_await(|| self.auth_owner(&provider_id)).await;
+        let owner = boxed_await(|| self.auth_owner(agent_id, &provider_id)).await;
         let provider_id = intent_providers::base_provider_id(&provider_id).to_owned();
         // Resume path: no `sessionTitle` — the durable thread already has its
         // title and `session/load` behavior must stay unchanged (monorepo#3151).
@@ -4820,7 +4849,7 @@ impl Services {
                         derived_default_provider(&self.effective_settings()).as_deref(),
                     ) {
                         Some(provider_id) => {
-                            self.auth_owner(&provider_id).await.demote();
+                            self.auth_owner(agent_id, &provider_id).await.demote();
                             Some(provider_id)
                         }
                         None => None,

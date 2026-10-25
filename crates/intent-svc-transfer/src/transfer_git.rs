@@ -16,8 +16,8 @@ use intent_core::{Error, Result, Workspace};
 use intent_store::Sandbox;
 use serde::{Deserialize, Serialize};
 
-use crate::nested_repos::{is_dirty, stage_all_skipping_nested};
 use crate::transfer_submodules::{find_unpublished_submodules, UnpublishedSubmodule};
+use intent_services::feature_api::nested_repos::{is_dirty, stage_all_skipping_nested};
 
 /// First line of every transfer WIP snapshot commit message. The import side
 /// identifies snapshot commits by this sentinel and unwinds them via
@@ -386,7 +386,7 @@ pub fn create_transfer_bundle(
     sandboxes: &[Sandbox],
     staging_dir: &Path,
 ) -> Result<TransferBundle> {
-    let worktree = crate::git_ops::worktree_path(ws).ok_or_else(|| {
+    let worktree = intent_services::feature_api::git_ops::worktree_path(ws).ok_or_else(|| {
         Error::Internal("workspace has no worktree or repository path".to_string())
     })?;
     std::fs::create_dir_all(staging_dir)
@@ -1978,7 +1978,7 @@ mod tests {
     /// published submodule produces no bundle at all.
     #[test]
     fn bundle_includes_unpublished_submodules() {
-        use crate::test_support::submodule_fixture::{
+        use intent_services::feature_api::test_support::submodule_fixture::{
             git, local_commit, superproject_with_submodule,
         };
         let dir = tempfile::TempDir::new().unwrap();
@@ -2048,7 +2048,7 @@ mod tests {
     /// entry names, and `refs.submodules` lists them parent-first.
     #[test]
     fn bundle_orders_nested_submodules_parent_first() {
-        use crate::test_support::submodule_fixture::{
+        use intent_services::feature_api::test_support::submodule_fixture::{
             git, init_repo, local_commit, superproject_with_submodule,
         };
         let dir = tempfile::TempDir::new().unwrap();
@@ -2128,7 +2128,7 @@ mod tests {
     /// layout is the same as for two unpublished submodules.
     #[test]
     fn bundle_carries_published_parent_of_nested_unpublished_submodule() {
-        use crate::test_support::submodule_fixture::{
+        use intent_services::feature_api::test_support::submodule_fixture::{
             git, nested_unpublished_under_published_parent, NestedFixture,
         };
         let dir = tempfile::TempDir::new().unwrap();
@@ -2196,7 +2196,7 @@ mod tests {
     /// the WIP snapshot is unwound, and no temp ref survives in either repo.
     #[test]
     fn submodule_bundle_failure_unwinds_wip_and_leaves_no_files() {
-        use crate::test_support::submodule_fixture::{
+        use intent_services::feature_api::test_support::submodule_fixture::{
             git, local_commit, superproject_with_submodule,
         };
         let dir = tempfile::TempDir::new().unwrap();

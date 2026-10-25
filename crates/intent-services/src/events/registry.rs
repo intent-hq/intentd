@@ -300,9 +300,11 @@ impl WatcherRegistry {
         }
     }
 
-    /// Await every requested shared watch actually being registered with the
-    /// OS. Registration is deferred off the caller's thread (monorepo#1572), so
-    /// tests must wait for it before mutating a watched tree.
+    /// Await every requested shared watch being LIVE with the OS, riding out a
+    /// creation retry and panicking on a dead watch or on `timeout` (see
+    /// [`SharedWatchHub::wait_all_established`]). Registration is deferred off
+    /// the caller's thread (monorepo#1572), so tests must wait for it before
+    /// mutating a watched tree.
     /// `expect_roots` is the number of watched roots the caller expects to
     /// exist, so a wait issued before the registry has subscribed does not
     /// return immediately against an empty hub.
