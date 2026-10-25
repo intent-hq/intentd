@@ -318,3 +318,62 @@ async fn cancellation_flag_preserves_success_when_open() {
     .unwrap();
     assert_eq!(result, serde_json::json!(42));
 }
+
+/// Host replies are built as JS values directly (intent-hq/intent#7688);
+/// they must keep `JSON.parse` semantics: `__proto__` stays an own data key,
+/// nested values and numbers round-trip.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_reply_keeps_json_parse_semantics() {
+    let host: HostFn = Arc::new(|_| {
+        Box::pin(async {
+            Ok(serde_json::json!({
+                "__proto__": { "polluted": true },
+                "nested": [1, 2.5, -3, 4_294_967_296_i64, null, true, "é"],
+            }))
+        })
+    });
+    let out = eval(
+        "const r = await host(null); \
+         return { own: Object.keys(r), proto: Object.getPrototypeOf(r) === Object.prototype, \
+                  polluted: r.polluted === undefined ? null : r.polluted, \
+                  key: r['__proto__'], nested: r.nested };",
+        &EvalOptions::default(),
+        Some(host),
+    )
+    .await
+    .expect("host reply builds");
+    assert_eq!(out["own"], serde_json::json!(["__proto__", "nested"]));
+    assert_eq!(out["proto"], serde_json::json!(true));
+    assert_eq!(out["polluted"], serde_json::Value::Null);
+    assert_eq!(out["key"], serde_json::json!({ "polluted": true }));
+    assert_eq!(
+        out["nested"],
+        serde_json::json!([1, 2.5, -3, 4_294_967_296_i64, null, true, "é"])
+    );
+}
+
+/// A reply too large for the memory limit rejects the host promise with a
+/// bounded, catchable error that says a write may already have applied.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oversized_host_reply_rejects_with_bounded_error() {
+    let host: HostFn =
+        Arc::new(|_| Box::pin(async { Ok(serde_json::json!({ "big": "€".repeat(4_000_000) })) }));
+    let opts = EvalOptions {
+        timeout: Duration::from_secs(10),
+        memory_limit_bytes: Some(4 * 1024 * 1024),
+    };
+    let out = eval(
+        "try { await host(null); return 'unreachable'; } catch (e) { return String(e.message); }",
+        &opts,
+        Some(host),
+    )
+    .await
+    .expect("rejection is catchable");
+    let msg = out.as_str().expect("message string");
+    assert!(
+        msg.contains("does not fit in the script memory limit")
+            && msg.contains("may already have been applied"),
+        "got: {msg}"
+    );
+    assert!(msg.len() < 300, "error must be bounded: {msg}");
+}

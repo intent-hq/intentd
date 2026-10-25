@@ -4,7 +4,10 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use rquickjs::{function::Async, AsyncContext, AsyncRuntime, CatchResultExt, Function, Promise};
+use rquickjs::{
+    function::Async, object::Property, Array, AsyncContext, AsyncRuntime, CatchResultExt, Ctx,
+    Function, IntoJs, Object, Promise, Value,
+};
 
 use crate::{
     EvalOptions, GuardedHostFn, HostAdmissionOutcome, HostCallId, HostFn, HostReply,
@@ -26,7 +29,7 @@ const HOST_BRIDGE_JS: &str = r#"
                 throw new TypeError("host(arg): argument is not JSON-serializable");
             }
             const reply = await raw(stringified);
-            const frame = reply == null ? { ok: true, value: null } : JSON.parse(reply);
+            const frame = reply == null ? { ok: true, value: null } : reply;
             if (!frame.ok) {
                 throw new Error(String(frame.error ?? "host call failed"));
             }
@@ -219,7 +222,7 @@ fn bind_host(ctx: &rquickjs::Ctx<'_>, host: GuardedHostFn) -> rquickjs::Result<(
                             "ok": false,
                             "error": format!("engine: host received non-JSON argument: {e}"),
                         });
-                        return Ok::<String, rquickjs::Error>(frame.to_string());
+                        return Ok::<HostFrame, rquickjs::Error>(HostFrame(frame.to_string()));
                     }
                 };
                 let encoded = match future.await {
@@ -245,13 +248,98 @@ fn bind_host(ctx: &rquickjs::Ctx<'_>, host: GuardedHostFn) -> rquickjs::Result<(
                         }
                     }
                 };
-                Ok::<String, rquickjs::Error>(encoded)
+                Ok::<HostFrame, rquickjs::Error>(HostFrame(encoded))
             }
         }),
     )?;
     ctx.globals().set("__hostRaw", host_raw)?;
     ctx.eval::<(), _>(HOST_BRIDGE_JS)?;
     Ok(())
+}
+
+/// An encoded `{ok, value|error}` host frame on its way into JS.
+///
+/// The frame is decoded in Rust and built directly as JS values, so the
+/// script heap holds only the final strings. Passing the JSON text and
+/// calling `JSON.parse` in JS held the reply text, its UTF-8 copy, and the
+/// parsed strings at once, which pushed multi-megabyte notes over the
+/// runtime memory limit (intent-hq/intent#7688).
+struct HostFrame(String);
+
+impl<'js> IntoJs<'js> for HostFrame {
+    fn into_js(self, ctx: &Ctx<'js>) -> rquickjs::Result<Value<'js>> {
+        let encoded_len = self.0.len();
+        let decoded = serde_json::from_str::<serde_json::Value>(&self.0);
+        drop(self.0);
+        let frame = match decoded {
+            Ok(frame) => frame,
+            Err(e) => {
+                return error_frame(ctx, &format!("engine: malformed host reply frame: {e}"));
+            }
+        };
+        let built = json_to_js(ctx, &frame);
+        drop(frame);
+        match built {
+            Ok(value) => Ok(value),
+            Err(rquickjs::Error::Exception) => {
+                // Usually the memory limit. Drop the pending exception (the
+                // partial values were released as the build unwound) and
+                // reject with a bounded, actionable message instead.
+                let _ = ctx.catch();
+                error_frame(ctx, &oversized_reply_message(encoded_len))
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
+fn oversized_reply_message(encoded_len: usize) -> String {
+    format!(
+        "host reply ({encoded_len} bytes of JSON) does not fit in the script memory limit; \
+         if this call changes state it may already have been applied"
+    )
+}
+
+fn error_frame<'js>(ctx: &Ctx<'js>, message: &str) -> rquickjs::Result<Value<'js>> {
+    let obj = Object::new(ctx.clone())?;
+    obj.set("ok", false)?;
+    obj.set("error", message)?;
+    Ok(obj.into_value())
+}
+
+/// Build `value` as JS values with `JSON.parse` semantics: object keys are
+/// defined as own data properties (so `__proto__` stays a plain key), and
+/// numbers become JS numbers. Depth is bounded by `serde_json`'s parser.
+fn json_to_js<'js>(ctx: &Ctx<'js>, value: &serde_json::Value) -> rquickjs::Result<Value<'js>> {
+    Ok(match value {
+        serde_json::Value::Null => Value::new_null(ctx.clone()),
+        serde_json::Value::Bool(b) => Value::new_bool(ctx.clone(), *b),
+        serde_json::Value::Number(n) => match n.as_i64().and_then(|i| i32::try_from(i).ok()) {
+            Some(i) => Value::new_int(ctx.clone(), i),
+            None => Value::new_number(ctx.clone(), n.as_f64().unwrap_or(f64::NAN)),
+        },
+        serde_json::Value::String(s) => rquickjs::String::from_str(ctx.clone(), s)?.into_value(),
+        serde_json::Value::Array(items) => {
+            let array = Array::new(ctx.clone())?;
+            for (idx, item) in items.iter().enumerate() {
+                array.set(idx, json_to_js(ctx, item)?)?;
+            }
+            array.into_value()
+        }
+        serde_json::Value::Object(map) => {
+            let obj = Object::new(ctx.clone())?;
+            for (key, item) in map {
+                obj.prop(
+                    key.as_str(),
+                    Property::from(json_to_js(ctx, item)?)
+                        .writable()
+                        .enumerable()
+                        .configurable(),
+                )?;
+            }
+            obj.into_value()
+        }
+    })
 }
 
 fn encode_host_outcome(outcome: Result<serde_json::Value, String>) -> String {
