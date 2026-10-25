@@ -3902,10 +3902,10 @@ case "$1" in
     done
     if [ "${FAKE_PARK_BEFORE_PID:-}" = 1 ]; then
       echo "$$" > "$INTENTD_DATA_DIR/daemon-parked"
-      # The ~2 min bound outlasts every test wait; it only stops a failed test leaking this loop.
-      i=0
+      # Bounded by the test's data dir, not a count: it outlasts every scaled
+      # test wait and still cannot outlive a failed test's tempdir.
       # // timing-guard: parked before recording its PID until the sitter kills it
-      while [ "$i" -lt 2400 ]; do sleep 0.05; i=$((i + 1)); done
+      while [ -d "$INTENTD_DATA_DIR" ]; do sleep 0.05; done
       exit 1
     fi
     echo "$$" > "$INTENTD_DATA_DIR/daemon-pid"
@@ -3917,6 +3917,19 @@ case "$1" in
     while [ -d "$INTENTD_DATA_DIR" ]; do sleep 0.05; done
     ;;
   call|status)
+    # Startup hold, for a test that launches a fresh supervisor: while
+    # hold-startup exists and sitter.pid is live, answer like a booting
+    # daemon. Both the start caller and the supervisor's initial-readiness
+    # wait probe here, and each fresh reply renews that prober's readiness
+    # budget. The caller's pre-launch probe runs before any supervisor
+    # exists, so it still launches. A probe whose parent is the PID in
+    # release-caller gets no reply, so only that caller's budget runs out.
+    if [ -f "$INTENTD_DATA_DIR/hold-startup" ] &&
+      kill -0 "$(cat "$INTENTD_DATA_DIR/sitter/sitter.pid" 2>/dev/null)" 2>/dev/null &&
+      [ "$PPID" != "$(cat "$INTENTD_DATA_DIR/release-caller" 2>/dev/null)" ]; then
+      echo '{"code":-32012,"message":"Daemon not ready","data":{"code":"daemon-not-ready","retryable":true,"retryAfterMs":1000,"startup":{"startupStatus":1,"attemptId":"boot-held","phase":"preparing","elapsedMs":10,"phaseElapsedMs":10,"progressAgeMs":10,"retryAfterMs":1000}}}' >&2
+      exit 1
+    fi
     test -f "$INTENTD_DATA_DIR/ready" || exit 1
     kill -0 "$(cat "$INTENTD_DATA_DIR/ready")" 2>/dev/null || exit 1
     echo '{"version":"0.1.0"}'
@@ -4358,23 +4371,44 @@ fn background_start_help_invalid_options_and_timeout_leave_no_supervisor() {
 /// Deterministic form of the loaded-runner ordering in intent-hq/intent#7703:
 /// the supervisor launches the daemon, but the readiness budget expires before
 /// the daemon records its PID. Timeout cleanup must still kill it.
+///
+/// The fixture's startup hold renews both the start caller's and the
+/// supervisor's readiness budgets, so neither deadline can fire while the test
+/// waits for the park and scans `/proc`, however late it runs. Releasing only
+/// the caller then makes its readiness timeout the one that ends the start.
 #[test]
 fn background_start_timeout_kills_a_daemon_that_never_recorded_its_pid() {
     let dir = tempfile::tempdir().unwrap();
     let fixture = background_fixture(dir.path());
+    fs::write(dir.path().join("hold-startup"), "").unwrap();
+    let budget = intentd_test_support::test_timeout(Duration::from_secs(5));
     let mut cmd = sitter_command(dir.path(), &dead_url());
     cmd.arg("start")
         .env("FAKE_PARK_BEFORE_PID", "1")
-        .env(intentd_sitter::readiness::TIMEOUT_ENV, scaled_ms(5000))
+        .env(
+            intentd_sitter::readiness::TIMEOUT_ENV,
+            budget.as_millis().to_string(),
+        )
         .env(KILL_TIMEOUT_ENV, "200");
+    let spawned = Instant::now();
     let mut child = spawn_guarded(&mut cmd);
-    let parked_path = dir.path().join("daemon-parked");
-    wait_until(
+    let parked = wait_for_recorded_pid(
         "parked daemon launch",
-        intentd_test_support::test_timeout(Duration::from_secs(5)),
-        || recorded_pid(&parked_path).is_some(),
+        Duration::from_secs(5),
+        &dir.path().join("daemon-parked"),
     );
-    let parked = recorded_pid(&parked_path).unwrap();
+    // Outlast the unrenewed deadline, so the checks below prove the hold works:
+    // without it, timeout cleanup would already have killed the parked daemon.
+    let unheld_deadline = budget + intentd_test_support::test_timeout(Duration::from_secs(1));
+    wait_until(
+        "the unheld readiness deadline to pass",
+        Duration::from_secs(10),
+        || spawned.elapsed() > unheld_deadline,
+    );
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "held startup replies must keep the start caller waiting"
+    );
     // Positive control: the scan sees what the sitter launched, so the
     // survivor check below cannot pass vacuously.
     #[cfg(target_os = "linux")]
@@ -4382,11 +4416,17 @@ fn background_start_timeout_kills_a_daemon_that_never_recorded_its_pid() {
         live_processes_with_data_dir(dir.path()).contains(&parked),
         "the scan must see the parked daemon"
     );
+    // The supervisor's budget stays held, so the caller's timeout fires first.
+    fs::write(dir.path().join("release-caller"), child.id().to_string()).unwrap();
     assert!(!child
         .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(15)))
         .unwrap()
         .unwrap()
         .success());
+    assert!(
+        read_or_empty(&stderr_path(dir.path())).contains("startup readiness timed out"),
+        "the start caller's readiness timeout must end the start"
+    );
     assert!(!fixture.paths.pid_path.exists());
     assert!(!dir.path().join("daemon-pid").exists());
     assert_no_survivors(dir.path(), Some(parked));
