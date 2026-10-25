@@ -229,10 +229,6 @@ fn spawn_daemon(
 ) -> Child {
     use std::os::unix::process::CommandExt;
     common::enable_ws_api(data_dir);
-    // Pin resumeInterruptedOnStart=off so the captured row stays pending until
-    // the explicit `agent.resolveInterrupted` call (the `auto` default resumes
-    // on headless hosts, which would race the assertions below).
-    common::disable_resume_on_start(data_dir);
     let mut cmd = common::hermetic_serve_command(data_dir);
     cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")

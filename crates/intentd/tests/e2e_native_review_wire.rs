@@ -499,7 +499,11 @@ impl Harness {
             .unwrap();
         startup_roles.returned();
         let startup_services = startup_milestones::begin(startup_milestones::Phase::Services);
-        std::fs::write(dir.path().join("config.toml"),"[providers]\nenabled = {}\n[mcp]\nenableUserServers = false\n[agents]\nresumeInterruptedOnStart = \"off\"\n").unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[providers]\nenabled = {}\n[mcp]\nenableUserServers = false\n",
+        )
+        .unwrap();
         let mut config = std::fs::OpenOptions::new()
             .append(true)
             .open(dir.path().join("config.toml"))
