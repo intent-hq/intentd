@@ -33,6 +33,9 @@ LIBRARY = {"release": True, "git_only": True, "publish": False,
            "git_release_enable": False, "git_tag_enable": False,
            "changelog_update": False, "version_group": "intentd",
            "git_tag_name": SHARED}
+# Keys an introduced package's own table may set. git_tag_name is excluded so
+# the override never duplicates an explicit key (it inherits SHARED instead).
+ALLOWED_KEYS = {"name"} | set(LIBRARY) - {"git_tag_name"}
 VERSION = re.compile(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
 
 
@@ -92,10 +95,14 @@ def prepare(repo):
         finally:
             run(repo, "git", "worktree", "remove", "--force", str(tree))
     introduced = sorted(shared - released)
-    # Only libraries matching the shared policy exactly may be introduced;
-    # intentd (and any other policy) missing from the baseline stays an error.
+    if "intentd" in introduced:
+        raise ValueError(f"intentd is absent from {baseline}; the shared baseline is unusable")
+    # Only libraries matching the shared policy exactly may be introduced: the
+    # effective values must equal LIBRARY and the table may set nothing else.
+    tables = {p["name"]: p for p in config["package"]}
     unexpected = [name for name in introduced
-                  if any(packages[name].get(key) != value for key, value in LIBRARY.items())]
+                  if any(packages[name].get(key) != value for key, value in LIBRARY.items())
+                  or not set(tables[name]) <= ALLOWED_KEYS]
     if unexpected:
         raise ValueError(f"unexpected packages absent from {baseline} without the shared "
                          f"library release policy: {unexpected}")
@@ -108,9 +115,9 @@ def prepare(repo):
     changed = original.decode()
     for name in introduced:
         reserved = f"{RESERVED}{name}-v{{{{ version }}}}"
+        header = f'name = "{name}"\ngit_tag_name = "{reserved}"'
         changed, count = re.subn(rf'(?m)^name = "{re.escape(name)}"[ \t]*$',
-                                 lambda _: f'name = "{name}"\ngit_tag_name = "{reserved}"',
-                                 changed)
+                                 lambda _, header=header: header, changed)
         if count != 1:
             raise ValueError(f"cannot locate exactly one {name} package table")
         for package in config["package"]:
