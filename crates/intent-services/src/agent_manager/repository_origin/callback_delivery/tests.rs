@@ -18,7 +18,9 @@ use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex as TokioMutex};
 
-const WAIT: Duration = Duration::from_secs(15);
+fn fixture_wait() -> Duration {
+    intentd_test_support::test_timeout(Duration::from_secs(15))
+}
 
 const METHOD: &str = "_intent/session/register_mcp_callback";
 
@@ -143,7 +145,7 @@ impl McpRequestContext for ObservedPendingContext {
 }
 
 async fn wait_count(counter: &AtomicUsize, changed: &Notify, wanted: usize) {
-    tokio::time::timeout(WAIT, async {
+    tokio::time::timeout(fixture_wait(), async {
         loop {
             let notification = changed.notified();
             tokio::pin!(notification);
@@ -190,7 +192,7 @@ impl PeerWriterGate {
         self.blocked.store(true, Ordering::SeqCst);
     }
     async fn reached(&self) {
-        tokio::time::timeout(WAIT, self.entered.notified())
+        tokio::time::timeout(fixture_wait(), self.entered.notified())
             .await
             .unwrap();
     }
@@ -414,7 +416,11 @@ if (capability === "missing-receipt") delete response._meta?.intentCallbackRegis
 
     async fn call(&self, method: &str, params: Value) -> Value {
         self.connection
-            .request_timeout(method, params, crate::test_support::fixture_timeout(WAIT))
+            .request_timeout(
+                method,
+                params,
+                crate::test_support::fixture_timeout(fixture_wait()),
+            )
             .await
             .unwrap_or_else(|error| {
                 panic!("{method}: {error}: {:?}", self.connection.recent_stderr())
@@ -823,7 +829,7 @@ async fn uncertain_sdk_completion_keeps_the_committed_response_without_retry_or_
     let task = start_task(&h);
     h.node.call("fixture/entered", json!({})).await;
     let captured = callback(&h.origin).unwrap().capture();
-    let id = tokio::time::timeout(WAIT, task)
+    let id = tokio::time::timeout(fixture_wait(), task)
         .await
         .unwrap()
         .unwrap()
@@ -1061,7 +1067,7 @@ async fn pending_request_queued_before_permit_never_adopts_new_endpoint_authorit
                 .request_timeout(
                     "fixture/call",
                     json!({"name":"workspace-mcp","code":format!("return 'queued-{i}'")}),
-                    WAIT,
+                    fixture_wait(),
                 )
                 .await
                 .unwrap()
@@ -1238,12 +1244,12 @@ async fn metadata_delivery_ordering(replace_handle: bool, install_before_old: bo
             };
             if let Some((entered, resume)) = gate {
                 let _ = entered.send(());
-                let _ = resume.recv_timeout(WAIT);
+                let _ = resume.recv_timeout(fixture_wait());
             }
         });
     drop(writer);
     let original = start_task(&h);
-    tokio::time::timeout(WAIT, model_wait)
+    tokio::time::timeout(fixture_wait(), model_wait)
         .await
         .unwrap()
         .unwrap();
@@ -1313,7 +1319,7 @@ async fn metadata_delivery_ordering(replace_handle: bool, install_before_old: bo
         assert!(delivery.is_some());
         deliver_optional(delivery).await;
     }
-    tokio::time::timeout(WAIT, effort_wait)
+    tokio::time::timeout(fixture_wait(), effort_wait)
         .await
         .unwrap()
         .unwrap();
@@ -1544,7 +1550,7 @@ async fn idle_wake_and_zero_settle_transcripts_keep_captured_connection_routes()
             .wake_listener_tick(&h.f.row.id, &h.f.row.workspace_id)
             .await
     );
-    tokio::time::timeout(WAIT, async {
+    tokio::time::timeout(fixture_wait(), async {
         loop {
             if !h.f.manager.is_busy(&h.f.row.id) && !transcript_tools(&h).await.is_empty() {
                 break;
@@ -1674,13 +1680,13 @@ async fn hard_stop_joins_real_source_dispatch_before_dropping_confirmed_bridge()
             Ok(())
         })
     });
-    inside.recv_timeout(WAIT).unwrap();
+    inside.recv_timeout(fixture_wait()).unwrap();
     let endpoint = h.origin.state.lock().unwrap().endpoint.clone().unwrap();
     let fixture = h.f.clone();
     let runtime = tokio::runtime::Handle::current();
     let stopping =
         std::thread::spawn(move || runtime.block_on(fixture.manager.stop(&fixture.row.id)));
-    tokio::time::timeout(WAIT, async {
+    tokio::time::timeout(fixture_wait(), async {
         loop {
             if h.origin.state.lock().unwrap().retired {
                 break;
@@ -1950,7 +1956,7 @@ impl NativeHold {
     }
 
     async fn reached(&self) {
-        tokio::time::timeout(WAIT, self.entered.notified())
+        tokio::time::timeout(fixture_wait(), self.entered.notified())
             .await
             .unwrap();
     }
@@ -2018,7 +2024,7 @@ impl<'a> BudgetRequestTrace<'a> {
             budget_ms, 30_000,
             "these controls preserve the original server budget"
         );
-        eprintln!("budget-request begin subcase={subcase} iterations={count} fixture_wait_ms={} server_budget_ms={budget_ms}", WAIT.as_millis());
+        eprintln!("budget-request begin subcase={subcase} iterations={count} fixture_wait_ms={} server_budget_ms={budget_ms}", fixture_wait().as_millis());
         Self {
             control,
             subcase,
@@ -2499,7 +2505,7 @@ impl NativeHarness {
         let params = json!({"query":query,"name":name,"code":code});
         tokio::spawn(async move {
             connection
-                .request_timeout("fixture/call", params, WAIT)
+                .request_timeout("fixture/call", params, fixture_wait())
                 .await
                 .unwrap()
         })
@@ -2882,7 +2888,7 @@ async fn confirmed_read_escaped_handles_retire_only_after_their_original_scope()
     drop(cloned);
     gate.release.add_permits(1);
     assert!(first.await.unwrap().to_string().contains("actual review"));
-    tokio::time::timeout(WAIT, async {
+    tokio::time::timeout(fixture_wait(), async {
         while source.retirement().check_current().is_ok() {
             tokio::task::yield_now().await;
         }
@@ -3205,7 +3211,7 @@ async fn confirmed_read_claimed_delete_retires_original_manager_before_late_outp
             .schedule_workspace_delete(h.git.workspace.id.clone(), 0)
             .await
             .unwrap();
-        tokio::time::timeout(WAIT, async {
+        tokio::time::timeout(fixture_wait(), async {
             while h
                 .original
                 .pending_workspace_deletes
@@ -3227,7 +3233,7 @@ async fn confirmed_read_claimed_delete_retires_original_manager_before_late_outp
     .await;
     // Taking the pending-delete claim precedes manager retirement. Wait for the
     // original endpoint to retire before releasing its held response.
-    tokio::time::timeout(WAIT, async {
+    tokio::time::timeout(fixture_wait(), async {
         while !h.origin.state.lock().unwrap().retired
             || !endpoint.cancelled.load(Ordering::Acquire)
             || endpoint.bridge.lock().unwrap().is_some()
@@ -3245,7 +3251,7 @@ async fn confirmed_read_claimed_delete_retires_original_manager_before_late_outp
             .contains("Private result delivery refused"),
         "{reply}"
     );
-    tokio::time::timeout(WAIT, async {
+    tokio::time::timeout(fixture_wait(), async {
         while h
             .original
             .store
@@ -3375,12 +3381,12 @@ async fn native_metadata_delivery_ordering(replace_handle: bool, install_before_
             };
             if let Some((entered, resume)) = gate {
                 let _ = entered.send(());
-                let _ = resume.recv_timeout(WAIT);
+                let _ = resume.recv_timeout(fixture_wait());
             }
         });
     drop(writer);
     let original = h.start_task();
-    tokio::time::timeout(WAIT, model_wait)
+    tokio::time::timeout(fixture_wait(), model_wait)
         .await
         .unwrap()
         .unwrap();
@@ -3448,7 +3454,7 @@ async fn native_metadata_delivery_ordering(replace_handle: bool, install_before_
         assert!(delivery.is_some());
         deliver_optional(delivery).await;
     }
-    tokio::time::timeout(WAIT, effort_wait)
+    tokio::time::timeout(fixture_wait(), effort_wait)
         .await
         .unwrap()
         .unwrap();
@@ -3628,7 +3634,7 @@ async fn confirmed_read_registration_failure_cancel_and_uncertainty_never_replay
             start.abort();
             assert!(start.await.unwrap_err().is_cancelled());
         } else {
-            let id = tokio::time::timeout(WAIT, start)
+            let id = tokio::time::timeout(fixture_wait(), start)
                 .await
                 .unwrap()
                 .unwrap()
@@ -4031,7 +4037,7 @@ async fn confirmed_read_idle_wake_and_zero_settle_transcripts_keep_captured_conn
             .wake_listener_tick(&h.f.row.id, &h.f.row.workspace_id)
             .await
     );
-    tokio::time::timeout(WAIT, async {
+    tokio::time::timeout(fixture_wait(), async {
         loop {
             if !h.f.manager.is_busy(&h.f.row.id) && !native_transcript_tools(&h).await.is_empty() {
                 break;
@@ -4667,7 +4673,7 @@ mod live_context {
             )
             .await
             .unwrap();
-        tokio::time::timeout(WAIT, async {
+        tokio::time::timeout(fixture_wait(), async {
             loop {
                 if !h.f.manager.is_busy(&row.id) && h.f.manager.workers.lock().unwrap().is_empty() {
                     break;
@@ -5438,7 +5444,9 @@ mod live_context {
         .await;
         held.release();
         holder.await.unwrap();
-        tokio::time::timeout(WAIT, draining).await.unwrap();
+        tokio::time::timeout(fixture_wait(), draining)
+            .await
+            .unwrap();
         dispatch(&h, &id, capture(&h).await, "fresh after real drain")
             .await
             .unwrap();
@@ -5619,7 +5627,7 @@ mod normal_launch {
                 _ => {}
             }
             h.rpc("fixture/release-prompt", json!({})).await;
-            tokio::time::timeout(WAIT, async {
+            tokio::time::timeout(fixture_wait(), async {
                 while h.f.manager.is_busy(&h.f.row.id)
                     || h.f.manager.services.has_ready_to_send(&h.f.row.id)
                     || !h.f.manager.workers.lock().unwrap().is_empty()
@@ -5779,7 +5787,7 @@ mod normal_launch {
             }
         })
         .await;
-        tokio::time::timeout(WAIT, async {
+        tokio::time::timeout(fixture_wait(), async {
             while h.f.manager.is_busy(&h.f.row.id)
                 || h.f.manager.services.has_ready_to_send(&h.f.row.id)
             {
@@ -6085,7 +6093,7 @@ mod normal_launch {
             "freshly admitted native Check and Flush must use the original destination: {result:?}"
         );
         assert_eq!(result.unwrap()["flushed"], true);
-        tokio::time::timeout(WAIT, async {
+        tokio::time::timeout(fixture_wait(), async {
             while h.f.manager.is_busy(&h.f.row.id)
                 || h.f.manager.services.has_ready_to_send(&h.f.row.id)
             {
@@ -6208,7 +6216,7 @@ mod normal_launch {
                 _ => {}
             }
             h.rpc("fixture/release-prompt", json!({})).await;
-            tokio::time::timeout(WAIT, async {
+            tokio::time::timeout(fixture_wait(), async {
                 while h.f.manager.is_busy(&h.f.row.id)
                     || h.f.manager.services.has_ready_to_send(&h.f.row.id)
                     || !h.f.manager.workers.lock().unwrap().is_empty()
@@ -6300,7 +6308,7 @@ mod normal_launch {
                 .unwrap()["flushed"],
             true
         );
-        tokio::time::timeout(WAIT, async {
+        tokio::time::timeout(fixture_wait(), async {
             while h.f.manager.is_busy(&h.f.row.id)
                 || h.f.manager.services.has_ready_to_send(&h.f.row.id)
                 || !h.f.manager.workers.lock().unwrap().is_empty()
@@ -6581,7 +6589,7 @@ mod normal_launch {
             .await;
         assert!(result.is_ok(),"explicit recovery requires fresh original admission, not the current remote: {result:?}");
         assert_eq!(result.unwrap()["flushed"], !no_net_change);
-        tokio::time::timeout(WAIT, async {
+        tokio::time::timeout(fixture_wait(), async {
             while h.f.manager.is_busy(&h.f.row.id)
                 || h.f.manager.services.has_ready_to_send(&h.f.row.id)
                 || !h.f.manager.workers.lock().unwrap().is_empty()
@@ -6718,7 +6726,7 @@ mod normal_launch {
                 }
             })
             .await;
-            tokio::time::timeout(WAIT, async {
+            tokio::time::timeout(fixture_wait(), async {
                 while h.f.manager.is_busy(&h.f.row.id)
                     || h.f.manager.services.has_ready_to_send(&h.f.row.id)
                 {
@@ -6768,7 +6776,7 @@ mod normal_launch {
                 }
             })
             .await;
-            tokio::time::timeout(WAIT, async {
+            tokio::time::timeout(fixture_wait(), async {
                 while h.f.manager.is_busy(&h.f.row.id)
                     || h.f.manager.services.has_ready_to_send(&h.f.row.id)
                 {
@@ -7037,7 +7045,7 @@ mod normal_launch {
                                 .clone()
                                 .try_drain_queue(agent.clone(), workspace.clone())
                                 .await;
-                            tokio::time::timeout(WAIT, async {
+                            tokio::time::timeout(fixture_wait(), async {
                                 while manager.is_busy(&agent)
                                     || manager.services.has_ready_to_send(&agent)
                                 {
@@ -7477,7 +7485,7 @@ mod normal_launch {
             .set_commit_hook(move || {
                 if let Some(wait) = wait.take() {
                     signal.notify_one();
-                    wait.recv_timeout(WAIT).unwrap();
+                    wait.recv_timeout(fixture_wait()).unwrap();
                 }
                 !abort_commit
             });
@@ -7502,7 +7510,7 @@ mod normal_launch {
                     .map(|message| message.is_some())
             },
         ));
-        tokio::time::timeout(WAIT, entered.notified())
+        tokio::time::timeout(fixture_wait(), entered.notified())
             .await
             .expect("actual monitor SQL COMMIT entered");
         if drop_caller {
@@ -7511,7 +7519,7 @@ mod normal_launch {
         let origin = h.origin();
         let probe = origin.state.lock().unwrap().retirement.clone().unwrap();
         let retired = tokio::task::spawn_blocking(move || origin.retire());
-        tokio::time::timeout(WAIT, async {
+        tokio::time::timeout(fixture_wait(), async {
             while !probe.detached_for_test() {
                 tokio::task::yield_now().await;
             }
@@ -7538,8 +7546,11 @@ mod normal_launch {
             before
         );
         release.send(()).unwrap();
-        tokio::time::timeout(WAIT, retired).await.unwrap().unwrap();
-        let outcome = tokio::time::timeout(WAIT, write).await.unwrap();
+        tokio::time::timeout(fixture_wait(), retired)
+            .await
+            .unwrap()
+            .unwrap();
+        let outcome = tokio::time::timeout(fixture_wait(), write).await.unwrap();
         if drop_caller {
             assert!(outcome.unwrap_err().is_cancelled());
         } else if abort_commit {
@@ -7547,7 +7558,7 @@ mod normal_launch {
         } else {
             assert!(outcome.unwrap().unwrap());
         }
-        let mut writer = tokio::time::timeout(WAIT, pool.acquire())
+        let mut writer = tokio::time::timeout(fixture_wait(), pool.acquire())
             .await
             .unwrap()
             .unwrap();
@@ -7569,7 +7580,7 @@ mod normal_launch {
         if acknowledge && !abort_commit {
             assert!(saved.pending_changes.is_empty());
             assert_eq!(saved.baseline_snapshot, saved.last_snapshot);
-            tokio::time::timeout(WAIT, async {
+            tokio::time::timeout(fixture_wait(), async {
                 while !completion.acknowledged() {
                     tokio::task::yield_now().await;
                 }
@@ -7712,7 +7723,9 @@ mod normal_launch {
                             .await
                     },
                 ));
-                tokio::time::timeout(WAIT, ready.notified()).await.unwrap();
+                tokio::time::timeout(fixture_wait(), ready.notified())
+                    .await
+                    .unwrap();
                 assert!(
                     !write.is_finished(),
                     "original writer reservation is blocked"
@@ -7726,14 +7739,14 @@ mod normal_launch {
                     _ => unreachable!(),
                 }
                 drop(writer);
-                let outcome = tokio::time::timeout(WAIT, write).await.unwrap();
+                let outcome = tokio::time::timeout(fixture_wait(), write).await.unwrap();
                 if mode == "waiting-cancel" {
                     assert!(outcome.unwrap_err().is_cancelled());
                 } else {
                     assert!(outcome.unwrap().is_err());
                 }
                 drop(
-                    tokio::time::timeout(WAIT, pool.acquire())
+                    tokio::time::timeout(fixture_wait(), pool.acquire())
                         .await
                         .unwrap()
                         .unwrap(),
@@ -8452,9 +8465,13 @@ if(frame.method==='session/prompt' && promptErrors.length) {
         }
         async fn rpc(&self, method: &str, params: Value) -> Value {
             let c = self.connection();
-            c.request_timeout(method, params, crate::test_support::fixture_timeout(WAIT))
-                .await
-                .unwrap_or_else(|e| panic!("{method}: {e}; {:?}", c.recent_stderr()))
+            c.request_timeout(
+                method,
+                params,
+                crate::test_support::fixture_timeout(fixture_wait()),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{method}: {e}; {:?}", c.recent_stderr()))
         }
         async fn confirmed(&self, query: usize) -> String {
             let names = self.rpc("fixture/names", json!({"query":query})).await;
@@ -8606,7 +8623,7 @@ if(frame.method==='session/prompt' && promptErrors.length) {
             )
             .await
             .unwrap();
-        tokio::time::timeout(WAIT, async {
+        tokio::time::timeout(fixture_wait(), async {
             while h.f.manager.is_busy(&h.f.row.id)
                 || !h.f.manager.workers.lock().unwrap().is_empty()
             {
@@ -8891,7 +8908,7 @@ if(frame.method==='session/prompt' && promptErrors.length) {
             let gate = control.at(Boundary::TcpResponse, false);
             let conn = h.connection();
             let task = tokio::spawn(async move {
-                conn.request_timeout("fixture/call",json!({"query":0,"name":name,"code":"await ws.workspace.setStatusMessage('completed original effect'); await ws.pr.snapshot(4); return 'completed private result';"}),WAIT).await.unwrap()
+                conn.request_timeout("fixture/call",json!({"query":0,"name":name,"code":"await ws.workspace.setStatusMessage('completed original effect'); await ws.pr.snapshot(4); return 'completed private result';"}),fixture_wait()).await.unwrap()
             });
             gate.reached().await;
             if required {
@@ -9000,7 +9017,7 @@ if(frame.method==='session/prompt' && promptErrors.length) {
         .await;
         held.release();
         holder.await.unwrap();
-        tokio::time::timeout(WAIT, drain).await.unwrap();
+        tokio::time::timeout(fixture_wait(), drain).await.unwrap();
         assert_eq!(h.http.count(), 0);
         h.finish().await;
     }

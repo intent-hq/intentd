@@ -3295,6 +3295,7 @@ mod tests {
     /// children had to be reaped by hand. `LIVENESS + TEARDOWN_MARGIN` must
     /// stay under that budget; `liveness_deadline_fits_inside_nextest_terminate_budget`
     /// reads the real config and pins the ordering.
+    // fixed-deadline: allow — stays under nextest's 180 s slow-timeout kill with TEARDOWN_MARGIN to spare; liveness_deadline_fits_inside_nextest_terminate_budget pins it
     const LIVENESS: Duration = Duration::from_secs(150);
     /// Headroom between a `LIVENESS` expiry and nextest's kill so the failing
     /// wait's diagnostic and process teardown complete before the SIGKILL.
@@ -6622,7 +6623,7 @@ mod tests {
         // SIGTERM→grace→SIGKILL escalation, then the `exited` write — well
         // under this deadline even on a loaded host, while the old per-chunk
         // sleep never fired at all under the ~1ms noise.
-        let bound = Duration::from_secs(20);
+        let bound = intentd_test_support::test_timeout(Duration::from_secs(20));
         let deadline = tokio::time::Instant::now() + bound;
         let st = loop {
             let st = h

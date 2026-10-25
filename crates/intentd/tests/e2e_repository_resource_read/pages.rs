@@ -151,12 +151,15 @@ async fn repository_child_git_real_uds_partial_write_refuses_remainder_after_dis
     let mut helper = UnixStream::connect(h.dir.path().join("intentd.sock"))
         .await
         .unwrap();
-    tokio::time::timeout(ACQUIRE, helper.write_all(format!("{request}\n").as_bytes()))
-        .await
-        .unwrap()
-        .unwrap();
+    tokio::time::timeout(
+        acquire(),
+        helper.write_all(format!("{request}\n").as_bytes()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     let mut received = vec![0; 128];
-    tokio::time::timeout(ACQUIRE, helper.read_exact(&mut received))
+    tokio::time::timeout(acquire(), helper.read_exact(&mut received))
         .await
         .unwrap()
         .unwrap();
@@ -167,7 +170,7 @@ async fn repository_child_git_real_uds_partial_write_refuses_remainder_after_dis
     let sentinel = json!({"jsonrpc":"2.0","id":"after-private-sentinel",
         "method":"test.publicSentinel","params":{}});
     tokio::time::timeout(
-        ACQUIRE,
+        acquire(),
         helper.write_all(format!("{sentinel}\n").as_bytes()),
     )
     .await
@@ -181,7 +184,7 @@ async fn repository_child_git_real_uds_partial_write_refuses_remainder_after_dis
         .await;
     assert_eq!(success(&disabled)["effective"], false);
 
-    tokio::time::timeout(ACQUIRE, helper.read_to_end(&mut received))
+    tokio::time::timeout(acquire(), helper.read_to_end(&mut received))
         .await
         .unwrap()
         .unwrap();

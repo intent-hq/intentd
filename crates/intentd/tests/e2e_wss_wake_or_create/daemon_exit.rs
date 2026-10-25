@@ -16,7 +16,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-pub(super) const BOUND: Duration = Duration::from_secs(5);
+pub(super) fn bound() -> Duration {
+    intentd_test_support::test_timeout(Duration::from_secs(5))
+}
 
 /// Explicitly finalized ownership, retaining the existing common panic/`KEEP_TMP`
 /// policy. No implicit `TempDir` removal may happen after a completion receipt.
@@ -120,7 +122,7 @@ pub(super) fn completion(
     json!({"clock": "monotonic", "elapsedNs": elapsed.map(|d| d.as_nanos()),
         "deadlineAfterStartNs": budget.map(|d| d.as_nanos()), "semanticFinalizationComplete": finalized,
         "withinDeadline": elapsed.is_some() && budget.is_some() && finished < deadline,
-        "normalCompletion": finalized && elapsed.is_some() && budget == Some(BOUND) && finished < deadline})
+        "normalCompletion": finalized && elapsed.is_some() && budget == Some(bound()) && finished < deadline})
 }
 
 pub(super) fn finalize_and_measure(
@@ -1093,7 +1095,7 @@ impl ControlShell {
     }
 
     fn finish(&mut self) -> Value {
-        let deadline = Instant::now() + BOUND;
+        let deadline = Instant::now() + bound();
         let closed = self
             .input
             .take()
@@ -1101,7 +1103,7 @@ impl ControlShell {
         let forced = self.waited.is_none();
         let mut row = json!({"pid":self.child.id(),"identity":self.identity,"stdinClose":closed,
             "forcedFailureCleanup":forced,"scope":"only this control shell; never daemon provider",
-            "cleanupBudgetNs":BOUND.as_nanos(),"kill":null,"wait":self.waited,"error":null});
+            "cleanupBudgetNs":bound().as_nanos(),"kill":null,"wait":self.waited,"error":null});
         if forced {
             let result = (|| -> io::Result<()> {
                 let killed = self.child.kill();
@@ -1221,7 +1223,7 @@ fn actual_child_pending_cancellation_and_wait() {
             assert_eq!(unsafe { libc::fcntl(pidfd, libc::F_GETFD) }, -1);
             assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
         }
-        owner.wait_with_release(Instant::now() + BOUND)
+        owner.wait_with_release(Instant::now() + bound())
     }));
 }
 
@@ -1243,7 +1245,7 @@ fn ack_and_expired_budget_cannot_complete_a_child_wait() {
         );
         // Explicit finite test-control settlement after the unchanged negative
         // operation. This is neither fixture success nor extra daemon grace.
-        owner.wait_with_release(Instant::now() + BOUND)
+        owner.wait_with_release(Instant::now() + bound())
     }));
 }
 
@@ -1288,7 +1290,7 @@ fn finalization_expiry_and_incomplete_cleanup_cannot_pass() {
     for case in ["on-time", "late-finalization", "incomplete"] {
         let mut directory: FixtureDir = super::common::test_tempdir("itd-woc-finalization-").into();
         let start = Instant::now();
-        let deadline = start + BOUND;
+        let deadline = start + bound();
         let clock = Cell::new(start);
         let path = directory.path().to_owned();
         let (resources, completed) = finalize_and_measure(
@@ -1348,7 +1350,7 @@ fn shutdown_rejects_another_peer_before_sending() {
     let socket = root.path().join("peer.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     let mut events = Vec::new();
-    assert!(shutdown(&socket, u32::MAX, Instant::now() + BOUND, &mut events).is_err());
+    assert!(shutdown(&socket, u32::MAX, Instant::now() + bound(), &mut events).is_err());
     assert!(events.is_empty(), "no request sent to an unqualified peer");
     drop(listener);
 }

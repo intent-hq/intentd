@@ -59,7 +59,7 @@ const INVARIANT_WINDOW: Duration = Duration::from_secs(8);
 /// (`min(daemon_startup_timeout, budget)` — 180 s at multiplier 3 on its own,
 /// so the clamp matters), the scan loop, and the capture barrier all end at
 /// `started + 150 s` at the latest, after which only the fixture ping (5 s
-/// connect + 5 s read) and the teardown sweep in `Drop` (`REAP_TIMEOUT`, 5 s)
+/// connect + 5 s read) and the teardown sweep in `Drop` (`reap_timeout()`, 5 s)
 /// remain. Worst case 150 + 10 + 5 = 165 s < 180 s.
 const TEST_BUDGET: Duration = Duration::from_secs(150);
 
@@ -72,7 +72,9 @@ const SCAN_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Bound on the teardown sweep for adopted orphans; they reparent within
 /// milliseconds of their parent's death, so this is margin, not expectation.
-const REAP_TIMEOUT: Duration = Duration::from_secs(5);
+fn reap_timeout() -> Duration {
+    intentd_test_support::test_timeout(Duration::from_secs(5))
+}
 
 fn self_pid() -> i32 {
     i32::try_from(std::process::id()).expect("pid fits")
@@ -426,7 +428,7 @@ impl Drop for Harness {
             &[self.driver_pid],
             &sessions,
             self.epoch,
-            Instant::now() + REAP_TIMEOUT,
+            Instant::now() + reap_timeout(),
         );
     }
 }
@@ -934,7 +936,7 @@ mod helper_tests {
         // Not in any tracked session: only the `starttime >= since` arm can
         // reach it — the same arm the harness relies on for a shell whose
         // daemon parent died before the teardown snapshot.
-        let killed = reap_adopted(&[], &HashSet::new(), since, Instant::now() + REAP_TIMEOUT);
+        let killed = reap_adopted(&[], &HashSet::new(), since, Instant::now() + reap_timeout());
         assert!(killed.contains(&orphan), "orphan not killed: {killed:?}");
         assert_eq!(
             read_stat(orphan).map(|p| (p.state, p.ppid)),

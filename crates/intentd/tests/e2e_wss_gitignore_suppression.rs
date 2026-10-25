@@ -242,6 +242,7 @@ async fn expect_suppressed_over_wss<S>(
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(20));
+    // fixed-deadline: allow — stays fixed: a write pacing interval for the retry loop, not a wait budget (the 20 s deadline above is scaled)
     let write_cadence = Duration::from_secs(1);
     let mut seen_control = false;
     let mut next_write = tokio::time::Instant::now();

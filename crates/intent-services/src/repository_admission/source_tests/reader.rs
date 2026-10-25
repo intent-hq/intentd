@@ -864,9 +864,12 @@ async fn cancelled_actual_file_read_retains_original_gate_until_worker_exit() {
                 f.owner.retirement().retire();
                 paused.resume();
                 drop(
-                    timeout(BUDGET, f.auth.service.gitlab_credential_gate.lock())
-                        .await
-                        .unwrap(),
+                    timeout(
+                        intentd_test_support::test_timeout(BUDGET),
+                        f.auth.service.gitlab_credential_gate.lock(),
+                    )
+                    .await
+                    .unwrap(),
                 );
                 assert!(matches!(
                     provider.get_repo("group", "project").await,
@@ -886,27 +889,58 @@ async fn real_post_load_authority_fence_rechecks_original_retirement_and_directo
     for replace_account in [false, true] {
         let server = Server::new().await;
         let f = Interaction::new(&server).await;
-        f.run(&server, vec![NativeReviewStage::CreatePr], |admission| { let f = &f; let server = &server; async move {
-            let stamp = start(&admission, NativeReviewStage::CreatePr).await;
-            let provider = f.callback(&stamp).into_provider().unwrap();
-            let entered = Arc::new(Notify::new());
-            let release = Arc::new(Notify::new());
-            let read = RepositoryDispatchStamp::probe_credential_fence(entered.clone(), release.clone(), provider.get_repo("group", "project"));
-            let mutation = async {
-                timeout(BUDGET, entered.notified()).await.unwrap();
-                drop(timeout(BUDGET, f.auth.service.gitlab_credential_gate.lock()).await.expect("file reader must release the original gate before actual R authority"));
-                if replace_account {
-                    f.auth.service.gitlab_connect_pat(server.host.clone(), "pat-second".into()).await.unwrap();
-                } else {
-                    f.owner.retirement().retire();
-                }
-                release.notify_one();
-            };
-            let (result, ()) = tokio::join!(read, mutation);
-            assert!(matches!(result, Err(intent_sourcecontrol::Error::AdmissionRetired)));
-            assert_eq!(project_calls(server), 0);
-            Ok(())
-        }}).await.unwrap();
+        f.run(&server, vec![NativeReviewStage::CreatePr], |admission| {
+            let f = &f;
+            let server = &server;
+            async move {
+                let stamp = start(&admission, NativeReviewStage::CreatePr).await;
+                let provider = f.callback(&stamp).into_provider().unwrap();
+                let entered = Arc::new(Notify::new());
+                let release = Arc::new(Notify::new());
+                let read = RepositoryDispatchStamp::probe_credential_fence(
+                    entered.clone(),
+                    release.clone(),
+                    provider.get_repo("group", "project"),
+                );
+                let mutation = async {
+                    timeout(
+                        intentd_test_support::test_timeout(BUDGET),
+                        entered.notified(),
+                    )
+                    .await
+                    .unwrap();
+                    drop(
+                        timeout(
+                            intentd_test_support::test_timeout(BUDGET),
+                            f.auth.service.gitlab_credential_gate.lock(),
+                        )
+                        .await
+                        .expect(
+                            "file reader must release the original gate before actual R authority",
+                        ),
+                    );
+                    if replace_account {
+                        f.auth
+                            .service
+                            .gitlab_connect_pat(server.host.clone(), "pat-second".into())
+                            .await
+                            .unwrap();
+                    } else {
+                        f.owner.retirement().retire();
+                    }
+                    release.notify_one();
+                };
+                let (result, ()) = tokio::join!(read, mutation);
+                assert!(matches!(
+                    result,
+                    Err(intent_sourcecontrol::Error::AdmissionRetired)
+                ));
+                assert_eq!(project_calls(server), 0);
+                Ok(())
+            }
+        })
+        .await
+        .unwrap();
     }
 }
 

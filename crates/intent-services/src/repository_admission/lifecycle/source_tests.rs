@@ -731,7 +731,9 @@ mod precise_registered_tests {
     use intent_core::caller::with_caller;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    const BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+    fn budget() -> std::time::Duration {
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(10))
+    }
 
     struct RegisteredFixture {
         f: Fixture,
@@ -993,7 +995,7 @@ mod precise_registered_tests {
     }
 
     async fn wait_blocked(read: &Arc<RepositoryReadRequest>, key: RepositoryLifecycleKey) {
-        tokio::time::timeout(BUDGET, async {
+        tokio::time::timeout(budget(), async {
             loop {
                 let optional = read.capture_optional().unwrap();
                 match optional
@@ -1043,7 +1045,7 @@ mod precise_registered_tests {
                                 consumer.transfer_with_optional(Some(&metadata), |include| {
                                     assert!(include);
                                     entered.send(()).unwrap();
-                                    blocked.recv_timeout(BUDGET).unwrap();
+                                    blocked.recv_timeout(budget()).unwrap();
                                     Ok(include)
                                 });
                             result_tx.send(result).unwrap();
@@ -1051,7 +1053,10 @@ mod precise_registered_tests {
                     ));
                     result_rx.recv().unwrap()
                 });
-                tokio::time::timeout(BUDGET, entry).await.unwrap().unwrap();
+                tokio::time::timeout(budget(), entry)
+                    .await
+                    .unwrap()
+                    .unwrap();
                 let changed = if required_root {
                     f.required.clone()
                 } else {
@@ -1094,10 +1099,13 @@ mod precise_registered_tests {
                         assert!(!writer.is_finished());
                         // A real unrelated workspace read and unrelated registry owner
                         // progress while the original mutation waits outside map locks.
-                        tokio::time::timeout(BUDGET, f.f.store.get_workspace(&other_workspace.id))
-                            .await
-                            .unwrap()
-                            .unwrap();
+                        tokio::time::timeout(
+                            budget(),
+                            f.f.store.get_workspace(&other_workspace.id),
+                        )
+                        .await
+                        .unwrap()
+                        .unwrap();
                         f.registry
                             .begin_mutation(&[RepositoryLifecycleKey::GitRoot(
                                 WorkspaceGitRootId::new(),
@@ -1110,12 +1118,12 @@ mod precise_registered_tests {
                     .await;
                 release.send(()).unwrap();
                 assert_eq!(action.join().unwrap(), Ok(true));
-                tokio::time::timeout(BUDGET, writer)
+                tokio::time::timeout(budget(), writer)
                     .await
                     .unwrap()
                     .unwrap()
                     .unwrap();
-                second_done.unwrap().recv_timeout(BUDGET).unwrap();
+                second_done.unwrap().recv_timeout(budget()).unwrap();
                 second_retire.unwrap().join().unwrap();
                 let result = required.transfer_with_optional(Some(ready.metadata()), Ok);
                 if required_root {
