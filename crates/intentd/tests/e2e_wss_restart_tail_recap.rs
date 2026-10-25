@@ -25,8 +25,9 @@
 
 use crate::common;
 
+use intentd_test_support::GuardedChild;
 use std::path::Path;
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -226,8 +227,7 @@ fn spawn_daemon(
     prompt_log: &Path,
     session_log: &Path,
     log_name: &str,
-) -> Child {
-    use std::os::unix::process::CommandExt;
+) -> GuardedChild {
     common::enable_ws_api(data_dir);
     let mut cmd = common::hermetic_serve_command(data_dir);
     cmd.env("INTENTD_DATA_DIR", data_dir)
@@ -241,8 +241,7 @@ fn spawn_daemon(
         .stderr(Stdio::from(
             std::fs::File::create(data_dir.join(log_name)).unwrap(),
         ));
-    cmd.process_group(0);
-    cmd.spawn().expect("spawn intentd serve")
+    GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
 }
 
 /// Poll a JSONL log file until `pred` matches a line; returns matching lines.

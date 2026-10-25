@@ -494,7 +494,8 @@ async fn wss_linked_skills_custom_config_directory_and_empty_fallback() {
             .stdout(Stdio::null())
             .stderr(Stdio::from(log));
         std::fs::create_dir_all(data.join("workspaces")).unwrap();
-        let mut daemon = common::DaemonGuard::process_only(command.spawn().unwrap());
+        let mut daemon =
+            common::DaemonGuard::process_only(common::spawn_guarded(&mut command).unwrap());
         let socket = data.join("intentd.sock");
         common::await_daemon_listening(daemon.child_mut(), &socket, &log_path).await;
         let status = common::await_wss_status_logged(&socket, &log_path).await;

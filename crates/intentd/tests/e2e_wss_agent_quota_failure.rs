@@ -38,8 +38,9 @@
 
 use crate::common;
 
+use intentd_test_support::GuardedChild;
 use std::path::Path;
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -78,7 +79,7 @@ const ORDINARY_FAILURE_BODY: &str = r#"{"type":"error","status":400,"error":{"ty
 const DISK_QUOTA_BODY: &str = r#"{"type":"error","error":{"message":"failed to write the session log to /var/agent/state.jsonl: Disk quota exceeded (os error 69)"}}"#;
 
 struct Daemon {
-    child: Child,
+    child: GuardedChild,
     /// Owned by the guard so the tree is swept only after the daemon log is
     /// dumped; `TempDir` handles the sweep (and `INTENTD_TEST_KEEP_TMP`).
     data_dir: tempfile::TempDir,
@@ -86,8 +87,7 @@ struct Daemon {
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.child.kill_tree();
         let log_path = self.data_dir.path().join("daemon.log");
         if let Ok(log) = std::fs::read_to_string(&log_path) {
             eprintln!("=== DAEMON LOG ===\n{log}\n=== END LOG ===");
@@ -99,7 +99,7 @@ fn temp_data_dir() -> tempfile::TempDir {
     common::test_tempdir_in("/tmp", "itd-wss-quota-")
 }
 
-fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
+fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> GuardedChild {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
@@ -114,7 +114,7 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
         cmd.env(k, v);
     }
     common::hermetic_fixture_identity(&mut cmd, data_dir);
-    cmd.spawn().expect("spawn intentd serve")
+    GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
 }
 
 async fn await_uds(socket: &Path) -> bool {

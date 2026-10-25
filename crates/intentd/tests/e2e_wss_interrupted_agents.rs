@@ -15,7 +15,6 @@
 
 use crate::common;
 
-use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -338,8 +337,7 @@ async fn interrupted_agents_persisted_across_restart() {
         ));
     // Spawn in its own process group to prevent ACP mock process leaks
     #[cfg(unix)]
-    cmd1.process_group(0);
-    let child1 = cmd1.spawn().expect("spawn intentd serve");
+    let child1 = common::spawn_guarded(&mut cmd1).expect("spawn intentd serve");
     let mut guard1 = DaemonGuard::new(child1, data_dir.clone(), false);
     if !await_uds(&socket).await {
         let log_path = data_dir.join("daemon.log");
@@ -418,8 +416,7 @@ async fn interrupted_agents_persisted_across_restart() {
     }
 
     // Kill daemon to simulate restart.
-    guard1.child_mut().kill().expect("kill daemon");
-    guard1.child_mut().wait().expect("wait daemon");
+    guard1.kill_tree().expect("kill daemon");
     drop(guard1);
 
     // Phase 2: Restart daemon — heal sweep should insert interrupted_agent row.
@@ -435,8 +432,7 @@ async fn interrupted_agents_persisted_across_restart() {
             std::fs::File::create(data_dir.join("daemon.log")).unwrap(),
         ));
     #[cfg(unix)]
-    cmd2.process_group(0);
-    let child2 = cmd2.spawn().expect("spawn intentd serve 2");
+    let child2 = common::spawn_guarded(&mut cmd2).expect("spawn intentd serve 2");
     let mut guard2 = DaemonGuard::new(child2, data_dir.clone(), false);
     assert!(await_uds(&socket).await, "daemon did not restart");
 
@@ -471,8 +467,7 @@ async fn interrupted_agents_persisted_across_restart() {
     assert!(interrupted["interruptedAt"].is_string());
 
     // Phase 4: Restart again — idempotent insert should not duplicate.
-    guard2.child_mut().kill().expect("kill daemon 2");
-    guard2.child_mut().wait().expect("wait daemon 2");
+    guard2.kill_tree().expect("kill daemon 2");
     drop(guard2);
     if listen != "uds" {
         common::enable_ws_api(&data_dir);
@@ -486,8 +481,7 @@ async fn interrupted_agents_persisted_across_restart() {
             std::fs::File::create(data_dir.join("daemon.log")).unwrap(),
         ));
     #[cfg(unix)]
-    cmd3.process_group(0);
-    let child3 = cmd3.spawn().expect("spawn intentd serve 3");
+    let child3 = common::spawn_guarded(&mut cmd3).expect("spawn intentd serve 3");
     let _guard3 = DaemonGuard::process_only(child3);
     assert!(await_uds(&socket).await, "daemon did not restart 2");
 
@@ -567,8 +561,11 @@ async fn assert_blocked_exec_stream_shutdown(eof: bool) {
         .env("INTENTD_TEST_EXEC_STREAM_WRITE_PENDING", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::from(std::fs::File::create(&log_path).unwrap()));
-    command.process_group(0);
-    let mut daemon = DaemonGuard::new(command.spawn().unwrap(), data.to_path_buf(), false);
+    let mut daemon = DaemonGuard::new(
+        common::spawn_guarded(&mut command).unwrap(),
+        data.to_path_buf(),
+        false,
+    );
     assert!(await_uds(&socket).await);
     let status = common::await_wss_status(&socket).await;
     let port = u16::try_from(status["result"]["port"].as_u64().unwrap()).unwrap();
@@ -742,8 +739,11 @@ async fn cancelled_settings_hook_joins_before_main_listener_teardown() {
         .env("INTENTD_TEST_SETTINGS_WS_START_GATE", start_path)
         .stdout(Stdio::null())
         .stderr(Stdio::from(std::fs::File::create(&log_path).unwrap()));
-    command.process_group(0);
-    let mut daemon = DaemonGuard::new(command.spawn().unwrap(), data.to_path_buf(), false);
+    let mut daemon = DaemonGuard::new(
+        common::spawn_guarded(&mut command).unwrap(),
+        data.to_path_buf(),
+        false,
+    );
     let (mut response, _) = timeout(common::daemon_startup_timeout(), responses.accept())
         .await
         .unwrap()
@@ -876,8 +876,11 @@ await import({});
         .env("INTENTD_TEST_MCP_ENABLE_CONFIG", config.to_string())
         .stdout(Stdio::null())
         .stderr(Stdio::from(std::fs::File::create(&log_path).unwrap()));
-    command.process_group(0);
-    let mut daemon = DaemonGuard::new(command.spawn().unwrap(), data.to_path_buf(), false);
+    let mut daemon = DaemonGuard::new(
+        common::spawn_guarded(&mut command).unwrap(),
+        data.to_path_buf(),
+        false,
+    );
     let (mut response, _) = timeout(common::daemon_startup_timeout(), responses.accept())
         .await
         .unwrap()
@@ -1024,8 +1027,7 @@ async fn graceful_shutdown_captures_interrupted_agents() {
             std::fs::File::create(data_dir.join("daemon.log")).unwrap(),
         ));
     #[cfg(unix)]
-    cmd1.process_group(0);
-    let child = cmd1.spawn().expect("spawn intentd serve");
+    let child = common::spawn_guarded(&mut cmd1).expect("spawn intentd serve");
     let mut daemon = DaemonGuard::new(child, data_dir.clone(), false);
     if !await_uds(&socket).await {
         let log_path = data_dir.join("daemon.log");
@@ -1260,8 +1262,7 @@ async fn graceful_shutdown_captures_interrupted_agents() {
             std::fs::File::create(data_dir.join("daemon2.log")).unwrap(),
         ));
     #[cfg(unix)]
-    cmd2.process_group(0);
-    let child2 = cmd2.spawn().expect("spawn intentd serve 2");
+    let child2 = common::spawn_guarded(&mut cmd2).expect("spawn intentd serve 2");
     let _daemon2 = DaemonGuard::process_only(child2);
     assert!(await_uds(&socket).await, "daemon did not restart");
 

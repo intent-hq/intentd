@@ -18,8 +18,9 @@
 
 use crate::common;
 
+use intentd_test_support::GuardedChild;
 use std::path::PathBuf;
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 
 use intent_core::{
@@ -91,13 +92,12 @@ fn workspace(id: &WorkspaceId) -> Workspace {
 }
 
 struct Daemon {
-    child: Child,
+    child: GuardedChild,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.child.kill_tree();
     }
 }
 
@@ -150,16 +150,17 @@ async fn launch_daemon(data_dir: &PathBuf, script: &str, behavior: &str) -> (Dae
     let log = std::fs::File::create(&log_path).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
-    let child = common::hermetic_serve_command(data_dir)
-        .env("INTENTD_DATA_DIR", data_dir)
-        .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
-        .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
-        .env("MOCK_AGENT_SCRIPT_PATH", script)
-        .env("MOCK_AGENT_BEHAVIOR", behavior)
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(log))
-        .spawn()
-        .expect("spawn intentd serve");
+    let child = GuardedChild::spawn(
+        common::hermetic_serve_command(data_dir)
+            .env("INTENTD_DATA_DIR", data_dir)
+            .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
+            .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
+            .env("MOCK_AGENT_SCRIPT_PATH", script)
+            .env("MOCK_AGENT_BEHAVIOR", behavior)
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(log)),
+    )
+    .expect("spawn intentd serve");
     let mut daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     common::await_daemon_listening(&mut daemon.child, &socket, &log_path).await;
@@ -261,16 +262,17 @@ async fn daemon_drives_agent_turn_and_mcp_tool_call_over_uds() {
     let log = std::fs::File::create(&log_path).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
-    let child = common::hermetic_serve_command(&data_dir)
-        .env("INTENTD_DATA_DIR", &data_dir)
-        .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
-        .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
-        .env("MOCK_AGENT_SCRIPT_PATH", &script)
-        .env("MOCK_AGENT_BEHAVIOR", &behavior)
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(log))
-        .spawn()
-        .expect("spawn intentd serve");
+    let child = GuardedChild::spawn(
+        common::hermetic_serve_command(&data_dir)
+            .env("INTENTD_DATA_DIR", &data_dir)
+            .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
+            .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
+            .env("MOCK_AGENT_SCRIPT_PATH", &script)
+            .env("MOCK_AGENT_BEHAVIOR", &behavior)
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(log)),
+    )
+    .expect("spawn intentd serve");
     let mut daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     common::await_daemon_listening(&mut daemon.child, &socket, &log_path).await;
