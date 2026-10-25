@@ -89,6 +89,7 @@ mod config_watcher;
 mod create_progress;
 mod delete_grace;
 mod delivery_tasks;
+mod desktop;
 mod device_ops;
 mod discovery_cache;
 mod discussion_activity;
@@ -610,6 +611,7 @@ pub struct Services {
     /// publish so concurrent setters never emit deltas out of order relative
     /// to the durable pin; the delta is read back from the committed row.
     browser_client_pin_gate: Arc<tokio::sync::Mutex<()>>,
+    desktop: Arc<desktop::Runtime>,
     /// Serializes each browser tab registry mutation (`browser.upsertTab` /
     /// `removeTab` / `syncTabs`) together with the publication of its
     /// `browser:tab-*` events. The store transaction alone orders the rows;
@@ -1582,10 +1584,12 @@ pub struct Services {
     /// [`with_idempotency`]: same-key first-use callers serialize on the
     /// key so one runs the operation and the rest replay its stored result.
     idempotency_inflight: Arc<IdempotencyInflight>,
-    /// Registered feature ports (see [`feature_ports`]). Feature state such
-    /// as in-flight transfer sessions lives in the port implementations;
-    /// shared across clones.
+    /// Registered feature ports (see [`feature_ports`]); shared across
+    /// clones.
     ports: feature_ports::FeaturePorts,
+    /// Feature state objects, such as the in-flight transfer sessions, keyed
+    /// by type; shared across clones.
+    features: feature_ports::FeatureSet,
 }
 
 /// Pause inserted between per-workspace iterations of the background sweeps
@@ -1679,6 +1683,7 @@ impl Services {
             agent_queue_persist_gate: Arc::new(tokio::sync::Mutex::new(())),
             agent_queue_publish_gate: Arc::new(tokio::sync::Mutex::new(())),
             browser_client_pin_gate: Arc::new(tokio::sync::Mutex::new(())),
+            desktop: Arc::new(desktop::Runtime::default()),
             browser_tab_gate: Arc::new(tokio::sync::Mutex::new(())),
             agent_retirement_gates: agent_ops::AgentRetirementGates::default(),
             hold_release_timers: Arc::new(Mutex::new(HashMap::new())),
@@ -1903,6 +1908,7 @@ impl Services {
             attachment_idempotency_inflight: Arc::new(Mutex::new(HashMap::new())),
             idempotency_inflight: Arc::new(IdempotencyInflight::default()),
             ports: feature_ports::FeaturePorts::default(),
+            features: feature_ports::FeatureSet::default(),
         };
         services
             .gitlab_credential_gate
@@ -18792,6 +18798,23 @@ impl Services {
 }
 
 impl WorkspaceApi for Services {
+    fn desktop_agent_call(
+        &self,
+        workspace: WorkspaceId,
+        method: String,
+        args: serde_json::Value,
+    ) -> BoxFuture<'_, intent_core::desktop::DesktopResult<serde_json::Value>> {
+        Box::pin(self.desktop_agent_op(workspace, method, args))
+    }
+    fn desktop_client_call(
+        &self,
+        method: String,
+        args: serde_json::Value,
+        connection: intent_core::desktop::DesktopConnection,
+    ) -> BoxFuture<'_, intent_core::desktop::DesktopResult<serde_json::Value>> {
+        Box::pin(self.desktop_client_op(method, args, connection))
+    }
+
     fn gitlab_child_git_policy_get(
         &self,
         query: intent_core::gitlab_child_git::GitlabChildGitPolicyQuery,
@@ -21622,77 +21645,35 @@ impl WorkspaceApi for Services {
         })
     }
 
-    fn workspace_transfer_plan(
-        &self,
-        id: WorkspaceId,
-    ) -> BoxFuture<'_, Result<intent_core::transfer::TransferPlan>> {
-        self.ports.transfer().transfer_plan(self, id)
-    }
-
-    fn workspace_import_begin(
-        &self,
-        manifest: serde_json::Value,
-        archive_size_bytes: u64,
-        archive_sha256: String,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        self.ports
-            .transfer()
-            .import_begin(self, manifest, archive_size_bytes, archive_sha256)
-    }
-
-    fn workspace_import_chunk(
-        &self,
-        import_id: String,
-        seq: u64,
-        data: String,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        self.ports
-            .transfer()
-            .import_chunk(self, import_id, seq, data)
-    }
-
-    fn workspace_import_commit(
-        &self,
-        import_id: String,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        self.ports.transfer().import_commit(self, import_id)
-    }
-
-    fn workspace_import_abort(
-        &self,
-        import_id: String,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        self.ports.transfer().import_abort(self, import_id)
-    }
-
-    fn workspace_export_start(&self, id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
-        self.ports.transfer().export_start(self, id)
-    }
-
-    fn workspace_export_read(
-        &self,
-        export_id: String,
-        seq: u64,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        self.ports.transfer().export_read(self, export_id, seq)
-    }
-
-    fn workspace_export_finalize(
-        &self,
-        export_id: String,
-        archive_source: bool,
-        final_status_message: Option<String>,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        self.ports
-            .transfer()
-            .export_finalize(self, export_id, archive_source, final_status_message)
-    }
-
-    fn workspace_export_abort(
-        &self,
-        export_id: String,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        self.ports.transfer().export_abort(self, export_id)
+    feature_ports::port_forwarders! {
+        transfer {
+            fn workspace_transfer_plan(&self, id: WorkspaceId)
+                -> BoxFuture<'_, Result<intent_core::transfer::TransferPlan>> => transfer_plan;
+            fn workspace_import_begin(
+                &self,
+                manifest: serde_json::Value,
+                archive_size_bytes: u64,
+                archive_sha256: String,
+            ) -> BoxFuture<'_, Result<serde_json::Value>> => import_begin;
+            fn workspace_import_chunk(&self, import_id: String, seq: u64, data: String)
+                -> BoxFuture<'_, Result<serde_json::Value>> => import_chunk;
+            fn workspace_import_commit(&self, import_id: String)
+                -> BoxFuture<'_, Result<serde_json::Value>> => import_commit;
+            fn workspace_import_abort(&self, import_id: String)
+                -> BoxFuture<'_, Result<serde_json::Value>> => import_abort;
+            fn workspace_export_start(&self, id: WorkspaceId)
+                -> BoxFuture<'_, Result<serde_json::Value>> => export_start;
+            fn workspace_export_read(&self, export_id: String, seq: u64)
+                -> BoxFuture<'_, Result<serde_json::Value>> => export_read;
+            fn workspace_export_finalize(
+                &self,
+                export_id: String,
+                archive_source: bool,
+                final_status_message: Option<String>,
+            ) -> BoxFuture<'_, Result<serde_json::Value>> => export_finalize;
+            fn workspace_export_abort(&self, export_id: String)
+                -> BoxFuture<'_, Result<serde_json::Value>> => export_abort;
+        }
     }
 
     fn create_workspace(
@@ -24511,6 +24492,9 @@ impl WorkspaceApi for Services {
                         }
                     }
                 }
+                // Desktop authority never survives archive, the caller's
+                // included: unarchive must not hand it back without consent.
+                this.desktop_terminate_workspace(&id).await;
                 // Cancel every active background hook in the workspace: task
                 // aborted, state persisted to `cancelled`, `hook:cancelled`
                 // emitted — silently per hook. Unarchive does NOT resurrect
@@ -25699,6 +25683,7 @@ impl WorkspaceApi for Services {
             store
                 .set_workspace_browser_client(&id, client_id.as_ref())
                 .await?;
+            self.desktop.assignment_changed(&id);
             let committed = store.workspace_browser_client(&id).await?;
             // Self-sufficient `workspace:updated` delta (§6.5); `null`
             // spells a cleared pin so clients can drop their copy.
@@ -25717,6 +25702,7 @@ impl WorkspaceApi for Services {
             if let Some(new_host) = &committed {
                 self.browser_tabs_migrate_claimed(&id, new_host).await?;
             }
+            self.desktop.changed.notify_waiters();
             self.browser_client_state(&id).await
         })
     }
@@ -32163,6 +32149,7 @@ impl WorkspaceApi for Services {
     fn agent_stop(&self, agent_id: AgentId) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             self.require_agent_member(&agent_id).await?;
+            self.desktop_terminate_agent(&agent_id).await;
             // Interrupt the in-flight turn while KEEPING the child alive (TS
             // `agent.stop` keep-alive: `provider.interrupt()`), emitting the
             // terminal `agent:stream:end`; falls back to a hard kill only when no

@@ -115,13 +115,14 @@ pub(crate) fn server_json(
     build_commit: Option<&str>,
     is_local: bool,
 ) -> Value {
+    let capabilities = json!({ "desktopControl": 1, "discussionConversations": 1, "discussionMessageActions": 1, "discussionReactions": 1, "discussionAgentMessaging": 1, "discussionAgentActivity": 1, "discussionPrincipalMentions": 1, "discussionManagement": 1, "liveState": true, "eventStreamRecovery": 1, "antigravitySetup": 1, "collaborationIdentity": 1, "hostMembership": 1, "workspaceMembershipEvents": 1, "workspaceGuestRoles": 1, "invitationAccountSearch": 1, "personalPairing": 1, "authenticatedDevices": 1, "agentRetire": 1, "scriptLifecycle": 1, "scriptMonitors": 2, "scriptActiveLists": 1, "repositoryContext": 1, "repositorySelection": 1, "nativeReview": 1, "nativeReviewCompanion": 1, "repositoryResourceRead": 1, "repositoryResourcePages": 1, "gitlabChildGitPolicy": 1, "gitlabCheckout": 1, "gitlabCheckoutRepoConfig": 1, "gitlabCheckoutOwnerAvatar": 1, "submissionCorrelation": 1, "prWorkspaceLookup": 1, "agentWorkers": 1, "noteTruncatedRead": 1 });
     let mut server = json!({
         "locality": if is_local { "local" } else { "remote" },
         "hasDisplay": has_display,
         "osArch": format!("{os}/{arch}"),
         "version": version,
         "protocolVersion": PROTOCOL_VERSION,
-        "capabilities": { "discussionConversations": 1, "discussionMessageActions": 1, "discussionReactions": 1, "discussionAgentMessaging": 1, "discussionAgentActivity": 1, "discussionPrincipalMentions": 1, "discussionManagement": 1, "liveState": true, "eventStreamRecovery": 1, "antigravitySetup": 1, "collaborationIdentity": 1, "hostMembership": 1, "workspaceMembershipEvents": 1, "workspaceGuestRoles": 1, "invitationAccountSearch": 1, "personalPairing": 1, "authenticatedDevices": 1, "agentRetire": 1, "scriptLifecycle": 1, "scriptMonitors": 2, "scriptActiveLists": 1, "repositoryContext": 1, "repositorySelection": 1, "nativeReview": 1, "nativeReviewCompanion": 1, "repositoryResourceRead": 1, "repositoryResourcePages": 1, "gitlabChildGitPolicy": 1, "gitlabCheckout": 1, "gitlabCheckoutRepoConfig": 1, "gitlabCheckoutOwnerAvatar": 1, "submissionCorrelation": 1, "prWorkspaceLookup": 1, "agentWorkers": 1, "noteTruncatedRead": 1 },
+        "capabilities": capabilities,
     });
     if let Some(build_commit) = build_commit {
         server

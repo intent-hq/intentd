@@ -7,6 +7,8 @@
 pub mod fixtures;
 #[cfg(test)]
 pub(crate) mod provider_installed;
+#[cfg(test)]
+pub(crate) mod quota_script;
 mod scratch;
 pub mod submodule_fixture;
 pub use scratch::{test_tempdir, test_tempdir_in};

@@ -84,6 +84,9 @@ mod tests_wsapi5;
 #[cfg(test)]
 mod tests_hidden_field_egress;
 
+#[cfg(test)]
+mod tests_large_note;
+
 /// Test-only process-global env setup. Runs before `main()` — and therefore
 /// before any test threads exist, making `set_var` race-free. Node children
 /// spawned by lib tests (e.g. MCP fixture servers) inherit this and skip
