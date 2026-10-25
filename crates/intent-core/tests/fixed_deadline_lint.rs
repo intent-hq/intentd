@@ -45,12 +45,23 @@
 //!   (`tokio::time::timeout`, `recv_timeout`, `Condvar::wait_timeout`'s
 //!   second argument, …; a `fn timeout(` definition is not a call), or (b) the operand of an
 //!   `Instant::now() + …` / `Instant::now().checked_add(…)` deadline.
+//!   The same positions also count a bare name bound in test code to exactly
+//!   such a literal: `const` / `static NAME: Duration = Duration::from_*(…);`
+//!   (visible throughout its enclosing `{…}` block or file) or
+//!   `let [mut] name[: Duration] = Duration::from_*(…);` (visible after its
+//!   statement, inside its block, until a later `let` of that name shadows
+//!   it), unless the use is scaled (`WAIT * m`, `WAIT.mul_f64(m)`) — intentd#2649
+//!   passed with `const LIMIT: Duration = Duration::from_secs(60)`. The
+//!   report names the binding (`[budget: const WAIT (line 21)]`). A const
+//!   cannot call the helper, so a hang-guard constant becomes a helper fn
+//!   (`fn wait() -> Duration { test_timeout(Duration::from_secs(15)) }`).
 //! - **Marker:** a standalone `// fixed-deadline: allow — <reason>` on the
 //!   line above the hit, or above the first line of its statement, exempts it
 //!   — for an observation window; write the reason as
 //!   `stays under <timer or constant>` so a reader can check the
-//!   relationship. A marker without a reason never exempts and is itself
-//!   reported.
+//!   relationship. The same marker above a `const` / `static` / `let`
+//!   binding exempts every use of it. A marker without a reason never
+//!   exempts and is itself reported.
 //! - **Baseline** (`tests/fixed_deadline_baseline.txt`): one `<path> <count>`
 //!   line per file that still has unmarked fixed deadlines, sorted by path. It
 //!   only ratchets down: a file over its entry (or absent) fails naming every
@@ -59,9 +70,12 @@
 //!   To rewrite it after a bulk conversion, run the lint with
 //!   `INTENTD_UPDATE_FIXED_DEADLINE_BASELINE=1`; update mode refuses to raise
 //!   or add an entry, or to record a malformed marker.
-//! - **Limits:** a fixed budget behind a `const` or a local binding
-//!   (`const WAIT: Duration = Duration::from_secs(5); timeout(WAIT, …)`) is
-//!   not seen; a call is matched by name only, so a method also called
+//! - **Limits:** a name is followed one step, within one file: a constant
+//!   imported from another file (`use super::WAIT`) or reached by path
+//!   (`Self::WAIT`, `super::WAIT`), a production constant used by a test, an
+//!   alias chain (`let b = WAIT;`), a field or a function parameter is not
+//!   seen, and a closure parameter that reuses a fixed `let`'s name is
+//!   mistaken for it; a call is matched by name only, so a method also called
 //!   `timeout` (a client builder's) counts too — wrap or mark it; and a
 //!   `#[cfg(test)] mod x;` nested inside an inline `mod a { … }` resolves as
 //!   if declared at file level.
@@ -113,20 +127,24 @@ fn expect(chars: &[char], j: usize, token: &str) -> Option<usize> {
         .then_some(j + len)
 }
 
-/// Is the expression at `j` (after whitespace) a `…Duration::from_*(` call?
-/// Reads a `::`-separated path and requires its last two segments to be
-/// `Duration` and `from_<unit>`, followed by `(`.
+/// Is the expression at `j` (after whitespace) a `…Duration::from_*(` call
+/// not scaled afterwards? See [`duration_literal_end`].
 fn is_duration_literal(chars: &[char], j: usize) -> bool {
+    duration_literal_end(chars, j).is_some()
+}
+
+/// Index just past the `)` of the `…Duration::from_*(…)` call at `j` (after
+/// whitespace), when it is one and is not scaled afterwards. Reads a
+/// `::`-separated path and requires its last two segments to be `Duration`
+/// and `from_<unit>`, followed by `(`.
+fn duration_literal_end(chars: &[char], j: usize) -> Option<usize> {
     let mut segments = Vec::new();
     let mut j = skip_whitespace(chars, j);
     loop {
-        let Some((word, end)) = chars
+        let (word, end) = chars
             .get(j)
             .filter(|c| is_ident(**c))
-            .and_then(|_| ident_at(chars, j))
-        else {
-            return false;
-        };
+            .and_then(|_| ident_at(chars, j))?;
         segments.push(word);
         let Some(next) = expect(chars, end, "::") else {
             j = end;
@@ -135,15 +153,40 @@ fn is_duration_literal(chars: &[char], j: usize) -> bool {
         j = skip_whitespace(chars, next);
     }
     let [.., ty, ctor] = segments.as_slice() else {
-        return false;
+        return None;
     };
     if ty != "Duration" || !ctor.starts_with("from_") {
-        return false;
+        return None;
     }
-    let Some(open) = expect(chars, j, "(") else {
-        return false;
-    };
-    !is_scaled_after(chars, close_paren(chars, open))
+    let close = close_paren(chars, expect(chars, j, "(")?);
+    (!is_scaled_after(chars, close)).then_some(close)
+}
+
+/// What sits in a budget position: a fixed `Duration` literal, or a bare
+/// name (with the offset of the name) that may resolve to a binding of one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Budget {
+    Literal,
+    Name(String, usize),
+}
+
+/// The budget expression at `j` (after whitespace): a fixed literal, or a
+/// bare identifier that is not a call, path, method receiver or macro and is
+/// not scaled at runtime (`WAIT * m`, `WAIT.mul_f64(m)`). `WAIT * 2` and
+/// `WAIT + slack` keep the name: a literal factor leaves the budget fixed.
+fn budget_at(chars: &[char], j: usize) -> Option<Budget> {
+    if is_duration_literal(chars, j) {
+        return Some(Budget::Literal);
+    }
+    let j = skip_whitespace(chars, j);
+    if !chars.get(j).is_some_and(|c| c.is_alphabetic() || *c == '_') {
+        return None;
+    }
+    let (name, end) = ident_at(chars, j)?;
+    let next = skip_whitespace(chars, end);
+    let continues = matches!(chars.get(next), Some('(' | '.' | '!' | '{'))
+        || expect(chars, end, "::").is_some();
+    (!continues && !is_scaled_after(chars, end)).then_some(Budget::Name(name, j))
 }
 
 /// Start index of each top-level argument of the call whose `(` ends just
@@ -210,9 +253,17 @@ fn word_before(chars: &[char], j: usize) -> String {
     chars[start..end].iter().collect()
 }
 
-/// Char offsets (of the call name / `Instant`) of every fixed deadline in
-/// `chars` (blanked source).
-fn deadline_offsets(chars: &[char]) -> Vec<usize> {
+/// A candidate deadline: the char offset of the call name / `Instant`, and
+/// the budgets in its budget position(s).
+struct Candidate {
+    offset: usize,
+    budgets: Vec<Budget>,
+}
+
+/// Every call or `Instant::now()` deadline in `chars` (blanked source) whose
+/// budget is a fixed literal or a bare name — [`scan_source`] decides which
+/// names resolve to a fixed binding.
+fn deadline_candidates(chars: &[char]) -> Vec<Candidate> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < chars.len() {
@@ -225,34 +276,192 @@ fn deadline_offsets(chars: &[char]) -> Vec<usize> {
             continue;
         };
         let call = DEADLINE_CALLS.iter().find(|(name, _)| *name == word);
-        let hit = if let Some((_, positions)) = call {
-            word_before(chars, i) != "fn"
-                && expect(chars, end, "(").is_some_and(|open| {
+        let budgets: Vec<Budget> = if let Some((_, positions)) = call {
+            if word_before(chars, i) == "fn" {
+                Vec::new()
+            } else {
+                expect(chars, end, "(").map_or_else(Vec::new, |open| {
                     argument_starts(chars, open)
                         .iter()
                         .enumerate()
-                        .any(|(n, j)| positions.contains(&n) && is_duration_literal(chars, *j))
+                        .filter(|(n, _)| positions.contains(n))
+                        .filter_map(|(_, j)| budget_at(chars, *j))
+                        .collect()
                 })
+            }
         } else if word == "Instant" {
             let now = ["::", "now", "(", ")"]
                 .iter()
                 .try_fold(end, |j, token| expect(chars, j, token));
-            now.is_some_and(|j| {
-                expect(chars, j, "+").is_some_and(|k| is_duration_literal(chars, k))
-                    || [".", "checked_add", "("]
+            now.and_then(|j| {
+                expect(chars, j, "+").or_else(|| {
+                    [".", "checked_add", "("]
                         .iter()
                         .try_fold(j, |k, token| expect(chars, k, token))
-                        .is_some_and(|k| is_duration_literal(chars, k))
+                })
             })
+            .and_then(|k| budget_at(chars, k))
+            .into_iter()
+            .collect()
         } else {
-            false
+            Vec::new()
         };
-        if hit {
-            out.push(i);
+        if !budgets.is_empty() {
+            out.push(Candidate { offset: i, budgets });
         }
         i = end;
     }
     out
+}
+
+/// A `const` / `static` / `let` binding of a plain name.
+#[derive(Debug, Clone)]
+struct Binding {
+    /// `const`, `static` or `let`.
+    kind: &'static str,
+    name: String,
+    /// Char offset of the keyword.
+    offset: usize,
+    /// Its initializer is exactly a fixed `Duration` literal.
+    literal: bool,
+    /// The `{…}` block (or whole file) the name is visible in.
+    scope: (usize, usize),
+    /// A `let` is visible after its statement; an item in its whole scope.
+    visible_from: usize,
+}
+
+/// Index of the `;` ending the statement that continues at `j` (depth 0 over
+/// `(…)` / `[…]` / `{…}`), or `chars.len()`.
+fn statement_end(chars: &[char], j: usize) -> usize {
+    let mut depth = 0usize;
+    for (k, c) in chars.iter().enumerate().skip(j) {
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' | ';' if depth == 0 => return k,
+            ')' | ']' | '}' => depth -= 1,
+            _ => {}
+        }
+    }
+    chars.len()
+}
+
+/// The innermost `{…}` block around each of `offsets` (sorted ascending),
+/// as `(open, close)` char offsets, or the whole file at top level.
+fn enclosing_blocks(chars: &[char], offsets: &[usize]) -> Vec<(usize, usize)> {
+    let mut close_of = BTreeMap::new();
+    let mut stack = Vec::new();
+    let mut open_at = Vec::with_capacity(offsets.len());
+    let mut queries = offsets.iter().peekable();
+    for (k, c) in chars.iter().enumerate() {
+        while queries.next_if(|q| **q == k).is_some() {
+            open_at.push(stack.last().copied());
+        }
+        match c {
+            '{' => stack.push(k),
+            '}' => {
+                if let Some(open) = stack.pop() {
+                    close_of.insert(open, k);
+                }
+            }
+            _ => {}
+        }
+    }
+    open_at.resize(offsets.len(), None);
+    open_at
+        .into_iter()
+        .map(|open| {
+            open.map_or((0, chars.len()), |open| {
+                (open, close_of.get(&open).copied().unwrap_or(chars.len()))
+            })
+        })
+        .collect()
+}
+
+/// Every `const NAME: T = …;`, `static [mut] NAME: T = …;` and
+/// `let [mut] NAME[: T] = …;` in blanked `chars` (destructuring patterns and
+/// `const fn` are skipped), marking those whose initializer is exactly an
+/// unscaled `Duration::from_*(…)` literal.
+fn bindings(chars: &[char]) -> Vec<Binding> {
+    let mut found = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if !is_ident(chars[i]) || (i > 0 && is_ident(chars[i - 1])) {
+            i += 1;
+            continue;
+        }
+        let Some((word, end)) = ident_at(chars, i) else {
+            i += 1;
+            continue;
+        };
+        let kind = match word.as_str() {
+            "const" => "const",
+            "static" => "static",
+            "let" => "let",
+            _ => {
+                i = end;
+                continue;
+            }
+        };
+        let mut j = skip_whitespace(chars, end);
+        let mut name = ident_at(chars, j);
+        if kind != "const" && name.as_ref().is_some_and(|(w, _)| w == "mut") {
+            j = skip_whitespace(chars, name.as_ref().map_or(j, |(_, e)| *e));
+            name = ident_at(chars, j);
+        }
+        let Some((name, after)) = name.filter(|(w, _)| !w.starts_with(|c: char| c.is_numeric()))
+        else {
+            i = end;
+            continue;
+        };
+        let init = if let Some(colon) =
+            expect(chars, after, ":").filter(|k| chars.get(*k) != Some(&':'))
+        {
+            chars[colon..]
+                .iter()
+                .position(|c| matches!(c, '=' | ';' | '{' | '}'))
+                .map(|n| colon + n)
+                .filter(|k| chars[*k] == '=')
+                .map(|k| k + 1)
+        } else if kind == "let" {
+            expect(chars, after, "=").filter(|k| !matches!(chars.get(*k), Some('=' | '>')))
+        } else {
+            None
+        };
+        let Some(init) = init else {
+            i = end;
+            continue;
+        };
+        let literal_end = duration_literal_end(chars, init).and_then(|e| expect(chars, e, ";"));
+        let semi = literal_end.map_or_else(|| statement_end(chars, init), |e| e - 1);
+        found.push(Binding {
+            kind,
+            name,
+            offset: i,
+            literal: literal_end.is_some(),
+            scope: (0, 0),
+            visible_from: if kind == "let" { semi } else { 0 },
+        });
+        i = end;
+    }
+    let offsets: Vec<usize> = found.iter().map(|b| b.offset).collect();
+    for (binding, scope) in found.iter_mut().zip(enclosing_blocks(chars, &offsets)) {
+        binding.scope = scope;
+        if binding.kind != "let" {
+            binding.visible_from = scope.0;
+        }
+    }
+    found
+}
+
+/// The binding `name` refers to at `offset`: among bindings of that name
+/// visible there, the innermost scope wins, then a `let` over an item, then
+/// the latest `let` (shadowing).
+fn resolve<'a>(bindings: &'a [Binding], name: &str, offset: usize) -> Option<&'a Binding> {
+    bindings
+        .iter()
+        .filter(|b| b.name == name)
+        .filter(|b| (b.scope.0..b.scope.1).contains(&offset) && b.visible_from <= offset)
+        .max_by_key(|b| (b.scope.0, b.kind == "let", b.offset))
 }
 
 /// Rewrites every `#[cfg(all(…, test, …))]` attribute in blanked `chars` to
@@ -366,6 +575,9 @@ struct Deadline {
     text: String,
     /// The consulted marker line carries a marker with no reason.
     marker_malformed: bool,
+    /// The fixed binding the budget names (`const WAIT (line 21)`), when it
+    /// is not a literal at the call.
+    via: Option<String>,
 }
 
 /// What one source file contributes: its unmarked deadlines in test code,
@@ -454,12 +666,32 @@ fn scan_source(src: &str, whole_file_is_test: bool) -> Scan {
             .unwrap_or(Marker::Absent)
     };
     let lines: Vec<&str> = src.lines().collect();
-    let deadlines = deadline_offsets(&chars)
+    let bindings = bindings(&chars);
+    let deadlines = deadline_candidates(&chars)
         .into_iter()
-        .filter(|offset| in_test(*offset))
-        .filter_map(|offset| {
-            let line = line_of(offset);
-            let consulted = [marker(line), marker(statement_line(&chars, offset))];
+        .filter(|candidate| in_test(candidate.offset))
+        .filter_map(|candidate| {
+            let mut via = None;
+            let fixed = candidate.budgets.iter().find_map(|budget| match budget {
+                Budget::Literal => Some(None),
+                Budget::Name(name, at) => resolve(&bindings, name, *at)
+                    .filter(|b| b.literal && in_test(b.offset))
+                    .map(Some),
+            })?;
+            let line = line_of(candidate.offset);
+            let mut consulted = vec![
+                marker(line),
+                marker(statement_line(&chars, candidate.offset)),
+            ];
+            if let Some(binding) = fixed {
+                let binding_line = line_of(binding.offset);
+                consulted.push(marker(binding_line));
+                consulted.push(marker(statement_line(&chars, binding.offset)));
+                via = Some(format!(
+                    "{} {} (line {binding_line})",
+                    binding.kind, binding.name
+                ));
+            }
             if consulted.contains(&Marker::WithReason) {
                 return None;
             }
@@ -467,6 +699,7 @@ fn scan_source(src: &str, whole_file_is_test: bool) -> Scan {
                 line,
                 text: lines.get(line - 1).map_or("", |l| l.trim()).to_string(),
                 marker_malformed: consulted.contains(&Marker::Malformed),
+                via,
             })
         })
         .collect();
@@ -692,7 +925,11 @@ fn report(
                 );
                 out.push(format!("{path}: {count} fixed test deadline(s), {allowed}:"));
                 for d in found {
-                    out.push(format!("  {path}:{}: {}", d.line, d.text));
+                    let via = d
+                        .via
+                        .as_ref()
+                        .map_or_else(String::new, |via| format!("  [budget: {via}]"));
+                    out.push(format!("  {path}:{}: {}{via}", d.line, d.text));
                 }
                 out.push(format!(
                     "  fix: decide what each wait brackets.\n  \
@@ -700,11 +937,14 @@ fn report(
                      in `intentd_test_support::test_timeout(…)` (or the crate's helper that \
                      delegates to it) so INTENTD_TEST_TIMEOUT_MULTIPLIER stretches it on slow \
                      coverage runners. A \"nothing arrives\" check with no production timer \
-                     behind it is a hang guard too: a longer window only makes it stricter.\n  \
+                     behind it is a hang guard too: a longer window only makes it stricter. For a \
+                     budget held in a `const` (a const cannot call the helper), make it a helper \
+                     — `fn wait() -> Duration {{ test_timeout(Duration::from_secs(15)) }}` — or \
+                     wrap each use: `timeout(test_timeout(WAIT), …)`.\n  \
                      - observation window (the wait proves nothing happens and must stay shorter \
                      than a fixed production timer or debounce): keep it fixed and put \
                      `// {TAG}: allow — stays under <timer>` on the line above, naming the timer \
-                     or constant. Stretching it would let that timer fire inside the window and \
+                     or constant (above the `const` / `let` it covers every use of the binding). Stretching it would let that timer fire inside the window and \
                      break the test on slow runners — never stretch an observation window by \
                      reflex."
                 ));
@@ -989,6 +1229,7 @@ fn report_follows_the_ratchet() {
         line,
         text: "timeout(Duration::from_secs(5), f);".to_string(),
         marker_malformed,
+        via: None,
     };
     let found = BTreeMap::from([
         ("crates/a/tests/equal.rs".to_string(), vec![d(1, false)]),
@@ -1131,5 +1372,164 @@ use some::module;
             PathBuf::from("crates/a/src/bus_tests/helpers.rs"),
             PathBuf::from("crates/a/src/bus_tests/helpers"),
         ]
+    );
+}
+
+fn hits_in(src: &str, whole_file_is_test: bool) -> Vec<(usize, Option<String>)> {
+    scan_source(src, whole_file_is_test)
+        .deadlines
+        .into_iter()
+        .map(|d| (d.line, d.via))
+        .collect()
+}
+
+#[test]
+fn a_fixed_budget_behind_a_const_or_static_is_caught() {
+    let src = "\
+const WAIT: Duration = Duration::from_secs(60);
+pub(crate) static LIMIT: std::time::Duration = std::time::Duration::from_millis(500);
+const SCALED: Duration = Duration::from_secs(5).mul_f64(MULTIPLIER);
+const COMPUTED: Duration = budget();
+async fn t() {
+    tokio::time::timeout(WAIT, rx.recv()).await.unwrap();
+    rx.recv_timeout(LIMIT);
+    let (g, _) = cv.wait_timeout(g, WAIT).unwrap();
+    let deadline = Instant::now() + WAIT;
+    let deadline = Instant::now().checked_add(LIMIT);
+    timeout(WAIT * 2, f);
+    timeout(test_timeout(WAIT), f);
+    timeout(WAIT.mul_f64(m), f);
+    timeout(WAIT * m, f);
+    timeout(SCALED, f);
+    timeout(COMPUTED, f);
+    timeout(UNKNOWN, f);
+    timeout(self.wait, f);
+    timeout(wait(), f);
+}
+";
+    let via_wait = Some("const WAIT (line 1)".to_string());
+    let via_limit = Some("static LIMIT (line 2)".to_string());
+    assert_eq!(
+        hits_in(src, true),
+        vec![
+            (6, via_wait.clone()),
+            (7, via_limit.clone()),
+            (8, via_wait.clone()),
+            (9, via_wait.clone()),
+            (10, via_limit),
+            (11, via_wait),
+        ]
+    );
+}
+
+#[test]
+fn a_const_in_a_test_module_is_caught_but_a_production_const_is_not() {
+    let src = "\
+const PRODUCTION_TIMEOUT: Duration = Duration::from_secs(10);
+fn production() {
+    let _ = timeout(PRODUCTION_TIMEOUT, f);
+}
+
+#[cfg(test)]
+mod tests {
+    const WAIT: Duration = Duration::from_secs(15);
+    async fn t() {
+        timeout(WAIT, f).await;
+        timeout(PRODUCTION_TIMEOUT, f).await;
+    }
+}
+";
+    assert_eq!(
+        hits_in(src, false),
+        vec![(10, Some("const WAIT (line 8)".to_string()))]
+    );
+}
+
+#[test]
+fn a_fixed_budget_behind_a_local_binding_is_caught_in_its_scope_only() {
+    let src = "\
+async fn t() {
+    timeout(d, f);
+    let d = Duration::from_secs(5);
+    let mut e: Duration = std::time::Duration::from_millis(250);
+    timeout(d, f);
+    rx.recv_timeout(e);
+    {
+        let d = test_timeout(d);
+        timeout(d, f);
+    }
+    timeout(d, f);
+    let scaled = Duration::from_secs(5).mul_f64(m);
+    timeout(scaled, f);
+}
+async fn other() {
+    timeout(d, f);
+    let inner = {
+        let w = Duration::from_secs(1);
+        w
+    };
+    timeout(w, f);
+}
+";
+    assert_eq!(
+        hits_in(src, true),
+        vec![
+            (5, Some("let d (line 3)".to_string())),
+            (6, Some("let e (line 4)".to_string())),
+            (11, Some("let d (line 3)".to_string())),
+        ]
+    );
+}
+
+#[test]
+fn a_marker_above_the_binding_exempts_every_use_and_needs_a_reason() {
+    let src = "\
+// fixed-deadline: allow — stays under the 800 ms SILENCE_LIMIT
+const QUIET: Duration = Duration::from_millis(50);
+// fixed-deadline: allow
+const BARE: Duration = Duration::from_secs(5);
+const WAIT: Duration = Duration::from_secs(5);
+async fn t() {
+    timeout(QUIET, f);
+    timeout(QUIET, g);
+    timeout(BARE, f);
+    // fixed-deadline: allow — stays under the 100 ms idle debounce
+    timeout(WAIT, f);
+    // fixed-deadline: allow — stays under the 10 s handshake
+    let window =
+        Duration::from_millis(500);
+    timeout(window, f);
+}
+";
+    let found = scan_source(src, true).deadlines;
+    assert_eq!(
+        found
+            .iter()
+            .map(|d| (d.line, d.marker_malformed))
+            .collect::<Vec<_>>(),
+        vec![(9, true)]
+    );
+}
+
+#[test]
+fn the_report_names_the_binding_behind_a_budget() {
+    let found = BTreeMap::from([(
+        "crates/a/tests/x.rs".to_string(),
+        vec![Deadline {
+            line: 6,
+            text: "timeout(WAIT, f);".to_string(),
+            marker_malformed: false,
+            via: Some("const WAIT (line 1)".to_string()),
+        }],
+    )]);
+    let report = report(&found, &BTreeMap::new());
+    assert!(
+        report
+            .contains("  crates/a/tests/x.rs:6: timeout(WAIT, f);  [budget: const WAIT (line 1)]"),
+        "{report}"
+    );
+    assert!(
+        report.contains("fn wait() -> Duration"),
+        "the fix text explains how to scale a constant budget:\n{report}"
     );
 }
