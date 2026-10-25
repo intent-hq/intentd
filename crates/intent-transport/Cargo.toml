@@ -54,6 +54,10 @@ ctor = "1.0.10"
 # dev-only edge introduces no cycle; the normal-build dependency direction
 # (transport → services only) is unchanged.
 intent-store = { path = "../intent-store", version = "0.11.42" }
+# The router catalog tests drive the gated workspace.export.* methods, which
+# need the real transfer feature registered. Dev-only: the normal-build
+# direction (transport -> services, never a feature crate) is unchanged.
+intent-svc-transfer = { path = "../intent-svc-transfer" }
 
 [lints]
 workspace = true

@@ -2504,6 +2504,7 @@ dependencies = [
  "intent-core",
  "intent-services",
  "intent-store",
+ "intent-svc-transfer",
  "intentd-test-support",
  "libc",
  "rcgen",
