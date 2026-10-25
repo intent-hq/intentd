@@ -6,6 +6,7 @@ use intent_core::{
 };
 
 mod lifecycle_diagnostics;
+mod workspace_lifecycle;
 
 struct Executor {
     connection: Mutex<DesktopConnection>,
@@ -112,6 +113,7 @@ impl AgentReverseDispatch for Executor {
 }
 pub(crate) struct Harness {
     _tmp: TempDb,
+    _dirs: Vec<tempfile::TempDir>,
     pub(crate) services: Services,
     pub(crate) workspace: WorkspaceId,
     pub(crate) agent: AgentId,
@@ -120,10 +122,63 @@ pub(crate) struct Harness {
 }
 impl Harness {
     pub(crate) async fn new() -> Self {
+        Self::build(false).await
+    }
+    /// A harness whose workspace is a real daemon-owned git worktree, so
+    /// `workspace.retire` can run its full teardown.
+    pub(crate) async fn with_worktree() -> Self {
+        Self::build(true).await
+    }
+    async fn build(worktree: bool) -> Self {
         let tmp = TempDb::new();
         let store = intent_store::Store::open(&tmp.path).await.unwrap();
-        let ws = WorkspaceId::new();
-        store.insert_workspace(&workspace(&ws)).await.unwrap();
+        let mut dirs = Vec::new();
+        let ws = if worktree {
+            let repo_dir = crate::tests::test_tempdir("intentd-desktop-repo-");
+            let repo = git2::Repository::init(repo_dir.path()).unwrap();
+            {
+                let mut cfg = repo.config().unwrap();
+                cfg.set_str("user.name", "Tester").unwrap();
+                cfg.set_str("user.email", "t@e.dev").unwrap();
+            }
+            std::fs::write(repo_dir.path().join("README.md"), "init\n").unwrap();
+            let mut index = repo.index().unwrap();
+            index
+                .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+                .unwrap();
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let sig = git2::Signature::now("Tester", "t@e.dev").unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, "chore: init", &tree, &[])
+                .unwrap();
+            let root_dir = crate::tests::test_tempdir("intentd-desktop-root-");
+            let creator = Caller::Wire {
+                principal_id: store.get_primary_principal().await.unwrap().id,
+                host_role: intent_core::HostRole::Owner,
+            };
+            let created = intent_core::with_caller(
+                creator,
+                Services::new(store.clone())
+                    .with_workspaces_root(root_dir.path().to_path_buf())
+                    .create_workspace(
+                        intent_core::WorkspaceCreate {
+                            repository_path: Some(repo_dir.path().to_string_lossy().to_string()),
+                            ..Default::default()
+                        },
+                        None,
+                    ),
+            )
+            .await
+            .unwrap()
+            .workspace;
+            dirs.push(repo_dir);
+            dirs.push(root_dir);
+            created.id
+        } else {
+            let ws = WorkspaceId::new();
+            store.insert_workspace(&workspace(&ws)).await.unwrap();
+            ws
+        };
         store
             .set_workspace_browser_client(&ws, Some(&ClientId::from("primary")))
             .await
@@ -159,7 +214,11 @@ impl Harness {
                 ("providers.paths".into(), json!({"auggie":"/bin/sh"})),
             ])
             .unwrap();
-        let services = Services::new(store.clone())
+        let mut services = Services::new(store.clone());
+        if let Some(root) = dirs.get(1) {
+            services = services.with_workspaces_root(root.path().to_path_buf());
+        }
+        let services = services
             .with_event_bus(EventBus::new(store))
             .with_settings_registry(settings)
             .with_reverse_dispatch(executor.clone());
@@ -180,6 +239,7 @@ impl Harness {
         let agent = AgentId::from(created["agent"]["id"].as_str().expect("created agent ID"));
         Self {
             _tmp: tmp,
+            _dirs: dirs,
             services,
             workspace: ws,
             agent,

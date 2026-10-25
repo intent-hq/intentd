@@ -435,7 +435,17 @@ impl Services {
         {
             return Err(error("desktop-not-active", "Agent has terminated"));
         }
+        if self.desktop_workspace_closed(&binding.workspace_id).await {
+            return Err(error("desktop-not-active", "Workspace is archived"));
+        }
         Ok(())
+    }
+    /// An archived or retired workspace never keeps desktop authority.
+    async fn desktop_workspace_closed(&self, workspace: &WorkspaceId) -> bool {
+        self.store
+            .get_workspace(workspace)
+            .await
+            .is_ok_and(|ws| ws.archived || ws.is_retired())
     }
     async fn desktop_prepare(
         &self,
@@ -1707,6 +1717,22 @@ impl Services {
     pub(crate) async fn desktop_terminate_agent(&self, agent: &AgentId) {
         let _ = self.desktop_end(agent, "agent_terminated", false).await;
     }
+    /// End every agent's desktop control and pending consent prompt in a
+    /// workspace that is being archived or retired, the caller included.
+    pub(crate) async fn desktop_terminate_workspace(&self, workspace: &WorkspaceId) {
+        let agents: Vec<AgentId> = self
+            .desktop
+            .live
+            .lock()
+            .expect("desktop states")
+            .iter()
+            .filter(|(_, live)| &live.binding.workspace_id == workspace)
+            .map(|(agent, _)| agent.clone())
+            .collect();
+        for agent in agents {
+            self.desktop_terminate_agent(&agent).await;
+        }
+    }
 }
 #[cfg(test)]
 pub(crate) mod tests;
@@ -1734,6 +1760,9 @@ impl Services {
             .is_ok_and(|owner| owner.as_ref() != Some(&binding.connection.principal_id))
         {
             return "owner_changed";
+        }
+        if self.desktop_workspace_closed(&binding.workspace_id).await {
+            return "agent_terminated";
         }
         if self
             .store

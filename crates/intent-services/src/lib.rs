@@ -24490,6 +24490,9 @@ impl WorkspaceApi for Services {
                         }
                     }
                 }
+                // Desktop authority never survives archive, the caller's
+                // included: unarchive must not hand it back without consent.
+                this.desktop_terminate_workspace(&id).await;
                 // Cancel every active background hook in the workspace: task
                 // aborted, state persisted to `cancelled`, `hook:cancelled`
                 // emitted — silently per hook. Unarchive does NOT resurrect

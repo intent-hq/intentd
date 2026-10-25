@@ -1,6 +1,6 @@
 use super::*;
 
-async fn outcome(h: &Harness, field: &str, id: &str) -> Value {
+pub(super) async fn outcome(h: &Harness, field: &str, id: &str) -> Value {
     h.services.desktop_flush_outbox().await;
     let conversation = intent_core::with_caller(
         h.owner.clone(),
