@@ -381,3 +381,84 @@ async fn retired_note_paging_delete_survives_write_pool_acquire_timeout() {
 
     assert_eq!(statements.iter().sum::<u64>(), 51, "{statements:?}");
 }
+
+/// intent-hq/intent#7705: workspace delete also sweeps private desktop state.
+/// A saturated writer at exactly that step must be waited out, and the
+/// workspace's desktop rows must still be removed.
+#[tokio::test]
+async fn workspace_delete_desktop_cleanup_survives_write_pool_acquire_timeout() {
+    let tmp = TempDb::new();
+    let store = short_acquire_store(&tmp).await;
+    let (ws_id, agent_id) = seed_workspace_with_agent(&store).await;
+    let principal = store.get_primary_principal().await.expect("principal").id;
+    store
+        .desktop_set_permission(&principal, &ws_id, &agent_id, "physical", true)
+        .await
+        .expect("seed desktop permission");
+    let desktop_rows = |store: Store, ws: WorkspaceId| async move {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM settings WHERE key GLOB 'desktop.v1/*' \
+             AND json_extract(value,'$.workspaceId') = ?",
+        )
+        .bind(ws.as_str())
+        .fetch_one(store.read_pool())
+        .await
+        .expect("count desktop rows")
+    };
+    assert!(
+        desktop_rows(store.clone(), ws_id.clone()).await >= 1,
+        "desktop state seeded"
+    );
+
+    let barrier = Arc::new(crate::desktop_repo::DeleteBarrier::default());
+    let observed = Arc::new(AtomicUsize::new(0));
+    let deleting = {
+        let store = store.clone();
+        let ws_id = ws_id.clone();
+        let observed = Arc::clone(&observed);
+        let barrier = Arc::clone(&barrier);
+        tokio::spawn(
+            crate::POOL_TIMEOUT_OBSERVER.scope(
+                observed,
+                crate::workspace_repo::DESKTOP_CLEANUP_ENTRY
+                    .scope(barrier, async move { store.delete_workspace(&ws_id).await }),
+            ),
+        )
+    };
+    tokio::time::timeout(WATCHDOG, barrier.entered.notified())
+        .await
+        .expect("delete reaches the desktop cleanup");
+    // Saturate the single writer exactly as the desktop cleanup begins.
+    let held = store
+        .write_pool()
+        .acquire()
+        .await
+        .expect("hold write connection");
+    barrier.release.notify_one();
+    let deadline = tokio::time::Instant::now() + WATCHDOG;
+    while observed.load(Ordering::SeqCst) == 0
+        && !deleting.is_finished()
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    drop(held);
+
+    deleting
+        .await
+        .expect("delete task")
+        .expect("workspace delete must retry its desktop cleanup through the acquire timeout");
+    assert!(
+        observed.load(Ordering::SeqCst) >= 1,
+        "the desktop cleanup must have hit a real PoolTimedOut"
+    );
+    assert_eq!(
+        desktop_rows(store.clone(), ws_id.clone()).await,
+        0,
+        "no private desktop state survives the workspace"
+    );
+    assert!(
+        matches!(store.get_workspace(&ws_id).await, Err(Error::NotFound(_))),
+        "workspace row removed"
+    );
+}
