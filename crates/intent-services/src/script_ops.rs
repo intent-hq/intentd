@@ -2157,7 +2157,6 @@ impl ScriptManager {
         let lock = self.locks.definition_lock(script_id);
         let admission = lock.lock_owned().await;
         self.require_admission(workspace_id, script_id).await?;
-        self.require_launch_open_locked(workspace_id).await?;
         if self.is_live(workspace_id, script_id)? {
             return Ok(
                 json!({"output": "", "warning": "Script is already running; wait for it to finish or use script.stop."}),
@@ -2168,6 +2167,28 @@ impl ScriptManager {
         let id = script_id.to_owned();
         let admission = self
             .spawn_admission(async move {
+                // Retired / closing refusal before any write below (prior
+                // settlement, archive restoration) and before the
+                // service-mode warning: a delayed run writes nothing. The
+                // row read is skipped when neither a write nor the warning
+                // can follow (a settled, unarchived command): that run's only
+                // durable write is the run row, which `prepare_launch`
+                // already refuses for a retired workspace, and the skip keeps
+                // the common admission free of an extra store round trip.
+                let may_write_or_warn = mgr
+                    .scripts
+                    .lock()
+                    .unwrap()
+                    .get(&(ws.clone(), id.clone()))
+                    .is_some_and(|m| {
+                        m.def.mode == ScriptMode::Service
+                            || m.def.archived_at.is_some()
+                            || m.run_id.is_some()
+                            || m.pending_result.is_some()
+                    });
+                if may_write_or_warn || mgr.locks.is_closing(&ws) {
+                    mgr.require_launch_open_locked(&ws).await?;
+                }
                 mgr.finish_previous_locked(&ws, &id).await;
                 // Publish restoration before reserving running in memory: a
                 // cancelled pre-spawn reservation is intentionally silent.
@@ -7180,6 +7201,66 @@ mod tests {
             .expect("fresh run");
         assert_eq!(out["timedOut"], true, "fresh run executed: {out:?}");
         assert!(out.get("warning").is_none(), "no warning: {out:?}");
+    }
+
+    /// Review regression (intentd#2605): a delayed `script.run` resuming
+    /// after its workspace was retired, on a command whose previous run still
+    /// holds an unsettled result, is refused with `workspace-retired` before
+    /// `finish_previous_locked` settles it: the pending result stays
+    /// unsettled, no run row is written and no `script:*` event is published.
+    #[intent_test_macros::daemon_test]
+    async fn script_run_on_retired_workspace_does_not_settle_a_pending_result() {
+        let h = harness().await;
+        let id = create_simple(&h, "pending", "echo hi", ScriptMode::Command).await;
+        let mgr = h.services.script_manager();
+        let pending = intent_core::ScriptLastRun {
+            run_id: Some("prior-run".to_string()),
+            outcome: ScriptRunOutcome::Succeeded,
+            exit_code: Some(0),
+            started_at: Some(now_iso()),
+            stopped_at: now_iso(),
+            error: None,
+        };
+        {
+            let mut scripts = mgr.scripts.lock().unwrap();
+            let m = scripts.get_mut(&(h.ws.clone(), id.clone())).expect("entry");
+            m.pending_result = Some(pending.clone());
+        }
+        let store = h.services.store();
+        store
+            .archive_workspace_detaching_guests(&h.ws, &now_iso())
+            .await
+            .unwrap();
+        assert!(store
+            .retire_workspace_if_archived(&h.ws, &now_iso())
+            .await
+            .unwrap());
+        let mut sub = subscribe(&h);
+
+        let out = mgr.run(&h.ws, &id, None, Some(5)).await;
+        assert!(
+            matches!(out, Err(Error::WorkspaceRetired { .. })),
+            "{out:?}"
+        );
+        assert_eq!(
+            mgr.scripts
+                .lock()
+                .unwrap()
+                .get(&(h.ws.clone(), id.clone()))
+                .and_then(|m| m.pending_result.clone()),
+            Some(pending),
+            "pending result left unsettled"
+        );
+        assert!(store.latest_script_run(&h.ws, &id).await.unwrap().is_none());
+        assert!(
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(300)),
+                sub.recv(),
+            )
+            .await
+            .is_err(),
+            "no script:* event"
+        );
     }
 
     #[intent_test_macros::daemon_test]
