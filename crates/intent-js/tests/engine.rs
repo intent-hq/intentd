@@ -377,3 +377,30 @@ async fn oversized_host_reply_rejects_with_bounded_error() {
     );
     assert!(msg.len() < 300, "error must be bounded: {msg}");
 }
+
+/// Setters a script installs on `Array.prototype` / `Object.prototype` must
+/// not run while a host reply is built: elements and keys are own data
+/// properties, exactly as `JSON.parse` would create them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_reply_ignores_prototype_setters() {
+    let host: HostFn =
+        Arc::new(|_| Box::pin(async { Ok(serde_json::json!({ "items": ["a", "b"], "ok": 1 })) }));
+    let out = eval(
+        "globalThis.hits = 0; \
+         Object.defineProperty(Array.prototype, '0', { set() { hits++; }, configurable: true }); \
+         Object.defineProperty(Array.prototype, '1', { set() { throw new Error('trap'); }, configurable: true }); \
+         Object.defineProperty(Object.prototype, 'items', { set() { hits++; }, configurable: true }); \
+         const r = await host(null); \
+         const seen = { items: [r.items[0], r.items[1]], len: r.items.length, own: Object.keys(r), hits }; \
+         delete Array.prototype[0]; delete Array.prototype[1]; delete Object.prototype.items; \
+         return seen;",
+        &EvalOptions::default(),
+        Some(host),
+    )
+    .await
+    .expect("host reply builds despite prototype setters");
+    assert_eq!(out["items"], serde_json::json!(["a", "b"]));
+    assert_eq!(out["len"], serde_json::json!(2));
+    assert_eq!(out["own"], serde_json::json!(["items", "ok"]));
+    assert_eq!(out["hits"], serde_json::json!(0));
+}

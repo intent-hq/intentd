@@ -302,13 +302,32 @@ fn oversized_reply_message(encoded_len: usize) -> String {
 
 fn error_frame<'js>(ctx: &Ctx<'js>, message: &str) -> rquickjs::Result<Value<'js>> {
     let obj = Object::new(ctx.clone())?;
-    obj.set("ok", false)?;
-    obj.set("error", message)?;
+    define_own(&obj, "ok", Value::new_bool(ctx.clone(), false))?;
+    define_own(
+        &obj,
+        "error",
+        rquickjs::String::from_str(ctx.clone(), message)?.into_value(),
+    )?;
     Ok(obj.into_value())
 }
 
-/// Build `value` as JS values with `JSON.parse` semantics: object keys are
-/// defined as own data properties (so `__proto__` stays a plain key), and
+/// Define `key` as an own enumerable, writable, configurable data property,
+/// as `JSON.parse` does. Unlike `set`, this never runs setters a script may
+/// have installed on `Object.prototype` / `Array.prototype`.
+fn define_own<'js, K: rquickjs::IntoAtom<'js>>(
+    obj: &Object<'js>,
+    key: K,
+    value: Value<'js>,
+) -> rquickjs::Result<()> {
+    obj.prop(
+        key,
+        Property::from(value).writable().enumerable().configurable(),
+    )
+}
+
+/// Build `value` as JS values with `JSON.parse` semantics: object keys and
+/// array indexes are defined as own data properties (so `__proto__` stays a
+/// plain key and prototype setters never run), and
 /// numbers become JS numbers. Depth is bounded by `serde_json`'s parser.
 fn json_to_js<'js>(ctx: &Ctx<'js>, value: &serde_json::Value) -> rquickjs::Result<Value<'js>> {
     Ok(match value {
@@ -322,20 +341,15 @@ fn json_to_js<'js>(ctx: &Ctx<'js>, value: &serde_json::Value) -> rquickjs::Resul
         serde_json::Value::Array(items) => {
             let array = Array::new(ctx.clone())?;
             for (idx, item) in items.iter().enumerate() {
-                array.set(idx, json_to_js(ctx, item)?)?;
+                let idx = u32::try_from(idx).map_err(|_| rquickjs::Error::Exception)?;
+                define_own(array.as_object(), idx, json_to_js(ctx, item)?)?;
             }
             array.into_value()
         }
         serde_json::Value::Object(map) => {
             let obj = Object::new(ctx.clone())?;
             for (key, item) in map {
-                obj.prop(
-                    key.as_str(),
-                    Property::from(json_to_js(ctx, item)?)
-                        .writable()
-                        .enumerable()
-                        .configurable(),
-                )?;
+                define_own(&obj, key.as_str(), json_to_js(ctx, item)?)?;
             }
             obj.into_value()
         }
