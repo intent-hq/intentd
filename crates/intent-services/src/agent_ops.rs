@@ -5819,7 +5819,8 @@ impl Services {
     /// `skip_if_explicitly_set` is `true` and the session's name was already
     /// explicitly set, the rename is a no-op returning the existing name with
     /// `skipped: true` (the FE `renameAgent` semantics). An applied rename
-    /// emits `agent:renamed`.
+    /// emits `agent:renamed` with `{ agentId, name, nameExplicitlySet }`, the
+    /// flag as written to the session row (§6.5).
     pub(crate) async fn agent_rename_op(
         &self,
         agent_id: AgentId,
@@ -5841,7 +5842,11 @@ impl Services {
             &workspace_id,
             &agent_id,
             intent_core::events::AGENT_RENAMED,
-            json!({ "agentId": agent_id.0, "name": name }),
+            json!({
+                "agentId": agent_id.0,
+                "name": name,
+                "nameExplicitlySet": session.name_explicitly_set,
+            }),
         )
         .await;
         self.refresh_token_usage_after_rename(&workspace_id, &agent_id)
@@ -6687,7 +6692,8 @@ impl Services {
     /// enforces the write-once (`acpSessionId`) and immutable (`provider`)
     /// invariants; malformed values in `changes` surface as `InvalidParams`.
     /// Emits `agent:updated` (or `agent:renamed` when `name` is the only field
-    /// mutated) so subscribed clients invalidate their cached projection.
+    /// mutated, carrying the persisted `nameExplicitlySet` — §6.5) so
+    /// subscribed clients invalidate their cached projection.
     pub(crate) async fn agent_update_op(&self, agent_id: AgentId, changes: Value) -> Result<Value> {
         let Value::Object(mut obj) = changes else {
             return Err(Error::InvalidParams(
@@ -7087,6 +7093,12 @@ impl Services {
         }
         if rename_placeholder {
             event_data.insert("name".into(), json!(session.name));
+        }
+        if mutated_only_name {
+            event_data.insert(
+                "nameExplicitlySet".into(),
+                json!(session.name_explicitly_set),
+            );
         }
         self.publish_agent_mutation_event(
             &session.workspace_id,
