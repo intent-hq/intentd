@@ -10,21 +10,14 @@ use intent_core::{NoteId, NoteUpdateInput, WorkspaceApi, WorkspaceId};
 use super::setup;
 use crate::Services;
 
-/// Wait until another caller joins `(ws, id)`'s lane beyond the test's own
-/// hold (`baseline`, read while only the test holds it), failing if the
-/// writer never queues — which is what an unlaned writer does: it lands
-/// without ever touching the lane.
-async fn wait_for_queued_writer(
-    services: &Services,
-    ws: &WorkspaceId,
-    id: &NoteId,
-    baseline: usize,
-) {
-    let key = (ws.clone(), id.clone());
+/// Wait until a second caller (the writer) is queued on `(ws, id)`'s
+/// lock behind the test's own hold, failing if it never queues — which is
+/// what an unlocked writer does: it lands without ever touching the lock.
+async fn wait_for_queued_writer(services: &Services, ws: &WorkspaceId, id: &NoteId) {
     tokio::time::timeout(
         intentd_test_support::test_timeout(Duration::from_secs(10)),
         async {
-            while services.note_content_writes.holders(&key) <= baseline {
+            while services.store.note_content_lock_users(ws, id) < 2 {
                 tokio::task::yield_now().await;
             }
         },
@@ -47,7 +40,7 @@ async fn stored_content(services: &Services, ws: &WorkspaceId, id: &NoteId) -> S
 async fn editor_save_waits_for_note_write_lane() {
     let (_tmp, services, ws, id) = setup("original").await;
     let lane = services.lock_note_content(&ws, &id).await;
-    let baseline = services.note_content_writes.holders(&(ws.clone(), id.clone()));
+    assert_eq!(services.store.note_content_lock_users(&ws, &id), 1);
 
     let writer = {
         let (services, ws, id) = (services.clone(), ws.clone(), id.clone());
@@ -65,7 +58,7 @@ async fn editor_save_waits_for_note_write_lane() {
         })
     };
 
-    wait_for_queued_writer(&services, &ws, &id, baseline).await;
+    wait_for_queued_writer(&services, &ws, &id).await;
     assert!(
         !writer.is_finished(),
         "editor save landed under a held lane"
@@ -118,7 +111,7 @@ async fn restore_version_waits_for_note_write_lane() {
     let target = target.expect("version one snapshot");
 
     let lane = services.lock_note_content(&ws, &id).await;
-    let baseline = services.note_content_writes.holders(&(ws.clone(), id.clone()));
+    assert_eq!(services.store.note_content_lock_users(&ws, &id), 1);
     let writer = {
         let (services, ws, id) = (services.clone(), ws.clone(), id.clone());
         intent_core::spawn_daemon(async move {
@@ -126,7 +119,7 @@ async fn restore_version_waits_for_note_write_lane() {
         })
     };
 
-    wait_for_queued_writer(&services, &ws, &id, baseline).await;
+    wait_for_queued_writer(&services, &ws, &id).await;
     assert!(!writer.is_finished(), "restore landed under a held lane");
     assert_eq!(stored_content(&services, &ws, &id).await, "version two");
 

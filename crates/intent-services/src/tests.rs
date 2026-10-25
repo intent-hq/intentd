@@ -4699,8 +4699,13 @@ async fn convert_blocks_rederives_onto_completed_user_save() {
     let mut user = other.get_note(&ws, &id).await.expect("get note");
     user.content = "intro TYPED\n\n@@@task\n# Do it\nbody\n@@@\n".into();
     user.updated_at = now_iso();
+    // A separately opened store has its own lock registry, so this external
+    // writer does not queue behind the parked op's lane: it is the
+    // out-of-band save the op's CAS retry must absorb.
+    let user_lock = other.lock_note_content(&ws, &id).await;
     let (rev, _) = other
         .update_note_with_version(
+            &user_lock,
             &user,
             Some(0),
             &crate::user_version_author(),
@@ -4708,6 +4713,7 @@ async fn convert_blocks_rederives_onto_completed_user_save() {
         )
         .await
         .expect("user save");
+    drop(user_lock);
     assert_eq!(rev, 1);
     drop(held);
 
@@ -7230,7 +7236,15 @@ async fn convert_blocks_warns_on_tree_ancestor_rejected_edge() {
         status: TaskStatus::NotStarted,
         ..Default::default()
     });
-    svc.store.update_note(&parent).await.expect("mark as task");
+    svc.store
+        .update_note(
+            &svc.store
+                .lock_note_content(&parent.workspace_id, &parent.id)
+                .await,
+            &parent,
+        )
+        .await
+        .expect("mark as task");
 
     let r = svc
         .convert_task_blocks(ws.clone(), id.clone(), None)
@@ -15770,7 +15784,13 @@ mod change_event_parity {
             .await
             .expect("get task note");
         tn.metadata.task.as_mut().expect("task metadata").status = status;
-        h.store.update_note(&tn).await.expect("update task note");
+        h.store
+            .update_note(
+                &h.store.lock_note_content(&tn.workspace_id, &tn.id).await,
+                &tn,
+            )
+            .await
+            .expect("update task note");
     }
 
     async fn note_content(h: &Harness, id: &str) -> (String, i64) {
@@ -15952,7 +15972,15 @@ mod change_event_parity {
         // An editor save lands in the same window.
         let mut edited = h.store.get_note(&h.ws, &spec_id()).await.expect("get spec");
         edited.content = format!("{}\n- [ ] added by editor", body("[x]", "[ ]"));
-        h.store.update_note(&edited).await.expect("editor save");
+        h.store
+            .update_note(
+                &h.store
+                    .lock_note_content(&edited.workspace_id, &edited.id)
+                    .await,
+                &edited,
+            )
+            .await
+            .expect("editor save");
         let (_, rev_before) = note_content(&h, "spec").await;
 
         let mut sub = subscribe(&h);
@@ -17029,7 +17057,15 @@ mod change_event_parity {
         spec.content = linked("[/]", "T", T1);
         spec.updated_at = now_iso();
         h.store
-            .update_note_with_version(&spec, None, &crate::user_version_author(), &spec.updated_at)
+            .update_note_with_version(
+                &h.store
+                    .lock_note_content(&spec.workspace_id, &spec.id)
+                    .await,
+                &spec,
+                None,
+                &crate::user_version_author(),
+                &spec.updated_at,
+            )
             .await
             .expect("versioned spec write");
         let agent = AgentId::from("agent-linked");

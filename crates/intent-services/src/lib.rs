@@ -48,7 +48,7 @@ use intent_core::{
     WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
 };
 use intent_core::{AgentReverseDispatch, ReverseDispatchError, ReverseLiveClient};
-use intent_store::{EventQuery, NewEvent, Store};
+use intent_store::{EventQuery, NewEvent, NoteWriteLock, Store};
 
 pub use intent_core::{Error, Result, WorkspaceApi};
 
@@ -1488,16 +1488,6 @@ pub struct Services {
     /// Serialize quota admission through persistence per owner, including
     /// adoption; unrelated owners never wait on each other's forge reads.
     pr_monitor_registration: Arc<KeyedInflight<AgentId>>,
-    /// Per-note content-write lane (intent-hq/intent#7184): the client
-    /// surgical and whole-content writers (`note.add` / `note.edit` /
-    /// `note.editLines` / `note.setContent`, `task.updateStatus`,
-    /// `task.update`, `task.convertBlocks`, `comment.add`, primitive appends)
-    /// hold their note's lane from the read their transform derives from
-    /// until the gated persist lands, so N parallel writers to one note apply
-    /// one after another against the latest text instead of racing the
-    /// bounded `Conflict` retry loop. Held for one read→persist window only
-    /// and never across another note write, so lanes never nest.
-    note_content_writes: Arc<KeyedInflight<(WorkspaceId, NoteId)>>,
     /// Original qualified registration lifetimes, never rebuilt from stored IDs.
     review_monitor_authorities: Arc<
         Mutex<HashMap<intent_core::PrMonitorId, Arc<repository_read_source::MonitorAuthority>>>,
@@ -1879,7 +1869,6 @@ impl Services {
             pr_monitor_debounce_seconds: None,
             pr_monitors_max_per_agent: None,
             pr_monitor_registration: Arc::default(),
-            note_content_writes: Arc::default(),
             review_monitor_authorities: Arc::default(),
             review_monitor_poll_lane: Arc::default(),
             legacy_pr_monitor_poll_lane: Arc::default(),
@@ -2738,19 +2727,20 @@ impl Services {
         self
     }
 
-    /// Take `note_id`'s content-write lane (see `note_content_writes`).
-    /// Hold the guard from the read a write derives from through its gated
-    /// persist, and drop it before any follow-up that may write a note
+    /// Take `note_id`'s content-write lane ([`Store::lock_note_content`],
+    /// intent-hq/intent#7184): every write that rewrites a note's text
+    /// requires it, so N parallel writers to one note apply one after another
+    /// against the latest text instead of racing the bounded `Conflict` retry
+    /// loop. Hold the lock from the read a write derives from through its
+    /// gated persist, and drop it before any follow-up that may write a note
     /// (auto-conversion, task-status redirects, materialization — which takes
-    /// the lane itself).
+    /// the lane itself), so lanes never nest.
     async fn lock_note_content(
         &self,
         workspace_id: &WorkspaceId,
         note_id: &NoteId,
-    ) -> KeyedInflightGuard<'_, (WorkspaceId, NoteId)> {
-        self.note_content_writes
-            .lock((workspace_id.clone(), note_id.clone()))
-            .await
+    ) -> NoteWriteLock {
+        self.store.lock_note_content(workspace_id, note_id).await
     }
 
     /// Park the first `task.update` attempt before its parent write when the
@@ -11020,12 +11010,13 @@ async fn persist_new_note(store: &Store, note: &Note, author: &NoteVersionAuthor
 /// [`Store::update_note_versioned`]). Returns the post-write `rev`.
 async fn persist_note_content(
     store: &Store,
+    lock: &NoteWriteLock,
     note: &Note,
     expected_version: Option<i64>,
     author: &NoteVersionAuthor,
 ) -> Result<i64> {
     store
-        .update_note_with_version(note, expected_version, author, &note.updated_at)
+        .update_note_with_version(lock, note, expected_version, author, &note.updated_at)
         .await
         .map(|(rev, _)| rev)
 }
@@ -11041,20 +11032,6 @@ async fn persist_note_content(
 /// Returns `Error::Internal` if the insert or the version append fails.
 pub async fn persist_system_new_note(store: &Store, note: &Note) -> Result<i64> {
     persist_new_note(store, note, &system_version_author()).await
-}
-
-/// [`persist_note_content`] with the daemon-internal system author and no
-/// `expectedVersion` gate, for noninteractive full-note *updates* outside this
-/// crate (the `intentd` importers re-writing an existing note). The row and
-/// its snapshot commit together, so an imported rev is never visible while
-/// its base still resolves to the previous content. Returns the post-write
-/// `rev`.
-///
-/// # Errors
-///
-/// Returns `Error::NotFound` if the note does not exist in the workspace; `Error::Internal` if the write fails.
-pub async fn persist_system_note_content(store: &Store, note: &Note) -> Result<i64> {
-    persist_note_content(store, note, None, &system_version_author()).await
 }
 
 /// Bounded read-merge-persist attempts for `note.setContent`: on a store
@@ -11281,10 +11258,11 @@ struct ContentWrite<'a> {
 /// deletions can empty a note neither side emptied.
 async fn persist_merged_content(
     store: &Store,
-    workspace_id: &WorkspaceId,
-    note_id: &NoteId,
+    lock: &NoteWriteLock,
     write: ContentWrite<'_>,
 ) -> Result<MergedContentWrite> {
+    let workspace_id = lock.workspace_id();
+    let note_id = lock.note_id();
     let ContentWrite {
         mut seed,
         incoming,
@@ -11361,7 +11339,7 @@ async fn persist_merged_content(
         note.content = content.clone();
         let now = now_iso();
         note.updated_at = now.clone();
-        match persist_note_content(store, &note, Some(current_rev), author).await {
+        match persist_note_content(store, lock, &note, Some(current_rev), author).await {
             Ok(rev) => {
                 plan.apply_orphaned(store, workspace_id).await?;
                 return Ok(MergedContentWrite {
@@ -12330,8 +12308,7 @@ async fn append_primitive(
         ..
     } = persist_merged_content(
         store,
-        workspace_id,
-        note_id,
+        &write_lane,
         ContentWrite {
             seed: Some(note),
             incoming: &incoming,
@@ -14142,7 +14119,7 @@ impl Services {
     /// — is merged into rather than overwritten. A parent that already carries
     /// the marker (or lost its link) after the fresh read is left untouched,
     /// as is one whose task note is gone or no longer a task. The read→write
-    /// window holds the parent's content-write lane (`note_content_writes`),
+    /// window holds the parent's content-write lane ([`Store::lock_note_content`]),
     /// so N parallel task transitions linked from one note rewrite it one
     /// after another instead of exhausting the bounded retry against each
     /// other and the laned client writers (intent-hq/intent#7184). Callers
@@ -14183,8 +14160,14 @@ impl Services {
             };
             note.content = content;
             note.updated_at = now_iso();
-            match persist_note_content(&self.store, &note, Some(note.rev), &system_version_author())
-                .await
+            match persist_note_content(
+                &self.store,
+                &write_lane,
+                &note,
+                Some(note.rev),
+                &system_version_author(),
+            )
+            .await
             {
                 Ok(_) => {}
                 Err(Error::Conflict { .. }) if attempt < MAX_ATTEMPTS => continue,
@@ -15952,24 +15935,6 @@ impl<K: std::hash::Hash + Eq + Clone> KeyedInflight<K> {
         }
     }
 
-    /// Take `key`'s lock and hold it until the returned guard drops (the
-    /// owned form of `enter` + `acquire`, for holds that span a whole
-    /// read→write window).
-    async fn lock(&self, key: K) -> KeyedInflightGuard<'_, K> {
-        let slot = self.enter(key);
-        let guard = Arc::clone(
-            slot.lock
-                .as_ref()
-                .expect("keyed inflight slot lock is taken only on drop"),
-        )
-        .lock_owned()
-        .await;
-        KeyedInflightGuard {
-            _guard: guard,
-            _slot: slot,
-        }
-    }
-
     /// Callers currently holding or waiting on `key`.
     #[cfg(test)]
     pub(crate) fn holders(&self, key: &K) -> usize {
@@ -15988,13 +15953,6 @@ impl<K: std::hash::Hash + Eq + Clone> KeyedInflight<K> {
             .expect("keyed inflight registry poisoned")
             .is_empty()
     }
-}
-
-/// A held [`KeyedInflight`] key (see `lock`). Field order matters: the
-/// mutex guard (and its `Arc` ref) drops before the slot's prune check.
-struct KeyedInflightGuard<'a, K: std::hash::Hash + Eq> {
-    _guard: tokio::sync::OwnedMutexGuard<()>,
-    _slot: KeyedInflightSlot<'a, K>,
 }
 
 /// One caller's hold on a [`KeyedInflight`] entry (see `enter`).
@@ -17031,6 +16989,7 @@ impl Services {
             let children: Vec<Note> = created.iter().map(|(child, _)| child.clone()).collect();
             match store
                 .update_note_with_version_and_children(
+                    &write_lane,
                     &note,
                     Some(read_rev),
                     &children,
@@ -26129,9 +26088,17 @@ impl WorkspaceApi for Services {
             }
             let caller_expected_version = input.expected_version;
             let mut expected_version = caller_expected_version;
-            let mut note = fetch_note(&store, &workspace_id, &note_id).await?;
             // content present → raw full set; otherwise title/tags metadata.
             let content_changed = input.content.is_some();
+            // A text write holds the note's lane from this read through the
+            // persist and the orphan-flag apply, like every other text
+            // writer; a metadata write leaves the text alone and takes none.
+            let write_lane = if content_changed {
+                Some(self.lock_note_content(&workspace_id, &note_id).await)
+            } else {
+                None
+            };
+            let mut note = fetch_note(&store, &workspace_id, &note_id).await?;
             if let (true, Some(base)) = (content_changed, input.base_content_bytes) {
                 // Truncated-read write guard, after the strict
                 // `expectedVersion` check (a stale value is `-32005` first).
@@ -26173,11 +26140,17 @@ impl WorkspaceApi for Services {
                 }
             }
             note.updated_at = now_iso();
-            if content_changed {
+            if let Some(write_lane) = write_lane.as_ref() {
                 // FE-only `note.update`: no caller-agent context on this arm
                 // (transport router path), so the version author is the user.
-                match persist_note_content(&store, &note, expected_version, &user_version_author())
-                    .await
+                match persist_note_content(
+                    &store,
+                    write_lane,
+                    &note,
+                    expected_version,
+                    &user_version_author(),
+                )
+                .await
                 {
                     // A guarded write the caller sent without
                     // `expectedVersion` lost the rev gate pinned above: a
@@ -26215,6 +26188,7 @@ impl WorkspaceApi for Services {
             if let Some(plan) = reanchor_plan {
                 plan.apply_orphaned(&store, &workspace_id).await?;
             }
+            drop(write_lane);
             if content_changed {
                 services.schedule_line_attribution_recompute(
                     &note.workspace_id.clone(),
@@ -26286,8 +26260,7 @@ impl WorkspaceApi for Services {
                 ..
             } = persist_merged_content(
                 &store,
-                &workspace_id,
-                &note_id,
+                &write_lane,
                 ContentWrite {
                     seed: Some(note),
                     incoming: &incoming,
@@ -26380,8 +26353,7 @@ impl WorkspaceApi for Services {
                 ..
             } = persist_merged_content(
                 &store,
-                &workspace_id,
-                &note_id,
+                &write_lane,
                 ContentWrite {
                     seed: Some(note),
                     incoming: &incoming,
@@ -26472,8 +26444,7 @@ impl WorkspaceApi for Services {
                 ..
             } = persist_merged_content(
                 &store,
-                &workspace_id,
-                &note_id,
+                &write_lane,
                 ContentWrite {
                     seed: Some(note),
                     incoming: &incoming,
@@ -26584,8 +26555,7 @@ impl WorkspaceApi for Services {
                 rev,
             } = persist_merged_content(
                 &store,
-                &workspace_id,
-                &note_id,
+                &write_lane,
                 ContentWrite {
                     seed: None,
                     incoming: &content,
@@ -26985,15 +26955,18 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             let _mutation = self.workspace_mutations.enter(&workspace_id)?;
             self.require_member(&workspace_id).await?;
+            // Resolved before taking the lane: it does not depend on the note.
+            let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
+            let write_lane = self.lock_note_content(&workspace_id, &note_id).await;
             let mut note = fetch_note(&store, &workspace_id, &note_id).await?;
             let version = store.get_note_version(&workspace_id, &note_id, v).await?;
             note.title = version.title;
             note.content = version.content;
             note.updated_at = now_iso();
-            let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
             let (_, new_v) = store
-                .update_note_with_version(&note, None, &author, &note.updated_at)
+                .update_note_with_version(&write_lane, &note, None, &author, &note.updated_at)
                 .await?;
+            drop(write_lane);
             services
                 .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
             publish_event(
@@ -27127,8 +27100,7 @@ impl WorkspaceApi for Services {
             let read_rev = note.rev;
             let MergedContentWrite { note, .. } = persist_merged_content(
                 &store,
-                &workspace_id,
-                &note_id,
+                &write_lane,
                 ContentWrite {
                     seed: Some(note),
                     incoming: &updated,
@@ -27322,8 +27294,7 @@ impl WorkspaceApi for Services {
                 if redirect.is_none() {
                     let merged = persist_merged_content(
                         &store,
-                        &workspace_id,
-                        &note_id,
+                        &write_lane,
                         ContentWrite {
                             seed: Some(note),
                             incoming: &update.content,
@@ -27342,7 +27313,9 @@ impl WorkspaceApi for Services {
                         .await?;
                 note.content = std::mem::take(&mut plan.content);
                 note.updated_at = now_iso();
-                match persist_note_content(&store, &note, Some(read_rev), &author).await {
+                match persist_note_content(&store, &write_lane, &note, Some(read_rev), &author)
+                    .await
+                {
                     Ok(_) => {
                         plan.apply_orphaned(&store, &workspace_id).await?;
                         break (note, update, redirect, true);
@@ -28313,6 +28286,7 @@ impl WorkspaceApi for Services {
                     // even when two adds race.
                     match store
                         .update_note_with_comment(
+                            &write_lane,
                             &note,
                             Some(read_rev),
                             &new_comment,
