@@ -40,6 +40,7 @@ async fn short_acquire_store(tmp: &TempDb) -> Store {
     Store {
         task_event_baselines: Arc::default(),
         task_events_enabled: Arc::default(),
+        note_write_lanes: std::sync::Arc::default(),
         _daemon_owner: None,
         write_pool: write_pool.into(),
         read_pool: crate::connect_read(&tmp.path)
@@ -132,7 +133,13 @@ async fn note_write_survives_write_pool_acquire_timeout() {
     note.content = "edited".to_string();
     let (rev, v) = run_while_writer_held(
         &store,
-        store.update_note_with_version(&note, Some(0), &author, &ts),
+        store.update_note_with_version(
+            &store.lock_note_content(&note.workspace_id, &note.id).await,
+            &note,
+            Some(0),
+            &author,
+            &ts,
+        ),
     )
     .await
     .expect("note edit must retry through the write-pool acquire timeout");
@@ -184,7 +191,13 @@ async fn note_write_gives_up_within_budget_under_continuous_saturation() {
     note.content = "edited".to_string();
     let started = std::time::Instant::now();
     let result = store
-        .update_note_with_version(&note, Some(0), &author, &ts)
+        .update_note_with_version(
+            &store.lock_note_content(&note.workspace_id, &note.id).await,
+            &note,
+            Some(0),
+            &author,
+            &ts,
+        )
         .await;
     let elapsed = started.elapsed();
     let err = result.expect_err("a saturated writer must fail the edit, not commit it late");

@@ -142,7 +142,13 @@ async fn drop_migration_keeps_notes_and_comments_and_comments_still_work() {
     note.content.push_str(" <!-- c:new -->");
     let added = sample_comment(&note.id, "new-thread", "new");
     let new_rev = store
-        .update_note_with_comment(&note, Some(rev), &added, &version_author())
+        .update_note_with_comment(
+            &store.lock_note_content(&note.workspace_id, &note.id).await,
+            &note,
+            Some(rev),
+            &added,
+            &version_author(),
+        )
         .await
         .unwrap();
     assert_eq!(new_rev, rev + 1);
@@ -224,8 +230,11 @@ async fn large_note_save_does_not_block_an_unrelated_write() {
         let snapshot = note.clone();
         let author = author.clone();
         let save = tokio::spawn(async move {
+            let lock = saver
+                .lock_note_content(&snapshot.workspace_id, &snapshot.id)
+                .await;
             saver
-                .update_note_with_version(&snapshot, Some(round), &author, &now_iso())
+                .update_note_with_version(&lock, &snapshot, Some(round), &author, &now_iso())
                 .await
         });
         tokio::task::yield_now().await;
@@ -293,7 +302,13 @@ async fn retired_paging_cleanup_resumes_after_a_restart_and_is_idempotent() {
     let mut note = store.get_note(&ws, &NoteId::from("n")).await.unwrap();
     note.content = "edited while partially cleared".into();
     store
-        .update_note_with_version(&note, Some(3), &version_author(), &now_iso())
+        .update_note_with_version(
+            &store.lock_note_content(&note.workspace_id, &note.id).await,
+            &note,
+            Some(3),
+            &version_author(),
+            &now_iso(),
+        )
         .await
         .unwrap();
     store.close().await;

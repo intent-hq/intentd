@@ -76,7 +76,15 @@ async fn note_fts_lifecycle_and_composite_identity() {
     first.title = "Newtitle".into();
     first.content = "shared freshbody".into();
     first.tags = vec!["unicorn".into(), "café".into()];
-    store.update_note(&first).await.unwrap();
+    store
+        .update_note(
+            &store
+                .lock_note_content(&first.workspace_id, &first.id)
+                .await,
+            &first,
+        )
+        .await
+        .unwrap();
     assert!(hits(&store, "oldtitle").await.is_empty());
     assert_eq!(hits(&store, "oldbody").await[0].workspace_id, "b");
     for query in ["newtitle", "freshbody", "unicorn", "cafe"] {
@@ -117,7 +125,10 @@ async fn note_fts_migration_backfills_and_rolls_back_atomically() {
     let mut n = note(&store, &a, "spec", "Backfilltitle", "backfillbody").await;
     n.tags = vec!["backfilltag".into()];
     n.is_archived = true;
-    store.update_note(&n).await.unwrap();
+    store
+        .update_note(&store.lock_note_content(&n.workspace_id, &n.id).await, &n)
+        .await
+        .unwrap();
     note(&store, &b, "spec", "Other", "backfillbody").await;
     let sql = include_str!("../../migrations/0141_note_fts.sql");
     // A failed migration transaction must leave original notes intact and no
@@ -414,7 +425,15 @@ async fn note_fts_survives_compaction_and_note_rowid_reassignment() {
     assert_eq!(hits(&store, "survivorword").await[0].note_id, "spec");
     assert!(hits(&store, "deletedword").await.is_empty());
     survivor.content = "aftercompaction".into();
-    store.update_note(&survivor).await.unwrap();
+    store
+        .update_note(
+            &store
+                .lock_note_content(&survivor.workspace_id, &survivor.id)
+                .await,
+            &survivor,
+        )
+        .await
+        .unwrap();
     assert!(hits(&store, "survivorword").await.is_empty());
     assert_eq!(hits(&store, "aftercompaction").await.len(), 1);
     note(&store, &ws, "later", "Later", "laterword").await;
