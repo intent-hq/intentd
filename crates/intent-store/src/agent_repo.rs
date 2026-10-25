@@ -4762,6 +4762,10 @@ impl Store {
         // Confirm the session exists under THIS workspace before touching any
         // children — the pre-delete statements are keyed by agent id alone, so
         // a mismatched workspace id must remain a no-op exactly like before.
+        // Not retried: this runs under lifecycle serialization, and a failure
+        // here has no side effects. The sweep steps after
+        // `release_serialization` run in the busy-retry window instead, so a
+        // saturated writer cannot fail the delete half-way (intent-hq/intent#7705).
         let exists: Option<i64> =
             sqlx::query_scalar("SELECT 1 FROM agent_session WHERE id = ? AND workspace_id = ?")
                 .bind(&id.0)
@@ -4797,21 +4801,27 @@ impl Store {
         // Recovery history has no FK cascade. There is at most one row per
         // agent; require both owners so inconsistent metadata is not erased.
         if cleanup_recovery {
-            sqlx::query("DELETE FROM interrupted_agent WHERE agent_id = ? AND workspace_id = ?")
+            crate::with_write_txn_retry(|| async {
+                sqlx::query("DELETE FROM interrupted_agent WHERE agent_id = ? AND workspace_id = ?")
+                    .bind(&id.0)
+                    .bind(&workspace_id.0)
+                    .execute(self.write_pool())
+                    .await
+                    .map_err(|e| {
+                        Error::Internal(format!("delete agent recovery history failed: {e}"))
+                    })
+            })
+            .await?;
+        }
+        let result = crate::with_write_txn_retry(|| async {
+            sqlx::query(DELETE_AGENT_SESSION_SQL)
                 .bind(&id.0)
                 .bind(&workspace_id.0)
                 .execute(self.write_pool())
                 .await
-                .map_err(|e| {
-                    Error::Internal(format!("delete agent recovery history failed: {e}"))
-                })?;
-        }
-        let result = sqlx::query(DELETE_AGENT_SESSION_SQL)
-            .bind(&id.0)
-            .bind(&workspace_id.0)
-            .execute(self.write_pool())
-            .await
-            .map_err(|e| Error::Internal(format!("delete agent session failed: {e}")))?;
+                .map_err(|e| Error::Internal(format!("delete agent session failed: {e}")))
+        })
+        .await?;
         lifecycle.settle_after_retirement().await?;
         Ok(result.rows_affected() > 0)
     }
@@ -4866,6 +4876,13 @@ const DELETE_MESSAGE_BATCH_SQL: &str = "DELETE FROM agent_message WHERE rowid IN
 /// implicit write transaction, and the yield between batches lets other
 /// writers queued on the pool interleave. Returns the number of non-empty
 /// batches executed.
+///
+/// Each batch runs in the busy-retry window ([`crate::with_write_txn_retry`]),
+/// so a write-pool acquire timeout or `SQLITE_BUSY` while another writer holds
+/// the single connection is waited out instead of failing the whole sweep
+/// (intent-hq/intent#7705). A retry is safe: a timed-out acquire ran nothing,
+/// a busy statement rolled back, and a batch only removes up to `batch`
+/// matching rows.
 pub(crate) async fn delete_in_bounded_batches(
     pool: &crate::StorePool,
     sql: &str,
@@ -4874,13 +4891,16 @@ pub(crate) async fn delete_in_bounded_batches(
 ) -> Result<u64> {
     let mut batches = 0u64;
     loop {
-        let removed = sqlx::query(sql)
-            .bind(scope_id)
-            .bind(batch)
-            .execute(pool)
-            .await
-            .map_err(|e| Error::Internal(format!("batched cascade delete failed: {e}")))?
-            .rows_affected();
+        let removed = crate::with_write_txn_retry(|| async {
+            sqlx::query(sql)
+                .bind(scope_id)
+                .bind(batch)
+                .execute(pool)
+                .await
+                .map_err(|e| Error::Internal(format!("batched cascade delete failed: {e}")))
+        })
+        .await?
+        .rows_affected();
         if removed > 0 {
             batches += 1;
         }

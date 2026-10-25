@@ -614,15 +614,18 @@ check the device's connection to Intent before trying to change assignments.
 
 While the desktop app is in front, an agent finishing work shows an in-app
 notification naming the agent and its workspace instead of a system notification;
-choose **Switch To** to open that agent's conversation. It is skipped when that
-workspace is already selected while **Settings → General → Notifications → Only when
-unfocused** is on (the default); turn that off to get it there too.
+choose **Switch To** to open that agent's conversation.
 
 **Switch To** notifications for agent failures, attention requests, and automatic
 workspace unarchiving are skipped when that workspace is already selected, even
-if another conversation, file, or note is open. Notifications for other workspaces
-can still appear. The workspace's agent status and conversation notices remain
-available.
+if another conversation, file, or note is open. Apps with selected-workspace
+suppression also skip finished-agent notifications there. Earlier app versions
+instead use **Settings → General → Notifications → Only when unfocused** (on by
+default); turning it off can show finished-agent notifications there. On app
+versions that support Assistant-chat suppression, those notifications are skipped
+while that chat is already open in the Assistant panel. Notifications for other
+workspaces can still appear. The workspace's agent status and conversation notices
+remain available.
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/chat/{StreamingStatus,TurnFailureNotice,FailureDetails,QueuedMessageList,QueuedMessageActions,ChatPanel}.svelte; messages/en.json. -->
 

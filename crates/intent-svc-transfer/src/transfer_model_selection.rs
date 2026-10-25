@@ -4,7 +4,7 @@
 //! An `agent_session` row stores its next-turn selection as the
 //! `(provider, model, reasoning_effort)` triple, where each NULL means "the
 //! daemon's default": a NULL `provider` resolves to `model.defaultProvider`
-//! at every spawn ([`crate::agent_session::resolve_provider_id`]), a NULL
+//! at every spawn ([`intent_services::feature_api::agent_session::resolve_provider_id`]), a NULL
 //! `model` is the provider's CLI default (Auto), and a NULL
 //! `reasoning_effort` is the provider's default effort (Auto). On the
 //! source machine that is unambiguous; once the row travels to another
@@ -49,7 +49,7 @@
 use intent_store::normalize_compound_model;
 use serde_json::{Map, Value};
 
-use crate::agent_ops::{
+use intent_services::feature_api::agent_ops::{
     ensure_effort_supported_by_model, resolve_agent_default_model_with_source,
     resolve_settings_default_reasoning_effort,
 };
@@ -68,7 +68,7 @@ fn canonical_source_provider(provider: &str) -> &str {
 /// stays Auto; its explicit effort, if any, is checked against the advertised
 /// default model when the catalog identifies one.
 fn selection_unavailable(
-    services: &crate::Services,
+    services: &intent_services::feature_api::Services,
     provider: &str,
     model: Option<&str>,
     effort: Option<&str>,
@@ -86,11 +86,17 @@ fn selection_unavailable(
     // Reuse spawn's provider-specific legacy effort interpretation, including
     // explicit-field precedence. Other providers may use slash model ids.
     let config = intent_providers::provider_config(provider);
-    let effort =
-        crate::agent_manager::AgentManager::session_model_effort(config, explicit_model, effort);
+    let effort = intent_services::feature_api::agent_manager::AgentManager::session_model_effort(
+        config,
+        explicit_model,
+        effort,
+    );
     let explicit_model = explicit_model.map(|model| {
         if config.config_option_model_strips_effort {
-            crate::agent_manager::AgentManager::split_codex_model_effort(model).0
+            intent_services::feature_api::agent_manager::AgentManager::split_codex_model_effort(
+                model,
+            )
+            .0
         } else {
             model
         }
@@ -122,10 +128,15 @@ fn selection_unavailable(
     Ok(())
 }
 
-impl crate::Services {
+/// Imported model selection reconciliation on [`Services`].
+pub(crate) trait TransferModelSelectionExt {
+    fn reconcile_imported_selections(&self, rows: &mut [(String, Vec<Value>)]);
+}
+
+impl TransferModelSelectionExt for intent_services::feature_api::Services {
     /// Run on the blocking pool before `transfer_import_rows`. Discovery and
     /// catalog reads are destination-local and never spawn a turn or probe.
-    pub(crate) fn reconcile_imported_selections(&self, rows: &mut [(String, Vec<Value>)]) {
+    fn reconcile_imported_selections(&self, rows: &mut [(String, Vec<Value>)]) {
         let settings = self.effective_settings();
         // One discovery per provider, not per imported agent.
         let mut availability = std::collections::HashMap::new();
@@ -198,7 +209,10 @@ impl crate::Services {
                     );
                 let Err(source_reason) = source else { continue };
                 let fallback = destination_default.get_or_insert_with(|| {
-                    let provider = crate::agent_session::derived_default_provider(&settings)
+                    let provider =
+                        intent_services::feature_api::agent_session::derived_default_provider(
+                            &settings,
+                        )
                         .ok_or_else(|| "no default provider is configured".to_string())?;
                     available(&provider)?;
                     // The same model/effort default chain as plain creation;
@@ -241,7 +255,7 @@ impl crate::Services {
 }
 
 /// A JSON column that is absent, `null`, or an empty string reads as unset —
-/// the same leniency [`crate::agent_session::resolve_provider_id`] applies.
+/// the same leniency [`intent_services::feature_api::agent_session::resolve_provider_id`] applies.
 fn column_str(map: &Map<String, Value>, key: &str) -> Option<String> {
     map.get(key)
         .and_then(Value::as_str)

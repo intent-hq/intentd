@@ -453,12 +453,13 @@ impl ModelCatalogReader<'_> {
             self.cache
                 .installed_key(source.provider_id)
                 .unwrap_or_else(|| {
-                    // Test-only synthetic seeding retains registry-based fixtures.
-                    #[cfg(test)]
+                    // Test-only synthetic seeding retains registry-based
+                    // fixtures, including for feature-crate tests (test-hooks).
+                    #[cfg(any(test, feature = "test-hooks"))]
                     {
                         (source.version_key)()
                     }
-                    #[cfg(not(test))]
+                    #[cfg(not(any(test, feature = "test-hooks")))]
                     {
                         "installed-unobserved".to_owned()
                     }
