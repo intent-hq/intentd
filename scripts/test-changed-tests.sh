@@ -1027,8 +1027,9 @@ expect_cargo "-p intentd --test suite_wss --test e2e_wss_agent_lifecycle --test 
 case_name="a checkout without the map keeps the per-crate selection"
 reset_repo
 g rm -q .config/e2e-test-map.txt
+commit_all "no map"
 edit crates/delta/src/script.rs
-run_script
+run_script --base HEAD
 expect_ok
 expect_cargo "-p delta --lib --bins --tests"
 
@@ -1104,6 +1105,67 @@ rm "$repo/.config/e2e-test-map.txt"
 run_script --check-map
 [[ "$status" -eq 2 ]] || fail "$case_name exited $status (expected 2): $stderr"
 [[ "$stderr" == "[check-map] .config/e2e-test-map.txt does not exist" ]] || fail "$case_name stderr: $stderr"
+
+case_name="map naming a test file that is not a test target"
+reset_repo
+write crates/intentd/Cargo.toml $'[package]\nname = "intentd"\nautotests = false\n\n[[test]]\nname = "suite_e2e"\n\n[[test]]\nname = "suite_wss"\n\n[[test]]\nname = "e2e_wss_agent_lifecycle"\n\n[dev-dependencies]\nname = "e2e_core"'
+echo "crates/delta/src/lib.rs intentd::e2e_core inner" >>"$repo/.config/e2e-test-map.txt"
+expect_map_error ".config/e2e-test-map.txt:8: intentd::e2e_core: crates/intentd/Cargo.toml sets autotests = false and declares no [[test]] named e2e_core"
+
+case_name="autotests = false map with registered targets is valid"
+reset_repo
+write crates/intentd/Cargo.toml $'[package]\nname = "intentd"\nautotests = false\n\n[[test]]\nname = "suite_e2e"\n\n[[test]]\nname = "suite_wss"\n\n[[test]]\nname = "e2e_wss_agent_lifecycle"'
+run_script --check-map
+expect_ok
+[[ "$stdout" == "[check-map] .config/e2e-test-map.txt: 4 entries valid" ]] || fail "$case_name printed '$stdout'"
+
+# rustc resolves the children of a #[path]-loaded file in that file's own
+# directory, as for a mod.rs file.
+case_name="map module below a #[path]-loaded file"
+reset_repo
+write crates/intentd/tests/e2e_shared/helper.rs 'mod deep;'
+write crates/intentd/tests/e2e_shared/deep.rs
+echo "crates/delta/src/lib.rs intentd::suite_e2e e2e_shared::helper::deep" >>"$repo/.config/e2e-test-map.txt"
+run_script --check-map
+expect_ok
+[[ "$stdout" == "[check-map] .config/e2e-test-map.txt: 5 entries valid" ]] || fail "$case_name printed '$stdout'"
+
+case_name="map declarations: comments, attribute spacing, one-line attributes, inline modules"
+reset_repo
+write crates/intentd/tests/suite_lex.rs $'//! lex suite\n#[path = "lex/a.rs"]\n\n// a comment between the attribute and the module\nmod a;\n#[path="lex/b.rs"]\n#[cfg(unix)]\npub(crate) mod b;\n#[cfg(unix)] mod c;\n#[path = "lex/d.rs"] pub mod d;\nmod e {\n    mod f {}\n}\nmod g; // trailing'
+write crates/intentd/tests/lex/a.rs
+write crates/intentd/tests/lex/b.rs
+write crates/intentd/tests/c.rs
+write crates/intentd/tests/lex/d.rs
+write crates/intentd/tests/g/mod.rs
+printf '%s\n' "crates/delta/src/lib.rs intentd::suite_lex a" "crates/delta/src/lib.rs intentd::suite_lex b" \
+  "crates/delta/src/lib.rs intentd::suite_lex c" "crates/delta/src/lib.rs intentd::suite_lex d" \
+  "crates/delta/src/lib.rs intentd::suite_lex e::f" "crates/delta/src/lib.rs intentd::suite_lex g" >>"$repo/.config/e2e-test-map.txt"
+run_script --check-map
+expect_ok
+[[ "$stdout" == "[check-map] .config/e2e-test-map.txt: 10 entries valid" ]] || fail "$case_name printed '$stdout'"
+
+case_name="deleting the map needs the full suite"
+reset_repo
+g rm -q .config/e2e-test-map.txt
+edit crates/delta/src/script.rs
+run_script
+[[ "$status" -eq 3 ]] || fail "$case_name exited $status (expected 3): $stderr"
+[[ "$stderr" == *"  .config/e2e-test-map.txt"* ]] || fail "$case_name stderr: $stderr"
+[[ -z "$cargo_log" ]] || fail "$case_name invoked cargo: $cargo_log"
+
+case_name="instrumented run skips a mapped auggie_context_e2e module"
+reset_repo
+echo "crates/delta/src/lib.rs intentd::suite_e2e auggie_context_e2e" >>"$repo/.config/e2e-test-map.txt"
+commit_all
+edit crates/delta/src/lib.rs
+run_script --instrumented --base HEAD
+expect_ok
+expect_cov "-p delta --lib --bins --tests"
+: >"$temp_dir/cargo.log"
+run_script --base HEAD
+expect_ok
+expect_cargo "-p delta --lib --bins --tests" "-p intentd --test suite_e2e -E (binary_id(=intentd::suite_e2e)&test(/^(auggie_context_e2e)::/))"
 
 echo "changed-tests tests passed under $("$script_bash" -c 'echo "bash $BASH_VERSION"')"
 [[ -z "${CHANGED_TESTS_TEST_BASH:-}" ]] || exit 0

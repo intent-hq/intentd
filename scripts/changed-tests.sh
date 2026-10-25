@@ -169,11 +169,17 @@ map_count=0
 
 # Sets resolve_problem (and returns 1) unless every segment of module path $2
 # is declared by its parent, starting at the test binary root $1, and the file
-# it resolves to exists: #[path = "<p>"] is relative to the declaring file's
-# directory; otherwise a root or mod.rs file looks in its own directory and
-# any other <name>.rs in <name>/, for <seg>.rs then <seg>/mod.rs.
+# it resolves to exists. This is a line scanner, not a parser: a declaration
+# is `[pub[(...)]] mod <seg>;` (or an inline `mod <seg> {`) after any
+# `#[...]` attributes on its own or the preceding lines (blank and `//` lines
+# may sit between). As rustc does, #[path = "<p>"] is relative to the
+# declaring file's directory; otherwise a directory owner (the root, a mod.rs
+# file or a #[path]-loaded file) looks in its own directory and any other
+# <name>.rs in <name>/, for <seg>.rs then <seg>/mod.rs. An inline module's
+# segments resolve in the same file (its file-module children are not
+# supported).
 resolve_module() {
-  local file=$1 path=$2 rest=$2 seg line trimmed attr found dir child is_root=1
+  local file=$1 path=$2 rest=$2 seg line trimmed attribute attr found dir child owner=1
   resolve_problem=""
   if [[ "$path" == ::* || "$path" == *:: || "$path" == *::::* ]]; then
     resolve_problem="module $path: empty segment"
@@ -186,28 +192,44 @@ resolve_module() {
     found=""
     while IFS= read -r line || [[ -n "$line" ]]; do
       trimmed=${line#"${line%%[![:space:]]*}"}
+      # Leading attributes, several on one line allowed; a path attribute
+      # names the module file.
+      while [[ "$trimmed" == '#['*']'* ]]; do
+        attribute=${trimmed%%]*}
+        trimmed=${trimmed#*]}
+        trimmed=${trimmed#"${trimmed%%[![:space:]]*}"}
+        if [[ "$attribute" == '#[path'*=*\"*\"* ]]; then
+          attr=${attribute#*\"}
+          attr=${attr%\"*}
+        fi
+      done
       case "$trimmed" in
-        '#[path = "'*'"]'*)
-          attr=${trimmed#'#[path = "'}
-          attr=${attr%%\"*}
-          ;;
-        '#['*) ;;
-        "mod $seg;"* | "pub mod $seg;"* | "pub(crate) mod $seg;"* | "pub(super) mod $seg;"*)
-          found=1
+        "" | //*) continue ;;
+        pub\ *) trimmed=${trimmed#pub } ;;
+        pub\(*\)\ *) trimmed=${trimmed#*) } ;;
+      esac
+      case "$trimmed" in
+        "mod $seg;"*)
+          found=file
           break
           ;;
-        *) attr="" ;;
+        "mod $seg {"* | "mod $seg{"*)
+          found=inline
+          break
+          ;;
       esac
+      attr=""
     done <"$file"
     if [[ -z "$found" ]]; then
       resolve_problem="module $path: $file declares no 'mod $seg;'"
       return 1
     fi
+    [[ "$found" == file ]] || continue
     dir=${file%/*}
     if [[ -n "$attr" ]]; then
       child="$dir/$attr"
     else
-      [[ -n "$is_root" || "${file##*/}" == mod.rs ]] || dir=${file%.rs}
+      [[ -n "$owner" || "${file##*/}" == mod.rs ]] || dir=${file%.rs}
       child="$dir/$seg.rs"
       [[ -f "$child" || ! -f "$dir/$seg/mod.rs" ]] || child="$dir/$seg/mod.rs"
     fi
@@ -216,14 +238,37 @@ resolve_module() {
       return 1
     fi
     file=$child
-    is_root=""
+    owner=$attr
   done
+}
+
+# True when tests/$2.rs of crate $1 is a test target: cargo builds every
+# tests/*.rs as one unless the manifest sets autotests = false, in which case
+# only its [[test]] names count (intentd's suite modules are not targets).
+is_test_target() {
+  local manifest="crates/$1/Cargo.toml" line section="" autotests="" names=$'\n'
+  [[ -f "crates/$1/tests/$2.rs" ]] || return 1
+  [[ -f "$manifest" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line=${line#"${line%%[![:space:]]*}"}
+    case "$line" in
+      '['*) section=$line ;;
+      autotests*=*false*) [[ "$section" != '[package]'* ]] || autotests=false ;;
+      name*=*\"*\"*)
+        if [[ "$section" == '[[test]]'* ]]; then
+          line=${line#*\"}
+          names+="${line%%\"*}"$'\n'
+        fi
+        ;;
+    esac
+  done <"$manifest"
+  [[ "$autotests" != false || "$names" == *$'\n'"$2"$'\n'* ]]
 }
 
 # Reads the map into e2e_entries ("<glob>\t<crate>\t<binary>\t<module>"
 # lines), collecting one map_errors line per invalid entry.
 load_e2e_map() {
-  local n=0 line glob target module extra crate binary root files file hit
+  local n=0 line glob target module extra crate binary root files file hit seen_globs=$'\n'
   [[ -f "$e2e_map" ]] || return 0
   while IFS= read -r line || [[ -n "$line" ]]; do
     n=$((n + 1))
@@ -237,20 +282,28 @@ load_e2e_map() {
     map_count=$((map_count + 1))
     crate=${target%%::*}
     binary=${target#*::}
-    files=$(git -c core.quotePath=false ls-files --cached --others --exclude-standard -- "$glob" </dev/null) ||
-      die 2 "git ls-files -- $glob failed (exit $?)"
+    # Entries usually repeat a glob once per module: look each up once.
     hit=""
-    while IFS= read -r file; do
-      # shellcheck disable=SC2053 # the glob is a pattern on purpose
-      if [[ -n "$file" && -f "$file" && "$file" == $glob ]]; then
-        hit=1
-        break
-      fi
-    done <<<"$files"
+    if [[ "$seen_globs" == *$'\n'"$glob"$'\n'* ]]; then
+      hit=1
+    else
+      files=$(git -c core.quotePath=false ls-files --cached --others --exclude-standard -- "$glob" </dev/null) ||
+        die 2 "git ls-files -- $glob failed (exit $?)"
+      while IFS= read -r file; do
+        # shellcheck disable=SC2053 # the glob is a pattern on purpose
+        if [[ -n "$file" && -f "$file" && "$file" == $glob ]]; then
+          hit=1
+          seen_globs+="$glob"$'\n'
+          break
+        fi
+      done <<<"$files"
+    fi
     [[ -n "$hit" ]] || map_errors+="$e2e_map:$n: source glob '$glob' matches no file"$'\n'
     root="crates/$crate/tests/$binary.rs"
     if [[ ! -f "$root" ]]; then
       map_errors+="$e2e_map:$n: $target: $root does not exist"$'\n'
+    elif ! is_test_target "$crate" "$binary"; then
+      map_errors+="$e2e_map:$n: $target: crates/$crate/Cargo.toml sets autotests = false and declares no [[test]] named $binary"$'\n'
     elif [[ -n "$module" ]] && ! resolve_module "$root" "$module"; then
       map_errors+="$e2e_map:$n: $target $resolve_problem"$'\n'
     elif [[ -n "$hit" ]]; then
@@ -387,6 +440,9 @@ map_e2e() {
     [[ -n "$glob" ]] || continue
     # shellcheck disable=SC2053 # the glob is a pattern on purpose
     [[ -z "$1" || "$1" == $glob ]] || continue
+    # As in map_path: the instrumented run excludes auggie_context_e2e, so
+    # naming only that module would select nothing.
+    [[ -z "$instrumented" || "$crate" != intentd || "${module%%::*}" != auggie_context_e2e ]] || continue
     if [[ -n "$module" ]]; then
       printf '%s\tmodule\t%s:%s\n' "$crate" "$binary" "$module"
     else
@@ -404,14 +460,16 @@ classify() {
   [[ -n "$path" && "$seen" != *$'\n'"$path"$'\n'* ]] || return 0
   seen+=$'\n'"$path"$'\n'
   # Editing the map runs every module it names (a new entry is exercised by
-  # the change that adds it) instead of deferring to the full suite.
-  if [[ "$path" == "$e2e_map" ]]; then
+  # the change that adds it) instead of deferring to the full suite; deleting
+  # it falls through to the outside-crates/ fallback.
+  if [[ "$path" == "$e2e_map" && -f "$e2e_map" ]]; then
     e2e=$(map_e2e "")
     mapped+="$e2e"$'\n'
     e2e_notes+="note: $e2e_map changed; every mapped end-to-end module runs"$'\n'
     return 0
   fi
-  e2e=$(map_e2e "$path")
+  e2e=""
+  [[ -z "$e2e_entries" ]] || e2e=$(map_e2e "$path")
   if [[ -n "$e2e" ]]; then
     mapped+="$e2e"$'\n'
     e2e_notes+="note: $path is mapped to end-to-end tests in $e2e_map"$'\n'
