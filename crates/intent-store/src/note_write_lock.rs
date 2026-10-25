@@ -94,6 +94,7 @@ impl NoteWriteLanes {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     fn users(&self, key: &NoteKey) -> usize {
         self.lanes
             .lock()
@@ -102,6 +103,7 @@ impl NoteWriteLanes {
             .map_or(0, |lane| lane.users)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     fn is_empty(&self) -> bool {
         self.lanes
             .lock()
@@ -163,7 +165,7 @@ impl Store {
 
     /// Callers holding or awaiting `note_id`'s content-write lock. A test
     /// seam for observing that a writer is queued.
-    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn note_content_lock_users(&self, workspace_id: &WorkspaceId, note_id: &NoteId) -> usize {
         self.note_write_lanes
@@ -172,7 +174,7 @@ impl Store {
 
     /// `true` when no note's content-write lock is held or awaited. A test
     /// seam for checking that locks are released.
-    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn note_content_locks_idle(&self) -> bool {
         self.note_write_lanes.is_empty()

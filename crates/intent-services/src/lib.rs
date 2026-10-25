@@ -2727,14 +2727,10 @@ impl Services {
         self
     }
 
-    /// Take `note_id`'s content-write lane ([`Store::lock_note_content`],
-    /// intent-hq/intent#7184): every write that rewrites a note's text
-    /// requires it, so N parallel writers to one note apply one after another
-    /// against the latest text instead of racing the bounded `Conflict` retry
-    /// loop. Hold the lock from the read a write derives from through its
-    /// gated persist, and drop it before any follow-up that may write a note
-    /// (auto-conversion, task-status redirects, materialization — which takes
-    /// the lane itself), so lanes never nest.
+    /// Take `note_id`'s content-write lane; see [`Store::lock_note_content`]
+    /// for the hold rules. In this crate, drop it before any follow-up that
+    /// may write a note (auto-conversion, task-status redirects,
+    /// materialization — which takes the lane itself).
     async fn lock_note_content(
         &self,
         workspace_id: &WorkspaceId,
