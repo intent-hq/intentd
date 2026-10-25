@@ -692,8 +692,8 @@ jobs:
         run: |
           echo "pwsh: $(command -v pwsh) ($(pwsh --version)); XDG_CACHE_HOME=$XDG_CACHE_HOME; ulimit -s: $(ulimit -s)"
           cargo test -p intentd-sitter --test install_ps1_owner
-  # Windows cross lint, pull requests only: Clippy for the Windows GNU target
-  # on a Linux runner, so a Windows-only lint error (an import only
+  # Windows cross lint, pull requests only: the native `windows-lint` job's
+  # two steps for the Windows GNU target on a Linux runner, so a Windows-only lint error (an import only
   # `#[cfg(unix)]` code uses, a `#[cfg(windows)]`-only warning) fails the PR
   # instead of ejecting it from the merge queue an hour later (intentd#2672,
   # merge-group run 40178615896; earlier #2555, #2556, #2579). PRs still never
@@ -712,7 +712,9 @@ jobs:
     needs: [route, release-fast-path]
     name: Windows cross lint (x86_64-pc-windows-gnu)
     runs-on: ${{ fromJSON(needs.route.outputs.cloud || '{}')['gh-linux-8x'] || fromJSON('["warp-ubuntu-2404-x64-8x"]') }}
-    timeout-minutes: 25
+    # A cold compile (sccache miss, lockfile bump) on 8 cores builds the
+    # workspace twice for a new target; the native windows-lint has 45.
+    timeout-minutes: 40
     env:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
@@ -737,6 +739,10 @@ jobs:
           command -v x86_64-w64-mingw32-gcc >/dev/null || missing+=(gcc-mingw-w64-x86-64)
           pkg-config --exists openssl || missing+=(libssl-dev)
           if [ "${#missing[@]}" -gt 0 ]; then
+            if ! sudo -n true 2>/dev/null; then
+              echo "::error::${RUNNER_NAME:-this runner} lacks ${missing[*]} and passwordless sudo to install them; windows-cross-lint needs a runner from route's cloud map (never a self-hosted slot)."
+              exit 1
+            fi
             for i in 1 2 3; do
               if sudo -n apt-get -o DPkg::Lock::Timeout=300 update -qq; then break; fi
               if [ "$i" -eq 3 ]; then exit 1; fi
@@ -756,6 +762,11 @@ jobs:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           targets: x86_64-pc-windows-gnu
           components: clippy
+      # Non-test production configuration first: --all-targets enables test
+      # fixture features and skips their production arms (see the `build`
+      # job's comment), so Clippy alone would miss those Windows errors.
+      - name: Check (Windows GNU production configuration)
+        run: cargo check --workspace --target x86_64-pc-windows-gnu
       - name: Clippy (Windows GNU target)
         run: cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu -- -D warnings
   # Release metadata classification (intent-hq/monorepo#1374): retain the
@@ -902,7 +913,9 @@ jobs:
       # closes the gap. It runs on merge-queue runs, not on push: the queue
       # tests the actual merged tree, and main's push run builds a tree the
       # queue already linted. (The Windows equivalent is the queue-only
-      # `windows-lint` job.) It runs on the
+      # `windows-lint` job; PRs get a Linux pre-filter for it,
+      # `windows-cross-lint`, because the Windows GNU target needs only
+      # MinGW-w64.) It runs on the
       # native runners rather than as Linux cross-target runs because
       # `cargo clippy --target <triple>` still executes the native build
       # scripts (libz-sys and friends try-compile C for the target even when
@@ -2416,7 +2429,8 @@ jobs:
               require pr-static "${{ needs.pr-static.result }}"
               # release-fast-path itself is advisory: a failed classifier must
               # degrade to full CI, never block the PR. Release-metadata PRs
-              # skip the two slow test jobs (see `check`); the skip is accepted
+              # skip the three slow compile jobs (`check`, `windows-cross-lint`,
+              # `coverage-changed`; see `check`); the skip is accepted
               # only when the classifier job succeeded and reported the fast
               # path. Any other PR must run them.
               slow=require

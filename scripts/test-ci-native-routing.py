@@ -1185,7 +1185,8 @@ class NativeRoutingTests(unittest.TestCase):
             for event in REQUIRED:
                 jobs = scheduled(self.workflow, event, fast_path=fast_path if event == "pull_request" else "", head_ref=RELEASE_BRANCH)
                 for name in FAST_PATH_SKIPS:
-                    expected = "skipped" if (event == "pull_request" and fast_path == "true") or name not in REQUIRED[event] else "success"
+                    pr_only = event == "merge_group" and name in WINDOWS_PR_JOBS
+                    expected = "skipped" if (event == "pull_request" and fast_path == "true") or event == "push" or pr_only else "success"
                     self.assertEqual(jobs[name], expected, f"{event}/{fast_path}: {name}")
         # A failed or skipped route still skips the slow jobs, and CI Gate
         # rejects that skip on a PR without a reported fast path.
@@ -1241,7 +1242,10 @@ class NativeRoutingTests(unittest.TestCase):
         # self-hosted slot). The queue and main pushes skip it.
         job = self.workflow["jobs"]["windows-cross-lint"]
         commands = [str(step.get("run", "")) for step in job["steps"]]
-        self.assertIn("cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu -- -D warnings", commands)
+        # The native job's production check, then Clippy, in that order.
+        self.assertEqual([run for run in commands if "cargo " in run], [
+            "cargo check --workspace --target x86_64-pc-windows-gnu",
+            "cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu -- -D warnings"])
         self.assertTrue(any("gcc-mingw-w64-x86-64" in run for run in commands))
         toolchain = next(step for step in job["steps"] if str(step.get("uses", "")).startswith("dtolnay/rust-toolchain@"))
         self.assertEqual(toolchain["with"]["targets"], "x86_64-pc-windows-gnu")
