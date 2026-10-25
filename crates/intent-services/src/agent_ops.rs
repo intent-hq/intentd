@@ -6978,11 +6978,13 @@ impl Services {
                 _ => unreachable!("guarded by allow-list above"),
             }
         }
+        let mut placeholder_renamed = false;
         if remember_specialist && is_manual_foreground_agent(&session) {
             if rename_placeholder {
                 session.name = selected_specialist_name
                     .clone()
                     .unwrap_or_else(|| "Agent".into());
+                placeholder_renamed = true;
             }
             let metadata = session.metadata.get_or_insert_with(|| json!({}));
             if let Some(metadata) = metadata.as_object_mut() {
@@ -7092,7 +7094,10 @@ impl Services {
         for (k, v) in &obj {
             event_data.insert(k.clone(), v.clone());
         }
-        if rename_placeholder {
+        // Only a placeholder rename that actually applied reports `name`: the
+        // same request can leave the manual-foreground scope (e.g.
+        // `isBackground: true`), which skips the rename above.
+        if placeholder_renamed {
             event_data.insert("name".into(), json!(session.name));
         }
         // Any payload carrying `name` reports the persisted flag after the

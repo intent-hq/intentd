@@ -575,6 +575,61 @@ async fn creation_preferences_mixed_mute_failure_rolls_back_all_changes() {
     );
 }
 
+/// A remembered-specialist update that also moves the agent out of the
+/// manual-foreground scope skips the placeholder rename, so its
+/// `agent:updated` must not report a `name` (or `nameExplicitlySet`).
+#[intent_test_macros::daemon_test]
+async fn creation_preferences_skipped_placeholder_rename_reports_no_name() {
+    let (_tmp, svc, ws) = setup().await;
+    let bus = crate::EventBus::new(svc.store.clone());
+    let svc = svc.with_event_bus(bus.clone());
+    let created = create(
+        &svc,
+        &ws,
+        Some("implementor"),
+        AgentCreateExtra {
+            remember_specialist: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let id = AgentId(created["agent"]["id"].as_str().unwrap().into());
+    let before = svc.store.get_agent_session(&id).await.unwrap();
+    let mut sub = bus.subscribe(crate::SubscriptionFilter {
+        event_types: vec!["agent:updated".into(), "agent:renamed".into()],
+        ..Default::default()
+    });
+    svc.agent_update(
+        id.clone(),
+        Some(ws.clone()),
+        json!({"specialist":null,"rememberSpecialist":true,"isBackground":true}),
+    )
+    .await
+    .unwrap();
+    let after = svc.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(
+        after.name, before.name,
+        "rename skipped outside manual scope"
+    );
+    let batch = tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(2)),
+        sub.recv(),
+    )
+    .await
+    .expect("update event")
+    .expect("open");
+    let updated = batch
+        .iter()
+        .find(|e| e.event_type == "agent:updated" && e.data["agentId"] == json!(id.0))
+        .expect("agent:updated for the agent");
+    assert!(
+        updated.data.get("name").is_none() && updated.data.get("nameExplicitlySet").is_none(),
+        "no phantom rename: {}",
+        updated.data
+    );
+}
+
 #[intent_test_macros::daemon_test]
 async fn creation_preferences_welcome_selection_freezes_complete_instructions() {
     let (_tmp, svc, ws) = setup().await;

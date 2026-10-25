@@ -32800,7 +32800,7 @@ async fn agent_update_with_name_reports_persisted_name_explicitly_set() {
         )
         .unwrap(),
     ];
-    for changes in cases {
+    for (changes, stored) in cases.into_iter().zip([true, true, false]) {
         let id = create_agent(&svc, &ws, "Before").await;
         let mut sub = bus.subscribe(SubscriptionFilter {
             event_types: vec![AGENT_UPDATED.to_string()],
@@ -32810,6 +32810,12 @@ async fn agent_update_with_name_reports_persisted_name_explicitly_set() {
             .await
             .expect("update");
         let session = svc.agent_get_session_op(id.clone()).await.expect("get");
+        // Pins today's store semantics: the last of `name` (sets `true`) and
+        // `nameExplicitlySet` in request order wins.
+        assert_eq!(
+            session.name_explicitly_set, stored,
+            "stored flag for {changes}"
+        );
         let batch = timeout(
             intentd_test_support::test_timeout(Duration::from_secs(2)),
             sub.recv(),
@@ -32819,7 +32825,11 @@ async fn agent_update_with_name_reports_persisted_name_explicitly_set() {
         .expect("open");
         let updated = batch
             .iter()
-            .find(|e| e.event_type == AGENT_UPDATED && e.data["agentId"] == json!(id.0))
+            .find(|e| {
+                e.event_type == AGENT_UPDATED
+                    && e.data["agentId"] == json!(id.0)
+                    && e.data.get("name").is_some()
+            })
             .expect("agent:updated in batch");
         assert_eq!(updated.data["name"], json!(session.name), "{changes}");
         assert_eq!(
