@@ -1087,6 +1087,27 @@ impl ScriptManager {
         Ok(())
     }
 
+    /// Test seam: [`Self::list`] for feature-crate tests.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub async fn list_for_test(&self, workspace_id: &WorkspaceId) -> Result<Value> {
+        self.list(workspace_id).await
+    }
+
+    /// Test seam: [`Self::run`] for feature-crate tests.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub async fn run_for_test(
+        &self,
+        workspace_id: &WorkspaceId,
+        script_id: &str,
+        max_lines: Option<i64>,
+        timeout_seconds: Option<i64>,
+    ) -> Result<Value> {
+        self.run(workspace_id, script_id, max_lines, timeout_seconds)
+            .await
+    }
+
     /// `script.list`: the workspace's scripts with merged runtime state.
     /// Bootstrap repo config `scripts[]` only for a workspace that has never
     /// held script definitions. An intentionally emptied workspace stays empty.

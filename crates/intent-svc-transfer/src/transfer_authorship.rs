@@ -74,7 +74,7 @@ fn snapshot(value: &Value) -> Result<HumanAuthor> {
 
 fn unbind_recovery_sources(object: &mut Map<String, Value>) -> Result<()> {
     if let Some(raw) = object.get_mut("recoverySources") {
-        let mut sources: Vec<crate::agent_ops::RecoverySource> =
+        let mut sources: Vec<intent_services::feature_api::agent_ops::RecoverySource> =
             serde_json::from_value(raw.clone()).map_err(invalid)?;
         for source in &mut sources {
             if !source.author.is_null() {
@@ -85,7 +85,7 @@ fn unbind_recovery_sources(object: &mut Map<String, Value>) -> Result<()> {
                 author.insert("principalId".into(), Value::Null);
             }
         }
-        *raw = json!(crate::agent_ops::RecoverySource::normalize(sources));
+        *raw = json!(intent_services::feature_api::agent_ops::RecoverySource::normalize(sources));
     }
     if let Some(Value::Array(contributions)) = object.get_mut("mergedMessageMetadata") {
         for contribution in contributions {
