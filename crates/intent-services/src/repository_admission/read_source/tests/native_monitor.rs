@@ -497,7 +497,7 @@ async fn native_monitor_admitted_cancel_emits_original_qualified_event() {
     reply.with_current(&mut || Ok(())).unwrap();
     let mut queued = Vec::new();
     for subscription in [&mut same, &mut sibling] {
-        let delivery = timeout(BUDGET, subscription.recv_delivery())
+        let delivery = timeout(budget(), subscription.recv_delivery())
             .await
             .unwrap()
             .unwrap();
@@ -542,7 +542,7 @@ pub(crate) async fn next_monitor_event(
     subscription: &mut crate::events::Subscription,
     kind: &str,
 ) -> Arc<dyn RepositoryPrivateOutput> {
-    let delivery = timeout(BUDGET, subscription.recv_delivery())
+    let delivery = timeout(budget(), subscription.recv_delivery())
         .await
         .expect("actual monitor lifecycle event")
         .unwrap();

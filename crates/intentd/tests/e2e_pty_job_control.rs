@@ -72,6 +72,7 @@ const SCAN_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Bound on the teardown sweep for adopted orphans; they reparent within
 /// milliseconds of their parent's death, so this is margin, not expectation.
+// fixed-deadline: allow — stays under nextest's 180 s kill: part of the unscaled TEST_BUDGET + PING + REAP_TIMEOUT = 165 s sum above
 const REAP_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn self_pid() -> i32 {

@@ -1422,9 +1422,12 @@ mod managed {
             *self.replies.pause.lock().unwrap() = Some(path.into());
         }
         async fn entered(&self) {
-            timeout(BUDGET, self.replies.entered.notified())
-                .await
-                .unwrap();
+            timeout(
+                intentd_test_support::test_timeout(BUDGET),
+                self.replies.entered.notified(),
+            )
+            .await
+            .unwrap();
         }
         fn resume(&self) {
             self.replies.release.notify_one();

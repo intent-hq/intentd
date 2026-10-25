@@ -13,7 +13,9 @@ use nix::unistd::{getpgid, getpgrp, setpgid, Pid};
 use super::GuardedChild;
 use crate::Barrier;
 
-const BOUND: Duration = Duration::from_secs(5);
+fn bound() -> Duration {
+    crate::test_timeout(Duration::from_secs(5))
+}
 
 /// Whether `pid` still names a process (signal 0 probe), zombies included.
 fn alive(pid: u32) -> bool {
@@ -24,9 +26,10 @@ fn alive(pid: u32) -> bool {
     }
 }
 
-/// Poll `cond` up to [`BOUND`]; panic with `what` when it never holds.
+/// Poll `cond` up to [`bound()`]; panic with `what` when it never holds.
 fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
-    let deadline = Instant::now() + BOUND;
+    let bound = bound();
+    let deadline = Instant::now() + bound;
     while Instant::now() < deadline {
         if cond() {
             return;
@@ -34,7 +37,7 @@ fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
         // timing-guard: poll interval
         thread::sleep(Duration::from_millis(20));
     }
-    panic!("timed out after {BOUND:?} waiting for {what}");
+    panic!("timed out after {bound:?} waiting for {what}");
 }
 
 /// Every child detaches its stdio so nextest's leak detector never sees an
@@ -178,7 +181,7 @@ fn barrier_release_and_entered() {
 
     barrier.release();
     let status = guard
-        .wait_with_timeout(BOUND)
+        .wait_with_timeout(bound())
         .unwrap()
         .expect("released script exits within the bound");
     assert_eq!(status.code(), Some(0));

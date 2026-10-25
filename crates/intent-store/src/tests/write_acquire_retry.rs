@@ -15,14 +15,16 @@ const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(1);
 /// Upper bound on how long the holder keeps the connection if the operation
 /// never reports a timeout; the test then fails on the observer assertion
 /// instead of hanging. Also bounds the pool-open retries.
-const WATCHDOG: Duration = Duration::from_secs(15);
+fn watchdog() -> Duration {
+    intentd_test_support::test_timeout(Duration::from_secs(15))
+}
 
 /// Open a migrated store whose write pool uses [`ACQUIRE_TIMEOUT`]. sqlx opens
 /// the first connection eagerly under that timeout, so retry the open on a
-/// loaded host until [`WATCHDOG`].
+/// loaded host until [`watchdog()`].
 async fn short_acquire_store(tmp: &TempDb) -> Store {
     drop(Store::open(&tmp.path).await.expect("open store"));
-    let open_deadline = tokio::time::Instant::now() + WATCHDOG;
+    let open_deadline = tokio::time::Instant::now() + watchdog();
     let write_pool = loop {
         match crate::connect_write_with_acquire_timeout(&tmp.path, ACQUIRE_TIMEOUT).await {
             Ok(pool) => break pool,
@@ -67,7 +69,7 @@ async fn run_while_writer_held<T>(
     let holder = {
         let observed = Arc::clone(&observed);
         tokio::spawn(async move {
-            let deadline = tokio::time::Instant::now() + WATCHDOG;
+            let deadline = tokio::time::Instant::now() + watchdog();
             while observed.load(Ordering::SeqCst) == 0 && tokio::time::Instant::now() < deadline {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
