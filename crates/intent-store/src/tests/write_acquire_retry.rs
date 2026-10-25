@@ -440,7 +440,7 @@ async fn workspace_delete_desktop_cleanup_survives_write_pool_acquire_timeout() 
             ),
         )
     };
-    tokio::time::timeout(WATCHDOG, barrier.entered.notified())
+    tokio::time::timeout(watchdog(), barrier.entered.notified())
         .await
         .expect("delete reaches the desktop cleanup");
     // Saturate the single writer exactly as the desktop cleanup begins.
@@ -450,7 +450,7 @@ async fn workspace_delete_desktop_cleanup_survives_write_pool_acquire_timeout() 
         .await
         .expect("hold write connection");
     barrier.release.notify_one();
-    let deadline = tokio::time::Instant::now() + WATCHDOG;
+    let deadline = tokio::time::Instant::now() + watchdog();
     while observed.load(Ordering::SeqCst) == 0
         && !deleting.is_finished()
         && tokio::time::Instant::now() < deadline
