@@ -308,8 +308,8 @@ impl WorkspaceMcpServer {
     /// Override the wall-clock budget for one `workspace_api` invocation
     /// (testing) — compresses the 30s production default so timeout-path
     /// tests finish in milliseconds, or widens it for load-bound controls in
-    /// other crates (the `test-support` feature).
-    #[cfg(any(test, feature = "test-support"))]
+    /// other crates (the dev-only `test-hooks` feature).
+    #[cfg(any(test, feature = "test-hooks"))]
     #[must_use]
     pub fn with_workspace_api_timeout(mut self, timeout: Duration) -> Self {
         self.workspace_api_timeout = timeout;

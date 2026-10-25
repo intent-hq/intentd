@@ -123,7 +123,8 @@ priority = 100
 # The two `run_quota` controls give each 63/64-call script a fixed 150s budget
 # (one call can take ~0.9s on a loaded host; 30s cut the loop short) and a
 # 180s in-test hang guard per pass. Two passes need more than the default 180s
-# kill, so these two alone are terminated at 540s (3 × 180s).
+# kill, so these two alone are terminated at 540s (3 × 180s). Keep this an exact
+# name list: script_ops' liveness guard test rejects broader slow-timeout overrides.
 [[profile.default.overrides]]
 filter = 'binary_id(=intent-services) & (test(=repository_read_policy::tests::aliases::mixed_names_and_raw_dispatch_have_one_sixty_four_record_acquisition_budget) | test(=repository_read_policy::tests::original_ledger_counts_cache_hits_and_lazy_read_at_sixty_four_and_sixty_five))'
 slow-timeout = { period = "180s", terminate-after = 3 }

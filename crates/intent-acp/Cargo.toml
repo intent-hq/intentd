@@ -8,10 +8,11 @@ license.workspace = true
 description = "ACP client, session multiplexing, and agent→BE MCP server"
 
 [features]
-# Test-only `WorkspaceMcpServer` knobs for other crates' tests. Enable only
-# from `[dev-dependencies]`: Cargo then turns it on for builds that also
-# compile test targets, never for release/packaging builds of the daemon.
-test-support = []
+# Test-only `WorkspaceMcpServer` knobs (`cfg(any(test, feature =
+# "test-hooks"))` items) for other crates' tests. Enable it only from a
+# dev-dependency: scripts/check-test-hooks-feature.sh fails CI when the
+# production graph of a shipped binary turns it on.
+test-hooks = []
 
 [dependencies]
 intent-core = { path = "../intent-core", version = "0.11.44" }
