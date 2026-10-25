@@ -418,8 +418,7 @@ if (capability === "missing-receipt") delete response._meta?.intentCallbackRegis
     }
 
     async fn call(&self, method: &str, params: Value) -> Value {
-        self.call_with_timeout(method, params, fixture_wait())
-            .await
+        self.call_with_timeout(method, params, fixture_wait()).await
     }
 
     async fn call_with_timeout(&self, method: &str, params: Value, timeout: Duration) -> Value {
