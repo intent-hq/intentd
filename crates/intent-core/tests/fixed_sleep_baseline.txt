@@ -5,7 +5,7 @@
 crates/intent-acp/tests/acp_integration.rs 3
 crates/intent-js/tests/engine.rs 2
 crates/intentd-sitter/tests/install_sh_startup.rs 2
-crates/intentd-sitter/tests/sitter_update_e2e.rs 3
+crates/intentd-sitter/tests/sitter_update_e2e.rs 2
 crates/intentd/tests/common/mod.rs 6
 crates/intentd/tests/e2e_agent_features_gating.rs 1
 crates/intentd/tests/e2e_config_precedence.rs 1

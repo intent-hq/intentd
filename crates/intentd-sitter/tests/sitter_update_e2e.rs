@@ -26,6 +26,7 @@ use intentd_sitter::paths::{SitterPaths, DAEMON_BIN_NAME, DATA_DIR_ENV};
 use intentd_sitter::readiness::TIMEOUT_ENV as READINESS_TIMEOUT_ENV;
 use intentd_sitter::state::{self, SitterState};
 use intentd_sitter::supervisor::MANIFEST_BASE_URL_ENV;
+use intentd_test_support::GuardedChild;
 
 const SITTER_BIN: &str = env!("CARGO_BIN_EXE_intentd-sitter");
 
@@ -248,17 +249,19 @@ fn probeable_daemon(version: Option<&str>) -> Vec<u8> {
 }
 
 /// Stand in for a serve-mode sitter: a shell that logs SIGHUP receipt.
-/// Writing its pid to `sitter.pid` is exactly what serve mode does.
-fn spawn_fake_sitter(paths: &SitterPaths, hup_log: &Path) -> std::process::Child {
-    let child = Command::new("/bin/sh")
-        .arg("-c")
-        .arg(format!(
-            "trap 'echo HUP >> \"{}\"' HUP; while :; do sleep 0.1; done",
-            hup_log.display()
-        ))
-        .spawn()
-        .unwrap();
-    fs::create_dir_all(paths.pid_path.parent().unwrap()).unwrap();
+/// Writing its pid to `sitter.pid` is exactly what serve mode does. Guarded,
+/// and it stops by itself once the data dir is gone, so a test that panics
+/// before its `kill_tree()` can never leave it looping.
+fn spawn_fake_sitter(paths: &SitterPaths, hup_log: &Path) -> GuardedChild {
+    let data_dir = paths.pid_path.parent().unwrap();
+    fs::create_dir_all(data_dir).unwrap();
+    let child = GuardedChild::spawn(Command::new("/bin/sh").arg("-c").arg(format!(
+        // timing-guard: the stand-in sitter idles until killed or its data dir is gone
+        "trap 'echo HUP >> \"{}\"' HUP; while [ -d \"{}\" ]; do sleep 0.1; done",
+        hup_log.display(),
+        data_dir.display()
+    )))
+    .unwrap();
     fs::write(&paths.pid_path, format!("{}\n", child.id())).unwrap();
     child
 }
@@ -867,8 +870,7 @@ fn update_signals_running_supervised_sitter_then_waits_for_it() {
         "the supervised sitter must receive SIGHUP"
     );
 
-    let _ = fake_sitter.kill();
-    let _ = fake_sitter.wait();
+    let _ = fake_sitter.kill_tree();
 }
 
 #[test]
@@ -913,8 +915,7 @@ fn update_reports_the_old_daemon_still_answering_past_the_deadline() {
         Some("0.2.0")
     );
 
-    let _ = fake_sitter.kill();
-    let _ = fake_sitter.wait();
+    let _ = fake_sitter.kill_tree();
 }
 
 #[test]
@@ -948,8 +949,7 @@ fn update_reports_a_daemon_that_never_answers() {
         "no probe succeeded, so there is no version to report; stderr: {stderr}"
     );
 
-    let _ = fake_sitter.kill();
-    let _ = fake_sitter.wait();
+    let _ = fake_sitter.kill_tree();
 }
 
 #[test]
@@ -999,8 +999,7 @@ fn update_with_channel_override_skips_restart_of_mismatched_service() {
         "the supervised sitter must not receive SIGHUP on a channel mismatch"
     );
 
-    let _ = fake_sitter.kill();
-    let _ = fake_sitter.wait();
+    let _ = fake_sitter.kill_tree();
 }
 
 #[test]
@@ -1101,8 +1100,7 @@ fi
     let hup_log = dir.path().join("hup.log");
     let mut sitter = spawn_fake_sitter(&paths, &hup_log);
     let output = run_sitter_with_readiness_timeout(dir.path(), &base_url, 2000, &["update"]);
-    let _ = sitter.kill();
-    let _ = sitter.wait();
+    let _ = sitter.kill_tree();
     assert!(
         output.status.success(),
         "{}; count={:?}",

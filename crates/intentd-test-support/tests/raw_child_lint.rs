@@ -61,7 +61,6 @@ use intentd_test_support::source_lint::{lex, markers_by_line, rust_files, worksp
 const BASELINE: &[&str] = &[
     "crates/intentd-sitter/tests/install_ps1_owner.rs",
     "crates/intentd-sitter/tests/install_sh_startup.rs",
-    "crates/intentd-sitter/tests/sitter_update_e2e.rs",
     "crates/intentd/tests/common/mod.rs",
     "crates/intentd/tests/e2e_agent_features_gating.rs",
     "crates/intentd/tests/e2e_config_precedence.rs",
