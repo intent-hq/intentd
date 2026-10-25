@@ -39,6 +39,8 @@ crates/
 ├── intent-core/           # leaf: domain types, errors, Config, WorkspaceApi trait
 ├── intent-store/          # SQLite + sqlx + migrations
 ├── intent-services/       # WorkspaceApi implementation (business logic)
+├── intent-svc-transfer/   # feature crate: workspace transfer, above intent-services
+├── intent-app/            # composition root: registers the feature crates (compose)
 ├── intent-transport/      # UDS + WSS listeners, JSON-RPC router
 ├── intent-acp/            # ACP client + agent provider plumbing
 ├── intent-context/        # context engines (e.g. Auggie)
@@ -53,7 +55,8 @@ crates/
 ```
 
 The `intentd` binary is the only composition root that wires concrete implementations
-together. Dependency direction is enforced per the "Dependency-direction rules" in
+together; it registers the feature crates through `intent_app::compose`, and tests that
+need a feature crate together with `intent-transport` live in `crates/intent-app/tests/`. Dependency direction is enforced per the "Dependency-direction rules" in
 `../../docs/ARCHITECTURE.md` — `intent-core` is the leaf and `intent-transport` depends
 only on `intent-services`, never on `intent-store`.
 
