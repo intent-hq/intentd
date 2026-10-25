@@ -3,9 +3,10 @@ on:
   # Push-to-main runs the macOS release build, packaging and runtime
   # checks, and the Windows runtime validation (the `windows` job, install-ps1
   # and the Windows pi-session-paths legs). Windows never runs on
-  # pull_request; the merge queue runs only the Windows lint (`windows-lint`:
-  # native check + target-gated Clippy), so a Windows-only compile or lint
-  # error cannot reach main. The runtime proofs are post-merge only, and a red
+  # pull_request (PRs get only `windows-cross-lint`, Clippy for the Windows
+  # GNU target on Linux); the merge queue runs only the Windows lint
+  # (`windows-lint`: native check + target-gated Clippy), so a Windows-only
+  # compile or lint error cannot reach main. The runtime proofs are post-merge only, and a red
   # or unfinished push CI Gate on the main tip blocks the next alpha cut
   # (auto-cut-alpha.yml checks it before merging the Release PR). The main ruleset routes every merge
   # through the merge queue (see `merge_group` below) and blocks direct
@@ -22,8 +23,10 @@ on:
   # are completely unaffected.
   pull_request:
   # PRs run Linux metadata, formatting, routing-policy and static consumer
-  # checks plus the Linux `check` job (clippy, source lints) and
-  # `coverage-changed` (the PR's changed tests). The queue reruns both and
+  # checks plus the Linux `check` job (clippy, source lints),
+  # `windows-cross-lint` (Windows GNU-target Clippy on Linux) and
+  # `coverage-changed` (the PR's changed tests). The queue reruns `check` and
+  # `coverage-changed` (its native `windows-lint` replaces the cross lint) and
   # adds the Linux/macOS runtime matrices, the Windows lint and full
   # instrumented coverage on the merged tree (no Windows runtime proofs —
   # see `push` above); CI Gate enforces each
@@ -689,6 +692,72 @@ jobs:
         run: |
           echo "pwsh: $(command -v pwsh) ($(pwsh --version)); XDG_CACHE_HOME=$XDG_CACHE_HOME; ulimit -s: $(ulimit -s)"
           cargo test -p intentd-sitter --test install_ps1_owner
+  # Windows cross lint, pull requests only: Clippy for the Windows GNU target
+  # on a Linux runner, so a Windows-only lint error (an import only
+  # `#[cfg(unix)]` code uses, a `#[cfg(windows)]`-only warning) fails the PR
+  # instead of ejecting it from the merge queue an hour later (intentd#2672,
+  # merge-group run 40178615896; earlier #2555, #2556, #2579). PRs still never
+  # wait on a Windows runner. The build scripts that compile C for the target
+  # (libz-sys and friends, see the `build` job's Clippy comment) only need
+  # MinGW-w64 for the GNU target, an apt package. intentd has no
+  # `target_env = "msvc"` code, so the GNU target lints the same Windows code
+  # as MSVC; the queue-only native `windows-lint` job stays the final
+  # authority and catches any GNU/MSVC difference. Local equivalent:
+  # `make check-windows` from the monorepo root. Same `if` as `check`:
+  # same-repo PRs only (route success), skipped on release-metadata PRs.
+  # Runs on the 8-core WarpBuild runner from route's `cloud` mapping, never a
+  # self-hosted slot (the apt install needs sudo, which the slots lack).
+  windows-cross-lint:
+    if: ${{ !cancelled() && needs.route.result == 'success' && github.event_name == 'pull_request' && needs.release-fast-path.outputs.fast_path != 'true' }}
+    needs: [route, release-fast-path]
+    name: Windows cross lint (x86_64-pc-windows-gnu)
+    runs-on: ${{ fromJSON(needs.route.outputs.cloud || '{}')['gh-linux-8x'] || fromJSON('["warp-ubuntu-2404-x64-8x"]') }}
+    timeout-minutes: 25
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - uses: actions/checkout@v7
+      - name: Configure the self-hosted compiler cache
+        shell: bash
+        env:
+          INTENT_SCCACHE_ENDPOINT: ${{ vars.INTENT_SCCACHE_ENDPOINT }}
+          INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
+          INTENT_SCCACHE_MODE: ${{ vars.INTENT_SCCACHE_MODE }}
+        run: python3 scripts/setup-sccache.py
+      # The host build scripts need OpenSSL headers (as in `check`) and the
+      # target's C compiler. Retries cover concurrent apt runs (see `check`).
+      - name: Install MinGW-w64 and libssl-dev if missing
+        run: |
+          missing=()
+          command -v x86_64-w64-mingw32-gcc >/dev/null || missing+=(gcc-mingw-w64-x86-64)
+          pkg-config --exists openssl || missing+=(libssl-dev)
+          if [ "${#missing[@]}" -gt 0 ]; then
+            for i in 1 2 3; do
+              if sudo -n apt-get -o DPkg::Lock::Timeout=300 update -qq; then break; fi
+              if [ "$i" -eq 3 ]; then exit 1; fi
+              sleep $((i * 15))
+            done
+            sudo -n apt-get -o DPkg::Lock::Timeout=300 install -y -qq --no-install-recommends "${missing[@]}"
+          fi
+          x86_64-w64-mingw32-gcc --version | head -n1
+      - name: Resolve pinned Rust channel
+        id: toolchain
+        shell: bash
+        run: |
+          channel=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n1)
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-11 (PR 185, --force-non-host)
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+          targets: x86_64-pc-windows-gnu
+          components: clippy
+      - name: Clippy (Windows GNU target)
+        run: cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu -- -D warnings
   # Release metadata classification (intent-hq/monorepo#1374): retain the
   # audited diff-shape output and fail-safe script behavior. Native builds
   # and full coverage are now job-skipped on every PR, independent of this
@@ -2331,7 +2400,7 @@ jobs:
     name: CI Gate
     if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
-    needs: [route, pr-static, release-fast-path, cache-smoke, daemon-lifecycle, check, build, windows-lint, windows, macos-services-runtime, coverage-e2e, coverage-all, coverage-changed, pr-title, conflict-markers, monorepo-consumer-checks, deb-packaging, release-scripts, install-ps1, pi-session-paths]
+    needs: [route, pr-static, release-fast-path, cache-smoke, daemon-lifecycle, check, windows-cross-lint, build, windows-lint, windows, macos-services-runtime, coverage-e2e, coverage-all, coverage-changed, pr-title, conflict-markers, monorepo-consumer-checks, deb-packaging, release-scripts, install-ps1, pi-session-paths]
     steps:
       - name: Check results
         run: |
@@ -2357,6 +2426,7 @@ jobs:
               optional cache-smoke "${{ needs.cache-smoke.result }}"
               optional daemon-lifecycle "${{ needs.daemon-lifecycle.result }}"
               "$slow" check "${{ needs.check.result }}"
+              "$slow" windows-cross-lint "${{ needs.windows-cross-lint.result }}"
               optional build "${{ needs.build.result }}"
               optional windows-lint "${{ needs.windows-lint.result }}"
               optional windows "${{ needs.windows.result }}"
@@ -2378,6 +2448,7 @@ jobs:
               require cache-smoke "${{ needs.cache-smoke.result }}"
               require daemon-lifecycle "${{ needs.daemon-lifecycle.result }}"
               require check "${{ needs.check.result }}"
+              optional windows-cross-lint "${{ needs.windows-cross-lint.result }}"
               require build "${{ needs.build.result }}"
               require windows-lint "${{ needs.windows-lint.result }}"
               optional windows "${{ needs.windows.result }}"
@@ -2399,6 +2470,7 @@ jobs:
               optional cache-smoke "${{ needs.cache-smoke.result }}"
               optional daemon-lifecycle "${{ needs.daemon-lifecycle.result }}"
               optional check "${{ needs.check.result }}"
+              optional windows-cross-lint "${{ needs.windows-cross-lint.result }}"
               require build "${{ needs.build.result }}"
               optional windows-lint "${{ needs.windows-lint.result }}"
               require windows "${{ needs.windows.result }}"
