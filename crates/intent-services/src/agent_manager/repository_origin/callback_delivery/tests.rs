@@ -8,6 +8,7 @@ use crate::repository_admission::lifecycle::RepositorySourceLifetime;
 use crate::repository_admission::read_request::RepositoryReadRequest;
 use crate::repository_admission::request_context::{current_read_request, current_source_lifetime};
 use crate::repository_admission::AdmissionError;
+use crate::test_support::quota_script;
 use intent_acp::callback_registration::CallbackOffer;
 use intent_acp::mcp_server::request_context::{McpRequestContext, McpRequestScope};
 use intent_acp::{Connection, ConnectionHooks, IncomingNotification};
@@ -2010,17 +2011,7 @@ struct BudgetRequestTrace<'a> {
 
 impl<'a> BudgetRequestTrace<'a> {
     fn new(control: &'a NativeControl, subcase: &'static str, count: usize) -> Self {
-        let override_ms = std::env::var("INTENTD_WORKSPACE_API_TIMEOUT_MS").ok();
-        let budget_ms = override_ms
-            .as_deref()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .filter(|ms| *ms > 0)
-            .unwrap_or(30_000);
-        assert_eq!(
-            budget_ms, 30_000,
-            "these controls preserve the original server budget"
-        );
-        eprintln!("budget-request begin subcase={subcase} iterations={count} fixture_wait_ms={} server_budget_ms={budget_ms}", fixture_wait().as_millis());
+        eprintln!("budget-request begin subcase={subcase} iterations={count} fixture_wait_ms={}", fixture_wait().as_millis());
         Self {
             control,
             subcase,
@@ -2268,9 +2259,52 @@ struct NativeHarness {
     user: McpBridge,
 }
 
+/// The `workspace_api` budget of the confirmed server `origin` actually serves.
+fn served_budget(origin: &RepositoryOrigin) -> Duration {
+    origin
+        .state
+        .lock()
+        .unwrap()
+        .endpoint
+        .as_ref()
+        .expect("a delivered callback endpoint")
+        .served_workspace_api_timeout
+        .lock()
+        .unwrap()
+        .expect("the endpoint served a confirmed server")
+}
+
+/// One 63/64 acquisition-budget control script over the fixture peer's
+/// `fixture/call`, guarded by the shared quota script budget.
+async fn quota_fixture_call(
+    subcase: &str,
+    origin: &RepositoryOrigin,
+    connection: Arc<Connection>,
+    query: usize,
+    name: &str,
+    code: &str,
+) -> Value {
+    let params = json!({"query":query,"name":name,"code":code});
+    quota_script::guard(subcase, served_budget(origin), async move {
+        connection
+            .request_timeout("fixture/call", params, quota_script::QUOTA_TRANSPORT_WAIT)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("fixture/call: {error}: {:?}", connection.recent_stderr())
+            })
+    })
+    .await
+}
+
 impl NativeHarness {
     async fn new(stamp: &str, opt_in: bool, failed_anchor: bool) -> Self {
         Self::observed(stamp, opt_in, failed_anchor, None, None).await
+    }
+
+    /// A harness for a 63/64 acquisition control: every server its blueprint
+    /// builds carries the shared quota script budget; use [`Self::quota_call`].
+    async fn quota(control: Option<Arc<NativeControl>>) -> Self {
+        Self::build("3.0", true, false, control, None, true).await
     }
 
     async fn observed(
@@ -2279,6 +2313,17 @@ impl NativeHarness {
         failed_anchor: bool,
         control: Option<Arc<NativeControl>>,
         pending_control: Option<Arc<NativeControl>>,
+    ) -> Self {
+        Self::build(stamp, opt_in, failed_anchor, control, pending_control, false).await
+    }
+
+    async fn build(
+        stamp: &str,
+        opt_in: bool,
+        failed_anchor: bool,
+        control: Option<Arc<NativeControl>>,
+        pending_control: Option<Arc<NativeControl>>,
+        quota: bool,
     ) -> Self {
         use crate::agent_manager::{AgentManager, BusEventSink};
         use crate::events::EventBus;
@@ -2396,6 +2441,9 @@ impl NativeHarness {
                 .with_turn_attachments(Some(attachments.clone()))
         })
         .with_original_services(original.clone(), f.row.clone());
+        if quota {
+            blueprint.workspace_api_timeout = Some(quota_script::QUOTA_SCRIPT_BUDGET);
+        }
         if let Some(control) = control {
             blueprint.context_decorator = Some(Arc::new(move |context| control.wrap(context)));
         }
@@ -2612,6 +2660,11 @@ impl NativeHarness {
                 json!({"query":query,"name":name,"code":code}),
             )
             .await
+    }
+
+    async fn quota_call(&self, subcase: &str, query: usize, name: &str, code: &str) -> Value {
+        let connection = self.node.connection.clone();
+        quota_fixture_call(subcase, &self.origin, connection, query, name, code).await
     }
 
     async fn finish(self) {
@@ -2985,12 +3038,12 @@ async fn confirmed_read_caught_discarded_shared_root_and_budget_bind_every_origi
             budget_hosts: Some(Arc::new(BudgetHosts::default())),
             ..NativeControl::default()
         });
-        let h = NativeHarness::observed("3.0", true, false, Some(control.clone()), None).await;
+        let h = NativeHarness::quota(Some(control.clone())).await;
         h.start().await;
         let code = format!("for(let i=0;i<{count};i++) {{await ws.pr.snapshot(4);}} return 'bounded original success';");
         let name = h.confirmed(0).await;
         let mut trace = BudgetRequestTrace::new(&control, "original-read-budget", count);
-        let reply = h.call(0, &name, &code).await;
+        let reply = h.quota_call("original-read-budget", 0, &name, &code).await;
         trace.returned = true;
         drop(trace);
         assert_eq!(
@@ -4306,7 +4359,7 @@ mod confirmed_aliases {
                 budget_hosts: Some(Arc::new(BudgetHosts::default())),
                 ..NativeControl::default()
             });
-            let h = NativeHarness::observed("3.0", true, false, Some(control.clone()), None).await;
+            let h = NativeHarness::quota(Some(control.clone())).await;
             no_spill(&h);
             h.start().await;
             let code = format!(
@@ -4323,7 +4376,7 @@ mod confirmed_aliases {
             );
             let name = h.confirmed(0).await;
             let mut trace = BudgetRequestTrace::new(&control, "mixed-alias-budget", count);
-            let reply = h.call(0, &name, &code).await;
+            let reply = h.quota_call("mixed-alias-budget", 0, &name, &code).await;
             trace.returned = true;
             drop(trace);
             if count == 63 {
@@ -4776,11 +4829,12 @@ mod live_context {
         assert_eq!(failed.http.count(), 0);
         failed.finish().await;
 
-        let qualified = selected(None).await;
+        let qualified = NativeHarness::quota(None).await;
+        select(&qualified, RepositorySelectionChange::Automatic).await;
         qualified.start().await;
         // One lazy read plus 64 calls overflows the real original ledger.
         // Catching the acquisition error cannot manufacture a successful zero.
-        let refused = qualified.call(0, &qualified.confirmed(0).await,
+        let refused = qualified.quota_call("context-failed-seal", 0, &qualified.confirmed(0).await,
             "for(let i=0;i<64;i++){try{await ws.pr.snapshot(4);}catch(e){}} return 'must-not-escape-failed-seal';").await;
         assert!(
             refused
@@ -8518,6 +8572,20 @@ if(frame.method==='session/prompt' && promptErrors.length) {
         async fn prompts(&self) -> Vec<Value> {
             serde_json::from_value(self.rpc("fixture/prompts", json!({})).await).unwrap()
         }
+        /// Serve this launch's confirmed servers with the shared quota script
+        /// budget (before `start`); use [`Self::quota_call`].
+        fn quota_budget(&self) {
+            let origin = self.origin();
+            let mut state = origin.state.lock().unwrap();
+            Arc::get_mut(state.blueprint.as_mut().unwrap())
+                .unwrap()
+                .server
+                .workspace_api_timeout = Some(quota_script::QUOTA_SCRIPT_BUDGET);
+        }
+        async fn quota_call(&self, subcase: &str, query: usize, name: &str, code: &str) -> Value {
+            let origin = self.origin();
+            quota_fixture_call(subcase, &origin, self.connection(), query, name, code).await
+        }
         fn decorate(&self, control: Arc<NativeControl>) {
             let origin = self.origin();
             let mut state = origin.state.lock().unwrap();
@@ -8891,6 +8959,7 @@ if(frame.method==='session/prompt' && promptErrors.length) {
             h.create_only().await;
             let control = Arc::new(NativeControl::default());
             h.decorate(control.clone());
+            h.quota_budget();
             h.start().await.unwrap();
             let name = h.confirmed(0).await;
             let zero = h.call(0, &name, "return 'authentic zero';").await;
@@ -8938,7 +9007,8 @@ if(frame.method==='session/prompt' && promptErrors.length) {
                     .contains("Private result delivery refused"));
                 h.select(RepositorySelectionChange::Automatic).await;
                 let failed = h
-                    .call(
+                    .quota_call(
+                        "normal-launch-failed-seal",
                         0,
                         &h.confirmed(0).await,
                         "for(let i=0;i<64;i++){try{await ws.pr.snapshot(4)}catch(e){}} return 'caught is not zero';",

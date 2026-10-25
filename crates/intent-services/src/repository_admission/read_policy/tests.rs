@@ -295,44 +295,23 @@ async fn artifact_start_admits_one_original_job_before_io_and_response_revalidat
     }
 }
 
-// These controls fill one real acquisition ledger with 63/64 snapshot calls.
-// On a loaded host one call can take ~0.9s, so the production 30-second
-// `workspace_api` budget cut the loop short and its timeout surfaced as the
-// same refusal a full ledger returns. Give the script a generous fixed
-// budget, keep the outer hang guard above it (unscaled, so it always fires
-// before the nextest kill; the script budget is the load allowance), and fail
-// loudly if a run reaches the budget: the 63/64 outcome must come from the
-// ledger, never from the timer.
-// The quota tests' nextest hang guard is widened to match (.config/nextest.toml).
-const QUOTA_SCRIPT_BUDGET: Duration = Duration::from_secs(150);
-
+// These controls fill one real acquisition ledger with 63/64 snapshot calls
+// under the shared quota script budget (test_support::quota_script), which
+// fails loudly if a run reaches that budget: the 63/64 outcome must come from
+// the ledger, never from the timer.
 async fn run_quota(server: WorkspaceMcpServer, code: &str, control: &Control) -> serde_json::Value {
-    let server = server.with_workspace_api_timeout(QUOTA_SCRIPT_BUDGET);
-    let started = std::time::Instant::now();
-    // fixed-deadline: allow — unscaled so it stays under the 540s nextest kill
-    let result = tokio::time::timeout(
-        QUOTA_SCRIPT_BUDGET + Duration::from_secs(30),
+    use crate::test_support::quota_script;
+    let server = quota_script::budget(server);
+    let result = quota_script::guard(
+        "read-policy-quota",
+        server.workspace_api_timeout(),
         server.handle_message(&crate::repository_read_source::tests::call(code)),
     )
     .await;
-    let elapsed = started.elapsed();
     eprintln!(
-        "quota result_ready={} elapsed_ms={} records={} events={:?}",
-        result.is_ok(),
-        elapsed.as_millis(),
+        "quota records={} events={:?}",
         control.records.lock().unwrap().len(),
         control.events.lock().unwrap()
-    );
-    let Ok(result) = result else {
-        panic!(
-            "quota dispatch hung past its {QUOTA_SCRIPT_BUDGET:?} script budget; \
-             the outer hang guard expired after {elapsed:?}"
-        );
-    };
-    assert!(
-        elapsed < QUOTA_SCRIPT_BUDGET,
-        "quota script hit its {QUOTA_SCRIPT_BUDGET:?} time limit after {elapsed:?}; \
-         its reply reflects the timer, not the acquisition ledger"
     );
     result.unwrap()
 }
