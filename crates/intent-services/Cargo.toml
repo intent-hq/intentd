@@ -65,6 +65,7 @@ tracing-subscriber.workspace = true
 intentd-test-support = { path = "../intentd-test-support" }
 intent-providers = { path = "../intent-providers", version = "0.11.44", features = ["test-support"] }
 intent-store = { path = "../intent-store", version = "0.11.44", features = ["test-support"] }
+intent-acp = { path = "../intent-acp", version = "0.11.44", features = ["test-hooks"] }
 
 [target."cfg(unix)".dependencies]
 nix = { workspace = true, features = ["signal", "process", "fs"] }

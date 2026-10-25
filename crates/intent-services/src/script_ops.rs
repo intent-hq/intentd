@@ -3352,14 +3352,54 @@ mod tests {
         Duration::from_secs_f64(secs)
     }
 
+    /// The test names of a nextest override filter that selects only an exact
+    /// list of tests: `test(=a) | test(=b)`, optionally scoped as
+    /// `binary_id(=crate) & (…)`. `None` for any other shape, which might
+    /// select tests nobody named.
+    fn exact_override_test_names(filter: &str) -> Option<Vec<&str>> {
+        let mut rest = filter.trim();
+        if let Some(scoped) = rest.strip_prefix("binary_id(=") {
+            let (_, tail) = scoped.split_once(')')?;
+            let inner = tail.trim_start().strip_prefix('&')?.trim();
+            rest = inner.strip_prefix('(')?.strip_suffix(')')?.trim();
+        }
+        rest.split('|')
+            .map(|term| {
+                let name = term.trim().strip_prefix("test(=")?.strip_suffix(')')?;
+                (!name.is_empty() && !name.contains(['(', ')', '&', '|'])).then_some(name)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn exact_override_test_names_accepts_only_exact_name_lists() {
+        assert_eq!(
+            exact_override_test_names("binary_id(=intent-services) & (test(=a::b) | test(=c))"),
+            Some(vec!["a::b", "c"])
+        );
+        assert_eq!(exact_override_test_names("test(=a)"), Some(vec!["a"]));
+        for broad in [
+            "binary_id(=intent-services)",
+            "binary_id(=intent-services) | test(=a)",
+            "test(/script_ops::/)",
+            "test(=a) | test(/b/)",
+            "not test(=a)",
+            "test(=a) & test(=b)",
+            "test(=)",
+        ] {
+            assert_eq!(exact_override_test_names(broad), None, "{broad}");
+        }
+    }
+
     /// Pins the ordering `LIVENESS` relies on (intent-hq/intentd#1822): a
     /// stalled harness wait must expire, print its diagnostic, and tear down
     /// before nextest's `slow-timeout` kill (`period × terminate-after`) from
     /// the real `.config/nextest.toml`, so the two numbers cannot drift apart
-    /// silently. No `[[profile.default.overrides]]` entry sets `slow-timeout`
-    /// (none matches `intent-services` tests either), so the `[profile.default]`
-    /// budget is the one that applies; the test fails loudly if that changes so
-    /// it can be taught which override governs this crate.
+    /// silently. A `[[profile.default.overrides]]` entry may set `slow-timeout`
+    /// only for an exact list of named tests outside `script_ops` (see
+    /// [`exact_override_test_names`]), so the `[profile.default]` budget is the
+    /// one that applies here; any broader override fails loudly so the test can
+    /// be taught which override governs this module.
     #[test]
     fn liveness_deadline_fits_inside_nextest_terminate_budget() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../.config/nextest.toml");
@@ -3392,11 +3432,18 @@ mod tests {
                     .collect()
             })
             .unwrap_or_default();
+        let governing: Vec<&String> = overrides_with_slow_timeout
+            .iter()
+            .filter(|filter| {
+                exact_override_test_names(filter)
+                    .is_none_or(|names| names.iter().any(|name| name.starts_with("script_ops::")))
+            })
+            .collect();
         assert!(
-            overrides_with_slow_timeout.is_empty(),
-            "{path}: [[profile.default.overrides]] entries now carry `slow-timeout` \
-             (filters: {overrides_with_slow_timeout:?}); extend this test to determine \
-             which override applies to intent-services tests before trusting the \
+            governing.is_empty(),
+            "{path}: [[profile.default.overrides]] entries with `slow-timeout` may \
+             cover script_ops tests (filters: {governing:?}); extend this test to \
+             determine which override applies to them before trusting the \
              [profile.default] budget"
         );
 
