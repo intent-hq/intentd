@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.42] - 2026-10-25
+
+### 📚 Documentation
+
+- *(guide)* Finished-agent toast skips the chat you're viewing ([#2654](https://github.com/intent-hq/intentd/pull/2654))
+
+
 ## [0.11.41] - 2026-10-24
 
 ### 🐛 Bug Fixes
