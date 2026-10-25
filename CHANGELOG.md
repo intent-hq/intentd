@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.42] - 2026-10-25
+
+### 🚀 Features
+
+- *(scripts)* Arm a completion monitor when an agent starts a script ([#2617](https://github.com/intent-hq/intentd/pull/2617))
+
+### 📚 Documentation
+
+- *(guide)* Finished-agent toast skips the chat you're viewing ([#2654](https://github.com/intent-hq/intentd/pull/2654))
+
+### 🧪 Testing
+
+- *(intentd)* Wait for persisted idle before SIGKILL in codex effort e2e ([#2652](https://github.com/intent-hq/intentd/pull/2652))
+
+
 ## [0.11.41] - 2026-10-24
 
 ### 🐛 Bug Fixes
