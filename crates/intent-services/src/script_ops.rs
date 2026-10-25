@@ -1838,7 +1838,21 @@ impl ScriptManager {
             let lock = mgr.locks.definition_lock(&id);
             let _guard = lock.lock().await;
             mgr.require_admission(&ws, &id).await?;
-            mgr.refuse_if_retired_locked(&ws).await?;
+            // A live or admitted script cannot belong to a retired
+            // workspace: retirement stops every one under its closing mark
+            // (and this lock) before the row flips, and launches are refused
+            // from the mark on. Only an idle entry needs the row read, which
+            // keeps a stop racing a launch window free of an extra store
+            // round trip before it raises the stop flag.
+            let live = mgr
+                .scripts
+                .lock()
+                .unwrap()
+                .get(&(ws.clone(), id.clone()))
+                .is_some_and(|m| mgr.entry_is_live_or_admitted(m));
+            if !live {
+                mgr.refuse_if_retired_locked(&ws).await?;
+            }
             mgr.ensure_known_locked(&ws, &id).await?;
             mgr.stop_inner(&ws, &id, true).await
         })
