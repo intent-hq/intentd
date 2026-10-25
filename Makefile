@@ -13,7 +13,7 @@
 # skipping suites that need CI-only tooling (scripts/release-scripts-local.py).
 
 MONOREPO_ROOT := ../..
-FORWARDED_TARGETS := check test test-changed test-select gate list-tests coverage-changed fmt clippy lint-sources
+FORWARDED_TARGETS := check test test-changed test-select gate list-tests coverage-changed fmt clippy check-windows lint-sources
 
 # Forward only to the intent monorepo: an unrelated Makefile two levels up
 # must not be mistaken for it, so ../../.gitmodules has to name this path.

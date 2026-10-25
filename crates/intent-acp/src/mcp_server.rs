@@ -320,7 +320,10 @@ impl WorkspaceMcpServer {
     /// (30s default, `INTENTD_WORKSPACE_API_TIMEOUT_MS` override, or the
     /// builder override above). The bridge derives its dispatch watchdog
     /// deadline from this so the two budgets can never cross (monorepo#2709).
-    pub(crate) fn workspace_api_timeout(&self) -> Duration {
+    /// Public so other crates' load-bound controls can prove which budget the
+    /// server they actually serve carries.
+    #[must_use]
+    pub fn workspace_api_timeout(&self) -> Duration {
         self.workspace_api_timeout
     }
 
