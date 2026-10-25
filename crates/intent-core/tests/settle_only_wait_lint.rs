@@ -26,6 +26,8 @@
 //!   the use or above the first line of its statement (so a method chain
 //!   rustfmt breaks across lines can carry the marker above the receiver);
 //! - such a marker with no reason;
+//! - a second use claiming a marker another use already claimed (one stated
+//!   reason per use, even inside one multi-line statement);
 //! - a stale marker: one on the line above no use.
 //!
 //! Comments and string literals are blanked by the shared lexer first, so a
@@ -62,6 +64,12 @@ fn is_definition(chars: &[char], start: usize) -> bool {
 
 /// Violations in one file, as `file:line: <what>` lines.
 fn offenders_in(rel: &str, src: &str) -> Vec<String> {
+    scan(rel, src).0
+}
+
+/// [`offenders_in`] plus the number of uses (the definition excluded), from
+/// one pass of the lexer.
+fn scan(rel: &str, src: &str) -> (Vec<String>, usize) {
     let lexed = lex(src);
     let markers = markers_by_line(src, &lexed.line_comments, TAG);
     let marker_at = |line: usize| markers.get(line).copied().unwrap_or(Marker::Absent);
@@ -69,6 +77,8 @@ fn offenders_in(rel: &str, src: &str) -> Vec<String> {
     let needle: Vec<char> = METHOD.chars().collect();
     let mut out = Vec::new();
     let mut covering_lines = Vec::new();
+    let mut claimed = Vec::new();
+    let mut uses = 0;
     let mut i = 0;
     while i + needle.len() <= chars.len() {
         let bounded = chars[i..i + needle.len()] == needle[..]
@@ -80,6 +90,7 @@ fn offenders_in(rel: &str, src: &str) -> Vec<String> {
         }
         let line = chars[..i].iter().filter(|c| **c == '\n').count() + 1;
         if !is_definition(&chars, i) {
+            uses += 1;
             let candidates: Vec<usize> = [line, statement_line(&chars, i)]
                 .into_iter()
                 .filter(|l| *l > 1)
@@ -87,7 +98,21 @@ fn offenders_in(rel: &str, src: &str) -> Vec<String> {
                 .collect();
             covering_lines.extend(candidates.iter().copied());
             let states: Vec<Marker> = candidates.iter().map(|l| marker_at(*l)).collect();
-            if states.contains(&Marker::WithReason) {
+            let marked = candidates
+                .iter()
+                .copied()
+                .find(|l| marker_at(*l) == Marker::WithReason);
+            if let Some(marker_line) = marked {
+                // One marker states the reason for one use: a second use in
+                // the same multi-line statement needs its own.
+                if claimed.contains(&marker_line) {
+                    out.push(format!(
+                        "{rel}:{line}: the `// {TAG}: allow` marker on line {marker_line} already \
+                         covers another `{METHOD}` use; give this one its own marker"
+                    ));
+                } else {
+                    claimed.push(marker_line);
+                }
                 i += needle.len();
                 continue;
             }
@@ -114,7 +139,7 @@ fn offenders_in(rel: &str, src: &str) -> Vec<String> {
         }
     }
     out.sort();
-    out
+    (out, uses)
 }
 
 #[test]
@@ -139,12 +164,13 @@ fn settle_only_wait_is_marked_with_a_reason() {
         if !text.contains(METHOD) && !text.contains(TAG) {
             continue;
         }
-        uses += lex(&text).blanked.matches(METHOD).count();
-        offenders.extend(offenders_in(&rel, &text));
+        let (found, n) = scan(&rel, &text);
+        uses += n;
+        offenders.extend(found);
     }
     assert!(
         uses > 0,
-        "`{METHOD}` no longer appears under crates/: retire or retarget this lint"
+        "`{METHOD}` is no longer used under crates/: retire it and this lint"
     );
     assert!(
         offenders.is_empty(),
@@ -235,4 +261,26 @@ fn definition_comments_strings_and_longer_names_are_ignored() {
 fn path_reference_counts_as_a_use() {
     let src = "fn f() {\n    let w = SubHandle::wait_settled_even_if_failed;\n}\n";
     assert_eq!(offenders_in("a.rs", src).len(), 1);
+}
+
+#[test]
+fn one_marker_covers_one_use_only() {
+    let src = "async fn t() {\n    // settle-only-wait: allow — asserts the failure\n    \
+               let _ = tokio::join!(\n        a.wait_settled_even_if_failed(T),\n        \
+               b.wait_settled_even_if_failed(T)\n    );\n}\n";
+    let got = offenders_in("a.rs", src);
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert!(
+        got[0].starts_with("a.rs:5:") && got[0].contains("already covers"),
+        "{got:?}"
+    );
+}
+
+#[test]
+fn use_count_excludes_the_definition() {
+    let def = "impl S {\n    async fn wait_settled_even_if_failed(&self) {}\n}\n";
+    assert_eq!(scan("a.rs", def).1, 0);
+    let call =
+        "fn f() {\n    // settle-only-wait: allow — x\n    s.wait_settled_even_if_failed(T);\n}\n";
+    assert_eq!(scan("a.rs", call), (Vec::new(), 1));
 }

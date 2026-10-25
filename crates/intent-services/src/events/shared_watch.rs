@@ -1198,13 +1198,16 @@ impl SharedWatchHub {
     /// registry has subscribed at all, when "nothing is pending" is trivially
     /// true. The wait does not finish until at least that many roots exist.
     ///
-    /// Like [`RegistrationProbe::wait_live`], a root settled as failed while
-    /// its group has no watcher yet is being retried, so the wait rides that
-    /// out rather than returning on it (intent-hq/intent#4845 / #4852 — a
-    /// settle-only wait let the test write before any OS watch existed).
-    /// Panics, naming every root that is not live with its registration state
-    /// and the OS watch limits, when a root failed with its group's watcher
-    /// live (nothing will retry that) or when `timeout` elapses.
+    /// A root that is not live keeps the wait going whatever its state: a
+    /// root settled as failed while its group has no watcher is re-registered
+    /// by the creation retry (intent-hq/intent#4845 / #4852 — a settle-only
+    /// wait let the test write before any OS watch existed), and unlike
+    /// [`RegistrationProbe::wait_live`] this hub-wide wait also sees roots a
+    /// [`super::root_watch::RootWatch`] owns, whose loop drops a failed
+    /// subscription and re-subscribes with backoff even while the group's
+    /// watcher is live — so "failed with the watcher live" is not dead here,
+    /// and there is no fail-fast. On `timeout` it panics naming every root
+    /// that is not live with its registration state, plus the OS watch limits.
     #[cfg(test)]
     pub(super) async fn wait_all_established(
         &self,
@@ -1213,47 +1216,49 @@ impl SharedWatchHub {
     ) {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
-            let (count, not_live, dead) = {
+            let (count, not_live) = {
                 let state = match self.state.lock() {
                     Ok(state) => state,
                     Err(e) => e.into_inner(),
                 };
                 let mut count = 0;
                 let mut not_live = Vec::new();
-                let mut dead = false;
                 for group in state.groups.values() {
-                    let watcher_live = group.watcher_live.load(Ordering::Acquire);
                     for (path, root) in &group.roots {
                         count += 1;
-                        if root.registration.live() {
-                            continue;
+                        if !root.registration.live() {
+                            not_live.push((
+                                path.clone(),
+                                Arc::clone(&root.registration),
+                                Arc::clone(&group.watcher_live),
+                            ));
                         }
-                        dead |= watcher_live && root.registration.failed();
-                        not_live.push(format!(
-                            "{} (registration {}, group watcher live: {watcher_live})",
-                            path.display(),
-                            root.registration.diagnose()
-                        ));
                     }
                 }
-                not_live.sort();
-                (count, not_live, dead)
+                (count, not_live)
             };
             if count >= expect_roots && not_live.is_empty() {
                 return;
             }
-            assert!(
-                !dead,
-                "shared watch registration failed with the group's watcher live; roots not live: [{}]; {}",
-                not_live.join(", "),
-                watch_capacity_diagnostics()
-            );
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "{count} of at least {expect_roots} shared watch roots requested, not all live within {timeout:?}; roots not live: [{}]; {}",
-                not_live.join(", "),
-                watch_capacity_diagnostics()
-            );
+            if tokio::time::Instant::now() >= deadline {
+                let mut roots: Vec<String> = not_live
+                    .iter()
+                    .map(|(path, registration, watcher_live)| {
+                        format!(
+                            "{} (registration {}, group watcher live: {})",
+                            path.display(),
+                            registration.diagnose(),
+                            watcher_live.load(Ordering::Acquire)
+                        )
+                    })
+                    .collect();
+                roots.sort();
+                panic!(
+                    "{count} of at least {expect_roots} shared watch roots requested, not all live within {timeout:?}; roots not live: [{}]; {}",
+                    roots.join(", "),
+                    watch_capacity_diagnostics()
+                );
+            }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     }
@@ -4343,14 +4348,15 @@ mod tests {
         );
     }
 
-    /// A root whose own `watch()` failed while its group's watcher is live
-    /// will never be retried, so `wait_all_established` fails at once naming
-    /// that root and its cause instead of returning (the old settle-only
-    /// behavior) or idling into its timeout.
+    /// A root whose own `watch()` failed is not live, so
+    /// `wait_all_established` does not return on it (the old settle-only
+    /// behavior did): it panics at its timeout naming that root and its
+    /// cause, and not the live root beside it. No fail-fast: hub-wide, a
+    /// failed root may belong to a `RootWatch` that is about to re-subscribe.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     #[expect(clippy::await_holding_lock)]
-    async fn wait_all_established_panics_on_a_root_that_will_not_be_retried() {
+    async fn wait_all_established_times_out_naming_roots_that_are_not_live() {
         let _serial = crate::events::WATCHER_TEST_SERIAL
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -4368,7 +4374,8 @@ mod tests {
         sub_healthy.wait_established(LIVENESS).await;
         let (_sub_faulty, _rx_faulty, faulty) = hub.subscribe(&faulty);
         let waiter = Arc::clone(&hub);
-        let panic = tokio::spawn(async move { waiter.wait_all_established(2, LIVENESS).await })
+        let budget = intentd_test_support::test_timeout(Duration::from_secs(2));
+        let panic = tokio::spawn(async move { waiter.wait_all_established(2, budget).await })
             .await
             .expect_err("wait_all_established must not return with a dead root");
         let message = panic
@@ -4377,7 +4384,8 @@ mod tests {
             .map(|m| *m)
             .expect("assert! panics with a formatted String");
         assert!(
-            message.starts_with("shared watch registration failed with the group's watcher live"),
+            message
+                .starts_with("2 of at least 2 shared watch roots requested, not all live within"),
             "{message}"
         );
         assert!(
