@@ -1976,7 +1976,9 @@ jobs:
   # genuine lint fails fast), plus the
   # stubbed-cargo harness for scripts/changed-tests.sh (the changed-tests
   # selection the monorepo's `make test-changed` delegates to, and its
-  # --instrumented llvm-cov form; intent-hq/intentd#1947), and the stub-root
+  # --instrumented llvm-cov form; intent-hq/intentd#1947) plus a check that
+  # every entry of its end-to-end map (.config/e2e-test-map.txt) still names
+  # an existing source path, test binary and module, and the stub-root
   # harness for the repo-root Makefile (every gate target forwards to the
   # monorepo root make with its command-line variables; a standalone clone or
   # an unrelated parent Makefile gets the exit-2 refusal). It also rejects
@@ -2085,6 +2087,10 @@ jobs:
           python3 -I -B scripts/test-macos-ci-workflows.py
       - name: Test changed-tests.sh
         run: python3 -S scripts/test-changed-tests-stdin.py
+      # A renamed or deleted test module or source file would otherwise leave
+      # a map entry that silently selects nothing (intentd#2617).
+      - name: Check the end-to-end test map
+        run: ./scripts/changed-tests.sh --check-map
       - name: Test the Makefile gate forwarder
         run: ./scripts/test-makefile-forwarder.sh
       - name: Test the ACP adapter rolling pin PR automation

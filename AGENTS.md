@@ -234,7 +234,7 @@ standalone clone they exit 2 and name the monorepo command):
 ```bash
 make check    # cargo fmt --check + cargo clippy --workspace --all-targets -- -D warnings
 make test     # cargo nextest run --workspace (resumable; see the root AGENTS.md)
-make test-changed  # nextest for only the crates this branch touched vs origin/main (BASE=<ref>); falls back to make test on manifest/lockfile/nextest-config changes
+make test-changed  # nextest for only the crates this branch touched vs origin/main (BASE=<ref>); falls back to make test on manifest/lockfile/nextest-config changes; also runs the end-to-end modules .config/e2e-test-map.txt maps changed source to — add an entry when an end-to-end test exercises another crate's source (scripts/changed-tests.sh --check-map validates it)
 make test-select E='test(/name/)'  # just the tests matching one nextest filterset, with make test's fixtures and gate-run record — use it to iterate on a few tests
 make coverage-changed  # the same changed selection under cargo llvm-cov (BASE=<ref>, DRY_RUN=1 prints the plan) — the local equivalent of CI's coverage-changed job (PRs and merge queue)
 make gate     # check, then test
