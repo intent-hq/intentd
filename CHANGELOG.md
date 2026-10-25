@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.43] - 2026-10-25
+
+### 🐛 Bug Fixes
+
+- *(store)* Retry write-pool acquire timeouts in delete sweeps ([#2658](https://github.com/intent-hq/intentd/pull/2658))
+
+
 ## [0.11.42] - 2026-10-25
 
 ### 🚀 Features
