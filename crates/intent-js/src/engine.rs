@@ -29,7 +29,9 @@ const HOST_BRIDGE_JS: &str = r#"
                 throw new TypeError("host(arg): argument is not JSON-serializable");
             }
             const reply = await raw(stringified);
-            const frame = reply == null ? { ok: true, value: null } : reply;
+            const frame = reply == null
+                ? { ok: true, value: null }
+                : typeof reply === "string" ? JSON.parse(reply) : reply;
             if (!frame.ok) {
                 throw new Error(String(frame.error ?? "host call failed"));
             }
@@ -269,14 +271,14 @@ struct HostFrame(String);
 impl<'js> IntoJs<'js> for HostFrame {
     fn into_js(self, ctx: &Ctx<'js>) -> rquickjs::Result<Value<'js>> {
         let encoded_len = self.0.len();
-        let decoded = serde_json::from_str::<serde_json::Value>(&self.0);
-        drop(self.0);
-        let frame = match decoded {
-            Ok(frame) => frame,
-            Err(e) => {
-                return error_frame(ctx, &format!("engine: malformed host reply frame: {e}"));
-            }
+        // Not decodable here (in practice only nesting past serde_json's
+        // recursion limit): hand the text to the bridge's `JSON.parse`, the
+        // previous path, which has no such depth limit.
+        let Ok(frame) = serde_json::from_str::<serde_json::Value>(&self.0) else {
+            return rquickjs::String::from_str(ctx.clone(), &self.0)
+                .map(rquickjs::String::into_value);
         };
+        drop(self.0);
         let built = json_to_js(ctx, &frame);
         drop(frame);
         match built {

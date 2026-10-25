@@ -404,3 +404,26 @@ async fn host_reply_ignores_prototype_setters() {
     assert_eq!(out["own"], serde_json::json!(["items", "ok"]));
     assert_eq!(out["hits"], serde_json::json!(0));
 }
+
+/// Replies nested deeper than `serde_json`'s recursion limit still arrive
+/// (via the bridge's `JSON.parse` fallback), as they did before #7688.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deeply_nested_host_reply_still_round_trips() {
+    let host: HostFn = Arc::new(|_| {
+        Box::pin(async {
+            let mut v = serde_json::json!("leaf");
+            for _ in 0..200 {
+                v = serde_json::json!([v]);
+            }
+            Ok(v)
+        })
+    });
+    let out = eval(
+        "let v = await host(null); let d = 0; while (Array.isArray(v)) { v = v[0]; d++; } return [d, v];",
+        &EvalOptions::default(),
+        Some(host),
+    )
+    .await
+    .expect("deep reply round-trips");
+    assert_eq!(out, serde_json::json!([200, "leaf"]));
+}
