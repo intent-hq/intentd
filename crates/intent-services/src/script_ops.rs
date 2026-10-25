@@ -7216,7 +7216,7 @@ mod tests {
         let mgr = h.services.script_manager();
         let pending = intent_core::ScriptLastRun {
             run_id: Some("prior-run".to_string()),
-            outcome: ScriptRunOutcome::Succeeded,
+            outcome: intent_core::ScriptRunOutcome::Succeeded,
             exit_code: Some(0),
             started_at: Some(now_iso()),
             stopped_at: now_iso(),
