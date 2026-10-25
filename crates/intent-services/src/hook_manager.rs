@@ -2489,6 +2489,7 @@ mod tests {
             context_links: None,
             archived: false,
             archived_at: None,
+            retired_at: None,
             task_stats: None,
             agent_summary: None,
             diff_summary: None,
@@ -3749,7 +3750,15 @@ mod tests {
         assert_eq!(hook.state, HookState::Scheduled);
         assert_eq!(hook.dispatch_count, 0);
         probe.content = "go".to_string();
-        svc.store().update_note(&probe).await.unwrap();
+        svc.store()
+            .update_note(
+                &svc.store()
+                    .lock_note_content(&probe.workspace_id, &probe.id)
+                    .await,
+                &probe,
+            )
+            .await
+            .unwrap();
 
         for fire in 1..=2 {
             svc.hook_run_now_op(&ws, &hook.hook_id)
@@ -3814,7 +3823,15 @@ mod tests {
         wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Running).await;
         skew.store(120_000, std::sync::atomic::Ordering::SeqCst);
         gate.content = "go".to_string();
-        svc.store().update_note(&gate).await.unwrap();
+        svc.store()
+            .update_note(
+                &svc.store()
+                    .lock_note_content(&gate.workspace_id, &gate.id)
+                    .await,
+                &gate,
+            )
+            .await
+            .unwrap();
         let expired = wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Expired).await;
         assert_eq!(expired.run_count, 1);
         assert_eq!(expired.dispatch_count, 1, "the fire still counted");
@@ -4070,7 +4087,15 @@ mod tests {
         let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
         assert_eq!(hook.state, HookState::Scheduled);
         probe.content = "go".to_string();
-        svc.store().update_note(&probe).await.unwrap();
+        svc.store()
+            .update_note(
+                &svc.store()
+                    .lock_note_content(&probe.workspace_id, &probe.id)
+                    .await,
+                &probe,
+            )
+            .await
+            .unwrap();
         svc.hook_run_now_op(&ws, &hook.hook_id)
             .await
             .expect("runNow");
@@ -4146,7 +4171,15 @@ mod tests {
             .unwrap();
         let parent: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
         probe.content = "go".into();
-        svc.store.update_note(&probe).await.unwrap();
+        svc.store
+            .update_note(
+                &svc.store
+                    .lock_note_content(&probe.workspace_id, &probe.id)
+                    .await,
+                &probe,
+            )
+            .await
+            .unwrap();
         svc.hook_run_now_op(&ws, &parent.hook_id).await.unwrap();
         tokio::time::timeout(poll_deadline(), park.entered.notified())
             .await
@@ -4239,7 +4272,15 @@ mod tests {
         })).await.unwrap();
         let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
         probe.content = "go".into();
-        svc.store().update_note(&probe).await.unwrap();
+        svc.store()
+            .update_note(
+                &svc.store()
+                    .lock_note_content(&probe.workspace_id, &probe.id)
+                    .await,
+                &probe,
+            )
+            .await
+            .unwrap();
         svc.hook_run_now_op(&ws, &hook.hook_id).await.unwrap();
         tokio::time::timeout(poll_deadline(), park.entered.notified())
             .await
@@ -4628,7 +4669,15 @@ mod tests {
             .await
             .expect("gate note");
         gate.content = "go".to_string();
-        svc.store().update_note(&gate).await.unwrap();
+        svc.store()
+            .update_note(
+                &svc.store()
+                    .lock_note_content(&gate.workspace_id, &gate.id)
+                    .await,
+                &gate,
+            )
+            .await
+            .unwrap();
     }
 
     /// Number of the owner's persisted messages containing `needle`.
@@ -5155,6 +5204,55 @@ mod tests {
         assert!(text.contains("cancelled"), "{text}");
     }
 
+    /// `workspace.retire` on an Active workspace runs the archive teardown
+    /// first, so every ACTIVE hook is cancelled exactly as on archive: task
+    /// aborted, row `cancelled`, `hook:cancelled` emitted.
+    #[intent_test_macros::daemon_test]
+    async fn workspace_retire_from_active_cancels_active_hooks() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({
+                    "name": "watching",
+                    "code": "return { dispatch: false };",
+                    "delayMs": 600_000,
+                }),
+            )
+            .await
+            .expect("schedule active");
+        let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
+        assert!(svc.hook_task_alive(&hook.hook_id));
+        // Retire only admits a git worktree checkout: give the row one.
+        let scratch = crate::test_support::test_tempdir("intentd-retire-wt-");
+        let mut row = svc.store().get_workspace(&ws).await.unwrap();
+        row.repository_path = Some(scratch.path().join("repo").to_string_lossy().into_owned());
+        row.worktree_path = Some(
+            svc.workspaces_root
+                .clone()
+                .expect("test workspaces root")
+                .join(ws.as_str())
+                .join("wt")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        row.checkout_mode = Some(intent_core::CheckoutMode::Worktree);
+        svc.store().update_workspace(&row).await.unwrap();
+
+        let retired = svc
+            .retire_workspace(ws.clone(), None)
+            .await
+            .expect("retire");
+        assert_eq!(retired.status, intent_core::WorkspaceStatus::Retired);
+
+        assert!(!svc.hook_task_alive(&hook.hook_id), "hook task aborted");
+        let stored = svc.store().get_hook(&hook.hook_id).await.unwrap();
+        assert_eq!(stored.state, HookState::Cancelled);
+        let types = hook_event_types(&svc, &ws, &[HOOK_CANCELLED]).await;
+        assert!(types.contains(&HOOK_CANCELLED.to_string()), "{types:?}");
+    }
+
     /// Retire sweep (`ws.agent.retire`): the retiring agent's ACTIVE hooks
     /// are cancelled through the shared transition — task aborted, row
     /// `cancelled`, `nextRunAt` cleared, `hook:cancelled` emitted — with NO
@@ -5367,7 +5465,15 @@ mod tests {
         let archiver: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
         assert_eq!(archiver.state, HookState::Scheduled);
         probe.content = "go".to_string();
-        svc.store().update_note(&probe).await.unwrap();
+        svc.store()
+            .update_note(
+                &svc.store()
+                    .lock_note_content(&probe.workspace_id, &probe.id)
+                    .await,
+                &probe,
+            )
+            .await
+            .unwrap();
         svc.hook_run_now_op(&ws, &archiver.hook_id)
             .await
             .expect("runNow");
@@ -5608,7 +5714,15 @@ mod tests {
             .expect("schedule");
         let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
         probe.content = "go".to_string();
-        svc.store().update_note(&probe).await.unwrap();
+        svc.store()
+            .update_note(
+                &svc.store()
+                    .lock_note_content(&probe.workspace_id, &probe.id)
+                    .await,
+                &probe,
+            )
+            .await
+            .unwrap();
         svc.hook_run_now_op(&ws, &hook.hook_id)
             .await
             .expect("runNow");
@@ -6800,7 +6914,15 @@ mod tests {
         );
         // A recovered run clears the warning.
         probe.content = "ok".to_string();
-        svc.store().update_note(&probe).await.unwrap();
+        svc.store()
+            .update_note(
+                &svc.store()
+                    .lock_note_content(&probe.workspace_id, &probe.id)
+                    .await,
+                &probe,
+            )
+            .await
+            .unwrap();
         svc.hook_run_now_op(&ws, &hook.hook_id)
             .await
             .expect("runNow");
@@ -6865,7 +6987,15 @@ mod tests {
         assert_eq!(hook.last_state.as_deref(), Some("{\"armed\":true}"));
         // `state: null` clears it.
         probe.content = "clear".to_string();
-        svc.store().update_note(&probe).await.unwrap();
+        svc.store()
+            .update_note(
+                &svc.store()
+                    .lock_note_content(&probe.workspace_id, &probe.id)
+                    .await,
+                &probe,
+            )
+            .await
+            .unwrap();
         svc.hook_run_now_op(&ws, &hook.hook_id)
             .await
             .expect("runNow again");
@@ -7347,7 +7477,15 @@ mod tests {
         wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Running).await;
         skew.store(120_000, std::sync::atomic::Ordering::SeqCst);
         gate.content = "go".to_string();
-        svc.store().update_note(&gate).await.unwrap();
+        svc.store()
+            .update_note(
+                &svc.store()
+                    .lock_note_content(&gate.workspace_id, &gate.id)
+                    .await,
+                &gate,
+            )
+            .await
+            .unwrap();
         let expired = wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Expired).await;
         assert_eq!(expired.run_count, 1, "the in-flight run completed");
         assert!(expired.last_run_at.is_some());
@@ -7411,7 +7549,15 @@ mod tests {
         wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Running).await;
         skew.store(120_000, std::sync::atomic::Ordering::SeqCst);
         gate.content = "go".to_string();
-        svc.store().update_note(&gate).await.unwrap();
+        svc.store()
+            .update_note(
+                &svc.store()
+                    .lock_note_content(&gate.workspace_id, &gate.id)
+                    .await,
+                &gate,
+            )
+            .await
+            .unwrap();
         let hook = wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Dispatched).await;
         assert_eq!(hook.run_count, 1);
         wait_for_wake(&svc, &owner, "made it in time").await;

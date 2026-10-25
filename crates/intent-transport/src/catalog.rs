@@ -34,8 +34,10 @@ pub const FORBIDDEN_ERROR_MESSAGE: &str = "Forbidden";
 /// arms match both canonical and alias spellings). Every method here is guaranteed
 /// to return `-32601 Method not found` when the method name is unknown, or a domain
 /// error code (never `-32601`) when the method is recognized but fails for other reasons.
-#[cfg(test)]
-pub(crate) const ROUTER_METHODS: &[&str] = &[
+///
+/// Public (not `cfg(test)`) so intent-app's router-gating tests, which need the
+/// feature crates registered, can sweep the same list.
+pub const ROUTER_METHODS: &[&str] = &[
     "accept-changes.addRemote",
     "accept-changes.execute",
     "accept-changes.getStatus",
@@ -428,6 +430,7 @@ pub(crate) const ROUTER_METHODS: &[&str] = &[
     "workspace.repositorySelection.reset",
     "workspace.repositorySelection.save",
     "workspace.restore",
+    "workspace.retire",
     "workspace.saveSetupScript",
     "workspace.setAutoCommit",
     "workspace.setBrowserClient",
@@ -585,7 +588,7 @@ pub(crate) const REVERSE_METHODS: &[&str] = &[
 /// `catalog/tests.rs` freezes the refused remainder so a new method must be
 /// classified explicitly. Manager-only creation and saved-script operations
 /// are admitted here and checked against current workspace roles in services.
-pub(crate) const COLLABORATOR_METHODS: &[(&str, &str)] = &[
+pub const COLLABORATOR_METHODS: &[(&str, &str)] = &[
     ("agent.appendMessage", "Steer: appends a row to a workspace agent conversation; the caller's principal is stamped on user rows and, for a collaborator member, a user row's content carries the sender preamble (other roles byte-identical). Workspace-scoped, no host reach."),
     ("agent.cancelSubscriptions", "Steer: cancels an agent's own event subscriptions / delegation groups. Agent-scoped bookkeeping, no host reach."),
     ("agent.create", "Manager: creates agents with workspace-scoped configuration; services check the durable role and reject protected overrides."),
@@ -975,6 +978,7 @@ pub(crate) const MEMBER_METHODS: &[&str] = &[
     "workspace.members.add",
     "workspace.members.remove",
     "workspace.restore",
+    "workspace.retire",
     "workspace.saveSetupScript",
     "workspace.setAutoCommit",
     "workspace.setBrowserClient",

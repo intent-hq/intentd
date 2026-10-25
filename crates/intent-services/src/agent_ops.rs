@@ -5819,7 +5819,8 @@ impl Services {
     /// `skip_if_explicitly_set` is `true` and the session's name was already
     /// explicitly set, the rename is a no-op returning the existing name with
     /// `skipped: true` (the FE `renameAgent` semantics). An applied rename
-    /// emits `agent:renamed`.
+    /// emits `agent:renamed` with `{ agentId, name, nameExplicitlySet }`, the
+    /// flag as written to the session row (§6.5).
     pub(crate) async fn agent_rename_op(
         &self,
         agent_id: AgentId,
@@ -5841,7 +5842,11 @@ impl Services {
             &workspace_id,
             &agent_id,
             intent_core::events::AGENT_RENAMED,
-            json!({ "agentId": agent_id.0, "name": name }),
+            json!({
+                "agentId": agent_id.0,
+                "name": name,
+                "nameExplicitlySet": session.name_explicitly_set,
+            }),
         )
         .await;
         self.refresh_token_usage_after_rename(&workspace_id, &agent_id)
@@ -6687,7 +6692,9 @@ impl Services {
     /// enforces the write-once (`acpSessionId`) and immutable (`provider`)
     /// invariants; malformed values in `changes` surface as `InvalidParams`.
     /// Emits `agent:updated` (or `agent:renamed` when `name` is the only field
-    /// mutated) so subscribed clients invalidate their cached projection.
+    /// mutated) so subscribed clients invalidate their cached projection; any
+    /// payload carrying `name` also carries the persisted `nameExplicitlySet`
+    /// (§6.5).
     pub(crate) async fn agent_update_op(&self, agent_id: AgentId, changes: Value) -> Result<Value> {
         let Value::Object(mut obj) = changes else {
             return Err(Error::InvalidParams(
@@ -6971,11 +6978,13 @@ impl Services {
                 _ => unreachable!("guarded by allow-list above"),
             }
         }
+        let mut placeholder_renamed = false;
         if remember_specialist && is_manual_foreground_agent(&session) {
             if rename_placeholder {
                 session.name = selected_specialist_name
                     .clone()
                     .unwrap_or_else(|| "Agent".into());
+                placeholder_renamed = true;
             }
             let metadata = session.metadata.get_or_insert_with(|| json!({}));
             if let Some(metadata) = metadata.as_object_mut() {
@@ -7085,8 +7094,21 @@ impl Services {
         for (k, v) in &obj {
             event_data.insert(k.clone(), v.clone());
         }
-        if rename_placeholder {
+        // Only a placeholder rename that actually applied reports `name`: the
+        // same request can leave the manual-foreground scope (e.g.
+        // `isBackground: true`), which skips the rename above.
+        if placeholder_renamed {
             event_data.insert("name".into(), json!(session.name));
+        }
+        // Any payload carrying `name` reports the persisted flag after the
+        // write (§6.5), overriding a request-echoed `nameExplicitlySet` whose
+        // value can differ from what was stored (key order) — covers
+        // `agent:renamed`, mixed updates and the placeholder rename alike.
+        if event_data.contains_key("name") {
+            event_data.insert(
+                "nameExplicitlySet".into(),
+                json!(session.name_explicitly_set),
+            );
         }
         self.publish_agent_mutation_event(
             &session.workspace_id,
@@ -15862,31 +15884,19 @@ impl Services {
     }
 
     /// Daemon-side equivalent of the FE `task.removeAgentFromAllTasks`: strip
-    /// the given agent ids from every task note in the workspace. Silent on
-    /// notes/tasks that never referenced the ids so it is safe to call with an
-    /// empty or partially-stale list.
+    /// the given agent ids from every task note in the workspace and emit
+    /// `note:updated` for each note it rewrites. Silent on notes/tasks that
+    /// never referenced the ids so it is safe to call with an empty or
+    /// partially-stale list.
     async fn remove_agent_ids_from_workspace_tasks(
         &self,
         workspace_id: &WorkspaceId,
         stale: &[AgentId],
     ) -> Result<()> {
-        if stale.is_empty() {
-            return Ok(());
-        }
-        let notes = self.store.list_notes(workspace_id).await?;
-        for mut note in notes {
-            let Some(mut task) = note.metadata.task.clone() else {
-                continue;
-            };
-            let before = task.assigned_agent_ids.len();
-            task.assigned_agent_ids.retain(|a| !stale.contains(a));
-            if task.assigned_agent_ids.len() == before {
-                continue;
-            }
-            let now = now_iso();
-            note.metadata.task = Some(task);
-            note.updated_at = now;
-            self.store.update_note_metadata(&note).await?;
+        for note in self
+            .strip_agents_from_workspace_tasks(workspace_id, stale)
+            .await?
+        {
             crate::publish_event(
                 self.event_bus.as_ref(),
                 crate::note_change_event(
@@ -15900,6 +15910,50 @@ impl Services {
             .await;
         }
         Ok(())
+    }
+
+    /// Remove `stale` from `assignedAgentIds` on every task note listing any
+    /// of them, returning the notes rewritten (bodies not loaded). The list
+    /// only picks candidates: each note is re-read under its write lane and
+    /// rewritten from that read, so a metadata write that landed since the
+    /// list is kept rather than reverted from the listed copy.
+    pub(crate) async fn strip_agents_from_workspace_tasks(
+        &self,
+        workspace_id: &WorkspaceId,
+        stale: &[AgentId],
+    ) -> Result<Vec<intent_core::Note>> {
+        let mut updated = Vec::new();
+        if stale.is_empty() {
+            return Ok(updated);
+        }
+        let lists_stale = |note: &intent_core::Note| {
+            note.metadata
+                .task
+                .as_ref()
+                .is_some_and(|t| t.assigned_agent_ids.iter().any(|a| stale.contains(a)))
+        };
+        for listed in self.store.list_notes(workspace_id).await? {
+            if !lists_stale(&listed) {
+                continue;
+            }
+            let write_lane = self.lock_note_content(workspace_id, &listed.id).await;
+            let mut note = match self.store.get_note_metadata(workspace_id, &listed.id).await {
+                Ok(note) => note,
+                Err(intent_core::Error::NotFound(_)) => continue,
+                Err(e) => return Err(e),
+            };
+            if !lists_stale(&note) {
+                continue;
+            }
+            if let Some(task) = note.metadata.task.as_mut() {
+                task.assigned_agent_ids.retain(|a| !stale.contains(a));
+            }
+            note.updated_at = now_iso();
+            self.store.update_note_metadata(&write_lane, &note).await?;
+            drop(write_lane);
+            updated.push(note);
+        }
+        Ok(updated)
     }
 
     /// Load a session, mapping `NotFound` to `-32603` for the methods whose TS

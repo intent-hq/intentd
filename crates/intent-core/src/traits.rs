@@ -26,7 +26,7 @@ use crate::model::{
     TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult, TaskRemoveAgentFromAllTasksResult,
     TaskSetRelationsResult, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult,
     TokenUsage, Workspace, WorkspaceCreate, WorkspaceCreateResult, WorkspaceEventSummary,
-    WorkspaceSetupStatus, WorkspaceTask, WorkspaceUpdate,
+    WorkspaceListFilter, WorkspaceSetupStatus, WorkspaceTask, WorkspaceUpdate,
 };
 use crate::repo_ref::RepoRef;
 
@@ -355,9 +355,14 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async { Err(Error::Forbidden("Repository selection unavailable".into())) })
     }
 
-    /// List workspaces, optionally including archived ones (PROTOCOL §5.1).
-    fn list_workspaces(&self, include_archived: bool) -> BoxFuture<'_, Result<Vec<Workspace>>> {
-        let _ = include_archived;
+    /// List workspaces admitted by `filter` (PROTOCOL §5.1). Retired
+    /// workspaces are returned only when `filter.include_retired` is set —
+    /// `include_archived` alone never includes them.
+    fn list_workspaces(
+        &self,
+        filter: WorkspaceListFilter,
+    ) -> BoxFuture<'_, Result<Vec<Workspace>>> {
+        let _ = filter;
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::list_workspaces not implemented".to_string(),
@@ -370,11 +375,14 @@ pub trait WorkspaceApi: Send + Sync {
     /// lookup"): most recently linked first, archived included, narrowed to the
     /// caller's visible workspaces. `Error::InvalidParams` when `url` is not a
     /// pull-request URL.
+    ///
+    /// Retired workspaces are included only with `include_retired`.
     fn find_workspaces_by_pull_request(
         &self,
         url: String,
+        include_retired: bool,
     ) -> BoxFuture<'_, Result<Vec<PullRequestWorkspace>>> {
-        let _ = url;
+        let _ = (url, include_retired);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::find_workspaces_by_pull_request not implemented".to_string(),
@@ -394,9 +402,9 @@ pub trait WorkspaceApi: Send + Sync {
     /// full `list_workspaces`.
     fn list_workspaces_lite(
         &self,
-        include_archived: bool,
+        filter: WorkspaceListFilter,
     ) -> BoxFuture<'_, Result<Vec<Workspace>>> {
-        self.list_workspaces(include_archived)
+        self.list_workspaces(filter)
     }
 
     /// Fetch one workspace by id; `NotFound` if absent (PROTOCOL §5.1).
@@ -700,6 +708,42 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::archive_workspace not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// The retired workspace a call is scoped to, if any (PROTOCOL §5.1
+    /// "Retired workspaces" read-only gate): `workspace_id` when that
+    /// workspace is `Retired`, else the workspace of `agent_id` when it is
+    /// `Retired`, else `None`. One cheap store read; the default (non-store
+    /// impls) reports nothing retired.
+    fn retired_workspace_for(
+        &self,
+        workspace_id: Option<WorkspaceId>,
+        agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<Option<WorkspaceId>>> {
+        let _ = (workspace_id, agent_id);
+        Box::pin(async { Ok(None) })
+    }
+
+    /// Retire a workspace (PROTOCOL §5.1 `workspace.retire`): allowed from
+    /// Active or Archived. An Active workspace gets the archive teardown
+    /// first (interrupt turns, cancel hooks / PR monitors, detach guests);
+    /// then the status flips to `Retired` with `retiredAt`, and the checkout
+    /// folder and git worktree registration are removed in the background.
+    /// The git branch and every DB row (agents, conversations, notes,
+    /// assets, tasks) are kept. Idempotent on an already-retired workspace.
+    /// `caller_agent_id` has the same meaning as on
+    /// [`Self::archive_workspace`].
+    fn retire_workspace(
+        &self,
+        id: WorkspaceId,
+        caller_agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<Workspace>> {
+        let _ = (id, caller_agent_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::retire_workspace not implemented".to_string(),
             ))
         })
     }
@@ -2089,7 +2133,9 @@ pub trait WorkspaceApi: Send + Sync {
     /// a `changes` object (PROTOCOL §5.5). Only the listed fields are touched;
     /// omitted fields are preserved. Write-once (`acpSessionId`) and immutable
     /// (`provider`) invariants are enforced by the store. Emits `agent:updated`
-    /// (or `agent:renamed` when `name` is the only mutated field). Returns
+    /// (or `agent:renamed` with `{ agentId, name, nameExplicitlySet }` when
+    /// `name` is the only mutated field); any event payload carrying `name`
+    /// also carries the persisted `nameExplicitlySet`. Returns
     /// `{ success: true, agent: AgentLite }` on success. `NotFound` when the
     /// session is unknown; `InvalidParams` when `changes` carries an unknown
     /// field or a malformed value.
@@ -8588,11 +8634,14 @@ pub trait WorkspaceApi: Send + Sync {
     /// `repositoryPath`, excluding self. Bare array of
     /// `{ id, title, branch, status, createdAt, updatedAt }` (`title` defaults
     /// to `"Untitled"`; `status` is the `PascalCase` `WorkspaceStatus`).
+    ///
+    /// Retired siblings are included only with `include_retired`.
     fn cross_workspace_list_siblings(
         &self,
         workspace_id: WorkspaceId,
+        include_retired: bool,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = workspace_id;
+        let _ = (workspace_id, include_retired);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::cross_workspace_list_siblings not implemented".to_string(),

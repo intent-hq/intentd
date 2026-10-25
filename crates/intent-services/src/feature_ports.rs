@@ -6,15 +6,20 @@
 //! feature. Its methods take `&Services` as an explicit context argument, so
 //! the feature object never holds a `Services` handle (no `Arc` cycle).
 //! Feature state (for example in-flight transfer sessions) lives in the
-//! object that implements the port, not in `Services` fields.
+//! feature's own object, which the feature reads back through the typed
+//! [`FeatureSet`] ([`Services::feature`]), not in `Services` fields.
 //!
-//! [`Services::new`] starts with [`UnavailableTransfer`], which fails every
-//! transfer RPC with the same error as the `WorkspaceApi` default. The
-//! composition root registers the real implementation (`intent-svc-transfer`)
-//! with [`Services::with_transfer_port`].
+//! The ports are declared once, in the `feature_port_registry!` call below.
+//! [`Services::new`] starts each with its "unavailable" default (for
+//! transfer, [`UnavailableTransfer`], which fails every RPC with the same
+//! error as the `WorkspaceApi` default). The composition root
+//! (`intent_app::compose`) registers the real implementations
+//! ([`Services::with_transfer_port`]) and then runs the startup check
+//! [`Services::ensure_feature_ports_registered`], so a missing registration
+//! fails at boot rather than at the first call. `port_forwarders!` writes
+//! the one-line `WorkspaceApi` forwarders.
 
-use std::any::Any;
-#[cfg(any(test, feature = "test-hooks"))]
+use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::sync::Arc;
 #[cfg(any(test, feature = "test-hooks"))]
@@ -36,9 +41,6 @@ pub const IMPORT_MAX_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 /// full RPC, authorization included, exactly as the `WorkspaceApi` method it
 /// backs.
 pub trait TransferPort: Send + Sync + 'static {
-    /// The concrete implementation, for the feature's own typed state lookup.
-    fn as_any(&self) -> &dyn Any;
-
     fn transfer_plan<'a>(
         &'a self,
         svc: &'a Services,
@@ -156,10 +158,6 @@ fn not_implemented<'a, T: Send + 'a>(method: &str) -> BoxFuture<'a, Result<T>> {
 }
 
 impl TransferPort for UnavailableTransfer {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn transfer_plan<'a>(
         &'a self,
         _svc: &'a Services,
@@ -281,40 +279,202 @@ impl TransferPort for UnavailableTransfer {
     }
 }
 
-/// The registered ports. Cloned with `Services`; every clone shares the
-/// same feature objects (and so the same feature state).
-#[derive(Clone)]
-pub(crate) struct FeaturePorts {
-    transfer: Arc<dyn TransferPort>,
+/// Typed feature state on [`Services`], keyed by type.
+///
+/// A feature crate stores its state object here once, when the composition
+/// root registers it ([`Services::with_feature`]), and its extension-trait
+/// code reads it back with [`Services::feature`]. The set is frozen once the
+/// `Services` is shared: it changes only through the owned builder methods,
+/// and clones share the same objects.
+#[derive(Clone, Default)]
+pub(crate) struct FeatureSet {
+    features: Arc<HashMap<TypeId, Arc<dyn Any + Send + Sync>>>,
 }
 
-impl Default for FeaturePorts {
-    fn default() -> Self {
-        Self {
-            transfer: Arc::new(UnavailableTransfer::default()),
-        }
+impl FeatureSet {
+    fn get<T: Any + Send + Sync>(&self) -> Option<&T> {
+        self.features
+            .get(&TypeId::of::<T>())
+            .and_then(|feature| feature.downcast_ref::<T>())
     }
-}
 
-impl FeaturePorts {
-    pub(crate) fn transfer(&self) -> &dyn TransferPort {
-        self.transfer.as_ref()
+    fn insert<T: Any + Send + Sync>(&mut self, feature: Arc<T>) {
+        let previous = Arc::make_mut(&mut self.features).insert(TypeId::of::<T>(), feature);
+        assert!(
+            previous.is_none(),
+            "feature {} registered twice",
+            std::any::type_name::<T>()
+        );
     }
 }
 
 impl Services {
+    /// Store a feature's state object. Every clone made afterwards shares
+    /// it; clones made before do not see it.
+    ///
+    /// # Panics
+    ///
+    /// If a feature of the same type is already registered: each feature is
+    /// registered once, by the composition root.
+    #[must_use]
+    pub fn with_feature<T: Any + Send + Sync>(mut self, feature: Arc<T>) -> Self {
+        self.features.insert(feature);
+        self
+    }
+
+    /// The registered feature state of type `T`, if any.
+    #[must_use]
+    pub fn feature<T: Any + Send + Sync>(&self) -> Option<&T> {
+        self.features.get::<T>()
+    }
+}
+
+/// A registered port and whether the composition root registered it (as
+/// opposed to the "unavailable" default [`Services::new`] starts with).
+struct PortSlot<P: ?Sized> {
+    port: Arc<P>,
+    registered: bool,
+}
+
+impl<P: ?Sized> Clone for PortSlot<P> {
+    fn clone(&self) -> Self {
+        Self {
+            port: Arc::clone(&self.port),
+            registered: self.registered,
+        }
+    }
+}
+
+/// Declares the feature port registry: the [`FeaturePorts`] fields, their
+/// accessors, the `Services::with_*_port` setters, and the list the startup
+/// check walks.
+///
+/// Adding a port is one line here: `name: Trait = UnavailableDefault,
+/// setter;`. Every port declared here is a production port, so
+/// [`Services::ensure_feature_ports_registered`] fails until the composition
+/// root registers it.
+macro_rules! feature_port_registry {
+    ($(
+        $(#[$setter_doc:meta])*
+        $name:ident: $port:ident = $default:ty, $setter:ident;
+    )*) => {
+        /// The registered ports. Cloned with `Services`; every clone shares
+        /// the same feature objects (and so the same feature state).
+        #[derive(Clone)]
+        pub(crate) struct FeaturePorts {
+            $($name: PortSlot<dyn $port>,)*
+        }
+
+        impl Default for FeaturePorts {
+            fn default() -> Self {
+                Self {
+                    $($name: PortSlot {
+                        port: Arc::new(<$default>::default()),
+                        registered: false,
+                    },)*
+                }
+            }
+        }
+
+        impl FeaturePorts {
+            /// Every declared port, by name.
+            pub(crate) const NAMES: &'static [&'static str] = &[$(stringify!($name)),*];
+
+            $(
+                pub(crate) fn $name(&self) -> &dyn $port {
+                    self.$name.port.as_ref()
+                }
+            )*
+
+            /// The declared ports no feature registered, in declaration
+            /// order.
+            pub(crate) fn unregistered(&self) -> Vec<&'static str> {
+                let registered = [$(self.$name.registered),*];
+                Self::NAMES
+                    .iter()
+                    .zip(registered)
+                    .filter(|(_, registered)| !registered)
+                    .map(|(name, _)| *name)
+                    .collect()
+            }
+        }
+
+        impl Services {
+            $(
+                $(#[$setter_doc])*
+                #[must_use]
+                pub fn $setter(mut self, port: Arc<dyn $port>) -> Self {
+                    self.ports.$name = PortSlot {
+                        port,
+                        registered: true,
+                    };
+                    self
+                }
+            )*
+        }
+    };
+}
+
+feature_port_registry! {
     /// Register the workspace transfer feature. Every clone made afterwards
     /// shares it; clones made before keep the port they had.
+    transfer: TransferPort = UnavailableTransfer, with_transfer_port;
+}
+
+/// Writes `WorkspaceApi` methods that forward to a feature port: each
+/// `fn method(&self, args..) -> Ret => port_method;` line expands to
+/// `self.ports.<port>().port_method(self, args..)`. Use it inside
+/// `impl WorkspaceApi for Services`.
+macro_rules! port_forwarders {
+    ($port:ident {
+        $(
+            fn $method:ident(&self $(, $arg:ident: $ty:ty)* $(,)?) -> $ret:ty => $target:ident;
+        )*
+    }) => {
+        $(
+            fn $method(&self $(, $arg: $ty)*) -> $ret {
+                self.ports.$port().$target(self $(, $arg)*)
+            }
+        )*
+    };
+}
+pub(crate) use port_forwarders;
+
+impl Services {
+    /// The declared feature ports that no feature registered. Empty once the
+    /// composition root has run.
     #[must_use]
-    pub fn with_transfer_port(mut self, port: Arc<dyn TransferPort>) -> Self {
-        self.ports.transfer = port;
-        self
+    pub fn unregistered_feature_ports(&self) -> Vec<&'static str> {
+        self.ports.unregistered()
+    }
+
+    /// The startup check: fails, naming every missing port, unless each
+    /// declared feature port was registered. An unregistered port would
+    /// otherwise surface only at its first call, as an "unavailable" error.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Internal`] listing the unregistered ports.
+    pub fn ensure_feature_ports_registered(&self) -> Result<()> {
+        let missing = self.unregistered_feature_ports();
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::Internal(format!(
+                "feature ports not registered: {}",
+                missing.join(", ")
+            )))
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use intent_core::{Error, WorkspaceApi, WorkspaceId};
+
+    use super::{FeaturePorts, TransferPort, UnavailableTransfer};
 
     use crate::test_support::fixtures::TempDb;
     use crate::Services;
@@ -369,5 +529,79 @@ mod tests {
             "workspace_export_abort",
         );
         assert!(!svc.feature_transfer_port().export_in_progress(ws.as_str()));
+    }
+
+    async fn bare_services(tmp: &TempDb) -> Services {
+        Services::new(intent_store::Store::open(&tmp.path).await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn the_startup_check_names_every_unregistered_port() {
+        let tmp = TempDb::new();
+        let svc = bare_services(&tmp).await;
+        assert_eq!(svc.unregistered_feature_ports(), FeaturePorts::NAMES);
+        assert_eq!(svc.unregistered_feature_ports(), ["transfer"]);
+        assert!(matches!(
+            svc.ensure_feature_ports_registered(),
+            Err(Error::Internal(m)) if m == "feature ports not registered: transfer"
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_registered_port_passes_the_startup_check_and_receives_calls() {
+        let tmp = TempDb::new();
+        let port = Arc::new(UnavailableTransfer::default());
+        let svc = bare_services(&tmp)
+            .await
+            .with_transfer_port(Arc::clone(&port) as Arc<dyn TransferPort>);
+        assert!(svc.unregistered_feature_ports().is_empty());
+        svc.ensure_feature_ports_registered()
+            .expect("every port registered");
+        let ws = WorkspaceId::new();
+        port.park_building_export_for_test("e1", &ws, None, std::path::PathBuf::new());
+        assert!(
+            svc.clone()
+                .feature_transfer_port()
+                .export_in_progress(ws.as_str()),
+            "the forwarders and clones reach the registered object"
+        );
+    }
+
+    #[derive(Debug, Default)]
+    struct Counter(std::sync::atomic::AtomicUsize);
+
+    #[tokio::test]
+    async fn the_feature_set_returns_the_registered_object_to_every_later_clone() {
+        let tmp = TempDb::new();
+        let before = bare_services(&tmp).await;
+        assert!(before.feature::<Counter>().is_none());
+        let counter = Arc::new(Counter::default());
+        let svc = before.clone().with_feature(Arc::clone(&counter));
+        let clone = svc.clone();
+        clone
+            .feature::<Counter>()
+            .expect("registered")
+            .0
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(counter.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(std::ptr::eq(
+            svc.feature::<Counter>().unwrap(),
+            Arc::as_ptr(&counter)
+        ));
+        assert!(
+            before.feature::<Counter>().is_none(),
+            "a clone made before registration does not see it"
+        );
+        assert!(svc.feature::<String>().is_none());
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "registered twice")]
+    async fn a_feature_registers_once() {
+        let tmp = TempDb::new();
+        let _ = bare_services(&tmp)
+            .await
+            .with_feature(Arc::new(Counter::default()))
+            .with_feature(Arc::new(Counter::default()));
     }
 }

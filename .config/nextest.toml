@@ -115,10 +115,17 @@ priority = 100
 # These seven controls deliberately perform 63/64 fresh repository acquisitions
 # through owned Git/ACP fixtures. Reserve the test slots for each control, as for
 # the real-daemon controls above; their deadline and quota assertions stay exact.
+# Each 63/64 script runs under the shared 150s quota script budget with a 180s
+# hang guard (intent-services test_support::quota_script; one call can take
+# ~0.9s on a loaded host, so the production 30s cut the loop short). Two passes
+# need more than the default 180s kill, so these seven are terminated at 540s
+# (3 × 180s). Keep this an exact name list: script_ops' liveness guard test
+# rejects broader slow-timeout overrides.
 [[profile.default.overrides]]
 filter = 'binary_id(=intent-services) & (test(=agent_manager::repository_origin::callback_delivery::tests::confirmed_aliases::confirmed_alias_mixed_names_share_one_acquisition_budget) | test(=agent_manager::repository_origin::callback_delivery::tests::confirmed_read_caught_discarded_shared_root_and_budget_bind_every_original_read) | test(=agent_manager::repository_origin::callback_delivery::tests::live_context::confirmed_context_successful_zero_pending_absent_and_failed_never_conflate) | test(=agent_manager::repository_origin::callback_delivery::tests::normal_launch::normal_callback_launch_optional_and_required_keep_completed_effect_truth) | test(=repository_read_policy::tests::aliases::mixed_names_and_raw_dispatch_have_one_sixty_four_record_acquisition_budget) | test(=repository_read_policy::tests::original_ledger_counts_cache_hits_and_lazy_read_at_sixty_four_and_sixty_five) | test(=repository_read_policy::tests::context_consumer::context_consumer_ledger_counts_distinct_calls_at_sixty_four_and_sixty_five))'
 threads-required = 'num-test-threads'
 priority = 100
+slow-timeout = { period = "180s", terminate-after = 3 }
 
 # Long wall-clock tests (>= 20s under coverage): the installer's literal 60s
 # crash-window replay (66s), a hook scheduled at the 60s delayMs minimum (68s),

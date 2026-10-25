@@ -468,7 +468,12 @@ async fn specialist_provider_invalid_pins_leave_no_creation_side_effects() {
         );
         set(&svc, "providers.enabled", json!({"auggie": false}));
         let sessions = svc.store().list_all_agent_sessions().await.unwrap().len();
-        let workspaces = svc.store().list_workspaces(true).await.unwrap().len();
+        let workspaces = svc
+            .store()
+            .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .unwrap()
+            .len();
         let notes = svc.store().list_all_notes().await.unwrap().len();
         let events = svc
             .store()
@@ -530,7 +535,11 @@ async fn specialist_provider_invalid_pins_leave_no_creation_side_effects() {
             sessions
         );
         assert_eq!(
-            svc.store().list_workspaces(true).await.unwrap().len(),
+            svc.store()
+                .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+                .await
+                .unwrap()
+                .len(),
             workspaces
         );
         assert_eq!(svc.store().list_all_notes().await.unwrap().len(), notes);

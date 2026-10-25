@@ -537,15 +537,6 @@ In **Home → Workspaces**, click a list row or board card to select it and show
 preview. Double-click it, or Cmd-click (Ctrl-click on Windows and Linux), to open the
 workspace directly.
 
-In app versions with the **Retired** filter, retired workspaces appear there
-separately from active and archived workspaces. **Retire** deletes the workspace
-folder, including uncommitted changes and untracked files, while keeping its
-conversations, notes, tasks and git branch. **Restore as blank workspace** starts a
-fresh checkout; it does not recover the deleted files. Retired rows do not offer
-**Dismiss for now**. When the app and daemon support it, Settings offers
-**Automatically retire archived workspaces** and **Retire after (days)**; this
-applies the same folder cleanup after the chosen number of archived days.
-
 Open **View options → Group by** in either list or board
 view. **Activity** groups work as **Needs you**, **PR ready**, **Running**, and
 **Done & idle**. In apps that support the **Waiting** group, it follows **Running**
@@ -569,6 +560,30 @@ activity first within the pinned and unpinned groups.
 The grouping choice is remembered with Home's settings for the current signed-in
 user and connected backend. **Activity** remains the default; existing saved
 grouping choices keep their behavior.
+
+## Retire and restore workspaces
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{home-workspace-menu.ts,HomeWorkspaceControls.svelte}; src/lib/components/workspace/RetiredWorkspaceBanner.svelte; src/lib/components/settings/GitWorkspaceSettings.svelte; messages/en.json. Daemon: workspace.retire, packages/intentd/crates/intent-services/src/{retire,auto_retire}.rs. -->
+
+In app and daemon versions that support retirement, retiring frees disk space: it
+deletes the workspace's folder, including uncommitted
+changes and untracked files, but keeps its conversations, notes, tasks, and git
+branch. In **Home → Workspaces**, right-click a workspace and choose **Retire**, then
+confirm. An active workspace is archived first. Workspaces whose folder is the
+repository itself (not a separate checkout) and remote workspaces cannot be retired.
+
+In apps with the **Retired** filter, retired workspaces appear there separately
+from active and archived workspaces. They do not offer **Dismiss for now**. Opening one
+shows its history read-only. To keep working, choose **Restore as blank workspace**
+from its menu or banner, or send it a message: Intent recreates it from a fresh
+checkout of the default branch on a new branch. The old branch still holds the
+earlier work; restoring does not recover the deleted files.
+
+When the app and daemon offer automatic retirement, turn on **Workspace setup →
+Automatically retire archived workspaces** (`/settings?tab=setup#git-workspace`) and
+set **Retire after (days)** (7 when first turned on). Intent checks about once an
+hour. It is off by default, and it skips remote, shared, and non-retirable
+workspaces.
 
 ## Home workspace status icons
 

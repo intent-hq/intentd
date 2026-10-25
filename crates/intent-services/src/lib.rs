@@ -48,7 +48,7 @@ use intent_core::{
     WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
 };
 use intent_core::{AgentReverseDispatch, ReverseDispatchError, ReverseLiveClient};
-use intent_store::{EventQuery, NewEvent, Store};
+use intent_store::{EventQuery, NewEvent, NoteWriteLock, Store};
 
 pub use intent_core::{Error, Result, WorkspaceApi};
 
@@ -59,8 +59,11 @@ mod agent_ops;
 mod agent_session;
 mod agent_subscriptions;
 mod agent_workers;
+mod auto_retire;
+mod retire;
 /// The §5.5b wire-ID rule, shared by the transport's request validation.
 pub use intent_acp::workers::is_wire_id;
+pub(crate) use retire::UnarchiveOutcome;
 pub mod antigravity;
 pub mod antigravity_install;
 pub mod antigravity_setup;
@@ -308,6 +311,7 @@ mod v2_5_goldens;
 mod v2_7_goldens;
 
 pub use acp_adapter::{adapter_slot_limit, init_adapter_slots, live_adapters};
+pub use auto_retire::AutoRetireReport;
 pub use config_watcher::{ConfigWatcher, PreparedReloadAdmission};
 pub(crate) use mcp_servers::McpHub;
 pub use settings::{
@@ -1493,16 +1497,6 @@ pub struct Services {
     /// Serialize quota admission through persistence per owner, including
     /// adoption; unrelated owners never wait on each other's forge reads.
     pr_monitor_registration: Arc<KeyedInflight<AgentId>>,
-    /// Per-note content-write lane (intent-hq/intent#7184): the client
-    /// surgical and whole-content writers (`note.add` / `note.edit` /
-    /// `note.editLines` / `note.setContent`, `task.updateStatus`,
-    /// `task.update`, `task.convertBlocks`, `comment.add`, primitive appends)
-    /// hold their note's lane from the read their transform derives from
-    /// until the gated persist lands, so N parallel writers to one note apply
-    /// one after another against the latest text instead of racing the
-    /// bounded `Conflict` retry loop. Held for one read→persist window only
-    /// and never across another note write, so lanes never nest.
-    note_content_writes: Arc<KeyedInflight<(WorkspaceId, NoteId)>>,
     /// Original qualified registration lifetimes, never rebuilt from stored IDs.
     review_monitor_authorities: Arc<
         Mutex<HashMap<intent_core::PrMonitorId, Arc<repository_read_source::MonitorAuthority>>>,
@@ -1593,10 +1587,12 @@ pub struct Services {
     /// [`with_idempotency`]: same-key first-use callers serialize on the
     /// key so one runs the operation and the rest replay its stored result.
     idempotency_inflight: Arc<IdempotencyInflight>,
-    /// Registered feature ports (see [`feature_ports`]). Feature state such
-    /// as in-flight transfer sessions lives in the port implementations;
-    /// shared across clones.
+    /// Registered feature ports (see [`feature_ports`]); shared across
+    /// clones.
     ports: feature_ports::FeaturePorts,
+    /// Feature state objects, such as the in-flight transfer sessions, keyed
+    /// by type; shared across clones.
+    features: feature_ports::FeatureSet,
 }
 
 /// Pause inserted between per-workspace iterations of the background sweeps
@@ -1885,7 +1881,6 @@ impl Services {
             pr_monitor_debounce_seconds: None,
             pr_monitors_max_per_agent: None,
             pr_monitor_registration: Arc::default(),
-            note_content_writes: Arc::default(),
             review_monitor_authorities: Arc::default(),
             review_monitor_poll_lane: Arc::default(),
             legacy_pr_monitor_poll_lane: Arc::default(),
@@ -1916,6 +1911,7 @@ impl Services {
             attachment_idempotency_inflight: Arc::new(Mutex::new(HashMap::new())),
             idempotency_inflight: Arc::new(IdempotencyInflight::default()),
             ports: feature_ports::FeaturePorts::default(),
+            features: feature_ports::FeatureSet::default(),
         };
         services
             .gitlab_credential_gate
@@ -2619,6 +2615,17 @@ impl Services {
         self
     }
 
+    /// Test seam: park `script.create` after its retired/closing checks,
+    /// before the definition is persisted.
+    #[cfg(test)]
+    pub(crate) fn with_script_create_admitted_park(
+        mut self,
+        park: Arc<script_ops::SupervisePark>,
+    ) -> Self {
+        self.script_parks.create_admitted = Some(park);
+        self
+    }
+
     /// Test seam (monorepo#4952): park `mark_running` after its eligibility
     /// check, before the `was_running` marker write and the in-memory flip to
     /// `running`, so persist-before-observable ordering is testable.
@@ -2744,19 +2751,16 @@ impl Services {
         self
     }
 
-    /// Take `note_id`'s content-write lane (see `note_content_writes`).
-    /// Hold the guard from the read a write derives from through its gated
-    /// persist, and drop it before any follow-up that may write a note
-    /// (auto-conversion, task-status redirects, materialization — which takes
-    /// the lane itself).
+    /// Take `note_id`'s content-write lane; see [`Store::lock_note_content`]
+    /// for the hold rules. In this crate, drop it before any follow-up that
+    /// may write a note (auto-conversion, task-status redirects,
+    /// materialization — which takes the lane itself).
     async fn lock_note_content(
         &self,
         workspace_id: &WorkspaceId,
         note_id: &NoteId,
-    ) -> KeyedInflightGuard<'_, (WorkspaceId, NoteId)> {
-        self.note_content_writes
-            .lock((workspace_id.clone(), note_id.clone()))
-            .await
+    ) -> NoteWriteLock {
+        self.store.lock_note_content(workspace_id, note_id).await
     }
 
     /// Park the first `task.update` attempt before its parent write when the
@@ -3870,7 +3874,11 @@ impl Services {
     /// candidate read and every git/filesystem probe stay off startup and RPC
     /// critical paths.
     pub async fn prewarm_repository_metadata(&self) {
-        match self.store.list_workspaces(false).await {
+        match self
+            .store
+            .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+            .await
+        {
             Ok(workspaces) => self.spawn_repository_owner_backfill(&workspaces),
             Err(error) => tracing::warn!(
                 %error,
@@ -6495,7 +6503,11 @@ impl Services {
     }
 
     async fn refresh_all_workspace_prs_owned(&self, tick: u64) {
-        let workspaces = match self.store.list_workspaces(false).await {
+        let workspaces = match self
+            .store
+            .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+            .await
+        {
             Ok(list) => list,
             Err(e) => {
                 tracing::warn!(error = %e, "pr refresh: listing workspaces failed");
@@ -6949,7 +6961,11 @@ impl Services {
     /// sweep never monopolizes `SQLite` pool slots (intent-hq/monorepo#703).
     /// Errors are logged per workspace and never abort the sweep.
     async fn scan_all_token_usage(&self) {
-        let workspaces = match self.store.list_workspaces(false).await {
+        let workspaces = match self
+            .store
+            .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+            .await
+        {
             Ok(list) => list,
             Err(e) => {
                 tracing::warn!(error = %e, "token usage scan: listing workspaces failed");
@@ -11067,12 +11083,13 @@ async fn persist_new_note(store: &Store, note: &Note, author: &NoteVersionAuthor
 /// [`Store::update_note_versioned`]). Returns the post-write `rev`.
 async fn persist_note_content(
     store: &Store,
+    lock: &NoteWriteLock,
     note: &Note,
     expected_version: Option<i64>,
     author: &NoteVersionAuthor,
 ) -> Result<i64> {
     store
-        .update_note_with_version(note, expected_version, author, &note.updated_at)
+        .update_note_with_version(lock, note, expected_version, author, &note.updated_at)
         .await
         .map(|(rev, _)| rev)
 }
@@ -11088,20 +11105,6 @@ async fn persist_note_content(
 /// Returns `Error::Internal` if the insert or the version append fails.
 pub async fn persist_system_new_note(store: &Store, note: &Note) -> Result<i64> {
     persist_new_note(store, note, &system_version_author()).await
-}
-
-/// [`persist_note_content`] with the daemon-internal system author and no
-/// `expectedVersion` gate, for noninteractive full-note *updates* outside this
-/// crate (the `intentd` importers re-writing an existing note). The row and
-/// its snapshot commit together, so an imported rev is never visible while
-/// its base still resolves to the previous content. Returns the post-write
-/// `rev`.
-///
-/// # Errors
-///
-/// Returns `Error::NotFound` if the note does not exist in the workspace; `Error::Internal` if the write fails.
-pub async fn persist_system_note_content(store: &Store, note: &Note) -> Result<i64> {
-    persist_note_content(store, note, None, &system_version_author()).await
 }
 
 /// Bounded read-merge-persist attempts for `note.setContent`: on a store
@@ -11328,10 +11331,11 @@ struct ContentWrite<'a> {
 /// deletions can empty a note neither side emptied.
 async fn persist_merged_content(
     store: &Store,
-    workspace_id: &WorkspaceId,
-    note_id: &NoteId,
+    lock: &NoteWriteLock,
     write: ContentWrite<'_>,
 ) -> Result<MergedContentWrite> {
+    let workspace_id = lock.workspace_id();
+    let note_id = lock.note_id();
     let ContentWrite {
         mut seed,
         incoming,
@@ -11408,7 +11412,7 @@ async fn persist_merged_content(
         note.content = content.clone();
         let now = now_iso();
         note.updated_at = now.clone();
-        match persist_note_content(store, &note, Some(current_rev), author).await {
+        match persist_note_content(store, lock, &note, Some(current_rev), author).await {
             Ok(rev) => {
                 plan.apply_orphaned(store, workspace_id).await?;
                 return Ok(MergedContentWrite {
@@ -11867,6 +11871,11 @@ impl Services {
         let _mutation = self.workspace_mutations.enter(workspace_id)?;
         let store = &self.store;
         let bus = self.event_bus.as_ref();
+        // The task note's lane covers this read through the metadata write,
+        // so no whole-row writer can revert the status from an older copy
+        // and no laned text writer sees the rev move under it. Released
+        // before materialization, which takes each parent's lane.
+        let write_lane = self.lock_note_content(workspace_id, note_id).await;
         let mut note = fetch_note(store, workspace_id, note_id).await?;
         let Some(mut task) = note.metadata.task.clone() else {
             return Err(Error::Internal(
@@ -11882,6 +11891,7 @@ impl Services {
                 TaskStatus::Cancelled => "cancelled",
                 _ => "complete",
             };
+            drop(write_lane);
             self.materialize_linked_checkboxes(&note.workspace_id, &note.id)
                 .await;
             return Ok(TaskUpdateNoteStatusResult {
@@ -11904,10 +11914,11 @@ impl Services {
                 Error::Internal("linked task recovery requires an observed revision".into())
             })?;
             if store
-                .update_note_metadata_if_agent_linked(&note, rev, &agent_id)
+                .update_note_metadata_if_agent_linked(&write_lane, &note, rev, &agent_id)
                 .await?
                 .is_none()
             {
+                drop(write_lane);
                 // A changed note or session link is an ordinary race: no task
                 // events, checkbox materialization, or side effects may fire.
                 let current = fetch_note(store, workspace_id, note_id).await?;
@@ -11928,9 +11939,10 @@ impl Services {
             }
         } else {
             store
-                .update_note_metadata_versioned(&note, expected_version)
+                .update_note_metadata_versioned(&write_lane, &note, expected_version)
                 .await?;
         }
+        drop(write_lane);
         // Mirror `notes.service.ts`: emit only when the status actually changed.
         let all = if previous_status == new_status {
             None
@@ -12377,8 +12389,7 @@ async fn append_primitive(
         ..
     } = persist_merged_content(
         store,
-        workspace_id,
-        note_id,
+        &write_lane,
         ContentWrite {
             seed: Some(note),
             incoming: &incoming,
@@ -14025,7 +14036,9 @@ mod orphan_trash_sweep_tests {
 /// (intent-hq/monorepo#2227). Best-effort: callers ignore the result so a
 /// sync failure never blocks/fails the `repo.list` response.
 async fn sync_repos_from_workspaces(store: &Store, workspaces_roots: &[PathBuf]) -> Result<()> {
-    let workspaces = store.list_workspaces(true).await?;
+    let workspaces = store
+        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await?;
     for ws in &workspaces {
         let Some(repo_path) = ws.repository_path.as_deref() else {
             continue;
@@ -14189,7 +14202,7 @@ impl Services {
     /// — is merged into rather than overwritten. A parent that already carries
     /// the marker (or lost its link) after the fresh read is left untouched,
     /// as is one whose task note is gone or no longer a task. The read→write
-    /// window holds the parent's content-write lane (`note_content_writes`),
+    /// window holds the parent's content-write lane ([`Store::lock_note_content`]),
     /// so N parallel task transitions linked from one note rewrite it one
     /// after another instead of exhausting the bounded retry against each
     /// other and the laned client writers (intent-hq/intent#7184). Callers
@@ -14230,8 +14243,14 @@ impl Services {
             };
             note.content = content;
             note.updated_at = now_iso();
-            match persist_note_content(&self.store, &note, Some(note.rev), &system_version_author())
-                .await
+            match persist_note_content(
+                &self.store,
+                &write_lane,
+                &note,
+                Some(note.rev),
+                &system_version_author(),
+            )
+            .await
             {
                 Ok(_) => {}
                 Err(Error::Conflict { .. }) if attempt < MAX_ATTEMPTS => continue,
@@ -15954,7 +15973,10 @@ pub(crate) fn publish_event_transient(bus: Option<&EventBus>, event: &NewEvent) 
 /// an archived workspace's worktree still resolves.
 async fn find_workspace_by_worktree_path(store: &Store, repo_path: &str) -> Option<Workspace> {
     let canon_target = std::fs::canonicalize(repo_path).ok()?;
-    let workspaces = store.list_workspaces(true).await.ok()?;
+    let workspaces = store
+        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await
+        .ok()?;
     workspaces.into_iter().find(|ws| {
         ws.worktree_path
             .as_deref()
@@ -15999,24 +16021,6 @@ impl<K: std::hash::Hash + Eq + Clone> KeyedInflight<K> {
         }
     }
 
-    /// Take `key`'s lock and hold it until the returned guard drops (the
-    /// owned form of `enter` + `acquire`, for holds that span a whole
-    /// read→write window).
-    async fn lock(&self, key: K) -> KeyedInflightGuard<'_, K> {
-        let slot = self.enter(key);
-        let guard = Arc::clone(
-            slot.lock
-                .as_ref()
-                .expect("keyed inflight slot lock is taken only on drop"),
-        )
-        .lock_owned()
-        .await;
-        KeyedInflightGuard {
-            _guard: guard,
-            _slot: slot,
-        }
-    }
-
     /// Callers currently holding or waiting on `key`.
     #[cfg(test)]
     pub(crate) fn holders(&self, key: &K) -> usize {
@@ -16035,13 +16039,6 @@ impl<K: std::hash::Hash + Eq + Clone> KeyedInflight<K> {
             .expect("keyed inflight registry poisoned")
             .is_empty()
     }
-}
-
-/// A held [`KeyedInflight`] key (see `lock`). Field order matters: the
-/// mutex guard (and its `Arc` ref) drops before the slot's prune check.
-struct KeyedInflightGuard<'a, K: std::hash::Hash + Eq> {
-    _guard: tokio::sync::OwnedMutexGuard<()>,
-    _slot: KeyedInflightSlot<'a, K>,
 }
 
 /// One caller's hold on a [`KeyedInflight`] entry (see `enter`).
@@ -17078,6 +17075,7 @@ impl Services {
             let children: Vec<Note> = created.iter().map(|(child, _)| child.clone()).collect();
             match store
                 .update_note_with_version_and_children(
+                    &write_lane,
                     &note,
                     Some(read_rev),
                     &children,
@@ -20285,6 +20283,12 @@ impl WorkspaceApi for Services {
             // Management admission also permits deletion retries for missing
             // workspaces; a member must not spawn an unmanageable terminal there.
             self.require_member(&workspace_id).await?;
+            // Held from the retired check through the spawn: retire flips
+            // the row and sweeps the workspace's PTYs under the same fence,
+            // so a create admitted before the flip finishes spawning before
+            // the sweep lists terminals, and one after it is refused.
+            let _archive = self.archive_fence.acquire(&workspace_id).await;
+            self.refuse_if_retired(&workspace_id).await?;
             terminal_ops::create_owned(
                 &self.terminal_tasks,
                 pty,
@@ -20312,6 +20316,7 @@ impl WorkspaceApi for Services {
             // Resolve the terminal's actual workspace before authorizing it.
             self.require_terminal_manager(&terminal_id, "terminal.write")
                 .await?;
+            self.refuse_terminal_if_retired(&terminal_id).await?;
             terminal_ops::write(&pty, &terminal_id, &data)
         })
     }
@@ -20326,6 +20331,7 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             self.require_terminal_manager(&terminal_id, "terminal.resize")
                 .await?;
+            self.refuse_terminal_if_retired(&terminal_id).await?;
             terminal_ops::resize(&pty, &terminal_id, cols, rows)
         })
     }
@@ -20335,6 +20341,7 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             self.require_terminal_manager(&terminal_id, "terminal.kill")
                 .await?;
+            self.refuse_terminal_if_retired(&terminal_id).await?;
             terminal_ops::kill(&pty, &terminal_id).await
         })
     }
@@ -20442,6 +20449,7 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             let _mutation = self.workspace_mutations.enter(&workspace_id)?;
             self.require_member(&workspace_id).await?;
+            self.refuse_if_retired(&workspace_id).await?;
             let root =
                 file_ops::resolve_root(&store, &workspace_id, caller_agent_id.as_ref()).await;
             let result = file_ops::write(&root, &path, &content)?;
@@ -20493,6 +20501,7 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             let _mutation = self.workspace_mutations.enter(&workspace_id)?;
             self.require_member(&workspace_id).await?;
+            self.refuse_if_retired(&workspace_id).await?;
             let root =
                 file_ops::resolve_root(&store, &workspace_id, caller_agent_id.as_ref()).await;
             let result = file_ops::delete(&root, &path)?;
@@ -20515,6 +20524,7 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
+            self.refuse_if_retired(&workspace_id).await?;
             let root =
                 file_ops::resolve_root(&store, &workspace_id, caller_agent_id.as_ref()).await;
             file_ops::mkdir(&root, &path)
@@ -20532,6 +20542,7 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             let _mutation = self.workspace_mutations.enter(&workspace_id)?;
             self.require_member(&workspace_id).await?;
+            self.refuse_if_retired(&workspace_id).await?;
             let root =
                 file_ops::resolve_root(&store, &workspace_id, caller_agent_id.as_ref()).await;
             let result = file_ops::rename(&root, &old_path, &new_path)?;
@@ -20660,6 +20671,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
+            self.refuse_if_retired(&workspace_id).await?;
             let idempotency_key = attachment_upload::validate_idempotency_key(idempotency_key)?;
             let decoded;
             let source = match (&data, &source_path) {
@@ -20720,6 +20732,12 @@ impl WorkspaceApi for Services {
                     sha256: None,
                 },
             });
+            // Same fence + fresh retired check as the chunked commit: retire
+            // holds the fence from its row flip through the folder sweep, so
+            // placement (which creates `.intent/` dirs) can never recreate a
+            // swept checkout.
+            let _archive = self.archive_fence.acquire(&workspace_id).await;
+            self.refuse_if_retired(&workspace_id).await?;
             self.place_attachment_registered(
                 workspace_id,
                 &file_name,
@@ -20742,6 +20760,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
+            self.refuse_if_retired(&workspace_id).await?;
             self.file_attachment_upload_begin_op(
                 workspace_id,
                 file_name,
@@ -20762,6 +20781,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             self.require_upload_member(&upload_id).await?;
+            self.refuse_upload_if_retired(&upload_id).await?;
             self.file_attachment_upload_chunk_op(upload_id, seq, data)
                 .await
         })
@@ -20773,6 +20793,7 @@ impl WorkspaceApi for Services {
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             self.require_upload_member(&upload_id).await?;
+            self.refuse_upload_if_retired(&upload_id).await?;
             self.file_attachment_upload_commit_op(upload_id).await
         })
     }
@@ -20985,6 +21006,7 @@ impl WorkspaceApi for Services {
     fn cross_workspace_list_siblings(
         &self,
         workspace_id: WorkspaceId,
+        include_retired: bool,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
         let store = self.store.clone();
         Box::pin(async move {
@@ -21001,7 +21023,9 @@ impl WorkspaceApi for Services {
                     "Current workspace is not associated with a repository".to_string(),
                 ));
             }
-            let mut all = store.list_workspaces(true).await?;
+            let mut all = store
+                .list_workspaces(intent_core::WorkspaceListFilter::new(true, include_retired))
+                .await?;
             self.retain_member_workspaces(&mut all).await?;
             let siblings: Vec<serde_json::Value> = all
                 .into_iter()
@@ -21455,11 +21479,17 @@ impl WorkspaceApi for Services {
         })
     }
 
-    fn list_workspaces(&self, include_archived: bool) -> BoxFuture<'_, Result<Vec<Workspace>>> {
+    fn list_workspaces(
+        &self,
+        filter: intent_core::WorkspaceListFilter,
+    ) -> BoxFuture<'_, Result<Vec<Workspace>>> {
         let store = self.store.clone();
         let this = self.clone();
+        // Retired rows stay `archived = 1`, so the archived-scoped aggregate
+        // reads below must cover them whenever the list includes them.
+        let include_archived = filter.include_archived || filter.include_retired;
         Box::pin(async move {
-            let mut list = store.list_workspaces(include_archived).await?;
+            let mut list = store.list_workspaces(filter).await?;
             // Membership filter (multiplayer w3) before any enrichment, so a
             // collaborator's rows never cost more than what it can see.
             this.retain_member_workspaces(&mut list).await?;
@@ -21510,10 +21540,11 @@ impl WorkspaceApi for Services {
 
     fn list_workspaces_lite(
         &self,
-        include_archived: bool,
+        filter: intent_core::WorkspaceListFilter,
     ) -> BoxFuture<'_, Result<Vec<Workspace>>> {
         let store = self.store.clone();
         let this = self.clone();
+        let include_archived = filter.include_archived || filter.include_retired;
         Box::pin(async move {
             // Store rows + live activity + cheap status aggregates only. No
             // notes/sessions enrichment so workspace.subscribe seq-0 stays
@@ -21524,7 +21555,7 @@ impl WorkspaceApi for Services {
             // `taskStats` (counting query, no note-body hydration),
             // `displayStatus` (same derivation as the enriched path), and
             // `cowSupported` (lifetime-cached probe, effectively free).
-            let mut list = store.list_workspaces(include_archived).await?;
+            let mut list = store.list_workspaces(filter).await?;
             this.retain_member_workspaces(&mut list).await?;
             let workspace_ids: Vec<_> = list.iter().map(|ws| ws.id.clone()).collect();
             let snapshot = this
@@ -21553,12 +21584,16 @@ impl WorkspaceApi for Services {
     fn find_workspaces_by_pull_request(
         &self,
         url: String,
+        include_retired: bool,
     ) -> BoxFuture<'_, Result<Vec<intent_core::PullRequestWorkspace>>> {
         let this = self.clone();
         Box::pin(async move {
             let key = intent_core::pull_request_key(&url)
                 .ok_or_else(|| Error::InvalidParams("url is not a pull-request URL".to_string()))?;
-            let mut rows = this.store.list_pull_request_workspaces(&key).await?;
+            let mut rows = this
+                .store
+                .list_pull_request_workspaces(&key, include_retired)
+                .await?;
             // Same membership narrowing as `workspace.list` (§5.48).
             if let Some(visible) = this.visible_workspace_ids().await? {
                 rows.retain(|row| visible.contains(&row.id));
@@ -21635,77 +21670,35 @@ impl WorkspaceApi for Services {
         })
     }
 
-    fn workspace_transfer_plan(
-        &self,
-        id: WorkspaceId,
-    ) -> BoxFuture<'_, Result<intent_core::transfer::TransferPlan>> {
-        self.ports.transfer().transfer_plan(self, id)
-    }
-
-    fn workspace_import_begin(
-        &self,
-        manifest: serde_json::Value,
-        archive_size_bytes: u64,
-        archive_sha256: String,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        self.ports
-            .transfer()
-            .import_begin(self, manifest, archive_size_bytes, archive_sha256)
-    }
-
-    fn workspace_import_chunk(
-        &self,
-        import_id: String,
-        seq: u64,
-        data: String,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        self.ports
-            .transfer()
-            .import_chunk(self, import_id, seq, data)
-    }
-
-    fn workspace_import_commit(
-        &self,
-        import_id: String,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        self.ports.transfer().import_commit(self, import_id)
-    }
-
-    fn workspace_import_abort(
-        &self,
-        import_id: String,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        self.ports.transfer().import_abort(self, import_id)
-    }
-
-    fn workspace_export_start(&self, id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
-        self.ports.transfer().export_start(self, id)
-    }
-
-    fn workspace_export_read(
-        &self,
-        export_id: String,
-        seq: u64,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        self.ports.transfer().export_read(self, export_id, seq)
-    }
-
-    fn workspace_export_finalize(
-        &self,
-        export_id: String,
-        archive_source: bool,
-        final_status_message: Option<String>,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        self.ports
-            .transfer()
-            .export_finalize(self, export_id, archive_source, final_status_message)
-    }
-
-    fn workspace_export_abort(
-        &self,
-        export_id: String,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        self.ports.transfer().export_abort(self, export_id)
+    feature_ports::port_forwarders! {
+        transfer {
+            fn workspace_transfer_plan(&self, id: WorkspaceId)
+                -> BoxFuture<'_, Result<intent_core::transfer::TransferPlan>> => transfer_plan;
+            fn workspace_import_begin(
+                &self,
+                manifest: serde_json::Value,
+                archive_size_bytes: u64,
+                archive_sha256: String,
+            ) -> BoxFuture<'_, Result<serde_json::Value>> => import_begin;
+            fn workspace_import_chunk(&self, import_id: String, seq: u64, data: String)
+                -> BoxFuture<'_, Result<serde_json::Value>> => import_chunk;
+            fn workspace_import_commit(&self, import_id: String)
+                -> BoxFuture<'_, Result<serde_json::Value>> => import_commit;
+            fn workspace_import_abort(&self, import_id: String)
+                -> BoxFuture<'_, Result<serde_json::Value>> => import_abort;
+            fn workspace_export_start(&self, id: WorkspaceId)
+                -> BoxFuture<'_, Result<serde_json::Value>> => export_start;
+            fn workspace_export_read(&self, export_id: String, seq: u64)
+                -> BoxFuture<'_, Result<serde_json::Value>> => export_read;
+            fn workspace_export_finalize(
+                &self,
+                export_id: String,
+                archive_source: bool,
+                final_status_message: Option<String>,
+            ) -> BoxFuture<'_, Result<serde_json::Value>> => export_finalize;
+            fn workspace_export_abort(&self, export_id: String)
+                -> BoxFuture<'_, Result<serde_json::Value>> => export_abort;
+        }
     }
 
     fn create_workspace(
@@ -22745,6 +22738,7 @@ impl WorkspaceApi for Services {
                         context_links: input.context_links.filter(|l| !l.is_empty()),
                         archived: false,
                         archived_at: None,
+                        retired_at: None,
                         // Card aggregates are computed on the list/get emit path only.
                         task_stats: None,
                         agent_summary: None,
@@ -24097,6 +24091,15 @@ impl WorkspaceApi for Services {
         }
         let mut changes = serde_json::to_value(&normalised).unwrap_or(serde_json::Value::Null);
         Box::pin(async move {
+            // `Retired` is entered only through `workspace.retire` / the
+            // automatic sweep (ownership proof, teardown, folder removal):
+            // a generic status write must never produce it.
+            if update.status == Some(WorkspaceStatus::Retired) {
+                return Err(Error::InvalidParams(
+                    "workspace.update: status \"Retired\" is set only by workspace.retire"
+                        .to_string(),
+                ));
+            }
             self.require_member(&id).await?;
             // Multiplayer w3: a member may steer the workspace card (title /
             // tags / status message / status image); every other field —
@@ -24422,6 +24425,11 @@ impl WorkspaceApi for Services {
                 return Ok(chief_workspace());
             }
             let mut ws = store.get_workspace(&id).await?;
+            // A retired workspace is already past archived; re-archiving
+            // would flip its status back to Archived without a folder.
+            if ws.is_retired() {
+                return Err(retire::retired_error(&id));
+            }
             // Archive ↔ unarchive fence (see `ArchiveFence`): held from
             // before the commit until the detached guests' queued messages
             // are dropped and their removal deltas are out (the guard moves
@@ -24632,6 +24640,26 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn retired_workspace_for(
+        &self,
+        workspace_id: Option<WorkspaceId>,
+        agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<Option<WorkspaceId>>> {
+        Box::pin(async move {
+            self.store
+                .retired_workspace_for(workspace_id.as_ref(), agent_id.as_ref())
+                .await
+        })
+    }
+
+    fn retire_workspace(
+        &self,
+        id: WorkspaceId,
+        caller_agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<Workspace>> {
+        Box::pin(self.retire_workspace_op(id, caller_agent_id))
+    }
+
     fn unarchive_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
         let this = self.clone();
         // Manual unarchive (`workspace.unarchive` / `workspace.restore`):
@@ -24771,6 +24799,7 @@ impl WorkspaceApi for Services {
                 context_links: None,
                 archived: false,
                 archived_at: None,
+                retired_at: None,
                 task_stats: None,
                 agent_summary: None,
                 diff_summary: None,
@@ -26226,9 +26255,15 @@ impl WorkspaceApi for Services {
             }
             let caller_expected_version = input.expected_version;
             let mut expected_version = caller_expected_version;
-            let mut note = fetch_note(&store, &workspace_id, &note_id).await?;
             // content present → raw full set; otherwise title/tags metadata.
             let content_changed = input.content.is_some();
+            // Both arms hold the note's lane from this read through the
+            // persist (and, for a text write, the orphan-flag apply), like
+            // every other writer: a metadata write that bumped the rev
+            // outside the lane could be reverted by a whole-row writer's
+            // older copy or burn a laned writer's bounded retries.
+            let write_lane = self.lock_note_content(&workspace_id, &note_id).await;
+            let mut note = fetch_note(&store, &workspace_id, &note_id).await?;
             if let (true, Some(base)) = (content_changed, input.base_content_bytes) {
                 // Truncated-read write guard, after the strict
                 // `expectedVersion` check (a stale value is `-32005` first).
@@ -26273,8 +26308,14 @@ impl WorkspaceApi for Services {
             if content_changed {
                 // FE-only `note.update`: no caller-agent context on this arm
                 // (transport router path), so the version author is the user.
-                match persist_note_content(&store, &note, expected_version, &user_version_author())
-                    .await
+                match persist_note_content(
+                    &store,
+                    &write_lane,
+                    &note,
+                    expected_version,
+                    &user_version_author(),
+                )
+                .await
                 {
                     // A guarded write the caller sent without
                     // `expectedVersion` lost the rev gate pinned above: a
@@ -26298,20 +26339,20 @@ impl WorkspaceApi for Services {
                     }
                 }
             } else {
-                // Metadata-scoped: leaves the stored content untouched even
-                // when a content write committed after the fetch above.
+                // Metadata-scoped: never rewrites the stored content, and
+                // the lane keeps any text writer out until the re-fetch.
                 store
-                    .update_note_metadata_versioned(&note, expected_version)
+                    .update_note_metadata_versioned(&write_lane, &note, expected_version)
                     .await?;
             }
-            // Return the row as committed — the bumped `rev`, the stored
-            // `updated_at`, and (on the metadata arm) any content a
-            // concurrent write landed — rather than the pre-write copy
+            // Return the row as committed — the bumped `rev` and the stored
+            // `updated_at` — rather than the pre-write copy
             // (intent-hq/intent#5589).
             note = fetch_note(&store, &workspace_id, &note_id).await?;
             if let Some(plan) = reanchor_plan {
                 plan.apply_orphaned(&store, &workspace_id).await?;
             }
+            drop(write_lane);
             if content_changed {
                 services.schedule_line_attribution_recompute(
                     &note.workspace_id.clone(),
@@ -26383,8 +26424,7 @@ impl WorkspaceApi for Services {
                 ..
             } = persist_merged_content(
                 &store,
-                &workspace_id,
-                &note_id,
+                &write_lane,
                 ContentWrite {
                     seed: Some(note),
                     incoming: &incoming,
@@ -26477,8 +26517,7 @@ impl WorkspaceApi for Services {
                 ..
             } = persist_merged_content(
                 &store,
-                &workspace_id,
-                &note_id,
+                &write_lane,
                 ContentWrite {
                     seed: Some(note),
                     incoming: &incoming,
@@ -26569,8 +26608,7 @@ impl WorkspaceApi for Services {
                 ..
             } = persist_merged_content(
                 &store,
-                &workspace_id,
-                &note_id,
+                &write_lane,
                 ContentWrite {
                     seed: Some(note),
                     incoming: &incoming,
@@ -26681,8 +26719,7 @@ impl WorkspaceApi for Services {
                 rev,
             } = persist_merged_content(
                 &store,
-                &workspace_id,
-                &note_id,
+                &write_lane,
                 ContentWrite {
                     seed: None,
                     incoming: &content,
@@ -26766,6 +26803,8 @@ impl WorkspaceApi for Services {
                     "At least one of title or tags must be provided".to_string(),
                 ));
             }
+            // The lane covers this read through the write (see `note.update`).
+            let write_lane = self.lock_note_content(&workspace_id, &note_id).await;
             let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
             let is_spec = note_id.as_str() == "spec";
             let mut changed = false;
@@ -26794,11 +26833,12 @@ impl WorkspaceApi for Services {
             }
             note.updated_at = now_iso();
             store
-                .update_note_metadata_versioned(&note, expected_version)
+                .update_note_metadata_versioned(&write_lane, &note, expected_version)
                 .await?;
             // Report the row as committed (intent-hq/intent#5589): the
             // bumped `rev` and stored `updated_at`, not the pre-write copy.
             let note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
+            drop(write_lane);
             publish_event(
                 bus.as_ref(),
                 note_change_event(
@@ -27082,15 +27122,25 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             let _mutation = self.workspace_mutations.enter(&workspace_id)?;
             self.require_member(&workspace_id).await?;
+            // Resolved before taking the lane: it does not depend on the note.
+            let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
+            let write_lane = self.lock_note_content(&workspace_id, &note_id).await;
             let mut note = fetch_note(&store, &workspace_id, &note_id).await?;
             let version = store.get_note_version(&workspace_id, &note_id, v).await?;
             note.title = version.title;
-            note.content = version.content;
+            // The restored text runs through the same comment-anchor pass as
+            // every other text write: a comment anchored after version `v`
+            // loses its markers and is flagged orphaned, and markers of a
+            // comment deleted since are scrubbed rather than brought back.
+            let mut plan =
+                reanchor_note_comments(&store, &workspace_id, &note_id, version.content).await?;
+            note.content = std::mem::take(&mut plan.content);
             note.updated_at = now_iso();
-            let author = resolve_note_version_author(&store, caller_agent_id.as_ref()).await;
             let (_, new_v) = store
-                .update_note_with_version(&note, None, &author, &note.updated_at)
+                .update_note_with_version(&write_lane, &note, None, &author, &note.updated_at)
                 .await?;
+            plan.apply_orphaned(&store, &workspace_id).await?;
+            drop(write_lane);
             services
                 .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
             publish_event(
@@ -27224,8 +27274,7 @@ impl WorkspaceApi for Services {
             let read_rev = note.rev;
             let MergedContentWrite { note, .. } = persist_merged_content(
                 &store,
-                &workspace_id,
-                &note_id,
+                &write_lane,
                 ContentWrite {
                     seed: Some(note),
                     incoming: &updated,
@@ -27419,8 +27468,7 @@ impl WorkspaceApi for Services {
                 if redirect.is_none() {
                     let merged = persist_merged_content(
                         &store,
-                        &workspace_id,
-                        &note_id,
+                        &write_lane,
                         ContentWrite {
                             seed: Some(note),
                             incoming: &update.content,
@@ -27439,7 +27487,9 @@ impl WorkspaceApi for Services {
                         .await?;
                 note.content = std::mem::take(&mut plan.content);
                 note.updated_at = now_iso();
-                match persist_note_content(&store, &note, Some(read_rev), &author).await {
+                match persist_note_content(&store, &write_lane, &note, Some(read_rev), &author)
+                    .await
+                {
                     Ok(_) => {
                         plan.apply_orphaned(&store, &workspace_id).await?;
                         break (note, update, redirect, true);
@@ -27629,6 +27679,9 @@ impl WorkspaceApi for Services {
             let new_status =
                 serde_json::from_value::<TaskStatus>(serde_json::Value::String(status.clone()))
                     .map_err(|_| Error::Internal(format!("Invalid status: {status}")))?;
+            // The lane covers this read through the metadata write; it is
+            // released before materialization takes the parents' lanes.
+            let write_lane = self.lock_note_content(&workspace_id, &note_id).await;
             let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
             // Relation writes are validated + cycle/tree-checked against the
             // workspace note set, exactly like `task.setRelations` (ALL notes,
@@ -27702,7 +27755,8 @@ impl WorkspaceApi for Services {
                 }
             }
             note.updated_at = now.clone();
-            store.update_note_metadata(&note).await?;
+            store.update_note_metadata(&write_lane, &note).await?;
+            drop(write_lane);
             // A markAsTask that crosses the complete boundary records/removes
             // the caller's flipped-completion pair, exactly like
             // `task.updateNoteStatus` (a same-status re-mark is a no-op here).
@@ -27840,6 +27894,8 @@ impl WorkspaceApi for Services {
         let services = self.clone();
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
+            // The lane covers this read through the metadata write.
+            let write_lane = self.lock_note_content(&workspace_id, &note_id).await;
             let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
             let Some(mut task) = note.metadata.task.clone() else {
                 return Err(Error::Internal("Note is not a task".to_string()));
@@ -27849,11 +27905,11 @@ impl WorkspaceApi for Services {
             // Validation + cycle/tree checks read the same workspace snapshot
             // the write is based on (ALL notes, not just tasks — the
             // tree-relative check walks `parent_id` chains that may cross
-            // non-task notes). Like every other task-metadata write this is
-            // last-writer-wins (no versioned CAS): concurrent relation writes
-            // are coordinator-driven and rare, and a racing write that slips a
-            // stale cycle past the check degrades readiness for the tasks
-            // involved, not data integrity.
+            // non-task notes). The note's own row cannot change under the
+            // lane, but other notes' relations can: concurrent relation writes
+            // are coordinator-driven and rare, and a racing write to another
+            // note that slips a stale cycle past the check degrades readiness
+            // for the tasks involved, not data integrity.
             let all = store.list_notes(&workspace_id).await?;
             if let Some(deps) = &depends_on {
                 validate_relation_ids(&note.id, deps, &all, "dependsOn")?;
@@ -27892,7 +27948,8 @@ impl WorkspaceApi for Services {
             }
             note.metadata.task = Some(task);
             note.updated_at = now_iso();
-            store.update_note_metadata(&note).await?;
+            store.update_note_metadata(&write_lane, &note).await?;
+            drop(write_lane);
             // Metadata changed → subscribers refetch the note (§6.5), same as
             // every other task-metadata write.
             publish_event(
@@ -28029,6 +28086,9 @@ impl WorkspaceApi for Services {
                     "Invalid agentId format: \"{agent_id}\". Agent IDs must be in format \"agent-{{uuid}}\" (e.g., \"agent-b0a8044a-5eac-4b52-8456-15d3b784decb\"). To create a new agent and assign it to this task, use create_agent with taskNoteId=\"{note_id}\" instead."
                 )));
             }
+            // The lane covers this read through the metadata write; it is
+            // released before materialization takes the parents' lanes.
+            let write_lane = self.lock_note_content(&workspace_id, &note_id).await;
             let mut note = match store.get_note(&workspace_id, &note_id).await {
                 Ok(n) => n,
                 Err(Error::NotFound(_)) => {
@@ -28093,7 +28153,8 @@ impl WorkspaceApi for Services {
             }
             note.metadata.task = Some(task);
             note.updated_at = now.clone();
-            store.update_note_metadata(&note).await?;
+            store.update_note_metadata(&write_lane, &note).await?;
+            drop(write_lane);
             // TS parity (`assignAgentToTask`): the assignment write routes
             // through `updateNote` (→ `note:updated`) and the not_started →
             // in_progress transition through `updateTaskStatus`
@@ -28163,25 +28224,12 @@ impl WorkspaceApi for Services {
         workspace_id: WorkspaceId,
         agent_id: AgentId,
     ) -> BoxFuture<'_, Result<TaskRemoveAgentFromAllTasksResult>> {
-        let store = self.store.clone();
         Box::pin(async move {
             self.require_agent_member(&agent_id).await?;
-            let notes = store.list_notes(&workspace_id).await?;
-            let now = now_iso();
-            let mut updated_count: u32 = 0;
-            for mut note in notes {
-                let Some(mut task) = note.metadata.task.clone() else {
-                    continue;
-                };
-                if !task.assigned_agent_ids.contains(&agent_id) {
-                    continue;
-                }
-                task.assigned_agent_ids.retain(|id| id != &agent_id);
-                note.metadata.task = Some(task);
-                note.updated_at = now.clone();
-                store.update_note_metadata(&note).await?;
-                updated_count += 1;
-            }
+            let updated = self
+                .strip_agents_from_workspace_tasks(&workspace_id, std::slice::from_ref(&agent_id))
+                .await?;
+            let updated_count = u32::try_from(updated.len()).unwrap_or(u32::MAX);
             Ok(TaskRemoveAgentFromAllTasksResult {
                 ok: true,
                 updated_count,
@@ -28410,6 +28458,7 @@ impl WorkspaceApi for Services {
                     // even when two adds race.
                     match store
                         .update_note_with_comment(
+                            &write_lane,
                             &note,
                             Some(read_rev),
                             &new_comment,
@@ -29537,6 +29586,7 @@ impl WorkspaceApi for Services {
         let status_cache = self.git_status_invalidator();
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
+            self.refuse_if_retired(&workspace_id).await?;
             // Reject `.`/`*`/`--all` and parse first (TS `ws.git.stage` order).
             let path_list = git_ops::parse_stage_paths(&paths)?;
             // All stage failures surface as `-32603` (TS wraps the whole path in
@@ -29565,6 +29615,7 @@ impl WorkspaceApi for Services {
         let status_cache = self.git_status_invalidator();
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
+            self.refuse_if_retired(&workspace_id).await?;
             // Same `.`/`*`/`--all` rejection + CSV/array parse as `git.stage`.
             let path_list = git_ops::parse_stage_paths(&paths)?;
             // Mirror `git.stage`: every failure surfaces as `-32603`, so a
@@ -29592,6 +29643,7 @@ impl WorkspaceApi for Services {
         let status_cache = self.git_status_invalidator();
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
+            self.refuse_if_retired(&workspace_id).await?;
             // Discard-specific parser: `.`/`*`/`--all` rejected in BOTH the
             // top-level string and every array element (closes the array-form
             // bypass that would otherwise let `["*"]` / `["--all"]` devolve
@@ -29630,6 +29682,7 @@ impl WorkspaceApi for Services {
         let status_cache = self.git_status_invalidator();
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
+            self.refuse_if_retired(&workspace_id).await?;
             // Wire policy mirrors `git.stage`: every failure surfaces as
             // `-32603`. A missing workspace/worktree stays `Internal`.
             let ws = store
@@ -29673,6 +29726,7 @@ impl WorkspaceApi for Services {
         let status_cache = self.git_status_invalidator();
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
+            self.refuse_if_retired(&workspace_id).await?;
             let ws = store
                 .get_workspace(&workspace_id)
                 .await
@@ -29715,6 +29769,7 @@ impl WorkspaceApi for Services {
         let status_cache = self.git_status_invalidator();
         self.execution_call(async move {
             self.require_member(&workspace_id).await?;
+            self.refuse_if_retired(&workspace_id).await?;
             let ws = store
                 .get_workspace(&workspace_id)
                 .await
@@ -29804,6 +29859,7 @@ impl WorkspaceApi for Services {
         let status_cache = self.git_status_invalidator();
         self.execution_call(async move {
             self.require_member(&workspace_id).await?;
+            self.refuse_if_retired(&workspace_id).await?;
             let ws = store
                 .get_workspace(&workspace_id)
                 .await
@@ -29870,6 +29926,7 @@ impl WorkspaceApi for Services {
         let status_cache = self.git_status_invalidator();
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
+            self.refuse_if_retired(&workspace_id).await?;
             if branch_name.trim().is_empty() {
                 return Err(Error::InvalidParams("branchName is required".to_string()));
             }
@@ -29918,6 +29975,7 @@ impl WorkspaceApi for Services {
         let status_cache = self.git_status_invalidator();
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
+            self.refuse_if_retired(&workspace_id).await?;
             if branch_name.trim().is_empty() {
                 return Err(Error::InvalidParams("branchName is required".to_string()));
             }
@@ -29962,6 +30020,7 @@ impl WorkspaceApi for Services {
         let status_cache = self.git_status_invalidator();
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
+            self.refuse_if_retired(&workspace_id).await?;
             if old_branch_name.trim().is_empty() {
                 return Err(Error::InvalidParams(
                     "oldBranchName cannot be empty".to_string(),
@@ -30025,6 +30084,7 @@ impl WorkspaceApi for Services {
         let locks = self.worktree_locks.clone();
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
+            self.refuse_if_retired(&workspace_id).await?;
             // Unknown workspace → surface as `-32603`; a bare `NotFound` here
             // would be misleading given the FE's `Result` shape.
             let ws = store
@@ -30430,6 +30490,7 @@ impl WorkspaceApi for Services {
         let this = self.clone();
         let tasks = self.store_tasks.clone();
         Box::pin(async move {
+            self.refuse_if_retired(&workspace_id).await?;
             let caller = intent_core::current_caller();
             let wire = intent_core::caller::current_wire_credential();
             if let Some(agent) = agent_id.as_ref() {
@@ -35949,6 +36010,7 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
+            self.refuse_if_retired(&workspace_id).await?;
             let path_list = file_tracking_ops::parse_paths(&paths)?;
             let ws = store
                 .get_workspace(&workspace_id)
@@ -35978,6 +36040,7 @@ impl WorkspaceApi for Services {
         let store = self.store.clone();
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
+            self.refuse_if_retired(&workspace_id).await?;
             let path_list = file_tracking_ops::parse_paths(&paths)?;
             let ws = store
                 .get_workspace(&workspace_id)
@@ -36786,11 +36849,17 @@ impl Services {
     /// `changes` as `autoUnarchive: { reason, agentId, agentName }`; manual
     /// callers pass `None` and the field is absent (PROTOCOL §6.5).
     ///
-    /// Returns the workspace plus whether THIS call performed the
-    /// Archived → Active flip: the row write is conditional
+    /// A Retired workspace is revived instead
+    /// ([`Services::revive_retired_checkout`]): its delta carries
+    /// `retiredAt: null`, the new `branch` / `baseCommitSha` and
+    /// `revived: { reason }` (the turn-start stamp, else `"manual"`) in
+    /// place of `autoUnarchive`.
+    ///
+    /// Returns the workspace plus the [`UnarchiveOutcome`] when THIS call
+    /// performed the flip (`None` otherwise): the row write is conditional
     /// (`unarchive_workspace_if_archived`, `WHERE archived = 1`), so
     /// concurrent unarchivers serialize at the statement and exactly one
-    /// caller reports `true`. A declined flip (already Active) still
+    /// caller reports an outcome. A declined flip (already Active) still
     /// succeeds for the manual RPCs (idempotent unarchive, delta still
     /// emitted) but skips the emit entirely on the auto path — the losing
     /// racer must not re-announce a flip it did not perform (the winner's
@@ -36804,12 +36873,26 @@ impl Services {
         &self,
         id: WorkspaceId,
         auto_unarchive: Option<serde_json::Value>,
-    ) -> Result<(Workspace, bool)> {
+    ) -> Result<(Workspace, Option<UnarchiveOutcome>)> {
+        self.unarchive_workspace_inner_fenced(id, auto_unarchive, None)
+            .await
+    }
+
+    /// [`Services::unarchive_workspace_inner`] with an optional archive
+    /// fence the caller already holds (the turn-start path takes it before
+    /// claiming its slot — see [`Services::turn_start_archive_fence`]); the
+    /// flip then runs under that hold instead of re-acquiring the fence.
+    async fn unarchive_workspace_inner_fenced(
+        &self,
+        id: WorkspaceId,
+        auto_unarchive: Option<serde_json::Value>,
+        held_fence: Option<ArchiveFenceGuard>,
+    ) -> Result<(Workspace, Option<UnarchiveOutcome>)> {
         let store = self.store.clone();
         let bus = self.event_bus.clone();
         let manager = self.agent_manager();
         if id.is_chief() {
-            return Ok((chief_workspace(), false));
+            return Ok((chief_workspace(), None));
         }
         // Conditional flip: writes only when the row is currently archived,
         // so two racing unarchivers (concurrent turn starts, or a manual
@@ -36821,13 +36904,38 @@ impl Services {
         // it unlocks — lands strictly after the archive tail's drop, never
         // inside it. Held only across the flip: the drain kicks below can
         // re-enter the turn-start auto-unarchive, which takes this fence.
-        let flipped = {
-            let _fence = self.archive_fence.acquire(&id).await;
-            store
-                .unarchive_workspace_if_archived(&id, &now_iso())
-                .await?
+        //
+        // A RETIRED workspace is revived instead (PROTOCOL §5.1 "Revive"):
+        // a fresh blank checkout on a new branch, provisioned under the same
+        // fence so the retire folder sweep can never delete it.
+        let (flipped, revived) = {
+            let _fence = match held_fence {
+                Some(fence) => fence,
+                None => self.archive_fence.acquire(&id).await,
+            };
+            let current = store.get_workspace(&id).await?;
+            if current.is_retired() {
+                let revived = self.revive_retired_checkout(&current).await?;
+                (revived.is_some(), revived)
+            } else {
+                let flipped = store
+                    .unarchive_workspace_if_archived(&id, &now_iso())
+                    .await?;
+                (flipped, None)
+            }
         };
         let mut ws = store.get_workspace(&id).await?;
+        if ws.is_retired() {
+            return Err(retire::retired_error(&id));
+        }
+        let outcome = match &revived {
+            Some(r) => Some(UnarchiveOutcome::Revived {
+                previous_branch: r.previous_branch.clone(),
+                branch: r.branch.clone(),
+            }),
+            None if flipped => Some(UnarchiveOutcome::Unarchived),
+            None => None,
+        };
         // The losing racer on the auto path stops here: the winner (a
         // concurrent turn start or a manual unarchive) already kicked the
         // parked drains and emitted its delta, so re-running the tail would
@@ -36836,7 +36944,7 @@ impl Services {
         // (unarchiving an Active workspace still re-derives and re-emits).
         if auto_unarchive.is_some() && !flipped {
             ws.activity = self.workspace_activity(&ws.id);
-            return Ok((ws, false));
+            return Ok((ws, None));
         }
         // Re-engage queues parked by the archived gates
         // (`try_drain_queue` / `deliver_wake_message`): nothing kicks a
@@ -36887,11 +36995,21 @@ impl Services {
             "status": ws.status,
             "archivedAt": serde_json::Value::Null,
         });
-        if let Some(stamp) = auto_unarchive {
+        if let Some(revived) = &revived {
+            // Revive delta (§6.5): `retiredAt` cleared, the fresh checkout's
+            // `branch` / `baseCommitSha`, and `revived: { reason }` — the
+            // turn-start stamp's agent fields carried over, never
+            // `autoUnarchive`.
+            changes["retiredAt"] = serde_json::Value::Null;
+            changes["branch"] = serde_json::json!(revived.branch);
+            changes["baseCommitSha"] = serde_json::json!(revived.base_commit_sha);
+            changes["revived"] =
+                auto_unarchive.unwrap_or_else(|| serde_json::json!({ "reason": "manual" }));
+        } else if let Some(stamp) = auto_unarchive {
             changes["autoUnarchive"] = stamp;
         }
         publish_event(bus.as_ref(), workspace_updated_event(&ws.id, &changes)).await;
-        Ok((ws, flipped))
+        Ok((ws, outcome))
     }
 
     /// Best-effort auto-unarchive at the turn-start choke point
@@ -36917,30 +37035,80 @@ impl Services {
     /// better than a lost turn, and the archived drain gates keep parking
     /// follow-on wakes until a later trigger succeeds.
     ///
-    /// Returns `true` only when THIS call actually flipped the workspace
-    /// from Archived to Active (the conditional write affected the row);
-    /// `false` on the chief skip, a non-archived workspace, a read failure,
-    /// a lost flip race, or an unarchive failure — the caller uses the flip
-    /// to persist the `auto_unarchived` transcript notice and inject the
-    /// triggering turn's prompt block.
+    /// Returns the [`UnarchiveOutcome`] only when THIS call actually flipped
+    /// the workspace — `Unarchived` for Archived → Active, `Revived` when a
+    /// Retired workspace was re-provisioned as a fresh blank checkout
+    /// (PROTOCOL §5.1 "Revive"); `None` on the chief skip, a non-archived
+    /// workspace, a read failure, a lost flip race, or an unarchive/revive
+    /// failure — the caller uses it to persist the matching transcript
+    /// notice and inject the triggering turn's prompt block.
     ///
     /// Returns a [`BoxFuture`] (rather than `async fn`) to break the async
     /// type cycle: this helper is awaited inside `try_begin`, and the
     /// unarchive's drain kick re-enters `try_begin` (bounded at runtime —
     /// the row is Active by then, so the re-entrant read short-circuits —
     /// but the inferred future type would be infinite).
+    #[cfg(test)]
     pub(crate) fn auto_unarchive_on_turn_start<'a>(
         &'a self,
         workspace_id: &'a WorkspaceId,
         agent_id: &'a AgentId,
-    ) -> BoxFuture<'a, bool> {
+    ) -> BoxFuture<'a, Option<UnarchiveOutcome>> {
+        Box::pin(async move {
+            self.auto_unarchive_on_turn_start_fenced(workspace_id, agent_id, None)
+                .await
+                .ok()
+                .flatten()
+        })
+    }
+
+    /// The archive fence a turn start takes BEFORE claiming its slot when
+    /// the workspace is Archived (or Retired), held through the claim and
+    /// the auto-unarchive / revive flip
+    /// ([`Services::auto_unarchive_on_turn_start_fenced`]). Retirement holds
+    /// the same fence from its Retired flip through its whole teardown —
+    /// including `stop_many`, which releases in-flight slots — so a turn
+    /// claimed before that fence would have its admission silently cleared
+    /// by the stop and its revive notice and prompt lost. Taking the fence
+    /// first orders the claim strictly after any retirement teardown, and
+    /// no retirement can start between the claim and the revive. Lock order
+    /// is turn-start gate → archive fence; nothing holding the fence takes a
+    /// turn-start gate. `None` for chief, an Active row, or a read failure
+    /// (the turn proceeds unfenced exactly as before).
+    pub(crate) async fn turn_start_archive_fence(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> Option<ArchiveFenceGuard> {
+        if workspace_id.is_chief() {
+            return None;
+        }
+        match self.store.get_workspace(workspace_id).await {
+            Ok(ws) if ws.archived => Some(self.archive_fence.acquire(workspace_id).await),
+            _ => None,
+        }
+    }
+
+    /// `Services::auto_unarchive_on_turn_start` under an archive fence the
+    /// caller may already hold ([`Services::turn_start_archive_fence`]).
+    ///
+    /// `Err` only when the workspace is RETIRED and its revive failed: a
+    /// turn must not start in a workspace without a checkout, so the caller
+    /// releases its claim and leaves the message queued. A failed unarchive
+    /// of a merely Archived workspace stays best-effort (`Ok(None)`; the
+    /// turn proceeds in the archived workspace as before).
+    pub(crate) fn auto_unarchive_on_turn_start_fenced<'a>(
+        &'a self,
+        workspace_id: &'a WorkspaceId,
+        agent_id: &'a AgentId,
+        held_fence: Option<ArchiveFenceGuard>,
+    ) -> BoxFuture<'a, Result<Option<UnarchiveOutcome>>> {
         Box::pin(async move {
             if workspace_id.is_chief() {
-                return false;
+                return Ok(None);
             }
-            match self.store.get_workspace(workspace_id).await {
-                Ok(ws) if ws.archived => {}
-                Ok(_) => return false,
+            let retired = match self.store.get_workspace(workspace_id).await {
+                Ok(ws) if ws.archived => ws.is_retired(),
+                Ok(_) => return Ok(None),
                 Err(e) => {
                     tracing::warn!(
                         workspace = %workspace_id.as_str(),
@@ -36948,9 +37116,9 @@ impl Services {
                         error = %e,
                         "auto-unarchive: workspace read failed; turn proceeds in archived workspace"
                     );
-                    return false;
+                    return Ok(None);
                 }
-            }
+            };
             // Name lookup is display-only: a lookup failure (or a session
             // with no row yet) degrades to `null`, never blocks the
             // unarchive.
@@ -36966,18 +37134,28 @@ impl Services {
                 "agentName": agent_name,
             });
             match self
-                .unarchive_workspace_inner(workspace_id.clone(), Some(stamp))
+                .unarchive_workspace_inner_fenced(workspace_id.clone(), Some(stamp), held_fence)
                 .await
             {
-                Ok((_, flipped)) => {
-                    if flipped {
+                Ok((_, outcome)) => {
+                    if outcome.is_some() {
                         tracing::info!(
                             workspace = %workspace_id.as_str(),
                             agent = %agent_id,
+                            outcome = ?outcome,
                             "auto-unarchived workspace on agent turn start"
                         );
                     }
-                    flipped
+                    Ok(outcome)
+                }
+                Err(e) if retired => {
+                    tracing::warn!(
+                        workspace = %workspace_id.as_str(),
+                        agent = %agent_id,
+                        error = %e,
+                        "revive failed; turn not started in retired workspace"
+                    );
+                    Err(e)
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -36986,7 +37164,7 @@ impl Services {
                         error = %e,
                         "auto-unarchive failed; turn proceeds in archived workspace"
                     );
-                    false
+                    Ok(None)
                 }
             }
         })

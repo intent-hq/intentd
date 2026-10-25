@@ -76,7 +76,15 @@ async fn note_fts_lifecycle_and_composite_identity() {
     first.title = "Newtitle".into();
     first.content = "shared freshbody".into();
     first.tags = vec!["unicorn".into(), "café".into()];
-    store.update_note(&first).await.unwrap();
+    store
+        .update_note(
+            &store
+                .lock_note_content(&first.workspace_id, &first.id)
+                .await,
+            &first,
+        )
+        .await
+        .unwrap();
     assert!(hits(&store, "oldtitle").await.is_empty());
     assert_eq!(hits(&store, "oldbody").await[0].workspace_id, "b");
     for query in ["newtitle", "freshbody", "unicorn", "cafe"] {
@@ -89,7 +97,15 @@ async fn note_fts_lifecycle_and_composite_identity() {
     first.tags = vec!["narwhal".into()];
     // Metadata-only writes must not reindex an old caller's body.
     first.content = "stale caller body".into();
-    store.update_note_metadata(&first).await.unwrap();
+    store
+        .update_note_metadata(
+            &store
+                .lock_note_content(&first.workspace_id, &first.id)
+                .await,
+            &first,
+        )
+        .await
+        .unwrap();
     assert!(hits(&store, "unicorn").await.is_empty());
     assert_eq!(hits(&store, "narwhal").await.len(), 1);
     assert_eq!(hits(&store, "freshbody").await.len(), 1);
@@ -117,7 +133,10 @@ async fn note_fts_migration_backfills_and_rolls_back_atomically() {
     let mut n = note(&store, &a, "spec", "Backfilltitle", "backfillbody").await;
     n.tags = vec!["backfilltag".into()];
     n.is_archived = true;
-    store.update_note(&n).await.unwrap();
+    store
+        .update_note(&store.lock_note_content(&n.workspace_id, &n.id).await, &n)
+        .await
+        .unwrap();
     note(&store, &b, "spec", "Other", "backfillbody").await;
     let sql = include_str!("../../migrations/0141_note_fts.sql");
     // A failed migration transaction must leave original notes intact and no
@@ -159,7 +178,15 @@ async fn note_fts_permissions_scope_and_archive_filter_before_top_n() {
     }
     let mut archived = note(&store, &allowed, "archived", "needle", "needle").await;
     archived.is_archived = true;
-    store.update_note_metadata(&archived).await.unwrap();
+    store
+        .update_note_metadata(
+            &store
+                .lock_note_content(&archived.workspace_id, &archived.id)
+                .await,
+            &archived,
+        )
+        .await
+        .unwrap();
     note(&store, &allowed, "visible", "Other", "needle").await;
     let permit = [allowed.clone()];
     let mut options = NoteFtsOptions {
@@ -193,7 +220,15 @@ async fn note_fts_permissions_scope_and_archive_filter_before_top_n() {
     options.workspace_id = Some(&allowed);
     options.include_archived = false;
     archived.is_archived = false;
-    store.update_note_metadata(&archived).await.unwrap();
+    store
+        .update_note_metadata(
+            &store
+                .lock_note_content(&archived.workspace_id, &archived.id)
+                .await,
+            &archived,
+        )
+        .await
+        .unwrap();
     assert_eq!(
         store
             .search_notes_fts("needle", &options)
@@ -239,7 +274,13 @@ async fn note_fts_ranking_weights_and_stable_ties() {
     note(&store, &a, "body", "padding", "needle").await;
     let mut tag = note(&store, &a, "tag", "padding", "").await;
     tag.tags = vec!["needle".into()];
-    store.update_note_metadata(&tag).await.unwrap();
+    store
+        .update_note_metadata(
+            &store.lock_note_content(&tag.workspace_id, &tag.id).await,
+            &tag,
+        )
+        .await
+        .unwrap();
     let ranked = hits(&store, "needle").await;
     assert_eq!(
         ranked
@@ -255,7 +296,15 @@ async fn note_fts_ranking_weights_and_stable_ties() {
     note(&store, &a, "a", "same", "tie").await;
     let mut newest = note(&store, &b, "new", "same", "tie").await;
     newest.updated_at = "2026-02-01T00:00:00Z".into();
-    store.update_note_metadata(&newest).await.unwrap();
+    store
+        .update_note_metadata(
+            &store
+                .lock_note_content(&newest.workspace_id, &newest.id)
+                .await,
+            &newest,
+        )
+        .await
+        .unwrap();
     let options = NoteFtsOptions {
         limit: Some(2),
         ..Default::default()
@@ -414,7 +463,15 @@ async fn note_fts_survives_compaction_and_note_rowid_reassignment() {
     assert_eq!(hits(&store, "survivorword").await[0].note_id, "spec");
     assert!(hits(&store, "deletedword").await.is_empty());
     survivor.content = "aftercompaction".into();
-    store.update_note(&survivor).await.unwrap();
+    store
+        .update_note(
+            &store
+                .lock_note_content(&survivor.workspace_id, &survivor.id)
+                .await,
+            &survivor,
+        )
+        .await
+        .unwrap();
     assert!(hits(&store, "survivorword").await.is_empty());
     assert_eq!(hits(&store, "aftercompaction").await.len(), 1);
     note(&store, &ws, "later", "Later", "laterword").await;

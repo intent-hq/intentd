@@ -4157,9 +4157,12 @@ mod workspace_needs_attention {
             expected.push((ws, status));
         }
 
-        let listed = svc.list_workspaces(false).await.expect("workspace.list");
+        let listed = svc
+            .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+            .await
+            .expect("workspace.list");
         let lite = svc
-            .list_workspaces_lite(false)
+            .list_workspaces_lite(intent_core::WorkspaceListFilter::ACTIVE)
             .await
             .expect("workspace.subscribe snapshot");
         for (ws, status) in expected {
@@ -4210,7 +4213,10 @@ mod workspace_needs_attention {
             "fixture must fail the batch tail read"
         );
 
-        let listed = svc.list_workspaces(false).await.expect("workspace.list");
+        let listed = svc
+            .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+            .await
+            .expect("workspace.list");
         let listed_ws = listed
             .iter()
             .find(|workspace| workspace.id == ws)
@@ -4626,7 +4632,10 @@ mod display_status_events {
             .expect("insert task");
 
         let mut sub = subscribe(&h);
-        let list = services.list_workspaces_lite(true).await.expect("lite");
+        let list = services
+            .list_workspaces_lite(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .expect("lite");
         let row = list.iter().find(|w| w.id == h.ws).expect("row");
         assert!(row.display_status.is_some(), "lite row carries the status");
         assert_silent(&mut sub).await;

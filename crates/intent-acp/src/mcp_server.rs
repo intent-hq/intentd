@@ -307,9 +307,11 @@ impl WorkspaceMcpServer {
 
     /// Override the wall-clock budget for one `workspace_api` invocation
     /// (testing) — compresses the 30s production default so timeout-path
-    /// tests finish in milliseconds.
-    #[cfg(test)]
-    pub(crate) fn with_workspace_api_timeout(mut self, timeout: Duration) -> Self {
+    /// tests finish in milliseconds, or widens it for load-bound controls in
+    /// other crates (the dev-only `test-hooks` feature).
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[must_use]
+    pub fn with_workspace_api_timeout(mut self, timeout: Duration) -> Self {
         self.workspace_api_timeout = timeout;
         self
     }
@@ -318,7 +320,10 @@ impl WorkspaceMcpServer {
     /// (30s default, `INTENTD_WORKSPACE_API_TIMEOUT_MS` override, or the
     /// builder override above). The bridge derives its dispatch watchdog
     /// deadline from this so the two budgets can never cross (monorepo#2709).
-    pub(crate) fn workspace_api_timeout(&self) -> Duration {
+    /// Public so other crates' load-bound controls can prove which budget the
+    /// server they actually serve carries.
+    #[must_use]
+    pub fn workspace_api_timeout(&self) -> Duration {
         self.workspace_api_timeout
     }
 

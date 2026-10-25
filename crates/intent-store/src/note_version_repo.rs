@@ -81,16 +81,22 @@ impl Store {
     /// write's, out of rev order. Returns `(rev, v)`: the post-write rev and
     /// the new version number.
     ///
+    /// Takes `note`'s [`NoteWriteLock`](crate::NoteWriteLock) from this store;
+    /// any other lock is refused with `Error::Internal` before anything is
+    /// written.
+    ///
     /// # Errors
     ///
     /// Returns `Error::Conflict` (carrying the current entity) when `expected_version` is supplied and does not match the stored `rev`; `Error::NotFound` if the note does not exist in the workspace; `Error::Internal` if encoding fields or a statement fails.
     pub async fn update_note_with_version(
         &self,
+        lock: &crate::NoteWriteLock,
         note: &Note,
         expected_version: Option<i64>,
         author: &NoteVersionAuthor,
         date: &str,
     ) -> Result<(i64, i64)> {
+        lock.ensure_covers(self, note)?;
         self.prepare_task_events(&note.workspace_id).await;
         let mut conn = crate::note_write_connection::NoteWriteConnection::begin(self).await?;
 
@@ -128,17 +134,23 @@ impl Store {
     /// save that already converted the same block). Returns `(rev, v)` for
     /// the parent.
     ///
+    /// Takes `note`'s [`NoteWriteLock`](crate::NoteWriteLock) from this store;
+    /// any other lock is refused with `Error::Internal` before anything is
+    /// written.
+    ///
     /// # Errors
     ///
     /// Returns `Error::Conflict` (carrying the current entity) when `expected_version` is supplied and does not match the stored `rev`; `Error::NotFound` if the parent does not exist in the workspace; `Error::Internal` if encoding fields or a statement fails (including a duplicate child `(id, workspace_id)`).
     pub async fn update_note_with_version_and_children(
         &self,
+        lock: &crate::NoteWriteLock,
         note: &Note,
         expected_version: Option<i64>,
         children: &[Note],
         author: &NoteVersionAuthor,
         date: &str,
     ) -> Result<(i64, i64)> {
+        lock.ensure_covers(self, note)?;
         self.prepare_task_events(&note.workspace_id).await;
         let mut conn = crate::note_write_connection::NoteWriteConnection::begin(self).await?;
 

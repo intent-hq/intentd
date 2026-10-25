@@ -41,6 +41,10 @@ pub(in crate::agent_manager) struct ServerBlueprint {
     original: Option<(Arc<Services>, AgentSession)>,
     #[cfg(test)]
     context_decorator: Option<ContextDecorator>,
+    /// Test-only `workspace_api` budget for every server this builds (the
+    /// 63/64 acquisition controls: `test_support::quota_script`).
+    #[cfg(test)]
+    workspace_api_timeout: Option<std::time::Duration>,
 }
 
 impl ServerBlueprint {
@@ -54,6 +58,8 @@ impl ServerBlueprint {
             original: None,
             #[cfg(test)]
             context_decorator: None,
+            #[cfg(test)]
+            workspace_api_timeout: None,
         }
     }
 
@@ -67,7 +73,13 @@ impl ServerBlueprint {
     }
 
     pub(in crate::agent_manager) fn server(&self) -> WorkspaceMcpServer {
-        (self.build)()
+        let server = (self.build)();
+        #[cfg(test)]
+        let server = match self.workspace_api_timeout {
+            Some(timeout) => server.with_workspace_api_timeout(timeout),
+            None => server,
+        };
+        server
     }
 
     /// Standard ACP confirms an original physical owner without registering a
@@ -336,6 +348,9 @@ pub(super) struct Endpoint {
     changed: Notify,
     bridge: Mutex<Option<McpBridge>>,
     live: Option<Arc<LiveContext>>,
+    /// The `workspace_api` budget of the server this endpoint actually serves.
+    #[cfg(test)]
+    served_workspace_api_timeout: Mutex<Option<std::time::Duration>>,
 }
 
 impl Endpoint {
@@ -346,6 +361,8 @@ impl Endpoint {
             changed: Notify::new(),
             bridge: Mutex::new(None),
             live,
+            #[cfg(test)]
+            served_workspace_api_timeout: Mutex::new(None),
         }
     }
 
@@ -464,6 +481,12 @@ impl ConfirmedCallbackAttempt {
             self.context.take().expect("one original context"),
             self.live.as_ref(),
         );
+        #[cfg(test)]
+        endpoint
+            .served_workspace_api_timeout
+            .lock()
+            .unwrap()
+            .replace(server.workspace_api_timeout());
         let bridge = match serve_workspace_mcp_tcp(Arc::new(server)).await {
             Ok(bridge) => bridge,
             Err(error) => {

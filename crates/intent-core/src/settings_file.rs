@@ -191,6 +191,10 @@ pub struct WorkspaceSettings {
     /// `workspace.create` falls back to a linked worktree (local repository)
     /// or a plain local clone (repo-cache hydration) instead of failing.
     pub cow_isolation: bool,
+    /// `workspace.autoRetireArchivedAfterDays` — retire workspaces archived
+    /// longer than this many days (PROTOCOL §5.12). Absent (`None`, the
+    /// default) = off; a hand-edited `0` also reads as off.
+    pub auto_retire_archived_after_days: Option<u32>,
 }
 
 /// `[git]` — git behavior (`git.*`).
@@ -904,6 +908,18 @@ impl Default for AgentsSettings {
     }
 }
 
+/// Test-only env seam that resolves an `agents.resumeInterruptedOnStart` of
+/// `auto` (the schema default, also written out by the generated config
+/// template); an explicit `on` / `off`, `--resume-all`, and update restarts
+/// keep precedence, and a value other than `auto` / `on` / `off` fails daemon
+/// startup. The intentd
+/// hermetic test launcher pins it to `off`: the `auto` default resumes only
+/// on display-less hosts, so restart suites otherwise picked up an extra
+/// agent turn on CI alone (intent-hq/intent#6058, intent-hq/intent#7706).
+/// Production never sets it. Shared here so the daemon and the harness
+/// cannot drift apart on the name.
+pub const RESUME_ON_START_TEST_DEFAULT_ENV: &str = "INTENTD_TEST_RESUME_ON_START_DEFAULT";
+
 /// `agents.resumeInterruptedOnStart` values. Serializes as lowercase strings
 /// (`"auto"`, `"on"`, `"off"`). Governs plain starts only: update-triggered
 /// restarts (the sitter respawning a freshly installed version, signaled via
@@ -930,6 +946,15 @@ impl ResumeInterruptedOnStart {
             ResumeInterruptedOnStart::On => "on",
             ResumeInterruptedOnStart::Off => "off",
         }
+    }
+
+    /// Parse the exact wire/TOML spelling ([`Self::as_str`]); anything else
+    /// (other casing, `true`/`false`, surrounding whitespace) is `None`.
+    #[must_use]
+    pub fn from_wire(raw: &str) -> Option<Self> {
+        [Self::Auto, Self::On, Self::Off]
+            .into_iter()
+            .find(|value| value.as_str() == raw)
     }
 }
 
@@ -1770,6 +1795,9 @@ providerSettings = {}
 # Copy-on-Write Isolation -- CoW workspaces + per-agent sandboxes (requires
 # CoW filesystem support on the workspaces root).
 cowIsolation = false
+# Auto-retire -- retire workspaces archived longer than this many days
+# (deletes their checkout folders; absent = off).
+# autoRetireArchivedAfterDays = 7
 
 [git]
 # Auto-commit -- allow agents to commit without explicit user request.
@@ -2450,6 +2478,23 @@ mod tests {
     }
 
     #[test]
+    fn resume_interrupted_on_start_from_wire_is_exact() {
+        for value in [
+            ResumeInterruptedOnStart::Auto,
+            ResumeInterruptedOnStart::On,
+            ResumeInterruptedOnStart::Off,
+        ] {
+            assert_eq!(
+                ResumeInterruptedOnStart::from_wire(value.as_str()),
+                Some(value)
+            );
+        }
+        for raw in ["", "OFF", " off", "true", "false", "0", "maybe"] {
+            assert_eq!(ResumeInterruptedOnStart::from_wire(raw), None, "{raw:?}");
+        }
+    }
+
+    #[test]
     fn resume_interrupted_on_start_defaults_to_auto() {
         let parsed = SettingsFile::parse_str("").expect("empty parses");
         assert_eq!(
@@ -2737,6 +2782,20 @@ mod tests {
         let err = SettingsFile::parse_str("[workspace]\nautoFetch = false\n").unwrap_err();
         assert!(err.to_string().contains("autoFetch"), "{err}");
         assert!(!DEFAULT_CONFIG_TEMPLATE.contains("autoFetch"));
+    }
+
+    #[test]
+    fn auto_retire_archived_after_days_parses_and_defaults_to_off() {
+        assert_eq!(
+            SettingsFile::default()
+                .workspace
+                .auto_retire_archived_after_days,
+            None
+        );
+        let file =
+            SettingsFile::parse_str("[workspace]\nautoRetireArchivedAfterDays = 7\n").unwrap();
+        assert_eq!(file.workspace.auto_retire_archived_after_days, Some(7));
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("# autoRetireArchivedAfterDays = 7"));
     }
 
     #[test]

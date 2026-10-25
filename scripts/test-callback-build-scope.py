@@ -76,13 +76,27 @@ class ScopeTests(unittest.TestCase):
             with self.subTest(plans=plans):
                 self.assert_scope(plans, FALLBACK)
 
+    def test_filterset_plans_are_validated_not_rejected(self):
+        # Suite-module and end-to-end map plans carry one -E filterset
+        # (changed-tests.sh); it narrows tests, not the Cargo build graph.
+        e2e = ["-p", "intentd", "--test", "suite_wss_g_r", "-E",
+               "(binary_id(=intentd::suite_wss_g_r)&test(/^(e2e_x::y)::/))"]
+        self.assert_scope([e2e], FALLBACK)
+        self.assert_scope([e2e, SHARED], SHARED + ["-p", "intent-acp"])
+        # The callback step adds its own -E, and nextest ORs repeated -E
+        # flags, so a plan's filterset never leaks into the scope.
+        self.assert_scope([SHARED + ["-E", "test(/^x::/)"]], SHARED + ["-p", "intent-acp"])
+
     def test_malformed_or_unsupported_plan_never_falls_back(self):
         for plans in (None, "shell text", [None], [[]], [["-p"]],
                       [["-p", "intent-services\n-p intent-acp"]],
                       [["-p", "intent-services", "--features", "unexpected"]],
                       [["-p", "intent-services", "--lib", "--workspace"]],
                       [["-p", "intent-services", "-p", "intent-services"]],
-                      [SHARED, ["--release"]]):
+                      [SHARED, ["--release"]],
+                      [["-p", "intentd", "--test", "suite_e2e", "-E"]],
+                      [["-p", "intentd", "--test", "suite_e2e", "-E", ""]],
+                      [["-p", "intentd", "-E", "a", "-E", "b"]]):
             with self.subTest(plans=plans):
                 result = self.select(plans)
                 self.assertNotEqual(result.returncode, 0)

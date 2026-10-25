@@ -295,28 +295,25 @@ async fn artifact_start_admits_one_original_job_before_io_and_response_revalidat
     }
 }
 
-// This control fills one real acquisition ledger. Give that one request the
-// existing workspace API's 30-second evaluation budget instead of the shared
-// 10-second single-read harness guard; all ordinary refusal controls keep it.
-async fn run_quota(
-    server: &WorkspaceMcpServer,
-    code: &str,
-    control: &Control,
-) -> serde_json::Value {
-    let started = std::time::Instant::now();
-    let result = tokio::time::timeout(
-        intentd_test_support::test_timeout(Duration::from_secs(30)),
+// These controls fill one real acquisition ledger with 63/64 snapshot calls
+// under the shared quota script budget (test_support::quota_script), which
+// fails loudly if a run reaches that budget: the 63/64 outcome must come from
+// the ledger, never from the timer.
+async fn run_quota(server: WorkspaceMcpServer, code: &str, control: &Control) -> serde_json::Value {
+    use crate::test_support::quota_script;
+    let server = quota_script::budget(server);
+    let result = quota_script::guard(
+        "read-policy-quota",
+        server.workspace_api_timeout(),
         server.handle_message(&crate::repository_read_source::tests::call(code)),
     )
     .await;
     eprintln!(
-        "quota result_ready={} elapsed_ms={} records={} events={:?}",
-        result.is_ok(),
-        started.elapsed().as_millis(),
+        "quota records={} events={:?}",
         control.records.lock().unwrap().len(),
         control.events.lock().unwrap()
     );
-    result.unwrap().unwrap()
+    result.unwrap()
 }
 
 #[intent_test_macros::daemon_test]
@@ -328,7 +325,7 @@ async fn original_ledger_counts_cache_hits_and_lazy_read_at_sixty_four_and_sixty
         let code = format!(
             "for (let i=0;i<{count};i++) {{ await ws.pr.snapshot(4); }} return 'bounded success';"
         );
-        let reply = run_quota(&controlled(&f, control.clone()), &code, &control).await;
+        let reply = run_quota(controlled(&f, control.clone()), &code, &control).await;
         assert_eq!(
             reply.to_string().contains("bounded success"),
             count == 63,

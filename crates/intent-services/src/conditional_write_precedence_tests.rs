@@ -643,10 +643,10 @@ async fn issue(
             let mut seed = read.clone();
             seed.rev = resolve(seed_rev);
             let author = super::system_version_author();
+            let lock = svc.store.lock_note_content(ws, id).await;
             super::persist_merged_content(
                 &svc.store,
-                ws,
-                id,
+                &lock,
                 ContentWrite {
                     expected_version: Some(seed.rev),
                     seed: Some(seed),

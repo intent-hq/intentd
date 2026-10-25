@@ -178,6 +178,7 @@ fn seed_workspace(title: &str, worktree_path: Option<String>, skip_worktree: boo
         context_links: None,
         archived: false,
         archived_at: None,
+        retired_at: None,
         task_stats: None,
         agent_summary: None,
         diff_summary: None,

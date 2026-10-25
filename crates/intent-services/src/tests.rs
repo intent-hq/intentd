@@ -16,7 +16,9 @@ use intent_store::Store;
 use crate::{repository_backfill_probe_count, BackfillCandidate, Services};
 
 mod line_attribution_retry;
+mod note_write_lock;
 mod orphan_flag_race;
+mod retire_workspace;
 mod skill_list;
 mod task_list_latency;
 mod task_push;
@@ -485,7 +487,10 @@ async fn workspace_list_and_get_populate_card_aggregates() {
     assert!(got.diff_summary.is_none());
 
     // workspace.list carries the same aggregates; assert the nested wire shape.
-    let list = svc.list_workspaces(false).await.expect("list");
+    let list = svc
+        .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+        .await
+        .expect("list");
     let v = serde_json::to_value(&list[0]).unwrap();
     assert_eq!(v["taskStats"]["total"], 4);
     assert_eq!(v["taskStats"]["completed"], 1);
@@ -671,7 +676,10 @@ async fn workspace_list_slims_token_usage_and_archived_agent_summary() {
     let svc = Services::new(store).with_workspaces_root(root.path().to_path_buf());
 
     // Full list: tokenUsage never present; agentSummary only on active rows.
-    let list = svc.list_workspaces(true).await.expect("list");
+    let list = svc
+        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await
+        .expect("list");
     let row_active = list.iter().find(|w| w.id == ws_active).expect("active row");
     let row_archived = list
         .iter()
@@ -729,7 +737,10 @@ async fn workspace_list_slims_token_usage_and_archived_agent_summary() {
     assert_eq!(v["activePullRequest"]["mergeableState"], "clean");
 
     // Lite list (workspace.subscribe seq-0): slimmed the same way.
-    let lite = svc.list_workspaces_lite(true).await.expect("lite list");
+    let lite = svc
+        .list_workspaces_lite(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await
+        .expect("lite list");
     assert!(lite.iter().all(|w| w.token_usage.is_none()));
     for row in &lite {
         assert_detail_stripped(row, "lite");
@@ -951,9 +962,12 @@ async fn worst_case_workspace_list_row() -> Workspace {
         principal_id: primary.id,
         host_role: intent_core::HostRole::Owner,
     };
-    let list = intent_core::with_caller(caller, svc.list_workspaces(true))
-        .await
-        .expect("list");
+    let list = intent_core::with_caller(
+        caller,
+        svc.list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED),
+    )
+    .await
+    .expect("list");
     let mut served = list
         .into_iter()
         .find(|w| w.id == ws)
@@ -1031,8 +1045,8 @@ async fn workspace_list_row_stays_within_row_budget() {
 /// populates every allowlisted field — each allowlisted key is present, so
 /// a stale allowlist entry fails too. The only allowlisted keys an active,
 /// idle row legitimately lacks are the state-conditional ones:
-/// `archivedAt` (archived rows), `pendingDeleteAt` (a running delete grace
-/// window) and `waiting` (omitted when `false`).
+/// `archivedAt` (archived rows), `retiredAt` (retired rows), `pendingDeleteAt`
+/// (a running delete grace window) and `waiting` (omitted when `false`).
 #[tokio::test]
 async fn workspace_list_row_keys_match_allowlist_golden() {
     use std::collections::BTreeSet;
@@ -1042,7 +1056,8 @@ async fn workspace_list_row_keys_match_allowlist_golden() {
         WORKSPACE_LIST_ROW_KEYS,
     };
 
-    const STATE_CONDITIONAL_KEYS: &[&str] = &["archivedAt", "pendingDeleteAt", "waiting"];
+    const STATE_CONDITIONAL_KEYS: &[&str] =
+        &["archivedAt", "retiredAt", "pendingDeleteAt", "waiting"];
 
     let row = worst_case_workspace_list_row().await;
     let measured = serde_json::to_value(&row).unwrap();
@@ -1261,8 +1276,14 @@ async fn workspace_list_caps_pull_requests_get_keeps_full_pool() {
     let root = tempfile::tempdir().expect("temp workspaces root");
     let svc = Services::new(store).with_workspaces_root(root.path().to_path_buf());
 
-    let list = svc.list_workspaces(true).await.expect("list");
-    let lite = svc.list_workspaces_lite(true).await.expect("lite list");
+    let list = svc
+        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await
+        .expect("list");
+    let lite = svc
+        .list_workspaces_lite(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await
+        .expect("lite list");
     // Entry `n` was updated `n` minutes into the hour on every source (a
     // snapshotless monitor's entry carries the monitor row's `updated_at`),
     // so the cap keeps the five newest on each; `get` serves the source's
@@ -1376,8 +1397,12 @@ async fn workspace_list_keeps_unfinished_root_prs_ahead_of_merged_active() {
     let root = tempfile::tempdir().expect("workspaces root");
     let svc = Services::new(store).with_workspaces_root(root.path().to_path_buf());
     for rows in [
-        svc.list_workspaces(true).await.unwrap(),
-        svc.list_workspaces_lite(true).await.unwrap(),
+        svc.list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .unwrap(),
+        svc.list_workspaces_lite(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .unwrap(),
     ] {
         let listed = rows.iter().find(|ws| ws.id == id).unwrap();
         let pool = listed.pull_requests.as_ref().unwrap();
@@ -1535,7 +1560,10 @@ async fn workspace_list_of_130_realistic_rows_stays_under_1mib() {
     let root = tempfile::tempdir().expect("temp workspaces root");
     let svc = Services::new(store).with_workspaces_root(root.path().to_path_buf());
 
-    let list = svc.list_workspaces(true).await.expect("list");
+    let list = svc
+        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await
+        .expect("list");
     assert_eq!(list.len(), WORKSPACES);
     let payload = serde_json::to_string(&serde_json::json!({ "workspaces": list })).unwrap();
     assert!(
@@ -1853,9 +1881,12 @@ async fn workspace_batch_projection_failures_are_isolated_per_workspace() {
             .expect("workspace.get");
         gets.insert(workspace_id, row);
     }
-    let list = svc.list_workspaces(false).await.expect("workspace.list");
+    let list = svc
+        .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+        .await
+        .expect("workspace.list");
     let lite = svc
-        .list_workspaces_lite(false)
+        .list_workspaces_lite(intent_core::WorkspaceListFilter::ACTIVE)
         .await
         .expect("workspace.subscribe snapshot");
 
@@ -1940,7 +1971,7 @@ async fn lite_list_is_self_sufficient_for_status_rendering() {
     // A cold read awaits the single budgeted probe once for the whole snapshot,
     // then fans the capability out to every row.
     let list = svc
-        .list_workspaces_lite(true)
+        .list_workspaces_lite(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
         .await
         .expect("cold lite list");
     assert!(
@@ -2003,7 +2034,10 @@ async fn bulk_workspace_list_serialization_matches_per_workspace_shape() {
         .workspaces_with_unread_top_level_sessions()
         .await
         .unwrap();
-    let mut expected = store.list_workspaces(true).await.unwrap();
+    let mut expected = store
+        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await
+        .unwrap();
     for row in &mut expected {
         row.activity = svc.workspace_activity(&row.id);
         row.pending_delete_at = svc
@@ -2022,7 +2056,10 @@ async fn bulk_workspace_list_serialization_matches_per_workspace_shape() {
         svc.attach_workspace_membership(row).await;
     }
 
-    let actual = svc.list_workspaces(true).await.unwrap();
+    let actual = svc
+        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await
+        .unwrap();
     assert_eq!(
         serde_json::to_vec(&actual).unwrap(),
         serde_json::to_vec(&expected).unwrap(),
@@ -2336,9 +2373,15 @@ async fn list_paths_merge_git_root_and_monitor_prs_into_pull_requests() {
         );
     };
 
-    let full = svc.list_workspaces(false).await.expect("full list");
+    let full = svc
+        .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+        .await
+        .expect("full list");
     assert_merged(&full, "workspace.list");
-    let lite = svc.list_workspaces_lite(false).await.expect("lite list");
+    let lite = svc
+        .list_workspaces_lite(intent_core::WorkspaceListFilter::ACTIVE)
+        .await
+        .expect("lite list");
     assert_merged(&lite, "lite list");
     // The detail read merges the same pool per workspace (scoped reads).
     let mut gets = Vec::new();
@@ -2349,7 +2392,10 @@ async fn list_paths_merge_git_root_and_monitor_prs_into_pull_requests() {
 
     // Archived-inclusive list: the archived row's git-root PR merges in —
     // and `get`, which serves archived workspaces regardless, merges it too.
-    let all = svc.list_workspaces_lite(true).await.expect("archived list");
+    let all = svc
+        .list_workspaces_lite(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await
+        .expect("archived list");
     let r5 = all.iter().find(|w| w.id == ws5).expect("ws5 row");
     let prs5 = r5.pull_requests.as_ref().expect("ws5 pullRequests");
     assert_eq!(prs5.len(), 1);
@@ -2468,8 +2514,14 @@ async fn display_status_folds_git_root_prs_on_every_read_surface() {
 
     let svc = Services::new(store.clone()).with_workspaces_root(root.path().to_path_buf());
 
-    let full = svc.list_workspaces(false).await.expect("full list");
-    let lite = svc.list_workspaces_lite(false).await.expect("lite list");
+    let full = svc
+        .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+        .await
+        .expect("full list");
+    let lite = svc
+        .list_workspaces_lite(intent_core::WorkspaceListFilter::ACTIVE)
+        .await
+        .expect("lite list");
     let row = |list: &[Workspace], id: &WorkspaceId| {
         list.iter()
             .find(|w| &w.id == id)
@@ -2729,8 +2781,14 @@ async fn served_pr_fields_carry_the_lifecycle_display_status_selected() {
     }
 
     let svc = Services::new(store.clone()).with_workspaces_root(root.path().to_path_buf());
-    let full = svc.list_workspaces(false).await.expect("full list");
-    let lite = svc.list_workspaces_lite(false).await.expect("lite list");
+    let full = svc
+        .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+        .await
+        .expect("full list");
+    let lite = svc
+        .list_workspaces_lite(intent_core::WorkspaceListFilter::ACTIVE)
+        .await
+        .expect("lite list");
     let row = |list: &[Workspace], id: &WorkspaceId| {
         list.iter()
             .find(|w| &w.id == id)
@@ -3073,11 +3131,15 @@ async fn merged_pr_pool_status_ladder_upgrades_stale_entries() {
 
     for (list, path) in [
         (
-            svc.list_workspaces(false).await.expect("full list"),
+            svc.list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+                .await
+                .expect("full list"),
             "workspace.list",
         ),
         (
-            svc.list_workspaces_lite(false).await.expect("lite list"),
+            svc.list_workspaces_lite(intent_core::WorkspaceListFilter::ACTIVE)
+                .await
+                .expect("lite list"),
             "lite list",
         ),
     ] {
@@ -3176,7 +3238,7 @@ async fn cross_workspace_list_siblings_scopes_to_repository() {
 
     let svc = Services::new(store);
     let v = svc
-        .cross_workspace_list_siblings(caller.clone())
+        .cross_workspace_list_siblings(caller.clone(), false)
         .await
         .expect("siblings");
     let arr = v.as_array().expect("array");
@@ -3264,7 +3326,7 @@ async fn cross_workspace_list_siblings_matches_github_identity_across_paths() {
 
     let svc = Services::new(store);
     let v = svc
-        .cross_workspace_list_siblings(caller.clone())
+        .cross_workspace_list_siblings(caller.clone(), false)
         .await
         .expect("siblings");
     let mut ids: Vec<String> = v
@@ -3357,7 +3419,7 @@ async fn cross_workspace_list_siblings_falls_back_to_repository_path() {
     };
 
     let v = svc
-        .cross_workspace_list_siblings(caller.clone())
+        .cross_workspace_list_siblings(caller.clone(), false)
         .await
         .expect("siblings");
     assert_eq!(list_ids(v), vec!["ws-partial", "ws-unbackfilled"]);
@@ -3367,13 +3429,13 @@ async fn cross_workspace_list_siblings_falls_back_to_repository_path() {
 
     // The relation is symmetric: the un-backfilled row sees the caller too.
     let v = svc
-        .cross_workspace_list_siblings(unbackfilled)
+        .cross_workspace_list_siblings(unbackfilled, false)
         .await
         .expect("siblings");
     assert_eq!(list_ids(v), vec!["ws-caller", "ws-partial"]);
 
     let v = svc
-        .cross_workspace_list_siblings(local_a.clone())
+        .cross_workspace_list_siblings(local_a.clone(), false)
         .await
         .expect("siblings");
     assert_eq!(list_ids(v), vec!["ws-local-b"]);
@@ -3406,7 +3468,7 @@ async fn cross_workspace_list_siblings_requires_repository() {
     store.insert_workspace(&w).await.unwrap();
     let svc = Services::new(store);
     let err = svc
-        .cross_workspace_list_siblings(caller.clone())
+        .cross_workspace_list_siblings(caller.clone(), false)
         .await
         .expect_err("should error");
     match err {
@@ -3424,7 +3486,7 @@ async fn cross_workspace_list_siblings_requires_repository() {
     }
     // A GitHub identity without a local path is enough to list.
     let v = svc
-        .cross_workspace_list_siblings(identity_only)
+        .cross_workspace_list_siblings(identity_only, false)
         .await
         .expect("identity-only caller lists");
     assert!(v.as_array().expect("array").is_empty());
@@ -4698,8 +4760,13 @@ async fn convert_blocks_rederives_onto_completed_user_save() {
     let mut user = other.get_note(&ws, &id).await.expect("get note");
     user.content = "intro TYPED\n\n@@@task\n# Do it\nbody\n@@@\n".into();
     user.updated_at = now_iso();
+    // A separately opened store has its own lock registry, so this external
+    // writer does not queue behind the parked op's lane: it is the
+    // out-of-band save the op's CAS retry must absorb.
+    let user_lock = other.lock_note_content(&ws, &id).await;
     let (rev, _) = other
         .update_note_with_version(
+            &user_lock,
             &user,
             Some(0),
             &crate::user_version_author(),
@@ -4707,6 +4774,7 @@ async fn convert_blocks_rederives_onto_completed_user_save() {
         )
         .await
         .expect("user save");
+    drop(user_lock);
     assert_eq!(rev, 1);
     drop(held);
 
@@ -7229,7 +7297,15 @@ async fn convert_blocks_warns_on_tree_ancestor_rejected_edge() {
         status: TaskStatus::NotStarted,
         ..Default::default()
     });
-    svc.store.update_note(&parent).await.expect("mark as task");
+    svc.store
+        .update_note(
+            &svc.store
+                .lock_note_content(&parent.workspace_id, &parent.id)
+                .await,
+            &parent,
+        )
+        .await
+        .expect("mark as task");
 
     let r = svc
         .convert_task_blocks(ws.clone(), id.clone(), None)
@@ -13489,7 +13565,11 @@ mod change_event_parity {
             .services
             .auto_unarchive_on_turn_start(&h.ws, &agent_id)
             .await;
-        assert!(flipped, "a persisted flip reports true");
+        assert_eq!(
+            flipped,
+            Some(crate::UnarchiveOutcome::Unarchived),
+            "a persisted flip reports Unarchived"
+        );
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &h.ws.0, "workspace:updated");
         assert_eq!(
@@ -13535,7 +13615,7 @@ mod change_event_parity {
             .services
             .auto_unarchive_on_turn_start(&h.ws, &agent_id)
             .await;
-        assert!(!flipped, "no flip on an active workspace");
+        assert!(flipped.is_none(), "no flip on an active workspace");
         let quiet = tokio::time::timeout(
             intentd_test_support::test_timeout(Duration::from_millis(200)),
             sub.recv(),
@@ -13564,7 +13644,7 @@ mod change_event_parity {
             .services
             .auto_unarchive_on_turn_start(&missing, &agent_id)
             .await;
-        assert!(!flipped, "a failed read reports no flip");
+        assert!(flipped.is_none(), "a failed read reports no flip");
         let quiet = tokio::time::timeout(
             intentd_test_support::test_timeout(Duration::from_millis(200)),
             sub.recv(),
@@ -13601,7 +13681,10 @@ mod change_event_parity {
             .unarchive_workspace_inner(h.ws.clone(), Some(stamp))
             .await
             .expect("losing racer still succeeds");
-        assert!(!flipped, "the losing racer must not claim the flip");
+        assert!(
+            flipped.is_none(),
+            "the losing racer must not claim the flip"
+        );
         assert!(!ws.archived, "the returned row reflects the Active state");
         let quiet = tokio::time::timeout(
             intentd_test_support::test_timeout(Duration::from_millis(200)),
@@ -13656,7 +13739,10 @@ mod change_event_parity {
             .services
             .auto_unarchive_on_turn_start(&h.ws, &agent_id)
             .await;
-        assert!(flipped, "the flip persists despite the missing session row");
+        assert!(
+            flipped.is_some(),
+            "the flip persists despite the missing session row"
+        );
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &h.ws.0, "workspace:updated");
         assert_eq!(
@@ -15769,7 +15855,13 @@ mod change_event_parity {
             .await
             .expect("get task note");
         tn.metadata.task.as_mut().expect("task metadata").status = status;
-        h.store.update_note(&tn).await.expect("update task note");
+        h.store
+            .update_note(
+                &h.store.lock_note_content(&tn.workspace_id, &tn.id).await,
+                &tn,
+            )
+            .await
+            .expect("update task note");
     }
 
     async fn note_content(h: &Harness, id: &str) -> (String, i64) {
@@ -15951,7 +16043,15 @@ mod change_event_parity {
         // An editor save lands in the same window.
         let mut edited = h.store.get_note(&h.ws, &spec_id()).await.expect("get spec");
         edited.content = format!("{}\n- [ ] added by editor", body("[x]", "[ ]"));
-        h.store.update_note(&edited).await.expect("editor save");
+        h.store
+            .update_note(
+                &h.store
+                    .lock_note_content(&edited.workspace_id, &edited.id)
+                    .await,
+                &edited,
+            )
+            .await
+            .expect("editor save");
         let (_, rev_before) = note_content(&h, "spec").await;
 
         let mut sub = subscribe(&h);
@@ -17028,7 +17128,15 @@ mod change_event_parity {
         spec.content = linked("[/]", "T", T1);
         spec.updated_at = now_iso();
         h.store
-            .update_note_with_version(&spec, None, &crate::user_version_author(), &spec.updated_at)
+            .update_note_with_version(
+                &h.store
+                    .lock_note_content(&spec.workspace_id, &spec.id)
+                    .await,
+                &spec,
+                None,
+                &crate::user_version_author(),
+                &spec.updated_at,
+            )
             .await
             .expect("versioned spec write");
         let agent = AgentId::from("agent-linked");
@@ -22310,7 +22418,10 @@ pub(crate) mod pr {
 
         // Seed the last-observed baseline at `complete` via a list read (a
         // seed never emits).
-        let list = svc.list_workspaces(false).await.unwrap();
+        let list = svc
+            .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+            .await
+            .unwrap();
         let row = list.iter().find(|w| w.id == ws.id).expect("row");
         assert_eq!(
             row.display_status,
@@ -22369,7 +22480,10 @@ pub(crate) mod pr {
             .unwrap();
 
         // Seed the baseline at `complete` via a list read (never emits).
-        let list = svc.list_workspaces(false).await.unwrap();
+        let list = svc
+            .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+            .await
+            .unwrap();
         let row = list.iter().find(|w| w.id == ws.id).expect("row");
         assert_eq!(
             row.display_status,
@@ -22783,7 +22897,10 @@ pub(crate) mod pr {
         svc: &Services,
         ws_id: &WorkspaceId,
     ) -> Option<intent_core::WorkspaceDisplayStatus> {
-        let list = svc.list_workspaces(false).await.unwrap();
+        let list = svc
+            .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+            .await
+            .unwrap();
         let row = list.iter().find(|w| &w.id == ws_id).expect("row");
         assert!(display_status_events(svc, ws_id).await.is_empty());
         row.display_status
@@ -31584,6 +31701,7 @@ mod rules {
             context_links: None,
             archived: false,
             archived_at: None,
+            retired_at: None,
             task_stats: None,
             agent_summary: None,
             diff_summary: None,
@@ -31737,6 +31855,7 @@ mod rules {
             context_links: None,
             archived: false,
             archived_at: None,
+            retired_at: None,
             task_stats: None,
             agent_summary: None,
             diff_summary: None,
@@ -31881,6 +32000,7 @@ mod rules {
             context_links: None,
             archived: false,
             archived_at: None,
+            retired_at: None,
             task_stats: None,
             agent_summary: None,
             diff_summary: None,
@@ -32020,6 +32140,7 @@ mod rules {
             context_links: None,
             archived: false,
             archived_at: None,
+            retired_at: None,
             task_stats: None,
             agent_summary: None,
             diff_summary: None,
@@ -32158,6 +32279,7 @@ mod rules {
             context_links: None,
             archived: false,
             archived_at: None,
+            retired_at: None,
             task_stats: None,
             agent_summary: None,
             diff_summary: None,
@@ -32301,6 +32423,7 @@ mod rules {
             context_links: None,
             archived: false,
             archived_at: None,
+            retired_at: None,
             task_stats: None,
             agent_summary: None,
             diff_summary: None,
@@ -33167,6 +33290,7 @@ mod known_repo {
             context_links: None,
             archived: false,
             archived_at: None,
+            retired_at: None,
             token_usage: None,
             task_stats: None,
             agent_summary: None,
@@ -33198,7 +33322,10 @@ mod known_repo {
                 });
 
         let probes_before = repository_backfill_probe_count(&repo_path.0);
-        let listed = svc.list_workspaces(false).await.expect("list workspaces");
+        let listed = svc
+            .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+            .await
+            .expect("list workspaces");
         assert!(listed.iter().any(|workspace| workspace.id == id));
         tokio::task::yield_now().await;
         assert_eq!(
@@ -33632,7 +33759,11 @@ mod worktree_provisioning {
             "got: {err}"
         );
         assert_eq!(err.code(), -32603);
-        assert!(store.list_workspaces(true).await.expect("list").is_empty());
+        assert!(store
+            .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .expect("list")
+            .is_empty());
     }
 
     /// intent-hq/monorepo#962: `isNewRepo: true` on an already-initialized
@@ -33753,7 +33884,11 @@ mod worktree_provisioning {
                     .starts_with(&format!("{repo_name}.deleting-"))
             });
         assert!(!trashed, "no trash rename of the user repository folder");
-        assert!(store.list_workspaces(true).await.expect("list").is_empty());
+        assert!(store
+            .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .expect("list")
+            .is_empty());
     }
 
     /// The standalone-checkout ownership gate is root-anchored, not
@@ -33806,7 +33941,11 @@ mod worktree_provisioning {
             repo_dir.parent().unwrap().exists(),
             "the <parent>/<wsId>/ directory must not be swept outside daemon roots"
         );
-        assert!(store.list_workspaces(true).await.expect("list").is_empty());
+        assert!(store
+            .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .expect("list")
+            .is_empty());
     }
 
     /// An `isNewRepo` create on an already-initialized repo honors a
@@ -33926,7 +34065,11 @@ mod worktree_provisioning {
             );
             assert_eq!(err.code(), -32602);
         }
-        assert!(store.list_workspaces(true).await.expect("list").is_empty());
+        assert!(store
+            .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .expect("list")
+            .is_empty());
     }
 
     /// intent-hq/monorepo#962 review hardening: a mid-init failure can leave
@@ -34477,7 +34620,11 @@ mod worktree_provisioning {
             matches!(err, Error::BaseRefUnresolvable { ref base_ref } if base_ref == "no-such-ref"),
             "got: {err}"
         );
-        assert!(store.list_workspaces(true).await.expect("list").is_empty());
+        assert!(store
+            .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .expect("list")
+            .is_empty());
         assert!(
             std::fs::read_dir(&root.0)
                 .expect("read workspaces root")
@@ -35997,7 +36144,10 @@ mod setup_lifecycle_events {
             "infrastructure failure is -32603, got {err:?}"
         );
 
-        let rows = store.list_workspaces(true).await.expect("workspaces");
+        let rows = store
+            .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .expect("workspaces");
         assert_eq!(rows.len(), 1, "the workspace row was inserted first");
         assert!(
             rows[0]
@@ -39046,7 +39196,7 @@ mod clone_orchestration {
                 "{label}: distinct checkout path"
             );
             let v = svc
-                .cross_workspace_list_siblings(ws.id.clone())
+                .cross_workspace_list_siblings(ws.id.clone(), false)
                 .await
                 .expect("siblings");
             let ids: Vec<&str> = v
@@ -39074,7 +39224,7 @@ mod clone_orchestration {
             }
         }
         let v = svc
-            .cross_workspace_list_siblings(github)
+            .cross_workspace_list_siblings(github, false)
             .await
             .expect("siblings");
         assert!(
@@ -39115,7 +39265,10 @@ mod clone_orchestration {
             format!("{err}").contains("clone"),
             "error mentions clone: {err}"
         );
-        let list = store.list_workspaces(true).await.expect("list");
+        let list = store
+            .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .expect("list");
         assert!(list.is_empty(), "no row persisted on clone failure");
     }
 
@@ -39455,7 +39608,10 @@ mod clone_orchestration {
             matches!(err, intent_core::Error::CloneFailed { .. }),
             "typed clone failure: {err}"
         );
-        let list = store.list_workspaces(true).await.expect("list");
+        let list = store
+            .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .expect("list");
         assert!(list.is_empty(), "no row persisted on hydration failure");
     }
 
@@ -39937,7 +40093,10 @@ mod clone_orchestration {
             "both callers observe the same workspace"
         );
 
-        let rows = store.list_workspaces(true).await.expect("list workspaces");
+        let rows = store
+            .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .expect("list workspaces");
         assert_eq!(
             rows.len(),
             1,
@@ -43334,7 +43493,7 @@ mod last_activity_events {
         // The lite list (seq-0 snapshot source) serves it without deriving.
         let lite = h
             .services
-            .list_workspaces_lite(true)
+            .list_workspaces_lite(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
             .await
             .expect("lite list");
         let row = lite
@@ -43373,7 +43532,7 @@ mod last_activity_events {
             .expect("stale bump"));
         let lite = h
             .services
-            .list_workspaces_lite(true)
+            .list_workspaces_lite(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
             .await
             .expect("lite list");
         let row = lite
@@ -43466,7 +43625,7 @@ mod last_activity_events {
         // The lite list (seq-0 snapshot source) serves it without deriving.
         let lite = h
             .services
-            .list_workspaces_lite(true)
+            .list_workspaces_lite(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
             .await
             .expect("lite list");
         let row = lite
@@ -47868,7 +48027,11 @@ mod delete_grace_window {
         // Row still served while pending, carrying the deadline.
         let got = h.services.get_workspace(h.ws.clone()).await.expect("get");
         assert_eq!(got.pending_delete_at.as_deref(), Some(delete_at.as_str()));
-        let listed = h.services.list_workspaces(false).await.expect("list");
+        let listed = h
+            .services
+            .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+            .await
+            .expect("list");
         let row = listed.iter().find(|w| w.id == h.ws).expect("row listed");
         assert_eq!(row.pending_delete_at.as_deref(), Some(delete_at.as_str()));
 
@@ -49740,7 +49903,7 @@ mod derived_workspace_unread {
         // list_workspaces serves the same derivation.
         let listed = h
             .services
-            .list_workspaces(false)
+            .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
             .await
             .expect("list workspaces");
         let row = listed.iter().find(|w| w.id == h.ws).expect("row");

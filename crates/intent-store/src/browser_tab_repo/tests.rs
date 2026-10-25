@@ -67,6 +67,7 @@ fn test_workspace(ws_id: &WorkspaceId, ts: &str) -> Workspace {
         context_links: None,
         archived: false,
         archived_at: None,
+        retired_at: None,
         task_stats: None,
         agent_summary: None,
         diff_summary: None,
