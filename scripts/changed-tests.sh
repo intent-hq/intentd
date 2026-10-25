@@ -43,7 +43,9 @@
 #   crates/<c>/src/**                -p <c> --lib --bins --tests
 #                                    (--lib only when src/lib.rs exists);
 #                                    crates/intent-services/src/** also selects
-#                                    every crates/intent-svc-* feature crate
+#                                    every crates/intent-svc-* feature crate;
+#                                    that and crates/intent-svc-*/src/** also
+#                                    select crates/intent-app
 #   crates/<c>/benches|examples/**   ignored (nextest does not run them)
 #   crates/<c>/<anything else>       -p <c>  (all test targets of <c>)
 #   a glob in .config/e2e-test-map.txt
@@ -65,7 +67,8 @@
 # target flags to every -p package on one command line, so crates with
 # different selections run as separate `cargo nextest run` invocations and
 # crates with identical selections share one. Reverse dependencies are NOT
-# propagated, except from intent-services to its feature crates and through
+# propagated, except from intent-services to its feature crates and intent-app,
+# from a feature crate to intent-app, and through
 # the end-to-end map: crates/<c>/src selects <c>'s own tests plus any mapped
 # end-to-end modules; the full suite (`make test`, the merge queue) stays the
 # complete gate.
@@ -518,6 +521,9 @@ done <<<"$e2e_notes"
 # The feature crates (crates/intent-svc-*) sit above intent-services and build
 # against its feature API, so an intent-services/src edit also selects every
 # feature crate's own tests ("dependent": the src selection, without a note).
+# intent-app composes the feature crates and holds the tests that need them
+# together with intent-transport, so a src edit in intent-services or in any
+# feature crate also selects intent-app.
 feature_crates=""
 if [[ "$mapped" == *$'\n'"intent-services"$'\t'"src"* || "$mapped" == "intent-services"$'\t'"src"* ]]; then
   for manifest in crates/intent-svc-*/Cargo.toml; do
@@ -527,6 +533,18 @@ if [[ "$mapped" == *$'\n'"intent-services"$'\t'"src"* || "$mapped" == "intent-se
     mapped+="$feature_crate"$'\t'"dependent"$'\n'
     feature_crates+="${feature_crates:+, }$feature_crate"
   done
+fi
+composed_src=""
+while IFS=$'\t' read -r rec_crate rec_kind _; do
+  case "$rec_crate" in
+    intent-services | intent-svc-*)
+      if [[ "$rec_kind" == src ]]; then composed_src=1; fi
+      ;;
+  esac
+done <<<"$mapped"
+if [[ -n "$composed_src" && -f crates/intent-app/Cargo.toml ]]; then
+  mapped+="intent-app"$'\t'"dependent"$'\n'
+  feature_crates+="${feature_crates:+, }intent-app"
 fi
 
 # Stock macOS ships Bash 3.2, which has no associative arrays: per-crate
@@ -567,7 +585,9 @@ crate_selection() {
       if [[ "$best" == dependent ]]; then
         :
       elif [[ "$crate" == intent-services && -n "$feature_crates" ]]; then
-        log "note: crates/$crate/src changed; its feature crates ($feature_crates) run too, other downstream crates are not selected"
+        log "note: crates/$crate/src changed; its feature crates and intent-app ($feature_crates) run too, other downstream crates are not selected"
+      elif [[ "$crate" == intent-svc-* && -f crates/intent-app/Cargo.toml ]]; then
+        log "note: crates/$crate/src changed; intent-app runs too, other downstream crates are not selected"
       else
         log "note: crates/$crate/src changed; only $crate's own tests run (downstream crates are not selected)"
       fi
