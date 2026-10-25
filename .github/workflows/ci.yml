@@ -567,6 +567,14 @@ jobs:
         run: |
           ./scripts/test-check-test-hooks-feature.sh
           ./scripts/check-test-hooks-feature.sh
+      # Services feature crates (intent-svc-*) sit above intent-services with
+      # intent-app on top. Fail on a wrong-way edge: core or intent-transport
+      # depending on a feature (dev-dependencies too), or a feature-to-feature
+      # edge the split plan does not allow. Metadata only, under a second.
+      - name: Services feature-crate dependency graph
+        run: |
+          ./scripts/test-check-feature-crate-deps.sh
+          python3 -I -B scripts/check-feature-crate-deps.py
       # CI is the guard against host-dependent tests: a test that relies on
       # an installed provider CLI passes locally and fails here only while
       # runners have none. Fail loudly if a runner image starts shipping one.
