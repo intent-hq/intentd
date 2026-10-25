@@ -406,23 +406,38 @@ impl Store {
     ///
     /// # Errors
     ///
+    /// Takes `note`'s [`NoteWriteLock`](crate::NoteWriteLock) from this store
+    /// like the content writers: a metadata write that bumped `rev` outside
+    /// the lane could land inside a laned writer's read→persist window, be
+    /// reverted by a whole-row writer's stale copy, or burn a gated writer's
+    /// bounded retries. Any other lock is refused with `Error::Internal`.
+    ///
+    /// # Errors
+    ///
     /// Returns `Error::NotFound` if the note does not exist in the workspace; `Error::Internal` if encoding fields or the update fails.
-    pub async fn update_note_metadata(&self, note: &Note) -> Result<i64> {
-        self.update_note_metadata_versioned(note, None).await
+    pub async fn update_note_metadata(
+        &self,
+        lock: &crate::NoteWriteLock,
+        note: &Note,
+    ) -> Result<i64> {
+        self.update_note_metadata_versioned(lock, note, None).await
     }
 
     /// [`Store::update_note_metadata`] optionally gated on `expected_version`,
     /// with the same conflict / not-found classification as
-    /// [`Store::update_note_versioned`].
+    /// [`Store::update_note_versioned`]. Takes `note`'s
+    /// [`NoteWriteLock`](crate::NoteWriteLock), like [`Store::update_note_metadata`].
     ///
     /// # Errors
     ///
     /// Returns `Error::Conflict` (carrying the current entity) when `expected_version` is supplied and does not match the stored `rev`; `Error::NotFound` if the note does not exist in the workspace; `Error::Internal` if encoding fields or the update fails.
     pub async fn update_note_metadata_versioned(
         &self,
+        lock: &crate::NoteWriteLock,
         note: &Note,
         expected_version: Option<i64>,
     ) -> Result<i64> {
+        lock.ensure_covers(self, note)?;
         self.exec_note_update(note, expected_version, NoteUpdateScope::Metadata)
             .await
     }
@@ -431,15 +446,19 @@ impl Store {
     /// note in the same workspace. The revision and session link are checked
     /// in one `SQLite` UPDATE, so a session-only relink cannot slip past the CAS.
     /// Returns None on a stale revision, missing note, or changed agent link.
+    /// Takes `note`'s [`NoteWriteLock`](crate::NoteWriteLock), like
+    /// [`Store::update_note_metadata`].
     ///
     /// # Errors
     /// Returns `Error::Internal` if encoding or the database write fails.
     pub async fn update_note_metadata_if_agent_linked(
         &self,
+        lock: &crate::NoteWriteLock,
         note: &Note,
         expected_version: i64,
         agent_id: &AgentId,
     ) -> Result<Option<i64>> {
+        lock.ensure_covers(self, note)?;
         self.prepare_task_events(&note.workspace_id).await;
         let mut conn = crate::note_write_connection::NoteWriteConnection::begin(self).await?;
         let result = exec_update_note_with_link_guard(

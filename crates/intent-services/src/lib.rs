@@ -11794,6 +11794,11 @@ impl Services {
         let _mutation = self.workspace_mutations.enter(workspace_id)?;
         let store = &self.store;
         let bus = self.event_bus.as_ref();
+        // The task note's lane covers this read through the metadata write,
+        // so no whole-row writer can revert the status from an older copy
+        // and no laned text writer sees the rev move under it. Released
+        // before materialization, which takes each parent's lane.
+        let write_lane = self.lock_note_content(workspace_id, note_id).await;
         let mut note = fetch_note(store, workspace_id, note_id).await?;
         let Some(mut task) = note.metadata.task.clone() else {
             return Err(Error::Internal(
@@ -11809,6 +11814,7 @@ impl Services {
                 TaskStatus::Cancelled => "cancelled",
                 _ => "complete",
             };
+            drop(write_lane);
             self.materialize_linked_checkboxes(&note.workspace_id, &note.id)
                 .await;
             return Ok(TaskUpdateNoteStatusResult {
@@ -11831,10 +11837,11 @@ impl Services {
                 Error::Internal("linked task recovery requires an observed revision".into())
             })?;
             if store
-                .update_note_metadata_if_agent_linked(&note, rev, &agent_id)
+                .update_note_metadata_if_agent_linked(&write_lane, &note, rev, &agent_id)
                 .await?
                 .is_none()
             {
+                drop(write_lane);
                 // A changed note or session link is an ordinary race: no task
                 // events, checkbox materialization, or side effects may fire.
                 let current = fetch_note(store, workspace_id, note_id).await?;
@@ -11855,9 +11862,10 @@ impl Services {
             }
         } else {
             store
-                .update_note_metadata_versioned(&note, expected_version)
+                .update_note_metadata_versioned(&write_lane, &note, expected_version)
                 .await?;
         }
+        drop(write_lane);
         // Mirror `notes.service.ts`: emit only when the status actually changed.
         let all = if previous_status == new_status {
             None
@@ -26086,14 +26094,12 @@ impl WorkspaceApi for Services {
             let mut expected_version = caller_expected_version;
             // content present → raw full set; otherwise title/tags metadata.
             let content_changed = input.content.is_some();
-            // A text write holds the note's lane from this read through the
-            // persist and the orphan-flag apply, like every other text
-            // writer; a metadata write leaves the text alone and takes none.
-            let write_lane = if content_changed {
-                Some(self.lock_note_content(&workspace_id, &note_id).await)
-            } else {
-                None
-            };
+            // Both arms hold the note's lane from this read through the
+            // persist (and, for a text write, the orphan-flag apply), like
+            // every other writer: a metadata write that bumped the rev
+            // outside the lane could be reverted by a whole-row writer's
+            // older copy or burn a laned writer's bounded retries.
+            let write_lane = self.lock_note_content(&workspace_id, &note_id).await;
             let mut note = fetch_note(&store, &workspace_id, &note_id).await?;
             if let (true, Some(base)) = (content_changed, input.base_content_bytes) {
                 // Truncated-read write guard, after the strict
@@ -26136,12 +26142,12 @@ impl WorkspaceApi for Services {
                 }
             }
             note.updated_at = now_iso();
-            if let Some(write_lane) = write_lane.as_ref() {
+            if content_changed {
                 // FE-only `note.update`: no caller-agent context on this arm
                 // (transport router path), so the version author is the user.
                 match persist_note_content(
                     &store,
-                    write_lane,
+                    &write_lane,
                     &note,
                     expected_version,
                     &user_version_author(),
@@ -26173,7 +26179,7 @@ impl WorkspaceApi for Services {
                 // Metadata-scoped: leaves the stored content untouched even
                 // when a content write committed after the fetch above.
                 store
-                    .update_note_metadata_versioned(&note, expected_version)
+                    .update_note_metadata_versioned(&write_lane, &note, expected_version)
                     .await?;
             }
             // Return the row as committed — the bumped `rev`, the stored
@@ -26635,6 +26641,8 @@ impl WorkspaceApi for Services {
                     "At least one of title or tags must be provided".to_string(),
                 ));
             }
+            // The lane covers this read through the write (see `note.update`).
+            let write_lane = self.lock_note_content(&workspace_id, &note_id).await;
             let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
             let is_spec = note_id.as_str() == "spec";
             let mut changed = false;
@@ -26663,11 +26671,12 @@ impl WorkspaceApi for Services {
             }
             note.updated_at = now_iso();
             store
-                .update_note_metadata_versioned(&note, expected_version)
+                .update_note_metadata_versioned(&write_lane, &note, expected_version)
                 .await?;
             // Report the row as committed (intent-hq/intent#5589): the
             // bumped `rev` and stored `updated_at`, not the pre-write copy.
             let note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
+            drop(write_lane);
             publish_event(
                 bus.as_ref(),
                 note_change_event(
@@ -26957,11 +26966,18 @@ impl WorkspaceApi for Services {
             let mut note = fetch_note(&store, &workspace_id, &note_id).await?;
             let version = store.get_note_version(&workspace_id, &note_id, v).await?;
             note.title = version.title;
-            note.content = version.content;
+            // The restored text runs through the same comment-anchor pass as
+            // every other text write: a comment anchored after version `v`
+            // loses its markers and is flagged orphaned, and markers of a
+            // comment deleted since are scrubbed rather than brought back.
+            let mut plan =
+                reanchor_note_comments(&store, &workspace_id, &note_id, version.content).await?;
+            note.content = std::mem::take(&mut plan.content);
             note.updated_at = now_iso();
             let (_, new_v) = store
                 .update_note_with_version(&write_lane, &note, None, &author, &note.updated_at)
                 .await?;
+            plan.apply_orphaned(&store, &workspace_id).await?;
             drop(write_lane);
             services
                 .schedule_line_attribution_recompute(&note.workspace_id.clone(), &note.id.clone());
@@ -27501,6 +27517,9 @@ impl WorkspaceApi for Services {
             let new_status =
                 serde_json::from_value::<TaskStatus>(serde_json::Value::String(status.clone()))
                     .map_err(|_| Error::Internal(format!("Invalid status: {status}")))?;
+            // The lane covers this read through the metadata write; it is
+            // released before materialization takes the parents' lanes.
+            let write_lane = self.lock_note_content(&workspace_id, &note_id).await;
             let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
             // Relation writes are validated + cycle/tree-checked against the
             // workspace note set, exactly like `task.setRelations` (ALL notes,
@@ -27574,7 +27593,8 @@ impl WorkspaceApi for Services {
                 }
             }
             note.updated_at = now.clone();
-            store.update_note_metadata(&note).await?;
+            store.update_note_metadata(&write_lane, &note).await?;
+            drop(write_lane);
             // A markAsTask that crosses the complete boundary records/removes
             // the caller's flipped-completion pair, exactly like
             // `task.updateNoteStatus` (a same-status re-mark is a no-op here).
@@ -27712,6 +27732,8 @@ impl WorkspaceApi for Services {
         let services = self.clone();
         Box::pin(async move {
             self.require_member(&workspace_id).await?;
+            // The lane covers this read through the metadata write.
+            let write_lane = self.lock_note_content(&workspace_id, &note_id).await;
             let mut note = fetch_note_peer(&store, &workspace_id, &note_id).await?;
             let Some(mut task) = note.metadata.task.clone() else {
                 return Err(Error::Internal("Note is not a task".to_string()));
@@ -27721,11 +27743,11 @@ impl WorkspaceApi for Services {
             // Validation + cycle/tree checks read the same workspace snapshot
             // the write is based on (ALL notes, not just tasks — the
             // tree-relative check walks `parent_id` chains that may cross
-            // non-task notes). Like every other task-metadata write this is
-            // last-writer-wins (no versioned CAS): concurrent relation writes
-            // are coordinator-driven and rare, and a racing write that slips a
-            // stale cycle past the check degrades readiness for the tasks
-            // involved, not data integrity.
+            // non-task notes). The note's own row cannot change under the
+            // lane, but other notes' relations can: concurrent relation writes
+            // are coordinator-driven and rare, and a racing write to another
+            // note that slips a stale cycle past the check degrades readiness
+            // for the tasks involved, not data integrity.
             let all = store.list_notes(&workspace_id).await?;
             if let Some(deps) = &depends_on {
                 validate_relation_ids(&note.id, deps, &all, "dependsOn")?;
@@ -27764,7 +27786,8 @@ impl WorkspaceApi for Services {
             }
             note.metadata.task = Some(task);
             note.updated_at = now_iso();
-            store.update_note_metadata(&note).await?;
+            store.update_note_metadata(&write_lane, &note).await?;
+            drop(write_lane);
             // Metadata changed → subscribers refetch the note (§6.5), same as
             // every other task-metadata write.
             publish_event(
@@ -27901,6 +27924,9 @@ impl WorkspaceApi for Services {
                     "Invalid agentId format: \"{agent_id}\". Agent IDs must be in format \"agent-{{uuid}}\" (e.g., \"agent-b0a8044a-5eac-4b52-8456-15d3b784decb\"). To create a new agent and assign it to this task, use create_agent with taskNoteId=\"{note_id}\" instead."
                 )));
             }
+            // The lane covers this read through the metadata write; it is
+            // released before materialization takes the parents' lanes.
+            let write_lane = self.lock_note_content(&workspace_id, &note_id).await;
             let mut note = match store.get_note(&workspace_id, &note_id).await {
                 Ok(n) => n,
                 Err(Error::NotFound(_)) => {
@@ -27965,7 +27991,8 @@ impl WorkspaceApi for Services {
             }
             note.metadata.task = Some(task);
             note.updated_at = now.clone();
-            store.update_note_metadata(&note).await?;
+            store.update_note_metadata(&write_lane, &note).await?;
+            drop(write_lane);
             // TS parity (`assignAgentToTask`): the assignment write routes
             // through `updateNote` (→ `note:updated`) and the not_started →
             // in_progress transition through `updateTaskStatus`
@@ -28041,7 +28068,23 @@ impl WorkspaceApi for Services {
             let notes = store.list_notes(&workspace_id).await?;
             let now = now_iso();
             let mut updated_count: u32 = 0;
-            for mut note in notes {
+            for listed in notes {
+                if !listed
+                    .metadata
+                    .task
+                    .as_ref()
+                    .is_some_and(|t| t.assigned_agent_ids.contains(&agent_id))
+                {
+                    continue;
+                }
+                // Re-read under the note's lane: writing back the listed copy
+                // would revert any metadata written since the list.
+                let write_lane = self.lock_note_content(&workspace_id, &listed.id).await;
+                let mut note = match store.get_note(&workspace_id, &listed.id).await {
+                    Ok(note) => note,
+                    Err(Error::NotFound(_)) => continue,
+                    Err(e) => return Err(e),
+                };
                 let Some(mut task) = note.metadata.task.clone() else {
                     continue;
                 };
@@ -28051,7 +28094,7 @@ impl WorkspaceApi for Services {
                 task.assigned_agent_ids.retain(|id| id != &agent_id);
                 note.metadata.task = Some(task);
                 note.updated_at = now.clone();
-                store.update_note_metadata(&note).await?;
+                store.update_note_metadata(&write_lane, &note).await?;
                 updated_count += 1;
             }
             Ok(TaskRemoveAgentFromAllTasksResult {

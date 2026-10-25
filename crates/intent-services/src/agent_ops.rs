@@ -15888,7 +15888,23 @@ impl Services {
             return Ok(());
         }
         let notes = self.store.list_notes(workspace_id).await?;
-        for mut note in notes {
+        for listed in notes {
+            if !listed
+                .metadata
+                .task
+                .as_ref()
+                .is_some_and(|t| t.assigned_agent_ids.iter().any(|a| stale.contains(a)))
+            {
+                continue;
+            }
+            // Re-read under the note's lane: writing back the listed copy
+            // would revert any metadata written since the list.
+            let write_lane = self.store.lock_note_content(workspace_id, &listed.id).await;
+            let mut note = match self.store.get_note(workspace_id, &listed.id).await {
+                Ok(note) => note,
+                Err(intent_core::Error::NotFound(_)) => continue,
+                Err(e) => return Err(e),
+            };
             let Some(mut task) = note.metadata.task.clone() else {
                 continue;
             };
@@ -15900,7 +15916,8 @@ impl Services {
             let now = now_iso();
             note.metadata.task = Some(task);
             note.updated_at = now;
-            self.store.update_note_metadata(&note).await?;
+            self.store.update_note_metadata(&write_lane, &note).await?;
+            drop(write_lane);
             crate::publish_event(
                 self.event_bus.as_ref(),
                 crate::note_change_event(

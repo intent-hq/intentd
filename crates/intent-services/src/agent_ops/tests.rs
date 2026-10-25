@@ -49514,7 +49514,15 @@ async fn task_push_assignment_cleanup_publishes_complete_metadata() {
     let stale = AgentId::from("stale-assignment");
     let mut note = svc.store().get_note(&ws, &note_id).await.unwrap();
     note.metadata.task.as_mut().unwrap().assigned_agent_ids = vec![stale.clone()];
-    svc.store().update_note_metadata(&note).await.unwrap();
+    svc.store()
+        .update_note_metadata(
+            &svc.store()
+                .lock_note_content(&note.workspace_id, &note.id)
+                .await,
+            &note,
+        )
+        .await
+        .unwrap();
     let bus = EventBus::new(svc.store().clone());
     let svc = svc.with_event_bus(bus.clone());
     svc.remove_agent_ids_from_workspace_tasks(&ws, &[stale])
