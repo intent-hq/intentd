@@ -238,8 +238,9 @@ fn spawn_serve_with(
         common::opt_into_resume_on_start(&mut cmd);
     }
     common::hermetic_fixture_identity(&mut cmd, data_dir);
-    // GuardedChild: own process group, so tearing the daemon down (drop,
-    // panic, or test-process death) also kills spawned Node.js ACP mock providers.
+    // GuardedChild: the daemon gets its own process group, killed on drop, panic
+    // or test-process death. ACP providers start their own groups (intent-acp),
+    // so this does not reach them.
     GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
 }
 
@@ -305,7 +306,7 @@ struct Daemon {
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        // Kills the whole process group (daemon + ACP provider children).
+        // Kills the daemon's process group (ACP providers run in their own groups).
         let _ = self.child.kill_tree();
         // On test panic, print data-dir path + daemon log tail for diagnosability
         if std::thread::panicking() {

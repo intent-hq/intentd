@@ -249,8 +249,6 @@ async fn resolve_interrupted_resume_and_abandon() {
         .stderr(Stdio::from(
             std::fs::File::create(data_dir.join("daemon.log")).unwrap(),
         ));
-    // Spawn in its own process group to prevent ACP mock process leaks
-    #[cfg(unix)]
     let child = common::spawn_guarded(&mut cmd).expect("spawn intentd serve");
     let mut guard = DaemonGuard::process_only(child);
     assert!(await_uds(&socket).await, "daemon did not start");
@@ -569,7 +567,6 @@ async fn resolve_interrupted_invalid_params_validation() {
         .stderr(Stdio::from(
             std::fs::File::create(data_dir.join("daemon.log")).unwrap(),
         ));
-    #[cfg(unix)]
     let child = common::spawn_guarded(&mut cmd).expect("spawn intentd serve");
     let mut guard = DaemonGuard::process_only(child);
     assert!(await_uds(&socket).await, "daemon did not start");

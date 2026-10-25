@@ -48,7 +48,7 @@ struct Daemon {
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        // Kills the whole process group (daemon + ACP provider children).
+        // Kills the daemon's process group (ACP providers run in their own groups).
         let _ = self.child.kill_tree();
     }
 }

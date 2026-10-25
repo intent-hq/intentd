@@ -318,8 +318,6 @@ async fn shutdown_reaps_provider_child_and_grandchild() {
         .stderr(Stdio::from(
             std::fs::File::create(data_dir.join("daemon.log")).unwrap(),
         ));
-    // Own process group so the DaemonGuard's SIGKILL cannot leak mock children
-    // if the test panics before the graceful path runs.
     // Assert before boot so a missing override cannot fall back to shared state.
     let explicit_env: std::collections::HashMap<_, _> = cmd.get_envs().collect();
     let owned_workspaces = explicit_env.get(std::ffi::OsStr::new("INTENTD_WORKSPACES_DIR"))

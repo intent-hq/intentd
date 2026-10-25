@@ -1051,6 +1051,7 @@ pub async fn wss_connect_with_retry(port: u16, cfg: Arc<rustls::ClientConfig>, u
 pub type DaemonChild = intentd_test_support::GuardedChild;
 /// See the Unix definition; Windows has no process groups to guard.
 #[cfg(not(unix))]
+// raw-child: allow — GuardedChild is Unix-only; Windows has no process groups
 pub type DaemonChild = std::process::Child;
 
 /// Spawn `cmd` as a [`DaemonChild`] (see there for the platform split).
@@ -1071,11 +1072,12 @@ pub fn spawn_guarded(cmd: &mut std::process::Command) -> std::io::Result<DaemonC
 
 /// RAII guard for a spawned `intentd serve` process.
 ///
-/// Holds a [`DaemonChild`], so on Unix the daemon and everything in its
-/// process group (e.g. Node mock agents in ACP provider tests) are killed
-/// when the guard drops, on panic, and — via the `GuardedChild` watchdog —
-/// when the test process is killed (nextest timeout) before any `Drop`
-/// runs. Optionally removes the temp data directory on drop.
+/// Holds a [`DaemonChild`], so on Unix the daemon and everything left in its
+/// process group are killed when the guard drops, on panic, and — via the
+/// `GuardedChild` watchdog — when the test process is killed (nextest
+/// timeout) before any `Drop` runs. ACP providers start process groups of
+/// their own (intent-acp), so they are outside this sweep. Optionally removes
+/// the temp data directory on drop.
 pub struct DaemonGuard {
     child: DaemonChild,
     data_dir: Option<PathBuf>,

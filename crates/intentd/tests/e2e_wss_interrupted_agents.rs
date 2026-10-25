@@ -335,8 +335,6 @@ async fn interrupted_agents_persisted_across_restart() {
         .stderr(Stdio::from(
             std::fs::File::create(data_dir.join("daemon.log")).unwrap(),
         ));
-    // Spawn in its own process group to prevent ACP mock process leaks
-    #[cfg(unix)]
     let child1 = common::spawn_guarded(&mut cmd1).expect("spawn intentd serve");
     let mut guard1 = DaemonGuard::new(child1, data_dir.clone(), false);
     if !await_uds(&socket).await {
@@ -431,7 +429,6 @@ async fn interrupted_agents_persisted_across_restart() {
         .stderr(Stdio::from(
             std::fs::File::create(data_dir.join("daemon.log")).unwrap(),
         ));
-    #[cfg(unix)]
     let child2 = common::spawn_guarded(&mut cmd2).expect("spawn intentd serve 2");
     let mut guard2 = DaemonGuard::new(child2, data_dir.clone(), false);
     assert!(await_uds(&socket).await, "daemon did not restart");
@@ -480,7 +477,6 @@ async fn interrupted_agents_persisted_across_restart() {
         .stderr(Stdio::from(
             std::fs::File::create(data_dir.join("daemon.log")).unwrap(),
         ));
-    #[cfg(unix)]
     let child3 = common::spawn_guarded(&mut cmd3).expect("spawn intentd serve 3");
     let _guard3 = DaemonGuard::process_only(child3);
     assert!(await_uds(&socket).await, "daemon did not restart 2");
@@ -1026,7 +1022,6 @@ async fn graceful_shutdown_captures_interrupted_agents() {
         .stderr(Stdio::from(
             std::fs::File::create(data_dir.join("daemon.log")).unwrap(),
         ));
-    #[cfg(unix)]
     let child = common::spawn_guarded(&mut cmd1).expect("spawn intentd serve");
     let mut daemon = DaemonGuard::new(child, data_dir.clone(), false);
     if !await_uds(&socket).await {
@@ -1261,7 +1256,6 @@ async fn graceful_shutdown_captures_interrupted_agents() {
         .stderr(Stdio::from(
             std::fs::File::create(data_dir.join("daemon2.log")).unwrap(),
         ));
-    #[cfg(unix)]
     let child2 = common::spawn_guarded(&mut cmd2).expect("spawn intentd serve 2");
     let _daemon2 = DaemonGuard::process_only(child2);
     assert!(await_uds(&socket).await, "daemon did not restart");

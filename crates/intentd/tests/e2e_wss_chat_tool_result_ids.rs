@@ -61,9 +61,8 @@ struct Daemon {
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        // Kill the whole process group (daemon + Node.js ACP children) BEFORE
-        // removing the data dir, so an orphaned child cannot re-create files
-        // under it after cleanup (GuardedChild gives the daemon its own group).
+        // Kill the daemon's process group (GuardedChild gives it its own) BEFORE
+        // the data dir is removed, so nothing in it can re-create files there.
         let _ = self.child.kill_tree();
     }
 }

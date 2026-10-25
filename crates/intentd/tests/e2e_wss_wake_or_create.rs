@@ -110,7 +110,14 @@ impl Drop for Daemon {
                 let cleanup = catch_unwind(AssertUnwindSafe(|| -> std::io::Result<()> {
                     events.push(json!({"event": "FailureCleanupKillAttempt", "pid": pid}));
 
-                    let killed = self.child.kill();
+                    // The whole group, not just the leader: reaping a lone
+                    // leader below would leave GuardedChild's Drop nothing
+                    // to sweep the group with.
+                    let killed = self
+                        .child
+                        .signal_group(nix::sys::signal::Signal::SIGKILL)
+                        .or_else(|_| self.child.signal(nix::sys::signal::Signal::SIGKILL))
+                        .map_err(std::io::Error::from);
 
                     events.push(
                         json!({"event": "FailureCleanupKillResult", "ok": killed.is_ok(),

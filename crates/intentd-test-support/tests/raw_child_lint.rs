@@ -24,7 +24,9 @@
 //!   `Option<Child>`, `Result<E, Child>`), as a tuple element (after `(`,
 //!   or after a `,` whose enclosing bracket is `(`: `-> (Child, u16)`,
 //!   `struct LiveProcess(Child)`, `Vec<(u16, Child)>`), or as an array /
-//!   slice element (after `[`: `[Child; 1]`, `Box<[Child]>`). A visibility
+//!   slice element (after `[`: `[Child; 1]`, `Box<[Child]>`), or as the
+//!   target of a type alias (`type Proc = Child;`, which would otherwise
+//!   launder it past every other position). A visibility
 //!   qualifier between the marker and the type — `pub`, `pub(crate)`,
 //!   `pub(super)`, `pub(self)`, `pub(in path)` — is skipped, so tuple-struct
 //!   fields such as `struct P(pub Child)` and `(u16, pub(crate) Child)` are
@@ -188,8 +190,49 @@ fn is_type_position(chars: &[char], start: usize) -> bool {
         ':' => k == 0 || chars[k - 1] != ':',
         '<' | '(' | '[' => true,
         ',' => matches!(enclosing_open_bracket(chars, k), Some('<' | '(')),
+        '=' => is_type_alias_eq(chars, k),
         _ => false,
     }
+}
+
+/// Whether the `=` at `eq` is the one in a type alias, `type Name = …` or
+/// `type Name<…> = …`: an alias would otherwise launder a bare `Child`
+/// past every other type position.
+fn is_type_alias_eq(chars: &[char], eq: usize) -> bool {
+    if eq > 0 && matches!(chars[eq - 1], '=' | '!' | '<' | '>') {
+        return false;
+    }
+    let Some(mut k) = last_non_ws_before(chars, eq) else {
+        return false;
+    };
+    if chars[k] == '>' {
+        let mut depth = 0usize;
+        loop {
+            match chars[k] {
+                '>' => depth += 1,
+                '<' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            if k == 0 {
+                return false;
+            }
+            k -= 1;
+        }
+    } else {
+        k += 1;
+    }
+    let Some((name_start, _)) = ident_before(chars, k) else {
+        return false;
+    };
+    let Some((kw_start, kw_end)) = ident_before(chars, name_start) else {
+        return false;
+    };
+    chars[kw_start..=kw_end].iter().collect::<String>() == "type"
 }
 
 fn excerpt(line: &str) -> String {
@@ -376,6 +419,18 @@ mod heuristic {
                    fn c() -> ::process::Child { todo!() }\n\
                    fn d() -> ::tokio::process::Child { todo!() }\n\
                    use ::std::process::Child;\n";
+        assert_eq!(hit_lines(src), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn type_alias_targets_hit() {
+        let src = "type Proc = Child;\n\
+                   pub type Proc2 = std::process::Child;\n\
+                   type P3<T> = (T, Child);\n\
+                   type P4<T> = Child;\n\
+                   type Q = GuardedChild;\n\
+                   type R = tokio::process::Child;\n\
+                   fn f(a: u8) -> bool { a == 1 }\n";
         assert_eq!(hit_lines(src), vec![1, 2, 3, 4]);
     }
 
