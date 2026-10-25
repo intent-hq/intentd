@@ -132,6 +132,10 @@ write crates/intent-services/src/lib.rs
 write crates/intent-services/tests/smoke.rs
 write crates/intent-svc-transfer/Cargo.toml
 write crates/intent-svc-transfer/src/lib.rs
+write crates/intent-svc-transfer/tests/smoke.rs
+write crates/intent-app/Cargo.toml
+write crates/intent-app/src/lib.rs
+write crates/intent-app/tests/smoke.rs
 write crates/intentd/Cargo.toml
 write crates/intentd/src/main.rs
 write crates/intentd/tests/auggie_context_e2e.rs
@@ -363,14 +367,14 @@ expect_cargo "-p alpha --lib --bins --tests"
 [[ "$stdout" == *"[test-changed] note: crates/alpha/src changed; only alpha's own tests run (downstream crates are not selected)"* ]] || fail "$case_name: no src note: $stdout"
 [[ "$(grep -c 'note:' <<<"$stdout")" -eq 1 ]] || fail "$case_name: note printed more than once: $stdout"
 
-case_name="intent-services src change also selects the feature crates above it"
+case_name="intent-services src change also selects the feature crates and intent-app above it"
 reset_repo
 edit crates/intent-services/src/lib.rs
 run_script
 expect_ok
-expect_plan "-p intent-services -p intent-svc-transfer --lib --bins --tests"
-expect_cargo "-p intent-services -p intent-svc-transfer --lib --bins --tests"
-[[ "$stdout" == *"[test-changed] note: crates/intent-services/src changed; its feature crates (intent-svc-transfer) run too, other downstream crates are not selected"* ]] || fail "$case_name: no src note: $stdout"
+expect_plan "-p intent-app -p intent-services -p intent-svc-transfer --lib --bins --tests"
+expect_cargo "-p intent-app -p intent-services -p intent-svc-transfer --lib --bins --tests"
+[[ "$stdout" == *"[test-changed] note: crates/intent-services/src changed; its feature crates and intent-app (intent-svc-transfer, intent-app) run too, other downstream crates are not selected"* ]] || fail "$case_name: no src note: $stdout"
 [[ "$(grep -c 'note:' <<<"$stdout")" -eq 1 ]] || fail "$case_name: expected one note: $stdout"
 
 case_name="intent-services test-only change does not select the feature crates"
@@ -380,12 +384,28 @@ run_script
 expect_ok
 expect_cargo "-p intent-services --test smoke"
 
-case_name="feature crate src change does not select intent-services"
+case_name="feature crate src change selects intent-app, not intent-services"
 reset_repo
 edit crates/intent-svc-transfer/src/lib.rs
 run_script
 expect_ok
-expect_cargo "-p intent-svc-transfer --lib --bins --tests"
+expect_cargo "-p intent-app -p intent-svc-transfer --lib --bins --tests"
+[[ "$stdout" == *"[test-changed] note: crates/intent-svc-transfer/src changed; intent-app runs too, other downstream crates are not selected"* ]] || fail "$case_name: no src note: $stdout"
+[[ "$(grep -c 'note:' <<<"$stdout")" -eq 1 ]] || fail "$case_name: expected one note: $stdout"
+
+case_name="feature crate test-only change does not select intent-app"
+reset_repo
+edit crates/intent-svc-transfer/tests/smoke.rs
+run_script
+expect_ok
+expect_cargo "-p intent-svc-transfer --test smoke"
+
+case_name="intent-app src change selects only intent-app"
+reset_repo
+edit crates/intent-app/src/lib.rs
+run_script
+expect_ok
+expect_cargo "-p intent-app --lib --bins --tests"
 
 case_name="src change in a crate without a lib drops --lib"
 reset_repo

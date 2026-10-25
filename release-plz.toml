@@ -51,6 +51,7 @@ changelog_path = "./CHANGELOG.md"
 # notes. Commits that also touch the daemon or its libraries remain visible.
 changelog_include = [
     "intent-acp",
+    "intent-app",
     "intent-context",
     "intent-core",
     "intent-git",
@@ -76,6 +77,12 @@ version_group = "intentd"
 
 [[package]]
 name = "intent-acp"
+release = true
+git_only = true
+version_group = "intentd"
+
+[[package]]
+name = "intent-app"
 release = true
 git_only = true
 version_group = "intentd"

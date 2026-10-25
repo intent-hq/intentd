@@ -10,6 +10,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
+use intent_app::StartupExt as _;
 #[cfg(test)]
 use intent_core::config::DEFAULT_STREAM_RETENTION_HOURS;
 use intent_core::{AgentId, Config, ServerControl, WorkspaceApi};
@@ -21,7 +22,6 @@ use intent_services::{
     WorkspaceSetupStates,
 };
 use intent_store::Store;
-use intent_svc_transfer::TransferServicesExt as _;
 use intent_transport::{
     advertised_hosts, collect_local_ips, collect_local_ipv6s, detect_has_display,
     detect_host_environment, ensure_tls_certificate, get_or_create_token, local_hostname,
@@ -2142,7 +2142,7 @@ async fn cmd_serve_owned(
         });
 
     // Composition root: register the feature crates on the core services.
-    let services = intent_svc_transfer::register(Services::new(store))
+    let services = intent_app::compose(Services::new(store))
         .with_assets_root(assets_root)
         // Persist the per-provider models.list cache in the data dir (§5.30).
         .with_models_cache_dir(&config.data_dir.clone())
