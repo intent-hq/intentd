@@ -531,3 +531,52 @@ async fn restore_strips_markers_of_deleted_comment() {
     assert_eq!(stored, "alpha beta gamma");
     assert_eq!(restored.note.content, stored);
 }
+
+/// `task.removeAgentFromAllTasks` picks candidates from a workspace list,
+/// then re-reads each note under its lane: a status written while the sweep
+/// waits for the lane is kept, not reverted from the listed copy.
+#[intent_test_macros::daemon_test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent_removal_sweep_rereads_under_note_write_lane() {
+    let (_tmp, services, ws, id) = setup_task("# Task").await;
+    let agent =
+        intent_core::AgentId::from_string("agent-b0a8044a-5eac-4b52-8456-15d3b784decb".to_string());
+    services
+        .assign_agent(ws.clone(), id.clone(), agent.0.clone(), None)
+        .await
+        .expect("assign");
+
+    let lane = services.lock_note_content(&ws, &id).await;
+    let sweep = {
+        let (services, ws, agent) = (services.clone(), ws.clone(), agent.clone());
+        intent_core::spawn_daemon(
+            async move { services.remove_agent_from_all_tasks(ws, agent).await },
+        )
+    };
+    wait_for_queued_writer(&services, &ws, &id).await;
+    assert!(!sweep.is_finished(), "sweep wrote under a held lane");
+    let mut note = services.store.get_note(&ws, &id).await.expect("read");
+    note.metadata.task.as_mut().expect("task").status = intent_core::TaskStatus::Complete;
+    services
+        .store
+        .update_note_metadata(&lane, &note)
+        .await
+        .expect("status under the held lane");
+    drop(lane);
+
+    let result = sweep.await.expect("sweep task").expect("sweep");
+    assert_eq!(result.updated_count, 1);
+    let task = services
+        .store
+        .get_note(&ws, &id)
+        .await
+        .expect("read")
+        .metadata
+        .task
+        .expect("task");
+    assert!(task.assigned_agent_ids.is_empty(), "agent not removed");
+    assert_eq!(
+        task.status,
+        intent_core::TaskStatus::Complete,
+        "status reverted by the sweep"
+    );
+}

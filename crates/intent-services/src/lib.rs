@@ -26176,15 +26176,14 @@ impl WorkspaceApi for Services {
                     }
                 }
             } else {
-                // Metadata-scoped: leaves the stored content untouched even
-                // when a content write committed after the fetch above.
+                // Metadata-scoped: never rewrites the stored content, and
+                // the lane keeps any text writer out until the re-fetch.
                 store
                     .update_note_metadata_versioned(&write_lane, &note, expected_version)
                     .await?;
             }
-            // Return the row as committed — the bumped `rev`, the stored
-            // `updated_at`, and (on the metadata arm) any content a
-            // concurrent write landed — rather than the pre-write copy
+            // Return the row as committed — the bumped `rev` and the stored
+            // `updated_at` — rather than the pre-write copy
             // (intent-hq/intent#5589).
             note = fetch_note(&store, &workspace_id, &note_id).await?;
             if let Some(plan) = reanchor_plan {
@@ -28062,41 +28061,12 @@ impl WorkspaceApi for Services {
         workspace_id: WorkspaceId,
         agent_id: AgentId,
     ) -> BoxFuture<'_, Result<TaskRemoveAgentFromAllTasksResult>> {
-        let store = self.store.clone();
         Box::pin(async move {
             self.require_agent_member(&agent_id).await?;
-            let notes = store.list_notes(&workspace_id).await?;
-            let now = now_iso();
-            let mut updated_count: u32 = 0;
-            for listed in notes {
-                if !listed
-                    .metadata
-                    .task
-                    .as_ref()
-                    .is_some_and(|t| t.assigned_agent_ids.contains(&agent_id))
-                {
-                    continue;
-                }
-                // Re-read under the note's lane: writing back the listed copy
-                // would revert any metadata written since the list.
-                let write_lane = self.lock_note_content(&workspace_id, &listed.id).await;
-                let mut note = match store.get_note(&workspace_id, &listed.id).await {
-                    Ok(note) => note,
-                    Err(Error::NotFound(_)) => continue,
-                    Err(e) => return Err(e),
-                };
-                let Some(mut task) = note.metadata.task.clone() else {
-                    continue;
-                };
-                if !task.assigned_agent_ids.contains(&agent_id) {
-                    continue;
-                }
-                task.assigned_agent_ids.retain(|id| id != &agent_id);
-                note.metadata.task = Some(task);
-                note.updated_at = now.clone();
-                store.update_note_metadata(&write_lane, &note).await?;
-                updated_count += 1;
-            }
+            let updated = self
+                .strip_agents_from_workspace_tasks(&workspace_id, std::slice::from_ref(&agent_id))
+                .await?;
+            let updated_count = u32::try_from(updated.len()).unwrap_or(u32::MAX);
             Ok(TaskRemoveAgentFromAllTasksResult {
                 ok: true,
                 updated_count,

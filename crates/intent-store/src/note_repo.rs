@@ -404,8 +404,6 @@ impl Store {
     /// content snapshot at or below it, which is the content the row still
     /// holds. Returns the post-write `rev`.
     ///
-    /// # Errors
-    ///
     /// Takes `note`'s [`NoteWriteLock`](crate::NoteWriteLock) from this store
     /// like the content writers: a metadata write that bumped `rev` outside
     /// the lane could land inside a laned writer's read→persist window, be
