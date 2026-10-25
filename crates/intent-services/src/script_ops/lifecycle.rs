@@ -31,7 +31,7 @@ impl ScriptManager {
         m.run_id.is_some() || self.entry_is_live(m)
     }
 
-    fn entry_is_live(&self, m: &ManagedScript) -> bool {
+    pub(super) fn entry_is_live(&self, m: &ManagedScript) -> bool {
         !matches!(m.state.status, ScriptStatus::Idle | ScriptStatus::Exited)
             || m.run_reserved.is_some()
             || m.supervisor
@@ -57,6 +57,7 @@ impl ScriptManager {
         if self.locks.is_closing(ws) {
             return Err(Error::NotFound(format!("workspace {ws}")));
         }
+        self.refuse_if_retired_locked(ws).await?;
         self.require_admission(ws, id).await?;
         if self
             .scripts
@@ -160,6 +161,7 @@ impl ScriptManager {
         for id in ids.into_iter().filter(|id| seen.insert(id.clone())) {
             let lock = self.locks.definition_lock(&id);
             let _guard = lock.lock().await;
+            self.refuse_if_retired_locked(ws).await?;
             if self.store.script_workspace(&id).await?.as_ref() == Some(ws) {
                 self.ensure_known_locked(ws, &id).await?;
             }

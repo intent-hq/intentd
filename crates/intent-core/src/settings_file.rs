@@ -191,6 +191,10 @@ pub struct WorkspaceSettings {
     /// `workspace.create` falls back to a linked worktree (local repository)
     /// or a plain local clone (repo-cache hydration) instead of failing.
     pub cow_isolation: bool,
+    /// `workspace.autoRetireArchivedAfterDays` — retire workspaces archived
+    /// longer than this many days (PROTOCOL §5.12). Absent (`None`, the
+    /// default) = off; a hand-edited `0` also reads as off.
+    pub auto_retire_archived_after_days: Option<u32>,
 }
 
 /// `[git]` — git behavior (`git.*`).
@@ -1794,6 +1798,9 @@ providerSettings = {}
 # Copy-on-Write Isolation -- CoW workspaces + per-agent sandboxes (requires
 # CoW filesystem support on the workspaces root).
 cowIsolation = false
+# Auto-retire -- retire workspaces archived longer than this many days
+# (deletes their checkout folders; absent = off).
+# autoRetireArchivedAfterDays = 7
 
 [git]
 # Auto-commit -- allow agents to commit without explicit user request.
@@ -2782,6 +2789,20 @@ mod tests {
         let err = SettingsFile::parse_str("[workspace]\nautoFetch = false\n").unwrap_err();
         assert!(err.to_string().contains("autoFetch"), "{err}");
         assert!(!DEFAULT_CONFIG_TEMPLATE.contains("autoFetch"));
+    }
+
+    #[test]
+    fn auto_retire_archived_after_days_parses_and_defaults_to_off() {
+        assert_eq!(
+            SettingsFile::default()
+                .workspace
+                .auto_retire_archived_after_days,
+            None
+        );
+        let file =
+            SettingsFile::parse_str("[workspace]\nautoRetireArchivedAfterDays = 7\n").unwrap();
+        assert_eq!(file.workspace.auto_retire_archived_after_days, Some(7));
+        assert!(DEFAULT_CONFIG_TEMPLATE.contains("# autoRetireArchivedAfterDays = 7"));
     }
 
     #[test]

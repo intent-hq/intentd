@@ -136,6 +136,7 @@ pub(super) fn workspace(id: &WorkspaceId) -> Workspace {
         context_links: None,
         archived: false,
         archived_at: None,
+        retired_at: None,
         task_stats: None,
         agent_summary: None,
         diff_summary: None,
@@ -17625,7 +17626,11 @@ async fn file_blocks_inline_data_rejected_on_every_seam() {
     // spec note and no `workspace:created` event is left behind (both the
     // top-level `initialAgent.fileBlocks` and its `metadata.fileBlocks`
     // mirror).
-    let workspaces_before = svc.list_workspaces(true).await.expect("list").len();
+    let workspaces_before = svc
+        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await
+        .expect("list")
+        .len();
     let notes_before = svc.store().list_all_notes().await.expect("notes").len();
     let created_events = || async {
         svc.store()
@@ -17665,7 +17670,10 @@ async fn file_blocks_inline_data_rejected_on_every_seam() {
         expect_rejected("workspace.create", err);
     }
     assert_eq!(
-        svc.list_workspaces(true).await.expect("list").len(),
+        svc.list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .expect("list")
+            .len(),
         workspaces_before,
         "workspace.create rejection must precede the workspace row"
     );
@@ -17929,7 +17937,11 @@ async fn workspace_create_rejects_every_invalid_input_before_side_effects() {
         ),
     ];
 
-    let workspaces_before = svc.list_workspaces(true).await.expect("list").len();
+    let workspaces_before = svc
+        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await
+        .expect("list")
+        .len();
     let notes_before = svc.store().list_all_notes().await.expect("notes").len();
     let created_events = || async {
         svc.store()
@@ -17967,7 +17979,10 @@ async fn workspace_create_rejects_every_invalid_input_before_side_effects() {
             "{name}: rejection must come from this arm's validator; got: {msg}"
         );
         assert_eq!(
-            svc.list_workspaces(true).await.expect("list").len(),
+            svc.list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+                .await
+                .expect("list")
+                .len(),
             workspaces_before,
             "{name}: workspace.create rejection must precede the workspace row"
         );
@@ -18268,7 +18283,11 @@ async fn specialist_acceptance_is_decided_by_the_plan_root_on_both_seams() {
 
     // `workspace.create` adopting root A: root A decides.
     let sessions_before = sessions().await;
-    let workspaces_before = svc.list_workspaces(true).await.expect("list").len();
+    let workspaces_before = svc
+        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await
+        .expect("list")
+        .len();
     let notes_before = svc.store().list_all_notes().await.expect("notes").len();
     let created_events = || async {
         svc.store()
@@ -18299,7 +18318,10 @@ async fn specialist_acceptance_is_decided_by_the_plan_root_on_both_seams() {
         "rejection must persist no session"
     );
     assert_eq!(
-        svc.list_workspaces(true).await.expect("list").len(),
+        svc.list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .expect("list")
+            .len(),
         workspaces_before,
         "rejection must precede the workspace row"
     );
@@ -48298,7 +48320,11 @@ async fn wire_agent_wake_or_create_rejects_compound_model() {
 #[intent_test_macros::daemon_test]
 async fn wire_create_workspace_rejects_compound_initial_agent_model() {
     let (_t, svc, _ws) = setup().await;
-    let before = svc.list_workspaces(true).await.expect("list").len();
+    let before = svc
+        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await
+        .expect("list")
+        .len();
     for bad in ["mock:default", ":default"] {
         let err = WorkspaceApi::create_workspace(
             &svc,
@@ -48316,7 +48342,11 @@ async fn wire_create_workspace_rejects_compound_initial_agent_model() {
         .expect_err("compound initialAgent.model must reject");
         assert_compound_model_rejection(err, "initialAgent.model");
     }
-    let after = svc.list_workspaces(true).await.expect("list").len();
+    let after = svc
+        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await
+        .expect("list")
+        .len();
     assert_eq!(after, before, "rejection must precede any side effect");
 }
 
@@ -49530,7 +49560,15 @@ async fn task_push_assignment_cleanup_publishes_complete_metadata() {
     let stale = AgentId::from("stale-assignment");
     let mut note = svc.store().get_note(&ws, &note_id).await.unwrap();
     note.metadata.task.as_mut().unwrap().assigned_agent_ids = vec![stale.clone()];
-    svc.store().update_note_metadata(&note).await.unwrap();
+    svc.store()
+        .update_note_metadata(
+            &svc.store()
+                .lock_note_content(&note.workspace_id, &note.id)
+                .await,
+            &note,
+        )
+        .await
+        .unwrap();
     let bus = EventBus::new(svc.store().clone());
     let svc = svc.with_event_bus(bus.clone());
     svc.remove_agent_ids_from_workspace_tasks(&ws, &[stale])

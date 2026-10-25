@@ -2489,6 +2489,7 @@ mod tests {
             context_links: None,
             archived: false,
             archived_at: None,
+            retired_at: None,
             task_stats: None,
             agent_summary: None,
             diff_summary: None,
@@ -5200,6 +5201,55 @@ mod tests {
         // manager attached, so nothing can spawn a turn).
         let text = wait_for_wake(&svc, &owner, "workspace was archived").await;
         assert!(text.contains("cancelled"), "{text}");
+    }
+
+    /// `workspace.retire` on an Active workspace runs the archive teardown
+    /// first, so every ACTIVE hook is cancelled exactly as on archive: task
+    /// aborted, row `cancelled`, `hook:cancelled` emitted.
+    #[intent_test_macros::daemon_test]
+    async fn workspace_retire_from_active_cancels_active_hooks() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({
+                    "name": "watching",
+                    "code": "return { dispatch: false };",
+                    "delayMs": 600_000,
+                }),
+            )
+            .await
+            .expect("schedule active");
+        let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
+        assert!(svc.hook_task_alive(&hook.hook_id));
+        // Retire only admits a git worktree checkout: give the row one.
+        let scratch = crate::test_support::test_tempdir("intentd-retire-wt-");
+        let mut row = svc.store().get_workspace(&ws).await.unwrap();
+        row.repository_path = Some(scratch.path().join("repo").to_string_lossy().into_owned());
+        row.worktree_path = Some(
+            svc.workspaces_root
+                .clone()
+                .expect("test workspaces root")
+                .join(ws.as_str())
+                .join("wt")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        row.checkout_mode = Some(intent_core::CheckoutMode::Worktree);
+        svc.store().update_workspace(&row).await.unwrap();
+
+        let retired = svc
+            .retire_workspace(ws.clone(), None)
+            .await
+            .expect("retire");
+        assert_eq!(retired.status, intent_core::WorkspaceStatus::Retired);
+
+        assert!(!svc.hook_task_alive(&hook.hook_id), "hook task aborted");
+        let stored = svc.store().get_hook(&hook.hook_id).await.unwrap();
+        assert_eq!(stored.state, HookState::Cancelled);
+        let types = hook_event_types(&svc, &ws, &[HOOK_CANCELLED]).await;
+        assert!(types.contains(&HOOK_CANCELLED.to_string()), "{types:?}");
     }
 
     /// Retire sweep (`ws.agent.retire`): the retiring agent's ACTIVE hooks

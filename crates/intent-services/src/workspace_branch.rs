@@ -137,7 +137,10 @@ mod tests {
             serde_json::json!({ "branch": "feat/renamed" })
         );
         assert_eq!(
-            svc.list_workspaces_lite(false).await.unwrap()[0].branch,
+            svc.list_workspaces_lite(intent_core::WorkspaceListFilter::ACTIVE)
+                .await
+                .unwrap()[0]
+                .branch,
             "feat/renamed"
         );
         refresh(&svc, &ws).await;

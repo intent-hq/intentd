@@ -2022,6 +2022,7 @@ async fn process_cap_events_queued_resumed_evicted() {
         context_links: None,
         archived: false,
         archived_at: None,
+        retired_at: None,
         task_stats: None,
         agent_summary: None,
         diff_summary: None,
@@ -2397,14 +2398,23 @@ pub(super) async fn manager() -> (TempDb, AgentManager) {
 /// Like [`manager`] but also returns the [`EventBus`] so a test can subscribe and
 /// assert which lifecycle events the manager publishes.
 async fn manager_with_bus() -> (TempDb, AgentManager, EventBus) {
+    manager_with_bus_in(None).await
+}
+
+/// [`manager_with_bus`] whose services provision under `root` (the
+/// daemon-owned workspaces root that retire / revive ownership checks use).
+async fn manager_with_bus_in(root: Option<&std::path::Path>) -> (TempDb, AgentManager, EventBus) {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
-    let services = Services::new_with_file_secrets(
+    let mut services = Services::new_with_file_secrets(
         store,
         intent_core::FileSecretStore::with_path(tmp.path.with_extension("secrets.json")),
     )
     .with_event_bus(bus.clone());
+    if let Some(root) = root {
+        services = services.with_workspaces_root(root.to_path_buf());
+    }
     let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
     (tmp, AgentManager::new(services, sink, 8), bus)
 }
@@ -3539,6 +3549,334 @@ async fn winning_try_begin_auto_unarchives_the_workspace() {
     mgr.end_turn(&id).await;
 }
 
+/// A git repo with one commit on `main` plus the kept branch `feat-old`, and
+/// a retired worktree workspace row pointing at a (deleted) checkout path.
+fn init_revive_repo(dir: &std::path::Path) {
+    let repo = git2::Repository::init(dir).expect("init repo");
+    {
+        let mut cfg = repo.config().unwrap();
+        cfg.set_str("user.name", "Tester").unwrap();
+        cfg.set_str("user.email", "t@e.dev").unwrap();
+    }
+    std::fs::write(dir.join("README.md"), "init\n").unwrap();
+    let mut index = repo.index().unwrap();
+    index
+        .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+        .unwrap();
+    index.write().unwrap();
+    let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+    let sig = git2::Signature::now("Tester", "t@e.dev").unwrap();
+    let commit = repo
+        .commit(Some("HEAD"), &sig, &sig, "chore: init", &tree, &[])
+        .unwrap();
+    let commit = repo.find_commit(commit).unwrap();
+    repo.branch("feat-old", &commit, false).unwrap();
+}
+
+/// A turn start in a RETIRED workspace whose revive fails (the source
+/// repository is gone) does not start the turn: the claim is released, the
+/// session never goes `Active`, no checkout appears, and the row stays
+/// Retired. (A merely Archived workspace's unarchive stays best-effort.)
+#[tokio::test]
+async fn failed_revive_of_a_retired_workspace_does_not_start_the_turn() {
+    let root = test_tempdir("intentd-revive-fail-root-");
+    let (_tmp, mgr, _bus) = manager_with_bus_in(Some(root.path())).await;
+    let ws = WorkspaceId::from("ws-revive-fail");
+    let id = AgentId::from("a-revive-fail");
+    seed_agent(&mgr, &ws, &id).await;
+    let missing_repo = root.path().join("no-such-repo");
+    let wt = root.path().join(ws.as_str()).join("repo");
+    let mut row = mgr.services.store.get_workspace(&ws).await.unwrap();
+    row.repository_path = Some(missing_repo.to_string_lossy().into_owned());
+    row.worktree_path = Some(wt.to_string_lossy().into_owned());
+    row.checkout_mode = Some(intent_core::CheckoutMode::Worktree);
+    mgr.services
+        .store
+        .update_workspace_with_branch(&row, Some("feat-old"))
+        .await
+        .unwrap();
+    mgr.services
+        .store
+        .archive_workspace_detaching_guests(&ws, &now_iso())
+        .await
+        .expect("archive row");
+    assert!(mgr
+        .services
+        .store
+        .retire_workspace_if_archived(&ws, &now_iso())
+        .await
+        .expect("retire row"));
+    let status_before = mgr
+        .services
+        .store
+        .get_agent_session(&id)
+        .await
+        .unwrap()
+        .status;
+
+    assert!(
+        !mgr.try_begin(&id, &ws).await,
+        "no turn starts when the revive fails"
+    );
+    assert!(
+        !mgr.busy.lock().unwrap().contains(&id),
+        "the claimed slot was released"
+    );
+    let after = mgr.services.store.get_workspace(&ws).await.unwrap();
+    assert!(after.is_retired(), "row stays Retired: {:?}", after.status);
+    assert!(!wt.exists(), "nothing provisioned");
+    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(session.status, status_before, "session never went Active");
+    assert_ne!(session.status, AgentStatus::Active);
+}
+
+/// A winning `try_begin` in a RETIRED workspace revives it: a fresh blank
+/// checkout is provisioned at the same path on a new branch, the row flips
+/// to Active, ONE `workspace_revived` system row lands in the transcript,
+/// and THIS turn's prompt — and only this turn's — carries the notice that
+/// all prior on-disk state is gone.
+#[tokio::test]
+async fn winning_try_begin_revives_a_retired_workspace() {
+    let root = test_tempdir("intentd-revive-root-");
+    let (_tmp, mgr, bus) = manager_with_bus_in(Some(root.path())).await;
+    let ws = WorkspaceId::from("ws-revive");
+    let id = AgentId::from("a-revive");
+    seed_agent(&mgr, &ws, &id).await;
+    let repo_dir = test_tempdir("intentd-revive-repo-");
+    init_revive_repo(repo_dir.path());
+    let wt = root.path().join(ws.as_str()).join("repo");
+    let mut row = mgr.services.store.get_workspace(&ws).await.unwrap();
+    row.repository_path = Some(repo_dir.path().to_string_lossy().into_owned());
+    row.worktree_path = Some(wt.to_string_lossy().into_owned());
+    row.checkout_mode = Some(intent_core::CheckoutMode::Worktree);
+    mgr.services
+        .store
+        .update_workspace_with_branch(&row, Some("feat-old"))
+        .await
+        .unwrap();
+    assert_eq!(
+        mgr.services.store.get_workspace(&ws).await.unwrap().branch,
+        "feat-old"
+    );
+    mgr.services
+        .store
+        .archive_workspace_detaching_guests(&ws, &now_iso())
+        .await
+        .expect("archive row");
+    assert!(mgr
+        .services
+        .store
+        .retire_workspace_if_archived(&ws, &now_iso())
+        .await
+        .expect("retire row"));
+    assert!(!wt.exists());
+
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    assert!(
+        mgr.try_begin(&id, &ws).await,
+        "the claim wins despite the retired workspace"
+    );
+
+    let after = mgr.services.store.get_workspace(&ws).await.unwrap();
+    assert_eq!(after.status, WorkspaceStatus::Active, "revived to Active");
+    assert!(!after.archived);
+    assert!(after.retired_at.is_none());
+    assert_ne!(after.branch, "feat-old", "revive uses a new branch");
+    assert!(wt.join("README.md").is_file(), "fresh checkout provisioned");
+
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
+        events.extend(batch);
+    }
+    let delta = events
+        .iter()
+        .find(|e| e.event_type == "workspace:updated")
+        .expect("revive published workspace:updated");
+    assert_eq!(
+        delta.data["changes"]["revived"],
+        json!({ "reason": "agent_activity", "agentId": id.0, "agentName": "Builder" })
+    );
+    assert!(delta.data["changes"].get("autoUnarchive").is_none());
+
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .unwrap();
+    assert_eq!(messages.len(), 1, "exactly one notice row");
+    let notice = &messages[0];
+    assert_eq!(notice.role, "system");
+    assert_eq!(
+        notice.content,
+        json!([{ "type": "text", "text": super::WORKSPACE_REVIVED_NOTICE_TEXT }])
+    );
+    assert_eq!(
+        notice.metadata,
+        Some(json!({ "type": "workspace_revived", "reason": "agent_activity" }))
+    );
+
+    let prompt = mgr
+        .build_turn_prompt(&id, &ws, "hello", &super::TurnOptions::default())
+        .await
+        .unwrap();
+    let last = serde_json::to_value(prompt.last().expect("non-empty prompt")).unwrap();
+    let text = last["text"].as_str().expect("text block");
+    assert!(
+        text.starts_with("[SYSTEM NOTICE] This workspace was retired"),
+        "{text}"
+    );
+    assert!(text.contains("are gone"), "{text}");
+    assert!(
+        text.contains("feat-old"),
+        "names the kept old branch: {text}"
+    );
+    assert!(text.contains(&after.branch), "names the new branch: {text}");
+    assert!(
+        !text.contains("automatically unarchived"),
+        "a revive is not reported as a plain unarchive: {text}"
+    );
+    mgr.end_turn(&id).await;
+
+    assert!(mgr.try_begin(&id, &ws).await, "second claim wins");
+    let next = mgr
+        .build_turn_prompt(&id, &ws, "hello", &super::TurnOptions::default())
+        .await
+        .unwrap();
+    assert!(
+        !serde_json::to_string(&next)
+            .unwrap()
+            .contains("was retired"),
+        "the notice must not replay on later turns"
+    );
+    mgr.end_turn(&id).await;
+    assert_eq!(
+        mgr.services
+            .store
+            .get_agent_messages(&id, None)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "no second notice row"
+    );
+}
+
+/// A turn start that races a retirement teardown must not be lost
+/// (verifier finding on intentd#2605): retire holds the archive fence from
+/// its Retired flip through `stop_many`, which releases in-flight slots. The
+/// turn start must therefore take the fence BEFORE claiming its slot, so the
+/// teardown's stop cannot clear the admission; once the teardown releases
+/// the fence the claim wins, revives the workspace, and THIS turn's prompt
+/// carries the one-shot revive notice. Deterministic: the test plays the
+/// retire tail itself — it holds the fence, waits until the turn start is
+/// parked (on the fence, or — the old bug — holding a claimed slot), runs
+/// the same `stop_many` retire runs, then releases.
+#[tokio::test]
+async fn turn_start_during_retire_teardown_keeps_its_admission_and_notice() {
+    let root = test_tempdir("intentd-revive-race-root-");
+    let (_tmp, mgr, _bus) = manager_with_bus_in(Some(root.path())).await;
+    let ws = WorkspaceId::from("ws-revive-race");
+    let id = AgentId::from("a-revive-race");
+    seed_agent(&mgr, &ws, &id).await;
+    let repo_dir = test_tempdir("intentd-revive-race-repo-");
+    init_revive_repo(repo_dir.path());
+    let wt = root.path().join(ws.as_str()).join("repo");
+    let mut row = mgr.services.store.get_workspace(&ws).await.unwrap();
+    row.repository_path = Some(repo_dir.path().to_string_lossy().into_owned());
+    row.worktree_path = Some(wt.to_string_lossy().into_owned());
+    row.checkout_mode = Some(intent_core::CheckoutMode::Worktree);
+    mgr.services
+        .store
+        .update_workspace_with_branch(&row, Some("feat-old"))
+        .await
+        .unwrap();
+    mgr.services
+        .store
+        .archive_workspace_detaching_guests(&ws, &now_iso())
+        .await
+        .expect("archive row");
+
+    // Retire's flip + teardown hold: fence first, then the Retired flip.
+    let fence = mgr.services.archive_fence.acquire(&ws).await;
+    assert!(mgr
+        .services
+        .store
+        .retire_workspace_if_archived(&ws, &now_iso())
+        .await
+        .expect("retire row"));
+
+    let teardown = async {
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_secs(5));
+        loop {
+            let parked_on_fence = mgr
+                .services
+                .archive_fence
+                .locks
+                .lock()
+                .unwrap()
+                .get(&ws)
+                .is_some_and(|lock| Arc::strong_count(lock) >= 3);
+            let claimed = mgr.busy.lock().unwrap().contains(&id);
+            if parked_on_fence || claimed {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "turn start never reached the retirement fence"
+            );
+            tokio::task::yield_now().await;
+        }
+        // The retire tail's agent stop, then the fence release (the folder
+        // sweep is a no-op: the retired checkout never existed here).
+        drop(mgr.stop_many(std::slice::from_ref(&id)).await);
+        drop(fence);
+    };
+    let (won, ()) = tokio::join!(mgr.try_begin(&id, &ws), teardown);
+    assert!(won, "the claim wins once the teardown releases the fence");
+    assert!(
+        mgr.busy.lock().unwrap().contains(&id),
+        "the triggering turn still holds its slot — the teardown did not clear it"
+    );
+
+    let after = mgr.services.store.get_workspace(&ws).await.unwrap();
+    assert_eq!(after.status, WorkspaceStatus::Active, "revived to Active");
+    assert!(wt.join("README.md").is_file(), "fresh checkout provisioned");
+
+    let prompt = mgr
+        .build_turn_prompt(&id, &ws, "hello", &super::TurnOptions::default())
+        .await
+        .unwrap();
+    let last = serde_json::to_value(prompt.last().expect("non-empty prompt")).unwrap();
+    let text = last["text"].as_str().expect("text block");
+    assert!(
+        text.starts_with("[SYSTEM NOTICE] This workspace was retired"),
+        "the triggering turn carries the revive notice: {text}"
+    );
+    mgr.end_turn(&id).await;
+
+    assert!(mgr.try_begin(&id, &ws).await, "second claim wins");
+    let next = mgr
+        .build_turn_prompt(&id, &ws, "hello", &super::TurnOptions::default())
+        .await
+        .unwrap();
+    let next = serde_json::to_value(next.last().expect("non-empty prompt")).unwrap();
+    assert!(
+        !next["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("[SYSTEM NOTICE] This workspace was retired"),
+        "the notice is one-shot"
+    );
+    mgr.end_turn(&id).await;
+}
+
 /// A claim in a NON-archived workspace persists no `auto_unarchived` notice
 /// and injects nothing into the turn's prompt.
 #[tokio::test]
@@ -3667,22 +4005,22 @@ async fn auto_unarchive_flag_arm_skipped_when_slot_released() {
 
     // Slot held: the arm lands.
     assert!(mgr.try_begin(&id, &ws).await);
-    mgr.arm_auto_unarchive_flag_if_slot_held(&id);
+    mgr.arm_auto_unarchive_flag_if_slot_held(&id, super::AUTO_UNARCHIVE_PROMPT_NOTICE.to_string());
     assert!(
-        mgr.auto_unarchived.lock().unwrap().contains(&id),
+        mgr.auto_unarchived.lock().unwrap().contains_key(&id),
         "the arm lands while the claim holds the slot"
     );
     mgr.end_turn(&id).await;
     assert!(
-        !mgr.auto_unarchived.lock().unwrap().contains(&id),
+        !mgr.auto_unarchived.lock().unwrap().contains_key(&id),
         "the release clears the armed flag"
     );
 
     // The race: the slot was released (concurrent stop/teardown) before the
     // arm ran — the late arm must be skipped, not inserted after the clear.
-    mgr.arm_auto_unarchive_flag_if_slot_held(&id);
+    mgr.arm_auto_unarchive_flag_if_slot_held(&id, super::AUTO_UNARCHIVE_PROMPT_NOTICE.to_string());
     assert!(
-        !mgr.auto_unarchived.lock().unwrap().contains(&id),
+        !mgr.auto_unarchived.lock().unwrap().contains_key(&id),
         "a late arm after the slot release must be skipped"
     );
 
@@ -5012,6 +5350,7 @@ fn file_tracking_workspace(
         context_links: None,
         archived: false,
         archived_at: None,
+        retired_at: None,
         task_stats: None,
         agent_summary: None,
         diff_summary: None,
@@ -5918,6 +6257,7 @@ async fn seed_agent_with_task_graph(
         context_links: None,
         archived: false,
         archived_at: None,
+        retired_at: None,
         task_stats: None,
         agent_summary: None,
         diff_summary: None,
@@ -13160,6 +13500,7 @@ async fn delete_workspace_stops_live_agents_and_leaves_no_ghost_state() {
         context_links: None,
         archived: false,
         archived_at: None,
+        retired_at: None,
         task_stats: None,
         agent_summary: None,
         diff_summary: None,
@@ -18768,6 +19109,7 @@ async fn resolve_spawn_prefers_existing_workspace_path() {
         context_links: None,
         archived: false,
         archived_at: None,
+        retired_at: None,
         task_stats: None,
         agent_summary: None,
         diff_summary: None,
@@ -18887,6 +19229,7 @@ async fn resolve_spawn_falls_back_to_repository_path() {
         context_links: None,
         archived: false,
         archived_at: None,
+        retired_at: None,
         task_stats: None,
         agent_summary: None,
         diff_summary: None,
@@ -19309,6 +19652,7 @@ async fn resolve_image_block_refs_inlines_attachment_bytes() {
         context_links: None,
         archived: false,
         archived_at: None,
+        retired_at: None,
         task_stats: None,
         agent_summary: None,
         diff_summary: None,
@@ -19985,6 +20329,7 @@ async fn derive_agent_type_uses_workspace_project_specialists_dir() {
         context_links: None,
         archived: false,
         archived_at: None,
+        retired_at: None,
         task_stats: None,
         agent_summary: None,
         diff_summary: None,

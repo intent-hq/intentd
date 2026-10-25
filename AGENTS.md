@@ -245,6 +245,7 @@ make test-changed  # nextest for only the crates this branch touched vs origin/m
 make test-select E='test(/name/)'  # just the tests matching one nextest filterset, with make test's fixtures and gate-run record — use it to iterate on a few tests
 make coverage-changed  # the same changed selection under cargo llvm-cov (BASE=<ref>, DRY_RUN=1 prints the plan) — the local equivalent of CI's coverage-changed job (PRs and merge queue)
 make gate     # check, then test
+make check-windows  # cargo check + clippy --all-targets for x86_64-pc-windows-gnu (needs MinGW-w64), as CI's windows-cross-lint runs on every PR — run it while iterating on cfg(unix) / cfg(windows) code, before pushing
 scripts/changed-tests.sh --instrumented  # (from packages/intentd) the same changed selection under cargo llvm-cov — what CI's coverage-changed job runs on PRs and in the merge queue
 ```
 
@@ -261,6 +262,11 @@ Raw invocations must also run under the rustup-managed toolchain pinned in
 `rust-toolchain.toml` (`rustup run <pin> cargo ...` when a non-rustup cargo shadows
 `PATH` — a Homebrew cargo once ran the gates on the wrong toolchain, see
 intent-hq/intentd#1853); the `make` targets are the supported path.
+
+`make check` lints only the host target, so code gated to `cfg(unix)` or `cfg(windows)` can be
+clean there and still fail Windows Clippy (an import that only `cfg(unix)` code uses, intentd#2672).
+CI's `windows-cross-lint` job runs the same check on every PR, on Linux, so a local run only
+saves a push round trip; the merge queue's native `windows-lint` job stays the final authority.
 
 The CI `check` job also runs the **source lints**: every `crates/<crate>/tests/*_lint.rs`
 integration test is a source-scanning lint, selected by convention — run them all with

@@ -513,6 +513,7 @@ fn minimal_params(f: &Fixture) -> Vec<(&'static str, Value)> {
             json!({ "workspaceId": ws, "principalId": "p" }),
         ),
         ("workspace.restore", json!({ "workspaceId": ws })),
+        ("workspace.retire", json!({ "workspaceId": ws })),
         (
             "workspace.saveSetupScript",
             json!({ "workspaceId": ws, "script": "" }),

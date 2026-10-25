@@ -2890,6 +2890,170 @@ mod task_delta_re_read {
     }
 }
 
+// --- workspace channel — retired workspaces are opt-in (includeRetired) ----
+
+mod workspace_retired_opt_in {
+    use super::*;
+    use intent_core::{
+        chief_workspace, BoxFuture, Result, Workspace, WorkspaceApi, WorkspaceId,
+        WorkspaceListFilter, WorkspaceStatus,
+    };
+
+    /// `ws-live` is Active, `ws-retired` is Retired; the list honors the
+    /// filter like the store does.
+    struct RetiredApi;
+
+    fn row(id: &str) -> Workspace {
+        let mut ws = Workspace {
+            id: WorkspaceId::from(id),
+            ..chief_workspace()
+        };
+        if id == "ws-retired" {
+            ws.status = WorkspaceStatus::Retired;
+            ws.archived = true;
+            ws.retired_at = Some("2026-10-22T00:00:00Z".to_string());
+        }
+        ws
+    }
+
+    impl WorkspaceApi for RetiredApi {
+        fn get_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
+            Box::pin(async move { Ok(row(id.as_str())) })
+        }
+
+        fn list_workspaces(
+            &self,
+            filter: WorkspaceListFilter,
+        ) -> BoxFuture<'_, Result<Vec<Workspace>>> {
+            Box::pin(async move {
+                Ok(["ws-live", "ws-retired"]
+                    .into_iter()
+                    .map(row)
+                    .filter(|w| filter.admits(w))
+                    .collect())
+            })
+        }
+    }
+
+    fn event(event_type: &str, id: &str) -> Event {
+        Event {
+            id: "evt-1".into(),
+            event_type: event_type.to_string(),
+            timestamp: now_iso(),
+            workspace_id: WorkspaceId::from(id),
+            session_id: None,
+            correlation_id: None,
+            parent_event_id: None,
+            metadata: None,
+            actor: EventActor {
+                actor_type: ActorType::System,
+                ..Default::default()
+            },
+            data: json!({ "workspaceId": id }),
+        }
+    }
+
+    fn snapshot_ids(v: &Value) -> Vec<String> {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|w| w["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// The seq-0 snapshot excludes retired rows unless the subscriber opted
+    /// in; the generic channel snapshot never includes them.
+    #[tokio::test]
+    async fn snapshot_excludes_retired_unless_opted_in() {
+        assert_eq!(
+            snapshot_ids(&workspace_snapshot(&RetiredApi, false).await),
+            vec!["ws-live"]
+        );
+        assert_eq!(
+            snapshot_ids(&workspace_snapshot(&RetiredApi, true).await),
+            vec!["ws-live", "ws-retired"]
+        );
+        let generic = channel_snapshot(
+            &RetiredApi,
+            Channel::Workspace,
+            &WorkspaceId::from(String::new()),
+            None,
+        )
+        .await;
+        assert_eq!(snapshot_ids(&generic), vec!["ws-live"]);
+    }
+
+    /// For a subscriber that did not opt in, a retire transition arrives as a
+    /// removal and a retired row is never added; an opted-in subscriber gets
+    /// the retired row as an update.
+    #[tokio::test]
+    async fn retire_is_a_removal_unless_opted_in() {
+        let retire = event(WORKSPACE_UPDATED, "ws-retired");
+        let d = workspace_delta(&RetiredApi, &retire, None, false)
+            .await
+            .unwrap();
+        assert_eq!(d, json!({ "removedIds": ["ws-retired"] }));
+
+        let mut visible: HashSet<String> = ["ws-retired".to_string()].into();
+        let d = workspace_delta(&RetiredApi, &retire, Some(&mut visible), false)
+            .await
+            .unwrap();
+        assert_eq!(d, json!({ "removedIds": ["ws-retired"] }));
+        assert!(visible.is_empty(), "removed from the shown set");
+        assert!(
+            workspace_delta(&RetiredApi, &retire, Some(&mut visible), false)
+                .await
+                .is_none(),
+            "a non-administrator never gets a tombstone for an id it was not shown"
+        );
+        assert!(workspace_delta(
+            &RetiredApi,
+            &event(WORKSPACE_CREATED, "ws-retired"),
+            None,
+            false
+        )
+        .await
+        .is_none());
+
+        let d = workspace_delta(&RetiredApi, &retire, None, true)
+            .await
+            .unwrap();
+        assert_eq!(d["updated"][0]["id"], "ws-retired", "{d}");
+        assert_eq!(d["updated"][0]["status"], "Retired", "{d}");
+        let d = workspace_delta(
+            &RetiredApi,
+            &event(WORKSPACE_UPDATED, "ws-live"),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(d["updated"][0]["id"], "ws-live", "{d}");
+    }
+
+    /// `workspace.subscribe { includeRetired }` is an optional strict bool:
+    /// only omission means `false`; any supplied non-boolean, `null`
+    /// included, is rejected (PROTOCOL §5.1).
+    #[test]
+    fn subscribe_params_parse_include_retired() {
+        let parse = |v: Value| parse_workspace_subscribe_params(v.as_object().unwrap());
+        assert!(!parse(json!({})).unwrap().include_retired);
+        assert!(
+            !parse(json!({ "includeRetired": false }))
+                .unwrap()
+                .include_retired
+        );
+        assert!(parse(json!({ "includeRetired": null })).is_err());
+        assert!(parse(json!({ "includeRetired": 1 })).is_err());
+        assert!(
+            parse(json!({ "includeRetired": true }))
+                .unwrap()
+                .include_retired
+        );
+        assert!(parse(json!({ "includeRetired": "yes" })).is_err());
+    }
+}
+
 // --- workspace_delta — the virtual Chief workspace never rides a delta -----
 
 mod workspace_delta_chief {
@@ -2963,13 +3127,17 @@ mod workspace_delta_chief {
             // Id resolved from `data.workspaceId` …
             let from_data = workspace_event(event_type, "w", Some(CHIEF_WORKSPACE_ID));
             assert!(
-                workspace_delta(&api, &from_data, None).await.is_none(),
+                workspace_delta(&api, &from_data, None, false)
+                    .await
+                    .is_none(),
                 "{event_type} with data.workspaceId=__chief__ must map to no delta"
             );
             // … and from the event's own `workspaceId` fallback.
             let from_event = workspace_event(event_type, CHIEF_WORKSPACE_ID, None);
             assert!(
-                workspace_delta(&api, &from_event, None).await.is_none(),
+                workspace_delta(&api, &from_event, None, false)
+                    .await
+                    .is_none(),
                 "{event_type} scoped to __chief__ must map to no delta"
             );
         }
@@ -2989,17 +3157,28 @@ mod workspace_delta_chief {
             &api,
             &workspace_event(WORKSPACE_UPDATED, "w", Some("w")),
             None,
+            false,
         )
         .await
         .expect("real workspace update maps to a delta");
         assert_eq!(d["updated"][0]["id"], "w", "delta: {d}");
-        let d = workspace_delta(&api, &workspace_event(WORKSPACE_CREATED, "w", None), None)
-            .await
-            .expect("real workspace create maps to a delta");
+        let d = workspace_delta(
+            &api,
+            &workspace_event(WORKSPACE_CREATED, "w", None),
+            None,
+            false,
+        )
+        .await
+        .expect("real workspace create maps to a delta");
         assert_eq!(d["added"][0]["id"], "w", "delta: {d}");
-        let d = workspace_delta(&api, &workspace_event(WORKSPACE_DELETED, "w", None), None)
-            .await
-            .expect("real workspace delete maps to a delta");
+        let d = workspace_delta(
+            &api,
+            &workspace_event(WORKSPACE_DELETED, "w", None),
+            None,
+            false,
+        )
+        .await
+        .expect("real workspace delete maps to a delta");
         assert_eq!(d["removedIds"][0], "w", "delta: {d}");
         assert_eq!(api.reads.load(Ordering::SeqCst), 2);
     }
@@ -3105,9 +3284,14 @@ mod workspace_delta_list_projection {
                     .any(|t| t == event_type),
                 "Home must subscribe to {event_type}"
             );
-            let delta = workspace_delta(&DetailWorkspaceApi, &workspace_event(event_type), None)
-                .await
-                .expect("external PR changes refresh the background list row");
+            let delta = workspace_delta(
+                &DetailWorkspaceApi,
+                &workspace_event(event_type),
+                None,
+                false,
+            )
+            .await
+            .expect("external PR changes refresh the background list row");
             assert_eq!(delta["updated"][0]["id"], "w");
             assert_eq!(
                 delta["updated"][0]["pullRequests"]
@@ -3131,9 +3315,14 @@ mod workspace_delta_list_projection {
             (WORKSPACE_UPDATED, "updated"),
             (PR_UPDATED, "updated"),
         ] {
-            let d = workspace_delta(&DetailWorkspaceApi, &workspace_event(event_type), None)
-                .await
-                .expect("delta");
+            let d = workspace_delta(
+                &DetailWorkspaceApi,
+                &workspace_event(event_type),
+                None,
+                false,
+            )
+            .await
+            .expect("delta");
             let row = &d[key][0];
             let obj = row.as_object().expect("row object");
             for detail in ["tokenUsage", "setupScript", "contextLinks", "diskUsage"] {
@@ -5602,7 +5791,7 @@ mod channel_membership {
 
         fn list_workspaces(
             &self,
-            _include_archived: bool,
+            _filter: intent_core::WorkspaceListFilter,
         ) -> BoxFuture<'_, intent_core::Result<Vec<Workspace>>> {
             let mut ids: Vec<String> = self.members.lock().unwrap().iter().cloned().collect();
             ids.sort();

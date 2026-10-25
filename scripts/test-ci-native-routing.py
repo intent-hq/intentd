@@ -34,15 +34,18 @@ RUNTIME = {"deb-packaging", "release-scripts", "pi-session-paths"}
 # runner is ever requested on pull_request.
 WINDOWS_QUEUE_JOBS = {"windows-lint"}
 WINDOWS_JOBS = {"windows", "install-ps1"}
+# PRs lint the Windows GNU target on Linux (no Windows runner), so most
+# Windows-only lint errors fail the PR instead of the queue (intentd#2672).
+WINDOWS_PR_JOBS = {"windows-cross-lint"}
 REQUIRED = {
-    "pull_request": ALWAYS_REQUIRED | {"pr-static", "monorepo-consumer-checks", "check", "coverage-changed", "release-scripts"},
+    "pull_request": ALWAYS_REQUIRED | WINDOWS_PR_JOBS | {"pr-static", "monorepo-consumer-checks", "check", "coverage-changed", "release-scripts"},
     "merge_group": ALWAYS_REQUIRED | RUNTIME | WINDOWS_QUEUE_JOBS | {"cache-smoke", "daemon-lifecycle", "check", "build", "macos-services-runtime", "coverage-e2e", "coverage-all", "coverage-changed", "monorepo-consumer-checks"},
     "push": ALWAYS_REQUIRED | RUNTIME | WINDOWS_JOBS | {"build"},
 }
 PR_METADATA = {"pr-title", "conflict-markers"}
 # Release-metadata PRs (release-fast-path reports fast_path=true) skip these
 # slow jobs; the queue still requires them (intentd#2493).
-FAST_PATH_SKIPS = {"check", "coverage-changed"}
+FAST_PATH_SKIPS = {"check", "windows-cross-lint", "coverage-changed"}
 # Advisory gate dependencies: any result is accepted (the gate reads only
 # their outputs), so a failed classifier degrades to full CI.
 ADVISORY = {"release-fast-path"}
@@ -1182,7 +1185,8 @@ class NativeRoutingTests(unittest.TestCase):
             for event in REQUIRED:
                 jobs = scheduled(self.workflow, event, fast_path=fast_path if event == "pull_request" else "", head_ref=RELEASE_BRANCH)
                 for name in FAST_PATH_SKIPS:
-                    expected = "skipped" if (event == "pull_request" and fast_path == "true") or event == "push" else "success"
+                    pr_only = event == "merge_group" and name in WINDOWS_PR_JOBS
+                    expected = "skipped" if (event == "pull_request" and fast_path == "true") or event == "push" or pr_only else "success"
                     self.assertEqual(jobs[name], expected, f"{event}/{fast_path}: {name}")
         # A failed or skipped route still skips the slow jobs, and CI Gate
         # rejects that skip on a PR without a reported fast path.
@@ -1211,6 +1215,7 @@ class NativeRoutingTests(unittest.TestCase):
             "ignore-output": (' && [ "${{ needs.release-fast-path.outputs.fast_path }}" = true ]', ""),
             "optional-check": ('"$slow" check', "optional check"),
             "optional-coverage": ('"$slow" coverage-changed', "optional coverage-changed"),
+            "optional-windows-cross-lint": ('"$slow" windows-cross-lint', "optional windows-cross-lint"),
         }
         for label, (old, new) in mutations.items():
             with self.subTest(mutation=label):
@@ -1220,10 +1225,40 @@ class NativeRoutingTests(unittest.TestCase):
                 step["run"] = step["run"].replace(old, new, 1)
                 self.assertTrue(gate_errors(workflow))
         for job in FAST_PATH_SKIPS:
-            with self.subTest(job=job):
-                workflow = copy.deepcopy(self.workflow)
-                workflow["jobs"][job]["if"] = workflow["jobs"][job]["if"].replace("github.event_name == 'merge_group' || ", "")
-                self.assertTrue(routing_errors(workflow))
+            widen = [" && needs.release-fast-path.outputs.fast_path != 'true'"]
+            if job in REQUIRED["merge_group"]:
+                widen.append("github.event_name == 'merge_group' || ")
+            for clause in widen:
+                with self.subTest(job=job, clause=clause):
+                    workflow = copy.deepcopy(self.workflow)
+                    self.assertIn(clause, workflow["jobs"][job]["if"])
+                    workflow["jobs"][job]["if"] = workflow["jobs"][job]["if"].replace(clause, "")
+                    self.assertTrue(routing_errors(workflow))
+
+    def test_windows_cross_lint_runs_on_prs_only_on_a_cloud_linux_runner(self):
+        # The PR-time pre-filter for the queue's native windows-lint: Clippy
+        # for the Windows GNU target, denying warnings, on a Linux runner
+        # that can apt-install MinGW (route's `cloud` map never returns a
+        # self-hosted slot). The queue and main pushes skip it.
+        job = self.workflow["jobs"]["windows-cross-lint"]
+        commands = [str(step.get("run", "")) for step in job["steps"]]
+        # The native job's production check, then Clippy, in that order.
+        self.assertEqual([run for run in commands if "cargo " in run], [
+            "cargo check --workspace --target x86_64-pc-windows-gnu",
+            "cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu -- -D warnings"])
+        self.assertTrue(any("gcc-mingw-w64-x86-64" in run for run in commands))
+        toolchain = next(step for step in job["steps"] if str(step.get("uses", "")).startswith("dtolnay/rust-toolchain@"))
+        self.assertEqual(toolchain["with"]["targets"], "x86_64-pc-windows-gnu")
+        self.assertIn("clippy", toolchain["with"]["components"])
+        self.assertIn("needs.route.outputs.cloud", job["runs-on"])
+        self.assertIn("['gh-linux-8x']", job["runs-on"])
+        self.assertNotIn("windows", job["runs-on"].lower())
+        self.assertNotIn("strategy", job)
+        self.assertFalse(job.get("continue-on-error"))
+        for event in REQUIRED:
+            expected = "success" if event == "pull_request" else "skipped"
+            self.assertEqual(scheduled(self.workflow, event)["windows-cross-lint"], expected, event)
+        self.assertEqual(scheduled(self.workflow, "pull_request", fork=True)["windows-cross-lint"], "skipped")
 
     def test_mutation_cannot_drop_gate_dependency(self):
         workflow = copy.deepcopy(self.workflow)

@@ -2569,6 +2569,11 @@ async fn cmd_serve_owned(
     // `scripts.outputRetentionHours` (read live; `0` disables), keeping the
     // current run of any running script. Aborted on clean shutdown.
     let script_output_sweep = startup_work.spawn(|| services.spawn_script_output_sweep_loop());
+    // Automatic retire (PROTOCOL §5.1): shortly after startup and then
+    // hourly, retire workspaces archived longer than
+    // `workspace.autoRetireArchivedAfterDays` (read live; absent = off).
+    // Aborted on clean shutdown.
+    let auto_retire_loop = startup_work.spawn(|| services.spawn_auto_retire_loop());
     let execution_context_loop = startup_work.spawn(|| services.spawn_execution_context_loop());
     // Idle agent reaping (§5.6/§6.7): periodically evict agents idle past the
     // configured TTL, killing each one's whole process group — and, when an
@@ -3253,6 +3258,8 @@ async fn cmd_serve_owned(
     let _ = tracked_changes_sweep.await;
     script_output_sweep.abort();
     let _ = script_output_sweep.await;
+    auto_retire_loop.abort();
+    let _ = auto_retire_loop.await;
     execution_context_loop.abort();
     let _ = execution_context_loop.await;
     if let Some(reap_task) = reap_task {

@@ -238,7 +238,11 @@ async fn optional_local_key_retires_only_its_prepared_owner_and_required_coverag
         })),
     )
     .await;
-    assert!(f.store.list_workspaces(false).await.is_ok());
+    assert!(f
+        .store
+        .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+        .await
+        .is_ok());
 }
 
 #[tokio::test]
@@ -769,7 +773,13 @@ async fn optional_shared_required_fence_waits_and_retirement_wins_before_later_t
 async fn optional_pending_workspace_barrier_retires_original_but_preserves_fresh_physical_capture()
 {
     let f = OptionalFixture::new().await;
-    let workspace = f.store.list_workspaces(false).await.unwrap().remove(0).id;
+    let workspace = f
+        .store
+        .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+        .await
+        .unwrap()
+        .remove(0)
+        .id;
     let scope = McpRequestContext::capture(&f.context);
     let mut ready = None;
     with_caller(
