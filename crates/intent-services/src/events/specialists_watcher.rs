@@ -142,16 +142,7 @@ impl SpecialistsWatcher {
         for watch in &self._user_watchers {
             watch.wait_established(budget.remaining()).await;
         }
-        let probes: Vec<_> = self
-            .workspace_watchers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .values()
-            .map(TierWatch::probe)
-            .collect();
-        for probe in &probes {
-            probe.wait_live(budget.remaining()).await;
-        }
+        super::shared_watch::wait_tier_watches_live(&self.workspace_watchers, &budget).await;
     }
 
     /// Deregister a workspace at runtime (#611): tear down its project-tier
