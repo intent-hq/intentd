@@ -135,6 +135,27 @@ pub(crate) fn controlled(f: &LiveFixture, c: Arc<Control>) -> WorkspaceMcpServer
         .with_repository_guidance(&f.session, f.owner.guidance_source())
 }
 pub(crate) async fn tcp(server: WorkspaceMcpServer, code: &str) -> Value {
+    tcp_within(
+        server,
+        code,
+        crate::test_support::fixture_timeout(Duration::from_secs(15)),
+    )
+    .await
+}
+/// [`tcp`] for a 63/64 acquisition control: the served server carries the
+/// shared quota script budget and the reply is guarded against its timer.
+pub(crate) async fn quota_tcp(server: WorkspaceMcpServer, code: &str) -> Value {
+    use crate::test_support::quota_script;
+    let server = quota_script::budget(server);
+    let budget = server.workspace_api_timeout();
+    quota_script::guard(
+        "context-output-quota-tcp",
+        budget,
+        tcp_within(server, code, quota_script::QUOTA_TRANSPORT_WAIT),
+    )
+    .await
+}
+async fn tcp_within(server: WorkspaceMcpServer, code: &str, wait: Duration) -> Value {
     let bridge = intent_acp::mcp_bridge::serve_workspace_mcp_tcp(Arc::new(server))
         .await
         .unwrap();
@@ -144,13 +165,10 @@ pub(crate) async fn tcp(server: WorkspaceMcpServer, code: &str) -> Value {
         .await
         .unwrap();
     let mut line = String::new();
-    tokio::time::timeout(
-        crate::test_support::fixture_timeout(Duration::from_secs(15)),
-        BufReader::new(stream).read_line(&mut line),
-    )
-    .await
-    .unwrap()
-    .unwrap();
+    tokio::time::timeout(wait, BufReader::new(stream).read_line(&mut line))
+        .await
+        .unwrap()
+        .unwrap();
     drop(bridge);
     serde_json::from_str(&line).unwrap()
 }
