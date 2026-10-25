@@ -51,6 +51,8 @@ mod note_repo;
 mod note_search_repo;
 mod note_version_repo;
 mod note_write_connection;
+mod note_write_lock;
+pub use note_write_lock::NoteWriteLock;
 mod pr_monitor_repo;
 mod presence_focus_repo;
 mod principal_repo;
@@ -401,6 +403,8 @@ pub struct Store {
     browser_tab_displayed: browser_tab_repo::DisplayedOverlay,
     task_event_baselines: std::sync::Arc<TaskEventBaselines>,
     task_events_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Per-note content-write locks; see `note_write_lock`.
+    note_write_lanes: std::sync::Arc<note_write_lock::NoteWriteLanes>,
     #[cfg(test)]
     export_author_barrier: std::sync::Arc<
         std::sync::Mutex<Option<std::sync::Arc<transfer_authorship::ExportAuthorBarrier>>>,
@@ -470,6 +474,7 @@ impl Store {
             repository_lifecycle,
             task_event_baselines: std::sync::Arc::default(),
             task_events_enabled: std::sync::Arc::default(),
+            note_write_lanes: std::sync::Arc::default(),
             write_pool: StorePool::new(write_pool, owner.is_some()),
             read_pool: StorePool::new(read_pool, owner.is_some()),
             _daemon_owner: owner,

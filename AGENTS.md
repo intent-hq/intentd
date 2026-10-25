@@ -39,6 +39,8 @@ crates/
 ├── intent-core/           # leaf: domain types, errors, Config, WorkspaceApi trait
 ├── intent-store/          # SQLite + sqlx + migrations
 ├── intent-services/       # WorkspaceApi implementation (business logic)
+├── intent-svc-transfer/   # feature crate: workspace transfer, above intent-services
+├── intent-app/            # composition root: registers the feature crates (compose)
 ├── intent-transport/      # UDS + WSS listeners, JSON-RPC router
 ├── intent-acp/            # ACP client + agent provider plumbing
 ├── intent-context/        # context engines (e.g. Auggie)
@@ -53,7 +55,8 @@ crates/
 ```
 
 The `intentd` binary is the only composition root that wires concrete implementations
-together. Dependency direction is enforced per the "Dependency-direction rules" in
+together; it registers the feature crates through `intent_app::compose`, and tests that
+need a feature crate together with `intent-transport` live in `crates/intent-app/tests/`. Dependency direction is enforced per the "Dependency-direction rules" in
 `../../docs/ARCHITECTURE.md` — `intent-core` is the leaf and `intent-transport` depends
 only on `intent-services`, never on `intent-store`.
 
@@ -204,7 +207,10 @@ New tests should reuse the harness already in `crates/intentd/tests/`:
   `hermetic_serve_command_fixed_port(data_dir)` when the settings-file port is required.
   Both remove `GITHUB_TOKEN`, `GH_TOKEN`, `GH_ENTERPRISE_TOKEN`,
   `GITHUB_ENTERPRISE_TOKEN`, and `GH_HOST`, and select private gh config/secrets under the
-  owned directory; retain it through shutdown. Reapply `hermetic_fixture_identity` after
+  owned directory; retain it through shutdown. They also pin startup resume of interrupted
+  agents off (`INTENTD_TEST_RESUME_ON_START_DEFAULT=off` resolves `auto`, which resumes
+  only on display-less hosts such as CI; explicit `on` / `off` still win); a recovery
+  test opts back in with `common::opt_into_resume_on_start(&mut cmd)`. Reapply `hermetic_fixture_identity` after
   generic environment overrides. Intentional mock identity uses `common::mock_github_token`
   with a local `// fixture-identity: allow — <private mock reason>` comment.
   `serve_spawn_lint.rs` checks raw/retired builders and identity mutations on simple command
@@ -234,7 +240,7 @@ standalone clone they exit 2 and name the monorepo command):
 ```bash
 make check    # cargo fmt --check + cargo clippy --workspace --all-targets -- -D warnings
 make test     # cargo nextest run --workspace (resumable; see the root AGENTS.md)
-make test-changed  # nextest for only the crates this branch touched vs origin/main (BASE=<ref>); falls back to make test on manifest/lockfile/nextest-config changes
+make test-changed  # nextest for only the crates this branch touched vs origin/main (BASE=<ref>); falls back to make test on manifest/lockfile/nextest-config changes; also runs the end-to-end modules .config/e2e-test-map.txt maps changed source to — add an entry when an end-to-end test exercises another crate's source (scripts/changed-tests.sh --check-map validates it)
 make test-select E='test(/name/)'  # just the tests matching one nextest filterset, with make test's fixtures and gate-run record — use it to iterate on a few tests
 make coverage-changed  # the same changed selection under cargo llvm-cov (BASE=<ref>, DRY_RUN=1 prints the plan) — the local equivalent of CI's coverage-changed job (PRs and merge queue)
 make gate     # check, then test
@@ -284,6 +290,7 @@ down (the lint fails until a fixed file's entry is removed or lowered).
 | `transfer_version_source_lint` | `CARGO_PKG_VERSION` within 20 lines of the transfer manifest's `creating_intentd_version` / `creatingIntentdVersion` field outside `crates/intent-core/src/transfer.rs` — crate versions can drift in a release, so export, the import check and test manifests must all use `intent_core::transfer::CREATING_INTENTD_VERSION` | none |
 | `workflow_grep_quiet_lint` | a `\| grep -q` / `-Eq` / `--quiet` / `--silent` pipeline in `.github/workflows/*.yml` — under `bash -eo pipefail` a large matched input makes the producer die of SIGPIPE and the step report "no match" (cloudlands-fe#2709); use a here-string for variable input, `\| grep -E pat >/dev/null` for a real producer, or `grep -q pat file` | none |
 | `cli_fixture_version_lint` | a hand-written Codex/Claude `--version` output (`codex-cli X`, `X (Claude Code)`, `claude X`, `fixture-cli X`, …) in a string literal of any `crates/**/*.rs` file or in a `.mjs`/`.cjs`/`.js`/`.py`/`.sh` fixture script — old or new, it breaks once an adapter bump moves the minimum (intentd#2567); print `intent_providers::test_support::current_cli_version` or use `current_cli_script`; a marker that covers no version is stale | `// cli-fixture-version: allow — <reason>` (`#` in shell/Python) on the line above, or above a multi-line literal's opening line |
+| `settle_only_wait_lint` | a use of `SubHandle::wait_settled_even_if_failed` in any `crates/**/*.rs` file, test code included — it returns on a registration settled as FAILED, so a test writing next races the shared watch's creation retry and its event wait hangs (intent-hq/intent#4845, #4852, #6128); sync on `wait_established` / `wait_all_established` / `RegistrationProbe::wait_live`, which ride the retry out; one marker covers one use, and a marker that covers no use is stale | `// settle-only-wait: allow — <reason>` on the line above the use or its statement, only for a test that expects the registration to fail |
 
 See the [root `AGENTS.md`](../../AGENTS.md) for the full submodule-PR → monorepo-bump
 workflow and conventional-commit / breadcrumb conventions.

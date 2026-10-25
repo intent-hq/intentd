@@ -2212,6 +2212,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "intent-app"
+version = "0.11.43"
+dependencies = [
+ "intent-core",
+ "intent-services",
+ "intent-store",
+ "intent-svc-transfer",
+ "intent-transport",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "intent-context"
 version = "0.11.43"
 dependencies = [
@@ -2504,7 +2518,6 @@ dependencies = [
  "intent-core",
  "intent-services",
  "intent-store",
- "intent-svc-transfer",
  "intentd-test-support",
  "libc",
  "rcgen",
@@ -2555,6 +2568,7 @@ dependencies = [
  "futures-util",
  "image",
  "intent-acp",
+ "intent-app",
  "intent-context",
  "intent-core",
  "intent-git",
@@ -2565,7 +2579,6 @@ dependencies = [
  "intent-services",
  "intent-sourcecontrol",
  "intent-store",
- "intent-svc-transfer",
  "intent-test-macros",
  "intent-transport",
  "intent-voice",

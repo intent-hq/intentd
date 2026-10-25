@@ -348,11 +348,15 @@ impl Store {
     /// [`Store::update_note_metadata`] / [`Store::update_note_metadata_versioned`],
     /// which leave `content` alone. This method remains for fixtures.
     ///
+    /// Takes `note`'s [`NoteWriteLock`](crate::NoteWriteLock) from this store;
+    /// any other lock is refused with `Error::Internal` before anything is
+    /// written.
+    ///
     /// # Errors
     ///
     /// Returns `Error::NotFound` if the note does not exist in the workspace; `Error::Internal` if encoding fields or the update fails.
-    pub async fn update_note(&self, note: &Note) -> Result<i64> {
-        self.update_note_versioned(note, None).await
+    pub async fn update_note(&self, lock: &crate::NoteWriteLock, note: &Note) -> Result<i64> {
+        self.update_note_versioned(lock, note, None).await
     }
 
     /// Update an existing note, optionally gating on `expected_version`
@@ -373,14 +377,20 @@ impl Store {
     /// [`Store::update_note_with_version`], which runs this same conditional
     /// UPDATE and the snapshot in one transaction.
     ///
+    /// Takes `note`'s [`NoteWriteLock`](crate::NoteWriteLock) from this store;
+    /// any other lock is refused with `Error::Internal` before anything is
+    /// written.
+    ///
     /// # Errors
     ///
     /// Returns `Error::Conflict` (carrying the current entity) when `expected_version` is supplied and does not match the stored `rev`; `Error::NotFound` if the note does not exist in the workspace; `Error::Internal` if encoding fields or the update fails.
     pub async fn update_note_versioned(
         &self,
+        lock: &crate::NoteWriteLock,
         note: &Note,
         expected_version: Option<i64>,
     ) -> Result<i64> {
+        lock.ensure_covers(self, note)?;
         self.exec_note_update(note, expected_version, NoteUpdateScope::FullRow)
             .await
     }

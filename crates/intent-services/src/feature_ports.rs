@@ -10,8 +10,8 @@
 //!
 //! [`Services::new`] starts with [`UnavailableTransfer`], which fails every
 //! transfer RPC with the same error as the `WorkspaceApi` default. The
-//! composition root registers the real implementation (`intent-svc-transfer`)
-//! with [`Services::with_transfer_port`].
+//! composition root (`intent_app::compose`) registers the real implementation
+//! (`intent-svc-transfer`) with [`Services::with_transfer_port`].
 
 use std::any::Any;
 #[cfg(any(test, feature = "test-hooks"))]
