@@ -1368,6 +1368,195 @@ async fn script_mutations_after_retire_returns_are_refused_and_write_nothing() {
     );
 }
 
+/// An archived workspace whose command finished but whose result could not
+/// be persisted (a trigger refuses the `last_run` write), so the script still
+/// holds an unsettled admitted run.
+async fn archived_with_unsettled_run(f: &Fixture) -> (intent_core::Workspace, String) {
+    let ws = create_workspace(f).await;
+    let v = f
+        .svc
+        .script_create(
+            ws.id.clone(),
+            intent_core::ScriptCreateParams {
+                name: "done".to_string(),
+                command: "printf done".to_string(),
+                mode: intent_core::ScriptMode::Command,
+                purpose: Some(intent_core::ScriptPurpose::Saved),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create");
+    let id = v["id"].as_str().expect("script id").to_string();
+    sqlx::query(
+        "CREATE TRIGGER refuse_result BEFORE UPDATE OF last_run ON script \
+         BEGIN SELECT RAISE(FAIL,'result refused'); END",
+    )
+    .execute(f.store.write_pool())
+    .await
+    .unwrap();
+    let out = f
+        .svc
+        .script_run(ws.id.clone(), id.clone(), None, Some(10))
+        .await
+        .expect("run");
+    assert_eq!(out["exitCode"], 0, "{out}");
+    f.svc
+        .archive_workspace(ws.id.clone(), None)
+        .await
+        .expect("archive");
+    (ws, id)
+}
+
+/// The retire flip waits for the scripts to be fully stopped AND settled:
+/// asserts the row stays Archived (not Retired), the checkout is kept and
+/// the run's result is still unsettled.
+async fn assert_still_archived_and_unsettled(f: &Fixture, ws: &intent_core::Workspace, id: &str) {
+    let row = f.store.get_workspace(&ws.id).await.unwrap();
+    assert!(row.archived && !row.is_retired(), "{row:?}");
+    assert!(std::path::Path::new(ws.worktree_path.as_deref().unwrap()).is_dir());
+    let def = f
+        .store
+        .get_script_in_workspace(&ws.id, id)
+        .await
+        .unwrap()
+        .expect("script row");
+    assert!(def.last_run.is_none(), "result still unsettled: {def:?}");
+}
+
+/// Review regression (intentd#2605): a manual `workspace.retire` whose
+/// script close cannot settle a finished run (the result write fails)
+/// aborts before the Retired flip with a typed error, so a Retired workspace
+/// never holds a live or admitted script. Once the store recovers, retire
+/// succeeds and settles the run.
+#[intent_test_macros::daemon_test]
+async fn manual_retire_aborts_while_a_script_result_cannot_be_settled() {
+    let f = fixture().await;
+    let (ws, id) = archived_with_unsettled_run(&f).await;
+
+    let err = f
+        .svc
+        .retire_workspace(ws.id.clone(), None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Internal(_)), "{err:?}");
+    assert_still_archived_and_unsettled(&f, &ws, &id).await;
+
+    sqlx::query("DROP TRIGGER refuse_result")
+        .execute(f.store.write_pool())
+        .await
+        .unwrap();
+    let retired = f
+        .svc
+        .retire_workspace(ws.id.clone(), None)
+        .await
+        .expect("retire after recovery");
+    assert!(retired.is_retired());
+    let def = f
+        .store
+        .get_script_in_workspace(&ws.id, &id)
+        .await
+        .unwrap()
+        .expect("script row");
+    assert!(
+        def.last_run.is_some(),
+        "run settled before the flip: {def:?}"
+    );
+}
+
+/// Review regression (intentd#2605): the automatic sweep's retire skips
+/// (logs and counts a failure) a workspace whose script close cannot settle
+/// a finished run, leaving it Archived for the next sweep.
+#[intent_test_macros::daemon_test]
+async fn auto_retire_skips_a_workspace_whose_script_result_cannot_be_settled() {
+    let f = fixture().await;
+    let (ws, id) = archived_with_unsettled_run(&f).await;
+
+    let out = f
+        .svc
+        .auto_retire_workspace_op(ws.id.clone(), days_from_now(8))
+        .await;
+    assert!(matches!(out, Err(Error::Internal(_))), "{out:?}");
+    assert_still_archived_and_unsettled(&f, &ws, &id).await;
+}
+
+/// Review regression (intentd#2605): a `script.create` of a NEW id that
+/// passed its retired check while the workspace was still Archived is
+/// waited for by retire's script close (it is not yet in the registry
+/// snapshot), so its definition commits strictly before the Retired flip and
+/// never after `workspace.retire` returned.
+#[intent_test_macros::daemon_test]
+async fn script_create_admitted_before_retire_commits_before_the_flip() {
+    let f = fixture().await;
+    let park = std::sync::Arc::new(crate::script_ops::SupervisePark::default());
+    let svc = f.svc.clone().with_script_create_admitted_park(park.clone());
+    let ws = create_workspace(&f).await;
+    svc.archive_workspace(ws.id.clone(), None)
+        .await
+        .expect("archive");
+
+    let create = intent_core::spawn_daemon({
+        let svc = svc.clone();
+        let id = ws.id.clone();
+        async move {
+            svc.script_create(
+                id,
+                intent_core::ScriptCreateParams {
+                    name: "racing".to_string(),
+                    command: "echo racing".to_string(),
+                    mode: intent_core::ScriptMode::Command,
+                    purpose: Some(intent_core::ScriptPurpose::Saved),
+                    script_id: Some("racing-script".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+        }
+    });
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        park.entered.notified(),
+    )
+    .await
+    .expect("create parks after its checks");
+    let retire = intent_core::spawn_daemon({
+        let svc = svc.clone();
+        let id = ws.id.clone();
+        async move { svc.retire_workspace(id, None).await }
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !retire.is_finished(),
+        "retire must wait for the admitted create before flipping"
+    );
+    assert!(!f.store.get_workspace(&ws.id).await.unwrap().is_retired());
+    park.release.notify_one();
+
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        create,
+    )
+    .await
+    .expect("create finishes")
+    .expect("join")
+    .expect("create admitted before retirement");
+    let retired = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        retire,
+    )
+    .await
+    .expect("retire finishes")
+    .expect("join")
+    .expect("retire");
+    assert!(retired.is_retired());
+    assert!(f
+        .store
+        .get_script_in_workspace(&ws.id, "racing-script")
+        .await
+        .unwrap()
+        .is_some());
+}
+
 // ---------------------------------------------------------------------------
 // Ownership: `Retired` is entered only through workspace.retire, and revive
 // never detaches a folder the daemon cannot prove it owns.

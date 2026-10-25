@@ -193,7 +193,19 @@ impl Services {
         // Stop every running script and refuse new launches until the folder
         // is gone, so nothing writes into the checkout being removed. After
         // the flip below, `script.start` is refused by the retired guard.
-        let _scripts_closed = self.script_manager().close_workspace(&id).await;
+        let scripts_closed = self.script_manager().close_workspace(&id).await;
+        // A Retired workspace must hold no live or admitted script (the
+        // script admission guards rely on it): if any could not be stopped
+        // and settled, abort before the flip. Dropping the guard releases
+        // the closing mark; the workspace stays Archived and the automatic
+        // sweep retries on its next pass.
+        if !scripts_closed.unsettled().is_empty() {
+            return Err(Error::Internal(format!(
+                "workspace {id}: scripts {:?} could not be stopped and settled; \
+                 retire aborted, the workspace stays archived",
+                scripts_closed.unsettled()
+            )));
+        }
         let retired_at = now_iso();
         let ws = {
             let flipped = self

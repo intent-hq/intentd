@@ -31,7 +31,7 @@ impl ScriptManager {
         m.run_id.is_some() || self.entry_is_live(m)
     }
 
-    fn entry_is_live(&self, m: &ManagedScript) -> bool {
+    pub(super) fn entry_is_live(&self, m: &ManagedScript) -> bool {
         !matches!(m.state.status, ScriptStatus::Idle | ScriptStatus::Exited)
             || m.run_reserved.is_some()
             || m.supervisor

@@ -2606,6 +2606,17 @@ impl Services {
         self
     }
 
+    /// Test seam: park `script.create` after its retired/closing checks,
+    /// before the definition is persisted.
+    #[cfg(test)]
+    pub(crate) fn with_script_create_admitted_park(
+        mut self,
+        park: Arc<script_ops::SupervisePark>,
+    ) -> Self {
+        self.script_parks.create_admitted = Some(park);
+        self
+    }
+
     /// Test seam (monorepo#4952): park `mark_running` after its eligibility
     /// check, before the `was_running` marker write and the in-memory flip to
     /// `running`, so persist-before-observable ordering is testable.
