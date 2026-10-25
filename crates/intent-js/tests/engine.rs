@@ -534,3 +534,51 @@ async fn oversized_reply_frame_ignores_inherited_then() {
         "got: {msg}"
     );
 }
+
+/// Same as above with a callable inherited `then` that would substitute the
+/// envelope: primitive and error replies still arrive untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_reply_envelope_ignores_inherited_callable_then() {
+    let host: HostFn = Arc::new(|arg| {
+        Box::pin(async move {
+            match arg.as_str() {
+                Some("err") => Err("host said no".to_string()),
+                _ => Ok(serde_json::json!(42)),
+            }
+        })
+    });
+    let out = eval(
+        "Object.prototype.then = function (resolve) { resolve('hijacked'); }; \
+         const n = await host(null); \
+         let e; try { await host('err'); } catch (x) { e = String(x.message); } \
+         delete Object.prototype.then; \
+         return [n, e];",
+        &EvalOptions::default(),
+        Some(host),
+    )
+    .await
+    .expect("replies are delivered despite a callable inherited then");
+    assert_eq!(out, serde_json::json!([42, "host said no"]));
+}
+
+/// Object *values* keep `JSON.parse` semantics (they inherit
+/// `Object.prototype`), so returning one from the async `host` wrapper
+/// resolves through its inherited `then` exactly as it did when the reply
+/// was parsed in JS. This pins that unchanged behavior.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn object_reply_value_resolution_is_unchanged() {
+    let host: HostFn = Arc::new(|_| Box::pin(async { Ok(serde_json::json!({ "k": 1 })) }));
+    let out = eval(
+        "Object.defineProperty(Object.prototype, 'then', { \
+             get() { throw new Error('value then'); }, configurable: true }); \
+         let m; try { await host(null); m = 'resolved'; } catch (e) { m = String(e.message); } \
+         delete Object.prototype.then; \
+         const o = await host(null); \
+         return [m, o.k, Object.getPrototypeOf(o) === Object.prototype];",
+        &EvalOptions::default(),
+        Some(host),
+    )
+    .await
+    .expect("object value round-trips");
+    assert_eq!(out, serde_json::json!(["value then", 1, true]));
+}
