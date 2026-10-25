@@ -19,9 +19,9 @@
 
 use crate::common;
 
-use std::os::unix::process::CommandExt;
+use intentd_test_support::GuardedChild;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -207,7 +207,12 @@ async fn wss_rpc(
     }
 }
 
-fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)], resume_all: bool) -> Child {
+fn spawn_serve(
+    data_dir: &Path,
+    listen: &str,
+    env: &[(&str, &str)],
+    resume_all: bool,
+) -> GuardedChild {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
@@ -227,11 +232,10 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)], resume_all: 
         cmd.env(k, v);
     }
     common::hermetic_fixture_identity(&mut cmd, data_dir);
-    // Spawn in its own process group (pgid == child pid) so killing the daemon
-    // also kills spawned Node.js ACP mock providers via killpg.
-    #[cfg(unix)]
-    cmd.process_group(0);
-    cmd.spawn().expect("spawn intentd serve")
+    // GuardedChild: the daemon gets its own process group, killed on drop, panic
+    // or test-process death. ACP providers start their own groups (intent-acp),
+    // so this does not reach them.
+    GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
 }
 
 async fn seed_workspace_with_guest(data_dir: &Path) -> (String, intent_core::Principal) {
@@ -335,26 +339,14 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
 }
 
 struct Daemon {
-    child: Child,
+    child: GuardedChild,
     data_dir: PathBuf,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        // Kill the whole process group FIRST (daemon + any Node.js ACP provider
-        // children) BEFORE wait(), so children are reaped before reparenting.
-        #[cfg(unix)]
-        {
-            use nix::sys::signal::{self, Signal};
-            use nix::unistd::Pid;
-            let pid = Pid::from_raw(self.child.id().cast_signed());
-            let _ = signal::killpg(pid, Signal::SIGKILL);
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = self.child.kill();
-        }
-        let _ = self.child.wait();
+        // Kills the daemon's process group (ACP providers run in their own groups).
+        let _ = self.child.kill_tree();
         // On test panic, print data-dir path + daemon log tail for diagnosability
         if std::thread::panicking() {
             eprintln!("\n=== DAEMON CLEANUP (test panicked) ===");

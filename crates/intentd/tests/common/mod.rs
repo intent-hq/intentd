@@ -15,7 +15,6 @@ pub mod codex_npx;
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::Child;
 use std::sync::{Arc, Mutex, Once};
 use std::thread::ThreadId;
 use std::time::Duration;
@@ -382,7 +381,11 @@ pub fn registry_with_default_provider(
 /// (UDS); gated so test binaries without `#![cfg(unix)]` still compile
 /// `common` on non-Unix targets and keep the ctor guard.
 #[cfg(unix)]
-pub async fn await_daemon_listening(child: &mut Child, socket: &Path, log_path: &Path) {
+pub async fn await_daemon_listening(
+    child: &mut std::process::Child,
+    socket: &Path,
+    log_path: &Path,
+) {
     let budget = daemon_startup_timeout();
     let deadline = tokio::time::Instant::now() + budget;
     loop {
@@ -1040,17 +1043,43 @@ pub async fn wss_connect_with_retry(port: u16, cfg: Arc<rustls::ClientConfig>, u
     }
 }
 
+/// The process a [`DaemonGuard`] owns: an `intentd_test_support::GuardedChild`
+/// on Unix — its own process group, killed with the group on drop and by a
+/// watchdog when the test process itself dies (a nextest timeout runs no
+/// `Drop`) — and a plain `Child` on Windows, which has no process groups.
+#[cfg(unix)]
+pub type DaemonChild = intentd_test_support::GuardedChild;
+/// See the Unix definition; Windows has no process groups to guard.
+#[cfg(not(unix))]
+// raw-child: allow — GuardedChild is Unix-only; Windows has no process groups
+pub type DaemonChild = std::process::Child;
+
+/// Spawn `cmd` as a [`DaemonChild`] (see there for the platform split).
+///
+/// # Errors
+///
+/// Any error from spawning the command.
+pub fn spawn_guarded(cmd: &mut std::process::Command) -> std::io::Result<DaemonChild> {
+    #[cfg(unix)]
+    {
+        intentd_test_support::GuardedChild::spawn(cmd)
+    }
+    #[cfg(not(unix))]
+    {
+        cmd.spawn()
+    }
+}
+
 /// RAII guard for a spawned `intentd serve` process.
 ///
-/// Ensures the daemon child process is killed on drop (SIGKILL to the process
-/// group) and optionally removes the temp data directory. This prevents leaked
-/// daemon processes when tests panic or abort before explicit cleanup.
-///
-/// The guard sends SIGKILL to the process group (not just the parent PID),
-/// which also terminates any child processes spawned by the daemon (e.g., Node
-/// mock agents in ACP provider tests).
+/// Holds a [`DaemonChild`], so on Unix the daemon and everything left in its
+/// process group are killed when the guard drops, on panic, and — via the
+/// `GuardedChild` watchdog — when the test process is killed (nextest
+/// timeout) before any `Drop` runs. ACP providers start process groups of
+/// their own (intent-acp), so they are outside this sweep. Optionally removes
+/// the temp data directory on drop.
 pub struct DaemonGuard {
-    child: Child,
+    child: DaemonChild,
     data_dir: Option<PathBuf>,
 }
 
@@ -1058,7 +1087,7 @@ impl DaemonGuard {
     /// Create a new daemon guard that will kill the child process on drop.
     ///
     /// If `cleanup_data_dir` is true, the data directory will be removed on drop.
-    pub fn new(child: Child, data_dir: PathBuf, cleanup_data_dir: bool) -> Self {
+    pub fn new(child: DaemonChild, data_dir: PathBuf, cleanup_data_dir: bool) -> Self {
         Self {
             child,
             data_dir: if cleanup_data_dir {
@@ -1070,7 +1099,7 @@ impl DaemonGuard {
     }
 
     /// Create a daemon guard that only kills the process (no data dir cleanup).
-    pub fn process_only(child: Child) -> Self {
+    pub fn process_only(child: DaemonChild) -> Self {
         Self {
             child,
             data_dir: None,
@@ -1079,23 +1108,29 @@ impl DaemonGuard {
 
     /// Get a mutable reference to the child process.
     ///
-    /// Useful for calling `wait()`, `try_wait()`, or `kill()` explicitly.
-    pub fn child_mut(&mut self) -> &mut Child {
+    /// Useful for `try_wait()` or signalling. To stop the daemon, call
+    /// [`DaemonGuard::kill_tree`] rather than `kill()` + `wait()`: reaping the
+    /// leader first leaves nothing for the group sweep to name.
+    pub fn child_mut(&mut self) -> &mut DaemonChild {
         &mut self.child
     }
 
-    /// Take ownership of the child process, consuming the guard.
+    /// Force-kill the daemon (its whole process group on Unix) and reap it,
+    /// e.g. to simulate a crash before restarting on the same data dir.
     ///
-    /// The caller is responsible for cleanup after this point.
-    pub fn into_child(mut self) -> Child {
-        let child = std::mem::replace(
-            &mut self.child,
-            // Placeholder - will be dropped immediately after we return the real child
-            unsafe { std::mem::zeroed() },
-        );
-        // Prevent Drop from running by forgetting self
-        std::mem::forget(self);
-        child
+    /// # Errors
+    ///
+    /// Any error from waiting on the child.
+    pub fn kill_tree(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        #[cfg(unix)]
+        {
+            self.child.kill_tree()
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = self.child.kill();
+            self.child.wait()
+        }
     }
 
     /// Disable data directory cleanup on drop.
@@ -1109,10 +1144,9 @@ impl DaemonGuard {
 
 impl Drop for DaemonGuard {
     fn drop(&mut self) {
-        // SIGKILL the process (or process group if set).
-        // Ignore errors - the process may have already exited.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        // Kill (and reap) the daemon before removing its data directory.
+        // Errors are ignored: the process may have already exited.
+        let _ = self.kill_tree();
 
         // Clean up data directory if requested.
         if let Some(ref dir) = self.data_dir {
@@ -1215,13 +1249,14 @@ mod tests {
         // Spawn a sleep process. Detach all three stdio streams so the child
         // never inherits nextest's stdout/stderr capture pipes — an inherited
         // pipe is what nextest's leak detector keys on (intent-hq/intent#4284).
-        let child = Command::new("sleep")
-            .arg("3600")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn sleep");
+        let child = spawn_guarded(
+            Command::new("sleep")
+                .arg("3600")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null()),
+        )
+        .expect("spawn sleep");
         let pid = child.id();
 
         {
