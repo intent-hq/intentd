@@ -531,11 +531,20 @@ until Intent sees them again.
 
 ## Home Workspaces
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceSettings,HomeWorkspaceBoard}.svelte; src/features/home/{home-workspace-opening,home-workspace-status-groups,home-workspaces-persistence}.ts; src/shared/utils/workspace-attention-reminder.ts. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceSettings,HomeWorkspaceBoard}.svelte; src/features/home/{home-workspace-opening,home-workspace-status-groups,home-workspaces-persistence,home-workspace-menu}.ts; src/features/home/home-retired-workspaces.svelte.ts; src/lib/components/settings/GitWorkspaceSettings.svelte; src/shared/utils/workspace-attention-reminder.ts; messages/en.json. -->
 
 In **Home → Workspaces**, click a list row or board card to select it and show its
 preview. Double-click it, or Cmd-click (Ctrl-click on Windows and Linux), to open the
 workspace directly.
+
+In app versions with the **Retired** filter, retired workspaces appear there
+separately from active and archived workspaces. **Retire** deletes the workspace
+folder, including uncommitted changes and untracked files, while keeping its
+conversations, notes, tasks and git branch. **Restore as blank workspace** starts a
+fresh checkout; it does not recover the deleted files. Retired rows do not offer
+**Dismiss for now**. When the app and daemon support it, Settings offers
+**Automatically retire archived workspaces** and **Retire after (days)**; this
+applies the same folder cleanup after the chosen number of archived days.
 
 Open **View options → Group by** in either list or board
 view. **Activity** groups work as **Needs you**, **PR ready**, **Running**, and
