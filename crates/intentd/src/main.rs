@@ -10584,7 +10584,6 @@ for line in sys.stdin:
     #[test]
     fn resume_test_default_parse_rejects_anything_but_exact_values() {
         use intent_core::settings_file::ResumeInterruptedOnStart as R;
-        use std::ffi::OsString;
         assert_eq!(parse_resume_test_default(None).unwrap(), None);
         for (raw, expected) in [("off", R::Off), ("on", R::On), ("auto", R::Auto)] {
             assert_eq!(
@@ -10602,6 +10601,7 @@ for line in sys.stdin:
         }
         #[cfg(unix)]
         {
+            use std::ffi::OsString;
             use std::os::unix::ffi::OsStringExt;
             assert!(parse_resume_test_default(Some(OsString::from_vec(vec![0x6f, 0xff]))).is_err());
         }
