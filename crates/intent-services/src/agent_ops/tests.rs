@@ -32782,6 +32782,54 @@ async fn agent_update_name_only_emits_agent_renamed() {
     assert_eq!(renamed.data["nameExplicitlySet"], json!(true));
 }
 
+/// An `agent:updated` carrying `name` also carries the session's persisted
+/// `nameExplicitlySet` after the write (§6.5), overriding any request-echoed
+/// value: a mixed update reports `true`, and `{ name, nameExplicitlySet }`
+/// reports the stored flag in either key order.
+#[tokio::test]
+async fn agent_update_with_name_reports_persisted_name_explicitly_set() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let cases = [
+        json!({ "name": "Mixed", "systemPrompt": "be brief" }),
+        serde_json::from_str::<serde_json::Value>(
+            r#"{ "nameExplicitlySet": false, "name": "FlagFirst" }"#,
+        )
+        .unwrap(),
+        serde_json::from_str::<serde_json::Value>(
+            r#"{ "name": "NameFirst", "nameExplicitlySet": false }"#,
+        )
+        .unwrap(),
+    ];
+    for changes in cases {
+        let id = create_agent(&svc, &ws, "Before").await;
+        let mut sub = bus.subscribe(SubscriptionFilter {
+            event_types: vec![AGENT_UPDATED.to_string()],
+            ..Default::default()
+        });
+        svc.agent_update_op(id.clone(), changes.clone())
+            .await
+            .expect("update");
+        let session = svc.agent_get_session_op(id.clone()).await.expect("get");
+        let batch = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("recv")
+        .expect("open");
+        let updated = batch
+            .iter()
+            .find(|e| e.event_type == AGENT_UPDATED && e.data["agentId"] == json!(id.0))
+            .expect("agent:updated in batch");
+        assert_eq!(updated.data["name"], json!(session.name), "{changes}");
+        assert_eq!(
+            updated.data["nameExplicitlySet"],
+            json!(session.name_explicitly_set),
+            "event flag must equal the persisted flag for {changes}"
+        );
+    }
+}
+
 /// `agent.update` runs the same registry validation on the `imageBlocks`
 /// reference arm as the other ingress seams (monorepo#3338): an unknown
 /// `attachmentId` is `-32602` naming the id and nothing is persisted.

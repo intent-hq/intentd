@@ -401,6 +401,57 @@ async fn agent_create_name_explicitly_set_controls_guarded_rename_over_wss() {
         "agent:renamed from agent.update delivered over WSS"
     );
 
+    // 1c) A mixed `agent.update` listing `nameExplicitlySet` BEFORE `name`
+    //     emits `agent:updated`; its `nameExplicitlySet` is the persisted flag
+    //     after the write (the `name` arm stores `true`), not the request's
+    //     echoed `false` (§6.5).
+    let created = wss_rpc(
+        &mut rpc,
+        37,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Placeholder 3", "nameExplicitlySet": false }),
+    )
+    .await;
+    let mixed_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+    let mixed = wss_rpc(
+        &mut rpc,
+        38,
+        "agent.update",
+        json!({
+            "workspaceId": ws_id,
+            "agentId": mixed_id,
+            "changes": { "nameExplicitlySet": false, "name": "Mixed Name" },
+        }),
+    )
+    .await;
+    let persisted = mixed["agent"]["nameExplicitlySet"].clone();
+    assert!(persisted.is_boolean(), "update result: {mixed}");
+    let mut saw_mixed_updated = false;
+    for _ in 0..40 {
+        let frame = wss_event(&mut sub, 15).await;
+        let event = &frame["params"]["event"];
+        if event["type"] != "agent:updated" || event["data"]["agentId"] != json!(mixed_id) {
+            continue;
+        }
+        if event["data"].get("name").is_none() {
+            continue;
+        }
+        assert_eq!(event["data"]["name"], "Mixed Name", "event data: {frame}");
+        assert_eq!(
+            event["data"]["nameExplicitlySet"], persisted,
+            "agent:updated carries the persisted flag, not the echoed request value: {frame}"
+        );
+        saw_mixed_updated = true;
+        break;
+    }
+    assert!(
+        saw_mixed_updated,
+        "agent:updated from a mixed agent.update delivered over WSS"
+    );
+
     // 2) Back-compat: a name WITHOUT the flag stays explicit — the guarded
     //    rename is a no-op echoing the existing name with `skipped: true`.
     let created = wss_rpc(

@@ -552,8 +552,18 @@ async fn creation_preferences_mixed_mute_failure_rolls_back_all_changes() {
         sub.recv(),
     )
     .await
-    .expect("successful mixed update event");
-    assert!(event.is_some());
+    .expect("successful mixed update event")
+    .expect("open");
+    let updated = event
+        .iter()
+        .find(|e| e.event_type == "agent:updated" && e.data.get("name").is_some())
+        .expect("placeholder rename agent:updated carries name");
+    assert_eq!(updated.data["name"], "Agent");
+    assert_eq!(
+        updated.data["nameExplicitlySet"],
+        json!(false),
+        "placeholder rename reports the persisted (still implicit) flag"
+    );
     svc.store.update_agent_session(&ws, &before).await.unwrap();
     assert!(
         svc.store

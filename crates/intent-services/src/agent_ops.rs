@@ -6692,8 +6692,9 @@ impl Services {
     /// enforces the write-once (`acpSessionId`) and immutable (`provider`)
     /// invariants; malformed values in `changes` surface as `InvalidParams`.
     /// Emits `agent:updated` (or `agent:renamed` when `name` is the only field
-    /// mutated, carrying the persisted `nameExplicitlySet` — §6.5) so
-    /// subscribed clients invalidate their cached projection.
+    /// mutated) so subscribed clients invalidate their cached projection; any
+    /// payload carrying `name` also carries the persisted `nameExplicitlySet`
+    /// (§6.5).
     pub(crate) async fn agent_update_op(&self, agent_id: AgentId, changes: Value) -> Result<Value> {
         let Value::Object(mut obj) = changes else {
             return Err(Error::InvalidParams(
@@ -7094,7 +7095,11 @@ impl Services {
         if rename_placeholder {
             event_data.insert("name".into(), json!(session.name));
         }
-        if mutated_only_name {
+        // Any payload carrying `name` reports the persisted flag after the
+        // write (§6.5), overriding a request-echoed `nameExplicitlySet` whose
+        // value can differ from what was stored (key order) — covers
+        // `agent:renamed`, mixed updates and the placeholder rename alike.
+        if event_data.contains_key("name") {
             event_data.insert(
                 "nameExplicitlySet".into(),
                 json!(session.name_explicitly_set),
