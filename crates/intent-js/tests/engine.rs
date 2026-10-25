@@ -405,8 +405,8 @@ async fn host_reply_ignores_prototype_setters() {
     assert_eq!(out["hits"], serde_json::json!(0));
 }
 
-/// Replies nested deeper than `serde_json`'s recursion limit still arrive
-/// (via the bridge's `JSON.parse` fallback), as they did before #7688.
+/// Replies nested deeper than `serde_json`'s parser recursion limit still
+/// arrive, as they did with the previous `JSON.parse` path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn deeply_nested_host_reply_still_round_trips() {
     let host: HostFn = Arc::new(|_| {
@@ -426,4 +426,54 @@ async fn deeply_nested_host_reply_still_round_trips() {
     .await
     .expect("deep reply round-trips");
     assert_eq!(out, serde_json::json!([200, "leaf"]));
+}
+
+/// Numbers reach JS as the host's exact `f64` (no text round-trip through a
+/// non-round-trip float parser).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_reply_numbers_keep_exact_f64() {
+    let tiny = 1.079_014_325_864_572_3e-180_f64;
+    let host: HostFn =
+        Arc::new(move |_| Box::pin(async move { Ok(serde_json::json!([tiny, 0.1, -0.0])) }));
+    let out = eval(
+        "const r = await host(null); \
+         return [r[0] === 1.0790143258645723e-180, r[1] === 0.1, Object.is(r[2], -0)];",
+        &EvalOptions::default(),
+        Some(host),
+    )
+    .await
+    .expect("numbers round-trip");
+    assert_eq!(out, serde_json::json!([true, true, true]));
+}
+
+/// A deeply nested reply that does not fit still rejects with the bounded
+/// message (no unlabelled raw out-of-memory).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deep_oversized_host_reply_rejects_with_bounded_error() {
+    let host: HostFn = Arc::new(|_| {
+        Box::pin(async {
+            let mut v = serde_json::json!("€".repeat(4_000_000));
+            for _ in 0..200 {
+                v = serde_json::json!([v]);
+            }
+            Ok(v)
+        })
+    });
+    let opts = EvalOptions {
+        timeout: Duration::from_secs(10),
+        memory_limit_bytes: Some(4 * 1024 * 1024),
+    };
+    let out = eval(
+        "try { await host(null); return 'unreachable'; } catch (e) { return String(e.message); }",
+        &opts,
+        Some(host),
+    )
+    .await
+    .expect("rejection is catchable");
+    let msg = out.as_str().expect("message string");
+    assert!(
+        msg.contains("does not fit in the script memory limit")
+            && msg.contains("may already have been applied"),
+        "got: {msg}"
+    );
 }
