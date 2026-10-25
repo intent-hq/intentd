@@ -660,7 +660,19 @@ pub fn hermetic_serve_command_fixed_port(data_dir: &Path) -> std::process::Comma
 /// The private secrets file may contain deliberately seeded state and is never
 /// truncated (restarts must retain it); symlinks and non-files are rejected.
 /// Intentional identity tests can layer private mock configuration afterwards.
+///
+/// Also pins startup resume off ([`RESUME_ON_START_TEST_DEFAULT_ENV`] =
+/// `off`) unless the command already carries an explicit entry for it (an
+/// [`opt_into_resume_on_start`] opt-in survives a later reset). Every daemon
+/// fixture passes through here — `serve_spawn_lint.rs` requires it — so no
+/// restart can quietly resume an interrupted turn on a headless CI runner.
 pub fn hermetic_fixture_identity(cmd: &mut std::process::Command, data_dir: &Path) {
+    let resume_is_caller_owned = cmd
+        .get_envs()
+        .any(|(key, _)| key == std::ffi::OsStr::new(RESUME_ON_START_TEST_DEFAULT_ENV));
+    if !resume_is_caller_owned {
+        cmd.env(RESUME_ON_START_TEST_DEFAULT_ENV, "off");
+    }
     let gh_config_dir = data_dir.join("gh-config");
     match std::fs::create_dir(&gh_config_dir) {
         Ok(()) => {}
@@ -738,10 +750,16 @@ pub fn mock_github_token(cmd: &mut std::process::Command, data_dir: &Path, token
 /// The PTY driver execs the daemon through bash. Copy the supported constructor's
 /// complete environment, including explicit removals, into its wrapper command.
 /// `portable_pty` snapshots the environment at construction; `env_remove` deletes
-/// inherited entries from that snapshot as well as explicit overrides.
+/// inherited entries from that snapshot as well as explicit overrides. A
+/// resume-on-start entry already on `cmd` (an opt-in) is kept, matching
+/// [`hermetic_fixture_identity`].
 pub fn hermetic_pty_fixture_identity(cmd: &mut portable_pty::CommandBuilder, data_dir: &Path) {
     let isolated = hermetic_serve_command(data_dir);
+    let resume_is_caller_owned = cmd.get_env(RESUME_ON_START_TEST_DEFAULT_ENV).is_some();
     for (key, value) in isolated.get_envs() {
+        if resume_is_caller_owned && key == std::ffi::OsStr::new(RESUME_ON_START_TEST_DEFAULT_ENV) {
+            continue;
+        }
         match value {
             Some(value) => cmd.env(key, value),
             None => cmd.env_remove(key),
@@ -824,42 +842,21 @@ pub fn seed_default_provider(data_dir: &std::path::Path) {
     std::fs::write(&path, text).expect("seed config.toml with model.defaultProvider");
 }
 
-/// Seed `config.toml` with `[agents] resumeInterruptedOnStart = "off"` so a
-/// restarted daemon does NOT auto-resume pending interrupted agents. Restart
-/// suites that assert rows stay pending in `agent.listInterrupted` need this
-/// pin: the setting defaults to `auto`, which resumes on headless hosts (no
-/// display) — exactly what CI runners are. Appends to an existing seeded
-/// config; idempotent when the pin is already present (restart suites call
-/// this on every daemon boot). Panics if an `[agents]` table exists WITHOUT
-/// the pin — silently skipping would only surface as a flake on headless
-/// runners.
-pub fn disable_resume_on_start(data_dir: &std::path::Path) {
-    std::fs::create_dir_all(data_dir).expect("mkdir data dir");
-    let path = data_dir.join("config.toml");
-    let mut text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => panic!("read {}: {e}", path.display()),
-    };
-    if text.lines().any(|l| l.trim_start().starts_with("[agents]")) {
-        if text
-            .lines()
-            .any(|l| l.trim() == "resumeInterruptedOnStart = \"off\"")
-        {
-            return;
-        }
-        panic!(
-            "{} already has an [agents] table without resumeInterruptedOnStart = \
-             \"off\" — disable_resume_on_start cannot append a second table; merge \
-             the pin into the existing [agents] table at the test site instead",
-            path.display()
-        );
-    }
-    if !text.is_empty() && !text.ends_with('\n') {
-        text.push('\n');
-    }
-    text.push_str("\n[agents]\nresumeInterruptedOnStart = \"off\"\n");
-    std::fs::write(&path, text).expect("seed config.toml with agents.resumeInterruptedOnStart");
+/// Daemon env seam (read in `intentd` `main.rs`) that replaces the
+/// `agents.resumeInterruptedOnStart` schema default when `config.toml` does
+/// not set the key. [`hermetic_fixture_identity`] pins it to `off` for every
+/// fixture daemon: the production default `auto` resumes interrupted agents
+/// only on headless hosts, so restart suites used to pick up an extra agent
+/// turn on CI runners alone (intent-hq/intent#6058, intent-hq/intent#7706).
+/// An explicit file value, `--resume-all`, and update restarts still win.
+pub const RESUME_ON_START_TEST_DEFAULT_ENV: &str = "INTENTD_TEST_RESUME_ON_START_DEFAULT";
+
+/// Opt a fixture daemon back into startup resume of interrupted agents.
+/// Sets `on` (not the production `auto`) so recovery tests resume on every
+/// host, display or not. Survives a later [`hermetic_fixture_identity`]
+/// reset; call on every boot that should resume.
+pub fn opt_into_resume_on_start(cmd: &mut std::process::Command) {
+    cmd.env(RESUME_ON_START_TEST_DEFAULT_ENV, "on");
 }
 
 /// The pinned-TLS WebSocket client stream type shared by the WSS e2e suites.

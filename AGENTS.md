@@ -204,7 +204,10 @@ New tests should reuse the harness already in `crates/intentd/tests/`:
   `hermetic_serve_command_fixed_port(data_dir)` when the settings-file port is required.
   Both remove `GITHUB_TOKEN`, `GH_TOKEN`, `GH_ENTERPRISE_TOKEN`,
   `GITHUB_ENTERPRISE_TOKEN`, and `GH_HOST`, and select private gh config/secrets under the
-  owned directory; retain it through shutdown. Reapply `hermetic_fixture_identity` after
+  owned directory; retain it through shutdown. They also pin startup resume of interrupted
+  agents off (`INTENTD_TEST_RESUME_ON_START_DEFAULT=off`; the production `auto` default
+  resumes only on display-less hosts such as CI); a recovery test opts back in with
+  `common::opt_into_resume_on_start(&mut cmd)`. Reapply `hermetic_fixture_identity` after
   generic environment overrides. Intentional mock identity uses `common::mock_github_token`
   with a local `// fixture-identity: allow — <private mock reason>` comment.
   `serve_spawn_lint.rs` checks raw/retired builders and identity mutations on simple command

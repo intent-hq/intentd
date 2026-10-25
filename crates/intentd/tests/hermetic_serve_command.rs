@@ -339,3 +339,58 @@ fn pty_wrapper_copies_complete_constructor_after_synthetic_overrides() {
     assert_eq!(cmd.get_env("INTENTD_TCP_PORT"), Some(OsStr::new("0")));
     assert_eq!(cmd.get_env("FIXTURE"), Some(OsStr::new("keep-me")));
 }
+
+const RESUME: &str = common::RESUME_ON_START_TEST_DEFAULT_ENV;
+
+#[test]
+fn both_constructors_pin_resume_on_start_off() {
+    for fixed in [false, true] {
+        let dir = common::test_tempdir("serve-contract-resume-");
+        let cmd = fixture_command(dir.path(), fixed);
+        assert_eq!(
+            explicit_env(&cmd, RESUME),
+            EnvSetting::Set(OsStr::new("off"))
+        );
+    }
+}
+
+#[test]
+fn resume_opt_in_survives_a_later_identity_reset() {
+    let dir = common::test_tempdir("serve-contract-resume-opt-in-");
+    let mut cmd = fixture_command(dir.path(), false);
+    common::opt_into_resume_on_start(&mut cmd);
+    common::hermetic_fixture_identity(&mut cmd, dir.path());
+    assert_eq!(
+        explicit_env(&cmd, RESUME),
+        EnvSetting::Set(OsStr::new("on"))
+    );
+    assert_eq!(identity_contract(&cmd, dir.path()), Ok(()));
+}
+
+#[test]
+fn identity_reset_after_env_clear_restores_resume_off() {
+    let dir = common::test_tempdir("serve-contract-resume-clear-");
+    let mut cmd = fixture_command(dir.path(), false);
+    common::opt_into_resume_on_start(&mut cmd);
+    cmd.env_clear();
+    assert_eq!(explicit_env(&cmd, RESUME), EnvSetting::Inherited);
+    common::hermetic_fixture_identity(&mut cmd, dir.path());
+    assert_eq!(
+        explicit_env(&cmd, RESUME),
+        EnvSetting::Set(OsStr::new("off"))
+    );
+}
+
+#[test]
+fn pty_wrapper_pins_resume_off_and_keeps_an_opt_in() {
+    let dir = common::test_tempdir("pty-resume-contract-");
+    let mut pinned = portable_pty::CommandBuilder::new("never-executed");
+    pinned.env_remove(RESUME);
+    common::hermetic_pty_fixture_identity(&mut pinned, dir.path());
+    assert_eq!(pinned.get_env(RESUME), Some(OsStr::new("off")));
+
+    let mut opted = portable_pty::CommandBuilder::new("never-executed");
+    opted.env(RESUME, "on");
+    common::hermetic_pty_fixture_identity(&mut opted, dir.path());
+    assert_eq!(opted.get_env(RESUME), Some(OsStr::new("on")));
+}

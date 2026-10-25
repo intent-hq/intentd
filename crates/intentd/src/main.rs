@@ -2373,7 +2373,22 @@ async fn cmd_serve_owned(
     // bounded candidate read gates startup; per-agent service work runs below
     // in an owned background sweep. Reservations prevent a manual-dialog flash.
     // --resume-all and update-triggered restarts still override the setting.
-    let resume_setting = boot_settings.effective.agents.resume_interrupted_on_start;
+    let test_default = std::env::var(RESUME_ON_START_TEST_DEFAULT_ENV).ok();
+    let resume_setting = match resolve_resume_setting(
+        boot_settings.effective.agents.resume_interrupted_on_start,
+        boot_settings.origin("agents.resumeInterruptedOnStart"),
+        test_default.as_deref(),
+    ) {
+        Ok(setting) => setting,
+        Err(raw) => {
+            tracing::warn!(
+                value = %raw,
+                env = RESUME_ON_START_TEST_DEFAULT_ENV,
+                "ignoring invalid resume-on-start test default (expected auto, on, or off)"
+            );
+            boot_settings.effective.agents.resume_interrupted_on_start
+        }
+    };
     let has_display = detect_has_display();
     // Captured in `main()` before the env var was scrubbed from the
     // environment (so it never leaks into daemon-spawned subprocesses).
@@ -2384,6 +2399,7 @@ async fn cmd_serve_owned(
         resume_all,
         update_restart,
         setting = resume_setting.as_str(),
+        test_default = test_default.as_deref().unwrap_or(""),
         has_display,
         resume = resume_on_start,
         "startup interrupted-agent resume decision"
@@ -7768,6 +7784,40 @@ async fn report_context_engine() {
     }
 }
 
+/// Test-only seam: replaces the `agents.resumeInterruptedOnStart` schema
+/// default (`auto`) when the key is absent from `config.toml` and unpinned.
+/// The hermetic test launcher sets it to `off` so a restarted test daemon
+/// never resumes a turn unless the test opts in; without it, `auto` resumed
+/// only on headless CI runners and repeatedly flaked restart suites
+/// (intent-hq/intent#6058, intent-hq/intent#7706). An explicit file value,
+/// `--resume-all`, and update restarts keep their precedence. Production
+/// never sets it, so its behaviour is unchanged.
+const RESUME_ON_START_TEST_DEFAULT_ENV: &str = "INTENTD_TEST_RESUME_ON_START_DEFAULT";
+
+/// Resolve the effective resume-on-start setting: an explicit (`File` or
+/// `Flag`) origin keeps `setting`; a `Default` origin takes `test_default`
+/// when set. `Err` carries an unparseable `test_default` so the caller can
+/// warn and fall back to `setting`.
+fn resolve_resume_setting(
+    setting: intent_core::settings_file::ResumeInterruptedOnStart,
+    origin: Option<intent_services::SettingOrigin>,
+    test_default: Option<&str>,
+) -> Result<intent_core::settings_file::ResumeInterruptedOnStart, &str> {
+    use intent_core::settings_file::ResumeInterruptedOnStart as R;
+    let Some(raw) = test_default else {
+        return Ok(setting);
+    };
+    if !matches!(origin, None | Some(intent_services::SettingOrigin::Default)) {
+        return Ok(setting);
+    }
+    match raw.trim() {
+        "auto" => Ok(R::Auto),
+        "on" => Ok(R::On),
+        "off" => Ok(R::Off),
+        _ => Err(raw),
+    }
+}
+
 /// Whether the startup interrupted-agent resume sweep should run. The
 /// `--resume-all` flag forces the sweep, as does `update_restart` (the
 /// sitter set `INTENTD_UPDATE_RESTART=1` because this start is an
@@ -10486,6 +10536,65 @@ for line in sys.stdin:
             assert!(should_resume_on_start(false, false, R::On, has_display));
             assert!(!should_resume_on_start(false, false, R::Off, has_display));
         }
+    }
+
+    #[test]
+    fn resume_setting_test_default_replaces_only_the_schema_default() {
+        use intent_core::settings_file::ResumeInterruptedOnStart as R;
+        use intent_services::SettingOrigin as O;
+        for origin in [None, Some(O::Default)] {
+            for (raw, expected) in [("off", R::Off), ("on", R::On), ("auto", R::Auto)] {
+                assert_eq!(
+                    resolve_resume_setting(R::Auto, origin, Some(raw)),
+                    Ok(expected),
+                    "{origin:?} {raw}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn resume_setting_explicit_origin_beats_test_default() {
+        use intent_core::settings_file::ResumeInterruptedOnStart as R;
+        use intent_services::SettingOrigin as O;
+        for origin in [O::File, O::Flag] {
+            for setting in [R::Auto, R::On, R::Off] {
+                for raw in ["off", "on", "auto", "bogus"] {
+                    assert_eq!(
+                        resolve_resume_setting(setting, Some(origin), Some(raw)),
+                        Ok(setting),
+                        "{origin:?} {setting:?} {raw}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn resume_setting_without_test_default_is_unchanged() {
+        use intent_core::settings_file::ResumeInterruptedOnStart as R;
+        use intent_services::SettingOrigin as O;
+        for origin in [None, Some(O::Default), Some(O::File), Some(O::Flag)] {
+            for setting in [R::Auto, R::On, R::Off] {
+                assert_eq!(resolve_resume_setting(setting, origin, None), Ok(setting));
+            }
+        }
+    }
+
+    #[test]
+    fn resume_setting_invalid_test_default_is_reported() {
+        use intent_core::settings_file::ResumeInterruptedOnStart as R;
+        use intent_services::SettingOrigin as O;
+        for raw in ["", "OFF", "false", "maybe"] {
+            assert_eq!(
+                resolve_resume_setting(R::Auto, Some(O::Default), Some(raw)),
+                Err(raw)
+            );
+        }
+        assert_eq!(
+            resolve_resume_setting(R::Auto, Some(O::Default), Some(" off ")),
+            Ok(R::Off)
+        );
     }
 
     #[test]
