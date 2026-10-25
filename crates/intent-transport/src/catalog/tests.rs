@@ -275,12 +275,13 @@ const LIVE_SURFACE: CatalogSurface<'static> = CatalogSurface {
 };
 
 /// One `<kind> <name>` line per entry (`alias <from> -> <to>` for aliases),
-/// sorted, so the file orders by kind then name.
-fn method_golden_entries(surface: &CatalogSurface<'_>) -> BTreeSet<String> {
+/// sorted, so the file orders by kind then name. Duplicates are kept so
+/// [`duplicate_lines`] can name them.
+fn method_golden_entries(surface: &CatalogSurface<'_>) -> Vec<String> {
     let tagged = |kind: &str, names: &[&str]| -> Vec<String> {
         names.iter().map(|name| format!("{kind} {name}")).collect()
     };
-    let mut entries = BTreeSet::new();
+    let mut entries = Vec::new();
     entries.extend(tagged("router", surface.router));
     entries.extend(tagged("fastpath", surface.fastpath));
     entries.extend(tagged("notification", surface.notifications));
@@ -291,7 +292,19 @@ fn method_golden_entries(surface: &CatalogSurface<'_>) -> BTreeSet<String> {
             .iter()
             .map(|(from, to)| format!("alias {from} -> {to}")),
     );
+    entries.sort();
     entries
+}
+
+/// Each line that appears more than once in sorted `lines`, once.
+fn duplicate_lines(lines: &[String]) -> Vec<&str> {
+    let mut dups: Vec<&str> = lines
+        .windows(2)
+        .filter(|pair| pair[0] == pair[1])
+        .map(|pair| pair[0].as_str())
+        .collect();
+    dups.dedup();
+    dups
 }
 
 fn render_method_golden(surface: &CatalogSurface<'_>) -> String {
@@ -307,24 +320,38 @@ fn render_method_golden(surface: &CatalogSurface<'_>) -> String {
     out
 }
 
-fn parse_method_golden(text: &str) -> BTreeSet<String> {
-    text.lines()
+/// The golden's entry lines, sorted, duplicates kept.
+fn parse_method_golden(text: &str) -> Vec<String> {
+    let mut lines: Vec<String> = text
+        .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .map(str::to_string)
-        .collect()
+        .collect();
+    lines.sort();
+    lines
 }
 
-/// `None` when `actual` (the checked-in golden) is exactly `expected`;
-/// otherwise a failure message listing the drifted entries and the fix.
+/// `None` when `actual` (the checked-in golden) is exactly `expected`, up to
+/// CRLF line endings; otherwise a failure message listing the drifted entries
+/// and the fix.
 fn method_golden_drift(expected: &str, actual: &str) -> Option<String> {
+    let actual = actual.replace("\r\n", "\n");
     if expected == actual {
         return None;
     }
     let want = parse_method_golden(expected);
-    let have = parse_method_golden(actual);
+    let have_lines = parse_method_golden(&actual);
+    let have_dups = duplicate_lines(&have_lines);
+    let want: BTreeSet<String> = want.into_iter().collect();
+    let have: BTreeSet<String> = have_lines.iter().cloned().collect();
     let mut msg = String::from("Protocol method catalog drift: ");
-    if want == have {
+    if want == have && !have_dups.is_empty() {
+        msg.push_str("the golden repeats entries (a conflict resolution kept both sides?).\n");
+        for dup in have_dups {
+            let _ = writeln!(msg, "  duplicate line in the golden: {dup}");
+        }
+    } else if want == have {
         msg.push_str(
             "the golden lists the right entries but is not in canonical form (order, comments, or whitespace).\n",
         );
@@ -421,19 +448,35 @@ fn method_golden_drift_flags_non_canonical_order() {
     assert!(msg.contains(METHOD_GOLDEN_REGENERATE), "{msg}");
 }
 
-/// The live golden keeps one line per entry, so its line count is the
-/// catalog's size; a sanity floor guards against an emptied catalog.
 #[test]
-fn live_method_golden_counts_every_entry() {
+fn method_golden_drift_names_duplicate_lines() {
+    let canonical = "# header\nrouter a.one\nrouter b.two\n";
+    let doubled = "# header\nrouter a.one\nrouter b.two\nrouter b.two\n";
+    let msg = method_golden_drift(canonical, doubled).expect("duplicate detected");
+    assert!(
+        msg.contains("duplicate line in the golden: router b.two"),
+        "{msg}"
+    );
+    assert!(!msg.contains("router a.one"), "{msg}");
+}
+
+#[test]
+fn method_golden_drift_ignores_crlf_line_endings() {
+    let canonical = "# header\nrouter a.one\nrouter b.two\n";
+    let crlf = canonical.replace('\n', "\r\n");
+    assert_eq!(method_golden_drift(canonical, &crlf), None);
+}
+
+/// Every catalog entry renders to a distinct golden line: within one kind a
+/// name is listed once (a name may appear under two kinds, e.g. a dual-role
+/// reverse RPC that is also a router method).
+#[test]
+fn live_method_golden_has_no_duplicate_entries() {
     let entries = method_golden_entries(&LIVE_SURFACE);
-    assert_eq!(
-        entries.len(),
-        ROUTER_METHODS.len()
-            + FASTPATH_METHODS.len()
-            + METHOD_ALIASES.len()
-            + NOTIFICATIONS.len()
-            + REVERSE_METHODS.len(),
-        "every catalog entry renders to a distinct golden line"
+    let dups = duplicate_lines(&entries);
+    assert!(
+        dups.is_empty(),
+        "catalog.rs lists these entries more than once: {dups:?}"
     );
 }
 
