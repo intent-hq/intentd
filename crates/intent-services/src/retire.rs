@@ -245,6 +245,9 @@ impl Services {
         // are kept — `agent.stop` semantics): their working directory is
         // about to disappear. The initiating agent is excluded for the same
         // reason as the archive interrupt sweep: it is blocked on this call.
+        // Desktop control and consent prompts end for every agent, the caller
+        // included, before the provider processes stop.
+        self.desktop_terminate_workspace(&id).await;
         if let Some(manager) = self.agent_manager() {
             let sessions = self.store.list_agent_session_summaries(&id).await?;
             let ids: Vec<AgentId> = sessions

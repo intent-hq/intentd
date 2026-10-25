@@ -965,3 +965,47 @@ async fn recovery_discussion_access_is_projected_after_backpressure_clears() {
         "revoked discussion escaped after capacity became available"
     );
 }
+
+#[tokio::test]
+async fn desktop_authority_survives_recovery_forwarder_and_fence() {
+    let mut h = Harness::new().await;
+    let caller = intent_core::Caller::Wire {
+        principal_id: PrincipalId::from("desktop-owner"),
+        host_role: intent_core::HostRole::Owner,
+    };
+    let connection = intent_core::desktop::DesktopConnection {
+        client_id: intent_core::ClientId::from("desktop-client"),
+        principal_id: PrincipalId::from("desktop-owner"),
+        connection_epoch: "current".into(),
+    };
+    let sid = crate::context::with_credential_context(
+        true,
+        Some(caller),
+        None,
+        Some(connection),
+        h.subscribe(json!({"eventTypes":["desktop:*"],"lossRecovery":1})),
+    )
+    .await;
+    for (principal, epoch, marker) in [
+        ("foreign-owner", "current", "foreign"),
+        ("desktop-owner", "retired", "stale"),
+        ("desktop-owner", "current", "authorized"),
+    ] {
+        let mut e = event(
+            "ws-a",
+            intent_core::events::DESKTOP_SESSION_CHANGED,
+            json!({"marker":marker}),
+        );
+        e.metadata = Some(json!({"desktopPrincipalId":principal,"desktopConnectionEpoch":epoch}));
+        let _ = h.bus.publish_transient(&e);
+    }
+    h.fence(std::slice::from_ref(&sid)).await;
+    let delivered = h.written().await;
+    assert_eq!(delivered["method"], "events.event");
+    assert!(delivered.to_string().contains("authorized"));
+    assert!(!delivered.to_string().contains("foreign"));
+    assert!(!delivered.to_string().contains("stale"));
+    let receipt = h.written().await;
+    assert_eq!(receipt["id"], 62);
+    assert!(h.rx.bulk.try_recv().is_err());
+}

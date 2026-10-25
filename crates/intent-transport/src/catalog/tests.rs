@@ -191,6 +191,8 @@ fn extract_fastpath_methods() -> HashSet<String> {
 /// Protocol 13.0 removes the deprecated git.commit router method.
 // GitLab pre-workspace checkout (13.5): +6 router methods.
 // Provider adapter preparation (13.6): +1 fast-path method.
+// Desktop control adds four router methods; reverse methods are counted separately.
+// GitLab checkout repository configuration adds one router method.
 // Cancellable note deletion (13.10): +3 router methods.
 // Legacy workspace import removal (15.0): -1 fast-path method.
 // Human workspace discussions: +5 router methods; PR workspace lookup: +1.
@@ -204,7 +206,7 @@ fn extract_fastpath_methods() -> HashSet<String> {
 // Scoped repository pages and child Git policy (15.1): +8 router methods.
 // Provider worker observations (§5.5b, `agentWorkers: 1`): +2 router, +1 fast path.
 // Note paging removal: -3 router methods (cancellable note deletion).
-const EXPECTED_TOTAL_METHODS: usize = 459;
+const EXPECTED_TOTAL_METHODS: usize = 463;
 
 /// Golden count: router methods (canonical + canonical forms of aliases).
 /// Protocol 12.0 removes five router methods, three fast paths and two aliases.
@@ -219,7 +221,7 @@ const EXPECTED_TOTAL_METHODS: usize = 459;
 /// Scoped repository pages and child Git policy add eight router methods.
 /// Provider worker observations (§5.5b) add `agent.workers.list` / `.stop`.
 /// Removing note paging drops the three cancellable note deletion controls.
-const EXPECTED_ROUTER_METHODS: usize = 401;
+const EXPECTED_ROUTER_METHODS: usize = 405;
 
 /// Golden count: fast-path methods (intercepted before router).
 /// `agent.workers.subscribe` (§5.5b) holds per-connection subscription state.
@@ -232,7 +234,7 @@ const EXPECTED_ALIASES: usize = 0;
 const EXPECTED_NOTIFICATIONS: usize = 7;
 
 /// Golden count: client-served reverse RPCs.
-const EXPECTED_REVERSE_METHODS: usize = 5;
+const EXPECTED_REVERSE_METHODS: usize = 6;
 
 #[test]
 fn router_methods_match_actual_source() {
@@ -608,6 +610,10 @@ const NON_USER_ORIGIN_METHODS: &[&str] = &[
     "crossWorkspace.listSiblings",
     "crossWorkspace.readNote",
     "debug.sampleStacks",
+    "desktop.getState",
+    "desktop.respondPermission",
+    "desktop.revoke",
+    "desktop.setPermission",
     "discussion.conversations",
     "discussion.list",
     "discussion.react",
@@ -1274,6 +1280,9 @@ const COLLABORATOR_REFUSED_METHODS: &[&str] = &[
     "browser.syncTabs",
     "browser.upsertTab",
     "debug.sampleStacks",
+    "desktop.getState",
+    "desktop.respondPermission",
+    "desktop.setPermission",
     "file-tracking.getAgentLocks",
     "file-tracking.getChanges",
     "file-tracking.loadCommits",

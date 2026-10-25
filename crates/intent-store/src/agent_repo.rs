@@ -4726,7 +4726,7 @@ impl Store {
             .await
     }
 
-    /// Only for workspace deletion after its bounded recovery sweep has
+    /// Only for workspace deletion after its recovery and desktop sweeps have
     /// completed, with workspace writers stopped. Keep ownership checks and
     /// all other child sweeps identical to standalone agent deletion.
     pub(super) async fn delete_workspace_agent_session(
@@ -4742,7 +4742,7 @@ impl Store {
         &self,
         workspace_id: &WorkspaceId,
         id: &AgentId,
-        cleanup_recovery: bool,
+        cleanup_scope: bool,
     ) -> Result<bool> {
         let mut lifecycle = self.repository_lifecycle_write().await?;
         // Confirm the session exists under THIS workspace before touching any
@@ -4786,7 +4786,7 @@ impl Store {
         }
         // Recovery history has no FK cascade. There is at most one row per
         // agent; require both owners so inconsistent metadata is not erased.
-        if cleanup_recovery {
+        if cleanup_scope {
             crate::with_write_txn_retry(|| async {
                 sqlx::query("DELETE FROM interrupted_agent WHERE agent_id = ? AND workspace_id = ?")
                     .bind(&id.0)
@@ -4799,13 +4799,41 @@ impl Store {
             })
             .await?;
         }
+        if !cleanup_scope {
+            // Workspace teardown already removed private desktop state before
+            // any session deletion, with runtime writers stopped. Keep this
+            // path batch-aware instead of opening a scope transaction per agent.
+            let result = crate::with_write_txn_retry(|| async {
+                sqlx::query(DELETE_AGENT_SESSION_SQL)
+                    .bind(&id.0)
+                    .bind(&workspace_id.0)
+                    .execute(self.write_pool())
+                    .await
+                    .map_err(|e| Error::Internal(format!("delete agent session failed: {e}")))
+            })
+            .await?;
+            lifecycle.settle_after_retirement().await?;
+            return Ok(result.rows_affected() > 0);
+        }
+        // The private desktop scope and the session row go in one transaction;
+        // a busy or saturated writer retries the whole transaction (#7705).
         let result = crate::with_write_txn_retry(|| async {
-            sqlx::query(DELETE_AGENT_SESSION_SQL)
+            let mut tx = self
+                .write_pool()
+                .begin()
+                .await
+                .map_err(|e| Error::Internal(format!("delete agent transaction: {e}")))?;
+            crate::desktop_repo::delete_desktop_scope(&mut tx, workspace_id, Some(id)).await?;
+            let result = sqlx::query(DELETE_AGENT_SESSION_SQL)
                 .bind(&id.0)
                 .bind(&workspace_id.0)
-                .execute(self.write_pool())
+                .execute(&mut *tx)
                 .await
-                .map_err(|e| Error::Internal(format!("delete agent session failed: {e}")))
+                .map_err(|e| Error::Internal(format!("delete agent session failed: {e}")))?;
+            tx.commit()
+                .await
+                .map_err(|e| Error::Internal(format!("delete agent commit: {e}")))?;
+            Ok(result)
         })
         .await?;
         lifecycle.settle_after_retirement().await?;
