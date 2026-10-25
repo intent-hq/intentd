@@ -271,7 +271,7 @@ struct HostFrame(serde_json::Value);
 impl<'js> IntoJs<'js> for HostFrame {
     fn into_js(self, ctx: &Ctx<'js>) -> rquickjs::Result<Value<'js>> {
         let approx_len = approx_json_len(&self.0);
-        let built = json_to_js(ctx, &self.0);
+        let built = json_to_js(ctx, &self.0).and_then(non_thenable);
         drop(self.0);
         match built {
             Ok(value) => Ok(value),
@@ -309,8 +309,21 @@ fn oversized_reply_message(approx_len: usize) -> String {
     )
 }
 
+/// Give the private reply envelope a null prototype. The host function is
+/// async, so its result passes through promise resolution, which reads
+/// `.then`; with `Object.prototype` in the chain a script-installed `then`
+/// could intercept, replace, or stall the reply before the bridge sees it.
+/// Only the envelope is affected: the `value` inside keeps normal objects.
+fn non_thenable(envelope: Value<'_>) -> rquickjs::Result<Value<'_>> {
+    if let Some(obj) = envelope.as_object() {
+        obj.set_prototype(None)?;
+    }
+    Ok(envelope)
+}
+
 fn error_frame<'js>(ctx: &Ctx<'js>, message: &str) -> rquickjs::Result<Value<'js>> {
     let obj = Object::new(ctx.clone())?;
+    obj.set_prototype(None)?;
     define_own(&obj, "ok", Value::new_bool(ctx.clone(), false))?;
     define_own(
         &obj,

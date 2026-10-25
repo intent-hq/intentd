@@ -477,3 +477,60 @@ async fn deep_oversized_host_reply_rejects_with_bounded_error() {
         "got: {msg}"
     );
 }
+
+/// A `then` a script installs on `Object.prototype` must not intercept the
+/// private reply envelope during promise resolution, for values, errors, or
+/// the oversized-reply frame; user value objects still inherit normally.
+/// (Returning a user object from the async `host` wrapper reads its `then`
+/// exactly as before this change, so that case is not asserted here.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_reply_envelope_ignores_inherited_then() {
+    let host: HostFn = Arc::new(|arg| {
+        Box::pin(async move {
+            match arg.as_str() {
+                Some("err") => Err("host said no".to_string()),
+                Some("obj") => Ok(serde_json::json!({ "k": 1 })),
+                _ => Ok(serde_json::json!(42)),
+            }
+        })
+    });
+    let out = eval(
+        "Object.defineProperty(Object.prototype, 'then', { \
+             get() { throw new Error('inherited then intercepted'); }, configurable: true }); \
+         const n = await host(null); \
+         let e; try { await host('err'); } catch (x) { e = String(x.message); } \
+         delete Object.prototype.then; \
+         const o = await host('obj'); \
+         return [n, e, o.k, Object.getPrototypeOf(o) === Object.prototype];",
+        &EvalOptions::default(),
+        Some(host),
+    )
+    .await
+    .expect("replies are delivered despite an inherited then");
+    assert_eq!(out, serde_json::json!([42, "host said no", 1, true]));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oversized_reply_frame_ignores_inherited_then() {
+    let host: HostFn =
+        Arc::new(|_| Box::pin(async { Ok(serde_json::json!({ "big": "€".repeat(4_000_000) })) }));
+    let opts = EvalOptions {
+        timeout: Duration::from_secs(10),
+        memory_limit_bytes: Some(4 * 1024 * 1024),
+    };
+    let out = eval(
+        "Object.defineProperty(Object.prototype, 'then', { \
+             get() { throw new Error('inherited then intercepted'); }, configurable: true }); \
+         let m; try { await host(null); m = 'unreachable'; } catch (e) { m = String(e.message); } \
+         delete Object.prototype.then; return m;",
+        &opts,
+        Some(host),
+    )
+    .await
+    .expect("rejection is catchable");
+    let msg = out.as_str().expect("message string");
+    assert!(
+        msg.contains("does not fit in the script memory limit"),
+        "got: {msg}"
+    );
+}
