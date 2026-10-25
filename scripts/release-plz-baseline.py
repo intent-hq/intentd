@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
-"""Prepare a temporary release-pr config for intent-nodes' first shared release.
+"""Prepare a temporary release-pr config for new libraries' first shared release.
 
 release-plz 0.3.162 errors when a git-only package is missing from the latest
-shared tag (#6163). Only confirmed workspace-member absence enables the initial
-release path. Once the shared baseline contains nodes, copy the original bytes.
+shared tag (#6163; recurred for intent-svc-transfer in #7760). Each library
+confirmed absent from that tag's workspace, present in the current workspace,
+and carrying exactly the shared library release policy gets a reserved,
+never-created tag lookup so the tool takes its initial-release path. Anything
+else missing (intentd itself, a non-member, a different policy) fails closed.
+Once the shared baseline contains every package, copy the original bytes.
 Never use this configuration for `release`: the publication job stays unchanged.
 
 Tag selection mirrors that pinned version's release_regex.rs and
@@ -21,9 +25,14 @@ import sys
 import tempfile
 import tomllib
 
-PACKAGE = "intent-nodes"
 SHARED = "v{{ version }}"
-RESERVED = "__initial_intent-nodes-v"
+RESERVED = "__initial_"
+# The only policy that may take the initial-release path: an untagged,
+# unpublished, changelog-less library riding intentd's shared version.
+LIBRARY = {"release": True, "git_only": True, "publish": False,
+           "git_release_enable": False, "git_tag_enable": False,
+           "changelog_update": False, "version_group": "intentd",
+           "git_tag_name": SHARED}
 VERSION = re.compile(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
 
 
@@ -56,13 +65,8 @@ def prepare(repo):
     config = tomllib.loads(original.decode())
     defaults = config["workspace"]
     packages = {p["name"]: {**defaults, **p} for p in config["package"]}
-    policy = packages[PACKAGE]
-    expected = {"release": True, "git_only": True, "publish": False,
-                "git_release_enable": False, "git_tag_enable": False,
-                "changelog_update": False, "version_group": "intentd",
-                "git_tag_name": SHARED}
-    if any(policy.get(key) != value for key, value in expected.items()):
-        raise ValueError("intent-nodes release policy changed; reassess the baseline workaround")
+    if len(packages) != len(config["package"]):
+        raise ValueError("duplicate release-plz package tables")
     if packages["intentd"].get("git_tag_name") != SHARED:
         raise ValueError("intentd shared-tag policy changed")
     if run(repo, "git", "rev-parse", "--is-shallow-repository").strip() != "false":
@@ -71,8 +75,11 @@ def prepare(repo):
     if any(tag.startswith(RESERVED) for tag in tags):
         raise ValueError("reserved initial-release tag collision")
     current = members(repo)
-    if PACKAGE not in current:
-        raise ValueError("intent-nodes is not a current workspace member")
+    shared = {name for name, p in packages.items()
+              if p.get("git_only") is True and p.get("git_tag_name") == SHARED}
+    strays = sorted(shared - current)
+    if strays:
+        raise ValueError(f"configured packages are not current workspace members: {strays}")
     baseline = latest_tag(tags)
     if baseline is None:
         return original
@@ -84,26 +91,31 @@ def prepare(repo):
             released = members(tree)
         finally:
             run(repo, "git", "worktree", "remove", "--force", str(tree))
-    # Do not silently expand this one-package workaround to later introductions.
-    shared = {name for name, p in packages.items()
-              if p.get("git_only") is True and p.get("git_tag_name") == SHARED}
-    unexpected = (shared - released) - {PACKAGE}
+    introduced = sorted(shared - released)
+    # Only libraries matching the shared policy exactly may be introduced;
+    # intentd (and any other policy) missing from the baseline stays an error.
+    unexpected = [name for name in introduced
+                  if any(packages[name].get(key) != value for key, value in LIBRARY.items())]
     if unexpected:
-        raise ValueError(f"unexpected packages absent from {baseline}: {sorted(unexpected)}")
-    print(f"Shared baseline {baseline}@{commit}; intent-nodes present: {PACKAGE in released}",
+        raise ValueError(f"unexpected packages absent from {baseline} without the shared "
+                         f"library release policy: {unexpected}")
+    print(f"Shared baseline {baseline}@{commit}; introduced packages: {introduced}",
           file=sys.stderr)
-    if PACKAGE in released:
+    if not introduced:
         return original
     # Keep all formatting and every other policy untouched; reparse to prove the
-    # sole semantic change landed inside the existing intent-nodes package table.
-    changed, count = re.subn(r'(?m)^name = "intent-nodes"[ \t]*$',
-                            f'name = "intent-nodes"\ngit_tag_name = "{RESERVED}{{{{ version }}}}"',
-                            original.decode())
-    if count != 1:
-        raise ValueError("cannot locate exactly one intent-nodes package table")
-    for package in config["package"]:
-        if package["name"] == PACKAGE:
-            package["git_tag_name"] = RESERVED + "{{ version }}"
+    # only semantic changes landed inside the introduced packages' existing tables.
+    changed = original.decode()
+    for name in introduced:
+        reserved = f"{RESERVED}{name}-v{{{{ version }}}}"
+        changed, count = re.subn(rf'(?m)^name = "{re.escape(name)}"[ \t]*$',
+                                 lambda _: f'name = "{name}"\ngit_tag_name = "{reserved}"',
+                                 changed)
+        if count != 1:
+            raise ValueError(f"cannot locate exactly one {name} package table")
+        for package in config["package"]:
+            if package["name"] == name:
+                package["git_tag_name"] = reserved
     if tomllib.loads(changed) != config:
         raise ValueError("temporary configuration changed unrelated release policy")
     return changed.encode()
