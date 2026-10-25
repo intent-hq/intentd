@@ -31,12 +31,16 @@ use intent_core::{clock::now_iso, AgentId, Error, Result, Workspace, WorkspaceId
 use intent_store::{Sandbox, SandboxStatus};
 use sha2::Digest as _;
 
-use crate::capability::gated_collaborator_caller;
+use crate::transfer::TransferStateExt;
 use crate::transfer_git::TransferRefsManifest;
+use crate::transfer_model_selection::TransferModelSelectionExt;
 use crate::transfer_model_selection::{resolve_imported_selection, ImportedSelection};
-use crate::{publish_event, workspace_created_event, workspace_setup_completed_event, Services};
+use intent_services::feature_api::capability::gated_collaborator_caller;
+use intent_services::feature_api::{
+    publish_event, workspace_created_event, workspace_setup_completed_event, Services,
+};
 
-pub(crate) use crate::feature_ports::IMPORT_MAX_CHUNK_BYTES;
+pub(crate) use intent_services::feature_api::feature_ports::IMPORT_MAX_CHUNK_BYTES;
 
 /// One in-flight staged import: everything `chunk`/`commit`/`abort` need
 /// between calls. Lives in [`crate::transfer::TransferFeature::imports`]; in-memory only.
@@ -72,10 +76,52 @@ fn chunk_file_name(seq: u64) -> String {
     format!("chunk-{seq:08}")
 }
 
-impl Services {
+/// Target-side import (`workspace.import.*`) on [`Services`].
+pub(crate) trait TransferImportExt {
+    async fn require_import_actor(&self, id: &str, what: &str) -> Result<()>;
+    fn import_staging_root(&self) -> PathBuf;
+    async fn workspace_import_begin_op(
+        &self,
+        manifest: serde_json::Value,
+        archive_size_bytes: u64,
+        archive_sha256: String,
+    ) -> Result<serde_json::Value>;
+    async fn sweep_orphaned_staging_dirs(&self);
+    async fn reject_workspace_collision(&self, id: &WorkspaceId) -> Result<()>;
+    async fn workspace_import_chunk_op(
+        &self,
+        import_id: String,
+        seq: u64,
+        data: String,
+    ) -> Result<serde_json::Value>;
+    async fn workspace_import_abort_op(&self, import_id: String) -> Result<serde_json::Value>;
+    async fn workspace_import_commit_op(&self, import_id: String) -> Result<serde_json::Value>;
+    async fn workspace_import_commit_body(
+        &self,
+        import_id: &str,
+        claim: (
+            PathBuf,
+            u64,
+            String,
+            TransferManifest,
+            WorkspaceId,
+            Vec<u64>,
+        ),
+    ) -> Result<serde_json::Value>;
+    async fn place_imported_assets(&self, workspace_id: &WorkspaceId, assets_dir: &Path);
+    async fn materialize_imported_git(
+        &self,
+        workspace_id: &WorkspaceId,
+        extracted_dir: &Path,
+        rows: &mut [(String, Vec<serde_json::Value>)],
+    ) -> Result<Option<crate::transfer_materialize::MaterializedGit>>;
+    async fn rehydrate_after_import(&self) -> serde_json::Value;
+}
+
+impl TransferImportExt for Services {
     /// Chunk/session handles never confer another authenticated person's
     /// transfer authority. Reconnects retain access through the same principal.
-    pub(crate) async fn require_import_actor(&self, id: &str, what: &str) -> Result<()> {
+    async fn require_import_actor(&self, id: &str, what: &str) -> Result<()> {
         self.require_host_execution(what).await?;
         let Some(principal) = gated_collaborator_caller(what)? else {
             return Ok(());
@@ -97,9 +143,11 @@ impl Services {
     /// Root directory staged imports live under. Sibling of the workspace
     /// checkouts so the final asset/worktree moves stay on one filesystem.
     fn import_staging_root(&self) -> PathBuf {
-        self.workspaces_root
-            .clone()
-            .unwrap_or_else(crate::default_workspaces_root)
+        self.feature_workspaces_root()
+            .map_or_else(
+                intent_services::feature_api::default_workspaces_root,
+                std::path::Path::to_path_buf,
+            )
             .join(".import-staging")
     }
 
@@ -110,7 +158,7 @@ impl Services {
     /// no backwards compatibility, spec decision #5), the chief workspace,
     /// and workspace-id collisions (an existing row OR another pending
     /// import). Returns `{ importId, maxChunkBytes }`.
-    pub(crate) async fn workspace_import_begin_op(
+    async fn workspace_import_begin_op(
         &self,
         manifest: serde_json::Value,
         archive_size_bytes: u64,
@@ -240,7 +288,7 @@ impl Services {
     /// `InvalidParams` naming the conflict when `id` already exists on this
     /// daemon (import never overwrites; the user renames/deletes first).
     async fn reject_workspace_collision(&self, id: &WorkspaceId) -> Result<()> {
-        match self.store.get_workspace(id).await {
+        match self.store().get_workspace(id).await {
             Ok(existing) => Err(Error::InvalidParams(format!(
                 "workspace id {} already exists on this daemon (title: {:?}) — delete it or rename before importing",
                 id.0, existing.title
@@ -256,7 +304,7 @@ impl Services {
     /// in the same file) and chunks may arrive in any order. Rejects decoded
     /// slices over [`IMPORT_MAX_CHUNK_BYTES`] and totals beyond the declared
     /// archive size. Returns `{ importId, seq, receivedBytes }`.
-    pub(crate) async fn workspace_import_chunk_op(
+    async fn workspace_import_chunk_op(
         &self,
         import_id: String,
         seq: u64,
@@ -333,10 +381,7 @@ impl Services {
     /// directory. Idempotent — aborting an unknown id succeeds quietly (the
     /// FE may retry an abort after a timeout). Rejected while a commit of
     /// the same import is in flight (abort would race the commit's cleanup).
-    pub(crate) async fn workspace_import_abort_op(
-        &self,
-        import_id: String,
-    ) -> Result<serde_json::Value> {
+    async fn workspace_import_abort_op(&self, import_id: String) -> Result<serde_json::Value> {
         let session = {
             let mut imports = self
                 .transfer_state()
@@ -368,10 +413,7 @@ impl Services {
     /// While a commit runs, its session is flagged `committing`, so a
     /// concurrent commit/chunk/abort of the same import is rejected instead
     /// of mutating the files being hashed.
-    pub(crate) async fn workspace_import_commit_op(
-        &self,
-        import_id: String,
-    ) -> Result<serde_json::Value> {
+    async fn workspace_import_commit_op(&self, import_id: String) -> Result<serde_json::Value> {
         // Phase 1 — validate and CLAIM the `committing` flag under one lock
         // hold. Errors here (unknown id, already committing, incomplete,
         // gaps) never touch a flag another commit owns.
@@ -490,10 +532,10 @@ impl Services {
 
         // Transform: path rewrites against OUR workspaces root, session-id
         // clearing, in-flight → interrupted, drafts dropped.
-        let target_root = self
-            .workspaces_root
-            .clone()
-            .unwrap_or_else(crate::default_workspaces_root);
+        let target_root = self.feature_workspaces_root().map_or_else(
+            intent_services::feature_api::default_workspaces_root,
+            std::path::Path::to_path_buf,
+        );
         let mut outcome = transform_rows(rows, &workspace_id, &target_root, &now_iso())?;
         // Provider discovery inspects the filesystem / enhanced PATH. Keep
         // it off the async runtime, and reconcile before any rows are visible.
@@ -541,7 +583,7 @@ impl Services {
         // If the row insert fails AFTER materialization succeeded, unwind
         // the checkout/sandboxes so a retried commit does not hit
         // "materialize target already exists".
-        let imported_rows = match self.store.transfer_import_rows(&outcome.rows).await {
+        let imported_rows = match self.store().transfer_import_rows(&outcome.rows).await {
             Ok(n) => n,
             Err(e) => {
                 rollback_materialized_attachments(&attachment_paths).await;
@@ -590,14 +632,17 @@ impl Services {
             .remove(import_id);
         let _ = tokio::fs::remove_dir_all(&staging_dir).await;
 
-        let ws = self.store.get_workspace(&workspace_id).await?;
-        publish_event(self.event_bus.as_ref(), workspace_created_event(&ws)).await;
+        let ws = self.store().get_workspace(&workspace_id).await?;
+        publish_event(self.feature_event_bus(), workspace_created_event(&ws)).await;
         // Imports run no setup stage: publish the completion immediately so
         // the watcher registry starts this workspace's watchers instead of
         // holding the deferred start until the setup backstop expires.
-        crate::record_setup_skipped(&self.workspace_setup_states, &workspace_id);
+        intent_services::feature_api::record_setup_skipped(
+            self.feature_workspace_setup_states(),
+            &workspace_id,
+        );
         publish_event(
-            self.event_bus.as_ref(),
+            self.feature_event_bus(),
             workspace_setup_completed_event(&workspace_id, false, None),
         )
         .await;
@@ -617,7 +662,7 @@ impl Services {
             // no assets/ in the archive
             return;
         };
-        let Some(root) = self.assets_root.clone() else {
+        let Some(root) = self.feature_assets_root().map(std::path::Path::to_path_buf) else {
             tracing::warn!(
                 workspace = %workspace_id.0,
                 "import archive carries assets but no assets root is configured — skipping"
@@ -706,10 +751,10 @@ impl Services {
             .map(|(_, objects)| objects.iter().map(sandbox_for_materialize).collect())
             .unwrap_or_default();
 
-        let target_root = self
-            .workspaces_root
-            .clone()
-            .unwrap_or_else(crate::default_workspaces_root);
+        let target_root = self.feature_workspaces_root().map_or_else(
+            intent_services::feature_api::default_workspaces_root,
+            std::path::Path::to_path_buf,
+        );
         let out = crate::transfer_materialize::materialize_workspace_git(
             bundle,
             refs,
@@ -1019,7 +1064,7 @@ async fn materialize_imported_attachments(
             tokio::fs::create_dir_all(root)
                 .await
                 .map_err(|e| Error::Internal(format!("create workspace root failed: {e}")))?;
-            let dest = crate::file_ops::resolve_attachment_source(root, stored_path)
+            let dest = intent_services::feature_api::file_ops::resolve_attachment_source(root, stored_path)
                 .map_err(|_| escape_err())?;
             let file_name = dest.file_name().map(PathBuf::from).ok_or_else(escape_err)?;
             let parent = dest.parent().ok_or_else(escape_err)?;
@@ -1334,7 +1379,7 @@ fn has_discussion_reference(value: &serde_json::Value) -> bool {
 }
 
 /// Agent statuses that count as in-flight at export time — the same set
-/// [`crate::is_stale_in_flight_status`] heals after a daemon restart, in
+/// [`intent_services::feature_api::is_stale_in_flight_status`] heals after a daemon restart, in
 /// their persisted DB spellings (serde wire forms of `Active` / `Processing`
 /// / `Waiting`).
 const IN_FLIGHT_STATUSES: &[&str] = &["active", "Processing", "Waiting"];
@@ -1827,9 +1872,9 @@ mod tests {
 
     #[tokio::test]
     async fn discussion_transfer_does_not_rebind_colliding_human_or_retry_identity() {
-        use crate::tests::{workspace, TempDb};
         use intent_core::discussion::DiscussionAuthor;
         use intent_core::{with_caller, Caller, HostRole};
+        use intent_services::feature_api::tests::{workspace, TempDb};
 
         let source_db = TempDb::new();
         let source = Store::open(&source_db.path).await.unwrap();
@@ -1919,13 +1964,13 @@ mod tests {
             .transfer_import_rows(&transformed.rows)
             .await
             .unwrap();
-        let service = Services::new(target);
+        let service = crate::register(Services::new(target));
         let caller = Caller::Wire {
             principal_id: local.id.clone(),
             host_role: HostRole::Owner,
         };
         assert!(!service
-            .store
+            .store()
             .discussion_is_participant(&ws(), &private.conversation.id, &local.id)
             .await
             .unwrap());
@@ -1936,7 +1981,7 @@ mod tests {
         .await
         .is_err());
         let archived = service
-            .store
+            .store()
             .discussion_conversation(&ws(), &private.conversation.id)
             .await
             .unwrap();
@@ -1959,7 +2004,7 @@ mod tests {
             author
         );
         let inert = service
-            .store
+            .store()
             .discussion_reaction_state(&ws(), "default", &original.id, &local.id)
             .await
             .unwrap();
@@ -1967,14 +2012,14 @@ mod tests {
         assert_eq!(inert.reactions[0].count, 1);
         assert!(!inert.reactions[0].reacted);
         let (removed, changed) = service
-            .store
+            .store()
             .set_discussion_reaction(&ws(), "default", &original.id, &local.id, "👍", false)
             .await
             .unwrap();
         assert!(!changed);
         assert_eq!(removed, inert);
         let (added, changed) = service
-            .store
+            .store()
             .set_discussion_reaction(&ws(), "default", &original.id, &local.id, "👍", true)
             .await
             .unwrap();
@@ -2456,10 +2501,10 @@ mod tests {
         workspaces_root: &Path,
         assets_root: &Path,
     ) -> (tempfile::TempDir, Services) {
-        let db_dir = crate::test_support::test_tempdir("import-test-");
+        let db_dir = intent_services::feature_api::test_support::test_tempdir("import-test-");
         let db = db_dir.path().join("store.db");
         let store = Store::open(&db).await.expect("open store");
-        let svc = Services::new(store)
+        let svc = crate::register(Services::new(store))
             .with_workspaces_root(workspaces_root.to_path_buf())
             .with_assets_root(assets_root.to_path_buf());
         (db_dir, svc)
@@ -2640,7 +2685,7 @@ mod tests {
 
     struct SelectionFixture {
         root: TempDir,
-        _env: crate::agent_manager::tests::EnvGuard,
+        _env: intent_services::feature_api::agent_manager::tests::EnvGuard,
     }
 
     impl Drop for SelectionFixture {
@@ -2675,11 +2720,15 @@ mod tests {
             &std::env::var_os("PATH").unwrap_or_default(),
         ));
         let path = std::env::join_paths(paths).unwrap();
-        let env =
-            crate::agent_manager::tests::EnvGuard::set_all(&[("PATH", path.to_str().unwrap())]);
+        let env = intent_services::feature_api::agent_manager::tests::EnvGuard::set_all(&[(
+            "PATH",
+            path.to_str().unwrap(),
+        )]);
         let assets = TempDir::new("import-selection-assets");
-        let registry =
-            std::sync::Arc::new(crate::SettingsRegistry::load(root.0.join("config.toml")).unwrap());
+        let registry = std::sync::Arc::new(
+            intent_services::feature_api::SettingsRegistry::load(root.0.join("config.toml"))
+                .unwrap(),
+        );
         // Discovery and resolve_spawn only inspect these executable paths;
         // importing must never execute them or open an ACP session.
         registry
@@ -2710,15 +2759,15 @@ mod tests {
                 &svc,
                 provider,
                 model,
-                crate::model_catalog::ModelCatalogCache::now_ms(),
+                intent_services::feature_api::model_catalog::ModelCatalogCache::now_ms(),
             );
         }
         (SelectionFixture { root, _env: env }, assets, db_dir, svc)
     }
 
     fn seed_selection_catalog(svc: &Services, provider: &str, model: &str, now: u64) {
-        let source = crate::model_catalog::source_for(provider).unwrap();
-        svc.models_catalog.test_store(provider, &(source.version_key)(), vec![serde_json::json!({
+        let source = intent_services::feature_api::model_catalog::source_for(provider).unwrap();
+        svc.models_catalog_for_test().test_store(provider, &(source.version_key)(), vec![serde_json::json!({
             "id": model, "provider": provider, "isDefault": true, "effortLevels": ["low", "high"]
         })], now);
     }
@@ -2759,11 +2808,11 @@ mod tests {
             .unwrap();
         svc.workspace_import_commit_op(id).await.unwrap();
         let agent = intent_core::AgentId::from("agent-live");
-        let session = svc.store.get_agent_session(&agent).await.unwrap();
+        let session = svc.store().get_agent_session(&agent).await.unwrap();
         assert!(!session.is_active);
         assert!(session.acp_session_id.is_none());
         assert!(session.backend_session_id.is_none());
-        let persisted = svc.store.transfer_export_rows(&ws).await.unwrap();
+        let persisted = svc.store().transfer_export_rows(&ws).await.unwrap();
         let raw = &persisted
             .iter()
             .find(|(table, _)| table == "agent_session")
@@ -2778,7 +2827,7 @@ mod tests {
             "import must not rewrite history"
         );
         assert_eq!(
-            svc.store
+            svc.store()
                 .transfer_table_stats(&ws)
                 .await
                 .unwrap()
@@ -2807,7 +2856,7 @@ mod tests {
             (Some(provider), model, effort)
         );
         assert_eq!(
-            crate::agent_manager::imported_spawn_selection_for_test(
+            intent_services::feature_api::agent_manager::imported_spawn_selection_for_test(
                 session,
                 &svc.effective_settings()
             ),
@@ -2878,7 +2927,7 @@ mod tests {
             // The store's legacy read backstop splits compound ids. Verify the
             // unchanged persisted selection independently of normalized reads.
             let rows = svc
-                .store
+                .store()
                 .transfer_export_rows(&session.workspace_id)
                 .await
                 .unwrap();
@@ -2941,7 +2990,7 @@ mod tests {
         )
         .await;
         let rows = svc
-            .store
+            .store()
             .transfer_export_rows(&session.workspace_id)
             .await
             .unwrap();
@@ -2959,7 +3008,7 @@ mod tests {
         assert!(session.effort_levels.is_none());
         assert!(session.attention_request_kind.is_none());
         assert_eq!(
-            crate::agent_manager::imported_spawn_selection_for_test(
+            intent_services::feature_api::agent_manager::imported_spawn_selection_for_test(
                 &session,
                 &svc.effective_settings()
             ),
@@ -2994,7 +3043,7 @@ mod tests {
             &svc,
             "auggie",
             model,
-            crate::model_catalog::ModelCatalogCache::now_ms(),
+            intent_services::feature_api::model_catalog::ModelCatalogCache::now_ms(),
         );
         let session = import_selection(
             &svc,
@@ -3101,7 +3150,7 @@ mod tests {
             effort,
         );
         let rows = svc
-            .store
+            .store()
             .transfer_export_rows(&session.workspace_id)
             .await
             .unwrap();
@@ -3121,7 +3170,7 @@ mod tests {
             "auggie"
         );
         assert_eq!(
-            crate::agent_manager::imported_spawn_selection_for_test(
+            intent_services::feature_api::agent_manager::imported_spawn_selection_for_test(
                 &session,
                 &svc.effective_settings()
             ),
@@ -3182,29 +3231,30 @@ mod tests {
     async fn import_selection_temporary_catalog_uncertainty_preserves_source() {
         for uncertainty in ["cold", "stale", "version", "failed-refresh"] {
             let (_root, _assets, _db_dir, mut svc) = selection_fixture().await;
-            let source = crate::model_catalog::source_for("auggie").unwrap();
+            let source = intent_services::feature_api::model_catalog::source_for("auggie").unwrap();
             let version = (source.version_key)();
             match uncertainty {
                 "cold" => {
-                    svc.models_catalog =
-                        std::sync::Arc::new(crate::model_catalog::ModelCatalogCache::new(None));
+                    svc.set_models_catalog_for_test(std::sync::Arc::new(
+                        intent_services::feature_api::model_catalog::ModelCatalogCache::new(None),
+                    ));
                 }
                 "stale" => seed_selection_catalog(&svc, "auggie", "different-model", 0),
-                "version" => svc.models_catalog.store_for_test(
+                "version" => svc.models_catalog_for_test().store_for_test(
                     "auggie",
                     "old-adapter",
                     vec![serde_json::json!({"id":"different-model"})],
                 ),
                 "failed-refresh" => {
-                    crate::model_catalog::resolve_with_cache(
-                        &svc.models_catalog,
+                    intent_services::feature_api::model_catalog::resolve_with_cache(
+                        svc.models_catalog_for_test(),
                         "auggie",
                         &version,
                         true,
-                        crate::model_catalog::ModelCatalogCache::now_ms(),
+                        intent_services::feature_api::model_catalog::ModelCatalogCache::now_ms(),
                         || {
                             Box::pin(async {
-                                crate::model_catalog::ModelFetchResult {
+                                intent_services::feature_api::model_catalog::ModelFetchResult {
                                     models: None,
                                     warning: Some("temporary authentication probe failure".into()),
                                 }
@@ -3215,7 +3265,9 @@ mod tests {
                 }
                 _ => unreachable!(),
             }
-            crate::provider_auth::seed_auth_verdict_for_tests("auggie", None);
+            intent_services::feature_api::provider_auth::seed_auth_verdict_for_tests(
+                "auggie", None,
+            );
             let session = import_selection(&svc, serde_json::json!({"provider":"auggie", "model":"new-model", "reasoning_effort":"new-effort"})).await;
             assert_selection(
                 &svc,
@@ -3256,8 +3308,9 @@ mod tests {
             ));
             svc.settings_registry().unwrap().apply(&settings).unwrap();
             if tier == "cli" {
-                svc.models_catalog =
-                    std::sync::Arc::new(crate::model_catalog::ModelCatalogCache::new(None));
+                svc.set_models_catalog_for_test(std::sync::Arc::new(
+                    intent_services::feature_api::model_catalog::ModelCatalogCache::new(None),
+                ));
             }
             let session = import_selection(&svc, serde_json::json!({"provider":"unknown-provider", "model":"foreign-model", "reasoning_effort":"low"})).await;
             assert_selection(
@@ -3279,10 +3332,10 @@ mod tests {
             &svc,
             "auggie",
             "gpt-6-astra",
-            crate::model_catalog::ModelCatalogCache::now_ms(),
+            intent_services::feature_api::model_catalog::ModelCatalogCache::now_ms(),
         );
-        let source = crate::model_catalog::source_for("codex").unwrap();
-        svc.models_catalog.store_for_test(
+        let source = intent_services::feature_api::model_catalog::source_for("codex").unwrap();
+        svc.models_catalog_for_test().store_for_test(
             "codex",
             &(source.version_key)(),
             vec![serde_json::json!({
@@ -3332,22 +3385,25 @@ mod tests {
                     "interrupted_at":"t0", "resolution":"resumed"
                 })],
             ));
-            svc.store.transfer_import_rows(&stale).await.unwrap();
+            svc.store().transfer_import_rows(&stale).await.unwrap();
             sqlx::query(
                 "UPDATE script SET command='echo stale', cwd='old-cwd' WHERE id='script-reimport'",
             )
-            .execute(svc.store.write_pool())
+            .execute(svc.store().write_pool())
             .await
             .unwrap();
             sqlx::query("INSERT INTO script (id, workspace_id, name, command, mode, source, created_at) VALUES ('script-keeper', 'keeper', 'Keep', 'echo keep', 'command', 'user', 't0'), ('script-unlisted', 'ws-reimport', 'Unlisted', 'echo unlisted', 'command', 'user', 't0')")
-                .execute(svc.store.write_pool()).await.unwrap();
+                .execute(svc.store().write_pool()).await.unwrap();
             assert_eq!(svc.hydrate_scripts().await.unwrap(), 3);
             let manager = svc.script_manager();
-            let cached_before = manager.list(&ws).await.unwrap();
-            let keeper_before = manager.list(&WorkspaceId::from("keeper")).await.unwrap();
+            let cached_before = manager.list_for_test(&ws).await.unwrap();
+            let keeper_before = manager
+                .list_for_test(&WorkspaceId::from("keeper"))
+                .await
+                .unwrap();
             sqlx::query("INSERT INTO attachment_idempotency_keys (workspace_id, key, attachment_id, fingerprint, created_at) VALUES (?, 'retry', 'att-live', 'old', 't0')")
-                .bind(&ws.0).execute(svc.store.write_pool()).await.unwrap();
-            let before = svc.store.transfer_export_rows(&ws).await.unwrap();
+                .bind(&ws.0).execute(svc.store().write_pool()).await.unwrap();
+            let before = svc.store().transfer_export_rows(&ws).await.unwrap();
             if fail_late {
                 rows.iter_mut()
                     .find(|(t, _)| *t == "attachments")
@@ -3376,14 +3432,14 @@ mod tests {
                 let err = result.unwrap_err();
                 assert!(err.to_string().contains("attachments.file_name"), "{err}");
                 assert!(!file.exists(), "failed insert unwinds materialized files");
-                assert_eq!(svc.store.transfer_export_rows(&ws).await.unwrap(), before);
-                assert_eq!(manager.list(&ws).await.unwrap(), cached_before);
+                assert_eq!(svc.store().transfer_export_rows(&ws).await.unwrap(), before);
+                assert_eq!(manager.list_for_test(&ws).await.unwrap(), cached_before);
                 svc.workspace_import_abort_op(id).await.unwrap();
             } else {
                 let result = result.unwrap();
                 assert_eq!(result["workspace"]["id"], ws.0);
                 assert_eq!(tokio::fs::read(file).await.unwrap(), b"attachment-bytes");
-                let scripts = manager.list(&ws).await.unwrap();
+                let scripts = manager.list_for_test(&ws).await.unwrap();
                 let imported = scripts["scripts"]
                     .as_array()
                     .unwrap()
@@ -3402,7 +3458,7 @@ mod tests {
                 #[cfg(unix)]
                 {
                     manager
-                        .run(&ws, "script-reimport", None, Some(5))
+                        .run_for_test(&ws, "script-reimport", None, Some(5))
                         .await
                         .unwrap();
                     assert_eq!(
@@ -3420,7 +3476,7 @@ mod tests {
                 let resolution: String = sqlx::query_scalar(
                     "SELECT resolution FROM interrupted_agent WHERE agent_id='agent-live'",
                 )
-                .fetch_one(svc.store.read_pool())
+                .fetch_one(svc.store().read_pool())
                 .await
                 .unwrap();
                 assert_eq!(
@@ -3429,19 +3485,22 @@ mod tests {
                 );
             }
             assert_eq!(
-                manager.list(&WorkspaceId::from("keeper")).await.unwrap(),
+                manager
+                    .list_for_test(&WorkspaceId::from("keeper"))
+                    .await
+                    .unwrap(),
                 keeper_before
             );
             let retry_keys: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM attachment_idempotency_keys WHERE workspace_id=?",
             )
             .bind(&ws.0)
-            .fetch_one(svc.store.read_pool())
+            .fetch_one(svc.store().read_pool())
             .await
             .unwrap();
             assert_eq!(retry_keys, i64::from(fail_late));
             assert!(sqlx::query("PRAGMA foreign_key_check")
-                .fetch_all(svc.store.read_pool())
+                .fetch_all(svc.store().read_pool())
                 .await
                 .unwrap()
                 .is_empty());
@@ -3481,7 +3540,7 @@ mod tests {
 
         // Nothing visible before commit.
         assert!(matches!(
-            svc.store.get_workspace(&ws).await,
+            svc.store().get_workspace(&ws).await,
             Err(Error::NotFound(_))
         ));
 
@@ -3508,7 +3567,11 @@ mod tests {
             .await
             .expect("commit");
 
-        let imported = svc.store.get_workspace(&ws).await.expect("workspace live");
+        let imported = svc
+            .store()
+            .get_workspace(&ws)
+            .await
+            .expect("workspace live");
         assert_eq!(imported.title, "Imported");
         // Imports run no setup stage: the setup state records `skipped`
         // alongside the immediate `workspace:setup:completed` publish.
@@ -3524,7 +3587,7 @@ mod tests {
         );
 
         let session = svc
-            .store
+            .store()
             .get_agent_session(&intent_core::AgentId("agent-live".to_string()))
             .await
             .expect("session");
@@ -3534,7 +3597,7 @@ mod tests {
         // 0103 stats counters rebuilt from the re-inserted messages by the
         // triggers — not the exported 999s, and not doubled.
         let stats = svc
-            .store
+            .store()
             .get_agent_session_message_stats(&ws)
             .await
             .expect("message stats");
@@ -3551,7 +3614,7 @@ mod tests {
         assert!(committed["importedRows"].as_u64().unwrap() >= 4);
 
         // Draft dropped; asset placed.
-        let stats = svc.store.transfer_table_stats(&ws).await.expect("stats");
+        let stats = svc.store().transfer_table_stats(&ws).await.expect("stats");
         let row_count = |n: &str| {
             stats
                 .iter()
@@ -3569,7 +3632,11 @@ mod tests {
         // Attachment registry rows landed; the existing file materialized at
         // its stored path (under the re-rooted worktree) with the ignore-all
         // marker, while the deleted one imported as a row without a file.
-        let atts = svc.store.list_attachments(&ws).await.expect("attachments");
+        let atts = svc
+            .store()
+            .list_attachments(&ws)
+            .await
+            .expect("attachments");
         assert_eq!(atts.len(), 2);
         let att_dir = expected_wt.join(".intent/attachments");
         assert_eq!(
@@ -3595,7 +3662,7 @@ mod tests {
         let root = TempDir::new("legacy-authors");
         let (_db_dir, svc) =
             fresh_services(&root.0.join("workspaces"), &root.0.join("assets")).await;
-        let owner = svc.store.get_primary_principal().await.unwrap();
+        let owner = svc.store().get_primary_principal().await.unwrap();
         let ws = WorkspaceId::new();
         let mut m = manifest(&ws);
         m.format_version = 1;
@@ -3607,7 +3674,8 @@ mod tests {
             .unwrap()
             .1;
         messages[0]["metadata"]=serde_json::json!({"fromPrincipalId":owner.id,"humanAuthor":{"login":"planted","displayName":null,"avatarUrl":null},"keep":42}).to_string().into();
-        let originals = crate::human_attribution_tests::legacy_metadata_values();
+        let originals =
+            intent_services::feature_api::human_attribution_tests::legacy_metadata_values();
         let prototype = messages[0].clone();
         let mut queue = Vec::new();
         for (i, metadata) in originals.iter().enumerate() {
@@ -3692,7 +3760,7 @@ mod tests {
             assert_eq!(pending.message_metadata.as_ref(), Some(&human["metadata"]));
             assert!(!pending.ready_to_send());
         }
-        let exported = svc.store.transfer_export_rows(&ws).await.unwrap();
+        let exported = svc.store().transfer_export_rows(&ws).await.unwrap();
         let row = exported
             .iter()
             .find(|(t, _)| t == "agent_message")
@@ -3756,9 +3824,9 @@ mod tests {
             .await
             .unwrap();
         assert!(svc.workspace_import_commit_op(import).await.is_err());
-        assert!(svc.store.get_workspace(&ws).await.is_err());
+        assert!(svc.store().get_workspace(&ws).await.is_err());
         assert!(svc
-            .store
+            .store()
             .get_agent_session(&AgentId::from("agent-live"))
             .await
             .is_err());
@@ -3905,7 +3973,7 @@ mod tests {
         // test) so a row-key mapping mistake in a helper cannot cancel out
         // across the export/import round-trip.
         let src_ws = {
-            let mut w = crate::tests::workspace(&ws);
+            let mut w = intent_services::feature_api::tests::workspace(&ws);
             w.branch = "feature".to_string();
             w.base_ref = Some("main".to_string());
             w.repository_path = Some(repo.to_string_lossy().into_owned());
@@ -3963,7 +4031,11 @@ mod tests {
 
         // Stored workspace row: rewritten to the materialized checkout, and
         // the stale row branch replaced by the branch the bundle carried.
-        let imported = svc.store.get_workspace(&ws).await.expect("workspace live");
+        let imported = svc
+            .store()
+            .get_workspace(&ws)
+            .await
+            .expect("workspace live");
         let checkout = ws_root.0.join(&ws.0).join("test-repo");
         assert_eq!(
             imported.repository_path.as_deref(),
@@ -3991,7 +4063,7 @@ mod tests {
 
         // Sandbox rows: the bundled one rewritten on disk + in the store,
         // the ghost dropped.
-        let sandboxes = svc.store.list_sandboxes(&ws).await.expect("sandboxes");
+        let sandboxes = svc.store().list_sandboxes(&ws).await.expect("sandboxes");
         assert_eq!(sandboxes.len(), 1);
         let expected_sb = ws_root
             .0
@@ -4007,7 +4079,7 @@ mod tests {
 
         // The workspace-owned checkout stays out of known_repo.
         assert_eq!(
-            svc.store.list_known_repos().await.expect("known repos"),
+            svc.store().list_known_repos().await.expect("known repos"),
             vec![],
             "materialized checkout is not registered in known_repo"
         );
@@ -4067,7 +4139,7 @@ mod tests {
         );
         // Nothing landed; the session survives for abort.
         assert!(matches!(
-            svc.store.get_workspace(&ws).await,
+            svc.store().get_workspace(&ws).await,
             Err(Error::NotFound(_))
         ));
         svc.workspace_import_abort_op(import_id)
@@ -4106,7 +4178,7 @@ mod tests {
         });
 
         let src_ws = {
-            let mut w = crate::tests::workspace(&ws);
+            let mut w = intent_services::feature_api::tests::workspace(&ws);
             w.repository_path = Some(repo.to_string_lossy().into_owned());
             w.repository_name = Some("test-repo".to_string());
             w
@@ -4150,7 +4222,7 @@ mod tests {
         assert!(!checkout.exists(), "checkout removed by rollback");
         assert!(!ws_root.0.join(&ws.0).exists(), "workspace dir removed");
         assert!(
-            svc.store
+            svc.store()
                 .list_known_repos()
                 .await
                 .expect("known repos")
@@ -4158,7 +4230,7 @@ mod tests {
             "known_repo registration rolled back"
         );
         assert!(matches!(
-            svc.store.get_workspace(&ws).await,
+            svc.store().get_workspace(&ws).await,
             Err(Error::NotFound(_))
         ));
 
@@ -4247,7 +4319,7 @@ mod tests {
         assert!(!att_dir.join("doc.pdf").exists(), "attachment rolled back");
         assert!(!att_dir.exists(), "empty attachments dir pruned");
         assert!(matches!(
-            svc.store.get_workspace(&ws).await,
+            svc.store().get_workspace(&ws).await,
             Err(Error::NotFound(_))
         ));
 
@@ -4312,7 +4384,7 @@ mod tests {
             "escaping stored_path never landed"
         );
         assert!(matches!(
-            svc.store.get_workspace(&ws).await,
+            svc.store().get_workspace(&ws).await,
             Err(Error::NotFound(_))
         ));
         svc.workspace_import_abort_op(import_id)
@@ -4384,7 +4456,7 @@ mod tests {
             "nothing written outside the workspace"
         );
         assert!(matches!(
-            svc.store.get_workspace(&ws).await,
+            svc.store().get_workspace(&ws).await,
             Err(Error::NotFound(_))
         ));
         svc.workspace_import_abort_op(import_id)
@@ -4436,8 +4508,8 @@ mod tests {
         assert!(err.to_string().contains("64 hex"));
 
         // Collision with an existing workspace row.
-        let existing = crate::tests::workspace(&ws);
-        svc.store.insert_workspace(&existing).await.expect("seed");
+        let existing = intent_services::feature_api::tests::workspace(&ws);
+        svc.store().insert_workspace(&existing).await.expect("seed");
         let err = svc
             .workspace_import_begin_op(serde_json::to_value(manifest(&ws)).unwrap(), 10, sha)
             .await
@@ -4488,7 +4560,7 @@ mod tests {
             .expect_err("checksum");
         assert!(err.to_string().contains("checksum mismatch"));
         assert!(matches!(
-            svc.store.get_workspace(&ws).await,
+            svc.store().get_workspace(&ws).await,
             Err(Error::NotFound(_))
         ));
 

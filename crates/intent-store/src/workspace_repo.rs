@@ -1097,10 +1097,15 @@ impl Store {
             let id = id.clone();
             let deleted = tokio::spawn(async move {
                 // Keep the writer until eviction so a subsequent writer also
-                // observes the completed batch's overlay cleanup.
-                let mut conn = store.write_pool().acquire().await.map_err(|e| {
-                    Error::Internal(format!("delete workspace browser acquire failed: {e}"))
-                })?;
+                // observes the completed batch's overlay cleanup. Only the
+                // acquire is retried (nothing has run yet), so a saturated
+                // writer does not fail the sweep (intent-hq/intent#7705).
+                let mut conn = crate::with_write_txn_retry(|| async {
+                    store.write_pool().acquire().await.map_err(|e| {
+                        Error::Internal(format!("delete workspace browser acquire failed: {e}"))
+                    })
+                })
+                .await?;
                 let tab_ids: Vec<String> = sqlx::query_scalar(DELETE_WORKSPACE_BROWSER_BATCH_SQL)
                     .bind(&id.0)
                     .bind(DELETE_CASCADE_BATCH)

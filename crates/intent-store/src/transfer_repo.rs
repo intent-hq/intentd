@@ -29,7 +29,7 @@ use crate::Store;
 ///    predicate, or to [`TRANSFER_EXCLUDED_TABLES`] with a rationale.
 /// 2. Does any column hold machine-local values (absolute paths, client ids,
 ///    daemon-local ids)? If so, add an import-side transformation in
-///    `intent-services/src/transfer_import.rs` (see its path/ID rewriting).
+///    `intent-svc-transfer/src/transfer_import.rs` (see its path/ID rewriting).
 /// 3. Is there matching non-DB state? Assets dir and git bundle ride the
 ///    archive separately (`transfer_export.rs` / `transfer_git.rs`); runtime
 ///    state (hooks, PR monitors, agent queues) is rehydrated from these rows
@@ -2002,7 +2002,7 @@ mod tests {
              If it transfers and any column holds machine-local values \
              (absolute paths, client ids, daemon-local ids), also add an \
              import-side transformation in \
-             intent-services/src/transfer_import.rs, and update the column \
+             intent-svc-transfer/src/transfer_import.rs, and update the column \
              snapshot in transferred_table_columns_match_snapshot. See the \
              'Transfer checklist' on TRANSFER_TABLES."
         );
@@ -2090,7 +2090,7 @@ pull_request_workspace: pr_key, workspace_id, source, linked_at";
              transfer:\n\
              - does the new column hold machine-local values (absolute paths, \
              client ids, daemon-local ids)? If so, add an import-side \
-             transformation in intent-services/src/transfer_import.rs (see \
+             transformation in intent-svc-transfer/src/transfer_import.rs (see \
              its existing path/ID rewriting);\n\
              - exported archives created before this change lack the column — \
              make sure the import path tolerates its absence (or defaults it);\n\

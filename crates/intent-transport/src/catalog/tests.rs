@@ -1813,7 +1813,7 @@ mod unbound_owner_only_methods {
             })
             .await
             .expect("insert workspace");
-        let services = Services::new(store)
+        let services = intent_svc_transfer::register(Services::new(store))
             .with_workspaces_root(dir.path().join("workspaces"))
             .with_assets_root(dir.path().join("assets"));
         Fixture { services, ws, dir }
