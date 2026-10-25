@@ -325,13 +325,19 @@ async fn agent_create_name_explicitly_set_controls_guarded_rename_over_wss() {
         "guarded rename must apply, not skip: {renamed}"
     );
 
-    // The applied rename emits `agent:renamed` with { agentId, name }.
+    // The applied rename emits `agent:renamed` with
+    // { agentId, name, nameExplicitlySet } (§6.5).
     let mut saw_renamed = false;
     for _ in 0..40 {
         let frame = wss_event(&mut sub, 15).await;
         let event = &frame["params"]["event"];
         if event["type"] == "agent:renamed" && event["data"]["agentId"] == json!(placeholder_id) {
             assert_eq!(event["data"]["name"], "Self-Chosen", "event data: {frame}");
+            assert_eq!(
+                event["data"]["nameExplicitlySet"],
+                json!(true),
+                "agent:renamed carries the persisted flag: {frame}"
+            );
             saw_renamed = true;
             break;
         }
@@ -349,6 +355,55 @@ async fn agent_create_name_explicitly_set_controls_guarded_rename_over_wss() {
     .await;
     assert_eq!(got["agent"]["name"], "Self-Chosen");
     assert_eq!(got["agent"]["nameExplicitlySet"], json!(true));
+
+    // 1b) A name-only `agent.update` also emits `agent:renamed` carrying the
+    //     persisted `nameExplicitlySet` (§5.5 / §6.5).
+    let created = wss_rpc(
+        &mut rpc,
+        35,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Placeholder 2", "nameExplicitlySet": false }),
+    )
+    .await;
+    let updated_id = created["agent"]["id"]
+        .as_str()
+        .expect("agent id")
+        .to_string();
+    let updated = wss_rpc(
+        &mut rpc,
+        36,
+        "agent.update",
+        json!({ "workspaceId": ws_id, "agentId": updated_id, "changes": { "name": "Updated Name" } }),
+    )
+    .await;
+    assert_eq!(
+        updated["agent"]["name"], "Updated Name",
+        "update result: {updated}"
+    );
+    let mut saw_update_renamed = false;
+    for _ in 0..40 {
+        let frame = wss_event(&mut sub, 15).await;
+        let event = &frame["params"]["event"];
+        if event["data"]["agentId"] != json!(updated_id) || event["type"] == "agent:created" {
+            continue;
+        }
+        assert_eq!(
+            event["type"], "agent:renamed",
+            "name-only update folds into agent:renamed: {frame}"
+        );
+        assert_eq!(event["data"]["name"], "Updated Name", "event data: {frame}");
+        assert_eq!(
+            event["data"]["nameExplicitlySet"],
+            json!(true),
+            "agent:renamed carries the persisted flag: {frame}"
+        );
+        saw_update_renamed = true;
+        break;
+    }
+    assert!(
+        saw_update_renamed,
+        "agent:renamed from agent.update delivered over WSS"
+    );
 
     // 2) Back-compat: a name WITHOUT the flag stays explicit — the guarded
     //    rename is a no-op echoing the existing name with `skipped: true`.
