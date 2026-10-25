@@ -17,11 +17,13 @@ use intent_core::transfer::{
 use intent_core::{clock::now_iso, BoxFuture, Error, Result, Workspace, WorkspaceId};
 use intent_store::SandboxStatus;
 
-use crate::feature_ports::TransferPort;
+use crate::transfer_export::TransferExportExt;
+use crate::transfer_import::TransferImportExt;
 use crate::transfer_submodules::{
     estimate_submodule_bundle_bytes, find_unpublished_submodules, UnpublishedSubmodule,
 };
-use crate::{file_ops, git_ops, Services};
+use intent_services::feature_api::feature_ports::TransferPort;
+use intent_services::feature_api::{file_ops, git_ops, Services};
 
 /// The in-crate [`TransferPort`] implementation: owns every in-flight
 /// transfer session. One instance is registered by [`Services::new`] and
@@ -52,11 +54,15 @@ pub(crate) struct TransferFeature {
         Mutex<Option<crate::transfer_export::MonitorExportBarrier>>,
 }
 
-impl Services {
+/// The registered transfer feature on [`Services`].
+pub(crate) trait TransferStateExt {
+    fn transfer_state(&self) -> &TransferFeature;
+}
+
+impl TransferStateExt for Services {
     /// The registered transfer feature and its session state.
-    pub(crate) fn transfer_state(&self) -> &TransferFeature {
-        self.ports
-            .transfer()
+    fn transfer_state(&self) -> &TransferFeature {
+        self.feature_transfer_port()
             .as_any()
             .downcast_ref::<TransferFeature>()
             .expect("the in-crate transfer feature is registered")
@@ -191,29 +197,74 @@ impl TransferPort for TransferFeature {
             .values()
             .any(|session| session.workspace_id.as_str() == workspace_id)
     }
+
+    #[cfg(test)]
+    fn park_building_export_for_test(
+        &self,
+        export_id: &str,
+        workspace_id: &WorkspaceId,
+        initiator: Option<intent_core::PrincipalId>,
+        staging_dir: PathBuf,
+    ) {
+        self.exports.lock().expect("export registry").insert(
+            export_id.to_string(),
+            crate::transfer_export::ExportSession {
+                initiator,
+                workspace_id: workspace_id.clone(),
+                staging_dir,
+                state: crate::transfer_export::ExportState::Building { aborted: false },
+                wip_paths: vec![],
+                max_chunk_bytes: crate::transfer_export::EXPORT_MAX_CHUNK_BYTES,
+            },
+        );
+    }
+
+    #[cfg(test)]
+    fn remove_export_for_test(&self, export_id: &str) {
+        self.exports
+            .lock()
+            .expect("export registry")
+            .remove(export_id);
+    }
+
+    #[cfg(test)]
+    fn export_count_for_test(&self) -> usize {
+        self.exports.lock().expect("export registry").len()
+    }
 }
 
-impl Services {
+/// The transfer plan (`workspace.transfer.plan`) on [`Services`].
+pub(crate) trait TransferPlanExt {
+    async fn workspace_transfer_plan_op(&self, id: WorkspaceId) -> Result<TransferPlan>;
+    async fn transfer_attachments(
+        &self,
+        id: &WorkspaceId,
+        ws: &Workspace,
+    ) -> Result<Vec<TransferAttachment>>;
+    async fn transfer_assets(&self, id: &WorkspaceId) -> Vec<TransferAsset>;
+}
+
+impl TransferPlanExt for Services {
     /// Build the transfer plan for `id`: per-table row stats (spec §1
     /// inventory, `event` excluded), asset list with sizes, git state summary
     /// (branch, dirty files, sandbox branches), an estimated git bundle size,
     /// and non-blocking pre-flight warnings. `NotFound` for unknown ids;
     /// the chief workspace is not transferable (`InvalidParams`).
-    pub(crate) async fn workspace_transfer_plan_op(&self, id: WorkspaceId) -> Result<TransferPlan> {
+    async fn workspace_transfer_plan_op(&self, id: WorkspaceId) -> Result<TransferPlan> {
         if id.is_chief() {
             return Err(Error::InvalidParams(
                 "The chief workspace cannot be transferred".to_string(),
             ));
         }
-        let ws = self.store.get_workspace(&id).await?;
+        let ws = self.store().get_workspace(&id).await?;
 
-        let tables = self.store.transfer_table_stats(&id).await?;
+        let tables = self.store().transfer_table_stats(&id).await?;
         let assets = self.transfer_assets(&id).await;
         let attachments = self.transfer_attachments(&id, &ws).await?;
 
         // Sandbox branches ride in the bundle only while they can still hold
         // unmerged work; merged/discarded sandboxes may have deleted branches.
-        let sandboxes = self.store.list_sandboxes(&id).await?;
+        let sandboxes = self.store().list_sandboxes(&id).await?;
         let live_sandboxes: Vec<_> = sandboxes
             .iter()
             .filter(|s| {
@@ -254,7 +305,8 @@ impl Services {
                             Err(_) => (intent_git::status::current_branch_at(&root), Vec::new()),
                         };
                         let bundle = estimate_bundle_bytes(&root, &branches);
-                        let nested = crate::nested_repos::nested_repo_dirs(&root);
+                        let nested =
+                            intent_services::feature_api::nested_repos::nested_repo_dirs(&root);
                         let (submodules, submodule_bytes) =
                             scan_unpublished_submodules(&root, &sandbox_paths);
                         (
@@ -288,7 +340,7 @@ impl Services {
             };
 
         let mut warnings = Vec::new();
-        let sessions = self.store.list_agent_session_summaries(&id).await?;
+        let sessions = self.store().list_agent_session_summaries(&id).await?;
         let running = sessions
             .iter()
             .filter(|s| s.is_active || s.status.is_running_turn())
@@ -376,12 +428,12 @@ impl Services {
     /// bytes — the row still transfers, the archive just carries no file
     /// entry for it. A registry row whose `stored_path` escapes the workspace
     /// root is treated the same way (never read outside the store).
-    pub(crate) async fn transfer_attachments(
+    async fn transfer_attachments(
         &self,
         id: &WorkspaceId,
         ws: &Workspace,
     ) -> Result<Vec<TransferAttachment>> {
-        let records = self.store.list_attachments(id).await?;
+        let records = self.store().list_attachments(id).await?;
         if records.is_empty() {
             return Ok(Vec::new());
         }
@@ -415,7 +467,7 @@ impl Services {
     /// entries: the archive carries them, so the manifest (and its byte
     /// total) reflects exactly what a transfer would copy.
     async fn transfer_assets(&self, id: &WorkspaceId) -> Vec<TransferAsset> {
-        let Some(root) = self.assets_root.clone() else {
+        let Some(root) = self.feature_assets_root().map(std::path::Path::to_path_buf) else {
             return Vec::new();
         };
         let dir: PathBuf = root.join(&id.0);
@@ -615,8 +667,10 @@ mod tests {
     use intent_core::{AgentId, AgentSession, AgentStatus, NoteId, WorkspaceId};
     use intent_store::{Sandbox, SandboxStatus, Store};
 
-    use crate::tests::{workspace, TempDb};
-    use crate::Services;
+    use intent_services::feature_api::tests::{workspace, TempDb};
+    use intent_services::feature_api::Services;
+
+    use super::TransferPlanExt;
 
     fn run_git(dir: &std::path::Path, args: &[&str]) {
         let out = std::process::Command::new("git")
@@ -809,7 +863,7 @@ mod tests {
                 .expect("attachment row");
         }
 
-        let svc = Services::new(store).with_assets_root(assets_root.0.clone());
+        let svc = crate::register(Services::new(store)).with_assets_root(assets_root.0.clone());
         let plan = svc
             .workspace_transfer_plan_op(ws.clone())
             .await
@@ -893,7 +947,7 @@ mod tests {
         w.worktree_path = Some(repo.0.to_string_lossy().to_string());
         store.insert_workspace(&w).await.expect("ws");
 
-        let svc = Services::new(store);
+        let svc = crate::register(Services::new(store));
         let plan = svc
             .workspace_transfer_plan_op(ws.clone())
             .await
@@ -922,7 +976,7 @@ mod tests {
     /// clears all three; the plan itself writes nothing to either repo.
     #[tokio::test]
     async fn transfer_plan_warns_on_unpublished_submodule_until_pushed() {
-        use crate::test_support::submodule_fixture::{
+        use intent_services::feature_api::test_support::submodule_fixture::{
             git, local_commit, superproject_with_submodule,
         };
 
@@ -938,7 +992,7 @@ mod tests {
         let mut w = workspace(&ws);
         w.worktree_path = Some(sup.to_string_lossy().to_string());
         store.insert_workspace(&w).await.expect("ws");
-        let svc = Services::new(store);
+        let svc = crate::register(Services::new(store));
 
         let clean = svc
             .workspace_transfer_plan_op(ws.clone())
@@ -1014,7 +1068,7 @@ mod tests {
     /// (`published: false`), and the estimate includes both bundles.
     #[tokio::test]
     async fn transfer_plan_carries_published_parent_of_nested_submodule() {
-        use crate::test_support::submodule_fixture::{
+        use intent_services::feature_api::test_support::submodule_fixture::{
             nested_unpublished_under_published_parent, NestedFixture,
         };
 
@@ -1033,7 +1087,7 @@ mod tests {
         let mut w = workspace(&ws);
         w.worktree_path = Some(sup.to_string_lossy().to_string());
         store.insert_workspace(&w).await.expect("ws");
-        let svc = Services::new(store);
+        let svc = crate::register(Services::new(store));
         let plan = svc.workspace_transfer_plan_op(ws).await.expect("plan");
 
         let warns: Vec<_> = plan
@@ -1075,7 +1129,7 @@ mod tests {
     /// the worktree's `(path, sha)` is not repeated.
     #[tokio::test]
     async fn transfer_plan_reports_sandbox_only_submodule_as_not_carried() {
-        use crate::test_support::submodule_fixture::{
+        use intent_services::feature_api::test_support::submodule_fixture::{
             git, local_commit, superproject_with_submodule,
         };
 
@@ -1124,7 +1178,7 @@ mod tests {
             })
             .await
             .expect("sandbox");
-        let svc = Services::new(store);
+        let svc = crate::register(Services::new(store));
 
         let plan = svc
             .workspace_transfer_plan_op(ws.clone())
@@ -1269,7 +1323,7 @@ mod tests {
             .await
             .expect("session");
 
-        let svc = Services::new(store);
+        let svc = crate::register(Services::new(store));
         let plan = svc
             .workspace_transfer_plan_op(ws.clone())
             .await
@@ -1288,7 +1342,7 @@ mod tests {
     async fn transfer_plan_rejects_missing_and_chief() {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
-        let svc = Services::new(store);
+        let svc = crate::register(Services::new(store));
 
         let missing = svc.workspace_transfer_plan_op(WorkspaceId::new()).await;
         assert!(matches!(missing, Err(intent_core::Error::NotFound(_))));
@@ -1310,7 +1364,7 @@ mod tests {
             .await
             .expect("note");
 
-        let svc = Services::new(store);
+        let svc = crate::register(Services::new(store));
         let first = svc.workspace_transfer_plan_op(ws.clone()).await.expect("1");
         let second = svc.workspace_transfer_plan_op(ws).await.expect("2");
         assert_eq!(first.manifest.tables, second.manifest.tables);

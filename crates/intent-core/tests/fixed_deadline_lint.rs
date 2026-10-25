@@ -32,8 +32,11 @@
 //!   `tests/` directory, files reached through a `#[cfg(test)] mod name;`
 //!   declaration (and that module's directory, and any `mod` a test file
 //!   declares in turn), and every `#[cfg(test)]` or `#[cfg(all(…, test,
-//!   …))]` item. Production code — including `cfg(any(test, …))` items,
-//!   which also build outside tests — is never scanned.
+//!   …))]` item, plus `cfg(any(test, feature = "test-hooks"))` ones (the
+//!   `test-hooks` feature never builds into production:
+//!   scripts/check-test-hooks-feature.sh). Other production code — including
+//!   other `cfg(any(test, …))` items, which also build outside tests — is
+//!   never scanned.
 //! - **What counts:** on comment- and literal-blanked text (so quoted
 //!   examples never count), a `Duration::from_*(` path — `std::time::` /
 //!   `tokio::time::` qualified or not, any whitespace or line breaks between
@@ -308,6 +311,54 @@ fn normalize_cfg_all_test(chars: &mut [char]) {
     }
 }
 
+/// Rewrites every `#[cfg(any(test, feature = "test-hooks"))]` attribute in
+/// blanked `chars` to a padded `#[cfg(test)]`, like
+/// [`normalize_cfg_all_test`]: the `test-hooks` feature only builds test
+/// seams for other crates' tests, and CI keeps it out of the production
+/// feature graph (scripts/check-test-hooks-feature.sh). The feature name is
+/// blanked with the literal, so it is read from `literals`.
+fn normalize_cfg_test_hooks(chars: &mut [char], literals: &[Literal]) {
+    let mut i = 0;
+    while i < chars.len() {
+        let head = (chars[i] == '#')
+            .then(|| {
+                [
+                    "#", "[", "cfg", "(", "any", "(", "test", ",", "feature", "=",
+                ]
+                .iter()
+                .try_fold(i, |j, token| expect(chars, j, token))
+            })
+            .flatten();
+        let Some(after_eq) = head else {
+            i += 1;
+            continue;
+        };
+        // The blanked literal reads as whitespace, so find it by offset: the
+        // first literal at or after `=` with only whitespace before it.
+        let end = literals
+            .iter()
+            .find(|l| l.offset >= after_eq)
+            .filter(|l| chars[after_eq..l.offset].iter().all(|c| c.is_whitespace()))
+            .filter(|l| !l.raw && l.text == "test-hooks")
+            .and_then(|l| {
+                [")", ")", "]"]
+                    .iter()
+                    .try_fold(l.offset + l.text.chars().count() + 2, |k, token| {
+                        expect(chars, k, token)
+                    })
+            });
+        let Some(end) = end else {
+            i += 1;
+            continue;
+        };
+        let mut replacement = "#[cfg(test)]".chars();
+        for c in chars[i..end].iter_mut().filter(|c| **c != '\n') {
+            *c = replacement.next().unwrap_or(' ');
+        }
+        i = end;
+    }
+}
+
 /// A fixed deadline with no reasoned marker: its 1-based line and text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Deadline {
@@ -377,6 +428,7 @@ fn scan_source(src: &str, whole_file_is_test: bool) -> Scan {
     let lexed = lex(src);
     let mut chars: Vec<char> = lexed.blanked.chars().collect();
     normalize_cfg_all_test(&mut chars);
+    normalize_cfg_test_hooks(&mut chars, &lexed.literals);
     let line_starts: Vec<usize> = std::iter::once(0)
         .chain(
             chars
@@ -982,6 +1034,26 @@ fn report_follows_the_ratchet() {
     }
     assert!(!report.contains("equal.rs"), "{report}");
     assert!(!report.contains("clean.rs"), "{report}");
+}
+
+#[test]
+fn cfg_any_test_or_test_hooks_items_are_test_code() {
+    let src = "\
+#[cfg(any(test, feature = \"test-hooks\"))]
+fn seam() { timeout(Duration::from_secs(5), f); }
+#[cfg(any( test , feature=\"test-hooks\" ))]
+mod spaced {
+    fn t() { timeout(Duration::from_secs(5), f); }
+}
+#[cfg(any(test, feature = \"test-hooks-docs\"))]
+fn look_alike() { timeout(Duration::from_secs(5), f); }
+#[cfg(any(test, feature = \"fixtures\"))]
+fn shared() { timeout(Duration::from_secs(5), f); }
+#[cfg(any(test, feature = r\"test-hooks\"))]
+fn raw() { timeout(Duration::from_secs(5), f); }
+";
+    let found = scan_source(src, false).deadlines;
+    assert_eq!(found.iter().map(|d| d.line).collect::<Vec<_>>(), vec![2, 5]);
 }
 
 #[test]

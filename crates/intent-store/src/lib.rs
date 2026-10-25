@@ -377,7 +377,7 @@ mod tests;
 /// (with a rationale) — schema-parity tests in `transfer_repo` fail until the
 /// decision is made explicit. Machine-local column values (absolute paths,
 /// client ids, daemon-local ids) need import-side rewriting in
-/// `intent-services/src/transfer_import.rs`. Remember non-DB state too: the
+/// `intent-svc-transfer/src/transfer_import.rs`. Remember non-DB state too: the
 /// assets dir and git bundle are exported separately, and runtime state
 /// (hooks, PR monitors, agent queues) is rehydrated from imported rows on the
 /// target.

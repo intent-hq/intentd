@@ -262,7 +262,7 @@ pub(crate) fn estimate_submodule_bundle_bytes(sub: &UnpublishedSubmodule) -> u64
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::submodule_fixture::{
+    use intent_services::feature_api::test_support::submodule_fixture::{
         git, init_repo, local_commit, nested_unpublished_under_published_parent,
         superproject_with_submodule, NestedFixture,
     };

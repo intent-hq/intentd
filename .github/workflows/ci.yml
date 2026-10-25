@@ -489,7 +489,7 @@ jobs:
       - name: Real import and public session contract
         env:
           INTENTD_ASSERT_BOUND_CALLER: "1"
-        run: "cargo test -p intent-services --lib transfer_selection_contract::"
+        run: "cargo test -p intent-svc-transfer --lib transfer_selection_contract::"
       # Real claude-agent-acp contract (claude_adapter_contract): the pinned
       # adapter moves by auto-merging rolling PRs (auto-pin-acp-adapters.yml),
       # so every PR and merge-queue run installs the exact pin and checks that
@@ -558,6 +558,15 @@ jobs:
       # each with a comment explaining why.
       - name: Unused dependencies (cargo-shear)
         run: cargo shear --deny-warnings
+      # intent-services' `test-hooks` feature compiles test seams and
+      # fixtures into the library for feature-crate tests. Only
+      # dev-dependencies may enable it; fail if the production feature graph
+      # of a shipped binary does. The regression test runs the check against
+      # throwaway workspaces first (path dependencies only, a few seconds).
+      - name: No test-hooks in the production feature graph
+        run: |
+          ./scripts/test-check-test-hooks-feature.sh
+          ./scripts/check-test-hooks-feature.sh
       # CI is the guard against host-dependent tests: a test that relies on
       # an installed provider CLI passes locally and fails here only while
       # runners have none. Fail loudly if a runner image starts shipping one.

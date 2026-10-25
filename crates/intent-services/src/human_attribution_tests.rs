@@ -1,22 +1,6 @@
 use intent_core::{with_caller, Caller, HostRole, PrincipalIdentity, WorkspaceApi};
 use serde_json::json;
 
-pub(crate) fn legacy_metadata_values() -> Vec<Option<serde_json::Value>> {
-    vec![
-        None,
-        Some(serde_json::Value::Null),
-        Some(json!("legacy")),
-        Some(json!(42)),
-        Some(json!(false)),
-        Some(
-            json!(["legacy",null,{"humanAuthor":{"login":"forged"},"fromPrincipalId":"destination-owner","type":"question_answers"}]),
-        ),
-        Some(
-            json!({"keep":7,"humanAuthorOriginalMetadata":{"humanAuthor":{"login":"forged"},"fromPrincipalId":"destination-owner","type":"question_answers"}}),
-        ),
-    ]
-}
-
 async fn queued_fixture(
     svc: &crate::Services,
     ws: &intent_core::WorkspaceId,

@@ -574,6 +574,31 @@ mod tests {
         }
     }
 
+    /// Run `poke(attempt)` and poll 1.5 s for the workspace's next event,
+    /// repeating until one arrives or `budget` is spent. Retried because the
+    /// shared stream can begin delivering a little after registration lands,
+    /// and a mutation that predates delivery leaves nothing to observe. The
+    /// caller's establishment wait draws on the same `budget`, so a creation
+    /// retry that delays the watch shortens this loop instead of pushing the
+    /// test past nextest's kill (intent-hq/intent#6128).
+    async fn poke_until_event(
+        sub: &mut Subscription,
+        ws_id: &WorkspaceId,
+        budget: &crate::events::TestBudget,
+        mut poke: impl FnMut(usize),
+    ) -> Option<Event> {
+        let mut attempt = 0;
+        while !budget.remaining().is_zero() {
+            poke(attempt);
+            attempt += 1;
+            let poll = Duration::from_millis(1500).min(budget.remaining());
+            if let Some(ev) = next_event(sub, ws_id, poll).await {
+                return Some(ev);
+            }
+        }
+        None
+    }
+
     #[test]
     fn metadata_path_filter_is_narrow() {
         let git_dir = Path::new("/ws/root/.git");
@@ -766,31 +791,24 @@ mod tests {
             &root.path.clone(),
         )
         .expect("git repo must gain a metadata watch");
-        // Let the OS watch settle before mutating.
-        watcher.wait_established(crate::events::LIVENESS).await;
+        // Let the OS watch settle before mutating. Establishment and the
+        // probe loop share one pure-liveness budget (monorepo#1630).
+        let budget = crate::events::TestBudget::liveness();
+        watcher.wait_established(budget.remaining()).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         // External `git checkout`-style operation: only `.git` metadata moves
-        // (HEAD rewrite; no worktree change). Retried because the shared stream
-        // can begin delivering a little after registration lands, and a HEAD
-        // rewrite that predates delivery leaves nothing to observe. Attempt
-        // count sized so the total probe budget (attempts x 1500ms) reaches
-        // `LIVENESS` — a pure-liveness bound (monorepo#1630).
-        let attempts = crate::events::LIVENESS.as_millis() / 1500;
-        let mut ev = None;
-        for i in 0..attempts {
+        // (HEAD rewrite; no worktree change).
+        let ev = poke_until_event(&mut status_sub, &ws.id, &budget, |i| {
             let target = if i % 2 == 0 {
                 "refs/heads/other"
             } else {
                 "refs/heads/main"
             };
             repo.set_head(target).unwrap();
-            ev = next_event(&mut status_sub, &ws.id, Duration::from_millis(1500)).await;
-            if ev.is_some() {
-                break;
-            }
-        }
-        let ev = ev.expect("external HEAD change must yield a changes:git-status event");
+        })
+        .await
+        .expect("external HEAD change must yield a changes:git-status event");
         assert_eq!(ev.event_type, CHANGES_GIT_STATUS);
         assert_eq!(ev.data["workspaceId"], ws.id.as_str());
         assert!(ev.data["status"].get("uncommittedCount").is_some());
@@ -847,7 +865,8 @@ mod tests {
             &wt_path.clone(),
         )
         .expect("linked worktree workspace must gain a metadata watch");
-        watcher.wait_established(crate::events::LIVENESS).await;
+        let budget = crate::events::TestBudget::liveness();
+        watcher.wait_established(budget.remaining()).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         // External `git checkout`-style HEAD rewrite in the worktree's own
@@ -857,20 +876,16 @@ mod tests {
         // the regular-repo test above.
         let head_commit = wt_repo.head().unwrap().peel_to_commit().unwrap();
         wt_repo.branch("wt-alt", &head_commit, false).unwrap();
-        let mut ev = None;
-        for i in 0..20 {
+        let ev = poke_until_event(&mut status_sub, &ws.id, &budget, |i| {
             let target = if i % 2 == 0 {
                 "refs/heads/wt-alt"
             } else {
                 "refs/heads/wt"
             };
             wt_repo.set_head(target).unwrap();
-            ev = next_event(&mut status_sub, &ws.id, Duration::from_millis(1500)).await;
-            if ev.is_some() {
-                break;
-            }
-        }
-        let ev = ev.expect("external worktree HEAD change must yield a changes:git-status event");
+        })
+        .await
+        .expect("external worktree HEAD change must yield a changes:git-status event");
         assert_eq!(ev.event_type, CHANGES_GIT_STATUS);
         assert_eq!(ev.data["workspaceId"], ws.id.as_str());
 
@@ -964,7 +979,8 @@ mod tests {
             &checkout.clone(),
         )
         .expect("separate-git-dir checkout must gain a metadata watch");
-        watcher.wait_established(crate::events::LIVENESS).await;
+        let budget = crate::events::TestBudget::liveness();
+        watcher.wait_established(budget.remaining()).await;
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         let inodes = inotify_watched_inodes();
@@ -984,21 +1000,16 @@ mod tests {
 
         let head_commit = repo.head().unwrap().peel_to_commit().unwrap();
         repo.branch("alt", &head_commit, false).unwrap();
-        let mut ev = None;
-        for i in 0..20 {
+        let ev = poke_until_event(&mut status_sub, &ws.id, &budget, |i| {
             let target = if i % 2 == 0 {
                 "refs/heads/alt"
             } else {
                 "refs/heads/main"
             };
             repo.set_head(target).unwrap();
-            ev = next_event(&mut status_sub, &ws.id, Duration::from_millis(1500)).await;
-            if ev.is_some() {
-                break;
-            }
-        }
-        let ev =
-            ev.expect("external HEAD change in the separate git dir must yield changes:git-status");
+        })
+        .await
+        .expect("external HEAD change in the separate git dir must yield changes:git-status");
         assert_eq!(ev.event_type, CHANGES_GIT_STATUS);
         assert_eq!(ev.data["workspaceId"], ws.id.as_str());
     }
@@ -1067,19 +1078,16 @@ mod tests {
         // e.g. a commit/fetch in the main checkout. Retried for the same
         // delivery-start race as the other real-watcher tests.
         let head_commit = main_repo.head().unwrap().peel_to_commit().unwrap();
-        let mut ev_a = None;
-        for i in 0..20 {
+        let ev_a = poke_until_event(&mut status_sub_a, &ws_a.id, &budget, |i| {
             main_repo
                 .branch(&format!("fan-{i}"), &head_commit, true)
                 .unwrap();
-            ev_a = next_event(&mut status_sub_a, &ws_a.id, Duration::from_millis(1500)).await;
-            if ev_a.is_some() {
-                break;
-            }
-        }
-        let ev_a = ev_a.expect("shared ref change must refresh worktree A");
+        })
+        .await
+        .expect("shared ref change must refresh worktree A");
         assert_eq!(ev_a.event_type, CHANGES_GIT_STATUS);
-        let ev_b = next_event(&mut status_sub_b, &ws_b.id, Duration::from_secs(5))
+        let ev_b_wait = Duration::from_secs(5).min(budget.remaining());
+        let ev_b = next_event(&mut status_sub_b, &ws_b.id, ev_b_wait)
             .await
             .expect("shared ref change must fan out to worktree B");
         assert_eq!(ev_b.event_type, CHANGES_GIT_STATUS);

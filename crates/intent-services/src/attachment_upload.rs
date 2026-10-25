@@ -1163,14 +1163,12 @@ mod tests {
 
         let root = crate::test_support::test_tempdir("fixture-db-cleanup-");
         let mut residue = Vec::new();
-        for (index, test) in [
-            "attachment_upload::tests::upload_multi_chunk_out_of_order_with_retry_commits",
-            "transfer_export::tests::export_guards_and_abort",
-            "transfer_export::tests::export_build_failure_cleans_up_and_allows_retry",
-            "transfer_import::tests::import_lifecycle_begin_chunk_commit",
-        ]
-        .into_iter()
-        .enumerate()
+        // intent-svc-transfer runs the same check over its own fixture
+        // consumers (fixture_cleanup_tests).
+        for (index, test) in
+            ["attachment_upload::tests::upload_multi_chunk_out_of_order_with_retry_commits"]
+                .into_iter()
+                .enumerate()
         {
             let scratch = root.path().join(index.to_string());
             std::fs::create_dir(&scratch).unwrap();

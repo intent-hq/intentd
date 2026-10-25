@@ -1,6 +1,6 @@
 [package]
 name = "intent-transport"
-version = "0.11.39"
+version = "0.11.43"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -13,8 +13,8 @@ default = []
 repository-test-fixtures = []
 
 [dependencies]
-intent-core = { path = "../intent-core", version = "0.11.39" }
-intent-services = { path = "../intent-services", version = "0.11.39" }
+intent-core = { path = "../intent-core", version = "0.11.43" }
+intent-services = { path = "../intent-services", version = "0.11.43" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -53,7 +53,11 @@ ctor = "1.0.10"
 # `intent_store::Store`. `intent-store` depends only on `intent-core`, so this
 # dev-only edge introduces no cycle; the normal-build dependency direction
 # (transport → services only) is unchanged.
-intent-store = { path = "../intent-store", version = "0.11.39" }
+intent-store = { path = "../intent-store", version = "0.11.43" }
+# The router catalog tests drive the gated workspace.export.* methods, which
+# need the real transfer feature registered. Dev-only: the normal-build
+# direction (transport -> services, never a feature crate) is unchanged.
+intent-svc-transfer = { path = "../intent-svc-transfer" }
 
 [lints]
 workspace = true
