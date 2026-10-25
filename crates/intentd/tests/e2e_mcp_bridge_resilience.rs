@@ -89,6 +89,7 @@ fn workspace(id: &WorkspaceId, path: Option<std::path::PathBuf>) -> Workspace {
         display_status: None,
         waiting: false,
         scripts_running: false,
+        background_tasks_running: false,
     }
 }
 
