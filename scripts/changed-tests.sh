@@ -3,7 +3,7 @@
 #
 #   scripts/changed-tests.sh [--dry-run] [--base REF] [--instrumented]
 #                            [--build-jobs N] [--test-threads N] [--runner CMD]
-#                            [--plan-json PATH]
+#                            [--plan-json PATH] [--check-map]
 #
 # Each flag falls back to an environment variable: DRY_RUN=1, BASE (default
 # origin/main), BUILD_JOBS, TEST_THREADS, NEXTEST_RUNNER. NEXTEST_SHOW_PROGRESS /
@@ -46,6 +46,12 @@
 #                                    every crates/intent-svc-* feature crate
 #   crates/<c>/benches|examples/**   ignored (nextest does not run them)
 #   crates/<c>/<anything else>       -p <c>  (all test targets of <c>)
+#   a glob in .config/e2e-test-map.txt
+#                                    also the end-to-end modules it maps to:
+#                                    -p <c> --test <s> -E 'binary_id(=<c>::<s>)&test(/^(<m>)::/)'
+#                                    (the suite-module shape; a module-less
+#                                    entry selects --test <s> whole)
+#   .config/e2e-test-map.txt itself  every mapped end-to-end module
 #   outside crates/, inert           ignored: *.md, LICENSE, NOTICE, .gitignore,
 #                                    .github/**, docs/**, deny.toml,
 #                                    release-plz.toml, dist-workspace.toml
@@ -59,11 +65,19 @@
 # target flags to every -p package on one command line, so crates with
 # different selections run as separate `cargo nextest run` invocations and
 # crates with identical selections share one. Reverse dependencies are NOT
-# propagated, except from intent-services to its feature crates:
-# crates/<c>/src selects <c>'s own tests only; the full suite (`make test`,
-# the merge queue) stays the complete gate.
+# propagated, except from intent-services to its feature crates and through
+# the end-to-end map: crates/<c>/src selects <c>'s own tests plus any mapped
+# end-to-end modules; the full suite (`make test`, the merge queue) stays the
+# complete gate.
 #
-# Exit codes: 0 = nothing to test, or every invocation passed; 2 = usage error
+# The map is validated on every run, and --check-map validates it alone (and
+# requires it to exist): each source glob must match a tracked or untracked
+# file, each test binary root crates/<c>/tests/<s>.rs must exist, and each
+# segment of a module path must be declared by its parent with its file
+# present. An invalid map exits 2 naming every bad line.
+#
+# Exit codes: 0 = nothing to test, every invocation passed, or --check-map
+# found the map valid; 2 = usage error, an invalid end-to-end map
 # or a git command failed; 3 = a build-wide file changed (Cargo.toml,
 # Cargo.lock, crates/*/Cargo.toml, crates/*/build.rs, .config/nextest.toml,
 # rust-toolchain.toml, .cargo/**) or a non-inert path outside crates/ changed
@@ -89,9 +103,10 @@ dry_run=${DRY_RUN:-}
 runner=${NEXTEST_RUNNER:-}
 instrumented=""
 plan_json=""
+check_map=""
 
 usage() {
-  echo "Usage: $0 [--dry-run] [--base REF] [--instrumented] [--build-jobs N] [--test-threads N] [--runner CMD] [--plan-json PATH]" >&2
+  echo "Usage: $0 [--dry-run] [--base REF] [--instrumented] [--build-jobs N] [--test-threads N] [--runner CMD] [--plan-json PATH] [--check-map]" >&2
   exit 2
 }
 
@@ -99,6 +114,7 @@ while (($# > 0)); do
   case "$1" in
     --dry-run) dry_run=1 ;;
     --instrumented) instrumented=1 ;;
+    --check-map) check_map=1 ;;
     --base=*) base=${1#--base=} ;;
     --build-jobs=*) build_jobs=${1#--build-jobs=} ;;
     --test-threads=*) test_threads=${1#--test-threads=} ;;
@@ -125,6 +141,7 @@ done
 
 label=test-changed
 [[ -z "$instrumented" ]] || label=coverage-changed
+[[ -z "$check_map" ]] || label=check-map
 
 log() {
   echo "[$label] $*"
@@ -139,6 +156,122 @@ die() {
 
 cd "$repo_root"
 git rev-parse --git-dir >/dev/null 2>&1 || die 2 "$repo_root is not a git checkout"
+
+# The end-to-end test map: source globs whose change also selects the
+# end-to-end test modules that exercise them, because crates/<c>/src selects
+# only <c>'s own tests and those modules live in another crate (intentd#2617:
+# a script-binding change in intent-acp broke an intentd end-to-end test that
+# only the merge queue ran). Format and rules are in the file's header.
+e2e_map=.config/e2e-test-map.txt
+e2e_entries=""
+map_errors=""
+map_count=0
+
+# Sets resolve_problem (and returns 1) unless every segment of module path $2
+# is declared by its parent, starting at the test binary root $1, and the file
+# it resolves to exists: #[path = "<p>"] is relative to the declaring file's
+# directory; otherwise a root or mod.rs file looks in its own directory and
+# any other <name>.rs in <name>/, for <seg>.rs then <seg>/mod.rs.
+resolve_module() {
+  local file=$1 path=$2 rest=$2 seg line trimmed attr found dir child is_root=1
+  resolve_problem=""
+  if [[ "$path" == ::* || "$path" == *:: || "$path" == *::::* ]]; then
+    resolve_problem="module $path: empty segment"
+    return 1
+  fi
+  while [[ -n "$rest" ]]; do
+    seg=${rest%%::*}
+    if [[ "$rest" == *::* ]]; then rest=${rest#*::}; else rest=""; fi
+    attr=""
+    found=""
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      trimmed=${line#"${line%%[![:space:]]*}"}
+      case "$trimmed" in
+        '#[path = "'*'"]'*)
+          attr=${trimmed#'#[path = "'}
+          attr=${attr%%\"*}
+          ;;
+        '#['*) ;;
+        "mod $seg;"* | "pub mod $seg;"* | "pub(crate) mod $seg;"* | "pub(super) mod $seg;"*)
+          found=1
+          break
+          ;;
+        *) attr="" ;;
+      esac
+    done <"$file"
+    if [[ -z "$found" ]]; then
+      resolve_problem="module $path: $file declares no 'mod $seg;'"
+      return 1
+    fi
+    dir=${file%/*}
+    if [[ -n "$attr" ]]; then
+      child="$dir/$attr"
+    else
+      [[ -n "$is_root" || "${file##*/}" == mod.rs ]] || dir=${file%.rs}
+      child="$dir/$seg.rs"
+      [[ -f "$child" || ! -f "$dir/$seg/mod.rs" ]] || child="$dir/$seg/mod.rs"
+    fi
+    if [[ ! -f "$child" ]]; then
+      resolve_problem="module $path: $child does not exist"
+      return 1
+    fi
+    file=$child
+    is_root=""
+  done
+}
+
+# Reads the map into e2e_entries ("<glob>\t<crate>\t<binary>\t<module>"
+# lines), collecting one map_errors line per invalid entry.
+load_e2e_map() {
+  local n=0 line glob target module extra crate binary root files file hit
+  [[ -f "$e2e_map" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    n=$((n + 1))
+    glob="" target="" module="" extra=""
+    read -r glob target module extra <<<"$line"
+    [[ -n "$glob" && "$glob" != \#* ]] || continue
+    if [[ -n "$extra" || "$target" != ?*::?* || "$target" == *::*::* ]]; then
+      map_errors+="$e2e_map:$n: expected '<source glob> <crate>::<test binary> [<module path>]'"$'\n'
+      continue
+    fi
+    map_count=$((map_count + 1))
+    crate=${target%%::*}
+    binary=${target#*::}
+    files=$(git -c core.quotePath=false ls-files --cached --others --exclude-standard -- "$glob" </dev/null) ||
+      die 2 "git ls-files -- $glob failed (exit $?)"
+    hit=""
+    while IFS= read -r file; do
+      # shellcheck disable=SC2053 # the glob is a pattern on purpose
+      if [[ -n "$file" && -f "$file" && "$file" == $glob ]]; then
+        hit=1
+        break
+      fi
+    done <<<"$files"
+    [[ -n "$hit" ]] || map_errors+="$e2e_map:$n: source glob '$glob' matches no file"$'\n'
+    root="crates/$crate/tests/$binary.rs"
+    if [[ ! -f "$root" ]]; then
+      map_errors+="$e2e_map:$n: $target: $root does not exist"$'\n'
+    elif [[ -n "$module" ]] && ! resolve_module "$root" "$module"; then
+      map_errors+="$e2e_map:$n: $target $resolve_problem"$'\n'
+    elif [[ -n "$hit" ]]; then
+      e2e_entries+="$glob"$'\t'"$crate"$'\t'"$binary"$'\t'"$module"$'\n'
+    fi
+  done <"$e2e_map"
+}
+
+load_e2e_map
+[[ -z "$check_map" || -f "$e2e_map" ]] || die 2 "$e2e_map does not exist"
+if [[ -n "$map_errors" ]]; then
+  while IFS= read -r line; do
+    [[ -z "$line" ]] || echo "[$label] $line" >&2
+  done <<<"$map_errors"
+  die 2 "invalid end-to-end test map: fix or remove the entries above ($e2e_map header explains the format)"
+fi
+if [[ -n "$check_map" ]]; then
+  log "$e2e_map: $map_count entries valid"
+  exit 0
+fi
+
 merge_base=$(git merge-base HEAD "$base" 2>/dev/null) ||
   die 4 "cannot resolve BASE '$base'; run 'git fetch origin main' or set BASE=<ref>"
 
@@ -245,13 +378,44 @@ map_path() {
   esac
 }
 
+# Prints a selection record for each map entry whose glob matches path $1
+# (every entry when $1 is empty): "<crate>\tmodule\t<binary>:<module path>",
+# or "<crate>\ttest\t<binary>" for an entry naming a whole binary.
+map_e2e() {
+  local glob crate binary module
+  while IFS=$'\t' read -r glob crate binary module; do
+    [[ -n "$glob" ]] || continue
+    # shellcheck disable=SC2053 # the glob is a pattern on purpose
+    [[ -z "$1" || "$1" == $glob ]] || continue
+    if [[ -n "$module" ]]; then
+      printf '%s\tmodule\t%s:%s\n' "$crate" "$binary" "$module"
+    else
+      printf '%s\ttest\t%s\n' "$crate" "$binary"
+    fi
+  done <<<"$e2e_entries"
+}
+
 fallback=""
 mapped=""
 seen=""
+e2e_notes=""
 classify() {
-  local path=$1
+  local path=$1 e2e
   [[ -n "$path" && "$seen" != *$'\n'"$path"$'\n'* ]] || return 0
   seen+=$'\n'"$path"$'\n'
+  # Editing the map runs every module it names (a new entry is exercised by
+  # the change that adds it) instead of deferring to the full suite.
+  if [[ "$path" == "$e2e_map" ]]; then
+    e2e=$(map_e2e "")
+    mapped+="$e2e"$'\n'
+    e2e_notes+="note: $e2e_map changed; every mapped end-to-end module runs"$'\n'
+    return 0
+  fi
+  e2e=$(map_e2e "$path")
+  if [[ -n "$e2e" ]]; then
+    mapped+="$e2e"$'\n'
+    e2e_notes+="note: $path is mapped to end-to-end tests in $e2e_map"$'\n'
+  fi
   if is_fallback "$path"; then
     fallback+="$path"$'\n'
     # Under --instrumented a build-wide file inside a crate still selects
@@ -288,6 +452,10 @@ if [[ -n "$fallback" ]]; then
     exit 3
   fi
 fi
+
+while IFS= read -r note; do
+  [[ -z "$note" ]] || log "$note"
+done <<<"$e2e_notes"
 
 # The feature crates (crates/intent-svc-*) sit above intent-services and build
 # against its feature API, so an intent-services/src edit also selects every
@@ -356,6 +524,15 @@ crate_selection() {
         crate_filter+="${crate_filter:+ }--test $test"
         expr+="${expr:+|}binary_id(=$crate::$test)"
       done <<<"$tests"
+      # A binary selected whole (its root changed, or a map entry names it
+      # without a module) already runs its modules: drop them, so it is
+      # named once.
+      local kept=""
+      while IFS= read -r module; do
+        [[ -n "$module" && $'\n'"$tests"$'\n' != *$'\n'"${module%%:*}"$'\n'* ]] || continue
+        kept+="$module"$'\n'
+      done <<<"$modules"
+      modules=$kept
       if [[ -n "$modules" ]]; then
         modules=$(printf '%s' "$modules" | sort -u)
         while IFS= read -r suite; do
