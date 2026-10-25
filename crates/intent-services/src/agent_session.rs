@@ -1562,7 +1562,11 @@ pub(crate) fn agent_actor(agent_id: &AgentId) -> EventActor {
 /// The deprecated `providers.active` is deliberately NOT consulted — the
 /// boot migration ([`crate::settings::migrate_active_provider_setting`])
 /// carries a legacy value into `model.defaultProvider` once at startup.
-pub(crate) fn derived_default_provider(
+#[expect(
+    clippy::must_use_candidate,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn derived_default_provider(
     settings: &intent_core::settings_file::SettingsFile,
 ) -> Option<String> {
     settings.model.default_provider.as_deref().and_then(|id| {
@@ -1594,7 +1598,7 @@ pub(crate) fn derived_default_provider(
 /// that may not be installed. Spawn-adjacent callers surface
 /// [`no_default_provider_error`] instead; stats-attribution callers (which
 /// pass `configured_default: None`) fall to their existing `"unknown"` tail.
-pub(crate) fn resolve_provider_id(
+pub fn resolve_provider_id(
     provider: Option<&str>,
     configured_default: Option<&str>,
 ) -> Option<String> {

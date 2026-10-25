@@ -369,6 +369,39 @@ jobs:
           node-version: '24'
       - name: Check CI routing and gate failures
         run: python3 -I -B scripts/test-ci-native-routing.py
+      # The suggested-prompts cases are an exact-byte copy of the monorepo
+      # contract (docs/protocol/suggested-prompts.md); an edited copy fails here.
+      - name: Read pinned suggested-prompts case revision
+        id: suggested-prompts-cases
+        run: |
+          node --input-type=module <<'NODE'
+          import { readFileSync, appendFileSync } from 'node:fs';
+          const lock = JSON.parse(readFileSync('crates/intent-services/tests/fixtures/suggested-prompts.lock.json', 'utf8'));
+          if (lock.sourceRepository !== 'intent-hq/intent' || !/^[0-9a-f]{40}$/.test(lock.sourceCommit)) {
+            throw new Error('suggested-prompts case lock must pin a full intent-hq/intent commit');
+          }
+          appendFileSync(process.env.GITHUB_OUTPUT, `source-commit=${lock.sourceCommit}\n`);
+          NODE
+      - name: Checkout exact canonical suggested-prompts cases
+        uses: actions/checkout@v7
+        with:
+          repository: intent-hq/intent
+          ref: ${{ steps.suggested-prompts-cases.outputs.source-commit }}
+          path: .suggested-prompts-contract-source
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /scripts/suggested-prompts-contract.mjs
+            /docs/protocol/fixtures/suggested-prompts/v1/
+      - name: Verify suggested-prompts case provenance
+        env:
+          SOURCE_COMMIT: ${{ steps.suggested-prompts-cases.outputs.source-commit }}
+        run: |
+          set -euo pipefail
+          node .suggested-prompts-contract-source/scripts/suggested-prompts-contract.mjs verify \
+            --source-root "$GITHUB_WORKSPACE/.suggested-prompts-contract-source" \
+            --source-commit "$SOURCE_COMMIT" --component intentd --component-root "$GITHUB_WORKSPACE" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
       # Release PRs run this job too: a release that would split the intentd
       # version_group (intent-hq/intentd#2461) fails here before it merges.
       - name: Check release-plz version groups stay in lockstep
@@ -525,6 +558,15 @@ jobs:
       # each with a comment explaining why.
       - name: Unused dependencies (cargo-shear)
         run: cargo shear --deny-warnings
+      # intent-services' `test-hooks` feature compiles test seams and
+      # fixtures into the library for feature-crate tests. Only
+      # dev-dependencies may enable it; fail if the production feature graph
+      # of a shipped binary does. The regression test runs the check against
+      # throwaway workspaces first (path dependencies only, a few seconds).
+      - name: No test-hooks in the production feature graph
+        run: |
+          ./scripts/test-check-test-hooks-feature.sh
+          ./scripts/check-test-hooks-feature.sh
       # CI is the guard against host-dependent tests: a test that relies on
       # an installed provider CLI passes locally and fails here only while
       # runners have none. Fail loudly if a runner image starts shipping one.

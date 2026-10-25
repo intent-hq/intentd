@@ -430,6 +430,9 @@ mod tests_catalog_default_model;
 #[cfg(test)]
 mod tests_unknown_model;
 
+#[cfg(test)]
+mod tests_suggested_prompts_contract;
+
 /// Resolve the default model from settings when no explicit model is supplied
 /// at agent creation time. Precedence chain (the per-workspace override tier
 /// was removed in monorepo#1000; the background-agent tier was removed in
@@ -489,7 +492,7 @@ fn resolve_default_model_from_settings(
 /// companion to the settings default *model*, so it applies only when the
 /// model itself came from [`Settings`](DefaultModelSource::Settings).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DefaultModelSource {
+pub enum DefaultModelSource {
     /// Step 1 — a caller-supplied `model`. Never returned by the resolver
     /// (which only runs when the caller supplied none); stamped by the create
     /// seam so the effort resolution can tell a pinned model apart.
@@ -654,7 +657,11 @@ pub(crate) fn resolve_agent_default_model(
 /// [`resolve_agent_default_model`] plus the [`DefaultModelSource`] rung that
 /// produced the value, for callers that must distinguish a settings-chain
 /// default from a specialist pin (creation-time effort resolution).
-pub(crate) fn resolve_agent_default_model_with_source(
+#[expect(
+    clippy::must_use_candidate,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn resolve_agent_default_model_with_source(
     services: &Services,
     specialist: Option<&str>,
     workspace_path: Option<&Path>,
@@ -784,7 +791,11 @@ impl Services {
     /// ([`Services::ensure_provider_ref_selectable`]) and fails with
     /// `provider-profile-replacement-required` otherwise — never falling back
     /// to the bare base (PROTOCOL §5.54).
-    pub(crate) fn ensure_selectable_provider(&self, method: &str, provider_id: &str) -> Result<()> {
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub fn ensure_selectable_provider(&self, method: &str, provider_id: &str) -> Result<()> {
         if crate::provider_profiles::is_qualified_ref(provider_id) {
             return self.ensure_provider_ref_selectable(provider_id);
         }
@@ -898,7 +909,11 @@ pub(crate) fn ensure_model_offered_by_provider(
 /// passes through unvalidated, since providers own the effort vocabulary
 /// (PROTOCOL §5.5). Matching is case-insensitive; the stored value is the
 /// caller's spelling.
-pub(crate) fn ensure_effort_supported_by_model(
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn ensure_effort_supported_by_model(
     method: &str,
     cache: &crate::model_catalog::ModelCatalogReader<'_>,
     model_id: Option<&str>,
@@ -932,7 +947,7 @@ pub(crate) fn ensure_effort_supported_by_model(
 /// is dropped with a warn, never a `-32602` — only caller-supplied efforts
 /// reject. With no cached evidence the level passes through, matching
 /// [`ensure_effort_supported_by_model`].
-pub(crate) fn resolve_settings_default_reasoning_effort(
+pub fn resolve_settings_default_reasoning_effort(
     services: &Services,
     model_source: DefaultModelSource,
     resolved_model: Option<&str>,
@@ -1435,7 +1450,7 @@ fn merge_queue_metadata(existing: &mut Option<Value>, incoming: Option<Value>) {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct RecoverySource {
+pub struct RecoverySource {
     pub message_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub submission_ids: Option<Vec<String>>,
@@ -1444,7 +1459,7 @@ pub(crate) struct RecoverySource {
 }
 
 impl RecoverySource {
-    pub(crate) fn normalize(sources: impl IntoIterator<Item = Self>) -> Vec<Self> {
+    pub fn normalize(sources: impl IntoIterator<Item = Self>) -> Vec<Self> {
         let mut result: Vec<Self> = Vec::new();
         for source in sources {
             if let Some(existing) = result.iter_mut().find(|existing| {
@@ -1492,7 +1507,7 @@ impl RecoverySource {
 #[expect(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct QueuedMessage {
+pub struct QueuedMessage {
     /// An original current-runtime owner. It is never a serialized payload or
     /// restored permission; unsupported queue projections withhold this entry.
     #[serde(skip)]
@@ -1971,7 +1986,11 @@ impl QueuedMessage {
     /// The ready-to-send predicate shared by every drain path and idle gate
     /// (PROTOCOL §5.5/§6.5): not under edit, held, or awaiting a destination
     /// owner's explicit authorization for an imported human instruction.
-    pub(crate) fn ready_to_send(&self) -> bool {
+    #[expect(
+        clippy::must_use_candidate,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub fn ready_to_send(&self) -> bool {
         !self.editing
             && !self.is_held()
             && !intent_core::human_author::is_unbound_historical_human(
@@ -2051,7 +2070,7 @@ pub(crate) struct QueuedPrepend {
 /// the containing queue row retains its existing identity and permissions.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct QueuedDeliveryGroup {
+pub struct QueuedDeliveryGroup {
     /// Durable source identity, private to queue persistence and carry-over.
     /// Legacy groups have no identity; equal payloads never supply one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2176,6 +2195,127 @@ fn strip_spans(s: &str, start: &str, end: &str) -> String {
     out
 }
 
+/// Opener of a suggested-prompts block that ends `line`, mirroring the
+/// desktop's `(<|&lt;)!--[ \t]*suggested-prompts[ \t]*$`: its byte offset and
+/// whether it is the HTML-escaped spelling.
+fn prompt_opener_at(line: &str) -> Option<(usize, bool)> {
+    let line = line.trim_end_matches([' ', '\t', '\r']);
+    [("<!--", false), ("&lt;!--", true)]
+        .into_iter()
+        .find_map(|(marker, escaped)| {
+            let pos = line.rfind(marker)?;
+            let rest = line[pos + marker.len()..].trim_start_matches([' ', '\t']);
+            (rest == "suggested-prompts").then_some((pos, escaped))
+        })
+}
+
+/// A line that closes a block: the closer alone, or ending a final prompt
+/// (the desktop's fused-closer rule). A line holding a comment opener of its
+/// own (`<!-- note -->`) never closes a block, so the preview errs on hiding.
+fn is_prompt_closer(line: &str, escaped: bool) -> bool {
+    let closer = if escaped { "--&gt;" } else { "-->" };
+    let line = line.trim_end_matches([' ', '\t', '\r']);
+    if line.trim_start_matches([' ', '\t']) == closer {
+        return true;
+    }
+    line.strip_suffix(closer).is_some_and(|rest| {
+        !rest.trim().is_empty() && !rest.contains("<!--") && !rest.contains("&lt;!--")
+    })
+}
+
+/// Remove suggested-prompts markup in one pass over the original text, taking
+/// each opener of either spelling in order:
+/// - A block opener (a line ending in an opener, like the desktop's
+///   `scanSuggestedPrompts`) closes on a later closer line of the same
+///   spelling: the closer alone, or fused with the final prompt. An embedded
+///   arrow such as `A --> B` never ends it early.
+/// - A block reopened by another block opener before any closer is hidden up
+///   to that opener, which then starts its own block.
+/// - An unclosed block (still streaming, or cut off) hides the rest of the text.
+/// - Any other opener (an inline mention, or text after the opener on its
+///   line) keeps the old first-closer rule, but stops at the next block opener
+///   so it never swallows a later block or the reply after it.
+///
+/// The preview errs on hiding: no prompt line or block markup reaches it.
+/// Code fences are deliberately not tracked: persisted previews keep only a
+/// text block's tail, which can start inside a fence and invert fence state.
+/// Shared cases: monorepo `docs/protocol/suggested-prompts.md`.
+fn strip_prompt_blocks(s: &str) -> String {
+    const INLINE: [(&str, &str); 2] = [
+        ("<!-- suggested-prompts", "-->"),
+        ("&lt;!-- suggested-prompts", "--&gt;"),
+    ];
+    if !s.contains("suggested-prompts") {
+        return s.to_owned();
+    }
+    let mut lines = Vec::new();
+    let mut offset = 0;
+    for line in s.split('\n') {
+        lines.push((offset, line));
+        offset += line.len() + 1;
+    }
+    // Block openers in text order: (byte offset, line index, escaped).
+    let blocks: Vec<(usize, usize, bool)> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &(start, line))| {
+            prompt_opener_at(line).map(|(pos, escaped)| (start + pos, i, escaped))
+        })
+        .collect();
+    let mut out = String::with_capacity(s.len());
+    // Every search moves forward only, so the scan stays linear in the text
+    // however many blocks or markers it holds (it reruns on each streamed
+    // preview frame): `bi` is the first block opener at or after `at`, and
+    // `marks` caches each spelling's next marker (`None` once none is left).
+    let mut at = 0;
+    let mut bi = 0;
+    let mut marks = INLINE.map(|(marker, _)| s.find(marker));
+    while at < s.len() {
+        while blocks.get(bi).is_some_and(|b| b.0 < at) {
+            bi += 1;
+        }
+        for (mark, (marker, _)) in marks.iter_mut().zip(INLINE) {
+            if mark.is_some_and(|m| m < at) {
+                *mark = s[at..].find(marker).map(|i| at + i);
+            }
+        }
+        let inline = marks
+            .iter()
+            .zip(INLINE)
+            .filter_map(|(mark, (marker, closer))| mark.map(|m| (m, marker, closer)))
+            .min_by_key(|m| m.0);
+        let block = blocks.get(bi).copied();
+        match (block, inline) {
+            (Some((pos, line, escaped)), inline) if inline.is_none_or(|m| pos <= m.0) => {
+                out.push_str(&s[at..pos]);
+                let next = blocks.get(bi + 1);
+                let limit = next.map_or(lines.len(), |next| next.1);
+                let close = (line + 1..limit).find(|&j| is_prompt_closer(lines[j].1, escaped));
+                at = match (close, next) {
+                    (Some(j), _) => lines[j].0 + lines[j].1.len(),
+                    (None, Some(next)) => next.0,
+                    (None, None) => s.len(),
+                };
+            }
+            (next, Some((pos, marker, closer))) => {
+                // Here any next block opener lies after `pos`; the span ends
+                // at the first closer before it, else at it (or the end).
+                out.push_str(&s[at..pos]);
+                let from = pos + marker.len();
+                let limit = next.map_or(s.len(), |b| b.0).max(from);
+                at = s[from..limit]
+                    .find(closer)
+                    .map_or(limit, |j| from + j + closer.len());
+            }
+            (_, None) => {
+                out.push_str(&s[at..]);
+                at = s.len();
+            }
+        }
+    }
+    out
+}
+
 /// Drop `<group:…>` / `</group…>` tags (the streamed response group markers).
 fn strip_group_tags(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -2199,13 +2339,14 @@ fn strip_group_tags(s: &str) -> String {
 
 /// Clean an assistant text block of digest/suggested-prompts/group markers,
 /// mirroring the TS `agent.list` cleaning before the last-line extraction.
+/// Both prompts spellings ([`strip_prompt_blocks`]): the HTML-escaped one is
+/// what a model can copy from an XML-escaped history replay (see
+/// `history_xml::REPLAY_ESCAPING_NOTE`).
 fn clean_response_text(text: &str) -> String {
     let mut cleaned = strip_spans(text, "<agent_digest>", "</agent_digest>");
-    cleaned = strip_spans(&cleaned, "<!-- suggested-prompts", "-->");
-    // The HTML-escaped spelling a model can copy from an XML-escaped history
-    // replay (see `history_xml::REPLAY_ESCAPING_NOTE`).
-    cleaned = strip_spans(&cleaned, "&lt;!-- suggested-prompts", "--&gt;");
+    // Group tags go first so one on an opener or closer line cannot break it.
     cleaned = strip_group_tags(&cleaned);
+    cleaned = strip_prompt_blocks(&cleaned);
     cleaned.trim().to_string()
 }
 
@@ -3365,7 +3506,11 @@ pub(crate) fn is_qualified_monitor_message(message: &AgentMessage) -> bool {
     is_qualified_monitor_envelope(&message.content, message.metadata.as_ref())
 }
 
-pub(crate) fn is_qualified_monitor_envelope(content: &Value, metadata: Option<&Value>) -> bool {
+#[expect(
+    clippy::must_use_candidate,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn is_qualified_monitor_envelope(content: &Value, metadata: Option<&Value>) -> bool {
     is_qualified_monitor_metadata(metadata)
         || content.as_array().is_some_and(|blocks| {
             blocks
@@ -6509,7 +6654,11 @@ impl Services {
     /// the FE-side agent-backend-handler retirement (C1d/C1e) so a `loadAgent`
     /// caller can rehydrate the full session shape from the daemon. Emits no
     /// events (a pure read). `NotFound` when the session is unknown.
-    pub(crate) async fn agent_get_session_op(&self, agent_id: AgentId) -> Result<AgentSession> {
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub async fn agent_get_session_op(&self, agent_id: AgentId) -> Result<AgentSession> {
         let mut session = self.store.get_agent_session(&agent_id).await?;
         // monorepo#940: derived on emit (never persisted); see
         // `project_lite_with_flags`.
@@ -7818,7 +7967,12 @@ impl Services {
 
     /// The live entry `message_id` of `agent_id`, cloned, or `None` when it
     /// is not in the live queue (absent, or provisionally popped for drain).
-    pub(crate) fn find_queued_message(
+    #[expect(
+        clippy::missing_panics_doc,
+        clippy::must_use_candidate,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub fn find_queued_message(
         &self,
         agent_id: &AgentId,
         message_id: &str,
@@ -16624,7 +16778,12 @@ impl Services {
     /// unexpired debounce hold — are skipped (left in place) so the agent stays
     /// idle only when *every* remaining entry is under edit or held
     /// (PROTOCOL §5.5/§6.5 invariant).
-    pub(crate) fn dequeue_message(&self, agent_id: &AgentId) -> Option<QueuedMessage> {
+    #[expect(
+        clippy::missing_panics_doc,
+        clippy::must_use_candidate,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub fn dequeue_message(&self, agent_id: &AgentId) -> Option<QueuedMessage> {
         let mut guard = self
             .agent_queues
             .lock()

@@ -1,14 +1,21 @@
 //! Unit-test scratch and local CLI apparatus.
+//!
+//! Compiled for this crate's tests and, under the `test-hooks` feature, for
+//! the tests of feature crates. The parts that need dev-only dependencies
+//! (provider CLI stubs, fixture timeouts) stay `cfg(test)`.
 
+pub mod fixtures;
+#[cfg(test)]
 pub(crate) mod provider_installed;
 mod scratch;
-pub(crate) mod submodule_fixture;
-pub(crate) use scratch::{test_tempdir, test_tempdir_in};
+pub mod submodule_fixture;
+pub use scratch::{test_tempdir, test_tempdir_in};
 
 /// Supply the canonical installed CLI required even by a mock ACP adapter:
 /// [`intent_providers::test_support::current_cli_script`], so the launch
 /// never selects a bundled copy. Keep the guard alive with the fixture; it
 /// restores PATH under the test env lock.
+#[cfg(test)]
 #[cfg(unix)]
 pub(crate) fn installed_cli_env(
     dir: &std::path::Path,
@@ -33,6 +40,7 @@ pub(crate) fn installed_cli_env(
 }
 
 /// Mock ACP adapter for quick-action effort tests, with an exact request log.
+#[cfg(test)]
 #[cfg(unix)]
 pub(crate) fn quick_action_effort_adapter(
     behavior: &serde_json::Value,
@@ -61,6 +69,7 @@ pub(crate) fn quick_action_effort_adapter(
 
 /// Bound fixture I/O without shortening normal runs under coverage settings
 /// (delegates to [`intentd_test_support::test_timeout`]).
+#[cfg(test)]
 pub(crate) fn fixture_timeout(base: std::time::Duration) -> std::time::Duration {
     intentd_test_support::test_timeout(base)
 }

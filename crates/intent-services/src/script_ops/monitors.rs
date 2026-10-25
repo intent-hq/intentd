@@ -127,6 +127,7 @@ impl ScriptManager {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) async fn monitor(
         &self,
         ws: &WorkspaceId,
@@ -134,27 +135,49 @@ impl ScriptManager {
         id: &str,
         options: Value,
     ) -> Result<Value> {
+        self.monitor_replacing(ws, agent, id, options, None).await
+    }
+
+    /// `ws.script.monitor` registration. When the script's active monitor is
+    /// `replaceable` (the one `ws.script.start` armed by default) and `agent`
+    /// owns it, the request replaces it with a monitor carrying its own
+    /// options, under the same locks: every check runs first, then the old
+    /// monitor is silently retired and the new one inserted (one row per
+    /// script). A rejected request keeps the old monitor, and a failed insert
+    /// reinstates it.
+    pub(crate) async fn monitor_replacing(
+        &self,
+        ws: &WorkspaceId,
+        agent: &AgentId,
+        id: &str,
+        options: Value,
+        replaceable: Option<&str>,
+    ) -> Result<Value> {
         let options = Options::parse(&options)?;
         let definition = self.locks.definition_lock(id);
         let _definition = definition.lock().await;
         let _lane = self.locks.monitor_lane.lock().await;
         self.eligible_monitor_owner(ws, agent).await?;
         let rows = self.store.script_monitors(ws, None).await?;
+        let mut replacing = None;
         if let Some(row) = rows
             .iter()
             .find(|m| m.script_id == id && m.state == "active")
         {
-            if row.agent_id != *agent {
+            if row.agent_id == *agent && replaceable == Some(row.monitor_id.as_str()) {
+                replacing = Some(row.clone());
+            } else if row.agent_id != *agent {
                 let mut response = json!({"ok":false,"refused":true,"reason":"already-monitored","ownerAgentId":row.agent_id,"monitorId":row.monitor_id,"workspaceId":ws,"scriptId":id,"runId":row.run_id,"instruction":"Ask the owner to relay results or stop monitoring before registering."});
                 if let Ok(owner) = self.store.get_agent_session_summary(&row.agent_id).await {
                     response["ownerAgentName"] = json!(owner.name);
                 }
                 return Ok(response);
+            } else {
+                if options.run.as_ref().is_some_and(|run| run != &row.run_id) {
+                    return Err(invalid("runId differs from the active monitor"));
+                }
+                return Ok(json!({"ok":true,"monitor":row}));
             }
-            if options.run.as_ref().is_some_and(|run| run != &row.run_id) {
-                return Err(invalid("runId differs from the active monitor"));
-            }
-            return Ok(json!({"ok":true,"monitor":row}));
         }
         let latest = self.store.latest_script_run(ws, id).await?;
         let (run, result) = latest.ok_or_else(|| invalid("script has no accepted run"))?;
@@ -180,6 +203,11 @@ impl ScriptManager {
         if rows
             .iter()
             .filter(|m| m.agent_id == *agent && m.state == "active")
+            .filter(|m| {
+                replacing
+                    .as_ref()
+                    .is_none_or(|r| r.monitor_id != m.monitor_id)
+            })
             .count()
             >= 5
         {
@@ -224,7 +252,20 @@ impl ScriptManager {
         } else {
             (0, LineDecoder::new(true))
         };
-        self.store.insert_script_monitor(&row).await?;
+        // One monitor row per script: the replaced default must leave before
+        // the replacement is inserted. Every check above has already passed,
+        // and a failed insert reinstates the default, so the run is never left
+        // without a wake.
+        let replaced = match replacing {
+            Some(old) => self.retire_replaced_monitor(old).await?,
+            None => None,
+        };
+        if let Err(error) = self.store.insert_script_monitor(&row).await {
+            if let Some(old) = replaced {
+                self.reinstate_replaced_monitor(old, attempt).await;
+            }
+            return Err(error);
+        }
         self.locks.monitor_windows.lock().unwrap().insert(
             row.monitor_id.clone(),
             Window {
@@ -245,6 +286,70 @@ impl ScriptManager {
         }
 
         Ok(json!({"ok":true,"monitor":row}))
+    }
+
+    /// Silently retire a replaced default monitor (the `ws.script.unmonitor`
+    /// transition) under the monitor lane, returning the row as it was so a
+    /// failed replacement can reinstate it. `None` when reconciliation found
+    /// the run already finished and settled the default with its normal wake.
+    /// A failed retirement keeps the default active and fails the request.
+    async fn retire_replaced_monitor(
+        &self,
+        mut old: ScriptMonitor,
+    ) -> Result<Option<ScriptMonitor>> {
+        let original = old.clone();
+        if self.reconcile_locked(&mut old).await? {
+            return Ok(None);
+        }
+        old.state = "cancelled".into();
+        old.reason = Some("unmonitored".into());
+        old.settled_at = Some(now_iso());
+        if let Err(error) = self.commit_monitor(&old).await {
+            // Do not let maintenance later commit the cancellation: the
+            // request failed, so the default must keep watching the run.
+            if let Some(window) = self
+                .locks
+                .monitor_windows
+                .lock()
+                .unwrap()
+                .get_mut(&old.monitor_id)
+            {
+                window.pending_terminal = None;
+            }
+            return Err(error);
+        }
+        Ok(Some(original))
+    }
+
+    /// Best-effort undo of [`Self::retire_replaced_monitor`] when the
+    /// replacement could not be stored.
+    async fn reinstate_replaced_monitor(&self, old: ScriptMonitor, attempt: Option<PtyId>) {
+        if let Err(error) = self.store.insert_script_monitor(&old).await {
+            tracing::warn!(%error, monitor = %old.monitor_id, "replaced script monitor could not be reinstated");
+            return;
+        }
+        let (cursor, decoder) = attempt
+            .and_then(|pty| self.pty.observation_cursor(pty).ok())
+            .unwrap_or((0, LineDecoder::new(true)));
+        let pattern = old
+            .output_pattern
+            .as_deref()
+            .and_then(|p| regex::Regex::new(p).ok());
+        self.locks.monitor_windows.lock().unwrap().insert(
+            old.monitor_id.clone(),
+            Window {
+                row: old.clone(),
+                pattern,
+                decoder,
+                attempt,
+                cursor,
+                count: 0,
+                cancelled: false,
+                closed: false,
+                pending_terminal: None,
+            },
+        );
+        self.emit_monitor(&old, "registered").await;
     }
 
     async fn emit_monitor(&self, row: &ScriptMonitor, kind: &str) {
@@ -416,7 +521,12 @@ impl ScriptManager {
         Ok(owners)
     }
 
-    pub(crate) async fn recover_monitors(&self) -> Result<()> {
+    #[expect(
+        clippy::missing_errors_doc,
+        clippy::missing_panics_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub async fn recover_monitors(&self) -> Result<()> {
         let _lane = self.locks.monitor_lane.lock().await;
         let pending_runs = self.store.pending_script_runs().await?;
         for (mut row, cancel_intent) in self.store.pending_script_monitors().await? {
