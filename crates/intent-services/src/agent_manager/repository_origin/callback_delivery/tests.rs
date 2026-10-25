@@ -416,11 +416,7 @@ if (capability === "missing-receipt") delete response._meta?.intentCallbackRegis
 
     async fn call(&self, method: &str, params: Value) -> Value {
         self.connection
-            .request_timeout(
-                method,
-                params,
-                crate::test_support::fixture_timeout(fixture_wait()),
-            )
+            .request_timeout(method, params, fixture_wait())
             .await
             .unwrap_or_else(|error| {
                 panic!("{method}: {error}: {:?}", self.connection.recent_stderr())
@@ -8465,13 +8461,9 @@ if(frame.method==='session/prompt' && promptErrors.length) {
         }
         async fn rpc(&self, method: &str, params: Value) -> Value {
             let c = self.connection();
-            c.request_timeout(
-                method,
-                params,
-                crate::test_support::fixture_timeout(fixture_wait()),
-            )
-            .await
-            .unwrap_or_else(|e| panic!("{method}: {e}; {:?}", c.recent_stderr()))
+            c.request_timeout(method, params, fixture_wait())
+                .await
+                .unwrap_or_else(|e| panic!("{method}: {e}; {:?}", c.recent_stderr()))
         }
         async fn confirmed(&self, query: usize) -> String {
             let names = self.rpc("fixture/names", json!({"query":query})).await;
