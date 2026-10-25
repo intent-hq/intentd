@@ -165,7 +165,11 @@ impl Harness {
             .await
             .unwrap();
         drop(store);
-        std::fs::write(dir.path().join("config.toml"),"[providers]\nenabled = {}\n[mcp]\nenableUserServers = false\n[agents]\nresumeInterruptedOnStart = \"off\"\n").unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[providers]\nenabled = {}\n[mcp]\nenableUserServers = false\n",
+        )
+        .unwrap();
         common::enable_ws_api(dir.path());
         let bins = dir.path().join("bin");
         std::fs::create_dir(&bins).unwrap();

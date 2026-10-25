@@ -1,6 +1,6 @@
 //! Real bridge/queue/TCP tests with injected neutral policy, not native proof.
 use super::*;
-use crate::mcp_server::private_results::tests::{call, refused, server, Api, Policy, SECRET, WAIT};
+use crate::mcp_server::private_results::tests::{call, refused, server, wait, Api, Policy, SECRET};
 use crate::mcp_server::private_results::{DeliveryOutcome, McpPrivateBoundaryKind};
 use std::sync::atomic::Ordering;
 use tokio::io::AsyncBufReadExt;
@@ -47,7 +47,7 @@ async fn retired_bridge_refusal(optional: bool) {
     gate.reached().await;
     policy.retire();
     drop(bridge);
-    tokio::time::timeout(WAIT, async {
+    tokio::time::timeout(wait(), async {
         while !accept_loop.is_finished() {
             tokio::task::yield_now().await;
         }
@@ -55,7 +55,7 @@ async fn retired_bridge_refusal(optional: bool) {
     .await
     .unwrap();
     gate.release.add_permits(1);
-    let line = tokio::time::timeout(WAIT, lines.next_line())
+    let line = tokio::time::timeout(wait(), lines.next_line())
         .await
         .unwrap()
         .unwrap()
@@ -74,7 +74,7 @@ async fn retired_bridge_refusal(optional: bool) {
         .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":38,\"method\":\"ping\"}\n")
         .await
         .unwrap();
-    let line = tokio::time::timeout(WAIT, lines.next_line())
+    let line = tokio::time::timeout(wait(), lines.next_line())
         .await
         .unwrap()
         .unwrap()
@@ -104,7 +104,7 @@ async fn tcp_final_admission_retirement_orders_and_completed_effects() {
         gate.reached().await;
         policy.retire();
         gate.release.add_permits(1);
-        let line = tokio::time::timeout(WAIT, lines.next_line())
+        let line = tokio::time::timeout(wait(), lines.next_line())
             .await
             .unwrap()
             .unwrap()
@@ -149,7 +149,7 @@ async fn full_original_response_queue_refuses_using_its_one_unused_permit() {
         .unwrap()
         .into_line(&lifetime.token())
         .contains("ordinary"));
-    tokio::time::timeout(WAIT, task).await.unwrap().unwrap();
+    tokio::time::timeout(wait(), task).await.unwrap().unwrap();
     let line = receiver.recv().await.unwrap().into_line(&lifetime.token());
     refused(&serde_json::from_str(&line).unwrap());
     assert!(receiver.recv().await.is_none());

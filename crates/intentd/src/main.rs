@@ -10,6 +10,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
+use intent_app::StartupExt as _;
 #[cfg(test)]
 use intent_core::config::DEFAULT_STREAM_RETENTION_HOURS;
 use intent_core::{AgentId, Config, ServerControl, WorkspaceApi};
@@ -1820,6 +1821,11 @@ async fn cmd_serve_owned(
         intent_services::SettingsRegistry::load(&config.config_path)
             .map_err(|e| anyhow::anyhow!(e.to_string()))?,
     );
+    // Validate the test-only resume seam before any startup work: a typo must
+    // fail loudly, not fall back to the display-dependent `auto` default.
+    let resume_test_default = parse_resume_test_default(std::env::var_os(
+        intent_core::settings_file::RESUME_ON_START_TEST_DEFAULT_ENV,
+    ))?;
     // Startup flag/env pins (§9.8 precedence: defaults < config.toml < pins):
     // pinned keys take the flag value, report origin `flag` on the wire,
     // reject `settings.update`, and ignore the file value on live-reload. An
@@ -2140,7 +2146,8 @@ async fn cmd_serve_owned(
             )))
         });
 
-    let services = Services::new(store)
+    // Composition root: register the feature crates on the core services.
+    let services = intent_app::compose(Services::new(store))
         .with_assets_root(assets_root)
         // Persist the per-provider models.list cache in the data dir (§5.30).
         .with_models_cache_dir(&config.data_dir.clone())
@@ -2371,7 +2378,10 @@ async fn cmd_serve_owned(
     // bounded candidate read gates startup; per-agent service work runs below
     // in an owned background sweep. Reservations prevent a manual-dialog flash.
     // --resume-all and update-triggered restarts still override the setting.
-    let resume_setting = boot_settings.effective.agents.resume_interrupted_on_start;
+    let (resume_setting, test_default_applied) = resolve_resume_setting(
+        boot_settings.effective.agents.resume_interrupted_on_start,
+        resume_test_default,
+    );
     let has_display = detect_has_display();
     // Captured in `main()` before the env var was scrubbed from the
     // environment (so it never leaks into daemon-spawned subprocesses).
@@ -2382,6 +2392,7 @@ async fn cmd_serve_owned(
         resume_all,
         update_restart,
         setting = resume_setting.as_str(),
+        test_default_applied,
         has_display,
         resume = resume_on_start,
         "startup interrupted-agent resume decision"
@@ -2538,6 +2549,11 @@ async fn cmd_serve_owned(
     // `Linked-Note-Id:` trailers via `git_agent_commit`. No-op-safe without an
     // event bus. Aborted on clean shutdown.
     let auto_commit_loop = startup_work.spawn(|| services.spawn_auto_commit_loop());
+    // Idle PR refresh worker: on `agent:idle`, check that workspace's branch
+    // PR, git roots, and stale PR monitors once, through the same automatic
+    // admission, rate-limit pause, and budgets as the 60 s sweep. No-op-safe
+    // without an event bus. Aborted on clean shutdown.
+    let idle_pr_refresh_loop = startup_work.spawn(|| services.spawn_idle_pr_refresh_loop());
     // Agent-locks recompute worker (§5.19/§6.5): watch agent lifecycle, task
     // status, auto-commit policy, and tracked-change events and publish the
     // per-workspace `changes:agent-locks` snapshot when it changes. No-op-safe
@@ -3229,6 +3245,8 @@ async fn cmd_serve_owned(
     let _ = completion_delivery.await;
     auto_commit_loop.abort();
     let _ = auto_commit_loop.await;
+    idle_pr_refresh_loop.abort();
+    let _ = idle_pr_refresh_loop.await;
     agent_locks_loop.abort();
     let _ = agent_locks_loop.await;
     tracked_changes_sweep.abort();
@@ -7759,6 +7777,44 @@ async fn report_context_engine() {
     }
 }
 
+/// Parse [`intent_core::settings_file::RESUME_ON_START_TEST_DEFAULT_ENV`]
+/// (test-only; production never sets it). Unset → `None`. A value that is
+/// not exactly `auto` / `on` / `off` (or is not UTF-8) is a startup error:
+/// silently ignoring it would fall back to `auto`, which resumes only on
+/// display-less hosts — the CI-only flake the seam exists to prevent.
+fn parse_resume_test_default(
+    raw: Option<std::ffi::OsString>,
+) -> anyhow::Result<Option<intent_core::settings_file::ResumeInterruptedOnStart>> {
+    use intent_core::settings_file::{ResumeInterruptedOnStart, RESUME_ON_START_TEST_DEFAULT_ENV};
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    raw.to_str()
+        .and_then(ResumeInterruptedOnStart::from_wire)
+        .map(Some)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{RESUME_ON_START_TEST_DEFAULT_ENV}={} is invalid; expected auto, on, or off",
+                raw.display()
+            )
+        })
+}
+
+/// Effective resume-on-start setting plus whether the test default was
+/// applied. `test_default` replaces only `auto` — the schema default, which a
+/// fresh data dir's generated `config.toml` template also writes out
+/// explicitly — so an explicit `on` / `off` always wins.
+fn resolve_resume_setting(
+    setting: intent_core::settings_file::ResumeInterruptedOnStart,
+    test_default: Option<intent_core::settings_file::ResumeInterruptedOnStart>,
+) -> (intent_core::settings_file::ResumeInterruptedOnStart, bool) {
+    use intent_core::settings_file::ResumeInterruptedOnStart as R;
+    match (setting, test_default) {
+        (R::Auto, Some(value)) => (value, true),
+        _ => (setting, false),
+    }
+}
+
 /// Whether the startup interrupted-agent resume sweep should run. The
 /// `--resume-all` flag forces the sweep, as does `update_restart` (the
 /// sitter set `INTENTD_UPDATE_RESTART=1` because this start is an
@@ -10478,6 +10534,78 @@ for line in sys.stdin:
         for has_display in [true, false] {
             assert!(should_resume_on_start(false, false, R::On, has_display));
             assert!(!should_resume_on_start(false, false, R::Off, has_display));
+        }
+    }
+
+    #[test]
+    fn resume_setting_test_default_replaces_only_auto() {
+        use intent_core::settings_file::ResumeInterruptedOnStart as R;
+        for value in [R::Off, R::On, R::Auto] {
+            assert_eq!(resolve_resume_setting(R::Auto, Some(value)), (value, true));
+            for explicit in [R::On, R::Off] {
+                assert_eq!(
+                    resolve_resume_setting(explicit, Some(value)),
+                    (explicit, false),
+                    "explicit {explicit:?} must beat test default {value:?}"
+                );
+            }
+        }
+        for setting in [R::Auto, R::On, R::Off] {
+            assert_eq!(resolve_resume_setting(setting, None), (setting, false));
+        }
+    }
+
+    /// A fresh data dir has no `config.toml`, so the daemon writes the default
+    /// template, which spells out `resumeInterruptedOnStart = "auto"`. The
+    /// test default must still apply there (an origin-based "unset key only"
+    /// rule would miss it and leave UDS-only fixtures resuming on CI).
+    #[test]
+    fn resume_test_default_applies_to_the_generated_config_template() {
+        use intent_core::settings_file::ResumeInterruptedOnStart as R;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let registry = intent_services::SettingsRegistry::load(path.clone()).unwrap();
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("resumeInterruptedOnStart = \"auto\""),
+            "the generated template writes the key explicitly"
+        );
+        let setting = registry
+            .snapshot()
+            .effective
+            .agents
+            .resume_interrupted_on_start;
+        assert_eq!(setting, R::Auto);
+        assert_eq!(
+            resolve_resume_setting(setting, Some(R::Off)),
+            (R::Off, true)
+        );
+    }
+
+    #[test]
+    fn resume_test_default_parse_rejects_anything_but_exact_values() {
+        use intent_core::settings_file::ResumeInterruptedOnStart as R;
+        assert_eq!(parse_resume_test_default(None).unwrap(), None);
+        for (raw, expected) in [("off", R::Off), ("on", R::On), ("auto", R::Auto)] {
+            assert_eq!(
+                parse_resume_test_default(Some(raw.into())).unwrap(),
+                Some(expected)
+            );
+        }
+        for raw in ["", "OFF", " off", "false", "0", "maybe"] {
+            let err = parse_resume_test_default(Some(raw.into())).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains(intent_core::settings_file::RESUME_ON_START_TEST_DEFAULT_ENV),
+                "{err}"
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::ffi::OsString;
+            use std::os::unix::ffi::OsStringExt;
+            assert!(parse_resume_test_default(Some(OsString::from_vec(vec![0x6f, 0xff]))).is_err());
         }
     }
 

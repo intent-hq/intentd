@@ -184,6 +184,7 @@ async fn connect_ws(port: u16, cfg: Arc<ClientConfig>) -> TlsWs {
 
 /// Whole-test wall-clock budget (monorepo#1562): every wait below is clamped
 /// so a stall panics naming its own step before nextest's 180s kill.
+// fixed-deadline: allow — stays under nextest's unscaled 180 s slow-timeout kill (.config/nextest.toml) so a stall panics naming its step
 const TEST_BUDGET: Duration = Duration::from_secs(150);
 
 #[derive(Clone, Copy)]

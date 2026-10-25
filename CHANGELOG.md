@@ -2,6 +2,35 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.44] - 2026-10-25
+
+### 🚀 Features
+
+- Refresh PR state when agents go idle ([#2665](https://github.com/intent-hq/intentd/pull/2665))
+- *(agents)* Include nameExplicitlySet in agent:renamed events ([#2668](https://github.com/intent-hq/intentd/pull/2668))
+- *(agents)* Report persisted nameExplicitlySet on name-bearing agent:updated ([#2677](https://github.com/intent-hq/intentd/pull/2677))
+
+### 🔧 Refactor
+
+- *(services)* Move workspace transfer into intent-svc-transfer ([#2660](https://github.com/intent-hq/intentd/pull/2660))
+- *(notes)* Require the note write lock to save note content ([#2673](https://github.com/intent-hq/intentd/pull/2673))
+- *(services)* Add the intent-app composition root ([#2675](https://github.com/intent-hq/intentd/pull/2675))
+
+### 🧪 Testing
+
+- *(events)* Make the live watch wait the default and lint the settle-only one ([#2671](https://github.com/intent-hq/intentd/pull/2671))
+- Stop sitter fake daemons leaking past their tests ([#2667](https://github.com/intent-hq/intentd/pull/2667))
+- Catch fixed test waits held in consts and lets ([#2663](https://github.com/intent-hq/intentd/pull/2663))
+- Pin hermetic test daemons to resume-on-start off ([#2672](https://github.com/intent-hq/intentd/pull/2672))
+
+
+## [0.11.43] - 2026-10-25
+
+### 🐛 Bug Fixes
+
+- *(store)* Retry write-pool acquire timeouts in delete sweeps ([#2658](https://github.com/intent-hq/intentd/pull/2658))
+
+
 ## [0.11.42] - 2026-10-25
 
 ### 🚀 Features

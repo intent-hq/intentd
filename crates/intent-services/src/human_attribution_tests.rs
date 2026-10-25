@@ -1,8 +1,6 @@
 use intent_core::{with_caller, Caller, HostRole, PrincipalIdentity, WorkspaceApi};
 use serde_json::json;
 
-pub(crate) use crate::test_support::fixtures::legacy_metadata_values;
-
 async fn queued_fixture(
     svc: &crate::Services,
     ws: &intent_core::WorkspaceId,

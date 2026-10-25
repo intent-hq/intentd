@@ -432,7 +432,7 @@ async fn mixed_names_and_raw_dispatch_have_one_sixty_four_record_acquisition_bud
             }}
             return 'bounded success';"
         );
-        let reply = run_quota(&endpoint, &code, &control).await;
+        let reply = run_quota(endpoint, &code, &control).await;
         if count == 63 {
             assert!(reply.to_string().contains("bounded success"), "{reply}");
             let records = control.records.lock().unwrap();

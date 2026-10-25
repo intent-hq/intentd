@@ -12,8 +12,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use intent_core::{
-    now_iso, NoteAddInput, NoteCreate, NoteEditInput, NoteEditLinesInput, NoteId, TaskStatus,
-    Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
+    now_iso, NoteAddInput, NoteCreate, NoteEditInput, NoteEditLinesInput, NoteId, NoteUpdateInput,
+    TaskStatus, Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceId,
+    WorkspaceStatus,
 };
 use intent_services::{EventBus, Services};
 use intent_store::Store;
@@ -621,4 +622,115 @@ async fn concurrent_linked_task_status_updates_all_materialize() {
             task.text
         );
     }
+}
+
+/// The note's stored content must be the content of its newest version
+/// snapshot: every text write commits its row and snapshot together.
+async fn assert_content_matches_latest_version(services: &Services, ws: &WorkspaceId, id: &NoteId) {
+    let note = services
+        .get_note(ws.clone(), id.clone())
+        .await
+        .expect("get note");
+    let latest = services
+        .list_note_versions(ws.clone(), id.clone())
+        .await
+        .expect("list versions")
+        .last()
+        .expect("at least one version")
+        .v;
+    let version = services
+        .get_note_version(ws.clone(), id.clone(), latest)
+        .await
+        .expect("get version");
+    assert_eq!(note.content, version.content);
+}
+
+/// Whole-note editor saves (`note.update` with `content`) racing parallel
+/// `note.add` writers on one note: the saves take the note's write lane like
+/// every other text writer, so no add exhausts its bounded `Conflict` retry
+/// against an unlaned save landing inside its read→persist window.
+#[intent_test_macros::daemon_test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_editor_saves_and_adds_all_apply() {
+    let (services, ws, _tmp) = setup().await;
+    let note_id = create_note_with(&services, &ws, "# Log".to_string()).await;
+
+    let results = run_together(WRITERS, |i| {
+        let (services, ws, note_id) = (Arc::clone(&services), ws.clone(), note_id.clone());
+        async move {
+            if i % 2 == 0 {
+                services
+                    .update_note(
+                        ws,
+                        note_id,
+                        NoteUpdateInput {
+                            content: Some(format!("# Log\nsaved by editor {i}")),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .map(|_| ())
+            } else {
+                services
+                    .add_to_note(
+                        ws,
+                        note_id,
+                        NoteAddInput {
+                            content: format!("entry {i} from writer"),
+                            heading: None,
+                            position: Some("end".to_string()),
+                        },
+                        None,
+                    )
+                    .await
+                    .map(|_| ())
+            }
+        }
+    })
+    .await;
+    assert_eq!(failures(&results), Vec::<String>::new());
+    assert_content_matches_latest_version(&services, &ws, &note_id).await;
+}
+
+/// `note.restoreVersion` calls racing parallel `note.add` writers on one
+/// note: restores take the note's write lane, so every writer lands.
+#[intent_test_macros::daemon_test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_restores_and_adds_all_apply() {
+    let (services, ws, _tmp) = setup().await;
+    let note_id = create_note_with(&services, &ws, "# Log".to_string()).await;
+    let first = services
+        .list_note_versions(ws.clone(), note_id.clone())
+        .await
+        .expect("list versions")
+        .first()
+        .expect("initial version")
+        .v;
+
+    let results = run_together(WRITERS, |i| {
+        let (services, ws, note_id) = (Arc::clone(&services), ws.clone(), note_id.clone());
+        async move {
+            if i % 2 == 0 {
+                services
+                    .restore_note_version(ws, note_id, first, None)
+                    .await
+                    .map(|_| ())
+            } else {
+                services
+                    .add_to_note(
+                        ws,
+                        note_id,
+                        NoteAddInput {
+                            content: format!("entry {i} from writer"),
+                            heading: None,
+                            position: Some("end".to_string()),
+                        },
+                        None,
+                    )
+                    .await
+                    .map(|_| ())
+            }
+        }
+    })
+    .await;
+    assert_eq!(failures(&results), Vec::<String>::new());
+    assert_content_matches_latest_version(&services, &ws, &note_id).await;
 }

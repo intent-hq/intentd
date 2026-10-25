@@ -132,6 +132,66 @@ impl Store {
         Ok(clocks)
     }
 
+    /// Requested workspaces whose known PRs are all finished: at least one PR
+    /// snapshot exists on the workspace or its git roots, and every one of
+    /// them (link status, active PR, discovered pools) is `Merged` or
+    /// `Closed`. A link without a status or a malformed snapshot counts as
+    /// unknown, so the workspace is not settled. Read in bounded batches.
+    ///
+    /// # Errors
+    /// Returns an internal error if the metadata query fails.
+    pub async fn workspaces_with_settled_pull_requests(
+        &self,
+        workspace_ids: &[WorkspaceId],
+    ) -> Result<HashSet<WorkspaceId>> {
+        const SQL: &str = "WITH ids(id) AS (SELECT DISTINCT value FROM json_each(?1)), \
+             pools(workspace_id, pool) AS ( \
+               SELECT w.id, w.pull_requests FROM workspace w JOIN ids ON ids.id = w.id \
+                 WHERE w.pull_requests IS NOT NULL \
+               UNION ALL \
+               SELECT r.workspace_id, r.pull_requests FROM workspace_git_root r \
+                 JOIN ids ON ids.id = r.workspace_id WHERE r.pull_requests IS NOT NULL), \
+             statuses(workspace_id, status) AS ( \
+               SELECT w.id, w.pr_status FROM workspace w JOIN ids ON ids.id = w.id \
+                 WHERE w.pr_status IS NOT NULL OR w.pr_url IS NOT NULL \
+               UNION ALL \
+               SELECT r.workspace_id, r.pr_status FROM workspace_git_root r \
+                 JOIN ids ON ids.id = r.workspace_id \
+                 WHERE r.pr_status IS NOT NULL OR r.pr_url IS NOT NULL \
+               UNION ALL \
+               SELECT w.id, CASE WHEN json_valid(w.active_pull_request) \
+                 THEN json_extract(w.active_pull_request, '$.status') END \
+                 FROM workspace w JOIN ids ON ids.id = w.id \
+                 WHERE w.active_pull_request IS NOT NULL \
+               UNION ALL \
+               SELECT p.workspace_id, CASE WHEN j.type = 'object' \
+                 THEN json_extract(j.value, '$.status') END \
+                 FROM pools p, json_each(CASE WHEN json_valid(p.pool) \
+                   AND json_type(p.pool) = 'array' THEN p.pool ELSE '[null]' END) j) \
+             SELECT workspace_id FROM statuses GROUP BY workspace_id \
+             HAVING SUM(COALESCE(status IN ('Merged', 'Closed'), 0) = 0) = 0";
+        let ids: Vec<&str> = workspace_ids
+            .iter()
+            .map(|id| id.0.as_str())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let mut settled = HashSet::new();
+        for batch in ids.chunks(400) {
+            let encoded = serde_json::to_string(batch)
+                .map_err(|e| Error::Internal(format!("encode workspace ids failed: {e}")))?;
+            let rows: Vec<String> = sqlx::query_scalar(SQL)
+                .bind(encoded)
+                .fetch_all(&self.read_pool)
+                .await
+                .map_err(|e| {
+                    Error::Internal(format!("workspace settled pull requests read failed: {e}"))
+                })?;
+            settled.extend(rows.into_iter().map(WorkspaceId));
+        }
+        Ok(settled)
+    }
+
     /// Insert a workspace row. `activity` is derived and never persisted (§9.9).
     ///
     /// # Errors

@@ -2106,7 +2106,9 @@ pub trait WorkspaceApi: Send + Sync {
     /// a `changes` object (PROTOCOL §5.5). Only the listed fields are touched;
     /// omitted fields are preserved. Write-once (`acpSessionId`) and immutable
     /// (`provider`) invariants are enforced by the store. Emits `agent:updated`
-    /// (or `agent:renamed` when `name` is the only mutated field). Returns
+    /// (or `agent:renamed` with `{ agentId, name, nameExplicitlySet }` when
+    /// `name` is the only mutated field); any event payload carrying `name`
+    /// also carries the persisted `nameExplicitlySet`. Returns
     /// `{ success: true, agent: AgentLite }` on success. `NotFound` when the
     /// session is unknown; `InvalidParams` when `changes` carries an unknown
     /// field or a malformed value.

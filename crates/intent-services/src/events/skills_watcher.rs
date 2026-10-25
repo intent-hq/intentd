@@ -112,17 +112,21 @@ impl SkillsWatcher {
         }
     }
 
-    /// Await every user-tier root watch actually being established. Their
-    /// registration is deferred off the caller's thread (monorepo#1572), so
-    /// tests must wait for it before mutating those directories. Project tiers
-    /// ride the shared stream and need no separate sync point — subscribing is
-    /// synchronous bookkeeping.
+    /// Await the user-tier root watches and every project-tier shared watch
+    /// actually being live. Both registrations are deferred off the caller's
+    /// thread (monorepo#1572) — subscribing to the shared stream is
+    /// synchronous bookkeeping, but the OS `watch()` behind it is not — so
+    /// tests must wait for both before mutating either tier
+    /// (intent-hq/intent#4852). Panics with a diagnostic on a dead watch or on
+    /// `timeout`, which bounds ALL the tiers together, not each one afresh.
     #[cfg(test)]
     #[expect(clippy::used_underscore_binding)] // RAII field; underscore documents production lifetime-only intent
     async fn wait_established(&self, timeout: Duration) {
+        let budget = crate::events::TestBudget::new(timeout);
         for watch in &self._user_watchers {
-            watch.wait_established(timeout).await;
+            watch.wait_established(budget.remaining()).await;
         }
+        super::shared_watch::wait_tier_watches_live(&self.workspace_watchers, &budget).await;
     }
 
     /// Deregister a workspace at runtime (#611): tear down its project-tier
@@ -653,6 +657,49 @@ mod tests {
         assert!(
             events.iter().all(|e| e.workspace_id != ws_id),
             "deregistered workspace must stop emitting, got {events:?}"
+        );
+    }
+
+    /// `wait_established` covers the project tiers, not only the user tiers:
+    /// when a workspace root's own `watch()` fails (the group's watcher live,
+    /// so nothing will retry it), the wait fails naming that root. It used to
+    /// await the user tiers alone and return, so a test went on to write
+    /// project-tier files nothing watched (intent-hq/intent#4852).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[expect(clippy::await_holding_lock)]
+    async fn wait_established_fails_on_a_dead_project_tier_watch() {
+        let _serial = crate::events::WATCHER_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (_db, bus, _sub) = bus_and_sub().await;
+        let base = TempDir::new("dead-tier");
+        let ws_path = base.path.join("faulty-ws");
+        std::fs::create_dir_all(&ws_path).expect("mk ws");
+        let hub = SharedWatchHub::with_watch_fault(&super::super::shared_watch::WatchFault::nth(
+            "faulty-ws",
+            1,
+        ));
+
+        let watcher = Arc::new(SkillsWatcher::start(
+            &hub,
+            bus,
+            vec![(WorkspaceId::from("ws-skills-dead"), ws_path)],
+        ));
+        let waiter = Arc::clone(&watcher);
+        let panic = tokio::spawn(async move { waiter.wait_established(LIVENESS).await })
+            .await
+            .expect_err("wait_established must not return with a dead project-tier watch");
+        let message = panic
+            .into_panic()
+            .downcast::<String>()
+            .map(|m| *m)
+            .expect("assert! panics with a formatted String");
+        assert!(
+            message.starts_with("shared watch registration failed for ")
+                && message.contains("faulty-ws")
+                && message.contains("injected watch failure"),
+            "the panic must name the dead project-tier root and its cause: {message}"
         );
     }
 

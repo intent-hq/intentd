@@ -35,6 +35,7 @@ const TOKEN: &str = "abababababababababababababababababababababababababababababa
 
 /// Pure-liveness deadline for polls that return as soon as the awaited
 /// condition holds; only has to outlast a worst-case CI machine stall.
+// fixed-deadline: allow — stays under nextest's unscaled 180 s slow-timeout kill (.config/nextest.toml) so a stall panics naming its step
 const LIVENESS: Duration = Duration::from_secs(120);
 
 type TlsWs = WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;

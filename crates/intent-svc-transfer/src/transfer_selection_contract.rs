@@ -21,7 +21,7 @@ use intentd_test_support::GuardedChild;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use crate::{test_support::test_tempdir, Services, SettingsRegistry};
+use intent_services::feature_api::{test_support::test_tempdir, Services, SettingsRegistry};
 
 const TEST_NAME: &str = "transfer_selection_contract::public_import_matches_contract";
 const SOURCE: &[u8] = include_bytes!("transfer_selection_contract.rs");
@@ -206,14 +206,14 @@ async fn import_case(
             ),
         ])
         .unwrap();
-    let services = Services::new(store.clone())
+    let services = crate::register(Services::new(store.clone()))
         .with_settings_registry(registry)
         .with_models_cache_dir(root)
         .with_workspaces_root(root.join("workspaces"))
         .with_assets_root(root.join("assets"));
     for (provider, models) in contract["models"].as_object().unwrap() {
-        let source = crate::model_catalog::source_for(provider).unwrap();
-        services.models_catalog.store_for_test(
+        let source = intent_services::feature_api::model_catalog::source_for(provider).unwrap();
+        services.models_catalog_for_test().store_for_test(
             provider,
             &(source.version_key)(),
             models.as_array().unwrap().clone(),
@@ -284,10 +284,11 @@ async fn import_case(
             .unwrap();
     }
     let stored_session = store.get_agent_session(&agent).await.unwrap();
-    let (provider, model, effort) = crate::agent_manager::imported_spawn_selection_for_test(
-        &stored_session,
-        &services.effective_settings(),
-    );
+    let (provider, model, effort) =
+        intent_services::feature_api::agent_manager::imported_spawn_selection_for_test(
+            &stored_session,
+            &services.effective_settings(),
+        );
     let public = services.agent_get_session(agent, None).await.unwrap();
     let rows = store.transfer_export_rows(&workspace).await.unwrap();
     let raw = &rows
@@ -392,10 +393,10 @@ if (mode === 'check') {
   const revision = git('rev-parse', 'HEAD');
   if (git('status', '--porcelain', '--untracked-files=all')) throw new Error('export requires clean committed intentd source');
   if (compiledRevision !== revision) throw new Error('Cargo build revision differs: use scripts/test-transfer-selection-contract.sh');
-  const generator = createHash('sha256').update(fs.readFileSync(path.join(component, 'crates/intent-services/src/transfer_selection_contract.rs'))).digest('hex');
+  const generator = createHash('sha256').update(fs.readFileSync(path.join(component, 'crates/intent-svc-transfer/src/transfer_selection_contract.rs'))).digest('hex');
   if (generator !== compiledGenerator) throw new Error('compiled generator differs from source');
   const artifact = {formatVersion: 1, normalizationVersion: 1, provenance: {
-    kind: 'intentd-public-import', generator: 'intent-services/transfer-selection-contract',
+    kind: 'intentd-public-import', generator: 'intent-svc-transfer/transfer-selection-contract',
     intentdRevision: revision, intentdDirty: false, generatorSha256: generator,
     contractSha256: hashJson(contract), payloadSha256: hashJson(cases),
   }, cases};

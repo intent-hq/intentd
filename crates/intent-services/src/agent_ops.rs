@@ -5823,7 +5823,8 @@ impl Services {
     /// `skip_if_explicitly_set` is `true` and the session's name was already
     /// explicitly set, the rename is a no-op returning the existing name with
     /// `skipped: true` (the FE `renameAgent` semantics). An applied rename
-    /// emits `agent:renamed`.
+    /// emits `agent:renamed` with `{ agentId, name, nameExplicitlySet }`, the
+    /// flag as written to the session row (§6.5).
     pub(crate) async fn agent_rename_op(
         &self,
         agent_id: AgentId,
@@ -5845,7 +5846,11 @@ impl Services {
             &workspace_id,
             &agent_id,
             intent_core::events::AGENT_RENAMED,
-            json!({ "agentId": agent_id.0, "name": name }),
+            json!({
+                "agentId": agent_id.0,
+                "name": name,
+                "nameExplicitlySet": session.name_explicitly_set,
+            }),
         )
         .await;
         self.refresh_token_usage_after_rename(&workspace_id, &agent_id)
@@ -6693,7 +6698,9 @@ impl Services {
     /// enforces the write-once (`acpSessionId`) and immutable (`provider`)
     /// invariants; malformed values in `changes` surface as `InvalidParams`.
     /// Emits `agent:updated` (or `agent:renamed` when `name` is the only field
-    /// mutated) so subscribed clients invalidate their cached projection.
+    /// mutated) so subscribed clients invalidate their cached projection; any
+    /// payload carrying `name` also carries the persisted `nameExplicitlySet`
+    /// (§6.5).
     pub(crate) async fn agent_update_op(&self, agent_id: AgentId, changes: Value) -> Result<Value> {
         let Value::Object(mut obj) = changes else {
             return Err(Error::InvalidParams(
@@ -6977,11 +6984,13 @@ impl Services {
                 _ => unreachable!("guarded by allow-list above"),
             }
         }
+        let mut placeholder_renamed = false;
         if remember_specialist && is_manual_foreground_agent(&session) {
             if rename_placeholder {
                 session.name = selected_specialist_name
                     .clone()
                     .unwrap_or_else(|| "Agent".into());
+                placeholder_renamed = true;
             }
             let metadata = session.metadata.get_or_insert_with(|| json!({}));
             if let Some(metadata) = metadata.as_object_mut() {
@@ -7091,8 +7100,21 @@ impl Services {
         for (k, v) in &obj {
             event_data.insert(k.clone(), v.clone());
         }
-        if rename_placeholder {
+        // Only a placeholder rename that actually applied reports `name`: the
+        // same request can leave the manual-foreground scope (e.g.
+        // `isBackground: true`), which skips the rename above.
+        if placeholder_renamed {
             event_data.insert("name".into(), json!(session.name));
+        }
+        // Any payload carrying `name` reports the persisted flag after the
+        // write (§6.5), overriding a request-echoed `nameExplicitlySet` whose
+        // value can differ from what was stored (key order) — covers
+        // `agent:renamed`, mixed updates and the placeholder rename alike.
+        if event_data.contains_key("name") {
+            event_data.insert(
+                "nameExplicitlySet".into(),
+                json!(session.name_explicitly_set),
+            );
         }
         self.publish_agent_mutation_event(
             &session.workspace_id,

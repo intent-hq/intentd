@@ -904,6 +904,18 @@ impl Default for AgentsSettings {
     }
 }
 
+/// Test-only env seam that resolves an `agents.resumeInterruptedOnStart` of
+/// `auto` (the schema default, also written out by the generated config
+/// template); an explicit `on` / `off`, `--resume-all`, and update restarts
+/// keep precedence, and a value other than `auto` / `on` / `off` fails daemon
+/// startup. The intentd
+/// hermetic test launcher pins it to `off`: the `auto` default resumes only
+/// on display-less hosts, so restart suites otherwise picked up an extra
+/// agent turn on CI alone (intent-hq/intent#6058, intent-hq/intent#7706).
+/// Production never sets it. Shared here so the daemon and the harness
+/// cannot drift apart on the name.
+pub const RESUME_ON_START_TEST_DEFAULT_ENV: &str = "INTENTD_TEST_RESUME_ON_START_DEFAULT";
+
 /// `agents.resumeInterruptedOnStart` values. Serializes as lowercase strings
 /// (`"auto"`, `"on"`, `"off"`). Governs plain starts only: update-triggered
 /// restarts (the sitter respawning a freshly installed version, signaled via
@@ -930,6 +942,15 @@ impl ResumeInterruptedOnStart {
             ResumeInterruptedOnStart::On => "on",
             ResumeInterruptedOnStart::Off => "off",
         }
+    }
+
+    /// Parse the exact wire/TOML spelling ([`Self::as_str`]); anything else
+    /// (other casing, `true`/`false`, surrounding whitespace) is `None`.
+    #[must_use]
+    pub fn from_wire(raw: &str) -> Option<Self> {
+        [Self::Auto, Self::On, Self::Off]
+            .into_iter()
+            .find(|value| value.as_str() == raw)
     }
 }
 
@@ -2453,6 +2474,23 @@ mod tests {
                 SettingsFile::parse_str(&format!("[agents]\nresumeInterruptedOnStart = {raw}\n"))
                     .expect("parses");
             assert_eq!(parsed.agents.resume_interrupted_on_start, expected, "{raw}");
+        }
+    }
+
+    #[test]
+    fn resume_interrupted_on_start_from_wire_is_exact() {
+        for value in [
+            ResumeInterruptedOnStart::Auto,
+            ResumeInterruptedOnStart::On,
+            ResumeInterruptedOnStart::Off,
+        ] {
+            assert_eq!(
+                ResumeInterruptedOnStart::from_wire(value.as_str()),
+                Some(value)
+            );
+        }
+        for raw in ["", "OFF", " off", "true", "false", "0", "maybe"] {
+            assert_eq!(ResumeInterruptedOnStart::from_wire(raw), None, "{raw:?}");
         }
     }
 

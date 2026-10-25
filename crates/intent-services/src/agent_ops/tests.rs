@@ -10648,6 +10648,7 @@ async fn create_rename_set_model_emit_agent_events() {
     .expect("sub closed");
     assert_eq!(batch[0].event_type, AGENT_RENAMED);
     assert_eq!(batch[0].data["name"], "Renamed");
+    assert_eq!(batch[0].data["nameExplicitlySet"], json!(true));
 
     svc.agent_set_model_op(id.clone(), "auggie:opus4.7".into(), None)
         .await
@@ -32215,7 +32216,15 @@ async fn diagnostics_task_filter_matches_session_side_only() {
     );
     task.assigned_agent_ids.clear();
     note.metadata.task = Some(task);
-    svc.store.update_note(&note).await.expect("update note");
+    svc.store
+        .update_note(
+            &svc.store
+                .lock_note_content(&note.workspace_id, &note.id)
+                .await,
+            &note,
+        )
+        .await
+        .expect("update note");
 
     let result = svc
         .agent_diagnostics_op(ws.clone(), None, Some(note_id.clone()), None)
@@ -32784,7 +32793,70 @@ async fn agent_update_name_only_emits_agent_renamed() {
     .await
     .expect("recv")
     .expect("open");
-    assert!(batch.iter().any(|e| e.event_type == AGENT_RENAMED));
+    let renamed = batch
+        .iter()
+        .find(|e| e.event_type == AGENT_RENAMED)
+        .expect("agent:renamed in batch");
+    assert_eq!(renamed.data["name"], "NewName");
+    assert_eq!(renamed.data["nameExplicitlySet"], json!(true));
+}
+
+/// An `agent:updated` carrying `name` also carries the session's persisted
+/// `nameExplicitlySet` after the write (§6.5), overriding any request-echoed
+/// value: a mixed update reports `true`, and `{ name, nameExplicitlySet }`
+/// reports the stored flag in either key order.
+#[tokio::test]
+async fn agent_update_with_name_reports_persisted_name_explicitly_set() {
+    let (_t, svc, ws, bus) = setup_with_bus().await;
+    let cases = [
+        json!({ "name": "Mixed", "systemPrompt": "be brief" }),
+        serde_json::from_str::<serde_json::Value>(
+            r#"{ "nameExplicitlySet": false, "name": "FlagFirst" }"#,
+        )
+        .unwrap(),
+        serde_json::from_str::<serde_json::Value>(
+            r#"{ "name": "NameFirst", "nameExplicitlySet": false }"#,
+        )
+        .unwrap(),
+    ];
+    for (changes, stored) in cases.into_iter().zip([true, true, false]) {
+        let id = create_agent(&svc, &ws, "Before").await;
+        let mut sub = bus.subscribe(SubscriptionFilter {
+            event_types: vec![AGENT_UPDATED.to_string()],
+            ..Default::default()
+        });
+        svc.agent_update_op(id.clone(), changes.clone())
+            .await
+            .expect("update");
+        let session = svc.agent_get_session_op(id.clone()).await.expect("get");
+        // Pins today's store semantics: the last of `name` (sets `true`) and
+        // `nameExplicitlySet` in request order wins.
+        assert_eq!(
+            session.name_explicitly_set, stored,
+            "stored flag for {changes}"
+        );
+        let batch = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            sub.recv(),
+        )
+        .await
+        .expect("recv")
+        .expect("open");
+        let updated = batch
+            .iter()
+            .find(|e| {
+                e.event_type == AGENT_UPDATED
+                    && e.data["agentId"] == json!(id.0)
+                    && e.data.get("name").is_some()
+            })
+            .expect("agent:updated in batch");
+        assert_eq!(updated.data["name"], json!(session.name), "{changes}");
+        assert_eq!(
+            updated.data["nameExplicitlySet"],
+            json!(session.name_explicitly_set),
+            "event flag must equal the persisted flag for {changes}"
+        );
+    }
 }
 
 /// `agent.update` runs the same registry validation on the `imageBlocks`

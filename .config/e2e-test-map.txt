@@ -1,0 +1,39 @@
+# End-to-end test map for scripts/changed-tests.sh (`make test-changed`, CI's
+# coverage-changed).
+#
+# A change to crates/<c>/src selects only <c>'s own tests, but the end-to-end
+# tests that exercise that source usually live in another crate (intentd's
+# suites). Each entry below makes a change to matching source also run the
+# named end-to-end module, so PR CI catches the break instead of the merge
+# queue (intentd#2617: a script-binding change in intent-acp broke
+# e2e_wss_hook_mcp_tools::script_monitors, which only coverage-e2e ran).
+#
+# Format, one entry per line (`#` starts a comment line):
+#   <source glob>  <crate>::<test binary>  [<module path>]
+# - <source glob>: a Bash pattern matched against the repo-relative path of a
+#   changed file; `*` also matches `/`.
+# - <crate>::<test binary>: the nextest binary id, e.g. intentd::suite_wss_g_r
+#   (the cargo [[test]] target, root file crates/<crate>/tests/<binary>.rs).
+# - <module path>: the test-name prefix inside that binary, e.g.
+#   e2e_wss_hook_mcp_tools::script_monitors; omit it to run the whole binary.
+# The selection is `--test <binary> -E 'binary_id(=<crate>::<binary>)&test(/^(<module path>)::/)'`.
+#
+# `scripts/changed-tests.sh --check-map` (CI's release-scripts job, and every
+# selection run) fails when a glob matches no file or a binary or module no
+# longer exists. Editing this file runs every module it names.
+
+# Script bindings (ws.script.*): the MCP binding drives script creation,
+# start/run and monitors end to end.
+crates/intent-acp/src/mcp_server/bindings/script.rs  intentd::suite_wss_g_r    e2e_wss_hook_mcp_tools::script_monitors
+crates/intent-acp/src/mcp_server/bindings/script.rs  intentd::suite_wss_s_z    e2e_wss_script_monitors
+crates/intent-acp/src/mcp_server/bindings/script.rs  intentd::wss_integration  script_lifecycle
+
+# Script monitors: registration, completion wakes and the start-time monitor.
+crates/intent-core/src/script_monitor.rs             intentd::suite_wss_g_r    e2e_wss_hook_mcp_tools::script_monitors
+crates/intent-core/src/script_monitor.rs             intentd::suite_wss_s_z    e2e_wss_script_monitors
+crates/intent-services/src/script_monitor.rs         intentd::suite_wss_g_r    e2e_wss_hook_mcp_tools::script_monitors
+crates/intent-services/src/script_monitor.rs         intentd::suite_wss_s_z    e2e_wss_script_monitors
+crates/intent-services/src/script_ops.rs             intentd::suite_wss_g_r    e2e_wss_hook_mcp_tools::script_monitors
+crates/intent-services/src/script_ops.rs             intentd::suite_wss_s_z    e2e_wss_script_monitors
+crates/intent-services/src/script_ops/monitors.rs    intentd::suite_wss_g_r    e2e_wss_hook_mcp_tools::script_monitors
+crates/intent-services/src/script_ops/monitors.rs    intentd::suite_wss_s_z    e2e_wss_script_monitors
