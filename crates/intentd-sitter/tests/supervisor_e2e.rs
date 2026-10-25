@@ -643,8 +643,8 @@ fn sitter_with_a_daemon_that_ignores_term(dir: &Path) -> (GuardedChild, u32) {
             "#!/bin/sh\n\
              trap 'echo term >> \"${FAKE_DAEMON_LOG}\"' TERM\n\
              echo \"pid $$\" >> \"${FAKE_DAEMON_LOG}\"\n\
-             # // timing-guard: the fake outlives SIGTERM until something kills it\n\
-             while :; do sleep 0.05; done\n"
+             # // timing-guard: the fake outlives SIGTERM until killed or its data dir is gone\n\
+             while [ -d \"${DATA_DIR_ENV}\" ]; do sleep 0.05; done\n"
         ),
     );
     let mut sitter = spawn_guarded(
@@ -3899,7 +3899,7 @@ case "$1" in
     trap 'rm -f "$INTENTD_DATA_DIR/ready"; exit 0' TERM INT
     if [ "${FAKE_NO_READY:-}" != 1 ]; then echo "$$" > "$INTENTD_DATA_DIR/ready"; fi
     # // timing-guard: the fake daemon remains alive until signalled
-    while :; do sleep 0.05; done
+    while [ -d "$INTENTD_DATA_DIR" ]; do sleep 0.05; done
     ;;
   call|status)
     test -f "$INTENTD_DATA_DIR/ready" || exit 1
@@ -3995,7 +3995,7 @@ serve)
   trap '' TERM
   echo "$$" > "$INTENTD_DATA_DIR/owned-daemon"
   # // timing-guard: force the supervisor to exercise its bounded child-kill fallback
-  while :; do sleep 0.05; done
+  while [ -d "$INTENTD_DATA_DIR" ]; do sleep 0.05; done
   ;;
 *) exit 1;;
 esac
@@ -4039,7 +4039,7 @@ serve)
   trap 'echo stopping > "$INTENTD_DATA_DIR/stop-seen"' TERM
   echo "$$" > "$INTENTD_DATA_DIR/owned-daemon"
   # // timing-guard: fixture remains alive after TERM until its owned group is killed
-  while :; do sleep 0.05; done
+  while [ -d "$INTENTD_DATA_DIR" ]; do sleep 0.05; done
   ;;
 *) exit 1;;
 esac

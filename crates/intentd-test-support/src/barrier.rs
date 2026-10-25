@@ -1,6 +1,11 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+
+/// Numbers each [`Barrier::sh_wait`] snippet's poll counter, so a hold run
+/// from a signal trap cannot reset the counter of a hold it interrupted.
+static NEXT_WAIT_ID: AtomicU64 = AtomicU64::new(0);
 
 /// How often [`Barrier::sh_wait`] polls for the release file.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -79,7 +84,8 @@ impl Barrier {
     /// the script with [`Barrier::ABANDONED_EXIT_CODE`] (after one line on
     /// stderr) once the barrier's directory is gone or the hold deadline has
     /// passed. POSIX `sh`; it uses only double quotes, so it also fits inside
-    /// a single-quoted `trap` handler.
+    /// a single-quoted `trap` handler. Every call gets its own poll-counter
+    /// variable, so holds nested through a trap keep separate deadlines.
     #[must_use]
     pub fn sh_wait(&self) -> String {
         let path = self.path.display();
@@ -88,7 +94,10 @@ impl Barrier {
         let code = Self::ABANDONED_EXIT_CODE;
         let held = self.deadline.as_secs_f64();
         let interval = POLL_INTERVAL.as_secs_f64();
-        let polled = "_intentd_barrier_polls";
+        let polled = format!(
+            "_intentd_barrier_polls_{}",
+            NEXT_WAIT_ID.fetch_add(1, Ordering::Relaxed)
+        );
         let abandon = |why: &str| {
             format!(
                 "echo \"intentd-test-support: barrier {path} abandoned: {why}\" >&2; exit {code}"

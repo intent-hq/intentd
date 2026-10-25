@@ -124,21 +124,10 @@ fn kill_tree_after_reap_returns_the_exit_status() {
 fn spawn_with_grandchild_then_kill_the_leader() -> (GuardedChild, u32) {
     let (guard, grandchild) = spawn_with_grandchild();
     guard.signal(nix::sys::signal::Signal::SIGKILL).unwrap();
-    let leader = Pid::from_raw(guard.id().cast_signed());
     // Wait for the exit without reaping, as the guard's own peek does.
+    let leader = guard.id();
     wait_until("the leader to exit (unreaped)", || {
-        let mut info = std::mem::MaybeUninit::<nix::libc::siginfo_t>::zeroed();
-        // SAFETY: writable zeroed storage; WNOWAIT never reaps our child.
-        let ok = unsafe {
-            nix::libc::waitid(
-                nix::libc::P_PID,
-                leader.as_raw().cast_unsigned(),
-                info.as_mut_ptr(),
-                nix::libc::WEXITED | nix::libc::WNOHANG | nix::libc::WNOWAIT,
-            )
-        } == 0;
-        // SAFETY: zeroed storage; si_pid stays 0 until an exit is reported.
-        ok && unsafe { info.assume_init().si_pid() } != 0
+        super::peek_unreaped(leader) == Some(true)
     });
     assert!(alive(grandchild), "the grandchild outlives its leader");
     (guard, grandchild)
@@ -166,6 +155,78 @@ fn kill_tree_sweeps_the_group_of_a_killed_but_unreaped_leader() {
         Some(nix::sys::signal::Signal::SIGKILL as i32)
     );
     wait_until("the orphaned grandchild to be gone", || !alive(grandchild));
+}
+
+/// Env var naming the file [`guarded_group_probe_parks`] reports its pids to.
+const PROBE_OUT_ENV: &str = "INTENTD_GUARDED_GROUP_PROBE_OUT";
+
+/// Runs only as a child of `test_process_death_kills_the_guarded_group`:
+/// guards a shell with a grandchild, reports `<child> <grandchild>`, then
+/// parks until the parent test SIGKILLs this whole test process.
+#[test]
+#[ignore = "run by test_process_death_kills_the_guarded_group, which then kills it"]
+fn guarded_group_probe_parks() {
+    let Ok(out) = std::env::var(PROBE_OUT_ENV) else {
+        eprintln!("skipped: run through test_process_death_kills_the_guarded_group");
+        return;
+    };
+    let (guard, grandchild) = spawn_with_grandchild();
+    let partial = format!("{out}.partial");
+    std::fs::write(&partial, format!("{} {grandchild}", guard.id())).unwrap();
+    std::fs::rename(&partial, &out).unwrap();
+    // timing-guard: parks until the parent test kills this process
+    thread::sleep(Duration::from_secs(60));
+    drop(guard);
+}
+
+/// Regression for finding the fakes alive after a nextest timeout: nextest
+/// kills only the test's own process group, and a killed process runs no
+/// `Drop`, so a guarded child — in a group of its own — used to outlive it.
+/// The group's watchdog must take it down once the test process is gone.
+#[test]
+fn test_process_death_kills_the_guarded_group() {
+    let dir = tempfile::Builder::new()
+        .prefix("intentd-test-support-")
+        .tempdir()
+        .unwrap();
+    let out = dir.path().join("probe.pids");
+    let mut probe = GuardedChild::spawn(
+        detached(std::env::current_exe().unwrap().to_str().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "guarded_child::tests::guarded_group_probe_parks",
+            ])
+            .args(["--test-threads", "1"])
+            .env(PROBE_OUT_ENV, &out),
+    )
+    .unwrap();
+    let deadline = Instant::now() + crate::test_timeout(Duration::from_secs(15));
+    let pids = loop {
+        if let Ok(pids) = std::fs::read_to_string(&out) {
+            break pids;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the probe never reported its pids"
+        );
+        // timing-guard: poll interval
+        thread::sleep(Duration::from_millis(20));
+    };
+    let (child, grandchild) = pids.split_once(' ').unwrap();
+    let (child, grandchild): (u32, u32) = (child.parse().unwrap(), grandchild.parse().unwrap());
+    assert!(
+        alive(child) && alive(grandchild),
+        "the probe's guarded tree is up"
+    );
+
+    // Kill only the probe process, as nextest does: its guard never drops.
+    probe.signal(nix::sys::signal::Signal::SIGKILL).unwrap();
+    let _ = probe.wait();
+    wait_until(
+        "the probe's guarded child and grandchild to die with it",
+        || !alive(child) && !alive(grandchild),
+    );
 }
 
 #[test]
@@ -354,29 +415,63 @@ fn barrier_wait_gives_up_after_its_deadline() {
     }
 }
 
+/// The poll budget a [`Barrier::sh_wait`] snippet gives up after.
+fn sh_wait_polls(barrier: &Barrier) -> u64 {
+    let wait = barrier.sh_wait();
+    let (_, rest) = wait.split_once("-ge ").unwrap();
+    rest.split_whitespace().next().unwrap().parse().unwrap()
+}
+
+/// Runs only as a child of
+/// `barrier_default_deadline_scales_with_the_test_timeout`, which sets the
+/// multiplier to 3: the default 120s hold must stretch to 360s (7200 polls).
+#[test]
+#[ignore = "run by barrier_default_deadline_scales_with_the_test_timeout with the multiplier at 3"]
+fn barrier_default_deadline_probe() {
+    if std::env::var(crate::TIMEOUT_MULTIPLIER_ENV).as_deref() != Ok("3") {
+        eprintln!("skipped: run through barrier_default_deadline_scales_with_the_test_timeout");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(sh_wait_polls(&Barrier::new(dir.path(), "hold")), 7200);
+}
+
 /// The default hold deadline is the base stretched by the test multiplier,
-/// so coverage runs never abandon a hold a normal run would keep.
+/// so coverage runs never abandon a hold a normal run would keep. Proven in a
+/// child test process with the multiplier pinned, whatever this run uses.
 #[test]
 fn barrier_default_deadline_scales_with_the_test_timeout() {
-    let dir = tempfile::tempdir().unwrap();
-    let polls = |barrier: &Barrier| {
-        let wait = barrier.sh_wait();
-        let (_, rest) = wait.split_once("-ge ").unwrap();
-        rest.split_whitespace()
-            .next()
-            .unwrap()
-            .parse::<u64>()
-            .unwrap()
-    };
-    let expected = crate::test_timeout(crate::DEFAULT_HOLD_DEADLINE)
-        .as_nanos()
-        .div_ceil(Duration::from_millis(50).as_nanos());
+    let dir = tempfile::Builder::new()
+        .prefix("intentd-test-support-")
+        .tempdir()
+        .unwrap();
     assert_eq!(
-        u128::from(polls(&Barrier::new(dir.path(), "hold"))),
-        expected
-    );
-    assert_eq!(
-        polls(&Barrier::new(dir.path(), "hold").with_deadline(Duration::ZERO)),
+        sh_wait_polls(&Barrier::new(dir.path(), "hold").with_deadline(Duration::ZERO)),
         1
+    );
+
+    let out_path = dir.path().join("probe.out");
+    let out = std::fs::File::create(&out_path).unwrap();
+    let mut probe = GuardedChild::spawn(
+        detached(std::env::current_exe().unwrap().to_str().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "guarded_child::tests::barrier_default_deadline_probe",
+            ])
+            .args(["--test-threads", "1"])
+            .env(crate::TIMEOUT_MULTIPLIER_ENV, "3")
+            .stdout(out.try_clone().unwrap())
+            .stderr(out),
+    )
+    .unwrap();
+    let status = probe
+        .wait_with_timeout(crate::test_timeout(Duration::from_secs(30)))
+        .unwrap();
+    let output = std::fs::read_to_string(&out_path).unwrap_or_default();
+    assert!(
+        status.is_some_and(|status| status.success())
+            && output.contains("barrier_default_deadline_probe ... ok"),
+        "probe failed ({status:?}):\n{output}"
     );
 }
