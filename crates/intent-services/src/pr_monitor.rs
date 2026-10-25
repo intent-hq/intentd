@@ -3796,9 +3796,15 @@ impl Services {
             .max()
             .map(|at| u64::try_from((now - at).whole_seconds()).unwrap_or(0));
         let (monitors, intervals) = if let Some((workspace_id, min_age_secs)) = nudge {
+            // The minimum age is a hard floor per monitor, applied before PR
+            // grouping, and no fresh monitor's catch-up marker can win the
+            // nudge's fetch.
             let monitors: Vec<_> = monitors
                 .into_iter()
-                .filter(|m| &m.workspace_id == workspace_id)
+                .filter(|m| {
+                    &m.workspace_id == workspace_id
+                        && !polled_within(m.last_polled_at.as_deref(), min_age_secs, now)
+                })
                 .collect();
             let intervals = HashMap::from([(workspace_id.clone(), min_age_secs)]);
             (monitors, intervals)
@@ -3825,7 +3831,7 @@ impl Services {
             .into_iter()
             .map(|monitor| DueCandidate {
                 anchor: monitor.last_polled_at.as_deref().and_then(parse_iso),
-                catch_up: catch_up_unattempted(&monitor, &catch_up),
+                catch_up: nudge.is_none() && catch_up_unattempted(&monitor, &catch_up),
                 interval: time::Duration::seconds(
                     i64::try_from(
                         intervals
@@ -11149,6 +11155,51 @@ mod tests {
         stale(2 * 86_400).await;
         svc.nudge_workspace_pr_monitors(&ws, 60).await;
         assert!(forge.take_fetched_numbers().is_empty(), "quota deferral");
+    }
+
+    /// The 60 s floor holds per monitor: a fresh monitor's catch-up marker
+    /// does not win the nudge a fetch, and its `lastPolledAt` is kept.
+    #[tokio::test]
+    async fn idle_nudge_ignores_fresh_catch_up_monitors() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let svc = svc.with_pr_monitor_poll_seconds(60);
+        let stale_monitor = register(&svc, &ws, &owner).await;
+        let (caught_up, _) = svc
+            .pr_monitor_register(&ws, &owner, "o", "r", 7)
+            .await
+            .expect("register");
+        make_workspace_idle(&svc, &ws).await;
+        let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
+        let stale = intent_core::iso_from_unix_secs(now_unix - 120);
+        let fresh = intent_core::iso_from_unix_secs(now_unix - 10);
+        backdate(&svc, &stale_monitor.monitor_id, &stale).await;
+        backdate(&svc, &caught_up.monitor_id, &fresh).await;
+        svc.pr_monitor_catch_up.lock().unwrap().insert(
+            caught_up.monitor_id.clone(),
+            time::OffsetDateTime::now_utc(),
+        );
+        forge.take_fetched_numbers();
+        svc.nudge_workspace_pr_monitors(&ws, 60).await;
+        assert_eq!(forge.take_fetched_numbers(), vec![42], "only the stale PR");
+        let polled = |id: PrMonitorId| {
+            let svc = svc.clone();
+            async move {
+                svc.store()
+                    .get_pr_monitor(&id)
+                    .await
+                    .unwrap()
+                    .last_polled_at
+            }
+        };
+        assert_ne!(
+            polled(stale_monitor.monitor_id.clone()).await.as_deref(),
+            Some(stale.as_str())
+        );
+        assert_eq!(
+            polled(caught_up.monitor_id.clone()).await.as_deref(),
+            Some(fresh.as_str()),
+            "a fresh catch-up monitor is not nudged"
+        );
     }
 
     /// The nudge and the legacy sweep share one lane: a nudge skips while a
