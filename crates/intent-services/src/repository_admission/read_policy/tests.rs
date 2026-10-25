@@ -295,26 +295,36 @@ async fn artifact_start_admits_one_original_job_before_io_and_response_revalidat
     }
 }
 
-// This control fills one real acquisition ledger. Give that one request the
-// existing workspace API's 30-second evaluation budget instead of the shared
-// 10-second single-read harness guard; all ordinary refusal controls keep it.
-async fn run_quota(
-    server: &WorkspaceMcpServer,
-    code: &str,
-    control: &Control,
-) -> serde_json::Value {
+// These controls fill one real acquisition ledger with 63/64 snapshot calls.
+// On a loaded host one call can take ~0.9s, so the production 30-second
+// `workspace_api` budget cut the loop short and its timeout surfaced as the
+// same refusal a full ledger returns. Give the script a generous fixed
+// budget, keep the outer guard above it, and fail loudly if a run reaches the
+// budget: the 63/64 outcome must come from the ledger, never from the timer.
+// The quota tests' nextest hang guard is widened to match (.config/nextest.toml).
+const QUOTA_SCRIPT_BUDGET: Duration = Duration::from_secs(150);
+
+async fn run_quota(server: WorkspaceMcpServer, code: &str, control: &Control) -> serde_json::Value {
+    let server = server.with_workspace_api_timeout(QUOTA_SCRIPT_BUDGET);
     let started = std::time::Instant::now();
+    // fixed-deadline: allow — stays under the 540s nextest kill even at x3
     let result = tokio::time::timeout(
-        intentd_test_support::test_timeout(Duration::from_secs(30)),
+        QUOTA_SCRIPT_BUDGET + Duration::from_secs(30),
         server.handle_message(&crate::repository_read_source::tests::call(code)),
     )
     .await;
+    let elapsed = started.elapsed();
     eprintln!(
         "quota result_ready={} elapsed_ms={} records={} events={:?}",
         result.is_ok(),
-        started.elapsed().as_millis(),
+        elapsed.as_millis(),
         control.records.lock().unwrap().len(),
         control.events.lock().unwrap()
+    );
+    assert!(
+        elapsed < QUOTA_SCRIPT_BUDGET,
+        "quota script hit its {QUOTA_SCRIPT_BUDGET:?} time limit after {elapsed:?}; \
+         its reply reflects the timer, not the acquisition ledger"
     );
     result.unwrap().unwrap()
 }
@@ -328,7 +338,7 @@ async fn original_ledger_counts_cache_hits_and_lazy_read_at_sixty_four_and_sixty
         let code = format!(
             "for (let i=0;i<{count};i++) {{ await ws.pr.snapshot(4); }} return 'bounded success';"
         );
-        let reply = run_quota(&controlled(&f, control.clone()), &code, &control).await;
+        let reply = run_quota(controlled(&f, control.clone()), &code, &control).await;
         assert_eq!(
             reply.to_string().contains("bounded success"),
             count == 63,

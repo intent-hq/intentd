@@ -7,6 +7,12 @@ repository.workspace = true
 license.workspace = true
 description = "ACP client, session multiplexing, and agent→BE MCP server"
 
+[features]
+# Test-only `WorkspaceMcpServer` knobs for other crates' tests. Enable only
+# from `[dev-dependencies]`: Cargo then turns it on for builds that also
+# compile test targets, never for release/packaging builds of the daemon.
+test-support = []
+
 [dependencies]
 intent-core = { path = "../intent-core", version = "0.11.44" }
 # Best-effort propose-time base-ref validation + repo-default-branch lookup
