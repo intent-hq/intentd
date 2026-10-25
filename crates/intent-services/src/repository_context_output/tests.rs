@@ -166,9 +166,9 @@ async fn tcp_within(server: WorkspaceMcpServer, code: &str, wait: Duration) -> V
         .unwrap();
     let mut line = String::new();
     tokio::time::timeout(wait, BufReader::new(stream).read_line(&mut line))
-    .await
-    .unwrap()
-    .unwrap();
+        .await
+        .unwrap()
+        .unwrap();
     drop(bridge);
     serde_json::from_str(&line).unwrap()
 }

@@ -2011,7 +2011,10 @@ struct BudgetRequestTrace<'a> {
 
 impl<'a> BudgetRequestTrace<'a> {
     fn new(control: &'a NativeControl, subcase: &'static str, count: usize) -> Self {
-        eprintln!("budget-request begin subcase={subcase} iterations={count} fixture_wait_ms={}", fixture_wait().as_millis());
+        eprintln!(
+            "budget-request begin subcase={subcase} iterations={count} fixture_wait_ms={}",
+            fixture_wait().as_millis()
+        );
         Self {
             control,
             subcase,
@@ -2314,7 +2317,15 @@ impl NativeHarness {
         control: Option<Arc<NativeControl>>,
         pending_control: Option<Arc<NativeControl>>,
     ) -> Self {
-        Self::build(stamp, opt_in, failed_anchor, control, pending_control, false).await
+        Self::build(
+            stamp,
+            opt_in,
+            failed_anchor,
+            control,
+            pending_control,
+            false,
+        )
+        .await
     }
 
     async fn build(
