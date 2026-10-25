@@ -768,40 +768,6 @@ async fn discussion_store_rechecks_sender_membership_but_retry_survives_recipien
 }
 
 #[tokio::test]
-async fn discussion_export_cannot_bypass_participant_authorization() {
-    let (_tmp, svc, ws, p) = conversation_fixture().await;
-    with_caller(
-        human(&p[1].id),
-        svc.discussion_send_to_op(
-            &ws,
-            "private",
-            "private body",
-            &recipients(&[p[2].id.clone()]),
-        ),
-    )
-    .await
-    .unwrap();
-    for caller in [
-        Caller::Wire {
-            principal_id: p[0].id.clone(),
-            host_role: HostRole::Owner,
-        },
-        Caller::Agent {
-            agent_id: AgentId::new(),
-        },
-    ] {
-        assert!(matches!(
-            with_caller(caller, svc.workspace_export_start(ws.clone())).await,
-            Err(Error::Unsupported(_))
-        ));
-    }
-    assert!(
-        svc.feature_transfer_port().export_count_for_test() == 0,
-        "no readable export session"
-    );
-}
-
-#[tokio::test]
 async fn discussion_reactions_are_idempotent_projected_and_participant_scoped() {
     let (_tmp, svc, ws, p) = conversation_fixture().await;
     let made = with_caller(

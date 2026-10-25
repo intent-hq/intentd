@@ -41,7 +41,9 @@
 #                                    #[path]-includes tests/<m>/ (else --tests)
 #   crates/<c>/tests/<dir>/**        -p <c> --tests
 #   crates/<c>/src/**                -p <c> --lib --bins --tests
-#                                    (--lib only when src/lib.rs exists)
+#                                    (--lib only when src/lib.rs exists);
+#                                    crates/intent-services/src/** also selects
+#                                    every crates/intent-svc-* feature crate
 #   crates/<c>/benches|examples/**   ignored (nextest does not run them)
 #   crates/<c>/<anything else>       -p <c>  (all test targets of <c>)
 #   outside crates/, inert           ignored: *.md, LICENSE, NOTICE, .gitignore,
@@ -57,8 +59,9 @@
 # target flags to every -p package on one command line, so crates with
 # different selections run as separate `cargo nextest run` invocations and
 # crates with identical selections share one. Reverse dependencies are NOT
-# propagated: crates/<c>/src selects <c>'s own tests only; the full suite
-# (`make test`, the merge queue) stays the complete gate.
+# propagated, except from intent-services to its feature crates:
+# crates/<c>/src selects <c>'s own tests only; the full suite (`make test`,
+# the merge queue) stays the complete gate.
 #
 # Exit codes: 0 = nothing to test, or every invocation passed; 2 = usage error
 # or a git command failed; 3 = a build-wide file changed (Cargo.toml,
@@ -286,6 +289,20 @@ if [[ -n "$fallback" ]]; then
   fi
 fi
 
+# The feature crates (crates/intent-svc-*) sit above intent-services and build
+# against its feature API, so an intent-services/src edit also selects every
+# feature crate's own tests ("dependent": the src selection, without a note).
+feature_crates=""
+if [[ "$mapped" == *$'\n'"intent-services"$'\t'"src"* || "$mapped" == "intent-services"$'\t'"src"* ]]; then
+  for manifest in crates/intent-svc-*/Cargo.toml; do
+    [[ -f "$manifest" ]] || continue
+    feature_crate=${manifest#crates/}
+    feature_crate=${feature_crate%/Cargo.toml}
+    mapped+="$feature_crate"$'\t'"dependent"$'\n'
+    feature_crates+="${feature_crates:+, }$feature_crate"
+  done
+fi
+
 # Stock macOS ships Bash 3.2, which has no associative arrays: per-crate
 # lookups scan the newline-separated "<crate>\t<kind>[\t<test>]" records.
 crates=""
@@ -310,17 +327,24 @@ crate_selection() {
     case "$kind" in
       all) best=all ;;
       src) [[ "$best" == all ]] || best=src ;;
-      tests) [[ "$best" == all || "$best" == src ]] || best=tests ;;
+      dependent) [[ "$best" == all || "$best" == src ]] || best=dependent ;;
+      tests) [[ "$best" == all || "$best" == src || "$best" == dependent ]] || best=tests ;;
       test) tests+="$test"$'\n' ;;
       module) modules+="$test"$'\n' ;;
     esac
   done <<<"$mapped"
   case "$best" in
     all) crate_filter="" ;;
-    src)
+    src | dependent)
       crate_filter="--bins --tests"
       [[ -f "crates/$crate/src/lib.rs" ]] && crate_filter="--lib $crate_filter"
-      log "note: crates/$crate/src changed; only $crate's own tests run (downstream crates are not selected)"
+      if [[ "$best" == dependent ]]; then
+        :
+      elif [[ "$crate" == intent-services && -n "$feature_crates" ]]; then
+        log "note: crates/$crate/src changed; its feature crates ($feature_crates) run too, other downstream crates are not selected"
+      else
+        log "note: crates/$crate/src changed; only $crate's own tests run (downstream crates are not selected)"
+      fi
       ;;
     tests) crate_filter="--tests" ;;
     test)

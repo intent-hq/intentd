@@ -264,19 +264,6 @@ pub(crate) mod stack_sample;
 mod task_effort;
 mod terminal_ops;
 pub mod tool_block;
-mod transfer;
-mod transfer_authorship;
-mod transfer_export;
-pub mod transfer_git;
-mod transfer_import;
-pub(crate) mod transfer_materialize;
-mod transfer_model_selection;
-mod transfer_remotes;
-#[cfg(test)]
-mod transfer_roundtrip;
-#[cfg(all(test, unix))]
-mod transfer_selection_contract;
-mod transfer_submodules;
 #[cfg(test)]
 mod truncated_read_guard_tests;
 mod unsloth_server;
@@ -1922,7 +1909,7 @@ impl Services {
             attachment_uploads: Arc::new(Mutex::new(HashMap::new())),
             attachment_idempotency_inflight: Arc::new(Mutex::new(HashMap::new())),
             idempotency_inflight: Arc::new(IdempotencyInflight::default()),
-            ports: feature_ports::FeaturePorts::new(Arc::new(transfer::TransferFeature::default())),
+            ports: feature_ports::FeaturePorts::default(),
         };
         services
             .gitlab_credential_gate

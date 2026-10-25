@@ -205,12 +205,14 @@ fn materialize_inner(
     // sharing ONE slug matters more here.) `ws.repository_path` still holds
     // the SOURCE path — the caller rewrites it via [`MaterializedGit::apply`]
     // after success.
-    let repo_name = crate::known_repo_name(
+    let repo_name = intent_services::feature_api::known_repo_name(
         ws.repository_name.as_deref(),
         ws.repository_path.as_deref().unwrap_or(""),
     );
     let ws_dir = workspaces_root.join(&ws.id.0);
-    let checkout_dir = ws_dir.join(crate::worktree_folder_slug(&repo_name));
+    let checkout_dir = ws_dir.join(intent_services::feature_api::worktree_folder_slug(
+        &repo_name,
+    ));
     if checkout_dir.exists() {
         return Err(Error::Internal(format!(
             "materialize target already exists: {}",
@@ -304,7 +306,9 @@ fn materialize_inner(
             continue;
         };
         let agent_dir = ws_dir.join("sandboxes").join(&sb.agent_id.0);
-        let sandbox_path = agent_dir.join(crate::worktree_folder_slug(&repo_name));
+        let sandbox_path = agent_dir.join(intent_services::feature_api::worktree_folder_slug(
+            &repo_name,
+        ));
         // Only track for rollback what THIS call creates: a pre-existing
         // agent dir must never be recursively deleted by a later failure, so
         // in that case track just the sandbox path — which must not itself
@@ -1468,7 +1472,7 @@ mod tests {
 
     // -- submodule hydration ------------------------------------------------
 
-    use crate::test_support::submodule_fixture::{
+    use intent_services::feature_api::test_support::submodule_fixture::{
         git as fgit, init_repo as finit_repo, local_commit,
         nested_unpublished_under_published_parent as nested_fixture, superproject_with_submodule,
         NestedFixture,
@@ -2604,7 +2608,7 @@ mod tests {
     /// (intent-hq/monorepo#2227).
     #[tokio::test]
     async fn async_entry_does_not_register_known_repo() {
-        let tmp = crate::tests::TempDb::new();
+        let tmp = intent_services::feature_api::tests::TempDb::new();
         let store = intent_store::Store::open(&tmp.path)
             .await
             .expect("open store");

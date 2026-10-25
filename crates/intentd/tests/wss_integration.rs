@@ -250,7 +250,7 @@ async fn make_services(
         intent_services::SettingsRegistry::load(dir.path().join("config.toml"))
             .expect("load settings registry"),
     );
-    let mut services = Services::new(store.clone())
+    let mut services = intent_svc_transfer::register(Services::new(store.clone()))
         .with_assets_root(dir.path().join("assets"))
         .with_workspaces_root(workspaces_root)
         .with_settings_registry(registry.clone())
@@ -21437,9 +21437,9 @@ async fn wss_workspace_import_commit_materializes_git() {
     src_ws.repository_path = Some(repo.to_string_lossy().into_owned());
     src_ws.repository_name = Some("test-repo".to_string());
     let staging = src.path().join("staging");
-    let intent_services::transfer_git::TransferBundle {
+    let intent_svc_transfer::transfer_git::TransferBundle {
         bundle_path, refs, ..
-    } = intent_services::transfer_git::create_transfer_bundle(&src_ws, &[], &staging)
+    } = intent_svc_transfer::transfer_git::create_transfer_bundle(&src_ws, &[], &staging)
         .expect("bundle");
     assert!(
         refs.workspace_wip_commit_sha.is_some(),

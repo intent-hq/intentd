@@ -489,7 +489,7 @@ jobs:
       - name: Real import and public session contract
         env:
           INTENTD_ASSERT_BOUND_CALLER: "1"
-        run: "cargo test -p intent-services --lib transfer_selection_contract::"
+        run: "cargo test -p intent-svc-transfer --lib transfer_selection_contract::"
       # Real claude-agent-acp contract (claude_adapter_contract): the pinned
       # adapter moves by auto-merging rolling PRs (auto-pin-acp-adapters.yml),
       # so every PR and merge-queue run installs the exact pin and checks that
