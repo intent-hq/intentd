@@ -39,6 +39,32 @@ pub(crate) const PRELUDE: &str = r"
     };
 ";
 
+/// Combined UTF-8 size of `oldContent` + `newContent` above which a
+/// mutation result drops the full-note echo. The daemon has already
+/// committed the write by the time the result is shaped; echoing two copies
+/// of a multi-megabyte note into the script could exhaust its memory limit
+/// and surface a committed write as an error (intent-hq/intent#7688).
+pub(crate) const MAX_MUTATION_ECHO_BYTES: usize = 1024 * 1024;
+
+/// Bound a committed mutation's result: past [`MAX_MUTATION_ECHO_BYTES`],
+/// remove `oldContent` / `newContent` and mark `contentOmitted: true`; every
+/// other field (ok, noteId, lengths, task conversion results) is kept.
+fn bound_mutation_echo(mut result: Value) -> Value {
+    if let Some(obj) = result.as_object_mut() {
+        let echoed: usize = ["oldContent", "newContent"]
+            .iter()
+            .filter_map(|key| obj.get(*key).and_then(Value::as_str))
+            .map(str::len)
+            .sum();
+        if echoed > MAX_MUTATION_ECHO_BYTES {
+            obj.remove("oldContent");
+            obj.remove("newContent");
+            obj.insert("contentOmitted".to_string(), Value::Bool(true));
+        }
+    }
+    result
+}
+
 pub(crate) async fn dispatch(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
@@ -53,10 +79,18 @@ pub(crate) async fn dispatch(
         "listTasks" => list_tasks(api, ws, args).await,
         "readAsset" => read_asset(api, ws, args).await,
         "saveAsset" => save_asset(api, ws, args).await,
-        "setContent" => set_content(api, ws, caller_agent_id, args).await,
-        "add" => add(api, ws, caller_agent_id, args).await,
-        "edit" => edit(api, ws, caller_agent_id, args).await,
-        "editLines" => edit_lines(api, ws, caller_agent_id, args).await,
+        "setContent" => set_content(api, ws, caller_agent_id, args)
+            .await
+            .map(bound_mutation_echo),
+        "add" => add(api, ws, caller_agent_id, args)
+            .await
+            .map(bound_mutation_echo),
+        "edit" => edit(api, ws, caller_agent_id, args)
+            .await
+            .map(bound_mutation_echo),
+        "editLines" => edit_lines(api, ws, caller_agent_id, args)
+            .await
+            .map(bound_mutation_echo),
         "updateMetadata" => update_metadata(api, ws, caller_agent_id, args).await,
         "delete" => delete(api, ws, args).await,
         other => Err(format!("host: unknown method `note.{other}`")),

@@ -318,3 +318,267 @@ async fn cancellation_flag_preserves_success_when_open() {
     .unwrap();
     assert_eq!(result, serde_json::json!(42));
 }
+
+/// Host replies are built as JS values directly (intent-hq/intent#7688);
+/// they must keep `JSON.parse` semantics: `__proto__` stays an own data key,
+/// nested values and numbers round-trip.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_reply_keeps_json_parse_semantics() {
+    let host: HostFn = Arc::new(|_| {
+        Box::pin(async {
+            Ok(serde_json::json!({
+                "__proto__": { "polluted": true },
+                "nested": [1, 2.5, -3, 4_294_967_296_i64, null, true, "é"],
+            }))
+        })
+    });
+    let out = eval(
+        "const r = await host(null); \
+         return { own: Object.keys(r), proto: Object.getPrototypeOf(r) === Object.prototype, \
+                  polluted: r.polluted === undefined ? null : r.polluted, \
+                  key: r['__proto__'], nested: r.nested };",
+        &EvalOptions::default(),
+        Some(host),
+    )
+    .await
+    .expect("host reply builds");
+    assert_eq!(out["own"], serde_json::json!(["__proto__", "nested"]));
+    assert_eq!(out["proto"], serde_json::json!(true));
+    assert_eq!(out["polluted"], serde_json::Value::Null);
+    assert_eq!(out["key"], serde_json::json!({ "polluted": true }));
+    assert_eq!(
+        out["nested"],
+        serde_json::json!([1, 2.5, -3, 4_294_967_296_i64, null, true, "é"])
+    );
+}
+
+/// A reply too large for the memory limit rejects the host promise with a
+/// bounded, catchable error that says a write may already have applied.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oversized_host_reply_rejects_with_bounded_error() {
+    let host: HostFn =
+        Arc::new(|_| Box::pin(async { Ok(serde_json::json!({ "big": "€".repeat(4_000_000) })) }));
+    let opts = EvalOptions {
+        timeout: Duration::from_secs(10),
+        memory_limit_bytes: Some(4 * 1024 * 1024),
+    };
+    let out = eval(
+        "try { await host(null); return 'unreachable'; } catch (e) { return String(e.message); }",
+        &opts,
+        Some(host),
+    )
+    .await
+    .expect("rejection is catchable");
+    let msg = out.as_str().expect("message string");
+    assert!(
+        msg.contains("does not fit in the script memory limit")
+            && msg.contains("may already have been applied"),
+        "got: {msg}"
+    );
+    assert!(msg.len() < 300, "error must be bounded: {msg}");
+}
+
+/// Setters a script installs on `Array.prototype` / `Object.prototype` must
+/// not run while a host reply is built: elements and keys are own data
+/// properties, exactly as `JSON.parse` would create them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_reply_ignores_prototype_setters() {
+    let host: HostFn =
+        Arc::new(|_| Box::pin(async { Ok(serde_json::json!({ "items": ["a", "b"], "ok": 1 })) }));
+    let out = eval(
+        "globalThis.hits = 0; \
+         Object.defineProperty(Array.prototype, '0', { set() { hits++; }, configurable: true }); \
+         Object.defineProperty(Array.prototype, '1', { set() { throw new Error('trap'); }, configurable: true }); \
+         Object.defineProperty(Object.prototype, 'items', { set() { hits++; }, configurable: true }); \
+         const r = await host(null); \
+         const seen = { items: [r.items[0], r.items[1]], len: r.items.length, own: Object.keys(r), hits }; \
+         delete Array.prototype[0]; delete Array.prototype[1]; delete Object.prototype.items; \
+         return seen;",
+        &EvalOptions::default(),
+        Some(host),
+    )
+    .await
+    .expect("host reply builds despite prototype setters");
+    assert_eq!(out["items"], serde_json::json!(["a", "b"]));
+    assert_eq!(out["len"], serde_json::json!(2));
+    assert_eq!(out["own"], serde_json::json!(["items", "ok"]));
+    assert_eq!(out["hits"], serde_json::json!(0));
+}
+
+/// Replies nested deeper than `serde_json`'s parser recursion limit still
+/// arrive, as they did with the previous `JSON.parse` path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deeply_nested_host_reply_still_round_trips() {
+    let host: HostFn = Arc::new(|_| {
+        Box::pin(async {
+            let mut v = serde_json::json!("leaf");
+            for _ in 0..200 {
+                v = serde_json::json!([v]);
+            }
+            Ok(v)
+        })
+    });
+    let out = eval(
+        "let v = await host(null); let d = 0; while (Array.isArray(v)) { v = v[0]; d++; } return [d, v];",
+        &EvalOptions::default(),
+        Some(host),
+    )
+    .await
+    .expect("deep reply round-trips");
+    assert_eq!(out, serde_json::json!([200, "leaf"]));
+}
+
+/// Numbers reach JS as the host's exact `f64` (no text round-trip through a
+/// non-round-trip float parser).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_reply_numbers_keep_exact_f64() {
+    let tiny = 1.079_014_325_864_572_3e-180_f64;
+    let host: HostFn =
+        Arc::new(move |_| Box::pin(async move { Ok(serde_json::json!([tiny, 0.1, -0.0])) }));
+    let out = eval(
+        "const r = await host(null); \
+         return [r[0] === 1.0790143258645723e-180, r[1] === 0.1, Object.is(r[2], -0)];",
+        &EvalOptions::default(),
+        Some(host),
+    )
+    .await
+    .expect("numbers round-trip");
+    assert_eq!(out, serde_json::json!([true, true, true]));
+}
+
+/// A deeply nested reply that does not fit still rejects with the bounded
+/// message (no unlabelled raw out-of-memory).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deep_oversized_host_reply_rejects_with_bounded_error() {
+    let host: HostFn = Arc::new(|_| {
+        Box::pin(async {
+            let mut v = serde_json::json!("€".repeat(4_000_000));
+            for _ in 0..200 {
+                v = serde_json::json!([v]);
+            }
+            Ok(v)
+        })
+    });
+    let opts = EvalOptions {
+        timeout: Duration::from_secs(10),
+        memory_limit_bytes: Some(4 * 1024 * 1024),
+    };
+    let out = eval(
+        "try { await host(null); return 'unreachable'; } catch (e) { return String(e.message); }",
+        &opts,
+        Some(host),
+    )
+    .await
+    .expect("rejection is catchable");
+    let msg = out.as_str().expect("message string");
+    assert!(
+        msg.contains("does not fit in the script memory limit")
+            && msg.contains("may already have been applied"),
+        "got: {msg}"
+    );
+}
+
+/// A `then` a script installs on `Object.prototype` must not intercept the
+/// private reply envelope during promise resolution, for values, errors, or
+/// the oversized-reply frame; user value objects still inherit normally.
+/// (Returning a user object from the async `host` wrapper reads its `then`
+/// exactly as before this change, so that case is not asserted here.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_reply_envelope_ignores_inherited_then() {
+    let host: HostFn = Arc::new(|arg| {
+        Box::pin(async move {
+            match arg.as_str() {
+                Some("err") => Err("host said no".to_string()),
+                Some("obj") => Ok(serde_json::json!({ "k": 1 })),
+                _ => Ok(serde_json::json!(42)),
+            }
+        })
+    });
+    let out = eval(
+        "Object.defineProperty(Object.prototype, 'then', { \
+             get() { throw new Error('inherited then intercepted'); }, configurable: true }); \
+         const n = await host(null); \
+         let e; try { await host('err'); } catch (x) { e = String(x.message); } \
+         delete Object.prototype.then; \
+         const o = await host('obj'); \
+         return [n, e, o.k, Object.getPrototypeOf(o) === Object.prototype];",
+        &EvalOptions::default(),
+        Some(host),
+    )
+    .await
+    .expect("replies are delivered despite an inherited then");
+    assert_eq!(out, serde_json::json!([42, "host said no", 1, true]));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oversized_reply_frame_ignores_inherited_then() {
+    let host: HostFn =
+        Arc::new(|_| Box::pin(async { Ok(serde_json::json!({ "big": "€".repeat(4_000_000) })) }));
+    let opts = EvalOptions {
+        timeout: Duration::from_secs(10),
+        memory_limit_bytes: Some(4 * 1024 * 1024),
+    };
+    let out = eval(
+        "Object.defineProperty(Object.prototype, 'then', { \
+             get() { throw new Error('inherited then intercepted'); }, configurable: true }); \
+         let m; try { await host(null); m = 'unreachable'; } catch (e) { m = String(e.message); } \
+         delete Object.prototype.then; return m;",
+        &opts,
+        Some(host),
+    )
+    .await
+    .expect("rejection is catchable");
+    let msg = out.as_str().expect("message string");
+    assert!(
+        msg.contains("does not fit in the script memory limit"),
+        "got: {msg}"
+    );
+}
+
+/// Same as above with a callable inherited `then` that would substitute the
+/// envelope: primitive and error replies still arrive untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_reply_envelope_ignores_inherited_callable_then() {
+    let host: HostFn = Arc::new(|arg| {
+        Box::pin(async move {
+            match arg.as_str() {
+                Some("err") => Err("host said no".to_string()),
+                _ => Ok(serde_json::json!(42)),
+            }
+        })
+    });
+    let out = eval(
+        "Object.prototype.then = function (resolve) { resolve('hijacked'); }; \
+         const n = await host(null); \
+         let e; try { await host('err'); } catch (x) { e = String(x.message); } \
+         delete Object.prototype.then; \
+         return [n, e];",
+        &EvalOptions::default(),
+        Some(host),
+    )
+    .await
+    .expect("replies are delivered despite a callable inherited then");
+    assert_eq!(out, serde_json::json!([42, "host said no"]));
+}
+
+/// Object *values* keep `JSON.parse` semantics (they inherit
+/// `Object.prototype`), so returning one from the async `host` wrapper
+/// resolves through its inherited `then` exactly as it did when the reply
+/// was parsed in JS. This pins that unchanged behavior.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn object_reply_value_resolution_is_unchanged() {
+    let host: HostFn = Arc::new(|_| Box::pin(async { Ok(serde_json::json!({ "k": 1 })) }));
+    let out = eval(
+        "Object.defineProperty(Object.prototype, 'then', { \
+             get() { throw new Error('value then'); }, configurable: true }); \
+         let m; try { await host(null); m = 'resolved'; } catch (e) { m = String(e.message); } \
+         delete Object.prototype.then; \
+         const o = await host(null); \
+         return [m, o.k, Object.getPrototypeOf(o) === Object.prototype];",
+        &EvalOptions::default(),
+        Some(host),
+    )
+    .await
+    .expect("object value round-trips");
+    assert_eq!(out, serde_json::json!(["value then", 1, true]));
+}
