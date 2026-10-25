@@ -3917,10 +3917,7 @@ fn background_start_stop_exits_cleanly_after_forced_child_cleanup() {
 case "$1" in
 serve)
   trap '' TERM
-  # Publish by rename: the test waits for the file to exist, then reads it,
-  # so it must never observe `>`'s truncated, still-empty record.
-  echo "$$" > "$INTENTD_DATA_DIR/owned-daemon.tmp"
-  mv "$INTENTD_DATA_DIR/owned-daemon.tmp" "$INTENTD_DATA_DIR/owned-daemon"
+  echo "$$" > "$INTENTD_DATA_DIR/owned-daemon"
   # // timing-guard: force the supervisor to exercise its bounded child-kill fallback
   while :; do sleep 0.05; done
   ;;
@@ -3935,13 +3932,12 @@ esac
             command.env(intentd_sitter::startup::STARTING_ENV, "1");
         }
         let mut owner = spawn_guarded(&mut command);
+        // `>` truncates before it writes, so wait for a complete record.
+        let record = dir.path().join("owned-daemon");
         wait_until("owned daemon", Duration::from_secs(10), || {
-            dir.path().join("owned-daemon").exists()
+            recorded_pid(&record).is_some()
         });
-        let daemon_pid = read_or_empty(&dir.path().join("owned-daemon"))
-            .trim()
-            .parse()
-            .unwrap();
+        let daemon_pid = recorded_pid(&record).unwrap();
         let out = background_call(dir.path(), &base, &["stop"]);
         assert!(out.status.success(), "{out:?}");
         assert!(owner.wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(1))).unwrap().unwrap().success(),
@@ -3964,11 +3960,9 @@ fn background_start_stop_reports_supervisor_crash_with_live_daemon() {
 case "$1" in
 serve)
   # The record is the readiness signal the test stops on, so arm the trap
-  # first. Publish by rename: the test waits for the file to exist, then
-  # reads it, so it must never observe `>`'s truncated, still-empty record.
+  # first: a forwarded stop must never land before it exists.
   trap 'echo stopping > "$INTENTD_DATA_DIR/stop-seen"' TERM
-  echo "$$" > "$INTENTD_DATA_DIR/owned-daemon.tmp"
-  mv "$INTENTD_DATA_DIR/owned-daemon.tmp" "$INTENTD_DATA_DIR/owned-daemon"
+  echo "$$" > "$INTENTD_DATA_DIR/owned-daemon"
   # // timing-guard: fixture remains alive after TERM until its owned group is killed
   while :; do sleep 0.05; done
   ;;
@@ -3982,13 +3976,12 @@ esac
             .env(KILL_TIMEOUT_ENV, "30000")
             .arg("serve"),
     );
+    // `>` truncates before it writes, so wait for a complete record.
+    let record = dir.path().join("owned-daemon");
     wait_until("owned daemon", Duration::from_secs(10), || {
-        dir.path().join("owned-daemon").exists()
+        recorded_pid(&record).is_some()
     });
-    let daemon_pid = read_or_empty(&dir.path().join("owned-daemon"))
-        .trim()
-        .parse()
-        .unwrap();
+    let daemon_pid = recorded_pid(&record).unwrap();
     let mut stop = spawn_guarded(
         sitter_command(dir.path(), &base)
             .env(KILL_TIMEOUT_ENV, "500")
@@ -4494,17 +4487,13 @@ fn supervisor_death_during_startup(ready: bool) {
         .env(intentd_sitter::readiness::TIMEOUT_ENV, "5000")
         .env(KILL_TIMEOUT_ENV, "100");
     let mut caller = spawn_guarded(&mut command);
+    // `>` truncates before it writes, so wait for a complete record.
+    let record = dir.path().join("daemon-pid");
     wait_until("owned daemon launch", Duration::from_secs(5), || {
-        dir.path().join("daemon-pid").exists()
+        recorded_pid(&record).is_some()
     });
     caller.signal(Signal::SIGSTOP).unwrap();
-    let daemon = Pid::from_raw(
-        fs::read_to_string(dir.path().join("daemon-pid"))
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap(),
-    );
+    let daemon = Pid::from_raw(recorded_pid(&record).unwrap().cast_signed());
     let supervisor = intentd_sitter::supervisor::read_live_pid(&fixture.paths.pid_path).unwrap();
     kill(supervisor, Signal::SIGKILL).unwrap();
     wait_until("orphan adoption", Duration::from_secs(5), || {
