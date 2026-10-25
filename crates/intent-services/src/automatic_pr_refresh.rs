@@ -170,7 +170,8 @@ impl Services {
 
     /// Spawn the `agent:idle` PR refresh worker. Each batch of idle events is
     /// reduced to its distinct workspaces; a workspace whose refresh is still
-    /// running is not started twice. No-op-safe without an event bus.
+    /// running is not started twice. Each refresh is a draining store task, so
+    /// shutdown waits for it to finish. No-op-safe without an event bus.
     ///
     /// # Panics
     /// Panics if the in-flight workspace set's mutex is poisoned.
@@ -203,14 +204,22 @@ impl Services {
                     {
                         continue;
                     }
-                    let services = services.clone();
-                    let running = running.clone();
-                    intent_core::spawn_daemon(async move {
-                        services
-                            .refresh_prs_on_agent_idle(&event.workspace_id)
-                            .await;
+                    // Owned by the store writers, so daemon shutdown drains an
+                    // in-flight refresh (and its root and monitor tail) instead
+                    // of leaving it detached.
+                    let job = {
+                        let services = services.clone();
+                        let running = running.clone();
+                        let workspace_id = event.workspace_id.clone();
+                        async move {
+                            services.refresh_prs_on_agent_idle(&workspace_id).await;
+                            running.lock().unwrap().remove(&workspace_id);
+                        }
+                    };
+                    if services.store_tasks.spawn_draining(job).is_none() {
                         running.lock().unwrap().remove(&event.workspace_id);
-                    });
+                        break;
+                    }
                 }
             }
         })

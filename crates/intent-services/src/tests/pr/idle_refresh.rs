@@ -264,6 +264,88 @@ async fn idle_refresh_skips_unconfigured_source_control_and_archived_workspaces(
     assert_eq!(forge.seen_pr_queries.lock().unwrap().len(), 0);
 }
 
+/// Shutdown drains an in-flight idle refresh, including the git-root tail
+/// that runs after the workspace refresh: the worker's jobs are owned, not
+/// detached.
+#[tokio::test]
+async fn shutdown_drains_an_in_flight_idle_refresh() {
+    let primary = SweepRepo::init("main", None);
+    let sub = SweepRepo::init("feature", Some("https://github.com/o/r.git"));
+    sweep_commit(&sub.dir);
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws_id = WorkspaceId::new();
+    let mut ws = workspace(&ws_id);
+    ws.worktree_path = Some(primary.dir.to_string_lossy().into_owned());
+    ws.branch = "feature".into();
+    ws.repository_owner = Some("o".into());
+    ws.repository_name = Some("r".into());
+    ws.pr_number = Some(42);
+    ws.updated_at = now_iso();
+    store.insert_workspace(&ws).await.unwrap();
+    let mut root = sweep_root(&ws_id, &sub.dir, Some(("o", "r")));
+    root.pr_number = Some(43);
+    store.upsert_workspace_git_root(&root).await.unwrap();
+    let park = Arc::new(GetPrPark::default());
+    let forge = Arc::new(StubForge {
+        get_pr_park: Some(park.clone()),
+        ..Default::default()
+    });
+    let bus = crate::EventBus::new(store.clone());
+    let svc = Services::new(store)
+        .with_event_bus(bus.clone())
+        .with_source_control(forge.clone());
+    let task = svc.spawn_idle_pr_refresh_loop();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(5)),
+        async {
+            while bus.subscriber_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        },
+    )
+    .await
+    .unwrap();
+    publish_idle(&bus, &ws_id, "agent-a").await;
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(10)),
+        park.entered.notified(),
+    )
+    .await
+    .expect("the workspace refresh reached the forge");
+    let shutdown = {
+        let svc = svc.clone();
+        tokio::spawn(async move { svc.shutdown_store_writers().await })
+    };
+    assert!(
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_millis(200)),
+            async {
+                while !shutdown.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            },
+        )
+        .await
+        .is_err(),
+        "shutdown waits for the parked refresh"
+    );
+    park.release.notify_one();
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(std::time::Duration::from_secs(10)),
+        shutdown,
+    )
+    .await
+    .expect("shutdown finished")
+    .unwrap();
+    assert_eq!(
+        *forge.seen_get_pr.lock().unwrap(),
+        vec![42, 43],
+        "the root tail ran before shutdown returned"
+    );
+    task.await.unwrap();
+}
+
 async fn refresh_setup_shared(
     forge: Arc<StubForge>,
     branch: &str,

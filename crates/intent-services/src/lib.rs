@@ -1512,6 +1512,10 @@ pub struct Services {
     >,
     /// GitLab's configured connection has an independent, non-overlapping poll lane.
     review_monitor_poll_lane: Arc<tokio::sync::Mutex<()>>,
+    /// The legacy PR-monitor sweep's lane: loop ticks wait for it, an
+    /// `agent:idle` nudge skips while it is held, so the two never poll the
+    /// same monitors concurrently.
+    legacy_pr_monitor_poll_lane: Arc<tokio::sync::Mutex<()>>,
     /// Bounded controls consumed by the existing monitor loop, never a wake queue.
     review_monitor_controls: Arc<
         Mutex<Option<tokio::sync::mpsc::Sender<repository_native_wire::monitor::flush::Command>>>,
@@ -1885,6 +1889,7 @@ impl Services {
             note_content_writes: Arc::default(),
             review_monitor_authorities: Arc::default(),
             review_monitor_poll_lane: Arc::default(),
+            legacy_pr_monitor_poll_lane: Arc::default(),
             review_monitor_controls: Arc::default(),
             review_monitor_deliveries: Arc::default(),
             #[cfg(test)]

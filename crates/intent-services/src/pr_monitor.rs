@@ -3556,6 +3556,18 @@ impl Services {
     }
 
     async fn sweep_legacy_pr_monitors_accounted(&self, scope: &SweepScope) {
+        // Hold the lane through load, selection and every poll, so the
+        // freshness each sweep reads cannot be invalidated by another sweep
+        // polling the same monitors meanwhile. A nudge never waits: a running
+        // sweep already covers whatever is due.
+        let _lane = if matches!(scope, SweepScope::Nudge { .. }) {
+            let Ok(lane) = self.legacy_pr_monitor_poll_lane.clone().try_lock_owned() else {
+                return;
+            };
+            lane
+        } else {
+            self.legacy_pr_monitor_poll_lane.clone().lock_owned().await
+        };
         let mut probed = None;
         if self.sweeps_rate_limited() {
             let lifted = match pr_ops::resolve_source_control(self.source_control.clone()).await {
@@ -3611,27 +3623,21 @@ impl Services {
                 min_age_secs,
             } => {
                 let now = time::OffsetDateTime::now_utc();
-                let stale: Vec<_> = monitors
-                    .into_iter()
-                    .filter(|m| {
-                        &m.workspace_id == workspace_id
-                            && !polled_within(m.last_polled_at.as_deref(), *min_age_secs, now)
-                    })
-                    .collect();
-                if stale.is_empty() {
+                // Cheap pre-check before spending the shared quota probe.
+                if !monitors.iter().any(|m| {
+                    &m.workspace_id == workspace_id
+                        && !polled_within(m.last_polled_at.as_deref(), *min_age_secs, now)
+                }) {
                     return;
                 }
-                let distinct_prs = stale.iter().map(pr_key).collect::<HashSet<_>>().len();
                 let quota = self.pr_monitor_quota_window(&sc, probed).await;
-                if let Some(QuotaCadence::DeferUntilReset { .. }) = plan_quota_cadence(
-                    distinct_prs,
-                    self.pr_monitor_poll_interval().as_secs(),
+                self.select_due_pr_monitors_scoped(
+                    monitors,
                     quota,
-                    self.pr_monitor_quota_share_percent(),
-                ) {
-                    return;
-                }
-                stale
+                    now,
+                    Some((workspace_id, *min_age_secs)),
+                )
+                .await
             }
         };
         let mut shared: HashMap<PrKey, std::result::Result<SharedPrSnapshot, String>> =
@@ -3741,6 +3747,24 @@ impl Services {
         quota: Option<QuotaWindow>,
         now: time::OffsetDateTime,
     ) -> Vec<PrMonitor> {
+        self.select_due_pr_monitors_scoped(monitors, quota, now, None)
+            .await
+    }
+
+    /// [`Self::select_due_pr_monitors`], optionally narrowed to one
+    /// workspace's monitors for the `agent:idle` nudge: `nudge` replaces only
+    /// the workspace's idle-tier interval with its minimum age. The hourly
+    /// budget and quota cadence, the quota deferral, the catch-up rule, and
+    /// the per-tick fetch cap (with its spacing hold) are still computed over
+    /// every active monitor, so a nudge never polls a PR sooner than the
+    /// global budget allows.
+    async fn select_due_pr_monitors_scoped(
+        &self,
+        monitors: Vec<PrMonitor>,
+        quota: Option<QuotaWindow>,
+        now: time::OffsetDateTime,
+        nudge: Option<(&WorkspaceId, u64)>,
+    ) -> Vec<PrMonitor> {
         let distinct_prs = monitors.iter().map(pr_key).collect::<HashSet<_>>().len();
         let poll_secs = self.pr_monitor_poll_interval().as_secs();
         let budget_secs = effective_pr_monitor_interval_secs(
@@ -3765,20 +3789,35 @@ impl Services {
         };
         self.note_pr_monitor_cadence(distinct_prs, effective_secs, poll_secs, budget_secs, quota);
         let interval = time::Duration::seconds(effective_secs.cast_signed());
-        let workspace_ids: Vec<_> = monitors
+        // The spacing hold is global: measured over every active monitor.
+        let newest_anchor_age_secs = monitors
             .iter()
-            .map(|m| m.workspace_id.clone())
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
-        let intervals = match self
-            .workspace_automatic_check_intervals(&workspace_ids, now)
-            .await
-        {
-            Ok(intervals) => intervals,
-            Err(error) => {
-                tracing::warn!(%error, "pr monitor activity read failed; skipping tick");
-                return Vec::new();
+            .filter_map(|m| m.last_polled_at.as_deref().and_then(parse_iso))
+            .max()
+            .map(|at| u64::try_from((now - at).whole_seconds()).unwrap_or(0));
+        let (monitors, intervals) = if let Some((workspace_id, min_age_secs)) = nudge {
+            let monitors: Vec<_> = monitors
+                .into_iter()
+                .filter(|m| &m.workspace_id == workspace_id)
+                .collect();
+            let intervals = HashMap::from([(workspace_id.clone(), min_age_secs)]);
+            (monitors, intervals)
+        } else {
+            let workspace_ids: Vec<_> = monitors
+                .iter()
+                .map(|m| m.workspace_id.clone())
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect();
+            match self
+                .workspace_automatic_check_intervals(&workspace_ids, now)
+                .await
+            {
+                Ok(intervals) => (monitors, intervals),
+                Err(error) => {
+                    tracing::warn!(%error, "pr monitor activity read failed; skipping tick");
+                    return Vec::new();
+                }
             }
         };
         let catch_up = self.pr_monitor_catch_up.lock().unwrap().clone();
@@ -3799,11 +3838,6 @@ impl Services {
                 monitor,
             })
             .collect();
-        let newest_anchor_age_secs = candidates
-            .iter()
-            .filter_map(|c| c.anchor)
-            .max()
-            .map(|at| u64::try_from((now - at).whole_seconds()).unwrap_or(0));
         select_due_pr_monitors(
             candidates,
             now,
@@ -11047,6 +11081,119 @@ mod tests {
         );
         svc.nudge_workspace_pr_monitors(&ws, 60).await;
         assert!(forge.take_fetched_numbers().is_empty(), "just polled");
+    }
+
+    /// The nudge replaces only the idle tier: the hourly-budget cadence, the
+    /// quota-stretched cadence, and the per-tick fetch cap still bound it.
+    #[tokio::test]
+    async fn idle_nudge_honours_budget_quota_cadence_and_fetch_cap() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let svc = svc
+            .with_pr_monitor_poll_seconds(60)
+            .with_pr_monitor_hourly_request_budget(100)
+            .with_pr_monitor_quota_share_percent(50);
+        let mut ids = Vec::new();
+        for pr in 1_u64..=3 {
+            let (m, _) = svc
+                .pr_monitor_register(&ws, &owner, "o", "r", pr)
+                .await
+                .expect("register");
+            ids.push(m.monitor_id);
+        }
+        make_workspace_idle(&svc, &ws).await;
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let stale = |secs: u64| {
+            let svc = svc.clone();
+            let ids = ids.clone();
+            async move {
+                let at = intent_core::iso_from_unix_secs((now_unix - secs).cast_signed());
+                for id in &ids {
+                    backdate(&svc, id, &at).await;
+                }
+            }
+        };
+        forge.take_fetched_numbers();
+
+        // Budget only (no quota signal): 3 PRs × 3 requests × 3600 / 100 =
+        // 324 s per PR. Two minutes stale is past the 60 s floor but not due.
+        stale(120).await;
+        svc.nudge_workspace_pr_monitors(&ws, 60).await;
+        assert!(forge.take_fetched_numbers().is_empty(), "budget cadence");
+        // Past the budget cadence the fetch cap allows one PR per nudge.
+        stale(400).await;
+        svc.nudge_workspace_pr_monitors(&ws, 60).await;
+        assert_eq!(forge.take_fetched_numbers().len(), 1, "fetch cap");
+
+        // Low quota: 20 requests left for an hour at a 50 % share pays for
+        // 3 × 3 × 3600 / 10 = 3240 s per PR; ten-minute-stale PRs wait.
+        forge.edit(|s| {
+            s.rate_limit_remaining = Some(20);
+            s.rate_limit_limit = Some(5_000);
+            s.rate_limit_reset_at = Some(now_unix + 3600);
+        });
+        stale(600).await;
+        svc.nudge_workspace_pr_monitors(&ws, 60).await;
+        assert!(forge.take_fetched_numbers().is_empty(), "quota cadence");
+        stale(2 * 86_400).await;
+        svc.nudge_workspace_pr_monitors(&ws, 60).await;
+        assert_eq!(
+            forge.take_fetched_numbers().len(),
+            1,
+            "a stretched cadence still caps the nudge at one fetch"
+        );
+        // A share that cannot pay for one fetch defers everything.
+        forge.edit(|s| s.rate_limit_remaining = Some(2));
+        stale(2 * 86_400).await;
+        svc.nudge_workspace_pr_monitors(&ws, 60).await;
+        assert!(forge.take_fetched_numbers().is_empty(), "quota deferral");
+    }
+
+    /// The nudge and the legacy sweep share one lane: a nudge skips while a
+    /// sweep holds it, a sweep waits for it, and the nudge after the sweep
+    /// re-reads `lastPolledAt` and does not poll the PR again.
+    #[tokio::test]
+    async fn idle_nudge_and_due_sweep_never_poll_concurrently() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        let svc = svc.with_pr_monitor_poll_seconds(60);
+        register(&svc, &ws, &owner).await;
+        age_all(&svc, 120).await;
+        forge.take_fetched_numbers();
+
+        let held = svc.legacy_pr_monitor_poll_lane.clone().lock_owned().await;
+        svc.nudge_workspace_pr_monitors(&ws, 60).await;
+        assert!(
+            forge.take_fetched_numbers().is_empty(),
+            "a nudge never overlaps a running sweep"
+        );
+        let sweep = {
+            let svc = svc.clone();
+            tokio::spawn(async move { svc.poll_due_pr_monitors().await })
+        };
+        assert!(
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(200)),
+                async {
+                    while !sweep.is_finished() {
+                        tokio::task::yield_now().await;
+                    }
+                }
+            )
+            .await
+            .is_err(),
+            "the sweep waits for the lane"
+        );
+        assert!(forge.take_fetched_numbers().is_empty());
+        drop(held);
+        sweep.await.unwrap();
+        assert_eq!(forge.take_fetched_numbers(), vec![42]);
+        svc.nudge_workspace_pr_monitors(&ws, 60).await;
+        assert!(
+            forge.take_fetched_numbers().is_empty(),
+            "the nudge re-reads the sweep's poll"
+        );
     }
 
     async fn make_workspace_idle(svc: &Services, ws: &WorkspaceId) {
