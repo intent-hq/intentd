@@ -1,14 +1,28 @@
 //! Admission shared by automatic linkage commands and the background sweep.
 //! Reserve before I/O, including failures, so reconnects and concurrent windows
 //! cannot turn a failed refresh into an unbounded retry loop.
+//!
+//! The `agent:idle` worker ([`Services::spawn_idle_pr_refresh_loop`]) reuses
+//! the same admission: when an agent finishes, its workspace's branch PR, its
+//! registered git roots, and its stale PR monitors are checked once, unless
+//! the shared clock says they were checked within the idle gate.
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use intent_core::{Result, WorkspaceId};
+use intent_core::events::AGENT_IDLE;
+use intent_core::{Error, Result, WorkspaceId, WorkspaceStatus};
 use tokio::time::Instant;
 
-use crate::{pr_ops, Services};
+use crate::events::SubscriptionFilter;
+use crate::{pr_discovery, pr_ops, Services};
+
+/// The idle gate's floor: an idle refresh never re-checks a workspace, root,
+/// or PR monitor that any automatic path checked less than 60 s ago.
+pub(crate) const IDLE_REFRESH_MIN_AGE_SECS: u64 = 60;
+/// Idle events arriving together are delivered as one batch, so a team of
+/// agents finishing at once becomes one refresh per workspace.
+const IDLE_REFRESH_BATCH_WINDOW: Duration = Duration::from_millis(250);
 
 type Key = (WorkspaceId, Option<String>);
 
@@ -141,6 +155,131 @@ impl Services {
         owner
             .await
             .map_err(|e| intent_core::Error::Internal(format!("PR refresh worker failed: {e}")))?
+    }
+}
+
+impl Services {
+    /// The idle gate: max(60 s, the configured active interval). It
+    /// deliberately ignores the idle tier, because the workspace was just
+    /// active.
+    pub(crate) fn idle_pr_refresh_gate_secs(&self) -> u64 {
+        self.pr_monitor_poll_interval()
+            .as_secs()
+            .max(IDLE_REFRESH_MIN_AGE_SECS)
+    }
+
+    /// Spawn the `agent:idle` PR refresh worker. Each batch of idle events is
+    /// reduced to its distinct workspaces; a workspace whose refresh is still
+    /// running is not started twice. Each refresh is a draining store task, so
+    /// shutdown waits for it to finish. No-op-safe without an event bus.
+    ///
+    /// # Panics
+    /// Panics if the in-flight workspace set's mutex is poisoned.
+    pub fn spawn_idle_pr_refresh_loop(&self) -> tokio::task::JoinHandle<()> {
+        let Some(bus) = self.event_bus.clone() else {
+            tracing::info!("idle PR refresh loop disabled: no event bus");
+            return intent_core::spawn_daemon(async {});
+        };
+        let services = self.clone();
+        intent_core::spawn_daemon(async move {
+            let filter = SubscriptionFilter {
+                event_types: vec![AGENT_IDLE.to_string()],
+                batch_window: Some(IDLE_REFRESH_BATCH_WINDOW),
+                ..Default::default()
+            };
+            let mut sub = bus.subscribe(filter);
+            let running: Arc<Mutex<HashSet<WorkspaceId>>> = Arc::default();
+            loop {
+                let events = tokio::select! {
+                    biased;
+                    () = services.settings_tasks.closed() => break,
+                    events = sub.recv() => events,
+                };
+                let Some(events) = events else {
+                    break;
+                };
+                for event in events {
+                    if event.event_type != AGENT_IDLE
+                        || !running.lock().unwrap().insert(event.workspace_id.clone())
+                    {
+                        continue;
+                    }
+                    // Owned by the store writers, so daemon shutdown drains an
+                    // in-flight refresh (and its root and monitor tail) instead
+                    // of leaving it detached.
+                    let job = {
+                        let services = services.clone();
+                        let running = running.clone();
+                        let workspace_id = event.workspace_id.clone();
+                        async move {
+                            services.refresh_prs_on_agent_idle(&workspace_id).await;
+                            running.lock().unwrap().remove(&workspace_id);
+                        }
+                    };
+                    if services.store_tasks.spawn_draining(job).is_none() {
+                        running.lock().unwrap().remove(&event.workspace_id);
+                        break;
+                    }
+                }
+            }
+        })
+    }
+
+    /// One opportunistic refresh after an agent in `workspace_id` went idle:
+    /// the branch PR (discovery and status), each registered git root, then
+    /// the workspace's PR monitors. Every forge call goes through the
+    /// automatic admission at the idle gate, the shared rate-limit pause,
+    /// and provider failure caching and budgets (never the forced
+    /// `explicitly_refresh` path). Skips archived, deleted, remote, or
+    /// missing workspaces, and is silent when source control is
+    /// unconfigured. Errors are logged, never returned.
+    pub(crate) async fn refresh_prs_on_agent_idle(&self, workspace_id: &WorkspaceId) {
+        let Ok(ws) = self.store.get_workspace(workspace_id).await else {
+            return;
+        };
+        if ws.archived
+            || ws.is_remote
+            || matches!(
+                ws.status,
+                WorkspaceStatus::Archived | WorkspaceStatus::Deleted
+            )
+        {
+            return;
+        }
+        let Ok(sc) = pr_ops::resolve_source_control(self.source_control.clone()).await else {
+            return;
+        };
+        let gate = self.idle_pr_refresh_gate_secs();
+        let admitted = (!self.sweeps_rate_limited())
+            .then(|| self.admit_automatic_pr_refresh(&ws.id, None, gate))
+            .flatten();
+        if let Some(_permit) = admitted {
+            let refreshed = pr_discovery::automatically_refresh(
+                gate,
+                self.refresh_workspace_pr_with_sc(ws.clone(), &sc),
+            )
+            .await;
+            match refreshed {
+                Err(Error::RateLimited(detail)) => {
+                    intent_sourcecontrol::traffic::with_caller(
+                        intent_sourcecontrol::traffic::Caller::WorkspaceRefresh,
+                        self.pause_sweeps_for_rate_limit(&sc, &detail),
+                    )
+                    .await;
+                }
+                Err(error) => tracing::debug!(
+                    workspace = %ws.id.as_str(),
+                    %error,
+                    "idle PR refresh: workspace refresh did not complete"
+                ),
+                Ok(_) => {}
+            }
+        }
+        let mut deferrals = pr_discovery::DeferralTally::default();
+        self.sweep_workspace_git_roots_tallied(&ws, Some(&sc), gate, false, &mut deferrals)
+            .await;
+        deferrals.log(&self.pr_discovery);
+        self.nudge_workspace_pr_monitors(&ws.id, gate).await;
     }
 }
 

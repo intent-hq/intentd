@@ -11,7 +11,9 @@ use crate::handshake::handshake_with_callbacks;
 use crate::session::{map_notification, map_notification_with_callback_routes, MappedUpdate};
 use crate::transport::{ConnectionHooks, IncomingNotification};
 
-const WAIT: Duration = Duration::from_secs(15);
+fn wait() -> Duration {
+    intentd_test_support::test_timeout(Duration::from_secs(15))
+}
 const RECEIPT: &str = "11111111-1111-4111-8111-111111111111";
 const SERVER: &str = "intent-callback-22222222-2222-4222-8222-222222222222";
 
@@ -42,7 +44,7 @@ impl Peer {
     async fn read(&mut self) -> Value {
         let mut line = String::new();
         assert!(
-            timeout(WAIT, self.read.read_line(&mut line))
+            timeout(wait(), self.read.read_line(&mut line))
                 .await
                 .unwrap()
                 .unwrap()
@@ -584,7 +586,7 @@ impl NodePeer {
     }
     async fn call(&self, method: &str, params: Value) -> Value {
         self.connection
-            .request_timeout(method, params, WAIT)
+            .request_timeout(method, params, wait())
             .await
             .unwrap_or_else(|e| panic!("{e}: {:?}", self.connection.recent_stderr()))
     }
@@ -680,12 +682,12 @@ async fn actual_adapter_sdk_and_rust_mcp_deliver_distinct_callback_preserving_ol
         conn.request_timeout(
             "fixture/call",
             json!({"name":"workspace-mcp","code":"return 'old ordinary result';"}),
-            WAIT,
+            wait(),
         )
         .await
         .unwrap()
     });
-    timeout(WAIT, old_api.entered.notified()).await.unwrap();
+    timeout(wait(), old_api.entered.notified()).await.unwrap();
     let (fresh, _) = mcp().await;
     let outcome = bridge_registration(opened.query.unwrap(), &fresh)
         .run(pending())
@@ -1034,7 +1036,7 @@ async fn monitor_receipt_same_id_load_retires_before_reply_and_ignores_stale_com
         .is_none());
     assert!(fresh.is_current());
     drop(peer);
-    timeout(WAIT, async {
+    timeout(wait(), async {
         while fresh.is_current() {
             tokio::task::yield_now().await;
         }
@@ -1608,13 +1610,13 @@ async fn monitor_context_retirement_join_survives_waiter_drop_and_is_shared() {
         );
         peer.reply(&request, json!({"retired":joined})).await;
         assert_eq!(
-            timeout(WAIT, repeated).await.unwrap().unwrap().is_ok(),
+            timeout(wait(), repeated).await.unwrap().unwrap().is_ok(),
             joined
         );
         let again = client
             .begin_review_context_retirement("original", &context)
             .unwrap();
-        assert_eq!(timeout(WAIT, again.join()).await.unwrap().is_ok(), joined);
+        assert_eq!(timeout(wait(), again.join()).await.unwrap().is_ok(), joined);
         assert!(
             timeout(
                 intentd_test_support::test_timeout(Duration::from_millis(20)),
@@ -1648,7 +1650,7 @@ async fn monitor_context_retirement_drop_before_wait_retains_original_join() {
     .expect("dropping the caller lost its exact remote retirement obligation");
     peer.reply(&request, json!({"retired":true})).await;
     assert!(timeout(
-        WAIT,
+        wait(),
         client
             .begin_review_context_retirement("original", &context)
             .unwrap()

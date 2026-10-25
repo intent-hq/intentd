@@ -18,7 +18,9 @@ use std::collections::HashMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Notify;
 use tokio::time::timeout;
-const BUDGET: Duration = Duration::from_secs(10);
+fn budget() -> Duration {
+    intentd_test_support::test_timeout(Duration::from_secs(10))
+}
 const MR: &str = "/api/v4/projects/group%2Fproject/merge_requests/4";
 const PROJECT: &str = "/api/v4/projects/group%2Fproject";
 
@@ -223,7 +225,7 @@ pub(crate) fn call(code: &str) -> Value {
 }
 
 pub(crate) async fn run(server: &WorkspaceMcpServer, code: &str) -> Value {
-    timeout(BUDGET, server.handle_message(&call(code)))
+    timeout(budget(), server.handle_message(&call(code)))
         .await
         .unwrap()
         .unwrap()
@@ -1799,7 +1801,7 @@ impl ReadServer {
         *self.replies.pause.lock().unwrap() = Some(path.into());
     }
     pub(crate) async fn entered(&self) {
-        timeout(BUDGET, self.replies.entered.notified())
+        timeout(budget(), self.replies.entered.notified())
             .await
             .unwrap();
     }
@@ -1873,7 +1875,7 @@ async fn detached_actual_file_read_cancellation_keeps_lease_and_never_dispatches
     .await
     .is_err());
     file.resume();
-    drop(timeout(BUDGET, gate).await.unwrap());
+    drop(timeout(budget(), gate).await.unwrap());
     assert_eq!(http.count(), 0);
     let fresh = run(&f.server(), "return await ws.pr.snapshot(4);").await;
     assert!(fresh.to_string().contains("actual review"), "{fresh}");
