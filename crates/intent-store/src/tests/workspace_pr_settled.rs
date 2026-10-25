@@ -49,6 +49,16 @@ fn root(ws: &WorkspaceId, prs: Option<Vec<PullRequestInfo>>) -> WorkspaceGitRoot
     }
 }
 
+/// (id, link status, active PR, pool, git-root pool, expected settled).
+type Case = (
+    &'static str,
+    Option<PullRequestStatus>,
+    Option<PullRequestStatus>,
+    Option<Vec<PullRequestStatus>>,
+    Option<Vec<PullRequestStatus>>,
+    bool,
+);
+
 #[tokio::test]
 async fn settled_workspaces_need_a_pr_and_no_open_or_unknown_one() {
     use PullRequestStatus::{Closed, Draft, Merged, Open};
@@ -60,17 +70,8 @@ async fn settled_workspaces_need_a_pr_and_no_open_or_unknown_one() {
         .unwrap()
         .is_empty());
 
-    // (id, pr_status, active PR, pool, git root pool, expected settled)
-    #[allow(clippy::type_complexity)]
     #[rustfmt::skip]
-    let cases: Vec<(
-        &str,
-        Option<PullRequestStatus>,
-        Option<PullRequestStatus>,
-        Option<Vec<PullRequestStatus>>,
-        Option<Vec<PullRequestStatus>>,
-        bool,
-    )> = vec![
+    let cases: Vec<Case> = vec![
         ("no-prs", None, None, None, None, false),
         ("empty-pool", None, None, Some(vec![]), None, false),
         ("merged", Some(Merged), Some(Merged), Some(vec![Merged]), None, true),
