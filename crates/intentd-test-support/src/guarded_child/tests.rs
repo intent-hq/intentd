@@ -81,6 +81,93 @@ fn drop_kills_child_and_grandchild() {
     });
 }
 
+/// Regression for the leaked sitter fakes: a test that gave up on its child
+/// with `kill()` + `wait()` killed only the leader and reaped it, so `Drop`
+/// could no longer reach the grandchild. `kill_tree` takes the tree down
+/// before reaping.
+#[test]
+fn kill_tree_kills_child_and_grandchild_before_reaping() {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    let (mut guard, grandchild) = spawn_with_grandchild();
+    let child = guard.id();
+    assert!(alive(child) && alive(grandchild));
+
+    let status = guard.kill_tree().unwrap();
+    assert_eq!(
+        status.signal(),
+        Some(nix::sys::signal::Signal::SIGKILL as i32)
+    );
+    wait_until("the grandchild to be gone", || !alive(grandchild));
+    assert!(!alive(child), "kill_tree reaps the child");
+
+    // Already reaped: neither a second call nor Drop signals anything.
+    assert_eq!(guard.kill_tree().unwrap(), status);
+    drop(guard);
+}
+
+/// After a reap the pid may belong to someone else: `kill_tree` signals
+/// nothing and hands back the status the reap recorded.
+#[test]
+fn kill_tree_after_reap_returns_the_exit_status() {
+    let mut guard = GuardedChild::spawn(&mut sh("exit 3")).unwrap();
+    let status = guard
+        .wait_with_timeout(BOUND)
+        .unwrap()
+        .expect("`exit 3` exits within the bound");
+    assert_eq!(guard.kill_tree().unwrap(), status);
+    assert_eq!(status.code(), Some(3));
+}
+
+/// SIGKILL only the leader, leaving it an unreaped zombie with its
+/// `sleep 60` grandchild still running in the group.
+fn spawn_with_grandchild_then_kill_the_leader() -> (GuardedChild, u32) {
+    let (guard, grandchild) = spawn_with_grandchild();
+    guard.signal(nix::sys::signal::Signal::SIGKILL).unwrap();
+    let leader = Pid::from_raw(guard.id().cast_signed());
+    // Wait for the exit without reaping, as the guard's own peek does.
+    wait_until("the leader to exit (unreaped)", || {
+        let mut info = std::mem::MaybeUninit::<nix::libc::siginfo_t>::zeroed();
+        // SAFETY: writable zeroed storage; WNOWAIT never reaps our child.
+        let ok = unsafe {
+            nix::libc::waitid(
+                nix::libc::P_PID,
+                leader.as_raw().cast_unsigned(),
+                info.as_mut_ptr(),
+                nix::libc::WEXITED | nix::libc::WNOHANG | nix::libc::WNOWAIT,
+            )
+        } == 0;
+        // SAFETY: zeroed storage; si_pid stays 0 until an exit is reported.
+        ok && unsafe { info.assume_init().si_pid() } != 0
+    });
+    assert!(alive(grandchild), "the grandchild outlives its leader");
+    (guard, grandchild)
+}
+
+/// Regression for the leaked sitter fakes: a test that sent `SIGKILL` only to its
+/// supervisor (to prove the daemon survives it) relied on the guard to clean
+/// the daemon up, but Drop reaped the dead leader first and then skipped the
+/// sweep — one immortal fake per run piled up under `systemd --user`.
+#[test]
+fn drop_sweeps_the_group_of_a_killed_but_unreaped_leader() {
+    let (guard, grandchild) = spawn_with_grandchild_then_kill_the_leader();
+    drop(guard);
+    wait_until("the orphaned grandchild to be gone", || !alive(grandchild));
+}
+
+#[test]
+fn kill_tree_sweeps_the_group_of_a_killed_but_unreaped_leader() {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    let (mut guard, grandchild) = spawn_with_grandchild_then_kill_the_leader();
+    let status = guard.kill_tree().unwrap();
+    assert_eq!(
+        status.signal(),
+        Some(nix::sys::signal::Signal::SIGKILL as i32)
+    );
+    wait_until("the orphaned grandchild to be gone", || !alive(grandchild));
+}
+
 #[test]
 fn panic_after_spawn_still_reaps() {
     let pids = Mutex::new(None);
@@ -185,4 +272,111 @@ fn barrier_release_and_entered() {
         .unwrap()
         .expect("released script exits within the bound");
     assert_eq!(status.code(), Some(0));
+}
+
+/// Wait for a guarded script to exit within [`BOUND`]; panic naming `what`.
+fn exit_code_within_bound(guard: &mut GuardedChild, what: &str) -> Option<i32> {
+    guard
+        .wait_with_timeout(BOUND)
+        .unwrap()
+        .unwrap_or_else(|| panic!("{what} did not exit within {BOUND:?}"))
+        .code()
+}
+
+/// Regression: a test that drops its `TempDir` without releasing used to
+/// leave the script polling for a release file that can never appear.
+#[test]
+fn barrier_wait_gives_up_once_its_directory_is_gone() {
+    let dir = tempfile::Builder::new()
+        .prefix("intentd-test-support-")
+        .tempdir()
+        .unwrap();
+    let barrier = Barrier::new(dir.path(), "hold");
+    let script = format!("{}; {}; exit 0", barrier.sh_arrive(), barrier.sh_wait());
+    let mut guard = GuardedChild::spawn(&mut sh(&script)).unwrap();
+    wait_until("script to arrive at the barrier", || barrier.entered());
+
+    dir.close().unwrap();
+    assert_eq!(
+        exit_code_within_bound(&mut guard, "a hold whose directory is gone"),
+        Some(Barrier::ABANDONED_EXIT_CODE)
+    );
+}
+
+/// Regression for the leaked sitter fakes: the hold runs inside a USR2 trap
+/// (as `idle_restart_script` does), where the shell defers its TERM trap, so
+/// the barrier's own exit is the only way out once the test is gone.
+#[test]
+fn barrier_wait_inside_a_trap_handler_gives_up_once_its_directory_is_gone() {
+    let dir = tempfile::Builder::new()
+        .prefix("intentd-test-support-")
+        .tempdir()
+        .unwrap();
+    let ready = Barrier::new(dir.path(), "ready");
+    let hold = Barrier::new(dir.path(), "hold");
+    let script = format!(
+        "trap 'exit 0' TERM; trap '{arrive}; {wait}; exit 75' USR2; {ready}; \
+         while :; do sleep 0.05; done",
+        arrive = hold.sh_arrive(),
+        wait = hold.sh_wait(),
+        ready = ready.sh_arrive(),
+    );
+    let mut guard = GuardedChild::spawn(&mut sh(&script)).unwrap();
+    wait_until("traps to be installed", || ready.entered());
+    guard.signal(nix::sys::signal::Signal::SIGUSR2).unwrap();
+    wait_until("the USR2 handler to reach the hold", || hold.entered());
+
+    dir.close().unwrap();
+    assert_eq!(
+        exit_code_within_bound(&mut guard, "a trapped hold whose directory is gone"),
+        Some(Barrier::ABANDONED_EXIT_CODE)
+    );
+}
+
+/// A hold whose directory survives (the test process got `SIGKILL`, so its
+/// `TempDir` never dropped) still gives up after its deadline.
+#[test]
+fn barrier_wait_gives_up_after_its_deadline() {
+    let dir = tempfile::Builder::new()
+        .prefix("intentd-test-support-")
+        .tempdir()
+        .unwrap();
+    for deadline in [Duration::ZERO, Duration::from_millis(200)] {
+        let barrier = Barrier::new(dir.path(), "hold").with_deadline(deadline);
+        let script = format!("{}; exit 0", barrier.sh_wait());
+        let mut guard = GuardedChild::spawn(&mut sh(&script)).unwrap();
+        assert_eq!(
+            exit_code_within_bound(&mut guard, "a hold past its deadline"),
+            Some(Barrier::ABANDONED_EXIT_CODE),
+            "{deadline:?}"
+        );
+        assert!(dir.path().is_dir() && !barrier.path().exists());
+    }
+}
+
+/// The default hold deadline is the base stretched by the test multiplier,
+/// so coverage runs never abandon a hold a normal run would keep.
+#[test]
+fn barrier_default_deadline_scales_with_the_test_timeout() {
+    let dir = tempfile::tempdir().unwrap();
+    let polls = |barrier: &Barrier| {
+        let wait = barrier.sh_wait();
+        let (_, rest) = wait.split_once("-ge ").unwrap();
+        rest.split_whitespace()
+            .next()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
+    };
+    let expected = crate::test_timeout(crate::DEFAULT_HOLD_DEADLINE)
+        .as_nanos()
+        .div_ceil(Duration::from_millis(50).as_nanos());
+    assert_eq!(
+        u128::from(polls(&Barrier::new(dir.path(), "hold"))),
+        expected
+    );
+    assert_eq!(
+        polls(&Barrier::new(dir.path(), "hold").with_deadline(Duration::ZERO)),
+        1
+    );
 }

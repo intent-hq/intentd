@@ -606,13 +606,18 @@ fn wait_until_within(what: &str, window: Duration, mut cond: impl FnMut() -> boo
 /// `INTENTD_TEST_TIMEOUT_MULTIPLIER` — a hang guard — force-killing it on
 /// timeout so a broken build never wedges the test run. A window that must
 /// stay under a fixed production timer uses [`wait_exit_within`] instead.
-fn wait_exit(child: &mut Child, timeout: Duration) -> ExitStatus {
+///
+/// The force-kill takes the sitter's whole process group down
+/// ([`GuardedChild::kill_tree`]): killing and reaping only the sitter left
+/// its fake daemon — often parked on a [`Barrier`] in a signal trap that
+/// defers SIGTERM — running forever once the test's tempdir was gone.
+fn wait_exit(child: &mut GuardedChild, timeout: Duration) -> ExitStatus {
     wait_exit_within(child, intentd_test_support::test_timeout(timeout))
 }
 
 /// [`wait_exit`] for exactly `window`, never stretched; see
 /// [`wait_until_within`].
-fn wait_exit_within(child: &mut Child, window: Duration) -> ExitStatus {
+fn wait_exit_within(child: &mut GuardedChild, window: Duration) -> ExitStatus {
     let deadline = Instant::now() + window;
     while Instant::now() < deadline {
         if let Some(status) = child.try_wait().unwrap() {
@@ -621,9 +626,94 @@ fn wait_exit_within(child: &mut Child, window: Duration) -> ExitStatus {
         // timing-guard: poll interval
         thread::sleep(Duration::from_millis(20));
     }
-    let _ = child.kill();
-    let _ = child.wait();
+    let _ = child.kill_tree();
     panic!("sitter did not exit within {window:?}");
+}
+
+/// A serving sitter whose fake daemon ignores SIGTERM (it only logs it) and
+/// never exits — the shape of every leaked fake. The sitter has been told to
+/// stop and is sitting out its hour-long kill timeout. Returns the sitter and
+/// the daemon's pid.
+fn sitter_with_a_daemon_that_ignores_term(dir: &Path) -> (GuardedChild, u32) {
+    let paths = SitterPaths::from_data_dir(dir);
+    preinstall(
+        &paths,
+        "0.1.0",
+        &format!(
+            "#!/bin/sh\n\
+             trap 'echo term >> \"${FAKE_DAEMON_LOG}\"' TERM\n\
+             echo \"pid $$\" >> \"${FAKE_DAEMON_LOG}\"\n\
+             # // timing-guard: the fake outlives SIGTERM until something kills it\n\
+             while :; do sleep 0.05; done\n"
+        ),
+    );
+    let mut sitter = spawn_guarded(
+        sitter_command(dir, &dead_url())
+            .env(CHECK_MIN_ENV, "3600000")
+            .env(CHECK_MAX_ENV, "3600001")
+            .env(KILL_TIMEOUT_ENV, "3600000")
+            .arg("serve"),
+    );
+    let log_path = daemon_log_path(dir);
+    wait_until("the daemon to start", Duration::from_secs(15), || {
+        read_or_empty(&log_path).contains("pid ")
+    });
+    let daemon: u32 = read_or_empty(&log_path)
+        .lines()
+        .find_map(|line| line.strip_prefix("pid "))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    send_signal(&sitter, "TERM");
+    wait_until(
+        "the daemon to ignore the forwarded SIGTERM",
+        Duration::from_secs(15),
+        || read_or_empty(&log_path).contains("term"),
+    );
+    assert!(
+        sitter.try_wait().unwrap().is_none(),
+        "the sitter waits on its daemon"
+    );
+    (sitter, daemon)
+}
+
+/// Regression for the leaked fake daemons: when `wait_exit` gave up on a
+/// sitter it killed and reaped only the sitter, orphaning a daemon that
+/// ignores `SIGTERM` under `systemd --user` forever. It must take the daemon
+/// down with the sitter.
+#[test]
+fn wait_exit_giving_up_kills_the_fake_daemon_too() {
+    let _serial = SERVE_LOOP_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().unwrap();
+    let (mut sitter, daemon) = sitter_with_a_daemon_that_ignores_term(dir.path());
+
+    let gave_up = panic::catch_unwind(AssertUnwindSafe(|| {
+        // fixed-deadline: allow — stays under the sitter's hour-long KILL_TIMEOUT_ENV
+        wait_exit_within(&mut sitter, Duration::from_millis(500))
+    }));
+    let survived = panic::catch_unwind(|| {
+        wait_until("the daemon to be gone", Duration::from_secs(5), || {
+            !alive(daemon)
+        });
+    });
+    if survived.is_err() {
+        // Never leak the fake this test exists to catch.
+        let _ = kill(
+            Pid::from_raw(daemon.cast_signed()),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+    }
+    assert!(
+        gave_up.is_err(),
+        "the sitter cannot exit inside its kill timeout"
+    );
+    assert!(
+        survived.is_ok(),
+        "wait_exit left the fake daemon {daemon} running"
+    );
 }
 
 /// Runs only as a child of `wait_helpers_stretch_with_the_timeout_multiplier`,
@@ -721,17 +811,14 @@ fn forwards_args_verbatim_and_clean_exit_passes_through() {
 
     // No timing overrides: the persisted schedule must use the real stable
     // tick window (the sitter exits with the one-shot child long before).
-    let mut sitter = sitter_command(dir.path(), &base_url)
-        .args([
-            "serve",
-            "--sitter-channel=stable",
-            "--resume-all",
-            "--weird-flag=x y",
-            "-v",
-            "positional arg",
-        ])
-        .spawn()
-        .unwrap();
+    let mut sitter = spawn_guarded(sitter_command(dir.path(), &base_url).args([
+        "serve",
+        "--sitter-channel=stable",
+        "--resume-all",
+        "--weird-flag=x y",
+        "-v",
+        "positional arg",
+    ]));
     let status = wait_exit(&mut sitter, Duration::from_secs(30));
     assert_eq!(status.code(), Some(0), "clean child exit passes through");
 
@@ -764,10 +851,8 @@ fn no_network_startup_falls_back_to_installed_version() {
     let paths = SitterPaths::from_data_dir(dir.path());
     preinstall(&paths, "0.1.0", &args_dump_script());
 
-    let mut sitter = sitter_command(dir.path(), &dead_url())
-        .args(["serve", "--resume-all"])
-        .spawn()
-        .unwrap();
+    let mut sitter =
+        spawn_guarded(sitter_command(dir.path(), &dead_url()).args(["serve", "--resume-all"]));
     let status = wait_exit(&mut sitter, Duration::from_secs(30));
     assert_eq!(status.code(), Some(0));
 
@@ -787,10 +872,7 @@ fn no_network_startup_falls_back_to_installed_version() {
 fn no_network_and_nothing_installed_exits_nonzero() {
     let dir = tempfile::tempdir().unwrap();
 
-    let mut sitter = sitter_command(dir.path(), &dead_url())
-        .arg("serve")
-        .spawn()
-        .unwrap();
+    let mut sitter = spawn_guarded(sitter_command(dir.path(), &dead_url()).arg("serve"));
     let status = wait_exit(&mut sitter, Duration::from_secs(30));
     assert_eq!(status.code(), Some(1), "expected a non-zero fail-fast exit");
 
@@ -820,14 +902,14 @@ fn update_mid_run_swaps_binary_and_preserves_args() {
     )])));
     let base_url = serve(Arc::clone(&routes));
 
-    let mut sitter = sitter_command(dir.path(), &base_url)
-        .env(CHANNEL_ENV, "beta")
-        .env(CHECK_MIN_ENV, "300")
-        .env(CHECK_MAX_ENV, "301")
-        .env(KILL_TIMEOUT_ENV, "5000")
-        .args(["serve", "--resume-all", "--extra=flag"])
-        .spawn()
-        .unwrap();
+    let mut sitter = spawn_guarded(
+        sitter_command(dir.path(), &base_url)
+            .env(CHANNEL_ENV, "beta")
+            .env(CHECK_MIN_ENV, "300")
+            .env(CHECK_MAX_ENV, "301")
+            .env(KILL_TIMEOUT_ENV, "5000")
+            .args(["serve", "--resume-all", "--extra=flag"]),
+    );
     let log_path = daemon_log_path(dir.path());
     wait_until("daemon 0.1.0 to start", Duration::from_secs(15), || {
         read_or_empty(&log_path).contains("start 0.1.0")
@@ -887,15 +969,15 @@ fn update_mid_run_respawn_sets_update_restart_env() {
     )])));
     let base_url = serve(Arc::clone(&routes));
 
-    let mut sitter = sitter_command(dir.path(), &base_url)
-        .env(CHANNEL_ENV, "beta")
-        .env_remove(UPDATE_RESTART_ENV)
-        .env(CHECK_MIN_ENV, "300")
-        .env(CHECK_MAX_ENV, "301")
-        .env(KILL_TIMEOUT_ENV, "5000")
-        .arg("serve")
-        .spawn()
-        .unwrap();
+    let mut sitter = spawn_guarded(
+        sitter_command(dir.path(), &base_url)
+            .env(CHANNEL_ENV, "beta")
+            .env_remove(UPDATE_RESTART_ENV)
+            .env(CHECK_MIN_ENV, "300")
+            .env(CHECK_MAX_ENV, "301")
+            .env(KILL_TIMEOUT_ENV, "5000")
+            .arg("serve"),
+    );
     let log_path = daemon_log_path(dir.path());
     wait_until("daemon 0.1.0 to start", Duration::from_secs(15), || {
         read_or_empty(&log_path).contains("start 0.1.0")
@@ -950,14 +1032,14 @@ fn sighup_same_version_respawn_does_not_set_update_restart_env() {
     let base_url = serve(Arc::clone(&routes));
 
     // Hour-long check interval: only the SIGHUP may restart the child.
-    let mut sitter = sitter_command(dir.path(), &base_url)
-        .env_remove(UPDATE_RESTART_ENV)
-        .env(CHECK_MIN_ENV, "3600000")
-        .env(CHECK_MAX_ENV, "3600001")
-        .env(KILL_TIMEOUT_ENV, "5000")
-        .arg("serve")
-        .spawn()
-        .unwrap();
+    let mut sitter = spawn_guarded(
+        sitter_command(dir.path(), &base_url)
+            .env_remove(UPDATE_RESTART_ENV)
+            .env(CHECK_MIN_ENV, "3600000")
+            .env(CHECK_MAX_ENV, "3600001")
+            .env(KILL_TIMEOUT_ENV, "5000")
+            .arg("serve"),
+    );
     let log_path = daemon_log_path(dir.path());
     wait_until("daemon 0.1.0 to start", Duration::from_secs(15), || {
         read_or_empty(&log_path).contains("start 0.1.0")
@@ -1002,14 +1084,14 @@ fn inherited_update_restart_env_is_cleared_on_plain_spawns() {
     let base_url = serve(Arc::clone(&routes));
 
     // Hour-long check interval: only the SIGHUP may restart the child.
-    let mut sitter = sitter_command(dir.path(), &base_url)
-        .env(UPDATE_RESTART_ENV, "1")
-        .env(CHECK_MIN_ENV, "3600000")
-        .env(CHECK_MAX_ENV, "3600001")
-        .env(KILL_TIMEOUT_ENV, "5000")
-        .arg("serve")
-        .spawn()
-        .unwrap();
+    let mut sitter = spawn_guarded(
+        sitter_command(dir.path(), &base_url)
+            .env(UPDATE_RESTART_ENV, "1")
+            .env(CHECK_MIN_ENV, "3600000")
+            .env(CHECK_MAX_ENV, "3600001")
+            .env(KILL_TIMEOUT_ENV, "5000")
+            .arg("serve"),
+    );
     let log_path = daemon_log_path(dir.path());
     wait_until("daemon 0.1.0 to start", Duration::from_secs(15), || {
         read_or_empty(&log_path).contains("start 0.1.0")
@@ -1053,16 +1135,16 @@ fn crash_respawn_does_not_set_update_restart_env() {
     )])));
     let base_url = serve(Arc::clone(&routes));
 
-    let mut sitter = sitter_command(dir.path(), &base_url)
-        .env_remove(UPDATE_RESTART_ENV)
-        .env(BACKOFF_INITIAL_ENV, "50")
-        .env(BACKOFF_CAP_ENV, "100")
-        .env(GIVE_UP_AFTER_ENV, "10000")
-        .env(CHECK_MIN_ENV, "3600000")
-        .env(CHECK_MAX_ENV, "3600001")
-        .arg("serve")
-        .spawn()
-        .unwrap();
+    let mut sitter = spawn_guarded(
+        sitter_command(dir.path(), &base_url)
+            .env_remove(UPDATE_RESTART_ENV)
+            .env(BACKOFF_INITIAL_ENV, "50")
+            .env(BACKOFF_CAP_ENV, "100")
+            .env(GIVE_UP_AFTER_ENV, "10000")
+            .env(CHECK_MIN_ENV, "3600000")
+            .env(CHECK_MAX_ENV, "3600001")
+            .arg("serve"),
+    );
     let log_path = daemon_log_path(dir.path());
     wait_until("two crash respawns", Duration::from_secs(15), || {
         read_or_empty(&log_path).lines().count() >= 3
@@ -1101,14 +1183,14 @@ fn sighup_respawn_with_version_change_sets_update_restart_env() {
     let base_url = serve(Arc::clone(&routes));
 
     // Hour-long check interval: only the SIGHUP may restart the child.
-    let mut sitter = sitter_command(dir.path(), &base_url)
-        .env_remove(UPDATE_RESTART_ENV)
-        .env(CHECK_MIN_ENV, "3600000")
-        .env(CHECK_MAX_ENV, "3600001")
-        .env(KILL_TIMEOUT_ENV, "5000")
-        .arg("serve")
-        .spawn()
-        .unwrap();
+    let mut sitter = spawn_guarded(
+        sitter_command(dir.path(), &base_url)
+            .env_remove(UPDATE_RESTART_ENV)
+            .env(CHECK_MIN_ENV, "3600000")
+            .env(CHECK_MAX_ENV, "3600001")
+            .env(KILL_TIMEOUT_ENV, "5000")
+            .arg("serve"),
+    );
     let log_path = daemon_log_path(dir.path());
     wait_until("daemon 0.1.0 to start", Duration::from_secs(15), || {
         read_or_empty(&log_path).contains("start 0.1.0")
@@ -1154,14 +1236,14 @@ fn config_channel_switch_applies_at_next_periodic_check() {
     // No --sitter-channel flag and no INTENTD_CHANNEL env: the channel comes
     // from config.toml / the stable default, so the supervisor re-resolves
     // it before each periodic check.
-    let mut sitter = sitter_command(dir.path(), &base_url)
-        .env_remove(CHANNEL_ENV)
-        .env(CHECK_MIN_ENV, "300")
-        .env(CHECK_MAX_ENV, "301")
-        .env(KILL_TIMEOUT_ENV, "5000")
-        .arg("serve")
-        .spawn()
-        .unwrap();
+    let mut sitter = spawn_guarded(
+        sitter_command(dir.path(), &base_url)
+            .env_remove(CHANNEL_ENV)
+            .env(CHECK_MIN_ENV, "300")
+            .env(CHECK_MAX_ENV, "301")
+            .env(KILL_TIMEOUT_ENV, "5000")
+            .arg("serve"),
+    );
     let log_path = daemon_log_path(dir.path());
     wait_until("daemon 0.1.0 to start", Duration::from_secs(15), || {
         read_or_empty(&log_path).contains("start 0.1.0")
@@ -1233,13 +1315,13 @@ fn flag_pinned_channel_ignores_config_switch_mid_run() {
         );
     }
 
-    let mut sitter = sitter_command(dir.path(), &base_url)
-        .env(CHECK_MIN_ENV, "100")
-        .env(CHECK_MAX_ENV, "101")
-        .env(KILL_TIMEOUT_ENV, "5000")
-        .args(["serve", "--sitter-channel=beta"])
-        .spawn()
-        .unwrap();
+    let mut sitter = spawn_guarded(
+        sitter_command(dir.path(), &base_url)
+            .env(CHECK_MIN_ENV, "100")
+            .env(CHECK_MAX_ENV, "101")
+            .env(KILL_TIMEOUT_ENV, "5000")
+            .args(["serve", "--sitter-channel=beta"]),
+    );
     let log_path = daemon_log_path(dir.path());
     wait_until("daemon 0.1.0 to start", Duration::from_secs(15), || {
         read_or_empty(&log_path).contains("start 0.1.0")
@@ -1283,18 +1365,18 @@ fn crash_respawn_backs_off_exponentially() {
     let paths = SitterPaths::from_data_dir(dir.path());
     preinstall(&paths, "0.1.0", &crash_script(7));
 
-    let mut sitter = sitter_command(dir.path(), &dead_url())
-        .env(BACKOFF_INITIAL_ENV, "50")
-        .env(BACKOFF_CAP_ENV, "400")
-        .env(BACKOFF_RESET_ENV, "60000")
-        // This test measures the backoff curve, not the give-up threshold:
-        // raise the threshold out of reach so the loop runs for the whole
-        // window (`permanent_startup_failure_gives_up_and_exits_zero` owns
-        // the give-up behaviour).
-        .env(GIVE_UP_AFTER_ENV, "10000")
-        .arg("serve")
-        .spawn()
-        .unwrap();
+    let mut sitter = spawn_guarded(
+        sitter_command(dir.path(), &dead_url())
+            .env(BACKOFF_INITIAL_ENV, "50")
+            .env(BACKOFF_CAP_ENV, "400")
+            .env(BACKOFF_RESET_ENV, "60000")
+            // This test measures the backoff curve, not the give-up threshold:
+            // raise the threshold out of reach so the loop runs for the whole
+            // window (`permanent_startup_failure_gives_up_and_exits_zero` owns
+            // the give-up behaviour).
+            .env(GIVE_UP_AFTER_ENV, "10000")
+            .arg("serve"),
+    );
     // timing-guard: measurement window
     thread::sleep(Duration::from_secs(5));
     send_signal(&sitter, "TERM");
@@ -1345,15 +1427,15 @@ fn permanent_startup_failure_gives_up_and_exits_zero() {
     let paths = SitterPaths::from_data_dir(dir.path());
     preinstall(&paths, "0.1.0", &crash_script(9));
 
-    let mut sitter = sitter_command(dir.path(), &dead_url())
-        .env(BACKOFF_INITIAL_ENV, "50")
-        .env(BACKOFF_CAP_ENV, "100")
-        // No start can ever reach this uptime, so nothing resets the count.
-        .env(BACKOFF_RESET_ENV, "60000")
-        .env(GIVE_UP_AFTER_ENV, "4")
-        .arg("serve")
-        .spawn()
-        .unwrap();
+    let mut sitter = spawn_guarded(
+        sitter_command(dir.path(), &dead_url())
+            .env(BACKOFF_INITIAL_ENV, "50")
+            .env(BACKOFF_CAP_ENV, "100")
+            // No start can ever reach this uptime, so nothing resets the count.
+            .env(BACKOFF_RESET_ENV, "60000")
+            .env(GIVE_UP_AFTER_ENV, "4")
+            .arg("serve"),
+    );
 
     // Nothing signals the sitter: it must exit on its own.
     let status = wait_exit(&mut sitter, Duration::from_secs(30));
@@ -1395,14 +1477,14 @@ fn crashes_after_a_healthy_run_never_trip_the_give_up() {
     // Up for ~500ms (well past the 200ms reset window), then exit 1.
     preinstall(&paths, "0.1.0", &long_lived_crash_script("0.5", 1));
 
-    let mut sitter = sitter_command(dir.path(), &dead_url())
-        .env(BACKOFF_INITIAL_ENV, "50")
-        .env(BACKOFF_CAP_ENV, "100")
-        .env(BACKOFF_RESET_ENV, "200")
-        .env(GIVE_UP_AFTER_ENV, "4")
-        .arg("serve")
-        .spawn()
-        .unwrap();
+    let mut sitter = spawn_guarded(
+        sitter_command(dir.path(), &dead_url())
+            .env(BACKOFF_INITIAL_ENV, "50")
+            .env(BACKOFF_CAP_ENV, "100")
+            .env(BACKOFF_RESET_ENV, "200")
+            .env(GIVE_UP_AFTER_ENV, "4")
+            .arg("serve"),
+    );
 
     // Six runs is past the threshold of 4: without the reset the sitter
     // would already have given up and this would time out.
@@ -1499,14 +1581,14 @@ fn install_log_contract_crash_loop_lines_are_emitted_verbatim() {
     let paths = SitterPaths::from_data_dir(dir.path());
     preinstall(&paths, "0.1.0", &crash_script(3));
 
-    let mut sitter = sitter_command(dir.path(), &dead_url())
-        .env(BACKOFF_INITIAL_ENV, "50")
-        .env(BACKOFF_CAP_ENV, "100")
-        .env(BACKOFF_RESET_ENV, "60000")
-        .env(GIVE_UP_AFTER_ENV, "2")
-        .arg("serve")
-        .spawn()
-        .unwrap();
+    let mut sitter = spawn_guarded(
+        sitter_command(dir.path(), &dead_url())
+            .env(BACKOFF_INITIAL_ENV, "50")
+            .env(BACKOFF_CAP_ENV, "100")
+            .env(BACKOFF_RESET_ENV, "60000")
+            .env(GIVE_UP_AFTER_ENV, "2")
+            .arg("serve"),
+    );
     let status = wait_exit(&mut sitter, Duration::from_secs(30));
     assert_eq!(status.code(), Some(0));
 
@@ -1542,14 +1624,14 @@ fn install_log_contract_spawn_failure_line_is_emitted_verbatim() {
         fs::set_permissions(&bin, fs::Permissions::from_mode(0o644)).unwrap();
     }
 
-    let mut sitter = sitter_command(dir.path(), &dead_url())
-        .env(BACKOFF_INITIAL_ENV, "50")
-        .env(BACKOFF_CAP_ENV, "100")
-        .env(BACKOFF_RESET_ENV, "60000")
-        .env(GIVE_UP_AFTER_ENV, "1")
-        .arg("serve")
-        .spawn()
-        .unwrap();
+    let mut sitter = spawn_guarded(
+        sitter_command(dir.path(), &dead_url())
+            .env(BACKOFF_INITIAL_ENV, "50")
+            .env(BACKOFF_CAP_ENV, "100")
+            .env(BACKOFF_RESET_ENV, "60000")
+            .env(GIVE_UP_AFTER_ENV, "1")
+            .arg("serve"),
+    );
     let status = wait_exit(&mut sitter, Duration::from_secs(30));
     assert_eq!(status.code(), Some(0));
 
@@ -1588,18 +1670,18 @@ fn crash_loop_self_heals_when_the_channel_publishes_a_fix() {
 
     // Periodic checks disabled (hour-long interval) and give-up out of
     // reach: only the failed-start re-check can find the fix.
-    let mut sitter = sitter_command(dir.path(), &base_url)
-        .env_remove(UPDATE_RESTART_ENV)
-        .env(BACKOFF_INITIAL_ENV, "50")
-        .env(BACKOFF_CAP_ENV, "200")
-        .env(BACKOFF_RESET_ENV, "60000")
-        .env(GIVE_UP_AFTER_ENV, "10000")
-        .env(CHECK_MIN_ENV, "3600000")
-        .env(CHECK_MAX_ENV, "3600001")
-        .env(KILL_TIMEOUT_ENV, "5000")
-        .arg("serve")
-        .spawn()
-        .unwrap();
+    let mut sitter = spawn_guarded(
+        sitter_command(dir.path(), &base_url)
+            .env_remove(UPDATE_RESTART_ENV)
+            .env(BACKOFF_INITIAL_ENV, "50")
+            .env(BACKOFF_CAP_ENV, "200")
+            .env(BACKOFF_RESET_ENV, "60000")
+            .env(GIVE_UP_AFTER_ENV, "10000")
+            .env(CHECK_MIN_ENV, "3600000")
+            .env(CHECK_MAX_ENV, "3600001")
+            .env(KILL_TIMEOUT_ENV, "5000")
+            .arg("serve"),
+    );
     let log_path = daemon_log_path(dir.path());
 
     // Wait for the startup check plus at least one failed-start re-check
@@ -1684,17 +1766,17 @@ fn fix_published_at_the_give_up_threshold_heals_instead_of_giving_up() {
     // The 1s backoff after the first crash is the window in which the test
     // publishes the fix, so the second (= threshold) failure's re-check
     // deterministically sees 0.2.0.
-    let mut sitter = sitter_command(dir.path(), &base_url)
-        .env(BACKOFF_INITIAL_ENV, "1000")
-        .env(BACKOFF_CAP_ENV, "2000")
-        .env(BACKOFF_RESET_ENV, "60000")
-        .env(GIVE_UP_AFTER_ENV, "2")
-        .env(CHECK_MIN_ENV, "3600000")
-        .env(CHECK_MAX_ENV, "3600001")
-        .env(KILL_TIMEOUT_ENV, "5000")
-        .arg("serve")
-        .spawn()
-        .unwrap();
+    let mut sitter = spawn_guarded(
+        sitter_command(dir.path(), &base_url)
+            .env(BACKOFF_INITIAL_ENV, "1000")
+            .env(BACKOFF_CAP_ENV, "2000")
+            .env(BACKOFF_RESET_ENV, "60000")
+            .env(GIVE_UP_AFTER_ENV, "2")
+            .env(CHECK_MIN_ENV, "3600000")
+            .env(CHECK_MAX_ENV, "3600001")
+            .env(KILL_TIMEOUT_ENV, "5000")
+            .arg("serve"),
+    );
     let log_path = daemon_log_path(dir.path());
 
     // Startup check + the first failure's re-check both saw 0.1.0: the fix
@@ -1759,16 +1841,16 @@ fn give_up_still_fires_when_the_recheck_confirms_no_newer_version() {
     )])));
     let (base_url, requests) = serve_recording(routes);
 
-    let mut sitter = sitter_command(dir.path(), &base_url)
-        .env(BACKOFF_INITIAL_ENV, "50")
-        .env(BACKOFF_CAP_ENV, "100")
-        .env(BACKOFF_RESET_ENV, "60000")
-        .env(GIVE_UP_AFTER_ENV, "4")
-        .env(CHECK_MIN_ENV, "3600000")
-        .env(CHECK_MAX_ENV, "3600001")
-        .arg("serve")
-        .spawn()
-        .unwrap();
+    let mut sitter = spawn_guarded(
+        sitter_command(dir.path(), &base_url)
+            .env(BACKOFF_INITIAL_ENV, "50")
+            .env(BACKOFF_CAP_ENV, "100")
+            .env(BACKOFF_RESET_ENV, "60000")
+            .env(GIVE_UP_AFTER_ENV, "4")
+            .env(CHECK_MIN_ENV, "3600000")
+            .env(CHECK_MAX_ENV, "3600001")
+            .arg("serve"),
+    );
     let status = wait_exit(&mut sitter, Duration::from_secs(30));
     assert_eq!(
         status.code(),
@@ -1825,17 +1907,17 @@ fn spawn_failure_loop_self_heals_when_the_channel_publishes_a_fix() {
     )])));
     let (base_url, requests) = serve_recording(Arc::clone(&routes));
 
-    let mut sitter = sitter_command(dir.path(), &base_url)
-        .env(BACKOFF_INITIAL_ENV, "50")
-        .env(BACKOFF_CAP_ENV, "200")
-        .env(BACKOFF_RESET_ENV, "60000")
-        .env(GIVE_UP_AFTER_ENV, "10000")
-        .env(CHECK_MIN_ENV, "3600000")
-        .env(CHECK_MAX_ENV, "3600001")
-        .env(KILL_TIMEOUT_ENV, "5000")
-        .arg("serve")
-        .spawn()
-        .unwrap();
+    let mut sitter = spawn_guarded(
+        sitter_command(dir.path(), &base_url)
+            .env(BACKOFF_INITIAL_ENV, "50")
+            .env(BACKOFF_CAP_ENV, "200")
+            .env(BACKOFF_RESET_ENV, "60000")
+            .env(GIVE_UP_AFTER_ENV, "10000")
+            .env(CHECK_MIN_ENV, "3600000")
+            .env(CHECK_MAX_ENV, "3600001")
+            .env(KILL_TIMEOUT_ENV, "5000")
+            .arg("serve"),
+    );
     let stderr = stderr_path(dir.path());
     wait_until(
         "a failed-spawn re-check against the 0.1.0 manifest",
@@ -1891,16 +1973,16 @@ fn sighup_during_crash_backoff_respawns_the_state_json_version() {
     )])));
     let base_url = serve(Arc::clone(&routes));
 
-    let mut sitter = sitter_command(dir.path(), &base_url)
-        .env_remove(CHANNEL_ENV)
-        .env(BACKOFF_INITIAL_ENV, "30000")
-        .env(BACKOFF_CAP_ENV, "30000")
-        .env(CHECK_MIN_ENV, "3600000")
-        .env(CHECK_MAX_ENV, "3600001")
-        .env(KILL_TIMEOUT_ENV, "5000")
-        .arg("serve")
-        .spawn()
-        .unwrap();
+    let mut sitter = spawn_guarded(
+        sitter_command(dir.path(), &base_url)
+            .env_remove(CHANNEL_ENV)
+            .env(BACKOFF_INITIAL_ENV, "30000")
+            .env(BACKOFF_CAP_ENV, "30000")
+            .env(CHECK_MIN_ENV, "3600000")
+            .env(CHECK_MAX_ENV, "3600001")
+            .env(KILL_TIMEOUT_ENV, "5000")
+            .arg("serve"),
+    );
     let log_path = daemon_log_path(dir.path());
     let stderr = stderr_path(dir.path());
     wait_until(
@@ -1982,14 +2064,14 @@ fn sigusr1_installs_newer_version_and_restarts_with_update_env() {
     let base_url = serve(Arc::clone(&routes));
 
     // Hour-long check interval: only the SIGUSR1 may check and restart.
-    let mut sitter = sitter_command(dir.path(), &base_url)
-        .env_remove(UPDATE_RESTART_ENV)
-        .env(CHECK_MIN_ENV, "3600000")
-        .env(CHECK_MAX_ENV, "3600001")
-        .env(KILL_TIMEOUT_ENV, "5000")
-        .arg("serve")
-        .spawn()
-        .unwrap();
+    let mut sitter = spawn_guarded(
+        sitter_command(dir.path(), &base_url)
+            .env_remove(UPDATE_RESTART_ENV)
+            .env(CHECK_MIN_ENV, "3600000")
+            .env(CHECK_MAX_ENV, "3600001")
+            .env(KILL_TIMEOUT_ENV, "5000")
+            .arg("serve"),
+    );
     let log_path = daemon_log_path(dir.path());
     wait_until("daemon 0.1.0 to start", Duration::from_secs(15), || {
         read_or_empty(&log_path).contains("start 0.1.0")
@@ -2058,13 +2140,13 @@ fn sigusr1_when_already_current_leaves_daemon_running() {
     let (base_url, requests) = serve_recording(routes);
 
     // Hour-long check interval: only the SIGUSR1 may trigger a check.
-    let mut sitter = sitter_command(dir.path(), &base_url)
-        .env(CHECK_MIN_ENV, "3600000")
-        .env(CHECK_MAX_ENV, "3600001")
-        .env(KILL_TIMEOUT_ENV, "5000")
-        .arg("serve")
-        .spawn()
-        .unwrap();
+    let mut sitter = spawn_guarded(
+        sitter_command(dir.path(), &base_url)
+            .env(CHECK_MIN_ENV, "3600000")
+            .env(CHECK_MAX_ENV, "3600001")
+            .env(KILL_TIMEOUT_ENV, "5000")
+            .arg("serve"),
+    );
     let log_path = daemon_log_path(dir.path());
     wait_until("daemon 0.1.0 to start", Duration::from_secs(15), || {
         read_or_empty(&log_path).contains("start 0.1.0")
@@ -2117,13 +2199,13 @@ fn sigterm_during_a_stalled_sigusr1_check_still_shuts_down() {
     let (base_url, stall) = serve_stallable(routes);
 
     // Hour-long check interval: only the SIGUSR1 may trigger a check.
-    let mut sitter = sitter_command(dir.path(), &base_url)
-        .env(CHECK_MIN_ENV, "3600000")
-        .env(CHECK_MAX_ENV, "3600001")
-        .env(KILL_TIMEOUT_ENV, "5000")
-        .arg("serve")
-        .spawn()
-        .unwrap();
+    let mut sitter = spawn_guarded(
+        sitter_command(dir.path(), &base_url)
+            .env(CHECK_MIN_ENV, "3600000")
+            .env(CHECK_MAX_ENV, "3600001")
+            .env(KILL_TIMEOUT_ENV, "5000")
+            .arg("serve"),
+    );
     let log_path = daemon_log_path(dir.path());
     wait_until("daemon 0.1.0 to start", Duration::from_secs(15), || {
         read_or_empty(&log_path).contains("start 0.1.0")
@@ -2171,16 +2253,16 @@ fn sigusr1_during_crash_backoff_checks_and_respawns_the_fix() {
     )])));
     let base_url = serve(Arc::clone(&routes));
 
-    let mut sitter = sitter_command(dir.path(), &base_url)
-        .env(BACKOFF_INITIAL_ENV, "30000")
-        .env(BACKOFF_CAP_ENV, "30000")
-        .env(GIVE_UP_AFTER_ENV, "10000")
-        .env(CHECK_MIN_ENV, "3600000")
-        .env(CHECK_MAX_ENV, "3600001")
-        .env(KILL_TIMEOUT_ENV, "5000")
-        .arg("serve")
-        .spawn()
-        .unwrap();
+    let mut sitter = spawn_guarded(
+        sitter_command(dir.path(), &base_url)
+            .env(BACKOFF_INITIAL_ENV, "30000")
+            .env(BACKOFF_CAP_ENV, "30000")
+            .env(GIVE_UP_AFTER_ENV, "10000")
+            .env(CHECK_MIN_ENV, "3600000")
+            .env(CHECK_MAX_ENV, "3600001")
+            .env(KILL_TIMEOUT_ENV, "5000")
+            .arg("serve"),
+    );
     let log_path = daemon_log_path(dir.path());
     let stderr = stderr_path(dir.path());
     wait_until(
@@ -2543,15 +2625,15 @@ fn periodic_check_force_restarts_a_staged_version_the_daemon_never_took() {
     )])));
     let base_url = serve(Arc::clone(&routes));
 
-    let mut sitter = sitter_command(dir.path(), &base_url)
-        .env(CHANNEL_ENV, "beta")
-        .env_remove(UPDATE_RESTART_ENV)
-        .env(CHECK_MIN_ENV, "300")
-        .env(CHECK_MAX_ENV, "301")
-        .env(KILL_TIMEOUT_ENV, "5000")
-        .arg("serve")
-        .spawn()
-        .unwrap();
+    let mut sitter = spawn_guarded(
+        sitter_command(dir.path(), &base_url)
+            .env(CHANNEL_ENV, "beta")
+            .env_remove(UPDATE_RESTART_ENV)
+            .env(CHECK_MIN_ENV, "300")
+            .env(CHECK_MAX_ENV, "301")
+            .env(KILL_TIMEOUT_ENV, "5000")
+            .arg("serve"),
+    );
     let log_path = daemon_log_path(dir.path());
     wait_until("daemon 0.1.0 to start", Duration::from_secs(15), || {
         read_or_empty(&log_path).contains("start 0.1.0")
@@ -2748,11 +2830,11 @@ fn one_shot_subcommand_nonzero_exit_passes_through_without_respawn() {
 
     // A non-`serve` invocation (e.g. `doctor`) is one-shot: a non-zero exit
     // is the daemon's answer, not a crash — no respawn, status passes through.
-    let mut sitter = sitter_command(dir.path(), &dead_url())
-        .env(BACKOFF_INITIAL_ENV, "50")
-        .arg("doctor")
-        .spawn()
-        .unwrap();
+    let mut sitter = spawn_guarded(
+        sitter_command(dir.path(), &dead_url())
+            .env(BACKOFF_INITIAL_ENV, "50")
+            .arg("doctor"),
+    );
     let status = wait_exit(&mut sitter, Duration::from_secs(30));
     assert_eq!(
         status.code(),
@@ -2841,10 +2923,9 @@ fn stable_startup_skips_the_check_when_already_checked_today() {
     )])));
     let (base_url, requests) = serve_recording(routes);
 
-    let mut sitter = sitter_command(dir.path(), &base_url)
-        .args(["serve", "--sitter-channel=stable"])
-        .spawn()
-        .unwrap();
+    let mut sitter = spawn_guarded(
+        sitter_command(dir.path(), &base_url).args(["serve", "--sitter-channel=stable"]),
+    );
     let status = wait_exit(&mut sitter, Duration::from_secs(30));
     assert_eq!(status.code(), Some(0));
 
@@ -2875,10 +2956,9 @@ fn stable_startup_checks_when_the_last_check_was_yesterday() {
     )])));
     let (base_url, requests) = serve_recording(routes);
 
-    let mut sitter = sitter_command(dir.path(), &base_url)
-        .args(["serve", "--sitter-channel=stable"])
-        .spawn()
-        .unwrap();
+    let mut sitter = spawn_guarded(
+        sitter_command(dir.path(), &base_url).args(["serve", "--sitter-channel=stable"]),
+    );
     let status = wait_exit(&mut sitter, Duration::from_secs(30));
     assert_eq!(status.code(), Some(0));
 
@@ -2904,10 +2984,9 @@ fn beta_startup_checks_even_when_already_checked_today() {
     )])));
     let (base_url, requests) = serve_recording(routes);
 
-    let mut sitter = sitter_command(dir.path(), &base_url)
-        .args(["serve", "--sitter-channel=beta"])
-        .spawn()
-        .unwrap();
+    let mut sitter = spawn_guarded(
+        sitter_command(dir.path(), &base_url).args(["serve", "--sitter-channel=beta"]),
+    );
     let status = wait_exit(&mut sitter, Duration::from_secs(30));
     assert_eq!(status.code(), Some(0));
 
@@ -3314,10 +3393,8 @@ fn one_shot_with_installed_version_never_touches_the_updater() {
         routes.insert(MANIFEST_PATH.to_string(), manifest);
     }
 
-    let mut sitter = sitter_command(dir.path(), &base_url)
-        .args(["doctor", "--verbose"])
-        .spawn()
-        .unwrap();
+    let mut sitter =
+        spawn_guarded(sitter_command(dir.path(), &base_url).args(["doctor", "--verbose"]));
     let status = wait_exit(&mut sitter, Duration::from_secs(30));
     assert_eq!(status.code(), Some(0));
 
@@ -3394,10 +3471,9 @@ fn one_shot_channel_mismatch_warns_and_runs_installed_daemon() {
 
     // The channel flag only governs updater behavior, which one-shots don't
     // have: a mismatch prints a notice but still runs the installed daemon.
-    let mut sitter = sitter_command(dir.path(), &base_url)
-        .args(["--sitter-channel=beta", "doctor"])
-        .spawn()
-        .unwrap();
+    let mut sitter = spawn_guarded(
+        sitter_command(dir.path(), &base_url).args(["--sitter-channel=beta", "doctor"]),
+    );
     let status = wait_exit(&mut sitter, Duration::from_secs(30));
     assert_eq!(status.code(), Some(0));
 
@@ -3433,7 +3509,7 @@ fn one_shot_with_nothing_installed_fails_fast_without_installing() {
         routes.insert(MANIFEST_PATH.to_string(), manifest);
     }
 
-    let mut sitter = sitter_command(dir.path(), &base_url).spawn().unwrap();
+    let mut sitter = spawn_guarded(&mut sitter_command(dir.path(), &base_url));
     let status = wait_exit(&mut sitter, Duration::from_secs(30));
     assert_eq!(status.code(), Some(1), "expected a non-zero fail-fast exit");
 
@@ -3490,14 +3566,14 @@ fn restart_command_respawns_state_version_without_exiting_sitter() {
     let base_url = serve(Arc::clone(&routes));
 
     // Hour-long check interval: only the SIGHUP may restart the child.
-    let mut sitter = sitter_command(dir.path(), &base_url)
-        .env_remove(CHANNEL_ENV)
-        .env(CHECK_MIN_ENV, "3600000")
-        .env(CHECK_MAX_ENV, "3600001")
-        .env(KILL_TIMEOUT_ENV, "5000")
-        .arg("serve")
-        .spawn()
-        .unwrap();
+    let mut sitter = spawn_guarded(
+        sitter_command(dir.path(), &base_url)
+            .env_remove(CHANNEL_ENV)
+            .env(CHECK_MIN_ENV, "3600000")
+            .env(CHECK_MAX_ENV, "3600001")
+            .env(KILL_TIMEOUT_ENV, "5000")
+            .arg("serve"),
+    );
     let log_path = daemon_log_path(dir.path());
     wait_until("daemon 0.1.0 to start", Duration::from_secs(15), || {
         read_or_empty(&log_path).contains("start 0.1.0")
@@ -3755,11 +3831,11 @@ fn sitter_initiated_stop_does_not_respawn() {
     let paths = SitterPaths::from_data_dir(dir.path());
     preinstall(&paths, "0.1.0", &long_running_script("0.1.0"));
 
-    let mut sitter = sitter_command(dir.path(), &dead_url())
-        .env(KILL_TIMEOUT_ENV, "5000")
-        .args(["serve", "--resume-all"])
-        .spawn()
-        .unwrap();
+    let mut sitter = spawn_guarded(
+        sitter_command(dir.path(), &dead_url())
+            .env(KILL_TIMEOUT_ENV, "5000")
+            .args(["serve", "--resume-all"]),
+    );
     let log_path = daemon_log_path(dir.path());
     wait_until("daemon to start", Duration::from_secs(15), || {
         read_or_empty(&log_path).contains("start 0.1.0")
@@ -3990,8 +4066,10 @@ esac
         Duration::from_secs(3),
         || dir.path().join("stop-seen").exists(),
     );
-    // Kill only the supervisor. The guard still owns its process group and
-    // cleans the intentionally surviving daemon when this scope ends.
+    // Kill only the supervisor. Nothing waits on `owner`, so it stays an
+    // unreaped zombie and its process-group id stays reserved: the group
+    // (the intentionally surviving daemon) can still be swept below, and the
+    // guard's Drop sweeps it on any panic in between.
     send_signal(&owner, "KILL");
     let status = stop
         .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(5)))
@@ -4004,6 +4082,18 @@ esac
     assert!(
         alive(daemon_pid),
         "fixture must prove the daemon survived its supervisor"
+    );
+    // The daemon ignores SIGTERM and loops forever: every run used to leak one
+    // under `systemd --user` because the guard reaped the dead supervisor
+    // before sweeping its group. Sweep it explicitly and prove it is gone.
+    owner
+        .signal_group(nix::sys::signal::Signal::SIGKILL)
+        .expect("the dead, unreaped supervisor's group still exists");
+    drop(owner);
+    wait_until(
+        "the surviving daemon to be swept",
+        Duration::from_secs(5),
+        || !alive(daemon_pid),
     );
 }
 
