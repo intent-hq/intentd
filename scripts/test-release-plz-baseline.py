@@ -189,11 +189,75 @@ class BaselineTests(unittest.TestCase):
                   'name = "intent-nodes"\ngit_tag_enable = true'))
         self.assertIn("policy", self.prepare(success=False).stderr)
 
-    def test_unexpected_missing_package_fails(self):
+    def add_library(self, name, version="0.9.114", policy=""):
+        self.package(name, version)
+        self.put("release-plz.toml", (self.repo / "release-plz.toml").read_text()
+                 + f'\n[[package]]\nname = "{name}"\nrelease = true\ngit_only = true\n'
+                 f'version_group = "intentd"\n{policy}')
+
+    def test_two_new_libraries_each_get_initial_release(self):
+        # intent-hq/intent#7760: a second introduction (intent-svc-transfer)
+        # must not be rejected just because it is not intent-nodes.
+        self.add_library("intent-svc-transfer")
+        self.run_ok("cargo", "generate-lockfile")
+        self.commit("feat: add transfer")
+        tags = self.run_ok("git", "tag")
+        self.prepare()
+        config = tomllib.loads(self.output.read_text())
+        expected = tomllib.loads((self.repo / "release-plz.toml").read_text())
+        for package in expected["package"]:
+            if package["name"] in ("intent-nodes", "intent-svc-transfer"):
+                package["git_tag_name"] = f"__initial_{package['name']}-v{{{{ version }}}}"
+        self.assertEqual(config, expected)
+        self.update()
+        for name in ("intentd", "intent-nodes", "intent-svc-transfer"):
+            self.assertEqual(self.version(name), "0.9.115", name)
+        self.assertEqual(self.version("intentd-sitter"), "0.1.0")
+        self.assertEqual(self.run_ok("git", "tag"), tags)
+        self.commit("chore: release v0.9.115")
+        self.run_ok("git", "tag", "v0.9.115")
+        self.output.unlink()
+        self.prepare()
+        self.assertEqual(self.output.read_bytes(), (self.repo / "release-plz.toml").read_bytes())
+
+    def test_new_library_with_other_policy_fails(self):
+        self.add_library("another-new-crate", policy="git_tag_enable = true\n")
+        result = self.prepare(success=False)
+        self.assertIn("library release policy: ['another-new-crate']", result.stderr)
+
+    def test_new_library_with_extra_or_explicit_keys_fails(self):
+        for policy in ('changelog_path = "./X.md"\n', 'git_tag_name = "v{{ version }}"\n'):
+            with self.subTest(policy=policy):
+                self.run_ok("git", "checkout", "-q", "--", "release-plz.toml")
+                self.add_library("another-new-crate", policy=policy)
+                result = self.prepare(success=False)
+                self.assertIn("library release policy: ['another-new-crate']", result.stderr)
+
+    def test_new_library_outside_version_group_fails(self):
         self.package("another-new-crate", "0.9.114")
         self.put("release-plz.toml", CONFIG + '\n[[package]]\nname = "another-new-crate"\n'
-                 'release = true\ngit_only = true\nversion_group = "intentd"\n')
+                 'release = true\ngit_only = true\n')
         self.assertIn("another-new-crate", self.prepare(success=False).stderr)
+
+    def test_configured_package_that_is_not_a_member_fails(self):
+        self.put("release-plz.toml", CONFIG + '\n[[package]]\nname = "ghost-crate"\n'
+                 'release = true\ngit_only = true\nversion_group = "intentd"\n')
+        result = self.prepare(success=False)
+        self.assertIn("ghost-crate", result.stderr)
+        self.assertIn("workspace member", result.stderr)
+
+    def test_intentd_absent_from_baseline_fails(self):
+        self.run_ok("git", "checkout", "--detach", "v0.9.114")
+        self.run_ok("git", "rm", "-rq", "crates/intentd")
+        self.run_ok("cargo", "generate-lockfile")
+        self.commit("chore: baseline without the daemon")
+        self.run_ok("git", "tag", "v0.9.115")
+        self.run_ok("git", "checkout", "main")
+        self.assertIn("intentd is absent from v0.9.115", self.prepare(success=False).stderr)
+
+    def test_any_reserved_prefix_collision_fails(self):
+        self.run_ok("git", "tag", "__initial_intent-svc-transfer-v0.9.115")
+        self.assertIn("reserved", self.prepare(success=False).stderr)
 
     def test_malformed_current_metadata_fails(self):
         self.put("crates/intent-nodes/Cargo.toml", "not valid toml {")
@@ -232,32 +296,46 @@ class BaselineTests(unittest.TestCase):
         self.output = self.repo / "generated.toml"
         self.assertIn("outside", self.prepare(success=False).stderr)
 
-    def test_real_repository_config_changes_only_nodes_tag_lookup(self):
+    def production_config_introduces(self, name, version, message):
+        # Mirrors production: intentd and its libraries sit at the shared tag.
         original = (ROOT / "release-plz.toml").read_bytes()
         config = tomllib.loads(original.decode())
         self.run_ok("git", "checkout", "--detach", "v0.9.114")
+        self.package("intentd", "0.9.115")
         for package in config["package"]:
-            name = package["name"]
-            if name not in ("intent-nodes", "intentd", "intentd-sitter"):
-                self.package(name, "0.9.114")
+            if package["name"] not in (name, "intentd", "intentd-sitter"):
+                self.package(package["name"], "0.9.115")
         self.put("release-plz.toml", original.decode())
         self.run_ok("cargo", "generate-lockfile")
         self.commit("chore: production configuration baseline")
         self.run_ok("git", "tag", "v0.9.115")
-        self.package("intent-nodes", "0.9.113")
+        self.package(name, version)
         self.run_ok("cargo", "generate-lockfile")
-        self.commit("feat: add nodes")
+        self.commit(message)
         self.run_ok("git", "switch", "-c", "production-config-fixture")
         self.prepare()
         expected = tomllib.loads(original.decode())
         for package in expected["package"]:
-            if package["name"] == "intent-nodes":
-                package["git_tag_name"] = RESERVED + "{{ version }}"
+            if package["name"] == name:
+                package["git_tag_name"] = f"__initial_{name}-v{{{{ version }}}}"
         self.assertEqual(tomllib.loads(self.output.read_text()), expected)
         self.update()
-        self.assertIn("Add nodes", (self.repo / "CHANGELOG.md").read_text())
         self.assertEqual((self.repo / "release-plz.toml").read_bytes(), original)
         self.assertEqual(self.version("intentd-sitter"), "0.1.0")
+        self.assertEqual(self.version("intentd"), "0.9.116")
+        self.assertEqual(self.version(name), "0.9.116")
+
+    def test_real_repository_config_changes_only_nodes_tag_lookup(self):
+        self.production_config_introduces("intent-nodes", "0.9.113", "feat: add nodes")
+        self.assertIn("Add nodes", (self.repo / "CHANGELOG.md").read_text())
+
+    def test_real_repository_config_changes_only_transfer_tag_lookup(self):
+        # The v0.11.43 shape from intent-hq/intent#7760: the new crate already
+        # carries the baseline version, and only it is missing from the tag.
+        self.production_config_introduces("intent-svc-transfer", "0.9.115",
+                                          "refactor: move transfer into its own crate")
+        self.assertIn("Move transfer into its own crate",
+                      (self.repo / "CHANGELOG.md").read_text())
 
     def test_workflow_limits_temporary_config_to_pinned_planning_action(self):
         workflow = (ROOT / ".github/workflows/release-plz.yml").read_text()
