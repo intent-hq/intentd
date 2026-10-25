@@ -4,13 +4,24 @@ use intent_core::PrincipalId;
 
 #[tokio::test]
 async fn discussion_upgrade_from_main_preserves_data_and_migration_checksums() {
+    assert_discussion_upgrade_preserves_data_and_migration_checksums(172).await;
+}
+
+#[tokio::test]
+async fn discussion_upgrade_from_pre_discussions_preserves_data_and_migration_checksums() {
+    assert_discussion_upgrade_preserves_data_and_migration_checksums(164).await;
+}
+
+async fn assert_discussion_upgrade_preserves_data_and_migration_checksums(
+    last_applied_version: i64,
+) {
     let tmp = TempDb::new();
     let pool = crate::connect_write(&tmp.path).await.unwrap();
     let prefix = sqlx::migrate::Migrator {
         migrations: std::borrow::Cow::Owned(
             crate::MIGRATOR
                 .iter()
-                .filter(|m| m.version <= 164)
+                .filter(|m| m.version <= last_applied_version)
                 .cloned()
                 .collect(),
         ),
@@ -35,8 +46,9 @@ async fn discussion_upgrade_from_main_preserves_data_and_migration_checksums() {
 
     let store = Store::open(&tmp.path).await.unwrap();
     let preserved: Vec<(i64, Vec<u8>)> = sqlx::query_as(
-        "SELECT version, checksum FROM _sqlx_migrations WHERE version <= 164 ORDER BY version",
+        "SELECT version, checksum FROM _sqlx_migrations WHERE version <= ? ORDER BY version",
     )
+    .bind(last_applied_version)
     .fetch_all(store.read_pool())
     .await
     .unwrap();
@@ -341,13 +353,13 @@ async fn discussion_conversation_migration_preserves_default_history_and_retry()
         .await
         .unwrap();
     sqlx::raw_sql(include_str!(
-        "../migrations/0172_discussion_principal_mentions.sql"
+        "../migrations/0173_discussion_principal_mentions.sql"
     ))
     .execute(store.write_pool())
     .await
     .unwrap();
     sqlx::raw_sql(include_str!(
-        "../migrations/0173_workspace_discussion_management.sql"
+        "../migrations/0174_workspace_discussion_management.sql"
     ))
     .execute(store.write_pool())
     .await

@@ -15,14 +15,16 @@ const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(1);
 /// Upper bound on how long the holder keeps the connection if the operation
 /// never reports a timeout; the test then fails on the observer assertion
 /// instead of hanging. Also bounds the pool-open retries.
-const WATCHDOG: Duration = Duration::from_secs(15);
+fn watchdog() -> Duration {
+    intentd_test_support::test_timeout(Duration::from_secs(15))
+}
 
 /// Open a migrated store whose write pool uses [`ACQUIRE_TIMEOUT`]. sqlx opens
 /// the first connection eagerly under that timeout, so retry the open on a
-/// loaded host until [`WATCHDOG`].
+/// loaded host until [`watchdog()`].
 async fn short_acquire_store(tmp: &TempDb) -> Store {
     drop(Store::open(&tmp.path).await.expect("open store"));
-    let open_deadline = tokio::time::Instant::now() + WATCHDOG;
+    let open_deadline = tokio::time::Instant::now() + watchdog();
     let write_pool = loop {
         match crate::connect_write_with_acquire_timeout(&tmp.path, ACQUIRE_TIMEOUT).await {
             Ok(pool) => break pool,
@@ -38,6 +40,7 @@ async fn short_acquire_store(tmp: &TempDb) -> Store {
     Store {
         task_event_baselines: Arc::default(),
         task_events_enabled: Arc::default(),
+        note_write_lanes: std::sync::Arc::default(),
         _daemon_owner: None,
         write_pool: write_pool.into(),
         read_pool: crate::connect_read(&tmp.path)
@@ -67,7 +70,7 @@ async fn run_while_writer_held<T>(
     let holder = {
         let observed = Arc::clone(&observed);
         tokio::spawn(async move {
-            let deadline = tokio::time::Instant::now() + WATCHDOG;
+            let deadline = tokio::time::Instant::now() + watchdog();
             while observed.load(Ordering::SeqCst) == 0 && tokio::time::Instant::now() < deadline {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -130,7 +133,13 @@ async fn note_write_survives_write_pool_acquire_timeout() {
     note.content = "edited".to_string();
     let (rev, v) = run_while_writer_held(
         &store,
-        store.update_note_with_version(&note, Some(0), &author, &ts),
+        store.update_note_with_version(
+            &store.lock_note_content(&note.workspace_id, &note.id).await,
+            &note,
+            Some(0),
+            &author,
+            &ts,
+        ),
     )
     .await
     .expect("note edit must retry through the write-pool acquire timeout");
@@ -182,7 +191,13 @@ async fn note_write_gives_up_within_budget_under_continuous_saturation() {
     note.content = "edited".to_string();
     let started = std::time::Instant::now();
     let result = store
-        .update_note_with_version(&note, Some(0), &author, &ts)
+        .update_note_with_version(
+            &store.lock_note_content(&note.workspace_id, &note.id).await,
+            &note,
+            Some(0),
+            &author,
+            &ts,
+        )
         .await;
     let elapsed = started.elapsed();
     let err = result.expect_err("a saturated writer must fail the edit, not commit it late");

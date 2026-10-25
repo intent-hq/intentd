@@ -244,7 +244,11 @@ impl Harness {
             .await
             .unwrap();
         drop(store);
-        std::fs::write(dir.path().join("config.toml"),"[providers]\nenabled = {}\n[mcp]\nenableUserServers = false\n[agents]\nresumeInterruptedOnStart = \"off\"\n").unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[providers]\nenabled = {}\n[mcp]\nenableUserServers = false\n",
+        )
+        .unwrap();
         if let Some((_, endpoint)) = history {
             let config = dir.path().join("config.toml");
             let text = std::fs::read_to_string(&config).unwrap();

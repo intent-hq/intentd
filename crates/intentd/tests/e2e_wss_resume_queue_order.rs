@@ -214,10 +214,6 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)], resume_all: 
     if listen != "uds" {
         common::enable_ws_api(data_dir);
     }
-    // Pin resumeInterruptedOnStart=off: this suite asserts pending rows stay
-    // inert until the explicit resume path (`--resume-all` still forces the
-    // sweep over the pin), but the `auto` default resumes on headless hosts.
-    common::disable_resume_on_start(data_dir);
     let mut cmd = common::hermetic_serve_command(data_dir);
     cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
@@ -320,6 +316,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         context_links: None,
         archived: false,
         archived_at: None,
+        retired_at: None,
         task_stats: None,
         agent_summary: None,
         diff_summary: None,

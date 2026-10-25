@@ -2489,6 +2489,7 @@ mod tests {
             context_links: None,
             archived: false,
             archived_at: None,
+            retired_at: None,
             task_stats: None,
             agent_summary: None,
             diff_summary: None,
@@ -2653,14 +2654,16 @@ mod tests {
     /// under a loaded host (e.g. a parallel `cargo build`) persistence can
     /// lag far behind the happy path, and a short deadline fails
     /// otherwise-passing tests (intent-hq/monorepo#1358).
-    const POLL_DEADLINE: Duration = Duration::from_secs(10);
+    fn poll_deadline() -> Duration {
+        intentd_test_support::test_timeout(Duration::from_secs(10))
+    }
 
     /// Poll the persisted hook until `pred` holds or the timeout elapses.
     async fn wait_for_hook<F>(svc: &Services, id: &HookId, pred: F) -> Hook
     where
         F: Fn(&Hook) -> bool,
     {
-        let deadline = std::time::Instant::now() + POLL_DEADLINE;
+        let deadline = std::time::Instant::now() + poll_deadline();
         loop {
             let hook = svc.store().get_hook(id).await.expect("get hook");
             if pred(&hook) {
@@ -2679,7 +2682,7 @@ mod tests {
     /// terminal state persists BEFORE the loop exits, so asserting
     /// `!hook_task_alive` right after a state wait races the teardown.
     async fn wait_for_task_exit(svc: &Services, id: &HookId) {
-        let deadline = std::time::Instant::now() + POLL_DEADLINE;
+        let deadline = std::time::Instant::now() + poll_deadline();
         while svc.hook_task_alive(id) {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -2693,7 +2696,7 @@ mod tests {
     /// `needle`, returning the serialized messages. The wake lands after the
     /// terminal state persists, so a plain read can race it.
     async fn wait_for_wake(svc: &Services, owner: &AgentId, needle: &str) -> String {
-        let deadline = std::time::Instant::now() + POLL_DEADLINE;
+        let deadline = std::time::Instant::now() + poll_deadline();
         loop {
             let session = svc.store().get_agent_session(owner).await.unwrap();
             let text = serde_json::to_string(&session.messages).unwrap();
@@ -2714,7 +2717,7 @@ mod tests {
     /// helper polls until all are present (on deadline it returns whatever
     /// was seen — the caller's asserts then report the shortfall).
     async fn hook_event_types(svc: &Services, ws: &WorkspaceId, expected: &[&str]) -> Vec<String> {
-        let deadline = std::time::Instant::now() + POLL_DEADLINE;
+        let deadline = std::time::Instant::now() + poll_deadline();
         loop {
             let mut evs = svc
                 .store()
@@ -2953,7 +2956,7 @@ mod tests {
             .unwrap();
         let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
         svc.hook_run_now_op(&ws, &hook.hook_id).await.unwrap();
-        tokio::time::timeout(POLL_DEADLINE, async {
+        tokio::time::timeout(poll_deadline(), async {
             loop {
                 if svc
                     .store
@@ -2983,7 +2986,7 @@ mod tests {
         .await
         .is_ok();
         if !timely {
-            tokio::time::timeout(POLL_DEADLINE, shutdown)
+            tokio::time::timeout(poll_deadline(), shutdown)
                 .await
                 .unwrap()
                 .unwrap();
@@ -3746,7 +3749,15 @@ mod tests {
         assert_eq!(hook.state, HookState::Scheduled);
         assert_eq!(hook.dispatch_count, 0);
         probe.content = "go".to_string();
-        svc.store().update_note(&probe).await.unwrap();
+        svc.store()
+            .update_note(
+                &svc.store()
+                    .lock_note_content(&probe.workspace_id, &probe.id)
+                    .await,
+                &probe,
+            )
+            .await
+            .unwrap();
 
         for fire in 1..=2 {
             svc.hook_run_now_op(&ws, &hook.hook_id)
@@ -3811,7 +3822,15 @@ mod tests {
         wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Running).await;
         skew.store(120_000, std::sync::atomic::Ordering::SeqCst);
         gate.content = "go".to_string();
-        svc.store().update_note(&gate).await.unwrap();
+        svc.store()
+            .update_note(
+                &svc.store()
+                    .lock_note_content(&gate.workspace_id, &gate.id)
+                    .await,
+                &gate,
+            )
+            .await
+            .unwrap();
         let expired = wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Expired).await;
         assert_eq!(expired.run_count, 1);
         assert_eq!(expired.dispatch_count, 1, "the fire still counted");
@@ -3839,7 +3858,7 @@ mod tests {
         assert!(types.contains(&HOOK_DISPATCHED.to_string()), "{types:?}");
         assert!(types.contains(&HOOK_EXPIRED.to_string()), "{types:?}");
         // Task deregistered after the terminal outcome.
-        let deadline = std::time::Instant::now() + POLL_DEADLINE;
+        let deadline = std::time::Instant::now() + poll_deadline();
         while svc.hook_task_alive(&hook.hook_id) {
             assert!(std::time::Instant::now() < deadline, "task not removed");
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -4067,7 +4086,15 @@ mod tests {
         let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
         assert_eq!(hook.state, HookState::Scheduled);
         probe.content = "go".to_string();
-        svc.store().update_note(&probe).await.unwrap();
+        svc.store()
+            .update_note(
+                &svc.store()
+                    .lock_note_content(&probe.workspace_id, &probe.id)
+                    .await,
+                &probe,
+            )
+            .await
+            .unwrap();
         svc.hook_run_now_op(&ws, &hook.hook_id)
             .await
             .expect("runNow");
@@ -4086,7 +4113,7 @@ mod tests {
         );
         assert!(text.contains(r#""hookStillActive":false"#), "{text}");
         // Task deregistered after the terminal outcome.
-        let deadline = std::time::Instant::now() + POLL_DEADLINE;
+        let deadline = std::time::Instant::now() + poll_deadline();
         while svc.hook_task_alive(&hook.hook_id) {
             assert!(std::time::Instant::now() < deadline, "task not removed");
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -4143,9 +4170,17 @@ mod tests {
             .unwrap();
         let parent: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
         probe.content = "go".into();
-        svc.store.update_note(&probe).await.unwrap();
+        svc.store
+            .update_note(
+                &svc.store
+                    .lock_note_content(&probe.workspace_id, &probe.id)
+                    .await,
+                &probe,
+            )
+            .await
+            .unwrap();
         svc.hook_run_now_op(&ws, &parent.hook_id).await.unwrap();
-        tokio::time::timeout(POLL_DEADLINE, park.entered.notified())
+        tokio::time::timeout(poll_deadline(), park.entered.notified())
             .await
             .unwrap();
         let child = svc
@@ -4172,12 +4207,12 @@ mod tests {
         park.release.notify_one();
         if expired_perpetual {
             // Expired perpetual validation sends a dispatch and an expiry notice.
-            tokio::time::timeout(POLL_DEADLINE, park.entered.notified())
+            tokio::time::timeout(poll_deadline(), park.entered.notified())
                 .await
                 .unwrap();
             park.release.notify_one();
         }
-        tokio::time::timeout(POLL_DEADLINE, shutdown)
+        tokio::time::timeout(poll_deadline(), shutdown)
             .await
             .unwrap()
             .unwrap();
@@ -4236,9 +4271,17 @@ mod tests {
         })).await.unwrap();
         let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
         probe.content = "go".into();
-        svc.store().update_note(&probe).await.unwrap();
+        svc.store()
+            .update_note(
+                &svc.store()
+                    .lock_note_content(&probe.workspace_id, &probe.id)
+                    .await,
+                &probe,
+            )
+            .await
+            .unwrap();
         svc.hook_run_now_op(&ws, &hook.hook_id).await.unwrap();
-        tokio::time::timeout(POLL_DEADLINE, park.entered.notified())
+        tokio::time::timeout(poll_deadline(), park.entered.notified())
             .await
             .unwrap();
         assert_eq!(
@@ -4268,7 +4311,7 @@ mod tests {
         mgr.begin_shutdown();
         // A committed tail may still be waiting on event publication. Recovery
         // must already be durable before shutdown awaits that tail.
-        tokio::time::timeout(POLL_DEADLINE, mgr.checkpoint_shutdown())
+        tokio::time::timeout(poll_deadline(), mgr.checkpoint_shutdown())
             .await
             .unwrap();
         assert!(svc
@@ -4292,7 +4335,7 @@ mod tests {
             tokio::task::yield_now().await;
         }
         park.release.notify_one();
-        tokio::time::timeout(POLL_DEADLINE, shutdown)
+        tokio::time::timeout(poll_deadline(), shutdown)
             .await
             .unwrap()
             .unwrap();
@@ -4343,7 +4386,7 @@ mod tests {
             .unwrap();
         let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
         svc.hook_run_now_op(&ws, &hook.hook_id).await.unwrap();
-        tokio::time::timeout(POLL_DEADLINE, park.entered.notified())
+        tokio::time::timeout(poll_deadline(), park.entered.notified())
             .await
             .unwrap();
         assert!(mgr.try_begin_turn(&owner, &ws).await.is_some());
@@ -4379,7 +4422,7 @@ mod tests {
         // Always release the fixture before asserting the expected baseline failure.
         park.release.notify_one();
         if !timely {
-            tokio::time::timeout(POLL_DEADLINE, shutdown)
+            tokio::time::timeout(poll_deadline(), shutdown)
                 .await
                 .unwrap()
                 .unwrap();
@@ -4625,7 +4668,15 @@ mod tests {
             .await
             .expect("gate note");
         gate.content = "go".to_string();
-        svc.store().update_note(&gate).await.unwrap();
+        svc.store()
+            .update_note(
+                &svc.store()
+                    .lock_note_content(&gate.workspace_id, &gate.id)
+                    .await,
+                &gate,
+            )
+            .await
+            .unwrap();
     }
 
     /// Number of the owner's persisted messages containing `needle`.
@@ -4642,7 +4693,7 @@ mod tests {
     /// (the wake lands after the state a test gated on), then return the
     /// count so the caller can assert it is exactly `n`.
     async fn wait_for_wake_count(svc: &Services, owner: &AgentId, needle: &str, n: usize) -> usize {
-        let deadline = std::time::Instant::now() + POLL_DEADLINE;
+        let deadline = std::time::Instant::now() + poll_deadline();
         loop {
             let count = wake_count(svc, owner, needle).await;
             if count >= n || std::time::Instant::now() >= deadline {
@@ -5152,6 +5203,55 @@ mod tests {
         assert!(text.contains("cancelled"), "{text}");
     }
 
+    /// `workspace.retire` on an Active workspace runs the archive teardown
+    /// first, so every ACTIVE hook is cancelled exactly as on archive: task
+    /// aborted, row `cancelled`, `hook:cancelled` emitted.
+    #[intent_test_macros::daemon_test]
+    async fn workspace_retire_from_active_cancels_active_hooks() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({
+                    "name": "watching",
+                    "code": "return { dispatch: false };",
+                    "delayMs": 600_000,
+                }),
+            )
+            .await
+            .expect("schedule active");
+        let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
+        assert!(svc.hook_task_alive(&hook.hook_id));
+        // Retire only admits a git worktree checkout: give the row one.
+        let scratch = crate::test_support::test_tempdir("intentd-retire-wt-");
+        let mut row = svc.store().get_workspace(&ws).await.unwrap();
+        row.repository_path = Some(scratch.path().join("repo").to_string_lossy().into_owned());
+        row.worktree_path = Some(
+            svc.workspaces_root
+                .clone()
+                .expect("test workspaces root")
+                .join(ws.as_str())
+                .join("wt")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        row.checkout_mode = Some(intent_core::CheckoutMode::Worktree);
+        svc.store().update_workspace(&row).await.unwrap();
+
+        let retired = svc
+            .retire_workspace(ws.clone(), None)
+            .await
+            .expect("retire");
+        assert_eq!(retired.status, intent_core::WorkspaceStatus::Retired);
+
+        assert!(!svc.hook_task_alive(&hook.hook_id), "hook task aborted");
+        let stored = svc.store().get_hook(&hook.hook_id).await.unwrap();
+        assert_eq!(stored.state, HookState::Cancelled);
+        let types = hook_event_types(&svc, &ws, &[HOOK_CANCELLED]).await;
+        assert!(types.contains(&HOOK_CANCELLED.to_string()), "{types:?}");
+    }
+
     /// Retire sweep (`ws.agent.retire`): the retiring agent's ACTIVE hooks
     /// are cancelled through the shared transition — task aborted, row
     /// `cancelled`, `nextRunAt` cleared, `hook:cancelled` emitted — with NO
@@ -5364,13 +5464,21 @@ mod tests {
         let archiver: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
         assert_eq!(archiver.state, HookState::Scheduled);
         probe.content = "go".to_string();
-        svc.store().update_note(&probe).await.unwrap();
+        svc.store()
+            .update_note(
+                &svc.store()
+                    .lock_note_content(&probe.workspace_id, &probe.id)
+                    .await,
+                &probe,
+            )
+            .await
+            .unwrap();
         svc.hook_run_now_op(&ws, &archiver.hook_id)
             .await
             .expect("runNow");
 
         // The archive lands in the store...
-        let deadline = std::time::Instant::now() + POLL_DEADLINE;
+        let deadline = std::time::Instant::now() + poll_deadline();
         loop {
             let row = svc.store().get_workspace(&ws).await.expect("get workspace");
             if row.archived {
@@ -5385,7 +5493,7 @@ mod tests {
         }
 
         // ...and the §6.5 delta is published exactly once, in full.
-        let deadline = std::time::Instant::now() + POLL_DEADLINE;
+        let deadline = std::time::Instant::now() + poll_deadline();
         let deltas = loop {
             let deltas = archive_delta_events(&svc, &ws).await;
             if !deltas.is_empty() {
@@ -5605,14 +5713,22 @@ mod tests {
             .expect("schedule");
         let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
         probe.content = "go".to_string();
-        svc.store().update_note(&probe).await.unwrap();
+        svc.store()
+            .update_note(
+                &svc.store()
+                    .lock_note_content(&probe.workspace_id, &probe.id)
+                    .await,
+                &probe,
+            )
+            .await
+            .unwrap();
         svc.hook_run_now_op(&ws, &hook.hook_id)
             .await
             .expect("runNow");
         wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Dispatched).await;
         // The settled dispatch drops the waiting flag without any
         // displayStatus transition.
-        let deadline = std::time::Instant::now() + POLL_DEADLINE;
+        let deadline = std::time::Instant::now() + poll_deadline();
         loop {
             if !svc.workspace_is_waiting(&ws).await {
                 break;
@@ -5722,7 +5838,7 @@ mod tests {
             .await
             .expect("runNow");
         wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Expired).await;
-        let deadline = std::time::Instant::now() + POLL_DEADLINE;
+        let deadline = std::time::Instant::now() + poll_deadline();
         loop {
             if waiting_events(&svc, &ws).await == vec![true, false] {
                 break;
@@ -6638,7 +6754,7 @@ mod tests {
 
     /// Poll the persisted transcript until it holds `want` assistant rows and
     /// the manager reports the owner idle (the mock ACP turn is a real child
-    /// process, so allow well past `POLL_DEADLINE`).
+    /// process, so allow well past `poll_deadline()`).
     async fn wait_for_assistant_rows(
         svc: &Services,
         mgr: &crate::agent_manager::AgentManager,
@@ -6797,7 +6913,15 @@ mod tests {
         );
         // A recovered run clears the warning.
         probe.content = "ok".to_string();
-        svc.store().update_note(&probe).await.unwrap();
+        svc.store()
+            .update_note(
+                &svc.store()
+                    .lock_note_content(&probe.workspace_id, &probe.id)
+                    .await,
+                &probe,
+            )
+            .await
+            .unwrap();
         svc.hook_run_now_op(&ws, &hook.hook_id)
             .await
             .expect("runNow");
@@ -6862,7 +6986,15 @@ mod tests {
         assert_eq!(hook.last_state.as_deref(), Some("{\"armed\":true}"));
         // `state: null` clears it.
         probe.content = "clear".to_string();
-        svc.store().update_note(&probe).await.unwrap();
+        svc.store()
+            .update_note(
+                &svc.store()
+                    .lock_note_content(&probe.workspace_id, &probe.id)
+                    .await,
+                &probe,
+            )
+            .await
+            .unwrap();
         svc.hook_run_now_op(&ws, &hook.hook_id)
             .await
             .expect("runNow again");
@@ -7241,7 +7373,7 @@ mod tests {
         assert!(!text.contains("retired"), "{text}");
         assert!(!text.contains("hookStillActive"), "{text}");
         // Task deregistered after the terminal outcome.
-        let deadline = std::time::Instant::now() + POLL_DEADLINE;
+        let deadline = std::time::Instant::now() + poll_deadline();
         while svc.hook_task_alive(&hook.hook_id) {
             assert!(std::time::Instant::now() < deadline, "task not removed");
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -7344,7 +7476,15 @@ mod tests {
         wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Running).await;
         skew.store(120_000, std::sync::atomic::Ordering::SeqCst);
         gate.content = "go".to_string();
-        svc.store().update_note(&gate).await.unwrap();
+        svc.store()
+            .update_note(
+                &svc.store()
+                    .lock_note_content(&gate.workspace_id, &gate.id)
+                    .await,
+                &gate,
+            )
+            .await
+            .unwrap();
         let expired = wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Expired).await;
         assert_eq!(expired.run_count, 1, "the in-flight run completed");
         assert!(expired.last_run_at.is_some());
@@ -7408,7 +7548,15 @@ mod tests {
         wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Running).await;
         skew.store(120_000, std::sync::atomic::Ordering::SeqCst);
         gate.content = "go".to_string();
-        svc.store().update_note(&gate).await.unwrap();
+        svc.store()
+            .update_note(
+                &svc.store()
+                    .lock_note_content(&gate.workspace_id, &gate.id)
+                    .await,
+                &gate,
+            )
+            .await
+            .unwrap();
         let hook = wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Dispatched).await;
         assert_eq!(hook.run_count, 1);
         wait_for_wake(&svc, &owner, "made it in time").await;

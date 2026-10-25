@@ -345,6 +345,7 @@ async fn seed_workspace(data_dir: &Path) -> (String, String) {
             context_links: None,
             archived: false,
             archived_at: None,
+            retired_at: None,
             task_stats: None,
             agent_summary: None,
             diff_summary: None,
@@ -1034,7 +1035,6 @@ async fn restart_and_retry_discussion_delivery(admitted: bool) {
         return;
     };
     let data_dir = temp_data_dir();
-    common::disable_resume_on_start(data_dir.path());
     let (workspace, _) = seed_workspace(data_dir.path()).await;
     let log = data_dir.path().join("restart-prompts.jsonl");
     let env = [

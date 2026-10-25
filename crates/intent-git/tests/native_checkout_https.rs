@@ -21,7 +21,9 @@ use tokio::net::TcpListener;
 use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
 
-const LIMIT: Duration = Duration::from_secs(30);
+fn limit() -> Duration {
+    intentd_test_support::test_timeout(Duration::from_secs(30))
+}
 const CHILD: &str = "INTENT_NATIVE_CHECKOUT_FIXTURE";
 const BASIC: &str = "Basic b2F1dGgyOmNoZWNrb3V0LWZpeHR1cmUtc2VjcmV0";
 
@@ -537,7 +539,7 @@ fn backend(root: &Path, method: &str, target: &str, body: &[u8]) -> Vec<u8> {
         .unwrap()
         .read_to_end(&mut output)
         .unwrap();
-    assert!(child.wait_with_timeout(LIMIT).unwrap().unwrap().success());
+    assert!(child.wait_with_timeout(limit()).unwrap().unwrap().success());
     let split = output.windows(4).position(|s| s == b"\r\n\r\n").unwrap();
     let head = String::from_utf8(output[..split].to_vec()).unwrap();
     assert!(
@@ -606,7 +608,7 @@ async fn run(name: &str, mode: &str) {
             let Ok(mut stream) = TlsAcceptor::from(tls.clone()).accept(socket).await else {
                 continue;
             };
-            timeout(LIMIT, async {
+            timeout(limit(), async {
                 let mut header = Vec::new();
                 let mut byte = [0];
                 while !header.ends_with(b"\r\n\r\n") {
@@ -685,7 +687,7 @@ async fn run(name: &str, mode: &str) {
     }
     let mut child = GuardedChild::spawn(&mut command).unwrap();
     let result = child
-        .wait_with_timeout(LIMIT)
+        .wait_with_timeout(limit())
         .unwrap()
         .expect("native checkout child timed out");
     drop(server);

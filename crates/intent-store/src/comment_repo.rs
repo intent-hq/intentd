@@ -198,16 +198,22 @@ impl Store {
     /// so the caller can echo the authoritative value; nothing persists on
     /// any error.
     ///
+    /// Takes `note`'s [`NoteWriteLock`](crate::NoteWriteLock) from this store;
+    /// any other lock is refused with `Error::Internal` before anything is
+    /// written.
+    ///
     /// # Errors
     ///
     /// Returns `Error::Conflict` (carrying the current entity) when `expected_version` is supplied and does not match the stored `rev`; `Error::NotFound` if the note row is absent; `Error::InvalidInput` on a duplicate comment id; `Error::Internal` if encoding fields or the transaction fails.
     pub async fn update_note_with_comment(
         &self,
+        lock: &crate::NoteWriteLock,
         note: &Note,
         expected_version: Option<i64>,
         c: &Comment,
         author: &NoteVersionAuthor,
     ) -> Result<i64> {
+        lock.ensure_covers(self, note)?;
         let (anchor_json, extra_json) = encode_comment_json(c, &Map::new())?;
 
         // IMMEDIATE mode: acquires the write lock upfront, avoiding the

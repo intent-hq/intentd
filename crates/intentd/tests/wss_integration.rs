@@ -250,7 +250,7 @@ async fn make_services(
         intent_services::SettingsRegistry::load(dir.path().join("config.toml"))
             .expect("load settings registry"),
     );
-    let mut services = intent_svc_transfer::register(Services::new(store.clone()))
+    let mut services = intent_app::compose(Services::new(store.clone()))
         .with_assets_root(dir.path().join("assets"))
         .with_workspaces_root(workspaces_root)
         .with_settings_registry(registry.clone())
@@ -14038,6 +14038,7 @@ fn fixture_workspace(id: &WorkspaceId) -> Workspace {
         context_links: None,
         archived: false,
         archived_at: None,
+        retired_at: None,
         task_stats: None,
         agent_summary: None,
         diff_summary: None,
@@ -21437,9 +21438,9 @@ async fn wss_workspace_import_commit_materializes_git() {
     src_ws.repository_path = Some(repo.to_string_lossy().into_owned());
     src_ws.repository_name = Some("test-repo".to_string());
     let staging = src.path().join("staging");
-    let intent_svc_transfer::transfer_git::TransferBundle {
+    let intent_app::transfer::transfer_git::TransferBundle {
         bundle_path, refs, ..
-    } = intent_svc_transfer::transfer_git::create_transfer_bundle(&src_ws, &[], &staging)
+    } = intent_app::transfer::transfer_git::create_transfer_bundle(&src_ws, &[], &staging)
         .expect("bundle");
     assert!(
         refs.workspace_wip_commit_sha.is_some(),
@@ -23627,7 +23628,15 @@ async fn wss_explicit_blocker_recovery_scope_generation_and_task_states() {
             .await
             .unwrap();
         note.metadata.task.as_mut().unwrap().assigned_agent_ids = vec![agent.clone()];
-        srv.store.update_note_metadata(&note).await.unwrap();
+        srv.store
+            .update_note_metadata(
+                &srv.store
+                    .lock_note_content(&note.workspace_id, &note.id)
+                    .await,
+                &note,
+            )
+            .await
+            .unwrap();
         let mut session = srv.store.get_agent_session(&agent).await.unwrap();
         session.task_note_id = Some(intent_core::NoteId(note_id.into()));
         srv.store.update_agent_session(&ws, &session).await.unwrap();
@@ -23718,7 +23727,15 @@ async fn wss_explicit_blocker_recovery_relink_rejects_prepared_task_write() {
         assert!(marked.get("error").is_none(), "{marked}");
         let mut task = srv.store.get_note(&ws, &note).await.unwrap();
         task.metadata.task.as_mut().unwrap().assigned_agent_ids = vec![agent.clone()];
-        srv.store.update_note_metadata(&task).await.unwrap();
+        srv.store
+            .update_note_metadata(
+                &srv.store
+                    .lock_note_content(&task.workspace_id, &task.id)
+                    .await,
+                &task,
+            )
+            .await
+            .unwrap();
         notes.push(note);
     }
     let old = &notes[0];
@@ -23783,7 +23800,14 @@ async fn wss_explicit_blocker_recovery_relink_rejects_prepared_task_write() {
     );
     let rejected = srv
         .store
-        .update_note_metadata_if_agent_linked(&prepared, before_note.rev, &agent)
+        .update_note_metadata_if_agent_linked(
+            &srv.store
+                .lock_note_content(&prepared.workspace_id, &prepared.id)
+                .await,
+            &prepared,
+            before_note.rev,
+            &agent,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -23825,13 +23849,27 @@ async fn wss_explicit_blocker_recovery_relink_rejects_prepared_task_write() {
     valid.metadata.task.as_mut().unwrap().status = intent_core::TaskStatus::InProgress;
     let accepted = srv
         .store
-        .update_note_metadata_if_agent_linked(&valid, current.rev, &agent)
+        .update_note_metadata_if_agent_linked(
+            &srv.store
+                .lock_note_content(&valid.workspace_id, &valid.id)
+                .await,
+            &valid,
+            current.rev,
+            &agent,
+        )
         .await
         .unwrap();
     assert_eq!(accepted, Some(current.rev + 1));
     assert_eq!(
         srv.store
-            .update_note_metadata_if_agent_linked(&current, current.rev, &agent)
+            .update_note_metadata_if_agent_linked(
+                &srv.store
+                    .lock_note_content(&current.workspace_id, &current.id)
+                    .await,
+                &current,
+                current.rev,
+                &agent
+            )
             .await
             .unwrap(),
         None

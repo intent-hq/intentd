@@ -378,6 +378,7 @@ async fn seed_workspace_only(data_dir: &Path) -> String {
             context_links: None,
             archived: false,
             archived_at: None,
+            retired_at: None,
             task_stats: None,
             agent_summary: None,
             diff_summary: None,
@@ -886,8 +887,8 @@ async fn assistant_profile_and_reference_survive_restart_over_wss() {
     // The SIGKILL below skips graceful shutdown, which is what normally
     // finishes a post-turn idle write still in flight. Killing before that
     // write lands leaves the session `active`, so the restarted daemon heals
-    // it as a crashed turn and auto-resumes it — the resume prompt then
-    // becomes the second prompt instead of the message sent below.
+    // it as a crashed turn (hermetic daemons pin resume-on-start off, so it
+    // is recorded, not resumed; the stop-reason check below catches it).
     await_durable_idle(&mut sub, &agent).await;
     let before = wss_rpc(&mut rpc, 4, "agent.getSession", json!({"agentId": agent})).await;
     let system = before["session"]["systemPrompt"].as_str().unwrap();
@@ -918,8 +919,8 @@ async fn assistant_profile_and_reference_survive_restart_over_wss() {
     .await;
     // Startup heals before serving RPCs. A completed first turn misread as a
     // crash carries the heal's stop reason here until a resumed turn clears
-    // it; the prompt check below covers that case (resume runs only on
-    // headless hosts under the default `auto` setting).
+    // it; the prompt check below also guards a resumed turn should a test
+    // opt back into resume-on-start.
     let restarted = wss_rpc(&mut rpc, 7, "agent.getSession", json!({"agentId": agent})).await;
     let stop_reason = restarted["session"]["stopReason"]
         .as_str()

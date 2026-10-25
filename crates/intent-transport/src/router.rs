@@ -241,6 +241,28 @@ fn domain_to_rpc(e: Error) -> RpcErr {
             message: e.to_string(),
             data: Some(json!({ "code": "not-a-file", "path": path, "mode": mode })),
         },
+        // Mutation on a retired workspace (§5.1 "Retired workspaces"):
+        // -32602 with `data = { code: "workspace-retired", workspaceId }`.
+        ref e @ Error::WorkspaceRetired { ref workspace_id } => RpcErr {
+            code: e.code(),
+            message: e.to_string(),
+            data: Some(json!({ "code": "workspace-retired", "workspaceId": workspace_id })),
+        },
+        // `workspace.retire` on a non-worktree checkout (§5.1): -32602 with
+        // `data = { code: "retire-unsupported", checkoutMode? }`.
+        ref e @ Error::RetireUnsupported {
+            ref checkout_mode, ..
+        } => {
+            let mut data = json!({ "code": "retire-unsupported" });
+            if let Some(mode) = checkout_mode {
+                data["checkoutMode"] = json!(mode);
+            }
+            RpcErr {
+                code: e.code(),
+                message: e.to_string(),
+                data: Some(data),
+            }
+        }
         // Opportunistic warm rejected because one is already in flight:
         // -32603 with machine-readable `data = { code: "warm-in-flight",
         // owner, repo }` naming the repo currently being warmed, so the FE
@@ -579,7 +601,12 @@ pub(crate) async fn prepare_message(
     );
     let profile_span = span.clone();
     async move {
-        let result = dispatch(api, method, &params).await;
+        // Retired workspaces are read-only (§5.1): refuse gated writes
+        // before any handler runs.
+        let result = match crate::retired_gate::check(api, method, &params).await {
+            Ok(()) => dispatch(api, method, &params).await,
+            Err(e) => Err(domain_to_rpc(e)),
+        };
         let kind = if result.is_ok() {
             intent_core::repository_request::RepositoryReadReplyKind::Result
         } else {
@@ -876,8 +903,14 @@ async fn dispatch(
                 .get("includeArchived")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
+            // Retired rows are opt-in only (§5.1): `includeArchived` alone
+            // never returns them.
+            let include_retired = opt_bool_if_present(params, "includeRetired")?.unwrap_or(false);
             let workspaces = api
-                .list_workspaces(include_archived)
+                .list_workspaces(intent_core::WorkspaceListFilter::new(
+                    include_archived,
+                    include_retired,
+                ))
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(json!({ "workspaces": workspaces }))
@@ -887,8 +920,9 @@ async fn dispatch(
                 .get("url")
                 .and_then(Value::as_str)
                 .ok_or_else(|| invalid_params("Missing required parameter: url"))?;
+            let include_retired = opt_bool_if_present(params, "includeRetired")?.unwrap_or(false);
             let workspaces = api
-                .find_workspaces_by_pull_request(url.to_string())
+                .find_workspaces_by_pull_request(url.to_string(), include_retired)
                 .await
                 .map_err(domain_to_rpc)?;
             Ok(json!({ "workspaces": workspaces }))
@@ -969,6 +1003,14 @@ async fn dispatch(
             let id = require_workspace_id(params)?;
             let ws = api
                 .archive_workspace(id, None)
+                .await
+                .map_err(workspace_err)?;
+            Ok(json!({ "workspace": ws }))
+        }
+        "workspace.retire" => {
+            let id = require_workspace_id(params)?;
+            let ws = api
+                .retire_workspace(id, None)
                 .await
                 .map_err(workspace_err)?;
             Ok(json!({ "workspace": ws }))
@@ -4926,7 +4968,8 @@ async fn dispatch(
         }
         "crossWorkspace.listSiblings" => {
             let ws = require_ws_note(params)?;
-            api.cross_workspace_list_siblings(ws)
+            let include_retired = opt_bool_if_present(params, "includeRetired")?.unwrap_or(false);
+            api.cross_workspace_list_siblings(ws, include_retired)
                 .await
                 .map_err(domain_to_rpc)
         }
@@ -5818,6 +5861,17 @@ fn opt_bool(params: &Map<String, Value>, name: &str) -> Option<bool> {
 fn opt_bool_strict(params: &Map<String, Value>, name: &str) -> Result<Option<bool>, RpcErr> {
     match params.get(name) {
         None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(b)) => Ok(Some(*b)),
+        Some(_) => Err(invalid_params(format!("{name} must be a boolean"))),
+    }
+}
+
+/// Stricter than [`opt_bool_strict`]: only an ABSENT key is `None`; a
+/// supplied `null` or any other non-boolean is `-32602`. Used for
+/// `includeRetired` (PROTOCOL §5.1), where only omission means `false`.
+fn opt_bool_if_present(params: &Map<String, Value>, name: &str) -> Result<Option<bool>, RpcErr> {
+    match params.get(name) {
+        None => Ok(None),
         Some(Value::Bool(b)) => Ok(Some(*b)),
         Some(_) => Err(invalid_params(format!("{name} must be a boolean"))),
     }

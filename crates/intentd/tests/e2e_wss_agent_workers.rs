@@ -1047,8 +1047,6 @@ async fn restart_interrupts_an_idle_agent_with_a_running_worker_over_wss() {
         ("MOCK_AGENT_BEHAVIOR", &behavior),
         ("MOCK_AGENT_PROMPT_LOG", prompt_log.to_str().unwrap()),
     ];
-    // Resume explicitly below: `auto` would resume on headless hosts.
-    common::disable_resume_on_start(&data_dir);
     let socket = data_dir.join("intentd.sock");
 
     // Phase 1: the agent ends its turn with a running background shell.

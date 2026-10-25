@@ -208,6 +208,8 @@
         "repositoryName",
         "repositoryOwner",
         "repositoryPath",
+        "retiredAt",
+        "revived",
         "scope",
         "setupScript",
         "skipIsolation",

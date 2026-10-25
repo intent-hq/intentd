@@ -328,9 +328,6 @@ async fn interrupted_agents_persisted_across_restart() {
     if listen != "uds" {
         common::enable_ws_api(&data_dir);
     }
-    // Pin resumeInterruptedOnStart=off: this suite asserts pending rows
-    // survive a restart, but the `auto` default resumes on headless hosts.
-    common::disable_resume_on_start(&data_dir);
     let mut cmd1 = common::hermetic_serve_command(&data_dir);
     cmd1.env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_LEGACY_IMPORT_ROOTS", "")
@@ -1015,9 +1012,6 @@ async fn graceful_shutdown_captures_interrupted_agents() {
     if listen != "uds" {
         common::enable_ws_api(&data_dir);
     }
-    // Pin resumeInterruptedOnStart=off: this suite asserts the captured row
-    // is still pending after restart, but `auto` resumes on headless hosts.
-    common::disable_resume_on_start(&data_dir);
     let mut cmd1 = common::hermetic_serve_command(&data_dir);
     cmd1.env("INTENTD_DATA_DIR", &data_dir)
         .env("INTENTD_WORKSPACES_DIR", data_dir.join("workspaces"))
@@ -1369,6 +1363,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         context_links: None,
         archived: false,
         archived_at: None,
+        retired_at: None,
         task_stats: None,
         agent_summary: None,
         diff_summary: None,

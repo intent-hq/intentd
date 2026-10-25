@@ -267,9 +267,9 @@ where
 /// `agent:idle` both precede the post-turn `RuntimeIdle` write, whose
 /// `agent:status-changed` publishes only after the store commit. A SIGKILL
 /// before that write leaves an active status, so startup recovery records an
-/// interrupted turn and (headless `auto`) resumes it with an extra prompt
-/// (intent-hq/intent#6058, intent-hq/intent#7706). Call before killing the
-/// daemon. Fails fast, naming `context`, if the turn fails instead.
+/// interrupted turn (and, before hermetic daemons pinned resume-on-start off,
+/// resumed it with an extra prompt on headless CI: intent-hq/intent#6058,
+/// intent-hq/intent#7706). Call before killing the daemon. Fails fast, naming `context`, if the turn fails instead.
 async fn await_persisted_idle<S>(sub: &mut WebSocketStream<S>, agent_id: &str, context: &str)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,

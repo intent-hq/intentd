@@ -9,7 +9,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 const CHILD: &str = "INTENT_CHECKOUT_WIRE_FIXTURE";
-const LIMIT: Duration = Duration::from_secs(45);
+fn limit() -> Duration {
+    intentd_test_support::test_timeout(Duration::from_secs(45))
+}
 
 fn run_tool(mut command: Command) {
     command
@@ -17,7 +19,7 @@ fn run_tool(mut command: Command) {
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     let mut child = GuardedChild::spawn(&mut command).unwrap();
-    assert!(child.wait_with_timeout(LIMIT).unwrap().unwrap().success());
+    assert!(child.wait_with_timeout(limit()).unwrap().unwrap().success());
 }
 fn tls(root: &Path) -> Arc<rustls::ServerConfig> {
     let mut req = Command::new("openssl");
@@ -126,7 +128,7 @@ fn git(path: &Path, args: &[&str]) -> String {
         .stderr(Stdio::null());
     let mut child = GuardedChild::spawn(&mut command).unwrap();
     assert!(
-        child.wait_with_timeout(LIMIT).unwrap().unwrap().success(),
+        child.wait_with_timeout(limit()).unwrap().unwrap().success(),
         "owned fixture Git {args:?}"
     );
     let mut output = String::new();
@@ -260,7 +262,7 @@ fn backend(root: PathBuf, method: String, target: &str, body: &[u8]) -> Vec<u8> 
         .unwrap()
         .read_to_end(&mut bytes)
         .unwrap();
-    assert!(child.wait_with_timeout(LIMIT).unwrap().unwrap().success());
+    assert!(child.wait_with_timeout(limit()).unwrap().unwrap().success());
     let split = bytes.windows(4).position(|b| b == b"\r\n\r\n").unwrap();
     let headers = String::from_utf8(bytes[..split].to_vec()).unwrap();
     assert!(!headers.contains("Status:"));
@@ -550,7 +552,7 @@ async fn original_child(instance: &str, sha: &str) {
         late_client.close().await;
         response
     });
-    tokio::time::timeout(ACQUIRE, server.state.entered.notified())
+    tokio::time::timeout(acquire(), server.state.entered.notified())
         .await
         .unwrap();
     // The actual public auth flow replaces A, not an injected renderer credential.
@@ -594,7 +596,10 @@ async fn original_child(instance: &str, sha: &str) {
     assert_eq!(success(&refused)["status"], "unavailable");
     assert!(success(&refused).get("value").is_none());
     server.state.release.notify_one();
-    let late = tokio::time::timeout(ACQUIRE, late).await.unwrap().unwrap();
+    let late = tokio::time::timeout(acquire(), late)
+        .await
+        .unwrap()
+        .unwrap();
     assert!(late.get("error").is_some() || late["result"]["status"] == "unavailable");
     assert!(
         !late.to_string().contains(PROJECT),
@@ -693,7 +698,7 @@ async fn checkout_original_tls_wire_direct_cached_exact_head_and_private_account
                                 Ok(stream)=>stream,
                                 Err(error)=>{eprintln!("owned checkout TLS handshake failed: {error}");return;}
                             };
-                            tokio::time::timeout(LIMIT,async {
+                            tokio::time::timeout(limit(),async {
                                 let mut header=Vec::new();let mut byte=[0];
                                 while !header.ends_with(b"\r\n\r\n") {
                                     if stream.read(&mut byte).await.unwrap_or(0)==0{return;}
@@ -741,8 +746,8 @@ async fn checkout_original_tls_wire_direct_cached_exact_head_and_private_account
             .env("PATH",std::env::join_paths(std::iter::once(sentinels).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap()))).unwrap())
             .stdin(Stdio::null()).stdout(output.try_clone().unwrap()).stderr(output);
         let mut child=GuardedChild::spawn(&mut command).unwrap();
-        let outcome=child.wait_with_timeout(LIMIT).unwrap();
-        stop.send(()).unwrap();tokio::time::timeout(LIMIT,server).await.unwrap().unwrap();
+        let outcome=child.wait_with_timeout(limit()).unwrap();
+        stop.send(()).unwrap();tokio::time::timeout(limit(),server).await.unwrap().unwrap();
         let text=std::fs::read_to_string(&log).unwrap();
         eprintln!("owned checkout authenticated request count={}",requests.load(Ordering::SeqCst));
         for receipt in text.lines().filter(|line|line.starts_with("checkout moved-branch receipt ")) { eprintln!("{receipt}"); }
@@ -766,7 +771,12 @@ async fn moved_branch_create_controls(
     assert_ne!(moved, selected);
     git(&bare, &["update-ref", reference, &moved, selected]);
 
-    let before = h.store.list_workspaces(true).await.unwrap().len();
+    let before = h
+        .store
+        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await
+        .unwrap()
+        .len();
     let mut direct = selection.clone();
     direct["mode"] = json!("direct");
     let refused = client
@@ -780,11 +790,16 @@ async fn moved_branch_create_controls(
         json!({"jsonrpc":"2.0","id":client.id,"error":{"code":-32003,"message":"Forbidden","data":{"code":"forbidden","detail":"Repository checkout unavailable"}}}),
         "assert the final protected wire envelope, not the upstream native error"
     );
-    let after_refusal = h.store.list_workspaces(true).await.unwrap().len();
+    let after_refusal = h
+        .store
+        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await
+        .unwrap()
+        .len();
     assert_eq!(after_refusal, before);
     let published_before = h
         .store
-        .list_workspaces(true)
+        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
         .await
         .unwrap()
         .into_iter()
@@ -818,7 +833,12 @@ async fn moved_branch_create_controls(
         .unwrap()
         .len();
     assert_eq!(requests_after, requests_before);
-    let after_cached = h.store.list_workspaces(true).await.unwrap().len();
+    let after_cached = h
+        .store
+        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await
+        .unwrap()
+        .len();
     assert_eq!(after_cached, before + 1);
     assert_eq!(git(&bare, &["rev-parse", reference]), moved);
     eprintln!(
@@ -830,7 +850,7 @@ async fn moved_branch_create_controls(
 }
 
 async fn wait_for_file(path: &Path) {
-    tokio::time::timeout(ACQUIRE, async {
+    tokio::time::timeout(acquire(), async {
         while !path.exists() {
             // timing-guard: poll the owned child phase file within the original acquire deadline.
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -928,7 +948,12 @@ async fn late_completion_controls(
     let denied = client.rpc("sourceControl.checkout.branches", q).await;
     assert_eq!(success(&denied)["status"], "unavailable");
     assert!(success(&denied).get("value").is_none());
-    let before = h.store.list_workspaces(true).await.unwrap().len();
+    let before = h
+        .store
+        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await
+        .unwrap()
+        .len();
     let mut forbidden_selection = project_query(&replacement);
     forbidden_selection["branch"] = json!("late/cache-update");
     forbidden_selection["commitSha"] = json!(late_sha);
@@ -940,9 +965,19 @@ async fn late_completion_controls(
         )
         .await;
     assert!(denied.get("error").is_some());
-    assert_eq!(h.store.list_workspaces(true).await.unwrap().len(), before);
+    assert_eq!(
+        h.store
+            .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .unwrap()
+            .len(),
+        before
+    );
     std::fs::write(root.join("upload-release"), []).unwrap();
-    let result = tokio::time::timeout(ACQUIRE, warm).await.unwrap().unwrap();
+    let result = tokio::time::timeout(acquire(), warm)
+        .await
+        .unwrap()
+        .unwrap();
     assert!(result.get("error").is_some() || result["result"]["status"] == "unavailable");
     assert!(!result.to_string().contains(&late_sha));
     // Inspect only the owned cache; the late pack cannot publish tracking refs.
@@ -1028,7 +1063,10 @@ async fn late_completion_controls(
             .await,
     );
     std::fs::write(root.join("receive-release"), []).unwrap();
-    let result = tokio::time::timeout(ACQUIRE, push).await.unwrap().unwrap();
+    let result = tokio::time::timeout(acquire(), push)
+        .await
+        .unwrap()
+        .unwrap();
     assert!(
         result.get("error").is_some(),
         "retired push private reply: {result}"

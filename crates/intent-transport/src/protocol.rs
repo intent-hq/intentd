@@ -749,9 +749,12 @@ use std::time::{Duration, Instant};
 // 15.1 adds scoped repository pages and owner-bound GitLab child Git policy methods,
 // human workspace discussion history, sends, live messages, and capability-gated
 // persisted guest roles with owner-only role assignment.
+// 15.2 adds the Retired workspace state: workspace.retire, includeRetired list opt-in
+// (workspace.list/subscribe/findByPullRequest, crossWorkspace.listSiblings) and the
+// workspace-retired / retire-unsupported errors.
 // The 13.9/13.10 note paging, annotation and cancellable deletion surface was
 // later removed without a version bump: no client ever adopted it.
-pub const PROTOCOL_VERSION: &str = "15.1";
+pub const PROTOCOL_VERSION: &str = "15.2";
 
 /// Maximum size in bytes of a single inbound JSON-RPC message accepted by
 /// either transport (one newline-delimited UDS frame, one WebSocket text

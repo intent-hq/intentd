@@ -58,7 +58,7 @@ fn root(ws: &WorkspaceId, prs: Option<Vec<PullRequestInfo>>) -> WorkspaceGitRoot
 
 async fn linked(store: &Store, key: &str) -> Vec<(String, bool)> {
     store
-        .list_pull_request_workspaces(key)
+        .list_pull_request_workspaces(key, false)
         .await
         .expect("lookup")
         .into_iter()

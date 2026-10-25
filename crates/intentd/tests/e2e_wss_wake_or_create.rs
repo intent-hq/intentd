@@ -61,7 +61,7 @@ impl Drop for Daemon {
         use std::panic::{catch_unwind, AssertUnwindSafe};
         let was_panicking = std::thread::panicking();
         let started = std::time::Instant::now();
-        let deadline = started + daemon_exit::BOUND;
+        let deadline = started + daemon_exit::bound();
         let pid = self.child.id();
         let mut events = vec![json!({"event": "TeardownEntered", "pid": pid})];
         let mut wait_attempted = false;
@@ -412,6 +412,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         context_links: None,
         archived: false,
         archived_at: None,
+        retired_at: None,
         task_stats: None,
         agent_summary: None,
         diff_summary: None,

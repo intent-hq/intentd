@@ -291,7 +291,7 @@ async fn qualified_scheduler_revocation_during_http_discards_late_response() {
     provider.entered().await;
     fixture.owner.retirement().retire();
     provider.resume();
-    timeout(BUDGET, poll).await.unwrap().unwrap();
+    timeout(budget(), poll).await.unwrap().unwrap();
     let after = fixture
         .auth
         .service

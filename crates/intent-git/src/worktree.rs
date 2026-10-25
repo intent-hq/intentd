@@ -292,6 +292,33 @@ pub fn detach_worktree(repo_path: &Path, worktree_path: &Path) -> Result<Option<
     Ok(trash)
 }
 
+/// Whether `worktree_path` is a linked worktree registered in the
+/// repository at `repo_path` (`git worktree list`). Paths are compared both
+/// verbatim and canonicalized (symlinked temp dirs). `false` when the
+/// repository cannot be opened.
+#[must_use]
+pub fn is_registered_worktree(repo_path: &Path, worktree_path: &Path) -> bool {
+    let Ok(repo) = Repository::open(repo_path) else {
+        return false;
+    };
+    let Ok(names) = repo.worktrees() else {
+        return false;
+    };
+    let wanted = std::fs::canonicalize(worktree_path).ok();
+    for i in 0..names.len() {
+        let Ok(Some(n)) = names.get(i) else { continue };
+        let Ok(wt) = repo.find_worktree(n) else {
+            continue;
+        };
+        let path = wt.path();
+        if path == worktree_path || (wanted.is_some() && std::fs::canonicalize(path).ok() == wanted)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Phase 2 of worktree removal — the expensive recursive delete of a
 /// directory detached by [`detach_worktree`], parallelized via
 /// [`crate::fs_remove::remove_dir_all_parallel`]. Run this outside any
