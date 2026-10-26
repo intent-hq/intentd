@@ -192,7 +192,9 @@ rdeps_roots="intent-core"
 # dependency is a workspace crate when its path names crates/<dir>, its
 # `package =` or else its key names a crates/<name> directory (workspace
 # inheritance). Comments and other
-# sections are skipped. A line scanner, not a TOML parser.
+# sections are skipped. A line scanner, not a TOML parser: CI's check job
+# compares its output with cargo metadata (scripts/check-rdeps-parity.py), so
+# extend it when that check names a manifest style it misses.
 workspace_edges() {
   local manifest crate line section dep key
   for manifest in crates/*/Cargo.toml; do

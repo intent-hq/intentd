@@ -578,6 +578,16 @@ jobs:
         run: |
           ./scripts/test-check-feature-crate-deps.sh
           python3 -I -B scripts/check-feature-crate-deps.py
+      # scripts/changed-tests.sh (make test-changed, coverage-changed) reads
+      # crates/*/Cargo.toml with a line scanner, because test selection runs
+      # before a toolchain is installed. Fail when it disagrees with cargo
+      # metadata, naming the missing or extra crates: a missed manifest style
+      # silently drops intent-core dependents from the run (intentd#2704,
+      # c0ac2a532). Metadata only, under a second.
+      - name: changed-tests.sh dependency scanner matches cargo metadata
+        run: |
+          ./scripts/test-check-rdeps-parity.sh
+          python3 -I -B scripts/check-rdeps-parity.py
       # CI is the guard against host-dependent tests: a test that relies on
       # an installed provider CLI passes locally and fails here only while
       # runners have none. Fail loudly if a runner image starts shipping one.
