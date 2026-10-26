@@ -4,20 +4,26 @@
 Runs as ci.yml's `supersede` job on every push to main. For this run's commit
 S it:
 
-1. cancels every live push-event ci.yml run on main whose commit is a strict
-   ancestor of S (compare run...S is `ahead` with behind_by 0), and
-2. prints `superseded=true` when main's live tip is strictly ahead of S, so
-   this run skips its own Windows post-merge job; otherwise `superseded=false`.
+1. reads and validates main's live tip T first (nothing is cancelled when it
+   is unreadable),
+2. cancels every other live push-event ci.yml run on main whose commit is a
+   strict ancestor of T (compare run...T is `ahead` with behind_by 0), and
+3. prints `superseded=true` when T is strictly ahead of S and every read and
+   cancel succeeded, so this run skips its own Windows post-merge job;
+   otherwise `superseded=false`.
 
-Only ancestry decides, never run order: GitHub admits concurrency-group runs in
-no guaranteed order, so a late older run must not be able to cancel the tip's.
-Main is linear (the ruleset blocks force pushes and deletion), so the live tip
-is never a strict ancestor of a pushed main commit and its run is never
-cancelled here; an older run admitted after the tip's finds main ahead of it
-and skips its Windows job instead. Every unreadable or unexpected answer leaves
-runs alone and reports `superseded=false`: the cost of an error is one extra
-Windows run, never a missing proof on the tip. The cancel request is
-best-effort (202 means accepted, not stopped).
+Only ancestry against the validated live tip decides, never run order or the
+caller's commit: GitHub admits concurrency-group runs in no guaranteed order,
+and a re-run of an old scan (or a main reset) must not cancel the tip's run.
+T is never a strict ancestor of itself, so its run is never cancelled here; an
+older run admitted after the tip's finds main ahead of it and skips its
+Windows job instead. Every unreadable or unexpected answer reports
+`superseded=false`: the cost of an error is one extra Windows run, never a
+missing proof on the tip. The cancel request is best-effort (202 means
+accepted, not stopped). Residual race, as in retire-obsolete-merge-runs.py:
+the tip can only move between the read and a cancel by a push (whose run
+then supersedes the cancelled one) or by an administrative reset the ruleset
+forbids.
 
 https://docs.github.com/en/rest/commits/commits#compare-two-commits
 https://docs.github.com/en/rest/actions/workflow-runs#cancel-a-workflow-run
@@ -56,9 +62,24 @@ def live_runs(api, repo):
 
 
 def supersede(api, repo, sha, run_id, log=print):
-    """Cancel strictly older live main-push runs; return whether `sha` is superseded."""
+    """Cancel live main-push runs strictly behind main's live tip.
+
+    Returns True only when every read and cancel succeeded and `sha` is
+    strictly behind the live tip. The tip is read first and is the only
+    reference for cancelling, so a caller on an older or reset-away commit
+    can never cancel the tip's run; an unreadable tip cancels nothing.
+    """
     if not SHA.fullmatch(sha):
         raise ValueError(f'not a commit sha: {sha!r}')
+    errors = (subprocess.SubprocessError, OSError, ValueError, KeyError, TypeError, AttributeError)
+    try:
+        tip = api('GET', f'repos/{repo}/git/ref/heads/main')['object']['sha']
+        if not SHA.fullmatch(str(tip)):
+            raise ValueError(f'unreadable main tip: {tip!r}')
+    except errors as err:
+        log(f'::warning::cancelling nothing and treating {sha[:12]} as the tip: {err}')
+        return False
+    clean = True
     try:
         for run in live_runs(api, repo):
             other = str(run.get('head_sha', ''))
@@ -66,21 +87,23 @@ def supersede(api, repo, sha, run_id, log=print):
                     or run.get('path') != WORKFLOW or not SHA.fullmatch(other)):
                 continue
             try:
-                if strictly_behind(api, repo, other, sha):
+                if strictly_behind(api, repo, other, tip):
                     api('POST', f'repos/{repo}/actions/runs/{run["id"]}/cancel')
                     log(f'cancelled superseded push run {run["id"]} on {other[:12]}')
-            except (subprocess.SubprocessError, OSError, ValueError, KeyError) as err:
+            except errors as err:
+                clean = False
                 log(f'::warning::left push run {run.get("id")} running: {err}')
-    except (subprocess.SubprocessError, OSError, ValueError) as err:
+    except errors as err:
+        clean = False
         log(f'::warning::could not list live push runs: {err}')
     try:
-        tip = api('GET', f'repos/{repo}/git/ref/heads/main').get('object', {}).get('sha', '')
-        if not SHA.fullmatch(str(tip)):
-            raise ValueError(f'unreadable main tip: {tip!r}')
-        return strictly_behind(api, repo, sha, tip)
-    except (subprocess.SubprocessError, OSError, ValueError) as err:
+        superseded = strictly_behind(api, repo, sha, tip)
+    except errors as err:
         log(f'::warning::treating {sha[:12]} as the tip: {err}')
         return False
+    if superseded and not clean:
+        log(f'::warning::running Windows on superseded {sha[:12]}: the scan hit an API error')
+    return superseded and clean
 
 
 def main(argv=None, api=gh_api):

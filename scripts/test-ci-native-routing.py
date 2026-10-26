@@ -1242,8 +1242,10 @@ class NativeRoutingTests(unittest.TestCase):
                 self.assertTrue(supersede_job_errors(workflow))
 
     def test_release_push_keeps_macos_release_build(self):
-        # The push macOS release build is the only pre-tag compile of
-        # release-profile code (cfg(not(debug_assertions))) on macOS, so a
+        # The push macOS release build is the only mandatory per-tip macOS
+        # workspace release build (release-profile code such as
+        # cfg(not(debug_assertions)) is never compiled in the queue;
+        # release-cache.yml builds only on matching paths or dispatch), so a
         # release-metadata push skips only Windows.
         steps = {step.get("name"): step for step in self.workflow["jobs"]["build"]["steps"]}
         for name in ("Build (release)", "Warm merge queue check cache"):

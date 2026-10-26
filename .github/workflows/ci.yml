@@ -831,12 +831,12 @@ jobs:
   # Superseded main pushes (push to main only). auto-cut-alpha.yml reads only
   # the push run on main's live tip, so per-commit Windows proofs cover only
   # commits that reach the tip (each tip's tree contains every superseded
-  # commit). scripts/supersede-push-runs.py cancels live push runs whose
-  # commit is a strict ancestor of this one, and reports superseded=true when
-  # main's live tip is already strictly ahead of this commit (an older run
-  # admitted late), which skips this run's Windows post-merge job. Main is
-  # linear, so the tip's run is never cancelled; any API error leaves runs
-  # alone and reports false. Hosted and independent of `route` so it starts at
+  # commit). scripts/supersede-push-runs.py reads main's live tip first and
+  # cancels only live push runs whose commit is strictly behind that tip, so
+  # the tip's run is never cancelled (even by an old re-run or after a reset).
+  # It reports superseded=true when the tip is already strictly ahead of this
+  # commit (an older run admitted late), which skips this run's Windows
+  # post-merge job; any API error reports false so Windows runs. Hosted and independent of `route` so it starts at
   # once; advisory in CI Gate.
   supersede:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
