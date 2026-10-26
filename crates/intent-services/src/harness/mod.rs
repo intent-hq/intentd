@@ -34,7 +34,7 @@
 //! Each version also owns a [`Doctrine`] — its bundled instruction/specialist
 //! markdown set under `resources/agent-instructions/<ver>/` and
 //! `resources/specialists/<ver>/` — and the [`REGISTRY`] maps the stamped
-//! session `harnessVersion` (`"1.0"` through `"3.2"`) to the pair, so a session
+//! session `harnessVersion` (`"1.0"` through `"3.3"`) to the pair, so a session
 //! keeps assembling the exact doctrine
 //! it was created with even after the binary ships a newer set. All past
 //! versions stay bundled.
@@ -54,6 +54,7 @@ pub(crate) mod v2_7;
 pub(crate) mod v2_8;
 pub(crate) mod v2_9;
 pub(crate) mod v3_1;
+pub(crate) mod v3_3;
 
 // Context rendering is admitted separately from the versioned text bundle.
 #[cfg_attr(not(test), expect(dead_code))]
@@ -546,6 +547,7 @@ static REGISTRY: &[&HarnessEntry] = &[
     &V3_ENTRY,
     &v3_1::ENTRY,
     &V3_2_ENTRY,
+    &v3_3::ENTRY,
 ];
 
 /// The registry row for [`LATEST_VERSION`]. A unit test pins that the row
@@ -602,7 +604,7 @@ mod tests {
     fn registry_resolves_stamped_current_version() {
         let entry = resolve_entry(intent_core::CURRENT_HARNESS_VERSION);
         assert_eq!(entry.version, intent_core::CURRENT_HARNESS_VERSION);
-        assert_eq!(entry.version, "3.2");
+        assert_eq!(entry.version, "3.3");
         let repository_guidance = resolve_entry("3.0");
         let previous = resolve_entry("2.10");
         assert_eq!(previous.version, "2.10");
@@ -625,6 +627,40 @@ mod tests {
         assert_eq!(next_steps(entry.harness), next_steps(&v2_4::V2_4));
         assert_ne!(next_steps(entry.harness), next_steps(&v2_3::V2_3));
         assert_ne!(next_steps(entry.harness), next_steps(&v1::V1));
+    }
+
+    /// 3.3 changes only the unknown/default-agent composition flag; text
+    /// surfaces, specialists, feature defaults and every instruction body stay
+    /// those of 3.2 (intent-hq/intent#5835).
+    #[test]
+    fn registry_v3_3_only_flips_single_workspace_fallback() {
+        let current = resolve_entry("3.3");
+        let previous = resolve_entry("3.2");
+        assert_eq!(current.version, "3.3");
+        assert!(std::ptr::eq(
+            data_ptr(current.harness),
+            data_ptr(previous.harness)
+        ));
+        assert_eq!(current.doctrine.specialists, previous.doctrine.specialists);
+        assert_eq!((current.default_features)(), (previous.default_features)());
+        assert_eq!(current.feature_labels, previous.feature_labels);
+        let (a, b) = (
+            current.doctrine.instructions,
+            previous.doctrine.instructions,
+        );
+        assert!(a.single_workspace_fallback);
+        assert!(!b.single_workspace_fallback);
+        assert_eq!(a.assistant, b.assistant);
+        assert_eq!(a.common, b.common);
+        assert_eq!(a.workspace, b.workspace);
+        assert_eq!(a.workspace_agent, b.workspace_agent);
+        for entry in REGISTRY.iter().filter(|e| e.version != "3.3") {
+            assert!(
+                !entry.doctrine.instructions.single_workspace_fallback,
+                "{} must keep its creation-time composition",
+                entry.version
+            );
+        }
     }
 
     /// A "1.0"-stamped session keeps resolving the v1 row (its original

@@ -237,7 +237,8 @@ fn enabled_override(overrides: &Map<String, Value>, rule_type: &str) -> Option<S
 ///
 /// PARITY NOTE: [`crate::agent_manager`]'s `DEFAULT_AGENT_TYPE = "interactive"`
 /// is an unknown instruction id, so tier 3 composes `common + workspace +
-/// workspace` via the reference's `fallbackToWorkspace` path. The FE file-watch
+/// workspace` via the reference's `fallbackToWorkspace` path (harness < 3.3;
+/// 3.3+ composes `common + workspace`, intent-hq/intent#5835). The FE file-watch
 /// cache-invalidation around the workspace file is intentionally not ported — the
 /// daemon re-resolves per spawn, so the file is always read fresh.
 ///
