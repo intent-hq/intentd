@@ -440,6 +440,15 @@ pub struct Workspace {
     /// `displayStatus`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub scripts_running: bool,
+    /// Daemon-owned orthogonal background-task flag (PROTOCOL §5.1): `true`
+    /// while any agent of the workspace has a §5.5b provider background task
+    /// (e.g. a backgrounded shell command) still running on a supported,
+    /// continuous connection. Read live from the in-memory worker
+    /// projections on the same emit path as `scripts_running`; never
+    /// persisted; omitted (not `false`) when none runs. Feeds neither
+    /// `activity` nor `displayStatus`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub background_tasks_running: bool,
     /// Durable token/credit usage accounting (§5.23 / §19.1), materialized by the
     /// daemon-internal periodic scan job and surfaced by `workspace.getTokenUsage`.
     /// Omitted (not `null`) until the first scan writes a snapshot.
@@ -891,6 +900,7 @@ pub fn chief_workspace() -> Workspace {
         display_status: None,
         waiting: false,
         scripts_running: false,
+        background_tasks_running: false,
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
@@ -3861,12 +3871,12 @@ pub fn lift_from_principal_id(metadata: Option<&serde_json::Value>) -> Option<Pr
 /// doctrine text or feature defaults change materially; existing sessions keep their stamped version
 /// for life (no upgrade/migration path). Pre-feature rows backfill to "1.0"
 /// (migration 0096).
-pub const CURRENT_HARNESS_VERSION: &str = "3.2";
+pub const CURRENT_HARNESS_VERSION: &str = "3.3";
 
 /// Explicit admission preserves repository guidance without admitting unknown versions.
 #[must_use]
 pub fn harness_supports_repository_guidance(version: &str) -> bool {
-    matches!(version, "3.0" | "3.1" | "3.2")
+    matches!(version, "3.0" | "3.1" | "3.2" | "3.3")
 }
 
 /// Serde default for [`AgentSession::harness_version`]: payloads persisted or
@@ -7638,6 +7648,7 @@ mod tests {
             display_status: None,
             waiting: false,
             scripts_running: false,
+            background_tasks_running: false,
             token_usage: None,
             cow_supported: None,
             browser_client_id: None,
@@ -7689,6 +7700,18 @@ mod tests {
         assert_eq!(v["scriptsRunning"], serde_json::json!(true));
         let back: Workspace = serde_json::from_value(v).unwrap();
         assert_eq!(back, running_ws);
+
+        // Presence-detected `backgroundTasksRunning`: omitted when false.
+        assert!(serde_json::to_value(&ws)
+            .unwrap()
+            .get("backgroundTasksRunning")
+            .is_none());
+        let mut background_ws = ws.clone();
+        background_ws.background_tasks_running = true;
+        let v = serde_json::to_value(&background_ws).unwrap();
+        assert_eq!(v["backgroundTasksRunning"], serde_json::json!(true));
+        let back: Workspace = serde_json::from_value(v).unwrap();
+        assert_eq!(back, background_ws);
     }
 
     /// The card aggregates serialize with the exact nested field names + casing

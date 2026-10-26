@@ -22,6 +22,8 @@
 //! [`get_instruction_with_common`] composes `common + workspace + workspace` (the
 //! workspace body appears as both the prepended workspace layer and the resolved
 //! "specific" instruction) — exactly as the reference does for unknown types.
+//! Harness 3.3+ sets drop the duplicate (`common + workspace`); sessions stamped
+//! earlier keep the duplicated composition (intent-hq/intent#5835).
 
 use intent_core::settings_file::AgentFeaturesSettings;
 use std::borrow::Cow;
@@ -92,6 +94,10 @@ pub(crate) struct InstructionSet {
     pub code_walkthrough: &'static str,
     pub commit_message: &'static str,
     pub pr_description: &'static str,
+    /// When true, an unknown agent type (including the `interactive` spawn
+    /// default) gets the workspace body once, not as both the workspace layer
+    /// and the fallback specific body. Harness 3.3+ (intent-hq/intent#5835).
+    pub single_workspace_fallback: bool,
 }
 
 /// The v1 instruction set (`resources/agent-instructions/v1/`): today's text,
@@ -115,6 +121,7 @@ pub(crate) static V1: InstructionSet = InstructionSet {
     code_walkthrough: CODE_WALKTHROUGH,
     commit_message: COMMIT_MESSAGE,
     pr_description: PR_DESCRIPTION,
+    single_workspace_fallback: false,
 };
 
 /// The v1.1 instruction set (`resources/agent-instructions/v1.1/`): a
@@ -141,6 +148,7 @@ pub(crate) static V1_1: InstructionSet = InstructionSet {
     code_walkthrough: instr!("v1.1", "code-walkthrough"),
     commit_message: instr!("v1.1", "commit-message"),
     pr_description: instr!("v1.1", "pr-description"),
+    single_workspace_fallback: false,
 };
 
 /// Harness v2 keeps every v1.1 instruction body except the common guidance,
@@ -181,6 +189,13 @@ pub(crate) static V2_10: InstructionSet = InstructionSet {
 pub(crate) static V3_1: InstructionSet = InstructionSet {
     assistant: Some(instr!("v3.1", "assistant")),
     ..V2_10
+};
+
+/// Harness v3.3 keeps every v3.1 body; unknown/default agent types now carry
+/// the workspace body once instead of twice (intent-hq/intent#5835).
+pub(crate) static V3_3: InstructionSet = InstructionSet {
+    single_workspace_fallback: true,
+    ..V3_1
 };
 
 /// Utility agents that don't get the workspace instruction layer (port of
@@ -470,6 +485,9 @@ pub(crate) fn get_instruction_with_common_for(
     if is_utility_agent(agent_type) {
         return format!("{common}\n\n---\n\n{specific}");
     }
+    if set.single_workspace_fallback && get_instruction_by_id(set, agent_type, false).is_none() {
+        return format!("{common}\n\n---\n\n{specific}");
+    }
     let workspace = set.workspace;
     format!("{common}\n\n---\n\n{workspace}\n\n---\n\n{specific}")
 }
@@ -661,12 +679,79 @@ mod tests {
 
     #[test]
     fn unknown_type_falls_back_to_workspace_specific() {
-        // The spawn default agent type is unknown → fallbackToWorkspace.
-        let out = get_instruction_with_common("interactive", &all_on());
-        assert_eq!(
-            out,
-            format!("{COMMON_LATEST}\n\n---\n\n{WORKSPACE_LATEST}\n\n---\n\n{WORKSPACE_LATEST}")
-        );
+        // The spawn default agent type is unknown → fallbackToWorkspace. From
+        // harness 3.3 the fallback body is the workspace layer itself, so it
+        // appears exactly once (intent-hq/intent#5835).
+        for agent_type in ["interactive", "some-unknown-type"] {
+            let out = get_instruction_with_common(agent_type, &all_on());
+            assert_eq!(
+                out,
+                format!("{COMMON_LATEST}\n\n---\n\n{WORKSPACE_LATEST}"),
+                "agent type {agent_type}"
+            );
+            assert_eq!(out.matches(WORKSPACE_LATEST).count(), 1);
+            assert_eq!(out, get_instruction_with_common("workspace", &all_on()));
+        }
+    }
+
+    #[test]
+    fn pre_3_3_sessions_keep_the_duplicated_workspace_fallback() {
+        // Sessions stamped before 3.3 keep their creation-time prompt byte for
+        // byte, including the duplicated workspace layer.
+        for version in ["1.0", "2.2", "2.10", "3.0", "3.1", "3.2"] {
+            let set = crate::harness::resolve_entry(version).doctrine.instructions;
+            let out = get_instruction_with_common_for(set, "interactive", &all_on());
+            let (common, workspace) = (gated_common(set, &all_on()), set.workspace);
+            assert_eq!(
+                out,
+                format!("{common}\n\n---\n\n{workspace}\n\n---\n\n{workspace}"),
+                "harness {version}"
+            );
+        }
+    }
+
+    #[test]
+    fn specialist_agent_types_are_unchanged_by_3_3() {
+        let previous = crate::harness::resolve_entry("3.2").doctrine.instructions;
+        let current = crate::harness::latest_entry().doctrine.instructions;
+        for agent_type in [
+            "workspace",
+            "workspace-agent",
+            "task-loop",
+            "task-focused",
+            "task-debug",
+            "task-breakdown",
+            "ralph-loop",
+            "chat",
+            "debug",
+            "fix",
+            "review",
+            "walkthrough",
+            "notes-system-guide",
+            "setup-script-generator",
+            "code-review",
+            "commit-message",
+            "common",
+        ] {
+            let gates_off = AgentFeaturesSettings {
+                background_hooks: false,
+                rich_chat_blocks: false,
+                attention_requests: false,
+                task_graph: false,
+                scripts: false,
+                terminal_access: false,
+                host_exec: false,
+                pr_monitor: false,
+                ..defaults()
+            };
+            for features in [all_on(), gates_off] {
+                assert_eq!(
+                    get_instruction_with_common_for(current, agent_type, &features),
+                    get_instruction_with_common_for(previous, agent_type, &features),
+                    "agent type {agent_type}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -20,7 +20,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use intent_core::events::{
-    WORKSPACE_DISPLAY_STATUS_CHANGED, WORKSPACE_SCRIPTS_RUNNING_CHANGED, WORKSPACE_WAITING_CHANGED,
+    WORKSPACE_BACKGROUND_TASKS_RUNNING_CHANGED, WORKSPACE_DISPLAY_STATUS_CHANGED,
+    WORKSPACE_SCRIPTS_RUNNING_CHANGED, WORKSPACE_WAITING_CHANGED,
 };
 use intent_core::{
     now_iso, AgentId, PullRequestInfo, PullRequestStatus, Workspace, WorkspaceActivity,
@@ -61,28 +62,62 @@ pub(crate) type DisplayStatusCache = LastObservedCache<WorkspaceDisplayStatus>;
 /// Last-observed orthogonal `waiting` flag per workspace (PROTOCOL §5.1).
 pub(crate) type WaitingStatusCache = LastObservedCache<bool>;
 
-/// All `Workspace.scriptsRunning` recompute state, behind ONE `Arc` on
-/// `Services` (every extra `Services` field is copied into each future that
-/// captures a services clone, and deep agent-turn futures sit near the test
-/// thread's stack limit):
+/// All recompute state for the orthogonal in-memory running flags
+/// `Workspace.scriptsRunning` and `Workspace.backgroundTasksRunning`, behind
+/// ONE `Arc` on `Services` (every extra `Services` field is copied into each
+/// future that captures a services clone, and deep agent-turn futures sit
+/// near the test thread's stack limit):
 ///
-/// - `cache`: the last-observed value per workspace, the transition baseline
-///   for `workspace:scriptsRunning-changed`;
-/// - `locks`: the per-workspace ordering gate. The registry read, baseline
-///   record and publication run under it, so recomputes triggered by
-///   different scripts of one workspace (each holding only its own
-///   publication lock) cannot publish out of order. Different workspaces
-///   never contend;
+/// - `scripts` / `background_tasks`: one [`RunningFlagGate`] per flag;
 /// - `park` (tests only): see [`ScriptsRunningPark`].
 #[derive(Default)]
 pub(crate) struct ScriptsRunningState {
-    cache: WaitingStatusCache,
-    locks: Mutex<HashMap<WorkspaceId, Arc<tokio::sync::Mutex<()>>>>,
+    scripts: RunningFlagGate,
+    background_tasks: RunningFlagGate,
     #[cfg(test)]
     park: Mutex<Option<Arc<ScriptsRunningPark>>>,
 }
 
 impl ScriptsRunningState {
+    fn gate(&self, flag: RunningFlag) -> &RunningFlagGate {
+        match flag {
+            RunningFlag::Scripts => &self.scripts,
+            RunningFlag::BackgroundTasks => &self.background_tasks,
+        }
+    }
+
+    /// Drop a deleted workspace's baselines and gates.
+    fn evict(&self, workspace_id: &WorkspaceId) {
+        self.scripts.evict(workspace_id);
+        self.background_tasks.evict(workspace_id);
+    }
+}
+
+/// One orthogonal in-memory running flag (PROTOCOL §5.1).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RunningFlag {
+    /// `Workspace.scriptsRunning`: a command-mode script run in flight.
+    Scripts,
+    /// `Workspace.backgroundTasksRunning`: a §5.5b worker still running.
+    BackgroundTasks,
+}
+
+/// The state behind one [`RunningFlag`]:
+///
+/// - `cache`: the last-observed value per workspace, the transition baseline
+///   for the flag's change event;
+/// - `locks`: the per-workspace ordering gate. The live read, baseline
+///   record and publication run under it, so concurrent recomputes for one
+///   workspace (two scripts, each holding only its own publication lock, or
+///   recomputes spawned from successive worker snapshots) cannot publish out
+///   of order. Different workspaces never contend.
+#[derive(Default)]
+struct RunningFlagGate {
+    cache: WaitingStatusCache,
+    locks: Mutex<HashMap<WorkspaceId, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl RunningFlagGate {
     fn lock_for(&self, workspace_id: &WorkspaceId) -> Arc<tokio::sync::Mutex<()>> {
         self.locks
             .lock()
@@ -338,11 +373,10 @@ impl Services {
         // `scriptsRunning` reads the in-memory script registry directly (no
         // store I/O), so the served value is always live; the read also seeds
         // the `workspace:scriptsRunning-changed` baseline.
-        let scripts_generation = self.scripts_running_state.cache.generation();
-        ws.scripts_running = self.workspace_scripts_running(&ws.id);
-        self.scripts_running_state
-            .cache
-            .seed(&ws.id, ws.scripts_running, scripts_generation);
+        ws.scripts_running = self.seed_running_flag(&ws.id, RunningFlag::Scripts);
+        // `backgroundTasksRunning` likewise reads the in-memory worker
+        // projections (§5.5b) and seeds its own transition baseline.
+        ws.background_tasks_running = self.seed_running_flag(&ws.id, RunningFlag::BackgroundTasks);
         // Pre-read generation snapshot: a `workspace.delete` eviction racing
         // the awaits below must not have this seed resurrect the baseline.
         let generation = self.last_display_statuses.generation();
@@ -664,64 +698,94 @@ impl Services {
         }
     }
 
+    /// The live value of `flag` for `workspace_id`: one in-memory read, no
+    /// store I/O.
+    fn read_running_flag(&self, workspace_id: &WorkspaceId, flag: RunningFlag) -> bool {
+        match flag {
+            RunningFlag::Scripts => self.workspace_scripts_running(workspace_id),
+            RunningFlag::BackgroundTasks => self
+                .agent_workers()
+                .workspace_has_running_workers(workspace_id),
+        }
+    }
+
+    /// Read `flag` live for an emit-path enrichment and seed its transition
+    /// baseline (a seed never emits).
+    fn seed_running_flag(&self, workspace_id: &WorkspaceId, flag: RunningFlag) -> bool {
+        let cache = &self.scripts_running_state.gate(flag).cache;
+        let generation = cache.generation();
+        let running = self.read_running_flag(workspace_id, flag);
+        cache.seed(workspace_id, running, generation);
+        running
+    }
+
     /// Recompute `Workspace.scriptsRunning` and publish
     /// `workspace:scriptsRunning-changed` iff it transitioned (PROTOCOL §5.1 /
     /// §6.5). Called from the script lifecycle choke points (every
     /// `script:state` / `script:changed` publication and definition
-    /// removal). The derivation is one in-memory registry read; an unchanged
-    /// value returns before any store I/O. A missing baseline reads as
-    /// `false` — nothing runs before the daemon's first script start — so the
-    /// first run after a restart still emits. Best-effort like
-    /// [`Services::maybe_emit_waiting_changed`].
+    /// removal). A missing baseline reads as `false` — nothing runs before
+    /// the daemon's first script start — so the first run after a restart
+    /// still emits. Best-effort like [`Services::maybe_emit_waiting_changed`].
     pub(crate) async fn maybe_emit_scripts_running_changed(&self, workspace_id: &WorkspaceId) {
+        self.maybe_emit_running_flag_changed(workspace_id, RunningFlag::Scripts)
+            .await;
+    }
+
+    /// Recompute `Workspace.backgroundTasksRunning` and publish
+    /// `workspace:backgroundTasksRunning-changed` iff it transitioned
+    /// (PROTOCOL §5.1 / §6.5). Called after every changed `WorkerSnapshot`
+    /// publication ([`Services::publish_workers_snapshot`]: generation
+    /// start, negotiation, session bind, accepted frame, disconnect and
+    /// release). A missing baseline reads as `false` (no worker survives a
+    /// daemon restart).
+    pub(crate) async fn maybe_emit_background_tasks_running_changed(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) {
+        self.maybe_emit_running_flag_changed(workspace_id, RunningFlag::BackgroundTasks)
+            .await;
+    }
+
+    /// Shared recompute-and-compare for one [`RunningFlag`]. The derivation
+    /// is one in-memory read; an unchanged value returns before any store
+    /// I/O. Serialize the read → record → publish sequence per workspace,
+    /// and re-read after the store await below, so a recompute that observed
+    /// an older state can never publish (or record) it after a newer one.
+    async fn maybe_emit_running_flag_changed(&self, workspace_id: &WorkspaceId, flag: RunningFlag) {
         if workspace_id.is_chief() {
             return;
         }
-        // Callers hold only their own script's publication lock, so two
-        // scripts of one workspace can recompute concurrently. Serialize the
-        // read → record → publish sequence per workspace, and re-read the
-        // registry after the store await below, so a recompute that observed
-        // an older state can never publish (or record) it after a newer one.
-        let gate = self.scripts_running_state.lock_for(workspace_id);
+        let state = self.scripts_running_state.gate(flag);
+        let gate = state.lock_for(workspace_id);
         let _serialized = gate.lock().await;
-        let generation = self.scripts_running_state.cache.generation();
-        let running = self.workspace_scripts_running(workspace_id);
-        if self
-            .scripts_running_state
-            .cache
-            .get(workspace_id)
-            .unwrap_or(false)
-            == running
-        {
-            self.scripts_running_state
-                .cache
-                .seed(workspace_id, running, generation);
+        let generation = state.cache.generation();
+        let running = self.read_running_flag(workspace_id, flag);
+        if state.cache.get(workspace_id).unwrap_or(false) == running {
+            state.cache.seed(workspace_id, running, generation);
             return;
         }
         #[cfg(test)]
-        self.park_scripts_running_recompute().await;
+        if flag == RunningFlag::Scripts {
+            self.park_scripts_running_recompute().await;
+        }
         // Deleted-workspace guard: never publish for (or seed a baseline of)
         // a workspace whose row is gone.
         if self.store.get_workspace(workspace_id).await.is_err() {
             return;
         }
-        let running = self.workspace_scripts_running(workspace_id);
-        self.scripts_running_state
-            .cache
-            .seed(workspace_id, false, generation);
-        let Some(transitioned) =
-            self.scripts_running_state
-                .cache
-                .record(workspace_id, running, generation)
-        else {
+        let running = self.read_running_flag(workspace_id, flag);
+        state.cache.seed(workspace_id, false, generation);
+        let Some(transitioned) = state.cache.record(workspace_id, running, generation) else {
             return;
         };
         if transitioned {
-            publish_event(
-                self.event_bus.as_ref(),
-                scripts_running_changed_event(workspace_id, running),
-            )
-            .await;
+            let event = match flag {
+                RunningFlag::Scripts => scripts_running_changed_event(workspace_id, running),
+                RunningFlag::BackgroundTasks => {
+                    background_tasks_running_changed_event(workspace_id, running)
+                }
+            };
+            publish_event(self.event_bus.as_ref(), event).await;
         }
     }
 
@@ -1590,6 +1654,23 @@ fn scripts_running_changed_event(workspace_id: &WorkspaceId, scripts_running: bo
         data: serde_json::json!({
             "workspaceId": workspace_id.as_str(),
             "scriptsRunning": scripts_running,
+        }),
+    }
+}
+
+fn background_tasks_running_changed_event(workspace_id: &WorkspaceId, running: bool) -> NewEvent {
+    NewEvent {
+        workspace_id: workspace_id.clone(),
+        timestamp: now_iso(),
+        event_type: WORKSPACE_BACKGROUND_TASKS_RUNNING_CHANGED.to_string(),
+        actor: system_actor(),
+        session_id: None,
+        correlation_id: None,
+        parent_event_id: None,
+        metadata: None,
+        data: serde_json::json!({
+            "workspaceId": workspace_id.as_str(),
+            "backgroundTasksRunning": running,
         }),
     }
 }
@@ -5837,5 +5918,230 @@ mod display_status_events {
             ev["data"],
             json!({ "workspaceId": h.ws.0, "displayStatus": "idle" })
         );
+    }
+}
+
+/// `Workspace.backgroundTasksRunning` (PROTOCOL §5.1 / §6.5): the workspace
+/// roll-up of §5.5b worker observations, driven through the real worker
+/// projections and the `publish_workers_snapshot` choke point.
+#[cfg(test)]
+mod background_tasks_running_events {
+    use std::sync::Weak;
+    use std::time::Duration;
+
+    use intent_acp::workers::WorkerFrame;
+    use intent_core::events::WORKSPACE_BACKGROUND_TASKS_RUNNING_CHANGED;
+    use intent_core::{AgentId, WorkspaceApi, WorkspaceId};
+    use intent_store::Store;
+    use serde_json::{json, Value};
+
+    use crate::agent_workers::{AdapterIdentity, Scope, SUPPORTED_ADAPTERS};
+    use crate::tests::{workspace, TempDb};
+    use crate::{EventBus, Services};
+
+    struct Harness {
+        _tmp: TempDb,
+        services: Services,
+        ws: WorkspaceId,
+        agent: AgentId,
+    }
+
+    async fn harness() -> Harness {
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        let bus = EventBus::new(store.clone());
+        let services = Services::new(store).with_event_bus(bus);
+        Harness {
+            _tmp: tmp,
+            services,
+            ws,
+            agent: AgentId::from("agent-bg"),
+        }
+    }
+
+    /// Start a supported, session-bound Claude generation for the agent and
+    /// publish its snapshot, like `begin_worker_generation` + negotiation.
+    fn begin(h: &Harness, generation: &str) {
+        let adapter = &SUPPORTED_ADAPTERS[1];
+        let snapshot = h.services.agent_workers().begin(
+            Scope {
+                workspace_id: h.ws.clone(),
+                agent_id: h.agent.clone(),
+                provider: adapter.provider.to_owned(),
+                acp_session_id: Some("session-bg".to_owned()),
+                connection_generation: Some(generation.to_owned()),
+            },
+            &AdapterIdentity {
+                name: Some(adapter.name.to_owned()),
+                version: Some(adapter.version.to_owned()),
+            },
+            true,
+            Weak::new(),
+        );
+        h.services.publish_workers_snapshot(snapshot);
+    }
+
+    fn ingest(h: &Harness, generation: &str, update: Value) {
+        let frame = WorkerFrame {
+            session_id: Some("session-bg".to_owned()),
+            update,
+            received_at_ms: 1000,
+        };
+        if let Some(snapshot) = h
+            .services
+            .agent_workers()
+            .ingest(&h.agent, generation, &frame)
+        {
+            h.services.publish_workers_snapshot(snapshot);
+        }
+    }
+
+    fn spawn(id: &str) -> Value {
+        json!({ "sessionUpdate": "async_task_spawned", "asyncTaskId": id, "taskType": "shell",
+                "name": "Run full spec in background", "canStop": true })
+    }
+
+    fn ended(id: &str, state: &str) -> Value {
+        json!({ "sessionUpdate": "async_task_state_update", "asyncTaskId": id, "state": state })
+    }
+
+    /// Persisted `backgroundTasksRunning` payloads, oldest-first.
+    async fn flag_events(h: &Harness) -> Vec<bool> {
+        let mut events = h
+            .services
+            .store()
+            .query_events(&intent_store::EventQuery {
+                workspace_id: Some(h.ws.clone()),
+                event_types: vec![WORKSPACE_BACKGROUND_TASKS_RUNNING_CHANGED.to_string()],
+                ..Default::default()
+            })
+            .await
+            .expect("query flag events");
+        events.reverse();
+        events
+            .into_iter()
+            .map(|e| {
+                assert_eq!(e.data["workspaceId"], json!(h.ws.as_str()));
+                e.data["backgroundTasksRunning"]
+                    .as_bool()
+                    .expect("boolean payload")
+            })
+            .collect()
+    }
+
+    /// The recompute is spawned from the publication, so poll for it.
+    async fn await_flag_events(h: &Harness, expected: &[bool]) {
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_secs(5));
+        loop {
+            let seen = flag_events(h).await;
+            if seen == expected {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "flag events never reached {expected:?}; last seen {seen:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    async fn served(h: &Harness) -> bool {
+        let ws = WorkspaceApi::get_workspace(&h.services, h.ws.clone())
+            .await
+            .expect("get workspace");
+        let wire = serde_json::to_value(&ws).expect("serialize workspace");
+        assert_eq!(
+            wire.get("backgroundTasksRunning").is_some(),
+            ws.background_tasks_running,
+            "presence-detected on the wire: {wire}"
+        );
+        assert!(!ws.scripts_running, "a worker never moves scriptsRunning");
+        ws.background_tasks_running
+    }
+
+    /// A running background shell raises the flag with exactly one event;
+    /// unchanged recomputes stay silent; its end drops the flag.
+    #[intent_test_macros::daemon_test]
+    async fn background_tasks_running_tracks_worker_rows() {
+        let h = harness().await;
+        assert!(!served(&h).await, "no generation yet");
+        begin(&h, "gen-1");
+        assert!(!served(&h).await, "a generation without rows");
+
+        ingest(&h, "gen-1", spawn("task-1"));
+        await_flag_events(&h, &[true]).await;
+        assert!(served(&h).await, "background shell running");
+
+        // A second running row and a direct (awaited) recompute leave the
+        // flag raised and stay silent.
+        ingest(&h, "gen-1", spawn("task-2"));
+        ingest(&h, "gen-1", ended("task-2", "completed"));
+        h.services
+            .maybe_emit_background_tasks_running_changed(&h.ws)
+            .await;
+        assert_eq!(flag_events(&h).await, vec![true]);
+        assert!(served(&h).await, "task-1 still runs");
+
+        // Every recompute reads the live projections under the per-workspace
+        // gate, so the ones spawned for task-2 can only observe `true`
+        // (before task-1 ends) or match the `false` baseline (after): the
+        // exact final sequence proves no spurious transition was published.
+        ingest(&h, "gen-1", ended("task-1", "stopped"));
+        await_flag_events(&h, &[true, false]).await;
+        h.services
+            .maybe_emit_background_tasks_running_changed(&h.ws)
+            .await;
+        assert_eq!(flag_events(&h).await, vec![true, false]);
+        assert!(!served(&h).await, "every row ended");
+    }
+
+    /// A dropped provider connection or a released session cannot vouch
+    /// for its workers, so either drops the flag.
+    #[intent_test_macros::daemon_test]
+    async fn background_tasks_running_drops_on_disconnect_and_release() {
+        let h = harness().await;
+        begin(&h, "gen-1");
+        ingest(&h, "gen-1", spawn("task-1"));
+        await_flag_events(&h, &[true]).await;
+        if let Some(snapshot) = h.services.agent_workers().disconnect(&h.agent, "gen-1") {
+            h.services.publish_workers_snapshot(snapshot);
+        }
+        await_flag_events(&h, &[true, false]).await;
+        assert!(!served(&h).await, "disconnected");
+
+        begin(&h, "gen-2");
+        ingest(&h, "gen-2", spawn("task-1"));
+        await_flag_events(&h, &[true, false, true]).await;
+        if let Some(snapshot) = h.services.agent_workers().release(&h.agent) {
+            h.services.publish_workers_snapshot(snapshot);
+        }
+        await_flag_events(&h, &[true, false, true, false]).await;
+        assert!(!served(&h).await, "released");
+    }
+
+    /// Another workspace's worker never raises this workspace's flag.
+    #[intent_test_macros::daemon_test]
+    async fn background_tasks_running_is_scoped_per_workspace() {
+        let h = harness().await;
+        let other = WorkspaceId::new();
+        h.services
+            .store()
+            .insert_workspace(&workspace(&other))
+            .await
+            .expect("other ws");
+        let other_h = Harness {
+            _tmp: TempDb::new(),
+            services: h.services.clone(),
+            ws: other,
+            agent: AgentId::from("agent-other"),
+        };
+        begin(&other_h, "gen-1");
+        ingest(&other_h, "gen-1", spawn("task-1"));
+        await_flag_events(&other_h, &[true]).await;
+        assert!(!served(&h).await);
+        assert!(flag_events(&h).await.is_empty());
     }
 }

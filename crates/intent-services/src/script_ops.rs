@@ -240,11 +240,6 @@ pub(crate) struct ScriptLocks {
 }
 
 impl ScriptLocks {
-    /// Create an empty lock registry.
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
-
     /// Whether `workspace_id` is being deleted.
     pub(crate) fn is_closing(&self, workspace_id: &WorkspaceId) -> bool {
         self.closing.lock().unwrap().contains(workspace_id)
@@ -3934,6 +3929,7 @@ mod tests {
             display_status: None,
             waiting: false,
             scripts_running: false,
+            background_tasks_running: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,

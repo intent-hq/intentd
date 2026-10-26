@@ -346,9 +346,10 @@ or path. Long labels truncate; hover to read the full name. Repository-specific
 views identify the repository in the page heading.
 
 Grouped by status, Home sorts workspaces into **Needs you**, **Running**, **Waiting**,
-and **Done & idle**, in that priority order. **Running** covers an agent at work or a
-running command script such as a build or test; a dev server or other service script
-alone does not count. **Waiting** covers workspaces watching something external: a
+and **Done & idle**, in that priority order. **Running** covers an agent at work, a
+running command script such as a build or test, or an agent's background task such as
+a shell command it left running; a dev server or other service script, or an open
+terminal tab, alone does not count. **Waiting** covers workspaces watching something external: a
 monitored PR, a background hook, a delegated agent, a script run monitor, or a PR in
 the merge queue. The **Waiting** filter shows the same workspaces.
 

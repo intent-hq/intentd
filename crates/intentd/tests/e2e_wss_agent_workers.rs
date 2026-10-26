@@ -12,7 +12,7 @@
 //! Hermetic setup (shared with the npx isolation suite): the daemon child's
 //! `PATH` starts with a scratch `bin/` holding a fake `node`, a fake `npx`
 //! that execs the deterministic mock ACP fixture, and a version-only `claude`
-//! CLI. The mock answers `initialize` with the reviewed claude-agent-acp
+//! CLI. The mock answers `initialize` with the pinned claude-agent-acp
 //! identity (`agentInfo`), records the client capabilities it was offered
 //! (`MOCK_AGENT_INIT_LOG`) and every stop request (`MOCK_AGENT_STOP_LOG`).
 //! Nothing is downloaded. Gated on `node`, `git` and the mock script.
@@ -473,6 +473,53 @@ where
     events
 }
 
+/// The next `workspace:backgroundTasksRunning-changed` payload for
+/// `workspace_id` on a connection subscribed to that type (§5.1 / §6.5).
+async fn background_tasks_flag<S>(ws: &mut WebSocketStream<S>, workspace_id: &str) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    loop {
+        let frame = wss_event(ws, 60).await;
+        let ev = &frame["params"]["event"];
+        if ev["type"] == "workspace:backgroundTasksRunning-changed"
+            && ev["data"]["workspaceId"] == json!(workspace_id)
+        {
+            return ev["data"].clone();
+        }
+    }
+}
+
+/// The served `Workspace.backgroundTasksRunning`, asserting it is
+/// presence-detected: `true` or absent, never `false`.
+async fn served_background_tasks<S>(
+    ws: &mut WebSocketStream<S>,
+    id: i64,
+    workspace_id: &str,
+) -> bool
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let got = wss_rpc(
+        ws,
+        id,
+        "workspace.get",
+        json!({ "workspaceId": workspace_id }),
+    )
+    .await;
+    match got["workspace"].get("backgroundTasksRunning") {
+        None => false,
+        Some(v) => {
+            assert_eq!(v, &json!(true), "presence-detected flag: {got}");
+            assert!(
+                got["workspace"].get("scriptsRunning").is_none(),
+                "a worker never moves scriptsRunning: {got}"
+            );
+            true
+        }
+    }
+}
+
 fn read_jsonl(path: &Path) -> Vec<Value> {
     std::fs::read_to_string(path)
         .unwrap_or_default()
@@ -600,6 +647,21 @@ async fn provider_workers_are_listed_streamed_and_stopped_over_wss() {
     let agent_id = agent["agent"]["id"].as_str().expect("agent id").to_string();
     let target = json!({ "workspaceId": ws_id, "agentId": agent_id });
 
+    // The workspace roll-up (§5.1): a dedicated firehose for its transitions.
+    let mut flags = connect_ws(port, cfg.clone()).await;
+    let flag_sub = wss_rpc(
+        &mut flags,
+        11,
+        "events.subscribe",
+        json!({ "eventTypes": ["workspace:backgroundTasksRunning-changed"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(flag_sub["subscriptionId"].is_string(), "{flag_sub}");
+    assert!(
+        !served_background_tasks(&mut rpc, 12, &ws_id).await,
+        "nothing runs before the first turn"
+    );
+
     // Subscribe before the agent has a provider process: ack, then seq-0.
     let mut workers = connect_ws(port, cfg.clone()).await;
     let ack = wss_call(&mut workers, 20, "agent.workers.subscribe", target.clone()).await;
@@ -695,6 +757,14 @@ async fn provider_workers_are_listed_streamed_and_stopped_over_wss() {
     assert_eq!(listed["workers"], running["workers"]);
     assert_eq!(listed["connectionGeneration"], json!(generation));
 
+    // The running shell raises the workspace flag: one self-sufficient
+    // transition event, and the served row carries it.
+    assert_eq!(
+        background_tasks_flag(&mut flags, &ws_id).await,
+        json!({ "workspaceId": ws_id, "backgroundTasksRunning": true })
+    );
+    assert!(served_background_tasks(&mut rpc, 24, &ws_id).await);
+
     // Error envelopes (§9): the stop answers are decided before any provider call.
     let stop = |id: i64, generation: &str, task: &str| {
         (
@@ -765,6 +835,12 @@ async fn provider_workers_are_listed_streamed_and_stopped_over_wss() {
     })
     .await;
     assert_eq!(ended["workers"][0]["providerState"], "stopped");
+    // Its last running worker ended, so the workspace flag drops.
+    assert_eq!(
+        background_tasks_flag(&mut flags, &ws_id).await,
+        json!({ "workspaceId": ws_id, "backgroundTasksRunning": false })
+    );
+    assert!(!served_background_tasks(&mut rpc, 37, &ws_id).await);
     assert!(ended["workers"][0]["observedAt"].as_u64() >= row["observedAt"].as_u64());
     let firehose = events_within(&mut sub, &agent_id, Duration::from_secs(2)).await;
     assert!(

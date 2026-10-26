@@ -144,7 +144,7 @@ impl Harness {
                 )
                 .await
                 .unwrap();
-            assert_eq!(created["agent"]["harnessVersion"], "3.2");
+            assert_eq!(created["agent"]["harnessVersion"], "3.3");
             services
                 .store
                 .get_agent_session(&AgentId::from(created["agent"]["id"].as_str().unwrap()))
@@ -802,7 +802,7 @@ let SESSION_ID = `config-session-${process.pid}`;
                 )
                 .await
                 .unwrap();
-            assert_eq!(created["agent"]["harnessVersion"], "3.2");
+            assert_eq!(created["agent"]["harnessVersion"], "3.3");
             services
                 .store
                 .get_agent_session(&AgentId::from(created["agent"]["id"].as_str().unwrap()))
@@ -919,7 +919,7 @@ let SESSION_ID = `config-session-${process.pid}`;
             (state.endpoint.is_none(), state.prompt_context.clone())
         };
         assert!(endpoint_absent);
-        if stored.harness_version == "3.2" {
+        if matches!(stored.harness_version.as_str(), "3.2" | "3.3") {
             let context = context.expect("initialized original prompt owner");
             assert!(!context.acknowledged.load(Ordering::SeqCst));
             assert!(!context.requires_callback_ack);

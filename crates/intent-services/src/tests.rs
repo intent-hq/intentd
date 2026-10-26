@@ -18553,6 +18553,8 @@ pub(crate) mod pr {
                 verdict,
                 body,
                 submitted_at: "2026-06-17T05:00:00.000Z".into(),
+                id: None,
+                commit_sha: None,
             })
         }
         async fn review_decision(&self, _: &RepoRef, _: u64) -> ScResult<Option<ReviewDecision>> {
@@ -18571,12 +18573,16 @@ pub(crate) mod pr {
                     verdict: ReviewVerdict::Approve,
                     body: None,
                     submitted_at: "2026-01-01".into(),
+                    id: None,
+                    commit_sha: None,
                 },
                 Review {
                     author: "bob".into(),
                     verdict: ReviewVerdict::Comment,
                     body: None,
                     submitted_at: "2026-01-02".into(),
+                    id: None,
+                    commit_sha: None,
                 },
             ])
         }
@@ -31712,6 +31718,7 @@ mod rules {
             display_status: None,
             waiting: false,
             scripts_running: false,
+            background_tasks_running: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
@@ -31865,6 +31872,7 @@ mod rules {
             display_status: None,
             waiting: false,
             scripts_running: false,
+            background_tasks_running: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
@@ -32009,6 +32017,7 @@ mod rules {
             display_status: None,
             waiting: false,
             scripts_running: false,
+            background_tasks_running: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
@@ -32148,6 +32157,7 @@ mod rules {
             display_status: None,
             waiting: false,
             scripts_running: false,
+            background_tasks_running: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
@@ -32286,6 +32296,7 @@ mod rules {
             display_status: None,
             waiting: false,
             scripts_running: false,
+            background_tasks_running: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
@@ -32429,6 +32440,7 @@ mod rules {
             display_status: None,
             waiting: false,
             scripts_running: false,
+            background_tasks_running: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
@@ -33295,6 +33307,7 @@ mod known_repo {
             display_status: None,
             waiting: false,
             scripts_running: false,
+            background_tasks_running: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
@@ -49147,7 +49160,7 @@ mod harness_versioning {
         let (_tmp, svc, ws) = setup().await;
         let created = create_agent(&svc, &ws, None).await;
         let agent = &created["agent"];
-        assert_eq!(agent["harnessVersion"], "3.2");
+        assert_eq!(agent["harnessVersion"], "3.3");
         assert_eq!(
             agent["harnessVersion"],
             intent_core::CURRENT_HARNESS_VERSION,
@@ -49173,7 +49186,7 @@ mod harness_versioning {
         assert_eq!(persisted["taskGraph"], serde_json::json!(true));
         assert_eq!(persisted["peerAgents"], serde_json::json!(true));
         let full = svc.agent_get_session_op(id).await.expect("getSession");
-        assert_eq!(full.harness_version, "3.2");
+        assert_eq!(full.harness_version, "3.3");
         assert_eq!(full.harness_features.as_ref(), Some(&persisted));
         assert_eq!(agent["harnessFeatures"], persisted);
     }
@@ -49195,19 +49208,19 @@ mod harness_versioning {
         .await
         .unwrap();
         let child = create_agent(&svc, &ws, Some(parent_id.clone())).await;
-        assert_eq!(child["agent"]["harnessVersion"], "3.2");
+        assert_eq!(child["agent"]["harnessVersion"], "3.3");
         assert_eq!(child["agent"]["harnessFeatures"]["hostExec"], true);
         assert_eq!(child["agent"]["harnessFeatures"]["peerAgents"], true);
         let child_id = AgentId::from(child["agent"]["id"].as_str().unwrap());
         let child_row = svc.store().get_agent_session(&child_id).await.unwrap();
-        assert_eq!(child_row.harness_version, "3.2");
+        assert_eq!(child_row.harness_version, "3.3");
         assert_eq!(child_row.parent_agent_id.as_ref(), Some(&parent_id));
         assert_eq!(
             child_row.harness_features.as_ref(),
             Some(&child["agent"]["harnessFeatures"])
         );
         let child_full = svc.agent_get_session_op(child_id).await.unwrap();
-        assert_eq!(child_full.harness_version, "3.2");
+        assert_eq!(child_full.harness_version, "3.3");
         assert_eq!(child_full.harness_features, child_row.harness_features);
         let parent = svc.store().get_agent_session(&parent_id).await.unwrap();
         assert_eq!(parent.harness_version, "2.9");

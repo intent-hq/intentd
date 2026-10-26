@@ -167,6 +167,60 @@ fn attention_verb(kind: &str) -> &str {
     }
 }
 
+/// Per-reviewer review changes (intentd#2605: a repeated `changes
+/// requested` left the decision and counts unchanged, so no wake fired).
+/// Reported only when BOTH snapshots carry `latestReviews`, so a baseline
+/// persisted before the field existed is adopted silently. Two lines:
+/// a reviewer's latest review identity moved ("new review"), and an
+/// approve / changes-requested review is now known to be on an older
+/// commit and was not already reported so ("older commit"; a baseline whose
+/// head was unknown counts as not yet reported).
+fn diff_latest_reviews(old: &PrMonitorSnapshot, new: &PrMonitorSnapshot) -> Vec<String> {
+    let (Some(before), Some(after)) = (
+        old.requirements.approvals.latest_reviews.as_ref(),
+        new.requirements.approvals.latest_reviews.as_ref(),
+    ) else {
+        return Vec::new();
+    };
+    let short = |sha: &str| -> String { sha.chars().take(8).collect() };
+    let head = new.head_sha.as_deref().filter(|h| !h.is_empty());
+    let mut changes = Vec::new();
+    // Oldest first, so a wake reads chronologically.
+    for review in after.iter().rev() {
+        let prior = before.iter().find(|b| b.reviewer == review.reviewer);
+        let state = review.state.replace('_', " ");
+        if prior.is_none_or(|p| p.identity() != review.identity()) {
+            let place = match (review.commit_sha.as_deref(), review.on_current_head) {
+                (Some(commit), Some(true)) => format!(" on {} (current head)", short(commit)),
+                (Some(commit), Some(false)) => format!(
+                    " on {} (older commit; head is {})",
+                    short(commit),
+                    head.map_or_else(|| "unknown".to_string(), short)
+                ),
+                (Some(commit), None) => format!(" on {}", short(commit)),
+                (None, _) => String::new(),
+            };
+            changes.push(format!(
+                "new review from {}: {state}{place}",
+                review.reviewer
+            ));
+        } else if matches!(review.state.as_str(), "approved" | "changes_requested")
+            && review.on_current_head == Some(false)
+            && prior.is_some_and(|p| p.on_current_head != Some(false))
+        {
+            if let (Some(commit), Some(head)) = (review.commit_sha.as_deref(), head) {
+                changes.push(format!(
+                    "{}'s latest review ({state}) is on an older commit {}; head is {}",
+                    review.reviewer,
+                    short(commit),
+                    short(head)
+                ));
+            }
+        }
+    }
+    changes
+}
+
 fn describe_opt<T: std::fmt::Display>(v: Option<T>) -> String {
     v.map_or_else(|| "unknown".to_string(), |v| v.to_string())
 }
@@ -967,8 +1021,20 @@ impl Harness for V1 {
     }
 
     fn pr_checklist(&self, s: &PrMonitorSnapshot) -> String {
+        let mut requirements =
+            serde_json::to_value(&s.requirements).expect("serialize requirements");
+        // A carried-forward list is bookkeeping, not this read's observation:
+        // render the row as unknown rather than as fresh data.
+        if s.latest_reviews_carried {
+            if let Some(approvals) = requirements
+                .get_mut("approvals")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                approvals.remove("latestReviews");
+            }
+        }
         super::review_wake::checklist(
-            &serde_json::to_value(&s.requirements).expect("serialize requirements"),
+            &requirements,
             crate::pr_monitor::requirements_ready(&s.requirements),
         )
     }
@@ -1024,6 +1090,7 @@ impl Harness for V1 {
                 describe_opt(n.approvals.needed)
             ));
         }
+        changes.extend(diff_latest_reviews(old, new));
 
         // Comments + threads.
         if old.conversation_count != new.conversation_count {

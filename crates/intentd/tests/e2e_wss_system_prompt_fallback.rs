@@ -389,6 +389,7 @@ async fn seed_workspace_only(data_dir: &Path) -> String {
             display_status: None,
             waiting: false,
             scripts_running: false,
+            background_tasks_running: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
@@ -897,7 +898,7 @@ async fn assistant_profile_and_reference_survive_restart_over_wss() {
     assert!(!system.contains("WORKSPACE_ONLY_MARKER"));
     assert!(!system.contains("## Commit Policy"));
     assert!(!system.contains("## Delegating Tasks"));
-    assert_eq!(before["session"]["harnessVersion"], "3.2");
+    assert_eq!(before["session"]["harnessVersion"], "3.3");
     wss_rpc(&mut rpc, 5, "agent.stop", json!({"agentId": agent})).await;
     daemon.child.kill_tree().unwrap();
     drop(rpc);
