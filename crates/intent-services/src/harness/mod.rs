@@ -262,9 +262,18 @@ pub(crate) trait Harness: Send + Sync {
 
     // --- Prompt notices (`agent_manager.rs`) ---
 
-    /// `[System: {n} image(s) …]` notice after note-referenced images are
-    /// inlined (Fidelity B, PROTOCOL §5.5).
-    fn note_images_notice(&self, n: usize) -> String;
+    /// `[Note in context: …]` reference notice (Fidelity B, PROTOCOL §5.5):
+    /// the note's title and id plus its embedded `workspace-asset://` image
+    /// URLs (`omitted` more beyond the listed cap), with the `ws.note.read` /
+    /// `ws.note.readAsset` retrieval instructions — neither the note content
+    /// nor its image bytes ride the prompt.
+    fn note_reference_notice(
+        &self,
+        title: &str,
+        id: &str,
+        image_urls: &[String],
+        omitted: usize,
+    ) -> String;
     /// `[Attachment: …]` reference notice (PROTOCOL §5.5): metadata plus the
     /// `ws.file.getAttachment` retrieval instruction.
     fn attachment_reference_notice(

@@ -110,7 +110,7 @@ impl ScriptManager {
     async fn eligible_monitor_owner(&self, ws: &WorkspaceId, agent: &AgentId) -> Result<()> {
         let owner = self.store.get_agent_session_summary(agent).await?;
         if owner.workspace_id != *ws
-            || crate::agent_ops::is_terminal_status(owner.status)
+            || self.agent_wake.is_terminal_status(owner.status)
             || self
                 .store
                 .get_agent_session_retired_at(agent)
@@ -521,11 +521,6 @@ impl ScriptManager {
         Ok(owners)
     }
 
-    #[expect(
-        clippy::missing_errors_doc,
-        clippy::missing_panics_doc,
-        reason = "internal doc-hidden feature API, not a public library API"
-    )]
     pub async fn recover_monitors(&self) -> Result<()> {
         let _lane = self.locks.monitor_lane.lock().await;
         let pending_runs = self.store.pending_script_runs().await?;

@@ -500,6 +500,76 @@ expect_cargo "$core_rdeps_lib" "-p intentd --bins --tests"
 [[ "$stdout" != *"not selected"* ]] || fail "$case_name: misleading note: $stdout"
 [[ "$(grep -c 'note:' <<<"$stdout")" -eq 1 ]] || fail "$case_name: expected one note: $stdout"
 
+# --print-edges / --print-rdeps expose the scanner's view for
+# scripts/check-rdeps-parity.py, which compares it with cargo metadata in CI.
+fixture_edges=$'alpha\tintent-core\ndelta\talpha\ngamma\tintent-core\nintent-app\tintent-services\nintent-services\tintent-core\nintent-svc-transfer\tintent-services\nintentd\tintent-services'
+fixture_rdeps=$'intent-core\talpha delta gamma intent-app intent-services intent-svc-transfer intentd'
+
+case_name="--print-edges prints every workspace dependency, sorted"
+reset_repo
+run_script --print-edges
+expect_ok
+[[ "$stdout" == "$fixture_edges" ]] || fail "$case_name: edges were"$'\n'"$stdout"$'\n'"expected"$'\n'"$fixture_edges"
+[[ -z "$cargo_log" ]] || fail "$case_name: cargo ran: $cargo_log"
+
+# Byte order whatever the locale: glibc's en_US.UTF-8 collation ignores '-'
+# and would put intentd before intent-services.
+if locale -a 2>/dev/null | grep -qix 'en_US.utf-\{0,1\}8'; then
+  case_name="--print-edges / --print-rdeps sort in byte order under en_US.UTF-8"
+  reset_repo
+  LC_ALL=en_US.UTF-8 run_script --print-edges
+  expect_ok
+  [[ "$stdout" == "$fixture_edges" ]] || fail "$case_name: edges were"$'\n'"$stdout"
+  LC_ALL=en_US.UTF-8 run_script --print-rdeps
+  expect_ok
+  [[ "$stdout" == "$fixture_rdeps" ]] || fail "$case_name: rdeps were '$stdout'"
+fi
+
+case_name="--print-rdeps prints intent-core's transitive dependents"
+reset_repo
+run_script --print-rdeps
+expect_ok
+[[ "$stdout" == "$fixture_rdeps" ]] || fail "$case_name: rdeps were '$stdout', expected '$fixture_rdeps'"
+
+case_name="--print-edges follows a renamed workspace dependency without a path"
+reset_repo
+write crates/gamma/Cargo.toml $'[package]\nname = "gamma"\n\n[dev-dependencies]\ncore = { package = "intent-core", workspace = true }'
+write crates/beta/Cargo.toml $'[package]\nname = "beta"\n\n[dependencies.core]\npackage = "intent-core"\nworkspace = true'
+run_script --print-edges
+expect_ok
+[[ "$stdout" == $'alpha\tintent-core\nbeta\tintent-core\n'* ]] || fail "$case_name: beta edge missing: $stdout"
+[[ "$stdout" == *$'\ngamma\tintent-core\n'* ]] || fail "$case_name: gamma edge missing: $stdout"
+run_script --print-rdeps
+expect_ok
+[[ "$stdout" == $'intent-core\talpha beta delta gamma intent-app intent-services intent-svc-transfer intentd' ]] ||
+  fail "$case_name: rdeps were '$stdout'"
+
+case_name="print modes need no git checkout, BASE or valid end-to-end map"
+reset_repo
+nogit="$temp_dir/nogit"
+rm -rf "$nogit"
+mkdir -p "$nogit/scripts"
+cp -R "$repo/crates" "$nogit/"
+cp "$script" "$nogit/scripts/"
+mkdir -p "$nogit/.config"
+printf 'not a valid map line\n' >"$nogit/.config/e2e-test-map.txt"
+set +e
+stdout=$(cd "$nogit" && PATH="$bin_dir" BASE=no-such-ref "$script_bash" "$nogit/scripts/changed-tests.sh" --print-rdeps 2>"$temp_dir/stderr")
+status=$?
+set -e
+stderr=$(<"$temp_dir/stderr")
+expect_ok
+[[ "$stdout" == "$fixture_rdeps" ]] || fail "$case_name: rdeps were '$stdout'"
+rm -rf "$nogit"
+
+case_name="a print mode combined with another flag is a usage error"
+reset_repo
+for args in "--print-edges --print-rdeps" "--print-rdeps --dry-run" "--instrumented --print-edges" "--print-edges --base origin/main"; do
+  # shellcheck disable=SC2086 # split the flag list on purpose
+  run_script $args
+  [[ "$status" -eq 2 && "$stderr" == *"Usage:"* ]] || fail "$case_name: '$args' exited $status: $stderr"
+done
+
 case_name="a crate other than intent-core does not propagate to its dependents"
 reset_repo
 edit crates/alpha/src/lib.rs
@@ -1076,7 +1146,7 @@ edit crates/delta/src/script.rs
 run_script
 expect_ok
 expect_cargo "-p delta --lib --bins --tests" "$e2e_script_plan"
-[[ "$stdout" == *"[test-changed] note: crates/delta/src/script.rs is mapped to end-to-end tests in .config/e2e-test-map.txt"* ]] ||
+[[ "$stdout" == *"[test-changed] note: crates/delta/src/script.rs is mapped to tests of other targets in .config/e2e-test-map.txt"* ]] ||
   fail "$case_name: no mapping note: $stdout"
 [[ "$stdout" == *"[test-changed] cargo nextest run -p intentd --test e2e_wss_agent_lifecycle --test suite_e2e -E '(binary_id(=intentd::e2e_wss_agent_lifecycle)&test(/^(helper)::/))|(binary_id(=intentd::suite_e2e)&test(/^(e2e_core::inner)::/))'"* ]] ||
   fail "$case_name plan line is not a pasteable command: $stdout"
@@ -1141,7 +1211,7 @@ echo "# a new comment" >>"$repo/.config/e2e-test-map.txt"
 run_script
 expect_ok
 expect_cargo "-p intentd --test suite_wss --test e2e_wss_agent_lifecycle --test suite_e2e -E binary_id(=intentd::suite_wss)|(binary_id(=intentd::e2e_wss_agent_lifecycle)&test(/^(helper)::/))|(binary_id(=intentd::suite_e2e)&test(/^(e2e_core::inner|e2e_shared::helper)::/))"
-[[ "$stdout" == *"[test-changed] note: .config/e2e-test-map.txt changed; every mapped end-to-end module runs"* ]] ||
+[[ "$stdout" == *"[test-changed] note: .config/e2e-test-map.txt changed; every mapped test module runs"* ]] ||
   fail "$case_name: no map note: $stdout"
 
 case_name="a checkout without the map keeps the per-crate selection"
@@ -1286,6 +1356,118 @@ expect_cov "-p delta --lib --bins --tests"
 run_script --base HEAD
 expect_ok
 expect_cargo "-p delta --lib --bins --tests" "-p intentd --test suite_e2e -E (binary_id(=intentd::suite_e2e)&test(/^(auggie_context_e2e)::/))"
+
+# <crate>::lib map entries select library unit-test modules of another crate
+# (intentd#2543: an adapter pin bump in intent-providers broke intent-services
+# unit tests that only the merge queue ran). alpha's lib gets an inline test
+# module and a #[path] test module of a non-root file, as intent-services'
+# model_preference::tests and agent_workers::tests are.
+lib_fixture() {
+  write crates/alpha/src/lib.rs $'mod util;\nmod workers;\n#[cfg(test)]\nmod tests {\n}'
+  write crates/alpha/src/workers.rs $'#[cfg(test)]\n#[path = "workers_tests.rs"]\nmod tests;'
+  write crates/alpha/src/workers_tests.rs
+  printf '%s\n' "$@" >>"$repo/.config/e2e-test-map.txt"
+  commit_all "lib fixture"
+}
+
+case_name="mapped source selects library unit-test modules of another crate"
+reset_repo
+lib_fixture "crates/delta/src/script.rs alpha::lib workers::tests" "crates/delta/src/script.rs alpha::lib tests"
+edit crates/delta/src/script.rs
+run_script --base HEAD
+expect_ok
+expect_cargo "-p alpha --lib -E (binary_id(=alpha)&test(/^(tests|workers::tests)::/))" "-p delta --lib --bins --tests" "$e2e_script_plan"
+[[ "$stdout" == *"[test-changed] cargo nextest run -p alpha --lib -E '(binary_id(=alpha)&test(/^(tests|workers::tests)::/))'"* ]] ||
+  fail "$case_name plan line is not a pasteable command: $stdout"
+
+case_name="a whole-lib entry selects --lib without a filterset"
+reset_repo
+lib_fixture "crates/delta/src/whole.rs alpha::lib" "crates/delta/src/whole.rs alpha::lib tests"
+edit crates/delta/src/whole.rs
+run_script --base HEAD
+expect_ok
+expect_cargo "-p alpha --lib" "-p delta --lib --bins --tests" "-p intentd --test suite_wss"
+
+case_name="library modules share one filterset with the crate's other mapped targets"
+reset_repo
+lib_fixture "crates/delta/src/whole.rs alpha::lib tests" "crates/delta/src/whole.rs alpha::one"
+edit crates/delta/src/whole.rs
+run_script --base HEAD
+expect_ok
+expect_cargo "-p alpha --lib --test one -E (binary_id(=alpha)&test(/^(tests)::/))|binary_id(=alpha::one)" "-p delta --lib --bins --tests" "-p intentd --test suite_wss"
+
+case_name="a whole lib and a whole test binary need no filterset"
+reset_repo
+lib_fixture "crates/delta/src/whole.rs alpha::lib" "crates/delta/src/whole.rs alpha::one"
+edit crates/delta/src/whole.rs
+run_script --base HEAD
+expect_ok
+expect_cargo "-p alpha --lib --test one" "-p delta --lib --bins --tests" "-p intentd --test suite_wss"
+
+case_name="a src change of the mapped crate subsumes its library modules"
+reset_repo
+lib_fixture "crates/delta/src/whole.rs alpha::lib tests"
+edit crates/delta/src/whole.rs
+edit crates/alpha/src/workers.rs
+run_script --base HEAD
+expect_ok
+expect_cargo "-p alpha -p delta --lib --bins --tests" "-p intentd --test suite_wss"
+
+case_name="instrumented library module ANDs the exclusion into its filterset"
+reset_repo
+lib_fixture "crates/delta/src/whole.rs alpha::lib tests"
+edit crates/delta/src/whole.rs
+run_script --instrumented --base HEAD
+expect_ok
+cov_expected="$repo: INTENTD_TEST_TIMEOUT_MULTIPLIER=3 llvm-cov --no-report nextest -p alpha --lib -E ((binary_id(=alpha)&test(/^(tests)::/))) and (not test(/^auggie_context_e2e::/))"$'\n'"$repo: INTENTD_TEST_TIMEOUT_MULTIPLIER=3 llvm-cov --no-report nextest -p delta --lib --bins --tests -E not test(/^auggie_context_e2e::/)"$'\n'"$repo: INTENTD_TEST_TIMEOUT_MULTIPLIER=3 llvm-cov --no-report nextest -p intentd --test suite_wss -E not test(/^auggie_context_e2e::/)"
+[[ "$cargo_log" == "$cov_expected" ]] || fail "$case_name: cargo argv was"$'\n'"$cargo_log"$'\n'"expected"$'\n'"$cov_expected"
+
+case_name="check-map accepts library modules"
+reset_repo
+lib_fixture "crates/delta/src/lib.rs alpha::lib tests" "crates/delta/src/lib.rs alpha::lib workers::tests" \
+  "crates/delta/src/lib.rs alpha::lib util" "crates/delta/src/lib.rs alpha::lib"
+run_script --check-map
+expect_ok
+[[ "$stdout" == "[check-map] .config/e2e-test-map.txt: 8 entries valid" ]] || fail "$case_name printed '$stdout'"
+
+case_name="map naming a removed library module"
+reset_repo
+lib_fixture "crates/delta/src/lib.rs alpha::lib workers::tests" "crates/delta/src/lib.rs alpha::lib gone"
+write crates/alpha/src/workers.rs '//! tests were removed'
+expect_map_error ".config/e2e-test-map.txt:8: alpha::lib module workers::tests: crates/alpha/src/workers.rs declares no 'mod tests;'" \
+  ".config/e2e-test-map.txt:9: alpha::lib module gone: crates/alpha/src/lib.rs declares no 'mod gone;'"
+
+case_name="map naming the lib of a crate without one, or with a tests/lib.rs"
+reset_repo
+write crates/gamma/tests/lib.rs
+printf '%s\n' "crates/delta/src/lib.rs beta::lib" "crates/delta/src/lib.rs gamma::lib" >>"$repo/.config/e2e-test-map.txt"
+expect_map_error ".config/e2e-test-map.txt:8: beta::lib: crates/beta/src/lib.rs does not exist" \
+  ".config/e2e-test-map.txt:9: gamma::lib is ambiguous: crates/gamma/tests/lib.rs also exists"
+
+case_name="map naming a lib its manifest moves or opts out of tests"
+reset_repo
+write crates/alpha/Cargo.toml $'[package]\nname = "alpha"\n\n[lib]\ntest = false'
+write crates/gamma/Cargo.toml $'[package]\nname = "gamma"\npath = "ignored-outside-lib"\n\n[lib]\npath = "src/other.rs"'
+printf '%s\n' "crates/delta/src/lib.rs alpha::lib" "crates/delta/src/lib.rs gamma::lib" >>"$repo/.config/e2e-test-map.txt"
+expect_map_error ".config/e2e-test-map.txt:8: alpha::lib: crates/alpha/Cargo.toml sets [lib] test = false" \
+  ".config/e2e-test-map.txt:9: gamma::lib: crates/gamma/Cargo.toml sets [lib] path = \"src/other.rs\", not src/lib.rs"
+
+case_name="a library module and a suite module of one crate share one filterset"
+reset_repo
+write crates/intentd/src/lib.rs $'#[cfg(test)]\nmod tests {\n}'
+lib_fixture "crates/delta/src/lib.rs intentd::lib tests" "crates/delta/src/lib.rs intentd::suite_e2e e2e_core::inner"
+edit crates/delta/src/lib.rs
+run_script --base HEAD
+expect_ok
+expect_cargo "-p delta --lib --bins --tests" "-p intentd --lib --test suite_e2e -E (binary_id(=intentd)&test(/^(tests)::/))|(binary_id(=intentd::suite_e2e)&test(/^(e2e_core::inner)::/))"
+
+case_name="editing the map also selects every mapped library module"
+reset_repo
+lib_fixture "crates/delta/src/lib.rs alpha::lib tests"
+echo "# a new comment" >>"$repo/.config/e2e-test-map.txt"
+run_script --base HEAD
+expect_ok
+expect_cargo "-p alpha --lib -E (binary_id(=alpha)&test(/^(tests)::/))" "-p intentd --test suite_wss --test e2e_wss_agent_lifecycle --test suite_e2e -E binary_id(=intentd::suite_wss)|(binary_id(=intentd::e2e_wss_agent_lifecycle)&test(/^(helper)::/))|(binary_id(=intentd::suite_e2e)&test(/^(e2e_core::inner|e2e_shared::helper)::/))"
 
 echo "changed-tests tests passed under $("$script_bash" -c 'echo "bash $BASH_VERSION"')"
 [[ -z "${CHANGED_TESTS_TEST_BASH:-}" ]] || exit 0

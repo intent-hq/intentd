@@ -1,25 +1,11 @@
 //! Durable script-monitor wake delivery and lifecycle suppression.
 use crate::Services;
-use intent_core::{AgentId, MessageOrigin, Result, ScriptMonitor, WorkspaceId};
+use std::sync::Arc;
+
+use intent_core::{AgentId, Result, ScriptMonitor, WorkspaceId};
 use serde_json::{json, Value};
 
-pub(crate) fn wake_id(metadata: Option<&Value>) -> Option<String> {
-    let md = metadata?;
-    (md["type"] == "script_monitor_wake")
-        .then(|| {
-            md["monitorId"]
-                .as_str()
-                .map(|id| format!("script-monitor:{id}"))
-        })
-        .flatten()
-}
-
-pub(crate) fn monitor_id(metadata: Option<&Value>) -> Option<&str> {
-    let md = metadata?;
-    (md["type"] == "script_monitor_wake")
-        .then(|| md["monitorId"].as_str())
-        .flatten()
-}
+use crate::feature_ports::{monitor_id, wake_id};
 
 impl Services {
     /// Ids of the active monitors on `script_id` (any owner).
@@ -123,16 +109,13 @@ impl Services {
         if !self.script_monitor_export_blocked(metadata) {
             return false;
         }
-        self.enqueue_message_with_id(
+        // The queued entry is what matters; its receipt is not needed here.
+        let _receipt = self.ports.agent_wake().enqueue_automatic_message(
+            self,
             agent,
             wake_id(metadata),
             content.to_owned(),
-            None,
-            None,
             metadata.cloned(),
-            None,
-            false,
-            MessageOrigin::Automatic,
         );
         true
     }
@@ -201,12 +184,12 @@ impl Services {
                         }
                     }
                 }
-                if let (Some(manager), Ok(owners)) = (
-                    services.agent_manager(),
+                if let (Some(drainer), Ok(owners)) = (
+                    services.ports.agent_wake().queue_drainer(&services),
                     services.store.script_notification_delivery_owners().await,
                 ) {
                     for (agent, ws) in owners {
-                        manager.clone().try_drain_queue(agent, ws).await;
+                        Arc::clone(&drainer).try_drain_queue(agent, ws).await;
                     }
                 }
             }
@@ -281,35 +264,22 @@ impl Services {
             self.store.finish_script_monitor_wake(id, true).await?;
             return Ok(());
         }
-        let Some(manager) = self.agent_manager() else {
+        let agents = self.ports.agent_wake();
+        let Some(drainer) = agents.queue_drainer(self) else {
             return Ok(());
         };
-        let (queued, position) = self.enqueue_message_with_id(
+        let receipt = agents.enqueue_automatic_message(
+            self,
             &job.agent_id,
             Some(job.wake_id.clone()),
             job.body.clone(),
-            None,
-            None,
             Some(job.metadata.clone()),
-            None,
-            false,
-            MessageOrigin::Automatic,
-        );
-        let receipt = intent_store::AgentQueueRow {
-            id: queued.id.clone(),
-            agent_id: job.agent_id.clone(),
-            position: i64::try_from(position).unwrap_or(i64::MAX),
-            payload: serde_json::to_value(&queued)
-                .map_err(|e| intent_core::Error::Internal(e.to_string()))?,
-            created_at: queued.queued_at.clone(),
-            turn_id: queued.turn_id.clone(),
-        };
+        )?;
         // This transaction, not the transcript or best-effort snapshot, transfers ownership.
         self.store.admit_script_notification(&receipt).await?;
-        self.publish_queue_updated(&job.agent_id).await;
+        agents.publish_queue_updated(self, &job.agent_id).await;
         drop(lane);
-        manager
-            .clone()
+        drainer
             .try_drain_queue(job.agent_id.clone(), job.workspace_id.clone())
             .await;
         Ok(())

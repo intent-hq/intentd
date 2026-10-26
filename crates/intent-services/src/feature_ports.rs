@@ -20,7 +20,7 @@
 //! the one-line `WorkspaceApi` forwarders.
 
 use std::any::{Any, TypeId};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 #[cfg(any(test, feature = "test-hooks"))]
@@ -28,9 +28,10 @@ use std::sync::Mutex;
 
 use intent_core::transfer::TransferPlan;
 
+use intent_core::execution::HostExecutionContext;
 use intent_core::{
-    AgentId, BoxFuture, BrowserTab, BrowserTabInput, ClientId, Error, Result, ReverseTarget,
-    ScriptCreateParams, WorkspaceApi, WorkspaceId,
+    AgentId, AgentStatus, BoxFuture, BrowserTab, BrowserTabInput, ClientId, Error, HookId, Result,
+    ReverseTarget, ScriptCreateParams, WorkspaceApi, WorkspaceId,
 };
 
 use crate::Services;
@@ -684,6 +685,210 @@ pub trait RuntimePort: Send + Sync + 'static {
         svc: &Services,
         run: SetupScriptRun,
     ) -> BoxFuture<'static, (bool, Option<u32>)>;
+
+    // Hook and script-monitor state agents read and settle (agent views,
+    // waiting annotations, retire/delete sweeps, turn admission). Each
+    // behaves exactly as the runtime `Services` method of the same name; the
+    // async ones box that method's future, adding no await point.
+
+    /// The active hooks `agent_id` owns, as hook rows.
+    fn active_hooks_for_agent<'a>(
+        &'a self,
+        svc: &'a Services,
+        agent_id: &'a AgentId,
+    ) -> BoxFuture<'a, Vec<serde_json::Value>>;
+
+    /// The active hooks of `workspace_id`, keyed by owning agent id.
+    fn active_hooks_by_agent<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
+    ) -> BoxFuture<'a, HashMap<String, Vec<serde_json::Value>>>;
+
+    /// Add `waitingOnHooks` to an idle payload when `agent_id` owns active
+    /// hooks; resolves to the hook rows.
+    fn annotate_waiting_on_hooks<'a>(
+        &'a self,
+        svc: &'a Services,
+        agent_id: &'a AgentId,
+        data: &'a mut serde_json::Value,
+    ) -> BoxFuture<'a, Vec<serde_json::Value>>;
+
+    /// Cancel every active hook `agent_id` owns (retire sweep).
+    fn cancel_agent_hooks<'a>(
+        &'a self,
+        svc: &'a Services,
+        agent_id: &'a AgentId,
+    ) -> BoxFuture<'a, ()>;
+
+    /// The active script monitors `agent_id` owns, as waiting rows.
+    fn active_script_monitors_for_agent<'a>(
+        &'a self,
+        svc: &'a Services,
+        agent_id: &'a AgentId,
+    ) -> BoxFuture<'a, Vec<serde_json::Value>>;
+
+    /// Add `waitingOnScriptMonitors` to an idle payload when `agent_id` owns
+    /// active script monitors.
+    fn annotate_waiting_on_script_monitors<'a>(
+        &'a self,
+        svc: &'a Services,
+        agent_id: &'a AgentId,
+        data: &'a mut serde_json::Value,
+    ) -> BoxFuture<'a, ()>;
+
+    /// Cancel the active script monitors of `workspace_id` (only `agent_id`'s
+    /// when given), recording `reason`.
+    fn cancel_script_monitors<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
+        agent_id: Option<&'a AgentId>,
+        reason: &'a str,
+    ) -> BoxFuture<'a, Result<()>>;
+
+    /// Whether `metadata` is a script-monitor wake whose workspace is being
+    /// exported (its delivery must wait).
+    fn script_monitor_export_blocked(
+        &self,
+        svc: &Services,
+        metadata: Option<&serde_json::Value>,
+    ) -> bool;
+
+    /// Re-queue an export-blocked script-monitor wake for `agent_id`;
+    /// `false` (nothing queued) when it is not blocked.
+    fn defer_script_monitor_for_export(
+        &self,
+        svc: &Services,
+        agent_id: &AgentId,
+        content: &str,
+        metadata: Option<&serde_json::Value>,
+    ) -> bool;
+
+    /// Record which script-monitor wake (if any) `agent_id`'s starting turn
+    /// delivers.
+    fn track_script_monitor_worker(
+        &self,
+        svc: &Services,
+        agent_id: &AgentId,
+        metadata: Option<&serde_json::Value>,
+    );
+
+    /// Complete the script-monitor delivery `agent_id`'s finished turn
+    /// carried, if any.
+    fn settle_script_monitor_worker<'a>(
+        &'a self,
+        svc: &'a Services,
+        agent_id: &'a AgentId,
+    ) -> BoxFuture<'a, ()>;
+
+    /// Admit a turn carrying `metadata` under the monitor lane: `true` for a
+    /// non-monitor turn or an accepted monitor delivery.
+    fn admit_script_monitor_turn<'a>(
+        &'a self,
+        svc: &'a Services,
+        agent_id: &'a AgentId,
+        metadata: Option<&'a serde_json::Value>,
+    ) -> BoxFuture<'a, Result<bool>>;
+
+    /// Whether a turn carrying `metadata` may still be delivered to
+    /// `agent_id` (`true` for a non-monitor turn).
+    fn script_monitor_delivery_allowed<'a>(
+        &'a self,
+        svc: &'a Services,
+        agent_id: &'a AgentId,
+        metadata: Option<&'a serde_json::Value>,
+    ) -> BoxFuture<'a, Result<bool>>;
+
+    /// Record script-monitor delivery `monitor_id` to `agent_id` as finished.
+    fn complete_script_monitor_delivery<'a>(
+        &'a self,
+        svc: &'a Services,
+        agent_id: &'a AgentId,
+        monitor_id: &'a str,
+    ) -> BoxFuture<'a, ()>;
+
+    /// The lane that serializes script-monitor delivery with queue
+    /// suppression and exports.
+    fn script_monitor_lane<'a>(&'a self, svc: &'a Services) -> &'a tokio::sync::Mutex<()>;
+
+    /// Stop every script of `workspace_id` and refuse new launches while the
+    /// returned guard lives (workspace retire).
+    fn close_workspace_scripts<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
+    ) -> BoxFuture<'a, Box<dyn ScriptsClosing>>;
+
+    // Daemon and workspace lifecycle entry points core reaches the runtime
+    // through (boot hydration, shutdown, workspace delete / archive, the
+    // host execution context, and agents' ACP terminal host). Each behaves
+    // exactly as the runtime code it forwards to; the async ones box that
+    // future, adding no await point.
+
+    /// Recover pending script monitors, start their maintenance loop and
+    /// hydrate the script registry from the store; resolves to the number of
+    /// scripts loaded.
+    fn hydrate_scripts<'a>(&'a self, svc: &'a Services) -> BoxFuture<'a, Result<usize>>;
+
+    /// Command-mode script runs in flight and the last settlement time.
+    fn command_script_activity(&self, svc: &Services) -> CommandScriptActivity;
+
+    /// Whether `workspace_id` has a command-mode script run in flight.
+    fn workspace_scripts_running(&self, svc: &Services, workspace_id: &WorkspaceId) -> bool;
+
+    /// Stop every managed script and kill every PTY session for daemon
+    /// shutdown; resolves to `(scripts_stopped, ptys_killed)`.
+    fn stop_all_scripts<'a>(&'a self, svc: &'a Services) -> BoxFuture<'a, (usize, usize)>;
+
+    /// Drop every live hook scheduler task handle (agent-delivery shutdown).
+    fn clear_hook_tasks(&self, svc: &Services);
+
+    /// Abort `workspace_id`'s live hook scheduler tasks (workspace delete).
+    fn abort_workspace_hook_tasks<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
+    ) -> BoxFuture<'a, ()>;
+
+    /// Cancel every active hook of `workspace_id` (archive sweep); resolves
+    /// to the cancelled `(name, id)` pairs per owning agent.
+    fn cancel_workspace_hooks<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
+    ) -> BoxFuture<'a, BTreeMap<AgentId, Vec<(String, HookId)>>>;
+
+    /// Delete `workspace_id`'s on-disk script output; `false` when the
+    /// best-effort delete failed.
+    fn delete_workspace_script_output<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
+    ) -> BoxFuture<'a, bool>;
+
+    /// The host execution context snapshot (`host.executionContext`).
+    fn execution_context_snapshot<'a>(
+        &'a self,
+        svc: &'a Services,
+    ) -> BoxFuture<'a, Result<HostExecutionContext>>;
+
+    /// The ACP terminal host an agent session's provider drives: PTY
+    /// terminals on the shared host, spawned through a shell when
+    /// `terminal_requires_shell`, defaulting to `session_cwd`.
+    fn agent_terminal_host(
+        &self,
+        svc: &Services,
+        terminal_requires_shell: bool,
+        session_cwd: Option<PathBuf>,
+    ) -> Arc<dyn intent_acp::TerminalHost>;
+}
+
+/// A workspace's script closing mark ([`RuntimePort::close_workspace_scripts`]):
+/// dropping it reopens the workspace for script launches.
+pub trait ScriptsClosing: Send {
+    /// Script ids the close could not fully stop and settle.
+    fn unsettled(&self) -> &[String];
 }
 
 /// The core-internal entry points of an unregistered runtime port fail
@@ -742,6 +947,195 @@ pub struct SetupScriptRun {
     pub branch_name: String,
     /// `SOURCE_BRANCH`.
     pub source_branch: String,
+}
+
+/// Command-mode run activity for the idle update handshake (see
+/// [`RuntimePort::command_script_activity`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CommandScriptActivity {
+    /// Command runs in flight: admitted and not yet durably settled, or with
+    /// a live process. A run stays in flight after its process exits until
+    /// its result is persisted, so a restart never races the settlement.
+    pub in_flight: usize,
+    /// When the most recent command run settled, so a run that starts and
+    /// ends between two samples still restarts an idle grace.
+    pub last_settled_at: Option<std::time::Instant>,
+}
+
+/// The queued-message id of a script-monitor wake (`script-monitor:<id>`),
+/// if `metadata` describes one. Shared by runtime and agents.
+pub(crate) fn wake_id(metadata: Option<&serde_json::Value>) -> Option<String> {
+    let md = metadata?;
+    (md["type"] == "script_monitor_wake")
+        .then(|| {
+            md["monitorId"]
+                .as_str()
+                .map(|id| format!("script-monitor:{id}"))
+        })
+        .flatten()
+}
+
+/// The monitor id of a script-monitor wake, if `metadata` describes one.
+pub(crate) fn monitor_id(metadata: Option<&serde_json::Value>) -> Option<&str> {
+    let md = metadata?;
+    (md["type"] == "script_monitor_wake")
+        .then(|| md["monitorId"].as_str())
+        .flatten()
+}
+
+/// How a cancel transition ([`Services::cancel_active_hook`],
+/// [`Services::cancel_active_pr_monitor`]) settles the owner's deferred
+/// completion watches. A completion watch on an idle owner defers while the
+/// owner has active hooks / PR monitors, so cancelling the LAST one must
+/// re-run the deferral backstop
+/// ([`Services::redeliver_completion_after_queue_mutation`]) — either
+/// through a wake or directly — or the watch strands forever.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum CancelSettlement<'a> {
+    /// Wake the owner with this notice; the wake runs the backstop itself
+    /// after the delivery attempt (FE/app cancel).
+    Notify(&'a str),
+    /// No wake; run the backstop directly (owner-side cancel, retire sweep).
+    Resettle,
+    /// Neither: the caller sweeps several items and runs the backstop ONCE
+    /// per owner after queueing its consolidated wake (archive sweep). The
+    /// per-item backstop would otherwise see an empty queue and no remaining
+    /// watches on the final item and synthesize a genuine completion,
+    /// consuming a parent's watch BEFORE the consolidated notice is queued.
+    Deferred,
+}
+
+/// The agent-wake feature: what the runtime (script monitors, hooks, script
+/// ownership checks) and host execution need from agents, so they never name
+/// agent types. Implemented on the agents side (`crate::agent_wake`).
+///
+/// Each method behaves exactly as the agent call it replaces; the async ones
+/// box the same future, adding no await point.
+pub trait AgentWakePort: Send + Sync + 'static {
+    /// Deliver `content` to `agent_id` as a wake message, starting a turn or
+    /// queueing it (`Services::deliver_wake_message`).
+    fn deliver_wake_message<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
+        agent_id: &'a AgentId,
+        content: &'a str,
+        metadata: Option<&'a serde_json::Value>,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    /// Queue an automatic message for `agent_id` (no attachments, prepend or
+    /// interrupt) under `message_id`, without draining. Returns the queue
+    /// row describing the queued entry.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Internal`] if the queued entry cannot be serialized; the
+    /// message is queued either way.
+    fn enqueue_automatic_message(
+        &self,
+        svc: &Services,
+        agent_id: &AgentId,
+        message_id: Option<String>,
+        content: String,
+        metadata: Option<serde_json::Value>,
+    ) -> Result<intent_store::AgentQueueRow>;
+
+    /// Persist `agent_id`'s queue snapshot and publish `agent:queue_updated`.
+    fn publish_queue_updated<'a>(
+        &'a self,
+        svc: &'a Services,
+        agent_id: &'a AgentId,
+    ) -> BoxFuture<'a, ()>;
+
+    /// The live queue drainer (the agent manager), if one is attached. The
+    /// caller holds the handle across the steps that need it.
+    fn queue_drainer(&self, svc: &Services) -> Option<Arc<dyn AgentQueueDrainer>>;
+
+    /// The per-agent gate that serializes retirement with restore; hold its
+    /// lock to keep `agent_id` from retiring meanwhile.
+    fn retirement_gate(&self, svc: &Services, agent_id: &AgentId) -> Arc<tokio::sync::Mutex<()>>;
+
+    /// Whether `status` is terminal: the agent can no longer receive wakes.
+    fn is_terminal_status(&self, status: AgentStatus) -> bool;
+
+    /// Whether settings disable `provider_id` (`providers.enabled`).
+    fn provider_is_disabled(
+        &self,
+        provider_id: &str,
+        enabled: Option<&std::collections::BTreeMap<String, bool>>,
+    ) -> bool;
+}
+
+/// Drains an agent's message queue: starts the next queued turn if the agent
+/// is idle ([`AgentWakePort::queue_drainer`]).
+pub trait AgentQueueDrainer: Send + Sync {
+    fn try_drain_queue(
+        self: Arc<Self>,
+        agent_id: AgentId,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'static, ()>;
+}
+
+/// The agent-wake port of a `Services` no agents feature was registered on:
+/// there is no agent to wake. Deliveries and enqueues fail, there is no
+/// drainer, every status is terminal and no provider is disabled.
+#[derive(Default)]
+pub(crate) struct UnavailableAgentWake;
+
+fn agent_wake_unavailable() -> Error {
+    Error::Internal("agent wake port not registered".into())
+}
+
+impl AgentWakePort for UnavailableAgentWake {
+    fn deliver_wake_message<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _workspace_id: &'a WorkspaceId,
+        _agent_id: &'a AgentId,
+        _content: &'a str,
+        _metadata: Option<&'a serde_json::Value>,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        Box::pin(async { Err(agent_wake_unavailable()) })
+    }
+
+    fn enqueue_automatic_message(
+        &self,
+        _svc: &Services,
+        _agent_id: &AgentId,
+        _message_id: Option<String>,
+        _content: String,
+        _metadata: Option<serde_json::Value>,
+    ) -> Result<intent_store::AgentQueueRow> {
+        Err(agent_wake_unavailable())
+    }
+
+    fn publish_queue_updated<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _agent_id: &'a AgentId,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
+
+    fn queue_drainer(&self, _svc: &Services) -> Option<Arc<dyn AgentQueueDrainer>> {
+        None
+    }
+
+    fn retirement_gate(&self, _svc: &Services, _agent_id: &AgentId) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::new(tokio::sync::Mutex::new(()))
+    }
+
+    fn is_terminal_status(&self, _status: AgentStatus) -> bool {
+        true
+    }
+
+    fn provider_is_disabled(
+        &self,
+        _provider_id: &str,
+        _enabled: Option<&std::collections::BTreeMap<String, bool>>,
+    ) -> bool {
+        false
+    }
 }
 
 /// A `WorkspaceApi` with no overrides: every method is the trait default.
@@ -1212,6 +1606,245 @@ impl RuntimePort for UnavailableRuntime {
     ) -> BoxFuture<'static, (bool, Option<u32>)> {
         Box::pin(async { (false, None) })
     }
+
+    fn active_hooks_for_agent<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _agent_id: &'a AgentId,
+    ) -> BoxFuture<'a, Vec<serde_json::Value>> {
+        Box::pin(async { Vec::new() })
+    }
+
+    fn active_hooks_by_agent<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _workspace_id: &'a WorkspaceId,
+    ) -> BoxFuture<'a, HashMap<String, Vec<serde_json::Value>>> {
+        Box::pin(async { HashMap::new() })
+    }
+
+    fn annotate_waiting_on_hooks<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _agent_id: &'a AgentId,
+        _data: &'a mut serde_json::Value,
+    ) -> BoxFuture<'a, Vec<serde_json::Value>> {
+        Box::pin(async { Vec::new() })
+    }
+
+    fn cancel_agent_hooks<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _agent_id: &'a AgentId,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
+
+    fn active_script_monitors_for_agent<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _agent_id: &'a AgentId,
+    ) -> BoxFuture<'a, Vec<serde_json::Value>> {
+        Box::pin(async { Vec::new() })
+    }
+
+    fn annotate_waiting_on_script_monitors<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _agent_id: &'a AgentId,
+        _data: &'a mut serde_json::Value,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
+
+    fn cancel_script_monitors<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _workspace_id: &'a WorkspaceId,
+        _agent_id: Option<&'a AgentId>,
+        _reason: &'a str,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn script_monitor_export_blocked(
+        &self,
+        _svc: &Services,
+        _metadata: Option<&serde_json::Value>,
+    ) -> bool {
+        false
+    }
+
+    fn defer_script_monitor_for_export(
+        &self,
+        _svc: &Services,
+        _agent_id: &AgentId,
+        _content: &str,
+        _metadata: Option<&serde_json::Value>,
+    ) -> bool {
+        false
+    }
+
+    fn track_script_monitor_worker(
+        &self,
+        _svc: &Services,
+        _agent_id: &AgentId,
+        _metadata: Option<&serde_json::Value>,
+    ) {
+    }
+
+    fn settle_script_monitor_worker<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _agent_id: &'a AgentId,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
+
+    fn admit_script_monitor_turn<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _agent_id: &'a AgentId,
+        metadata: Option<&'a serde_json::Value>,
+    ) -> BoxFuture<'a, Result<bool>> {
+        Box::pin(async move { Ok(monitor_id(metadata).is_none()) })
+    }
+
+    fn script_monitor_delivery_allowed<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _agent_id: &'a AgentId,
+        metadata: Option<&'a serde_json::Value>,
+    ) -> BoxFuture<'a, Result<bool>> {
+        Box::pin(async move { Ok(monitor_id(metadata).is_none()) })
+    }
+
+    fn complete_script_monitor_delivery<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _agent_id: &'a AgentId,
+        _monitor_id: &'a str,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
+
+    fn script_monitor_lane<'a>(&'a self, _svc: &'a Services) -> &'a tokio::sync::Mutex<()> {
+        static LANE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        &LANE
+    }
+
+    fn close_workspace_scripts<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _workspace_id: &'a WorkspaceId,
+    ) -> BoxFuture<'a, Box<dyn ScriptsClosing>> {
+        Box::pin(async { Box::new(NoScriptsClosing) as Box<dyn ScriptsClosing> })
+    }
+
+    fn hydrate_scripts<'a>(&'a self, _svc: &'a Services) -> BoxFuture<'a, Result<usize>> {
+        Box::pin(async { Ok(0) })
+    }
+
+    fn command_script_activity(&self, _svc: &Services) -> CommandScriptActivity {
+        CommandScriptActivity::default()
+    }
+
+    fn workspace_scripts_running(&self, _svc: &Services, _workspace_id: &WorkspaceId) -> bool {
+        false
+    }
+
+    fn stop_all_scripts<'a>(&'a self, _svc: &'a Services) -> BoxFuture<'a, (usize, usize)> {
+        Box::pin(async { (0, 0) })
+    }
+
+    fn clear_hook_tasks(&self, _svc: &Services) {}
+
+    fn abort_workspace_hook_tasks<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _workspace_id: &'a WorkspaceId,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
+
+    fn cancel_workspace_hooks<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _workspace_id: &'a WorkspaceId,
+    ) -> BoxFuture<'a, BTreeMap<AgentId, Vec<(String, HookId)>>> {
+        Box::pin(async { BTreeMap::new() })
+    }
+
+    fn delete_workspace_script_output<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _workspace_id: &'a WorkspaceId,
+    ) -> BoxFuture<'a, bool> {
+        Box::pin(async { true })
+    }
+
+    fn execution_context_snapshot<'a>(
+        &'a self,
+        _svc: &'a Services,
+    ) -> BoxFuture<'a, Result<HostExecutionContext>> {
+        Box::pin(async { Err(runtime_unavailable()) })
+    }
+
+    fn agent_terminal_host(
+        &self,
+        _svc: &Services,
+        _terminal_requires_shell: bool,
+        _session_cwd: Option<PathBuf>,
+    ) -> Arc<dyn intent_acp::TerminalHost> {
+        Arc::new(NoTerminalHost)
+    }
+}
+
+/// The ACP terminal host of an unregistered runtime: every request fails.
+struct NoTerminalHost;
+
+fn no_terminal_host() -> intent_acp::AcpError {
+    intent_acp::AcpError::Terminal("runtime feature not registered".into())
+}
+
+impl intent_acp::TerminalHost for NoTerminalHost {
+    fn create(
+        &self,
+        _params: intent_acp::TerminalCreateParams,
+    ) -> BoxFuture<'_, intent_acp::AcpResult<String>> {
+        Box::pin(async { Err(no_terminal_host()) })
+    }
+
+    fn output(
+        &self,
+        _terminal_id: String,
+    ) -> BoxFuture<'_, intent_acp::AcpResult<intent_acp::TerminalOutputInfo>> {
+        Box::pin(async { Err(no_terminal_host()) })
+    }
+
+    fn wait_for_exit(
+        &self,
+        _terminal_id: String,
+    ) -> BoxFuture<'_, intent_acp::AcpResult<intent_acp::TerminalExitInfo>> {
+        Box::pin(async { Err(no_terminal_host()) })
+    }
+
+    fn release(&self, _terminal_id: String) -> BoxFuture<'_, intent_acp::AcpResult<()>> {
+        Box::pin(async { Err(no_terminal_host()) })
+    }
+
+    fn kill(&self, _terminal_id: String) -> BoxFuture<'_, intent_acp::AcpResult<()>> {
+        Box::pin(async { Err(no_terminal_host()) })
+    }
+}
+
+/// The closing mark of an unregistered runtime: there are no scripts.
+struct NoScriptsClosing;
+
+impl ScriptsClosing for NoScriptsClosing {
+    fn unsettled(&self) -> &[String] {
+        &[]
+    }
 }
 
 /// Typed feature state on [`Services`], keyed by type.
@@ -1357,6 +1990,9 @@ feature_port_registry! {
     /// Register the workspace runtime feature (scripts and hooks).
     /// [`Services::new`] registers the in-crate one.
     runtime: RuntimePort = UnavailableRuntime, with_runtime_port;
+    /// Register the agent-wake feature runtime code wakes agents through.
+    /// [`Services::new`] registers the in-crate one.
+    agent_wake: AgentWakePort = UnavailableAgentWake, with_agent_wake_port;
 }
 
 /// Writes `WorkspaceApi` methods that forward to a feature port: each
@@ -1377,6 +2013,14 @@ macro_rules! port_forwarders {
     };
 }
 pub(crate) use port_forwarders;
+
+impl FeaturePorts {
+    /// A shared handle on the agent-wake port, for holders that outlive the
+    /// borrow of `Services` (the script manager).
+    pub(crate) fn agent_wake_port(&self) -> Arc<dyn AgentWakePort> {
+        Arc::clone(&self.agent_wake.port)
+    }
+}
 
 impl Services {
     /// The declared feature ports that no feature registered. Empty once the
@@ -1413,8 +2057,8 @@ mod tests {
     use intent_core::{Error, WorkspaceApi, WorkspaceId};
 
     use super::{
-        FeaturePorts, RuntimePort, TransferPort, UnavailableRuntime, UnavailableTransfer,
-        DEFAULT_WORKSPACE_API,
+        AgentWakePort, FeaturePorts, RuntimePort, TransferPort, UnavailableAgentWake,
+        UnavailableRuntime, UnavailableTransfer, DEFAULT_WORKSPACE_API,
     };
 
     use crate::test_support::fixtures::TempDb;
@@ -1480,16 +2124,16 @@ mod tests {
     async fn the_startup_check_names_every_unregistered_port() {
         let tmp = TempDb::new();
         let svc = bare_services(&tmp).await;
-        assert_eq!(FeaturePorts::NAMES, ["transfer", "runtime"]);
+        assert_eq!(FeaturePorts::NAMES, ["transfer", "runtime", "agent_wake"]);
         assert_eq!(
             FeaturePorts::default().unregistered(),
             FeaturePorts::NAMES,
-            "every declared port, the runtime port included, starts unregistered"
+            "every declared port, the in-crate ones included, starts unregistered"
         );
         assert_eq!(
             svc.unregistered_feature_ports(),
             ["transfer"],
-            "Services::new registers the in-crate runtime feature"
+            "Services::new registers the in-crate runtime and agent-wake features"
         );
         assert!(matches!(
             svc.ensure_feature_ports_registered(),
@@ -1529,6 +2173,96 @@ mod tests {
             svc.feature::<crate::runtime::RuntimeFeature>()
                 .expect("registered")
         ));
+    }
+
+    #[tokio::test]
+    async fn unregistered_agent_wake_port_has_no_agent_to_wake() {
+        let tmp = TempDb::new();
+        let svc = bare_services(&tmp)
+            .await
+            .with_agent_wake_port(Arc::new(UnavailableAgentWake) as Arc<dyn AgentWakePort>);
+        let port = svc.ports.agent_wake();
+        let ws = WorkspaceId::new();
+        let agent = intent_core::AgentId::new();
+        let unavailable =
+            |e: &Error| matches!(e, Error::Internal(m) if m == "agent wake port not registered");
+        let delivered = port
+            .deliver_wake_message(&svc, &ws, &agent, "wake", None)
+            .await;
+        assert!(delivered.as_ref().is_err_and(unavailable), "{delivered:?}");
+        let queued = port.enqueue_automatic_message(&svc, &agent, None, "m".into(), None);
+        assert!(queued.as_ref().is_err_and(unavailable), "{queued:?}");
+        port.publish_queue_updated(&svc, &agent).await;
+        assert!(port.queue_drainer(&svc).is_none());
+        let first = port.retirement_gate(&svc, &agent);
+        let _held = first.try_lock().expect("a fresh gate");
+        assert!(port.is_terminal_status(intent_core::AgentStatus::Idle));
+        let disabled = std::collections::BTreeMap::from([("claude".to_owned(), false)]);
+        assert!(!port.provider_is_disabled("claude", Some(&disabled)));
+    }
+
+    #[tokio::test]
+    async fn the_registered_agent_wake_port_answers_like_the_agent_calls() {
+        use intent_core::AgentStatus;
+        let tmp = TempDb::new();
+        let svc = bare_services(&tmp).await;
+        let port = svc.ports.agent_wake();
+        for status in AgentStatus::ALL {
+            assert_eq!(
+                port.is_terminal_status(status),
+                crate::agent_ops::is_terminal_status(status),
+                "{status:?}"
+            );
+        }
+        for enabled in [
+            None,
+            Some(std::collections::BTreeMap::from([(
+                "claude".to_owned(),
+                false,
+            )])),
+            Some(std::collections::BTreeMap::from([(
+                "claude".to_owned(),
+                true,
+            )])),
+        ] {
+            for provider in ["claude", "codex", "no-such-provider"] {
+                assert_eq!(
+                    port.provider_is_disabled(provider, enabled.as_ref()),
+                    crate::agent_ops::provider_is_disabled(provider, enabled.as_ref()),
+                    "{provider} {enabled:?}"
+                );
+            }
+        }
+        let agent = intent_core::AgentId::new();
+        let gate = port.retirement_gate(&svc, &agent);
+        assert!(
+            Arc::ptr_eq(&gate, &svc.agent_retirement_gates.for_agent(&agent)),
+            "the port hands out the agent's own retirement gate"
+        );
+        assert!(
+            port.queue_drainer(&svc).is_none(),
+            "no drainer before an agent manager is attached"
+        );
+        let receipt = port
+            .enqueue_automatic_message(
+                &svc,
+                &agent,
+                Some("wake-1".into()),
+                "body".into(),
+                Some(serde_json::json!({"type": "script_monitor_wake"})),
+            )
+            .expect("queued");
+        assert_eq!(receipt.id, "wake-1");
+        assert_eq!(receipt.agent_id, agent);
+        assert_eq!(receipt.position, 0);
+        assert_eq!(receipt.payload["content"], "body");
+        assert_eq!(receipt.payload["userOrigin"], false);
+        assert_eq!(
+            receipt.payload["messageMetadata"]["type"],
+            "script_monitor_wake"
+        );
+        assert_eq!(receipt.turn_id, receipt.payload["turnId"]);
+        assert_eq!(receipt.created_at, receipt.payload["queuedAt"]);
     }
 
     #[tokio::test]

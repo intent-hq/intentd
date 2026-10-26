@@ -58,6 +58,7 @@ mod agent_manager;
 mod agent_ops;
 mod agent_session;
 mod agent_subscriptions;
+mod agent_wake;
 mod agent_workers;
 mod auto_retire;
 mod retire;
@@ -101,6 +102,7 @@ mod enhance_ops;
 mod event_ops;
 mod event_subscriptions;
 pub mod events;
+mod execution_call;
 #[doc(hidden)]
 pub mod feature_api;
 mod feature_ports;
@@ -252,13 +254,14 @@ pub mod repo_config;
 pub mod retention;
 mod rtk;
 mod runtime;
+mod runtime_config;
 mod sandbox_ops;
 mod script_monitor;
 mod script_ops;
 mod script_output_cleanup;
 mod script_output_store;
 pub mod worktree_presence;
-pub use script_ops::CommandScriptActivity;
+pub use feature_ports::CommandScriptActivity;
 mod search_ops;
 mod sentry_ops;
 mod settings;
@@ -325,7 +328,6 @@ pub use settings::{
 };
 pub use settings_registry::{SettingOrigin, SettingsRegistry, SettingsSnapshot, WsApiPortPolicy};
 pub(crate) use settings_registry::{SettingsChanged, KNOWN_PATHS};
-pub(crate) use terminal_ops::PtyTerminalHost;
 
 /// Re-export the auggie discovery surface so the transport layer can reuse the
 /// canonical resolver (`find_auggie`, managed binary, enhanced PATH) without
@@ -384,7 +386,7 @@ pub fn is_stale_in_flight_status(status: intent_core::AgentStatus) -> bool {
 /// intent-hq/monorepo#1468 follow-up): `deliver_completion_to_watches` parks
 /// between the `agent_waiting` probe and `mark_interim_skipped_idle` so a
 /// test can land a concurrent watch removal deterministically inside that
-/// window. Same shape as [`script_ops::SupervisePark`].
+/// window. Same shape as [`runtime_config::SupervisePark`].
 #[derive(Default)]
 pub(crate) struct CompletionClassifyPark {
     /// Signaled by the parked delivery on entering the window.
@@ -921,19 +923,19 @@ pub struct Services {
     /// [`AgentManager`] that builds the ACP terminal adapter — drives the same
     /// terminals.
     pty: Arc<intent_pty::PtyHost>,
-    /// On-disk per-run script output logs (`<data_dir>/script-output`). The
-    /// composition root points it at the daemon data dir; until then it uses a
-    /// per-instance temp dir so unconfigured instances never share logs.
-    script_output: script_output_store::ScriptOutputStore,
+    /// Where on-disk per-run script output logs live (`<data_dir>/script-output`).
+    /// The composition root points it at the daemon data dir; until then it
+    /// uses a per-instance temp dir so unconfigured instances never share logs.
+    script_output_config: runtime_config::ScriptOutputConfig,
     /// The `script.*` too-fast-exit floor in milliseconds
-    /// ([`script_ops::TOO_FAST_MS`] in production). Tests raise it via the
+    /// ([`runtime_config::TOO_FAST_MS`] in production). Tests raise it via the
     /// `#[cfg(test)]`-only `with_script_too_fast_ms` seam so the no-restart
     /// decision cannot flip under scheduler load (monorepo#514).
     script_too_fast_ms: u128,
     /// Test park seam (monorepo#1180) for the `script.*` supervisor
     /// pre-registration race window. `None` in production wiring; tests
     /// inject via the `#[cfg(test)]`-only `with_script_supervise_park`.
-    script_parks: script_ops::ScriptParks,
+    script_parks: runtime_config::ScriptParks,
     /// Test park seam (issue intent-hq/monorepo#1468 follow-up) for the
     /// completion-delivery classify→mark window: parks
     /// `deliver_completion_to_watches` after the `agent_waiting` probe and
@@ -966,7 +968,7 @@ pub struct Services {
     /// former read-modify-write window) so tests can deterministically
     /// interleave a concurrent row mutation. `None` in production wiring;
     /// tests inject via the `#[cfg(test)]`-only `with_attention_write_park`.
-    attention_write_park: Option<Arc<script_ops::SupervisePark>>,
+    attention_write_park: Option<Arc<runtime_config::SupervisePark>>,
     /// Test park seam (intent-hq/intent#5137) at the ENTRY of
     /// `settle_workspace_unread_after_seen` — after the caller's write, before
     /// the settle's unread probe — so two concurrent settles can be held
@@ -974,28 +976,28 @@ pub struct Services {
     /// that still sees the other's session unread. `None` in production
     /// wiring; tests inject via the `#[cfg(test)]`-only
     /// `with_unread_settle_entry_park`.
-    unread_settle_entry_park: Option<Arc<script_ops::SupervisePark>>,
+    unread_settle_entry_park: Option<Arc<runtime_config::SupervisePark>>,
     /// Test park seam (intent-hq/intent#5654) for the cache-hit fold's
     /// row lookup → projection window: parks `fold_served_pr` per hit row
     /// after the referencing-rows read, before the atomic signal
     /// projection, so a REST refresh committing in between is
     /// deterministic. `None` in production wiring; tests inject via the
     /// `#[cfg(test)]`-only `with_fold_hit_park`.
-    fold_hit_park: Option<Arc<script_ops::SupervisePark>>,
+    fold_hit_park: Option<Arc<runtime_config::SupervisePark>>,
     /// Test park seam (intent-hq/monorepo#2739) for the
     /// `deliver_wake_message` archived-gate read → enqueue window: parks the
     /// wake delivery after the gate observed the workspace archived and
     /// before the enqueue, so a concurrent `workspace.unarchive` landing
     /// inside that window is deterministic. `None` in production wiring;
     /// tests inject via the `#[cfg(test)]`-only `with_wake_archived_park`.
-    wake_archived_park: Option<Arc<script_ops::SupervisePark>>,
+    wake_archived_park: Option<Arc<runtime_config::SupervisePark>>,
     /// Test park seam (intent-hq/intentd#1857) for the `task.update`
     /// linked-line redirect: parks the first attempt after the line is
     /// projected from the task read and before the gated parent write, so a
     /// concurrent task completion + materialization inside that window is
     /// deterministic. `None` in production wiring; tests inject via the
     /// `#[cfg(test)]`-only `with_task_update_projection_park`.
-    task_update_projection_park: Option<Arc<script_ops::SupervisePark>>,
+    task_update_projection_park: Option<Arc<runtime_config::SupervisePark>>,
     /// Per-workspace archive ↔ unarchive fence (see [`ArchiveFence`]);
     /// shared across [`Services`] clones.
     archive_fence: Arc<ArchiveFence>,
@@ -1006,14 +1008,14 @@ pub struct Services {
     /// principal is deterministically ordered behind it. `None` in
     /// production wiring; tests inject via the `#[cfg(test)]`-only
     /// `with_archive_tail_park`.
-    archive_tail_park: Option<Arc<script_ops::SupervisePark>>,
+    archive_tail_park: Option<Arc<runtime_config::SupervisePark>>,
     /// Test park seam for the `workspace.archive` post-commit, PRE-drop
     /// window: parks the detached tail right after the guest sweep
     /// committed and BEFORE the detached guests' queued messages are dropped
     /// and their removal deltas published (fence held). `None` in production
     /// wiring; tests inject via the `#[cfg(test)]`-only
     /// `with_archive_predrop_park`.
-    archive_predrop_park: Option<Arc<script_ops::SupervisePark>>,
+    archive_predrop_park: Option<Arc<runtime_config::SupervisePark>>,
     /// Test park seam (intentd#2068) for the per-id queue mutations
     /// (`agent.editQueuedMessage` / `removeQueuedMessage` /
     /// `sendQueuedMessageNow`): parks each between its ownership
@@ -1021,7 +1023,7 @@ pub struct Services {
     /// `requeue_front` landing inside that window is deterministic. `None`
     /// in production wiring; tests inject via the `#[cfg(test)]`-only
     /// `with_queue_mutation_gate_park`.
-    queue_mutation_gate_park: Option<Arc<script_ops::SupervisePark>>,
+    queue_mutation_gate_park: Option<Arc<runtime_config::SupervisePark>>,
     /// Secret persistence for **sensitive** settings (§9.8) — the secret-store
     /// seam behind `settings.*`. Defaults to the file-backed
     /// [`intent_core::FileSecretStore`] (`~/intent/.secrets.json`); tests inject
@@ -1413,7 +1415,7 @@ pub struct Services {
     /// step (intent-hq/intent#5035): `Some(err)` fails that attempt without
     /// touching the store. `None` in production wiring.
     #[cfg(test)]
-    hook_store_fault: Option<hook_manager::HookStoreFault>,
+    hook_store_fault: Option<runtime_config::HookStoreFault>,
     /// Host suspend-overlap query used by [`Services::run_prompt_turn`] to
     /// recognize a sleep-induced turn failure and enroll it as interrupted for
     /// wake-triggered resume (Task C). Wired by the composition root from the
@@ -1537,7 +1539,7 @@ pub struct Services {
     workspace_mutations: workspace_mutations::WorkspaceMutations,
     startup_resume_candidates: Arc<Mutex<HashSet<AgentId>>>,
     #[cfg(test)]
-    interrupted_list_park: Option<Arc<script_ops::SupervisePark>>,
+    interrupted_list_park: Option<Arc<runtime_config::SupervisePark>>,
     #[cfg(test)]
     interrupted_resume_park: Option<Arc<CompletionClassifyPark>>,
     #[cfg(test)]
@@ -1726,12 +1728,12 @@ impl Services {
             agent_activity: Arc::new(Mutex::new(HashMap::new())),
             pty: Arc::new(intent_pty::PtyHost::new()),
             daemon_boot_id,
-            script_output: script_output_store::ScriptOutputStore::new(
-                &std::env::temp_dir().join(format!("intentd-{}", uuid::Uuid::new_v4())),
-                intent_core::config::DEFAULT_SCRIPT_OUTPUT_MAX_BYTES_PER_RUN,
-            ),
-            script_too_fast_ms: script_ops::TOO_FAST_MS,
-            script_parks: script_ops::ScriptParks::default(),
+            script_output_config: runtime_config::ScriptOutputConfig {
+                data_dir: std::env::temp_dir().join(format!("intentd-{}", uuid::Uuid::new_v4())),
+                max_bytes_per_run: intent_core::config::DEFAULT_SCRIPT_OUTPUT_MAX_BYTES_PER_RUN,
+            },
+            script_too_fast_ms: runtime_config::TOO_FAST_MS,
+            script_parks: runtime_config::ScriptParks::default(),
             completion_classify_park: None,
             #[cfg(test)]
             hook_wake_park: None,
@@ -1844,9 +1846,9 @@ impl Services {
             git_status_scan_probe: None,
             ac_status_inflight: Arc::new(ac_status_singleflight::AcStatusSingleFlight::default()),
             hooks_max_per_agent: intent_core::config::DEFAULT_HOOKS_MAX_PER_AGENT,
-            hook_eval_timeout: hook_manager::HOOK_EVAL_TIMEOUT,
+            hook_eval_timeout: runtime_config::HOOK_EVAL_TIMEOUT,
             hook_clock_skew: None,
-            hook_store_retry_base: hook_manager::HOOK_STORE_RETRY_BASE,
+            hook_store_retry_base: runtime_config::HOOK_STORE_RETRY_BASE,
             #[cfg(test)]
             hook_store_fault: None,
             suspend_tracker: None,
@@ -1896,7 +1898,7 @@ impl Services {
             ports: feature_ports::FeaturePorts::default(),
             features: feature_ports::FeatureSet::default(),
         };
-        let services = runtime::register(services);
+        let services = agent_wake::register(runtime::register(services));
         services
             .gitlab_credential_gate
             .attach_repository(services.repository_connection_directory(), descriptor)
@@ -2035,7 +2037,7 @@ impl Services {
     /// injector is called with the step name before every attempt and fails
     /// the attempt when it returns `Some(err)`.
     #[cfg(test)]
-    pub(crate) fn with_hook_store_fault(mut self, fault: hook_manager::HookStoreFault) -> Self {
+    pub(crate) fn with_hook_store_fault(mut self, fault: runtime_config::HookStoreFault) -> Self {
         self.hook_store_fault = Some(fault);
         self
     }
@@ -2534,31 +2536,9 @@ impl Services {
         self.pty.clone()
     }
 
-    /// Build a [`ScriptManager`](script_ops::ScriptManager) view over the shared
-    /// PTY host, event bus, store, script registry, and bootstrap locks for one `script.*` call.
-    #[expect(
-        clippy::must_use_candidate,
-        reason = "internal doc-hidden feature API, not a public library API"
-    )]
-    pub fn script_manager(&self) -> script_ops::ScriptManager {
-        script_ops::ScriptManager::new(
-            self.pty.clone(),
-            self.event_bus.clone(),
-            self.store.clone(),
-            self.runtime().scripts.clone(),
-            self.runtime().script_locks.clone(),
-            self.script_too_fast_ms,
-            self.script_parks.clone(),
-        )
-        .with_settings(self.settings_registry.clone())
-        .with_output_store(self.script_output.clone())
-        .with_tasks(self.store_tasks.clone())
-        .with_owner_services(self.clone())
-    }
-
     /// Test seam: raise the `script.*` too-fast-exit floor so the no-restart
     /// decision is independent of scheduler load (monorepo#514). Production
-    /// wiring keeps the [`script_ops::TOO_FAST_MS`] default.
+    /// wiring keeps the [`runtime_config::TOO_FAST_MS`] default.
     #[cfg(test)]
     pub(crate) fn with_script_too_fast_ms(mut self, ms: u128) -> Self {
         self.script_too_fast_ms = ms;
@@ -2571,7 +2551,7 @@ impl Services {
     #[cfg(test)]
     pub(crate) fn with_script_supervise_park(
         mut self,
-        park: Arc<script_ops::SupervisePark>,
+        park: Arc<runtime_config::SupervisePark>,
     ) -> Self {
         self.script_parks.supervise = Some(park);
         self
@@ -2582,7 +2562,7 @@ impl Services {
     #[cfg(test)]
     pub(crate) fn with_script_before_spawn_park(
         mut self,
-        park: Arc<script_ops::SupervisePark>,
+        park: Arc<runtime_config::SupervisePark>,
     ) -> Self {
         self.script_parks.before_spawn = Some(park);
         self
@@ -2593,7 +2573,7 @@ impl Services {
     #[cfg(test)]
     pub(crate) fn with_script_workspace_closed_park(
         mut self,
-        park: Arc<script_ops::SupervisePark>,
+        park: Arc<runtime_config::SupervisePark>,
     ) -> Self {
         self.script_parks.workspace_closed = Some(park);
         self
@@ -2604,7 +2584,7 @@ impl Services {
     #[cfg(test)]
     pub(crate) fn with_script_create_admitted_park(
         mut self,
-        park: Arc<script_ops::SupervisePark>,
+        park: Arc<runtime_config::SupervisePark>,
     ) -> Self {
         self.script_parks.create_admitted = Some(park);
         self
@@ -2617,7 +2597,7 @@ impl Services {
     #[cfg(test)]
     pub(crate) fn with_script_mark_running_park(
         mut self,
-        park: Arc<script_ops::SupervisePark>,
+        park: Arc<runtime_config::SupervisePark>,
     ) -> Self {
         self.script_parks.mark_running_persist = Some(park);
         self
@@ -2670,7 +2650,7 @@ impl Services {
     #[cfg(test)]
     pub(crate) fn with_attention_write_park(
         mut self,
-        park: Arc<script_ops::SupervisePark>,
+        park: Arc<runtime_config::SupervisePark>,
     ) -> Self {
         self.attention_write_park = Some(park);
         self
@@ -2683,7 +2663,7 @@ impl Services {
     #[cfg(test)]
     pub(crate) fn with_unread_settle_entry_park(
         mut self,
-        park: Arc<script_ops::SupervisePark>,
+        park: Arc<runtime_config::SupervisePark>,
     ) -> Self {
         self.unread_settle_entry_park = Some(park);
         self
@@ -2694,7 +2674,7 @@ impl Services {
     /// projection, so a REST refresh committing inside that window is
     /// deterministic. Production wiring keeps `None` (no parking).
     #[cfg(test)]
-    pub(crate) fn with_fold_hit_park(mut self, park: Arc<script_ops::SupervisePark>) -> Self {
+    pub(crate) fn with_fold_hit_park(mut self, park: Arc<runtime_config::SupervisePark>) -> Self {
         self.fold_hit_park = Some(park);
         self
     }
@@ -2704,7 +2684,10 @@ impl Services {
     /// `workspace.unarchive` inside that window is deterministic. Production
     /// wiring keeps `None` (no parking).
     #[cfg(test)]
-    pub(crate) fn with_wake_archived_park(mut self, park: Arc<script_ops::SupervisePark>) -> Self {
+    pub(crate) fn with_wake_archived_park(
+        mut self,
+        park: Arc<runtime_config::SupervisePark>,
+    ) -> Self {
         self.wake_archived_park = Some(park);
         self
     }
@@ -2716,7 +2699,7 @@ impl Services {
     #[cfg(test)]
     pub(crate) fn with_task_update_projection_park(
         mut self,
-        park: Arc<script_ops::SupervisePark>,
+        park: Arc<runtime_config::SupervisePark>,
     ) -> Self {
         self.task_update_projection_park = Some(park);
         self
@@ -2729,7 +2712,7 @@ impl Services {
     #[cfg(test)]
     pub(crate) fn with_queue_mutation_gate_park(
         mut self,
-        park: Arc<script_ops::SupervisePark>,
+        park: Arc<runtime_config::SupervisePark>,
     ) -> Self {
         self.queue_mutation_gate_park = Some(park);
         self
@@ -2765,7 +2748,10 @@ impl Services {
     /// principal is deterministically ordered behind the fence. Production
     /// wiring keeps `None` (no parking).
     #[cfg(test)]
-    pub(crate) fn with_archive_tail_park(mut self, park: Arc<script_ops::SupervisePark>) -> Self {
+    pub(crate) fn with_archive_tail_park(
+        mut self,
+        park: Arc<runtime_config::SupervisePark>,
+    ) -> Self {
         self.archive_tail_park = Some(park);
         self
     }
@@ -2778,7 +2764,7 @@ impl Services {
     #[cfg(test)]
     pub(crate) fn with_archive_predrop_park(
         mut self,
-        park: Arc<script_ops::SupervisePark>,
+        park: Arc<runtime_config::SupervisePark>,
     ) -> Self {
         self.archive_predrop_park = Some(park);
         self
@@ -3034,9 +3020,7 @@ impl Services {
     ///
     /// Returns `Error::Internal` if loading the persisted scripts from the store fails.
     pub async fn hydrate_scripts(&self) -> Result<usize> {
-        self.script_manager().recover_monitors().await?;
-        self.start_script_monitor_maintenance();
-        self.script_manager().hydrate().await
+        self.ports.runtime().hydrate_scripts(self).await
     }
 
     /// Command-mode script runs in flight right now (admitted and not yet
@@ -3048,14 +3032,16 @@ impl Services {
     /// for `system.status` and a 1 s poll.
     #[must_use]
     pub fn command_script_activity(&self) -> CommandScriptActivity {
-        script_ops::command_activity(&self.runtime().scripts, &self.runtime().script_locks)
+        self.ports.runtime().command_script_activity(self)
     }
 
     /// Whether `workspace_id` has a command-mode script run in flight — the
     /// [`Self::command_script_activity`] predicate scoped to one workspace,
     /// backing `Workspace.scriptsRunning` (§5.1). One registry lock, no I/O.
     pub(crate) fn workspace_scripts_running(&self, workspace_id: &WorkspaceId) -> bool {
-        script_ops::workspace_command_running(&self.runtime().scripts, workspace_id)
+        self.ports
+            .runtime()
+            .workspace_scripts_running(self, workspace_id)
     }
 
     /// Clean daemon shutdown (monorepo#1526): flag every managed script with
@@ -3065,7 +3051,7 @@ impl Services {
     /// await the supervisor settles under a bounded backstop. Returns
     /// `(scripts_stopped, ptys_killed)`.
     pub async fn shutdown_pty_sessions(&self) -> (usize, usize) {
-        self.script_manager().stop_all().await
+        self.ports.runtime().stop_all_scripts(self).await
     }
 
     /// Derive the read-only [`WorkspaceActivity`] for a workspace from the live
@@ -4820,28 +4806,30 @@ impl Services {
         Ok(total_loaded)
     }
 
-    /// Configure the note-asset root directory (for `note.readAsset`).
-    /// Resolve `noteIds` (PROTOCOL §5.5) to ACP `image` content-block
-    /// payloads. Port of the FE extraction in
-    /// `agent-backend-handler.service.ts`: for each note, scan the raw
-    /// markdown for `![alt](url)` images whose URL is a
-    /// `workspace-asset://<workspaceId>/<assetId>` reference in the
-    /// requesting workspace, load the asset bytes from disk, and return a
-    /// list of `{ data: base64, mimeType }` tuples in document order.
-    /// Missing notes, missing assets, and non-workspace-asset URLs are
-    /// silently skipped so a partial `noteIds` array never breaks the
-    /// turn. External HTTP(S) image URLs are NOT fetched here — that path
-    /// is deferred (the FE variant would fetch via `fetch()`).
-    pub(crate) async fn load_note_image_blocks(
+    /// Resolve `noteIds` (PROTOCOL §5.5) to by-reference note context: for
+    /// each distinct note, its title plus the distinct `workspace-asset://`
+    /// image URLs in the requesting workspace that its markdown embeds, in
+    /// document order, capped at [`MAX_NOTE_REFERENCE_IMAGE_URLS`]
+    /// ([`NoteReference::omitted`] counts the rest). Neither note content
+    /// nor asset bytes are loaded: the agent reads them on demand with
+    /// `ws.note.read` / `ws.note.readAsset`, so a note with many large
+    /// screenshots can never overflow the provider image budget. Missing
+    /// (e.g. deleted) notes and URLs outside this workspace are skipped so a
+    /// partial `noteIds` array never breaks the turn; without an asset root
+    /// no image URLs are listed, since `ws.note.readAsset` could not serve
+    /// them.
+    pub(crate) async fn load_note_references(
         &self,
         workspace_id: &WorkspaceId,
         note_ids: &[String],
-    ) -> Vec<(String, String)> {
-        let Some(root) = self.assets_root.clone() else {
-            return Vec::new();
-        };
-        let mut out: Vec<(String, String)> = Vec::new();
+    ) -> Vec<NoteReference> {
+        let prefix = format!("workspace-asset://{}/", workspace_id.0);
+        let mut seen_notes = HashSet::new();
+        let mut out = Vec::new();
         for note_id in note_ids {
+            if !seen_notes.insert(note_id.as_str()) {
+                continue;
+            }
             let Ok(note) = self
                 .store
                 .get_note(workspace_id, &NoteId::from(note_id.as_str()))
@@ -4849,36 +4837,35 @@ impl Services {
             else {
                 continue;
             };
-            for url in extract_markdown_image_urls(&note.content) {
-                if !url.starts_with("workspace-asset://") {
-                    continue;
-                }
-                let rest = &url["workspace-asset://".len()..];
-                let Some((ws_from_url, asset_id)) = rest.split_once('/') else {
-                    continue;
-                };
-                if ws_from_url != workspace_id.0 || asset_id.is_empty() {
-                    continue;
-                }
-                let asset_path = root.join(&workspace_id.0).join(asset_id);
-                let bytes = match tokio::fs::read(&asset_path).await {
-                    Ok(b) => b,
-                    Err(e) => {
-                        tracing::warn!(
-                            note = %note_id, asset = %asset_id, error = %e,
-                            "failed to read note-referenced asset"
-                        );
+            let mut seen_urls = HashSet::new();
+            let mut image_urls: Vec<String> = Vec::new();
+            let mut omitted = 0;
+            if self.assets_root.is_some() {
+                for target in extract_markdown_image_urls(&note.content) {
+                    let Some(url) = note_asset_url(&target, &prefix) else {
+                        continue;
+                    };
+                    if !seen_urls.insert(url.clone()) {
                         continue;
                     }
-                };
-                let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                let mime = crate::note_ops::mime_from_extension(asset_id);
-                out.push((data, mime));
+                    if image_urls.len() < MAX_NOTE_REFERENCE_IMAGE_URLS {
+                        image_urls.push(url);
+                    } else {
+                        omitted += 1;
+                    }
+                }
             }
+            out.push(NoteReference {
+                id: note.id.to_string(),
+                title: note.title,
+                image_urls,
+                omitted,
+            });
         }
         out
     }
 
+    /// Configure the note-asset root directory (for `note.readAsset`).
     #[must_use]
     pub fn with_assets_root(mut self, root: PathBuf) -> Self {
         self.assets_root = Some(root);
@@ -4889,16 +4876,11 @@ impl Services {
     /// per run). Composition-root only — call before the surface is shared.
     #[must_use]
     pub fn with_script_output_dir(mut self, data_dir: &Path) -> Self {
-        self.script_output = script_output_store::ScriptOutputStore::new(
-            data_dir,
-            intent_core::config::DEFAULT_SCRIPT_OUTPUT_MAX_BYTES_PER_RUN,
-        );
+        self.script_output_config = runtime_config::ScriptOutputConfig {
+            data_dir: data_dir.to_path_buf(),
+            max_bytes_per_run: intent_core::config::DEFAULT_SCRIPT_OUTPUT_MAX_BYTES_PER_RUN,
+        };
         self
-    }
-
-    /// The on-disk script output store.
-    pub(crate) fn script_output_store(&self) -> &script_output_store::ScriptOutputStore {
-        &self.script_output
     }
 
     /// Load named provider profile metadata from
@@ -7162,7 +7144,7 @@ impl Services {
             .lock()
             .unwrap()
             .clear();
-        self.runtime().hook_tasks.lock().unwrap().clear();
+        self.ports.runtime().clear_hook_tasks(self);
         self.event_subscriptions.lock().unwrap().clear();
     }
 
@@ -15572,7 +15554,7 @@ async fn github_git_token_for_url(
 pub async fn github_git_credential(
     registry: Option<&SettingsRegistry>,
 ) -> Option<(String, String)> {
-    if !terminal_ops::expose_git_credential(registry) {
+    if !execution_call::expose_git_credential(registry) {
         return None;
     }
     let token = intent_sourcecontrol::token::resolve(&github_token_source(registry)).await;
@@ -18261,7 +18243,11 @@ impl Services {
             // Refuse new script launches, auto-restarts and output logs, and
             // stop the running scripts, so nothing writes a log after the
             // output folder is deleted below. Held until this delete returns.
-            let _scripts_closed = services.script_manager().close_workspace(&id).await;
+            let _scripts_closed = services
+                .ports
+                .runtime()
+                .close_workspace_scripts(&services, &id)
+                .await;
             // Terminate live agent sessions BEFORE the store cascade drops
             // their rows. A same-slug recreate hitting `agent.list` after the
             // delete would otherwise surface ghost sessions whose workers are
@@ -18492,7 +18478,11 @@ impl Services {
             // Eagerly abort the workspace's live hook scheduler tasks BEFORE
             // the store cascade drops their rows — otherwise each task would
             // linger until its next tick before noticing the row is gone.
-            services.abort_workspace_hook_tasks(&id).await;
+            services
+                .ports
+                .runtime()
+                .abort_workspace_hook_tasks(&services, &id)
+                .await;
             // Capture workspace state for the async cleanup below (before the
             // row delete). Best-effort: when the workspace is already gone or
             // the read fails, the background task simply skips the worktree
@@ -18530,7 +18520,11 @@ impl Services {
             }
             // The row is gone and its scripts are stopped: delete its on-disk
             // script output (best-effort; the startup orphan sweep retries).
-            services.delete_workspace_script_output(&id).await;
+            services
+                .ports
+                .runtime()
+                .delete_workspace_script_output(&services, &id)
+                .await;
             // Cancel any pending debounced lastActivity derivation
             // (monorepo#3623): the timer must not outlive the workspace —
             // it would fire against the deleted row and log a spurious
@@ -19293,8 +19287,13 @@ impl WorkspaceApi for Services {
     fn host_execution_context(&self) -> BoxFuture<'_, Result<serde_json::Value>> {
         Box::pin(async move {
             self.require_host_execution("host.executionContext").await?;
-            serde_json::to_value(self.execution_context_snapshot().await?)
-                .map_err(|e| Error::Internal(e.to_string()))
+            serde_json::to_value(
+                self.ports
+                    .runtime()
+                    .execution_context_snapshot(self)
+                    .await?,
+            )
+            .map_err(|e| Error::Internal(e.to_string()))
         })
     }
 
@@ -23590,7 +23589,7 @@ impl WorkspaceApi for Services {
                     "workspace.create failed"
                 );
             }
-            let mut result = result.map_err(|e| host_execution::git_error(e, execution_origin.as_deref()))?;
+            let mut result = result.map_err(|e| execution_call::git_error(e, execution_origin.as_deref()))?;
             self.attach_workspace_membership(&mut result.workspace)
                 .await;
             Ok(result)
@@ -24083,7 +24082,7 @@ impl WorkspaceApi for Services {
                 // emitted — silently per hook. Unarchive does NOT resurrect
                 // cancelled hooks; the consolidated notice below tells the
                 // owner to reschedule if the condition still matters.
-                let cancelled_hooks = this.cancel_workspace_hooks(&id).await;
+                let cancelled_hooks = this.ports.runtime().cancel_workspace_hooks(&this, &id).await;
                 // Cancel every ACTIVE PR monitor the same way
                 // (intent-hq/monorepo#1828): state persisted to `cancelled`,
                 // `prMonitor:cancelled` emitted, silently per monitor.
@@ -29332,7 +29331,7 @@ impl WorkspaceApi for Services {
                         token.as_deref(),
                     )
                     .map_err(|e| {
-                        host_execution::git_error(
+                        execution_call::git_error(
                             e,
                             intent_git::remote::origin_url(&worktree)
                                 .ok()
@@ -29408,7 +29407,7 @@ impl WorkspaceApi for Services {
                         })?;
                     intent_git::fetch::fetch(&worktree, "origin", &branch, token.as_deref())
                         .map_err(|e| {
-                            host_execution::git_error(
+                            execution_call::git_error(
                                 e,
                                 intent_git::remote::origin_url(&worktree)
                                     .ok()
@@ -29706,7 +29705,7 @@ impl WorkspaceApi for Services {
                     let origin = intent_git::remote::origin_url(std::path::Path::new(&repo_path))
                         .ok()
                         .flatten();
-                    match host_execution::git_error(error, origin.as_deref()) {
+                    match execution_call::git_error(error, origin.as_deref()) {
                         Error::GitAuthorization(message) => intent_core::GitPullResult {
                             ok: false,
                             error: Some(message),
@@ -29788,7 +29787,7 @@ impl WorkspaceApi for Services {
             let spawn_target = target.clone();
             let _ = self
                 .store_tasks
-                .spawn_draining(host_execution::background_execution(
+                .spawn_draining(execution_call::background_execution(
                     self.clone(),
                     None,
                     async move {
@@ -29807,7 +29806,7 @@ impl WorkspaceApi for Services {
                         })
                         .await;
                         if let Err(failure) = result {
-                            let _ = host_execution::git_error(
+                            let _ = execution_call::git_error(
                                 Error::CloneFailed {
                                     category: failure
                                         .category
@@ -29958,7 +29957,7 @@ impl WorkspaceApi for Services {
             // serializes behind this ensure on the per-repo cache lock.
             let task_owner = owner.clone();
             let task_repo = repo.clone();
-            let _ = self.store_tasks.spawn_draining(host_execution::background_execution(
+            let _ = self.store_tasks.spawn_draining(execution_call::background_execution(
                 self.clone(),
                 None,
                 async move {
@@ -29980,7 +29979,7 @@ impl WorkspaceApi for Services {
                             "opportunistic repo cache warm completed"
                         ),
                         Err(e) => {
-                            let error = host_execution::git_error(e, Some(&url));
+                            let error = execution_call::git_error(e, Some(&url));
                             tracing::warn!(owner = %task_owner, repo = %task_repo, error = %error,
                             "opportunistic repo cache warm failed");
                         }
@@ -35829,7 +35828,7 @@ impl Services {
     /// after the workspace is Active again, and its wording says so.
     ///
     /// The per-item cancels were DEFERRED
-    /// ([`crate::hook_manager::CancelSettlement::Deferred`]): none ran the
+    /// ([`crate::feature_ports::CancelSettlement::Deferred`]): none ran the
     /// deferral backstop, so this tail runs
     /// [`Services::redeliver_completion_after_queue_mutation`] once per
     /// owner AFTER queueing its wake — on delivery failure too. Ordering is
@@ -38154,6 +38153,42 @@ pub(crate) mod setup_scripts {
             assert_eq!(s.script, "echo hi");
         }
     }
+}
+
+/// Per-note cap on the image URLs listed in a by-reference note notice; the
+/// rest are counted, and stay discoverable in the note content.
+const MAX_NOTE_REFERENCE_IMAGE_URLS: usize = 50;
+
+/// One `noteIds` entry resolved for by-reference prompt context
+/// ([`Services::load_note_references`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NoteReference {
+    pub id: String,
+    pub title: String,
+    /// Distinct in-workspace `workspace-asset://` image URLs, document order.
+    pub image_urls: Vec<String>,
+    /// Distinct image URLs beyond [`MAX_NOTE_REFERENCE_IMAGE_URLS`].
+    pub omitted: usize,
+}
+
+/// The `workspace-asset://` URL a markdown image target names, when it is an
+/// asset in this workspace (`prefix` = `workspace-asset://<workspaceId>/`).
+/// The target is a `CommonMark` destination plus optional title, so only the
+/// first whitespace-separated token (minus `<…>`) is the URL; anything whose
+/// asset id is not a plain file name is rejected rather than echoed into
+/// the prompt.
+fn note_asset_url(target: &str, prefix: &str) -> Option<String> {
+    let destination = target.split_whitespace().next()?;
+    let destination = destination
+        .strip_prefix('<')
+        .and_then(|d| d.strip_suffix('>'))
+        .unwrap_or(destination);
+    let asset_id = destination.strip_prefix(prefix)?;
+    let plain = !asset_id.is_empty()
+        && asset_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~' | '%'));
+    plain.then(|| destination.to_string())
 }
 
 /// Iterate `![alt](url)` matches in `content` (markdown image syntax) and

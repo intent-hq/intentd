@@ -463,6 +463,8 @@ const core = { info: message => logs.push(message), setOutput: (name, value) => 
 const context = { repo: { owner: 'intent-hq', repo: 'intentd' }, runId: 99, eventName: fixture.eventName || 'push', payload: fixture.payload || {} };
 process.env.THRESHOLD = '2';
 process.env.XL_THRESHOLD = fixture.xlThreshold || '';
+// The fleet's configured bigmem limit; pass '' for the unset default (0).
+process.env.BIGMEM_THRESHOLD = fixture.bigmemThreshold ?? '2';
 process.env.LINUX_SIZE = '16';
 process.env.WINDOWS_RUNNER_DISABLED = fixture.windowsDisabled || '';
 process.env.MACOS_RUNNER_DISABLED = fixture.macosDisabled || '';
@@ -537,9 +539,17 @@ def runner(platform="macOS", arch="ARM64", *, status="online", busy=False, extra
 CACHE = ["self-hosted", "linux", "x64", "intent-cache"]
 SMALL = ["self-hosted", "linux", "x64", "intent-cache-small"]
 XL = ["self-hosted", "linux", "x64", "intent-cache-xl"]
+# Heavy slots with 30 GB or more also carry `intent-cache-bigmem`; gh-linux-16x
+# jobs overflow from xl only to these.
+BIG = ["self-hosted", "linux", "x64", "intent-cache", "intent-cache-bigmem"]
 
 
 def slot(**kwargs):
+    return runner("Linux", "X64", extra=("intent-cache", "intent-cache-bigmem"), **kwargs)
+
+
+def small_heavy_slot(**kwargs):
+    # A 12 GB heavy slot (intent-ci3): 8-core jobs only.
     return runner("Linux", "X64", extra=("intent-cache",), **kwargs)
 
 
@@ -618,9 +628,11 @@ class RunnerAvailabilityTests(unittest.TestCase):
                 result = self.assert_mac_route({"org": fleet, "jobs": jobs, "queueErrors": queue_errors},
                                               ["warp-macos-26-arm64-12x"] if queue_errors else ["self-hosted", "macOS", "ARM64"])
                 outputs = result["outputs"]
-                self.assertEqual(json.loads(outputs["linux_labels"]), ["warp-ubuntu-2404-x64-16x"] if linux_burst else CACHE)
+                # Both slots are busy, so 16-core work has no idle bigmem runner and bursts;
+                # 8-core work keeps the heavy pool's queue semantics.
+                self.assertEqual(json.loads(outputs["linux_labels"]), ["warp-ubuntu-2404-x64-16x"])
                 self.assertEqual(json.loads(outputs["check_labels"]), ["warp-ubuntu-2404-x64-8x"] if linux_burst else CACHE)
-                self.assertEqual(outputs["linux_burst"], str(linux_burst).lower())
+                self.assertEqual(outputs["linux_burst"], "true")
                 self.assertEqual(json.loads(outputs["windows_labels"]), ["warp-windows-2022-x64-16x"] if queue_errors else ["self-hosted", "Windows", "X64"])
                 self.assertEqual(outputs["windows_burst"], str(bool(queue_errors)).lower())
         for fixture in ({}, {"orgError": "403", "repoError": "403"},
@@ -651,13 +663,13 @@ class RunnerAvailabilityTests(unittest.TestCase):
                     # The one free heavy slot goes to `coverage-changed` on a PR (it ranks
                     # above check); the queue lists no heavy job. check bursts to its 16x WarpBuild runner.
                     self.assertEqual(slots["check"], ["warp-ubuntu-2404-x64-16x"])
-                    self.assertEqual(slots["coverage-changed"], CACHE if event == "pull_request" and idle else ["warp-ubuntu-2404-x64-16x"])
+                    self.assertEqual(slots["coverage-changed"], BIG if event == "pull_request" and idle else ["warp-ubuntu-2404-x64-16x"])
                     # Free standard labels never take a self-hosted slot, even an idle one.
                     self.assertEqual(slots["release-scripts"], ["ubuntu-24.04"])
                     # Unlisted heavy jobs only get a slot that is still free after the listed ones.
                     unlisted = hosted or event == "pull_request"
                     self.assertEqual(json.loads(outputs["linux_labels"]),
-                                     ["warp-ubuntu-2404-x64-16x"] if unlisted else CACHE)
+                                     ["warp-ubuntu-2404-x64-16x"] if unlisted else BIG)
                     self.assertEqual(json.loads(outputs["check_labels"]),
                                      ["warp-ubuntu-2404-x64-8x"] if unlisted else CACHE)
                     self.assertEqual(outputs["linux_burst"], str(unlisted).lower())
@@ -752,7 +764,7 @@ class RunnerAvailabilityTests(unittest.TestCase):
                 result = run_route(self.workflow, org=[slot(), slot()], eventName="pull_request",
                                    payload=same_repo, jobs=[busy] * (2 - free))
                 slots = json.loads(result["outputs"]["slots"])
-                self.assertEqual(sorted(k for k, v in slots.items() if v == CACHE), expected)
+                self.assertEqual(sorted(k for k, v in slots.items() if v == BIG), expected)
         result = run_route(self.workflow, org=[slot(), slot()], eventName="pull_request",
                            payload=same_repo, linuxDisabled="true")
         # The kill switch sends every listed job to its hosted label.
@@ -764,18 +776,18 @@ class RunnerAvailabilityTests(unittest.TestCase):
     def test_pr_check_takes_an_xl_slot_only_after_coverage_changed(self):
         # Two xl slots (intent-ci1 and intent-ci2) and two heavy slots online.
         # coverage-changed (15.5 min on xl, ~33 on heavy) always picks first;
-        # check takes what is left: xl, then heavy, then a 16x burst.
+        # check takes what is left: xl, then a bigmem heavy slot, then a 16x burst.
         same_repo = {"pull_request": {"head": {"repo": {"full_name": "intent-hq/intentd"}}}}
         fleet = [xl_slot(), xl_slot(), slot(), slot()]
         def busy(labels):
             return {"status": "in_progress", "labels": labels, "created_at": "2099-01-01T00:00:00Z"}
         for xl_free, heavy_free, coverage, check in (
                 (2, 2, XL, XL),
-                (1, 2, XL, CACHE),
-                (0, 2, CACHE, CACHE),
+                (1, 2, XL, BIG),
+                (0, 2, BIG, BIG),
                 # Both xl slots busy, one heavy slot free: coverage-changed takes
-                # the heavy slot and check bursts.
-                (0, 1, CACHE, ["warp-ubuntu-2404-x64-16x"]),
+                # the bigmem slot and check bursts.
+                (0, 1, BIG, ["warp-ubuntu-2404-x64-16x"]),
                 (0, 0, ["warp-ubuntu-2404-x64-16x"], ["warp-ubuntu-2404-x64-16x"])):
             with self.subTest(xl_free=xl_free, heavy_free=heavy_free):
                 jobs = [busy(XL)] * (2 - xl_free) + [busy(CACHE)] * (2 - heavy_free)
@@ -786,6 +798,31 @@ class RunnerAvailabilityTests(unittest.TestCase):
         # In the merge queue check is unlisted for the event and bursts at 16x.
         result = run_route(self.workflow, org=fleet, eventName="merge_group", xlThreshold="2")
         self.assertEqual(json.loads(result["outputs"]["slots"])["check"], ["warp-ubuntu-2404-x64-16x"])
+
+    def test_16_core_jobs_never_overflow_to_small_heavy_slots(self):
+        # intent-ci3's 12 GB heavy slots OOM-killed check and coverage-changed
+        # (one rustc passed 12 GB) when both xl slots were busy.
+        same_repo = {"pull_request": {"head": {"repo": {"full_name": "intent-hq/intentd"}}}}
+        busy_xl = {"status": "in_progress", "labels": XL, "created_at": "2099-01-01T00:00:00Z"}
+        fleet = [xl_slot(), xl_slot()] + [small_heavy_slot() for _ in range(4)]
+        for event in ("pull_request", "merge_group"):
+            with self.subTest(event=event):
+                result = run_route(self.workflow, org=fleet, eventName=event, payload=same_repo if event == "pull_request" else {},
+                                   jobs=[busy_xl] * 2, xlThreshold="2")
+                slots = json.loads(result["outputs"]["slots"])
+                for key in ("check", "coverage-changed", "coverage-all", "coverage-e2e", "daemon-lifecycle-linux"):
+                    self.assertEqual(slots[key], ["warp-ubuntu-2404-x64-16x"], key)
+                self.assertEqual(json.loads(result["outputs"]["linux_labels"]), ["warp-ubuntu-2404-x64-16x"])
+                # 8-core work still uses the small heavy slots.
+                self.assertEqual(json.loads(result["outputs"]["check_labels"]), CACHE)
+        # With CI_LINUX_BIGMEM_SLOTS unset, 16-core overflow bursts even with bigmem slots online.
+        result = run_route(self.workflow, org=[xl_slot(), slot(), slot()], eventName="pull_request", payload=same_repo,
+                           jobs=[busy_xl], xlThreshold="1", bigmemThreshold="")
+        slots = json.loads(result["outputs"]["slots"])
+        self.assertEqual((slots["coverage-changed"], slots["check"]), (["warp-ubuntu-2404-x64-16x"],) * 2)
+        step = next(s for s in self.workflow["jobs"]["route"]["steps"] if s.get("id") == "decide")
+        self.assertEqual(step["env"].get("BIGMEM_THRESHOLD"), "${{ env.LINUX_BIGMEM_BURST_THRESHOLD }}")
+        self.assertEqual(self.workflow["env"]["LINUX_BIGMEM_BURST_THRESHOLD"], "${{ vars.CI_LINUX_BIGMEM_SLOTS || '0' }}")
 
     def test_windows_bursts_without_explicit_idle_capacity(self):
         missing_busy = runner("Windows", "X64")
@@ -813,7 +850,7 @@ class RunnerAvailabilityTests(unittest.TestCase):
                 self.assertEqual(json.loads(outputs["windows_labels"]),
                                  ["warp-windows-2022-x64-16x"] if disabled == "true" else ["self-hosted", "Windows", "X64"])
                 self.assertEqual(outputs["windows_burst"], str(disabled == "true").lower())
-                self.assertEqual(json.loads(outputs["linux_labels"]), CACHE)
+                self.assertEqual(json.loads(outputs["linux_labels"]), BIG)
                 self.assertEqual(json.loads(outputs["macos_labels"]), ["self-hosted", "macOS", "ARM64"])
 
     def test_linux_maintenance_override_preserves_native_runner_preferences(self):
@@ -822,7 +859,7 @@ class RunnerAvailabilityTests(unittest.TestCase):
             with self.subTest(disabled=disabled):
                 outputs = run_route(self.workflow, org=fleet, linuxDisabled=disabled)["outputs"]
                 self.assertEqual(json.loads(outputs["linux_labels"]),
-                                 ["warp-ubuntu-2404-x64-16x"] if disabled == "true" else CACHE)
+                                 ["warp-ubuntu-2404-x64-16x"] if disabled == "true" else BIG)
                 self.assertEqual(json.loads(outputs["check_labels"]),
                                  ["warp-ubuntu-2404-x64-8x"] if disabled == "true" else CACHE)
                 self.assertEqual(outputs["linux_burst"], str(disabled == "true").lower())
@@ -839,7 +876,7 @@ class RunnerAvailabilityTests(unittest.TestCase):
                 self.assertEqual(json.loads(outputs["macos_labels"]),
                                  ["warp-macos-26-arm64-12x"] if disabled == "true" else ["self-hosted", "macOS", "ARM64"])
                 self.assertEqual(outputs["macos_burst"], str(disabled == "true").lower())
-                self.assertEqual(json.loads(outputs["linux_labels"]), CACHE)
+                self.assertEqual(json.loads(outputs["linux_labels"]), BIG)
                 self.assertEqual(json.loads(outputs["windows_labels"]), ["self-hosted", "Windows", "X64"])
         step = next(s for s in self.workflow["jobs"]["route"]["steps"] if s.get("id") == "decide")
         self.assertEqual(step["env"].get("MACOS_RUNNER_DISABLED"), "${{ vars.CI_MACOS_RUNNER_DISABLED }}")

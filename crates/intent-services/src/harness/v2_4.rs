@@ -177,8 +177,14 @@ impl Harness for V2_4 {
         V1.empty_wake_attention_reason()
     }
 
-    fn note_images_notice(&self, n: usize) -> String {
-        V1.note_images_notice(n)
+    fn note_reference_notice(
+        &self,
+        title: &str,
+        id: &str,
+        image_urls: &[String],
+        omitted: usize,
+    ) -> String {
+        V1.note_reference_notice(title, id, image_urls, omitted)
     }
 
     fn attachment_reference_notice(

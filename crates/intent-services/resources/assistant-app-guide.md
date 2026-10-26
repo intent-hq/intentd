@@ -197,16 +197,21 @@ the original configuration is **Codex · Default**. Each profile has its own **F
 mode** (Claude Code) or **Service Tier** (Codex) in its ⋯ menu; it starts off and
 never follows the Default setting. Delegated agents follow their
 explicit, specialist, or default selection, never the parent's profile.
-When the app offers **Environment variables** in the Codex or Claude Code ⋯
-menu, use it to rename the original configuration or give it its own environment
+In app versions with a pinned Default profile, a provider with profiles lists its
+original configuration first, where backups start from. It cannot be moved, and
+shows its name with a **Default** badge once renamed. When offered, choose **Edit**
+in that profile's ⋯ menu, or **Environment variables** in the Codex or Claude Code
+⋯ menu, to rename the original configuration or give it its own environment
 variables (same rules as a profile, without the backup switch); a blank name
-restores **Default**. Older app versions may not offer this control.
+restores **Default**. Older app versions may not show this row or either editing
+control; check availability before directing users to them. Settings → Providers
+does not mark the app's default model or provider; use **Default model** for that.
 
 **Backup profiles.** These controls require matching app and daemon support.
 Older apps may support provider profiles without profile ordering or backup
 controls; check availability before directing users to them. In supporting apps,
-drag a profile in **Settings → Providers**, or focus its handle and use the Up and
-Down arrow keys, to set its order. Turn on **Use as backup
+drag a named profile in **Settings → Providers**, or focus its handle and use the
+Up and Down arrow keys, to set its order below the Default profile. Turn on **Use as backup
 provider** in the profile dialog; backup profiles show a **Backup** badge. When a
 conversation's current Codex or Claude Code configuration runs out of quota, the turn
 continues on the next backup of the same provider in saved order, with the same

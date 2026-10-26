@@ -193,7 +193,11 @@ impl Services {
         // Stop every running script and refuse new launches until the folder
         // is gone, so nothing writes into the checkout being removed. After
         // the flip below, `script.start` is refused by the retired guard.
-        let scripts_closed = self.script_manager().close_workspace(&id).await;
+        let scripts_closed = self
+            .ports
+            .runtime()
+            .close_workspace_scripts(self, &id)
+            .await;
         // A Retired workspace must hold no live or admitted script (the
         // script admission guards rely on it): if any could not be stopped
         // and settled, abort before the flip. Dropping the guard releases

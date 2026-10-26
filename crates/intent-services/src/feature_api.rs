@@ -124,11 +124,6 @@ pub mod nested_repos {
     pub use crate::nested_repos::{is_dirty, nested_repo_dirs, stage_all_skipping_nested};
 }
 
-/// The script manager.
-pub mod script_ops {
-    pub use crate::script_ops::ScriptManager;
-}
-
 /// Private `Services` state a feature reads, exposed as accessors so the
 /// fields themselves stay private.
 impl Services {
@@ -165,7 +160,7 @@ impl Services {
     #[doc(hidden)]
     #[must_use]
     pub fn feature_script_monitor_lane(&self) -> &tokio::sync::Mutex<()> {
-        &self.runtime().script_locks.monitor_lane
+        self.ports.runtime().script_monitor_lane(self)
     }
 
     /// Per-workspace setup state.

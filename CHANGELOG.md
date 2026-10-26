@@ -2,6 +2,38 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.54] - 2026-10-26
+
+### 🐛 Bug Fixes
+
+- *(agent)* Attach context notes by reference instead of inlining images ([#2710](https://github.com/intent-hq/intentd/pull/2710))
+
+### 🔧 Refactor
+
+- *(services)* Cut remaining lifecycle references into runtime ([#2714](https://github.com/intent-hq/intentd/pull/2714))
+
+
+## [0.11.53] - 2026-10-26
+
+### 🔧 Refactor
+
+- *(services)* Cut agent-side inbound references into runtime ([#2712](https://github.com/intent-hq/intentd/pull/2712))
+
+
+## [0.11.52] - 2026-10-26
+
+### 🔧 Refactor
+
+- *(services)* Add an agent-wake port for runtime ([#2707](https://github.com/intent-hq/intentd/pull/2707))
+
+
+## [0.11.51] - 2026-10-26
+
+### 🔧 Refactor
+
+- *(core)* Build Workspace rows with a shared Default ([#2699](https://github.com/intent-hq/intentd/pull/2699))
+
+
 ## [0.11.50] - 2026-10-26
 
 ### 🚀 Features
