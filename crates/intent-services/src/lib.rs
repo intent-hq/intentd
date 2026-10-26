@@ -47,7 +47,7 @@ use intent_core::{
     WorkspaceGitRootId, WorkspaceId, WorkspaceSetupState, WorkspaceSetupStatus, WorkspaceStatus,
     WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
 };
-use intent_core::{AgentReverseDispatch, ReverseDispatchError, ReverseLiveClient};
+use intent_core::{AgentReverseDispatch, ReverseLiveClient};
 use intent_store::{EventQuery, NewEvent, NoteWriteLock, Store};
 
 pub use intent_core::{Error, Result, WorkspaceApi};
@@ -4983,7 +4983,7 @@ impl Services {
         } else {
             self.store.workspace_browser_client(id).await?
         };
-        let target = self.driving_client_target(id).await?;
+        let target = self.ports.runtime().driving_client_target(self, id).await?;
         let resolved = self
             .reverse_dispatch
             .as_ref()
@@ -9949,7 +9949,7 @@ impl Services {
     ) -> bool {
         // Check retry count (cap at 2 bounces)
         const MAX_RETRIES: i64 = 2;
-        use crate::sandbox_ops::{merge_sandbox, MergeOutcome};
+        use crate::feature_ports::MergeOutcome;
         use intent_store::SandboxStatus;
 
         // Load sandbox record
@@ -10015,7 +10015,12 @@ impl Services {
         }
 
         // Attempt merge
-        let outcome = match merge_sandbox(&self.store, workspace_id, agent_id).await {
+        let outcome = match self
+            .ports
+            .runtime()
+            .merge_sandbox(self, workspace_id, agent_id)
+            .await
+        {
             Ok(outcome) => outcome,
             Err(e) => {
                 tracing::error!(
@@ -10292,8 +10297,11 @@ impl Services {
             }
         }
 
-        if let Err(e) =
-            crate::sandbox_ops::discard_sandbox(&self.store, workspace_id, agent_id).await
+        if let Err(e) = self
+            .ports
+            .runtime()
+            .discard_sandbox(self, workspace_id, agent_id)
+            .await
         {
             tracing::warn!(
                 agent = %agent_id.0,
@@ -10435,7 +10443,7 @@ impl Services {
     }
 
     async fn sweep_merge_pending_sandboxes_owned(&self) -> MergeSweepSummary {
-        use crate::sandbox_ops::{merge_sandbox, MergeOutcome};
+        use crate::feature_ports::MergeOutcome;
         use intent_store::SandboxStatus;
 
         let mut summary = MergeSweepSummary::default();
@@ -10520,7 +10528,12 @@ impl Services {
                 }
             }
 
-            match merge_sandbox(&self.store, &workspace_id, &agent_id).await {
+            match self
+                .ports
+                .runtime()
+                .merge_sandbox(self, &workspace_id, &agent_id)
+                .await
+            {
                 Ok(MergeOutcome::Merged {
                     commit_range,
                     canonical_head,
@@ -20231,135 +20244,6 @@ impl WorkspaceApi for Services {
         })
     }
 
-    fn terminal_create(
-        &self,
-        workspace_id: WorkspaceId,
-        cols: u16,
-        rows: u16,
-        cwd: Option<String>,
-        command: Option<String>,
-        env: Option<std::collections::BTreeMap<String, String>>,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let pty = self.pty.clone();
-        let bus = self.event_bus.clone();
-        let store = self.store.clone();
-        let settings = self.settings_registry.clone();
-        Box::pin(async move {
-            // Workspace terminals use the host owner's execution setup.
-            self.require_workspace_manager(&workspace_id, "terminal.create")
-                .await?;
-            // Management admission also permits deletion retries for missing
-            // workspaces; a member must not spawn an unmanageable terminal there.
-            self.require_member(&workspace_id).await?;
-            // Held from the retired check through the spawn: retire flips
-            // the row and sweeps the workspace's PTYs under the same fence,
-            // so a create admitted before the flip finishes spawning before
-            // the sweep lists terminals, and one after it is refused.
-            let _archive = self.archive_fence.acquire(&workspace_id).await;
-            self.refuse_if_retired(&workspace_id).await?;
-            terminal_ops::create_owned(
-                &self.terminal_tasks,
-                pty,
-                bus,
-                Some(store),
-                settings,
-                workspace_id,
-                cols,
-                rows,
-                cwd,
-                command,
-                env,
-            )
-            .await
-        })
-    }
-
-    fn terminal_write(
-        &self,
-        terminal_id: String,
-        data: String,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let pty = self.pty.clone();
-        Box::pin(async move {
-            // Resolve the terminal's actual workspace before authorizing it.
-            self.require_terminal_manager(&terminal_id, "terminal.write")
-                .await?;
-            self.refuse_terminal_if_retired(&terminal_id).await?;
-            terminal_ops::write(&pty, &terminal_id, &data)
-        })
-    }
-
-    fn terminal_resize(
-        &self,
-        terminal_id: String,
-        cols: u16,
-        rows: u16,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let pty = self.pty.clone();
-        Box::pin(async move {
-            self.require_terminal_manager(&terminal_id, "terminal.resize")
-                .await?;
-            self.refuse_terminal_if_retired(&terminal_id).await?;
-            terminal_ops::resize(&pty, &terminal_id, cols, rows)
-        })
-    }
-
-    fn terminal_kill(&self, terminal_id: String) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let pty = self.pty.clone();
-        Box::pin(async move {
-            self.require_terminal_manager(&terminal_id, "terminal.kill")
-                .await?;
-            self.refuse_terminal_if_retired(&terminal_id).await?;
-            terminal_ops::kill(&pty, &terminal_id).await
-        })
-    }
-
-    fn terminal_get_buffer(
-        &self,
-        terminal_id: String,
-        max_bytes: Option<i64>,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let pty = self.pty.clone();
-        Box::pin(async move {
-            self.require_terminal_manager(&terminal_id, "terminal.getBuffer")
-                .await?;
-            terminal_ops::get_buffer(&pty, &terminal_id, max_bytes)
-        })
-    }
-
-    fn terminal_list(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let pty = self.pty.clone();
-        let boot_id = pty.daemon_boot_id().to_string();
-        Box::pin(async move {
-            self.require_workspace_manager(&workspace_id, "terminal.list")
-                .await?;
-            terminal_ops::list(&pty, &workspace_id, &boot_id)
-        })
-    }
-
-    fn terminal_read_output(
-        &self,
-        workspace_id: WorkspaceId,
-        terminal_id: String,
-        max_lines: Option<i64>,
-        paginate: Option<bool>,
-        page_token: Option<String>,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let pty = self.pty.clone();
-        Box::pin(async move {
-            self.require_workspace_manager(&workspace_id, "terminal.readOutput")
-                .await?;
-            terminal_ops::read_output(
-                &pty,
-                &workspace_id,
-                &terminal_id,
-                max_lines,
-                paginate.unwrap_or(false),
-                page_token.as_ref(),
-            )
-        })
-    }
-
     fn file_read(
         &self,
         workspace_id: WorkspaceId,
@@ -21176,6 +21060,93 @@ impl WorkspaceApi for Services {
             ) -> BoxFuture<'_, Result<serde_json::Value>> => hook_cancel;
             fn hook_run_now(&self, workspace_id: WorkspaceId, hook_id: intent_core::HookId)
                 -> BoxFuture<'_, Result<serde_json::Value>> => hook_run_now;
+            fn terminal_create(
+                &self,
+                workspace_id: WorkspaceId,
+                cols: u16,
+                rows: u16,
+                cwd: Option<String>,
+                command: Option<String>,
+                env: Option<std::collections::BTreeMap<String, String>>,
+            ) -> BoxFuture<'_, Result<serde_json::Value>> => terminal_create;
+            fn terminal_write(
+                &self,
+                terminal_id: String,
+                data: String,
+            ) -> BoxFuture<'_, Result<serde_json::Value>> => terminal_write;
+            fn terminal_resize(
+                &self,
+                terminal_id: String,
+                cols: u16,
+                rows: u16,
+            ) -> BoxFuture<'_, Result<serde_json::Value>> => terminal_resize;
+            fn terminal_kill(
+                &self,
+                terminal_id: String,
+            ) -> BoxFuture<'_, Result<serde_json::Value>> => terminal_kill;
+            fn terminal_get_buffer(
+                &self,
+                terminal_id: String,
+                max_bytes: Option<i64>,
+            ) -> BoxFuture<'_, Result<serde_json::Value>> => terminal_get_buffer;
+            fn terminal_list(
+                &self,
+                workspace_id: WorkspaceId,
+            ) -> BoxFuture<'_, Result<serde_json::Value>> => terminal_list;
+            fn terminal_read_output(
+                &self,
+                workspace_id: WorkspaceId,
+                terminal_id: String,
+                max_lines: Option<i64>,
+                paginate: Option<bool>,
+                page_token: Option<String>,
+            ) -> BoxFuture<'_, Result<serde_json::Value>> => terminal_read_output;
+            fn browser_list_tabs(
+                &self,
+                workspace_id: WorkspaceId,
+            ) -> BoxFuture<'_, Result<Vec<intent_core::BrowserTab>>> => browser_list_tabs;
+            fn browser_upsert_tab(
+                &self,
+                host: ClientId,
+                tab: intent_core::BrowserTabInput,
+            ) -> BoxFuture<'_, Result<intent_core::BrowserTab>> => browser_upsert_tab;
+            fn browser_remove_tab(
+                &self,
+                host: ClientId,
+                tab_id: String,
+            ) -> BoxFuture<'_, Result<()>> => browser_remove_tab;
+            fn browser_sync_tabs(
+                &self,
+                host: ClientId,
+                tabs: Vec<intent_core::BrowserTabInput>,
+            ) -> BoxFuture<'_, Result<Vec<String>>> => browser_sync_tabs;
+            fn browser_exec(
+                &self,
+                workspace_id: WorkspaceId,
+                actions: Vec<serde_json::Value>,
+                tab_id: Option<String>,
+                agent_id: Option<AgentId>,
+            ) -> BoxFuture<'_, Result<serde_json::Value>> => browser_exec;
+            fn browser_navigate_tab(
+                &self,
+                tab_id: String,
+                url: String,
+            ) -> BoxFuture<'_, Result<serde_json::Value>> => browser_navigate_tab;
+            fn browser_close_tab(
+                &self,
+                tab_id: String,
+                force: bool,
+            ) -> BoxFuture<'_, Result<serde_json::Value>> => browser_close_tab;
+            fn sandbox_merge(
+                &self,
+                workspace_id: WorkspaceId,
+                sandbox_id: AgentId,
+            ) -> BoxFuture<'_, Result<serde_json::Value>> => sandbox_merge;
+            fn sandbox_discard(
+                &self,
+                workspace_id: WorkspaceId,
+                sandbox_id: AgentId,
+            ) -> BoxFuture<'_, Result<serde_json::Value>> => sandbox_discard;
         }
     }
 
@@ -23481,7 +23452,6 @@ impl WorkspaceApi for Services {
                     // on every terminal path of the setup stage. Idempotent replays
                     // publish nothing (same as `workspace:created`).
                     if let Some(checkout) = &native_checkout { checkout.current().await?; }
-                    let pty_for_setup = self.pty.clone();
                     let bus_for_setup = self.event_bus.clone();
                     let setup_states = self.workspace_setup_states.clone();
                     if let (Some(worktree_path_buf), Some(script)) =
@@ -23490,21 +23460,24 @@ impl WorkspaceApi for Services {
                         // Spawn background task to execute the setup script (fire-and-forget).
                         let workspace_id = ws.id.clone();
                         let worktree_path = worktree_path_buf.to_string_lossy().to_string();
-                        let repo_path = ws
-                            .repository_path
-                            .clone()
-                            .unwrap_or_default();
-                        let branch_name = ws.branch.clone();
-                        let source_branch = ws
-                            .base_ref
-                            .clone()
-                            .unwrap_or_default();
-                        let worktree_for_read = worktree_path_buf.clone();
-                        let terminal_tasks = self.terminal_tasks.clone();
+                        let script_length = script.len();
+                        // The runtime runs the script in the "Setup" terminal;
+                        // nothing happens until the task below polls it.
+                        let run_setup = self.ports.runtime().run_setup_script(
+                            self,
+                            feature_ports::SetupScriptRun {
+                                workspace_id: workspace_id.clone(),
+                                worktree: worktree_path_buf,
+                                script,
+                                repo_path: ws.repository_path.clone().unwrap_or_default(),
+                                branch_name: ws.branch.clone(),
+                                source_branch: ws.base_ref.clone().unwrap_or_default(),
+                            },
+                        );
                         let _ = self.store_tasks.spawn_draining(async move {
                             tracing::info!(
                                 workspace = %workspace_id.as_str(),
-                                script_length = script.len(),
+                                script_length,
                                 worktree = %worktree_path,
                                 "executing setup script in background"
                             );
@@ -23517,164 +23490,7 @@ impl WorkspaceApi for Services {
                             .await;
                             // Every terminal path below funnels into exactly one
                             // `workspace:setup:completed` publish after this block.
-                            let (ran_script, exit_code): (bool, Option<u32>) = 'setup: {
-                            // Write script to a private file under worktree .intent/ directory
-                            // (mode 0600 on Unix, safe from other users, isolated from /tmp races).
-                            let script_id = uuid::Uuid::new_v4();
-                            let intent_dir = worktree_for_read.join(".intent");
-                            // Security: refuse if .intent exists as a symlink (prevents writing
-                            // script outside the worktree via a repo-committed symlink attack).
-                            if let Ok(meta) = tokio::fs::symlink_metadata(&intent_dir).await {
-                                if !meta.is_dir() {
-                                    tracing::warn!(
-                                        workspace = %workspace_id.as_str(),
-                                        "setup script execution skipped: .intent is not a real directory (symlink or file)"
-                                    );
-                                    break 'setup (false, None);
-                                }
-                            } else {
-                                // .intent doesn't exist, create it with restrictive permissions
-                                if let Err(e) = tokio::fs::create_dir_all(&intent_dir).await {
-                                    tracing::warn!(
-                                        workspace = %workspace_id.as_str(),
-                                        error = %e,
-                                        "failed to create .intent directory for setup script"
-                                    );
-                                    break 'setup (false, None);
-                                }
-                                #[cfg(unix)]
-                                {
-                                    use std::os::unix::fs::PermissionsExt;
-                                    if let Err(e) = tokio::fs::set_permissions(
-                                        &intent_dir,
-                                        std::fs::Permissions::from_mode(0o700),
-                                    )
-                                    .await
-                                    {
-                                        tracing::warn!(
-                                            workspace = %workspace_id.as_str(),
-                                            error = %e,
-                                            "failed to set .intent directory permissions"
-                                        );
-                                    }
-                                }
-                            }
-                            // Select the platform runner: POSIX always spawns
-                            // absolute /bin/sh + the inline timing wrapper
-                            // (byte-identical to the historic spawn); Windows
-                            // prefers a discovered Git-for-Windows sh.exe
-                            // running the same wrapper (so bash setup scripts
-                            // keep working), else falls back to a cmd.exe
-                            // `.cmd` wrapper with the same summary format.
-                            let runner = setup_runner::select(
-                                cfg!(windows),
-                                if cfg!(windows) {
-                                    setup_runner::find_windows_sh()
-                                } else {
-                                    None
-                                },
-                            );
-                            let script_path = intent_dir.join(format!(
-                                "setup-{}.{}",
-                                script_id.simple(),
-                                runner.script_extension()
-                            ));
-                            if let Err(e) = write_private_script(&script_path, &script).await {
-                                tracing::warn!(
-                                    workspace = %workspace_id.as_str(),
-                                    error = %e,
-                                    "failed to write setup script to private file"
-                                );
-                                break 'setup (false, None);
-                            }
-                            // cmd.exe fallback only: the timing wrapper is a
-                            // sibling .cmd file rather than an inline `-c`
-                            // string (cmd has no equivalent of `sh -c`).
-                            let wrapper_path = if runner.needs_cmd_wrapper_file() {
-                                let p = intent_dir
-                                    .join(format!("setup-wrapper-{}.cmd", script_id.simple()));
-                                if let Err(e) =
-                                    write_private_script(&p, setup_runner::SETUP_SCRIPT_WRAPPER_CMD)
-                                        .await
-                                {
-                                    tracing::warn!(
-                                        workspace = %workspace_id.as_str(),
-                                        error = %e,
-                                        "failed to write setup script cmd wrapper"
-                                    );
-                                    let _ = tokio::fs::remove_file(&script_path).await;
-                                    break 'setup (false, None);
-                                }
-                                Some(p)
-                            } else {
-                                None
-                            };
-                            // Spawn through the timing wrapper so the scrollback
-                            // ends with a completion summary and the script's
-                            // exit code is preserved. `extra_env` carries the
-                            // cmd.exe fallback's script path (see
-                            // `SetupScriptRunner::command`); empty otherwise.
-                            let (program, args, extra_env) =
-                                runner.command(&script_path, wrapper_path.as_deref());
-                            let mut spec =
-                                intent_pty::SpawnSpec::new(workspace_id.as_str(), program);
-                            spec.args = args;
-                            spec.size = intent_pty::PtySize { rows: 24, cols: 80 };
-                            spec.name = Some(SETUP_TERMINAL_NAME.to_string());
-                            spec.cwd = Some(worktree_for_read.clone());
-                            spec.env = vec![
-                                ("MAIN_CHECKOUT".to_string(), repo_path),
-                                ("WORKTREE_PATH".to_string(), worktree_path.clone()),
-                                ("BRANCH_NAME".to_string(), branch_name),
-                                ("SOURCE_BRANCH".to_string(), source_branch),
-                            ];
-                            spec.env.extend(extra_env);
-                            match pty_for_setup.spawn(spec) {
-                                Ok(pty_id) => {
-                                    let terminal_id = pty_id.to_string();
-                                    tracing::info!(
-                                        workspace = %workspace_id.as_str(),
-                                        terminal_id = %terminal_id,
-                                        "setup script terminal spawned"
-                                    );
-                                    record_setup_running(
-                                        &setup_states,
-                                        &workspace_id,
-                                        &terminal_id,
-                                    );
-                                    // Spawn output stream to fan setup script output to event bus
-                                    crate::terminal_ops::spawn_output_stream(
-                                        &terminal_tasks,
-                                        pty_for_setup.clone(),
-                                        bus_for_setup.clone(),
-                                        workspace_id.clone(),
-                                        pty_id,
-                                        terminal_id,
-                                    );
-                                    // Wait for the script to actually complete before cleanup
-                                    let exit = pty_for_setup.wait(pty_id).await;
-                                    // Best-effort cleanup of the script + wrapper files (after exit)
-                                    let _ = tokio::fs::remove_file(&script_path).await;
-                                    if let Some(w) = &wrapper_path {
-                                        let _ = tokio::fs::remove_file(w).await;
-                                    }
-                                    (true, exit.ok().filter(|e| e.observed).map(|e| e.exit_code))
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        workspace = %workspace_id.as_str(),
-                                        error = %e,
-                                        "failed to spawn setup script terminal"
-                                    );
-                                    // Cleanup on spawn failure
-                                    let _ = tokio::fs::remove_file(&script_path).await;
-                                    if let Some(w) = &wrapper_path {
-                                        let _ = tokio::fs::remove_file(w).await;
-                                    }
-                                    (false, None)
-                                }
-                            }
-                            };
+                            let (ran_script, exit_code): (bool, Option<u32>) = run_setup.await;
                             record_setup_finished(
                                 &setup_states,
                                 &workspace_id,
@@ -25427,7 +25243,10 @@ impl WorkspaceApi for Services {
             // moved tab. Clearing the pin moves nothing — the driving client
             // then falls back to the host of those same claimed tabs.
             if let Some(new_host) = &committed {
-                self.browser_tabs_migrate_claimed(&id, new_host).await?;
+                self.ports
+                    .runtime()
+                    .migrate_claimed_browser_tabs(self, &id, new_host)
+                    .await?;
             }
             self.desktop.changed.notify_waiters();
             self.browser_client_state(&id).await
@@ -32618,143 +32437,6 @@ impl WorkspaceApi for Services {
     // triggering merge-back or discarding a sandbox when auto-merge fails.
     // ========================================================================
 
-    fn sandbox_merge(
-        &self,
-        workspace_id: WorkspaceId,
-        sandbox_id: AgentId,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let store = self.store.clone();
-        Box::pin(async move {
-            use crate::sandbox_ops::{merge_sandbox, MergeOutcome};
-            use intent_store::SandboxStatus;
-
-            self.require_agent_member(&sandbox_id).await?;
-
-            // Claim the merge atomically (current status → merging) so the RPC
-            // never merges concurrently with the completion path or the
-            // background retry sweep — every merge path goes through the same
-            // compare-and-swap claim protocol.
-            let sandbox = store
-                .get_sandbox(&workspace_id, &sandbox_id)
-                .await?
-                .ok_or_else(|| Error::Internal("Sandbox not found".to_string()))?;
-            if sandbox.status == SandboxStatus::Merging {
-                return Err(Error::Internal(
-                    "Sandbox merge already in progress".to_string(),
-                ));
-            }
-            let claimed = store
-                .try_transition_sandbox_status(
-                    &workspace_id,
-                    &sandbox_id,
-                    sandbox.status,
-                    SandboxStatus::Merging,
-                    &now_iso(),
-                )
-                .await?;
-            if !claimed {
-                return Err(Error::Internal(
-                    "Sandbox merge already in progress".to_string(),
-                ));
-            }
-
-            // Attempt merge. On a hard error return the sandbox to
-            // merge_pending so it stays visible to the retry sweep and
-            // retryable via this RPC rather than stranded `merging`.
-            let outcome = match merge_sandbox(&store, &workspace_id, &sandbox_id).await {
-                Ok(outcome) => outcome,
-                Err(e) => {
-                    let _ = store
-                        .update_sandbox_status(
-                            &workspace_id,
-                            &sandbox_id,
-                            SandboxStatus::MergePending,
-                            &now_iso(),
-                        )
-                        .await;
-                    return Err(e);
-                }
-            };
-
-            match outcome {
-                MergeOutcome::Merged {
-                    commit_range,
-                    canonical_head,
-                } => {
-                    // Shared bookkeeping: mark merged, discard sandbox, emit
-                    // sandbox:cow:merged, clear retry count.
-                    self.finalize_sandbox_merged(
-                        &workspace_id,
-                        &sandbox_id,
-                        &commit_range,
-                        &canonical_head,
-                    )
-                    .await;
-
-                    Ok(serde_json::json!({
-                        "ok": true,
-                        "status": "merged",
-                        "commitRange": commit_range,
-                        "canonicalHead": canonical_head,
-                    }))
-                }
-                MergeOutcome::Conflict {
-                    conflicting_paths,
-                    canonical_head,
-                } => {
-                    let _ = store
-                        .update_sandbox_status(
-                            &workspace_id,
-                            &sandbox_id,
-                            SandboxStatus::ConflictBounced,
-                            &now_iso(),
-                        )
-                        .await;
-
-                    Ok(serde_json::json!({
-                        "ok": true,
-                        "status": "conflict",
-                        "conflictingPaths": conflicting_paths,
-                        "canonicalHead": canonical_head,
-                    }))
-                }
-                MergeOutcome::Blocked {
-                    reason,
-                    overlapping_paths,
-                } => {
-                    let _ = store
-                        .update_sandbox_status(
-                            &workspace_id,
-                            &sandbox_id,
-                            SandboxStatus::MergePending,
-                            &now_iso(),
-                        )
-                        .await;
-
-                    Ok(serde_json::json!({
-                        "ok": true,
-                        "status": "blocked",
-                        "reason": reason,
-                        "overlappingPaths": overlapping_paths,
-                    }))
-                }
-            }
-        })
-    }
-
-    fn sandbox_discard(
-        &self,
-        workspace_id: WorkspaceId,
-        sandbox_id: AgentId,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let store = self.store.clone();
-        Box::pin(async move {
-            self.require_agent_member(&sandbox_id).await?;
-            crate::sandbox_ops::discard_sandbox(&store, &workspace_id, &sandbox_id).await?;
-            Ok(serde_json::json!({ "ok": true }))
-        })
-    }
-
     // ========================================================================
     // pr.* read surface (PROTOCOL §5.7). Maps onto the host-agnostic
     // `SourceControl` trait (§7.5); `pr.status` requires an active PR on the
@@ -35917,271 +35599,6 @@ impl WorkspaceApi for Services {
         })
     }
 
-    fn browser_list_tabs(
-        &self,
-        workspace_id: WorkspaceId,
-    ) -> BoxFuture<'_, Result<Vec<intent_core::BrowserTab>>> {
-        let svc = self.clone();
-        Box::pin(async move {
-            self.require_member(&workspace_id).await?;
-            svc.browser_tabs_list(workspace_id).await
-        })
-    }
-
-    fn browser_upsert_tab(
-        &self,
-        host: ClientId,
-        tab: intent_core::BrowserTabInput,
-    ) -> BoxFuture<'_, Result<intent_core::BrowserTab>> {
-        let svc = self.clone();
-        Box::pin(async move { svc.browser_tab_upsert(host, tab).await })
-    }
-
-    fn browser_remove_tab(&self, host: ClientId, tab_id: String) -> BoxFuture<'_, Result<()>> {
-        let svc = self.clone();
-        Box::pin(async move { svc.browser_tab_remove(host, tab_id).await })
-    }
-
-    fn browser_sync_tabs(
-        &self,
-        host: ClientId,
-        tabs: Vec<intent_core::BrowserTabInput>,
-    ) -> BoxFuture<'_, Result<Vec<String>>> {
-        let svc = self.clone();
-        Box::pin(async move { svc.browser_tabs_sync(host, tabs).await })
-    }
-
-    /// `browser.exec` — agent-initiated CDP forward (REV-2, PROTOCOL §5.14/§12.4).
-    ///
-    /// When an agent triggers this via the MCP `ws.browser.exec` binding
-    /// there is no per-connection reverse channel to use (the caller is the
-    /// daemon-hosted MCP server, not a client connection), so we route the
-    /// batch through the injected [`AgentReverseDispatch`]. The target is
-    /// the workspace's **driving client** ([`Self::driving_client_target`],
-    /// REV-2 Model 5 & 10: pin → host of the workspace's claimed tabs →
-    /// first-connected eligible client); a driving client that is offline is
-    /// a hard `-32603` ("browser client … for this workspace is not
-    /// connected"), never a silent fallback. Two rules run before dispatch:
-    /// every `tabId` the batch names (envelope or per action) must be an
-    /// open registry tab of this workspace (`-32602` "tab not found"), and
-    /// `listTabs` is answered by the daemon from the registry — all hosts
-    /// aggregated, no reverse call — so a `listTabs` batch never mixes with
-    /// FE-executed actions (`-32602`). After a successful dispatch, a
-    /// `claimTab` that succeeded re-homes the row to the driving client as
-    /// re-resolved at commit time (`browser:tab-updated { changes: {
-    /// hostClientId, ownerAgentId } }`, see
-    /// [`Self::browser_tab_claim_migrate`]).
-    /// Attribution fields (`workspaceId`, `agentId`,
-    /// `tabId`) are threaded into the forwarded params so the FE sees the
-    /// same envelope shape the client-triggered path already emits. Result
-    /// shaping stays in [`browser_ops`], via the agent-surface variant
-    /// [`browser_ops::shape_agent_result`]: structured per-action failures
-    /// (`not-owner` / `already-claimed`) are preserved as data instead of
-    /// flattening into a top-level error (intent-hq/monorepo#3042).
-    /// Remaining failure modes surface as `Error::Internal` with the
-    /// underlying reason so the MCP caller can distinguish "no client
-    /// connected" from a proxy-side failure. An empty `actions` batch is
-    /// rejected with
-    /// `Error::InvalidParams` (JSON-RPC `-32602`) before any dispatch — the
-    /// FE tool has no meaningful behavior on an empty batch and the
-    /// client-triggered path already enforces the same guard. When no
-    /// dispatcher is wired (unit tests, read-only wiring) the request
-    /// short-circuits with `no client connected`.
-    fn browser_exec(
-        &self,
-        workspace_id: WorkspaceId,
-        actions: Vec<serde_json::Value>,
-        tab_id: Option<String>,
-        agent_id: Option<AgentId>,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move {
-            if let Some(agent) = agent_id.as_ref() {
-                self.require_agent_member(agent).await?;
-            }
-            if actions.is_empty() {
-                return Err(Error::InvalidParams(
-                    "browser.exec: actions must be a non-empty array".to_string(),
-                ));
-            }
-            // Every tab the batch names must be an open registry tab of this
-            // workspace — before anything is answered or dispatched; the
-            // driving client is the one host, so no per-tab host lookup is
-            // involved (Model 5).
-            let mut named_tabs: Vec<&str> = actions
-                .iter()
-                .filter_map(|a| a["tabId"].as_str())
-                .chain(tab_id.as_deref())
-                .filter(|id| !id.is_empty())
-                .collect();
-            named_tabs.sort_unstable();
-            named_tabs.dedup();
-            for id in &named_tabs {
-                let known = self
-                    .store
-                    .get_browser_tab(id)
-                    .await?
-                    .is_some_and(|tab| tab.workspace_id == workspace_id);
-                if !known {
-                    return Err(Error::InvalidParams(format!(
-                        "browser.exec: tab not found: {id}"
-                    )));
-                }
-            }
-            let list_tabs_count = actions
-                .iter()
-                .filter(|a| a["action"] == browser_tabs::LIST_TABS_ACTION)
-                .count();
-            if list_tabs_count > 0 {
-                if list_tabs_count != actions.len() {
-                    return Err(Error::InvalidParams(
-                        "browser.exec: listTabs is answered by the daemon and cannot be batched \
-                         with other actions"
-                            .to_string(),
-                    ));
-                }
-                let mut results = Vec::with_capacity(actions.len());
-                for action in &actions {
-                    let scope = match &action["scope"] {
-                        serde_json::Value::Null => None,
-                        serde_json::Value::String(scope) => Some(scope.as_str()),
-                        other => {
-                            return Err(Error::InvalidParams(format!(
-                                "browser.exec: listTabs scope must be \"mine\", \"unclaimed\" or \
-                                 \"all\", got {other}"
-                            )))
-                        }
-                    };
-                    results.push(
-                        self.browser_tabs_list_for_agent(&workspace_id, scope, agent_id.as_ref())
-                            .await?,
-                    );
-                }
-                return Ok(if results.len() == 1 {
-                    results.remove(0)
-                } else {
-                    serde_json::json!({ "results": results })
-                });
-            }
-            let Some(dispatch) = self.reverse_dispatch.clone() else {
-                return Err(Error::Internal(
-                    "browser.exec: no client connected".to_string(),
-                ));
-            };
-            let target = self.driving_client_target(&workspace_id).await?;
-            // Claims re-home their tab after the dispatch; record which
-            // client executed them (the commit re-validates the host).
-            let claims: Vec<String> = actions
-                .iter()
-                .filter(|a| a["action"] == "claimTab")
-                .filter_map(|a| a["tabId"].as_str().or(tab_id.as_deref()))
-                .map(str::to_string)
-                .collect();
-            let executed_on = if claims.is_empty() {
-                None
-            } else {
-                dispatch.resolve(&target).ok().map(|r| r.client_id)
-            };
-            // Shape by *request* arity: the FE aborts a batch on the first
-            // failing action, so the reply's results count can be shorter
-            // than the batch (see `shape_agent_result`).
-            let requested_actions = actions.len();
-            let args = browser_ops::BrowserExecArgs {
-                actions,
-                tab_id,
-                agent_id: agent_id.as_ref().map(|a| a.as_str().to_string()),
-                workspace_id: Some(workspace_id.as_str().to_string()),
-            };
-            let forwarded = browser_ops::build_forward_params(&args);
-            let response = match dispatch.dispatch("browser.exec", forwarded, target).await {
-                Ok(response) => response,
-                Err(ReverseDispatchError::NoClient) => {
-                    return Err(Error::Internal(
-                        "browser.exec: no client connected".to_string(),
-                    ));
-                }
-                Err(err) => {
-                    let message = self.browser_dispatch_error_message(err).await;
-                    return Err(Error::Internal(format!("browser.exec: {message}")));
-                }
-            };
-            if let Some(executed_on) = executed_on {
-                for tab_id in browser_ops::successful_claims(&response, &claims) {
-                    self.browser_tab_claim_migrate(&tab_id, &executed_on, agent_id.as_ref())
-                        .await?;
-                }
-            }
-            browser_ops::shape_agent_result(&response, requested_actions)
-                .map_err(|e| Error::Internal(e.message))
-        })
-    }
-
-    /// `browser.navigateTab { tabId, url }` (REV-2 Model 4): route a
-    /// navigation request to the client that renders the live tab — the
-    /// workspace's driving client for a claimed tab, the physical host for
-    /// an unclaimed one — as a reverse `browser.exec { action: "navigate"
-    /// }` and echo that action's result envelope. The host then reports the
-    /// resulting navigation through `browser.upsertTab` and every client
-    /// follows the canonical row.
-    fn browser_navigate_tab(
-        &self,
-        tab_id: String,
-        url: String,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move {
-            let tab = self
-                .browser_tab_required("browser.navigateTab", &tab_id)
-                .await?;
-            let response = self
-                .browser_tab_dispatch(
-                    "browser.navigateTab",
-                    &tab,
-                    serde_json::json!({ "action": "navigate", "tabId": tab_id, "url": url }),
-                )
-                .await?;
-            browser_ops::shape_result(&response).map_err(|e| Error::Internal(e.message))
-        })
-    }
-
-    /// `browser.closeTab { tabId, force? }` (REV-2 Model 6): route the close
-    /// to the tab's routing target (as `browser_navigate_tab`) so the host's
-    /// own `browser.removeTab` deletes the row. With `force` the row is
-    /// tombstoned daemon-side regardless (after a best-effort routed close
-    /// when the target is reachable); a target that is offline without
-    /// `force` is `Error::Internal`. Unknown tab ⇒ `Error::InvalidParams`.
-    fn browser_close_tab(
-        &self,
-        tab_id: String,
-        force: bool,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move {
-            let tab = self
-                .browser_tab_required("browser.closeTab", &tab_id)
-                .await?;
-            let action = serde_json::json!({ "action": "closeTab", "tabId": tab_id });
-            if force {
-                let target = self.browser_tab_route_target(&tab).await?;
-                let reachable = self
-                    .reverse_dispatch
-                    .as_ref()
-                    .is_some_and(|d| d.resolve(&target).is_ok());
-                if reachable {
-                    // The host is told directly; failures fall through to
-                    // the tombstone, which its next sync reconciles.
-                    let _ = self
-                        .browser_tab_dispatch("browser.closeTab", &tab, action)
-                        .await;
-                }
-                self.browser_tab_force_close(&tab_id).await?;
-                return Ok(serde_json::json!({ "ok": true }));
-            }
-            let response = self
-                .browser_tab_dispatch("browser.closeTab", &tab, action)
-                .await?;
-            browser_ops::shape_result(&response).map_err(|e| Error::Internal(e.message))?;
-            Ok(serde_json::json!({ "ok": true }))
-        })
-    }
-
     /// `ws.host.exec` (agent-JS binding seam): delegate to the shared one-shot
     /// exec primitive with the caller's workspace pinned as the cwd
     /// containment root. Semantics are identical to the wire `host.exec`
@@ -36767,14 +36184,15 @@ impl Services {
         &self,
         workspace_id: &WorkspaceId,
         agent_id: &AgentId,
-    ) -> Result<sandbox_ops::ProvisionOutcome> {
-        let config = sandbox_ops::ProvisionConfig {
-            workspaces_root: self
-                .workspaces_root
-                .clone()
-                .ok_or_else(|| Error::Internal("workspaces_root not configured".to_string()))?,
-        };
-        sandbox_ops::provision_sandbox(&self.store, workspace_id, agent_id, &config).await
+    ) -> Result<feature_ports::ProvisionOutcome> {
+        let workspaces_root = self
+            .workspaces_root
+            .clone()
+            .ok_or_else(|| Error::Internal("workspaces_root not configured".to_string()))?;
+        self.ports
+            .runtime()
+            .provision_sandbox(self, workspace_id, agent_id, workspaces_root)
+            .await
     }
 
     /// Register an in-flight provisioning gate for `agent_id` (monorepo#871).

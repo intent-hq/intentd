@@ -52,42 +52,9 @@ async fn apply_test_provision_hooks() -> Result<()> {
     Ok(())
 }
 
-/// Outcome of sandbox provisioning.
-#[derive(Debug, Clone)]
-pub enum ProvisionOutcome {
-    /// `CoW` is supported; sandbox was created.
-    Supported {
-        path: PathBuf,
-        branch: String,
-        base_commit_sha: String,
-        snapshot_commit_sha: Option<String>,
-    },
-    /// `CoW` is not supported; fallback to shared mode (no bytes copied).
-    Unsupported,
-}
-
-/// Outcome of a merge-back attempt.
-#[derive(Debug, Clone)]
-pub enum MergeOutcome {
-    /// Clean merge; sandbox commits applied to canonical.
-    Merged {
-        commit_range: String,
-        canonical_head: String,
-    },
-    /// Conflicts detected; user's repo left pristine.
-    Conflict {
-        conflicting_paths: Vec<String>,
-        canonical_head: String,
-    },
-    /// Blocked: the merge could not proceed but stays retryable — canonical
-    /// has uncommitted user edits overlapping merge paths (`overlapping_paths`
-    /// populated), or the sandbox branch is missing/unborn (`overlapping_paths`
-    /// empty; see `reason`).
-    Blocked {
-        reason: String,
-        overlapping_paths: Vec<String>,
-    },
-}
+/// The outcome types are declared with the runtime port, which core code
+/// matches on.
+pub use crate::feature_ports::{MergeOutcome, ProvisionOutcome};
 
 /// Configuration for sandbox provisioning.
 pub(crate) struct ProvisionConfig {
