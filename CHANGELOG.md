@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.54] - 2026-10-26
+
+### 🐛 Bug Fixes
+
+- *(agent)* Attach context notes by reference instead of inlining images ([#2710](https://github.com/intent-hq/intentd/pull/2710))
+
+### 🔧 Refactor
+
+- *(services)* Cut remaining lifecycle references into runtime ([#2714](https://github.com/intent-hq/intentd/pull/2714))
+
+
 ## [0.11.53] - 2026-10-26
 
 ### 🔧 Refactor
