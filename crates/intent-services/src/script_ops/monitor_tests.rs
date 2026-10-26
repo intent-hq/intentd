@@ -949,6 +949,10 @@ async fn monitor_recovery_prior_result_deadline_interruption_and_cancel_intent()
         let now = chrono::Utc::now().timestamp_millis() + 60000;
         let clock = Arc::new(std::sync::atomic::AtomicI64::new(now));
         let mut mgr = h.services.script_manager();
+        // Drive recovery and dispatch explicitly below. An old-boot maintenance
+        // task would retain the original locks and race the recovered manager
+        // between deleting the active row and publishing its terminal event.
+        mgr.owner_services = None;
         mgr.parks.monitor_clock = Some(clock.clone());
         let registered = mgr
             .monitor(
