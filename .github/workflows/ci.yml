@@ -876,20 +876,32 @@ jobs:
       release_push: ${{ github.event_name == 'push' && steps.decide.outputs.fast_path || '' }}
     steps:
       - uses: actions/checkout@v7
+      # A push needs this commit's parent (`--exact-parent` below); a PR
+      # needs its base commit.
       - name: Fetch base commit
         env:
           BASE_SHA: ${{ github.event_name == 'push' && github.event.before || github.event.pull_request.base.sha }}
-        run: git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT" = push ]; then
+            git fetch --no-tags --depth=2 origin "$GITHUB_SHA"
+          else
+            git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          fi
       - name: Evaluate diff shape
         id: decide
         env:
           BASE_SHA: ${{ github.event_name == 'push' && github.event.before || github.event.pull_request.base.sha }}
+          EVENT: ${{ github.event_name }}
         run: |
           set -euo pipefail
           # Script contract: prints fast_path=true|false; non-zero exit means
           # no-match. Never fail this step — a broken checker must degrade to
-          # full CI, not block the PR.
-          out=$(./scripts/release-pr-fast-path.sh "$BASE_SHA" HEAD) || {
+          # full CI, not block the PR. A push must be a single commit directly
+          # on the previous tip, so a force push cannot borrow a merge-base diff.
+          mode=()
+          if [ "$EVENT" = push ]; then mode=(--exact-parent); fi
+          out=$(./scripts/release-pr-fast-path.sh ${mode[@]+"${mode[@]}"} "$BASE_SHA" HEAD) || {
             echo "release-pr-fast-path.sh exited non-zero — falling back to full CI"
             out="fast_path=false"
           }
@@ -912,8 +924,10 @@ jobs:
     # `route` places the native entry and runs on every event this job runs
     # on. route runs on ubuntu-24.04, so this dependency can never queue
     # behind the self-hosted runners it decides about.
-    needs: [release-fast-path, route]
-    if: ${{ !cancelled() && (github.event_name == 'merge_group' || github.event_name == 'push') }}
+    # On push it is skipped when `supersede` reports this commit superseded
+    # (only the tip's proof is read); CI Gate accepts that skip only then.
+    needs: [release-fast-path, route, supersede]
+    if: ${{ !cancelled() && (github.event_name == 'merge_group' || (github.event_name == 'push' && needs.supersede.outputs.superseded != 'true')) }}
     strategy:
       # Don't let one platform's failure cancel the other's required check.
       fail-fast: false
@@ -2580,8 +2594,10 @@ jobs:
               if [ "${{ needs.release-fast-path.result }}" = success ] && [ "${{ needs.release-fast-path.outputs.release_push }}" = true ]; then
                 windows=optional
               fi
+              build=require
               if [ "${{ needs.supersede.result }}" = success ] && [ "${{ needs.supersede.outputs.superseded }}" = true ]; then
                 windows=optional
+                build=optional
               fi
               require route "${{ needs.route.result }}"
               optional pr-static "${{ needs.pr-static.result }}"
@@ -2589,7 +2605,7 @@ jobs:
               optional daemon-lifecycle "${{ needs.daemon-lifecycle.result }}"
               optional check "${{ needs.check.result }}"
               optional windows-cross-lint "${{ needs.windows-cross-lint.result }}"
-              require build "${{ needs.build.result }}"
+              "$build" build "${{ needs.build.result }}"
               optional windows-lint "${{ needs.windows-lint.result }}"
               "$windows" windows "${{ needs.windows.result }}"
               optional macos-services-runtime "${{ needs.macos-services-runtime.result }}"
