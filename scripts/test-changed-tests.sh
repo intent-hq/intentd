@@ -1704,9 +1704,12 @@ run_lookup() {
   fail "find_bash3 does not honor BASH3_CACHE_DIR"
 [[ "$(run_lookup BASH3_BIN="$lookup_dir/explicit-bash" XDG_CACHE_HOME="$lookup_dir/xdg")" == "$lookup_dir/explicit-bash" ]] ||
   fail "find_bash3 does not prefer BASH3_BIN over the cache"
+# A rejected cache falls through: to nothing, or to a stock 3.x /bin/bash
+# (macOS), the only candidate an empty PATH leaves.
 printf '#!/bin/sh\nexit 1\n' >"$lookup_dir/moved/bash"
-[[ "$(run_lookup BASH3_CACHE_DIR="$lookup_dir/moved")" != "$lookup_dir/moved/bash" ]] ||
-  fail "find_bash3 accepts a cached binary that is not Bash 3"
+fallthrough=$(run_lookup BASH3_CACHE_DIR="$lookup_dir/moved")
+[[ -z "$fallthrough" || "$fallthrough" == /bin/bash ]] ||
+  fail "find_bash3 does not fall through past a cached binary that is not Bash 3: got $fallthrough"
 # Without an interpreter, the notice names `make bash3` and REQUIRE_BASH3 turns
 # the skip into a failure.
 missing=$(BASH3_CACHE_DIR="$lookup_dir/none" REQUIRE_BASH3='' report_missing_bash3) ||
