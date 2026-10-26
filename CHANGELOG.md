@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.57] - 2026-10-26
+
+### 🔧 Refactor
+
+- *(services)* Gather runtime-dependent core tests beside the runtime ([#2730](https://github.com/intent-hq/intentd/pull/2730))
+
+
 ## [0.11.56] - 2026-10-26
 
 ### 🔧 Refactor
