@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.52] - 2026-10-26
+
+### 🔧 Refactor
+
+- *(services)* Add an agent-wake port for runtime ([#2707](https://github.com/intent-hq/intentd/pull/2707))
+
+
 ## [0.11.51] - 2026-10-26
 
 ### 🔧 Refactor
