@@ -640,6 +640,7 @@ impl Harness for V1 {
         image_urls: &[String],
         omitted: usize,
     ) -> String {
+        let (title, id) = (notice_field(title), notice_field(id));
         let mut notice = format!(
             "[Note in context: \"{title}\" (ID: {id}). Its content is NOT inlined in this \
              message; read it with ws.note.read(\"{id}\")."
@@ -1432,4 +1433,21 @@ impl Harness for V1 {
              your other work or end your turn."
         )
     }
+}
+
+/// A user-controlled value (note title / id) made safe to quote inside a
+/// bracketed prompt notice: control characters (newlines included) become
+/// spaces, `"` becomes `'`, and `[` / `]` become `(` / `)`, so the value
+/// cannot close the notice or forge a separate system note.
+fn notice_field(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| match c {
+            c if c.is_control() => ' ',
+            '"' => '\'',
+            '[' => '(',
+            ']' => ')',
+            c => c,
+        })
+        .collect()
 }

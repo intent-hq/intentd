@@ -20640,6 +20640,49 @@ async fn build_turn_prompt_note_ids_render_reference_notice() {
             3,
         ))
     );
+
+    // Only the destination of a markdown image target is a URL: a title is
+    // dropped, `<…>` is unwrapped, and a target that is not a plain asset
+    // file name (here an unclosed image swallowing prose) is not listed.
+    // A repeated note id is referenced once.
+    let tricky_id = NoteId::new();
+    let tricky = Note {
+        id: tricky_id.clone(),
+        content: format!(
+            "![a](workspace-asset://{ws}/a.png \"caption\")\n\
+             ![b](<workspace-asset://{ws}/b.png>)\n\
+             ![c](workspace-asset://{ws}/\n\nSecret paragraph text)\n",
+            ws = ws.0,
+        ),
+        ..note.clone()
+    };
+    store.insert_note(&tricky).await.expect("insert tricky");
+    let options = super::TurnOptions {
+        note_ids: Some(json!([tricky_id.to_string(), tricky_id.to_string()])),
+        ..super::TurnOptions::default()
+    };
+    let prompt = mgr
+        .build_turn_prompt(&id, &ws, "look", &options)
+        .await
+        .unwrap();
+    let wire = serde_json::to_value(&prompt).unwrap();
+    assert_eq!(
+        wire.as_array().unwrap().len(),
+        2,
+        "one notice per note: {wire}"
+    );
+    assert_eq!(
+        wire[1]["text"],
+        json!(super::note_reference_notice(
+            "Spec",
+            &tricky_id.to_string(),
+            &[
+                format!("workspace-asset://{}/a.png", ws.0),
+                format!("workspace-asset://{}/b.png", ws.0),
+            ],
+            0,
+        ))
+    );
 }
 
 /// Regression: a note in chat context whose screenshots together exceed the

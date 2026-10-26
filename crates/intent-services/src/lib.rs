@@ -4773,24 +4773,30 @@ impl Services {
         Ok(total_loaded)
     }
 
-    /// Configure the note-asset root directory (for `note.readAsset`).
     /// Resolve `noteIds` (PROTOCOL §5.5) to by-reference note context: for
-    /// each note, its title plus the distinct `workspace-asset://` image URLs
-    /// in the requesting workspace that its markdown embeds, in document
-    /// order, capped at [`MAX_NOTE_REFERENCE_IMAGE_URLS`]
-    /// ([`NoteReference::omitted`] counts the rest). Neither note content nor asset bytes are
-    /// loaded: the agent reads them on demand with `ws.note.read` /
-    /// `ws.note.readAsset`, so a note with many large screenshots can never
-    /// overflow the provider image budget. Missing (e.g. deleted) notes and
-    /// URLs outside this workspace are skipped so a partial `noteIds` array
-    /// never breaks the turn.
+    /// each distinct note, its title plus the distinct `workspace-asset://`
+    /// image URLs in the requesting workspace that its markdown embeds, in
+    /// document order, capped at [`MAX_NOTE_REFERENCE_IMAGE_URLS`]
+    /// ([`NoteReference::omitted`] counts the rest). Neither note content
+    /// nor asset bytes are loaded: the agent reads them on demand with
+    /// `ws.note.read` / `ws.note.readAsset`, so a note with many large
+    /// screenshots can never overflow the provider image budget. Missing
+    /// (e.g. deleted) notes and URLs outside this workspace are skipped so a
+    /// partial `noteIds` array never breaks the turn; without an asset root
+    /// no image URLs are listed, since `ws.note.readAsset` could not serve
+    /// them.
     pub(crate) async fn load_note_references(
         &self,
         workspace_id: &WorkspaceId,
         note_ids: &[String],
     ) -> Vec<NoteReference> {
+        let prefix = format!("workspace-asset://{}/", workspace_id.0);
+        let mut seen_notes = HashSet::new();
         let mut out = Vec::new();
         for note_id in note_ids {
+            if !seen_notes.insert(note_id.as_str()) {
+                continue;
+            }
             let Ok(note) = self
                 .store
                 .get_note(workspace_id, &NoteId::from(note_id.as_str()))
@@ -4798,20 +4804,24 @@ impl Services {
             else {
                 continue;
             };
-            let prefix = format!("workspace-asset://{}/", workspace_id.0);
+            let mut seen_urls = HashSet::new();
             let mut image_urls: Vec<String> = Vec::new();
-            for url in extract_markdown_image_urls(&note.content) {
-                let in_workspace = url
-                    .strip_prefix(&prefix)
-                    .is_some_and(|asset_id| !asset_id.is_empty());
-                if in_workspace && !image_urls.contains(&url) {
-                    image_urls.push(url);
+            let mut omitted = 0;
+            if self.assets_root.is_some() {
+                for target in extract_markdown_image_urls(&note.content) {
+                    let Some(url) = note_asset_url(&target, &prefix) else {
+                        continue;
+                    };
+                    if !seen_urls.insert(url.clone()) {
+                        continue;
+                    }
+                    if image_urls.len() < MAX_NOTE_REFERENCE_IMAGE_URLS {
+                        image_urls.push(url);
+                    } else {
+                        omitted += 1;
+                    }
                 }
             }
-            let omitted = image_urls
-                .len()
-                .saturating_sub(MAX_NOTE_REFERENCE_IMAGE_URLS);
-            image_urls.truncate(MAX_NOTE_REFERENCE_IMAGE_URLS);
             out.push(NoteReference {
                 id: note.id.to_string(),
                 title: note.title,
@@ -4822,6 +4832,7 @@ impl Services {
         out
     }
 
+    /// Configure the note-asset root directory (for `note.readAsset`).
     #[must_use]
     pub fn with_assets_root(mut self, root: PathBuf) -> Self {
         self.assets_root = Some(root);
@@ -38120,6 +38131,26 @@ pub(crate) struct NoteReference {
     pub image_urls: Vec<String>,
     /// Distinct image URLs beyond [`MAX_NOTE_REFERENCE_IMAGE_URLS`].
     pub omitted: usize,
+}
+
+/// The `workspace-asset://` URL a markdown image target names, when it is an
+/// asset in this workspace (`prefix` = `workspace-asset://<workspaceId>/`).
+/// The target is a `CommonMark` destination plus optional title, so only the
+/// first whitespace-separated token (minus `<…>`) is the URL; anything whose
+/// asset id is not a plain file name is rejected rather than echoed into
+/// the prompt.
+fn note_asset_url(target: &str, prefix: &str) -> Option<String> {
+    let destination = target.split_whitespace().next()?;
+    let destination = destination
+        .strip_prefix('<')
+        .and_then(|d| d.strip_suffix('>'))
+        .unwrap_or(destination);
+    let asset_id = destination.strip_prefix(prefix)?;
+    let plain = !asset_id.is_empty()
+        && asset_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~' | '%'));
+    plain.then(|| destination.to_string())
 }
 
 /// Iterate `![alt](url)` matches in `content` (markdown image syntax) and

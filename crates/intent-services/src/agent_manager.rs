@@ -531,8 +531,9 @@ async fn cancel_and_settle_idle_prompt(
 /// Per-turn prompt-assembly hints threaded through `agent.sendMessage`
 /// (PROTOCOL §5.5). `stdin_context` is prepended verbatim to the outbound
 /// prompt as a `Context:` block (reference-parity `acp-provider.ts`);
-/// `note_ids` and `context_references` are carried forward for downstream
-/// note-image / context-reference resolution and are otherwise inert today.
+/// `note_ids` each add a by-reference note notice (title, id and embedded
+/// image URLs; no content or image bytes), and `context_references` are
+/// carried forward for downstream context-reference resolution.
 ///
 /// Only the FIRST turn triggered by a `sendMessage` call carries these
 /// options; queue-drained follow-up turns run with [`TurnOptions::default`]
