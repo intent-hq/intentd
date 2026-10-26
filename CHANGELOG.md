@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.48] - 2026-10-26
+
+### 🚀 Features
+
+- *(workspace)* Add backgroundTasksRunning flag for agent background tasks ([#2688](https://github.com/intent-hq/intentd/pull/2688))
+
+### 🧪 Testing
+
+- *(catalog)* Freeze protocol methods with a golden name list ([#2692](https://github.com/intent-hq/intentd/pull/2692))
+- Own every e2e daemon through GuardedChild so none outlives its test ([#2689](https://github.com/intent-hq/intentd/pull/2689))
+
+
 ## [0.11.47] - 2026-10-25
 
 ### 🚀 Features
