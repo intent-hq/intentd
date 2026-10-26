@@ -1136,7 +1136,7 @@ class CliAndWorkflowTests(unittest.TestCase):
                 "esac\nexit 99\n")
             gh.chmod(0o755)
             log = Path(tmp) / "gh.log"
-            result = subprocess.run(
+            result = subprocess.run(  # env-policy: no-python-child: bash step with a sh fake gh
                 [shutil.which("bash") or "/bin/bash", "-e", "-c", "\n".join(body)],
                 text=True, capture_output=True, timeout=30,
                 env={"PATH": f"{tmp}:/usr/bin:/bin", "GH_LOG": str(log),
