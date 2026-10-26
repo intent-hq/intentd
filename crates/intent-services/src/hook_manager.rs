@@ -59,6 +59,7 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
 
+use crate::feature_ports::CancelSettlement;
 use crate::{publish_event, system_actor, Services};
 
 /// Minimum inter-run delay (spec decision 5): `delayMs` below this floor is
@@ -133,28 +134,6 @@ const HOOK_WAKE_LOGS_CAP: usize = crate::harness::v1::HOOK_WAKE_LOGS_CAP;
 /// `state` is dropped (the previous state is kept) with a warning line
 /// appended to that run's logs.
 const HOOK_STATE_MAX_BYTES: usize = 16 * 1024;
-
-/// How a cancel transition ([`Services::cancel_active_hook`],
-/// [`Services::cancel_active_pr_monitor`]) settles the owner's deferred
-/// completion watches. A completion watch on an idle owner defers while the
-/// owner has active hooks / PR monitors, so cancelling the LAST one must
-/// re-run the deferral backstop
-/// ([`Services::redeliver_completion_after_queue_mutation`]) — either
-/// through a wake or directly — or the watch strands forever.
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum CancelSettlement<'a> {
-    /// Wake the owner with this notice; the wake runs the backstop itself
-    /// after the delivery attempt (FE/app cancel).
-    Notify(&'a str),
-    /// No wake; run the backstop directly (owner-side cancel, retire sweep).
-    Resettle,
-    /// Neither: the caller sweeps several items and runs the backstop ONCE
-    /// per owner after queueing its consolidated wake (archive sweep). The
-    /// per-item backstop would otherwise see an empty queue and no remaining
-    /// watches on the final item and synthesize a genuine completion,
-    /// consuming a parent's watch BEFORE the consolidated notice is queued.
-    Deferred,
-}
 
 /// Cap (in chars) on the `message` a dispatching run returns and on the error
 /// text an eviction wake carries. Longer text is head-kept and tail-marked

@@ -85,7 +85,7 @@ use intent_sourcecontrol::{
 use intent_store::{NewEvent, PrMonitorListEntry, PrMonitorPollUpdate};
 use serde_json::{json, Value};
 
-use crate::hook_manager::CancelSettlement;
+use crate::feature_ports::CancelSettlement;
 use crate::pr_ops::{self, MergeRequirements};
 use crate::rate_limit::RATE_LIMIT_MAX_PAUSE;
 use crate::workspace_status::MonitorPrSignals;
@@ -4958,7 +4958,9 @@ impl Services {
         agent_id: &AgentId,
         data: &mut Value,
     ) -> Vec<Value> {
-        self.annotate_waiting_on_script_monitors(agent_id, data)
+        self.ports
+            .runtime()
+            .annotate_waiting_on_script_monitors(self, agent_id, data)
             .await;
         let records = self
             .store

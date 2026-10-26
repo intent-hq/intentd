@@ -1944,10 +1944,17 @@ impl Services {
                         // sender-watches that get no report-time wake).
                         if settled
                             && matches!(call_site, WatchReconcileCallSite::Registration)
-                            && (!self.active_hooks_for_agent(child_id).await.is_empty()
+                            && (!self
+                                .ports
+                                .runtime()
+                                .active_hooks_for_agent(self, child_id)
+                                .await
+                                .is_empty()
                                 || (!self.active_pr_monitors_for_agent(child_id).await.is_empty()
                                     || !self
-                                        .active_script_monitors_for_agent(child_id)
+                                        .ports
+                                        .runtime()
+                                        .active_script_monitors_for_agent(self, child_id)
                                         .await
                                         .is_empty())
                                 || !self.list_event_subscriptions_for_agent(child_id).is_empty())
@@ -2038,7 +2045,10 @@ impl Services {
                 data["completionReport"] = serde_json::Value::String(report.clone());
                 data["report"] = serde_json::Value::String(report.clone());
             }
-            self.annotate_waiting_on_hooks(child_id, &mut data).await;
+            self.ports
+                .runtime()
+                .annotate_waiting_on_hooks(self, child_id, &mut data)
+                .await;
             self.annotate_waiting_on_pr_monitors(child_id, &mut data)
                 .await;
             data["isWaitingForOtherAgents"] =
@@ -2309,7 +2319,9 @@ impl Services {
                         // Failed/deleted children record regardless.
                         if event_type == intent_core::events::AGENT_IDLE
                             && !self
-                                .annotate_waiting_on_hooks(&child_id, &mut data)
+                                .ports
+                                .runtime()
+                                .annotate_waiting_on_hooks(self, &child_id, &mut data)
                                 .await
                                 .is_empty()
                             && !completion_reported
@@ -2515,7 +2527,9 @@ impl Services {
         if !completion_reported
             && (!self.active_pr_monitors_for_agent(agent_id).await.is_empty()
                 || !self
-                    .active_script_monitors_for_agent(agent_id)
+                    .ports
+                    .runtime()
+                    .active_script_monitors_for_agent(self, agent_id)
                     .await
                     .is_empty())
         {

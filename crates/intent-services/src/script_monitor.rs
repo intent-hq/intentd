@@ -5,23 +5,7 @@ use std::sync::Arc;
 use intent_core::{AgentId, Result, ScriptMonitor, WorkspaceId};
 use serde_json::{json, Value};
 
-pub(crate) fn wake_id(metadata: Option<&Value>) -> Option<String> {
-    let md = metadata?;
-    (md["type"] == "script_monitor_wake")
-        .then(|| {
-            md["monitorId"]
-                .as_str()
-                .map(|id| format!("script-monitor:{id}"))
-        })
-        .flatten()
-}
-
-pub(crate) fn monitor_id(metadata: Option<&Value>) -> Option<&str> {
-    let md = metadata?;
-    (md["type"] == "script_monitor_wake")
-        .then(|| md["monitorId"].as_str())
-        .flatten()
-}
+use crate::feature_ports::{monitor_id, wake_id};
 
 impl Services {
     /// Ids of the active monitors on `script_id` (any owner).
