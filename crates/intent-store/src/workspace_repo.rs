@@ -2,8 +2,8 @@
 
 use intent_core::{
     now_iso, AgentId, CheckoutMode, ClientId, ContextLink, Error, PullRequestInfo,
-    PullRequestWorkspace, Result, SetupScript, TokenUsage, Workspace, WorkspaceActivity,
-    WorkspaceAttention, WorkspaceId, WorkspaceListFilter, WorkspaceStatus, CHIEF_WORKSPACE_ID,
+    PullRequestWorkspace, Result, SetupScript, TokenUsage, Workspace, WorkspaceAttention,
+    WorkspaceId, WorkspaceListFilter, WorkspaceStatus, CHIEF_WORKSPACE_ID,
 };
 use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
@@ -1877,8 +1877,6 @@ fn map_workspace_row(row: &SqliteRow) -> Result<Workspace> {
         status: enum_from_db::<WorkspaceStatus>(&col::<String>(row, "status")?)?,
         status_message: col(row, "status_message")?,
         status_image_asset_id: col(row, "status_image_asset_id")?,
-        // Derived, read-only; never persisted (§9.9).
-        activity: WorkspaceActivity::Idle,
         attention: enum_from_db::<WorkspaceAttention>(&col::<String>(row, "attention")?)?,
         created_at: col(row, "created_at")?,
         updated_at: col(row, "updated_at")?,
@@ -1904,25 +1902,46 @@ fn map_workspace_row(row: &SqliteRow) -> Result<Workspace> {
         archived: col::<i64>(row, "archived")? != 0,
         archived_at: col(row, "archived_at")?,
         retired_at: col(row, "retired_at")?,
-        // Card aggregates are computed on the workspace.list/get emit path
-        // (intent-services), never persisted.
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        display_status: None,
-        waiting: false,
-        scripts_running: false,
-        background_tasks_running: false,
         token_usage,
-        // cow_supported is computed on the emit path (intent-services), never persisted.
-        cow_supported: None,
         checkout_mode,
         browser_client_id: col::<Option<String>>(row, "browser_client_id")?.map(ClientId),
-        // disk_usage is computed on the emit path (intent-services), never persisted.
-        disk_usage: None,
-        pending_delete_at: None,
-        // pull_requests_total is set by the list-row slimming (intent-core), never persisted.
-        pull_requests_total: None,
-        membership: None,
+        // The remaining fields are never persisted: `activity` is derived
+        // (§9.9), the emit-only fields (card aggregates, `displayStatus`, the
+        // wait/script/background flags, `cowSupported`, `diskUsage`,
+        // `pendingDeleteAt`, `membership`) are filled by intent-services, and
+        // `pullRequestsTotal` by list-row slimming (intent-core). A new
+        // persisted column must be read above;
+        // `every_selected_column_is_read_by_the_row_mapper` enforces that.
+        ..Default::default()
     })
+}
+
+#[cfg(test)]
+mod row_mapper_tests {
+    use super::WORKSPACE_COLUMNS;
+
+    /// `map_workspace_row` ends in `..Default::default()`, so the compiler no
+    /// longer forces it to read a new field. A column added to
+    /// `WORKSPACE_COLUMNS` (written by INSERT, served by SELECT) but never
+    /// read here would round-trip as the default; fail instead.
+    #[test]
+    fn every_selected_column_is_read_by_the_row_mapper() {
+        let src = include_str!("workspace_repo.rs");
+        let start = src
+            .find("fn map_workspace_row(")
+            .expect("map_workspace_row in workspace_repo.rs");
+        let len = src[start..]
+            .find("\n}\n")
+            .expect("end of map_workspace_row");
+        let body = &src[start..start + len];
+        let missing: Vec<&str> = WORKSPACE_COLUMNS
+            .split(',')
+            .map(str::trim)
+            .filter(|column| !body.contains(&format!("\"{column}\"")))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "WORKSPACE_COLUMNS lists columns map_workspace_row never reads: {missing:?}"
+        );
+    }
 }
