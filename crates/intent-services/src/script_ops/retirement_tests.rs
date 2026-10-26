@@ -17,7 +17,7 @@ async fn retired(h: &Harness, id: &str) -> intent_core::Script {
         loop {
             let def = h
                 .services
-                .store
+                .store()
                 .get_script_in_workspace(&h.ws, id)
                 .await
                 .unwrap()
@@ -81,7 +81,7 @@ async fn retirement_start_output_events_and_rerun_preserve_previous_result() {
     }
     let live = h
         .services
-        .store
+        .store()
         .get_script_in_workspace(&h.ws, &id)
         .await
         .unwrap()
@@ -138,7 +138,7 @@ async fn retirement_startup_failure_stop_and_timeout_have_explicit_outcomes() {
         .unwrap();
     let def = h
         .services
-        .store
+        .store()
         .get_script_in_workspace(&h.ws, &never)
         .await
         .unwrap()
@@ -161,7 +161,7 @@ async fn retirement_startup_failure_stop_and_timeout_have_explicit_outcomes() {
         .unwrap();
     let stopped = h
         .services
-        .store
+        .store()
         .get_script_in_workspace(&h.ws, &timed)
         .await
         .unwrap()
@@ -220,14 +220,14 @@ async fn retirement_stop_pending_start_and_restart_gap_do_not_deadlock() {
         .unwrap();
     let row = h
         .services
-        .store
+        .store()
         .get_script_in_workspace(&h.ws, &id)
         .await
         .unwrap()
         .unwrap();
     assert!(row.archived_at.is_none());
     assert_eq!(row.last_run, Some(cancelled));
-    let pending = h.services.store.pending_script_runs().await.unwrap();
+    let pending = h.services.store().pending_script_runs().await.unwrap();
     assert!(pending.iter().any(|(_, sid, _, _)| sid == &id));
     let stopping = {
         let mgr = mgr.clone();
@@ -267,19 +267,19 @@ async fn retirement_pending_recovery_is_idempotent_and_overrides_previous_succes
             .await
             .unwrap();
         h.services
-            .store
+            .store()
             .set_script_archived_at(&h.ws, &id, None)
             .await
             .unwrap();
         h.services
-            .store
+            .store()
             .admit_script_run(&h.ws, &id, "pending-restart")
             .await
             .unwrap();
         let svc = Services::new(Store::open(&h.tmp.path).await.unwrap());
         svc.hydrate_scripts().await.unwrap();
         let recovered = svc
-            .store
+            .store()
             .get_script_in_workspace(&h.ws, &id)
             .await
             .unwrap()
@@ -301,7 +301,7 @@ async fn retirement_pending_recovery_is_idempotent_and_overrides_previous_succes
         let again = Services::new(Store::open(&h.tmp.path).await.unwrap());
         again.hydrate_scripts().await.unwrap();
         let next = again
-            .store
+            .store()
             .get_script_in_workspace(&h.ws, &id)
             .await
             .unwrap()
@@ -311,7 +311,7 @@ async fn retirement_pending_recovery_is_idempotent_and_overrides_previous_succes
         again.script_stop(h.ws.clone(), id.clone()).await.unwrap();
         assert_eq!(
             again
-                .store
+                .store()
                 .get_script_in_workspace(&h.ws, &id)
                 .await
                 .unwrap()
@@ -326,7 +326,7 @@ async fn retirement_pending_recovery_is_idempotent_and_overrides_previous_succes
 async fn retirement_durable_token_fences_rerun_replacement_removal_and_scope() {
     let h = harness().await;
     let id = one_off(&h, "true").await;
-    let store = &h.services.store;
+    let store = &h.services.store();
     let result = intent_core::ScriptLastRun {
         run_id: None,
         outcome: intent_core::ScriptRunOutcome::Succeeded,
@@ -390,7 +390,7 @@ async fn retirement_database_failure_keeps_real_result_and_output_active() {
     let h = harness().await;
     let id = one_off(&h, "printf retained").await;
     sqlx::query("CREATE TRIGGER refuse_result BEFORE UPDATE OF last_run ON script BEGIN SELECT RAISE(FAIL,'result refused'); END")
-        .execute(h.services.store.write_pool()).await.unwrap();
+        .execute(h.services.store().write_pool()).await.unwrap();
     let result = h
         .services
         .script_run(h.ws.clone(), id.clone(), None, Some(5))
@@ -400,7 +400,7 @@ async fn retirement_database_failure_keeps_real_result_and_output_active() {
     assert!(result["output"].as_str().unwrap().contains("retained"));
     let def = h
         .services
-        .store
+        .store()
         .get_script_in_workspace(&h.ws, &id)
         .await
         .unwrap()
@@ -415,7 +415,7 @@ async fn retirement_database_failure_keeps_real_result_and_output_active() {
     );
     let changes = h
         .services
-        .store
+        .store()
         .query_events(&EventQuery {
             workspace_id: Some(h.ws.clone()),
             event_types: vec![SCRIPT_CHANGED.to_string()],
@@ -432,7 +432,7 @@ async fn retirement_database_failure_keeps_real_result_and_output_active() {
     let recovered = Services::new(Store::open(&h.tmp.path).await.unwrap());
     assert_eq!(recovered.hydrate_scripts().await.unwrap(), 1);
     let row = recovered
-        .store
+        .store()
         .get_script_in_workspace(&h.ws, &id)
         .await
         .unwrap()
@@ -506,7 +506,7 @@ async fn retirement_dropped_run_waiter_finishes_and_shutdown_recovers_pending_st
     let svc = Services::new(Store::open(&h.tmp.path).await.unwrap());
     svc.hydrate_scripts().await.unwrap();
     let def = svc
-        .store
+        .store()
         .get_script_in_workspace(&h.ws, &pending)
         .await
         .unwrap()
@@ -565,7 +565,7 @@ async fn retirement_unobservable_exit_and_stale_finalizer_are_fenced() {
     mgr.finish_run_locked(&h.ws, &id, generation).await;
     let replaced = h
         .services
-        .store
+        .store()
         .get_script_in_workspace(&h.ws, &id)
         .await
         .unwrap()
@@ -593,7 +593,7 @@ async fn retirement_cancelled_waiter_cannot_split_committed_result_and_registry(
     assert!(run.await.unwrap_err().is_cancelled());
     assert!(h
         .services
-        .store
+        .store()
         .get_script_in_workspace(&h.ws, &id)
         .await
         .unwrap()
@@ -605,7 +605,7 @@ async fn retirement_cancelled_waiter_cannot_split_committed_result_and_registry(
     let _guard = tokio::time::timeout(LIVENESS, lock.lock()).await.unwrap();
     let def = h
         .services
-        .store
+        .store()
         .get_script_in_workspace(&h.ws, &id)
         .await
         .unwrap()
@@ -627,7 +627,7 @@ async fn retirement_shutdown_in_restart_teardown_recovers_only_predecessor() {
     tokio::time::timeout(LIVENESS, park.entered.notified())
         .await
         .unwrap();
-    let old = h.services.store.pending_script_runs().await.unwrap()[0]
+    let old = h.services.store().pending_script_runs().await.unwrap()[0]
         .2
         .clone();
     let restart = {
@@ -653,7 +653,7 @@ async fn retirement_shutdown_in_restart_teardown_recovers_only_predecessor() {
     })
     .await
     .unwrap();
-    let pending = h.services.store.pending_script_runs().await.unwrap();
+    let pending = h.services.store().pending_script_runs().await.unwrap();
     assert_eq!(
         pending[0].2, old,
         "successor admission must follow predecessor settlement"
@@ -688,7 +688,7 @@ async fn retirement_shutdown_in_restart_teardown_recovers_only_predecessor() {
     let svc = Services::new(Store::open(&h.tmp.path).await.unwrap());
     svc.hydrate_scripts().await.unwrap();
     let def = svc
-        .store
+        .store()
         .get_script_in_workspace(&h.ws, &id)
         .await
         .unwrap()
@@ -756,7 +756,7 @@ async fn retirement_shutdown_drains_known_result_before_returning() {
     fresh.hydrate_scripts().await.unwrap();
     assert_eq!(
         fresh
-            .store
+            .store()
             .get_script_in_workspace(&h.ws, &id)
             .await
             .unwrap()
@@ -787,7 +787,7 @@ async fn retirement_recovery_fences_a_pending_finalizer() {
     let fresh = Services::new(Store::open(&h.tmp.path).await.unwrap());
     fresh.hydrate_scripts().await.unwrap();
     let recovered = fresh
-        .store
+        .store()
         .get_script_in_workspace(&h.ws, &id)
         .await
         .unwrap()
@@ -804,7 +804,7 @@ async fn retirement_recovery_fences_a_pending_finalizer() {
     park.release.notify_one();
     run.await.unwrap().unwrap();
     let after = fresh
-        .store
+        .store()
         .get_script_in_workspace(&h.ws, &id)
         .await
         .unwrap()
@@ -895,7 +895,7 @@ async fn retirement_shutdown_preserves_terminal_result_before_marker_persistence
         assert_eq!(captured.0.unwrap().outcome, expected);
         let before = h
             .services
-            .store
+            .store()
             .get_script_in_workspace(&h.ws, &id)
             .await
             .unwrap()
@@ -928,7 +928,7 @@ async fn retirement_shutdown_preserves_terminal_result_before_marker_persistence
         let fresh = Services::new(Store::open(&h.tmp.path).await.unwrap());
         fresh.hydrate_scripts().await.unwrap();
         let after = fresh
-            .store
+            .store()
             .get_script_in_workspace(&h.ws, &id)
             .await
             .unwrap()
@@ -951,12 +951,12 @@ async fn retirement_cannot_admit_successor_before_predecessor_publication() {
         .unwrap();
     let lock = mgr.locks.definition_lock(&id);
     let guard = lock.lock().await;
-    let token = h.services.store.pending_script_runs().await.unwrap()[0]
+    let token = h.services.store().pending_script_runs().await.unwrap()[0]
         .2
         .clone();
     assert!(mgr.prepare_restart(&h.ws, &id).await.is_err());
     assert_eq!(
-        h.services.store.pending_script_runs().await.unwrap()[0].2,
+        h.services.store().pending_script_runs().await.unwrap()[0].2,
         token
     );
     park.release.notify_one();
@@ -969,7 +969,7 @@ async fn retirement_cannot_admit_successor_before_predecessor_publication() {
     let fresh = Services::new(Store::open(&h.tmp.path).await.unwrap());
     fresh.hydrate_scripts().await.unwrap();
     let def = fresh
-        .store
+        .store()
         .get_script_in_workspace(&h.ws, &id)
         .await
         .unwrap()
@@ -1024,7 +1024,7 @@ async fn cancelled_observed_failure_retires(bad_cwd: bool) {
     assert!(observed.started_at.is_none());
     assert!(observed.error.is_some());
     assert_eq!(
-        h.services.store.pending_script_runs().await.unwrap().len(),
+        h.services.store().pending_script_runs().await.unwrap().len(),
         1
     );
     run.abort();
@@ -1035,7 +1035,7 @@ async fn cancelled_observed_failure_retires(bad_cwd: bool) {
     assert_eq!(settled.last_run, Some(observed));
     assert!(h
         .services
-        .store
+        .store()
         .pending_script_runs()
         .await
         .unwrap()

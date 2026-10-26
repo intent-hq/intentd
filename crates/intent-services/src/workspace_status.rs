@@ -549,7 +549,7 @@ impl Services {
     /// baseline stale until the next transition. The activity read and cache
     /// insert have no await between them, so the window is negligible and
     /// self-heals on the next transition.
-    pub(crate) async fn maybe_emit_display_status_changed(&self, workspace_id: &WorkspaceId) {
+    pub async fn maybe_emit_display_status_changed(&self, workspace_id: &WorkspaceId) {
         // Pre-read generation snapshot: an eviction (workspace.delete)
         // landing between the store reads below and the cache write must
         // drop this compute rather than re-insert a baseline for the
@@ -623,7 +623,7 @@ impl Services {
     /// probe itself fails open to `false` on store errors, which the dedup
     /// baseline absorbs: a transient flap emits at most one pair of
     /// transitions, and the next recompute converges on truth.
-    pub(crate) async fn maybe_emit_waiting_changed(&self, workspace_id: &WorkspaceId) {
+    pub async fn maybe_emit_waiting_changed(&self, workspace_id: &WorkspaceId) {
         // Chief is a fixed virtual workspace synthesized on read
         // (`workspace.get` returns `chief_workspace()` before enrichment and
         // `workspace.list` excludes it), so its rows can never carry
@@ -726,7 +726,7 @@ impl Services {
     /// removal). A missing baseline reads as `false` — nothing runs before
     /// the daemon's first script start — so the first run after a restart
     /// still emits. Best-effort like [`Services::maybe_emit_waiting_changed`].
-    pub(crate) async fn maybe_emit_scripts_running_changed(&self, workspace_id: &WorkspaceId) {
+    pub async fn maybe_emit_scripts_running_changed(&self, workspace_id: &WorkspaceId) {
         self.maybe_emit_running_flag_changed(workspace_id, RunningFlag::Scripts)
             .await;
     }

@@ -171,7 +171,11 @@ impl Services {
 
     /// Member+ gate for a workspace-scoped read / steer / edit. A
     /// collaborator who is not a member gets `NotFound`.
-    pub(crate) async fn require_member(&self, workspace_id: &WorkspaceId) -> Result<()> {
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub async fn require_member(&self, workspace_id: &WorkspaceId) -> Result<()> {
         if let Some(principal_id) = gated_collaborator_caller("member")? {
             match self.store.get_host_role(&principal_id).await {
                 Ok(HostRole::Owner) => return Ok(()),
@@ -249,7 +253,11 @@ impl Services {
     /// Scoped authority for agent creation and operating saved scripts. Never
     /// use for terminal access, arbitrary execution, sharing or workspace CRUD.
     /// Returns whether this is a restricted Manager guest (for field checks).
-    pub(crate) async fn require_workspace_operator(
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub async fn require_workspace_operator(
         &self,
         workspace_id: &WorkspaceId,
         what: &str,
@@ -276,7 +284,11 @@ impl Services {
         Ok(false)
     }
 
-    pub(crate) async fn require_saved_script_operator(
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub async fn require_saved_script_operator(
         &self,
         workspace_id: &WorkspaceId,
         script_id: &str,
@@ -361,7 +373,11 @@ impl Services {
     /// Member+ gate keyed by agent: resolves the agent's workspace (one point
     /// read, collaborator callers only) and requires membership there. An
     /// unknown agent is `NotFound` either way.
-    pub(crate) async fn require_agent_member(&self, agent_id: &AgentId) -> Result<()> {
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub async fn require_agent_member(&self, agent_id: &AgentId) -> Result<()> {
         if gated_collaborator_caller("member")?.is_none() {
             return Ok(());
         }
@@ -404,11 +420,11 @@ impl Services {
 
     /// PTY ids are host-global. Resolve their workspace before admitting a
     /// member; an ACP session-scoped PTY is not a workspace terminal.
-    pub(crate) async fn require_terminal_manager(
-        &self,
-        terminal_id: &str,
-        what: &str,
-    ) -> Result<()> {
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub async fn require_terminal_manager(&self, terminal_id: &str, what: &str) -> Result<()> {
         if gated_collaborator_caller(what)?.is_none() {
             return Ok(());
         }

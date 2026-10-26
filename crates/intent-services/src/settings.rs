@@ -208,7 +208,7 @@ type MutationHook<T> = Arc<Mutex<Option<Box<dyn FnOnce() -> T + Send>>>>;
 /// most one blocking-pool thread total (not one per request). Cache entries are
 /// invalidated on successful writes and expire on TTL.
 #[derive(Clone)]
-pub(crate) struct AsyncSecretStore {
+pub struct AsyncSecretStore {
     paired_gitlab: Option<std::path::PathBuf>,
     repository_gate: Arc<OnceLock<GitlabCredentialGate>>,
     repository_write: Option<Arc<RepositorySettingsWrite>>,
@@ -485,7 +485,12 @@ impl AsyncSecretStore {
     /// `Err` on timeout / backing-error. Concurrent callers for the same `account`
     /// are coalesced into a single `spawn_blocking`; a cached result is served
     /// without touching the backing store until it expires.
-    pub(crate) async fn load(&self, account: &str) -> Result<Option<String>> {
+    #[expect(
+        clippy::missing_errors_doc,
+        clippy::missing_panics_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub async fn load(&self, account: &str) -> Result<Option<String>> {
         let action = {
             let mut state = self.state.lock().unwrap();
             match state.entries.get(account) {

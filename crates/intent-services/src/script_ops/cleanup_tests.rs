@@ -552,7 +552,7 @@ async fn cancelled_workspace_delete_reopens_scripts_and_retry_deletes_output() {
         "a cancelled delete reopens the workspace"
     );
     assert!(
-        h.services.store.get_workspace(&h.ws).await.is_ok(),
+        h.services.store().get_workspace(&h.ws).await.is_ok(),
         "workspace survives"
     );
     assert!(
@@ -583,10 +583,10 @@ async fn orphan_sweep_keeps_every_folder_when_the_store_cannot_be_read() {
     let orphan = WorkspaceId::new();
     write_log(&h.services, &ws, "s", "r");
     write_log(&h.services, orphan.as_str(), "s", "r");
-    h.services.store.close().await;
+    h.services.store().close().await;
     assert!(
         h.services
-            .store
+            .store()
             .get_workspace(&h.ws)
             .await
             .is_err_and(|e| !matches!(e, crate::Error::NotFound(_))),

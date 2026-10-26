@@ -30,7 +30,7 @@ struct DeliveryTask {
 }
 
 impl DeliveryTasks {
-    pub(crate) fn cancellation_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+    pub fn cancellation_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
         self.2.clone()
     }
 
@@ -60,14 +60,14 @@ impl DeliveryTasks {
 
     /// Retain a finite original request through cancellation without replacing
     /// its caller or wire credential with daemon authority.
-    pub(crate) fn spawn_draining_with_current_caller<T: Send + 'static>(
+    pub fn spawn_draining_with_current_caller<T: Send + 'static>(
         &self,
         future: impl Future<Output = T> + Send + 'static,
     ) -> Option<JoinHandle<T>> {
         self.spawn_owned(future, true, true)
     }
 
-    pub(crate) async fn closed(&self) {
+    pub async fn closed(&self) {
         let notified = self.1.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
@@ -158,7 +158,11 @@ impl DeliveryTasks {
     }
 
     /// Close synchronously so recovery can be persisted before any joins.
-    pub(crate) fn close(&self) {
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub fn close(&self) {
         let mut state = self.0.lock().unwrap();
         state.closed = true;
         self.2.store(true, std::sync::atomic::Ordering::Relaxed);

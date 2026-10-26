@@ -312,7 +312,11 @@ pub(crate) fn paginate_slice<T: Clone>(
 /// historical-output reads. Trailing blank lines are trimmed (mirroring the
 /// legacy formatted reads) before paging; the per-page size follows the standard
 /// clamp (default 50, max 200) and the token is append-stable per [`page_window`].
-pub(crate) fn paginate_text_lines(text: &str, limit: Option<i64>, token: Option<&str>) -> Value {
+#[expect(
+    clippy::must_use_candidate,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn paginate_text_lines(text: &str, limit: Option<i64>, token: Option<&str>) -> Value {
     let mut lines: Vec<&str> = text.split('\n').collect();
     while lines.last().is_some_and(|l| l.trim().is_empty()) {
         lines.pop();

@@ -21,7 +21,7 @@ async fn agent_start_armed(
 
 async fn monitors_for(h: &Harness, id: &str) -> Vec<intent_core::ScriptMonitor> {
     h.services
-        .store
+        .store()
         .script_monitors(&h.ws, None)
         .await
         .unwrap()

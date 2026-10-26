@@ -19,14 +19,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 #[derive(Default)]
-pub(crate) struct Runtime {
+pub struct Runtime {
     live: Mutex<HashMap<AgentId, Live>>,
     candidates: Mutex<HashMap<String, Vec<Binding>>>,
     original_candidates: Mutex<HashMap<String, Vec<Binding>>>,
     assignment_generations: Mutex<HashMap<WorkspaceId, String>>,
     revoked: Mutex<std::collections::HashSet<String>>,
     outbox_gate: tokio::sync::Mutex<()>,
-    pub(crate) changed: tokio::sync::Notify,
+    pub changed: tokio::sync::Notify,
     watchers: Mutex<HashMap<AgentId, String>>,
     gates: Mutex<HashMap<AgentId, Arc<tokio::sync::Mutex<()>>>>,
     #[cfg(test)]
@@ -138,14 +138,22 @@ impl Runtime {
             .or_insert_with(id)
             .clone()
     }
-    pub(crate) fn assignment_changed(&self, workspace: &WorkspaceId) {
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub fn assignment_changed(&self, workspace: &WorkspaceId) {
         self.assignment_generations
             .lock()
             .expect("desktop assignment generations")
             .insert(workspace.clone(), id());
         self.changed.notify_waiters();
     }
-    pub(crate) fn active_client(&self, workspace: &WorkspaceId) -> Option<intent_core::ClientId> {
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub fn active_client(&self, workspace: &WorkspaceId) -> Option<intent_core::ClientId> {
         self.live
             .lock()
             .expect("desktop state")

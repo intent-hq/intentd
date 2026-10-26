@@ -52,7 +52,7 @@ async fn archive_round_trip_preserves_output_scope_and_hydrates() {
     }
     let history = h
         .services
-        .store
+        .store()
         .get_script_in_workspace(&h.ws, &id)
         .await
         .unwrap()
@@ -187,7 +187,7 @@ async fn archive_rejects_pending_launch_and_start_restores_first() {
     let rows = services.script_list(h.ws.clone()).await.unwrap();
     assert!(rows["scripts"][0].get("archivedAt").is_none());
     assert_eq!(
-        services.store.list_was_running_script_ids().await.unwrap(),
+        services.store().list_was_running_script_ids().await.unwrap(),
         vec![(h.ws.to_string(), id.clone())]
     );
     park.release.notify_one();
@@ -203,7 +203,7 @@ async fn archive_write_failure_cannot_hide_or_start_a_process() {
         .await
         .unwrap();
     sqlx::query("CREATE TRIGGER refuse_restore BEFORE UPDATE OF archived_at ON script BEGIN SELECT RAISE(FAIL, 'injected archive write failure'); END")
-        .execute(h.services.store.write_pool()).await.unwrap();
+        .execute(h.services.store().write_pool()).await.unwrap();
     assert!(h
         .services
         .script_start(h.ws.clone(), id.clone())
@@ -224,7 +224,7 @@ async fn archive_write_failure_cannot_hide_or_start_a_process() {
     );
     assert!(h
         .services
-        .store
+        .store()
         .get_script_in_workspace(&h.ws, &id)
         .await
         .unwrap()
@@ -270,7 +270,7 @@ async fn archive_commit_and_cancelled_waiter_serialize_with_start() {
         .unwrap();
     assert!(h
         .services
-        .store
+        .store()
         .get_script_in_workspace(&h.ws, &id)
         .await
         .unwrap()
@@ -291,7 +291,7 @@ async fn archive_batch_failure_commits_only_successful_predecessors() {
     let a = create_simple(&h, "a", "true", ScriptMode::Command).await;
     let b = create_simple(&h, "b", "true", ScriptMode::Command).await;
     sqlx::query("CREATE TRIGGER refuse_second_archive BEFORE UPDATE OF archived_at ON script WHEN NEW.name='b' BEGIN SELECT RAISE(FAIL,'injected'); END")
-        .execute(h.services.store.write_pool()).await.unwrap();
+        .execute(h.services.store().write_pool()).await.unwrap();
     assert!(matches!(
         h.services
             .script_archive(h.ws.clone(), vec![a.clone(), b.clone()])
@@ -300,7 +300,7 @@ async fn archive_batch_failure_commits_only_successful_predecessors() {
     ));
     assert!(h
         .services
-        .store
+        .store()
         .get_script_in_workspace(&h.ws, &a)
         .await
         .unwrap()
@@ -309,7 +309,7 @@ async fn archive_batch_failure_commits_only_successful_predecessors() {
         .is_some());
     assert!(h
         .services
-        .store
+        .store()
         .get_script_in_workspace(&h.ws, &b)
         .await
         .unwrap()
@@ -318,7 +318,7 @@ async fn archive_batch_failure_commits_only_successful_predecessors() {
         .is_none());
     let changes = h
         .services
-        .store
+        .store()
         .query_events(&EventQuery {
             workspace_id: Some(h.ws.clone()),
             event_types: vec![SCRIPT_CHANGED.to_string()],
@@ -338,7 +338,7 @@ async fn archive_batch_failure_commits_only_successful_predecessors() {
     assert_eq!(updates[0].data["script"]["id"], a);
     assert!(updates[0].data["script"]["archivedAt"].is_string());
     sqlx::query("DROP TRIGGER refuse_second_archive")
-        .execute(h.services.store.write_pool())
+        .execute(h.services.store().write_pool())
         .await
         .unwrap();
     assert_eq!(
@@ -519,7 +519,7 @@ async fn archive_run_cancelled_after_restore_commit_keeps_registry_consistent() 
     let _settled = tokio::time::timeout(LIVENESS, lock.lock()).await.unwrap();
     assert!(h
         .services
-        .store
+        .store()
         .get_script_in_workspace(&h.ws, &id)
         .await
         .unwrap()
@@ -565,7 +565,7 @@ async fn archive_empty_active_view_never_rebootstraps_repository_scripts() {
     sqlx::query("UPDATE workspace SET repository_path = ? WHERE id = ?")
         .bind(repo.0.to_str().unwrap())
         .bind(h.ws.as_str())
-        .execute(h.services.store.write_pool())
+        .execute(h.services.store().write_pool())
         .await
         .unwrap();
     let active = h
@@ -597,14 +597,14 @@ async fn archive_empty_active_view_never_rebootstraps_repository_scripts() {
         .is_err());
     assert!(h
         .services
-        .store
+        .store()
         .get_script_in_workspace(&h.ws, &id)
         .await
         .unwrap()
         .unwrap()
         .archived_at
         .is_some());
-    assert_eq!(h.services.store.list_all_scripts().await.unwrap().len(), 1);
+    assert_eq!(h.services.store().list_all_scripts().await.unwrap().len(), 1);
 }
 
 #[intent_test_macros::daemon_test]
@@ -639,7 +639,7 @@ async fn retirement_run_records_success_failure_and_saved_summary() {
         assert_eq!(result["exitCode"], code);
         let def = h
             .services
-            .store
+            .store()
             .get_script_in_workspace(&h.ws, &id)
             .await
             .unwrap()
@@ -755,7 +755,7 @@ async fn new_command_defaults_to_one_off_but_upserts_and_reload_preserve_purpose
     }))
     .unwrap();
     assert_eq!(legacy.purpose, ScriptPurpose::Saved);
-    restarted.store.upsert_script(&legacy).await.unwrap();
+    restarted.store().upsert_script(&legacy).await.unwrap();
     restarted.hydrate_scripts().await.unwrap();
     let updated = restarted
         .script_create(
@@ -893,7 +893,7 @@ async fn archived_script_remove_by_known_id_after_restart() {
             .script_archive(h.ws.clone(), vec![id.clone()])
             .await
             .unwrap();
-        h.services.store.close().await;
+        h.services.store().close().await;
         let restarted = Services::new(Store::open(&h.tmp.path).await.unwrap());
         restarted.hydrate_scripts().await.unwrap();
         assert!(restarted
@@ -910,7 +910,7 @@ async fn archived_script_remove_by_known_id_after_restart() {
         );
         let other_ws = WorkspaceId::new();
         restarted
-            .store
+            .store()
             .insert_workspace(&workspace(&other_ws, None))
             .await
             .unwrap();
@@ -931,7 +931,7 @@ async fn archived_script_remove_by_known_id_after_restart() {
         };
         assert_eq!(removed.unwrap(), json!({"ok":true,"scriptId":id}));
         assert!(restarted
-            .store
+            .store()
             .get_script_in_workspace(&h.ws, &id)
             .await
             .unwrap()
