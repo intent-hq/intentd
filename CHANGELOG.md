@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.47] - 2026-10-25
+
+### 🚀 Features
+
+- Add consented desktop control sessions and agent API ([#2245](https://github.com/intent-hq/intentd/pull/2245))
+
+### 🐛 Bug Fixes
+
+- *(workspace-api)* Keep large-note reads and committed writes within the script heap ([#2685](https://github.com/intent-hq/intentd/pull/2685))
+
+
 ## [0.11.46] - 2026-10-25
 
 ### 🚀 Features

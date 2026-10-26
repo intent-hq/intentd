@@ -9,8 +9,9 @@
 
 #![cfg(unix)]
 
+use intentd_test_support::GuardedChild;
 use std::path::Path;
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -27,7 +28,7 @@ fn temp_data_dir() -> tempfile::TempDir {
 }
 
 /// Spawn `intentd serve` (UDS always serves) with the hermetic env seams plus `env`.
-fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
+fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> GuardedChild {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
@@ -41,7 +42,7 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
         cmd.env(k, v);
     }
     common::hermetic_fixture_identity(&mut cmd, data_dir);
-    cmd.spawn().expect("spawn intentd serve")
+    GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
 }
 
 /// Wait for the daemon's UDS to accept connections, up to the shared

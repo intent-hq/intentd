@@ -11,8 +11,9 @@
 
 use crate::common;
 
+use intentd_test_support::GuardedChild;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 
 use tokio::time::timeout;
@@ -39,17 +40,18 @@ fn make_dirs() -> TestDirs {
     }
 }
 
-fn spawn_daemon(dirs: &TestDirs) -> Child {
+fn spawn_daemon(dirs: &TestDirs) -> GuardedChild {
     let log = std::fs::File::create(dirs.data_dir.join("daemon.log")).expect("create daemon log");
-    common::hermetic_serve_command(&dirs.data_dir)
-        .env("INTENTD_DATA_DIR", &dirs.data_dir)
-        .env("INTENTD_WORKSPACES_DIR", &dirs.workspaces)
-        .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
-        .env_remove("INTENTD_AUTH_TOKEN")
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(log))
-        .spawn()
-        .expect("spawn intentd serve")
+    GuardedChild::spawn(
+        common::hermetic_serve_command(&dirs.data_dir)
+            .env("INTENTD_DATA_DIR", &dirs.data_dir)
+            .env("INTENTD_WORKSPACES_DIR", &dirs.workspaces)
+            .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
+            .env_remove("INTENTD_AUTH_TOKEN")
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(log)),
+    )
+    .expect("spawn intentd serve")
 }
 
 /// Poll until `path` no longer exists, bounded by the shared startup budget

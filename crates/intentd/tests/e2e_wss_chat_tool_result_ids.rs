@@ -26,9 +26,10 @@
 
 use crate::common;
 
+use intentd_test_support::GuardedChild;
 use std::collections::HashMap;
 use std::path::Path;
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -55,21 +56,14 @@ type TlsWs = WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
 
 /// Live `intentd serve` process; killed and its data dir removed on drop.
 struct Daemon {
-    child: Child,
+    child: GuardedChild,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        // Kill the whole process group (daemon + Node.js ACP children) BEFORE
-        // removing the data dir, so an orphaned child cannot re-create files
-        // under it after cleanup. Spawned with process_group(0).
-        {
-            use nix::sys::signal::{self, Signal};
-            use nix::unistd::Pid;
-            let pid = Pid::from_raw(self.child.id().cast_signed());
-            let _ = signal::killpg(pid, Signal::SIGKILL);
-        }
-        let _ = self.child.wait();
+        // Kill the daemon's process group (GuardedChild gives it its own) BEFORE
+        // the data dir is removed, so nothing in it can re-create files there.
+        let _ = self.child.kill_tree();
     }
 }
 
@@ -77,7 +71,7 @@ fn temp_data_dir() -> tempfile::TempDir {
     common::test_tempdir_in("/tmp", "itd-wss-chatids-")
 }
 
-fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
+fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> GuardedChild {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
@@ -93,16 +87,11 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
-    // Group leader so Daemon::drop can killpg the daemon + ACP children.
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
     for (k, v) in env {
         cmd.env(k, v);
     }
     common::hermetic_fixture_identity(&mut cmd, data_dir);
-    cmd.spawn().expect("spawn intentd serve")
+    GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
 }
 
 /// Wait for the daemon's UDS to accept connections, up to the shared

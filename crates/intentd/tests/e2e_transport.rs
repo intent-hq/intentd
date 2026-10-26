@@ -19,9 +19,10 @@
 
 use crate::common;
 
+use intentd_test_support::GuardedChild;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -48,13 +49,12 @@ const TOKEN: &str = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdc
 
 /// A spawned `intentd serve` process; killed on drop.
 struct Daemon {
-    child: Child,
+    child: GuardedChild,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.child.kill_tree();
     }
 }
 
@@ -66,7 +66,7 @@ fn temp_data_dir() -> tempfile::TempDir {
 
 /// Spawn `intentd serve` with the given data dir + env. The
 /// caller holds the returned [`Daemon`] for the test's lifetime.
-fn spawn_serve(data_dir: &PathBuf, listen: &str, env: &[(&str, &str)]) -> Child {
+fn spawn_serve(data_dir: &PathBuf, listen: &str, env: &[(&str, &str)]) -> GuardedChild {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
@@ -83,7 +83,7 @@ fn spawn_serve(data_dir: &PathBuf, listen: &str, env: &[(&str, &str)]) -> Child 
         cmd.env(k, v);
     }
     common::hermetic_fixture_identity(&mut cmd, data_dir);
-    cmd.spawn().expect("spawn intentd serve")
+    GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
 }
 
 /// Run an `intentd <args>` control subcommand against `data_dir` to completion.

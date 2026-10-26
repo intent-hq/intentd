@@ -17,8 +17,9 @@
 
 use crate::common;
 
+use intentd_test_support::GuardedChild;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -52,7 +53,7 @@ fn make_dirs() -> TestDirs {
 /// armed. `workspaces_dir: None` reproduces the unguarded-harness regression
 /// this suite protects against: no `INTENTD_WORKSPACES_DIR`, so resolving the
 /// default workspaces root must refuse instead of falling back to `$HOME`.
-fn spawn_daemon(dirs: &TestDirs, workspaces_dir: Option<&Path>) -> Child {
+fn spawn_daemon(dirs: &TestDirs, workspaces_dir: Option<&Path>) -> GuardedChild {
     let log = std::fs::File::create(dirs.data_dir.join("daemon.log")).expect("create daemon log");
     let mut cmd = common::hermetic_serve_command(&dirs.data_dir);
     cmd.env("HOME", &dirs.home)
@@ -65,7 +66,7 @@ fn spawn_daemon(dirs: &TestDirs, workspaces_dir: Option<&Path>) -> Child {
     if let Some(dir) = workspaces_dir {
         cmd.env("INTENTD_WORKSPACES_DIR", dir);
     }
-    cmd.spawn().expect("spawn intentd serve")
+    GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
 }
 
 async fn await_socket(socket: &Path) -> bool {

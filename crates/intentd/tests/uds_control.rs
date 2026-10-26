@@ -10,8 +10,9 @@
 
 use crate::common;
 
+use intentd_test_support::GuardedChild;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -20,21 +21,20 @@ use tokio::net::UnixStream;
 use tokio::time::timeout;
 
 struct Daemon {
-    child: Child,
+    child: GuardedChild,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.child.kill_tree();
     }
 }
 
-fn spawn_daemon(data_dir: &PathBuf) -> Child {
+fn spawn_daemon(data_dir: &PathBuf) -> GuardedChild {
     spawn_daemon_with_env(data_dir, &[])
 }
 
-fn spawn_daemon_with_env(data_dir: &PathBuf, extra_env: &[(&str, &str)]) -> Child {
+fn spawn_daemon_with_env(data_dir: &PathBuf, extra_env: &[(&str, &str)]) -> GuardedChild {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
@@ -48,7 +48,7 @@ fn spawn_daemon_with_env(data_dir: &PathBuf, extra_env: &[(&str, &str)]) -> Chil
         cmd.env(key, value);
     }
     common::hermetic_fixture_identity(&mut cmd, data_dir);
-    cmd.spawn().expect("spawn intentd serve")
+    GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
 }
 
 async fn await_socket(socket: &std::path::Path) -> bool {

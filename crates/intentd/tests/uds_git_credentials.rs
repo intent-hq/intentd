@@ -17,8 +17,9 @@
 
 use crate::common;
 
+use intentd_test_support::GuardedChild;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use tokio::time::timeout;
@@ -27,13 +28,12 @@ use tokio::time::timeout;
 const TEST_TOKEN: &str = "gho_e2e_test_token_1234567890";
 
 struct Daemon {
-    child: Child,
+    child: GuardedChild,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.child.kill_tree();
     }
 }
 
@@ -59,10 +59,8 @@ fn mock_env_token_command(data_dir: &Path) -> Command {
     cmd
 }
 
-fn spawn_serve(data_dir: &Path) -> Child {
-    mock_env_token_command(data_dir)
-        .spawn()
-        .expect("spawn intentd serve")
+fn spawn_serve(data_dir: &Path) -> GuardedChild {
+    GuardedChild::spawn(&mut mock_env_token_command(data_dir)).expect("spawn intentd serve")
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -228,10 +226,8 @@ fn mock_stored_token_command(data_dir: &Path) -> Command {
     cmd
 }
 
-fn spawn_serve_with_stored_token(data_dir: &Path) -> Child {
-    mock_stored_token_command(data_dir)
-        .spawn()
-        .expect("spawn intentd serve")
+fn spawn_serve_with_stored_token(data_dir: &Path) -> GuardedChild {
+    GuardedChild::spawn(&mut mock_stored_token_command(data_dir)).expect("spawn intentd serve")
 }
 
 /// Phase 2.2 revocation e2e: with the token stored in the secrets store

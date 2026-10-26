@@ -17,8 +17,9 @@
 
 use crate::common;
 
+use intentd_test_support::GuardedChild;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 /// Artificial watcher-init delay: far longer than any plausible daemon boot,
@@ -52,25 +53,26 @@ fn make_dirs() -> TestDirs {
     }
 }
 
-fn spawn_daemon(dirs: &TestDirs) -> Child {
+fn spawn_daemon(dirs: &TestDirs) -> GuardedChild {
     let log = std::fs::File::create(dirs.data_dir.join("daemon.log")).expect("create daemon log");
-    common::hermetic_serve_command(&dirs.data_dir)
-        .env("INTENTD_DATA_DIR", &dirs.data_dir)
-        .env("INTENTD_WORKSPACES_DIR", &dirs.workspaces)
-        .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
-        .env(
-            "INTENTD_TEST_WATCHER_INIT_DELAY_MS",
-            watcher_delay().as_millis().to_string(),
-        )
-        // One Tokio worker: the harshest version of the saturated-runtime case.
-        // A blocking init that is merely `spawn`ed lands on the same worker that
-        // must reach the UDS bind, so this fails without `block_in_place`.
-        .env("TOKIO_WORKER_THREADS", "1")
-        .env_remove("INTENTD_AUTH_TOKEN")
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(log))
-        .spawn()
-        .expect("spawn intentd serve")
+    GuardedChild::spawn(
+        common::hermetic_serve_command(&dirs.data_dir)
+            .env("INTENTD_DATA_DIR", &dirs.data_dir)
+            .env("INTENTD_WORKSPACES_DIR", &dirs.workspaces)
+            .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
+            .env(
+                "INTENTD_TEST_WATCHER_INIT_DELAY_MS",
+                watcher_delay().as_millis().to_string(),
+            )
+            // One Tokio worker: the harshest version of the saturated-runtime case.
+            // A blocking init that is merely `spawn`ed lands on the same worker that
+            // must reach the UDS bind, so this fails without `block_in_place`.
+            .env("TOKIO_WORKER_THREADS", "1")
+            .env_remove("INTENTD_AUTH_TOKEN")
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(log)),
+    )
+    .expect("spawn intentd serve")
 }
 
 /// One `system.status` round-trip over the daemon's UDS control socket.

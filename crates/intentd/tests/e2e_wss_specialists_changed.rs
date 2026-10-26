@@ -12,9 +12,10 @@
 mod claude_agents;
 use crate::common;
 
+use intentd_test_support::GuardedChild;
 use std::io::Write;
 use std::path::Path;
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -39,7 +40,7 @@ fn scratch_dir(prefix: &str) -> tempfile::TempDir {
 
 /// Spawn `intentd serve` with a hermetic HOME so the user-tier specialists
 /// directory (`~/.intent/specialists`) never touches the real home.
-fn spawn_serve(data_dir: &Path, home_dir: &Path) -> Child {
+fn spawn_serve(data_dir: &Path, home_dir: &Path) -> GuardedChild {
     spawn_serve_with_claude_config(data_dir, home_dir, None)
 }
 
@@ -47,7 +48,7 @@ fn spawn_serve_with_claude_config(
     data_dir: &Path,
     home_dir: &Path,
     claude_config: Option<&Path>,
-) -> Child {
+) -> GuardedChild {
     // Keep both boots' logs so restart teardown can be diagnosed.
     let log = std::fs::OpenOptions::new()
         .create(true)
@@ -93,7 +94,7 @@ fn spawn_serve_with_claude_config(
             "specialist fixture must remove inherited {key} before spawning"
         );
     }
-    cmd.spawn().expect("spawn intentd serve")
+    GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
 }
 
 async fn await_uds(socket: &Path) -> bool {
