@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.56] - 2026-10-26
+
+### 🔧 Refactor
+
+- *(services)* Route remaining runtime calls through ports before the crate move ([#2728](https://github.com/intent-hq/intentd/pull/2728))
+
+
 ## [0.11.55] - 2026-10-26
 
 ### 🔧 Refactor
