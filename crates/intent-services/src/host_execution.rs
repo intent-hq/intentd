@@ -18,11 +18,10 @@ impl Services {
     /// collaboration-purpose credential slots here.
     pub(crate) async fn execution_context_snapshot(&self) -> Result<HostExecutionContext> {
         let settings = self.effective_settings();
+        let agents = self.ports.agent_wake();
         let mut enabled_provider_ids: Vec<_> = intent_providers::all_provider_ids()
             .into_iter()
-            .filter(|id| {
-                !crate::agent_ops::provider_is_disabled(id, settings.providers.enabled.as_ref())
-            })
+            .filter(|id| !agents.provider_is_disabled(id, settings.providers.enabled.as_ref()))
             .map(str::to_owned)
             .collect();
         enabled_provider_ids.sort_unstable();

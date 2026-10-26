@@ -2370,7 +2370,10 @@ impl Services {
         };
         let content = harness.hook_wake_framing(&hook.name, message, state_note.as_deref());
         if let Err(e) = self
+            .ports
+            .agent_wake()
             .deliver_wake_message(
+                self,
                 &hook.workspace_id,
                 &hook.agent_id,
                 &content,

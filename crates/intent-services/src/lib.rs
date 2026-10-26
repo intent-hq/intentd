@@ -58,6 +58,7 @@ mod agent_manager;
 mod agent_ops;
 mod agent_session;
 mod agent_subscriptions;
+mod agent_wake;
 mod agent_workers;
 mod auto_retire;
 mod retire;
@@ -1890,7 +1891,7 @@ impl Services {
             ports: feature_ports::FeaturePorts::default(),
             features: feature_ports::FeatureSet::default(),
         };
-        let services = runtime::register(services);
+        let services = agent_wake::register(runtime::register(services));
         services
             .gitlab_credential_gate
             .attach_repository(services.repository_connection_directory(), descriptor)

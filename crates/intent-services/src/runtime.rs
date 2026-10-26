@@ -254,7 +254,7 @@ impl RuntimePort for RuntimeFeature {
             let _admission = svc.workspace_mutations.enter(&workspace_id)?;
             svc.require_member(&workspace_id).await?;
             let _archive = svc.archive_fence.acquire(&workspace_id).await;
-            let retirement = svc.agent_retirement_gates.for_agent(&agent_id);
+            let retirement = svc.ports.agent_wake().retirement_gate(svc, &agent_id);
             let _retirement = retirement.lock().await;
             let key = (workspace_id.clone(), script_id.clone());
             let auto = self.auto_start_monitors.lock().unwrap().get(&key).cloned();

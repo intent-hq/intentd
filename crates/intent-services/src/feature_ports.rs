@@ -29,8 +29,8 @@ use std::sync::Mutex;
 use intent_core::transfer::TransferPlan;
 
 use intent_core::{
-    AgentId, BoxFuture, BrowserTab, BrowserTabInput, ClientId, Error, Result, ReverseTarget,
-    ScriptCreateParams, WorkspaceApi, WorkspaceId,
+    AgentId, AgentStatus, BoxFuture, BrowserTab, BrowserTabInput, ClientId, Error, Result,
+    ReverseTarget, ScriptCreateParams, WorkspaceApi, WorkspaceId,
 };
 
 use crate::Services;
@@ -744,6 +744,139 @@ pub struct SetupScriptRun {
     pub source_branch: String,
 }
 
+/// The agent-wake feature: what the runtime (script monitors, hooks, script
+/// ownership checks) and host execution need from agents, so they never name
+/// agent types. Implemented on the agents side (`crate::agent_wake`).
+///
+/// Each method behaves exactly as the agent call it replaces; the async ones
+/// box the same future, adding no await point.
+pub trait AgentWakePort: Send + Sync + 'static {
+    /// Deliver `content` to `agent_id` as a wake message, starting a turn or
+    /// queueing it (`Services::deliver_wake_message`).
+    fn deliver_wake_message<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
+        agent_id: &'a AgentId,
+        content: &'a str,
+        metadata: Option<&'a serde_json::Value>,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    /// Queue an automatic message for `agent_id` (no attachments, prepend or
+    /// interrupt) under `message_id`, without draining. Returns the queue
+    /// row describing the queued entry.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Internal`] if the queued entry cannot be serialized; the
+    /// message is queued either way.
+    fn enqueue_automatic_message(
+        &self,
+        svc: &Services,
+        agent_id: &AgentId,
+        message_id: Option<String>,
+        content: String,
+        metadata: Option<serde_json::Value>,
+    ) -> Result<intent_store::AgentQueueRow>;
+
+    /// Persist `agent_id`'s queue snapshot and publish `agent:queue_updated`.
+    fn publish_queue_updated<'a>(
+        &'a self,
+        svc: &'a Services,
+        agent_id: &'a AgentId,
+    ) -> BoxFuture<'a, ()>;
+
+    /// The live queue drainer (the agent manager), if one is attached. The
+    /// caller holds the handle across the steps that need it.
+    fn queue_drainer(&self, svc: &Services) -> Option<Arc<dyn AgentQueueDrainer>>;
+
+    /// The per-agent gate that serializes retirement with restore; hold its
+    /// lock to keep `agent_id` from retiring meanwhile.
+    fn retirement_gate(&self, svc: &Services, agent_id: &AgentId) -> Arc<tokio::sync::Mutex<()>>;
+
+    /// Whether `status` is terminal: the agent can no longer receive wakes.
+    fn is_terminal_status(&self, status: AgentStatus) -> bool;
+
+    /// Whether settings disable `provider_id` (`providers.enabled`).
+    fn provider_is_disabled(
+        &self,
+        provider_id: &str,
+        enabled: Option<&std::collections::BTreeMap<String, bool>>,
+    ) -> bool;
+}
+
+/// Drains an agent's message queue: starts the next queued turn if the agent
+/// is idle ([`AgentWakePort::queue_drainer`]).
+pub trait AgentQueueDrainer: Send + Sync {
+    fn try_drain_queue(
+        self: Arc<Self>,
+        agent_id: AgentId,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'static, ()>;
+}
+
+/// The agent-wake port of a `Services` no agents feature was registered on:
+/// there is no agent to wake. Deliveries and enqueues fail, there is no
+/// drainer, every status is terminal and no provider is disabled.
+#[derive(Default)]
+pub(crate) struct UnavailableAgentWake;
+
+fn agent_wake_unavailable() -> Error {
+    Error::Internal("agent wake port not registered".into())
+}
+
+impl AgentWakePort for UnavailableAgentWake {
+    fn deliver_wake_message<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _workspace_id: &'a WorkspaceId,
+        _agent_id: &'a AgentId,
+        _content: &'a str,
+        _metadata: Option<&'a serde_json::Value>,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        Box::pin(async { Err(agent_wake_unavailable()) })
+    }
+
+    fn enqueue_automatic_message(
+        &self,
+        _svc: &Services,
+        _agent_id: &AgentId,
+        _message_id: Option<String>,
+        _content: String,
+        _metadata: Option<serde_json::Value>,
+    ) -> Result<intent_store::AgentQueueRow> {
+        Err(agent_wake_unavailable())
+    }
+
+    fn publish_queue_updated<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _agent_id: &'a AgentId,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
+
+    fn queue_drainer(&self, _svc: &Services) -> Option<Arc<dyn AgentQueueDrainer>> {
+        None
+    }
+
+    fn retirement_gate(&self, _svc: &Services, _agent_id: &AgentId) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::new(tokio::sync::Mutex::new(()))
+    }
+
+    fn is_terminal_status(&self, _status: AgentStatus) -> bool {
+        true
+    }
+
+    fn provider_is_disabled(
+        &self,
+        _provider_id: &str,
+        _enabled: Option<&std::collections::BTreeMap<String, bool>>,
+    ) -> bool {
+        false
+    }
+}
+
 /// A `WorkspaceApi` with no overrides: every method is the trait default.
 struct DefaultWorkspaceApi;
 
@@ -1357,6 +1490,9 @@ feature_port_registry! {
     /// Register the workspace runtime feature (scripts and hooks).
     /// [`Services::new`] registers the in-crate one.
     runtime: RuntimePort = UnavailableRuntime, with_runtime_port;
+    /// Register the agent-wake feature runtime code wakes agents through.
+    /// [`Services::new`] registers the in-crate one.
+    agent_wake: AgentWakePort = UnavailableAgentWake, with_agent_wake_port;
 }
 
 /// Writes `WorkspaceApi` methods that forward to a feature port: each
@@ -1377,6 +1513,14 @@ macro_rules! port_forwarders {
     };
 }
 pub(crate) use port_forwarders;
+
+impl FeaturePorts {
+    /// A shared handle on the agent-wake port, for holders that outlive the
+    /// borrow of `Services` (the script manager).
+    pub(crate) fn agent_wake_port(&self) -> Arc<dyn AgentWakePort> {
+        Arc::clone(&self.agent_wake.port)
+    }
+}
 
 impl Services {
     /// The declared feature ports that no feature registered. Empty once the
@@ -1413,8 +1557,8 @@ mod tests {
     use intent_core::{Error, WorkspaceApi, WorkspaceId};
 
     use super::{
-        FeaturePorts, RuntimePort, TransferPort, UnavailableRuntime, UnavailableTransfer,
-        DEFAULT_WORKSPACE_API,
+        AgentWakePort, FeaturePorts, RuntimePort, TransferPort, UnavailableAgentWake,
+        UnavailableRuntime, UnavailableTransfer, DEFAULT_WORKSPACE_API,
     };
 
     use crate::test_support::fixtures::TempDb;
@@ -1480,16 +1624,16 @@ mod tests {
     async fn the_startup_check_names_every_unregistered_port() {
         let tmp = TempDb::new();
         let svc = bare_services(&tmp).await;
-        assert_eq!(FeaturePorts::NAMES, ["transfer", "runtime"]);
+        assert_eq!(FeaturePorts::NAMES, ["transfer", "runtime", "agent_wake"]);
         assert_eq!(
             FeaturePorts::default().unregistered(),
             FeaturePorts::NAMES,
-            "every declared port, the runtime port included, starts unregistered"
+            "every declared port, the in-crate ones included, starts unregistered"
         );
         assert_eq!(
             svc.unregistered_feature_ports(),
             ["transfer"],
-            "Services::new registers the in-crate runtime feature"
+            "Services::new registers the in-crate runtime and agent-wake features"
         );
         assert!(matches!(
             svc.ensure_feature_ports_registered(),
@@ -1529,6 +1673,96 @@ mod tests {
             svc.feature::<crate::runtime::RuntimeFeature>()
                 .expect("registered")
         ));
+    }
+
+    #[tokio::test]
+    async fn unregistered_agent_wake_port_has_no_agent_to_wake() {
+        let tmp = TempDb::new();
+        let svc = bare_services(&tmp)
+            .await
+            .with_agent_wake_port(Arc::new(UnavailableAgentWake) as Arc<dyn AgentWakePort>);
+        let port = svc.ports.agent_wake();
+        let ws = WorkspaceId::new();
+        let agent = intent_core::AgentId::new();
+        let unavailable =
+            |e: &Error| matches!(e, Error::Internal(m) if m == "agent wake port not registered");
+        let delivered = port
+            .deliver_wake_message(&svc, &ws, &agent, "wake", None)
+            .await;
+        assert!(delivered.as_ref().is_err_and(unavailable), "{delivered:?}");
+        let queued = port.enqueue_automatic_message(&svc, &agent, None, "m".into(), None);
+        assert!(queued.as_ref().is_err_and(unavailable), "{queued:?}");
+        port.publish_queue_updated(&svc, &agent).await;
+        assert!(port.queue_drainer(&svc).is_none());
+        let first = port.retirement_gate(&svc, &agent);
+        let _held = first.try_lock().expect("a fresh gate");
+        assert!(port.is_terminal_status(intent_core::AgentStatus::Idle));
+        let disabled = std::collections::BTreeMap::from([("claude".to_owned(), false)]);
+        assert!(!port.provider_is_disabled("claude", Some(&disabled)));
+    }
+
+    #[tokio::test]
+    async fn the_registered_agent_wake_port_answers_like_the_agent_calls() {
+        use intent_core::AgentStatus;
+        let tmp = TempDb::new();
+        let svc = bare_services(&tmp).await;
+        let port = svc.ports.agent_wake();
+        for status in AgentStatus::ALL {
+            assert_eq!(
+                port.is_terminal_status(status),
+                crate::agent_ops::is_terminal_status(status),
+                "{status:?}"
+            );
+        }
+        for enabled in [
+            None,
+            Some(std::collections::BTreeMap::from([(
+                "claude".to_owned(),
+                false,
+            )])),
+            Some(std::collections::BTreeMap::from([(
+                "claude".to_owned(),
+                true,
+            )])),
+        ] {
+            for provider in ["claude", "codex", "no-such-provider"] {
+                assert_eq!(
+                    port.provider_is_disabled(provider, enabled.as_ref()),
+                    crate::agent_ops::provider_is_disabled(provider, enabled.as_ref()),
+                    "{provider} {enabled:?}"
+                );
+            }
+        }
+        let agent = intent_core::AgentId::new();
+        let gate = port.retirement_gate(&svc, &agent);
+        assert!(
+            Arc::ptr_eq(&gate, &svc.agent_retirement_gates.for_agent(&agent)),
+            "the port hands out the agent's own retirement gate"
+        );
+        assert!(
+            port.queue_drainer(&svc).is_none(),
+            "no drainer before an agent manager is attached"
+        );
+        let receipt = port
+            .enqueue_automatic_message(
+                &svc,
+                &agent,
+                Some("wake-1".into()),
+                "body".into(),
+                Some(serde_json::json!({"type": "script_monitor_wake"})),
+            )
+            .expect("queued");
+        assert_eq!(receipt.id, "wake-1");
+        assert_eq!(receipt.agent_id, agent);
+        assert_eq!(receipt.position, 0);
+        assert_eq!(receipt.payload["content"], "body");
+        assert_eq!(receipt.payload["userOrigin"], false);
+        assert_eq!(
+            receipt.payload["messageMetadata"]["type"],
+            "script_monitor_wake"
+        );
+        assert_eq!(receipt.turn_id, receipt.payload["turnId"]);
+        assert_eq!(receipt.created_at, receipt.payload["queuedAt"]);
     }
 
     #[tokio::test]
