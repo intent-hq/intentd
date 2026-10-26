@@ -570,7 +570,7 @@ class RunnerAvailabilityTests(unittest.TestCase):
         result = run_route(self.workflow, **fixture)
         outputs = route_outputs(self.workflow, result["outputs"])
         self.assertEqual(json.loads(outputs.get("macos_labels", "null")), expected)
-        self.assertEqual(outputs.get("macos_burst"), str(expected == ["warp-macos-26-arm64-12x"]).lower())
+        self.assertEqual(outputs.get("macos_burst"), str(expected == ["warp-macos-26-arm64-6x"]).lower())
         for job_id, field, value in (("build", "target", "aarch64-apple-darwin"),
                                      ("daemon-lifecycle", "platform", "macos")):
             job = self.workflow["jobs"][job_id]
@@ -590,7 +590,7 @@ class RunnerAvailabilityTests(unittest.TestCase):
                       [{**runner(), "labels": [{"name": "macOS"}, {"name": "ARM64"}]}],
                       [runner(busy=True), runner(status="offline"), runner(arch="X64")]):
             with self.subTest(fleet=fleet):
-                self.assert_mac_route({"org": fleet}, ["warp-macos-26-arm64-12x"])
+                self.assert_mac_route({"org": fleet}, ["warp-macos-26-arm64-6x"])
         for fleet in ([runner()], [runner(platform="MACos", arch="arm64")],
                       [{**runner(), "labels": [{"name": n} for n in ("SELF-HOSTED", "macos", "arm64")]}],
                       [runner(busy=True), runner(status="offline"), runner(), runner(arch="X64")]):
@@ -598,15 +598,15 @@ class RunnerAvailabilityTests(unittest.TestCase):
                 self.assert_mac_route({"org": fleet}, ["self-hosted", "macOS", "ARM64"])
 
     def test_org_lookup_and_repo_fallback_are_shared_and_fail_to_hosted(self):
-        cases = [({}, ["warp-macos-26-arm64-12x"], ["org"]),
+        cases = [({}, ["warp-macos-26-arm64-6x"], ["org"]),
                  ({"orgError": "403 missing permission", "repo": [runner()]},
                   ["self-hosted", "macOS", "ARM64"], ["org", "repo"]),
-                 ({"orgError": "403", "repo": [runner(busy=True)]}, ["warp-macos-26-arm64-12x"], ["org", "repo"]),
-                 ({"orgError": "403", "repo": []}, ["warp-macos-26-arm64-12x"], ["org", "repo"]),
-                 ({"orgError": "403", "repoError": "403 missing permission"}, ["warp-macos-26-arm64-12x"], ["org", "repo"]),
-                 ({"orgError": "network timeout", "repoError": "503 unavailable"}, ["warp-macos-26-arm64-12x"], ["org", "repo"]),
-                 ({"org": {"unexpected": "response"}}, ["warp-macos-26-arm64-12x"], ["org"]),
-                 ({"org": [], "repo": [runner()]}, ["warp-macos-26-arm64-12x"], ["org"])]
+                 ({"orgError": "403", "repo": [runner(busy=True)]}, ["warp-macos-26-arm64-6x"], ["org", "repo"]),
+                 ({"orgError": "403", "repo": []}, ["warp-macos-26-arm64-6x"], ["org", "repo"]),
+                 ({"orgError": "403", "repoError": "403 missing permission"}, ["warp-macos-26-arm64-6x"], ["org", "repo"]),
+                 ({"orgError": "network timeout", "repoError": "503 unavailable"}, ["warp-macos-26-arm64-6x"], ["org", "repo"]),
+                 ({"org": {"unexpected": "response"}}, ["warp-macos-26-arm64-6x"], ["org"]),
+                 ({"org": [], "repo": [runner()]}, ["warp-macos-26-arm64-6x"], ["org"])]
         for fixture, expected, endpoints in cases:
             with self.subTest(fixture=fixture):
                 result = self.assert_mac_route(fixture, expected)
@@ -626,7 +626,7 @@ class RunnerAvailabilityTests(unittest.TestCase):
                 # Jobs still asking for the generic self-hosted Linux fleet never occupy a slot.
                 jobs += [{"status": "in_progress", "labels": ["self-hosted", "Linux", "X64"]}] * 5
                 result = self.assert_mac_route({"org": fleet, "jobs": jobs, "queueErrors": queue_errors},
-                                              ["warp-macos-26-arm64-12x"] if queue_errors else ["self-hosted", "macOS", "ARM64"])
+                                              ["warp-macos-26-arm64-6x"] if queue_errors else ["self-hosted", "macOS", "ARM64"])
                 outputs = result["outputs"]
                 # Both slots are busy, so 16-core work has no idle bigmem runner and bursts;
                 # 8-core work keeps the heavy pool's queue semantics.
@@ -715,7 +715,7 @@ class RunnerAvailabilityTests(unittest.TestCase):
     def test_bursts_go_to_warpbuild(self):
         same_repo = {"pull_request": {"head": {"repo": {"full_name": "intent-hq/intentd"}}}}
         warp = {"linux_labels": ["warp-ubuntu-2404-x64-16x"], "check_labels": ["warp-ubuntu-2404-x64-8x"],
-                "windows_labels": ["warp-windows-2022-x64-16x"], "macos_labels": ["warp-macos-26-arm64-12x"]}
+                "windows_labels": ["warp-windows-2022-x64-16x"], "macos_labels": ["warp-macos-26-arm64-6x"]}
         for event in ("pull_request", "push", "merge_group"):
             with self.subTest(event=event):
                 result = run_route(self.workflow, org=[], eventName=event, warpbuildDisabled="",
@@ -904,7 +904,7 @@ class RunnerAvailabilityTests(unittest.TestCase):
             with self.subTest(disabled=disabled):
                 outputs = run_route(self.workflow, org=fleet, macosDisabled=disabled)["outputs"]
                 self.assertEqual(json.loads(outputs["macos_labels"]),
-                                 ["warp-macos-26-arm64-12x"] if disabled == "true" else ["self-hosted", "macOS", "ARM64"])
+                                 ["warp-macos-26-arm64-6x"] if disabled == "true" else ["self-hosted", "macOS", "ARM64"])
                 self.assertEqual(outputs["macos_burst"], str(disabled == "true").lower())
                 self.assertEqual(json.loads(outputs["linux_labels"]), BIG)
                 self.assertEqual(json.loads(outputs["windows_labels"]), ["self-hosted", "Windows", "X64"])
@@ -914,7 +914,7 @@ class RunnerAvailabilityTests(unittest.TestCase):
     def test_empty_outputs_use_hosted_macos_in_both_matrices(self):
         for job_id in ("build", "windows", "daemon-lifecycle", "macos-services-runtime"):
             for row in self.workflow["jobs"][job_id]["strategy"]["matrix"]["include"]:
-                expected = ["warp-macos-26-arm64-12x"] if row.get("target") == "aarch64-apple-darwin" or row.get("platform") == "macos" else (
+                expected = ["warp-macos-26-arm64-6x"] if row.get("target") == "aarch64-apple-darwin" or row.get("platform") == "macos" else (
                     ["warp-ubuntu-2404-x64-16x"] if row.get("platform") == "linux" else ["warp-windows-2022-x64-16x"])
                 for outputs in ({}, {"macos_labels": "", "windows_labels": "", "linux_labels": ""}):
                     with self.subTest(job=job_id, row=row, outputs=outputs):
@@ -925,7 +925,7 @@ class RunnerAvailabilityTests(unittest.TestCase):
 
     def test_hosted_macos_skips_persistent_cleanup_and_uses_cache(self):
         steps = {s.get("name"): s for s in self.workflow["jobs"]["build"]["steps"]}
-        for labels in (["warp-macos-26-arm64-12x"], ["self-hosted", "macOS", "ARM64"]):
+        for labels in (["warp-macos-26-arm64-6x"], ["self-hosted", "macOS", "ARM64"]):
             for fast_path in ("", "true"):
                 values = {**context("merge_group", fast_path=fast_path), "matrix.os": labels}
                 for name in ("Ensure macOS CI disk headroom", "Point CARGO_TARGET_DIR outside the work dir (self-hosted)"):
