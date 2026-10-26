@@ -15,7 +15,7 @@ use intent_core::{
 use intent_store::Store;
 use serde_json::{json, Value};
 
-use super::{workspace, TempDb, WorkspacesRoot};
+use crate::test_support::fixtures::{workspace, TempDb, WorkspacesRoot};
 use crate::{EventBus, Services, SubscriptionFilter};
 
 /// A dispatcher with a fixed set of live clients: `browser_exec == true`
@@ -151,8 +151,7 @@ fn actions() -> Vec<Value> {
 
 #[tokio::test]
 async fn client_list_projects_live_clients() {
-    let reg =
-        FakeRegistry::new(&[("desktop-a", Some("Desktop A"), true), ("aux", None, false)]);
+    let reg = FakeRegistry::new(&[("desktop-a", Some("Desktop A"), true), ("aux", None, false)]);
     let (_t, _r, svc, _bus, _ws) = setup(reg).await;
     let clients = svc.client_list().await.expect("list");
     let wire = serde_json::to_value(&clients).unwrap();
@@ -440,7 +439,7 @@ async fn set_rejects_never_seen_client_chief_and_unknown_workspace() {
     // hello'd client: it has a `client` row but is still rejected.
     let anon = ClientId::from_string("anon-draft");
     svc.ensure_client(anon.clone()).await.expect("placeholder");
-    assert!(svc.store.get_client(&anon).await.unwrap().is_some());
+    assert!(svc.store().get_client(&anon).await.unwrap().is_some());
     let err = svc
         .set_workspace_browser_client(ws.clone(), Some(anon))
         .await
@@ -497,12 +496,12 @@ async fn pre_upgrade_named_row_is_pinnable_and_nameless_row_is_not() {
         .await
         .expect("placeholder");
     sqlx::query("UPDATE client SET last_hello_at = NULL")
-        .execute(svc.store.write_pool())
+        .execute(svc.store().write_pool())
         .await
         .expect("shape pre-upgrade rows");
     for id in [&named, &nameless] {
         assert_eq!(
-            svc.store
+            svc.store()
                 .get_client(id)
                 .await
                 .unwrap()
@@ -511,12 +510,12 @@ async fn pre_upgrade_named_row_is_pinnable_and_nameless_row_is_not() {
             None
         );
     }
-    let backfill = include_str!("../../intent-store/migrations/0117_client_host_identity.sql")
+    let backfill = include_str!("../../../intent-store/migrations/0117_client_host_identity.sql")
         .lines()
         .find(|l| l.starts_with("UPDATE client SET last_hello_at"))
         .expect("0117 backfill statement");
     sqlx::raw_sql(backfill)
-        .execute(svc.store.write_pool())
+        .execute(svc.store().write_pool())
         .await
         .expect("re-run backfill");
 

@@ -18,7 +18,7 @@ use crate::{repository_backfill_probe_count, BackfillCandidate, Services};
 mod line_attribution_retry;
 mod note_write_lock;
 mod orphan_flag_race;
-mod retire_workspace;
+pub(crate) mod retire_workspace;
 mod skill_list;
 mod task_list_latency;
 mod task_push;
@@ -81,50 +81,9 @@ pub(crate) use crate::test_support::test_tempdir;
 
 pub(crate) use crate::test_support::fixtures::TempDb;
 
-/// A settings registry (backed by a config file next to the temp db, swept
-/// with [`TempDb`]'s dir) seeding `model.defaultProvider = "auggie"`: since
-/// monorepo#3044 there is no positional provider fallback, so tests that
-/// create/delegate agents without an explicit provider or model need a
-/// configured default to resolve to. The `providers.paths` override points
-/// auggie at a deterministic executable so availability checks
-/// (`agent.delegate`) pass without the real binary on the test host
-/// (monorepo#3162).
-pub(crate) fn test_registry_with_default_provider(
-    tmp: &TempDb,
-) -> std::sync::Arc<crate::SettingsRegistry> {
-    let cfg = PathBuf::from(format!("{}.config.toml", tmp.path.display()));
-    let registry = std::sync::Arc::new(crate::SettingsRegistry::load(cfg).expect("load registry"));
-    registry
-        .apply(&[
-            (
-                "model.defaultProvider".to_string(),
-                serde_json::json!("auggie"),
-            ),
-            (
-                "providers.paths".to_string(),
-                serde_json::json!({ "auggie": "/bin/sh" }),
-            ),
-        ])
-        .expect("seed default provider");
-    registry
-}
-
-/// Drop-cleanup wrapper around a per-test workspaces root, paired with the
-/// intent-services hermetic-tests guard (see `default_workspaces_root`). Every
-/// test that constructs a `Services` reachable from workspace provisioning
-/// **must** attach one via `.with_workspaces_root(root.path().to_path_buf())`;
-/// otherwise the guard panics rather than writing under `~/intent/workspaces`.
-pub(crate) struct WorkspacesRoot(tempfile::TempDir);
-
-impl WorkspacesRoot {
-    pub(crate) fn new() -> Self {
-        Self(test_tempdir("intentd-wss-"))
-    }
-
-    pub(crate) fn path(&self) -> &std::path::Path {
-        self.0.path()
-    }
-}
+pub(crate) use crate::test_support::fixtures::{
+    test_registry_with_default_provider, WorkspacesRoot,
+};
 
 pub(crate) use crate::test_support::fixtures::workspace;
 
@@ -34781,7 +34740,7 @@ mod worktree_provisioning {
 /// path — script exit (`ranScript: true` + `exitCode`), no script, skipped
 /// isolation, no worktree — and `workspace.duplicate` (which never runs a
 /// setup script) completes immediately with `ranScript: false`.
-mod setup_lifecycle_events {
+pub(crate) mod setup_lifecycle_events {
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -34799,7 +34758,7 @@ mod setup_lifecycle_events {
     /// Wait until the setup script has reached its barrier (proving the
     /// spawn succeeded and the script is parked there).
     #[cfg(unix)]
-    async fn wait_for_barrier(barrier: &Barrier) {
+    pub(crate) async fn wait_for_barrier(barrier: &Barrier) {
         tokio::time::timeout(
             intentd_test_support::test_timeout(Duration::from_secs(20)),
             async {
@@ -34814,15 +34773,15 @@ mod setup_lifecycle_events {
     }
 
     /// Temp directory tree swept on drop (see [`test_tempdir`]).
-    struct TempDir(PathBuf, #[expect(dead_code)] tempfile::TempDir);
+    pub(crate) struct TempDir(pub(crate) PathBuf, #[expect(dead_code)] tempfile::TempDir);
 
-    fn unique_dir(prefix: &str) -> TempDir {
+    pub(crate) fn unique_dir(prefix: &str) -> TempDir {
         let guard = test_tempdir(&format!("{prefix}-"));
         TempDir(guard.path().to_path_buf(), guard)
     }
 
     /// Init a git repo with one commit; returns (guard, head branch).
-    fn seed_repo(prefix: &str) -> (TempDir, String) {
+    pub(crate) fn seed_repo(prefix: &str) -> (TempDir, String) {
         let dir = unique_dir(prefix);
         let repo = git2::Repository::init(&dir.0).unwrap();
         {
@@ -34844,7 +34803,7 @@ mod setup_lifecycle_events {
         (dir, branch)
     }
 
-    async fn services(root: PathBuf) -> (Services, EventBus, TempDb) {
+    pub(crate) async fn services(root: PathBuf) -> (Services, EventBus, TempDb) {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
         let bus = EventBus::new(store.clone());
@@ -34856,7 +34815,7 @@ mod setup_lifecycle_events {
 
     /// Subscribe to only the setup lifecycle events (the setup terminal's
     /// `terminal:*` stream and the create's other events stay out of scope).
-    fn subscribe_setup(bus: &EventBus) -> Subscription {
+    pub(crate) fn subscribe_setup(bus: &EventBus) -> Subscription {
         bus.subscribe(SubscriptionFilter {
             event_types: vec!["workspace:setup:*".to_string()],
             ..Default::default()
@@ -34865,7 +34824,7 @@ mod setup_lifecycle_events {
 
     /// Receive one setup event (generous timeout: script paths cross a PTY
     /// spawn + reap poll), serialized to wire JSON.
-    async fn recv_setup(sub: &mut Subscription) -> Value {
+    pub(crate) async fn recv_setup(sub: &mut Subscription) -> Value {
         let batch = tokio::time::timeout(
             intentd_test_support::test_timeout(Duration::from_secs(20)),
             sub.recv(),
@@ -34877,7 +34836,7 @@ mod setup_lifecycle_events {
         serde_json::to_value(&batch[0]).expect("serialize event")
     }
 
-    async fn assert_quiet(sub: &mut Subscription) {
+    pub(crate) async fn assert_quiet(sub: &mut Subscription) {
         let quiet = tokio::time::timeout(
             intentd_test_support::test_timeout(Duration::from_millis(300)),
             sub.recv(),

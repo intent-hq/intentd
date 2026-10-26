@@ -1,3 +1,12 @@
+//! Hook wake and notice goldens that need the runtime's hook service (moved
+//! from `v1_goldens.rs`).
+
+use intent_core::{now_iso, AgentId};
+use serde_json::json;
+
+use crate::hook_manager::HookServicesExt;
+use crate::v1_goldens::{pr_monitor_row, seed_agent, setup, wake_texts_when};
+
 /// FE-cancel notices for hooks and PR monitors: exact wake bytes delivered
 /// to the owning agent. (The archive sweep's consolidated notice is a v2.7
 /// surface, pinned in `v2_7_goldens.rs`.)

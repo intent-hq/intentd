@@ -1,3 +1,17 @@
+//! Host-member authority over the runtime's script, terminal and execution
+//! context surfaces (moved from `capability/host_role_tests.rs`).
+
+use intent_core::{
+    with_caller, Caller, Error, HostRole, PrincipalId, WorkspaceApi, WorkspaceId, WorkspaceRole,
+};
+use intent_store::Store;
+use serde_json::json;
+
+use crate::host_execution::HostExecutionExt;
+use crate::test_support::capability_fixtures::host_role::{caller, fixture};
+use crate::test_support::fixtures::{workspace, TempDb};
+use crate::Services;
+
 #[tokio::test]
 async fn member_execution_context_event_is_durable_and_survives_store_reopen() {
     use crate::events::{EventBus, SubscriptionFilter};
@@ -15,7 +29,7 @@ async fn member_execution_context_event_is_durable_and_survives_store_reopen() {
             ("model.defaultProvider".into(), json!("codex")),
         ])
         .unwrap();
-    let bus = EventBus::new(svc.store.clone());
+    let bus = EventBus::new(svc.store().clone());
     let svc = svc
         .with_settings_registry(registry)
         .with_event_bus(bus.clone());
@@ -51,7 +65,7 @@ async fn member_execution_context_event_is_durable_and_survives_store_reopen() {
         event_types: vec![HOST_EXECUTION_CONTEXT_CHANGED.into()],
         ..Default::default()
     };
-    let persisted = svc.store.query_events(&query).await.unwrap();
+    let persisted = svc.store().query_events(&query).await.unwrap();
     assert_eq!(persisted.len(), 1, "live delivery must follow persistence");
     assert_eq!(persisted[0].id, live.id);
     assert_eq!(persisted[0].data, expected);
@@ -150,13 +164,13 @@ async fn member_execution_context_is_allowlisted_and_uses_host_policy() {
         assert!(!context.to_string().contains("/host/provider"));
         assert_eq!(svc.execution_provider_paths().await.unwrap()["codex"], "/host/provider");
         assert!(matches!(svc.settings_get("providers.paths".into()).await, Err(Error::Forbidden(_))));
-        svc.secrets.delete("sourceControl.github.token").await.unwrap();
+        svc.feature_secrets().delete("sourceControl.github.token").await.unwrap();
         assert_eq!(svc.host_execution_context().await.unwrap()["repositoryConnections"][0]["configured"], false,
             "collaboration credentials must never supply execution");
         registry.apply(&[("sourceControl.github.exposeGitCredentialToChildren".into(), json!(true))]).unwrap();
         assert_eq!(svc.host_execution_context().await.unwrap()["gitCredentialPolicy"]["managedHelperEnabled"], true);
     }).await;
-    svc.store.remove_host_member(&member).await.unwrap();
+    svc.store().remove_host_member(&member).await.unwrap();
     assert!(
         with_caller(caller(&member), svc.host_execution_context())
             .await
@@ -182,7 +196,7 @@ async fn member_execution_enablement_events_follow_committed_changes_and_reset()
     registry
         .apply(&[("sourceControl.github.tokenSource".into(), json!("explicit"))])
         .unwrap();
-    let bus = EventBus::new(svc.store.clone());
+    let bus = EventBus::new(svc.store().clone());
     let svc = svc
         .with_settings_registry(registry)
         .with_event_bus(bus.clone());
@@ -240,7 +254,7 @@ async fn member_execution_enablement_events_follow_committed_changes_and_reset()
         assert!(rows
             .iter()
             .any(|row| row.id == event.id && row.data == event.data));
-        let reloaded = Services::new(svc.store.clone()).with_settings_registry(Arc::new(
+        let reloaded = Services::new(svc.store().clone()).with_settings_registry(Arc::new(
             crate::SettingsRegistry::load(path.clone()).unwrap(),
         ));
         assert_eq!(
@@ -422,7 +436,7 @@ async fn member_script_create_cannot_replace_definition_from_another_workspace()
     let tmp = TempDb::new();
     let (svc, _, member) = fixture(&tmp).await;
     let target = WorkspaceId::new();
-    svc.store
+    svc.store()
         .insert_workspace(&workspace(&target))
         .await
         .unwrap();
@@ -455,7 +469,7 @@ async fn member_script_create_cannot_replace_definition_from_another_workspace()
         )
         .await;
         assert!(matches!(replaced, Err(Error::NotFound(_))), "{replaced:?}");
-        let scripts = svc.store.list_all_scripts().await.unwrap();
+        let scripts = svc.store().list_all_scripts().await.unwrap();
         let saved = scripts.iter().find(|s| s.id == id).unwrap();
         assert_eq!(saved.workspace_id, source.as_str());
         assert_eq!(saved.command, "original command");
@@ -466,15 +480,21 @@ async fn member_script_create_cannot_replace_definition_from_another_workspace()
         moved.workspace_id = target.to_string();
         moved.command = "replacement command".into();
         assert!(matches!(
-            svc.store.upsert_script_in_workspace(&moved).await,
+            svc.store().upsert_script_in_workspace(&moved).await,
             Err(Error::NotFound(_))
         ));
-        assert_eq!(svc.store.script_workspace(id).await.unwrap(), Some(source));
+        assert_eq!(
+            svc.store().script_workspace(id).await.unwrap(),
+            Some(source)
+        );
         // Preserve the owner/internal store API; subsequent updates within
         // that workspace remain legal through the scoped entry point too.
-        svc.store.upsert_script(&moved).await.unwrap();
+        svc.store().upsert_script(&moved).await.unwrap();
         moved.name = "Scoped update".into();
-        svc.store.upsert_script_in_workspace(&moved).await.unwrap();
+        svc.store()
+            .upsert_script_in_workspace(&moved)
+            .await
+            .unwrap();
     }
 }
 
@@ -497,7 +517,7 @@ async fn member_script_create_refuses_missing_workspace_without_persisting() {
     )
     .await;
     assert!(matches!(result, Err(Error::NotFound(_))), "{result:?}");
-    assert!(svc.store.list_all_scripts().await.unwrap().is_empty());
+    assert!(svc.store().list_all_scripts().await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -505,10 +525,10 @@ async fn member_script_remove_preserves_a_protected_definition_and_runtime() {
     use intent_core::{events::SCRIPT_CHANGED, ScriptCreateParams};
     let tmp = TempDb::new();
     let (svc, _, member) = fixture(&tmp).await;
-    let bus = crate::events::EventBus::new(svc.store.clone());
+    let bus = crate::events::EventBus::new(svc.store().clone());
     let svc = svc.with_event_bus(bus);
     let target = WorkspaceId::new();
-    svc.store
+    svc.store()
         .insert_workspace(&workspace(&target))
         .await
         .unwrap();
@@ -535,7 +555,7 @@ async fn member_script_remove_preserves_a_protected_definition_and_runtime() {
         event_types: vec![SCRIPT_CHANGED.into()],
         ..Default::default()
     };
-    let before = svc.store.query_events(&query).await.unwrap().len();
+    let before = svc.store().query_events(&query).await.unwrap().len();
     let result = with_caller(
         caller(&member),
         svc.script_remove(target.clone(), "dev".into()),
@@ -543,7 +563,7 @@ async fn member_script_remove_preserves_a_protected_definition_and_runtime() {
     .await;
     assert!(matches!(result, Err(Error::NotFound(_))), "{result:?}");
     assert_eq!(
-        svc.store.query_events(&query).await.unwrap().len(),
+        svc.store().query_events(&query).await.unwrap().len(),
         before,
         "refusal publishes no removal"
     );
@@ -553,7 +573,7 @@ async fn member_script_remove_preserves_a_protected_definition_and_runtime() {
     )
     .await
     .unwrap();
-    let saved = svc.store.list_all_scripts().await.unwrap();
+    let saved = svc.store().list_all_scripts().await.unwrap();
     assert_eq!(saved.len(), 1);
     assert_eq!(saved[0].workspace_id, WorkspaceId::chief().as_str());
     assert_eq!(saved[0].command, "echo protected");
@@ -582,12 +602,12 @@ async fn member_script_remove_preserves_a_protected_definition_and_runtime() {
             .unwrap();
     })
     .await;
-    assert_eq!(svc.store.list_all_scripts().await.unwrap().len(), 1);
+    assert_eq!(svc.store().list_all_scripts().await.unwrap().len(), 1);
     // The unrestricted owner path retains its legacy id-only delete semantics.
     with_caller(Caller::Daemon, svc.script_remove(target, "dev".into()))
         .await
         .unwrap();
-    assert!(svc.store.list_all_scripts().await.unwrap().is_empty());
+    assert!(svc.store().list_all_scripts().await.unwrap().is_empty());
 }
 
 #[cfg(unix)]
@@ -601,10 +621,10 @@ async fn member_terminal_create_refuses_missing_workspace_without_spawning() {
         svc.terminal_create(missing.clone(), 80, 24, None, Some("/bin/cat".into()), None),
     )
     .await;
-    let spawned = svc.pty.list_scope(missing.as_str());
+    let spawned = svc.pty().list_scope(missing.as_str());
     // Clean up a mistakenly admitted process before the regression assertion.
     for id in &spawned {
-        svc.pty.kill(*id).await;
+        svc.pty().kill(*id).await;
     }
     assert!(matches!(result, Err(Error::NotFound(_))), "{result:?}");
     assert!(spawned.is_empty(), "missing workspace spawned {spawned:?}");
@@ -616,7 +636,7 @@ async fn member_terminal_ids_resolve_the_workspace_and_recheck_revocation() {
     let tmp = TempDb::new();
     let (svc, _, member) = fixture(&tmp).await;
     let ws = WorkspaceId::from("member-terminal");
-    svc.store.insert_workspace(&workspace(&ws)).await.unwrap();
+    svc.store().insert_workspace(&workspace(&ws)).await.unwrap();
     let created = with_caller(
         caller(&member),
         svc.terminal_create(ws.clone(), 80, 24, None, Some("/bin/cat".into()), None),
@@ -643,7 +663,7 @@ async fn member_terminal_ids_resolve_the_workspace_and_recheck_revocation() {
             .is_err());
     })
     .await;
-    svc.store.remove_host_member(&member).await.unwrap();
+    svc.store().remove_host_member(&member).await.unwrap();
     assert!(with_caller(
         caller(&member),
         svc.terminal_write(id.clone(), "denied".into())
@@ -660,7 +680,7 @@ async fn member_tools_script_and_terminal_lists_admit_host_members() {
     let tmp = TempDb::new();
     let (svc, _, member) = fixture(&tmp).await;
     let ws = WorkspaceId::from("member-execution");
-    svc.store.insert_workspace(&workspace(&ws)).await.unwrap();
+    svc.store().insert_workspace(&workspace(&ws)).await.unwrap();
     with_caller(caller(&member), async {
         svc.terminal_list(ws.clone()).await.unwrap();
         svc.script_list(ws).await.unwrap();
@@ -676,7 +696,7 @@ async fn script_archive_restore_enforce_workspace_scope_and_guest_authority() {
     let a = WorkspaceId::new();
     let b = WorkspaceId::new();
     for ws in [&a, &b] {
-        svc.store.insert_workspace(&workspace(ws)).await.unwrap();
+        svc.store().insert_workspace(&workspace(ws)).await.unwrap();
     }
     let def = with_caller(
         Caller::Daemon,
@@ -710,7 +730,7 @@ async fn script_archive_restore_enforce_workspace_scope_and_guest_authority() {
     .await;
     sqlx::query("DELETE FROM host_member WHERE principal_id=?")
         .bind(member.as_str())
-        .execute(svc.store.write_pool())
+        .execute(svc.store().write_pool())
         .await
         .unwrap();
     let guest = Caller::Wire {
@@ -728,7 +748,7 @@ async fn script_archive_restore_enforce_workspace_scope_and_guest_authority() {
         ));
     })
     .await;
-    svc.store
+    svc.store()
         .add_workspace_member(&a, &member, WorkspaceRole::Collaborator)
         .await
         .unwrap();

@@ -15,20 +15,20 @@ use super::turn_end_unread_gate::session;
 use super::{note, test_tempdir, TempDb};
 use crate::{EventBus, Services};
 
-struct Fixture {
-    _tmp: TempDb,
-    _repo: tempfile::TempDir,
-    _root: tempfile::TempDir,
-    root: std::path::PathBuf,
-    repo: std::path::PathBuf,
-    store: Store,
-    bus: EventBus,
-    svc: Services,
+pub(crate) struct Fixture {
+    pub(crate) _tmp: TempDb,
+    pub(crate) _repo: tempfile::TempDir,
+    pub(crate) _root: tempfile::TempDir,
+    pub(crate) root: std::path::PathBuf,
+    pub(crate) repo: std::path::PathBuf,
+    pub(crate) store: Store,
+    pub(crate) bus: EventBus,
+    pub(crate) svc: Services,
 }
 
 /// A git repo with one commit, plus a `Services` with a per-test workspaces
 /// root and an event bus.
-async fn fixture() -> Fixture {
+pub(crate) async fn fixture() -> Fixture {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let repo_dir = test_tempdir("intentd-retire-repo-");
@@ -67,7 +67,7 @@ async fn fixture() -> Fixture {
 
 /// Provision a real worktree workspace off the fixture repo, with one note
 /// and one agent session so "rows are kept" is observable.
-async fn create_workspace(f: &Fixture) -> intent_core::Workspace {
+pub(crate) async fn create_workspace(f: &Fixture) -> intent_core::Workspace {
     let ws = f
         .svc
         .create_workspace(
@@ -759,7 +759,7 @@ async fn retire_and_revive_racing_leave_a_consistent_workspace() {
 // workspaces archived longer than the configured number of days.
 // ---------------------------------------------------------------------------
 
-fn days_from_now(days: i64) -> time::OffsetDateTime {
+pub(crate) fn days_from_now(days: i64) -> time::OffsetDateTime {
     time::OffsetDateTime::now_utc() + time::Duration::days(days)
 }
 
@@ -1155,7 +1155,7 @@ async fn manual_retire_does_not_stop_scripts_of_a_workspace_unarchived_while_wai
 /// An archived workspace whose command finished but whose result could not
 /// be persisted (a trigger refuses the `last_run` write), so the script still
 /// holds an unsettled admitted run.
-async fn archived_with_unsettled_run(f: &Fixture) -> (intent_core::Workspace, String) {
+pub(crate) async fn archived_with_unsettled_run(f: &Fixture) -> (intent_core::Workspace, String) {
     let ws = create_workspace(f).await;
     let v = f
         .svc
@@ -1195,7 +1195,11 @@ async fn archived_with_unsettled_run(f: &Fixture) -> (intent_core::Workspace, St
 /// The retire flip waits for the scripts to be fully stopped AND settled:
 /// asserts the row stays Archived (not Retired), the checkout is kept and
 /// the run's result is still unsettled.
-async fn assert_still_archived_and_unsettled(f: &Fixture, ws: &intent_core::Workspace, id: &str) {
+pub(crate) async fn assert_still_archived_and_unsettled(
+    f: &Fixture,
+    ws: &intent_core::Workspace,
+    id: &str,
+) {
     let row = f.store.get_workspace(&ws.id).await.unwrap();
     assert!(row.archived && !row.is_retired(), "{row:?}");
     assert!(std::path::Path::new(ws.worktree_path.as_deref().unwrap()).is_dir());
@@ -1430,7 +1434,7 @@ async fn retire_refuses_a_missing_checkout_whose_parent_is_outside() {
 
 /// Flip `ws` to Retired in the store only (the window before retire's
 /// teardown, or a terminal that escaped the sweep).
-async fn flip_retired(f: &Fixture, ws: &WorkspaceId) {
+pub(crate) async fn flip_retired(f: &Fixture, ws: &WorkspaceId) {
     f.store
         .archive_workspace_detaching_guests(ws, &intent_core::now_iso())
         .await

@@ -1,47 +1,9 @@
 use super::*;
 use crate::host_execution::HostExecutionExt;
+use crate::test_support::capability_fixtures::host_role::{caller, fixture};
 use crate::tests::{workspace, TempDb};
-use intent_core::{
-    now_iso, with_caller, Principal, WorkspaceApi, WorkspaceCreate, WorkspaceUpdate,
-};
+use intent_core::{now_iso, with_caller, WorkspaceApi, WorkspaceCreate, WorkspaceUpdate};
 use intent_store::Store;
-
-async fn fixture(tmp: &TempDb) -> (Services, PrincipalId, PrincipalId) {
-    let store = Store::open(&tmp.path).await.unwrap();
-    let owner = store.get_primary_principal().await.unwrap();
-    assert!(owner.identity_key().is_none(), "no forge account is needed");
-    let member = Principal {
-        id: PrincipalId::new(),
-        identity: None,
-        github_user_id: None,
-        login: None,
-        display_name: None,
-        avatar_url: None,
-        is_primary: false,
-        created_at: now_iso(),
-        updated_at: now_iso(),
-    };
-    store.upsert_principal(&member).await.unwrap();
-    sqlx::query("INSERT INTO host_member (principal_id, added_at) VALUES (?, ?)")
-        .bind(&member.id.0)
-        .bind(now_iso())
-        .execute(store.write_pool())
-        .await
-        .unwrap();
-    let root = tmp.path.parent().unwrap().join("workspaces");
-    (
-        Services::new(store).with_workspaces_root(root),
-        owner.id,
-        member.id,
-    )
-}
-
-fn caller(id: &PrincipalId) -> Caller {
-    Caller::Wire {
-        principal_id: id.clone(),
-        host_role: intent_core::HostRole::Member,
-    }
-}
 
 #[tokio::test]
 async fn scoped_owner_projection_matches_service_rights_and_role_loss() {

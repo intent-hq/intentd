@@ -1,3 +1,12 @@
+//! `workspace.retire` against running scripts and terminals (moved from
+//! `tests/retire_workspace.rs`).
+
+use std::time::Duration;
+
+use intent_core::{Error, WorkspaceApi, WorkspaceStatus};
+
+use crate::tests::retire_workspace::*;
+
 /// Review regression (intentd#2605): the automatic sweep's retire skips
 /// (logs and counts a failure) a workspace whose script close cannot settle
 /// a finished run, leaving it Archived for the next sweep.
@@ -65,13 +74,13 @@ async fn retire_kills_workspace_terminals() {
         .terminal_create(ws.id.clone(), 80, 24, None, None, None)
         .await
         .expect("terminal");
-    assert_eq!(f.svc.pty.list_scope(ws.id.as_str()).len(), 1);
+    assert_eq!(f.svc.pty().list_scope(ws.id.as_str()).len(), 1);
     f.svc
         .retire_workspace(ws.id.clone(), None)
         .await
         .expect("retire");
     assert!(
-        f.svc.pty.list_scope(ws.id.as_str()).is_empty(),
+        f.svc.pty().list_scope(ws.id.as_str()).is_empty(),
         "terminals killed on retire"
     );
 }
@@ -354,7 +363,7 @@ async fn script_mutations_after_retire_returns_are_refused_and_write_nothing() {
 async fn terminal_create_racing_retire_spawns_nothing() {
     let f = fixture().await;
     let ws = create_workspace(&f).await;
-    let guard = f.svc.archive_fence.acquire(&ws.id).await;
+    let guard = f.svc.feature_archive_fence().acquire(&ws.id).await;
     let create = intent_core::spawn_daemon({
         let svc = f.svc.clone();
         let id = ws.id.clone();
@@ -373,7 +382,7 @@ async fn terminal_create_racing_retire_spawns_nothing() {
     .expect("join")
     .unwrap_err();
     assert!(matches!(err, Error::WorkspaceRetired { .. }), "{err:?}");
-    assert!(f.svc.pty.list_scope(ws.id.as_str()).is_empty());
+    assert!(f.svc.pty().list_scope(ws.id.as_str()).is_empty());
 }
 
 /// `terminal.write` / `resize` / `kill`, addressed only by `terminalId`,
@@ -409,5 +418,5 @@ async fn terminal_id_mutations_refused_on_a_retired_workspace() {
     assert!(is_retired(&err), "resize: {err:?}");
     let err = f.svc.terminal_kill(terminal_id.clone()).await.unwrap_err();
     assert!(is_retired(&err), "kill: {err:?}");
-    assert_eq!(f.svc.pty.list_scope(ws.id.as_str()).len(), 1);
+    assert_eq!(f.svc.pty().list_scope(ws.id.as_str()).len(), 1);
 }

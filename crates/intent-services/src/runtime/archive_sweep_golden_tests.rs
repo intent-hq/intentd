@@ -1,3 +1,13 @@
+//! The archive sweep's consolidated wake, end to end through the runtime's
+//! hook service (moved from `v2_7_goldens.rs`).
+
+use intent_core::{AgentId, HookState, PrMonitorState, WorkspaceApi};
+use serde_json::json;
+
+use crate::hook_manager::HookServicesExt;
+use crate::v1_goldens::{pr_monitor_row, seed_agent, setup, wake_texts_when};
+use crate::v2_7_goldens::{PREFIX, RE_ARM_HOOKS, RE_ARM_MONITORS};
+
 /// Regression: archiving a workspace where agent A owns two hooks and one
 /// PR monitor queues exactly ONE wake for A — naming all three items and
 /// carrying every id in the metadata — while agent B, with no active

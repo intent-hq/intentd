@@ -5,8 +5,8 @@ use intent_core::{ScriptCreateParams, ScriptMode, WorkspaceApi, WorkspaceId};
 use intent_store::Store;
 use serde_json::Value;
 
-use super::{workspace, TempDb};
 use crate::events::{EventBus, Subscription, SubscriptionFilter};
+use crate::test_support::fixtures::{workspace, TempDb};
 use crate::Services;
 
 /// Pure-liveness deadline for the event-driven waits below (monorepo#515):
@@ -78,11 +78,7 @@ async fn create(h: &Harness, name: &str, command: &str, mode: ScriptMode) -> Str
 
 /// Drain script events until `pred` returns `Some`, accumulating decoded
 /// `script:output` chunks along the way.
-async fn drain_until<F, T>(
-    sub: &mut Subscription,
-    timeout: Duration,
-    mut pred: F,
-) -> (T, Vec<u8>)
+async fn drain_until<F, T>(sub: &mut Subscription, timeout: Duration, mut pred: F) -> (T, Vec<u8>)
 where
     F: FnMut(&Value) -> Option<T>,
 {

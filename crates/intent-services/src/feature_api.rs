@@ -100,6 +100,9 @@ pub mod desktop {
 /// Script output configuration and test parks that core owns.
 pub mod runtime_config {
     pub use crate::runtime_config::{ScriptOutputConfig, ScriptParks, SupervisePark};
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub use crate::runtime_config::HookStoreFault;
 }
 
 /// The async secret store.
@@ -347,7 +350,7 @@ impl Services {
     }
 
     /// The hook-evaluation test park (unset in production).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
     #[must_use]
     pub fn feature_hook_eval_park(&self) -> Option<&Arc<crate::CompletionClassifyPark>> {
@@ -355,7 +358,7 @@ impl Services {
     }
 
     /// The hook-wake test park (unset in production).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
     #[must_use]
     pub fn feature_hook_wake_park(&self) -> Option<&Arc<crate::CompletionClassifyPark>> {
@@ -435,7 +438,7 @@ impl Services {
     }
 
     /// The hook-run persistence fault injector (test wiring only).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
     #[must_use]
     pub fn feature_hook_store_fault(&self) -> Option<&crate::runtime_config::HookStoreFault> {
@@ -443,14 +446,14 @@ impl Services {
     }
 
     /// Test seam: park hook wakes inside their classify window.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
     pub fn set_hook_wake_park_for_test(&mut self, park: Arc<crate::CompletionClassifyPark>) {
         self.hook_wake_park = Some(park);
     }
 
     /// Test seam: park hook evaluations inside their window.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
     pub fn set_hook_eval_park_for_test(&mut self, park: Arc<crate::CompletionClassifyPark>) {
         self.hook_eval_park = Some(park);

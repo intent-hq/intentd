@@ -6,9 +6,7 @@
 use crate::browser_tabs::BrowserTabRoutingExt;
 use std::time::Duration;
 
-use intent_core::{
-    AgentId, BrowserTab, ClientId, Error, ReverseTarget, WorkspaceApi, WorkspaceId,
-};
+use intent_core::{AgentId, BrowserTab, ClientId, Error, ReverseTarget, WorkspaceApi, WorkspaceId};
 use serde_json::{json, Value};
 
 use super::browser_client_pin::{setup, FakeRegistry};
@@ -30,15 +28,15 @@ async fn register_tab(
     host: &str,
     owner: Option<&str>,
 ) -> BrowserTab {
-    if svc.store.get_workspace(ws).await.is_err() {
-        svc.store
-            .insert_workspace(&super::workspace(ws))
+    if svc.store().get_workspace(ws).await.is_err() {
+        svc.store()
+            .insert_workspace(&crate::test_support::fixtures::workspace(ws))
             .await
             .unwrap();
     }
     let host_id = ClientId::from_string(host);
-    if svc.store.get_client(&host_id).await.unwrap().is_none() {
-        svc.store
+    if svc.store().get_client(&host_id).await.unwrap().is_none() {
+        svc.store()
             .upsert_client(
                 &host_id,
                 None,
@@ -468,10 +466,7 @@ async fn claim_reply_with_tab_id_migrates_through_browser_exec() {
         fn is_connected(&self) -> bool {
             true
         }
-        fn resolve(
-            &self,
-            target: &ReverseTarget,
-        ) -> Result<ResolvedClient, ReverseDispatchError> {
+        fn resolve(&self, target: &ReverseTarget) -> Result<ResolvedClient, ReverseDispatchError> {
             Ok(ResolvedClient {
                 client_id: match target {
                     ReverseTarget::Default => ClientId::from_string("desktop-a"),
@@ -500,12 +495,12 @@ async fn claim_reply_with_tab_id_migrates_through_browser_exec() {
         }
     }
 
-    let tmp = super::TempDb::new();
-    let root = super::WorkspacesRoot::new();
+    let tmp = crate::test_support::fixtures::TempDb::new();
+    let root = crate::test_support::fixtures::WorkspacesRoot::new();
     let store = intent_store::Store::open(&tmp.path).await.unwrap();
     let ws = WorkspaceId::new();
     store
-        .insert_workspace(&super::workspace(&ws))
+        .insert_workspace(&crate::test_support::fixtures::workspace(&ws))
         .await
         .unwrap();
     // The driving client has hello'd (its `client` row exists).
@@ -585,10 +580,7 @@ async fn claim_completing_after_a_pin_switch_commits_to_the_new_driving_client()
         fn is_connected(&self) -> bool {
             true
         }
-        fn resolve(
-            &self,
-            target: &ReverseTarget,
-        ) -> Result<ResolvedClient, ReverseDispatchError> {
+        fn resolve(&self, target: &ReverseTarget) -> Result<ResolvedClient, ReverseDispatchError> {
             Ok(ResolvedClient {
                 client_id: match target {
                     ReverseTarget::Default => ClientId::from_string("desktop-a"),
@@ -623,12 +615,12 @@ async fn claim_completing_after_a_pin_switch_commits_to_the_new_driving_client()
         }
     }
 
-    let tmp = super::TempDb::new();
-    let root = super::WorkspacesRoot::new();
+    let tmp = crate::test_support::fixtures::TempDb::new();
+    let root = crate::test_support::fixtures::WorkspacesRoot::new();
     let store = intent_store::Store::open(&tmp.path).await.unwrap();
     let ws = WorkspaceId::new();
     store
-        .insert_workspace(&super::workspace(&ws))
+        .insert_workspace(&crate::test_support::fixtures::workspace(&ws))
         .await
         .unwrap();
     for (id, name) in [("desktop-a", "Desktop A"), ("desktop-b", "Desktop B")] {
@@ -702,7 +694,7 @@ async fn claim_completing_after_a_pin_switch_commits_to_the_new_driving_client()
         .await
         .expect("pin b");
     for (id, host) in [("tab-on-a", "desktop-a"), ("tab-on-b", "desktop-b")] {
-        let row = svc.store.get_browser_tab(id).await.unwrap().unwrap();
+        let row = svc.store().get_browser_tab(id).await.unwrap().unwrap();
         assert_eq!(row.host_client_id, ClientId::from_string(host));
         assert!(row.owner_agent_id.is_none());
     }
@@ -715,7 +707,7 @@ async fn claim_completing_after_a_pin_switch_commits_to_the_new_driving_client()
     assert_eq!(out["results"][0]["success"], true);
     assert_eq!(out["results"][1]["success"], true);
     for id in ["tab-on-a", "tab-on-b"] {
-        let row = svc.store.get_browser_tab(id).await.unwrap().unwrap();
+        let row = svc.store().get_browser_tab(id).await.unwrap().unwrap();
         assert_eq!(
             row.host_client_id,
             ClientId::from_string("desktop-b"),
@@ -766,8 +758,8 @@ async fn set_browser_client_migrates_claimed_tabs() {
     register_tab(&svc, &ws, "mine-1", "desktop-a", Some("agent-1")).await;
     register_tab(&svc, &ws, "mine-2", "desktop-a", Some("agent-2")).await;
     let other_ws = WorkspaceId::new();
-    svc.store
-        .insert_workspace(&super::workspace(&other_ws))
+    svc.store()
+        .insert_workspace(&crate::test_support::fixtures::workspace(&other_ws))
         .await
         .unwrap();
     register_tab(&svc, &other_ws, "elsewhere", "desktop-a", Some("agent-1")).await;
@@ -799,7 +791,7 @@ async fn set_browser_client_migrates_claimed_tabs() {
     let row_of = |id: &str| {
         let svc = svc.clone();
         let id = id.to_string();
-        async move { svc.store.get_browser_tab(&id).await.unwrap().unwrap() }
+        async move { svc.store().get_browser_tab(&id).await.unwrap().unwrap() }
     };
     let host_of = |id: &str| {
         let row = row_of(id);
@@ -910,7 +902,7 @@ async fn close_tab_routes_online_and_force_tombstones_offline() {
         json!([{ "action": "closeTab", "tabId": "live" }])
     );
     // The routed close leaves the row to the host's own report.
-    assert!(svc.store.get_browser_tab("live").await.unwrap().is_some());
+    assert!(svc.store().get_browser_tab("live").await.unwrap().is_some());
 
     let err = svc
         .browser_close_tab("stale".into(), false)
@@ -941,7 +933,12 @@ async fn close_tab_routes_online_and_force_tombstones_offline() {
     let evs = events.await.unwrap();
     assert_eq!(evs[0]["type"], "browser:tab-closed");
     assert_eq!(evs[0]["data"]["tab"]["tabId"], "stale");
-    assert!(svc.store.get_browser_tab("stale").await.unwrap().is_none());
+    assert!(svc
+        .store()
+        .get_browser_tab("stale")
+        .await
+        .unwrap()
+        .is_none());
     let listed = svc
         .browser_exec(
             ws.clone(),

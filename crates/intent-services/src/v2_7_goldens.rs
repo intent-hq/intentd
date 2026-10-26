@@ -7,18 +7,14 @@
 //! wake `workspace.archive` delivers to an owner (moved here from the v1
 //! per-item archive goldens; the sweeps emit through `harness::latest()`).
 
-use intent_core::{AgentId, HookState, PrMonitorState, WorkspaceApi};
-use serde_json::json;
-
 use crate::harness::Harness;
-use crate::hook_manager::HookServicesExt;
-use crate::v1_goldens::{pr_monitor_row, seed_agent, setup, wake_texts_when};
 
-const PREFIX: &str = "[SYSTEM NOTICE] This workspace was archived and has since been \
+pub(crate) const PREFIX: &str = "[SYSTEM NOTICE] This workspace was archived and has since been \
     unarchived. While it was archived, ";
 
-const RE_ARM_HOOKS: &str = "ws.hook.get(hookId) recovers a hook's script for ws.hook.schedule";
-const RE_ARM_MONITORS: &str = "ws.pr.monitor re-registers a PR";
+pub(crate) const RE_ARM_HOOKS: &str =
+    "ws.hook.get(hookId) recovers a hook's script for ws.hook.schedule";
+pub(crate) const RE_ARM_MONITORS: &str = "ws.pr.monitor re-registers a PR";
 
 fn v2_7() -> &'static dyn Harness {
     let entry = crate::harness::resolve_entry("2.7");
