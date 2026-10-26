@@ -103,8 +103,10 @@ jobs:
           # coverage-changed, else a bigmem heavy slot (30 GB or more; one of its
           # rustc processes passed 12 GB), else a 16x burst. It does the same
           # in the queue, where it ranks after coverage-all and coverage-e2e:
-          # on a bigmem slot it stays under coverage-all (p90 19 min vs ~21),
-          # while coverage-e2e there would grow from p90 9 to 23 min. Its minutes
+          # on a bigmem slot it slows down least (queue check on WarpBuild 16x
+          # p50 15 / p90 18 min; PR timings put it at roughly p50 16 / p90 22
+          # there, against coverage-all's p50 20 / p90 23 on xl), while
+          # coverage-e2e would grow from p90 9 to 23 min. Its minutes
           # (10, its xl time) stay below coverage-changed's (15.5 min on xl,
           # ~33 on heavy), so coverage-changed always picks first within a PR run. Two corners: with
           # no xl slot and one bigmem slot free, coverage-changed takes the
@@ -468,8 +470,11 @@ jobs:
     runs-on: ${{ fromJSON(needs.route.outputs.slots || '{}')['check'] || fromJSON('["warp-ubuntu-2404-x64-16x"]') }}
     # The cold-cache check job exhausted its 20-minute budget after its tests
     # passed in run 37305697722. Allow completion/cache margin without changing
-    # individual test timeouts.
-    timeout-minutes: 25
+    # individual test timeouts. In the merge queue it may now run on an 8-CPU
+    # bigmem slot (PR p90 19 min there, plus the queue-only GitLab feature
+    # build), so it gets the slot budget, still under the queue's 60-minute
+    # check response timeout (coverage-all 55, coverage-e2e 45).
+    timeout-minutes: 40
     env:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0

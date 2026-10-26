@@ -646,10 +646,12 @@ class RunnerAvailabilityTests(unittest.TestCase):
                 self.assertEqual(outputs["linux_burst"], "true")
                 self.assertEqual(outputs["windows_burst"], "true")
 
-    def test_merge_queue_keeps_heavy_linux_jobs_on_github_hosted(self):
-        # The queue starts ~4 heavy 16-CPU Rust jobs at once, more than the two
-        # 8-CPU intent-cache slots absorb in the queue's time budget. Light
-        # jobs, PRs and pushes keep the probe's choice.
+    def test_merge_queue_heavy_jobs_read_their_own_slots(self):
+        # The queue's heavy 16-CPU Rust jobs take only the slots their own
+        # merge_group entries win; the shared linux_labels mapping bursts there.
+        # Here the one bigmem slot goes to coverage-all, so check bursts too
+        # (test_merge_queue_check_takes_a_slot_after_the_coverage_suites covers
+        # check on a slot). Light jobs, PRs and pushes keep the probe's choice.
         same_repo = {"pull_request": {"head": {"repo": {"full_name": "intent-hq/intentd"}}}}
         for idle in (True, False):
             fleet = [slot(), small_slot(), runner("Windows", "X64"), runner()] if idle else []

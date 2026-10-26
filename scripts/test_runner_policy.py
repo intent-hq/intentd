@@ -310,6 +310,10 @@ class RunnerPolicy(unittest.TestCase):
             self.assertLess(listed['check']['minutes'], listed[suite]['minutes'], suite)
         self.assertGreater(listed['check']['minutes'], listed['daemon-lifecycle-linux']['minutes'])
         self.assertEqual(listed['coverage-changed']['events'], ['pull_request'])
+        # On an 8-CPU bigmem slot the queue's check (plus its GitLab feature
+        # build) runs past the 25 minutes sized for 16 CPUs; keep it under the
+        # queue's 60-minute check response timeout like coverage-all and e2e.
+        self.assertIn('    timeout-minutes: 40\n', jobs((ROOT / '.github/workflows/ci.yml').read_text())['check'])
 
     def test_routed_linux_jobs_run_unprivileged(self):
         # A routed Linux job may land on an intent-cache slot, which has no sudo or Docker.
