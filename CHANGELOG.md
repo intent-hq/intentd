@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.55] - 2026-10-26
+
+### 🔧 Refactor
+
+- *(services)* Route runtime through public core accessors ([#2719](https://github.com/intent-hq/intentd/pull/2719))
+- *(core)* Define harness guidance version sets in intent-core ([#2717](https://github.com/intent-hq/intentd/pull/2717))
+
+### 📚 Documentation
+
+- *(guide)* Describe the pinned Default profile in Settings → Providers ([#2718](https://github.com/intent-hq/intentd/pull/2718))
+
+
 ## [0.11.54] - 2026-10-26
 
 ### 🐛 Bug Fixes
