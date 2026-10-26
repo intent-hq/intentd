@@ -628,9 +628,11 @@ class RunnerAvailabilityTests(unittest.TestCase):
                 result = self.assert_mac_route({"org": fleet, "jobs": jobs, "queueErrors": queue_errors},
                                               ["warp-macos-26-arm64-12x"] if queue_errors else ["self-hosted", "macOS", "ARM64"])
                 outputs = result["outputs"]
-                self.assertEqual(json.loads(outputs["linux_labels"]), ["warp-ubuntu-2404-x64-16x"] if linux_burst else BIG)
+                # Both slots are busy, so 16-core work has no idle bigmem runner and bursts;
+                # 8-core work keeps the heavy pool's queue semantics.
+                self.assertEqual(json.loads(outputs["linux_labels"]), ["warp-ubuntu-2404-x64-16x"])
                 self.assertEqual(json.loads(outputs["check_labels"]), ["warp-ubuntu-2404-x64-8x"] if linux_burst else CACHE)
-                self.assertEqual(outputs["linux_burst"], str(linux_burst).lower())
+                self.assertEqual(outputs["linux_burst"], "true")
                 self.assertEqual(json.loads(outputs["windows_labels"]), ["warp-windows-2022-x64-16x"] if queue_errors else ["self-hosted", "Windows", "X64"])
                 self.assertEqual(outputs["windows_burst"], str(bool(queue_errors)).lower())
         for fixture in ({}, {"orgError": "403", "repoError": "403"},
