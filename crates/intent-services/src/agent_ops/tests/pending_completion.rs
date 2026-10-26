@@ -507,6 +507,7 @@ async fn completion_marker_retry_redelivers_deferred_completion_watch() {
         .await;
     assert_eq!(parent_message_count(&svc, &parent).await, 0);
     assert!(svc
+        .runtime()
         .script_locks
         .monitor_completions
         .lock()
@@ -526,6 +527,7 @@ async fn completion_marker_retry_redelivers_deferred_completion_watch() {
         .await;
     wait_for_completion(&svc, &parent, &child).await;
     assert!(svc
+        .runtime()
         .script_locks
         .monitor_completions
         .lock()

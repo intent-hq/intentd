@@ -165,7 +165,7 @@ impl Services {
     #[doc(hidden)]
     #[must_use]
     pub fn feature_script_monitor_lane(&self) -> &tokio::sync::Mutex<()> {
-        &self.script_locks.monitor_lane
+        &self.runtime().script_locks.monitor_lane
     }
 
     /// Per-workspace setup state.

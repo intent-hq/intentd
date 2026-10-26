@@ -1065,7 +1065,7 @@ async fn monitor_active_cap_retry_and_failed_registration_leave_no_memory_watch(
     );
     assert_eq!(
         h.services
-            .script_locks
+            .runtime().script_locks
             .monitor_windows
             .lock()
             .unwrap()
@@ -1078,7 +1078,7 @@ async fn monitor_active_cap_retry_and_failed_registration_leave_no_memory_watch(
         .unwrap();
     assert!(h
         .services
-        .script_locks
+        .runtime().script_locks
         .monitor_windows
         .lock()
         .unwrap()
@@ -1097,7 +1097,7 @@ async fn monitor_active_cap_retry_and_failed_registration_leave_no_memory_watch(
         .is_err());
     assert!(h
         .services
-        .script_locks
+        .runtime().script_locks
         .monitor_windows
         .lock()
         .unwrap()
@@ -1471,7 +1471,7 @@ async fn script_monitor_maintenance_loop_exits_once_settings_tasks_close() {
     let h = harness().await;
     let running = || {
         h.services
-            .script_locks
+            .runtime().script_locks
             .monitor_maintenance
             .load(Ordering::SeqCst)
     };
