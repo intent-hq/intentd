@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.53] - 2026-10-26
+
+### 🔧 Refactor
+
+- *(services)* Cut agent-side inbound references into runtime ([#2712](https://github.com/intent-hq/intentd/pull/2712))
+
+
 ## [0.11.52] - 2026-10-26
 
 ### 🔧 Refactor

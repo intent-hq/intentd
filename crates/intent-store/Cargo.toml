@@ -1,6 +1,6 @@
 [package]
 name = "intent-store"
-version = "0.11.52"
+version = "0.11.53"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -21,7 +21,7 @@ ignored-paths = ["tests/ui/store_pool_*.rs", "tests/ui/note_write_lock_*.rs"]
 test-support = []
 
 [dependencies]
-intent-core = { path = "../intent-core", version = "0.11.52" }
+intent-core = { path = "../intent-core", version = "0.11.53" }
 sqlx = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
