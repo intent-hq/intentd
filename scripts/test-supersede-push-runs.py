@@ -97,6 +97,27 @@ class SupersedeTests(unittest.TestCase):
         self.assertFalse(scan(api, C, 3))
         self.assertEqual(api.cancelled, [])
 
+    def test_old_caller_after_reset_never_cancels_the_live_tip(self):
+        # Main reset to B (or C's scan re-run later): only runs strictly
+        # behind the validated live tip are retired, never the tip's.
+        api = FakeApi(B, [run(1, A), run(2, B), run(3, C)])
+        self.assertFalse(scan(api, C, 3))
+        self.assertEqual(api.cancelled, [1])
+
+    def test_unreadable_tip_cancels_nothing(self):
+        api = FakeApi(C, [run(1, A), run(2, B)], fail={'git/ref/heads/main'})
+        self.assertFalse(scan(api, C, 3))
+        self.assertEqual(api.cancelled, [])
+
+    def test_any_api_error_reports_not_superseded(self):
+        # B is superseded by tip C, but any failed read or cancel must fall
+        # back to running Windows on B.
+        for marker in ('/runs?', f'compare/{A}...{C}', '/runs/1/cancel'):
+            with self.subTest(marker=marker):
+                api = FakeApi(C, [run(1, A)], fail={marker})
+                self.assertFalse(scan(api, B, 2))
+        self.assertTrue(scan(FakeApi(C, [run(1, A)]), B, 2))
+
     def test_main_prints_one_output_line(self):
         out = io.StringIO()
         with redirect_stdout(out):
