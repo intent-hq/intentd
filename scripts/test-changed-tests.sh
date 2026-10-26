@@ -1076,7 +1076,7 @@ edit crates/delta/src/script.rs
 run_script
 expect_ok
 expect_cargo "-p delta --lib --bins --tests" "$e2e_script_plan"
-[[ "$stdout" == *"[test-changed] note: crates/delta/src/script.rs is mapped to end-to-end tests in .config/e2e-test-map.txt"* ]] ||
+[[ "$stdout" == *"[test-changed] note: crates/delta/src/script.rs is mapped to tests of other targets in .config/e2e-test-map.txt"* ]] ||
   fail "$case_name: no mapping note: $stdout"
 [[ "$stdout" == *"[test-changed] cargo nextest run -p intentd --test e2e_wss_agent_lifecycle --test suite_e2e -E '(binary_id(=intentd::e2e_wss_agent_lifecycle)&test(/^(helper)::/))|(binary_id(=intentd::suite_e2e)&test(/^(e2e_core::inner)::/))'"* ]] ||
   fail "$case_name plan line is not a pasteable command: $stdout"
@@ -1141,7 +1141,7 @@ echo "# a new comment" >>"$repo/.config/e2e-test-map.txt"
 run_script
 expect_ok
 expect_cargo "-p intentd --test suite_wss --test e2e_wss_agent_lifecycle --test suite_e2e -E binary_id(=intentd::suite_wss)|(binary_id(=intentd::e2e_wss_agent_lifecycle)&test(/^(helper)::/))|(binary_id(=intentd::suite_e2e)&test(/^(e2e_core::inner|e2e_shared::helper)::/))"
-[[ "$stdout" == *"[test-changed] note: .config/e2e-test-map.txt changed; every mapped end-to-end module runs"* ]] ||
+[[ "$stdout" == *"[test-changed] note: .config/e2e-test-map.txt changed; every mapped test module runs"* ]] ||
   fail "$case_name: no map note: $stdout"
 
 case_name="a checkout without the map keeps the per-crate selection"
@@ -1373,6 +1373,31 @@ write crates/gamma/tests/lib.rs
 printf '%s\n' "crates/delta/src/lib.rs beta::lib" "crates/delta/src/lib.rs gamma::lib" >>"$repo/.config/e2e-test-map.txt"
 expect_map_error ".config/e2e-test-map.txt:8: beta::lib: crates/beta/src/lib.rs does not exist" \
   ".config/e2e-test-map.txt:9: gamma::lib is ambiguous: crates/gamma/tests/lib.rs also exists"
+
+case_name="map naming a lib its manifest moves or opts out of tests"
+reset_repo
+write crates/alpha/Cargo.toml $'[package]\nname = "alpha"\n\n[lib]\ntest = false'
+write crates/gamma/Cargo.toml $'[package]\nname = "gamma"\npath = "ignored-outside-lib"\n\n[lib]\npath = "src/other.rs"'
+printf '%s\n' "crates/delta/src/lib.rs alpha::lib" "crates/delta/src/lib.rs gamma::lib" >>"$repo/.config/e2e-test-map.txt"
+expect_map_error ".config/e2e-test-map.txt:8: alpha::lib: crates/alpha/Cargo.toml sets [lib] test = false" \
+  ".config/e2e-test-map.txt:9: gamma::lib: crates/gamma/Cargo.toml sets [lib] path = \"src/other.rs\", not src/lib.rs"
+
+case_name="a library module and a suite module of one crate share one filterset"
+reset_repo
+write crates/intentd/src/lib.rs $'#[cfg(test)]\nmod tests {\n}'
+lib_fixture "crates/delta/src/lib.rs intentd::lib tests" "crates/delta/src/lib.rs intentd::suite_e2e e2e_core::inner"
+edit crates/delta/src/lib.rs
+run_script --base HEAD
+expect_ok
+expect_cargo "-p delta --lib --bins --tests" "-p intentd --lib --test suite_e2e -E (binary_id(=intentd)&test(/^(tests)::/))|(binary_id(=intentd::suite_e2e)&test(/^(e2e_core::inner)::/))"
+
+case_name="editing the map also selects every mapped library module"
+reset_repo
+lib_fixture "crates/delta/src/lib.rs alpha::lib tests"
+echo "# a new comment" >>"$repo/.config/e2e-test-map.txt"
+run_script --base HEAD
+expect_ok
+expect_cargo "-p alpha --lib -E (binary_id(=alpha)&test(/^(tests)::/))" "-p intentd --test suite_wss --test e2e_wss_agent_lifecycle --test suite_e2e -E binary_id(=intentd::suite_wss)|(binary_id(=intentd::e2e_wss_agent_lifecycle)&test(/^(helper)::/))|(binary_id(=intentd::suite_e2e)&test(/^(e2e_core::inner|e2e_shared::helper)::/))"
 
 echo "changed-tests tests passed under $("$script_bash" -c 'echo "bash $BASH_VERSION"')"
 [[ -z "${CHANGED_TESTS_TEST_BASH:-}" ]] || exit 0

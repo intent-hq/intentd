@@ -82,7 +82,8 @@
 # The map is validated on every run, and --check-map validates it alone (and
 # requires it to exist): each source glob must match a tracked or untracked
 # file, each test binary root crates/<c>/tests/<s>.rs (crates/<c>/src/lib.rs
-# for <c>::lib, which must not also have a tests/lib.rs) must exist, and each
+# for <c>::lib, which must not also have a tests/lib.rs, nor a manifest
+# [lib] path elsewhere or test = false) must exist, and each
 # segment of a module path must be declared by its parent with its file
 # present. An invalid map exits 2 naming every bad line.
 #
@@ -275,6 +276,35 @@ is_test_target() {
   [[ "$autotests" != false || "$names" == *$'\n'"$2"$'\n'* ]]
 }
 
+# Sets lib_problem (and returns 1) when crate $1's manifest moves its lib off
+# src/lib.rs ([lib] path) or opts it out of tests ([lib] test = false): --lib
+# would then build the wrong root or no test binary.
+lib_is_testable() {
+  local manifest="crates/$1/Cargo.toml" line section="" value
+  lib_problem=""
+  [[ -f "$manifest" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line=${line#"${line%%[![:space:]]*}"}
+    case "$line" in
+      '['*) section=$line ;;
+      test*=*false*)
+        if [[ "$section" == '[lib]'* ]]; then
+          lib_problem="$manifest sets [lib] test = false"
+          return 1
+        fi
+        ;;
+      path*=*\"*\"*)
+        value=${line#*\"}
+        value=${value%%\"*}
+        if [[ "$section" == '[lib]'* && "$value" != src/lib.rs && "$value" != ./src/lib.rs ]]; then
+          lib_problem="$manifest sets [lib] path = \"$value\", not src/lib.rs"
+          return 1
+        fi
+        ;;
+    esac
+  done <"$manifest"
+}
+
 # Reads the map into e2e_entries ("<glob>\t<crate>\t<binary>\t<module>"
 # lines), collecting one map_errors line per invalid entry.
 load_e2e_map() {
@@ -316,6 +346,8 @@ load_e2e_map() {
         map_errors+="$e2e_map:$n: $target: $root does not exist"$'\n'
       elif [[ -f "crates/$crate/tests/lib.rs" ]]; then
         map_errors+="$e2e_map:$n: $target is ambiguous: crates/$crate/tests/lib.rs also exists"$'\n'
+      elif ! lib_is_testable "$crate"; then
+        map_errors+="$e2e_map:$n: $target: $lib_problem"$'\n'
       elif [[ -n "$module" ]] && ! resolve_module "$root" "$module"; then
         map_errors+="$e2e_map:$n: $target $resolve_problem"$'\n'
       elif [[ -n "$hit" ]]; then
@@ -499,14 +531,14 @@ classify() {
   if [[ "$path" == "$e2e_map" && -f "$e2e_map" ]]; then
     e2e=$(map_e2e "")
     mapped+="$e2e"$'\n'
-    e2e_notes+="note: $e2e_map changed; every mapped end-to-end module runs"$'\n'
+    e2e_notes+="note: $e2e_map changed; every mapped test module runs"$'\n'
     return 0
   fi
   e2e=""
   [[ -z "$e2e_entries" ]] || e2e=$(map_e2e "$path")
   if [[ -n "$e2e" ]]; then
     mapped+="$e2e"$'\n'
-    e2e_notes+="note: $path is mapped to end-to-end tests in $e2e_map"$'\n'
+    e2e_notes+="note: $path is mapped to tests of other targets in $e2e_map"$'\n'
   fi
   if is_fallback "$path"; then
     fallback+="$path"$'\n'

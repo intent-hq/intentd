@@ -44,13 +44,13 @@ crates/intent-services/src/script_ops/monitors.rs    intentd::suite_wss_s_z    e
 
 # Adapter pins (claude-agent-acp / codex-acp): the guards that must move with
 # a pin bump live in intent-services' unit tests and an intentd end-to-end
-# module, so a pin-only PR ran none of them and each merge-queue run surfaced
-# one more (intentd#2543). The auto-pin-acp-adapters PRs edit both files.
+# module, so a pin-only PR's coverage-changed ran none of them and each
+# merge-queue run surfaced one more (intentd#2543). The auto-pin-acp-adapters
+# PRs edit both files. claude_adapter_contract is not mapped: it skips without
+# its adapter fixture, and CI's check job already runs it with one.
 crates/intent-providers/src/config.rs                    intent-services::lib      agent_workers::tests
-crates/intent-providers/src/config.rs                    intent-services::lib      claude_adapter_contract
 crates/intent-providers/src/config.rs                    intent-services::lib      model_preference::tests
 crates/intent-providers/src/config.rs                    intentd::suite_wss_agents e2e_wss_agent_workers
 crates/intent-providers/data/adapter-cli-packages.json   intent-services::lib      agent_workers::tests
-crates/intent-providers/data/adapter-cli-packages.json   intent-services::lib      claude_adapter_contract
 crates/intent-providers/data/adapter-cli-packages.json   intent-services::lib      model_preference::tests
 crates/intent-providers/data/adapter-cli-packages.json   intentd::suite_wss_agents e2e_wss_agent_workers
