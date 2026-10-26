@@ -14424,7 +14424,7 @@ async fn queue_mutations_recheck_ownership_against_the_entry_at_mutation_time() 
     let store = Store::open(&tmp.path).await.expect("open store");
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
-    let park = Arc::new(crate::script_ops::SupervisePark::default());
+    let park = Arc::new(crate::runtime_config::SupervisePark::default());
     let svc = Services::new(store)
         .with_settings_registry(test_registry_with_default_provider(&tmp))
         .with_queue_mutation_gate_park(Arc::clone(&park));
@@ -48568,7 +48568,7 @@ async fn startup_resume_listing_never_exposes_a_stale_successful_candidate() {
         .await
         .unwrap();
     let reservations = svc.prepare_startup_resume().await.unwrap();
-    let park = Arc::new(crate::script_ops::SupervisePark::default());
+    let park = Arc::new(crate::runtime_config::SupervisePark::default());
     let mut listing = svc.clone();
     listing.interrupted_list_park = Some(park.clone());
     let (result, ()) = tokio::join!(listing.agent_list_interrupted(), async {

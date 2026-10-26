@@ -1131,7 +1131,7 @@ async fn auto_retire_with_a_huge_window_is_a_no_op() {
 #[intent_test_macros::daemon_test]
 async fn auto_retire_op_does_not_stop_scripts_of_a_workspace_unarchived_while_waiting() {
     let f = fixture().await;
-    let park = std::sync::Arc::new(crate::script_ops::SupervisePark::default());
+    let park = std::sync::Arc::new(crate::runtime_config::SupervisePark::default());
     let svc = f
         .svc
         .clone()
@@ -1190,7 +1190,7 @@ async fn auto_retire_op_does_not_stop_scripts_of_a_workspace_unarchived_while_wa
 #[intent_test_macros::daemon_test]
 async fn manual_retire_does_not_stop_scripts_of_a_workspace_unarchived_while_waiting() {
     let f = fixture().await;
-    let park = std::sync::Arc::new(crate::script_ops::SupervisePark::default());
+    let park = std::sync::Arc::new(crate::runtime_config::SupervisePark::default());
     let svc = f
         .svc
         .clone()
@@ -1488,7 +1488,7 @@ async fn auto_retire_skips_a_workspace_whose_script_result_cannot_be_settled() {
 #[intent_test_macros::daemon_test]
 async fn script_create_admitted_before_retire_commits_before_the_flip() {
     let f = fixture().await;
-    let park = std::sync::Arc::new(crate::script_ops::SupervisePark::default());
+    let park = std::sync::Arc::new(crate::runtime_config::SupervisePark::default());
     let svc = f.svc.clone().with_script_create_admitted_park(park.clone());
     let ws = create_workspace(&f).await;
     svc.archive_workspace(ws.id.clone(), None)

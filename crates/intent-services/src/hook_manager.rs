@@ -60,6 +60,8 @@ use time::OffsetDateTime;
 use tokio::sync::mpsc;
 
 use crate::feature_ports::CancelSettlement;
+#[cfg(test)]
+use crate::runtime_config::HookStoreFault;
 use crate::{publish_event, system_actor, Services};
 
 /// Minimum inter-run delay (spec decision 5): `delayMs` below this floor is
@@ -84,11 +86,6 @@ pub(crate) const RUN_AT_GRACE_MS: i64 = 3_600_000;
 /// Maximum hook name length (spec: name > 50 chars fails validation).
 pub(crate) const MAX_HOOK_NAME_LEN: usize = 50;
 
-/// Wall-clock budget for one hook script run (spec: any run exceeding 60 s is
-/// killed and the hook evicted). Tests compress it via the `#[cfg(test)]`-only
-/// [`Services::with_hook_eval_timeout`].
-pub(crate) const HOOK_EVAL_TIMEOUT: Duration = Duration::from_secs(60);
-
 // Validation runs are inline: their ws.hook.schedule calls re-enter the
 // service before any hook is persisted. Bound the evaluation chain, allowing
 // a running hook to validate one replacement, but not another generation.
@@ -108,14 +105,7 @@ tokio::task_local! {
 /// up and evicts the hook. Only the failing persistence step is retried — the
 /// script never re-runs and a dispatch is never re-delivered.
 pub(crate) const HOOK_STORE_RETRY_ATTEMPTS: u32 = 5;
-pub(crate) const HOOK_STORE_RETRY_BASE: Duration = Duration::from_secs(1);
 const HOOK_STORE_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(16);
-
-/// Test-only fault injector for hook-run persistence steps: called with the
-/// step name before each attempt; `Some(err)` fails that attempt in place of
-/// the real store call (see [`Services::with_hook_store_fault`]).
-#[cfg(test)]
-pub(crate) type HookStoreFault = Arc<Mutex<Box<dyn FnMut(&str) -> Option<Error> + Send>>>;
 
 /// Per-run console-capture caps: the in-envelope `console.*` shim buffers at
 /// most this many lines / bytes, dropping from the head (with a marker line)

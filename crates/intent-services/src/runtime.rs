@@ -10,21 +10,24 @@
 //! later move into its own crate turns that registration into the
 //! composition root's.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use intent_core::execution::HostExecutionContext;
 use intent_core::{
-    now_iso, AgentId, BoxFuture, BrowserTab, BrowserTabInput, ClientId, Error, Result,
+    now_iso, AgentId, BoxFuture, BrowserTab, BrowserTabInput, ClientId, Error, HookId, Result,
     ReverseDispatchError, ReverseTarget, ScriptCreateParams, WorkspaceApi, WorkspaceId,
 };
 
 use crate::feature_ports::{
-    MergeOutcome, ProvisionOutcome, RuntimePort, ScriptsClosing, SetupScriptRun,
+    CommandScriptActivity, MergeOutcome, ProvisionOutcome, RuntimePort, ScriptsClosing,
+    SetupScriptRun,
 };
 use crate::{
     browser_ops, browser_tabs, capability, hook_manager, record_setup_running, sandbox_ops,
-    script_ops, setup_runner, terminal_ops, write_private_script, Services, SETUP_TERMINAL_NAME,
+    script_ops, script_output_store, setup_runner, terminal_ops, write_private_script, Services,
+    SETUP_TERMINAL_NAME,
 };
 
 /// Runtime-owned state, shared by every clone of the [`Services`] it is
@@ -55,6 +58,37 @@ impl Services {
     pub(crate) fn runtime(&self) -> &RuntimeFeature {
         self.feature::<RuntimeFeature>()
             .expect("the in-crate runtime feature is registered")
+    }
+
+    /// Build a [`ScriptManager`](script_ops::ScriptManager) view over the shared
+    /// PTY host, event bus, store, script registry, and bootstrap locks for one `script.*` call.
+    #[expect(
+        clippy::must_use_candidate,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub fn script_manager(&self) -> script_ops::ScriptManager {
+        script_ops::ScriptManager::new(
+            self.pty.clone(),
+            self.event_bus.clone(),
+            self.store.clone(),
+            self.runtime().scripts.clone(),
+            self.runtime().script_locks.clone(),
+            self.script_too_fast_ms,
+            self.script_parks.clone(),
+        )
+        .with_settings(self.settings_registry.clone())
+        .with_output_store(self.script_output_store())
+        .with_tasks(self.store_tasks.clone())
+        .with_owner_services(self.clone())
+    }
+
+    /// The on-disk script output store, built from the core
+    /// [`ScriptOutputConfig`](crate::runtime_config::ScriptOutputConfig).
+    pub(crate) fn script_output_store(&self) -> script_output_store::ScriptOutputStore {
+        script_output_store::ScriptOutputStore::new(
+            &self.script_output_config.data_dir,
+            self.script_output_config.max_bytes_per_run,
+        )
     }
 }
 
@@ -1465,6 +1499,75 @@ impl RuntimePort for RuntimeFeature {
             Box::new(svc.script_manager().close_workspace(workspace_id).await)
                 as Box<dyn ScriptsClosing>
         })
+    }
+
+    fn hydrate_scripts<'a>(&'a self, svc: &'a Services) -> BoxFuture<'a, Result<usize>> {
+        Box::pin(async move {
+            svc.script_manager().recover_monitors().await?;
+            svc.start_script_monitor_maintenance();
+            svc.script_manager().hydrate().await
+        })
+    }
+
+    fn command_script_activity(&self, svc: &Services) -> CommandScriptActivity {
+        script_ops::command_activity(&svc.runtime().scripts, &svc.runtime().script_locks)
+    }
+
+    fn workspace_scripts_running(&self, svc: &Services, workspace_id: &WorkspaceId) -> bool {
+        script_ops::workspace_command_running(&svc.runtime().scripts, workspace_id)
+    }
+
+    fn stop_all_scripts<'a>(&'a self, svc: &'a Services) -> BoxFuture<'a, (usize, usize)> {
+        Box::pin(async move { svc.script_manager().stop_all().await })
+    }
+
+    fn clear_hook_tasks(&self, svc: &Services) {
+        svc.runtime().hook_tasks.lock().unwrap().clear();
+    }
+
+    fn abort_workspace_hook_tasks<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(svc.abort_workspace_hook_tasks(workspace_id))
+    }
+
+    fn cancel_workspace_hooks<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
+    ) -> BoxFuture<'a, BTreeMap<AgentId, Vec<(String, HookId)>>> {
+        Box::pin(svc.cancel_workspace_hooks(workspace_id))
+    }
+
+    fn delete_workspace_script_output<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
+    ) -> BoxFuture<'a, bool> {
+        Box::pin(svc.delete_workspace_script_output(workspace_id))
+    }
+
+    fn execution_context_snapshot<'a>(
+        &'a self,
+        svc: &'a Services,
+    ) -> BoxFuture<'a, Result<HostExecutionContext>> {
+        Box::pin(svc.execution_context_snapshot())
+    }
+
+    fn agent_terminal_host(
+        &self,
+        svc: &Services,
+        terminal_requires_shell: bool,
+        session_cwd: Option<PathBuf>,
+    ) -> Arc<dyn intent_acp::TerminalHost> {
+        Arc::new(terminal_ops::PtyTerminalHost::with_shell_mode(
+            svc.pty(),
+            svc.settings_registry(),
+            terminal_requires_shell,
+            session_cwd,
+        ))
     }
 }
 

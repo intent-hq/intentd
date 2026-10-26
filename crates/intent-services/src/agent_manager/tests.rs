@@ -13732,7 +13732,7 @@ async fn archived_wake_park_self_heals_when_unarchived_during_enqueue() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
-    let park = Arc::new(crate::script_ops::SupervisePark::default());
+    let park = Arc::new(crate::runtime_config::SupervisePark::default());
     let services = Services::new(store)
         .with_event_bus(bus.clone())
         .with_wake_archived_park(park.clone());
