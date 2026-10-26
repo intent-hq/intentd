@@ -143,9 +143,13 @@ jobs:
           ACTION: ${{ github.event.action }}
           ACTOR: ${{ github.actor }}
         run: |
-          gh pr merge "$PR" --repo "$GITHUB_REPOSITORY" --disable-auto
-          armed=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json autoMergeRequest --jq .autoMergeRequest)
-          if [ "$armed" != null ] && [ -n "$armed" ]; then
+          # A refusal (e.g. auto-merge already off) is judged by the re-read below.
+          gh pr merge "$PR" --repo "$GITHUB_REPOSITORY" --disable-auto || true
+          if ! armed=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json autoMergeRequest --jq '.autoMergeRequest != null'); then
+            echo "::error::Could not confirm auto-merge is off for #$PR ($ACTION by $ACTOR); check it by hand."
+            exit 1
+          fi
+          if [ "$armed" != false ]; then
             echo "::error::Auto-merge is still armed on #$PR after --disable-auto ($ACTION by $ACTOR); disable it by hand."
             exit 1
           fi

@@ -11,6 +11,7 @@ Use -S to exclude host-installed site hooks (for example test telemetry).
 
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -1097,23 +1098,76 @@ class CliAndWorkflowTests(unittest.TestCase):
         self.assertNotIn("secrets.", job)
         self.assertNotIn("scripts/", job)
 
-    def test_stand_down_token_can_disarm_and_verifies_it(self):
+    @staticmethod
+    def stand_down_job():
+        job = WORKFLOW.read_text().split("\n  stand-down:\n", 1)[1]
+        return re.split(r"\n  [A-Za-z0-9_-]+:\n", job, maxsplit=1)[0]
+
+    def test_stand_down_token_can_disarm(self):
         # GITHUB_TOKEN with contents: read cannot call disablePullRequestAutoMerge
         # ("Resource not accessible by integration"), which left intentd#2543
         # armed after a human push (run 40190604304).
-        job = WORKFLOW.read_text().split("\n  stand-down:\n", 1)[1]
+        job = self.stand_down_job()
         permissions = job.split("\n    permissions:\n", 1)[1].split("\n    steps:\n", 1)[0]
         self.assertEqual(
             sorted(line.strip() for line in permissions.splitlines() if line.strip()),
             ["contents: write", "pull-requests: write"])
         self.assertIn("GH_TOKEN: ${{ github.token }}", job)
-        disarm = job.index("--disable-auto")
-        verify = job.index("--json autoMergeRequest")
-        self.assertLess(disarm, verify)
-        check = job[verify:]
-        self.assertIn('[ "$armed" != null ]', check)
-        self.assertIn("::error::", check)
-        self.assertIn("exit 1", check)
+
+    def run_stand_down_step(self, disable_exit, view_out, view_exit=0):
+        """Run the stand-down step's shell as Actions does (bash -e) with a fake gh."""
+        job = self.stand_down_job()
+        steps = job.split("\n    steps:\n", 1)[1]
+        self.assertEqual(steps.count("        run: |\n"), 1)
+        lines = steps.split("        run: |\n", 1)[1].splitlines()
+        body = []
+        for line in lines:
+            if line.strip() and not line.startswith(" " * 10):
+                break
+            body.append(line[10:])
+        with tempfile.TemporaryDirectory() as tmp:
+            gh = Path(tmp) / "gh"
+            gh.write_text(
+                "#!/bin/sh\n"
+                'echo "$*" >> "$GH_LOG"\n'
+                'case "$1 $2" in\n'
+                '  "pr merge") exit "$FAKE_DISABLE_EXIT" ;;\n'
+                '  "pr view") printf "%s\\n" "$FAKE_VIEW_OUT"; exit "$FAKE_VIEW_EXIT" ;;\n'
+                "esac\nexit 99\n")
+            gh.chmod(0o755)
+            log = Path(tmp) / "gh.log"
+            result = subprocess.run(
+                [shutil.which("bash") or "/bin/bash", "-e", "-c", "\n".join(body)],
+                text=True, capture_output=True, timeout=30,
+                env={"PATH": f"{tmp}:/usr/bin:/bin", "GH_LOG": str(log),
+                     "GITHUB_REPOSITORY": REPO, "PR": "7", "ACTION": "labeled",
+                     "ACTOR": "someone", "FAKE_DISABLE_EXIT": str(disable_exit),
+                     "FAKE_VIEW_OUT": view_out, "FAKE_VIEW_EXIT": str(view_exit)})
+            calls = log.read_text().splitlines() if log.exists() else []
+        return result, calls
+
+    def test_stand_down_passes_only_when_auto_merge_reads_back_off(self):
+        result, calls = self.run_stand_down_step(0, "false")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Disabled auto-merge for #7", result.stdout)
+        self.assertEqual(calls, [
+            f"pr merge 7 --repo {REPO} --disable-auto",
+            f"pr view 7 --repo {REPO} --json autoMergeRequest --jq .autoMergeRequest != null"])
+
+    def test_stand_down_judges_a_refused_disarm_by_the_read_back(self):
+        # Already disarmed (by hand or an earlier run): the refusal is harmless.
+        result, _ = self.run_stand_down_step(1, "false")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_stand_down_fails_loudly_when_still_armed_or_unverifiable(self):
+        for disable_exit, view_out, view_exit in ((1, "true", 0), (0, "true", 0),
+                                                  (0, "", 0), (0, "false", 1)):
+            with self.subTest(disable_exit=disable_exit, view_out=view_out,
+                              view_exit=view_exit):
+                result, _ = self.run_stand_down_step(disable_exit, view_out, view_exit)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn("::error::", result.stdout)
+                self.assertNotIn("Disabled auto-merge", result.stdout)
 
 
 if __name__ == "__main__":
