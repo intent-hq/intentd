@@ -539,8 +539,9 @@ rdeps_roots="intent-core"
 # [dev-dependencies] or [build-dependencies] table, target-specific ones
 # included, inline (`<name> = { path = "../<dir>" }`, `<name>.workspace =
 # true`, a `package = ` rename) or as a [<table>.<name>] section. A
-# dependency is a workspace crate when its path names crates/<dir> or its key
-# names a crates/<key> directory (workspace inheritance). Comments and other
+# dependency is a workspace crate when its path names crates/<dir>, its
+# `package =` or else its key names a crates/<name> directory (workspace
+# inheritance). Comments and other
 # sections are skipped. A line scanner, not a TOML parser.
 workspace_edges() {
   local manifest crate line section dep key
@@ -575,6 +576,9 @@ workspace_edges() {
             dep=${line#*\"../}
             dep=${dep%%\"*}
             dep=${dep%/}
+          elif [[ "$line" == package*=*\"*\"* ]]; then
+            dep=${line#*\"}
+            dep=${dep%%\"*}
           fi
           ;;
         dependencies | dev-dependencies | build-dependencies | target.*.dependencies | target.*.dev-dependencies | target.*.build-dependencies)
@@ -583,6 +587,10 @@ workspace_edges() {
             dep=${line#*path*=*\"../}
             dep=${dep%%\"*}
             dep=${dep%/}
+          elif [[ "$line" == *package*=*\"*\"* ]]; then
+            # A rename inheriting from [workspace.dependencies] has no path.
+            dep=${line#*package*=*\"}
+            dep=${dep%%\"*}
           else
             key=${line%%=*}
             key=${key%%[[:space:]]*}
@@ -617,6 +625,9 @@ reverse_dependents() {
 }
 
 rdeps_propagated=""
+# Dependents of a propagated root: their own dependents are selected too, so
+# no "downstream crates are not selected" note is printed for them.
+rdeps_selected=""
 rdeps_edges=""
 for root in $rdeps_roots; do
   root_changed=""
@@ -632,6 +643,7 @@ for root in $rdeps_roots; do
     [[ -n "$dependent" ]] || continue
     mapped+="$dependent"$'\t'"dependent"$'\n'
     dependents+="${dependents:+, }$dependent"
+    rdeps_selected+=" $dependent "
   done <<<"$(reverse_dependents "$root" "$rdeps_edges")"
   rdeps_propagated+=" $root "
   if [[ -n "$dependents" ]]; then
@@ -705,7 +717,7 @@ crate_selection() {
     src | dependent)
       crate_filter="--bins --tests"
       [[ -f "crates/$crate/src/lib.rs" ]] && crate_filter="--lib $crate_filter"
-      if [[ "$best" == dependent || "$rdeps_propagated" == *" $crate "* ]]; then
+      if [[ "$best" == dependent || "$rdeps_propagated$rdeps_selected" == *" $crate "* ]]; then
         :
       elif [[ "$crate" == intent-services && -n "$feature_crates" ]]; then
         log "note: crates/$crate/src changed; its feature crates and intent-app ($feature_crates) run too, other downstream crates are not selected"

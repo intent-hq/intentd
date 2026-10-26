@@ -474,6 +474,32 @@ expect_ok
 expect_cov "$core_rdeps_lib" "-p intentd --bins --tests"
 [[ "$stdout" == *"[coverage-changed] note: crates/intent-core changed; its reverse dependencies run too"* ]] || fail "$case_name: no reverse-dependency note: $stdout"
 
+# A rename that inherits from [workspace.dependencies] names no path: the
+# package key identifies the crate (inline and table forms).
+case_name="intent-core renamed workspace dependency without a path is followed"
+reset_repo
+write crates/gamma/Cargo.toml $'[package]\nname = "gamma"\n\n[dev-dependencies]\ncore = { package = "intent-core", workspace = true }'
+write crates/beta/Cargo.toml $'[package]\nname = "beta"\n\n[dependencies.core]\npackage = "intent-core"\nworkspace = true'
+commit_all "renamed manifests"
+g update-ref refs/remotes/origin/main HEAD
+edit crates/intent-core/src/lib.rs
+run_script
+g update-ref refs/remotes/origin/main "$base_sha"
+expect_ok
+expect_cargo "$core_rdeps_lib" "-p beta -p intentd --bins --tests"
+[[ "$stdout" == *"its reverse dependencies run too (alpha, beta, delta, gamma, "* ]] || fail "$case_name: beta/gamma not in note: $stdout"
+
+case_name="crates selected through intent-core print no downstream-not-selected note"
+reset_repo
+edit crates/intent-core/src/lib.rs
+edit crates/alpha/src/lib.rs
+edit crates/intent-services/src/lib.rs
+run_script
+expect_ok
+expect_cargo "$core_rdeps_lib" "-p intentd --bins --tests"
+[[ "$stdout" != *"not selected"* ]] || fail "$case_name: misleading note: $stdout"
+[[ "$(grep -c 'note:' <<<"$stdout")" -eq 1 ]] || fail "$case_name: expected one note: $stdout"
+
 case_name="a crate other than intent-core does not propagate to its dependents"
 reset_repo
 edit crates/alpha/src/lib.rs
