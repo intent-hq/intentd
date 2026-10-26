@@ -8632,10 +8632,19 @@ mod wsapi3_bindings_tests {
             asset: String,
         ) -> BoxFuture<'_, Result<ReadAssetResult>> {
             self.read_asset_calls.lock().unwrap().push(asset.clone());
+            let mime_type = if std::path::Path::new(&asset)
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("webm"))
+            {
+                "video/webm"
+            } else {
+                "image/png"
+            };
             Box::pin(async move {
                 Ok(ReadAssetResult {
                     asset_id: asset,
-                    mime_type: "image/png".to_string(),
+                    mime_type: mime_type.to_string(),
                     data: "AAAA".to_string(),
                     size_kb: 1,
                 })
@@ -9517,12 +9526,43 @@ mod wsapi3_bindings_tests {
             "return await ws.note.readAsset('workspace-asset://amber-forest/img-1');",
         )
         .await;
+        let content = resp["result"]["content"].as_array().unwrap();
+        let image = content
+            .iter()
+            .find(|item| item["type"] == "image")
+            .expect("image assets must return a native MCP image block");
+        assert_eq!(image["mimeType"], json!("image/png"));
+        assert_eq!(image["data"], json!("AAAA"));
+        assert_eq!(resp["result"]["isError"], json!(false));
+
+        let resp = call(
+            &srv,
+            "const a = await ws.note.readAsset('workspace-asset://amber-forest/img-1'); return { assetId: a.assetId, mimeType: a.mimeType, data: a.data, sizeKb: a.sizeKb };",
+        )
+        .await;
         let v = body(&resp);
+        assert_eq!(v["assetId"], json!("workspace-asset://amber-forest/img-1"));
         assert_eq!(v["mimeType"], json!("image/png"));
+        assert_eq!(v["data"], json!("AAAA"));
         assert_eq!(v["sizeKb"], json!(1));
+
+        let resp = call(
+            &srv,
+            "return await ws.note.readAsset('workspace-asset://amber-forest/clip.webm');",
+        )
+        .await;
+        let v = body(&resp);
+        assert_eq!(v["mimeType"], json!("video/webm"));
+        assert_eq!(v["data"], json!("AAAA"));
+        assert_eq!(v["sizeKb"], json!(1));
+        assert!(v.get("__mcpContentItems").is_none());
         assert_eq!(
-            api.read_asset_calls.lock().unwrap()[0],
-            "workspace-asset://amber-forest/img-1"
+            *api.read_asset_calls.lock().unwrap(),
+            vec![
+                "workspace-asset://amber-forest/img-1".to_string(),
+                "workspace-asset://amber-forest/img-1".to_string(),
+                "workspace-asset://amber-forest/clip.webm".to_string(),
+            ]
         );
     }
 
