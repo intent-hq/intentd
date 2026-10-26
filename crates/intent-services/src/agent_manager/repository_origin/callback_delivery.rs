@@ -83,7 +83,9 @@ impl ServerBlueprint {
     }
 
     /// Standard ACP confirms an original physical owner without registering a
-    /// private callback. Only new 3.2+ sessions opt into this prompt envelope;
+    /// private callback. Only sessions stamped with a version admitted by
+    /// [`intent_core::harness_uses_repository_monitor_guidance`] (3.2 and
+    /// newer) opt into this prompt envelope;
     /// it never upgrades the initial MCP endpoint or acknowledges a Query.
     pub(super) fn bind_prompt_context(
         &self,
@@ -93,7 +95,7 @@ impl ServerBlueprint {
         agent: &intent_core::AgentId,
     ) -> Option<Arc<LiveContext>> {
         let (services, session) = self.original.as_ref()?;
-        if !matches!(session.harness_version.as_str(), "3.2" | "3.3" | "3.4")
+        if !intent_core::harness_uses_repository_monitor_guidance(&session.harness_version)
             || session.retired_at.is_some()
             || &session.workspace_id != workspace
             || &session.id != agent

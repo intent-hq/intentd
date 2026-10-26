@@ -231,12 +231,16 @@ the original configuration is **Codex · Default**. Each profile has its own **F
 mode** (Claude Code) or **Service Tier** (Codex) in its ⋯ menu; it starts off and
 never follows the Default setting. Delegated agents follow their
 explicit, specialist, or default selection, never the parent's profile.
-To rename the original configuration or give it its own environment variables
-(same rules as a profile, without the backup switch), choose **Environment
-variables** in the Codex or Claude Code ⋯ menu; a blank name restores **Default**.
+Once a provider has profiles, its original configuration is listed first as the
+Default profile, where backups start from; it cannot be moved, and shows its name
+with a **Default** badge once renamed. To rename it or give it its own environment
+variables (same rules as a profile, without the backup switch), choose **Edit** in
+its ⋯ menu, or **Environment variables** in the Codex or Claude Code ⋯ menu; a blank
+name restores **Default**. Settings → Providers does not mark the app's default
+model or provider; use **Default model** for that.
 
-**Backup profiles.** Drag a profile in **Settings → Providers**, or focus its
-handle and use the Up and Down arrow keys, to set its order. Turn on **Use as backup
+**Backup profiles.** Drag a named profile in **Settings → Providers**, or focus its
+handle and use the Up and Down arrow keys, to set its order below the Default profile. Turn on **Use as backup
 provider** in the profile dialog; backup profiles show a **Backup** badge. When a
 conversation's current Codex or Claude Code configuration runs out of quota, the turn
 continues on the next backup of the same provider in saved order, with the same

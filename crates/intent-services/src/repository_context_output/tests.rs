@@ -1150,7 +1150,7 @@ async fn manager_prompt_worker<T: Send + 'static>(
     services: Arc<crate::Services>,
     body: impl std::future::Future<Output = T> + Send + 'static,
 ) -> T {
-    intent_core::spawn_daemon(crate::host_execution::background_execution(
+    intent_core::spawn_daemon(crate::execution_call::background_execution(
         services.as_ref().clone(),
         None,
         body,
@@ -1542,7 +1542,10 @@ async fn monitor_guidance_current_context_continuation_preserves_saved_session()
             .flatten()
             .collect()
     }
-    for version in ["3.0", "3.1", "3.2", "3.3", "3.4"] {
+    for version in intent_core::REPOSITORY_GUIDANCE_HARNESS_VERSIONS
+        .iter()
+        .copied()
+    {
         let http = ReadServer::new().await;
         let f = LiveFixture::with_version(&http, version).await;
         let store = &f.base.auth.service.store;
@@ -1577,7 +1580,7 @@ async fn monitor_guidance_current_context_continuation_preserves_saved_session()
         assert!(first_text.contains("group/project"), "{first}");
         assert_eq!(
             first_text.contains("Qualified monitoring is prepared but production-disabled"),
-            matches!(version, "3.2" | "3.3" | "3.4")
+            intent_core::harness_uses_repository_monitor_guidance(version)
         );
         f.base.git.git(
             &f.base.git.path,
@@ -1624,7 +1627,7 @@ async fn monitor_guidance_current_context_continuation_preserves_saved_session()
             next_text.contains(
                 "Existing watches and restored history keep their original target and account"
             ),
-            matches!(version, "3.2" | "3.3" | "3.4")
+            intent_core::harness_uses_repository_monitor_guidance(version)
         );
         let caller = Caller::Agent {
             agent_id: f.session.id.clone(),

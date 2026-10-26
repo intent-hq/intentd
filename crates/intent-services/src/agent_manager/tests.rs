@@ -11,8 +11,8 @@ use intent_acp::{
     PermissionOutcome, PermissionPolicy, PermissionRequestData,
 };
 use intent_core::{
-    now_iso, AgentId, AgentSession, AgentStatus, Error, MessageOrigin, Workspace,
-    WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
+    now_iso, AgentId, AgentSession, AgentStatus, Error, MessageOrigin, Workspace, WorkspaceApi,
+    WorkspaceId, WorkspaceStatus,
 };
 use intent_store::Store;
 use serde_json::{json, Value};
@@ -1992,52 +1992,9 @@ async fn process_cap_events_queued_resumed_evicted() {
         id: ws_id.clone(),
         title: "Test".into(),
         branch: "main".into(),
-        base_ref: None,
-        base_commit_sha: None,
-        status: WorkspaceStatus::Active,
-        status_message: None,
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
-        attention: WorkspaceAttention::None,
         created_at: ts.clone(),
         updated_at: ts,
-        last_activity: None,
-        last_content_activity: None,
-        tags: vec![],
-        path: None,
-        repository_path: None,
-        repository_owner: None,
-        repository_name: None,
-        worktree_path: None,
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
-        default_model: None,
-        pr_number: None,
-        pr_url: None,
-        pr_status: None,
-        active_pull_request: None,
-        pull_requests: None,
-        context_links: None,
-        archived: false,
-        archived_at: None,
-        retired_at: None,
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        pull_requests_total: None,
-        display_status: None,
-        waiting: false,
-        scripts_running: false,
-        background_tasks_running: false,
-        checkout_mode: None,
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
+        ..Default::default()
     };
     store.insert_workspace(&ws).await.unwrap();
     let (a, b) = (AgentId::from("a"), AgentId::from("b"));
@@ -5315,58 +5272,16 @@ fn file_tracking_workspace(
     ws_id: &intent_core::WorkspaceId,
     worktree: &std::path::Path,
 ) -> intent_core::Workspace {
-    use intent_core::{now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus};
+    use intent_core::{now_iso, Workspace};
     let ts = now_iso();
     Workspace {
         id: ws_id.clone(),
         title: "WS".to_string(),
         branch: "main".to_string(),
-        base_ref: None,
-        base_commit_sha: None,
-        status: WorkspaceStatus::Active,
-        status_message: None,
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
-        attention: WorkspaceAttention::None,
         created_at: ts.clone(),
         updated_at: ts,
-        last_activity: None,
-        last_content_activity: None,
-        tags: vec![],
-        path: None,
-        repository_path: None,
-        repository_owner: None,
-        repository_name: None,
         worktree_path: Some(worktree.display().to_string()),
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
-        default_model: None,
-        pr_number: None,
-        pr_url: None,
-        pr_status: None,
-        active_pull_request: None,
-        pull_requests: None,
-        context_links: None,
-        archived: false,
-        archived_at: None,
-        retired_at: None,
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        pull_requests_total: None,
-        display_status: None,
-        waiting: false,
-        scripts_running: false,
-        background_tasks_running: false,
-        checkout_mode: None,
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
+        ..Default::default()
     }
 }
 
@@ -6229,52 +6144,9 @@ async fn seed_agent_with_task_graph(
         id: ws.clone(),
         title: "WS".to_string(),
         branch: "main".to_string(),
-        base_ref: None,
-        base_commit_sha: None,
-        status: WorkspaceStatus::Active,
-        status_message: None,
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
-        attention: WorkspaceAttention::None,
         created_at: ts.clone(),
         updated_at: ts.clone(),
-        last_activity: None,
-        last_content_activity: None,
-        tags: vec![],
-        path: None,
-        repository_path: None,
-        repository_owner: None,
-        repository_name: None,
-        worktree_path: None,
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
-        default_model: None,
-        pr_number: None,
-        pr_url: None,
-        pr_status: None,
-        active_pull_request: None,
-        pull_requests: None,
-        context_links: None,
-        archived: false,
-        archived_at: None,
-        retired_at: None,
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        pull_requests_total: None,
-        display_status: None,
-        waiting: false,
-        scripts_running: false,
-        background_tasks_running: false,
-        checkout_mode: None,
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
+        ..Default::default()
     };
     let session = AgentSession {
         harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
@@ -13473,52 +13345,9 @@ async fn delete_workspace_stops_live_agents_and_leaves_no_ghost_state() {
         id: ws.clone(),
         title: "WS".to_string(),
         branch: "main".to_string(),
-        base_ref: None,
-        base_commit_sha: None,
-        status: WorkspaceStatus::Active,
-        status_message: None,
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
-        attention: WorkspaceAttention::None,
         created_at: ts.clone(),
         updated_at: ts,
-        last_activity: None,
-        last_content_activity: None,
-        tags: vec![],
-        path: None,
-        repository_path: None,
-        repository_owner: None,
-        repository_name: None,
-        worktree_path: None,
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
-        default_model: None,
-        pr_number: None,
-        pr_url: None,
-        pr_status: None,
-        active_pull_request: None,
-        pull_requests: None,
-        context_links: None,
-        archived: false,
-        archived_at: None,
-        retired_at: None,
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        pull_requests_total: None,
-        display_status: None,
-        waiting: false,
-        scripts_running: false,
-        background_tasks_running: false,
-        checkout_mode: None,
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
+        ..Default::default()
     };
     store
         .insert_workspace(&workspace)
@@ -13903,7 +13732,7 @@ async fn archived_wake_park_self_heals_when_unarchived_during_enqueue() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
-    let park = Arc::new(crate::script_ops::SupervisePark::default());
+    let park = Arc::new(crate::runtime_config::SupervisePark::default());
     let services = Services::new(store)
         .with_event_bus(bus.clone())
         .with_wake_archived_park(park.clone());
@@ -19083,52 +18912,10 @@ async fn resolve_spawn_prefers_existing_workspace_path() {
         id: WorkspaceId::from("ws-rs"),
         title: "WS".to_string(),
         branch: "main".to_string(),
-        base_ref: None,
-        base_commit_sha: None,
-        status: WorkspaceStatus::Active,
-        status_message: None,
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
-        attention: WorkspaceAttention::None,
         created_at: now_iso(),
         updated_at: now_iso(),
-        last_activity: None,
-        last_content_activity: None,
-        tags: vec![],
         path: Some(ws_dir.display().to_string()),
-        repository_path: None,
-        repository_owner: None,
-        repository_name: None,
-        worktree_path: None,
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
-        default_model: None,
-        pr_number: None,
-        pr_url: None,
-        pr_status: None,
-        active_pull_request: None,
-        pull_requests: None,
-        context_links: None,
-        archived: false,
-        archived_at: None,
-        retired_at: None,
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        pull_requests_total: None,
-        display_status: None,
-        waiting: false,
-        scripts_running: false,
-        background_tasks_running: false,
-        checkout_mode: None,
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
+        ..Default::default()
     };
     let resolved = resolve_spawn(&session, Some(&workspace), &settings, None)
         .expect("existing workspace path resolves");
@@ -19204,52 +18991,11 @@ async fn resolve_spawn_falls_back_to_repository_path() {
         id: WorkspaceId::from("ws-repo-fb"),
         title: "WS".to_string(),
         branch: "main".to_string(),
-        base_ref: None,
-        base_commit_sha: None,
-        status: WorkspaceStatus::Active,
-        status_message: None,
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
-        attention: WorkspaceAttention::None,
         created_at: now_iso(),
         updated_at: now_iso(),
-        last_activity: None,
-        last_content_activity: None,
-        tags: vec![],
-        path: None,
         repository_path: Some(repo_dir.display().to_string()),
-        repository_owner: None,
-        repository_name: None,
-        worktree_path: None,
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
-        default_model: None,
-        pr_number: None,
-        pr_url: None,
-        pr_status: None,
-        active_pull_request: None,
-        pull_requests: None,
-        context_links: None,
-        archived: false,
-        archived_at: None,
-        retired_at: None,
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        pull_requests_total: None,
-        display_status: None,
-        waiting: false,
-        scripts_running: false,
-        background_tasks_running: false,
         checkout_mode: Some(intent_core::CheckoutMode::Direct),
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
+        ..Default::default()
     };
     let resolved = resolve_spawn(&session, Some(&workspace), &settings, None)
         .expect("repository_path fallback resolves");
@@ -19615,7 +19361,7 @@ async fn validate_image_block_refs_enforces_aggregate_cap() {
 #[tokio::test]
 async fn resolve_image_block_refs_inlines_attachment_bytes() {
     use base64::Engine as _;
-    use intent_core::{Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus};
+    use intent_core::Workspace;
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let root = tempfile::Builder::new()
@@ -19628,52 +19374,10 @@ async fn resolve_image_block_refs_inlines_attachment_bytes() {
         id: ws_id.clone(),
         title: "WS".into(),
         branch: "main".into(),
-        base_ref: None,
-        base_commit_sha: None,
-        status: WorkspaceStatus::Active,
-        status_message: None,
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
-        attention: WorkspaceAttention::None,
         created_at: ts.clone(),
         updated_at: ts,
-        last_activity: None,
-        last_content_activity: None,
-        tags: vec![],
-        path: None,
-        repository_path: None,
-        repository_owner: None,
-        repository_name: None,
         worktree_path: Some(root.path().display().to_string()),
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
-        default_model: None,
-        pr_number: None,
-        pr_url: None,
-        pr_status: None,
-        active_pull_request: None,
-        pull_requests: None,
-        context_links: None,
-        archived: false,
-        archived_at: None,
-        retired_at: None,
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        pull_requests_total: None,
-        display_status: None,
-        waiting: false,
-        scripts_running: false,
-        background_tasks_running: false,
-        checkout_mode: None,
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
+        ..Default::default()
     };
     store.insert_workspace(&ws).await.unwrap();
 
@@ -20306,52 +20010,10 @@ async fn derive_agent_type_uses_workspace_project_specialists_dir() {
         id: WorkspaceId::from("ws-dat"),
         title: "WS".to_string(),
         branch: "main".to_string(),
-        base_ref: None,
-        base_commit_sha: None,
-        status: WorkspaceStatus::Active,
-        status_message: None,
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
-        attention: WorkspaceAttention::None,
         created_at: now_iso(),
         updated_at: now_iso(),
-        last_activity: None,
-        last_content_activity: None,
-        tags: vec![],
         path: Some(ws_dir.display().to_string()),
-        repository_path: None,
-        repository_owner: None,
-        repository_name: None,
-        worktree_path: None,
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
-        default_model: None,
-        pr_number: None,
-        pr_url: None,
-        pr_status: None,
-        active_pull_request: None,
-        pull_requests: None,
-        context_links: None,
-        archived: false,
-        archived_at: None,
-        retired_at: None,
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        pull_requests_total: None,
-        display_status: None,
-        waiting: false,
-        scripts_running: false,
-        background_tasks_running: false,
-        checkout_mode: None,
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
+        ..Default::default()
     };
 
     assert_eq!(
@@ -20500,14 +20162,12 @@ async fn build_turn_prompt_uses_context_references_when_stdin_context_is_absent(
     assert!(!text.contains("ignored"));
 }
 
-/// `noteIds` (PROTOCOL §5.5): the resolver loads workspace-asset
-/// images referenced by each note's markdown content, appends them as
-/// ACP `image` content blocks, and adds a system text notice so the
-/// agent knows the images are inlined (parity with the FE extraction
-/// in `agent-backend-handler.service.ts`).
+/// `noteIds` (PROTOCOL §5.5): each note is attached by reference — one
+/// text notice with its id, title and the in-workspace `workspace-asset://`
+/// image URLs its markdown embeds. No image block is emitted and the asset
+/// bytes are never read.
 #[tokio::test]
-async fn build_turn_prompt_resolves_note_ids_to_image_blocks() {
-    use base64::Engine as _;
+async fn build_turn_prompt_note_ids_render_reference_notice() {
     use intent_core::{ContentType, Note, NoteId, NoteMetadata, NoteVisibility};
 
     let tmp = TempDb::new();
@@ -20567,18 +20227,23 @@ async fn build_turn_prompt_resolves_note_ids_to_image_blocks() {
         .unwrap();
     let wire = serde_json::to_value(&prompt).unwrap();
     let arr = wire.as_array().unwrap();
-    // Expect: original text prompt, image block, system notice.
-    assert_eq!(arr.len(), 3, "text + image + notice");
+    // Expect: original text prompt, then the note's reference notice.
+    assert_eq!(arr.len(), 2, "text + note notice: {wire}");
     assert_eq!(arr[0]["type"], json!("text"));
     assert!(arr[0]["text"].as_str().unwrap().contains("look"));
-    assert_eq!(arr[1]["type"], json!("image"));
-    let expected_b64 = base64::engine::general_purpose::STANDARD.encode(asset_bytes);
-    assert_eq!(arr[1]["data"], json!(expected_b64));
-    assert_eq!(arr[1]["mimeType"], json!("image/png"));
-    assert_eq!(arr[2]["type"], json!("text"));
-    assert!(arr[2]["text"].as_str().unwrap().contains("1 image(s)"));
+    assert_eq!(arr[1]["type"], json!("text"));
+    assert_eq!(
+        arr[1]["text"],
+        json!(super::note_reference_notice(
+            "Spec",
+            &note_id.to_string(),
+            &[format!("workspace-asset://{}/{asset_id}", ws.0)],
+            0,
+        ))
+    );
 
-    // A cross-workspace URL is silently skipped (no image, no notice).
+    // A cross-workspace URL is skipped: the note is still referenced, with
+    // no image list.
     let stray_id = NoteId::new();
     let stray = Note {
         id: stray_id.clone(),
@@ -20598,7 +20263,220 @@ async fn build_turn_prompt_resolves_note_ids_to_image_blocks() {
         .unwrap();
     let arr_json = serde_json::to_value(&prompt).unwrap();
     let arr = arr_json.as_array().unwrap();
-    assert_eq!(arr.len(), 1, "only text; stray URL is skipped");
+    assert_eq!(arr.len(), 2, "text + note notice");
+    let notice = arr[1]["text"].as_str().unwrap();
+    assert!(!notice.contains("workspace-asset://"), "{notice}");
+    assert!(!notice.contains("image(s)"), "{notice}");
+
+    // Past the per-note cap, the first 50 distinct URLs are listed and the
+    // rest counted.
+    let many_id = NoteId::new();
+    let many_urls: Vec<String> = (0..53)
+        .map(|i| format!("workspace-asset://{}/shot-{i}.png", ws.0))
+        .collect();
+    let many = Note {
+        id: many_id.clone(),
+        content: many_urls.iter().fold(String::new(), |mut acc, url| {
+            use std::fmt::Write as _;
+            let _ = writeln!(acc, "![s]({url})");
+            acc
+        }),
+        ..note.clone()
+    };
+    store.insert_note(&many).await.expect("insert many");
+    let options = super::TurnOptions {
+        note_ids: Some(json!([many_id.to_string()])),
+        ..super::TurnOptions::default()
+    };
+    let prompt = mgr
+        .build_turn_prompt(&id, &ws, "look", &options)
+        .await
+        .unwrap();
+    let wire = serde_json::to_value(&prompt).unwrap();
+    assert_eq!(
+        wire[1]["text"],
+        json!(super::note_reference_notice(
+            "Spec",
+            &many_id.to_string(),
+            &many_urls[..50],
+            3,
+        ))
+    );
+
+    // Only the destination of a markdown image target is a URL: a title is
+    // dropped, `<…>` is unwrapped, and a target that is not a plain asset
+    // file name (here an unclosed image swallowing prose) is not listed.
+    // A repeated note id is referenced once.
+    let tricky_id = NoteId::new();
+    let tricky = Note {
+        id: tricky_id.clone(),
+        content: format!(
+            "![a](workspace-asset://{ws}/a.png \"caption\")\n\
+             ![b](<workspace-asset://{ws}/b.png>)\n\
+             ![c](workspace-asset://{ws}/\n\nSecret paragraph text)\n",
+            ws = ws.0,
+        ),
+        ..note.clone()
+    };
+    store.insert_note(&tricky).await.expect("insert tricky");
+    let options = super::TurnOptions {
+        note_ids: Some(json!([tricky_id.to_string(), tricky_id.to_string()])),
+        ..super::TurnOptions::default()
+    };
+    let prompt = mgr
+        .build_turn_prompt(&id, &ws, "look", &options)
+        .await
+        .unwrap();
+    let wire = serde_json::to_value(&prompt).unwrap();
+    assert_eq!(
+        wire.as_array().unwrap().len(),
+        2,
+        "one notice per note: {wire}"
+    );
+    assert_eq!(
+        wire[1]["text"],
+        json!(super::note_reference_notice(
+            "Spec",
+            &tricky_id.to_string(),
+            &[
+                format!("workspace-asset://{}/a.png", ws.0),
+                format!("workspace-asset://{}/b.png", ws.0),
+            ],
+            0,
+        ))
+    );
+}
+
+/// Regression: a note in chat context whose screenshots together exceed the
+/// 8 MiB provider image budget must not fail the turn. The note is attached
+/// by reference — its ID plus each image's `workspace-asset://` URL — so the
+/// prepared prompt carries no image blocks and the agent opens what it needs
+/// with `ws.note.read` / `ws.note.readAsset`.
+#[tokio::test]
+async fn note_ids_attach_large_image_notes_by_reference() {
+    use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
+    use intent_core::{ContentType, Note, NoteId, NoteMetadata, NoteVisibility};
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let assets_dir = crate::tests::test_tempdir("intentd-note-ref-");
+    let services = Services::new(store.clone())
+        .with_event_bus(bus.clone())
+        .with_assets_root(assets_dir.path().to_path_buf());
+    let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
+    let mgr = AgentManager::new(services, sink, 8);
+
+    let ws = WorkspaceId::from("ws-note-ref");
+    let id = AgentId::from("a-note-ref");
+    seed_agent(&mgr, &ws, &id).await;
+
+    // An incompressible 1000x1000 screenshot is ~3 MB of PNG (~4 MB base64):
+    // under the per-image limits, so three of them overflow only the 8 MiB
+    // aggregate budget — the reported failure.
+    let mut state = 0x1234_5678_u32;
+    let shot = DynamicImage::ImageRgb8(RgbImage::from_fn(1000, 1000, |_, _| {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        let [r, g, b, _] = state.to_le_bytes();
+        Rgb([r, g, b])
+    }));
+    let mut png = std::io::Cursor::new(Vec::new());
+    shot.write_to(&mut png, ImageFormat::Png)
+        .expect("encode png");
+    let ws_dir = assets_dir.path().join(&ws.0);
+    std::fs::create_dir_all(&ws_dir).expect("asset dir");
+    let asset_ids = ["shot-1.png", "shot-2.png", "shot-3.png"];
+    for asset in asset_ids {
+        std::fs::write(ws_dir.join(asset), png.get_ref()).expect("write asset");
+    }
+    let urls: Vec<String> = asset_ids
+        .iter()
+        .map(|asset| format!("workspace-asset://{}/{asset}", ws.0))
+        .collect();
+
+    let note_id = NoteId::new();
+    let ts = now_iso();
+    let mut content = "# Walkthrough\n\nIntro text that is not inlined.\n".to_string();
+    {
+        use std::fmt::Write as _;
+        for url in &urls {
+            let _ = write!(content, "\n![step]({url})\n");
+        }
+        // A repeated reference is listed once.
+        let _ = write!(content, "\n![again]({})\n", urls[0]);
+    }
+    store
+        .insert_note(&Note {
+            id: note_id.clone(),
+            workspace_id: ws.clone(),
+            title: "Walkthrough".to_string(),
+            content,
+            content_type: ContentType::Markdown,
+            tags: vec![],
+            is_pinned: false,
+            is_archived: false,
+            is_default: false,
+            parent_id: None,
+            visibility: NoteVisibility::Workspace,
+            metadata: NoteMetadata::default(),
+            created_at: ts.clone(),
+            rev: 0,
+            updated_at: ts,
+        })
+        .await
+        .expect("insert note");
+
+    let options = super::TurnOptions {
+        note_ids: Some(json!([note_id.to_string()])),
+        ..super::TurnOptions::default()
+    };
+    let prompt = mgr
+        .build_turn_prompt(&id, &ws, "look", &options)
+        .await
+        .unwrap();
+    let prepared = crate::provider_images::PreparedPrompt::new(prompt)
+        .await
+        .expect("a large-image note must not exceed the provider image budget")
+        .into_blocks();
+    let wire = serde_json::to_value(&prepared).unwrap();
+    let arr = wire.as_array().unwrap();
+    assert!(
+        arr.iter().all(|block| block["type"] == json!("text")),
+        "note images are referenced, never inlined: {wire}"
+    );
+    let text: String = arr
+        .iter()
+        .filter_map(|block| block["text"].as_str())
+        .collect();
+    assert!(text.contains("look"));
+    assert!(!text.contains("Intro text"), "note content is not inlined");
+    assert!(
+        text.contains(&format!("ws.note.read(\"{note_id}\")")),
+        "{text}"
+    );
+    assert!(text.contains("\"Walkthrough\""), "{text}");
+    for url in &urls {
+        assert_eq!(
+            text.matches(url.as_str()).count(),
+            1,
+            "each image URL is listed exactly once: {text}"
+        );
+    }
+    assert!(text.contains("ws.note.readAsset("), "{text}");
+
+    // A deleted (missing) note contributes nothing.
+    let options = super::TurnOptions {
+        note_ids: Some(json!(["note-that-was-deleted"])),
+        ..super::TurnOptions::default()
+    };
+    let prompt = mgr
+        .build_turn_prompt(&id, &ws, "look", &options)
+        .await
+        .unwrap();
+    let wire = serde_json::to_value(&prompt).unwrap();
+    assert_eq!(wire.as_array().unwrap().len(), 1, "only the message text");
 }
 
 /// A10 — daemon-side merge of user MCP servers into the agent spawn config.

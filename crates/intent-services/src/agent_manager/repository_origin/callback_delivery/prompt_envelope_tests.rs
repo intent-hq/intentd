@@ -177,7 +177,7 @@ impl Harness {
         &self,
         body: impl std::future::Future<Output = T> + Send + 'static,
     ) -> T {
-        intent_core::spawn_daemon(crate::host_execution::background_execution(
+        intent_core::spawn_daemon(crate::execution_call::background_execution(
             self.services.as_ref().clone(),
             None,
             body,
@@ -925,7 +925,7 @@ let SESSION_ID = `config-session-${process.pid}`;
             (state.endpoint.is_none(), state.prompt_context.clone())
         };
         assert!(endpoint_absent);
-        if matches!(stored.harness_version.as_str(), "3.2" | "3.3" | "3.4") {
+        if intent_core::harness_uses_repository_monitor_guidance(&stored.harness_version) {
             let context = context.expect("initialized original prompt owner");
             assert!(!context.acknowledged.load(Ordering::SeqCst));
             assert!(!context.requires_callback_ack);

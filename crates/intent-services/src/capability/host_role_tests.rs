@@ -1383,7 +1383,7 @@ async fn member_terminal_ids_resolve_the_workspace_and_recheck_revocation() {
 
 #[tokio::test]
 async fn member_execution_errors_are_classified_and_sanitized_without_changing_owner_errors() {
-    use crate::host_execution::{ai_authorization_error, forge_error, git_error};
+    use crate::execution_call::{ai_authorization_error, forge_error, git_error};
     use intent_core::execution::ExecutionAuthorizationReason as Reason;
     use intent_sourcecontrol::Error as ScError;
     let tmp = TempDb::new();
@@ -1587,7 +1587,7 @@ async fn member_execution_context_events_cover_policy_setup_and_unchanged_config
     with_caller(
         caller(&member),
         svc.execution_call(async {
-            let _ = crate::host_execution::forge_error(intent_sourcecontrol::Error::Auth(
+            let _ = crate::execution_call::forge_error(intent_sourcecontrol::Error::Auth(
                 "private response".into(),
             ));
             Ok(())

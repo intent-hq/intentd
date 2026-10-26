@@ -4,6 +4,7 @@
 #   scripts/changed-tests.sh [--dry-run] [--base REF] [--instrumented]
 #                            [--build-jobs N] [--test-threads N] [--runner CMD]
 #                            [--plan-json PATH] [--check-map]
+#   scripts/changed-tests.sh --print-edges | --print-rdeps
 #
 # Each flag falls back to an environment variable: DRY_RUN=1, BASE (default
 # origin/main), BUILD_JOBS, TEST_THREADS, NEXTEST_RUNNER. NEXTEST_SHOW_PROGRESS /
@@ -11,7 +12,8 @@
 # them). The script works from any cwd: it changes to the repo root itself.
 #
 # All test children (including a custom runner) use with-test-policy.sh to
-# enforce INTENTD_ASSERT_BOUND_CALLER=1, even when inherited env disables it.
+# enforce INTENTD_ASSERT_BOUND_CALLER=1, even when inherited env disables it,
+# and run under the caller's LC_ALL; the script itself works in byte order.
 # Without a runner every plan runs as its own `cargo nextest run` from the repo
 # root. With one, the runner (a shell-quoted command line, exec'd once from the
 # caller's working directory) receives every plan instead:
@@ -48,11 +50,17 @@
 #                                    select crates/intent-app
 #   crates/<c>/benches|examples/**   ignored (nextest does not run them)
 #   crates/<c>/<anything else>       -p <c>  (all test targets of <c>)
+#   crates/intent-core/ (src/** or   also every crate depending on intent-core,
+#     <anything else>)               directly or transitively, as for src/**
+#                                    (dependencies read from crates/*/Cargo.toml)
 #   a glob in .config/e2e-test-map.txt
 #                                    also the end-to-end modules it maps to:
 #                                    -p <c> --test <s> -E 'binary_id(=<c>::<s>)&test(/^(<m>)::/)'
 #                                    (the suite-module shape; a module-less
-#                                    entry selects --test <s> whole)
+#                                    entry selects --test <s> whole), or for
+#                                    a <c>::lib entry the library unit tests:
+#                                    -p <c> --lib -E 'binary_id(=<c>)&test(/^(<m>)::/)'
+#                                    (module-less: --lib whole)
 #   .config/e2e-test-map.txt itself  every mapped end-to-end module
 #   outside crates/, inert           ignored: *.md, LICENSE, NOTICE, .gitignore,
 #                                    .github/**, docs/**, deny.toml,
@@ -66,16 +74,18 @@
 # A broader selection subsumes narrower ones for the same crate. Cargo applies
 # target flags to every -p package on one command line, so crates with
 # different selections run as separate `cargo nextest run` invocations and
-# crates with identical selections share one. Reverse dependencies are NOT
-# propagated, except from intent-services to its feature crates and intent-app,
-# from a feature crate to intent-app, and through
-# the end-to-end map: crates/<c>/src selects <c>'s own tests plus any mapped
-# end-to-end modules; the full suite (`make test`, the merge queue) stays the
-# complete gate.
+# crates with identical selections share one. Reverse dependencies are
+# propagated in full only from intent-core (intentd#2698); otherwise only from
+# intent-services to its feature crates and intent-app, from a feature crate
+# to intent-app, and through the end-to-end map: crates/<c>/src selects <c>'s
+# own tests plus any mapped end-to-end or library unit-test modules; the full
+# suite (`make test`, the merge queue) stays the complete gate.
 #
 # The map is validated on every run, and --check-map validates it alone (and
 # requires it to exist): each source glob must match a tracked or untracked
-# file, each test binary root crates/<c>/tests/<s>.rs must exist, and each
+# file, each test binary root crates/<c>/tests/<s>.rs (crates/<c>/src/lib.rs
+# for <c>::lib, which must not also have a tests/lib.rs, nor a manifest
+# [lib] path elsewhere or test = false) must exist, and each
 # segment of a module path must be declared by its parent with its file
 # present. An invalid map exits 2 naming every bad line.
 #
@@ -96,8 +106,23 @@
 
 set -euo pipefail
 
+# Byte order for every sort, glob and comparison below, whatever the caller's
+# locale: glibc's en_US.UTF-8 collation ignores '-' and '_', which put intentd
+# before intent-services in the crate list and the reverse-dependency note.
+# The tests themselves run under the caller's LC_ALL, as they do under make
+# test and in the merge queue: test_policy (below) hands it back through env,
+# so this shell never reloads a locale it may not have.
+if [[ -n "${LC_ALL+1}" ]]; then
+  caller_locale=(env "LC_ALL=$LC_ALL")
+else
+  caller_locale=(env -u LC_ALL)
+fi
+export LC_ALL=C
+
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
-test_policy="$repo_root/scripts/with-test-policy.sh"
+# Every test child starts with this: with-test-policy.sh under the caller's
+# LC_ALL.
+test_policy=("${caller_locale[@]}" "$BASH" "$repo_root/scripts/with-test-policy.sh")
 caller_dir=$PWD
 base=${BASE:-origin/main}
 build_jobs=${BUILD_JOBS:-}
@@ -107,17 +132,20 @@ runner=${NEXTEST_RUNNER:-}
 instrumented=""
 plan_json=""
 check_map=""
+print_mode=""
 
 usage() {
-  echo "Usage: $0 [--dry-run] [--base REF] [--instrumented] [--build-jobs N] [--test-threads N] [--runner CMD] [--plan-json PATH] [--check-map]" >&2
+  echo "Usage: $0 [--dry-run] [--base REF] [--instrumented] [--build-jobs N] [--test-threads N] [--runner CMD] [--plan-json PATH] [--check-map] | --print-edges | --print-rdeps" >&2
   exit 2
 }
 
+n_args=$#
 while (($# > 0)); do
   case "$1" in
     --dry-run) dry_run=1 ;;
     --instrumented) instrumented=1 ;;
     --check-map) check_map=1 ;;
+    --print-edges | --print-rdeps) print_mode=${1#--print-} ;;
     --base=*) base=${1#--base=} ;;
     --build-jobs=*) build_jobs=${1#--build-jobs=} ;;
     --test-threads=*) test_threads=${1#--test-threads=} ;;
@@ -141,6 +169,8 @@ done
 [[ -n "$base" ]] || usage
 [[ -z "$instrumented" || -z "$runner" ]] || usage
 [[ -n "$dry_run" && "$dry_run" != 0 ]] || dry_run=""
+# A print mode takes no other flag (not even the other print mode).
+[[ -z "$print_mode" || $n_args -eq 1 ]] || usage
 
 label=test-changed
 [[ -z "$instrumented" ]] || label=coverage-changed
@@ -158,6 +188,135 @@ die() {
 }
 
 cd "$repo_root"
+
+# intent-core is the leaf every other crate builds on, and its shared rules
+# (harness versions, wire types) are asserted by tests across the workspace:
+# a src (or other non-test) change there also selects every workspace crate
+# depending on it, directly or transitively ("dependent", like the feature
+# crates below). intentd#2698 changed a harness version in intent-core,
+# passed every changed test, and failed an intent-acp test in the merge
+# queue. Its reverse dependencies are nearly the whole workspace, so this is
+# close to the full suite, but it also holds under --instrumented, where a
+# full-suite fallback is not available. Other crates do not propagate: most
+# reach intentd's end-to-end suites through intent-services, so propagating
+# them would run the full suite for most changes.
+rdeps_roots="intent-core"
+
+# Prints "<dependent>\t<dependency>" for each dependency between workspace
+# crates declared in crates/*/Cargo.toml: any [dependencies],
+# [dev-dependencies] or [build-dependencies] table, target-specific ones
+# included, inline (`<name> = { path = "../<dir>" }`, `<name>.workspace =
+# true`, a `package = ` rename) or as a [<table>.<name>] section. A
+# dependency is a workspace crate when its path names crates/<dir>, its
+# `package =` or else its key names a crates/<name> directory (workspace
+# inheritance). Comments and other
+# sections are skipped. A line scanner, not a TOML parser: CI's check job
+# compares its output with cargo metadata (scripts/check-rdeps-parity.py), so
+# extend it when that check names a manifest style it misses.
+workspace_edges() {
+  local manifest crate line section dep key
+  for manifest in crates/*/Cargo.toml; do
+    [[ -f "$manifest" ]] || continue
+    crate=${manifest#crates/}
+    crate=${crate%/Cargo.toml}
+    section=""
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      line=${line#"${line%%[![:space:]]*}"}
+      case "$line" in
+        "" | '#'*) continue ;;
+        '['*)
+          section=${line#\[}
+          section=${section%%]*}
+          # A [<table>.<name>] section is one dependency; its key is the name.
+          case "$section" in
+            *dependencies.*)
+              key=${section##*dependencies.}
+              key=${key//\"/}
+              [[ ! -f "crates/$key/Cargo.toml" || "$key" == "$crate" ]] ||
+                printf '%s\t%s\n' "$crate" "$key"
+              ;;
+          esac
+          continue
+          ;;
+      esac
+      case "$section" in
+        *dependencies.*)
+          dep=""
+          if [[ "$line" == path*=*\"../*\"* ]]; then
+            dep=${line#*\"../}
+            dep=${dep%%\"*}
+            dep=${dep%/}
+          elif [[ "$line" == package*=*\"*\"* ]]; then
+            dep=${line#*\"}
+            dep=${dep%%\"*}
+          fi
+          ;;
+        dependencies | dev-dependencies | build-dependencies | target.*.dependencies | target.*.dev-dependencies | target.*.build-dependencies)
+          dep=""
+          if [[ "$line" == *path*=*\"../*\"* ]]; then
+            dep=${line#*path*=*\"../}
+            dep=${dep%%\"*}
+            dep=${dep%/}
+          elif [[ "$line" == *package*=*\"*\"* ]]; then
+            # A rename inheriting from [workspace.dependencies] has no path.
+            dep=${line#*package*=*\"}
+            dep=${dep%%\"*}
+          else
+            key=${line%%=*}
+            key=${key%%[[:space:]]*}
+            key=${key//\"/}
+            dep=${key%%.*}
+          fi
+          ;;
+        *) continue ;;
+      esac
+      [[ -z "$dep" || "$dep" == "$crate" || ! -f "crates/$dep/Cargo.toml" ]] ||
+        printf '%s\t%s\n' "$crate" "$dep"
+    done <"$manifest"
+  done
+}
+
+# Prints the workspace crates depending on crate $1, directly or
+# transitively, one per line in sorted order, from the workspace_edges
+# records in $2.
+reverse_dependents() {
+  local root=$1 edges=$2 frontier=$1 found=$'\n' next dependent dependency
+  while [[ -n "$frontier" ]]; do
+    next=""
+    while IFS=$'\t' read -r dependent dependency; do
+      [[ -n "$dependent" && $'\n'"$frontier"$'\n' == *$'\n'"$dependency"$'\n'* ]] || continue
+      [[ "$dependent" != "$root" && "$found" != *$'\n'"$dependent"$'\n'* ]] || continue
+      found+="$dependent"$'\n'
+      next+="$dependent"$'\n'
+    done <<<"$edges"
+    frontier=${next%$'\n'}
+  done
+  printf '%s' "${found#$'\n'}" | sort -u
+}
+
+# --print-edges prints the scanner's "<dependent>\t<dependency>" records,
+# byte-sorted; --print-rdeps prints "<root>\t<dependents, space-separated>" for
+# each propagated root. Both expose exactly what the selection reads, for
+# scripts/check-rdeps-parity.py to compare with `cargo metadata` in CI (a
+# line scanner can miss a manifest style and drop crates silently, as the
+# path-less `package =` rename did before intentd#2704). They read only
+# crates/*/Cargo.toml: no git, BASE or end-to-end map.
+if [[ -n "$print_mode" ]]; then
+  edges=$(workspace_edges | sort -u)
+  if [[ "$print_mode" == edges ]]; then
+    [[ -z "$edges" ]] || printf '%s\n' "$edges"
+  else
+    for root in $rdeps_roots; do
+      dependents=""
+      while IFS= read -r dependent; do
+        [[ -z "$dependent" ]] || dependents+="${dependents:+ }$dependent"
+      done <<<"$(reverse_dependents "$root" "$edges" | sort)"
+      printf '%s\t%s\n' "$root" "$dependents"
+    done
+  fi
+  exit 0
+fi
+
 git rev-parse --git-dir >/dev/null 2>&1 || die 2 "$repo_root is not a git checkout"
 
 # The end-to-end test map: source globs whose change also selects the
@@ -268,6 +427,35 @@ is_test_target() {
   [[ "$autotests" != false || "$names" == *$'\n'"$2"$'\n'* ]]
 }
 
+# Sets lib_problem (and returns 1) when crate $1's manifest moves its lib off
+# src/lib.rs ([lib] path) or opts it out of tests ([lib] test = false): --lib
+# would then build the wrong root or no test binary.
+lib_is_testable() {
+  local manifest="crates/$1/Cargo.toml" line section="" value
+  lib_problem=""
+  [[ -f "$manifest" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line=${line#"${line%%[![:space:]]*}"}
+    case "$line" in
+      '['*) section=$line ;;
+      test*=*false*)
+        if [[ "$section" == '[lib]'* ]]; then
+          lib_problem="$manifest sets [lib] test = false"
+          return 1
+        fi
+        ;;
+      path*=*\"*\"*)
+        value=${line#*\"}
+        value=${value%%\"*}
+        if [[ "$section" == '[lib]'* && "$value" != src/lib.rs && "$value" != ./src/lib.rs ]]; then
+          lib_problem="$manifest sets [lib] path = \"$value\", not src/lib.rs"
+          return 1
+        fi
+        ;;
+    esac
+  done <"$manifest"
+}
+
 # Reads the map into e2e_entries ("<glob>\t<crate>\t<binary>\t<module>"
 # lines), collecting one map_errors line per invalid entry.
 load_e2e_map() {
@@ -302,6 +490,22 @@ load_e2e_map() {
       done <<<"$files"
     fi
     [[ -n "$hit" ]] || map_errors+="$e2e_map:$n: source glob '$glob' matches no file"$'\n'
+    if [[ "$binary" == lib ]]; then
+      # <crate>::lib names the library unit tests, rooted at src/lib.rs.
+      root="crates/$crate/src/lib.rs"
+      if [[ ! -f "$root" ]]; then
+        map_errors+="$e2e_map:$n: $target: $root does not exist"$'\n'
+      elif [[ -f "crates/$crate/tests/lib.rs" ]]; then
+        map_errors+="$e2e_map:$n: $target is ambiguous: crates/$crate/tests/lib.rs also exists"$'\n'
+      elif ! lib_is_testable "$crate"; then
+        map_errors+="$e2e_map:$n: $target: $lib_problem"$'\n'
+      elif [[ -n "$module" ]] && ! resolve_module "$root" "$module"; then
+        map_errors+="$e2e_map:$n: $target $resolve_problem"$'\n'
+      elif [[ -n "$hit" ]]; then
+        e2e_entries+="$glob"$'\t'"$crate"$'\t'"$binary"$'\t'"$module"$'\n'
+      fi
+      continue
+    fi
     root="crates/$crate/tests/$binary.rs"
     if [[ ! -f "$root" ]]; then
       map_errors+="$e2e_map:$n: $target: $root does not exist"$'\n'
@@ -436,13 +640,23 @@ map_path() {
 
 # Prints a selection record for each map entry whose glob matches path $1
 # (every entry when $1 is empty): "<crate>\tmodule\t<binary>:<module path>",
-# or "<crate>\ttest\t<binary>" for an entry naming a whole binary.
+# or "<crate>\ttest\t<binary>" for an entry naming a whole binary; a
+# <crate>::lib entry prints "<crate>\tlibmodule\t<module path>", or
+# "<crate>\tlib" without a module.
 map_e2e() {
   local glob crate binary module
   while IFS=$'\t' read -r glob crate binary module; do
     [[ -n "$glob" ]] || continue
     # shellcheck disable=SC2053 # the glob is a pattern on purpose
     [[ -z "$1" || "$1" == $glob ]] || continue
+    if [[ "$binary" == lib ]]; then
+      if [[ -n "$module" ]]; then
+        printf '%s\tlibmodule\t%s\n' "$crate" "$module"
+      else
+        printf '%s\tlib\n' "$crate"
+      fi
+      continue
+    fi
     # As in map_path: the instrumented run excludes auggie_context_e2e, so
     # naming only that module would select nothing.
     [[ -z "$instrumented" || "$crate" != intentd || "${module%%::*}" != auggie_context_e2e ]] || continue
@@ -468,14 +682,14 @@ classify() {
   if [[ "$path" == "$e2e_map" && -f "$e2e_map" ]]; then
     e2e=$(map_e2e "")
     mapped+="$e2e"$'\n'
-    e2e_notes+="note: $e2e_map changed; every mapped end-to-end module runs"$'\n'
+    e2e_notes+="note: $e2e_map changed; every mapped test module runs"$'\n'
     return 0
   fi
   e2e=""
   [[ -z "$e2e_entries" ]] || e2e=$(map_e2e "$path")
   if [[ -n "$e2e" ]]; then
     mapped+="$e2e"$'\n'
-    e2e_notes+="note: $path is mapped to end-to-end tests in $e2e_map"$'\n'
+    e2e_notes+="note: $path is mapped to tests of other targets in $e2e_map"$'\n'
   fi
   if is_fallback "$path"; then
     fallback+="$path"$'\n'
@@ -517,6 +731,35 @@ fi
 while IFS= read -r note; do
   [[ -z "$note" ]] || log "$note"
 done <<<"$e2e_notes"
+
+rdeps_propagated=""
+# Dependents of a propagated root: their own dependents are selected too, so
+# no "downstream crates are not selected" note is printed for them.
+rdeps_selected=""
+rdeps_edges=""
+for root in $rdeps_roots; do
+  root_changed=""
+  while IFS=$'\t' read -r rec_crate rec_kind _; do
+    if [[ "$rec_crate" == "$root" && ("$rec_kind" == src || "$rec_kind" == all) ]]; then
+      root_changed=1
+    fi
+  done <<<"$mapped"
+  [[ -n "$root_changed" ]] || continue
+  [[ -n "$rdeps_edges" ]] || rdeps_edges=$(workspace_edges)
+  dependents=""
+  while IFS= read -r dependent; do
+    [[ -n "$dependent" ]] || continue
+    mapped+="$dependent"$'\t'"dependent"$'\n'
+    dependents+="${dependents:+, }$dependent"
+    rdeps_selected+=" $dependent "
+  done <<<"$(reverse_dependents "$root" "$rdeps_edges")"
+  rdeps_propagated+=" $root "
+  if [[ -n "$dependents" ]]; then
+    log "note: crates/$root changed; its reverse dependencies run too ($dependents)"
+  else
+    log "note: crates/$root changed; no workspace crate depends on it"
+  fi
+done
 
 # The feature crates (crates/intent-svc-*) sit above intent-services and build
 # against its feature API, so an intent-services/src edit also selects every
@@ -565,7 +808,7 @@ fi
 # Suite modules add their suite as a --test target and one -E naming the
 # changed modules; standalone targets of the same plan are ORed into that -E.
 crate_selection() {
-  local crate=$1 best=test tests="" modules="" c kind test
+  local crate=$1 best=test tests="" modules="" lib="" lib_modules="" c kind test
   while IFS=$'\t' read -r c kind test; do
     [[ "$c" == "$crate" ]] || continue
     case "$kind" in
@@ -575,6 +818,8 @@ crate_selection() {
       tests) [[ "$best" == all || "$best" == src || "$best" == dependent ]] || best=tests ;;
       test) tests+="$test"$'\n' ;;
       module) modules+="$test"$'\n' ;;
+      lib) lib=1 ;;
+      libmodule) lib_modules+="$test"$'\n' ;;
     esac
   done <<<"$mapped"
   case "$best" in
@@ -582,7 +827,7 @@ crate_selection() {
     src | dependent)
       crate_filter="--bins --tests"
       [[ -f "crates/$crate/src/lib.rs" ]] && crate_filter="--lib $crate_filter"
-      if [[ "$best" == dependent ]]; then
+      if [[ "$best" == dependent || "$rdeps_propagated$rdeps_selected" == *" $crate "* ]]; then
         :
       elif [[ "$crate" == intent-services && -n "$feature_crates" ]]; then
         log "note: crates/$crate/src changed; its feature crates and intent-app ($feature_crates) run too, other downstream crates are not selected"
@@ -595,7 +840,22 @@ crate_selection() {
     tests) crate_filter="--tests" ;;
     test)
       crate_filter=""
-      local expr="" suite module names
+      local expr="" suite module names narrowed=""
+      # Library unit tests (map entries naming <crate>::lib): the lib target
+      # is binary_id(=<crate>); a whole-lib entry drops its modules.
+      if [[ -n "$lib" || -n "$lib_modules" ]]; then
+        crate_filter="--lib"
+        if [[ -n "$lib" ]]; then
+          expr="binary_id(=$crate)"
+        else
+          names=""
+          while IFS= read -r module; do
+            [[ -z "$module" ]] || names+="${names:+|}$module"
+          done <<<"$(printf '%s' "$lib_modules" | sort -u)"
+          expr="(binary_id(=$crate)&test(/^($names)::/))"
+          narrowed=1
+        fi
+      fi
       tests=$(printf '%s' "$tests" | sort -u)
       while IFS= read -r test; do
         [[ -n "$test" ]] || continue
@@ -622,8 +882,11 @@ crate_selection() {
           crate_filter+="${crate_filter:+ }--test $suite"
           expr+="${expr:+|}(binary_id(=$crate::$suite)&test(/^($names)::/))"
         done <<<"$(while IFS= read -r module; do printf '%s\n' "${module%%:*}"; done <<<"$modules" | sort -u)"
-        crate_filter+=" -E $expr"
+        narrowed=1
       fi
+      # Target flags alone select whole binaries; a narrowed module needs the
+      # filterset, which then names every selected binary.
+      [[ -z "$narrowed" ]] || crate_filter+=" -E $expr"
       ;;
   esac
 }
@@ -719,7 +982,7 @@ if [[ -n "$runner" ]]; then
   [[ -n "$build_jobs" ]] && set -- "$@" --build-jobs "$build_jobs"
   [[ -n "$test_threads" ]] && set -- "$@" --test-threads "$test_threads"
   cd "$caller_dir"
-  exec "$BASH" "$test_policy" "$@"
+  exec "${test_policy[@]}" "$@"
 fi
 
 # The plans are read from fd 3 so cargo keeps the caller's stdin.
@@ -734,14 +997,14 @@ while IFS= read -r -u 3 plan; do
   scope_index=$((scope_index + 1))
   set +e
   if [[ -n "$instrumented" ]]; then
-    command=("$BASH" "$test_policy" cargo llvm-cov --no-report nextest "$@")
+    command=("${test_policy[@]}" cargo llvm-cov --no-report nextest "$@")
     if [[ -n "${COVERAGE_STORAGE_DIR:-}" ]]; then
       command=(python3 -I -B "$repo_root/scripts/coverage-storage.py" run
         --output "$COVERAGE_STORAGE_DIR" --stage "scope-$scope_index" -- "${command[@]}")
     fi
     INTENTD_TEST_TIMEOUT_MULTIPLIER=3 "${command[@]}"
   else
-    "$BASH" "$test_policy" cargo nextest run "$@"
+    "${test_policy[@]}" cargo nextest run "$@"
   fi
   status=$?
   set -e

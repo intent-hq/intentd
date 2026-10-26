@@ -189,6 +189,7 @@ impl RepositoryGuidanceSource for InertSource {
 fn immutable_session_gating_does_not_consult_features_or_parent_stamp() {
     let workspace = WorkspaceId::from("workspace-1");
     let caller = AgentId::from("agent-1");
+    let after_current = intent_core::harness_versions_after_current();
     for version in [
         None,
         Some(""),
@@ -209,8 +210,10 @@ fn immutable_session_gating_does_not_consult_features_or_parent_stamp() {
         Some(" 3.0"),
         Some("3.0\n"),
         Some("unknown"),
-        Some("3.5"),
-    ] {
+    ]
+    .into_iter()
+    .chain(after_current.iter().map(|v| Some(v.as_str())))
+    {
         assert!(
             GuidanceBinding::new(
                 &session(version),
@@ -222,8 +225,10 @@ fn immutable_session_gating_does_not_consult_features_or_parent_stamp() {
             "{version:?}"
         );
     }
-    // Harness 3.3 (intent-hq/intent#5835) and 3.4 keep 3.2's repository guidance.
-    for version in ["3.0", "3.1", "3.2", "3.3", "3.4"] {
+    for version in intent_core::REPOSITORY_GUIDANCE_HARNESS_VERSIONS
+        .iter()
+        .copied()
+    {
         assert!(
             GuidanceBinding::new(
                 &session(Some(version)),

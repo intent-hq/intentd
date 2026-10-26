@@ -10,9 +10,8 @@ mod pending_completion;
 use intent_acp::WorkspaceMcpServer;
 use intent_core::{
     now_iso, AgentDelegateInput, AgentId, AgentStatus, Error, MessageOrigin, NoteCreate,
-    NoteUpdateInput, PullRequestInfo, PullRequestStatus, Workspace, WorkspaceActivity,
-    WorkspaceApi, WorkspaceAttention, WorkspaceGitRoot, WorkspaceGitRootId, WorkspaceGitRootSource,
-    WorkspaceId, WorkspaceStatus,
+    NoteUpdateInput, PullRequestInfo, PullRequestStatus, Workspace, WorkspaceApi, WorkspaceGitRoot,
+    WorkspaceGitRootId, WorkspaceGitRootSource, WorkspaceId,
 };
 use std::time::Duration;
 
@@ -106,52 +105,9 @@ pub(super) fn workspace(id: &WorkspaceId) -> Workspace {
         id: id.clone(),
         title: "WS".to_string(),
         branch: "main".to_string(),
-        base_ref: None,
-        base_commit_sha: None,
-        status: WorkspaceStatus::Active,
-        status_message: None,
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
-        attention: WorkspaceAttention::None,
         created_at: ts.clone(),
         updated_at: ts,
-        last_activity: None,
-        last_content_activity: None,
-        tags: vec![],
-        path: None,
-        repository_path: None,
-        repository_owner: None,
-        repository_name: None,
-        worktree_path: None,
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
-        default_model: None,
-        pr_number: None,
-        pr_url: None,
-        pr_status: None,
-        active_pull_request: None,
-        pull_requests: None,
-        context_links: None,
-        archived: false,
-        archived_at: None,
-        retired_at: None,
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        pull_requests_total: None,
-        display_status: None,
-        waiting: false,
-        scripts_running: false,
-        background_tasks_running: false,
-        checkout_mode: None,
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
+        ..Default::default()
     }
 }
 
@@ -14468,7 +14424,7 @@ async fn queue_mutations_recheck_ownership_against_the_entry_at_mutation_time() 
     let store = Store::open(&tmp.path).await.expect("open store");
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
-    let park = Arc::new(crate::script_ops::SupervisePark::default());
+    let park = Arc::new(crate::runtime_config::SupervisePark::default());
     let svc = Services::new(store)
         .with_settings_registry(test_registry_with_default_provider(&tmp))
         .with_queue_mutation_gate_park(Arc::clone(&park));
@@ -48612,7 +48568,7 @@ async fn startup_resume_listing_never_exposes_a_stale_successful_candidate() {
         .await
         .unwrap();
     let reservations = svc.prepare_startup_resume().await.unwrap();
-    let park = Arc::new(crate::script_ops::SupervisePark::default());
+    let park = Arc::new(crate::runtime_config::SupervisePark::default());
     let mut listing = svc.clone();
     listing.interrupted_list_park = Some(park.clone());
     let (result, ()) = tokio::join!(listing.agent_list_interrupted(), async {

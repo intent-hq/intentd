@@ -4658,7 +4658,7 @@ mod live_context {
         h: &NativeHarness,
         body: impl std::future::Future<Output = T> + Send + 'static,
     ) -> T {
-        intent_core::spawn_daemon(crate::host_execution::background_execution(
+        intent_core::spawn_daemon(crate::execution_call::background_execution(
             h.original.as_ref().clone(),
             None,
             body,
@@ -5367,7 +5367,7 @@ mod live_context {
             let f = h.f.clone();
             let session = id.clone();
             let (entered, ready) = tokio::sync::oneshot::channel();
-            let task = intent_core::spawn_daemon(crate::host_execution::background_execution(
+            let task = intent_core::spawn_daemon(crate::execution_call::background_execution(
                 h.original.as_ref().clone(),
                 None,
                 async move {
@@ -7555,7 +7555,7 @@ mod normal_launch {
             });
         drop(writer);
         let completed = completion.clone();
-        let write = intent_core::spawn_daemon(crate::host_execution::background_execution(
+        let write = intent_core::spawn_daemon(crate::execution_call::background_execution(
             h.original.as_ref().clone(),
             None,
             async move {
@@ -7773,7 +7773,7 @@ mod normal_launch {
                 let pool = original.store.write_pool();
                 let writer = pool.acquire().await.unwrap();
                 let row_for_write = row.clone();
-                let write = intent_core::spawn_daemon(crate::host_execution::background_execution(
+                let write = intent_core::spawn_daemon(crate::execution_call::background_execution(
                     h.original.as_ref().clone(),
                     None,
                     async move {
@@ -8463,7 +8463,7 @@ if(frame.method==='session/prompt' && promptErrors.length) {
             &self,
             body: impl std::future::Future<Output = T> + Send + 'static,
         ) -> T {
-            intent_core::spawn_daemon(crate::host_execution::background_execution(
+            intent_core::spawn_daemon(crate::execution_call::background_execution(
                 self.original.as_ref().clone(),
                 None,
                 body,
@@ -9135,7 +9135,7 @@ if(frame.method==='session/prompt' && promptErrors.length) {
         let f = h.f.clone();
         let id = fresh.session_id.clone();
         let conn = turn.connection.clone();
-        let task = intent_core::spawn_daemon(crate::host_execution::background_execution(
+        let task = intent_core::spawn_daemon(crate::execution_call::background_execution(
             h.original.as_ref().clone(),
             None,
             async move {
@@ -9596,7 +9596,7 @@ mod genuine_native_startup {
             let row = self.row.clone();
             let execution = self.services.as_ref().clone();
             let subscriber = tracing_subscriber::registry().with(self.acknowledgments.clone());
-            intent_core::spawn_daemon(crate::host_execution::background_execution(
+            intent_core::spawn_daemon(crate::execution_call::background_execution(
                 execution,
                 None,
                 async move {

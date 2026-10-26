@@ -66,7 +66,8 @@ pub(crate) fn render(
     input: GuidanceContext<'_>,
 ) -> Option<RepositoryGuidance> {
     let session = session.filter(|s| eligible_harness_version(Some(&s.harness_version)))?;
-    let policy = if matches!(session.harness_version.as_str(), "3.2" | "3.3" | "3.4") {
+    let policy = if intent_core::harness_uses_repository_monitor_guidance(&session.harness_version)
+    {
         MONITOR_POLICY
     } else {
         POLICY
@@ -258,7 +259,9 @@ fn safe_instance_facts(root: &RepositoryRootContext) -> bool {
 }
 
 /// Eligibility never uses the registry's unknown-version fallback, the current
-/// harness constant, a parent's stamp or captured feature switches.
+/// harness constant, a parent's stamp or captured feature switches: it reads
+/// only the session's own stamp against intent-core's admitted-version list
+/// (a compile-time check keeps that list in step with the constant).
 fn eligible_harness_version(stamp: Option<&str>) -> bool {
     stamp.is_some_and(intent_core::harness_supports_repository_guidance)
 }

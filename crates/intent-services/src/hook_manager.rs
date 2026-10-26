@@ -59,6 +59,9 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
 
+use crate::feature_ports::CancelSettlement;
+#[cfg(test)]
+use crate::runtime_config::HookStoreFault;
 use crate::{publish_event, system_actor, Services};
 
 /// Minimum inter-run delay (spec decision 5): `delayMs` below this floor is
@@ -83,11 +86,6 @@ pub(crate) const RUN_AT_GRACE_MS: i64 = 3_600_000;
 /// Maximum hook name length (spec: name > 50 chars fails validation).
 pub(crate) const MAX_HOOK_NAME_LEN: usize = 50;
 
-/// Wall-clock budget for one hook script run (spec: any run exceeding 60 s is
-/// killed and the hook evicted). Tests compress it via the `#[cfg(test)]`-only
-/// [`Services::with_hook_eval_timeout`].
-pub(crate) const HOOK_EVAL_TIMEOUT: Duration = Duration::from_secs(60);
-
 // Validation runs are inline: their ws.hook.schedule calls re-enter the
 // service before any hook is persisted. Bound the evaluation chain, allowing
 // a running hook to validate one replacement, but not another generation.
@@ -107,14 +105,7 @@ tokio::task_local! {
 /// up and evicts the hook. Only the failing persistence step is retried — the
 /// script never re-runs and a dispatch is never re-delivered.
 pub(crate) const HOOK_STORE_RETRY_ATTEMPTS: u32 = 5;
-pub(crate) const HOOK_STORE_RETRY_BASE: Duration = Duration::from_secs(1);
 const HOOK_STORE_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(16);
-
-/// Test-only fault injector for hook-run persistence steps: called with the
-/// step name before each attempt; `Some(err)` fails that attempt in place of
-/// the real store call (see [`Services::with_hook_store_fault`]).
-#[cfg(test)]
-pub(crate) type HookStoreFault = Arc<Mutex<Box<dyn FnMut(&str) -> Option<Error> + Send>>>;
 
 /// Per-run console-capture caps: the in-envelope `console.*` shim buffers at
 /// most this many lines / bytes, dropping from the head (with a marker line)
@@ -133,28 +124,6 @@ const HOOK_WAKE_LOGS_CAP: usize = crate::harness::v1::HOOK_WAKE_LOGS_CAP;
 /// `state` is dropped (the previous state is kept) with a warning line
 /// appended to that run's logs.
 const HOOK_STATE_MAX_BYTES: usize = 16 * 1024;
-
-/// How a cancel transition ([`Services::cancel_active_hook`],
-/// [`Services::cancel_active_pr_monitor`]) settles the owner's deferred
-/// completion watches. A completion watch on an idle owner defers while the
-/// owner has active hooks / PR monitors, so cancelling the LAST one must
-/// re-run the deferral backstop
-/// ([`Services::redeliver_completion_after_queue_mutation`]) — either
-/// through a wake or directly — or the watch strands forever.
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum CancelSettlement<'a> {
-    /// Wake the owner with this notice; the wake runs the backstop itself
-    /// after the delivery attempt (FE/app cancel).
-    Notify(&'a str),
-    /// No wake; run the backstop directly (owner-side cancel, retire sweep).
-    Resettle,
-    /// Neither: the caller sweeps several items and runs the backstop ONCE
-    /// per owner after queueing its consolidated wake (archive sweep). The
-    /// per-item backstop would otherwise see an empty queue and no remaining
-    /// watches on the final item and synthesize a genuine completion,
-    /// consuming a parent's watch BEFORE the consolidated notice is queued.
-    Deferred,
-}
 
 /// Cap (in chars) on the `message` a dispatching run returns and on the error
 /// text an eviction wake carries. Longer text is head-kept and tail-marked
@@ -2370,7 +2339,10 @@ impl Services {
         };
         let content = harness.hook_wake_framing(&hook.name, message, state_note.as_deref());
         if let Err(e) = self
+            .ports
+            .agent_wake()
             .deliver_wake_message(
+                self,
                 &hook.workspace_id,
                 &hook.agent_id,
                 &content,
@@ -2432,10 +2404,7 @@ impl Services {
 mod tests {
     use std::path::PathBuf;
 
-    use intent_core::{
-        AgentSession, AgentStatus, Workspace, WorkspaceActivity, WorkspaceAttention,
-        WorkspaceStatus,
-    };
+    use intent_core::{AgentSession, AgentStatus, Workspace, WorkspaceStatus};
     use intent_store::Store;
 
     use super::*;
@@ -2468,52 +2437,9 @@ mod tests {
             id: id.clone(),
             title: "WS".to_string(),
             branch: "main".to_string(),
-            base_ref: None,
-            base_commit_sha: None,
-            status: WorkspaceStatus::Active,
-            status_message: None,
-            status_image_asset_id: None,
-            activity: WorkspaceActivity::Idle,
-            attention: WorkspaceAttention::None,
             created_at: ts.clone(),
             updated_at: ts,
-            last_activity: None,
-            last_content_activity: None,
-            tags: vec![],
-            path: None,
-            repository_path: None,
-            repository_owner: None,
-            repository_name: None,
-            worktree_path: None,
-            scope: None,
-            skip_worktree: false,
-            setup_script: None,
-            is_remote: false,
-            default_model: None,
-            pr_number: None,
-            pr_url: None,
-            pr_status: None,
-            active_pull_request: None,
-            pull_requests: None,
-            context_links: None,
-            archived: false,
-            archived_at: None,
-            retired_at: None,
-            task_stats: None,
-            agent_summary: None,
-            diff_summary: None,
-            token_usage: None,
-            cow_supported: None,
-            browser_client_id: None,
-            pull_requests_total: None,
-            display_status: None,
-            waiting: false,
-            scripts_running: false,
-            background_tasks_running: false,
-            checkout_mode: None,
-            disk_usage: None,
-            pending_delete_at: None,
-            membership: None,
+            ..Default::default()
         }
     }
 

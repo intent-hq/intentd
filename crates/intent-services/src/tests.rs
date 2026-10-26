@@ -9,7 +9,7 @@ use intent_core::{
     now_iso, AgentId, AgentSession, AgentStatus, BoxFuture, ContentType, Error, MessageOrigin,
     Note, NoteAddInput, NoteCreate, NoteEditInput, NoteEditLinesInput, NoteId, NoteMetadata,
     NoteUpdateInput, NoteVisibility, Workspace, WorkspaceActivity, WorkspaceApi,
-    WorkspaceAttention, WorkspaceId, WorkspaceStatus, WorkspaceUpdate,
+    WorkspaceAttention, WorkspaceId, WorkspaceUpdate,
 };
 use intent_store::Store;
 
@@ -10474,7 +10474,7 @@ mod change_event_parity {
     /// armed, so race tests can hold an attention path immediately before
     /// its scoped attention write (the former read-modify-write window).
     async fn harness_with_attention_park(
-        park: Option<std::sync::Arc<crate::script_ops::SupervisePark>>,
+        park: Option<std::sync::Arc<crate::runtime_config::SupervisePark>>,
     ) -> Harness {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -10502,7 +10502,7 @@ mod change_event_parity {
     /// projection park armed, so a race test can hold the first attempt
     /// between the linked-line projection and the gated parent write.
     async fn harness_with_task_update_park(
-        park: std::sync::Arc<crate::script_ops::SupervisePark>,
+        park: std::sync::Arc<crate::runtime_config::SupervisePark>,
     ) -> Harness {
         let mut h = harness().await;
         h.services = h.services.clone().with_task_update_projection_park(park);
@@ -12937,7 +12937,7 @@ mod change_event_parity {
     async fn archive_tail_fence_orders_unarchive_and_readd_behind_the_guest_drop() {
         use intent_core::{InviteErrorKind, MessageOrigin, WorkspaceApi, WorkspaceRole};
         use std::sync::Arc;
-        let park = Arc::new(crate::script_ops::SupervisePark::default());
+        let park = Arc::new(crate::runtime_config::SupervisePark::default());
         let mut h = harness().await;
         h.services = h.services.clone().with_archive_tail_park(park.clone());
         let guest = seat_collaborator(&h, "guest").await;
@@ -13118,7 +13118,7 @@ mod change_event_parity {
             WorkspaceUpdate,
         };
         use std::sync::Arc;
-        let park = Arc::new(crate::script_ops::SupervisePark::default());
+        let park = Arc::new(crate::runtime_config::SupervisePark::default());
         let mut h = harness().await;
         h.services = h.services.clone().with_archive_predrop_park(park.clone());
         let guest = seat_collaborator(&h, "guest").await;
@@ -13316,7 +13316,7 @@ mod change_event_parity {
             InviteErrorKind, MessageOrigin, WorkspaceApi, WorkspaceStatus, WorkspaceUpdate,
         };
         use std::sync::Arc;
-        let park = Arc::new(crate::script_ops::SupervisePark::default());
+        let park = Arc::new(crate::runtime_config::SupervisePark::default());
         let mut h = harness().await;
         h.services = h.services.clone().with_archive_predrop_park(park.clone());
         let guest = seat_collaborator(&h, "guest").await;
@@ -14342,7 +14342,7 @@ mod change_event_parity {
     async fn mark_seen_race_preserves_concurrent_row_mutation() {
         use intent_core::{WorkspaceApi, WorkspaceAttention};
         use std::sync::Arc;
-        let park = Arc::new(crate::script_ops::SupervisePark::default());
+        let park = Arc::new(crate::runtime_config::SupervisePark::default());
         let h = harness_with_attention_park(Some(park.clone())).await;
         // Seed attention via the store (the armed park would hold the
         // service-path raise too).
@@ -14391,7 +14391,7 @@ mod change_event_parity {
     async fn dismiss_attention_race_preserves_concurrent_row_mutation() {
         use intent_core::{WorkspaceApi, WorkspaceAttention};
         use std::sync::Arc;
-        let park = Arc::new(crate::script_ops::SupervisePark::default());
+        let park = Arc::new(crate::runtime_config::SupervisePark::default());
         let h = harness_with_attention_park(Some(park.clone())).await;
         let mut seeded = h.store.get_workspace(&h.ws).await.expect("load");
         seeded.attention = WorkspaceAttention::ReviewRequired;
@@ -14440,7 +14440,7 @@ mod change_event_parity {
     async fn raise_attention_race_preserves_concurrent_title_change() {
         use intent_core::WorkspaceAttention;
         use std::sync::Arc;
-        let park = Arc::new(crate::script_ops::SupervisePark::default());
+        let park = Arc::new(crate::runtime_config::SupervisePark::default());
         let h = harness_with_attention_park(Some(park.clone())).await;
 
         let services = h.services.clone();
@@ -17113,7 +17113,7 @@ mod change_event_parity {
     /// (the writer's own `todo` redirect is refused by the terminal guard).
     #[intent_test_macros::daemon_test]
     async fn linked_line_write_serializes_with_concurrent_completion() {
-        let park = std::sync::Arc::new(crate::script_ops::SupervisePark::default());
+        let park = std::sync::Arc::new(crate::runtime_config::SupervisePark::default());
         let h = harness_with_task_update_park(park.clone()).await;
         insert_task_note(&h, T1, TaskStatus::InProgress).await;
         // Versioned write so a snapshot exists at the writer's read rev: the
@@ -23751,7 +23751,7 @@ pub(crate) mod pr {
     #[intent_test_macros::daemon_test]
     async fn hit_projection_lands_on_a_same_head_refresh_committed_mid_window() {
         let (_t, _root, svc, ws_id) = cached_hover_setup(queue_signal_forge(true), None).await;
-        let park = Arc::new(crate::script_ops::SupervisePark::default());
+        let park = Arc::new(crate::runtime_config::SupervisePark::default());
         let svc = svc.with_fold_hit_park(park.clone());
         assert_eq!(
             seed_display_status(&svc, &ws_id).await,
@@ -23812,7 +23812,7 @@ pub(crate) mod pr {
     #[intent_test_macros::daemon_test]
     async fn hit_projection_writes_nothing_when_the_head_moved_mid_window() {
         let (_t, _root, svc, ws_id) = cached_hover_setup(queue_signal_forge(true), None).await;
-        let park = Arc::new(crate::script_ops::SupervisePark::default());
+        let park = Arc::new(crate::runtime_config::SupervisePark::default());
         let svc = svc.with_fold_hit_park(park.clone());
         assert_eq!(
             seed_display_status(&svc, &ws_id).await,
@@ -23861,7 +23861,7 @@ pub(crate) mod pr {
         super::WorkspacesRoot,
         Services,
         WorkspaceId,
-        Arc<crate::script_ops::SupervisePark>,
+        Arc<crate::runtime_config::SupervisePark>,
         SweepRepo,
     ) {
         let (t, wsroot, svc, ws_id) = fold_setup_with(queue_signal_forge(true), |_| {}).await;
@@ -23873,7 +23873,7 @@ pub(crate) mod pr {
             "",
         )]);
         svc.store().upsert_workspace_git_root(&root).await.unwrap();
-        let park = Arc::new(crate::script_ops::SupervisePark::default());
+        let park = Arc::new(crate::runtime_config::SupervisePark::default());
         let svc = svc.with_fold_hit_park(park.clone());
         assert_eq!(
             seed_display_status(&svc, &ws_id).await,
@@ -31677,52 +31677,14 @@ mod rules {
             id: intent_core::WorkspaceId::from("ws-1"),
             title: "Test".into(),
             branch: "main".into(),
-            base_ref: None,
-            base_commit_sha: None,
-            status: intent_core::WorkspaceStatus::Active,
-            status_message: None,
-            status_image_asset_id: None,
-            activity: intent_core::WorkspaceActivity::Idle,
-            attention: intent_core::WorkspaceAttention::None,
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
-            last_activity: None,
-            last_content_activity: None,
-            tags: vec![],
             path: Some("/test/path".into()),
             repository_path: Some("/test/repo".into()),
-            repository_owner: None,
             repository_name: Some("test-repo".into()),
-            worktree_path: None,
-            scope: None,
             skip_worktree: true,
-            setup_script: None,
-            is_remote: false,
-            default_model: None,
-            pr_number: None,
-            pr_url: None,
-            pr_status: None,
-            active_pull_request: None,
-            pull_requests: None,
-            context_links: None,
-            archived: false,
-            archived_at: None,
-            retired_at: None,
-            task_stats: None,
-            agent_summary: None,
-            diff_summary: None,
-            token_usage: None,
             cow_supported: Some(true),
-            browser_client_id: None,
-            pull_requests_total: None,
-            display_status: None,
-            waiting: false,
-            scripts_running: false,
-            background_tasks_running: false,
-            checkout_mode: None,
-            disk_usage: None,
-            pending_delete_at: None,
-            membership: None,
+            ..Default::default()
         };
 
         // Create a mock agent session with sandbox fields
@@ -31831,52 +31793,14 @@ mod rules {
             id: intent_core::WorkspaceId::from("ws-1"),
             title: "Test".into(),
             branch: "main".into(),
-            base_ref: None,
-            base_commit_sha: None,
-            status: intent_core::WorkspaceStatus::Active,
-            status_message: None,
-            status_image_asset_id: None,
-            activity: intent_core::WorkspaceActivity::Idle,
-            attention: intent_core::WorkspaceAttention::None,
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
-            last_activity: None,
-            last_content_activity: None,
-            tags: vec![],
             path: Some("/test/path".into()),
             repository_path: Some("/test/repo".into()),
-            repository_owner: None,
             repository_name: Some("test-repo".into()),
-            worktree_path: None,
-            scope: None,
             skip_worktree: true,
-            setup_script: None,
-            is_remote: false,
-            default_model: None,
-            pr_number: None,
-            pr_url: None,
-            pr_status: None,
-            active_pull_request: None,
-            pull_requests: None,
-            context_links: None,
-            archived: false,
-            archived_at: None,
-            retired_at: None,
-            task_stats: None,
-            agent_summary: None,
-            diff_summary: None,
-            token_usage: None,
             cow_supported: Some(true),
-            browser_client_id: None,
-            pull_requests_total: None,
-            display_status: None,
-            waiting: false,
-            scripts_running: false,
-            background_tasks_running: false,
-            checkout_mode: None,
-            disk_usage: None,
-            pending_delete_at: None,
-            membership: None,
+            ..Default::default()
         };
 
         // Coordinator session (no sandbox fields — coordinators don't run in sandboxes)
@@ -31976,52 +31900,14 @@ mod rules {
             id: intent_core::WorkspaceId::from("ws-1"),
             title: "Test".into(),
             branch: "main".into(),
-            base_ref: None,
-            base_commit_sha: None,
-            status: intent_core::WorkspaceStatus::Active,
-            status_message: None,
-            status_image_asset_id: None,
-            activity: intent_core::WorkspaceActivity::Idle,
-            attention: intent_core::WorkspaceAttention::None,
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
-            last_activity: None,
-            last_content_activity: None,
-            tags: vec![],
             path: Some("/test/worktree".into()),
             repository_path: Some("/test/repo".into()),
-            repository_owner: None,
             repository_name: Some("test-repo".into()),
             worktree_path: Some("/test/worktree".into()), // Worktree mode!
-            scope: None,
-            skip_worktree: false,
-            setup_script: None,
-            is_remote: false,
-            default_model: None,
-            pr_number: None,
-            pr_url: None,
-            pr_status: None,
-            active_pull_request: None,
-            pull_requests: None,
-            context_links: None,
-            archived: false,
-            archived_at: None,
-            retired_at: None,
-            task_stats: None,
-            agent_summary: None,
-            diff_summary: None,
-            token_usage: None,
             cow_supported: Some(true), // Capability reported even in worktree mode; hints stay off
-            browser_client_id: None,
-            pull_requests_total: None,
-            display_status: None,
-            waiting: false,
-            scripts_running: false,
-            background_tasks_running: false,
-            checkout_mode: None,
-            disk_usage: None,
-            pending_delete_at: None,
-            membership: None,
+            ..Default::default()
         };
 
         let agent_session = intent_core::AgentSession {
@@ -32116,52 +32002,14 @@ mod rules {
             id: intent_core::WorkspaceId::from("ws-1"),
             title: "Test".into(),
             branch: "main".into(),
-            base_ref: None,
-            base_commit_sha: None,
-            status: intent_core::WorkspaceStatus::Active,
-            status_message: None,
-            status_image_asset_id: None,
-            activity: intent_core::WorkspaceActivity::Idle,
-            attention: intent_core::WorkspaceAttention::None,
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
-            last_activity: None,
-            last_content_activity: None,
-            tags: vec![],
             path: Some("/test/path".into()),
             repository_path: Some("/test/repo".into()),
-            repository_owner: None,
             repository_name: Some("test-repo".into()),
-            worktree_path: None,
-            scope: None,
             skip_worktree: true,
-            setup_script: None,
-            is_remote: false,
-            default_model: None,
-            pr_number: None,
-            pr_url: None,
-            pr_status: None,
-            active_pull_request: None,
-            pull_requests: None,
-            context_links: None,
-            archived: false,
-            archived_at: None,
-            retired_at: None,
-            task_stats: None,
-            agent_summary: None,
-            diff_summary: None,
-            token_usage: None,
             cow_supported: Some(false), // CoW not supported!
-            browser_client_id: None,
-            pull_requests_total: None,
-            display_status: None,
-            waiting: false,
-            scripts_running: false,
-            background_tasks_running: false,
-            checkout_mode: None,
-            disk_usage: None,
-            pending_delete_at: None,
-            membership: None,
+            ..Default::default()
         };
 
         let agent_session = intent_core::AgentSession {
@@ -32255,52 +32103,14 @@ mod rules {
             id: intent_core::WorkspaceId::from("ws-1"),
             title: "Test".into(),
             branch: "main".into(),
-            base_ref: None,
-            base_commit_sha: None,
-            status: intent_core::WorkspaceStatus::Active,
-            status_message: None,
-            status_image_asset_id: None,
-            activity: intent_core::WorkspaceActivity::Idle,
-            attention: intent_core::WorkspaceAttention::None,
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
-            last_activity: None,
-            last_content_activity: None,
-            tags: vec![],
             path: Some("/test/path".into()),
             repository_path: Some("/test/repo".into()),
-            repository_owner: None,
             repository_name: Some("test-repo".into()),
-            worktree_path: None,
-            scope: None,
             skip_worktree: true,
-            setup_script: None,
-            is_remote: false,
-            default_model: None,
-            pr_number: None,
-            pr_url: None,
-            pr_status: None,
-            active_pull_request: None,
-            pull_requests: None,
-            context_links: None,
-            archived: false,
-            archived_at: None,
-            retired_at: None,
-            task_stats: None,
-            agent_summary: None,
-            diff_summary: None,
-            token_usage: None,
             cow_supported: Some(true), // CoW capable!
-            browser_client_id: None,
-            pull_requests_total: None,
-            display_status: None,
-            waiting: false,
-            scripts_running: false,
-            background_tasks_running: false,
-            checkout_mode: None,
-            disk_usage: None,
-            pending_delete_at: None,
-            membership: None,
+            ..Default::default()
         };
 
         // Agent session WITHOUT sandbox fields (explicit isolation:"shared" override)
@@ -32399,52 +32209,14 @@ mod rules {
             id: intent_core::WorkspaceId::from("ws-1"),
             title: "Test".into(),
             branch: "main".into(),
-            base_ref: None,
-            base_commit_sha: None,
-            status: intent_core::WorkspaceStatus::Active,
-            status_message: None,
-            status_image_asset_id: None,
-            activity: intent_core::WorkspaceActivity::Idle,
-            attention: intent_core::WorkspaceAttention::None,
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
-            last_activity: None,
-            last_content_activity: None,
-            tags: vec![],
             path: Some("/test/path".into()),
             repository_path: Some("/test/repo".into()),
-            repository_owner: None,
             repository_name: Some("test-repo".into()),
-            worktree_path: None,
-            scope: None,
             skip_worktree: true,
-            setup_script: None,
-            is_remote: false,
-            default_model: None,
-            pr_number: None,
-            pr_url: None,
-            pr_status: None,
-            active_pull_request: None,
-            pull_requests: None,
-            context_links: None,
-            archived: false,
-            archived_at: None,
-            retired_at: None,
-            task_stats: None,
-            agent_summary: None,
-            diff_summary: None,
-            token_usage: None,
             cow_supported: Some(true), // Setting could be OFF, but session is sandboxed
-            browser_client_id: None,
-            pull_requests_total: None,
-            display_status: None,
-            waiting: false,
-            scripts_running: false,
-            background_tasks_running: false,
-            checkout_mode: None,
-            disk_usage: None,
-            pending_delete_at: None,
-            membership: None,
+            ..Default::default()
         };
 
         // Agent session WITH sandbox fields (explicit isolation:"cow" override)
@@ -33266,52 +33038,10 @@ mod known_repo {
             id: id.clone(),
             title: "Backfill Test".to_string(),
             branch: "main".to_string(),
-            base_ref: None,
-            base_commit_sha: None,
-            status: WorkspaceStatus::Active,
-            status_message: None,
-            status_image_asset_id: None,
-            activity: WorkspaceActivity::Idle,
-            attention: WorkspaceAttention::None,
             created_at: now.clone(),
             updated_at: now.clone(),
-            last_activity: None,
-            last_content_activity: None,
-            tags: vec![],
-            path: None,
             repository_path: Some(repo_path.0.to_string_lossy().to_string()),
-            repository_owner: None,
-            repository_name: None,
-            worktree_path: None,
-            scope: None,
-            skip_worktree: false,
-            setup_script: None,
-            is_remote: false,
-            default_model: None,
-            pr_number: None,
-            pr_url: None,
-            pr_status: None,
-            active_pull_request: None,
-            pull_requests: None,
-            context_links: None,
-            archived: false,
-            archived_at: None,
-            retired_at: None,
-            token_usage: None,
-            task_stats: None,
-            agent_summary: None,
-            diff_summary: None,
-            cow_supported: None,
-            browser_client_id: None,
-            pull_requests_total: None,
-            display_status: None,
-            waiting: false,
-            scripts_running: false,
-            background_tasks_running: false,
-            checkout_mode: None,
-            disk_usage: None,
-            pending_delete_at: None,
-            membership: None,
+            ..Default::default()
         };
         store.insert_workspace(&ws).await.expect("insert workspace");
 
@@ -49687,7 +49417,7 @@ mod derived_workspace_unread {
     /// armed, so settle-race tests can hold the settlement immediately
     /// before its atomic clear (the probe→write gap).
     async fn harness_with_park(
-        park: Option<std::sync::Arc<crate::script_ops::SupervisePark>>,
+        park: Option<std::sync::Arc<crate::runtime_config::SupervisePark>>,
     ) -> Harness {
         harness_with_parks(park, None).await
     }
@@ -49696,8 +49426,8 @@ mod derived_workspace_unread {
     /// ENTRY park, which holds a settle after the caller's write and before
     /// its unread probe (see `Services::with_unread_settle_entry_park`).
     async fn harness_with_parks(
-        attention_write_park: Option<std::sync::Arc<crate::script_ops::SupervisePark>>,
-        settle_entry_park: Option<std::sync::Arc<crate::script_ops::SupervisePark>>,
+        attention_write_park: Option<std::sync::Arc<crate::runtime_config::SupervisePark>>,
+        settle_entry_park: Option<std::sync::Arc<crate::runtime_config::SupervisePark>>,
     ) -> Harness {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -50206,7 +49936,7 @@ mod derived_workspace_unread {
     #[intent_test_macros::daemon_test]
     async fn settle_race_new_message_in_gap_never_clears() {
         use std::sync::Arc;
-        let park = Arc::new(crate::script_ops::SupervisePark::default());
+        let park = Arc::new(crate::runtime_config::SupervisePark::default());
         let h = harness_with_park(Some(park.clone())).await;
         let last_a = seed_session(&h, "agent-a", &["user", "assistant"]).await;
         // Stored flag raised as the turn-end gate would have left it (seeded
@@ -50438,8 +50168,8 @@ mod derived_workspace_unread {
     #[intent_test_macros::daemon_test]
     async fn agent_retire_concurrent_unread_sessions_settle_exactly_once() {
         use std::sync::Arc;
-        let entry = Arc::new(crate::script_ops::SupervisePark::default());
-        let park = Arc::new(crate::script_ops::SupervisePark::default());
+        let entry = Arc::new(crate::runtime_config::SupervisePark::default());
+        let park = Arc::new(crate::runtime_config::SupervisePark::default());
         let h = harness_with_parks(Some(park.clone()), Some(entry.clone())).await;
         seed_session(&h, "agent-a", &["user", "assistant"]).await;
         seed_session(&h, "agent-b", &["user", "assistant"]).await;

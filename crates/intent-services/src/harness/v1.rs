@@ -633,8 +633,37 @@ impl Harness for V1 {
             .to_string()
     }
 
-    fn note_images_notice(&self, n: usize) -> String {
-        format!("[System: {n} image(s) from the referenced note(s) are attached to this message.]")
+    fn note_reference_notice(
+        &self,
+        title: &str,
+        id: &str,
+        image_urls: &[String],
+        omitted: usize,
+    ) -> String {
+        let (title, id) = (notice_field(title), notice_field(id));
+        let mut notice = format!(
+            "[Note in context: \"{title}\" (ID: {id}). Its content is NOT inlined in this \
+             message; read it with ws.note.read(\"{id}\")."
+        );
+        if !image_urls.is_empty() {
+            let total = image_urls.len() + omitted;
+            let _ = write!(
+                notice,
+                " It embeds {total} image(s), also NOT inlined; view one with \
+                 ws.note.readAsset(\"<url>\"):"
+            );
+            for url in image_urls {
+                let _ = write!(notice, "\n- {url}");
+            }
+            if omitted > 0 {
+                let _ = write!(
+                    notice,
+                    "\n- …and {omitted} more (listed in the note content)"
+                );
+            }
+        }
+        notice.push(']');
+        notice
     }
 
     fn attachment_reference_notice(
@@ -1404,4 +1433,21 @@ impl Harness for V1 {
              your other work or end your turn."
         )
     }
+}
+
+/// A user-controlled value (note title / id) made safe to quote inside a
+/// bracketed prompt notice: control characters (newlines included) become
+/// spaces, `"` becomes `'`, and `[` / `]` become `(` / `)`, so the value
+/// cannot close the notice or forge a separate system note.
+fn notice_field(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| match c {
+            c if c.is_control() => ' ',
+            '"' => '\'',
+            '[' => '(',
+            ']' => ')',
+            c => c,
+        })
+        .collect()
 }

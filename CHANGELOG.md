@@ -2,6 +2,54 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.54] - 2026-10-26
+
+### 🐛 Bug Fixes
+
+- *(agent)* Attach context notes by reference instead of inlining images ([#2710](https://github.com/intent-hq/intentd/pull/2710))
+
+### 🔧 Refactor
+
+- *(services)* Cut remaining lifecycle references into runtime ([#2714](https://github.com/intent-hq/intentd/pull/2714))
+
+
+## [0.11.53] - 2026-10-26
+
+### 🔧 Refactor
+
+- *(services)* Cut agent-side inbound references into runtime ([#2712](https://github.com/intent-hq/intentd/pull/2712))
+
+
+## [0.11.52] - 2026-10-26
+
+### 🔧 Refactor
+
+- *(services)* Add an agent-wake port for runtime ([#2707](https://github.com/intent-hq/intentd/pull/2707))
+
+
+## [0.11.51] - 2026-10-26
+
+### 🔧 Refactor
+
+- *(core)* Build Workspace rows with a shared Default ([#2699](https://github.com/intent-hq/intentd/pull/2699))
+
+
+## [0.11.50] - 2026-10-26
+
+### 🚀 Features
+
+- *(pr-monitor)* Report every new review and which commit it covers ([#2695](https://github.com/intent-hq/intentd/pull/2695))
+
+### 🐛 Bug Fixes
+
+- *(harness)* Stop duplicating the workspace block for default agents ([#2698](https://github.com/intent-hq/intentd/pull/2698))
+
+### 🔧 Refactor
+
+- *(services)* Route scripts and hooks through a runtime port ([#2697](https://github.com/intent-hq/intentd/pull/2697))
+- *(services)* Route terminals and browser tabs through the runtime port ([#2702](https://github.com/intent-hq/intentd/pull/2702))
+
+
 ## [0.11.49] - 2026-10-26
 
 ### 🐛 Bug Fixes

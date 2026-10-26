@@ -241,7 +241,7 @@ pub(crate) fn format_wait_duration(secs: i64) -> String {
 /// persisted-entry / unparseable-`queued_at` / sub-threshold skips above
 /// cover the stamp too.
 fn annotate_dequeue_wait(msg: &mut QueuedMessage) {
-    if crate::script_monitor::monitor_id(msg.message_metadata.as_ref()).is_some() {
+    if crate::feature_ports::monitor_id(msg.message_metadata.as_ref()).is_some() {
         return;
     }
     if msg.persisted || msg.content.contains(DEQUEUE_WAIT_NOTE_PREFIX) {
@@ -305,7 +305,7 @@ fn annotate_dequeue_wait(msg: &mut QueuedMessage) {
 /// row names its entry.
 pub(crate) fn stamp_queued_message_id(msg: &mut QueuedMessage) {
     msg.stamp_correlation();
-    if crate::script_monitor::monitor_id(msg.message_metadata.as_ref()).is_some() {
+    if crate::feature_ports::monitor_id(msg.message_metadata.as_ref()).is_some() {
         return;
     }
     if msg.persisted {
@@ -531,8 +531,9 @@ async fn cancel_and_settle_idle_prompt(
 /// Per-turn prompt-assembly hints threaded through `agent.sendMessage`
 /// (PROTOCOL §5.5). `stdin_context` is prepended verbatim to the outbound
 /// prompt as a `Context:` block (reference-parity `acp-provider.ts`);
-/// `note_ids` and `context_references` are carried forward for downstream
-/// note-image / context-reference resolution and are otherwise inert today.
+/// `note_ids` each add a by-reference note notice (title, id and embedded
+/// image URLs; no content or image bytes), and `context_references` are
+/// carried forward for downstream context-reference resolution.
 ///
 /// Only the FIRST turn triggered by a `sendMessage` call carries these
 /// options; queue-drained follow-up turns run with [`TurnOptions::default`]
@@ -3881,12 +3882,11 @@ impl AgentManager {
         let worker_connection = Arc::downgrade(&connection);
 
         let terminal_host: Arc<dyn intent_acp::TerminalHost> =
-            Arc::new(crate::PtyTerminalHost::with_shell_mode(
-                self.services.pty(),
-                self.services.settings_registry(),
+            self.services.ports.runtime().agent_terminal_host(
+                &self.services,
                 opts.provider.terminal_requires_shell,
                 Some(cwd.clone()),
-            ));
+            );
         let handler = Arc::new(
             ClientRequestHandler::new(
                 workspace_id.clone(),
@@ -5934,13 +5934,12 @@ impl AgentManager {
             )
             .await?;
         }
-        // Resolve `noteIds` to `workspace-asset://` image content blocks
-        // (Fidelity B, PROTOCOL §5.5): each note is scanned for markdown
-        // image references whose URL is a workspace-asset in the current
-        // workspace; the referenced bytes are loaded and appended as ACP
-        // `image` content blocks. A single system text block is added when
-        // any images are resolved so the agent knows they are inlined for
-        // direct viewing (parity with the FE notice).
+        // Attach `noteIds` by reference (Fidelity B, PROTOCOL §5.5): one
+        // notice per note naming its id/title and embedded workspace-asset
+        // image URLs. No content or image bytes ride the prompt, so a note
+        // full of screenshots cannot overflow the provider image budget and
+        // fail every turn while it is in context; the agent reads what it
+        // needs with `ws.note.read` / `ws.note.readAsset`.
         if let Some(ids_json) = options.note_ids.as_ref() {
             let ids: Vec<String> = ids_json
                 .as_array()
@@ -5951,21 +5950,13 @@ impl AgentManager {
                 })
                 .unwrap_or_default();
             if !ids.is_empty() {
-                let images = self
-                    .services
-                    .load_note_image_blocks(workspace_id, &ids)
-                    .await;
-                if !images.is_empty() {
-                    for (data, mime) in &images {
-                        if let Ok(img) = serde_json::from_value::<ContentBlock>(json!({
-                            "type": "image",
-                            "data": data,
-                            "mimeType": mime,
-                        })) {
-                            blocks.push(img);
-                        }
-                    }
-                    let notice = note_images_notice(images.len());
+                for note in self.services.load_note_references(workspace_id, &ids).await {
+                    let notice = note_reference_notice(
+                        &note.title,
+                        &note.id,
+                        &note.image_urls,
+                        note.omitted,
+                    );
                     blocks.extend(text_prompt(&notice));
                 }
             }
@@ -6555,7 +6546,11 @@ impl AgentManager {
                     .set_discussion_activity(&turn, "stopped", None)
                     .await;
             }
-            self.services.settle_script_monitor_worker(agent_id).await;
+            self.services
+                .ports
+                .runtime()
+                .settle_script_monitor_worker(&self.services, agent_id)
+                .await;
         }
         self.services
             .flush_pinned_turn_on_interruption(agent_id, InterruptReason::AgentStopped, None)
@@ -6744,7 +6739,11 @@ impl AgentManager {
                 .set_discussion_activity(&turn, "stopped", None)
                 .await;
         }
-        self.services.settle_script_monitor_worker(agent_id).await;
+        self.services
+            .ports
+            .runtime()
+            .settle_script_monitor_worker(&self.services, agent_id)
+            .await;
         // The abort may have landed between the streaming path's terminal-
         // error stash and the handler's take (monorepo#2050); the orphaned
         // context describes the aborted turn, so it must not survive into a
@@ -7070,7 +7069,9 @@ impl AgentManager {
                 // settlement idle in `run_prompt_turn` (omitted when the
                 // agent owns no active hook).
                 self.services
-                    .annotate_waiting_on_hooks(agent_id, &mut data)
+                    .ports
+                    .runtime()
+                    .annotate_waiting_on_hooks(&self.services, agent_id, &mut data)
                     .await;
                 // Idle-visibility (unified external-wait): same
                 // `waitingOnPrMonitors` stamp as the settlement idle
@@ -7738,7 +7739,10 @@ impl AgentManager {
         if self.is_shutting_down() || !self.owns_admission(agent_id, admission) {
             return;
         }
-        self.services.track_script_monitor_worker(agent_id, None);
+        self.services
+            .ports
+            .runtime()
+            .track_script_monitor_worker(&self.services, agent_id, None);
         self.clear_worker(agent_id);
         self.end_turn(agent_id).await;
         drop(starting);
@@ -7765,7 +7769,9 @@ impl AgentManager {
             }
             match self
                 .services
-                .admit_script_monitor_turn(agent_id, metadata)
+                .ports
+                .runtime()
+                .admit_script_monitor_turn(&self.services, agent_id, metadata)
                 .await
             {
                 Ok(allowed) => return allowed,
@@ -10034,8 +10040,11 @@ impl AgentManager {
             options.turn_id = Some(new_message_id());
         }
         self.track_discussion_turn(&agent_id, &options);
-        self.services
-            .track_script_monitor_worker(&agent_id, options.message_metadata.as_ref());
+        self.services.ports.runtime().track_script_monitor_worker(
+            &self.services,
+            &agent_id,
+            options.message_metadata.as_ref(),
+        );
         // Consume a pending zero-output stop redelivery
         // (intent-hq/monorepo#1757): the stopped turn's user message (text +
         // attachments) is merged into this turn's `prepend_*` options so the
@@ -10092,7 +10101,7 @@ impl AgentManager {
         let id = agent_id.clone();
         let execution = mgr.services.clone();
         let principal = intent_core::lift_from_principal_id(options.message_metadata.as_ref());
-        let handle = intent_core::spawn_daemon(crate::host_execution::background_execution(
+        let handle = intent_core::spawn_daemon(crate::execution_call::background_execution(
             execution,
             principal,
             async move {
@@ -13406,10 +13415,17 @@ fn push_image_blocks(blocks: &mut Vec<ContentBlock>, image_blocks: Option<&Value
     }
 }
 
-/// The system notice appended after note-referenced images are inlined
-/// (Fidelity B, PROTOCOL §5.5). Wording owned by the harness (H6).
-pub(crate) fn note_images_notice(n: usize) -> String {
-    crate::harness::latest().note_images_notice(n)
+/// The by-reference notice for one `noteIds` entry (Fidelity B, PROTOCOL
+/// §5.5): id, title and embedded image URLs plus the `ws.note.read` /
+/// `ws.note.readAsset` retrieval instructions. Wording owned by the harness
+/// (H6).
+pub(crate) fn note_reference_notice(
+    title: &str,
+    id: &str,
+    image_urls: &[String],
+    omitted: usize,
+) -> String {
+    crate::harness::latest().note_reference_notice(title, id, image_urls, omitted)
 }
 
 /// The attachment-reference notice (PROTOCOL §5.5): metadata plus the
@@ -14207,7 +14223,7 @@ fn dequeue_worker_raced_tail(
     // longer see its monitor identity. Never attach unrelated work to its wake.
     if crate::discussion_activity::is_discussion(next.message_metadata.as_ref())
         || next.monitor_turn.is_some()
-        || crate::script_monitor::monitor_id(next.message_metadata.as_ref()).is_some()
+        || crate::feature_ports::monitor_id(next.message_metadata.as_ref()).is_some()
     {
         return None;
     }
@@ -14303,19 +14319,34 @@ async fn run_message_worker(
             boxed_await(|| mgr.finish_monitor_worker(&agent_id, &workspace_id, admission)).await;
             return;
         }
-        mgr.services
-            .track_script_monitor_worker(&agent_id, options.message_metadata.as_ref());
-        if mgr.services.defer_script_monitor_for_export(
+        mgr.services.ports.runtime().track_script_monitor_worker(
+            &mgr.services,
             &agent_id,
-            &content,
             options.message_metadata.as_ref(),
-        ) {
+        );
+        if mgr
+            .services
+            .ports
+            .runtime()
+            .defer_script_monitor_for_export(
+                &mgr.services,
+                &agent_id,
+                &content,
+                options.message_metadata.as_ref(),
+            )
+        {
             boxed_await(|| mgr.finish_monitor_worker(&agent_id, &workspace_id, admission)).await;
             return;
         }
         match boxed_await(|| {
             mgr.services
-                .script_monitor_delivery_allowed(&agent_id, options.message_metadata.as_ref())
+                .ports
+                .runtime()
+                .script_monitor_delivery_allowed(
+                    &mgr.services,
+                    &agent_id,
+                    options.message_metadata.as_ref(),
+                )
         })
         .await
         {
@@ -14354,11 +14385,17 @@ async fn run_message_worker(
             })
             .await;
         }
-        if mgr.services.defer_script_monitor_for_export(
-            &agent_id,
-            &content,
-            options.message_metadata.as_ref(),
-        ) {
+        if mgr
+            .services
+            .ports
+            .runtime()
+            .defer_script_monitor_for_export(
+                &mgr.services,
+                &agent_id,
+                &content,
+                options.message_metadata.as_ref(),
+            )
+        {
             boxed_await(|| mgr.finish_monitor_worker(&agent_id, &workspace_id, admission)).await;
             return;
         }
@@ -14490,11 +14527,17 @@ async fn run_message_worker(
                         break 'outer;
                     }
                 };
-                if mgr.services.defer_script_monitor_for_export(
-                    &agent_id,
-                    &content,
-                    options.message_metadata.as_ref(),
-                ) {
+                if mgr
+                    .services
+                    .ports
+                    .runtime()
+                    .defer_script_monitor_for_export(
+                        &mgr.services,
+                        &agent_id,
+                        &content,
+                        options.message_metadata.as_ref(),
+                    )
+                {
                     restore_undelivered_context();
                     boxed_await(|| mgr.finish_monitor_worker(&agent_id, &workspace_id, admission))
                         .await;
@@ -14537,10 +14580,13 @@ async fn run_message_worker(
                         })
                         .await;
                         if let Some(id) =
-                            crate::script_monitor::monitor_id(options.message_metadata.as_ref())
+                            crate::feature_ports::monitor_id(options.message_metadata.as_ref())
                         {
                             boxed_await(|| {
-                                mgr.services.complete_script_monitor_delivery(&agent_id, id)
+                                mgr.services
+                                    .ports
+                                    .runtime()
+                                    .complete_script_monitor_delivery(&mgr.services, &agent_id, id)
                             })
                             .await;
                         }
@@ -14636,10 +14682,17 @@ async fn run_message_worker(
                             })
                             .await;
                             if let Some(id) =
-                                crate::script_monitor::monitor_id(options.message_metadata.as_ref())
+                                crate::feature_ports::monitor_id(options.message_metadata.as_ref())
                             {
                                 boxed_await(|| {
-                                    mgr.services.complete_script_monitor_delivery(&agent_id, id)
+                                    mgr.services
+                                        .ports
+                                        .runtime()
+                                        .complete_script_monitor_delivery(
+                                            &mgr.services,
+                                            &agent_id,
+                                            id,
+                                        )
                                 })
                                 .await;
                             }
@@ -14798,7 +14851,7 @@ async fn run_message_worker(
                                 })
                                 .await;
                                 if user_persisted {
-                                    if let Some(id) = crate::script_monitor::monitor_id(
+                                    if let Some(id) = crate::feature_ports::monitor_id(
                                         options.message_metadata.as_ref(),
                                     ) {
                                         if let Err(error) = boxed_await(|| {
@@ -15935,12 +15988,14 @@ async fn persist_user(
             pause.resume.notified().await;
         }
     }
-    if let Some(id) = crate::script_monitor::wake_id(message_metadata) {
+    if let Some(id) = crate::feature_ports::wake_id(message_metadata) {
         // A suppressed wake is successfully discarded, not a failed user send.
         // The worker independently fences delivery before starting a turn.
         match mgr
             .services
-            .script_monitor_delivery_allowed(agent_id, message_metadata)
+            .ports
+            .runtime()
+            .script_monitor_delivery_allowed(&mgr.services, agent_id, message_metadata)
             .await
         {
             Ok(true) => {}
@@ -15986,8 +16041,7 @@ async fn persist_user(
     // Bounded retry (#547): initial attempt + one retry per backoff delay.
     let backoff = persist_retry_backoff_ms();
     let mut attempt = 0usize;
-    let message_id =
-        crate::script_monitor::wake_id(message_metadata).unwrap_or_else(new_message_id);
+    let message_id = crate::feature_ports::wake_id(message_metadata).unwrap_or_else(new_message_id);
     let message = loop {
         match mgr
             .services
@@ -16004,7 +16058,7 @@ async fn persist_user(
             .await
         {
             Ok(message) => {
-                if let Some(id) = crate::script_monitor::wake_id(message_metadata) {
+                if let Some(id) = crate::feature_ports::wake_id(message_metadata) {
                     mgr.services.commit_queue_history(agent_id, &id);
                 }
 
@@ -16019,10 +16073,16 @@ async fn persist_user(
                 break message;
             }
             Err(e) => {
-                if let Some(id) = crate::script_monitor::wake_id(message_metadata) {
+                if let Some(id) = crate::feature_ports::wake_id(message_metadata) {
                     if matches!(
                         mgr.services
-                            .script_monitor_delivery_allowed(agent_id, message_metadata)
+                            .ports
+                            .runtime()
+                            .script_monitor_delivery_allowed(
+                                &mgr.services,
+                                agent_id,
+                                message_metadata
+                            )
                             .await,
                         Ok(false)
                     ) {
@@ -16258,7 +16318,7 @@ fn antigravity_setup_error(method: &str, error: &intent_acp::AcpError, rejection
                 "Antigravity {method}: agent stdout closed; no prompt was sent"
             ))
         }
-        AcpError::Auth(_) => crate::host_execution::ai_authorization_error(
+        AcpError::Auth(_) => crate::execution_call::ai_authorization_error(
             Error::InvalidParams(crate::provider_auth::not_authenticated_message(
                 "antigravity",
             )),
@@ -18601,7 +18661,7 @@ mod role_reminder_tests {
 
     use super::*;
     use crate::events::EventBus;
-    use intent_core::{AgentStatus, Workspace, WorkspaceActivity, WorkspaceStatus};
+    use intent_core::{AgentStatus, Workspace};
     use intent_store::Store;
 
     /// Seed a hermetic specialists dir under temp with one `<id>.md`. Keep the
@@ -18618,52 +18678,9 @@ mod role_reminder_tests {
             id: id.clone(),
             title: "WS".to_string(),
             branch: "main".to_string(),
-            base_ref: None,
-            base_commit_sha: None,
-            status: WorkspaceStatus::Active,
-            status_message: None,
-            status_image_asset_id: None,
-            activity: WorkspaceActivity::Idle,
-            attention: WorkspaceAttention::None,
             created_at: ts.clone(),
             updated_at: ts,
-            last_activity: None,
-            last_content_activity: None,
-            tags: vec![],
-            path: None,
-            repository_path: None,
-            repository_owner: None,
-            repository_name: None,
-            worktree_path: None,
-            scope: None,
-            skip_worktree: false,
-            setup_script: None,
-            is_remote: false,
-            default_model: None,
-            pr_number: None,
-            pr_url: None,
-            pr_status: None,
-            active_pull_request: None,
-            pull_requests: None,
-            context_links: None,
-            archived: false,
-            archived_at: None,
-            retired_at: None,
-            task_stats: None,
-            agent_summary: None,
-            diff_summary: None,
-            token_usage: None,
-            cow_supported: None,
-            browser_client_id: None,
-            pull_requests_total: None,
-            display_status: None,
-            waiting: false,
-            scripts_running: false,
-            background_tasks_running: false,
-            checkout_mode: None,
-            disk_usage: None,
-            pending_delete_at: None,
-            membership: None,
+            ..Default::default()
         }
     }
 
@@ -23307,10 +23324,7 @@ mod agent_retry_tests {
     use super::*;
     use crate::events::EventBus;
     use crate::BusEventSink;
-    use intent_core::{
-        AgentSession, AgentStatus, Workspace, WorkspaceActivity, WorkspaceAttention,
-        WorkspaceStatus,
-    };
+    use intent_core::{AgentSession, AgentStatus, Workspace};
     use intent_store::Store;
     use std::sync::Arc;
 
@@ -23320,52 +23334,9 @@ mod agent_retry_tests {
             id: id.clone(),
             title: "Test WS".to_string(),
             branch: "main".to_string(),
-            base_ref: None,
-            base_commit_sha: None,
-            status: WorkspaceStatus::Active,
-            status_message: None,
-            status_image_asset_id: None,
-            activity: WorkspaceActivity::Idle,
-            attention: WorkspaceAttention::None,
             created_at: ts.clone(),
             updated_at: ts.clone(),
-            last_activity: None,
-            last_content_activity: None,
-            tags: vec![],
-            path: None,
-            repository_path: None,
-            repository_owner: None,
-            repository_name: None,
-            worktree_path: None,
-            pull_requests: None,
-            context_links: None,
-            scope: None,
-            skip_worktree: false,
-            setup_script: None,
-            is_remote: false,
-            default_model: None,
-            archived: false,
-            archived_at: None,
-            retired_at: None,
-            active_pull_request: None,
-            pr_number: None,
-            pr_status: None,
-            pr_url: None,
-            agent_summary: None,
-            diff_summary: None,
-            token_usage: None,
-            cow_supported: None,
-            browser_client_id: None,
-            pull_requests_total: None,
-            display_status: None,
-            waiting: false,
-            scripts_running: false,
-            background_tasks_running: false,
-            checkout_mode: None,
-            disk_usage: None,
-            pending_delete_at: None,
-            membership: None,
-            task_stats: None,
+            ..Default::default()
         }
     }
 
@@ -23536,7 +23507,9 @@ mod agent_retry_tests {
             if boundary == "after-accept" {
                 assert!(mgr
                     .services
-                    .admit_script_monitor_turn(&agent, Some(&job.metadata))
+                    .ports
+                    .runtime()
+                    .admit_script_monitor_turn(&mgr.services, &agent, Some(&job.metadata))
                     .await
                     .unwrap());
             }
@@ -23581,7 +23554,13 @@ mod agent_retry_tests {
             );
             assert!(mgr
                 .services
-                .admit_script_monitor_turn(&agent, restored.message_metadata.as_ref())
+                .ports
+                .runtime()
+                .admit_script_monitor_turn(
+                    &mgr.services,
+                    &agent,
+                    restored.message_metadata.as_ref()
+                )
                 .await
                 .unwrap());
             let count: i64 = sqlx::query_scalar("SELECT count(*) FROM agent_message WHERE id=?")
@@ -23597,7 +23576,9 @@ mod agent_retry_tests {
                 .unwrap();
             assert!(!mgr
                 .services
-                .admit_script_monitor_turn(&agent, Some(&job.metadata))
+                .ports
+                .runtime()
+                .admit_script_monitor_turn(&mgr.services, &agent, Some(&job.metadata))
                 .await
                 .unwrap());
             assert!(store.load_all_agent_queues().await.unwrap().is_empty());
