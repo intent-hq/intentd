@@ -31,13 +31,22 @@
 //!   share the name (`Context::Workspace { workspace_id }`) never match.
 //! - Such a body passes when one of its elements starts with `..` (the struct
 //!   base). A range such as `0..5` inside a field value is not a rest element.
-//! - Skipped: `crates/intent-core/src/model.rs`, the type's own file.
+//! - Every file is scanned, `model.rs` included (it is also where the field
+//!   list comes from). Unbalanced brackets after a `Workspace {` are reported,
+//!   never silently skipped.
 //! - Opt-out: `// workspace-literal: allow — <reason>` on the line
 //!   immediately above the literal's `Workspace` token, in the shared marker
-//!   grammar. A malformed marker never suppresses the hit; the report says so.
+//!   grammar. A malformed marker never suppresses the hit, and a reasoned
+//!   marker that covers no full literal is stale; the report says so.
+//!
+//! Known blind spots (none occur today): `Self { … }` inside `impl Workspace`,
+//! a renamed import or type alias (`use … Workspace as W`), and a full pattern
+//! right after `for` (`for Workspace { … } in rows`, read as an
+//! `impl … for` header). Each still compiles only with every field listed, so
+//! the next added field surfaces it.
 
 use std::fs;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use intentd_test_support::source_lint::{
     lex, markers_by_line, rust_files, skip_whitespace, workspace_root, Marker,
@@ -45,13 +54,23 @@ use intentd_test_support::source_lint::{
 
 const TYPE_NAME: &str = "Workspace";
 const OPT_OUT_TAG: &str = "workspace-literal";
-const EXEMPT_FILE: &[&str] = &["crates", "intent-core", "src", "model.rs"];
+const MODEL_FILE: &[&str] = &["crates", "intent-core", "src", "model.rs"];
 const ITEM_KEYWORDS: &[&str] = &["struct", "enum", "union", "trait", "impl", "for"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HitKind {
+    /// A full literal with no (or only a malformed) opt-out marker.
+    Literal { marker_malformed: bool },
+    /// A reasoned marker whose next line starts no full literal.
+    StaleMarker,
+    /// No bracket closes the `Workspace {` on this line.
+    Unbalanced,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Hit {
     line: usize,
-    marker_malformed: bool,
+    kind: HitKind,
 }
 
 fn is_ident_char(c: char) -> bool {
@@ -172,7 +191,9 @@ fn struct_fields(model_src: &str) -> Vec<String> {
         .iter()
         .filter_map(|e| {
             let tokens: Vec<&str> = e.split_whitespace().collect();
-            let pub_at = tokens.iter().rposition(|t| *t == "pub")?;
+            let pub_at = tokens
+                .iter()
+                .rposition(|t| *t == "pub" || t.starts_with("pub("))?;
             let name = tokens.get(pub_at + 1)?.trim_end_matches(':');
             Some(name.to_string())
         })
@@ -183,14 +204,15 @@ fn line_of(chars: &[char], offset: usize) -> usize {
     1 + chars[..offset].iter().filter(|&&c| c == '\n').count()
 }
 
-/// Every full `Workspace` literal in one file's source, minus reasoned
-/// opt-outs.
+/// Every full `Workspace` literal in one file's source not covered by a
+/// reasoned opt-out, plus stale markers and unbalanced literals.
 fn scan_source(src: &str, fields: &[String]) -> Vec<Hit> {
     let lexed = lex(src);
     let markers = markers_by_line(src, &lexed.line_comments, OPT_OUT_TAG);
     let chars: Vec<char> = lexed.blanked.chars().collect();
     let name: Vec<char> = TYPE_NAME.chars().collect();
     let mut hits = Vec::new();
+    let mut used_markers = Vec::new();
     let mut i = 0;
     while i + name.len() <= chars.len() {
         let is_token = chars[i..i + name.len()] == name[..]
@@ -205,31 +227,41 @@ fn scan_source(src: &str, fields: &[String]) -> Vec<Hit> {
             i += name.len();
             continue;
         }
+        let line = line_of(&chars, i);
         let Some(close) = matching_close(&chars, open) else {
+            hits.push(Hit {
+                line,
+                kind: HitKind::Unbalanced,
+            });
             break;
         };
         if is_full_literal(&chars[open + 1..close], fields) {
-            let line = line_of(&chars, i);
-            let marker = markers.get(line - 1).copied().unwrap_or(Marker::Absent);
-            if marker != Marker::WithReason {
+            // `markers` is addressed by 1-based line; the marker sits above.
+            let marker_line = line - 1;
+            let marker = markers.get(marker_line).copied().unwrap_or(Marker::Absent);
+            if marker == Marker::WithReason {
+                used_markers.push(marker_line);
+            } else {
                 hits.push(Hit {
                     line,
-                    marker_malformed: marker == Marker::Malformed,
+                    kind: HitKind::Literal {
+                        marker_malformed: marker == Marker::Malformed,
+                    },
                 });
             }
         }
         i = open + 1;
     }
+    for (idx, marker) in markers.iter().enumerate() {
+        if *marker == Marker::WithReason && !used_markers.contains(&idx) {
+            hits.push(Hit {
+                line: idx,
+                kind: HitKind::StaleMarker,
+            });
+        }
+    }
+    hits.sort_by_key(|h| h.line);
     hits
-}
-
-fn is_exempt(rel: &Path) -> bool {
-    let parts: Vec<_> = rel.components().map(Component::as_os_str).collect();
-    parts.len() == EXEMPT_FILE.len()
-        && parts
-            .iter()
-            .zip(EXEMPT_FILE)
-            .all(|(have, want)| *have == *want)
 }
 
 fn display_rel(rel: &Path) -> String {
@@ -242,14 +274,14 @@ fn display_rel(rel: &Path) -> String {
 #[test]
 fn workspace_is_only_built_with_struct_update_syntax() {
     let root = workspace_root();
-    let exempt: PathBuf = EXEMPT_FILE.iter().collect();
+    let model: PathBuf = MODEL_FILE.iter().collect();
     assert!(
-        root.join(&exempt).is_file(),
-        "{} moved; update EXEMPT_FILE so the exemption keeps pointing at the Workspace type",
-        display_rel(&exempt)
+        root.join(&model).is_file(),
+        "{} moved; update MODEL_FILE so the field list keeps coming from the Workspace type",
+        display_rel(&model)
     );
-    let model_src = fs::read_to_string(root.join(&exempt))
-        .unwrap_or_else(|e| panic!("read {}: {e}", display_rel(&exempt)));
+    let model_src = fs::read_to_string(root.join(&model))
+        .unwrap_or_else(|e| panic!("read {}: {e}", display_rel(&model)));
     let fields = struct_fields(&model_src);
     assert!(
         fields.len() > 20 && fields.iter().any(|f| f == "id"),
@@ -268,16 +300,22 @@ fn workspace_is_only_built_with_struct_update_syntax() {
         let rel = file
             .strip_prefix(&root)
             .expect("source path under the workspace root");
-        if is_exempt(rel) {
-            continue;
-        }
         let src =
             fs::read_to_string(file).unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
         for hit in scan_source(&src, &fields) {
-            let note = if hit.marker_malformed {
-                "  (opt-out marker is malformed: expected `// workspace-literal: allow — <reason>`)"
-            } else {
-                ""
+            let note = match hit.kind {
+                HitKind::Literal {
+                    marker_malformed: false,
+                } => "",
+                HitKind::Literal {
+                    marker_malformed: true,
+                } => {
+                    "  (opt-out marker is malformed: expected `// workspace-literal: allow — <reason>`)"
+                }
+                HitKind::StaleMarker => {
+                    "  (stale opt-out marker: the next line starts no full Workspace literal)"
+                }
+                HitKind::Unbalanced => "  (no bracket closes this `Workspace {`; lexer gap?)",
             };
             report.push(format!("{}:{}{note}", display_rel(rel), hit.line));
         }
@@ -285,7 +323,7 @@ fn workspace_is_only_built_with_struct_update_syntax() {
 
     assert!(
         report.is_empty(),
-        "full `Workspace` struct literals outside crates/intent-core/src/model.rs:\n\n{}\n\n\
+        "full `Workspace` struct literals (or a marker problem):\n\n{}\n\n\
          Set only the fields that matter and end the literal with `..Default::default()` \
          (or spread a fixture such as `intent_services::test_support::fixtures::workspace`), \
          so adding a field to `Workspace` needs no edits here. A site that must list every \
@@ -297,14 +335,18 @@ fn workspace_is_only_built_with_struct_update_syntax() {
 
 #[cfg(test)]
 mod fixtures {
-    use super::{scan_source, struct_fields, Hit};
+    use super::{scan_source, struct_fields, Hit, HitKind};
 
     fn fields() -> Vec<String> {
         vec!["id".to_string(), "title".to_string()]
     }
 
     fn lines(src: &str) -> Vec<usize> {
-        scan_source(src, &fields()).iter().map(|h| h.line).collect()
+        scan_source(src, &fields())
+            .iter()
+            .filter(|h| matches!(h.kind, HitKind::Literal { .. }))
+            .map(|h| h.line)
+            .collect()
     }
 
     #[test]
@@ -383,8 +425,41 @@ mod fixtures {
             scan_source(src, &fields()),
             vec![Hit {
                 line: 4,
-                marker_malformed: true
+                kind: HitKind::Literal {
+                    marker_malformed: true
+                }
             }]
         );
+    }
+
+    #[test]
+    fn reports_a_marker_that_covers_no_full_literal() {
+        let src = "// workspace-literal: allow — was exhaustive\nlet a = Workspace { id, ..w };\n";
+        assert_eq!(
+            scan_source(src, &fields()),
+            vec![Hit {
+                line: 1,
+                kind: HitKind::StaleMarker
+            }]
+        );
+    }
+
+    #[test]
+    fn reports_unbalanced_brackets_instead_of_stopping_silently() {
+        let src = "let a = Workspace { id, title: f(\n";
+        assert_eq!(
+            scan_source(src, &fields()),
+            vec![Hit {
+                line: 1,
+                kind: HitKind::Unbalanced
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_restricted_visibility_fields() {
+        let model =
+            "pub struct Workspace {\n    pub(crate) id: WorkspaceId,\n    pub title: String,\n}\n";
+        assert_eq!(struct_fields(model), vec!["id", "title"]);
     }
 }

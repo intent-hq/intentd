@@ -1905,11 +1905,43 @@ fn map_workspace_row(row: &SqliteRow) -> Result<Workspace> {
         token_usage,
         checkout_mode,
         browser_client_id: col::<Option<String>>(row, "browser_client_id")?.map(ClientId),
-        // Everything else is never persisted: `activity` is derived (§9.9),
-        // the card aggregates, `displayStatus`, the wait/script/background
-        // flags, `cowSupported`, and `diskUsage` are filled on the
-        // intent-services emit path, and `pullRequestsTotal` by list-row
-        // slimming (intent-core). A new persisted column must be read above.
+        // The remaining fields are never persisted: `activity` is derived
+        // (§9.9), the emit-only fields (card aggregates, `displayStatus`, the
+        // wait/script/background flags, `cowSupported`, `diskUsage`,
+        // `pendingDeleteAt`, `membership`) are filled by intent-services, and
+        // `pullRequestsTotal` by list-row slimming (intent-core). A new
+        // persisted column must be read above;
+        // `every_selected_column_is_read_by_the_row_mapper` enforces that.
         ..Default::default()
     })
+}
+
+#[cfg(test)]
+mod row_mapper_tests {
+    use super::WORKSPACE_COLUMNS;
+
+    /// `map_workspace_row` ends in `..Default::default()`, so the compiler no
+    /// longer forces it to read a new field. A column added to
+    /// `WORKSPACE_COLUMNS` (written by INSERT, served by SELECT) but never
+    /// read here would round-trip as the default; fail instead.
+    #[test]
+    fn every_selected_column_is_read_by_the_row_mapper() {
+        let src = include_str!("workspace_repo.rs");
+        let start = src
+            .find("fn map_workspace_row(")
+            .expect("map_workspace_row in workspace_repo.rs");
+        let len = src[start..]
+            .find("\n}\n")
+            .expect("end of map_workspace_row");
+        let body = &src[start..start + len];
+        let missing: Vec<&str> = WORKSPACE_COLUMNS
+            .split(',')
+            .map(str::trim)
+            .filter(|column| !body.contains(&format!("\"{column}\"")))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "WORKSPACE_COLUMNS lists columns map_workspace_row never reads: {missing:?}"
+        );
+    }
 }

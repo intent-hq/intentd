@@ -310,7 +310,9 @@ pub enum WorkspaceDisplayStatus {
 /// `Idle`, no attention, `false`, `None`). Build rows with struct-update
 /// syntax — `Workspace { id, title, ..Default::default() }` — and set only
 /// the fields that matter, so a new optional field needs no edits outside
-/// this type. `workspace_literal_lint` rejects a full literal anywhere else.
+/// this type. `workspace_literal_lint` rejects a full literal anywhere.
+/// Because the id is a fresh UUID, two default-built rows never compare
+/// equal; a test that compares or looks up rows should set `id` explicitly.
 // The bool fields mirror the protocol's wire shape; grouping them would
 // change the serialized contract.
 #[expect(clippy::struct_excessive_bools)]
