@@ -102,6 +102,9 @@ pub use ids::{
 pub use model::asset_extension_from_mime;
 pub use model::extract_spec_task_ids;
 pub use model::harness_supports_repository_guidance;
+pub use model::harness_uses_repository_monitor_guidance;
+#[doc(hidden)]
+pub use model::harness_versions_after_current;
 pub use model::token_usage_reported;
 pub use model::MessageOrigin;
 pub use model::CURRENT_HARNESS_VERSION;
@@ -113,6 +116,8 @@ pub use model::PENDING_QUESTIONS_MESSAGE_ID_KEY;
 pub use model::PROPOSAL_OUTCOME_APPLIED;
 pub use model::PROPOSAL_OUTCOME_DISMISSED;
 pub use model::PROPOSAL_RESOLUTIONS_KEY;
+pub use model::REPOSITORY_GUIDANCE_HARNESS_VERSIONS;
+pub use model::REPOSITORY_MONITOR_GUIDANCE_HARNESS_VERSIONS;
 pub use model::WORKSPACE_STATUS_MESSAGE_MAX_LENGTH;
 pub use model::{
     cap_json_value, fit_agent_list_frame, format_key_bytes_table, last_tool_use_preview,

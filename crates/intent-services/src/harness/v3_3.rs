@@ -47,7 +47,7 @@ mod tests {
         .expect("assembled prompt")
     }
 
-    /// End to end through system-prompt assembly: a new (3.3) default agent
+    /// End to end through system-prompt assembly: a 3.3-stamped default agent
     /// carries the workspace block once, a 3.2-stamped session keeps its exact
     /// duplicated prompt, and a specialist agent type is byte-identical.
     #[tokio::test]
@@ -55,8 +55,8 @@ mod tests {
         let (_tmp, svc, ws) = setup().await;
         let id = AgentId::from("agent-5835");
         seed_agent(&svc, &ws, &id).await;
-        let current = svc.store().get_agent_session(&id).await.unwrap();
-        assert_eq!(current.harness_version, "3.3");
+        let mut current = svc.store().get_agent_session(&id).await.unwrap();
+        current.harness_version = "3.3".into();
         let mut previous = current.clone();
         previous.harness_version = "3.2".into();
         let workspace = super::ENTRY.doctrine.instructions.workspace;
