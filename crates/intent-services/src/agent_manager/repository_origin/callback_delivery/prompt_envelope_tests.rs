@@ -144,7 +144,10 @@ impl Harness {
                 )
                 .await
                 .unwrap();
-            assert_eq!(created["agent"]["harnessVersion"], "3.3");
+            assert_eq!(
+                created["agent"]["harnessVersion"],
+                intent_core::CURRENT_HARNESS_VERSION
+            );
             services
                 .store
                 .get_agent_session(&AgentId::from(created["agent"]["id"].as_str().unwrap()))
@@ -802,7 +805,10 @@ let SESSION_ID = `config-session-${process.pid}`;
                 )
                 .await
                 .unwrap();
-            assert_eq!(created["agent"]["harnessVersion"], "3.3");
+            assert_eq!(
+                created["agent"]["harnessVersion"],
+                intent_core::CURRENT_HARNESS_VERSION
+            );
             services
                 .store
                 .get_agent_session(&AgentId::from(created["agent"]["id"].as_str().unwrap()))
