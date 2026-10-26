@@ -357,7 +357,7 @@ API:
     The daemon polls the PR for you and wakes you with ONE consolidated message after the PR has been quiet for the debounce window, so a stream of comments/checks does not wake you repeatedly. Merge or close stops the monitor with an immediate final wake; the monitor otherwise has NO TTL and survives daemon restarts — this is why it beats a self-authored polling hook for PR watching. Re-registering the same PR is idempotent: it refreshes the baseline instead of adding a second monitor.
     Active monitors per agent are bounded by `prMonitor.maxPerAgent` (default 5, configurable 1–100 by the user). Raising it supports a multi-repository inventory on one owner; shared polling slows as inventory grows. Lowering it preserves existing watches. Prefer this setting over extra monitor-owner agents or duplicate polling hooks.
     ONE monitor per PR per workspace: when ANOTHER live agent in this workspace already holds an active monitor on the PR, the call is REFUSED (not an error) and returns `{ ok: false, refused: true, reason: "already-monitored", ownerAgentId, ownerAgentName?, monitorId, repo, prNumber, instruction }` instead of `{ ok, monitor, requirements }` — the owner's agent id, its session name when it has one, and its `monitorId`. That owner receives the PR's wakes — do not re-register; instead `ws.agent.send(ownerAgentId, …)` to ask the owner either to relay the specific PR events you care about when its monitor wakes, or to relinquish the monitor with `ws.pr.unmonitor` so you can call `ws.pr.monitor` yourself; use `ws.pr.snapshot` for a one-shot read of the current state. The PR becomes registrable again once the owner's monitor is cancelled or completes. Your OWN re-register is never refused. A monitor whose owner can no longer receive wakes (its session failed, was deleted or retired, or is gone) is ORPHANED, not held: your `ws.pr.monitor` on that PR ADOPTS it instead of being refused — the same monitor row is re-armed under you (baseline refreshed, pending changes cleared; no second row), the ordinary success payload carries `adoptedFrom` (the previous owner's agent id), and you receive the PR's wakes from then on. Adoption counts against your own monitor cap like a fresh registration. PARENT TAKEOVER: a monitor held by your own DIRECT sub-agent (its `parentAgentId` is you — no grandchildren, no peers, never the reverse) is likewise ADOPTED, not refused, once that child has SETTLED — its linked task note is `complete` / `cancelled`, or it is idle with nothing pending except its PR monitors (no busy turn, queued message, unresolved blocker/discussion or question, watch, event subscription, or active hook); the same success payload with `adoptedFrom` results, and the child is told once via a queued `pr_monitor_wake` with `reason: "transferred"` and `adoptedBy` (your agent id) so it does not re-register. A child that is still working keeps its monitor: you get the ordinary refusal, whose `instruction` says when it becomes adoptable — retry when the child's task moves to `complete` / `cancelled`, or when a `ws.agent.watch` on the child delivers its monitoring-idle advisory (`childExternallyWaiting` naming only `waitingOnPrMonitors`) or `ws.agent.status` shows it idle with nothing else pending. Do NOT wait for the child's genuine completion: while it holds the monitor that completion is exactly what the watch defers, so it may never come. Retry rather than asking it to relinquish.
-  ws.pr.unmonitor(prNumber, { repo? }) → { ok, monitor }  // Stop a PR watch only on merge/close or explicit user ask, not green checks or a done task. Stops a PR monitor you registered. Errors when you have no active monitor on it; you can only cancel your own monitors, and your own cancel never wakes you.
+  ws.pr.unmonitor(prNumber, { repo? }) → { ok, monitor }  // Stop on merge/close, user ask or handoff. Never stop just because checks are green or your task is done; this cancels a PR monitor you registered. Errors when you have no active monitor on it; you can only cancel your own monitors, and your own cancel never wakes you.
   ws.pr.monitors() → [monitors]  // List your active and completed monitors. Fields: `monitorId`, `repo`, `prNumber`, `title`, `url`, `state` (active|completed), `lastSnapshot` (last-refresh checklist summary), `pendingChanges` / `hasPendingChanges` (net changes since last report, awaiting debounce emit), `lastChangeAt?`, `lastPolledAt?`, `lastError?`, `pausedUntil?`.
     `pausedUntil?` (RFC 3339) is present on ACTIVE rows only while the daemon's global forge rate-limit pause is closed — polling is suspended until then, `lastError` names the same deadline, and `lastSnapshot` is stale until the first post-pause poll clears both.
   ws.pr.snapshot(prNumber, { repo? }?) → { repo, prNumber, title, url, state, isDraft, isMerged, isClosed, headSha, updatedAt, mergeable, mergeableState, mergeBlockedReason, checks: { total, passed, failed, pending, skipped, failedNames, skippedNames }, reviews: { decision, approvals, changesRequested }, comments: { conversationCount, reviewCommentCount, unresolvedThreadCount?, totalCount }, requirements: { state, isDraft, hasConflicts, isBehind, ancestry, branchUpdateRequired?, mergeable?, checks: { total, passed, failed, pending, skipped, items, failingRequired, pendingRequired, requiredKnown }, approvals: { decision, have, needed?, changesRequested }, threads: { unresolved?, resolutionRequired? }, mergeStateStatus?, mergeBlockedReason?, isInMergeQueue?, mergeQueue?, mergeQueueEjection?, checksNotStarted?, rulesKnown }, pausedUntil? }  // Compact, diff-friendly ONE-SHOT read of PR `prNumber`, in the workspace repo unless `repo: "owner/name"` overrides it (e.g. a submodule); the result echoes the resolved `repo` so a wrong-repo read is detectable. `prNumber` is required — no active-PR fallback. `comments.unresolvedThreadCount` and `requirements.threads.unresolved` are omitted (never null) when the thread resolution state was unreadable; 0 is the ordinary known count when every thread is resolved — treat absence as unknown. `passed` excludes checks the forge skipped without running; they are counted in `skipped` (named in `checks.skippedNames`, item status `skipped`) and do not block merge. `requirements.checksNotStarted` `{ headSha, headCommittedAt, thresholdMinutes }` appears when CI never started on the head (zero checks 15+ min after its commit time); push again or rebase to trigger it.
@@ -660,7 +660,7 @@ API:
     The daemon polls the PR for you and wakes you with ONE consolidated message after the PR has been quiet for the debounce window, so a stream of comments/checks does not wake you repeatedly. Merge or close stops the monitor with an immediate final wake; the monitor otherwise has NO TTL and survives daemon restarts — this is why it beats a self-authored polling hook for PR watching. Re-registering the same PR is idempotent: it refreshes the baseline instead of adding a second monitor.
     Active monitors per agent are bounded by `prMonitor.maxPerAgent` (default 5, configurable 1–100 by the user). Raising it supports a multi-repository inventory on one owner; shared polling slows as inventory grows. Lowering it preserves existing watches. Prefer this setting over extra monitor-owner agents or duplicate polling hooks.
     ONE monitor per PR per workspace: when ANOTHER live agent in this workspace already holds an active monitor on the PR, the call is REFUSED (not an error) and returns `{ ok: false, refused: true, reason: "already-monitored", ownerAgentId, ownerAgentName?, monitorId, repo, prNumber, instruction }` instead of `{ ok, monitor, requirements }` — the owner's agent id, its session name when it has one, and its `monitorId`. That owner receives the PR's wakes — do not re-register; instead `ws.agent.send(ownerAgentId, …)` to ask the owner either to relay the specific PR events you care about when its monitor wakes, or to relinquish the monitor with `ws.pr.unmonitor` so you can call `ws.pr.monitor` yourself; use `ws.pr.snapshot` for a one-shot read of the current state. The PR becomes registrable again once the owner's monitor is cancelled or completes. Your OWN re-register is never refused. A monitor whose owner can no longer receive wakes (its session failed, was deleted or retired, or is gone) is ORPHANED, not held: your `ws.pr.monitor` on that PR ADOPTS it instead of being refused — the same monitor row is re-armed under you (baseline refreshed, pending changes cleared; no second row), the ordinary success payload carries `adoptedFrom` (the previous owner's agent id), and you receive the PR's wakes from then on. Adoption counts against your own monitor cap like a fresh registration. PARENT TAKEOVER: a monitor held by your own DIRECT sub-agent (its `parentAgentId` is you — no grandchildren, no peers, never the reverse) is likewise ADOPTED, not refused, once that child has SETTLED — its linked task note is `complete` / `cancelled`, or it is idle with nothing pending except its PR monitors (no busy turn, queued message, unresolved blocker/discussion or question, watch, event subscription, or active hook); the same success payload with `adoptedFrom` results, and the child is told once via a queued `pr_monitor_wake` with `reason: "transferred"` and `adoptedBy` (your agent id) so it does not re-register. A child that is still working keeps its monitor: you get the ordinary refusal, whose `instruction` says when it becomes adoptable — retry when the child's task moves to `complete` / `cancelled`, or when a `ws.agent.watch` on the child delivers its monitoring-idle advisory (`childExternallyWaiting` naming only `waitingOnPrMonitors`) or `ws.agent.status` shows it idle with nothing else pending. Do NOT wait for the child's genuine completion: while it holds the monitor that completion is exactly what the watch defers, so it may never come. Retry rather than asking it to relinquish.
-  ws.pr.unmonitor(prNumber, { repo? }) → { ok, monitor }  // Stop a PR watch only on merge/close or explicit user ask, not green checks or a done task. Stops a PR monitor you registered. Errors when you have no active monitor on it; you can only cancel your own monitors, and your own cancel never wakes you.
+  ws.pr.unmonitor(prNumber, { repo? }) → { ok, monitor }  // Stop on merge/close, user ask or handoff. Never stop just because checks are green or your task is done; this cancels a PR monitor you registered. Errors when you have no active monitor on it; you can only cancel your own monitors, and your own cancel never wakes you.
   ws.pr.monitors() → [monitors]  // List your active and completed monitors. Fields: `monitorId`, `repo`, `prNumber`, `title`, `url`, `state` (active|completed), `lastSnapshot` (last-refresh checklist summary), `pendingChanges` / `hasPendingChanges` (net changes since last report, awaiting debounce emit), `lastChangeAt?`, `lastPolledAt?`, `lastError?`, `pausedUntil?`.
     `pausedUntil?` (RFC 3339) is present on ACTIVE rows only while the daemon's global forge rate-limit pause is closed — polling is suspended until then, `lastError` names the same deadline, and `lastSnapshot` is stale until the first post-pause poll clears both.
   ws.pr.snapshot(prNumber, { repo? }?) → { repo, prNumber, title, url, state, isDraft, isMerged, isClosed, headSha, updatedAt, mergeable, mergeableState, mergeBlockedReason, checks: { total, passed, failed, pending, skipped, failedNames, skippedNames }, reviews: { decision, approvals, changesRequested }, comments: { conversationCount, reviewCommentCount, unresolvedThreadCount?, totalCount }, requirements: { state, isDraft, hasConflicts, isBehind, ancestry, branchUpdateRequired?, mergeable?, checks: { total, passed, failed, pending, skipped, items, failingRequired, pendingRequired, requiredKnown }, approvals: { decision, have, needed?, changesRequested }, threads: { unresolved?, resolutionRequired? }, mergeStateStatus?, mergeBlockedReason?, isInMergeQueue?, mergeQueue?, mergeQueueEjection?, checksNotStarted?, rulesKnown }, pausedUntil? }  // Compact, diff-friendly ONE-SHOT read of PR `prNumber`, in the workspace repo unless `repo: "owner/name"` overrides it (e.g. a submodule); the result echoes the resolved `repo` so a wrong-repo read is detectable. `prNumber` is required — no active-PR fallback. `comments.unresolvedThreadCount` and `requirements.threads.unresolved` are omitted (never null) when the thread resolution state was unreadable; 0 is the ordinary known count when every thread is resolved — treat absence as unknown. `passed` excludes checks the forge skipped without running; they are counted in `skipped` (named in `checks.skippedNames`, item status `skipped`) and do not block merge. `requirements.checksNotStarted` `{ headSha, headCommittedAt, thresholdMinutes }` appears when CI never started on the head (zero checks 15+ min after its commit time); push again or rebase to trigger it.
@@ -2215,9 +2215,7 @@ mod tests {
             },
             &[],
         );
-        // +48 bytes (intent-hq/intent#4673): the `ws.pr.unmonitor` summary
-        // states when a monitor may be stopped.
-        assert!(without_desktop.len() < 24_048);
+        assert!(without_desktop.len() < 24_000);
         assert!(
             condensed.len() - without_desktop.len() <= 1_500,
             "desktop signatures exceed their 1500-byte allowance"
@@ -2289,28 +2287,35 @@ mod tests {
         );
     }
 
-    // intent-hq/intent#4673: the condensed index drops continuation lines, so
-    // the `ws.pr.unmonitor` summary's first sentence must itself state when
-    // stopping a monitor is appropriate (merge/close or an explicit user ask),
-    // not green checks or a finished task.
+    // intent-hq/intent#4673: the condensed index keeps only each summary's
+    // first sentence, so the `ws.pr.unmonitor` first sentence must itself
+    // name the stop boundary (merge/close, an explicit user ask, or a
+    // confirmed ownership handoff); the full text adds the negatives (green
+    // checks or a finished task are no reason to stop).
     #[test]
     fn condensed_unmonitor_summary_states_stop_boundary() {
-        for is_chief in [false, true] {
-            let condensed = condensed_workspace_api_description(
-                is_chief,
-                &AgentFeaturesSettings::default(),
-                &[],
-            );
-            let line = condensed
-                .lines()
+        let features = AgentFeaturesSettings::default();
+        let unmonitor_line = |text: &str| -> String {
+            text.lines()
                 .find(|l| l.trim_start().starts_with("ws.pr.unmonitor("))
-                .expect("condensed index lists ws.pr.unmonitor");
-            for needle in [
-                "only on merge/close",
-                "explicit user ask",
-                "not green checks or a done task",
-            ] {
-                assert!(line.contains(needle), "missing {needle:?} in: {line}");
+                .expect("description lists ws.pr.unmonitor")
+                .to_owned()
+        };
+        for is_chief in [false, true] {
+            let condensed = unmonitor_line(&condensed_workspace_api_description(
+                is_chief,
+                &features,
+                &[],
+            ));
+            for needle in ["merge/close", "user ask", "handoff"] {
+                assert!(
+                    condensed.contains(needle),
+                    "missing {needle:?} in: {condensed}"
+                );
+            }
+            let full = unmonitor_line(&workspace_api_description(is_chief, &features));
+            for needle in ["checks are green", "task is done"] {
+                assert!(full.contains(needle), "missing {needle:?} in: {full}");
             }
         }
     }
