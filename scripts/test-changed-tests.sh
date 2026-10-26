@@ -109,7 +109,7 @@ write Cargo.lock
 write rust-toolchain.toml
 write .config/nextest.toml
 write .cargo/config.toml
-write crates/alpha/Cargo.toml
+write crates/alpha/Cargo.toml $'[package]\nname = "alpha"\n\n[dependencies]\nintent-core = { path = "../intent-core", version = "0.1" }'
 write crates/alpha/src/lib.rs
 write crates/alpha/src/util/mod.rs
 write crates/alpha/tests/one.rs
@@ -119,24 +119,28 @@ write crates/alpha/tests/fixtures/data.json
 write crates/alpha/tests/fixtures/café.json
 write crates/alpha/benches/bench.rs
 write crates/alpha/examples/demo.rs
-write crates/beta/Cargo.toml
+write crates/beta/Cargo.toml $'[package]\nname = "beta"\n\n[dependencies]\n# intent-core = { path = "../intent-core" }\nserde = "1"'
 write crates/beta/build.rs
 write crates/beta/src/main.rs
 write crates/beta/tests/smoke.rs
 write crates/beta/migrations/001.sql
-write crates/gamma/Cargo.toml
+write crates/gamma/Cargo.toml $'[package]\nname = "gamma"\n\n[dev-dependencies]\ncore = { package = "intent-core", path = "../intent-core/" }'
 write crates/gamma/src/lib.rs
 write crates/gamma/tests/smoke.rs
-write crates/intent-services/Cargo.toml
+write crates/intent-core/Cargo.toml $'[package]\nname = "intent-core"'
+write crates/intent-core/src/lib.rs
+write crates/intent-core/tests/core.rs
+write crates/intent-core/resources/data.txt
+write crates/intent-services/Cargo.toml $'[package]\nname = "intent-services"\n\n[target."cfg(unix)".dependencies]\nintent-core.workspace = true'
 write crates/intent-services/src/lib.rs
 write crates/intent-services/tests/smoke.rs
-write crates/intent-svc-transfer/Cargo.toml
+write crates/intent-svc-transfer/Cargo.toml $'[package]\nname = "intent-svc-transfer"\n\n[dependencies]\nintent-services = { path = "../intent-services" }'
 write crates/intent-svc-transfer/src/lib.rs
 write crates/intent-svc-transfer/tests/smoke.rs
-write crates/intent-app/Cargo.toml
+write crates/intent-app/Cargo.toml $'[package]\nname = "intent-app"\n\n[dependencies]\nintent-services = { path = "../intent-services" }'
 write crates/intent-app/src/lib.rs
 write crates/intent-app/tests/smoke.rs
-write crates/intentd/Cargo.toml
+write crates/intentd/Cargo.toml $'[package]\nname = "intentd"\n\n[dependencies.intent-services]\nworkspace = true'
 write crates/intentd/src/main.rs
 write crates/intentd/tests/auggie_context_e2e.rs
 write crates/intentd/tests/e2e_core.rs $'//! fixture module\n\nmod inner;'
@@ -148,7 +152,7 @@ write crates/intentd/tests/suite_e2e.rs $'//! fixture suite\nmod common;\n\nmod 
 write crates/intentd/tests/suite_wss.rs $'mod common;\nmod e2e_wss_x;'
 write crates/intentd/tests/common/mod.rs
 write crates/intentd/tests/e2e_wss_agent_lifecycle.rs $'mod common;\n#[path = "e2e_shared/helper.rs"]\nmod helper;'
-write crates/delta/Cargo.toml
+write crates/delta/Cargo.toml $'[package]\nname = "delta"\n\n[build-dependencies.alpha]\npath = "../alpha"'
 write crates/delta/src/lib.rs
 write crates/delta/src/script.rs
 write crates/delta/src/monitor.rs
@@ -406,6 +410,76 @@ edit crates/intent-app/src/lib.rs
 run_script
 expect_ok
 expect_cargo "-p intent-app --lib --bins --tests"
+
+# intent-core is the leaf every crate builds on: a src change there selects
+# every workspace crate depending on it, directly or transitively, through
+# any dependency table (intentd#2698: an intent-core harness-version change
+# broke an intent-acp test that only the merge queue ran). The fixture covers
+# a plain path dependency (alpha), a renamed dev-dependency (gamma), a
+# target-specific workspace-inherited one (intent-services), table forms
+# (intentd, delta) and transitive edges (delta via alpha; intentd, intent-app
+# and intent-svc-transfer via intent-services); beta only names intent-core
+# in a comment.
+core_rdeps_lib="-p alpha -p delta -p gamma -p intent-app -p intent-core -p intent-services -p intent-svc-transfer --lib --bins --tests"
+core_rdeps_note="[test-changed] note: crates/intent-core changed; its reverse dependencies run too (alpha, delta, gamma, intent-app, intent-services, intent-svc-transfer, intentd)"
+
+case_name="intent-core src change selects every reverse dependency"
+reset_repo
+edit crates/intent-core/src/lib.rs
+commit_all
+run_script
+expect_ok
+expect_plan "$core_rdeps_lib" "-p intentd --bins --tests"
+expect_cargo "$core_rdeps_lib" "-p intentd --bins --tests"
+[[ "$stdout" == *"$core_rdeps_note"* ]] || fail "$case_name: no reverse-dependency note: $stdout"
+[[ "$(grep -c 'note:' <<<"$stdout")" -eq 1 ]] || fail "$case_name: expected one note: $stdout"
+
+case_name="intent-core non-src crate file also selects every reverse dependency"
+reset_repo
+edit crates/intent-core/resources/data.txt
+run_script
+expect_ok
+expect_cargo "-p alpha -p delta -p gamma -p intent-app -p intent-services -p intent-svc-transfer --lib --bins --tests" "-p intent-core" "-p intentd --bins --tests"
+[[ "$stdout" == *"$core_rdeps_note"* ]] || fail "$case_name: no reverse-dependency note: $stdout"
+
+case_name="intent-core test-only change selects only intent-core"
+reset_repo
+edit crates/intent-core/tests/core.rs
+run_script
+expect_ok
+expect_cargo "-p intent-core --test core"
+
+case_name="intent-core reverse dependencies subsume narrower selections"
+reset_repo
+edit crates/intent-core/src/lib.rs
+edit crates/alpha/tests/one.rs
+edit crates/delta/src/script.rs
+run_script
+expect_ok
+expect_cargo "$core_rdeps_lib" "-p intentd --bins --tests"
+
+case_name="intent-core dry run prints the reverse-dependency plan"
+reset_repo
+edit crates/intent-core/src/lib.rs
+DRY_RUN=1 run_script
+expect_ok
+expect_plan "$core_rdeps_lib" "-p intentd --bins --tests"
+[[ -z "$cargo_log" ]] || fail "$case_name invoked cargo: $cargo_log"
+
+case_name="instrumented intent-core src change selects every reverse dependency"
+reset_repo
+edit crates/intent-core/src/lib.rs
+run_script --instrumented
+expect_ok
+expect_cov "$core_rdeps_lib" "-p intentd --bins --tests"
+[[ "$stdout" == *"[coverage-changed] note: crates/intent-core changed; its reverse dependencies run too"* ]] || fail "$case_name: no reverse-dependency note: $stdout"
+
+case_name="a crate other than intent-core does not propagate to its dependents"
+reset_repo
+edit crates/alpha/src/lib.rs
+run_script
+expect_ok
+expect_cargo "-p alpha --lib --bins --tests"
 
 case_name="src change in a crate without a lib drops --lib"
 reset_repo
