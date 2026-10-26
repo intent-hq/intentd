@@ -54,11 +54,18 @@ env:
   LINUX_BIGMEM_BURST_THRESHOLD: ${{ vars.CI_LINUX_BIGMEM_SLOTS || '0' }}
 
 # The heavy jobs share two self-hosted Linux slots, so cancel
-# superseded PR runs instead of letting them back up the queue (push-to-main
-# runs are never cancelled).
+# superseded PR runs instead of letting them back up the queue. Main pushes
+# share one group too, and a newer push cancels the older commit's run even
+# mid-flight: auto-cut-alpha.yml reads only the push run on main's live tip,
+# and main is linear, so the cancelled run is never the tip's. Per-commit
+# Windows proofs therefore cover only commits that reach the tip (each tip's
+# tree contains every superseded commit). A re-run (attempt > 1) gets a group
+# of its own, so re-running an old commit can never cancel the tip's run.
+# Merge-queue refs are unique per entry and never cancelled here
+# (retire-obsolete-merge-runs.yml retires obsolete queue runs).
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ${{ github.workflow }}-${{ github.ref }}${{ github.event_name == 'push' && github.run_attempt != '1' && format('-rerun-{0}', github.run_id) || '' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
 
 jobs:
   # Paid-label workloads prefer compatible self-hosted capacity; free standard labels run on GitHub. Keep the probe
@@ -826,21 +833,30 @@ jobs:
   release-fast-path:
     needs: [route]
     runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
-    # Same-repo release-plz PRs only (fork PRs get no CI — see the
-    # `pull_request` trigger comment). Ordinary PRs skip it at once, so the
-    # `check` / `coverage-changed` dependency costs them no queue time.
-    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'release-plz-')
+    # Same-repo release-plz PRs (fork PRs get no CI — see the `pull_request`
+    # trigger comment) and every main push. Ordinary PRs skip it at once, so
+    # the `check` / `coverage-changed` dependency costs them no queue time.
+    # A main push compares against the previous tip (`github.event.before`):
+    # a release-metadata push (`chore: release vX.Y.Z`) is a tree auto-cut
+    # just required green plus release metadata, so it skips the Windows
+    # post-merge job (`release_push`). Each event gets only its own output,
+    # so a push never trips the `fast_path` guards on the `build` steps and
+    # the macOS release build still runs.
+    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'release-plz-'))
     timeout-minutes: 5
     outputs:
-      fast_path: ${{ steps.decide.outputs.fast_path }}
+      fast_path: ${{ github.event_name == 'pull_request' && steps.decide.outputs.fast_path || '' }}
+      release_push: ${{ github.event_name == 'push' && steps.decide.outputs.fast_path || '' }}
     steps:
       - uses: actions/checkout@v7
-      - name: Fetch PR base commit
-        run: git fetch --no-tags --depth=1 origin ${{ github.event.pull_request.base.sha }}
+      - name: Fetch base commit
+        env:
+          BASE_SHA: ${{ github.event_name == 'push' && github.event.before || github.event.pull_request.base.sha }}
+        run: git fetch --no-tags --depth=1 origin "$BASE_SHA"
       - name: Evaluate diff shape
         id: decide
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_SHA: ${{ github.event_name == 'push' && github.event.before || github.event.pull_request.base.sha }}
         run: |
           set -euo pipefail
           # Script contract: prints fast_path=true|false; non-zero exit means
@@ -861,7 +877,9 @@ jobs:
     # `windows` job below. The explicit event allowlist prevents matrix
     # expansion for all PRs, including forks and release-shaped PRs.
     # `!cancelled()` permits skipped release-fast-path and failed route
-    # dependencies: release metadata is PR-only, and the native runner has a
+    # dependencies: the PR `fast_path` output is empty on push and
+    # merge_group (a release push reports only `release_push`, which these
+    # steps ignore, so the macOS release build still runs), and the native runner has a
     # hosted fallback when routing fails. CI Gate still rejects skipped Linux
     # validation on merge_group after a route failure.
     # `route` places the native entry and runs on every event this job runs
@@ -963,9 +981,9 @@ jobs:
       # scripts (libz-sys and friends try-compile C for the target even when
       # pkg-config resolves a system lib), which would require a full
       # darwin / MSVC cross C toolchain on Linux; the native runners need
-      # nothing extra and share this job's warm target dir. release-fast-path
-      # is pull_request-only, so its output is empty on merge_group and the
-      # `!= 'true'` guard lets the step run there.
+      # nothing extra and share this job's warm target dir. release-fast-path's
+      # `fast_path` output is pull_request-only, so it is empty on merge_group
+      # and the `!= 'true'` guard lets the step run there.
       - name: Clippy (target-gated code)
         if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'merge_group'
         run: cargo clippy --workspace --all-targets --target ${{ matrix.target }} -- -D warnings
@@ -1146,10 +1164,14 @@ jobs:
   # them (the queue runs only `windows-lint` above). A Windows-only runtime
   # failure therefore lands on main; the push CI Gate goes red and
   # auto-cut-alpha.yml refuses to cut an alpha until a fix (or a re-run)
-  # turns it green. Routed like `windows-lint`.
+  # turns it green. Routed like `windows-lint`. A newer main push cancels a
+  # superseded commit's run (see the workflow `concurrency`), and a
+  # release-metadata push skips this job: release-fast-path reported
+  # release_push=true, and CI Gate accepts the skip only then. A failed or
+  # skipped classifier reports nothing, so the job still runs.
   windows:
-    needs: [route]
-    if: ${{ !cancelled() && github.event_name == 'push' }}
+    needs: [route, release-fast-path]
+    if: ${{ !cancelled() && github.event_name == 'push' && needs.release-fast-path.outputs.release_push != 'true' }}
     strategy:
       matrix:
         include:
@@ -1385,7 +1407,7 @@ jobs:
     # would skip it on fork PRs anyway, where route itself is skipped).
     # Nothing here may reference github.event.pull_request — that
     # context does not exist on merge_group. release-fast-path is no longer a
-    # dependency: it is pull_request-only, so its output is empty on
+    # dependency: its `fast_path` output is pull_request-only, so it is empty on
     # merge_group and must not be required; the fast-path skip it used to
     # provide is subsumed by the pull_request skip. Merge groups come from
     # the repo's own ruleset, so no same-repo fork guard applies.
@@ -2521,6 +2543,13 @@ jobs:
               require pi-session-paths "${{ needs.pi-session-paths.result }}"
               ;;
             push)
+              # Release-metadata pushes skip the Windows post-merge job; the
+              # skip is accepted only when the classifier job succeeded and
+              # reported release_push (see `release-fast-path`).
+              windows=require
+              if [ "${{ needs.release-fast-path.result }}" = success ] && [ "${{ needs.release-fast-path.outputs.release_push }}" = true ]; then
+                windows=optional
+              fi
               require route "${{ needs.route.result }}"
               optional pr-static "${{ needs.pr-static.result }}"
               optional cache-smoke "${{ needs.cache-smoke.result }}"
@@ -2529,7 +2558,7 @@ jobs:
               optional windows-cross-lint "${{ needs.windows-cross-lint.result }}"
               require build "${{ needs.build.result }}"
               optional windows-lint "${{ needs.windows-lint.result }}"
-              require windows "${{ needs.windows.result }}"
+              "$windows" windows "${{ needs.windows.result }}"
               optional macos-services-runtime "${{ needs.macos-services-runtime.result }}"
               optional coverage-e2e "${{ needs.coverage-e2e.result }}"
               optional coverage-all "${{ needs.coverage-all.result }}"

@@ -128,12 +128,14 @@ def template_value(value, values):
     A lone expression keeps its type; mixed text concatenates strings.
     """
     def evaluate(expression):
+        # Title-case bare true/false only, never inside quoted literals.
+        expression = re.sub(r"'[^']*'|\btrue\b|\bfalse\b",
+                            lambda m: m[0] if m[0].startswith("'") else m[0].title(), expression)
         expression = re.sub(r"format\('([^']*)', ([\w.]+)\)",
                             lambda m: repr(m[1].replace("{0}", str(values[m[2]]))), expression)
         expression = re.sub(r"\b(?:github|steps)\.[\w.-]+", lambda m: repr(values[m[0]]), expression)
         expression = expression.replace("&&", " and ").replace("||", " or ")
         expression = re.sub(r"!(?!=)", " not ", expression).strip()
-        expression = re.sub(r"\btrue\b|\bfalse\b", lambda m: m[0].title(), expression)
         tree = ast.parse(expression, mode="eval")
         allowed = (ast.Expression, ast.BoolOp, ast.UnaryOp, ast.Compare, ast.Constant,
                    ast.And, ast.Or, ast.Not, ast.Eq, ast.NotEq)
