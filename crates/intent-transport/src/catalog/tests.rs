@@ -5,9 +5,12 @@
 //! version" message.
 //!
 //! Router and fast-path methods are mechanically extracted from source at test
-//! runtime to detect drift. Notifications and reverse RPCs use count-based
-//! checks only (extracting reverse `.request("...")` call sites would be
-//! fragile); renames are a lower-risk edge case caught during code review.
+//! runtime to detect drift. Every catalog entry (router, fast path, aliases,
+//! notifications, reverse RPCs) is also frozen by name in the checked-in
+//! golden `tests/goldens/method_catalog.txt` ([`method_catalog_matches_golden`]);
+//! notifications and reverse RPCs are not extracted from source (reverse
+//! `.request("...")` call sites would be fragile), so the golden is their only
+//! freeze.
 
 use super::{
     canonical_method, collaborator_may_call, COLLABORATOR_METHODS, FASTPATH_METHODS,
@@ -126,116 +129,6 @@ fn extract_fastpath_methods() -> HashSet<String> {
     methods
 }
 
-/// Golden count: total client-callable methods (router + fastpath + aliases).
-///
-/// This constant must match the sum below. If it doesn't, you've added or
-/// removed methods without updating the catalog. The catalog freeze is
-/// intentional: any surface change requires a protocol version bump and a
-/// docs/protocol/ update.
-///
-/// REV-2 browser tab registry (intent-hq/intent#461): +4 fast-path methods
-/// (`browser.listTabs` / `browser.upsertTab` / `browser.removeTab` /
-/// `browser.syncTabs`), protocol 9.10. REV-2 routing: +2 fast-path methods
-/// (`browser.navigateTab` / `browser.closeTab`), protocol 9.11.
-///
-/// 355 → 366: `extract_router_methods` rejected `-` in method names, so the 11
-/// already-shipped `accept-changes.*` / `file-tracking.*` router arms were never
-/// frozen here. No protocol bump — the wire surface did not change.
-///
-/// Multiplayer w4 (invite links + identity-only join): +4 router methods
-/// (`workspace.invite.list` / `workspace.invite.revoke` /
-/// `workspace.members.leave` / `principal.revokeSelf`) and +2 fast-path
-/// methods (`workspace.invite.create`, `invite.redeem`).
-///
-/// Multiplayer w5 (presence): +2 fast-path methods (`presence.update`,
-/// `note.presence.update`) and +1 router method (`presence.snapshot`); the
-/// `note.presence.subscribe` / `note.presence.unsubscribe` channel pair is
-/// counted with the other subscription channels, not here.
-///
-/// Also within 10.3: +1 router method (`github.users.search`, the
-/// collaborator picker's login-prefix user search).
-///
-/// Agent memory attribution (§5.5): +1 router method (`agent.memoryUsage`).
-///
-/// Returning guest (multiplayer w4): +2 fast-path methods on the `/invite`
-/// endpoint (`invite.inspect`, `invite.accept`).
-///
-/// Gist identity proof (guest half): +2 router methods
-/// (`github.identityProof.create`, `github.identityProof.delete`).
-///
-/// Gist identity proof (host half): +2 fast-path methods on the `/invite`
-/// endpoint (`invite.challenge`, `invite.prove`).
-///
-/// Gist identity proof replaces the host-side device flow: −1 fast-path
-/// method (`invite.redeem`); the guest joins through `invite.challenge` /
-/// `invite.prove` (or `invite.accept` with a credential) instead.
-///
-/// Direct member add: +2 router methods (`principal.list`, the owner-only
-/// roster of credentialed guests; `workspace.members.add`, the owner-only
-/// direct attach of one of them).
-///
-/// Provider-generic auth (protocol 10.5, §5.27): +5 router methods
-/// (`sourceControl.authStatus` / `connect` / `cancelAuth` / `revoke` /
-/// `getUser`); the `github.*` auth quintet stays as byte-identical aliases.
-///
-/// Provider-generic identity proof (protocol 10.8): +2 router methods
-/// (`sourceControl.identityProof.create` / `delete`, the GitHub gist or
-/// GitLab snippet proof by `provider`); the `github.identityProof.*` pair
-/// stays as byte-identical aliases.
-/// Direct user retirement (protocol 10.10): +1 router method (`agent.retire`).
-/// Explicit PR detail reads (protocol 13.2): +3 router methods.
-/// Explicit queued batch sending (protocol 13.1): +1 router method.
-/// Reversible script history (protocol 10.11): +2 router methods
-/// (`script.archive`, `script.restore`).
-/// Durable script monitors (protocol 12.1): +3 router methods.
-/// Protocol 13.0 removes the deprecated git.commit router method.
-// GitLab pre-workspace checkout (13.5): +6 router methods.
-// Provider adapter preparation (13.6): +1 fast-path method.
-// Desktop control adds four router methods; reverse methods are counted separately.
-// GitLab checkout repository configuration adds one router method.
-// Cancellable note deletion (13.10): +3 router methods.
-// Legacy workspace import removal (15.0): -1 fast-path method.
-// Human workspace discussions: +5 router methods; PR workspace lookup: +1.
-// Named provider profiles (§5.54): +4 router methods.
-// Provider profile order (§5.54 `providers.profiles.reorder`): +1 router method.
-// Default configuration overrides (§5.54 `providers.profiles.updateDefault`): +1 router method.
-// Generic event recovery adds the events.fence fast path.
-// Correlated discussion controls: +2 router methods.
-// Persisted guest roles: +1 owner-only role assignment method.
-// Startup status (14.1): +1 fast-path method.
-// Scoped repository pages and child Git policy (15.1): +8 router methods.
-// Provider worker observations (§5.5b, `agentWorkers: 1`): +2 router, +1 fast path.
-// Note paging removal: -3 router methods (cancellable note deletion).
-const EXPECTED_TOTAL_METHODS: usize = 463;
-
-/// Golden count: router methods (canonical + canonical forms of aliases).
-/// Protocol 12.0 removes five router methods, three fast paths and two aliases.
-/// Protocol 12.1 adds the three script-monitor controls.
-/// The subsequent git.commit removal removes one more router method.
-/// Protocol 13.10 adds three cancellable note deletion controls.
-/// Five discussion methods and one PR workspace lookup method are additive.
-/// Named provider profiles (§5.54) add the four `providers.profiles.*` methods,
-/// then `providers.profiles.reorder` and `providers.profiles.updateDefault`.
-/// Correlated discussion controls add `discussion.stopAgent` and `discussion.retryAgent`.
-/// Persisted guest roles add `workspace.members.setRole`.
-/// Scoped repository pages and child Git policy add eight router methods.
-/// Provider worker observations (§5.5b) add `agent.workers.list` / `.stop`.
-/// Removing note paging drops the three cancellable note deletion controls.
-const EXPECTED_ROUTER_METHODS: usize = 405;
-
-/// Golden count: fast-path methods (intercepted before router).
-/// `agent.workers.subscribe` (§5.5b) holds per-connection subscription state.
-const EXPECTED_FASTPATH_METHODS: usize = 58;
-
-/// Golden count: method aliases.
-const EXPECTED_ALIASES: usize = 0;
-
-/// Golden count: server→client notifications.
-const EXPECTED_NOTIFICATIONS: usize = 7;
-
-/// Golden count: client-served reverse RPCs.
-const EXPECTED_REVERSE_METHODS: usize = 6;
-
 #[test]
 fn router_methods_match_actual_source() {
     let actual = extract_router_methods();
@@ -350,52 +243,240 @@ fn fastpath_methods_match_actual_source() {
     }
 }
 
+/// Checked-in golden list of every catalog entry, relative to the crate root.
+///
+/// Bare count constants used to freeze the catalog, but two PRs that each add
+/// a method make the identical `405 → 406` edit, which git merges silently and
+/// CI then rejects as off by one (intentd#2605). With one sorted line per
+/// entry, concurrent additions either conflict textually at merge time or
+/// merge into a list that is still correct.
+const METHOD_GOLDEN_REL: &str = "tests/goldens/method_catalog.txt";
+
+/// Set to `1` to rewrite the golden from `catalog.rs` instead of asserting.
+const UPDATE_GOLDENS_ENV: &str = "INTENTD_UPDATE_GOLDENS";
+
+const METHOD_GOLDEN_REGENERATE: &str = "INTENTD_UPDATE_GOLDENS=1 cargo test -p intent-transport --lib catalog::tests::method_catalog_matches_golden";
+
+/// The catalog surface a golden is rendered from (parameterized for tests).
+struct CatalogSurface<'a> {
+    router: &'a [&'a str],
+    fastpath: &'a [&'a str],
+    aliases: &'a [(&'a str, &'a str)],
+    notifications: &'a [&'a str],
+    reverse: &'a [&'a str],
+}
+
+const LIVE_SURFACE: CatalogSurface<'static> = CatalogSurface {
+    router: ROUTER_METHODS,
+    fastpath: FASTPATH_METHODS,
+    aliases: METHOD_ALIASES,
+    notifications: NOTIFICATIONS,
+    reverse: REVERSE_METHODS,
+};
+
+/// One `<kind> <name>` line per entry (`alias <from> -> <to>` for aliases),
+/// sorted, so the file orders by kind then name. Duplicates are kept so
+/// [`duplicate_lines`] can name them.
+fn method_golden_entries(surface: &CatalogSurface<'_>) -> Vec<String> {
+    let tagged = |kind: &str, names: &[&str]| -> Vec<String> {
+        names.iter().map(|name| format!("{kind} {name}")).collect()
+    };
+    let mut entries = Vec::new();
+    entries.extend(tagged("router", surface.router));
+    entries.extend(tagged("fastpath", surface.fastpath));
+    entries.extend(tagged("notification", surface.notifications));
+    entries.extend(tagged("reverse", surface.reverse));
+    entries.extend(
+        surface
+            .aliases
+            .iter()
+            .map(|(from, to)| format!("alias {from} -> {to}")),
+    );
+    entries.sort();
+    entries
+}
+
+/// Each line that appears more than once in sorted `lines`, once.
+fn duplicate_lines(lines: &[String]) -> Vec<&str> {
+    let mut dups: Vec<&str> = lines
+        .windows(2)
+        .filter(|pair| pair[0] == pair[1])
+        .map(|pair| pair[0].as_str())
+        .collect();
+    dups.dedup();
+    dups
+}
+
+fn render_method_golden(surface: &CatalogSurface<'_>) -> String {
+    let mut out = String::from(
+        "# Golden list of every intentd protocol catalog entry, one `<kind> <name>` per line.\n\
+         # Generated from crates/intent-transport/src/catalog.rs; do not hand-edit. Regenerate:\n",
+    );
+    let _ = writeln!(out, "#   {METHOD_GOLDEN_REGENERATE}");
+    for entry in method_golden_entries(surface) {
+        out.push_str(&entry);
+        out.push('\n');
+    }
+    out
+}
+
+/// The golden's entry lines, sorted, duplicates kept.
+fn parse_method_golden(text: &str) -> Vec<String> {
+    let mut lines: Vec<String> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_string)
+        .collect();
+    lines.sort();
+    lines
+}
+
+/// `None` when `actual` (the checked-in golden) is exactly `expected`, up to
+/// CRLF line endings; otherwise a failure message listing the drifted entries
+/// and the fix.
+fn method_golden_drift(expected: &str, actual: &str) -> Option<String> {
+    let actual = actual.replace("\r\n", "\n");
+    if expected == actual {
+        return None;
+    }
+    let want = parse_method_golden(expected);
+    let have_lines = parse_method_golden(&actual);
+    let have_dups = duplicate_lines(&have_lines);
+    let want: BTreeSet<String> = want.into_iter().collect();
+    let have: BTreeSet<String> = have_lines.iter().cloned().collect();
+    let mut msg = String::from("Protocol method catalog drift: ");
+    if want == have && !have_dups.is_empty() {
+        msg.push_str("the golden repeats entries (a conflict resolution kept both sides?).\n");
+        for dup in have_dups {
+            let _ = writeln!(msg, "  duplicate line in the golden: {dup}");
+        }
+    } else if want == have {
+        msg.push_str(
+            "the golden lists the right entries but is not in canonical form (order, comments, or whitespace).\n",
+        );
+    } else {
+        msg.push_str("catalog.rs and the checked-in golden disagree.\n");
+        for missing in want.difference(&have) {
+            let _ = writeln!(msg, "  in catalog.rs but not in the golden: {missing}");
+        }
+        for extra in have.difference(&want) {
+            let _ = writeln!(msg, "  in the golden but not in catalog.rs: {extra}");
+        }
+    }
+    let _ = write!(
+        msg,
+        "If you added/removed/renamed methods, update the catalog in catalog.rs, \
+         update docs/protocol/05-method-catalog.md, and bump the protocol version; \
+         then regenerate {METHOD_GOLDEN_REL} with:\n  {METHOD_GOLDEN_REGENERATE}"
+    );
+    Some(msg)
+}
+
 #[test]
-fn catalog_counts_frozen() {
-    let router_count = ROUTER_METHODS.len();
-    let fastpath_count = FASTPATH_METHODS.len();
-    let alias_count = METHOD_ALIASES.len();
-    let total = router_count + fastpath_count + alias_count;
+fn method_catalog_matches_golden() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(METHOD_GOLDEN_REL);
+    let expected = render_method_golden(&LIVE_SURFACE);
+    if std::env::var(UPDATE_GOLDENS_ENV).is_ok_and(|v| v == "1") {
+        std::fs::create_dir_all(path.parent().expect("golden has a parent dir"))
+            .expect("create golden dir");
+        std::fs::write(&path, &expected).expect("write method golden");
+        return;
+    }
+    let actual = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "cannot read {}: {e}. Generate it with:\n  {METHOD_GOLDEN_REGENERATE}",
+            path.display()
+        )
+    });
+    if let Some(msg) = method_golden_drift(&expected, &actual) {
+        panic!("{msg}");
+    }
+}
 
+#[test]
+fn method_golden_renders_sorted_kind_name_lines() {
+    let surface = CatalogSurface {
+        router: &["b.two", "a.one"],
+        fastpath: &["c.fast"],
+        aliases: &[("old.name", "a.one")],
+        notifications: &["events.event"],
+        reverse: &["a.one"],
+    };
+    let body: Vec<String> = render_method_golden(&surface)
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .map(str::to_string)
+        .collect();
     assert_eq!(
-        router_count, EXPECTED_ROUTER_METHODS,
-        "Router method count drift detected: expected {EXPECTED_ROUTER_METHODS}, got {router_count}. \
-         If you added/removed router methods, update ROUTER_METHODS in catalog.rs, \
-         bump EXPECTED_ROUTER_METHODS, update docs/protocol/05-method-catalog.md, and bump the protocol version."
+        body,
+        [
+            "alias old.name -> a.one",
+            "fastpath c.fast",
+            "notification events.event",
+            "reverse a.one",
+            "router a.one",
+            "router b.two",
+        ]
     );
+}
 
-    assert_eq!(
-        fastpath_count, EXPECTED_FASTPATH_METHODS,
-        "Fast-path method count drift detected: expected {EXPECTED_FASTPATH_METHODS}, got {fastpath_count}. \
-         If you added/removed fast-path methods, update FASTPATH_METHODS in catalog.rs, \
-         bump EXPECTED_FASTPATH_METHODS, update docs/protocol/05-method-catalog.md, and bump the protocol version."
+#[test]
+fn method_golden_drift_reports_missing_and_extra_entries() {
+    let golden = "# header\nrouter a.one\nrouter b.two\n";
+    let catalog = "# header\nrouter a.one\nrouter c.three\n";
+    assert_eq!(method_golden_drift(golden, golden), None);
+    let msg = method_golden_drift(catalog, golden).expect("drift detected");
+    assert!(
+        msg.contains("in catalog.rs but not in the golden: router c.three"),
+        "{msg}"
     );
-
-    assert_eq!(
-        alias_count, EXPECTED_ALIASES,
-        "Alias count drift detected: expected {EXPECTED_ALIASES}, got {alias_count}. \
-         If you added/removed aliases, update METHOD_ALIASES in catalog.rs, \
-         bump EXPECTED_ALIASES, update docs/protocol/05-method-catalog.md, and bump the protocol version."
+    assert!(
+        msg.contains("in the golden but not in catalog.rs: router b.two"),
+        "{msg}"
     );
+    assert!(msg.contains("docs/protocol/05-method-catalog.md"), "{msg}");
+    assert!(msg.contains(METHOD_GOLDEN_REGENERATE), "{msg}");
+}
 
-    assert_eq!(
-        total, EXPECTED_TOTAL_METHODS,
-        "Total method count drift detected: expected {EXPECTED_TOTAL_METHODS}, got {total} ({router_count} router + {fastpath_count} fastpath + {alias_count} aliases). \
-         Update the catalog, docs/protocol/05-method-catalog.md, and bump the protocol version."
+#[test]
+fn method_golden_drift_flags_non_canonical_order() {
+    let canonical = "# header\nrouter a.one\nrouter b.two\n";
+    let shuffled = "# header\nrouter b.two\nrouter a.one\n";
+    let msg = method_golden_drift(canonical, shuffled).expect("order drift detected");
+    assert!(msg.contains("not in canonical form"), "{msg}");
+    assert!(msg.contains(METHOD_GOLDEN_REGENERATE), "{msg}");
+}
+
+#[test]
+fn method_golden_drift_names_duplicate_lines() {
+    let canonical = "# header\nrouter a.one\nrouter b.two\n";
+    let doubled = "# header\nrouter a.one\nrouter b.two\nrouter b.two\n";
+    let msg = method_golden_drift(canonical, doubled).expect("duplicate detected");
+    assert!(
+        msg.contains("duplicate line in the golden: router b.two"),
+        "{msg}"
     );
+    assert!(!msg.contains("router a.one"), "{msg}");
+}
 
-    let notification_count = NOTIFICATIONS.len();
-    assert_eq!(
-        notification_count, EXPECTED_NOTIFICATIONS,
-        "Notification count drift detected: expected {EXPECTED_NOTIFICATIONS}, got {notification_count}. \
-         Update NOTIFICATIONS in catalog.rs, docs/protocol/05-method-catalog.md, and bump the protocol version."
-    );
+#[test]
+fn method_golden_drift_ignores_crlf_line_endings() {
+    let canonical = "# header\nrouter a.one\nrouter b.two\n";
+    let crlf = canonical.replace('\n', "\r\n");
+    assert_eq!(method_golden_drift(canonical, &crlf), None);
+}
 
-    let reverse_count = REVERSE_METHODS.len();
-    assert_eq!(
-        reverse_count, EXPECTED_REVERSE_METHODS,
-        "Reverse RPC count drift detected: expected {EXPECTED_REVERSE_METHODS}, got {reverse_count}. \
-         Update REVERSE_METHODS in catalog.rs, docs/protocol/05-method-catalog.md, and bump the protocol version."
+/// Every catalog entry renders to a distinct golden line: within one kind a
+/// name is listed once (a name may appear under two kinds, e.g. a dual-role
+/// reverse RPC that is also a router method).
+#[test]
+fn live_method_golden_has_no_duplicate_entries() {
+    let entries = method_golden_entries(&LIVE_SURFACE);
+    let dups = duplicate_lines(&entries);
+    assert!(
+        dups.is_empty(),
+        "catalog.rs lists these entries more than once: {dups:?}"
     );
 }
 
