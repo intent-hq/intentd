@@ -194,7 +194,11 @@ print('HTTP/2.0 ' + str(response.status) + ' response\n' + headers + '\n' + json
     def test_gate_and_protected_events_stay_unchanged(self):
         ci = workflow('ci.yml')
         self.assertEqual(set(ci[True]), {'push', 'pull_request', 'merge_group'})
-        self.assertEqual(ci['concurrency']['cancel-in-progress'], "${{ github.event_name == 'pull_request' }}")
+        # Merge-queue runs are never cancelled by ci.yml's concurrency (this
+        # workflow owns their retirement); superseded PR and main-push runs are.
+        self.assertEqual(ci['concurrency']['cancel-in-progress'], "${{ github.event_name == 'pull_request' || github.event_name == 'push' }}")
+        self.assertEqual(ci['concurrency']['group'], "${{ github.workflow }}-${{ github.ref }}"
+                         "${{ github.event_name == 'push' && github.run_attempt != '1' && format('-rerun-{0}', github.run_id) || '' }}")
         self.assertEqual(set(ci['jobs']['gate']['needs']), {
             'route', 'pr-static', 'release-fast-path', 'cache-smoke',
             'daemon-lifecycle', 'check', 'windows-cross-lint', 'build', 'windows-lint', 'windows', 'macos-services-runtime', 'coverage-e2e', 'coverage-all',
