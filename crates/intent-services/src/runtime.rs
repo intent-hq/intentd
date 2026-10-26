@@ -1645,3 +1645,21 @@ impl ScriptsClosing for script_ops::WorkspaceClosing {
         script_ops::WorkspaceClosing::unsettled(self)
     }
 }
+
+#[cfg(test)]
+mod archive_sweep_golden_tests;
+
+#[cfg(test)]
+mod guest_role_tests;
+
+#[cfg(test)]
+mod hook_golden_tests;
+
+#[cfg(test)]
+mod host_role_tests;
+
+#[cfg(test)]
+mod retire_workspace_tests;
+
+#[cfg(test)]
+mod setup_lifecycle_tests;

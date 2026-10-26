@@ -539,3 +539,12 @@ fn tab_event(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod browser_exec_reverse;
+
+#[cfg(test)]
+mod browser_client_pin;
+
+#[cfg(test)]
+mod browser_routing;

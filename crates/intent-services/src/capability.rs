@@ -887,8 +887,6 @@ impl Services {
 }
 
 #[cfg(test)]
-mod guest_role_tests;
-#[cfg(test)]
 mod sharing_tests;
 
 #[cfg(test)]
