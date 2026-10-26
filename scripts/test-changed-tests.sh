@@ -512,6 +512,19 @@ expect_ok
 [[ "$stdout" == "$fixture_edges" ]] || fail "$case_name: edges were"$'\n'"$stdout"$'\n'"expected"$'\n'"$fixture_edges"
 [[ -z "$cargo_log" ]] || fail "$case_name: cargo ran: $cargo_log"
 
+# Byte order whatever the locale: glibc's en_US.UTF-8 collation ignores '-'
+# and would put intentd before intent-services.
+if locale -a 2>/dev/null | grep -qix 'en_US.utf-\{0,1\}8'; then
+  case_name="--print-edges / --print-rdeps sort in byte order under en_US.UTF-8"
+  reset_repo
+  LC_ALL=en_US.UTF-8 run_script --print-edges
+  expect_ok
+  [[ "$stdout" == "$fixture_edges" ]] || fail "$case_name: edges were"$'\n'"$stdout"
+  LC_ALL=en_US.UTF-8 run_script --print-rdeps
+  expect_ok
+  [[ "$stdout" == "$fixture_rdeps" ]] || fail "$case_name: rdeps were '$stdout'"
+fi
+
 case_name="--print-rdeps prints intent-core's transitive dependents"
 reset_repo
 run_script --print-rdeps

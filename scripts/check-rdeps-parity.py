@@ -39,6 +39,7 @@ import sys
 from pathlib import Path
 
 HINT = "fix workspace_edges in scripts/changed-tests.sh so it reads this manifest style"
+EXTRA_HINT = "fix workspace_edges in scripts/changed-tests.sh so it does not match this line"
 
 
 def run(argv: list[str], cwd: Path) -> tuple[int, str, str]:
@@ -49,8 +50,11 @@ def run(argv: list[str], cwd: Path) -> tuple[int, str, str]:
     return proc.returncode, proc.stdout, proc.stderr
 
 
-def cargo_edges(manifest: Path) -> tuple[dict[tuple[str, str], set[str]], list[str]] | str:
-    """Returns ({(dependent, dependency): kinds}, members outside crates/) or an error."""
+Edges = dict[tuple[str, str], set[str]]
+
+
+def cargo_edges(manifest: Path) -> tuple[Edges, set[str], list[str]] | str:
+    """Returns ({(dependent, dependency): kinds}, members, members outside crates/) or an error."""
     flags = shlex.split(os.environ.get("CARGO_METADATA_FLAGS", "--locked"))
     # Run from the manifest's directory: cargo reads .cargo/config.toml from the
     # invocation directory upward, and another workspace's config must not leak
@@ -90,7 +94,7 @@ def cargo_edges(manifest: Path) -> tuple[dict[tuple[str, str], set[str]], list[s
             if dep.get("target"):
                 kind += f" ({dep['target']})"
             edges.setdefault((src, dst), set()).add(kind)
-    return edges, outside
+    return edges, set(dirs.values()), outside
 
 
 def scanner(script: Path, mode: str) -> list[list[str]] | str:
@@ -125,7 +129,7 @@ def main(argv: list[str]) -> int:
     if isinstance(truth, str):
         print(f"error: {truth}", file=sys.stderr)
         return 2
-    cargo, outside = truth
+    cargo, members, outside = truth
     printed_edges = scanner(script, "edges")
     if isinstance(printed_edges, str):
         print(f"error: {printed_edges}", file=sys.stderr)
@@ -146,10 +150,17 @@ def main(argv: list[str]) -> int:
         kinds = ", ".join(sorted(cargo[(src, dst)]))
         errors.append(f"{src} -> {dst} ({kinds} dependency) is missing from the scanner: {HINT}")
     for src, dst in sorted(scanned - set(cargo)):
-        errors.append(f"{src} -> {dst} is reported by the scanner but is not a path dependency in cargo metadata")
+        errors.append(
+            f"{src} -> {dst} is reported by the scanner but is not a path dependency in cargo metadata: {EXTRA_HINT}"
+        )
 
     summary = []
+    if not printed_rdeps:
+        errors.append("changed-tests.sh --print-rdeps names no root: check rdeps_roots in scripts/changed-tests.sh")
     for root, listed in printed_rdeps:
+        if root not in members:
+            errors.append(f"changed-tests.sh propagates from {root}, which is not a workspace member under crates/")
+            continue
         expected = reverse_dependents(root, set(cargo))
         got = set(listed.split())
         missing, extra = expected - got, got - expected

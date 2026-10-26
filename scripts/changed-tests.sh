@@ -124,10 +124,7 @@ while (($# > 0)); do
     --dry-run) dry_run=1 ;;
     --instrumented) instrumented=1 ;;
     --check-map) check_map=1 ;;
-    --print-edges | --print-rdeps)
-      [[ -z "$print_mode" ]] || usage
-      print_mode=${1#--print-}
-      ;;
+    --print-edges | --print-rdeps) print_mode=${1#--print-} ;;
     --base=*) base=${1#--base=} ;;
     --build-jobs=*) build_jobs=${1#--build-jobs=} ;;
     --test-threads=*) test_threads=${1#--test-threads=} ;;
@@ -151,7 +148,7 @@ done
 [[ -n "$base" ]] || usage
 [[ -z "$instrumented" || -z "$runner" ]] || usage
 [[ -n "$dry_run" && "$dry_run" != 0 ]] || dry_run=""
-# A print mode takes no other flag.
+# A print mode takes no other flag (not even the other print mode).
 [[ -z "$print_mode" || $n_args -eq 1 ]] || usage
 
 label=test-changed
@@ -277,14 +274,15 @@ reverse_dependents() {
 }
 
 # --print-edges prints the scanner's "<dependent>\t<dependency>" records,
-# sorted; --print-rdeps prints "<root>\t<dependents, space-separated>" for
+# byte-sorted; --print-rdeps prints "<root>\t<dependents, space-separated>" for
 # each propagated root. Both expose exactly what the selection reads, for
 # scripts/check-rdeps-parity.py to compare with `cargo metadata` in CI (a
 # line scanner can miss a manifest style and drop crates silently, as the
 # path-less `package =` rename did before intentd#2704). They read only
 # crates/*/Cargo.toml: no git, BASE or end-to-end map.
 if [[ -n "$print_mode" ]]; then
-  edges=$(workspace_edges | sort -u)
+  # Byte order, whatever the locale: glibc's en_US.UTF-8 ignores '-'.
+  edges=$(workspace_edges | LC_ALL=C sort -u)
   if [[ "$print_mode" == edges ]]; then
     [[ -z "$edges" ]] || printf '%s\n' "$edges"
   else
@@ -292,7 +290,7 @@ if [[ -n "$print_mode" ]]; then
       dependents=""
       while IFS= read -r dependent; do
         [[ -z "$dependent" ]] || dependents+="${dependents:+ }$dependent"
-      done <<<"$(reverse_dependents "$root" "$edges")"
+      done <<<"$(reverse_dependents "$root" "$edges" | LC_ALL=C sort)"
       printf '%s\t%s\n' "$root" "$dependents"
     done
   fi

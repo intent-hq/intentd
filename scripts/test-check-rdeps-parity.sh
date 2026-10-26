@@ -5,8 +5,8 @@
 # workspace's crates. Every manifest style the scanner supports must pass. A
 # scanner with its `package =` branches removed (the gap intentd#2704 fixed)
 # must fail and name the dropped crates and edges; so must a scanner that
-# over-reports (a registry dependency named like a member) and a member
-# outside crates/. Unreadable metadata or scanner output exits 2. Finally the
+# over-reports (a registry dependency named like a member), one that
+# propagates from no root or an unknown one, and a member outside crates/. Unreadable metadata or scanner output exits 2. Finally the
 # check must pass on this repo.
 #
 # Run directly: ./scripts/test-check-rdeps-parity.sh
@@ -52,6 +52,9 @@ TOML
   crate zeta $'[target.\'cfg(unix)\'.dependencies]\nalpha = { path = "../alpha" }'
   crate eta $'[build-dependencies]\nbeta = { path = "../beta" }'
   crate theta $'[dependencies.core]\npackage = "intent-core"\nworkspace = true'
+  crate lambda $'[target."cfg(unix)".dev-dependencies]\nalpha = { path = "../alpha" }'
+  crate mu $'[target."cfg(windows)".build-dependencies]\ngamma = { path = "../gamma" }'
+  crate nu $'[dependencies.delta]\npath = "../delta"'
   crate iota
 }
 
@@ -83,23 +86,24 @@ expect_fail() {
   done
 }
 
-# break_scanner NAME OLD: remove the exact text OLD from NAME's scanner copy,
-# failing loudly when it is gone (the scanner changed shape: update OLD).
+# break_scanner NAME OLD [NEW]: replace the exact text OLD in NAME's scanner
+# copy with NEW (default: remove it), failing loudly when OLD is gone (the
+# scanner changed shape: update OLD).
 break_scanner() {
-  python3 -I -B - "$tmp/$1/scripts/changed-tests.sh" "$2" <<'PY' || fail "$1: mutation target not found in changed-tests.sh"
+  python3 -I -B - "$tmp/$1/scripts/changed-tests.sh" "$2" "${3-}" <<'PY' || fail "$1: mutation target not found in changed-tests.sh"
 import pathlib, sys
-path, old = pathlib.Path(sys.argv[1]), sys.argv[2]
+path, old, new = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
 text = path.read_text()
 if text.count(old) != 1:
     sys.exit(1)
-path.write_text(text.replace(old, ""))
+path.write_text(text.replace(old, new))
 PY
 }
 
 new_workspace every-style
 expect_pass every-style
 case $out in
-  *"(8 workspace dependency edges; intent-core: 8 reverse dependencies)"*) ;;
+  *"(11 workspace dependency edges; intent-core: 11 reverse dependencies)"*) ;;
   *) fail "every-style: unexpected summary: $out" ;;
 esac
 
@@ -120,7 +124,16 @@ break_scanner no-package-branch '          elif [[ "$line" == package*=*\"*\"* ]
 expect_fail no-package-branch 1 \
   "delta -> intent-core (dev dependency) is missing from the scanner" \
   "theta -> intent-core (normal dependency) is missing from the scanner" \
-  "intent-core reverse dependencies differ from cargo metadata: missing delta, theta"
+  "intent-core reverse dependencies differ from cargo metadata: missing delta, nu, theta"
+
+# The reverse-dependency comparison cannot be skipped by a scanner that
+# propagates from no root, or from a name that is not a member.
+new_workspace no-root
+break_scanner no-root 'rdeps_roots="intent-core"' 'rdeps_roots=""'
+expect_fail no-root 1 "--print-rdeps names no root"
+new_workspace misspelled-root
+break_scanner misspelled-root 'rdeps_roots="intent-core"' 'rdeps_roots="intent_core"'
+expect_fail misspelled-root 1 "propagates from intent_core, which is not a workspace member"
 
 # A registry dependency that shares a member's name is not a workspace edge;
 # the scanner (which matches names against crates/<dir>) over-reports it.
