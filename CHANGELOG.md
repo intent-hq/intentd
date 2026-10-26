@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.58] - 2026-10-26
+
+### 🚀 Features
+
+- *(discussions)* Add workspace-wide creation and role management ([#2616](https://github.com/intent-hq/intentd/pull/2616))
+
+
 ## [0.11.57] - 2026-10-26
 
 ### 🔧 Refactor
