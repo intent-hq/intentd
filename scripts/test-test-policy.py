@@ -97,7 +97,9 @@ class PolicyTests(unittest.TestCase):
                         tests = [call for call in calls if "nextest" in call[0]]
                         self.assertEqual(len(tests), 1)
                         self.assertEqual(tests[0][1:], ["1", "3"])
-                        expected = ["llvm-cov", "--no-report", "nextest"]
+                        # --no-fail-fast: one merge-queue run lists every
+                        # failing test (intentd#2543 needed three runs).
+                        expected = ["llvm-cov", "--no-report", "nextest", "--no-fail-fast"]
                         expected += (["--workspace"] if script == "coverage-all.sh" else ["-p", "intentd", "-E", "kind(test) and not binary(intentd) and not test(/^auggie_context_e2e::/)"])
                         self.assertEqual(tests[0][0], expected)
                         for args, policy, multiplier in calls:

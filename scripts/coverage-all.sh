@@ -28,7 +28,10 @@ echo "Running all workspace tests with coverage instrumentation (nextest)..."
 # auggie_context_e2e test is env-gated (INTENTD_AUGGIE_E2E) and skips cleanly in CI
 # STAB-40, STAB-42, STAB-43, STAB-44 fixed (file sync, multi-threaded runtime, timeout multiplier)
 # Note: nextest does not run doctests; the workspace has none, so nothing is lost
-INTENTD_TEST_TIMEOUT_MULTIPLIER=3 "$BASH" scripts/with-test-policy.sh cargo llvm-cov --no-report nextest --workspace
+# --no-fail-fast: run every test even after a failure, so one merge-queue run
+# lists every failing test instead of one per ejection (intentd#2543: the first
+# failure left 10424/15393 tests unrun). The exit status still fails the job.
+INTENTD_TEST_TIMEOUT_MULTIPLIER=3 "$BASH" scripts/with-test-policy.sh cargo llvm-cov --no-report nextest --no-fail-fast --workspace
 
 # Generate lcov.info if requested (for CI artifact upload)
 # Do this BEFORE the floor check so the artifact is available even on failure
