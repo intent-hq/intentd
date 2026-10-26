@@ -1,6 +1,6 @@
 [package]
 name = "intent-app"
-version = "0.11.56"
+version = "0.11.57"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -8,13 +8,13 @@ license.workspace = true
 description = "Composition root for intentd: registers the feature crates on the core services"
 
 [dependencies]
-intent-services = { path = "../intent-services", version = "0.11.56" }
-intent-svc-transfer = { path = "../intent-svc-transfer", version = "0.11.56" }
+intent-services = { path = "../intent-services", version = "0.11.57" }
+intent-svc-transfer = { path = "../intent-svc-transfer", version = "0.11.57" }
 
 [dev-dependencies]
-intent-core = { path = "../intent-core", version = "0.11.56" }
-intent-store = { path = "../intent-store", version = "0.11.56" }
-intent-transport = { path = "../intent-transport", version = "0.11.56" }
+intent-core = { path = "../intent-core", version = "0.11.57" }
+intent-store = { path = "../intent-store", version = "0.11.57" }
+intent-transport = { path = "../intent-transport", version = "0.11.57" }
 serde_json = { workspace = true }
 tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }
