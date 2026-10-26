@@ -105,6 +105,26 @@
 
 set -euo pipefail
 
+# Byte order for every sort, glob and comparison below, whatever the caller's
+# locale: glibc's en_US.UTF-8 collation ignores '-' and '_', which put intentd
+# before intent-services in the crate list and the reverse-dependency note.
+# The tests themselves run under the caller's LC_ALL (restore_caller_locale),
+# as they do under make test and in the merge queue.
+caller_lc_all=${LC_ALL-}
+caller_lc_all_set=${LC_ALL+1}
+export LC_ALL=C
+
+# Puts the caller's LC_ALL back (unset when the caller had none), for the
+# commands that run tests: call it in the subshell or right before the exec
+# that starts them.
+restore_caller_locale() {
+  if [[ -n "$caller_lc_all_set" ]]; then
+    export LC_ALL="$caller_lc_all"
+  else
+    unset LC_ALL
+  fi
+}
+
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 test_policy="$repo_root/scripts/with-test-policy.sh"
 caller_dir=$PWD
@@ -286,8 +306,7 @@ reverse_dependents() {
 # path-less `package =` rename did before intentd#2704). They read only
 # crates/*/Cargo.toml: no git, BASE or end-to-end map.
 if [[ -n "$print_mode" ]]; then
-  # Byte order, whatever the locale: glibc's en_US.UTF-8 ignores '-'.
-  edges=$(workspace_edges | LC_ALL=C sort -u)
+  edges=$(workspace_edges | sort -u)
   if [[ "$print_mode" == edges ]]; then
     [[ -z "$edges" ]] || printf '%s\n' "$edges"
   else
@@ -295,7 +314,7 @@ if [[ -n "$print_mode" ]]; then
       dependents=""
       while IFS= read -r dependent; do
         [[ -z "$dependent" ]] || dependents+="${dependents:+ }$dependent"
-      done <<<"$(reverse_dependents "$root" "$edges" | LC_ALL=C sort)"
+      done <<<"$(reverse_dependents "$root" "$edges" | sort)"
       printf '%s\t%s\n' "$root" "$dependents"
     done
   fi
@@ -967,6 +986,7 @@ if [[ -n "$runner" ]]; then
   [[ -n "$build_jobs" ]] && set -- "$@" --build-jobs "$build_jobs"
   [[ -n "$test_threads" ]] && set -- "$@" --test-threads "$test_threads"
   cd "$caller_dir"
+  restore_caller_locale
   exec "$BASH" "$test_policy" "$@"
 fi
 
@@ -987,9 +1007,15 @@ while IFS= read -r -u 3 plan; do
       command=(python3 -I -B "$repo_root/scripts/coverage-storage.py" run
         --output "$COVERAGE_STORAGE_DIR" --stage "scope-$scope_index" -- "${command[@]}")
     fi
-    INTENTD_TEST_TIMEOUT_MULTIPLIER=3 "${command[@]}"
+    (
+      restore_caller_locale
+      INTENTD_TEST_TIMEOUT_MULTIPLIER=3 exec "${command[@]}"
+    )
   else
-    "$BASH" "$test_policy" cargo nextest run "$@"
+    (
+      restore_caller_locale
+      exec "$BASH" "$test_policy" cargo nextest run "$@"
+    )
   fi
   status=$?
   set -e
