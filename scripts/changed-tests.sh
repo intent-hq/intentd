@@ -55,7 +55,10 @@
 #                                    also the end-to-end modules it maps to:
 #                                    -p <c> --test <s> -E 'binary_id(=<c>::<s>)&test(/^(<m>)::/)'
 #                                    (the suite-module shape; a module-less
-#                                    entry selects --test <s> whole)
+#                                    entry selects --test <s> whole), or for
+#                                    a <c>::lib entry the library unit tests:
+#                                    -p <c> --lib -E 'binary_id(=<c>)&test(/^(<m>)::/)'
+#                                    (module-less: --lib whole)
 #   .config/e2e-test-map.txt itself  every mapped end-to-end module
 #   outside crates/, inert           ignored: *.md, LICENSE, NOTICE, .gitignore,
 #                                    .github/**, docs/**, deny.toml,
@@ -73,12 +76,13 @@
 # propagated in full only from intent-core (intentd#2698); otherwise only from
 # intent-services to its feature crates and intent-app, from a feature crate
 # to intent-app, and through the end-to-end map: crates/<c>/src selects <c>'s
-# own tests plus any mapped end-to-end modules; the full suite (`make test`,
-# the merge queue) stays the complete gate.
+# own tests plus any mapped end-to-end or library unit-test modules; the full
+# suite (`make test`, the merge queue) stays the complete gate.
 #
 # The map is validated on every run, and --check-map validates it alone (and
 # requires it to exist): each source glob must match a tracked or untracked
-# file, each test binary root crates/<c>/tests/<s>.rs must exist, and each
+# file, each test binary root crates/<c>/tests/<s>.rs (crates/<c>/src/lib.rs
+# for <c>::lib, which must not also have a tests/lib.rs) must exist, and each
 # segment of a module path must be declared by its parent with its file
 # present. An invalid map exits 2 naming every bad line.
 #
@@ -305,6 +309,20 @@ load_e2e_map() {
       done <<<"$files"
     fi
     [[ -n "$hit" ]] || map_errors+="$e2e_map:$n: source glob '$glob' matches no file"$'\n'
+    if [[ "$binary" == lib ]]; then
+      # <crate>::lib names the library unit tests, rooted at src/lib.rs.
+      root="crates/$crate/src/lib.rs"
+      if [[ ! -f "$root" ]]; then
+        map_errors+="$e2e_map:$n: $target: $root does not exist"$'\n'
+      elif [[ -f "crates/$crate/tests/lib.rs" ]]; then
+        map_errors+="$e2e_map:$n: $target is ambiguous: crates/$crate/tests/lib.rs also exists"$'\n'
+      elif [[ -n "$module" ]] && ! resolve_module "$root" "$module"; then
+        map_errors+="$e2e_map:$n: $target $resolve_problem"$'\n'
+      elif [[ -n "$hit" ]]; then
+        e2e_entries+="$glob"$'\t'"$crate"$'\t'"$binary"$'\t'"$module"$'\n'
+      fi
+      continue
+    fi
     root="crates/$crate/tests/$binary.rs"
     if [[ ! -f "$root" ]]; then
       map_errors+="$e2e_map:$n: $target: $root does not exist"$'\n'
@@ -439,13 +457,23 @@ map_path() {
 
 # Prints a selection record for each map entry whose glob matches path $1
 # (every entry when $1 is empty): "<crate>\tmodule\t<binary>:<module path>",
-# or "<crate>\ttest\t<binary>" for an entry naming a whole binary.
+# or "<crate>\ttest\t<binary>" for an entry naming a whole binary; a
+# <crate>::lib entry prints "<crate>\tlibmodule\t<module path>", or
+# "<crate>\tlib" without a module.
 map_e2e() {
   local glob crate binary module
   while IFS=$'\t' read -r glob crate binary module; do
     [[ -n "$glob" ]] || continue
     # shellcheck disable=SC2053 # the glob is a pattern on purpose
     [[ -z "$1" || "$1" == $glob ]] || continue
+    if [[ "$binary" == lib ]]; then
+      if [[ -n "$module" ]]; then
+        printf '%s\tlibmodule\t%s\n' "$crate" "$module"
+      else
+        printf '%s\tlib\n' "$crate"
+      fi
+      continue
+    fi
     # As in map_path: the instrumented run excludes auggie_context_e2e, so
     # naming only that module would select nothing.
     [[ -z "$instrumented" || "$crate" != intentd || "${module%%::*}" != auggie_context_e2e ]] || continue
@@ -700,7 +728,7 @@ fi
 # Suite modules add their suite as a --test target and one -E naming the
 # changed modules; standalone targets of the same plan are ORed into that -E.
 crate_selection() {
-  local crate=$1 best=test tests="" modules="" c kind test
+  local crate=$1 best=test tests="" modules="" lib="" lib_modules="" c kind test
   while IFS=$'\t' read -r c kind test; do
     [[ "$c" == "$crate" ]] || continue
     case "$kind" in
@@ -710,6 +738,8 @@ crate_selection() {
       tests) [[ "$best" == all || "$best" == src || "$best" == dependent ]] || best=tests ;;
       test) tests+="$test"$'\n' ;;
       module) modules+="$test"$'\n' ;;
+      lib) lib=1 ;;
+      libmodule) lib_modules+="$test"$'\n' ;;
     esac
   done <<<"$mapped"
   case "$best" in
@@ -730,7 +760,22 @@ crate_selection() {
     tests) crate_filter="--tests" ;;
     test)
       crate_filter=""
-      local expr="" suite module names
+      local expr="" suite module names narrowed=""
+      # Library unit tests (map entries naming <crate>::lib): the lib target
+      # is binary_id(=<crate>); a whole-lib entry drops its modules.
+      if [[ -n "$lib" || -n "$lib_modules" ]]; then
+        crate_filter="--lib"
+        if [[ -n "$lib" ]]; then
+          expr="binary_id(=$crate)"
+        else
+          names=""
+          while IFS= read -r module; do
+            [[ -z "$module" ]] || names+="${names:+|}$module"
+          done <<<"$(printf '%s' "$lib_modules" | sort -u)"
+          expr="(binary_id(=$crate)&test(/^($names)::/))"
+          narrowed=1
+        fi
+      fi
       tests=$(printf '%s' "$tests" | sort -u)
       while IFS= read -r test; do
         [[ -n "$test" ]] || continue
@@ -757,8 +802,11 @@ crate_selection() {
           crate_filter+="${crate_filter:+ }--test $suite"
           expr+="${expr:+|}(binary_id(=$crate::$suite)&test(/^($names)::/))"
         done <<<"$(while IFS= read -r module; do printf '%s\n' "${module%%:*}"; done <<<"$modules" | sort -u)"
-        crate_filter+=" -E $expr"
+        narrowed=1
       fi
+      # Target flags alone select whole binaries; a narrowed module needs the
+      # filterset, which then names every selected binary.
+      [[ -z "$narrowed" ]] || crate_filter+=" -E $expr"
       ;;
   esac
 }

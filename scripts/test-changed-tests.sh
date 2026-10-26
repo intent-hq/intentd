@@ -1287,6 +1287,93 @@ run_script --base HEAD
 expect_ok
 expect_cargo "-p delta --lib --bins --tests" "-p intentd --test suite_e2e -E (binary_id(=intentd::suite_e2e)&test(/^(auggie_context_e2e)::/))"
 
+# <crate>::lib map entries select library unit-test modules of another crate
+# (intentd#2543: an adapter pin bump in intent-providers broke intent-services
+# unit tests that only the merge queue ran). alpha's lib gets an inline test
+# module and a #[path] test module of a non-root file, as intent-services'
+# model_preference::tests and agent_workers::tests are.
+lib_fixture() {
+  write crates/alpha/src/lib.rs $'mod util;\nmod workers;\n#[cfg(test)]\nmod tests {\n}'
+  write crates/alpha/src/workers.rs $'#[cfg(test)]\n#[path = "workers_tests.rs"]\nmod tests;'
+  write crates/alpha/src/workers_tests.rs
+  printf '%s\n' "$@" >>"$repo/.config/e2e-test-map.txt"
+  commit_all "lib fixture"
+}
+
+case_name="mapped source selects library unit-test modules of another crate"
+reset_repo
+lib_fixture "crates/delta/src/script.rs alpha::lib workers::tests" "crates/delta/src/script.rs alpha::lib tests"
+edit crates/delta/src/script.rs
+run_script --base HEAD
+expect_ok
+expect_cargo "-p alpha --lib -E (binary_id(=alpha)&test(/^(tests|workers::tests)::/))" "-p delta --lib --bins --tests" "$e2e_script_plan"
+[[ "$stdout" == *"[test-changed] cargo nextest run -p alpha --lib -E '(binary_id(=alpha)&test(/^(tests|workers::tests)::/))'"* ]] ||
+  fail "$case_name plan line is not a pasteable command: $stdout"
+
+case_name="a whole-lib entry selects --lib without a filterset"
+reset_repo
+lib_fixture "crates/delta/src/whole.rs alpha::lib" "crates/delta/src/whole.rs alpha::lib tests"
+edit crates/delta/src/whole.rs
+run_script --base HEAD
+expect_ok
+expect_cargo "-p alpha --lib" "-p delta --lib --bins --tests" "-p intentd --test suite_wss"
+
+case_name="library modules share one filterset with the crate's other mapped targets"
+reset_repo
+lib_fixture "crates/delta/src/whole.rs alpha::lib tests" "crates/delta/src/whole.rs alpha::one"
+edit crates/delta/src/whole.rs
+run_script --base HEAD
+expect_ok
+expect_cargo "-p alpha --lib --test one -E (binary_id(=alpha)&test(/^(tests)::/))|binary_id(=alpha::one)" "-p delta --lib --bins --tests" "-p intentd --test suite_wss"
+
+case_name="a whole lib and a whole test binary need no filterset"
+reset_repo
+lib_fixture "crates/delta/src/whole.rs alpha::lib" "crates/delta/src/whole.rs alpha::one"
+edit crates/delta/src/whole.rs
+run_script --base HEAD
+expect_ok
+expect_cargo "-p alpha --lib --test one" "-p delta --lib --bins --tests" "-p intentd --test suite_wss"
+
+case_name="a src change of the mapped crate subsumes its library modules"
+reset_repo
+lib_fixture "crates/delta/src/whole.rs alpha::lib tests"
+edit crates/delta/src/whole.rs
+edit crates/alpha/src/workers.rs
+run_script --base HEAD
+expect_ok
+expect_cargo "-p alpha -p delta --lib --bins --tests" "-p intentd --test suite_wss"
+
+case_name="instrumented library module ANDs the exclusion into its filterset"
+reset_repo
+lib_fixture "crates/delta/src/whole.rs alpha::lib tests"
+edit crates/delta/src/whole.rs
+run_script --instrumented --base HEAD
+expect_ok
+cov_expected="$repo: INTENTD_TEST_TIMEOUT_MULTIPLIER=3 llvm-cov --no-report nextest -p alpha --lib -E ((binary_id(=alpha)&test(/^(tests)::/))) and (not test(/^auggie_context_e2e::/))"$'\n'"$repo: INTENTD_TEST_TIMEOUT_MULTIPLIER=3 llvm-cov --no-report nextest -p delta --lib --bins --tests -E not test(/^auggie_context_e2e::/)"$'\n'"$repo: INTENTD_TEST_TIMEOUT_MULTIPLIER=3 llvm-cov --no-report nextest -p intentd --test suite_wss -E not test(/^auggie_context_e2e::/)"
+[[ "$cargo_log" == "$cov_expected" ]] || fail "$case_name: cargo argv was"$'\n'"$cargo_log"$'\n'"expected"$'\n'"$cov_expected"
+
+case_name="check-map accepts library modules"
+reset_repo
+lib_fixture "crates/delta/src/lib.rs alpha::lib tests" "crates/delta/src/lib.rs alpha::lib workers::tests" \
+  "crates/delta/src/lib.rs alpha::lib util" "crates/delta/src/lib.rs alpha::lib"
+run_script --check-map
+expect_ok
+[[ "$stdout" == "[check-map] .config/e2e-test-map.txt: 8 entries valid" ]] || fail "$case_name printed '$stdout'"
+
+case_name="map naming a removed library module"
+reset_repo
+lib_fixture "crates/delta/src/lib.rs alpha::lib workers::tests" "crates/delta/src/lib.rs alpha::lib gone"
+write crates/alpha/src/workers.rs '//! tests were removed'
+expect_map_error ".config/e2e-test-map.txt:8: alpha::lib module workers::tests: crates/alpha/src/workers.rs declares no 'mod tests;'" \
+  ".config/e2e-test-map.txt:9: alpha::lib module gone: crates/alpha/src/lib.rs declares no 'mod gone;'"
+
+case_name="map naming the lib of a crate without one, or with a tests/lib.rs"
+reset_repo
+write crates/gamma/tests/lib.rs
+printf '%s\n' "crates/delta/src/lib.rs beta::lib" "crates/delta/src/lib.rs gamma::lib" >>"$repo/.config/e2e-test-map.txt"
+expect_map_error ".config/e2e-test-map.txt:8: beta::lib: crates/beta/src/lib.rs does not exist" \
+  ".config/e2e-test-map.txt:9: gamma::lib is ambiguous: crates/gamma/tests/lib.rs also exists"
+
 echo "changed-tests tests passed under $("$script_bash" -c 'echo "bash $BASH_VERSION"')"
 [[ -z "${CHANGED_TESTS_TEST_BASH:-}" ]] || exit 0
 
