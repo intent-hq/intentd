@@ -3886,7 +3886,28 @@ const fn is_suffix_of(suffix: &[&str], list: &[&str]) -> bool {
     true
 }
 
+const fn is_major_minor(version: &str) -> bool {
+    let bytes = version.as_bytes();
+    let (mut i, mut dots, mut digits_in_part) = (0, 0, 0);
+    while i < bytes.len() {
+        match bytes[i] {
+            b'0'..=b'9' => digits_in_part += 1,
+            b'.' if digits_in_part > 0 => {
+                dots += 1;
+                digits_in_part = 0;
+            }
+            _ => return false,
+        }
+        i += 1;
+    }
+    dots == 1 && digits_in_part > 0
+}
+
 const _: () = {
+    assert!(
+        is_major_minor(CURRENT_HARNESS_VERSION),
+        "CURRENT_HARNESS_VERSION must be MAJOR.MINOR (e.g. \"3.3\")"
+    );
     assert!(
         ends_with_current(REPOSITORY_GUIDANCE_HARNESS_VERSIONS),
         "CURRENT_HARNESS_VERSION changed: append it to REPOSITORY_GUIDANCE_HARNESS_VERSIONS"
@@ -3925,11 +3946,17 @@ pub fn harness_uses_repository_monitor_guidance(version: &str) -> bool {
 #[doc(hidden)]
 #[must_use]
 pub fn harness_versions_after_current() -> [String; 2] {
-    let (major, minor) = CURRENT_HARNESS_VERSION
-        .split_once('.')
-        .and_then(|(major, minor)| Some((major.parse::<u32>().ok()?, minor.parse::<u32>().ok()?)))
-        .expect("CURRENT_HARNESS_VERSION is MAJOR.MINOR");
-    [format!("{major}.{}", minor + 1), format!("{}.0", major + 1)]
+    harness_versions_after(CURRENT_HARNESS_VERSION)
+        .expect("CURRENT_HARNESS_VERSION is MAJOR.MINOR (checked at compile time)")
+}
+
+fn harness_versions_after(version: &str) -> Option<[String; 2]> {
+    let (major, minor) = version.split_once('.')?;
+    let (major, minor): (u32, u32) = (major.parse().ok()?, minor.parse().ok()?);
+    Some([
+        format!("{major}.{}", minor.checked_add(1)?),
+        format!("{}.0", major.checked_add(1)?),
+    ])
 }
 
 /// Serde default for [`AgentSession::harness_version`]: payloads persisted or
@@ -9017,13 +9044,44 @@ mod tests {
     }
 
     #[test]
-    fn harness_versions_after_current_are_next_minor_and_major() {
-        let (major, minor) = CURRENT_HARNESS_VERSION.split_once('.').unwrap();
-        let (major, minor): (u32, u32) = (major.parse().unwrap(), minor.parse().unwrap());
-        let [next_minor, next_major] = harness_versions_after_current();
-        assert_eq!(next_minor, format!("{major}.{}", minor + 1));
-        assert_eq!(next_major, format!("{}.0", major + 1));
-        assert!(!REPOSITORY_GUIDANCE_HARNESS_VERSIONS.contains(&next_minor.as_str()));
+    fn harness_versions_after_are_next_minor_and_major() {
+        let after = |v: &str| harness_versions_after(v).map(|[a, b]| (a, b));
+        assert_eq!(after("3.3"), Some(("3.4".into(), "4.0".into())));
+        assert_eq!(after("3.9"), Some(("3.10".into(), "4.0".into())));
+        assert_eq!(after("12.0"), Some(("12.1".into(), "13.0".into())));
+        for malformed in ["", "3", "3.", ".3", "3.3.1", "v3.3", "3.x"] {
+            assert_eq!(after(malformed), None, "{malformed:?}");
+        }
+        assert_eq!(
+            harness_versions_after_current(),
+            harness_versions_after(CURRENT_HARNESS_VERSION).unwrap()
+        );
+        for version in harness_versions_after_current() {
+            assert!(!REPOSITORY_GUIDANCE_HARNESS_VERSIONS.contains(&version.as_str()));
+        }
+    }
+
+    /// Versions that already shipped with guidance keep it for life: sessions
+    /// stamped with them persist. These literals are history, not the
+    /// current version, so a bump only appends to the lists and never
+    /// edits this test; dropping an entry fails it.
+    #[test]
+    fn harness_guidance_never_drops_shipped_versions() {
+        for version in ["3.0", "3.1", "3.2", "3.3"] {
+            assert!(harness_supports_repository_guidance(version), "{version}");
+        }
+        for version in ["3.2", "3.3"] {
+            assert!(
+                harness_uses_repository_monitor_guidance(version),
+                "{version}"
+            );
+        }
+        for version in ["3.0", "3.1"] {
+            assert!(
+                !harness_uses_repository_monitor_guidance(version),
+                "{version}"
+            );
+        }
     }
 
     #[test]
@@ -9038,6 +9096,12 @@ mod tests {
         assert!(is_suffix_of(&[], &["a"]));
         assert!(!is_suffix_of(&["a", "b"], &["a", "b", "c"]));
         assert!(!is_suffix_of(&["a", "b", "c", "d"], &["b", "c", "d"][..]));
+        for valid in ["3.3", "10.0", "3.10"] {
+            assert!(is_major_minor(valid), "{valid}");
+        }
+        for invalid in ["", "3", "3.", ".3", "3.3.1", "v3.3", "3.x", " 3.3"] {
+            assert!(!is_major_minor(invalid), "{invalid:?}");
+        }
     }
 
     #[test]

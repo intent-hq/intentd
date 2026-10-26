@@ -259,7 +259,9 @@ fn safe_instance_facts(root: &RepositoryRootContext) -> bool {
 }
 
 /// Eligibility never uses the registry's unknown-version fallback, the current
-/// harness constant, a parent's stamp or captured feature switches.
+/// harness constant, a parent's stamp or captured feature switches: it reads
+/// only the session's own stamp against intent-core's admitted-version list
+/// (a compile-time check keeps that list in step with the constant).
 fn eligible_harness_version(stamp: Option<&str>) -> bool {
     stamp.is_some_and(intent_core::harness_supports_repository_guidance)
 }

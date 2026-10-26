@@ -761,6 +761,19 @@ mod tests {
         }
     }
 
+    /// Every version intent-core admits to repository guidance has its own
+    /// registry row, so an admitted session never runs on the unknown-version
+    /// fallback doctrine.
+    #[test]
+    fn guidance_admitted_versions_have_exact_registry_rows() {
+        for version in intent_core::REPOSITORY_GUIDANCE_HARNESS_VERSIONS {
+            assert!(
+                REGISTRY.iter().any(|e| e.version == *version),
+                "no harness registry row for admitted version {version}"
+            );
+        }
+    }
+
     /// The v2 registry row selects new doctrine while v1 and v1.1 remain available.
     #[test]
     fn v2_selects_new_doctrine_without_changing_v1() {
