@@ -18,7 +18,7 @@ impl Services {
     /// collaboration-purpose credential slots here.
     pub(crate) async fn execution_context_snapshot(&self) -> Result<HostExecutionContext> {
         let settings = self.effective_settings();
-        let agents = self.ports.agent_wake();
+        let agents = self.feature_agent_wake();
         let mut enabled_provider_ids: Vec<_> = intent_providers::all_provider_ids()
             .into_iter()
             .filter(|id| !agents.provider_is_disabled(id, settings.providers.enabled.as_ref()))
@@ -31,14 +31,14 @@ impl Services {
             source,
             GithubTokenSource::Auto | GithubTokenSource::Explicit
         ) {
-            self.secrets
+            self.feature_secrets()
                 .load("sourceControl.github.token")
                 .await?
                 .is_some_and(|s| !s.trim().is_empty())
         } else {
             false
         };
-        let github_configured = self.source_control.is_some()
+        let github_configured = self.feature_source_control().is_some()
             || stored
             || match source {
                 GithubTokenSource::Explicit => false,
@@ -70,13 +70,13 @@ impl Services {
             enabled_provider_ids,
             repository_connections,
             git_credential_policy: GitCredentialPolicy::github_https(
-                crate::execution_call::expose_git_credential(self.settings_registry.as_deref()),
+                crate::execution_call::expose_git_credential(self.feature_settings_registry()),
             ),
         })
     }
 
     pub(crate) async fn publish_execution_context_changed(&self) {
-        let Some(bus) = self.event_bus.as_ref() else {
+        let Some(bus) = self.feature_event_bus() else {
             return;
         };
         if let Ok(snapshot) = self.execution_context_snapshot().await {
@@ -105,7 +105,7 @@ impl Services {
     /// a member disconnect never stops shared execution or these updates.
     #[must_use]
     pub fn spawn_execution_context_loop(&self) -> tokio::task::JoinHandle<()> {
-        let mut sub = self.event_bus.as_ref().map(|bus| {
+        let mut sub = self.feature_event_bus().map(|bus| {
             bus.subscribe(SubscriptionFilter {
                 event_types: vec![SETTINGS_CHANGED.into(), SOURCE_CONTROL_AUTH_CHANGED.into()],
                 ..Default::default()
@@ -123,7 +123,7 @@ impl Services {
                             services.publish_execution_context_changed().await;
                         }
                     }
-                    () = services.execution_invalidation.notified() => {
+                    () = services.feature_execution_invalidation().notified() => {
                         services.publish_execution_context_changed().await;
                     }
                 }

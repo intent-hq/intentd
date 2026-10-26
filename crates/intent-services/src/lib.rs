@@ -387,11 +387,11 @@ pub fn is_stale_in_flight_status(status: intent_core::AgentStatus) -> bool {
 /// test can land a concurrent watch removal deterministically inside that
 /// window. Same shape as [`runtime_config::SupervisePark`].
 #[derive(Default)]
-pub(crate) struct CompletionClassifyPark {
+pub struct CompletionClassifyPark {
     /// Signaled by the parked delivery on entering the window.
-    pub(crate) entered: tokio::sync::Notify,
+    pub entered: tokio::sync::Notify,
     /// Held by the parked delivery inside the window until the test releases it.
-    pub(crate) release: tokio::sync::Notify,
+    pub release: tokio::sync::Notify,
 }
 
 /// Provenance retained when a synthetic completion has to defer again.
@@ -2038,7 +2038,11 @@ impl Services {
 
     /// The current hook-expiry clock skew in milliseconds (0 when no test
     /// skew is injected).
-    pub(crate) fn hook_clock_skew_ms(&self) -> i64 {
+    #[expect(
+        clippy::must_use_candidate,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub fn hook_clock_skew_ms(&self) -> i64 {
         self.hook_clock_skew
             .as_ref()
             .map_or(0, |s| s.load(std::sync::atomic::Ordering::SeqCst))
@@ -7829,7 +7833,7 @@ impl Services {
     /// (queue empty, no worker in flight), so after re-running watch delivery
     /// this also seals the agent's open `after_all` group — the mutation
     /// removed the redrive whose terminal idle would otherwise have sealed it.
-    pub(crate) async fn redeliver_completion_after_queue_mutation(&self, child_id: &AgentId) {
+    pub async fn redeliver_completion_after_queue_mutation(&self, child_id: &AgentId) {
         if !self.has_interim_skipped_idle(child_id) {
             return;
         }
@@ -10256,7 +10260,14 @@ impl Services {
     /// the sandbox directory + record, emit `sandbox:cow:merged`, and clear the
     /// retry count. All store failures are logged and swallowed — the merge
     /// itself already landed in canonical.
-    pub(crate) async fn finalize_sandbox_merged(
+    #[cfg_attr(
+        test,
+        expect(
+            clippy::missing_panics_doc,
+            reason = "internal doc-hidden feature API, not a public library API"
+        )
+    )]
+    pub async fn finalize_sandbox_merged(
         &self,
         workspace_id: &WorkspaceId,
         agent_id: &AgentId,
@@ -14858,7 +14869,7 @@ pub fn record_setup_skipped(states: &WorkspaceSetupStates, workspace_id: &Worksp
 /// observable without its terminal; until then the record stays `pending`
 /// (the `workspace:setup:started` publish precedes the spawn attempt and is
 /// not tied to this transition).
-pub(crate) fn record_setup_running(
+pub fn record_setup_running(
     states: &WorkspaceSetupStates,
     workspace_id: &WorkspaceId,
     terminal_id: &str,
@@ -15524,7 +15535,7 @@ pub async fn github_git_credential(
 /// (logged at debug) — a lossy conversion would point the helper at a
 /// nonexistent binary, so the spawn simply proceeds without the helper,
 /// never failing on it.
-pub(crate) fn daemon_exe_path() -> Option<String> {
+pub fn daemon_exe_path() -> Option<String> {
     match std::env::current_exe() {
         Ok(path) => match path.into_os_string().into_string() {
             Ok(path) => Some(path),
@@ -15906,7 +15917,11 @@ impl Services {
 /// Publish a transient (broadcast-only, never persisted) event onto the bus
 /// when one is wired. Used for high-volume ephemeral events like
 /// `chat:stream:delta` that do not need durable storage.
-pub(crate) fn publish_event_transient(bus: Option<&EventBus>, event: &NewEvent) -> Option<Event> {
+#[expect(
+    clippy::must_use_candidate,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn publish_event_transient(bus: Option<&EventBus>, event: &NewEvent) -> Option<Event> {
     bus.map(|b| b.publish_transient(event))
 }
 
@@ -16045,7 +16060,7 @@ impl<K: std::hash::Hash + Eq> Drop for KeyedInflightSlot<'_, K> {
 /// so the archive tail — a detached task — can carry the hold across its
 /// spawn; an entry is pruned once nobody holds or awaits it.
 #[derive(Default)]
-pub(crate) struct ArchiveFence {
+pub struct ArchiveFence {
     locks: Mutex<HashMap<WorkspaceId, Arc<tokio::sync::Mutex<()>>>>,
 }
 
@@ -16053,7 +16068,11 @@ impl ArchiveFence {
     /// Take `workspace_id`'s fence (FIFO among waiters: tokio's mutex is
     /// fair, so an unarchive queued behind an archive tail acquires before
     /// the tail's own re-acquire).
-    async fn acquire(self: &Arc<Self>, workspace_id: &WorkspaceId) -> ArchiveFenceGuard {
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub async fn acquire(self: &Arc<Self>, workspace_id: &WorkspaceId) -> ArchiveFenceGuard {
         let lock = self
             .locks
             .lock()
@@ -16072,7 +16091,7 @@ impl ArchiveFence {
 
 /// One hold on an [`ArchiveFence`] entry; releases the lock and prunes the
 /// entry on drop once no other caller holds or awaits it.
-pub(crate) struct ArchiveFenceGuard {
+pub struct ArchiveFenceGuard {
     fence: Arc<ArchiveFence>,
     key: WorkspaceId,
     guard: Option<tokio::sync::OwnedMutexGuard<()>>,
@@ -38376,7 +38395,7 @@ fn parse_npx_version_ok(version_str: &str) -> bool {
 
 /// Display name of the workspace setup script terminal (`SpawnSpec::name`,
 /// surfaced through `terminal.list`).
-pub(crate) const SETUP_TERMINAL_NAME: &str = "Setup Script";
+pub const SETUP_TERMINAL_NAME: &str = "Setup Script";
 
 /// `/bin/sh` timing wrapper the setup script terminal runs via `/bin/sh -c`
 /// (`$1` is the script path): records the start epoch, runs the script through
@@ -38387,13 +38406,17 @@ pub(crate) const SETUP_TERMINAL_NAME: &str = "Setup Script";
 /// script's output ends with a newline (the common case). Assumes `date +%s`
 /// (epoch seconds; not in POSIX before Issue 8 but supported by macOS, GNU
 /// coreutils, and `BusyBox` — all platforms intentd targets).
-pub(crate) const SETUP_SCRIPT_WRAPPER: &str = r#"start=$(date +%s); /bin/sh "$1"; code=$?; elapsed=$(( $(date +%s) - start )); if [ "$code" -eq 0 ]; then printf '\nSetup script completed in %ss (exit code %s)\n' "$elapsed" "$code"; else printf '\nSetup script failed in %ss (exit code %s)\n' "$elapsed" "$code"; fi; exit "$code""#;
+pub const SETUP_SCRIPT_WRAPPER: &str = r#"start=$(date +%s); /bin/sh "$1"; code=$?; elapsed=$(( $(date +%s) - start )); if [ "$code" -eq 0 ]; then printf '\nSetup script completed in %ss (exit code %s)\n' "$elapsed" "$code"; else printf '\nSetup script failed in %ss (exit code %s)\n' "$elapsed" "$code"; fi; exit "$code""#;
 
 /// Write `contents` to a fresh file created with mode `0600` on unix (plain
 /// write elsewhere), so the script file is never exposed with world-readable
 /// permissions (parallel to secrets.rs `write_private`).
 #[cfg(unix)]
-async fn write_private_script(path: &Path, contents: &str) -> std::io::Result<()> {
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub async fn write_private_script(path: &Path, contents: &str) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt;
     let mut f = tokio::fs::OpenOptions::new()
         .write(true)
@@ -38406,7 +38429,11 @@ async fn write_private_script(path: &Path, contents: &str) -> std::io::Result<()
 }
 
 #[cfg(not(unix))]
-async fn write_private_script(path: &Path, contents: &str) -> std::io::Result<()> {
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub async fn write_private_script(path: &Path, contents: &str) -> std::io::Result<()> {
     tokio::fs::write(path, contents).await
 }
 

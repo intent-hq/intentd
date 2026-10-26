@@ -12,7 +12,7 @@ async fn purged_scripts_are_not_reseeded_by_an_inflight_first_list() {
         sqlx::query("UPDATE workspace SET repository_path = ? WHERE id = ?")
             .bind(repo.0.to_str().unwrap())
             .bind(h.ws.as_str())
-            .execute(h.services.store.write_pool())
+            .execute(h.services.store().write_pool())
             .await
             .unwrap();
         let park = Arc::new(SupervisePark::default());
@@ -49,7 +49,7 @@ async fn purged_scripts_are_not_reseeded_by_an_inflight_first_list() {
             assert_eq!(listed["scripts"][0]["id"], id);
         }
         assert_eq!(
-            h.services.store.list_all_scripts().await.unwrap().len(),
+            h.services.store().list_all_scripts().await.unwrap().len(),
             usize::from(!remove_custom)
         );
         assert_eq!(h.services.script_list(h.ws.clone()).await.unwrap(), listed);
@@ -67,7 +67,7 @@ async fn purged_repository_scripts_stay_empty_across_lists_and_restart() {
     std::fs::write(repo.0.join(".intent/config.json"), config).unwrap();
     let other_ws = WorkspaceId::new();
     h.services
-        .store
+        .store()
         .insert_workspace(&workspace(&other_ws, None))
         .await
         .unwrap();
@@ -75,7 +75,7 @@ async fn purged_repository_scripts_stay_empty_across_lists_and_restart() {
         sqlx::query("UPDATE workspace SET repository_path = ? WHERE id = ?")
             .bind(repo.0.to_str().unwrap())
             .bind(ws.as_str())
-            .execute(h.services.store.write_pool())
+            .execute(h.services.store().write_pool())
             .await
             .unwrap();
     }
@@ -90,7 +90,7 @@ async fn purged_repository_scripts_stay_empty_across_lists_and_restart() {
     h.services.script_remove(h.ws.clone(), id).await.unwrap();
     assert!(h
         .services
-        .store
+        .store()
         .list_all_scripts()
         .await
         .unwrap()
@@ -148,7 +148,7 @@ async fn purged_custom_scripts_stay_empty_before_first_repository_list() {
     sqlx::query("UPDATE workspace SET repository_path = ? WHERE id = ?")
         .bind(repo.0.to_str().unwrap())
         .bind(h.ws.as_str())
-        .execute(h.services.store.write_pool())
+        .execute(h.services.store().write_pool())
         .await
         .unwrap();
     let id = create_simple(&h, "custom", "true", ScriptMode::Command).await;

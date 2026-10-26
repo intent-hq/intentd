@@ -55,7 +55,11 @@ impl Services {
     /// workspace is retired: `Err(Error::WorkspaceRetired)`. Any other
     /// state — and a missing workspace or read failure, which the caller's
     /// own lookup reports with its usual error — passes.
-    pub(crate) async fn refuse_if_retired(&self, workspace_id: &WorkspaceId) -> Result<()> {
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub async fn refuse_if_retired(&self, workspace_id: &WorkspaceId) -> Result<()> {
         if workspace_id.is_chief() {
             return Ok(());
         }
@@ -69,7 +73,11 @@ impl Services {
     /// (`terminal.write` / `resize` / `kill`): the terminal's owning
     /// workspace is resolved from the PTY registry. An unknown terminal
     /// passes; the handler reports it with its usual `NotFound`.
-    pub(crate) async fn refuse_terminal_if_retired(&self, terminal_id: &str) -> Result<()> {
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub async fn refuse_terminal_if_retired(&self, terminal_id: &str) -> Result<()> {
         let Some(info) = intent_pty::PtyId::parse(terminal_id).and_then(|id| self.pty.info(id))
         else {
             return Ok(());
@@ -644,7 +652,11 @@ pub(crate) fn auto_retire_due(ws: &Workspace, cutoff: time::OffsetDateTime) -> b
 }
 
 /// The [`Error::WorkspaceRetired`] refusal for `workspace_id`.
-pub(crate) fn retired_error(workspace_id: &WorkspaceId) -> Error {
+#[expect(
+    clippy::must_use_candidate,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn retired_error(workspace_id: &WorkspaceId) -> Error {
     Error::WorkspaceRetired {
         workspace_id: workspace_id.as_str().to_string(),
     }

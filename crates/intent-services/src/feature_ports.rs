@@ -964,7 +964,11 @@ pub struct CommandScriptActivity {
 
 /// The queued-message id of a script-monitor wake (`script-monitor:<id>`),
 /// if `metadata` describes one. Shared by runtime and agents.
-pub(crate) fn wake_id(metadata: Option<&serde_json::Value>) -> Option<String> {
+#[expect(
+    clippy::must_use_candidate,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn wake_id(metadata: Option<&serde_json::Value>) -> Option<String> {
     let md = metadata?;
     (md["type"] == "script_monitor_wake")
         .then(|| {
@@ -976,7 +980,11 @@ pub(crate) fn wake_id(metadata: Option<&serde_json::Value>) -> Option<String> {
 }
 
 /// The monitor id of a script-monitor wake, if `metadata` describes one.
-pub(crate) fn monitor_id(metadata: Option<&serde_json::Value>) -> Option<&str> {
+#[expect(
+    clippy::must_use_candidate,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn monitor_id(metadata: Option<&serde_json::Value>) -> Option<&str> {
     let md = metadata?;
     (md["type"] == "script_monitor_wake")
         .then(|| md["monitorId"].as_str())
@@ -991,7 +999,7 @@ pub(crate) fn monitor_id(metadata: Option<&serde_json::Value>) -> Option<&str> {
 /// ([`Services::redeliver_completion_after_queue_mutation`]) — either
 /// through a wake or directly — or the watch strands forever.
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum CancelSettlement<'a> {
+pub enum CancelSettlement<'a> {
     /// Wake the owner with this notice; the wake runs the backstop itself
     /// after the delivery attempt (FE/app cancel).
     Notify(&'a str),
@@ -1080,7 +1088,7 @@ pub trait AgentQueueDrainer: Send + Sync {
 /// there is no agent to wake. Deliveries and enqueues fail, there is no
 /// drainer, every status is terminal and no provider is disabled.
 #[derive(Default)]
-pub(crate) struct UnavailableAgentWake;
+pub struct UnavailableAgentWake;
 
 fn agent_wake_unavailable() -> Error {
     Error::Internal("agent wake port not registered".into())

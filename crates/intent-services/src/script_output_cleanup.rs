@@ -16,7 +16,7 @@ impl Services {
     /// The live `scripts.outputRetentionHours` window; zero disables the
     /// expiry sweep.
     fn script_output_retention(&self) -> Duration {
-        let hours = self.settings_registry.as_ref().map_or(
+        let hours = self.feature_settings_registry().map_or(
             intent_core::config::DEFAULT_SCRIPT_OUTPUT_RETENTION_HOURS,
             |r| intent_core::config::script_output_retention_hours(&r.snapshot().effective),
         );
@@ -66,7 +66,7 @@ impl Services {
             if ws.is_chief() {
                 continue;
             }
-            match self.store.get_workspace(&ws).await {
+            match self.store().get_workspace(&ws).await {
                 Err(Error::NotFound(_)) => {
                     if self.delete_workspace_script_output(&ws).await {
                         removed += 1;
@@ -127,7 +127,7 @@ impl Services {
                 }
                 tokio::select! {
                     biased;
-                    () = services.settings_tasks.closed() => break,
+                    () = services.feature_settings_tasks().closed() => break,
                     () = tokio::time::sleep(SWEEP_INTERVAL) => {}
                 }
             }
