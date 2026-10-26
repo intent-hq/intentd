@@ -1,6 +1,6 @@
 [package]
 name = "intent-services"
-version = "0.11.53"
+version = "0.11.54"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
@@ -17,19 +17,19 @@ repository-test-fixtures = []
 test-hooks = []
 
 [dependencies]
-intent-core = { path = "../intent-core", version = "0.11.53" }
-intent-store = { path = "../intent-store", version = "0.11.53" }
-intent-git = { path = "../intent-git", version = "0.11.53" }
-intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.11.53" }
-intent-linear = { path = "../intent-linear", version = "0.11.53" }
-intent-sentry = { path = "../intent-sentry", version = "0.11.53" }
+intent-core = { path = "../intent-core", version = "0.11.54" }
+intent-store = { path = "../intent-store", version = "0.11.54" }
+intent-git = { path = "../intent-git", version = "0.11.54" }
+intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.11.54" }
+intent-linear = { path = "../intent-linear", version = "0.11.54" }
+intent-sentry = { path = "../intent-sentry", version = "0.11.54" }
 intent-voice = { path = "../intent-voice", version = "0.4.1" }
-intent-acp = { path = "../intent-acp", version = "0.11.53" }
-intent-js = { path = "../intent-js", version = "0.11.53" }
-intent-context = { path = "../intent-context", version = "0.11.53" }
-intent-providers = { path = "../intent-providers", version = "0.11.53" }
-intent-pty = { path = "../intent-pty", version = "0.11.53" }
-intent-search = { path = "../intent-search", version = "0.11.53" }
+intent-acp = { path = "../intent-acp", version = "0.11.54" }
+intent-js = { path = "../intent-js", version = "0.11.54" }
+intent-context = { path = "../intent-context", version = "0.11.54" }
+intent-providers = { path = "../intent-providers", version = "0.11.54" }
+intent-pty = { path = "../intent-pty", version = "0.11.54" }
+intent-search = { path = "../intent-search", version = "0.11.54" }
 base64 = { workspace = true }
 git2 = { workspace = true }
 ignore = { workspace = true }
@@ -63,9 +63,9 @@ ctor = "1.0.10"
 intent-test-macros = { path = "../intent-test-macros" }
 tracing-subscriber.workspace = true
 intentd-test-support = { path = "../intentd-test-support" }
-intent-providers = { path = "../intent-providers", version = "0.11.53", features = ["test-support"] }
-intent-store = { path = "../intent-store", version = "0.11.53", features = ["test-support"] }
-intent-acp = { path = "../intent-acp", version = "0.11.53", features = ["test-hooks"] }
+intent-providers = { path = "../intent-providers", version = "0.11.54", features = ["test-support"] }
+intent-store = { path = "../intent-store", version = "0.11.54", features = ["test-support"] }
+intent-acp = { path = "../intent-acp", version = "0.11.54", features = ["test-hooks"] }
 
 [target."cfg(unix)".dependencies]
 nix = { workspace = true, features = ["signal", "process", "fs"] }
