@@ -20,7 +20,7 @@
 //! the one-line `WorkspaceApi` forwarders.
 
 use std::any::{Any, TypeId};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 #[cfg(any(test, feature = "test-hooks"))]
@@ -28,8 +28,9 @@ use std::sync::Mutex;
 
 use intent_core::transfer::TransferPlan;
 
+use intent_core::execution::HostExecutionContext;
 use intent_core::{
-    AgentId, AgentStatus, BoxFuture, BrowserTab, BrowserTabInput, ClientId, Error, Result,
+    AgentId, AgentStatus, BoxFuture, BrowserTab, BrowserTabInput, ClientId, Error, HookId, Result,
     ReverseTarget, ScriptCreateParams, WorkspaceApi, WorkspaceId,
 };
 
@@ -818,6 +819,69 @@ pub trait RuntimePort: Send + Sync + 'static {
         svc: &'a Services,
         workspace_id: &'a WorkspaceId,
     ) -> BoxFuture<'a, Box<dyn ScriptsClosing>>;
+
+    // Daemon and workspace lifecycle entry points core reaches the runtime
+    // through (boot hydration, shutdown, workspace delete / archive, the
+    // host execution context, and agents' ACP terminal host). Each behaves
+    // exactly as the runtime code it forwards to; the async ones box that
+    // future, adding no await point.
+
+    /// Recover pending script monitors, start their maintenance loop and
+    /// hydrate the script registry from the store; resolves to the number of
+    /// scripts loaded.
+    fn hydrate_scripts<'a>(&'a self, svc: &'a Services) -> BoxFuture<'a, Result<usize>>;
+
+    /// Command-mode script runs in flight and the last settlement time.
+    fn command_script_activity(&self, svc: &Services) -> CommandScriptActivity;
+
+    /// Whether `workspace_id` has a command-mode script run in flight.
+    fn workspace_scripts_running(&self, svc: &Services, workspace_id: &WorkspaceId) -> bool;
+
+    /// Stop every managed script and kill every PTY session for daemon
+    /// shutdown; resolves to `(scripts_stopped, ptys_killed)`.
+    fn stop_all_scripts<'a>(&'a self, svc: &'a Services) -> BoxFuture<'a, (usize, usize)>;
+
+    /// Drop every live hook scheduler task handle (agent-delivery shutdown).
+    fn clear_hook_tasks(&self, svc: &Services);
+
+    /// Abort `workspace_id`'s live hook scheduler tasks (workspace delete).
+    fn abort_workspace_hook_tasks<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
+    ) -> BoxFuture<'a, ()>;
+
+    /// Cancel every active hook of `workspace_id` (archive sweep); resolves
+    /// to the cancelled `(name, id)` pairs per owning agent.
+    fn cancel_workspace_hooks<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
+    ) -> BoxFuture<'a, BTreeMap<AgentId, Vec<(String, HookId)>>>;
+
+    /// Delete `workspace_id`'s on-disk script output; `false` when the
+    /// best-effort delete failed.
+    fn delete_workspace_script_output<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
+    ) -> BoxFuture<'a, bool>;
+
+    /// The host execution context snapshot (`host.executionContext`).
+    fn execution_context_snapshot<'a>(
+        &'a self,
+        svc: &'a Services,
+    ) -> BoxFuture<'a, Result<HostExecutionContext>>;
+
+    /// The ACP terminal host an agent session's provider drives: PTY
+    /// terminals on the shared host, spawned through a shell when
+    /// `terminal_requires_shell`, defaulting to `session_cwd`.
+    fn agent_terminal_host(
+        &self,
+        svc: &Services,
+        terminal_requires_shell: bool,
+        session_cwd: Option<PathBuf>,
+    ) -> Arc<dyn intent_acp::TerminalHost>;
 }
 
 /// A workspace's script closing mark ([`RuntimePort::close_workspace_scripts`]):
@@ -883,6 +947,19 @@ pub struct SetupScriptRun {
     pub branch_name: String,
     /// `SOURCE_BRANCH`.
     pub source_branch: String,
+}
+
+/// Command-mode run activity for the idle update handshake (see
+/// [`RuntimePort::command_script_activity`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CommandScriptActivity {
+    /// Command runs in flight: admitted and not yet durably settled, or with
+    /// a live process. A run stays in flight after its process exits until
+    /// its result is persisted, so a restart never races the settlement.
+    pub in_flight: usize,
+    /// When the most recent command run settled, so a run that starts and
+    /// ends between two samples still restarts an idle grace.
+    pub last_settled_at: Option<std::time::Instant>,
 }
 
 /// The queued-message id of a script-monitor wake (`script-monitor:<id>`),
@@ -1662,6 +1739,102 @@ impl RuntimePort for UnavailableRuntime {
         _workspace_id: &'a WorkspaceId,
     ) -> BoxFuture<'a, Box<dyn ScriptsClosing>> {
         Box::pin(async { Box::new(NoScriptsClosing) as Box<dyn ScriptsClosing> })
+    }
+
+    fn hydrate_scripts<'a>(&'a self, _svc: &'a Services) -> BoxFuture<'a, Result<usize>> {
+        Box::pin(async { Ok(0) })
+    }
+
+    fn command_script_activity(&self, _svc: &Services) -> CommandScriptActivity {
+        CommandScriptActivity::default()
+    }
+
+    fn workspace_scripts_running(&self, _svc: &Services, _workspace_id: &WorkspaceId) -> bool {
+        false
+    }
+
+    fn stop_all_scripts<'a>(&'a self, _svc: &'a Services) -> BoxFuture<'a, (usize, usize)> {
+        Box::pin(async { (0, 0) })
+    }
+
+    fn clear_hook_tasks(&self, _svc: &Services) {}
+
+    fn abort_workspace_hook_tasks<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _workspace_id: &'a WorkspaceId,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
+
+    fn cancel_workspace_hooks<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _workspace_id: &'a WorkspaceId,
+    ) -> BoxFuture<'a, BTreeMap<AgentId, Vec<(String, HookId)>>> {
+        Box::pin(async { BTreeMap::new() })
+    }
+
+    fn delete_workspace_script_output<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _workspace_id: &'a WorkspaceId,
+    ) -> BoxFuture<'a, bool> {
+        Box::pin(async { true })
+    }
+
+    fn execution_context_snapshot<'a>(
+        &'a self,
+        _svc: &'a Services,
+    ) -> BoxFuture<'a, Result<HostExecutionContext>> {
+        Box::pin(async { Err(runtime_unavailable()) })
+    }
+
+    fn agent_terminal_host(
+        &self,
+        _svc: &Services,
+        _terminal_requires_shell: bool,
+        _session_cwd: Option<PathBuf>,
+    ) -> Arc<dyn intent_acp::TerminalHost> {
+        Arc::new(NoTerminalHost)
+    }
+}
+
+/// The ACP terminal host of an unregistered runtime: every request fails.
+struct NoTerminalHost;
+
+fn no_terminal_host() -> intent_acp::AcpError {
+    intent_acp::AcpError::Terminal("runtime feature not registered".into())
+}
+
+impl intent_acp::TerminalHost for NoTerminalHost {
+    fn create(
+        &self,
+        _params: intent_acp::TerminalCreateParams,
+    ) -> BoxFuture<'_, intent_acp::AcpResult<String>> {
+        Box::pin(async { Err(no_terminal_host()) })
+    }
+
+    fn output(
+        &self,
+        _terminal_id: String,
+    ) -> BoxFuture<'_, intent_acp::AcpResult<intent_acp::TerminalOutputInfo>> {
+        Box::pin(async { Err(no_terminal_host()) })
+    }
+
+    fn wait_for_exit(
+        &self,
+        _terminal_id: String,
+    ) -> BoxFuture<'_, intent_acp::AcpResult<intent_acp::TerminalExitInfo>> {
+        Box::pin(async { Err(no_terminal_host()) })
+    }
+
+    fn release(&self, _terminal_id: String) -> BoxFuture<'_, intent_acp::AcpResult<()>> {
+        Box::pin(async { Err(no_terminal_host()) })
+    }
+
+    fn kill(&self, _terminal_id: String) -> BoxFuture<'_, intent_acp::AcpResult<()>> {
+        Box::pin(async { Err(no_terminal_host()) })
     }
 }
 

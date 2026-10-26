@@ -3882,12 +3882,11 @@ impl AgentManager {
         let worker_connection = Arc::downgrade(&connection);
 
         let terminal_host: Arc<dyn intent_acp::TerminalHost> =
-            Arc::new(crate::PtyTerminalHost::with_shell_mode(
-                self.services.pty(),
-                self.services.settings_registry(),
+            self.services.ports.runtime().agent_terminal_host(
+                &self.services,
                 opts.provider.terminal_requires_shell,
                 Some(cwd.clone()),
-            ));
+            );
         let handler = Arc::new(
             ClientRequestHandler::new(
                 workspace_id.clone(),

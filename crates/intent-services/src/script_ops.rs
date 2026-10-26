@@ -36,6 +36,10 @@ mod retirement;
 use lifecycle::RunLease;
 
 use crate::events::EventBus;
+use crate::feature_ports::CommandScriptActivity;
+use crate::runtime_config::ScriptParks;
+#[cfg(test)]
+use crate::runtime_config::SupervisePark;
 use crate::script_output_store::ScriptOutputStore;
 use crate::shell::{default_shell, scrubbed_env_vars_except, shell_args};
 use crate::{publish_event, publish_event_transient, system_actor};
@@ -44,11 +48,6 @@ use crate::{publish_event, publish_event_transient, system_actor};
 const AUTO_RESTART_DELAY: Duration = Duration::from_secs(1);
 /// Max consecutive auto-restarts for a service (mirrors `AUTO_RESTART_MAX_RETRIES`).
 const AUTO_RESTART_MAX_RETRIES: u32 = 5;
-/// A run shorter than this is treated as a config error — do not auto-restart.
-/// The production floor; tests can raise it via
-/// [`Services::with_script_too_fast_ms`](crate::Services) so the decision is
-/// load-independent (monorepo#514).
-pub(crate) const TOO_FAST_MS: u128 = 2000;
 
 /// TTL of the monitor an agent's `ws.script.start` / `ws.script.restart`
 /// arms by default (see `WorkspaceApi::script_start_monitor`). Long enough for
@@ -153,19 +152,6 @@ fn next_generation() -> u64 {
 /// workspace ownership cannot cross runtime keys. Persisted definition IDs are
 /// globally unique; this registry does not permit duplicate public definitions.
 pub(crate) type ScriptRegistry = Arc<Mutex<HashMap<(WorkspaceId, String), ManagedScript>>>;
-
-/// Command-mode run activity for the idle update handshake (see
-/// [`crate::Services::command_script_activity`]).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct CommandScriptActivity {
-    /// Command runs in flight: admitted and not yet durably settled, or with
-    /// a live process. A run stays in flight after its process exits until
-    /// its result is persisted, so a restart never races the settlement.
-    pub in_flight: usize,
-    /// When the most recent command run settled, so a run that starts and
-    /// ends between two samples still restarts an idle grace.
-    pub last_settled_at: Option<Instant>,
-}
 
 /// [`CommandScriptActivity`] over `registry` (one registry lock) plus the
 /// registry-wide settlement stamp in `locks`.
@@ -342,7 +328,7 @@ pub struct ScriptManager {
     store: Store,
     scripts: ScriptRegistry,
     locks: ScriptLocks,
-    /// The too-fast-exit floor in milliseconds ([`TOO_FAST_MS`] in production;
+    /// The too-fast-exit floor in milliseconds ([`TOO_FAST_MS`](crate::runtime_config::TOO_FAST_MS) in production;
     /// tests inject a larger floor so the decision is load-independent).
     too_fast_ms: u128,
     /// Test park seams for the `script.*` race windows; all `None` in
@@ -351,53 +337,6 @@ pub struct ScriptManager {
     settings: Option<Arc<crate::SettingsRegistry>>,
     tasks: Arc<crate::delivery_tasks::DeliveryTasks>,
     output_store: ScriptOutputStore,
-}
-
-/// Test seam for a race window: lets a test hold a task inside a window
-/// (signal `entered`, await `release`). Used for `supervise()`'s
-/// pre-registration window (monorepo#1180).
-#[derive(Default)]
-pub(crate) struct SupervisePark {
-    /// Signaled by the parked task on entering the window.
-    pub(crate) entered: tokio::sync::Notify,
-    /// Held by the parked task inside the window until the test releases it.
-    pub(crate) release: tokio::sync::Notify,
-}
-
-/// The set of `script.*` test park seams (all `None` in production wiring),
-/// grouped so the manager constructor stays within arity limits.
-#[derive(Clone, Default)]
-pub(crate) struct ScriptParks {
-    /// Signals that a request passed the public gate and is waiting for admission.
-    pub(crate) admission_wait: Option<Arc<tokio::sync::Notify>>,
-    /// Parks a first-use list before its atomic bootstrap claim.
-    pub(crate) bootstrap_persist: Option<Arc<SupervisePark>>,
-    pub(crate) monitor_clock: Option<Arc<std::sync::atomic::AtomicI64>>,
-    /// Parks before process admission; cancellation must prevent the spawn.
-    pub(crate) before_spawn: Option<Arc<SupervisePark>>,
-    /// Parks `supervise()` in its pre-registration window — after
-    /// `pty.spawn`, before `mark_running` records the id (monorepo#1180).
-    pub(crate) supervise: Option<Arc<SupervisePark>>,
-    /// Parks `mark_running` after its eligibility check, before the
-    /// `was_running` marker write and the in-memory flip to `running`
-    /// (monorepo#4952).
-    pub(crate) mark_running_persist: Option<Arc<SupervisePark>>,
-    /// Parks archive after eligibility, while holding the admission lock.
-    pub(crate) archive_persist: Option<Arc<SupervisePark>>,
-    /// Parks after archive/restore commits, before the registry is updated.
-    pub(crate) archive_committed: Option<Arc<SupervisePark>>,
-    /// Parks after automatic settlement commits, before registry publication.
-    pub(crate) settlement_committed: Option<Arc<SupervisePark>>,
-    /// Parks settled process ownership before the outcome persistence decision.
-    pub(crate) settlement_ready: Option<Arc<SupervisePark>>,
-    /// Parks a terminal runtime transition before marker persistence/events.
-    pub(crate) terminal_persist: Option<Arc<SupervisePark>>,
-    /// Parks workspace deletion after its scripts stop, before the output
-    /// folder is deleted.
-    pub(crate) workspace_closed: Option<Arc<SupervisePark>>,
-    /// Parks `script.create` after its retired/closing checks, before it
-    /// persists the definition.
-    pub(crate) create_admitted: Option<Arc<SupervisePark>>,
 }
 
 /// Holds a workspace's closing mark (see [`ScriptManager::close_workspace`]);
@@ -1051,11 +990,6 @@ impl ScriptManager {
 
     /// Reconcile one committed import without rewriting its persisted definition
     /// or touching scripts absent from the archive. Imported scripts stay idle.
-    #[expect(
-        clippy::missing_errors_doc,
-        clippy::missing_panics_doc,
-        reason = "internal doc-hidden feature API, not a public library API"
-    )]
     pub async fn refresh_imported(
         &self,
         workspace_id: &WorkspaceId,
