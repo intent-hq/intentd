@@ -96,12 +96,9 @@ pub mod desktop {
     pub use crate::desktop::Runtime;
 }
 
-/// Runtime defaults and test parks that core owns.
+/// Script output configuration and test parks that core owns.
 pub mod runtime_config {
-    pub use crate::runtime_config::{
-        ScriptOutputConfig, ScriptParks, SupervisePark, HOOK_EVAL_TIMEOUT, HOOK_STORE_RETRY_BASE,
-        TOO_FAST_MS,
-    };
+    pub use crate::runtime_config::{ScriptOutputConfig, ScriptParks, SupervisePark};
 }
 
 /// The async secret store.

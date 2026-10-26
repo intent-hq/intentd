@@ -17,16 +17,16 @@ use intent_core::Error;
 /// The production floor; tests can raise it via
 /// `Services::with_script_too_fast_ms` so the decision is
 /// load-independent (monorepo#514).
-pub const TOO_FAST_MS: u128 = 2000;
+pub(crate) const TOO_FAST_MS: u128 = 2000;
 
 /// Wall-clock budget for one hook script run (spec: any run exceeding 60 s is
 /// killed and the hook evicted). Tests compress it via the `#[cfg(test)]`-only
 /// `Services::with_hook_eval_timeout`.
-pub const HOOK_EVAL_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const HOOK_EVAL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Base backoff between hook-run persistence retries (doubled per attempt;
 /// see `hook_manager::HOOK_STORE_RETRY_ATTEMPTS`).
-pub const HOOK_STORE_RETRY_BASE: Duration = Duration::from_secs(1);
+pub(crate) const HOOK_STORE_RETRY_BASE: Duration = Duration::from_secs(1);
 
 /// Test-only fault injector for hook-run persistence steps: called with the
 /// step name before each attempt; `Some(err)` fails that attempt in place of
