@@ -19,7 +19,9 @@ use intent_core::{
     ReverseDispatchError, ReverseTarget, ScriptCreateParams, WorkspaceApi, WorkspaceId,
 };
 
-use crate::feature_ports::{MergeOutcome, ProvisionOutcome, RuntimePort, SetupScriptRun};
+use crate::feature_ports::{
+    MergeOutcome, ProvisionOutcome, RuntimePort, ScriptsClosing, SetupScriptRun,
+};
 use crate::{
     browser_ops, browser_tabs, capability, hook_manager, record_setup_running, sandbox_ops,
     script_ops, setup_runner, terminal_ops, write_private_script, Services, SETUP_TERMINAL_NAME,
@@ -1326,5 +1328,148 @@ impl RuntimePort for RuntimeFeature {
                 }
             }
         })
+    }
+
+    fn active_hooks_for_agent<'a>(
+        &'a self,
+        svc: &'a Services,
+        agent_id: &'a AgentId,
+    ) -> BoxFuture<'a, Vec<serde_json::Value>> {
+        Box::pin(svc.active_hooks_for_agent(agent_id))
+    }
+
+    fn active_hooks_by_agent<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
+    ) -> BoxFuture<'a, HashMap<String, Vec<serde_json::Value>>> {
+        Box::pin(svc.active_hooks_by_agent(workspace_id))
+    }
+
+    fn annotate_waiting_on_hooks<'a>(
+        &'a self,
+        svc: &'a Services,
+        agent_id: &'a AgentId,
+        data: &'a mut serde_json::Value,
+    ) -> BoxFuture<'a, Vec<serde_json::Value>> {
+        Box::pin(svc.annotate_waiting_on_hooks(agent_id, data))
+    }
+
+    fn cancel_agent_hooks<'a>(
+        &'a self,
+        svc: &'a Services,
+        agent_id: &'a AgentId,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(svc.cancel_agent_hooks(agent_id))
+    }
+
+    fn active_script_monitors_for_agent<'a>(
+        &'a self,
+        svc: &'a Services,
+        agent_id: &'a AgentId,
+    ) -> BoxFuture<'a, Vec<serde_json::Value>> {
+        Box::pin(svc.active_script_monitors_for_agent(agent_id))
+    }
+
+    fn annotate_waiting_on_script_monitors<'a>(
+        &'a self,
+        svc: &'a Services,
+        agent_id: &'a AgentId,
+        data: &'a mut serde_json::Value,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(svc.annotate_waiting_on_script_monitors(agent_id, data))
+    }
+
+    fn cancel_script_monitors<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
+        agent_id: Option<&'a AgentId>,
+        reason: &'a str,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(svc.cancel_script_monitors(workspace_id, agent_id, reason))
+    }
+
+    fn script_monitor_export_blocked(
+        &self,
+        svc: &Services,
+        metadata: Option<&serde_json::Value>,
+    ) -> bool {
+        svc.script_monitor_export_blocked(metadata)
+    }
+
+    fn defer_script_monitor_for_export(
+        &self,
+        svc: &Services,
+        agent_id: &AgentId,
+        content: &str,
+        metadata: Option<&serde_json::Value>,
+    ) -> bool {
+        svc.defer_script_monitor_for_export(agent_id, content, metadata)
+    }
+
+    fn track_script_monitor_worker(
+        &self,
+        svc: &Services,
+        agent_id: &AgentId,
+        metadata: Option<&serde_json::Value>,
+    ) {
+        svc.track_script_monitor_worker(agent_id, metadata);
+    }
+
+    fn settle_script_monitor_worker<'a>(
+        &'a self,
+        svc: &'a Services,
+        agent_id: &'a AgentId,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(svc.settle_script_monitor_worker(agent_id))
+    }
+
+    fn admit_script_monitor_turn<'a>(
+        &'a self,
+        svc: &'a Services,
+        agent_id: &'a AgentId,
+        metadata: Option<&'a serde_json::Value>,
+    ) -> BoxFuture<'a, Result<bool>> {
+        Box::pin(svc.admit_script_monitor_turn(agent_id, metadata))
+    }
+
+    fn script_monitor_delivery_allowed<'a>(
+        &'a self,
+        svc: &'a Services,
+        agent_id: &'a AgentId,
+        metadata: Option<&'a serde_json::Value>,
+    ) -> BoxFuture<'a, Result<bool>> {
+        Box::pin(svc.script_monitor_delivery_allowed(agent_id, metadata))
+    }
+
+    fn complete_script_monitor_delivery<'a>(
+        &'a self,
+        svc: &'a Services,
+        agent_id: &'a AgentId,
+        monitor_id: &'a str,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(svc.complete_script_monitor_delivery(agent_id, monitor_id))
+    }
+
+    fn script_monitor_lane<'a>(&'a self, svc: &'a Services) -> &'a tokio::sync::Mutex<()> {
+        &svc.runtime().script_locks.monitor_lane
+    }
+
+    fn close_workspace_scripts<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
+    ) -> BoxFuture<'a, Box<dyn ScriptsClosing>> {
+        Box::pin(async move {
+            Box::new(svc.script_manager().close_workspace(workspace_id).await)
+                as Box<dyn ScriptsClosing>
+        })
+    }
+}
+
+impl ScriptsClosing for script_ops::WorkspaceClosing {
+    fn unsettled(&self) -> &[String] {
+        script_ops::WorkspaceClosing::unsettled(self)
     }
 }

@@ -174,7 +174,7 @@ impl Harness {
         &self,
         body: impl std::future::Future<Output = T> + Send + 'static,
     ) -> T {
-        intent_core::spawn_daemon(crate::host_execution::background_execution(
+        intent_core::spawn_daemon(crate::execution_call::background_execution(
             self.services.as_ref().clone(),
             None,
             body,

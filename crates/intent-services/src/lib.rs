@@ -102,6 +102,7 @@ mod enhance_ops;
 mod event_ops;
 mod event_subscriptions;
 pub mod events;
+mod execution_call;
 #[doc(hidden)]
 pub mod feature_api;
 mod feature_ports;
@@ -15526,7 +15527,7 @@ async fn github_git_token_for_url(
 pub async fn github_git_credential(
     registry: Option<&SettingsRegistry>,
 ) -> Option<(String, String)> {
-    if !terminal_ops::expose_git_credential(registry) {
+    if !execution_call::expose_git_credential(registry) {
         return None;
     }
     let token = intent_sourcecontrol::token::resolve(&github_token_source(registry)).await;
@@ -23544,7 +23545,7 @@ impl WorkspaceApi for Services {
                     "workspace.create failed"
                 );
             }
-            let mut result = result.map_err(|e| host_execution::git_error(e, execution_origin.as_deref()))?;
+            let mut result = result.map_err(|e| execution_call::git_error(e, execution_origin.as_deref()))?;
             self.attach_workspace_membership(&mut result.workspace)
                 .await;
             Ok(result)
@@ -29238,7 +29239,7 @@ impl WorkspaceApi for Services {
                         token.as_deref(),
                     )
                     .map_err(|e| {
-                        host_execution::git_error(
+                        execution_call::git_error(
                             e,
                             intent_git::remote::origin_url(&worktree)
                                 .ok()
@@ -29314,7 +29315,7 @@ impl WorkspaceApi for Services {
                         })?;
                     intent_git::fetch::fetch(&worktree, "origin", &branch, token.as_deref())
                         .map_err(|e| {
-                            host_execution::git_error(
+                            execution_call::git_error(
                                 e,
                                 intent_git::remote::origin_url(&worktree)
                                     .ok()
@@ -29612,7 +29613,7 @@ impl WorkspaceApi for Services {
                     let origin = intent_git::remote::origin_url(std::path::Path::new(&repo_path))
                         .ok()
                         .flatten();
-                    match host_execution::git_error(error, origin.as_deref()) {
+                    match execution_call::git_error(error, origin.as_deref()) {
                         Error::GitAuthorization(message) => intent_core::GitPullResult {
                             ok: false,
                             error: Some(message),
@@ -29694,7 +29695,7 @@ impl WorkspaceApi for Services {
             let spawn_target = target.clone();
             let _ = self
                 .store_tasks
-                .spawn_draining(host_execution::background_execution(
+                .spawn_draining(execution_call::background_execution(
                     self.clone(),
                     None,
                     async move {
@@ -29713,7 +29714,7 @@ impl WorkspaceApi for Services {
                         })
                         .await;
                         if let Err(failure) = result {
-                            let _ = host_execution::git_error(
+                            let _ = execution_call::git_error(
                                 Error::CloneFailed {
                                     category: failure
                                         .category
@@ -29864,7 +29865,7 @@ impl WorkspaceApi for Services {
             // serializes behind this ensure on the per-repo cache lock.
             let task_owner = owner.clone();
             let task_repo = repo.clone();
-            let _ = self.store_tasks.spawn_draining(host_execution::background_execution(
+            let _ = self.store_tasks.spawn_draining(execution_call::background_execution(
                 self.clone(),
                 None,
                 async move {
@@ -29886,7 +29887,7 @@ impl WorkspaceApi for Services {
                             "opportunistic repo cache warm completed"
                         ),
                         Err(e) => {
-                            let error = host_execution::git_error(e, Some(&url));
+                            let error = execution_call::git_error(e, Some(&url));
                             tracing::warn!(owner = %task_owner, repo = %task_repo, error = %error,
                             "opportunistic repo cache warm failed");
                         }
@@ -35735,7 +35736,7 @@ impl Services {
     /// after the workspace is Active again, and its wording says so.
     ///
     /// The per-item cancels were DEFERRED
-    /// ([`crate::hook_manager::CancelSettlement::Deferred`]): none ran the
+    /// ([`crate::feature_ports::CancelSettlement::Deferred`]): none ran the
     /// deferral backstop, so this tail runs
     /// [`Services::redeliver_completion_after_queue_mutation`] once per
     /// owner AFTER queueing its wake — on delivery failure too. Ordering is

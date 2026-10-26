@@ -684,6 +684,147 @@ pub trait RuntimePort: Send + Sync + 'static {
         svc: &Services,
         run: SetupScriptRun,
     ) -> BoxFuture<'static, (bool, Option<u32>)>;
+
+    // Hook and script-monitor state agents read and settle (agent views,
+    // waiting annotations, retire/delete sweeps, turn admission). Each
+    // behaves exactly as the runtime `Services` method of the same name; the
+    // async ones box that method's future, adding no await point.
+
+    /// The active hooks `agent_id` owns, as hook rows.
+    fn active_hooks_for_agent<'a>(
+        &'a self,
+        svc: &'a Services,
+        agent_id: &'a AgentId,
+    ) -> BoxFuture<'a, Vec<serde_json::Value>>;
+
+    /// The active hooks of `workspace_id`, keyed by owning agent id.
+    fn active_hooks_by_agent<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
+    ) -> BoxFuture<'a, HashMap<String, Vec<serde_json::Value>>>;
+
+    /// Add `waitingOnHooks` to an idle payload when `agent_id` owns active
+    /// hooks; resolves to the hook rows.
+    fn annotate_waiting_on_hooks<'a>(
+        &'a self,
+        svc: &'a Services,
+        agent_id: &'a AgentId,
+        data: &'a mut serde_json::Value,
+    ) -> BoxFuture<'a, Vec<serde_json::Value>>;
+
+    /// Cancel every active hook `agent_id` owns (retire sweep).
+    fn cancel_agent_hooks<'a>(
+        &'a self,
+        svc: &'a Services,
+        agent_id: &'a AgentId,
+    ) -> BoxFuture<'a, ()>;
+
+    /// The active script monitors `agent_id` owns, as waiting rows.
+    fn active_script_monitors_for_agent<'a>(
+        &'a self,
+        svc: &'a Services,
+        agent_id: &'a AgentId,
+    ) -> BoxFuture<'a, Vec<serde_json::Value>>;
+
+    /// Add `waitingOnScriptMonitors` to an idle payload when `agent_id` owns
+    /// active script monitors.
+    fn annotate_waiting_on_script_monitors<'a>(
+        &'a self,
+        svc: &'a Services,
+        agent_id: &'a AgentId,
+        data: &'a mut serde_json::Value,
+    ) -> BoxFuture<'a, ()>;
+
+    /// Cancel the active script monitors of `workspace_id` (only `agent_id`'s
+    /// when given), recording `reason`.
+    fn cancel_script_monitors<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
+        agent_id: Option<&'a AgentId>,
+        reason: &'a str,
+    ) -> BoxFuture<'a, Result<()>>;
+
+    /// Whether `metadata` is a script-monitor wake whose workspace is being
+    /// exported (its delivery must wait).
+    fn script_monitor_export_blocked(
+        &self,
+        svc: &Services,
+        metadata: Option<&serde_json::Value>,
+    ) -> bool;
+
+    /// Re-queue an export-blocked script-monitor wake for `agent_id`;
+    /// `false` (nothing queued) when it is not blocked.
+    fn defer_script_monitor_for_export(
+        &self,
+        svc: &Services,
+        agent_id: &AgentId,
+        content: &str,
+        metadata: Option<&serde_json::Value>,
+    ) -> bool;
+
+    /// Record which script-monitor wake (if any) `agent_id`'s starting turn
+    /// delivers.
+    fn track_script_monitor_worker(
+        &self,
+        svc: &Services,
+        agent_id: &AgentId,
+        metadata: Option<&serde_json::Value>,
+    );
+
+    /// Complete the script-monitor delivery `agent_id`'s finished turn
+    /// carried, if any.
+    fn settle_script_monitor_worker<'a>(
+        &'a self,
+        svc: &'a Services,
+        agent_id: &'a AgentId,
+    ) -> BoxFuture<'a, ()>;
+
+    /// Admit a turn carrying `metadata` under the monitor lane: `true` for a
+    /// non-monitor turn or an accepted monitor delivery.
+    fn admit_script_monitor_turn<'a>(
+        &'a self,
+        svc: &'a Services,
+        agent_id: &'a AgentId,
+        metadata: Option<&'a serde_json::Value>,
+    ) -> BoxFuture<'a, Result<bool>>;
+
+    /// Whether a turn carrying `metadata` may still be delivered to
+    /// `agent_id` (`true` for a non-monitor turn).
+    fn script_monitor_delivery_allowed<'a>(
+        &'a self,
+        svc: &'a Services,
+        agent_id: &'a AgentId,
+        metadata: Option<&'a serde_json::Value>,
+    ) -> BoxFuture<'a, Result<bool>>;
+
+    /// Record script-monitor delivery `monitor_id` to `agent_id` as finished.
+    fn complete_script_monitor_delivery<'a>(
+        &'a self,
+        svc: &'a Services,
+        agent_id: &'a AgentId,
+        monitor_id: &'a str,
+    ) -> BoxFuture<'a, ()>;
+
+    /// The lane that serializes script-monitor delivery with queue
+    /// suppression and exports.
+    fn script_monitor_lane<'a>(&'a self, svc: &'a Services) -> &'a tokio::sync::Mutex<()>;
+
+    /// Stop every script of `workspace_id` and refuse new launches while the
+    /// returned guard lives (workspace retire).
+    fn close_workspace_scripts<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
+    ) -> BoxFuture<'a, Box<dyn ScriptsClosing>>;
+}
+
+/// A workspace's script closing mark ([`RuntimePort::close_workspace_scripts`]):
+/// dropping it reopens the workspace for script launches.
+pub trait ScriptsClosing: Send {
+    /// Script ids the close could not fully stop and settle.
+    fn unsettled(&self) -> &[String];
 }
 
 /// The core-internal entry points of an unregistered runtime port fail
@@ -742,6 +883,49 @@ pub struct SetupScriptRun {
     pub branch_name: String,
     /// `SOURCE_BRANCH`.
     pub source_branch: String,
+}
+
+/// The queued-message id of a script-monitor wake (`script-monitor:<id>`),
+/// if `metadata` describes one. Shared by runtime and agents.
+pub(crate) fn wake_id(metadata: Option<&serde_json::Value>) -> Option<String> {
+    let md = metadata?;
+    (md["type"] == "script_monitor_wake")
+        .then(|| {
+            md["monitorId"]
+                .as_str()
+                .map(|id| format!("script-monitor:{id}"))
+        })
+        .flatten()
+}
+
+/// The monitor id of a script-monitor wake, if `metadata` describes one.
+pub(crate) fn monitor_id(metadata: Option<&serde_json::Value>) -> Option<&str> {
+    let md = metadata?;
+    (md["type"] == "script_monitor_wake")
+        .then(|| md["monitorId"].as_str())
+        .flatten()
+}
+
+/// How a cancel transition ([`Services::cancel_active_hook`],
+/// [`Services::cancel_active_pr_monitor`]) settles the owner's deferred
+/// completion watches. A completion watch on an idle owner defers while the
+/// owner has active hooks / PR monitors, so cancelling the LAST one must
+/// re-run the deferral backstop
+/// ([`Services::redeliver_completion_after_queue_mutation`]) — either
+/// through a wake or directly — or the watch strands forever.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum CancelSettlement<'a> {
+    /// Wake the owner with this notice; the wake runs the backstop itself
+    /// after the delivery attempt (FE/app cancel).
+    Notify(&'a str),
+    /// No wake; run the backstop directly (owner-side cancel, retire sweep).
+    Resettle,
+    /// Neither: the caller sweeps several items and runs the backstop ONCE
+    /// per owner after queueing its consolidated wake (archive sweep). The
+    /// per-item backstop would otherwise see an empty queue and no remaining
+    /// watches on the final item and synthesize a genuine completion,
+    /// consuming a parent's watch BEFORE the consolidated notice is queued.
+    Deferred,
 }
 
 /// The agent-wake feature: what the runtime (script monitors, hooks, script
@@ -1344,6 +1528,149 @@ impl RuntimePort for UnavailableRuntime {
         _run: SetupScriptRun,
     ) -> BoxFuture<'static, (bool, Option<u32>)> {
         Box::pin(async { (false, None) })
+    }
+
+    fn active_hooks_for_agent<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _agent_id: &'a AgentId,
+    ) -> BoxFuture<'a, Vec<serde_json::Value>> {
+        Box::pin(async { Vec::new() })
+    }
+
+    fn active_hooks_by_agent<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _workspace_id: &'a WorkspaceId,
+    ) -> BoxFuture<'a, HashMap<String, Vec<serde_json::Value>>> {
+        Box::pin(async { HashMap::new() })
+    }
+
+    fn annotate_waiting_on_hooks<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _agent_id: &'a AgentId,
+        _data: &'a mut serde_json::Value,
+    ) -> BoxFuture<'a, Vec<serde_json::Value>> {
+        Box::pin(async { Vec::new() })
+    }
+
+    fn cancel_agent_hooks<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _agent_id: &'a AgentId,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
+
+    fn active_script_monitors_for_agent<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _agent_id: &'a AgentId,
+    ) -> BoxFuture<'a, Vec<serde_json::Value>> {
+        Box::pin(async { Vec::new() })
+    }
+
+    fn annotate_waiting_on_script_monitors<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _agent_id: &'a AgentId,
+        _data: &'a mut serde_json::Value,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
+
+    fn cancel_script_monitors<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _workspace_id: &'a WorkspaceId,
+        _agent_id: Option<&'a AgentId>,
+        _reason: &'a str,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn script_monitor_export_blocked(
+        &self,
+        _svc: &Services,
+        _metadata: Option<&serde_json::Value>,
+    ) -> bool {
+        false
+    }
+
+    fn defer_script_monitor_for_export(
+        &self,
+        _svc: &Services,
+        _agent_id: &AgentId,
+        _content: &str,
+        _metadata: Option<&serde_json::Value>,
+    ) -> bool {
+        false
+    }
+
+    fn track_script_monitor_worker(
+        &self,
+        _svc: &Services,
+        _agent_id: &AgentId,
+        _metadata: Option<&serde_json::Value>,
+    ) {
+    }
+
+    fn settle_script_monitor_worker<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _agent_id: &'a AgentId,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
+
+    fn admit_script_monitor_turn<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _agent_id: &'a AgentId,
+        metadata: Option<&'a serde_json::Value>,
+    ) -> BoxFuture<'a, Result<bool>> {
+        Box::pin(async move { Ok(monitor_id(metadata).is_none()) })
+    }
+
+    fn script_monitor_delivery_allowed<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _agent_id: &'a AgentId,
+        metadata: Option<&'a serde_json::Value>,
+    ) -> BoxFuture<'a, Result<bool>> {
+        Box::pin(async move { Ok(monitor_id(metadata).is_none()) })
+    }
+
+    fn complete_script_monitor_delivery<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _agent_id: &'a AgentId,
+        _monitor_id: &'a str,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
+
+    fn script_monitor_lane<'a>(&'a self, _svc: &'a Services) -> &'a tokio::sync::Mutex<()> {
+        static LANE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        &LANE
+    }
+
+    fn close_workspace_scripts<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _workspace_id: &'a WorkspaceId,
+    ) -> BoxFuture<'a, Box<dyn ScriptsClosing>> {
+        Box::pin(async { Box::new(NoScriptsClosing) as Box<dyn ScriptsClosing> })
+    }
+}
+
+/// The closing mark of an unregistered runtime: there are no scripts.
+struct NoScriptsClosing;
+
+impl ScriptsClosing for NoScriptsClosing {
+    fn unsettled(&self) -> &[String] {
+        &[]
     }
 }
 

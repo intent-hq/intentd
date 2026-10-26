@@ -30,6 +30,7 @@ use std::time::Duration;
 use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 
 use crate::events::EventBus;
+use crate::execution_call::expose_git_credential;
 use crate::shell::{default_shell, scrubbed_env_vars_except, shell_true_invocation};
 use crate::{publish_event, publish_event_transient, system_actor, SettingsRegistry};
 
@@ -287,24 +288,6 @@ pub(crate) fn injected_git_env(
     let mut env = git_credential_env(settings, cwd);
     env.extend(intent_git::identity::commit_identity_env(cwd));
     env
-}
-
-/// The `exposeGitCredentialToChildren` gate. `None` (registry not wired —
-/// minimal/test compositions) reads as **off** so bare spawns never trigger
-/// token resolution; the production composition root always wires the
-/// registry, where the schema default (`true`) applies. Shared with the
-/// `system.gitCredential` UDS RPC (see [`crate::github_git_credential`]).
-pub(crate) fn expose_git_credential(settings: Option<&SettingsRegistry>) -> bool {
-    if intent_core::process_policy::ProcessPolicy::current().private_test_profile() {
-        return false;
-    }
-    settings.is_some_and(|r| {
-        r.snapshot()
-            .effective
-            .source_control
-            .github
-            .expose_git_credential_to_children
-    })
 }
 
 /// Build the daemon-backed helper env pair on top of the daemon's own

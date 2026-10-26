@@ -1301,7 +1301,7 @@ pub(crate) fn ensure_provider_authenticated(
     if auth_verdict != Some(false) {
         return Ok(());
     }
-    Err(crate::host_execution::ai_authorization_error(
+    Err(crate::execution_call::ai_authorization_error(
         Error::InvalidParams(format!(
             "{method}: {}",
             crate::provider_auth::not_authenticated_message(provider_id)
@@ -3863,7 +3863,10 @@ impl Services {
             (HashMap::new(), HashMap::new())
         } else {
             (
-                self.active_hooks_by_agent(&workspace_id).await,
+                self.ports
+                    .runtime()
+                    .active_hooks_by_agent(self, &workspace_id)
+                    .await,
                 self.active_pr_monitors_by_agent(&workspace_id).await,
             )
         };
@@ -3962,14 +3965,22 @@ impl Services {
             .await?;
         // Idle-visibility: overlay the agent's active-hook metadata
         // (`waitingOnHooks`, omitted when empty).
-        let waiting_on_hooks = self.active_hooks_for_agent(&agent_id).await;
+        let waiting_on_hooks = self
+            .ports
+            .runtime()
+            .active_hooks_for_agent(self, &agent_id)
+            .await;
         // Idle-visibility (unified external-wait): same overlay for active
         // PR monitors (`waitingOnPrMonitors`, omitted when empty).
         let waiting_on_pr_monitors = self.legacy_pr_monitor_wait_entries(&agent_id).await;
         let mut lite = self.project_lite_with_flags_from_projection(session, &projection);
         lite.waiting_on_hooks = waiting_on_hooks;
         lite.waiting_on_pr_monitors = waiting_on_pr_monitors;
-        lite.waiting_on_script_monitors = self.active_script_monitors_for_agent(&agent_id).await;
+        lite.waiting_on_script_monitors = self
+            .ports
+            .runtime()
+            .active_script_monitors_for_agent(self, &agent_id)
+            .await;
         Ok(lite)
     }
 
@@ -6118,7 +6129,9 @@ impl Services {
         if let Some(session_ws) = session_workspace_id.as_ref() {
             let retirement = self.agent_retirement_gates.for_agent(&agent_id);
             let _retirement = retirement.lock().await;
-            self.cancel_script_monitors(session_ws, Some(&agent_id), "owner-deleted")
+            self.ports
+                .runtime()
+                .cancel_script_monitors(self, session_ws, Some(&agent_id), "owner-deleted")
                 .await?;
             let deleted = self
                 .store
@@ -6475,7 +6488,14 @@ impl Services {
         // so a transient probe failure can never publish a spurious
         // `{ none }` through the settle's fallback.
         let before = self.snapshot_workspace_unread(&session.workspace_id).await;
-        self.cancel_script_monitors(&session.workspace_id, Some(&session.id), "owner-retired")
+        self.ports
+            .runtime()
+            .cancel_script_monitors(
+                self,
+                &session.workspace_id,
+                Some(&session.id),
+                "owner-retired",
+            )
             .await?;
         // CAS write: only the request that actually flips NULL → set emits
         // the event.
@@ -6511,7 +6531,10 @@ impl Services {
         // itself, so NO wake notice is queued. `agent.restore` does NOT
         // resurrect them (unarchive precedent) — the agent re-registers if
         // the condition still matters.
-        self.cancel_agent_hooks(&session.id).await;
+        self.ports
+            .runtime()
+            .cancel_agent_hooks(self, &session.id)
+            .await;
         self.cancel_agent_pr_monitors(&session.id).await;
         // Drop the retiring agent's OWN outgoing completion watches and
         // delegation groups (monorepo#4183): a retired watcher can never
@@ -8261,7 +8284,7 @@ impl Services {
         self.park_queue_mutation_gate(gate.as_ref()).await;
         // Serialize suppression with notification dispatch/admission. Commit
         // cancellation before removing the local row or acknowledging success.
-        let monitor_lane = self.runtime().script_locks.monitor_lane.lock().await;
+        let monitor_lane = self.ports.runtime().script_monitor_lane(self).lock().await;
         let monitor = {
             let queues = self
                 .agent_queues
@@ -8283,9 +8306,7 @@ impl Services {
                 ));
             }
             entry
-                .and_then(|entry| {
-                    crate::script_monitor::monitor_id(entry.message_metadata.as_ref())
-                })
+                .and_then(|entry| crate::feature_ports::monitor_id(entry.message_metadata.as_ref()))
                 .map(str::to_owned)
         };
         if let Some(id) = monitor {
@@ -12322,7 +12343,7 @@ impl Services {
     }
 
     /// Background half of the delegate CoW-isolation path (monorepo#871): run
-    /// [`provision_sandbox`](crate::sandbox_ops::provision_sandbox) and settle
+    /// [`RuntimePort::provision_sandbox`](crate::feature_ports::RuntimePort::provision_sandbox) and settle
     /// the outcome onto the child's session. Success persists the sandbox
     /// fields and emits `sandbox:cow:created` (payload unchanged, §5.5);
     /// `Unsupported`/failure falls back to shared mode exactly as before —
@@ -12334,9 +12355,13 @@ impl Services {
         agent_id: &AgentId,
         workspaces_root: std::path::PathBuf,
     ) {
-        use crate::sandbox_ops::{provision_sandbox, ProvisionConfig, ProvisionOutcome};
-        let config = ProvisionConfig { workspaces_root };
-        match provision_sandbox(&self.store, workspace_id, agent_id, &config).await {
+        use crate::feature_ports::ProvisionOutcome;
+        match self
+            .ports
+            .runtime()
+            .provision_sandbox(self, workspace_id, agent_id, workspaces_root)
+            .await
+        {
             Ok(ProvisionOutcome::Supported {
                 path,
                 branch,
@@ -12757,7 +12782,9 @@ impl Services {
             return Ok(true);
         }
         if !self
-            .active_script_monitors_for_agent(agent_id)
+            .ports
+            .runtime()
+            .active_script_monitors_for_agent(self, agent_id)
             .await
             .is_empty()
         {
@@ -14137,7 +14164,11 @@ impl Services {
         all_agent_ids.sort();
         // Idle-visibility: per-agent active-hook metadata (`waitingOnHooks`,
         // omitted when empty) from one workspace-wide hook query.
-        let mut hooks_by_agent = self.active_hooks_by_agent(&workspace_id).await;
+        let mut hooks_by_agent = self
+            .ports
+            .runtime()
+            .active_hooks_by_agent(self, &workspace_id)
+            .await;
         // Idle-visibility (unified external-wait): per-agent active PR
         // monitor metadata (`waitingOnPrMonitors`, omitted when empty) from
         // one workspace-wide monitor query.
@@ -16844,7 +16875,11 @@ impl Services {
             .expect("agent queue registry poisoned");
         let queue = guard.get_mut(agent_id)?;
         let idx = queue.iter().position(|m| {
-            m.ready_to_send() && !self.script_monitor_export_blocked(m.message_metadata.as_ref())
+            m.ready_to_send()
+                && !self
+                    .ports
+                    .runtime()
+                    .script_monitor_export_blocked(self, m.message_metadata.as_ref())
         })?;
         Some(queue.remove(idx))
     }
@@ -16896,7 +16931,7 @@ impl Services {
             m.ready_to_send()
                 && (crate::discussion_activity::is_discussion(m.message_metadata.as_ref())
                     || m.monitor_turn.is_some()
-                    || crate::script_monitor::monitor_id(m.message_metadata.as_ref()).is_some())
+                    || crate::feature_ports::monitor_id(m.message_metadata.as_ref()).is_some())
         }) {
             return None;
         }
@@ -17076,7 +17111,10 @@ impl Services {
             .is_some_and(|q| {
                 q.iter().any(|m| {
                     m.ready_to_send()
-                        && !self.script_monitor_export_blocked(m.message_metadata.as_ref())
+                        && !self
+                            .ports
+                            .runtime()
+                            .script_monitor_export_blocked(self, m.message_metadata.as_ref())
                 })
             })
     }
@@ -17569,7 +17607,7 @@ impl Services {
             if !entry.ready_to_send()
                 || crate::discussion_activity::is_discussion(entry.message_metadata.as_ref())
                 || entry.monitor_turn.is_some()
-                || crate::script_monitor::monitor_id(entry.message_metadata.as_ref()).is_some()
+                || crate::feature_ports::monitor_id(entry.message_metadata.as_ref()).is_some()
             {
                 return Err(Error::InvalidParams(
                     "queued message is not ready to send".into(),

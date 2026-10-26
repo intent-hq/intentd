@@ -1872,7 +1872,7 @@ fn map_acp_session_error_for(context: &str, e: &AcpError, owner: &AuthOwner) -> 
     let provider_id = owner.selection.as_str();
     if is_acp_auth_required(e) {
         owner.demote();
-        return crate::host_execution::ai_authorization_error(
+        return crate::execution_call::ai_authorization_error(
             Error::InvalidParams(format!(
                 "{context}: {}",
                 crate::provider_auth::not_authenticated_message(provider_id)
@@ -4855,7 +4855,7 @@ impl Services {
                         None => None,
                     }
                     .map(|provider_id| {
-                        crate::host_execution::ai_authorization_error(
+                        crate::execution_call::ai_authorization_error(
                             Error::InvalidParams(format!(
                                 "session/prompt: {}",
                                 crate::provider_auth::not_authenticated_message(&provider_id)
@@ -5110,7 +5110,10 @@ impl Services {
                 // (scheduled/running) background hooks is waiting, not
                 // stalled — stamp `waitingOnHooks` (omitted when none) so
                 // subscribers and the completion-watch wake can surface it.
-                self.annotate_waiting_on_hooks(agent_id, &mut data).await;
+                self.ports
+                    .runtime()
+                    .annotate_waiting_on_hooks(self, agent_id, &mut data)
+                    .await;
                 // Idle-visibility (unified external-wait, mirrors the hook
                 // stamp above): same `waitingOnPrMonitors` stamp for active
                 // PR monitors (omitted when none).
@@ -5880,7 +5883,10 @@ impl Services {
             Value::Bool(!self.waiting_watches_for_parent(agent_id).is_empty());
         // Idle-visibility: same `waitingOnHooks` stamp as the prompt-turn
         // idle (omitted when the agent owns no active hook).
-        self.annotate_waiting_on_hooks(agent_id, &mut data).await;
+        self.ports
+            .runtime()
+            .annotate_waiting_on_hooks(self, agent_id, &mut data)
+            .await;
         // Idle-visibility (unified external-wait): same `waitingOnPrMonitors`
         // stamp as the prompt-turn idle (omitted when the agent owns no
         // active monitor).
