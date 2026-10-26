@@ -788,6 +788,7 @@ fn merge_requirements(
             have: approvals_have,
             needed: Some(1),
             changes_requested: 0,
+            latest_reviews: None,
         },
         threads: crate::pr_ops::MergeRequirementsThreads {
             unresolved: Some(unresolved),
@@ -819,6 +820,7 @@ pub(crate) fn pr_snapshot(state: &str) -> crate::pr_monitor::PrMonitorSnapshot {
         required_check_names: None,
         observed_at: None,
         checks_not_started_delivered: None,
+        latest_reviews_carried: false,
     }
 }
 

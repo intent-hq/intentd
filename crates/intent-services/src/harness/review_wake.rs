@@ -73,6 +73,29 @@ pub(crate) fn checklist(r: &Value, ready: bool) -> String {
     if let Some(n) = a["changesRequested"].as_i64().filter(|n| *n > 0) {
         lines.push(format!("changes requested by {n} reviewer{}", plural(n)));
     }
+    if let Some(reviews) = a["latestReviews"].as_array().filter(|r| !r.is_empty()) {
+        let rendered: Vec<String> = reviews
+            .iter()
+            .map(|r| {
+                let mut entry = format!(
+                    "{} {}",
+                    text(&r["reviewer"]),
+                    text(&r["state"]).replace('_', " ")
+                );
+                if let Some(commit) = r["commitSha"].as_str() {
+                    let short: String = commit.chars().take(8).collect();
+                    let _ = write!(entry, " on {short}");
+                    match r["onCurrentHead"].as_bool() {
+                        Some(true) => entry.push_str(" (current head)"),
+                        Some(false) => entry.push_str(" (older commit)"),
+                        None => {}
+                    }
+                }
+                entry
+            })
+            .collect();
+        lines.push(format!("latest reviews: {}", rendered.join("; ")));
+    }
     let c = &r["checks"];
     let skipped = skipped_names(&c["items"]);
     let mut checks = if ["passed", "failed", "pending", "total"]

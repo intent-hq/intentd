@@ -18553,6 +18553,8 @@ pub(crate) mod pr {
                 verdict,
                 body,
                 submitted_at: "2026-06-17T05:00:00.000Z".into(),
+                id: None,
+                commit_sha: None,
             })
         }
         async fn review_decision(&self, _: &RepoRef, _: u64) -> ScResult<Option<ReviewDecision>> {
@@ -18571,12 +18573,16 @@ pub(crate) mod pr {
                     verdict: ReviewVerdict::Approve,
                     body: None,
                     submitted_at: "2026-01-01".into(),
+                    id: None,
+                    commit_sha: None,
                 },
                 Review {
                     author: "bob".into(),
                     verdict: ReviewVerdict::Comment,
                     body: None,
                     submitted_at: "2026-01-02".into(),
+                    id: None,
+                    commit_sha: None,
                 },
             ])
         }
