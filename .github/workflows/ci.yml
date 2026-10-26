@@ -156,7 +156,7 @@ jobs:
             const free = ['ubuntu-22.04', 'ubuntu-24.04', 'ubuntu-latest', 'ubuntu-24.04-arm', 'windows-2022', 'windows-2025'];
             // The paid sizes jobs ask for and the WarpBuild runner each bursts to.
             // GitHub's larger runners are off, so a paid size never runs on GitHub
-            // (same cores except Macs, which get 12 because every Mac job is CPU-bound;
+            // (same cores; Macs stay on 6, as 12 cost twice as much for at most 1.25x;
             // Windows stays on Server 2022, macOS 15 keeps signed builds off macOS 26).
             const warp = {
               'gh-linux-8x': 'warp-ubuntu-2404-x64-8x',
@@ -164,8 +164,8 @@ jobs:
               'gh-linux-arm64-8x': 'warp-ubuntu-2404-arm64-8x',
               'gh-windows-8x': 'warp-windows-2022-x64-8x',
               'gh-windows-16x': 'warp-windows-2022-x64-16x',
-              'macos-26-xlarge': 'warp-macos-26-arm64-12x',
-              'macos-15-xlarge': 'warp-macos-15-arm64-12x',
+              'macos-26-xlarge': 'warp-macos-26-arm64-6x',
+              'macos-15-xlarge': 'warp-macos-15-arm64-6x',
             };
             // Fork pull requests never spend WarpBuild minutes: a paid size runs on
             // the free standard runner of its OS instead.
@@ -881,7 +881,7 @@ jobs:
           # use the latest hosted ARM64 image. Empty route output also falls back to
           # hosted. Keep the check name independent of the runner.
           - target: aarch64-apple-darwin
-            os: ${{ fromJSON(needs.route.outputs.macos_labels || '["warp-macos-26-arm64-12x"]') }}
+            os: ${{ fromJSON(needs.route.outputs.macos_labels || '["warp-macos-26-arm64-6x"]') }}
             name: build (aarch64-apple-darwin)
     # Explicit per-entry names keep check history stable across runner changes.
     name: ${{ matrix.name }}
@@ -1262,7 +1262,7 @@ jobs:
       matrix:
         include:
           - target: aarch64-apple-darwin
-            os: ${{ fromJSON(needs.route.outputs.macos_labels || '["warp-macos-26-arm64-12x"]') }}
+            os: ${{ fromJSON(needs.route.outputs.macos_labels || '["warp-macos-26-arm64-6x"]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     env:
@@ -2404,7 +2404,7 @@ jobs:
           - platform: linux
             os: ${{ fromJSON(needs.route.outputs.slots || '{}')['daemon-lifecycle-linux'] || fromJSON('["warp-ubuntu-2404-x64-16x"]') }}
           - platform: macos
-            os: ${{ fromJSON(needs.route.outputs.macos_labels || '["warp-macos-26-arm64-12x"]') }}
+            os: ${{ fromJSON(needs.route.outputs.macos_labels || '["warp-macos-26-arm64-6x"]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     env:
