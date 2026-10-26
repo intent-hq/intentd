@@ -321,10 +321,19 @@ pub enum WorkspaceDisplayStatus {
 }
 
 /// Workspace entity (§9.1).
+///
+/// `Default` is the one shared constructor: every field takes its type's
+/// default (a fresh [`WorkspaceId`], empty strings and timestamps, `Active`,
+/// `Idle`, no attention, `false`, `None`). Build rows with struct-update
+/// syntax — `Workspace { id, title, ..Default::default() }` — and set only
+/// the fields that matter, so a new optional field needs no edits outside
+/// this type. `workspace_literal_lint` rejects a full literal anywhere.
+/// Because the id is a fresh UUID, two default-built rows never compare
+/// equal; a test that compares or looks up rows should set `id` explicitly.
 // The bool fields mirror the protocol's wire shape; grouping them would
 // change the serialized contract.
 #[expect(clippy::struct_excessive_bools)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Workspace {
     pub id: WorkspaceId,
@@ -882,54 +891,10 @@ pub fn chief_workspace() -> Workspace {
     Workspace {
         id: WorkspaceId::chief(),
         title: "Assistant".to_string(),
-        branch: String::new(),
-        base_ref: None,
-        base_commit_sha: None,
-        status: WorkspaceStatus::Active,
-        status_message: None,
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
-        attention: WorkspaceAttention::None,
         created_at: CHIEF_WORKSPACE_TIMESTAMP.to_string(),
         updated_at: CHIEF_WORKSPACE_TIMESTAMP.to_string(),
         last_activity: Some(CHIEF_WORKSPACE_TIMESTAMP.to_string()),
-        last_content_activity: None,
-        tags: Vec::new(),
-        path: None,
-        repository_path: None,
-        repository_owner: None,
-        repository_name: None,
-        worktree_path: None,
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
-        default_model: None,
-        pr_number: None,
-        pr_url: None,
-        pr_status: None,
-        active_pull_request: None,
-        pull_requests: None,
-        pull_requests_total: None,
-        context_links: None,
-        archived: false,
-        archived_at: None,
-        retired_at: None,
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        display_status: None,
-        attention_reminder: None,
-        waiting: false,
-        scripts_running: false,
-        background_tasks_running: false,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        checkout_mode: None,
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
+        ..Default::default()
     }
 }
 
@@ -3893,12 +3858,12 @@ pub fn lift_from_principal_id(metadata: Option<&serde_json::Value>) -> Option<Pr
 /// doctrine text or feature defaults change materially; existing sessions keep their stamped version
 /// for life (no upgrade/migration path). Pre-feature rows backfill to "1.0"
 /// (migration 0096).
-pub const CURRENT_HARNESS_VERSION: &str = "3.2";
+pub const CURRENT_HARNESS_VERSION: &str = "3.3";
 
 /// Explicit admission preserves repository guidance without admitting unknown versions.
 #[must_use]
 pub fn harness_supports_repository_guidance(version: &str) -> bool {
-    matches!(version, "3.0" | "3.1" | "3.2")
+    matches!(version, "3.0" | "3.1" | "3.2" | "3.3")
 }
 
 /// Serde default for [`AgentSession::harness_version`]: payloads persisted or
@@ -7633,53 +7598,9 @@ mod tests {
             id: WorkspaceId::from("ws-1"),
             title: "WS".to_string(),
             branch: "main".to_string(),
-            base_ref: None,
-            base_commit_sha: None,
-            status: WorkspaceStatus::Active,
-            status_message: None,
-            status_image_asset_id: None,
-            activity: WorkspaceActivity::Idle,
-            attention: WorkspaceAttention::None,
             created_at: ts.clone(),
             updated_at: ts.clone(),
-            last_activity: None,
-            last_content_activity: None,
-            tags: vec![],
-            path: None,
-            repository_path: None,
-            repository_owner: None,
-            repository_name: None,
-            worktree_path: None,
-            scope: None,
-            skip_worktree: false,
-            setup_script: None,
-            is_remote: false,
-            default_model: None,
-            pr_number: None,
-            pr_url: None,
-            pr_status: None,
-            active_pull_request: None,
-            pull_requests: None,
-            context_links: None,
-            archived: false,
-            archived_at: None,
-            retired_at: None,
-            task_stats: None,
-            agent_summary: None,
-            diff_summary: None,
-            display_status: None,
-            attention_reminder: None,
-            waiting: false,
-            scripts_running: false,
-            background_tasks_running: false,
-            token_usage: None,
-            cow_supported: None,
-            browser_client_id: None,
-            pull_requests_total: None,
-            checkout_mode: None,
-            disk_usage: None,
-            pending_delete_at: None,
-            membership: None,
+            ..Default::default()
         };
         let v = serde_json::to_value(&ws).unwrap();
         assert_eq!(v["status"], "Active");

@@ -13,7 +13,7 @@
 /// only this literal and refresh `data/adapter-cli-packages.json`.
 macro_rules! claude_agent_acp_version {
     () => {
-        "0.81.1"
+        "0.95.0"
     };
 }
 

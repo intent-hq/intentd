@@ -21,12 +21,17 @@
 
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 #[cfg(any(test, feature = "test-hooks"))]
 use std::sync::Mutex;
 
 use intent_core::transfer::TransferPlan;
-use intent_core::{BoxFuture, Error, Result, WorkspaceId};
+
+use intent_core::{
+    AgentId, BoxFuture, BrowserTab, BrowserTabInput, ClientId, Error, Result, ReverseTarget,
+    ScriptCreateParams, WorkspaceApi, WorkspaceId,
+};
 
 use crate::Services;
 
@@ -279,6 +284,936 @@ impl TransferPort for UnavailableTransfer {
     }
 }
 
+/// The workspace runtime feature: saved scripts (`script.*`, including
+/// script monitors), background hooks (`hook.*`), terminals (`terminal.*`),
+/// the browser tab registry (`browser.*`), agent sandboxes (`sandbox.*`)
+/// and workspace setup scripts. Each RPC method performs the full RPC,
+/// authorization included, exactly as the `WorkspaceApi` method of the same
+/// name it backs; the remaining methods are the entry points core code
+/// (sandbox merge-back, provisioning, the browser-client pin, workspace
+/// creation) reaches the runtime through.
+pub trait RuntimePort: Send + Sync + 'static {
+    fn script_list<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    fn script_list_filtered<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        archive: intent_core::ScriptArchiveFilter,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    fn script_list_view<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        options: serde_json::Value,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    fn script_get<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        script_id: String,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    fn script_monitor_list_view<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        agent_id: Option<AgentId>,
+        options: serde_json::Value,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    fn script_monitor_get<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        monitor_id: String,
+        owner: Option<AgentId>,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    fn script_archive<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        script_ids: Vec<String>,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    fn script_restore<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        script_ids: Vec<String>,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    fn script_create<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        params: ScriptCreateParams,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    fn script_remove<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        script_id: String,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    fn script_monitor<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        script_id: String,
+        options: serde_json::Value,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    fn script_monitor_list<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        agent_id: Option<AgentId>,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    fn script_monitor_cancel<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        monitor_id: String,
+        owner: Option<AgentId>,
+        stop_run: bool,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    fn script_start<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        script_id: String,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    fn script_start_monitor<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        script_id: String,
+        run_id: String,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    fn script_stop<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        script_id: String,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    fn script_restart<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        script_id: String,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    fn script_output<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        script_id: String,
+        max_lines: Option<i64>,
+        paginate: Option<bool>,
+        page_token: Option<String>,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    fn script_status<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        script_id: String,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    fn script_run<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        script_id: String,
+        max_lines: Option<i64>,
+        timeout_seconds: Option<i64>,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    /// `hook.schedule`: validate + immediate real run + persist + spawn the
+    /// per-hook scheduler task (see `hook_manager`).
+    fn hook_schedule<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        params: serde_json::Value,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    /// `hook.list`: hooks in a workspace, optionally one agent's; active
+    /// only by default, retired rows as a light projection on request.
+    fn hook_list<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        agent_id: Option<AgentId>,
+        include_retired: bool,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    /// `hook.get` (MCP-only): one hook row (including `code`) by id, active
+    /// or terminal; hooks from other workspaces read as `NotFound`.
+    fn hook_get<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        hook_id: intent_core::HookId,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    /// `hook.cancel`: stop an active hook; an agent caller may only cancel
+    /// its own hooks, while the FE path (`caller = None`) cancels any hook
+    /// and wakes the owning agent with a notice.
+    fn hook_cancel<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        hook_id: intent_core::HookId,
+        caller: Option<AgentId>,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    /// `hook.runNow`: trigger an immediate run of an active hook.
+    fn hook_run_now<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        hook_id: intent_core::HookId,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    /// `terminal.create`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the terminal.create RPC shape plus svc"
+    )]
+    fn terminal_create<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        cols: u16,
+        rows: u16,
+        cwd: Option<String>,
+        command: Option<String>,
+        env: Option<std::collections::BTreeMap<String, String>>,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    /// `terminal.write`.
+    fn terminal_write<'a>(
+        &'a self,
+        svc: &'a Services,
+        terminal_id: String,
+        data: String,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    /// `terminal.resize`.
+    fn terminal_resize<'a>(
+        &'a self,
+        svc: &'a Services,
+        terminal_id: String,
+        cols: u16,
+        rows: u16,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    /// `terminal.kill`.
+    fn terminal_kill<'a>(
+        &'a self,
+        svc: &'a Services,
+        terminal_id: String,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    /// `terminal.getBuffer`.
+    fn terminal_get_buffer<'a>(
+        &'a self,
+        svc: &'a Services,
+        terminal_id: String,
+        max_bytes: Option<i64>,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    /// `terminal.list`.
+    fn terminal_list<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    /// `terminal.readOutput`.
+    fn terminal_read_output<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        terminal_id: String,
+        max_lines: Option<i64>,
+        paginate: Option<bool>,
+        page_token: Option<String>,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    /// `browser.listTabs`.
+    fn browser_list_tabs<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'a, Result<Vec<BrowserTab>>>;
+
+    /// `browser.upsertTab`.
+    fn browser_upsert_tab<'a>(
+        &'a self,
+        svc: &'a Services,
+        host: ClientId,
+        tab: BrowserTabInput,
+    ) -> BoxFuture<'a, Result<BrowserTab>>;
+
+    /// `browser.removeTab`.
+    fn browser_remove_tab<'a>(
+        &'a self,
+        svc: &'a Services,
+        host: ClientId,
+        tab_id: String,
+    ) -> BoxFuture<'a, Result<()>>;
+
+    /// `browser.syncTabs`.
+    fn browser_sync_tabs<'a>(
+        &'a self,
+        svc: &'a Services,
+        host: ClientId,
+        tabs: Vec<BrowserTabInput>,
+    ) -> BoxFuture<'a, Result<Vec<String>>>;
+
+    /// `browser.exec` (agent-initiated CDP forward).
+    fn browser_exec<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        actions: Vec<serde_json::Value>,
+        tab_id: Option<String>,
+        agent_id: Option<AgentId>,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    /// `browser.navigateTab`.
+    fn browser_navigate_tab<'a>(
+        &'a self,
+        svc: &'a Services,
+        tab_id: String,
+        url: String,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    /// `browser.closeTab`.
+    fn browser_close_tab<'a>(
+        &'a self,
+        svc: &'a Services,
+        tab_id: String,
+        force: bool,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    /// `sandbox.cow.merge`.
+    fn sandbox_merge<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        sandbox_id: AgentId,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    /// `sandbox.cow.discard`.
+    fn sandbox_discard<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        sandbox_id: AgentId,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    /// The [`ReverseTarget`] an agent `browser.exec` for `workspace_id`
+    /// dispatches to: the workspace's driving client (REV-2 Model 10).
+    fn driving_client_target<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
+    ) -> BoxFuture<'a, Result<ReverseTarget>>;
+
+    /// Re-home every claimed browser tab of `workspace_id` to `new_host`,
+    /// the workspace's new driving-client pin (REV-2 Model 10).
+    fn migrate_claimed_browser_tabs<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
+        new_host: &'a ClientId,
+    ) -> BoxFuture<'a, Result<()>>;
+
+    /// Provision a `CoW` sandbox for `agent_id` under `workspaces_root`.
+    fn provision_sandbox<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
+        agent_id: &'a AgentId,
+        workspaces_root: PathBuf,
+    ) -> BoxFuture<'a, Result<ProvisionOutcome>>;
+
+    /// Attempt the merge-back of `agent_id`'s sandbox into canonical. The
+    /// caller owns the sandbox status claim and the bookkeeping.
+    fn merge_sandbox<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
+        agent_id: &'a AgentId,
+    ) -> BoxFuture<'a, Result<MergeOutcome>>;
+
+    /// Remove `agent_id`'s sandbox directory and record.
+    fn discard_sandbox<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
+        agent_id: &'a AgentId,
+    ) -> BoxFuture<'a, Result<()>>;
+
+    /// Run a new workspace's effective setup script in its "Setup"
+    /// terminal and wait for it to exit. Resolves to `(ran_script,
+    /// exit_code)`: whether the script was spawned, and its observed exit
+    /// code. The caller owns the `workspace:setup:*` lifecycle around it.
+    fn run_setup_script(
+        &self,
+        svc: &Services,
+        run: SetupScriptRun,
+    ) -> BoxFuture<'static, (bool, Option<u32>)>;
+}
+
+/// The core-internal entry points of an unregistered runtime port fail
+/// with this error (they have no `WorkspaceApi` default to mirror).
+fn runtime_unavailable() -> Error {
+    Error::Internal("runtime feature not registered".to_string())
+}
+
+/// Outcome of sandbox provisioning.
+#[derive(Debug, Clone)]
+pub enum ProvisionOutcome {
+    /// `CoW` is supported; sandbox was created.
+    Supported {
+        path: PathBuf,
+        branch: String,
+        base_commit_sha: String,
+        snapshot_commit_sha: Option<String>,
+    },
+    /// `CoW` is not supported; fallback to shared mode (no bytes copied).
+    Unsupported,
+}
+
+/// Outcome of a merge-back attempt.
+#[derive(Debug, Clone)]
+pub enum MergeOutcome {
+    /// Clean merge; sandbox commits applied to canonical.
+    Merged {
+        commit_range: String,
+        canonical_head: String,
+    },
+    /// Conflicts detected; user's repo left pristine.
+    Conflict {
+        conflicting_paths: Vec<String>,
+        canonical_head: String,
+    },
+    /// Blocked: the merge could not proceed but stays retryable — canonical
+    /// has uncommitted user edits overlapping merge paths (`overlapping_paths`
+    /// populated), or the sandbox branch is missing/unborn (`overlapping_paths`
+    /// empty; see `reason`).
+    Blocked {
+        reason: String,
+        overlapping_paths: Vec<String>,
+    },
+}
+
+/// One workspace-creation setup-script run ([`RuntimePort::run_setup_script`]).
+pub struct SetupScriptRun {
+    pub workspace_id: WorkspaceId,
+    /// The provisioned worktree: the script's cwd and `.intent/` parent.
+    pub worktree: PathBuf,
+    /// The effective setup script body.
+    pub script: String,
+    /// `MAIN_CHECKOUT`.
+    pub repo_path: String,
+    /// `BRANCH_NAME`.
+    pub branch_name: String,
+    /// `SOURCE_BRANCH`.
+    pub source_branch: String,
+}
+
+/// A `WorkspaceApi` with no overrides: every method is the trait default.
+struct DefaultWorkspaceApi;
+
+impl WorkspaceApi for DefaultWorkspaceApi {}
+
+static DEFAULT_WORKSPACE_API: DefaultWorkspaceApi = DefaultWorkspaceApi;
+
+/// The runtime port of a `Services` no runtime feature was registered on:
+/// every RPC answers exactly as the `WorkspaceApi` default does.
+#[derive(Default)]
+pub(crate) struct UnavailableRuntime;
+
+impl RuntimePort for UnavailableRuntime {
+    fn script_list<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.script_list(workspace_id)
+    }
+
+    fn script_list_filtered<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+        archive: intent_core::ScriptArchiveFilter,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.script_list_filtered(workspace_id, archive)
+    }
+
+    fn script_list_view<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+        options: serde_json::Value,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.script_list_view(workspace_id, options)
+    }
+
+    fn script_get<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+        script_id: String,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.script_get(workspace_id, script_id)
+    }
+
+    fn script_monitor_list_view<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+        agent_id: Option<AgentId>,
+        options: serde_json::Value,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.script_monitor_list_view(workspace_id, agent_id, options)
+    }
+
+    fn script_monitor_get<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+        monitor_id: String,
+        owner: Option<AgentId>,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.script_monitor_get(workspace_id, monitor_id, owner)
+    }
+
+    fn script_archive<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+        script_ids: Vec<String>,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.script_archive(workspace_id, script_ids)
+    }
+
+    fn script_restore<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+        script_ids: Vec<String>,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.script_restore(workspace_id, script_ids)
+    }
+
+    fn script_create<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+        params: ScriptCreateParams,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.script_create(workspace_id, params)
+    }
+
+    fn script_remove<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+        script_id: String,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.script_remove(workspace_id, script_id)
+    }
+
+    fn script_monitor<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        script_id: String,
+        options: serde_json::Value,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.script_monitor(workspace_id, agent_id, script_id, options)
+    }
+
+    fn script_monitor_list<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+        agent_id: Option<AgentId>,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.script_monitor_list(workspace_id, agent_id)
+    }
+
+    fn script_monitor_cancel<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+        monitor_id: String,
+        owner: Option<AgentId>,
+        stop_run: bool,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.script_monitor_cancel(workspace_id, monitor_id, owner, stop_run)
+    }
+
+    fn script_start<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+        script_id: String,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.script_start(workspace_id, script_id)
+    }
+
+    fn script_start_monitor<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        script_id: String,
+        run_id: String,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.script_start_monitor(workspace_id, agent_id, script_id, run_id)
+    }
+
+    fn script_stop<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+        script_id: String,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.script_stop(workspace_id, script_id)
+    }
+
+    fn script_restart<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+        script_id: String,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.script_restart(workspace_id, script_id)
+    }
+
+    fn script_output<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+        script_id: String,
+        max_lines: Option<i64>,
+        paginate: Option<bool>,
+        page_token: Option<String>,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.script_output(
+            workspace_id,
+            script_id,
+            max_lines,
+            paginate,
+            page_token,
+        )
+    }
+
+    fn script_status<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+        script_id: String,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.script_status(workspace_id, script_id)
+    }
+
+    fn script_run<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+        script_id: String,
+        max_lines: Option<i64>,
+        timeout_seconds: Option<i64>,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.script_run(workspace_id, script_id, max_lines, timeout_seconds)
+    }
+
+    fn hook_schedule<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        params: serde_json::Value,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.hook_schedule(workspace_id, agent_id, params)
+    }
+
+    fn hook_list<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+        agent_id: Option<AgentId>,
+        include_retired: bool,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.hook_list(workspace_id, agent_id, include_retired)
+    }
+
+    fn hook_get<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+        hook_id: intent_core::HookId,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.hook_get(workspace_id, hook_id)
+    }
+
+    fn hook_cancel<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+        hook_id: intent_core::HookId,
+        caller: Option<AgentId>,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.hook_cancel(workspace_id, hook_id, caller)
+    }
+
+    fn hook_run_now<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+        hook_id: intent_core::HookId,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.hook_run_now(workspace_id, hook_id)
+    }
+
+    fn terminal_create<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+        cols: u16,
+        rows: u16,
+        cwd: Option<String>,
+        command: Option<String>,
+        env: Option<std::collections::BTreeMap<String, String>>,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.terminal_create(workspace_id, cols, rows, cwd, command, env)
+    }
+
+    fn terminal_write<'a>(
+        &'a self,
+        _svc: &'a Services,
+        terminal_id: String,
+        data: String,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.terminal_write(terminal_id, data)
+    }
+
+    fn terminal_resize<'a>(
+        &'a self,
+        _svc: &'a Services,
+        terminal_id: String,
+        cols: u16,
+        rows: u16,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.terminal_resize(terminal_id, cols, rows)
+    }
+
+    fn terminal_kill<'a>(
+        &'a self,
+        _svc: &'a Services,
+        terminal_id: String,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.terminal_kill(terminal_id)
+    }
+
+    fn terminal_get_buffer<'a>(
+        &'a self,
+        _svc: &'a Services,
+        terminal_id: String,
+        max_bytes: Option<i64>,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.terminal_get_buffer(terminal_id, max_bytes)
+    }
+
+    fn terminal_list<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.terminal_list(workspace_id)
+    }
+
+    fn terminal_read_output<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+        terminal_id: String,
+        max_lines: Option<i64>,
+        paginate: Option<bool>,
+        page_token: Option<String>,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.terminal_read_output(
+            workspace_id,
+            terminal_id,
+            max_lines,
+            paginate,
+            page_token,
+        )
+    }
+
+    fn browser_list_tabs<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'a, Result<Vec<BrowserTab>>> {
+        DEFAULT_WORKSPACE_API.browser_list_tabs(workspace_id)
+    }
+
+    fn browser_upsert_tab<'a>(
+        &'a self,
+        _svc: &'a Services,
+        host: ClientId,
+        tab: BrowserTabInput,
+    ) -> BoxFuture<'a, Result<BrowserTab>> {
+        DEFAULT_WORKSPACE_API.browser_upsert_tab(host, tab)
+    }
+
+    fn browser_remove_tab<'a>(
+        &'a self,
+        _svc: &'a Services,
+        host: ClientId,
+        tab_id: String,
+    ) -> BoxFuture<'a, Result<()>> {
+        DEFAULT_WORKSPACE_API.browser_remove_tab(host, tab_id)
+    }
+
+    fn browser_sync_tabs<'a>(
+        &'a self,
+        _svc: &'a Services,
+        host: ClientId,
+        tabs: Vec<BrowserTabInput>,
+    ) -> BoxFuture<'a, Result<Vec<String>>> {
+        DEFAULT_WORKSPACE_API.browser_sync_tabs(host, tabs)
+    }
+
+    fn browser_exec<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+        actions: Vec<serde_json::Value>,
+        tab_id: Option<String>,
+        agent_id: Option<AgentId>,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.browser_exec(workspace_id, actions, tab_id, agent_id)
+    }
+
+    fn browser_navigate_tab<'a>(
+        &'a self,
+        _svc: &'a Services,
+        tab_id: String,
+        url: String,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.browser_navigate_tab(tab_id, url)
+    }
+
+    fn browser_close_tab<'a>(
+        &'a self,
+        _svc: &'a Services,
+        tab_id: String,
+        force: bool,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.browser_close_tab(tab_id, force)
+    }
+
+    fn sandbox_merge<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+        sandbox_id: AgentId,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.sandbox_merge(workspace_id, sandbox_id)
+    }
+
+    fn sandbox_discard<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+        sandbox_id: AgentId,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.sandbox_discard(workspace_id, sandbox_id)
+    }
+
+    fn driving_client_target<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _workspace_id: &'a WorkspaceId,
+    ) -> BoxFuture<'a, Result<ReverseTarget>> {
+        Box::pin(async { Err(runtime_unavailable()) })
+    }
+
+    fn migrate_claimed_browser_tabs<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _workspace_id: &'a WorkspaceId,
+        _new_host: &'a ClientId,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async { Err(runtime_unavailable()) })
+    }
+
+    fn provision_sandbox<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _workspace_id: &'a WorkspaceId,
+        _agent_id: &'a AgentId,
+        _workspaces_root: PathBuf,
+    ) -> BoxFuture<'a, Result<ProvisionOutcome>> {
+        Box::pin(async { Err(runtime_unavailable()) })
+    }
+
+    fn merge_sandbox<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _workspace_id: &'a WorkspaceId,
+        _agent_id: &'a AgentId,
+    ) -> BoxFuture<'a, Result<MergeOutcome>> {
+        Box::pin(async { Err(runtime_unavailable()) })
+    }
+
+    fn discard_sandbox<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _workspace_id: &'a WorkspaceId,
+        _agent_id: &'a AgentId,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async { Err(runtime_unavailable()) })
+    }
+
+    fn run_setup_script(
+        &self,
+        _svc: &Services,
+        _run: SetupScriptRun,
+    ) -> BoxFuture<'static, (bool, Option<u32>)> {
+        Box::pin(async { (false, None) })
+    }
+}
+
 /// Typed feature state on [`Services`], keyed by type.
 ///
 /// A feature crate stores its state object here once, when the composition
@@ -419,6 +1354,9 @@ feature_port_registry! {
     /// Register the workspace transfer feature. Every clone made afterwards
     /// shares it; clones made before keep the port they had.
     transfer: TransferPort = UnavailableTransfer, with_transfer_port;
+    /// Register the workspace runtime feature (scripts and hooks).
+    /// [`Services::new`] registers the in-crate one.
+    runtime: RuntimePort = UnavailableRuntime, with_runtime_port;
 }
 
 /// Writes `WorkspaceApi` methods that forward to a feature port: each
@@ -474,7 +1412,10 @@ mod tests {
 
     use intent_core::{Error, WorkspaceApi, WorkspaceId};
 
-    use super::{FeaturePorts, TransferPort, UnavailableTransfer};
+    use super::{
+        FeaturePorts, RuntimePort, TransferPort, UnavailableRuntime, UnavailableTransfer,
+        DEFAULT_WORKSPACE_API,
+    };
 
     use crate::test_support::fixtures::TempDb;
     use crate::Services;
@@ -539,8 +1480,17 @@ mod tests {
     async fn the_startup_check_names_every_unregistered_port() {
         let tmp = TempDb::new();
         let svc = bare_services(&tmp).await;
-        assert_eq!(svc.unregistered_feature_ports(), FeaturePorts::NAMES);
-        assert_eq!(svc.unregistered_feature_ports(), ["transfer"]);
+        assert_eq!(FeaturePorts::NAMES, ["transfer", "runtime"]);
+        assert_eq!(
+            FeaturePorts::default().unregistered(),
+            FeaturePorts::NAMES,
+            "every declared port, the runtime port included, starts unregistered"
+        );
+        assert_eq!(
+            svc.unregistered_feature_ports(),
+            ["transfer"],
+            "Services::new registers the in-crate runtime feature"
+        );
         assert!(matches!(
             svc.ensure_feature_ports_registered(),
             Err(Error::Internal(m)) if m == "feature ports not registered: transfer"
@@ -564,6 +1514,368 @@ mod tests {
                 .feature_transfer_port()
                 .export_in_progress(ws.as_str()),
             "the forwarders and clones reach the registered object"
+        );
+    }
+
+    #[tokio::test]
+    async fn services_new_registers_one_runtime_feature_shared_by_clones() {
+        let tmp = TempDb::new();
+        let svc = bare_services(&tmp).await;
+        assert!(!svc.unregistered_feature_ports().contains(&"runtime"));
+        let clone = svc.clone();
+        assert!(std::ptr::eq(svc.runtime(), clone.runtime()));
+        assert!(std::ptr::eq(
+            svc.runtime(),
+            svc.feature::<crate::runtime::RuntimeFeature>()
+                .expect("registered")
+        ));
+    }
+
+    #[tokio::test]
+    async fn unregistered_runtime_port_answers_like_the_workspace_api_default() {
+        let tmp = TempDb::new();
+        let svc = bare_services(&tmp)
+            .await
+            .with_runtime_port(Arc::new(UnavailableRuntime) as Arc<dyn RuntimePort>);
+        let api = &DEFAULT_WORKSPACE_API;
+        let ws = WorkspaceId::new();
+        let agent = intent_core::AgentId::new();
+        let hook = intent_core::HookId::new();
+        let same = |method: &str,
+                    got: intent_core::Result<serde_json::Value>,
+                    want: intent_core::Result<serde_json::Value>| {
+            assert_eq!(format!("{got:?}"), format!("{want:?}"), "{method}");
+        };
+        let summary = serde_json::json!({"view": "summary"});
+        let full = serde_json::json!({});
+        same(
+            "script_list",
+            svc.script_list(ws.clone()).await,
+            api.script_list(ws.clone()).await,
+        );
+        for archive in [
+            intent_core::ScriptArchiveFilter::Active,
+            intent_core::ScriptArchiveFilter::Archived,
+        ] {
+            same(
+                "script_list_filtered",
+                svc.script_list_filtered(ws.clone(), archive).await,
+                api.script_list_filtered(ws.clone(), archive).await,
+            );
+        }
+        for options in [&summary, &full] {
+            same(
+                "script_list_view",
+                svc.script_list_view(ws.clone(), options.clone()).await,
+                api.script_list_view(ws.clone(), options.clone()).await,
+            );
+            same(
+                "script_monitor_list_view",
+                svc.script_monitor_list_view(ws.clone(), None, options.clone())
+                    .await,
+                api.script_monitor_list_view(ws.clone(), None, options.clone())
+                    .await,
+            );
+        }
+        same(
+            "script_get",
+            svc.script_get(ws.clone(), "s".into()).await,
+            api.script_get(ws.clone(), "s".into()).await,
+        );
+        same(
+            "script_monitor_get",
+            svc.script_monitor_get(ws.clone(), "m".into(), None).await,
+            api.script_monitor_get(ws.clone(), "m".into(), None).await,
+        );
+        same(
+            "script_archive",
+            svc.script_archive(ws.clone(), vec![]).await,
+            api.script_archive(ws.clone(), vec![]).await,
+        );
+        same(
+            "script_restore",
+            svc.script_restore(ws.clone(), vec![]).await,
+            api.script_restore(ws.clone(), vec![]).await,
+        );
+        let params = intent_core::ScriptCreateParams::default;
+        same(
+            "script_create",
+            svc.script_create(ws.clone(), params()).await,
+            api.script_create(ws.clone(), params()).await,
+        );
+        same(
+            "script_remove",
+            svc.script_remove(ws.clone(), "s".into()).await,
+            api.script_remove(ws.clone(), "s".into()).await,
+        );
+        same(
+            "script_monitor",
+            svc.script_monitor(ws.clone(), agent.clone(), "s".into(), full.clone())
+                .await,
+            api.script_monitor(ws.clone(), agent.clone(), "s".into(), full.clone())
+                .await,
+        );
+        same(
+            "script_monitor_list",
+            svc.script_monitor_list(ws.clone(), None).await,
+            api.script_monitor_list(ws.clone(), None).await,
+        );
+        same(
+            "script_monitor_cancel",
+            svc.script_monitor_cancel(ws.clone(), "m".into(), None, false)
+                .await,
+            api.script_monitor_cancel(ws.clone(), "m".into(), None, false)
+                .await,
+        );
+        same(
+            "script_start",
+            svc.script_start(ws.clone(), "s".into()).await,
+            api.script_start(ws.clone(), "s".into()).await,
+        );
+        same(
+            "script_start_monitor",
+            svc.script_start_monitor(ws.clone(), agent.clone(), "s".into(), "r".into())
+                .await,
+            api.script_start_monitor(ws.clone(), agent.clone(), "s".into(), "r".into())
+                .await,
+        );
+        same(
+            "script_stop",
+            svc.script_stop(ws.clone(), "s".into()).await,
+            api.script_stop(ws.clone(), "s".into()).await,
+        );
+        same(
+            "script_restart",
+            svc.script_restart(ws.clone(), "s".into()).await,
+            api.script_restart(ws.clone(), "s".into()).await,
+        );
+        same(
+            "script_output",
+            svc.script_output(ws.clone(), "s".into(), None, None, None)
+                .await,
+            api.script_output(ws.clone(), "s".into(), None, None, None)
+                .await,
+        );
+        same(
+            "script_status",
+            svc.script_status(ws.clone(), "s".into()).await,
+            api.script_status(ws.clone(), "s".into()).await,
+        );
+        same(
+            "script_run",
+            svc.script_run(ws.clone(), "s".into(), None, None).await,
+            api.script_run(ws.clone(), "s".into(), None, None).await,
+        );
+        same(
+            "hook_schedule",
+            svc.hook_schedule(ws.clone(), agent.clone(), full.clone())
+                .await,
+            api.hook_schedule(ws.clone(), agent.clone(), full.clone())
+                .await,
+        );
+        same(
+            "hook_list",
+            svc.hook_list(ws.clone(), None, false).await,
+            api.hook_list(ws.clone(), None, false).await,
+        );
+        same(
+            "hook_get",
+            svc.hook_get(ws.clone(), hook.clone()).await,
+            api.hook_get(ws.clone(), hook.clone()).await,
+        );
+        same(
+            "hook_cancel",
+            svc.hook_cancel(ws.clone(), hook.clone(), None).await,
+            api.hook_cancel(ws.clone(), hook.clone(), None).await,
+        );
+        same(
+            "hook_run_now",
+            svc.hook_run_now(ws.clone(), hook.clone()).await,
+            api.hook_run_now(ws.clone(), hook.clone()).await,
+        );
+        let client = intent_core::ClientId::from_string("client");
+        let tab_input = || -> intent_core::BrowserTabInput {
+            serde_json::from_value(
+                serde_json::json!({"tabId": "t", "workspaceId": ws, "url": "about:blank"}),
+            )
+            .expect("tab input")
+        };
+        same(
+            "terminal_create",
+            svc.terminal_create(ws.clone(), 80, 24, None, None, None)
+                .await,
+            api.terminal_create(ws.clone(), 80, 24, None, None, None)
+                .await,
+        );
+        same(
+            "terminal_write",
+            svc.terminal_write("t".into(), "x".into()).await,
+            api.terminal_write("t".into(), "x".into()).await,
+        );
+        same(
+            "terminal_resize",
+            svc.terminal_resize("t".into(), 80, 24).await,
+            api.terminal_resize("t".into(), 80, 24).await,
+        );
+        same(
+            "terminal_kill",
+            svc.terminal_kill("t".into()).await,
+            api.terminal_kill("t".into()).await,
+        );
+        same(
+            "terminal_get_buffer",
+            svc.terminal_get_buffer("t".into(), None).await,
+            api.terminal_get_buffer("t".into(), None).await,
+        );
+        same(
+            "terminal_list",
+            svc.terminal_list(ws.clone()).await,
+            api.terminal_list(ws.clone()).await,
+        );
+        same(
+            "terminal_read_output",
+            svc.terminal_read_output(ws.clone(), "t".into(), None, None, None)
+                .await,
+            api.terminal_read_output(ws.clone(), "t".into(), None, None, None)
+                .await,
+        );
+        assert_eq!(
+            format!("{:?}", svc.browser_list_tabs(ws.clone()).await),
+            format!("{:?}", api.browser_list_tabs(ws.clone()).await),
+            "browser_list_tabs"
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                svc.browser_upsert_tab(client.clone(), tab_input()).await
+            ),
+            format!(
+                "{:?}",
+                api.browser_upsert_tab(client.clone(), tab_input()).await
+            ),
+            "browser_upsert_tab"
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                svc.browser_remove_tab(client.clone(), "t".into()).await
+            ),
+            format!(
+                "{:?}",
+                api.browser_remove_tab(client.clone(), "t".into()).await
+            ),
+            "browser_remove_tab"
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                svc.browser_sync_tabs(client.clone(), vec![tab_input()])
+                    .await
+            ),
+            format!(
+                "{:?}",
+                api.browser_sync_tabs(client.clone(), vec![tab_input()])
+                    .await
+            ),
+            "browser_sync_tabs"
+        );
+        same(
+            "browser_exec",
+            svc.browser_exec(ws.clone(), vec![full.clone()], None, None)
+                .await,
+            api.browser_exec(ws.clone(), vec![full.clone()], None, None)
+                .await,
+        );
+        same(
+            "browser_navigate_tab",
+            svc.browser_navigate_tab("t".into(), "about:blank".into())
+                .await,
+            api.browser_navigate_tab("t".into(), "about:blank".into())
+                .await,
+        );
+        same(
+            "browser_close_tab",
+            svc.browser_close_tab("t".into(), true).await,
+            api.browser_close_tab("t".into(), true).await,
+        );
+        same(
+            "sandbox_merge",
+            svc.sandbox_merge(ws.clone(), agent.clone()).await,
+            api.sandbox_merge(ws.clone(), agent.clone()).await,
+        );
+        same(
+            "sandbox_discard",
+            svc.sandbox_discard(ws.clone(), agent.clone()).await,
+            api.sandbox_discard(ws.clone(), agent.clone()).await,
+        );
+        assert!(
+            matches!(
+                svc.script_list(ws.clone()).await,
+                Err(Error::Internal(m)) if m == "WorkspaceApi::script_list not implemented"
+            ),
+            "the default is the trait's own unavailable answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn unregistered_runtime_port_refuses_the_core_entry_points() {
+        let tmp = TempDb::new();
+        let svc = bare_services(&tmp)
+            .await
+            .with_runtime_port(Arc::new(UnavailableRuntime) as Arc<dyn RuntimePort>);
+        let port = svc.ports.runtime();
+        let ws = WorkspaceId::new();
+        let agent = intent_core::AgentId::new();
+        let refused = |method: &str, got: String| {
+            assert_eq!(
+                got, r#"Err(Internal("runtime feature not registered"))"#,
+                "{method}"
+            );
+        };
+        refused(
+            "driving_client_target",
+            format!("{:?}", port.driving_client_target(&svc, &ws).await),
+        );
+        refused(
+            "migrate_claimed_browser_tabs",
+            format!(
+                "{:?}",
+                port.migrate_claimed_browser_tabs(
+                    &svc,
+                    &ws,
+                    &intent_core::ClientId::from_string("client")
+                )
+                .await
+            ),
+        );
+        refused(
+            "provision_sandbox",
+            format!(
+                "{:?}",
+                port.provision_sandbox(&svc, &ws, &agent, tmp.path.clone())
+                    .await
+            ),
+        );
+        refused(
+            "merge_sandbox",
+            format!("{:?}", port.merge_sandbox(&svc, &ws, &agent).await),
+        );
+        refused(
+            "discard_sandbox",
+            format!("{:?}", port.discard_sandbox(&svc, &ws, &agent).await),
+        );
+        let run = super::SetupScriptRun {
+            workspace_id: ws.clone(),
+            worktree: tmp.path.clone(),
+            script: "exit 0".into(),
+            repo_path: String::new(),
+            branch_name: String::new(),
+            source_branch: String::new(),
+        };
+        assert_eq!(
+            port.run_setup_script(&svc, run).await,
+            (false, None),
+            "an unregistered runtime runs no setup script"
         );
     }
 

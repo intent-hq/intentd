@@ -1542,7 +1542,7 @@ async fn monitor_guidance_current_context_continuation_preserves_saved_session()
             .flatten()
             .collect()
     }
-    for version in ["3.0", "3.1", "3.2"] {
+    for version in ["3.0", "3.1", "3.2", "3.3"] {
         let http = ReadServer::new().await;
         let f = LiveFixture::with_version(&http, version).await;
         let store = &f.base.auth.service.store;
@@ -1577,7 +1577,7 @@ async fn monitor_guidance_current_context_continuation_preserves_saved_session()
         assert!(first_text.contains("group/project"), "{first}");
         assert_eq!(
             first_text.contains("Qualified monitoring is prepared but production-disabled"),
-            version == "3.2"
+            matches!(version, "3.2" | "3.3")
         );
         f.base.git.git(
             &f.base.git.path,
@@ -1624,7 +1624,7 @@ async fn monitor_guidance_current_context_continuation_preserves_saved_session()
             next_text.contains(
                 "Existing watches and restored history keep their original target and account"
             ),
-            version == "3.2"
+            matches!(version, "3.2" | "3.3")
         );
         let caller = Caller::Agent {
             agent_id: f.session.id.clone(),

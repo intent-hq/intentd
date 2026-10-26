@@ -8792,9 +8792,7 @@ mod tests {
     /// error — and must not surface the retired "supply a fresh id" guidance.
     #[tokio::test]
     async fn insert_agent_session_duplicate_id_is_internal_error() {
-        use intent_core::{
-            now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus,
-        };
+        use intent_core::{now_iso, Workspace};
 
         use uuid::Uuid;
         let tmp = TempDb::new("test-agent-repo");
@@ -8805,53 +8803,9 @@ mod tests {
             id: ws_id.clone(),
             title: "Test".to_string(),
             branch: "main".to_string(),
-            base_ref: None,
-            base_commit_sha: None,
-            status: WorkspaceStatus::Active,
-            status_message: None,
-            status_image_asset_id: None,
-            activity: WorkspaceActivity::Idle,
-            attention: WorkspaceAttention::None,
             created_at: ts.clone(),
             updated_at: ts.clone(),
-            last_activity: None,
-            last_content_activity: None,
-            tags: vec![],
-            path: None,
-            repository_path: None,
-            repository_owner: None,
-            repository_name: None,
-            worktree_path: None,
-            scope: None,
-            skip_worktree: false,
-            setup_script: None,
-            is_remote: false,
-            default_model: None,
-            pr_number: None,
-            pr_url: None,
-            pr_status: None,
-            active_pull_request: None,
-            pull_requests: None,
-            context_links: None,
-            archived: false,
-            archived_at: None,
-            retired_at: None,
-            task_stats: None,
-            agent_summary: None,
-            diff_summary: None,
-            token_usage: None,
-            cow_supported: None,
-            browser_client_id: None,
-            pull_requests_total: None,
-            display_status: None,
-            attention_reminder: None,
-            waiting: false,
-            scripts_running: false,
-            background_tasks_running: false,
-            checkout_mode: None,
-            disk_usage: None,
-            pending_delete_at: None,
-            membership: None,
+            ..Default::default()
         };
         store
             .insert_workspace(&workspace)
@@ -8922,9 +8876,7 @@ mod tests {
     /// session id maps to `NotFound`.
     #[tokio::test]
     async fn token_usage_snapshot_roundtrip_and_replace() {
-        use intent_core::{
-            now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus,
-        };
+        use intent_core::{now_iso, Workspace};
 
         use uuid::Uuid;
         let tmp = TempDb::new("test-agent-repo");
@@ -8935,53 +8887,9 @@ mod tests {
             id: ws_id.clone(),
             title: "Test".to_string(),
             branch: "main".to_string(),
-            base_ref: None,
-            base_commit_sha: None,
-            status: WorkspaceStatus::Active,
-            status_message: None,
-            status_image_asset_id: None,
-            activity: WorkspaceActivity::Idle,
-            attention: WorkspaceAttention::None,
             created_at: ts.clone(),
             updated_at: ts.clone(),
-            last_activity: None,
-            last_content_activity: None,
-            tags: vec![],
-            path: None,
-            repository_path: None,
-            repository_owner: None,
-            repository_name: None,
-            worktree_path: None,
-            scope: None,
-            skip_worktree: false,
-            setup_script: None,
-            is_remote: false,
-            default_model: None,
-            pr_number: None,
-            pr_url: None,
-            pr_status: None,
-            active_pull_request: None,
-            pull_requests: None,
-            context_links: None,
-            archived: false,
-            archived_at: None,
-            retired_at: None,
-            task_stats: None,
-            agent_summary: None,
-            diff_summary: None,
-            token_usage: None,
-            cow_supported: None,
-            browser_client_id: None,
-            pull_requests_total: None,
-            display_status: None,
-            attention_reminder: None,
-            waiting: false,
-            scripts_running: false,
-            background_tasks_running: false,
-            checkout_mode: None,
-            disk_usage: None,
-            pending_delete_at: None,
-            membership: None,
+            ..Default::default()
         };
         store
             .insert_workspace(&workspace)
@@ -9709,58 +9617,14 @@ mod tests {
 
     /// Minimal workspace literal for the baseline-fold tests below.
     fn baseline_test_workspace(ws_id: &WorkspaceId, ts: &str) -> intent_core::Workspace {
-        use intent_core::{Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus};
+        use intent_core::Workspace;
         Workspace {
             id: ws_id.clone(),
             title: "Test".to_string(),
             branch: "main".to_string(),
-            base_ref: None,
-            base_commit_sha: None,
-            status: WorkspaceStatus::Active,
-            status_message: None,
-            status_image_asset_id: None,
-            activity: WorkspaceActivity::Idle,
-            attention: WorkspaceAttention::None,
             created_at: ts.to_string(),
             updated_at: ts.to_string(),
-            last_activity: None,
-            last_content_activity: None,
-            tags: vec![],
-            path: None,
-            repository_path: None,
-            repository_owner: None,
-            repository_name: None,
-            worktree_path: None,
-            scope: None,
-            skip_worktree: false,
-            setup_script: None,
-            is_remote: false,
-            default_model: None,
-            pr_number: None,
-            pr_url: None,
-            pr_status: None,
-            active_pull_request: None,
-            pull_requests: None,
-            context_links: None,
-            archived: false,
-            archived_at: None,
-            retired_at: None,
-            task_stats: None,
-            agent_summary: None,
-            diff_summary: None,
-            token_usage: None,
-            cow_supported: None,
-            browser_client_id: None,
-            pull_requests_total: None,
-            display_status: None,
-            attention_reminder: None,
-            waiting: false,
-            scripts_running: false,
-            background_tasks_running: false,
-            checkout_mode: None,
-            disk_usage: None,
-            pending_delete_at: None,
-            membership: None,
+            ..Default::default()
         }
     }
 
@@ -13528,9 +13392,7 @@ mod tests {
 
     #[tokio::test]
     async fn re_interruption_resets_resolution() {
-        use intent_core::{
-            now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus,
-        };
+        use intent_core::{now_iso, Workspace};
 
         let tmp = TempDb::new("test-agent-repo");
         let store = Store::open(&tmp).await.expect("create test store");
@@ -13543,53 +13405,9 @@ mod tests {
             id: ws_id.clone(),
             title: "Test".to_string(),
             branch: "main".to_string(),
-            base_ref: None,
-            base_commit_sha: None,
-            status: WorkspaceStatus::Active,
-            status_message: None,
-            status_image_asset_id: None,
-            activity: WorkspaceActivity::Idle,
-            attention: WorkspaceAttention::None,
             created_at: ts.clone(),
             updated_at: ts,
-            last_activity: None,
-            last_content_activity: None,
-            tags: vec![],
-            path: None,
-            repository_path: None,
-            repository_owner: None,
-            repository_name: None,
-            worktree_path: None,
-            scope: None,
-            skip_worktree: false,
-            setup_script: None,
-            is_remote: false,
-            default_model: None,
-            pr_number: None,
-            pr_url: None,
-            pr_status: None,
-            active_pull_request: None,
-            pull_requests: None,
-            context_links: None,
-            archived: false,
-            archived_at: None,
-            retired_at: None,
-            task_stats: None,
-            agent_summary: None,
-            diff_summary: None,
-            token_usage: None,
-            cow_supported: None,
-            browser_client_id: None,
-            pull_requests_total: None,
-            display_status: None,
-            attention_reminder: None,
-            waiting: false,
-            scripts_running: false,
-            background_tasks_running: false,
-            checkout_mode: None,
-            disk_usage: None,
-            pending_delete_at: None,
-            membership: None,
+            ..Default::default()
         };
         store
             .insert_workspace(&workspace)
@@ -13667,9 +13485,7 @@ mod tests {
 
     #[tokio::test]
     async fn double_claim_race() {
-        use intent_core::{
-            now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus,
-        };
+        use intent_core::{now_iso, Workspace};
 
         let tmp = TempDb::new("test-agent-repo");
         let store = Store::open(&tmp).await.expect("create test store");
@@ -13682,53 +13498,9 @@ mod tests {
             id: ws_id.clone(),
             title: "Test".to_string(),
             branch: "main".to_string(),
-            base_ref: None,
-            base_commit_sha: None,
-            status: WorkspaceStatus::Active,
-            status_message: None,
-            status_image_asset_id: None,
-            activity: WorkspaceActivity::Idle,
-            attention: WorkspaceAttention::None,
             created_at: ts.clone(),
             updated_at: ts,
-            last_activity: None,
-            last_content_activity: None,
-            tags: vec![],
-            path: None,
-            repository_path: None,
-            repository_owner: None,
-            repository_name: None,
-            worktree_path: None,
-            scope: None,
-            skip_worktree: false,
-            setup_script: None,
-            is_remote: false,
-            default_model: None,
-            pr_number: None,
-            pr_url: None,
-            pr_status: None,
-            active_pull_request: None,
-            pull_requests: None,
-            context_links: None,
-            archived: false,
-            archived_at: None,
-            retired_at: None,
-            task_stats: None,
-            agent_summary: None,
-            diff_summary: None,
-            token_usage: None,
-            cow_supported: None,
-            browser_client_id: None,
-            pull_requests_total: None,
-            display_status: None,
-            attention_reminder: None,
-            waiting: false,
-            scripts_running: false,
-            background_tasks_running: false,
-            checkout_mode: None,
-            disk_usage: None,
-            pending_delete_at: None,
-            membership: None,
+            ..Default::default()
         };
         store
             .insert_workspace(&workspace)
@@ -13758,10 +13530,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_agent_session_summaries_excludes_messages() {
-        use intent_core::{
-            now_iso, AgentSession, AgentStatus, Workspace, WorkspaceActivity, WorkspaceAttention,
-            WorkspaceStatus,
-        };
+        use intent_core::{now_iso, AgentSession, AgentStatus, Workspace};
 
         let tmp = TempDb::new("test-summaries");
         let store = Store::open(&tmp).await.expect("create test store");
@@ -13773,53 +13542,9 @@ mod tests {
             id: ws_id.clone(),
             title: "Test".to_string(),
             branch: "main".to_string(),
-            base_ref: None,
-            base_commit_sha: None,
-            status: WorkspaceStatus::Active,
-            status_message: None,
-            status_image_asset_id: None,
-            activity: WorkspaceActivity::Idle,
-            attention: WorkspaceAttention::None,
             created_at: ts.clone(),
             updated_at: ts.clone(),
-            last_activity: None,
-            last_content_activity: None,
-            tags: vec![],
-            path: None,
-            repository_path: None,
-            repository_owner: None,
-            repository_name: None,
-            worktree_path: None,
-            scope: None,
-            skip_worktree: false,
-            setup_script: None,
-            is_remote: false,
-            default_model: None,
-            pr_number: None,
-            pr_url: None,
-            pr_status: None,
-            active_pull_request: None,
-            pull_requests: None,
-            context_links: None,
-            archived: false,
-            archived_at: None,
-            retired_at: None,
-            task_stats: None,
-            agent_summary: None,
-            diff_summary: None,
-            token_usage: None,
-            cow_supported: None,
-            browser_client_id: None,
-            pull_requests_total: None,
-            display_status: None,
-            attention_reminder: None,
-            waiting: false,
-            scripts_running: false,
-            background_tasks_running: false,
-            checkout_mode: None,
-            disk_usage: None,
-            pending_delete_at: None,
-            membership: None,
+            ..Default::default()
         };
         store
             .insert_workspace(&workspace)
@@ -13961,10 +13686,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_agent_session_invariants_without_messages() {
-        use intent_core::{
-            now_iso, AgentSession, AgentStatus, Workspace, WorkspaceActivity, WorkspaceAttention,
-            WorkspaceStatus,
-        };
+        use intent_core::{now_iso, AgentSession, AgentStatus, Workspace};
 
         let tmp = TempDb::new("test-update-inv");
         let store = Store::open(&tmp).await.expect("create test store");
@@ -13978,53 +13700,9 @@ mod tests {
                 id: id.clone(),
                 title: "Test".to_string(),
                 branch: "main".to_string(),
-                base_ref: None,
-                base_commit_sha: None,
-                status: WorkspaceStatus::Active,
-                status_message: None,
-                status_image_asset_id: None,
-                activity: WorkspaceActivity::Idle,
-                attention: WorkspaceAttention::None,
                 created_at: ts.clone(),
                 updated_at: ts.clone(),
-                last_activity: None,
-                last_content_activity: None,
-                tags: vec![],
-                path: None,
-                repository_path: None,
-                repository_owner: None,
-                repository_name: None,
-                worktree_path: None,
-                scope: None,
-                skip_worktree: false,
-                setup_script: None,
-                is_remote: false,
-                default_model: None,
-                pr_number: None,
-                pr_url: None,
-                pr_status: None,
-                active_pull_request: None,
-                pull_requests: None,
-                context_links: None,
-                archived: false,
-                archived_at: None,
-                retired_at: None,
-                task_stats: None,
-                agent_summary: None,
-                diff_summary: None,
-                token_usage: None,
-                cow_supported: None,
-                browser_client_id: None,
-                pull_requests_total: None,
-                display_status: None,
-                attention_reminder: None,
-                waiting: false,
-                scripts_running: false,
-                background_tasks_running: false,
-                checkout_mode: None,
-                disk_usage: None,
-                pending_delete_at: None,
-                membership: None,
+                ..Default::default()
             };
             store.insert_workspace(&workspace).await.expect("insert");
         }
@@ -15348,10 +15026,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_agent_session_message_stats() {
-        use intent_core::{
-            now_iso, AgentSession, AgentStatus, Workspace, WorkspaceActivity, WorkspaceAttention,
-            WorkspaceStatus,
-        };
+        use intent_core::{now_iso, AgentSession, AgentStatus, Workspace};
 
         let tmp = TempDb::new("test-msg-stats");
         let store = Store::open(&tmp).await.expect("create test store");
@@ -15363,53 +15038,9 @@ mod tests {
             id: ws_id.clone(),
             title: "Test".to_string(),
             branch: "main".to_string(),
-            base_ref: None,
-            base_commit_sha: None,
-            status: WorkspaceStatus::Active,
-            status_message: None,
-            status_image_asset_id: None,
-            activity: WorkspaceActivity::Idle,
-            attention: WorkspaceAttention::None,
             created_at: ts.clone(),
             updated_at: ts.clone(),
-            last_activity: None,
-            last_content_activity: None,
-            tags: vec![],
-            path: None,
-            repository_path: None,
-            repository_owner: None,
-            repository_name: None,
-            worktree_path: None,
-            scope: None,
-            skip_worktree: false,
-            setup_script: None,
-            is_remote: false,
-            default_model: None,
-            pr_number: None,
-            pr_url: None,
-            pr_status: None,
-            active_pull_request: None,
-            pull_requests: None,
-            context_links: None,
-            archived: false,
-            archived_at: None,
-            retired_at: None,
-            task_stats: None,
-            agent_summary: None,
-            diff_summary: None,
-            token_usage: None,
-            cow_supported: None,
-            browser_client_id: None,
-            pull_requests_total: None,
-            display_status: None,
-            attention_reminder: None,
-            waiting: false,
-            scripts_running: false,
-            background_tasks_running: false,
-            checkout_mode: None,
-            disk_usage: None,
-            pending_delete_at: None,
-            membership: None,
+            ..Default::default()
         };
         store.insert_workspace(&workspace).await.expect("insert");
 
@@ -19942,61 +19573,15 @@ mod tests {
 
     /// Insert a minimal workspace row so agent-session FKs resolve.
     async fn insert_test_workspace(store: &Store, ws_id: &WorkspaceId) {
-        use intent_core::{
-            now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus,
-        };
+        use intent_core::{now_iso, Workspace};
         let ts = now_iso();
         let workspace = Workspace {
             id: ws_id.clone(),
             title: "Test".to_string(),
             branch: "main".to_string(),
-            base_ref: None,
-            base_commit_sha: None,
-            status: WorkspaceStatus::Active,
-            status_message: None,
-            status_image_asset_id: None,
-            activity: WorkspaceActivity::Idle,
-            attention: WorkspaceAttention::None,
             created_at: ts.clone(),
             updated_at: ts,
-            last_activity: None,
-            last_content_activity: None,
-            tags: vec![],
-            path: None,
-            repository_path: None,
-            repository_owner: None,
-            repository_name: None,
-            worktree_path: None,
-            scope: None,
-            skip_worktree: false,
-            setup_script: None,
-            is_remote: false,
-            default_model: None,
-            pr_number: None,
-            pr_url: None,
-            pr_status: None,
-            active_pull_request: None,
-            pull_requests: None,
-            context_links: None,
-            archived: false,
-            archived_at: None,
-            retired_at: None,
-            task_stats: None,
-            agent_summary: None,
-            diff_summary: None,
-            token_usage: None,
-            cow_supported: None,
-            browser_client_id: None,
-            pull_requests_total: None,
-            display_status: None,
-            attention_reminder: None,
-            waiting: false,
-            scripts_running: false,
-            background_tasks_running: false,
-            checkout_mode: None,
-            disk_usage: None,
-            pending_delete_at: None,
-            membership: None,
+            ..Default::default()
         };
         store
             .insert_workspace(&workspace)

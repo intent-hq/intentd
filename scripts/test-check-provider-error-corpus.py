@@ -55,6 +55,7 @@ export function providerFailureCategory(errorKind, isUsageLimit = false) {
 ACP_AGENT_JS = '''
 await failActiveWithSessionFailure("worker_shutdown", internalErrorForClient({ errorKind: "worker_shutdown" }));
 await failActiveWithSessionFailure("internal_error", RequestError.internalError(errorKindData("no_result"), TURN_NO_RESULT_MESSAGE));
+await failActiveWithSessionFailure("internal_error", RequestError.internalError(errorKindData("incomplete_tool_call"), message), message);
 await failActiveWithSessionFailure("transport_lost", internalErrorForClient({ errorKind: "transport_lost" }));
 '''
 SDK_TYPES = (

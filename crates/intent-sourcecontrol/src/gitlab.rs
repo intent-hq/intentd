@@ -849,6 +849,8 @@ fn approval_reviews(value: &Value) -> Result<Vec<Review>> {
                 verdict: ReviewVerdict::Approve,
                 body: None,
                 submitted_at: optional(entry, "approved_at").unwrap_or_default(),
+                id: None,
+                commit_sha: None,
             })
         })
         .collect()

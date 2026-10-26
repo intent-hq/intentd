@@ -94,6 +94,8 @@ fn review(author: &str, verdict: ReviewVerdict, submitted_at: &str) -> Review {
         verdict,
         body: None,
         submitted_at: submitted_at.into(),
+        id: None,
+        commit_sha: None,
     }
 }
 fn project(observation: &ReviewObservation) -> Value {
