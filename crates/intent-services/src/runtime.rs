@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use intent_core::execution::HostExecutionContext;
 use intent_core::{
     now_iso, AgentId, BoxFuture, BrowserTab, BrowserTabInput, ClientId, Error, HookId, Result,
-    ReverseDispatchError, ReverseTarget, ScriptCreateParams, WorkspaceApi, WorkspaceId,
+    ReverseDispatchError, ScriptCreateParams, WorkspaceApi, WorkspaceId,
 };
 
 use crate::browser_tabs::BrowserTabOpsExt;
@@ -817,7 +817,7 @@ impl RuntimePort for RuntimeFeature {
     /// there is no per-connection reverse channel to use (the caller is the
     /// daemon-hosted MCP server, not a client connection), so we route the
     /// batch through the injected [`AgentReverseDispatch`]. The target is
-    /// the workspace's **driving client** ([`Services::driving_client_target`](crate::browser_tabs::BrowserTabRoutingExt::driving_client_target),
+    /// the workspace's **driving client** ([`Services::driving_client_target`],
     /// REV-2 Model 5 & 10: pin → host of the workspace's claimed tabs →
     /// first-connected eligible client); a driving client that is offline is
     /// a hard `-32603` ("browser client … for this workspace is not
@@ -1181,14 +1181,6 @@ impl RuntimePort for RuntimeFeature {
             crate::sandbox_ops::discard_sandbox(&store, &workspace_id, &sandbox_id).await?;
             Ok(serde_json::json!({ "ok": true }))
         })
-    }
-
-    fn driving_client_target<'a>(
-        &'a self,
-        svc: &'a Services,
-        workspace_id: &'a WorkspaceId,
-    ) -> BoxFuture<'a, Result<ReverseTarget>> {
-        Box::pin(svc.driving_client_target(workspace_id))
     }
 
     fn migrate_claimed_browser_tabs<'a>(

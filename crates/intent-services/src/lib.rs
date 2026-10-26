@@ -4969,7 +4969,7 @@ impl Services {
         } else {
             self.store.workspace_browser_client(id).await?
         };
-        let target = self.ports.runtime().driving_client_target(self, id).await?;
+        let target = self.driving_client_target(id).await?;
         let resolved = self
             .reverse_dispatch
             .as_ref()
