@@ -1,6 +1,8 @@
 //! Service-level incremental deletion regressions (intent-hq/intent#5337).
 
 use super::{test_registry_with_default_provider, workspace, TempDb, WorkspacesRoot};
+use crate::browser_tabs::BrowserTabOpsExt;
+use crate::hook_manager::HookServicesExt;
 use crate::{EventBus, Services};
 use intent_core::{AgentId, Error, WorkspaceApi, WorkspaceId};
 use intent_store::Store;

@@ -1,3 +1,4 @@
+use crate::script_output_cleanup::ScriptOutputCleanupExt;
 /// On-disk script output is deleted when it expires, when its script is
 /// removed, when its workspace is deleted, and when its workspace no longer
 /// exists at startup.

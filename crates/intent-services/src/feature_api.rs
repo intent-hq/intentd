@@ -27,12 +27,13 @@ use intent_core::{AgentId, AgentReverseDispatch};
 use intent_sourcecontrol::SourceControl;
 
 use crate::delivery_tasks::DeliveryTasks;
-use crate::feature_ports::{AgentWakePort, TransferPort};
+use crate::feature_ports::{AgentWakePort, RuntimePort, TransferPort};
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::model_catalog::ModelCatalogCache;
 use crate::runtime_config::{ScriptOutputConfig, ScriptParks};
 use crate::WorkspaceSetupStates;
 
+pub use crate::runtime::RuntimeServicesExt;
 pub use crate::{
     daemon_exe_path, default_workspaces_root, is_stale_in_flight_status, known_repo_name,
     publish_event, publish_event_transient, record_setup_running, record_setup_skipped,
@@ -124,6 +125,16 @@ pub mod file_ops {
 /// Workspace git locations.
 pub mod git_ops {
     pub use crate::git_ops::worktree_path;
+}
+
+/// The hook wake and notice framing of the latest harness.
+pub mod harness {
+    pub use crate::harness::{latest_hook_framing, HookFraming};
+
+    /// Harness v1 constants.
+    pub mod v1 {
+        pub use crate::harness::v1::HOOK_WAKE_LOGS_CAP;
+    }
 }
 
 /// The cached model catalog.
@@ -364,6 +375,13 @@ impl Services {
     #[must_use]
     pub fn models_catalog_for_test(&self) -> &Arc<ModelCatalogCache> {
         &self.models_catalog
+    }
+
+    /// The registered runtime feature.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn feature_runtime(&self) -> &dyn RuntimePort {
+        self.ports.runtime()
     }
 
     /// The registered agent-wake feature.

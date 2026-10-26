@@ -575,6 +575,105 @@ pub(crate) fn latest() -> &'static dyn Harness {
     latest_entry().harness
 }
 
+/// The hook wake and notice framing of the latest harness, for the runtime
+/// feature crate. It forwards to [`Harness`] without making the trait (and
+/// the agent-side types its other methods name) public; each method is
+/// documented on the trait method of the same name.
+#[derive(Clone, Copy)]
+pub struct HookFraming(&'static dyn Harness);
+
+/// The hook framing of [`latest`].
+#[must_use]
+pub fn latest_hook_framing() -> HookFraming {
+    HookFraming(latest())
+}
+
+impl HookFraming {
+    #[must_use]
+    pub fn hook_wake_logs_section(&self, message: &str, logs: Option<&str>) -> String {
+        self.0.hook_wake_logs_section(message, logs)
+    }
+
+    #[must_use]
+    pub fn hook_state_dropped_warning(&self, state_bytes: usize, cap_bytes: usize) -> String {
+        self.0.hook_state_dropped_warning(state_bytes, cap_bytes)
+    }
+
+    #[must_use]
+    pub fn hook_wake_message_truncated_marker(
+        &self,
+        omitted_chars: usize,
+        total_chars: usize,
+        cap_chars: usize,
+    ) -> String {
+        self.0
+            .hook_wake_message_truncated_marker(omitted_chars, total_chars, cap_chars)
+    }
+
+    #[must_use]
+    pub fn hook_exec_failures_warning(&self, lines: &[&str], total: usize) -> String {
+        self.0.hook_exec_failures_warning(lines, total)
+    }
+
+    #[must_use]
+    pub fn hook_wake_framing(
+        &self,
+        hook_name: &str,
+        message: &str,
+        state_note: Option<&str>,
+    ) -> String {
+        self.0.hook_wake_framing(hook_name, message, state_note)
+    }
+
+    #[must_use]
+    pub fn hook_dispatch_active_note(&self, expires_at: Option<&str>) -> String {
+        self.0.hook_dispatch_active_note(expires_at)
+    }
+
+    #[must_use]
+    pub fn hook_dispatch_retired_note(&self, hook_id: &str) -> String {
+        self.0.hook_dispatch_retired_note(hook_id)
+    }
+
+    #[must_use]
+    pub fn hook_evicted_state_note(&self, hook_id: &str) -> String {
+        self.0.hook_evicted_state_note(hook_id)
+    }
+
+    #[must_use]
+    pub fn hook_evicted_failed_run_notice(&self, hook_name: &str, error: &str) -> String {
+        self.0.hook_evicted_failed_run_notice(hook_name, error)
+    }
+
+    #[must_use]
+    pub fn hook_evicted_internal_error_notice(&self, hook_name: &str, error: &str) -> String {
+        self.0.hook_evicted_internal_error_notice(hook_name, error)
+    }
+
+    #[must_use]
+    pub fn hook_expired_notice(
+        &self,
+        hook_name: &str,
+        hook_id: &str,
+        perpetual: bool,
+        run_count: i64,
+        dispatch_count: i64,
+    ) -> String {
+        self.0
+            .hook_expired_notice(hook_name, hook_id, perpetual, run_count, dispatch_count)
+    }
+
+    #[must_use]
+    pub fn hook_run_at_fired_notice(&self, hook_name: &str, hook_id: &str, run_at: &str) -> String {
+        self.0.hook_run_at_fired_notice(hook_name, hook_id, run_at)
+    }
+
+    #[must_use]
+    pub fn hook_cancelled_from_app_notice(&self) -> String {
+        self.0.hook_cancelled_from_app_notice()
+    }
+}
+
 /// Resolve a session's stamped `harnessVersion` to its registry row. Unknown
 /// versions fall back to the latest with a WARN (never fail a turn over a
 /// stale or corrupt stamp).

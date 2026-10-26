@@ -11,6 +11,7 @@ use intent_core::{AgentId, HookState, PrMonitorState, WorkspaceApi};
 use serde_json::json;
 
 use crate::harness::Harness;
+use crate::hook_manager::HookServicesExt;
 use crate::v1_goldens::{pr_monitor_row, seed_agent, setup, wake_texts_when};
 
 const PREFIX: &str = "[SYSTEM NOTICE] This workspace was archived and has since been \

@@ -12,11 +12,19 @@ use serde_json::Value;
 
 use crate::{events::SubscriptionFilter, publish_event, system_actor, Services};
 
-impl Services {
+/// The host execution context snapshot and its change loop, on [`Services`].
+pub(crate) trait HostExecutionExt {
+    async fn execution_context_snapshot(&self) -> Result<HostExecutionContext>;
+    async fn publish_execution_context_changed(&self);
+    #[must_use]
+    fn spawn_execution_context_loop(&self) -> tokio::task::JoinHandle<()>;
+}
+
+impl HostExecutionExt for Services {
     /// Presence only, with no forge request or AI provider spawn. The CLI
     /// credential fallback uses the existing bounded token cache. Never read
     /// collaboration-purpose credential slots here.
-    pub(crate) async fn execution_context_snapshot(&self) -> Result<HostExecutionContext> {
+    async fn execution_context_snapshot(&self) -> Result<HostExecutionContext> {
         let settings = self.effective_settings();
         let agents = self.feature_agent_wake();
         let mut enabled_provider_ids: Vec<_> = intent_providers::all_provider_ids()
@@ -75,7 +83,7 @@ impl Services {
         })
     }
 
-    pub(crate) async fn publish_execution_context_changed(&self) {
+    async fn publish_execution_context_changed(&self) {
         let Some(bus) = self.feature_event_bus() else {
             return;
         };
@@ -103,8 +111,7 @@ impl Services {
     /// Observe committed setup changes. Subscribe before returning, so an
     /// immediate mutation cannot race registration. The daemon owns lifetime;
     /// a member disconnect never stops shared execution or these updates.
-    #[must_use]
-    pub fn spawn_execution_context_loop(&self) -> tokio::task::JoinHandle<()> {
+    fn spawn_execution_context_loop(&self) -> tokio::task::JoinHandle<()> {
         let mut sub = self.feature_event_bus().map(|bus| {
             bus.subscribe(SubscriptionFilter {
                 event_types: vec![SETTINGS_CHANGED.into(), SOURCE_CONTROL_AUTH_CHANGED.into()],

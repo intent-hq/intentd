@@ -7896,10 +7896,17 @@ impl Services {
         // through and run the advisory-ALLOWED delivery variant instead.
         let advisory_pending = self.has_advisory_pending_interim_skip(child_id);
         if !advisory_pending
-            && (!self.active_hooks_for_agent(child_id).await.is_empty()
+            && (!self
+                .ports
+                .runtime()
+                .active_hooks_for_agent(self, child_id)
+                .await
+                .is_empty()
                 || (!self.active_pr_monitors_for_agent(child_id).await.is_empty()
                     || !self
-                        .active_script_monitors_for_agent(child_id)
+                        .ports
+                        .runtime()
+                        .active_script_monitors_for_agent(self, child_id)
                         .await
                         .is_empty()))
         {
@@ -7983,7 +7990,10 @@ impl Services {
         // (omitted) here unless the monorepo#1945 report bypass passed the
         // active-hooks guard above (or a hook was scheduled in the window),
         // matching the live emit sites' shape.
-        self.annotate_waiting_on_hooks(child_id, &mut data).await;
+        self.ports
+            .runtime()
+            .annotate_waiting_on_hooks(self, child_id, &mut data)
+            .await;
         // Idle-visibility (unified external-wait): same `waitingOnPrMonitors`
         // shape-parity stamp — empty (omitted) here unless the report bypass
         // passed the active-pr-monitors guard above.
@@ -8586,12 +8596,18 @@ impl Services {
         // kept: the advisory wake below names them.
         let active_hooks: Vec<serde_json::Value> =
             if event.event_type == AGENT_IDLE && !completion_reported {
-                self.active_hooks_for_agent(child_id).await
+                self.ports
+                    .runtime()
+                    .active_hooks_for_agent(self, child_id)
+                    .await
             } else {
                 Vec::new()
             };
         let active_script_monitors = if event.event_type == AGENT_IDLE && !completion_reported {
-            self.active_script_monitors_for_agent(child_id).await
+            self.ports
+                .runtime()
+                .active_script_monitors_for_agent(self, child_id)
+                .await
         } else {
             Vec::new()
         };
@@ -9661,7 +9677,11 @@ impl Services {
             grouped,
             child_of_recipient,
         );
-        let script_waits = self.active_script_monitors_for_agent(child_id).await;
+        let script_waits = self
+            .ports
+            .runtime()
+            .active_script_monitors_for_agent(self, child_id)
+            .await;
         if !script_waits.is_empty() {
             use std::fmt::Write as _;
             wake.push_str("\nActive script monitors:");
@@ -9676,7 +9696,9 @@ impl Services {
         let mut metadata = build_event_notification_metadata(&[event]);
         metadata["watchStillArmed"] = serde_json::json!(true);
         metadata["childExternallyWaiting"] = serde_json::json!(true);
-        self.annotate_waiting_on_script_monitors(child_id, &mut metadata)
+        self.ports
+            .runtime()
+            .annotate_waiting_on_script_monitors(self, child_id, &mut metadata)
             .await;
         if !active_hooks.is_empty() {
             metadata["waitingOnHooks"] = serde_json::Value::Array(active_hooks.to_vec());
@@ -18210,7 +18232,9 @@ impl Services {
             // Keep the permit through cleanup and terminal event publication.
             let _deletion = services.workspace_mutations.delete(&id).await;
             services
-                .cancel_script_monitors(&id, None, "workspace-deleted")
+                .ports
+                .runtime()
+                .cancel_script_monitors(&services, &id, None, "workspace-deleted")
                 .await?;
             // Refuse new script launches, auto-restarts and output logs, and
             // stop the running scripts, so nothing writes a log after the
@@ -23942,7 +23966,9 @@ impl WorkspaceApi for Services {
             // failure fails the RPC with the row still active: access
             // revocation is never best-effort. Unarchive does NOT restore
             // either; a guest rejoins by a fresh invite.
-            this.cancel_script_monitors(&id, None, "workspace-archived")
+            this.ports
+                .runtime()
+                .cancel_script_monitors(&this, &id, None, "workspace-archived")
                 .await?;
             let guest_sweep = store.archive_workspace_detaching_guests(&id, &now).await?;
             ws.status = WorkspaceStatus::Archived;
@@ -35738,7 +35764,7 @@ impl WorkspaceApi for Services {
 impl Services {
     /// Archive tail: queue ONE consolidated wake per agent whose background
     /// hooks and/or PR monitors the archive sweeps
-    /// ([`Services::cancel_workspace_hooks`],
+    /// ([`Services::cancel_workspace_hooks`](crate::hook_manager::HookServicesExt::cancel_workspace_hooks),
     /// [`Services::cancel_workspace_pr_monitors`]) just cancelled — the
     /// [`crate::harness::Harness::workspace_archived_watches_cancelled_notice`]
     /// surface naming every cancelled hook (`name` + id) and monitor

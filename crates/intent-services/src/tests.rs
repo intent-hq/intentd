@@ -41274,6 +41274,7 @@ mod browser_client_pin {
 // tab rows, and the tab-addressed `browser.navigateTab` / `browser.closeTab`.
 // ---------------------------------------------------------------------------
 mod browser_routing {
+    use crate::browser_tabs::BrowserTabRoutingExt;
     use std::time::Duration;
 
     use intent_core::{

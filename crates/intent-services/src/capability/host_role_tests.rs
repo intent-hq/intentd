@@ -1,4 +1,5 @@
 use super::*;
+use crate::host_execution::HostExecutionExt;
 use crate::tests::{workspace, TempDb};
 use intent_core::{
     now_iso, with_caller, Principal, WorkspaceApi, WorkspaceCreate, WorkspaceUpdate,

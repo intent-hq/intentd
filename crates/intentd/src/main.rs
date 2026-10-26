@@ -10,6 +10,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
+use intent_app::RuntimeServicesExt as _;
 use intent_app::StartupExt as _;
 #[cfg(test)]
 use intent_core::config::DEFAULT_STREAM_RETENTION_HOURS;
