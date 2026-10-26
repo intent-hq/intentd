@@ -689,6 +689,16 @@ impl AgentWorkers {
             .is_some_and(|e| e.projection.has_running_workers())
     }
 
+    /// Whether any agent of `workspace_id` has a current generation that
+    /// vouches for a running worker ([`Projection::has_running_workers`]) —
+    /// the `Workspace.backgroundTasksRunning` roll-up (PROTOCOL §5.1). One
+    /// leaf lock, no I/O.
+    pub(crate) fn workspace_has_running_workers(&self, workspace_id: &WorkspaceId) -> bool {
+        self.lock().values().any(|e| {
+            e.projection.scope.workspace_id == *workspace_id && e.projection.has_running_workers()
+        })
+    }
+
     /// Every agent whose current generation vouches for a running worker
     /// ([`Projection::has_running_workers`]), with its workspace, sorted by
     /// agent ID. Graceful shutdown enrolls these as interrupted before it

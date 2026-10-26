@@ -1912,6 +1912,7 @@ fn map_workspace_row(row: &SqliteRow) -> Result<Workspace> {
         display_status: None,
         waiting: false,
         scripts_running: false,
+        background_tasks_running: false,
         token_usage,
         // cow_supported is computed on the emit path (intent-services), never persisted.
         cow_supported: None,
