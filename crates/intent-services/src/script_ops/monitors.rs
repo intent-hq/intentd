@@ -5,6 +5,7 @@ use super::{
     json, now_iso, publish_event, script_event, Error, Ordering, PtyId, Result, ScriptManager,
     SpawnSpec, Value, WorkspaceId, LOST_AT_DAEMON_STOP_ERROR,
 };
+use crate::script_monitor::ScriptMonitorExt;
 use intent_core::script_output::LineDecoder;
 use intent_core::{AgentId, ScriptLastRun, ScriptMonitor, ScriptMonitorTrigger, ScriptRunOutcome};
 use intent_pty::OutputChunk;

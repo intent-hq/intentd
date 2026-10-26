@@ -113,7 +113,7 @@ pub(super) fn single_line_name(name: Option<&str>) -> Option<String> {
 
 /// Cap (in chars) on the `[hook logs]` section appended to dispatch/evict
 /// wakes.
-pub(crate) const HOOK_WAKE_LOGS_CAP: usize = 2048;
+pub const HOOK_WAKE_LOGS_CAP: usize = 2048;
 
 /// `{name} ({id})` display label for a settling child, falling back to the
 /// bare id when no name resolved.

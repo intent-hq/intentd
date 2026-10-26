@@ -8,7 +8,7 @@
 //! its own expiry — the fire time + 1 hour grace — and rejects an explicit
 //! `ttlMs`. On expiry the owner is woken so it can reschedule). Each
 //! active hook owns one tokio task; schedules persist to the `hook` table
-//! and rehydrate at boot ([`Services::rehydrate_hooks`]).
+//! and rehydrate at boot ([`Services::rehydrate_hooks`](crate::hook_manager::HookServicesExt::rehydrate_hooks)).
 //!
 //! Scripts evaluate in `QuickJS` via `intent_js::eval` with the exact same
 //! `ws.*` prelude + host dispatch the `workspace_api` MCP tool installs —
@@ -60,6 +60,7 @@ use time::OffsetDateTime;
 use tokio::sync::mpsc;
 
 use crate::feature_ports::CancelSettlement;
+use crate::runtime::RuntimeStateExt;
 #[cfg(test)]
 use crate::runtime_config::HookStoreFault;
 use crate::{publish_event, system_actor, Services};
@@ -158,7 +159,7 @@ pub(crate) type HookTasks = Arc<Mutex<HashMap<HookId, HookHandle>>>;
 
 /// Outcome of one script run. Every variant carries the run's captured
 /// console output (`None` when the script logged nothing).
-enum RunOutcome {
+pub(crate) enum RunOutcome {
     /// `{ dispatch: false }` / `undefined` — sleep and re-run.
     Continue {
         logs: Option<String>,
@@ -179,7 +180,7 @@ enum RunOutcome {
 
 /// How a completed run updates the hook's persisted carry-over state
 /// (`last_state`).
-enum StateUpdate {
+pub(crate) enum StateUpdate {
     /// No `state` field returned (or it was oversized) — keep the previous
     /// state.
     Keep,
@@ -204,7 +205,7 @@ impl StateUpdate {
 /// the eval envelope, so its logs survive; a timeout (or engine failure)
 /// kills the whole eval before the capture can be returned, so that run's
 /// logs are lost — the previously persisted `last_logs` is left untouched.
-enum RunLogs {
+pub(crate) enum RunLogs {
     Captured(Option<String>),
     Lost,
 }
@@ -245,7 +246,7 @@ fn duration_until(deadline: OffsetDateTime) -> Duration {
 ///   or unparseable persisted deadline falls back to the fresh countdown. A
 ///   row persisted as `Running` (daemon died mid-run) also gets the fresh
 ///   countdown: its `next_run_at` is the deadline of the run that already
-///   STARTED ([`Services::execute_hook_run`] leaves it in place), so
+///   STARTED ([`Services::execute_hook_run`](crate::hook_manager::HookServicesExt::execute_hook_run) leaves it in place), so
 ///   honoring it would immediately re-execute a potentially non-idempotent
 ///   interrupted run.
 fn resumed_next_run(hook: &Hook) -> (String, Duration) {
@@ -317,7 +318,7 @@ fn clamp_cron_ttl_ms(ttl_ms: Option<i64>) -> i64 {
 /// evaluated in UTC), or a one-shot future `runAt` timestamp (normalized to
 /// UTC RFC3339 at validation).
 #[derive(Debug, Clone, PartialEq)]
-enum ScheduleKind {
+pub(crate) enum ScheduleKind {
     Delay(i64),
     Cron(String),
     RunAt(String),
@@ -758,7 +759,7 @@ fn parse_exec_failures(v: Option<&Value>, total: Option<&Value>) -> Option<Strin
         .map_or(lines.len(), |t| usize::try_from(t).unwrap_or(usize::MAX))
         .max(lines.len());
     let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
-    Some(crate::harness::latest().hook_exec_failures_warning(&lines, total))
+    Some(crate::harness::latest_hook_framing().hook_exec_failures_warning(&lines, total))
 }
 
 /// Interpret a returned `state` field: absent keeps the previous carry-over
@@ -776,7 +777,7 @@ fn parse_state(v: &Value, logs: &mut Option<String>) -> StateUpdate {
     }
     let serialized = state.to_string();
     if serialized.len() > HOOK_STATE_MAX_BYTES {
-        let warning = crate::harness::latest()
+        let warning = crate::harness::latest_hook_framing()
             .hook_state_dropped_warning(serialized.len(), HOOK_STATE_MAX_BYTES);
         let combined = match logs.take() {
             Some(l) => format!("{l}\n{warning}"),
@@ -807,7 +808,7 @@ fn tail_truncate(s: String, max_bytes: usize) -> String {
 /// log-heavy run cannot flood the owner's queue. No-op when the run logged
 /// nothing. Wording and truncation owned by the harness (H6).
 pub(crate) fn with_wake_logs(message: &str, logs: Option<&str>) -> String {
-    crate::harness::latest().hook_wake_logs_section(message, logs)
+    crate::harness::latest_hook_framing().hook_wake_logs_section(message, logs)
 }
 
 /// Bound a dispatch message (or eviction error text) to
@@ -824,7 +825,7 @@ fn bound_wake_text(text: &str) -> String {
         .char_indices()
         .nth(HOOK_DISPATCH_MESSAGE_MAX_CHARS)
         .map_or(text.len(), |(i, _)| i);
-    let marker = crate::harness::latest().hook_wake_message_truncated_marker(
+    let marker = crate::harness::latest_hook_framing().hook_wake_message_truncated_marker(
         total - HOOK_DISPATCH_MESSAGE_MAX_CHARS,
         total,
         HOOK_DISPATCH_MESSAGE_MAX_CHARS,
@@ -849,7 +850,82 @@ fn waiting_on_hooks_entry(h: ActiveHookMetadata) -> Value {
     v
 }
 
-impl Services {
+/// The background hook service (`hook.*`), on [`Services`].
+pub(crate) trait HookServicesExt {
+    async fn hook_owner_is_sub_agent(&self, agent_id: &AgentId) -> bool;
+    async fn hook_schedule_op(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: &AgentId,
+        params: &Value,
+    ) -> Result<Value>;
+    async fn commit_hook_validation(
+        &self,
+        hook: Hook,
+        kind: ScheduleKind,
+        outcome: RunOutcome,
+    ) -> Result<Value>;
+    async fn hook_list_op(
+        &self,
+        workspace_id: &WorkspaceId,
+        agent_id: Option<&AgentId>,
+        include_retired: bool,
+    ) -> Result<Value>;
+    async fn hook_get_op(&self, workspace_id: &WorkspaceId, hook_id: &HookId) -> Result<Value>;
+    async fn active_hooks_for_agent(&self, agent_id: &AgentId) -> Vec<Value>;
+    async fn active_hooks_by_agent(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> HashMap<String, Vec<Value>>;
+    async fn annotate_waiting_on_hooks(&self, agent_id: &AgentId, data: &mut Value) -> Vec<Value>;
+    async fn hook_cancel_op(
+        &self,
+        workspace_id: &WorkspaceId,
+        hook_id: &HookId,
+        caller: Option<&AgentId>,
+    ) -> Result<Value>;
+    async fn cancel_active_hook(
+        &self,
+        hook: Hook,
+        settlement: CancelSettlement<'_>,
+    ) -> Result<Hook>;
+    async fn cancel_workspace_hooks(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> BTreeMap<AgentId, Vec<(String, HookId)>>;
+    async fn cancel_agent_hooks(&self, agent_id: &AgentId);
+    async fn abort_workspace_hook_tasks(&self, workspace_id: &WorkspaceId);
+    async fn hook_run_now_op(&self, workspace_id: &WorkspaceId, hook_id: &HookId) -> Result<Value>;
+    async fn rehydrate_hooks(&self) -> Result<usize>;
+    fn hook_task_alive(&self, hook_id: &HookId) -> bool;
+    fn abort_hook_task(&self, hook_id: &HookId);
+    fn spawn_hook_task_with_initial_delay(&self, hook: Hook, initial_delay: Option<Duration>);
+    async fn execute_hook_run(&self, hook: &mut Hook) -> Result<Option<Duration>>;
+    async fn hook_store_retry<T, F, Fut>(
+        &self,
+        hook_id: &HookId,
+        step: &'static str,
+        op: F,
+    ) -> Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>;
+    async fn persist_hook_exec_error(
+        &self,
+        hook: &mut Hook,
+        exec_error: Option<String>,
+    ) -> Result<()>;
+    async fn persist_hook_state(&self, hook: &mut Hook, state: StateUpdate) -> Result<()>;
+    async fn evict_hook_after_store_error(&self, hook: &mut Hook, cause: &Error);
+    async fn expire_hook(&self, hook: &mut Hook);
+    async fn finish_expiry(&self, hook: &Hook);
+    async fn finish_run_at_fire(&self, hook: &Hook);
+    async fn resettle_owner_after_hook_terminal(&self, hook: &Hook);
+    async fn wake_hook_owner(&self, hook: &Hook, message: &str, reason: &str);
+    async fn emit_hook_event(&self, event_type: &str, hook: &Hook, next_run_at: Option<String>);
+}
+
+impl HookServicesExt for Services {
     /// Whether a hook's owning session is a sub-agent
     /// (`parent_agent_id.is_some() || is_background`) — the same derivation
     /// the session's `workspace_api` bridge captures at spawn, so a
@@ -871,7 +947,7 @@ impl Services {
     /// Rejected outright when `agentFeatures.backgroundHooks` is off (services
     /// layer defense in depth behind the MCP dispatch deny); already-active
     /// hooks are unaffected by the toggle and run to their terminal state/TTL.
-    pub(crate) async fn hook_schedule_op(
+    async fn hook_schedule_op(
         &self,
         workspace_id: &WorkspaceId,
         agent_id: &AgentId,
@@ -1176,7 +1252,7 @@ impl Services {
     /// full-row recovery path. The state filter and the projection are
     /// applied in SQL ([`Store::list_hook_rows`]), so the handler is
     /// O(rows returned) and never hydrates a retired row's blobs.
-    pub(crate) async fn hook_list_op(
+    async fn hook_list_op(
         &self,
         workspace_id: &WorkspaceId,
         agent_id: Option<&AgentId>,
@@ -1194,11 +1270,7 @@ impl Services {
     /// recover a retired hook's script to re-arm it. A hook belonging to
     /// another workspace reads as `NotFound` (mirrors `hook.cancel` /
     /// `hook.runNow`), so hooks are never readable across workspaces.
-    pub(crate) async fn hook_get_op(
-        &self,
-        workspace_id: &WorkspaceId,
-        hook_id: &HookId,
-    ) -> Result<Value> {
+    async fn hook_get_op(&self, workspace_id: &WorkspaceId, hook_id: &HookId) -> Result<Value> {
         let hook = self.store().get_hook(hook_id).await?;
         if &hook.workspace_id != workspace_id {
             return Err(Error::NotFound(format!("hook {} not found", hook_id.0)));
@@ -1213,7 +1285,7 @@ impl Services {
     /// the agent owns no active hook; a store failure is logged and reads as
     /// empty (visibility is best-effort and must never block an idle emit or
     /// wake delivery).
-    pub(crate) async fn active_hooks_for_agent(&self, agent_id: &AgentId) -> Vec<Value> {
+    async fn active_hooks_for_agent(&self, agent_id: &AgentId) -> Vec<Value> {
         let hooks = match self.store().active_hook_metadata_by_agent(agent_id).await {
             Ok(hooks) => hooks,
             Err(e) => {
@@ -1233,7 +1305,7 @@ impl Services {
     /// `agent.list`: one store query for the whole workspace, grouped by
     /// owning agent id (agents with no active hook are absent). A store
     /// failure is logged and reads as empty, same as the per-agent lookup.
-    pub(crate) async fn active_hooks_by_agent(
+    async fn active_hooks_by_agent(
         &self,
         workspace_id: &WorkspaceId,
     ) -> HashMap<String, Vec<Value>> {
@@ -1268,11 +1340,7 @@ impl Services {
     /// never `[]` — otherwise, and an existing stamp is left untouched).
     /// Returns the stamped list (empty when nothing was stamped and no stamp
     /// was present).
-    pub(crate) async fn annotate_waiting_on_hooks(
-        &self,
-        agent_id: &AgentId,
-        data: &mut Value,
-    ) -> Vec<Value> {
+    async fn annotate_waiting_on_hooks(&self, agent_id: &AgentId, data: &mut Value) -> Vec<Value> {
         if let Some(existing) = data.get("waitingOnHooks").and_then(Value::as_array) {
             return existing.clone();
         }
@@ -1290,7 +1358,7 @@ impl Services {
     /// agent-owned, so a non-owner is rejected and an owner cancel delivers
     /// no self-wake. The FE path (`caller = None`) cancels any hook and
     /// additionally wakes the owning agent with a notice.
-    pub(crate) async fn hook_cancel_op(
+    async fn hook_cancel_op(
         &self,
         workspace_id: &WorkspaceId,
         hook_id: &HookId,
@@ -1318,7 +1386,7 @@ impl Services {
         // owner-side cancel delivers no wake.
         let notice = caller
             .is_none()
-            .then(|| crate::harness::latest().hook_cancelled_from_app_notice());
+            .then(|| crate::harness::latest_hook_framing().hook_cancelled_from_app_notice());
         let settlement = match notice.as_deref() {
             Some(notice) => CancelSettlement::Notify(notice),
             None => CancelSettlement::Resettle,
@@ -1327,9 +1395,9 @@ impl Services {
         Ok(json!({ "ok": true, "hook": hook }))
     }
 
-    /// Core cancel transition shared by [`Services::hook_cancel_op`] and the
-    /// archive / retire sweeps ([`Services::cancel_workspace_hooks`],
-    /// [`Services::cancel_agent_hooks`]): abort the scheduler task, persist
+    /// Core cancel transition shared by [`Services::hook_cancel_op`](crate::hook_manager::HookServicesExt::hook_cancel_op) and the
+    /// archive / retire sweeps ([`Services::cancel_workspace_hooks`](crate::hook_manager::HookServicesExt::cancel_workspace_hooks),
+    /// [`Services::cancel_agent_hooks`](crate::hook_manager::HookServicesExt::cancel_agent_hooks)): abort the scheduler task, persist
     /// `cancelled`, clear `nextRunAt`, and emit `hook:cancelled`. How the
     /// owner's deferred completion watches settle is the caller's
     /// [`CancelSettlement`] choice. The caller must have verified the hook
@@ -1367,7 +1435,7 @@ impl Services {
 
     /// Archive sweep (`workspace.archive`): cancel every ACTIVE
     /// (`scheduled`/`running`) hook in the workspace through the shared
-    /// cancel transition ([`Services::cancel_active_hook`]) — task aborted,
+    /// cancel transition ([`Services::cancel_active_hook`](crate::hook_manager::HookServicesExt::cancel_active_hook)) — task aborted,
     /// state persisted to `cancelled`, `hook:cancelled` emitted, waiting
     /// recomputed (§5.1). Each cancel is SILENT (no per-hook wake) and
     /// DEFERRED ([`CancelSettlement::Deferred`]: no per-item completion
@@ -1383,7 +1451,7 @@ impl Services {
     /// notice tells the owner to reschedule if the condition still matters.
     /// Best-effort per hook: a store failure is logged and the sweep moves
     /// on — archiving must not fail because one hook row would not update.
-    pub(crate) async fn cancel_workspace_hooks(
+    async fn cancel_workspace_hooks(
         &self,
         workspace_id: &WorkspaceId,
     ) -> BTreeMap<AgentId, Vec<(String, HookId)>> {
@@ -1427,7 +1495,7 @@ impl Services {
 
     /// Retire sweep (`ws.agent.retire`): cancel every ACTIVE
     /// (`scheduled`/`running`) hook owned by the retiring agent through the
-    /// shared cancel transition ([`Services::cancel_active_hook`]) — task
+    /// shared cancel transition ([`Services::cancel_active_hook`](crate::hook_manager::HookServicesExt::cancel_active_hook)) — task
     /// aborted, state persisted to `cancelled`, `nextRunAt` cleared,
     /// `hook:cancelled` emitted, waiting recomputed (§5.1). NO wake notice:
     /// the owner retired itself and is inert, so parking a notice in its
@@ -1437,7 +1505,7 @@ impl Services {
     /// the condition still matters. Best-effort per hook: a store failure
     /// is logged and the sweep moves on — retiring must not fail because
     /// one hook row would not update.
-    pub(crate) async fn cancel_agent_hooks(&self, agent_id: &AgentId) {
+    async fn cancel_agent_hooks(&self, agent_id: &AgentId) {
         let hooks = match self.store().list_hooks_by_agent(agent_id).await {
             Ok(hooks) => hooks,
             Err(e) => {
@@ -1476,7 +1544,7 @@ impl Services {
     /// Must run BEFORE the cascade so the rows are still listable.
     /// Best-effort: a list failure is logged and skipped (the lazy
     /// next-tick exit still applies).
-    pub(crate) async fn abort_workspace_hook_tasks(&self, workspace_id: &WorkspaceId) {
+    async fn abort_workspace_hook_tasks(&self, workspace_id: &WorkspaceId) {
         let hooks = match self.store().list_hooks_by_workspace(workspace_id).await {
             Ok(hooks) => hooks,
             Err(e) => {
@@ -1496,14 +1564,10 @@ impl Services {
     /// `hook.runNow`: signal an active hook's task to run immediately (the
     /// inter-run timer resets after the run). On a `runAt` hook the
     /// triggered run IS the one-shot fire — the hook fires early and
-    /// retires whether or not it dispatched ([`Services::execute_hook_run`]
+    /// retires whether or not it dispatched ([`Services::execute_hook_run`](crate::hook_manager::HookServicesExt::execute_hook_run)
     /// treats any `runAt` run as terminal), so the one-shot contract is
     /// honored over the timestamp.
-    pub(crate) async fn hook_run_now_op(
-        &self,
-        workspace_id: &WorkspaceId,
-        hook_id: &HookId,
-    ) -> Result<Value> {
+    async fn hook_run_now_op(&self, workspace_id: &WorkspaceId, hook_id: &HookId) -> Result<Value> {
         let hook = self.store().get_hook(hook_id).await?;
         if &hook.workspace_id != workspace_id {
             return Err(Error::NotFound(format!("hook {} not found", hook_id.0)));
@@ -1553,7 +1617,7 @@ impl Services {
     /// # Errors
     ///
     /// Returns `Error::Internal` if loading the persisted hooks or an owner status lookup fails.
-    pub async fn rehydrate_hooks(&self) -> Result<usize> {
+    async fn rehydrate_hooks(&self) -> Result<usize> {
         let hooks = self.store().load_active_hooks().await?;
         let mut resumed = 0;
         for mut hook in hooks {
@@ -1562,7 +1626,7 @@ impl Services {
             }
             // Prune hooks whose owner no longer exists (deleted agents keep
             // their session row with status `deleted`) or is soft-retired —
-            // the retire-time sweep ([`Services::cancel_agent_hooks`]) could
+            // the retire-time sweep ([`Services::cancel_agent_hooks`](crate::hook_manager::HookServicesExt::cancel_agent_hooks)) could
             // have been missed by a crash window.
             let owner_gone = match self.store().get_agent_session_summary(&hook.agent_id).await {
                 Ok(session) => {
@@ -1638,7 +1702,7 @@ impl Services {
     /// passes the resumed countdown (which may be shorter than the cadence,
     /// or zero for an overdue row) so the persisted `nextRunAt` is honored
     /// across restarts; every later iteration sleeps the duration the
-    /// previous run computed for its kind ([`Services::execute_hook_run`] —
+    /// previous run computed for its kind ([`Services::execute_hook_run`](crate::hook_manager::HookServicesExt::execute_hook_run) —
     /// the fixed `delayMs` cadence or the cron expression's next
     /// occurrence).
     fn spawn_hook_task_with_initial_delay(&self, hook: Hook, initial_delay: Option<Duration>) {
@@ -2034,7 +2098,7 @@ impl Services {
                 hook.run_count += 1;
                 hook.last_error = Some(error.clone());
                 self.emit_hook_event(HOOK_EVICTED, hook, None).await;
-                let notice = crate::harness::latest()
+                let notice = crate::harness::latest_hook_framing()
                     .hook_evicted_failed_run_notice(&hook.name, &bound_wake_text(&error));
                 let notice = match logs {
                     RunLogs::Captured(ref l) => with_wake_logs(&notice, l.as_deref()),
@@ -2167,7 +2231,7 @@ impl Services {
     /// loop: without this the row can sit in `running`/`scheduled` with no
     /// live task behind it. Every step here is itself best-effort (the store
     /// may still be failing) — log and move on rather than propagate.
-    pub(crate) async fn evict_hook_after_store_error(&self, hook: &mut Hook, cause: &Error) {
+    async fn evict_hook_after_store_error(&self, hook: &mut Hook, cause: &Error) {
         let error = format!("scheduler stopped after a store error: {cause}");
         tracing::warn!(hook = %hook.hook_id.0, error = %error, "evicting hook after store error");
         if let Err(e) = self
@@ -2188,7 +2252,7 @@ impl Services {
         hook.next_run_at = None;
         hook.last_error = Some(error.clone());
         self.emit_hook_event(HOOK_EVICTED, hook, None).await;
-        let notice = crate::harness::latest()
+        let notice = crate::harness::latest_hook_framing()
             .hook_evicted_internal_error_notice(&hook.name, &bound_wake_text(&error));
         self.wake_hook_owner(hook, &notice, "evicted").await;
         // The last active hook settling can demote the derived displayStatus
@@ -2201,7 +2265,7 @@ impl Services {
 
     /// Expire an active hook whose TTL deadline has passed and no run is in
     /// flight: persist the terminal state, then emit + wake via
-    /// [`Services::finish_expiry`]. A cancel can race the expiry timer, so
+    /// [`Services::finish_expiry`](crate::hook_manager::HookServicesExt::finish_expiry). A cancel can race the expiry timer, so
     /// the persisted state is re-read first and a no-longer-active hook is
     /// left untouched. Persistence is best-effort (mirrors
     /// `evict_hook_after_store_error`): the scheduler task is exiting either
@@ -2232,7 +2296,7 @@ impl Services {
     /// runs AND dispatches instead of "without a dispatch".
     async fn finish_expiry(&self, hook: &Hook) {
         self.emit_hook_event(HOOK_EXPIRED, hook, None).await;
-        let notice = crate::harness::latest().hook_expired_notice(
+        let notice = crate::harness::latest_hook_framing().hook_expired_notice(
             &hook.name,
             &hook.hook_id.0,
             hook.perpetual,
@@ -2251,13 +2315,13 @@ impl Services {
 
     /// Terminal tail for a `runAt` fire that continued (no dispatch): the
     /// one-shot timer fired and is retired — same persisted terminal state
-    /// (`expired`) and event/wake plumbing as [`Services::finish_expiry`],
+    /// (`expired`) and event/wake plumbing as [`Services::finish_expiry`](crate::hook_manager::HookServicesExt::finish_expiry),
     /// but the notice says the timer FIRED rather than that a TTL elapsed
     /// (the fire is the hook's purpose, not a watchdog giving up). The
     /// caller has already persisted `state = expired`.
     async fn finish_run_at_fire(&self, hook: &Hook) {
         self.emit_hook_event(HOOK_EXPIRED, hook, None).await;
-        let notice = crate::harness::latest().hook_run_at_fired_notice(
+        let notice = crate::harness::latest_hook_framing().hook_run_at_fired_notice(
             &hook.name,
             &hook.hook_id.0,
             hook.run_at.as_deref().unwrap_or_default(),
@@ -2329,7 +2393,7 @@ impl Services {
         if reason == "dispatched" {
             metadata["hookStillActive"] = json!(dispatch_still_active);
         }
-        let harness = crate::harness::latest();
+        let harness = crate::harness::latest_hook_framing();
         let state_note = match reason {
             "dispatched" if dispatch_still_active => {
                 Some(harness.hook_dispatch_active_note(hook.expires_at.as_deref()))
@@ -5288,7 +5352,7 @@ mod tests {
 
     /// Restart backstop: boot rehydration prunes (cancels) active hook rows
     /// whose owner is soft-retired — a crash window could have missed the
-    /// retire-time sweep ([`Services::cancel_agent_hooks`]).
+    /// retire-time sweep ([`Services::cancel_agent_hooks`](crate::hook_manager::HookServicesExt::cancel_agent_hooks)).
     #[tokio::test]
     async fn rehydration_prunes_hooks_of_retired_owner() {
         let (_tmp, _root, svc, ws, owner) = setup().await;
@@ -5850,6 +5914,50 @@ mod tests {
         assert_eq!(orphaned.state, HookState::Cancelled);
         // Idempotent: a second pass resumes nothing new.
         assert_eq!(svc.rehydrate_hooks().await.expect("second pass"), 0);
+    }
+
+    /// Transfer reaches hook rehydration through the runtime port and the
+    /// daemon through `RuntimeServicesExt`; both run the same pass.
+    #[tokio::test]
+    async fn rehydration_through_the_port_and_daemon_entry_point() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        let hook = Hook {
+            hook_id: HookId::new(),
+            workspace_id: ws.clone(),
+            agent_id: owner.clone(),
+            name: "sched".to_string(),
+            code: "return { dispatch: false };".to_string(),
+            delay_ms: 10_000,
+            cron: None,
+            run_at: None,
+            state: HookState::Scheduled,
+            created_at: now_iso(),
+            last_run_at: None,
+            next_run_at: None,
+            run_count: 0,
+            last_error: None,
+            last_logs: None,
+            last_state: None,
+            expires_at: Some(next_run_at_iso(MAX_HOOK_TTL_MS)),
+            perpetual: false,
+            dispatch_count: 0,
+        };
+        svc.store().insert_hook(&hook).await.unwrap();
+
+        let resumed = svc
+            .feature_runtime()
+            .rehydrate_hooks(&svc)
+            .await
+            .expect("port rehydrate");
+        assert_eq!(resumed, 1);
+        assert!(svc.hook_task_alive(&hook.hook_id));
+        let again = crate::runtime::RuntimeServicesExt::rehydrate_hooks(&svc)
+            .await
+            .expect("daemon rehydrate");
+        assert_eq!(
+            again, 0,
+            "the daemon entry point runs the same idempotent pass"
+        );
     }
 
     /// Row template for the rehydration-countdown tests below: a 10-minute

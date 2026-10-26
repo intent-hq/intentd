@@ -1,3 +1,5 @@
+use crate::runtime::RuntimeStateExt;
+use crate::script_monitor::ScriptMonitorExt;
 // Terminal decisions are observed through their post-commit lifecycle event in tests,
 // never through a retained monitor row or a new production history API.
 async fn monitor_snapshot(

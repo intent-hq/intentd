@@ -831,6 +831,21 @@ pub trait RuntimePort: Send + Sync + 'static {
     /// scripts loaded.
     fn hydrate_scripts<'a>(&'a self, svc: &'a Services) -> BoxFuture<'a, Result<usize>>;
 
+    /// After a workspace import commits: recover script monitors, start
+    /// their maintenance loop, and refresh the live definitions of the
+    /// imported `script_ids` of `workspace_id`. Best-effort: failures are
+    /// logged, never returned.
+    fn recover_imported_scripts<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
+        script_ids: &'a [String],
+    ) -> BoxFuture<'a, ()>;
+
+    /// Re-arm the active hooks from the store; resolves to the number of
+    /// hooks resumed.
+    fn rehydrate_hooks<'a>(&'a self, svc: &'a Services) -> BoxFuture<'a, Result<usize>>;
+
     /// Command-mode script runs in flight and the last settlement time.
     fn command_script_activity(&self, svc: &Services) -> CommandScriptActivity;
 
@@ -991,7 +1006,7 @@ pub fn monitor_id(metadata: Option<&serde_json::Value>) -> Option<&str> {
         .flatten()
 }
 
-/// How a cancel transition ([`Services::cancel_active_hook`],
+/// How a cancel transition ([`Services::cancel_active_hook`](crate::hook_manager::HookServicesExt::cancel_active_hook),
 /// [`Services::cancel_active_pr_monitor`]) settles the owner's deferred
 /// completion watches. A completion watch on an idle owner defers while the
 /// owner has active hooks / PR monitors, so cancelling the LAST one must
@@ -1753,6 +1768,19 @@ impl RuntimePort for UnavailableRuntime {
         Box::pin(async { Ok(0) })
     }
 
+    fn recover_imported_scripts<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _workspace_id: &'a WorkspaceId,
+        _script_ids: &'a [String],
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
+
+    fn rehydrate_hooks<'a>(&'a self, _svc: &'a Services) -> BoxFuture<'a, Result<usize>> {
+        Box::pin(async { Ok(0) })
+    }
+
     fn command_script_activity(&self, _svc: &Services) -> CommandScriptActivity {
         CommandScriptActivity::default()
     }
@@ -2060,6 +2088,7 @@ impl Services {
 
 #[cfg(test)]
 mod tests {
+    use crate::runtime::RuntimeStateExt;
     use std::sync::Arc;
 
     use intent_core::{Error, WorkspaceApi, WorkspaceId};
@@ -2619,6 +2648,15 @@ mod tests {
             (false, None),
             "an unregistered runtime runs no setup script"
         );
+        assert_eq!(
+            format!("{:?}", port.rehydrate_hooks(&svc).await),
+            "Ok(0)",
+            "an unregistered runtime resumes no hooks"
+        );
+        // Best-effort and infallible: an unregistered runtime has no
+        // imported scripts to recover.
+        port.recover_imported_scripts(&svc, &ws, &["script".to_owned()])
+            .await;
     }
 
     #[derive(Debug, Default)]

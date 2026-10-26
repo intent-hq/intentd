@@ -4,13 +4,14 @@
 //! and the shared script/hook registries the feature owns.
 //!
 //! Core reaches the feature only through the port (the `WorkspaceApi`
-//! forwarders) and through [`Services::runtime`] for the registries that
+//! forwarders) and through [`Services::runtime`](crate::runtime::RuntimeStateExt::runtime) for the registries that
 //! core-resident code (the script manager view, script monitors, hook
 //! scheduling, shutdown) still reads. [`Services::new`] registers it; the
 //! later move into its own crate turns that registration into the
 //! composition root's.
 
 use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -20,10 +21,16 @@ use intent_core::{
     ReverseDispatchError, ReverseTarget, ScriptCreateParams, WorkspaceApi, WorkspaceId,
 };
 
+use crate::browser_tabs::BrowserTabOpsExt;
+use crate::browser_tabs::BrowserTabRoutingExt;
 use crate::feature_ports::{
     CommandScriptActivity, MergeOutcome, ProvisionOutcome, RuntimePort, ScriptsClosing,
     SetupScriptRun,
 };
+use crate::hook_manager::HookServicesExt;
+use crate::host_execution::HostExecutionExt;
+use crate::script_monitor::ScriptMonitorExt;
+use crate::script_output_cleanup::ScriptOutputCleanupExt;
 use crate::{
     browser_ops, browser_tabs, capability, hook_manager, record_setup_running, sandbox_ops,
     script_ops, script_output_store, setup_runner, terminal_ops, write_private_script, Services,
@@ -49,17 +56,36 @@ pub(crate) struct RuntimeFeature {
     /// Live per-hook scheduler tasks for the background hook service
     /// (`hook.*`). Shared across clones so the RPC/MCP front doors and the
     /// tasks themselves observe the same set; rehydrated from the `hook`
-    /// table at boot via [`Services::rehydrate_hooks`].
+    /// table at boot via [`Services::rehydrate_hooks`](crate::hook_manager::HookServicesExt::rehydrate_hooks).
     pub(crate) hook_tasks: hook_manager::HookTasks,
 }
 
-impl Services {
+/// The runtime feature state and script output store, on [`Services`].
+pub(crate) trait RuntimeStateExt {
+    fn runtime(&self) -> &RuntimeFeature;
+    fn script_output_store(&self) -> script_output_store::ScriptOutputStore;
+}
+
+impl RuntimeStateExt for Services {
     /// The runtime feature registered by [`Services::new`].
-    pub(crate) fn runtime(&self) -> &RuntimeFeature {
+    fn runtime(&self) -> &RuntimeFeature {
         self.feature::<RuntimeFeature>()
             .expect("the in-crate runtime feature is registered")
     }
 
+    /// The on-disk script output store, built from the core
+    /// [`ScriptOutputConfig`](crate::runtime_config::ScriptOutputConfig).
+    fn script_output_store(&self) -> script_output_store::ScriptOutputStore {
+        script_output_store::ScriptOutputStore::new(
+            &self.feature_script_output_config().data_dir,
+            self.feature_script_output_config().max_bytes_per_run,
+        )
+    }
+}
+
+// Stays inherent until the transfer round-trip test that builds a script
+// manager view moves out with the crate split.
+impl Services {
     /// Build a [`ScriptManager`](script_ops::ScriptManager) view over the shared
     /// PTY host, event bus, store, script registry, and bootstrap locks for one `script.*` call.
     #[expect(
@@ -81,14 +107,34 @@ impl Services {
         .with_tasks(self.feature_store_tasks().clone())
         .with_owner_services(self.clone())
     }
+}
 
-    /// The on-disk script output store, built from the core
-    /// [`ScriptOutputConfig`](crate::runtime_config::ScriptOutputConfig).
-    pub(crate) fn script_output_store(&self) -> script_output_store::ScriptOutputStore {
-        script_output_store::ScriptOutputStore::new(
-            &self.feature_script_output_config().data_dir,
-            self.feature_script_output_config().max_bytes_per_run,
-        )
+/// Runtime entry points the daemon calls on [`Services`] directly, through
+/// the composition root's `StartupExt`.
+pub trait RuntimeServicesExt {
+    /// Re-arm the active hooks from the store at boot; resolves to the
+    /// number of hooks resumed.
+    fn rehydrate_hooks(&self) -> impl Future<Output = Result<usize>> + Send;
+
+    /// Start the periodic script output retention sweep.
+    fn spawn_script_output_sweep_loop(&self) -> tokio::task::JoinHandle<()>;
+
+    /// Start the loop that republishes the host execution context when its
+    /// inputs change.
+    fn spawn_execution_context_loop(&self) -> tokio::task::JoinHandle<()>;
+}
+
+impl RuntimeServicesExt for Services {
+    fn rehydrate_hooks(&self) -> impl Future<Output = Result<usize>> + Send {
+        HookServicesExt::rehydrate_hooks(self)
+    }
+
+    fn spawn_script_output_sweep_loop(&self) -> tokio::task::JoinHandle<()> {
+        ScriptOutputCleanupExt::spawn_script_output_sweep_loop(self)
+    }
+
+    fn spawn_execution_context_loop(&self) -> tokio::task::JoinHandle<()> {
+        HostExecutionExt::spawn_execution_context_loop(self)
     }
 }
 
@@ -771,7 +817,7 @@ impl RuntimePort for RuntimeFeature {
     /// there is no per-connection reverse channel to use (the caller is the
     /// daemon-hosted MCP server, not a client connection), so we route the
     /// batch through the injected [`AgentReverseDispatch`]. The target is
-    /// the workspace's **driving client** ([`Services::driving_client_target`],
+    /// the workspace's **driving client** ([`Services::driving_client_target`](crate::browser_tabs::BrowserTabRoutingExt::driving_client_target),
     /// REV-2 Model 5 & 10: pin → host of the workspace's claimed tabs →
     /// first-connected eligible client); a driving client that is offline is
     /// a hard `-32603` ("browser client … for this workspace is not
@@ -784,7 +830,7 @@ impl RuntimePort for RuntimeFeature {
     /// `claimTab` that succeeded re-homes the row to the driving client as
     /// re-resolved at commit time (`browser:tab-updated { changes: {
     /// hostClientId, ownerAgentId } }`, see
-    /// [`Services::browser_tab_claim_migrate`]).
+    /// [`Services::browser_tab_claim_migrate`](crate::browser_tabs::BrowserTabRoutingExt::browser_tab_claim_migrate)).
     /// Attribution fields (`workspaceId`, `agentId`,
     /// `tabId`) are threaded into the forwarded params so the FE sees the
     /// same envelope shape the client-triggered path already emits. Result
@@ -1509,6 +1555,35 @@ impl RuntimePort for RuntimeFeature {
             svc.start_script_monitor_maintenance();
             svc.script_manager().hydrate().await
         })
+    }
+
+    fn recover_imported_scripts<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
+        script_ids: &'a [String],
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            // Resolve imported monitor deadlines/results before compact run
+            // recovery manufactures an interruption. No source process is
+            // resumed here.
+            if let Err(error) = svc.script_manager().recover_monitors().await {
+                tracing::warn!(%error, "post-import script monitor recovery failed");
+            }
+            svc.start_script_monitor_maintenance();
+            if !script_ids.is_empty() {
+                let manager = svc.script_manager();
+                for id in script_ids {
+                    if let Err(error) = manager.refresh_imported(workspace_id, id).await {
+                        tracing::warn!(script = %id, %error, "post-import script refresh failed");
+                    }
+                }
+            }
+        })
+    }
+
+    fn rehydrate_hooks<'a>(&'a self, svc: &'a Services) -> BoxFuture<'a, Result<usize>> {
+        Box::pin(HookServicesExt::rehydrate_hooks(svc))
     }
 
     fn command_script_activity(&self, svc: &Services) -> CommandScriptActivity {

@@ -2,6 +2,8 @@
 //! projection (digest/lastResponse), conversation truncation, the queue
 //! lifecycle, send/force semantics, summary, model catalog, and subscriptions.
 
+use crate::hook_manager::HookServicesExt;
+use crate::script_monitor::ScriptMonitorExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 

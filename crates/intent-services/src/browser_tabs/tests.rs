@@ -7,6 +7,8 @@ use intent_core::{
 use intent_store::Store;
 use serde_json::json;
 
+use crate::browser_tabs::BrowserTabOpsExt;
+use crate::browser_tabs::BrowserTabRoutingExt;
 use crate::tests::{workspace, TempDb};
 use crate::{EventBus, Services, Subscription, SubscriptionFilter};
 
