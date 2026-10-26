@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.55] - 2026-10-26
+
+### 📚 Documentation
+
+- *(guide)* Describe the pinned Default profile in Settings → Providers ([#2718](https://github.com/intent-hq/intentd/pull/2718))
+
+
 ## [0.11.54] - 2026-10-26
 
 ### 🐛 Bug Fixes
