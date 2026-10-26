@@ -46,13 +46,14 @@ PR_METADATA = {"pr-title", "conflict-markers"}
 # Release-metadata PRs (release-fast-path reports fast_path=true) skip these
 # slow jobs; the queue still requires them (intentd#2493).
 FAST_PATH_SKIPS = {"check", "windows-cross-lint", "coverage-changed"}
-# Release-metadata main pushes (release-fast-path reports release_push=true)
-# skip the Windows post-merge job: the tree is a tip auto-cut-alpha just
-# required green plus release metadata. Every other push job still runs.
+# Main pushes skip the Windows post-merge job when release-fast-path reports
+# release_push=true (a tree auto-cut-alpha just required green plus release
+# metadata) or `supersede` reports superseded=true (main's live tip is already
+# strictly ahead of this commit). Every other push job still runs.
 RELEASE_PUSH_SKIPS = {"windows"}
 # Advisory gate dependencies: any result is accepted (the gate reads only
-# their outputs), so a failed classifier degrades to full CI.
-ADVISORY = {"release-fast-path"}
+# their outputs), so a failed classifier or scan degrades to full CI.
+ADVISORY = {"release-fast-path", "supersede"}
 RELEASE_BRANCH = "release-plz-2026-10-19T04-14-25Z"
 # macOS proofs that run once in the merge queue.
 NATIVE_STEPS = (
@@ -161,26 +162,28 @@ def run_concurrency(workflow, event, *, sha, run_id, attempt="1"):
 
 
 def concurrency_errors(workflow):
-    """Superseded main pushes are cancelled; nothing can cancel the tip's run.
+    """Concurrency never cancels or serializes main-push runs.
 
-    Main is linear (the ruleset blocks force pushes), so a newer first-attempt
-    push is the only event that may cancel a push run, and the run it cancels
-    is no longer the tip. A re-run (attempt > 1) of any commit gets a group of
-    its own, so re-running an old commit can never cancel the tip's run.
+    GitHub admits runs of one concurrency group in no guaranteed order, so a
+    shared cancelling group could let an older commit's late run cancel the
+    tip's, and a shared queueing group makes the tip wait behind an older run.
+    Each push run gets a group of its own; the `supersede` job retires older
+    runs by commit ancestry instead.
     """
     errors = []
-    older, _ = run_concurrency(workflow, "push", sha="a" * 40, run_id="10")
-    tip, cancel = run_concurrency(workflow, "push", sha="b" * 40, run_id="11")
-    if older != tip or cancel is not True:
-        errors.append("push: a newer main push must cancel the superseded run")
-    reruns = {run_concurrency(workflow, "push", sha=sha * 40, run_id=run_id, attempt="2")[0]
-              for sha, run_id in (("a", "10"), ("b", "11"))}
-    if tip in reruns or len(reruns) != 2:
-        errors.append("push: a re-run must not share a group with the tip or another re-run")
+    older, older_cancel = run_concurrency(workflow, "push", sha="a" * 40, run_id="10")
+    tip, tip_cancel = run_concurrency(workflow, "push", sha="b" * 40, run_id="11")
+    rerun, _ = run_concurrency(workflow, "push", sha="a" * 40, run_id="10", attempt="2")
+    if older == tip:
+        errors.append("push: runs must not share a concurrency group (admission order is not push order)")
+    if older_cancel is not False or tip_cancel is not False:
+        errors.append("push: concurrency must never cancel a push run")
+    if rerun == tip:
+        errors.append("push: a re-run must not share the tip's group")
     for event in ("pull_request", "merge_group"):
         group, _ = run_concurrency(workflow, event, sha="c" * 40, run_id="12")
-        if group == tip:
-            errors.append(f"{event}: must not share the main push group")
+        if group in (older, tip):
+            errors.append(f"{event}: must not share a main push group")
     if run_concurrency(workflow, "pull_request", sha="c" * 40, run_id="12")[1] is not True:
         errors.append("pull_request: superseded PR runs must stay cancelled")
     if run_concurrency(workflow, "merge_group", sha="c" * 40, run_id="12")[1] is not False:
@@ -191,7 +194,38 @@ def concurrency_errors(workflow):
     return errors
 
 
-def context(event, *, fork=False, fast_path="", platform="macOS", head_ref="feature", release_push=""):
+def supersede_job_errors(workflow):
+    """The ancestry scan: push-to-main only, hosted, independent, least privilege."""
+    errors = []
+    job = workflow["jobs"].get("supersede")
+    if not job:
+        return ["supersede: missing push job"]
+    for event in REQUIRED:
+        for ref in ("refs/heads/main", "refs/heads/other"):
+            values = {**context(event), "github.ref": ref}
+            if condition(job.get("if", True), values) != (event == "push" and ref == "refs/heads/main"):
+                errors.append(f"supersede: wrong selection for {event}/{ref}")
+    if job.get("needs"):
+        errors.append("supersede: must start at once, independent of route")
+    if job.get("runs-on") != "ubuntu-24.04":
+        errors.append("supersede: must run on the free hosted runner")
+    if job.get("permissions") != {"actions": "write", "contents": "read"}:
+        errors.append("supersede: permissions must be exactly actions: write, contents: read")
+    scan = next((step for step in job.get("steps", []) if step.get("id") == "scan"), {})
+    if "scripts/supersede-push-runs.py" not in str(scan.get("run", "")) or scan.get("continue-on-error"):
+        errors.append("supersede: scan step must run scripts/supersede-push-runs.py")
+    if job.get("outputs", {}).get("superseded") != "${{ steps.scan.outputs.superseded }}":
+        errors.append("supersede: must export the scan's superseded output")
+    if "supersede" not in (workflow["jobs"]["windows"].get("needs") or []):
+        errors.append("windows: must read the supersede scan")
+    tests = workflow["jobs"]["release-scripts"]["steps"]
+    if not any(re.search(r"^python3 -I -B scripts/test-supersede-push-runs\.py$", str(step.get("run", "")), re.M)
+               and not step.get("if") and not step.get("continue-on-error") for step in tests):
+        errors.append("supersede: its offline suite must run in release-scripts")
+    return errors
+
+
+def context(event, *, fork=False, fast_path="", platform="macOS", head_ref="feature", release_push="", superseded=""):
     return {
         "github.event_name": event,
         "github.head_ref": head_ref if event == "pull_request" else "",
@@ -199,12 +233,14 @@ def context(event, *, fork=False, fast_path="", platform="macOS", head_ref="feat
         "github.event.pull_request.head.repo.full_name": "outside/intentd" if fork else "intent-hq/intentd",
         "needs.release-fast-path.outputs.fast_path": fast_path,
         "needs.release-fast-path.outputs.release_push": release_push,
+        "needs.supersede.outputs.superseded": superseded,
+        "github.ref": "refs/heads/main" if event == "push" else "",
         "runner.os": platform,
     }
 
 
 def scheduled(workflow, event, *, fork=False, fast_path="", route="success", cancelled=False, head_ref="feature",
-              release_push="", classifier=None):
+              release_push="", classifier=None, superseded="", scan=None):
     results = {}
     pending = dict(workflow["jobs"])
     while pending:
@@ -219,19 +255,21 @@ def scheduled(workflow, event, *, fork=False, fast_path="", route="success", can
         needs = job.get("needs", [])
         if isinstance(needs, str):
             needs = [needs]
-        values = context(event, fork=fork, fast_path=fast_path, head_ref=head_ref, release_push=release_push)
+        values = context(event, fork=fork, fast_path=fast_path, head_ref=head_ref, release_push=release_push,
+                         superseded=superseded)
         values.update({f"needs.{key}.result": value for key, value in results.items()})
         runs = condition(job.get("if", True), values,
                          success=all(results[n] == "success" for n in needs), cancelled=cancelled)
-        outcome = {"route": route, "release-fast-path": classifier or "success"}.get(name, "success")
+        outcome = {"route": route, "release-fast-path": classifier or "success", "supersede": scan or "success"}.get(name, "success")
         results[name] = outcome if runs else "skipped"
     return results
 
 
-def gate_passes(workflow, event, results, fast_path="", release_push=""):
+def gate_passes(workflow, event, results, fast_path="", release_push="", superseded=""):
     body = next(s["run"] for s in workflow["jobs"]["gate"]["steps"] if s.get("name") == "Check results")
     values = {"github.event_name": event, "needs.release-fast-path.outputs.fast_path": fast_path,
               "needs.release-fast-path.outputs.release_push": release_push,
+              "needs.supersede.outputs.superseded": superseded,
               **{f"needs.{k}.result": v for k, v in results.items()}}
     body = re.sub(r"\$\{\{\s*(.*?)\s*\}\}", lambda m: values[m[1]], body)
     result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", body], capture_output=True, text=True, timeout=5)
@@ -264,28 +302,39 @@ def gate_errors(workflow):
 
 
 def release_push_gate_errors(workflow, expected):
-    """The push gate accepts a skipped Windows job only on a reported release push.
+    """The push gate accepts a skipped Windows job only on a reported skip.
 
-    Anything else fails closed: a failed or cancelled Windows job, a skip
-    without the classifier's success, and a skip of any other push job.
+    A skip is reported when release-fast-path succeeded with release_push=true
+    or supersede succeeded with superseded=true. Anything else fails closed: a
+    failed or cancelled Windows job, a skip without the reporting job's
+    success, and a skip of any other push job.
     """
     errors = []
     required = REQUIRED["push"]
-    for release_push in ("", "false", "true"):
-        for classifier in RESULTS:
-            reported = release_push == "true" and classifier == "success"
-            baseline = {name: "success" if name in required else "skipped" for name in expected}
-            baseline["release-fast-path"] = classifier
-            for name in RELEASE_PUSH_SKIPS:
-                baseline[name] = "skipped" if reported else "success"
-            label = f"push/release_push={release_push or '-'}/release-fast-path={classifier}"
-            if not gate_passes(workflow, "push", baseline, release_push=release_push):
-                errors.append(f"{label}: baseline")
-            for name in required:
-                for result in RESULTS:
-                    accepted = result == "success" or (result == "skipped" and reported and name in RELEASE_PUSH_SKIPS)
-                    if gate_passes(workflow, "push", {**baseline, name: result}, release_push=release_push) != accepted:
-                        errors.append(f"{label}: {name}={result}")
+    # The skip flags take all three values; cancelled is covered by the
+    # per-job results below and by gate_errors' generic table.
+    flags, outcomes = ("", "false", "true"), ("success", "skipped", "failure")
+    for release_push in flags:
+        for classifier in outcomes:
+            for superseded in flags:
+                for scan in outcomes:
+                    reported = (release_push == "true" and classifier == "success") or \
+                        (superseded == "true" and scan == "success")
+                    baseline = {name: "success" if name in required else "skipped" for name in expected}
+                    baseline["release-fast-path"] = classifier
+                    baseline["supersede"] = scan
+                    for name in RELEASE_PUSH_SKIPS:
+                        baseline[name] = "skipped" if reported else "success"
+                    label = (f"push/release_push={release_push or '-'}/release-fast-path={classifier}"
+                             f"/superseded={superseded or '-'}/supersede={scan}")
+                    flags_in = {"release_push": release_push, "superseded": superseded}
+                    if not gate_passes(workflow, "push", baseline, **flags_in):
+                        errors.append(f"{label}: baseline")
+                    for name in required:
+                        for result in ("skipped", "failure", "cancelled"):
+                            accepted = result == "skipped" and reported and name in RELEASE_PUSH_SKIPS
+                            if gate_passes(workflow, "push", {**baseline, name: result}, **flags_in) != accepted:
+                                errors.append(f"{label}: {name}={result}")
     return errors
 
 
@@ -317,11 +366,12 @@ def routing_errors(workflow):
         if event == "pull_request":
             cases = [("feature", "", "")] + [(RELEASE_BRANCH, f, "") for f in ("", "false", "true")]
         elif event == "push":
-            cases = [("", "", r) for r in ("", "false", "true")]
+            cases = [("", "", r, x) for r in ("", "false", "true") for x in ("", "false", "true")]
         else:
-            cases = [("", "", "")]
-        for head_ref, fast_path, release_push in cases:
-            jobs = scheduled(workflow, event, fast_path=fast_path, head_ref=head_ref, release_push=release_push)
+            cases = [("", "", "", "")]
+        for head_ref, fast_path, release_push, superseded in [c if len(c) == 4 else (*c, "") for c in cases]:
+            jobs = scheduled(workflow, event, fast_path=fast_path, head_ref=head_ref, release_push=release_push,
+                             superseded=superseded)
             expected = REQUIRED[event] | {"route", "gate"}
             if event == "pull_request":
                 expected |= PR_METADATA
@@ -330,17 +380,20 @@ def routing_errors(workflow):
                 if fast_path == "true":
                     expected -= FAST_PATH_SKIPS
             if event == "push":
-                # Every main push classifies its diff against the previous tip.
-                expected |= {"release-fast-path"}
-                if release_push == "true":
+                # Every main push classifies its diff against the previous tip
+                # and scans for superseded runs.
+                expected |= {"release-fast-path", "supersede"}
+                if "true" in (release_push, superseded):
                     expected -= RELEASE_PUSH_SKIPS
             actual = {name for name, result in jobs.items() if result == "success"}
             if actual != expected:
-                errors.append(f"{event}/{head_ref}/{fast_path}/{release_push}: wrong jobs {actual ^ expected}")
-    # A failed or cancelled classifier reports nothing: Windows still runs.
-    for classifier in ("failure", "cancelled"):
-        if scheduled(workflow, "push", classifier=classifier)["windows"] != "success":
-            errors.append(f"push: Windows skipped after release-fast-path={classifier}")
+                errors.append(f"{event}/{head_ref}/{fast_path}/{release_push}/{superseded}: wrong jobs {actual ^ expected}")
+    # A failed or cancelled classifier or scan reports nothing: Windows still runs.
+    for result in ("failure", "cancelled"):
+        if scheduled(workflow, "push", classifier=result)["windows"] != "success":
+            errors.append(f"push: Windows skipped after release-fast-path={result}")
+        if scheduled(workflow, "push", scan=result)["windows"] != "success":
+            errors.append(f"push: Windows skipped after supersede={result}")
     if any(value != "skipped" for value in scheduled(workflow, "pull_request", fork=True).values()):
         errors.append("fork PR allocated runners")
     for event in REQUIRED:
@@ -1152,15 +1205,17 @@ class NativeRoutingTests(unittest.TestCase):
     def test_job_selection_and_route_failures(self):
         self.assertEqual(routing_errors(self.workflow), [])
 
-    def test_superseded_main_pushes_cancel_and_the_tip_never_does(self):
+    def test_concurrency_never_cancels_or_serializes_main_pushes(self):
         self.assertEqual(concurrency_errors(self.workflow), [])
 
     def test_concurrency_mutations_are_caught(self):
         cases = {
-            "push-not-cancelled": lambda c: c.__setitem__("cancel-in-progress", "${{ github.event_name == 'pull_request' }}"),
+            "shared-cancelling-group": lambda c: c.update({
+                "group": "${{ github.workflow }}-${{ github.ref }}",
+                "cancel-in-progress": "${{ github.event_name == 'pull_request' || github.event_name == 'push' }}"}),
+            "shared-queueing-group": lambda c: c.__setitem__("group", "${{ github.workflow }}-${{ github.ref }}"),
+            "per-commit-cancelling": lambda c: c.__setitem__("cancel-in-progress", "${{ github.event_name != 'merge_group' }}"),
             "queue-cancelled": lambda c: c.__setitem__("cancel-in-progress", True),
-            "rerun-shares-tip-group": lambda c: c.__setitem__("group", "${{ github.workflow }}-${{ github.ref }}"),
-            "per-commit-group": lambda c: c.__setitem__("group", "${{ github.workflow }}-${{ github.ref }}-${{ github.sha }}"),
         }
         for label, mutate in cases.items():
             with self.subTest(mutation=label):
@@ -1170,6 +1225,21 @@ class NativeRoutingTests(unittest.TestCase):
         workflow = copy.deepcopy(self.workflow)
         workflow["jobs"]["windows"]["concurrency"] = {"group": "windows", "cancel-in-progress": True}
         self.assertIn("windows: job-level concurrency could cancel the tip's run", concurrency_errors(workflow))
+
+    def test_supersede_job_contract(self):
+        self.assertEqual(supersede_job_errors(self.workflow), [])
+        cases = {
+            "pr": lambda j: j.__setitem__("if", "github.event_name != 'merge_group'"),
+            "any-branch": lambda j: j.__setitem__("if", "github.event_name == 'push'"),
+            "routed": lambda j: j.__setitem__("needs", ["route"]),
+            "broad-token": lambda j: j["permissions"].__setitem__("contents", "write"),
+            "optional": lambda j: next(s for s in j["steps"] if s.get("id") == "scan").__setitem__("continue-on-error", True),
+        }
+        for label, mutate in cases.items():
+            with self.subTest(mutation=label):
+                workflow = copy.deepcopy(self.workflow)
+                mutate(workflow["jobs"]["supersede"])
+                self.assertTrue(supersede_job_errors(workflow))
 
     def test_release_push_keeps_macos_release_build(self):
         # The push macOS release build is the only pre-tag compile of
