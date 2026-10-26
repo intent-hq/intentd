@@ -1,11 +1,11 @@
 # End-to-end test map for scripts/changed-tests.sh (`make test-changed`, CI's
 # coverage-changed).
 #
-# A change to crates/<c>/src selects only <c>'s own tests, but the end-to-end
-# tests that exercise that source usually live in another crate (intentd's
-# suites). Each entry below makes a change to matching source also run the
-# named end-to-end module, so PR CI catches the break instead of the merge
-# queue (intentd#2617: a script-binding change in intent-acp broke
+# A change to crates/<c>/src selects only <c>'s own tests, but the tests that
+# exercise that source often live in another crate (intentd's end-to-end
+# suites, or another crate's unit tests). Each entry below makes a change to
+# matching source also run the named module, so PR CI catches the break
+# instead of the merge queue (intentd#2617: a script-binding change in intent-acp broke
 # e2e_wss_hook_mcp_tools::script_monitors, which only coverage-e2e ran).
 #
 # Format, one entry per line (`#` starts a comment line):
@@ -13,10 +13,14 @@
 # - <source glob>: a Bash pattern matched against the repo-relative path of a
 #   changed file; `*` also matches `/`.
 # - <crate>::<test binary>: the nextest binary id, e.g. intentd::suite_wss_g_r
-#   (the cargo [[test]] target, root file crates/<crate>/tests/<binary>.rs).
+#   (the cargo [[test]] target, root file crates/<crate>/tests/<binary>.rs),
+#   or <crate>::lib for the crate's library unit tests (root file
+#   crates/<crate>/src/lib.rs; the crate must not also have a tests/lib.rs).
 # - <module path>: the test-name prefix inside that binary, e.g.
-#   e2e_wss_hook_mcp_tools::script_monitors; omit it to run the whole binary.
-# The selection is `--test <binary> -E 'binary_id(=<crate>::<binary>)&test(/^(<module path>)::/)'`.
+#   e2e_wss_hook_mcp_tools::script_monitors or, for a lib,
+#   model_preference::tests; omit it to run the whole binary.
+# The selection is `--test <binary> -E 'binary_id(=<crate>::<binary>)&test(/^(<module path>)::/)'`,
+# or `--lib -E 'binary_id(=<crate>)&test(/^(<module path>)::/)'` for <crate>::lib.
 #
 # `scripts/changed-tests.sh --check-map` (CI's release-scripts job, and every
 # selection run) fails when a glob matches no file or a binary or module no
@@ -37,3 +41,16 @@ crates/intent-services/src/script_ops.rs             intentd::suite_wss_g_r    e
 crates/intent-services/src/script_ops.rs             intentd::suite_wss_s_z    e2e_wss_script_monitors
 crates/intent-services/src/script_ops/monitors.rs    intentd::suite_wss_g_r    e2e_wss_hook_mcp_tools::script_monitors
 crates/intent-services/src/script_ops/monitors.rs    intentd::suite_wss_s_z    e2e_wss_script_monitors
+
+# Adapter pins (claude-agent-acp / codex-acp): the guards that must move with
+# a pin bump live in intent-services' unit tests and an intentd end-to-end
+# module, so a pin-only PR's coverage-changed ran none of them and each
+# merge-queue run surfaced one more (intentd#2543). The auto-pin-acp-adapters
+# PRs edit both files. claude_adapter_contract is not mapped: it skips without
+# its adapter fixture, and CI's check job already runs it with one.
+crates/intent-providers/src/config.rs                    intent-services::lib      agent_workers::tests
+crates/intent-providers/src/config.rs                    intent-services::lib      model_preference::tests
+crates/intent-providers/src/config.rs                    intentd::suite_wss_agents e2e_wss_agent_workers
+crates/intent-providers/data/adapter-cli-packages.json   intent-services::lib      agent_workers::tests
+crates/intent-providers/data/adapter-cli-packages.json   intent-services::lib      model_preference::tests
+crates/intent-providers/data/adapter-cli-packages.json   intentd::suite_wss_agents e2e_wss_agent_workers
