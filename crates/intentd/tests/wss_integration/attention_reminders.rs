@@ -1,5 +1,6 @@
 //! Real authenticated RPC evidence for person-scoped, exact-reason acknowledgements.
 use super::*;
+use intent_core::WorkspaceAttention;
 use serde_json::json;
 
 type Ws = common::TlsWs;
