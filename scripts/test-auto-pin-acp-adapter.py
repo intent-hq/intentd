@@ -1097,6 +1097,24 @@ class CliAndWorkflowTests(unittest.TestCase):
         self.assertNotIn("secrets.", job)
         self.assertNotIn("scripts/", job)
 
+    def test_stand_down_token_can_disarm_and_verifies_it(self):
+        # GITHUB_TOKEN with contents: read cannot call disablePullRequestAutoMerge
+        # ("Resource not accessible by integration"), which left intentd#2543
+        # armed after a human push (run 40190604304).
+        job = WORKFLOW.read_text().split("\n  stand-down:\n", 1)[1]
+        permissions = job.split("\n    permissions:\n", 1)[1].split("\n    steps:\n", 1)[0]
+        self.assertEqual(
+            sorted(line.strip() for line in permissions.splitlines() if line.strip()),
+            ["contents: write", "pull-requests: write"])
+        self.assertIn("GH_TOKEN: ${{ github.token }}", job)
+        disarm = job.index("--disable-auto")
+        verify = job.index("--json autoMergeRequest")
+        self.assertLess(disarm, verify)
+        check = job[verify:]
+        self.assertIn('[ "$armed" != null ]', check)
+        self.assertIn("::error::", check)
+        self.assertIn("exit 1", check)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
