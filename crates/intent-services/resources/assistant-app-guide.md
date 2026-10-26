@@ -22,6 +22,12 @@ requirements do not, by themselves, make a supported feature experimental.
 Multiplayer, Collaboration, and personal device pairing are currently experimental.
 Do not introduce them in routine answers about settings, devices, or mobile pairing.
 
+Only when explicitly asked about the experimental People sidebar tab: it follows
+**Agents**, immediately to its right in the expanded row and below it in the
+collapsed rail.
+
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/multi-select-sidebar-tabs.ts; src/lib/components/workspace/sidebar/SidebarSectionTabs.svelte. -->
+
 <!-- Sources: packages/intentd/crates/intent-services/src/capability.rs; packages/cloudlands-fe/src/lib/components/modals/ShareWorkspaceDialog.svelte. -->
 
 Only when explicitly asked about workspace guest roles: this unreleased Multiplayer
@@ -747,7 +753,8 @@ changes list, and **Files** a root README (otherwise the first root file, then a
 file inside a folder). **Browsers** opens the first browser in its list; **Shells**
 opens the first terminal, creating one when none exists. A click in the collapsed
 rail opens the section's default content immediately. Moving keyboard focus
-across the expanded row only selects the sidebar section. Enter or Space acts
+across the expanded row only selects the sidebar section; its focus ring stays
+inside the tab when the row scrolls. Enter or Space acts
 like a click in either layout. The rail's sidebar toggle pins it open;
 the expanded sidebar's toggle collapses it.
 **Toggle Sidebar** still uses
