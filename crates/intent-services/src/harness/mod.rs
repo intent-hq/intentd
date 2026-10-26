@@ -592,9 +592,6 @@ pub(crate) fn resolve_entry(version: &str) -> &'static HarnessEntry {
 }
 
 #[cfg(test)]
-mod version_literal_guard;
-
-#[cfg(test)]
 mod tests {
     use super::*;
 
