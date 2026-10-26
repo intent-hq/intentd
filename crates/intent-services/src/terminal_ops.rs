@@ -2662,4 +2662,4 @@ mod tests {
 /// `terminal:data`/`terminal:exit` onto the bus, multi-subscriber fan-out,
 /// late-attach back-fill via `getBuffer`, write/resize/kill/list (§5.13, §12).
 #[cfg(unix)]
-mod terminal;
+mod terminal_tests;

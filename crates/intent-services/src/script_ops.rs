@@ -7952,4 +7952,4 @@ mod tests {
 /// `script.run`, service auto-restart/backoff, dev-server URL detection on
 /// `script:state`, and a terminal attaching to a running script's PTY.
 #[cfg(unix)]
-mod script;
+mod script_tests;

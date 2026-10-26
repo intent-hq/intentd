@@ -9,7 +9,7 @@ use std::time::Duration;
 use intent_core::{AgentId, BrowserTab, ClientId, Error, ReverseTarget, WorkspaceApi, WorkspaceId};
 use serde_json::{json, Value};
 
-use super::browser_client_pin::{setup, FakeRegistry};
+use super::browser_client_pin_tests::{setup, FakeRegistry};
 use crate::{EventBus, Services, SubscriptionFilter};
 
 fn agent(id: &str) -> AgentId {
