@@ -185,6 +185,43 @@ class MetadataTests(Fixture):
         self.classify(False)
 
 
+class ExactParentTests(Fixture):
+    """--exact-parent (main pushes): head must be a single commit on base."""
+
+    def run_exact(self, base, head):
+        result = subprocess.run(['bash', str(SCRIPT), '--exact-parent', base, head], cwd=self.repo,
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip()
+
+    def test_release_commit_directly_on_the_previous_tip(self):
+        self.bump()
+        self.assertEqual(self.run_exact(self.base, self.commit()), 'fast_path=true')
+
+    def test_non_ancestor_push_that_rolls_back_code_is_rejected(self):
+        original = self.base
+        self.write('crates/intentd/src/main.rs', 'fn main() { println!("fixed code"); }\n')
+        before = self.commit()
+        self.git('checkout', '-q', '--detach', original)
+        self.bump()
+        after = self.commit()
+        self.assertEqual(self.run_exact(before, after), 'fast_path=false')
+
+    def test_release_with_an_intermediate_commit_is_rejected(self):
+        self.write('crates/intentd/src/main.rs', 'fn main() { println!("code"); }\n')
+        self.commit()
+        self.bump()
+        self.assertEqual(self.run_exact(self.base, self.commit()), 'fast_path=false')
+
+    def test_merge_commit_is_rejected(self):
+        self.git('checkout', '-q', '-b', 'side')
+        self.bump()
+        side = self.commit()
+        self.git('checkout', '-q', '-')
+        self.git('merge', '-q', '--no-ff', '-m', 'merge', side)
+        self.assertEqual(self.run_exact(self.base, self.git('rev-parse', 'HEAD')), 'fast_path=false')
+
+
 class FixtureHygieneTests(Fixture):
     def test_git_never_spawns_background_maintenance(self):
         # git >= 2.47 detaches `maintenance run --auto` after commit/fetch; it

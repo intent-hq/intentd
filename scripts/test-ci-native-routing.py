@@ -51,6 +51,9 @@ FAST_PATH_SKIPS = {"check", "windows-cross-lint", "coverage-changed"}
 # metadata) or `supersede` reports superseded=true (main's live tip is already
 # strictly ahead of this commit). Every other push job still runs.
 RELEASE_PUSH_SKIPS = {"windows"}
+# A superseded commit also skips its paid macOS build (only the tip's proof is
+# read); a release push keeps it (see test_release_push_keeps_macos_release_build).
+SUPERSEDED_SKIPS = {"windows", "build"}
 # Advisory gate dependencies: any result is accepted (the gate reads only
 # their outputs), so a failed classifier or scan degrades to full CI.
 ADVISORY = {"release-fast-path", "supersede"}
@@ -216,8 +219,9 @@ def supersede_job_errors(workflow):
         errors.append("supersede: scan step must run scripts/supersede-push-runs.py")
     if job.get("outputs", {}).get("superseded") != "${{ steps.scan.outputs.superseded }}":
         errors.append("supersede: must export the scan's superseded output")
-    if "supersede" not in (workflow["jobs"]["windows"].get("needs") or []):
-        errors.append("windows: must read the supersede scan")
+    for name in SUPERSEDED_SKIPS:
+        if "supersede" not in (workflow["jobs"][name].get("needs") or []):
+            errors.append(f"{name}: must read the supersede scan")
     tests = workflow["jobs"]["release-scripts"]["steps"]
     if not any(re.search(r"^python3 -I -B scripts/test-supersede-push-runs\.py$", str(step.get("run", "")), re.M)
                and not step.get("if") and not step.get("continue-on-error") for step in tests):
@@ -318,13 +322,14 @@ def release_push_gate_errors(workflow, expected):
         for classifier in outcomes:
             for superseded in flags:
                 for scan in outcomes:
-                    reported = (release_push == "true" and classifier == "success") or \
-                        (superseded == "true" and scan == "success")
+                    release = release_push == "true" and classifier == "success"
+                    stale = superseded == "true" and scan == "success"
+                    skips = (RELEASE_PUSH_SKIPS if release else set()) | (SUPERSEDED_SKIPS if stale else set())
                     baseline = {name: "success" if name in required else "skipped" for name in expected}
                     baseline["release-fast-path"] = classifier
                     baseline["supersede"] = scan
-                    for name in RELEASE_PUSH_SKIPS:
-                        baseline[name] = "skipped" if reported else "success"
+                    for name in skips:
+                        baseline[name] = "skipped"
                     label = (f"push/release_push={release_push or '-'}/release-fast-path={classifier}"
                              f"/superseded={superseded or '-'}/supersede={scan}")
                     flags_in = {"release_push": release_push, "superseded": superseded}
@@ -332,7 +337,7 @@ def release_push_gate_errors(workflow, expected):
                         errors.append(f"{label}: baseline")
                     for name in required:
                         for result in ("skipped", "failure", "cancelled"):
-                            accepted = result == "skipped" and reported and name in RELEASE_PUSH_SKIPS
+                            accepted = result == "skipped" and name in skips
                             if gate_passes(workflow, "push", {**baseline, name: result}, **flags_in) != accepted:
                                 errors.append(f"{label}: {name}={result}")
     return errors
@@ -383,8 +388,10 @@ def routing_errors(workflow):
                 # Every main push classifies its diff against the previous tip
                 # and scans for superseded runs.
                 expected |= {"release-fast-path", "supersede"}
-                if "true" in (release_push, superseded):
+                if release_push == "true":
                     expected -= RELEASE_PUSH_SKIPS
+                if superseded == "true":
+                    expected -= SUPERSEDED_SKIPS
             actual = {name for name, result in jobs.items() if result == "success"}
             if actual != expected:
                 errors.append(f"{event}/{head_ref}/{fast_path}/{release_push}/{superseded}: wrong jobs {actual ^ expected}")
@@ -392,8 +399,9 @@ def routing_errors(workflow):
     for result in ("failure", "cancelled"):
         if scheduled(workflow, "push", classifier=result)["windows"] != "success":
             errors.append(f"push: Windows skipped after release-fast-path={result}")
-        if scheduled(workflow, "push", scan=result)["windows"] != "success":
-            errors.append(f"push: Windows skipped after supersede={result}")
+        for job in SUPERSEDED_SKIPS:
+            if scheduled(workflow, "push", scan=result)[job] != "success":
+                errors.append(f"push: {job} skipped after supersede={result}")
     if any(value != "skipped" for value in scheduled(workflow, "pull_request", fork=True).values()):
         errors.append("fork PR allocated runners")
     for event in REQUIRED:
@@ -1256,6 +1264,11 @@ class NativeRoutingTests(unittest.TestCase):
         job = self.workflow["jobs"]["release-fast-path"]
         self.assertTrue(condition(job["if"], context("push")))
         decide = next(step for step in job["steps"] if step.get("id") == "decide")
+        # A push classifies only a single commit on the previous tip, so a
+        # force push or multi-commit push cannot borrow a merge-base diff.
+        fetch = next(step for step in job["steps"] if "git fetch" in str(step.get("run", "")))
+        self.assertIn("--exact-parent", decide["run"])
+        self.assertIn("--depth=2", fetch["run"])
         for event, base in (("push", "github.event.before"), ("pull_request", "github.event.pull_request.base.sha")):
             values = {"github.event_name": event, "github.event.before": "before",
                       "github.event.pull_request.base.sha": "pr-base"}
