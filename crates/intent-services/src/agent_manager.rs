@@ -5934,13 +5934,12 @@ impl AgentManager {
             )
             .await?;
         }
-        // Resolve `noteIds` to `workspace-asset://` image content blocks
-        // (Fidelity B, PROTOCOL §5.5): each note is scanned for markdown
-        // image references whose URL is a workspace-asset in the current
-        // workspace; the referenced bytes are loaded and appended as ACP
-        // `image` content blocks. A single system text block is added when
-        // any images are resolved so the agent knows they are inlined for
-        // direct viewing (parity with the FE notice).
+        // Attach `noteIds` by reference (Fidelity B, PROTOCOL §5.5): one
+        // notice per note naming its id/title and embedded workspace-asset
+        // image URLs. No content or image bytes ride the prompt, so a note
+        // full of screenshots cannot overflow the provider image budget and
+        // fail every turn while it is in context; the agent reads what it
+        // needs with `ws.note.read` / `ws.note.readAsset`.
         if let Some(ids_json) = options.note_ids.as_ref() {
             let ids: Vec<String> = ids_json
                 .as_array()
@@ -5951,21 +5950,13 @@ impl AgentManager {
                 })
                 .unwrap_or_default();
             if !ids.is_empty() {
-                let images = self
-                    .services
-                    .load_note_image_blocks(workspace_id, &ids)
-                    .await;
-                if !images.is_empty() {
-                    for (data, mime) in &images {
-                        if let Ok(img) = serde_json::from_value::<ContentBlock>(json!({
-                            "type": "image",
-                            "data": data,
-                            "mimeType": mime,
-                        })) {
-                            blocks.push(img);
-                        }
-                    }
-                    let notice = note_images_notice(images.len());
+                for note in self.services.load_note_references(workspace_id, &ids).await {
+                    let notice = note_reference_notice(
+                        &note.title,
+                        &note.id,
+                        &note.image_urls,
+                        note.omitted,
+                    );
                     blocks.extend(text_prompt(&notice));
                 }
             }
@@ -13406,10 +13397,17 @@ fn push_image_blocks(blocks: &mut Vec<ContentBlock>, image_blocks: Option<&Value
     }
 }
 
-/// The system notice appended after note-referenced images are inlined
-/// (Fidelity B, PROTOCOL §5.5). Wording owned by the harness (H6).
-pub(crate) fn note_images_notice(n: usize) -> String {
-    crate::harness::latest().note_images_notice(n)
+/// The by-reference notice for one `noteIds` entry (Fidelity B, PROTOCOL
+/// §5.5): id, title and embedded image URLs plus the `ws.note.read` /
+/// `ws.note.readAsset` retrieval instructions. Wording owned by the harness
+/// (H6).
+pub(crate) fn note_reference_notice(
+    title: &str,
+    id: &str,
+    image_urls: &[String],
+    omitted: usize,
+) -> String {
+    crate::harness::latest().note_reference_notice(title, id, image_urls, omitted)
 }
 
 /// The attachment-reference notice (PROTOCOL §5.5): metadata plus the
