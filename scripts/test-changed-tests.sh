@@ -1637,10 +1637,19 @@ gate_sample miss '# mapfile is unavailable on Bash 3'
 gate_hits=$(gate_matches "$script" "$here/with-test-policy.sh" "${BASH_SOURCE[0]}")
 [[ -z "$gate_hits" ]] || fail "Bash 4+ constructs found (stock macOS bash is 3.2):"$'\n'"$gate_hits"
 
+# Lookup order, kept in step with the monorepo's scripts/find-bash3.sh (this
+# repo stands alone, so it carries its own copy): BASH3_BIN, the `make bash3`
+# cache (BASH3_CACHE_DIR, default ${XDG_CACHE_HOME:-~/.cache}/intent-bash3), a
+# bash3 on PATH, Homebrew bash@3, then a 3.x /bin/bash.
+bash3_cache_dir() {
+  printf '%s\n' "${BASH3_CACHE_DIR:-${XDG_CACHE_HOME:-${HOME:-}/.cache}/intent-bash3}"
+}
+
 find_bash3() {
-  local candidate resolved brew_prefix
+  local candidate resolved brew_prefix cache_bash
   brew_prefix=$(brew --prefix bash@3 2>/dev/null) || brew_prefix=""
-  for candidate in "${BASH3_BIN:-}" bash3 "${brew_prefix:+$brew_prefix/bin/bash}" \
+  cache_bash="$(bash3_cache_dir)/bash"
+  for candidate in "${BASH3_BIN:-}" "$cache_bash" bash3 "${brew_prefix:+$brew_prefix/bin/bash}" \
     /opt/homebrew/opt/bash@3/bin/bash /usr/local/opt/bash@3/bin/bash /bin/bash; do
     [[ -n "$candidate" ]] || continue
     resolved=$(command -v "$candidate" 2>/dev/null) || continue
@@ -1652,10 +1661,68 @@ find_bash3() {
   return 1
 }
 
+# How to get an interpreter, for the skip notice and the REQUIRE_BASH3 failure
+# (the monorepo's bash3_missing_hint wording).
+bash3_missing_hint() {
+  printf '%s\n' "run 'make bash3' from the monorepo to build one into $(bash3_cache_dir), or point BASH3_BIN at one"
+}
+
+# No Bash 3 found: a skip notice by default; a non-empty REQUIRE_BASH3 (CI)
+# makes it a failure instead.
+report_missing_bash3() {
+  if [[ -n "${REQUIRE_BASH3:-}" ]]; then
+    fail "no Bash 3 interpreter found and REQUIRE_BASH3 is set ($(bash3_missing_hint); or unset REQUIRE_BASH3 to skip the real 3.2 run)"
+  fi
+  echo "changed-tests tests: no Bash 3 interpreter found ($(bash3_missing_hint)); real 3.2 run skipped, static gate only"
+}
+
+# The lookup finds the `make bash3` cache on its own, in the monorepo's
+# scripts/find-bash3.sh order. PATH is an empty dir so a bash3 or brew on the
+# host cannot answer instead of the stubs.
+lookup_dir="$temp_dir/bash3-lookup"
+mkdir -p "$lookup_dir/empty-path" "$lookup_dir/xdg/intent-bash3" "$lookup_dir/home/.cache/intent-bash3" \
+  "$lookup_dir/moved"
+for stub in "$lookup_dir/xdg/intent-bash3/bash" "$lookup_dir/home/.cache/intent-bash3/bash" \
+  "$lookup_dir/moved/bash" "$lookup_dir/explicit-bash"; do
+  printf '#!/bin/sh\nexit 0\n' >"$stub"
+  chmod 755 "$stub"
+done
+run_lookup() {
+  (
+    unset BASH3_BIN BASH3_CACHE_DIR XDG_CACHE_HOME
+    # shellcheck disable=SC2123 # an empty search path is the point
+    PATH="$lookup_dir/empty-path"
+    for assignment in "$@"; do export "${assignment?}"; done
+    find_bash3
+  ) || true
+}
+[[ "$(run_lookup XDG_CACHE_HOME="$lookup_dir/xdg")" == "$lookup_dir/xdg/intent-bash3/bash" ]] ||
+  fail "find_bash3 does not find the make bash3 cache under XDG_CACHE_HOME"
+[[ "$(run_lookup HOME="$lookup_dir/home")" == "$lookup_dir/home/.cache/intent-bash3/bash" ]] ||
+  fail "find_bash3 does not find the make bash3 cache under ~/.cache"
+[[ "$(run_lookup BASH3_CACHE_DIR="$lookup_dir/moved" XDG_CACHE_HOME="$lookup_dir/xdg")" == "$lookup_dir/moved/bash" ]] ||
+  fail "find_bash3 does not honor BASH3_CACHE_DIR"
+[[ "$(run_lookup BASH3_BIN="$lookup_dir/explicit-bash" XDG_CACHE_HOME="$lookup_dir/xdg")" == "$lookup_dir/explicit-bash" ]] ||
+  fail "find_bash3 does not prefer BASH3_BIN over the cache"
+printf '#!/bin/sh\nexit 1\n' >"$lookup_dir/moved/bash"
+[[ "$(run_lookup BASH3_CACHE_DIR="$lookup_dir/moved")" != "$lookup_dir/moved/bash" ]] ||
+  fail "find_bash3 accepts a cached binary that is not Bash 3"
+# Without an interpreter, the notice names `make bash3` and REQUIRE_BASH3 turns
+# the skip into a failure.
+missing=$(BASH3_CACHE_DIR="$lookup_dir/none" REQUIRE_BASH3='' report_missing_bash3) ||
+  fail "the Bash 3 skip notice exits non-zero without REQUIRE_BASH3"
+[[ "$missing" == *"run 'make bash3'"*"$lookup_dir/none"*"real 3.2 run skipped"* ]] ||
+  fail "the Bash 3 skip notice does not name make bash3 and the cache: $missing"
+if missing=$( (BASH3_CACHE_DIR="$lookup_dir/none" REQUIRE_BASH3=1 report_missing_bash3) 2>&1); then
+  fail "REQUIRE_BASH3=1 does not fail when no Bash 3 is found"
+fi
+[[ "$missing" == *"REQUIRE_BASH3 is set"*"run 'make bash3'"* ]] ||
+  fail "the REQUIRE_BASH3 failure does not name make bash3: $missing"
+
 if [[ "${BASH_VERSINFO[0]}" -eq 3 ]]; then
   : # the fixtures above already ran under Bash 3
 elif bash3=$(find_bash3); then
   CHANGED_TESTS_TEST_BASH="$bash3" "$bash3" "${BASH_SOURCE[0]}"
 else
-  echo "changed-tests tests: no Bash 3 interpreter found (set BASH3_BIN); real 3.2 run skipped, static gate only"
+  report_missing_bash3
 fi
