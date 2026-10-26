@@ -4,6 +4,7 @@
 #   scripts/changed-tests.sh [--dry-run] [--base REF] [--instrumented]
 #                            [--build-jobs N] [--test-threads N] [--runner CMD]
 #                            [--plan-json PATH] [--check-map]
+#   scripts/changed-tests.sh --print-edges | --print-rdeps
 #
 # Each flag falls back to an environment variable: DRY_RUN=1, BASE (default
 # origin/main), BUILD_JOBS, TEST_THREADS, NEXTEST_RUNNER. NEXTEST_SHOW_PROGRESS /
@@ -115,17 +116,20 @@ runner=${NEXTEST_RUNNER:-}
 instrumented=""
 plan_json=""
 check_map=""
+print_mode=""
 
 usage() {
-  echo "Usage: $0 [--dry-run] [--base REF] [--instrumented] [--build-jobs N] [--test-threads N] [--runner CMD] [--plan-json PATH] [--check-map]" >&2
+  echo "Usage: $0 [--dry-run] [--base REF] [--instrumented] [--build-jobs N] [--test-threads N] [--runner CMD] [--plan-json PATH] [--check-map] | --print-edges | --print-rdeps" >&2
   exit 2
 }
 
+n_args=$#
 while (($# > 0)); do
   case "$1" in
     --dry-run) dry_run=1 ;;
     --instrumented) instrumented=1 ;;
     --check-map) check_map=1 ;;
+    --print-edges | --print-rdeps) print_mode=${1#--print-} ;;
     --base=*) base=${1#--base=} ;;
     --build-jobs=*) build_jobs=${1#--build-jobs=} ;;
     --test-threads=*) test_threads=${1#--test-threads=} ;;
@@ -149,6 +153,8 @@ done
 [[ -n "$base" ]] || usage
 [[ -z "$instrumented" || -z "$runner" ]] || usage
 [[ -n "$dry_run" && "$dry_run" != 0 ]] || dry_run=""
+# A print mode takes no other flag (not even the other print mode).
+[[ -z "$print_mode" || $n_args -eq 1 ]] || usage
 
 label=test-changed
 [[ -z "$instrumented" ]] || label=coverage-changed
@@ -166,6 +172,136 @@ die() {
 }
 
 cd "$repo_root"
+
+# intent-core is the leaf every other crate builds on, and its shared rules
+# (harness versions, wire types) are asserted by tests across the workspace:
+# a src (or other non-test) change there also selects every workspace crate
+# depending on it, directly or transitively ("dependent", like the feature
+# crates below). intentd#2698 changed a harness version in intent-core,
+# passed every changed test, and failed an intent-acp test in the merge
+# queue. Its reverse dependencies are nearly the whole workspace, so this is
+# close to the full suite, but it also holds under --instrumented, where a
+# full-suite fallback is not available. Other crates do not propagate: most
+# reach intentd's end-to-end suites through intent-services, so propagating
+# them would run the full suite for most changes.
+rdeps_roots="intent-core"
+
+# Prints "<dependent>\t<dependency>" for each dependency between workspace
+# crates declared in crates/*/Cargo.toml: any [dependencies],
+# [dev-dependencies] or [build-dependencies] table, target-specific ones
+# included, inline (`<name> = { path = "../<dir>" }`, `<name>.workspace =
+# true`, a `package = ` rename) or as a [<table>.<name>] section. A
+# dependency is a workspace crate when its path names crates/<dir>, its
+# `package =` or else its key names a crates/<name> directory (workspace
+# inheritance). Comments and other
+# sections are skipped. A line scanner, not a TOML parser: CI's check job
+# compares its output with cargo metadata (scripts/check-rdeps-parity.py), so
+# extend it when that check names a manifest style it misses.
+workspace_edges() {
+  local manifest crate line section dep key
+  for manifest in crates/*/Cargo.toml; do
+    [[ -f "$manifest" ]] || continue
+    crate=${manifest#crates/}
+    crate=${crate%/Cargo.toml}
+    section=""
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      line=${line#"${line%%[![:space:]]*}"}
+      case "$line" in
+        "" | '#'*) continue ;;
+        '['*)
+          section=${line#\[}
+          section=${section%%]*}
+          # A [<table>.<name>] section is one dependency; its key is the name.
+          case "$section" in
+            *dependencies.*)
+              key=${section##*dependencies.}
+              key=${key//\"/}
+              [[ ! -f "crates/$key/Cargo.toml" || "$key" == "$crate" ]] ||
+                printf '%s\t%s\n' "$crate" "$key"
+              ;;
+          esac
+          continue
+          ;;
+      esac
+      case "$section" in
+        *dependencies.*)
+          dep=""
+          if [[ "$line" == path*=*\"../*\"* ]]; then
+            dep=${line#*\"../}
+            dep=${dep%%\"*}
+            dep=${dep%/}
+          elif [[ "$line" == package*=*\"*\"* ]]; then
+            dep=${line#*\"}
+            dep=${dep%%\"*}
+          fi
+          ;;
+        dependencies | dev-dependencies | build-dependencies | target.*.dependencies | target.*.dev-dependencies | target.*.build-dependencies)
+          dep=""
+          if [[ "$line" == *path*=*\"../*\"* ]]; then
+            dep=${line#*path*=*\"../}
+            dep=${dep%%\"*}
+            dep=${dep%/}
+          elif [[ "$line" == *package*=*\"*\"* ]]; then
+            # A rename inheriting from [workspace.dependencies] has no path.
+            dep=${line#*package*=*\"}
+            dep=${dep%%\"*}
+          else
+            key=${line%%=*}
+            key=${key%%[[:space:]]*}
+            key=${key//\"/}
+            dep=${key%%.*}
+          fi
+          ;;
+        *) continue ;;
+      esac
+      [[ -z "$dep" || "$dep" == "$crate" || ! -f "crates/$dep/Cargo.toml" ]] ||
+        printf '%s\t%s\n' "$crate" "$dep"
+    done <"$manifest"
+  done
+}
+
+# Prints the workspace crates depending on crate $1, directly or
+# transitively, one per line in sorted order, from the workspace_edges
+# records in $2.
+reverse_dependents() {
+  local root=$1 edges=$2 frontier=$1 found=$'\n' next dependent dependency
+  while [[ -n "$frontier" ]]; do
+    next=""
+    while IFS=$'\t' read -r dependent dependency; do
+      [[ -n "$dependent" && $'\n'"$frontier"$'\n' == *$'\n'"$dependency"$'\n'* ]] || continue
+      [[ "$dependent" != "$root" && "$found" != *$'\n'"$dependent"$'\n'* ]] || continue
+      found+="$dependent"$'\n'
+      next+="$dependent"$'\n'
+    done <<<"$edges"
+    frontier=${next%$'\n'}
+  done
+  printf '%s' "${found#$'\n'}" | sort -u
+}
+
+# --print-edges prints the scanner's "<dependent>\t<dependency>" records,
+# byte-sorted; --print-rdeps prints "<root>\t<dependents, space-separated>" for
+# each propagated root. Both expose exactly what the selection reads, for
+# scripts/check-rdeps-parity.py to compare with `cargo metadata` in CI (a
+# line scanner can miss a manifest style and drop crates silently, as the
+# path-less `package =` rename did before intentd#2704). They read only
+# crates/*/Cargo.toml: no git, BASE or end-to-end map.
+if [[ -n "$print_mode" ]]; then
+  # Byte order, whatever the locale: glibc's en_US.UTF-8 ignores '-'.
+  edges=$(workspace_edges | LC_ALL=C sort -u)
+  if [[ "$print_mode" == edges ]]; then
+    [[ -z "$edges" ]] || printf '%s\n' "$edges"
+  else
+    for root in $rdeps_roots; do
+      dependents=""
+      while IFS= read -r dependent; do
+        [[ -z "$dependent" ]] || dependents+="${dependents:+ }$dependent"
+      done <<<"$(reverse_dependents "$root" "$edges" | LC_ALL=C sort)"
+      printf '%s\t%s\n' "$root" "$dependents"
+    done
+  fi
+  exit 0
+fi
+
 git rev-parse --git-dir >/dev/null 2>&1 || die 2 "$repo_root is not a git checkout"
 
 # The end-to-end test map: source globs whose change also selects the
@@ -580,109 +716,6 @@ fi
 while IFS= read -r note; do
   [[ -z "$note" ]] || log "$note"
 done <<<"$e2e_notes"
-
-# intent-core is the leaf every other crate builds on, and its shared rules
-# (harness versions, wire types) are asserted by tests across the workspace:
-# a src (or other non-test) change there also selects every workspace crate
-# depending on it, directly or transitively ("dependent", like the feature
-# crates below). intentd#2698 changed a harness version in intent-core,
-# passed every changed test, and failed an intent-acp test in the merge
-# queue. Its reverse dependencies are nearly the whole workspace, so this is
-# close to the full suite, but it also holds under --instrumented, where a
-# full-suite fallback is not available. Other crates do not propagate: most
-# reach intentd's end-to-end suites through intent-services, so propagating
-# them would run the full suite for most changes.
-rdeps_roots="intent-core"
-
-# Prints "<dependent>\t<dependency>" for each dependency between workspace
-# crates declared in crates/*/Cargo.toml: any [dependencies],
-# [dev-dependencies] or [build-dependencies] table, target-specific ones
-# included, inline (`<name> = { path = "../<dir>" }`, `<name>.workspace =
-# true`, a `package = ` rename) or as a [<table>.<name>] section. A
-# dependency is a workspace crate when its path names crates/<dir>, its
-# `package =` or else its key names a crates/<name> directory (workspace
-# inheritance). Comments and other
-# sections are skipped. A line scanner, not a TOML parser.
-workspace_edges() {
-  local manifest crate line section dep key
-  for manifest in crates/*/Cargo.toml; do
-    [[ -f "$manifest" ]] || continue
-    crate=${manifest#crates/}
-    crate=${crate%/Cargo.toml}
-    section=""
-    while IFS= read -r line || [[ -n "$line" ]]; do
-      line=${line#"${line%%[![:space:]]*}"}
-      case "$line" in
-        "" | '#'*) continue ;;
-        '['*)
-          section=${line#\[}
-          section=${section%%]*}
-          # A [<table>.<name>] section is one dependency; its key is the name.
-          case "$section" in
-            *dependencies.*)
-              key=${section##*dependencies.}
-              key=${key//\"/}
-              [[ ! -f "crates/$key/Cargo.toml" || "$key" == "$crate" ]] ||
-                printf '%s\t%s\n' "$crate" "$key"
-              ;;
-          esac
-          continue
-          ;;
-      esac
-      case "$section" in
-        *dependencies.*)
-          dep=""
-          if [[ "$line" == path*=*\"../*\"* ]]; then
-            dep=${line#*\"../}
-            dep=${dep%%\"*}
-            dep=${dep%/}
-          elif [[ "$line" == package*=*\"*\"* ]]; then
-            dep=${line#*\"}
-            dep=${dep%%\"*}
-          fi
-          ;;
-        dependencies | dev-dependencies | build-dependencies | target.*.dependencies | target.*.dev-dependencies | target.*.build-dependencies)
-          dep=""
-          if [[ "$line" == *path*=*\"../*\"* ]]; then
-            dep=${line#*path*=*\"../}
-            dep=${dep%%\"*}
-            dep=${dep%/}
-          elif [[ "$line" == *package*=*\"*\"* ]]; then
-            # A rename inheriting from [workspace.dependencies] has no path.
-            dep=${line#*package*=*\"}
-            dep=${dep%%\"*}
-          else
-            key=${line%%=*}
-            key=${key%%[[:space:]]*}
-            key=${key//\"/}
-            dep=${key%%.*}
-          fi
-          ;;
-        *) continue ;;
-      esac
-      [[ -z "$dep" || "$dep" == "$crate" || ! -f "crates/$dep/Cargo.toml" ]] ||
-        printf '%s\t%s\n' "$crate" "$dep"
-    done <"$manifest"
-  done
-}
-
-# Prints the workspace crates depending on crate $1, directly or
-# transitively, one per line in sorted order, from the workspace_edges
-# records in $2.
-reverse_dependents() {
-  local root=$1 edges=$2 frontier=$1 found=$'\n' next dependent dependency
-  while [[ -n "$frontier" ]]; do
-    next=""
-    while IFS=$'\t' read -r dependent dependency; do
-      [[ -n "$dependent" && $'\n'"$frontier"$'\n' == *$'\n'"$dependency"$'\n'* ]] || continue
-      [[ "$dependent" != "$root" && "$found" != *$'\n'"$dependent"$'\n'* ]] || continue
-      found+="$dependent"$'\n'
-      next+="$dependent"$'\n'
-    done <<<"$edges"
-    frontier=${next%$'\n'}
-  done
-  printf '%s' "${found#$'\n'}" | sort -u
-}
 
 rdeps_propagated=""
 # Dependents of a propagated root: their own dependents are selected too, so

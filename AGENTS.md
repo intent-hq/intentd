@@ -247,6 +247,7 @@ make coverage-changed  # the same changed selection under cargo llvm-cov (BASE=<
 make gate     # check, then test
 make check-windows  # cargo check + clippy --all-targets for x86_64-pc-windows-gnu (needs MinGW-w64), as CI's windows-cross-lint runs on every PR — run it while iterating on cfg(unix) / cfg(windows) code, before pushing
 scripts/changed-tests.sh --instrumented  # (from packages/intentd) the same changed selection under cargo llvm-cov — what CI's coverage-changed job runs on PRs and in the merge queue
+python3 -I -B scripts/check-rdeps-parity.py  # (from packages/intentd) changed-tests.sh's Cargo.toml scanner (--print-edges / --print-rdeps) must match cargo metadata; CI check job, regression test scripts/test-check-rdeps-parity.sh
 ```
 
 The raw equivalents in `packages/intentd` are `cargo fmt --check`,
