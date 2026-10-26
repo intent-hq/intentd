@@ -941,9 +941,9 @@ pub struct Services {
     /// deterministic. `None` in production wiring; tests inject via the
     /// `#[cfg(test)]`-only `with_completion_classify_park`.
     completion_classify_park: Option<Arc<CompletionClassifyPark>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     hook_wake_park: Option<Arc<CompletionClassifyPark>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     hook_eval_park: Option<Arc<CompletionClassifyPark>>,
     /// Test park seam (intent-hq/intent#4367) for the completion-delivery
     /// claim→send window: parks the ungrouped terminal delivery right after
@@ -1409,7 +1409,7 @@ pub struct Services {
     /// Test-only fault injector consulted before every hook-run persistence
     /// step (intent-hq/intent#5035): `Some(err)` fails that attempt without
     /// touching the store. `None` in production wiring.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     hook_store_fault: Option<runtime_config::HookStoreFault>,
     /// Host suspend-overlap query used by [`Services::run_prompt_turn`] to
     /// recognize a sleep-induced turn failure and enroll it as interrupted for
@@ -1730,9 +1730,9 @@ impl Services {
             script_too_fast_ms: runtime_config::TOO_FAST_MS,
             script_parks: runtime_config::ScriptParks::default(),
             completion_classify_park: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             hook_wake_park: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             hook_eval_park: None,
             completion_claim_park: None,
             completion_flip_take_park: None,
@@ -1843,7 +1843,7 @@ impl Services {
             hook_eval_timeout: runtime_config::HOOK_EVAL_TIMEOUT,
             hook_clock_skew: None,
             hook_store_retry_base: runtime_config::HOOK_STORE_RETRY_BASE,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             hook_store_fault: None,
             suspend_tracker: None,
             pr_monitor_catch_up: Arc::new(Mutex::new(HashMap::new())),
@@ -2001,8 +2001,10 @@ impl Services {
 
     /// Test-only: compress the hook script eval budget so timeout-eviction
     /// coverage completes in milliseconds.
-    #[cfg(test)]
-    pub(crate) fn with_hook_eval_timeout(mut self, timeout: std::time::Duration) -> Self {
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_hook_eval_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.hook_eval_timeout = timeout;
         self
     }
@@ -2010,19 +2012,20 @@ impl Services {
     /// Test-only: inject a shared clock skew (milliseconds) into the hook
     /// TTL expiry math so a test can move a deadline deterministically
     /// instead of racing wall clock.
-    #[cfg(test)]
-    pub(crate) fn with_hook_clock_skew(
-        mut self,
-        skew_ms: Arc<std::sync::atomic::AtomicI64>,
-    ) -> Self {
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_hook_clock_skew(mut self, skew_ms: Arc<std::sync::atomic::AtomicI64>) -> Self {
         self.hook_clock_skew = Some(skew_ms);
         self
     }
 
     /// Test-only: compress the backoff between hook persistence retries so
     /// store-failure coverage completes in milliseconds.
-    #[cfg(test)]
-    pub(crate) fn with_hook_store_retry_base(mut self, base: std::time::Duration) -> Self {
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_hook_store_retry_base(mut self, base: std::time::Duration) -> Self {
         self.hook_store_retry_base = base;
         self
     }
@@ -2030,8 +2033,10 @@ impl Services {
     /// Test-only: inject a fault into hook-run persistence steps. The
     /// injector is called with the step name before every attempt and fails
     /// the attempt when it returns `Some(err)`.
-    #[cfg(test)]
-    pub(crate) fn with_hook_store_fault(mut self, fault: runtime_config::HookStoreFault) -> Self {
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_hook_store_fault(mut self, fault: runtime_config::HookStoreFault) -> Self {
         self.hook_store_fault = Some(fault);
         self
     }
@@ -2537,8 +2542,10 @@ impl Services {
     /// Test seam: raise the `script.*` too-fast-exit floor so the no-restart
     /// decision is independent of scheduler load (monorepo#514). Production
     /// wiring keeps the [`runtime_config::TOO_FAST_MS`] default.
-    #[cfg(test)]
-    pub(crate) fn with_script_too_fast_ms(mut self, ms: u128) -> Self {
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_script_too_fast_ms(mut self, ms: u128) -> Self {
         self.script_too_fast_ms = ms;
         self
     }
@@ -2546,19 +2553,20 @@ impl Services {
     /// Test seam (monorepo#1180): park `script.*` supervisors in their
     /// pre-registration window so teardown-vs-registration races are
     /// deterministic. Production wiring keeps `None` (no parking).
-    #[cfg(test)]
-    pub(crate) fn with_script_supervise_park(
-        mut self,
-        park: Arc<runtime_config::SupervisePark>,
-    ) -> Self {
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_script_supervise_park(mut self, park: Arc<runtime_config::SupervisePark>) -> Self {
         self.script_parks.supervise = Some(park);
         self
     }
 
     /// Test seam: park every script launch before its PTY spawns and its
     /// output log opens (including service auto-restarts).
-    #[cfg(test)]
-    pub(crate) fn with_script_before_spawn_park(
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_script_before_spawn_park(
         mut self,
         park: Arc<runtime_config::SupervisePark>,
     ) -> Self {
@@ -2568,8 +2576,10 @@ impl Services {
 
     /// Test seam: park workspace deletion after its scripts stop, before the
     /// script output folder is deleted.
-    #[cfg(test)]
-    pub(crate) fn with_script_workspace_closed_park(
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_script_workspace_closed_park(
         mut self,
         park: Arc<runtime_config::SupervisePark>,
     ) -> Self {
@@ -2579,8 +2589,10 @@ impl Services {
 
     /// Test seam: park `script.create` after its retired/closing checks,
     /// before the definition is persisted.
-    #[cfg(test)]
-    pub(crate) fn with_script_create_admitted_park(
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_script_create_admitted_park(
         mut self,
         park: Arc<runtime_config::SupervisePark>,
     ) -> Self {
@@ -2592,8 +2604,10 @@ impl Services {
     /// check, before the `was_running` marker write and the in-memory flip to
     /// `running`, so persist-before-observable ordering is testable.
     /// Production wiring keeps `None` (no parking).
-    #[cfg(test)]
-    pub(crate) fn with_script_mark_running_park(
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_script_mark_running_park(
         mut self,
         park: Arc<runtime_config::SupervisePark>,
     ) -> Self {
@@ -3345,8 +3359,9 @@ impl Services {
     /// [`Self::enrich_workspace_aggregates_with_unread`] (the list path
     /// threads its batch unread set, `workspace.get` its pre-read external
     /// PR inputs); this no-argument form remains for tests.
-    #[cfg(test)]
-    pub(crate) async fn enrich_workspace_aggregates(&self, ws: &mut Workspace) {
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub async fn enrich_workspace_aggregates(&self, ws: &mut Workspace) {
         self.enrich_workspace_aggregates_with_unread(ws, None, None)
             .await;
     }
@@ -4969,7 +4984,7 @@ impl Services {
         } else {
             self.store.workspace_browser_client(id).await?
         };
-        let target = self.ports.runtime().driving_client_target(self, id).await?;
+        let target = self.driving_client_target(id).await?;
         let resolved = self
             .reverse_dispatch
             .as_ref()

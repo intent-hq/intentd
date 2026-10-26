@@ -7946,3 +7946,10 @@ mod tests {
         assert_eq!(st["error"], err);
     }
 }
+
+#[cfg(test)]
+/// `script.*` reconciled onto the same PTY host (§5.8, §12.2): command one-shot
+/// `script.run`, service auto-restart/backoff, dev-server URL detection on
+/// `script:state`, and a terminal attaching to a running script's PTY.
+#[cfg(unix)]
+mod script_tests;

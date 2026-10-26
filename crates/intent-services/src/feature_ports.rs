@@ -31,7 +31,7 @@ use intent_core::transfer::TransferPlan;
 use intent_core::execution::HostExecutionContext;
 use intent_core::{
     AgentId, AgentStatus, BoxFuture, BrowserTab, BrowserTabInput, ClientId, Error, HookId, Result,
-    ReverseTarget, ScriptCreateParams, WorkspaceApi, WorkspaceId,
+    ScriptCreateParams, WorkspaceApi, WorkspaceId,
 };
 
 use crate::Services;
@@ -632,14 +632,6 @@ pub trait RuntimePort: Send + Sync + 'static {
         workspace_id: WorkspaceId,
         sandbox_id: AgentId,
     ) -> BoxFuture<'a, Result<serde_json::Value>>;
-
-    /// The [`ReverseTarget`] an agent `browser.exec` for `workspace_id`
-    /// dispatches to: the workspace's driving client (REV-2 Model 10).
-    fn driving_client_target<'a>(
-        &'a self,
-        svc: &'a Services,
-        workspace_id: &'a WorkspaceId,
-    ) -> BoxFuture<'a, Result<ReverseTarget>>;
 
     /// Re-home every claimed browser tab of `workspace_id` to `new_host`,
     /// the workspace's new driving-client pin (REV-2 Model 10).
@@ -1575,14 +1567,6 @@ impl RuntimePort for UnavailableRuntime {
         sandbox_id: AgentId,
     ) -> BoxFuture<'a, Result<serde_json::Value>> {
         DEFAULT_WORKSPACE_API.sandbox_discard(workspace_id, sandbox_id)
-    }
-
-    fn driving_client_target<'a>(
-        &'a self,
-        _svc: &'a Services,
-        _workspace_id: &'a WorkspaceId,
-    ) -> BoxFuture<'a, Result<ReverseTarget>> {
-        Box::pin(async { Err(runtime_unavailable()) })
     }
 
     fn migrate_claimed_browser_tabs<'a>(
@@ -2603,10 +2587,6 @@ mod tests {
                 "{method}"
             );
         };
-        refused(
-            "driving_client_target",
-            format!("{:?}", port.driving_client_target(&svc, &ws).await),
-        );
         refused(
             "migrate_claimed_browser_tabs",
             format!(

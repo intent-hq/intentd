@@ -322,6 +322,45 @@ impl Binding {
         json!({"operation":operation,"workspaceId":self.workspace_id,"agentId":self.agent_id,"principalId":self.connection.principal_id,"connectionEpoch":self.connection.connection_epoch,"computerId":self.computer_id})
     }
 }
+/// Browser driving-client resolution: core state (the workspace pin, the
+/// desktop presence and the claimed tabs) that desktop control and the
+/// runtime feature's browser routing both read.
+impl Services {
+    /// The [`ReverseTarget`] every agent `browser.exec` (and every routed
+    /// claimed-tab request) for `workspace_id` dispatches to — the
+    /// workspace's **driving client** (REV-2 Model 10): the explicit pin
+    /// (`Pinned`), else the host of the workspace's existing claimed tabs
+    /// (`Client`), else the first-connected eligible client (`Default`).
+    /// Chief and workspaces the store does not know are unpinned.
+    #[doc(hidden)]
+    pub async fn driving_client_target(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> intent_core::Result<intent_core::ReverseTarget> {
+        use intent_core::{Error, ReverseTarget};
+
+        if workspace_id.is_chief() {
+            return Ok(ReverseTarget::Default);
+        }
+        match self.store().workspace_browser_client(workspace_id).await {
+            Ok(Some(client_id)) => return Ok(ReverseTarget::Pinned(client_id)),
+            Ok(None) | Err(Error::NotFound(_)) => {}
+            Err(e) => return Err(e),
+        }
+        if let Some(client) = self.feature_desktop().active_client(workspace_id) {
+            return Ok(ReverseTarget::Client(client));
+        }
+        let claimed_host = self
+            .store()
+            .list_browser_tabs(workspace_id)
+            .await?
+            .into_iter()
+            .find(|tab| tab.owner_agent_id.is_some())
+            .map(|tab| tab.host_client_id);
+        Ok(claimed_host.map_or(ReverseTarget::Default, ReverseTarget::Client))
+    }
+}
+
 impl Services {
     async fn desktop_validate_live(&self, live: &Live) -> DesktopResult<()> {
         if let Phase::Pending {
@@ -399,11 +438,7 @@ impl Services {
             .reverse_dispatch
             .as_ref()
             .ok_or_else(|| error("desktop-offline", "No primary desktop connected"))?;
-        let target = self
-            .ports
-            .runtime()
-            .driving_client_target(self, workspace)
-            .await?;
+        let target = self.driving_client_target(workspace).await?;
         dispatch.desktop_resolve(&target, principal)
     }
     async fn desktop_reverse(&self, binding: &Binding, params: Value) -> DesktopResult<Value> {
@@ -417,11 +452,7 @@ impl Services {
         let (principal, _) = self
             .desktop_owner(&binding.workspace_id, &binding.agent_id)
             .await?;
-        let target = self
-            .ports
-            .runtime()
-            .driving_client_target(self, &binding.workspace_id)
-            .await?;
+        let target = self.driving_client_target(&binding.workspace_id).await?;
         let target = if matches!(target, intent_core::ReverseTarget::Default) {
             intent_core::ReverseTarget::Client(binding.connection.client_id.clone())
         } else {
@@ -571,10 +602,7 @@ impl Services {
         }
         let generation = self.desktop.assignment_generation(workspace);
         let unassigned = matches!(
-            self.ports
-                .runtime()
-                .driving_client_target(self, workspace)
-                .await?,
+            self.driving_client_target(workspace).await?,
             intent_core::ReverseTarget::Default
         );
         let mut candidates = Vec::new();
@@ -1072,11 +1100,7 @@ impl Services {
         if method == "revoke" {
             return self.desktop_revoke(&workspace, &args, &connection).await;
         }
-        let target = self
-            .ports
-            .runtime()
-            .driving_client_target(self, &workspace)
-            .await?;
+        let target = self.driving_client_target(&workspace).await?;
         let unassigned = matches!(target, intent_core::ReverseTarget::Default);
         let candidate_target = if unassigned {
             intent_core::ReverseTarget::Client(connection.client_id.clone())
@@ -1174,10 +1198,7 @@ impl Services {
                     if claim_generation.as_ref()
                         != Some(&self.desktop.assignment_generation(&workspace))
                         || !matches!(
-                            self.ports
-                                .runtime()
-                                .driving_client_target(self, &workspace)
-                                .await?,
+                            self.driving_client_target(&workspace).await?,
                             intent_core::ReverseTarget::Default
                         )
                         || !self

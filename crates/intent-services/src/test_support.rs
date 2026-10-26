@@ -4,6 +4,7 @@
 //! the tests of feature crates. The parts that need dev-only dependencies
 //! (provider CLI stubs, fixture timeouts) stay `cfg(test)`.
 
+pub mod capability_fixtures;
 pub mod fixtures;
 #[cfg(test)]
 pub(crate) mod provider_installed;

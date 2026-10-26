@@ -2656,3 +2656,10 @@ mod tests {
         assert_eq!(ev.data["exitCode"], json!(2));
     }
 }
+
+#[cfg(test)]
+/// `terminal.*` lifecycle over a real PTY host wired into [`Services`]: stream
+/// `terminal:data`/`terminal:exit` onto the bus, multi-subscriber fan-out,
+/// late-attach back-fill via `getBuffer`, write/resize/kill/list (§5.13, §12).
+#[cfg(unix)]
+mod terminal_tests;

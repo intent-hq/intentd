@@ -34,7 +34,6 @@ pub(crate) const LIST_TABS_ACTION: &str = "listTabs";
 
 /// Browser-tab routing and agent-side tab operations, on [`Services`].
 pub(crate) trait BrowserTabRoutingExt {
-    async fn driving_client_target(&self, workspace_id: &WorkspaceId) -> Result<ReverseTarget>;
     async fn browser_tab_route_target(&self, tab: &BrowserTab) -> Result<ReverseTarget>;
     async fn browser_tab_required(&self, method: &str, tab_id: &str) -> Result<BrowserTab>;
     async fn require_browser_workspace(&self, workspace: &WorkspaceId) -> Result<()>;
@@ -71,34 +70,6 @@ pub(crate) trait BrowserTabRoutingExt {
 }
 
 impl BrowserTabRoutingExt for Services {
-    /// The [`ReverseTarget`] every agent `browser.exec` (and every routed
-    /// claimed-tab request) for `workspace_id` dispatches to — the
-    /// workspace's **driving client** (REV-2 Model 10): the explicit pin
-    /// (`Pinned`), else the host of the workspace's existing claimed tabs
-    /// (`Client`), else the first-connected eligible client (`Default`).
-    /// Chief and workspaces the store does not know are unpinned.
-    async fn driving_client_target(&self, workspace_id: &WorkspaceId) -> Result<ReverseTarget> {
-        if workspace_id.is_chief() {
-            return Ok(ReverseTarget::Default);
-        }
-        match self.store().workspace_browser_client(workspace_id).await {
-            Ok(Some(client_id)) => return Ok(ReverseTarget::Pinned(client_id)),
-            Ok(None) | Err(Error::NotFound(_)) => {}
-            Err(e) => return Err(e),
-        }
-        if let Some(client) = self.feature_desktop().active_client(workspace_id) {
-            return Ok(ReverseTarget::Client(client));
-        }
-        let claimed_host = self
-            .store()
-            .list_browser_tabs(workspace_id)
-            .await?
-            .into_iter()
-            .find(|tab| tab.owner_agent_id.is_some())
-            .map(|tab| tab.host_client_id);
-        Ok(claimed_host.map_or(ReverseTarget::Default, ReverseTarget::Client))
-    }
-
     /// Where a request about one registered tab goes (REV-2 Model 3 & 5): a
     /// claimed tab lives on its workspace's driving client, an unclaimed one
     /// on its physical host.
@@ -568,3 +539,12 @@ fn tab_event(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod browser_exec_reverse_tests;
+
+#[cfg(test)]
+mod browser_client_pin_tests;
+
+#[cfg(test)]
+mod browser_routing_tests;
