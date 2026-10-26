@@ -152,7 +152,7 @@ const COMPARED_SURFACES: &[&str] = &[
     "truncation_redrive_nudge",
     "empty_wake_redrive_nudge",
     "empty_wake_attention_reason",
-    "note_images_notice",
+    "note_reference_notice",
     "attachment_reference_notice",
     "context_size_requeue_marker",
     "completion_wake",
@@ -346,9 +346,10 @@ fn v2_4_matches_v2_3_on_every_other_surface() {
     same!(empty_wake_attention_reason());
 
     // --- Prompt notices ---
-    for n in [1, 2] {
-        same!(note_images_notice(n));
-    }
+    let urls = ["workspace-asset://ws/a.png".to_string()];
+    same!(note_reference_notice("Spec", "note-1", &urls, 0));
+    same!(note_reference_notice("Spec", "note-1", &urls, 3));
+    same!(note_reference_notice("Plain", "note-2", &[], 0));
     same!(attachment_reference_notice(
         "a.png",
         Some("image/png"),
