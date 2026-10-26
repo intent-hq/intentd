@@ -26,7 +26,9 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use intent_core::transfer::TransferPlan;
-use intent_core::{BoxFuture, Error, Result, WorkspaceId};
+use intent_core::{
+    AgentId, BoxFuture, Error, Result, ScriptCreateParams, WorkspaceApi, WorkspaceId,
+};
 
 use crate::Services;
 
@@ -279,6 +281,472 @@ impl TransferPort for UnavailableTransfer {
     }
 }
 
+/// The workspace runtime feature: saved scripts (`script.*`, including
+/// script monitors) and background hooks (`hook.*`). Each method performs
+/// the full RPC, authorization included, exactly as the `WorkspaceApi`
+/// method of the same name it backs.
+pub trait RuntimePort: Send + Sync + 'static {
+    fn script_list<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    fn script_list_filtered<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        archive: intent_core::ScriptArchiveFilter,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    fn script_list_view<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        options: serde_json::Value,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    fn script_get<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        script_id: String,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    fn script_monitor_list_view<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        agent_id: Option<AgentId>,
+        options: serde_json::Value,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    fn script_monitor_get<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        monitor_id: String,
+        owner: Option<AgentId>,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    fn script_archive<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        script_ids: Vec<String>,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    fn script_restore<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        script_ids: Vec<String>,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    fn script_create<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        params: ScriptCreateParams,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    fn script_remove<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        script_id: String,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    fn script_monitor<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        script_id: String,
+        options: serde_json::Value,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    fn script_monitor_list<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        agent_id: Option<AgentId>,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    fn script_monitor_cancel<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        monitor_id: String,
+        owner: Option<AgentId>,
+        stop_run: bool,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    fn script_start<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        script_id: String,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    fn script_start_monitor<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        script_id: String,
+        run_id: String,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    fn script_stop<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        script_id: String,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    fn script_restart<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        script_id: String,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    fn script_output<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        script_id: String,
+        max_lines: Option<i64>,
+        paginate: Option<bool>,
+        page_token: Option<String>,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    fn script_status<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        script_id: String,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    fn script_run<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        script_id: String,
+        max_lines: Option<i64>,
+        timeout_seconds: Option<i64>,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    /// `hook.schedule`: validate + immediate real run + persist + spawn the
+    /// per-hook scheduler task (see `hook_manager`).
+    fn hook_schedule<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        params: serde_json::Value,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    /// `hook.list`: hooks in a workspace, optionally one agent's; active
+    /// only by default, retired rows as a light projection on request.
+    fn hook_list<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        agent_id: Option<AgentId>,
+        include_retired: bool,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    /// `hook.get` (MCP-only): one hook row (including `code`) by id, active
+    /// or terminal; hooks from other workspaces read as `NotFound`.
+    fn hook_get<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        hook_id: intent_core::HookId,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    /// `hook.cancel`: stop an active hook; an agent caller may only cancel
+    /// its own hooks, while the FE path (`caller = None`) cancels any hook
+    /// and wakes the owning agent with a notice.
+    fn hook_cancel<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        hook_id: intent_core::HookId,
+        caller: Option<AgentId>,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+
+    /// `hook.runNow`: trigger an immediate run of an active hook.
+    fn hook_run_now<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: WorkspaceId,
+        hook_id: intent_core::HookId,
+    ) -> BoxFuture<'a, Result<serde_json::Value>>;
+}
+
+/// A `WorkspaceApi` with no overrides: every method is the trait default.
+struct DefaultWorkspaceApi;
+
+impl WorkspaceApi for DefaultWorkspaceApi {}
+
+static DEFAULT_WORKSPACE_API: DefaultWorkspaceApi = DefaultWorkspaceApi;
+
+/// The runtime port of a `Services` no runtime feature was registered on:
+/// every RPC answers exactly as the `WorkspaceApi` default does.
+#[derive(Default)]
+pub(crate) struct UnavailableRuntime;
+
+impl RuntimePort for UnavailableRuntime {
+    fn script_list<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.script_list(workspace_id)
+    }
+
+    fn script_list_filtered<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+        archive: intent_core::ScriptArchiveFilter,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.script_list_filtered(workspace_id, archive)
+    }
+
+    fn script_list_view<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+        options: serde_json::Value,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.script_list_view(workspace_id, options)
+    }
+
+    fn script_get<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+        script_id: String,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.script_get(workspace_id, script_id)
+    }
+
+    fn script_monitor_list_view<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+        agent_id: Option<AgentId>,
+        options: serde_json::Value,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.script_monitor_list_view(workspace_id, agent_id, options)
+    }
+
+    fn script_monitor_get<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+        monitor_id: String,
+        owner: Option<AgentId>,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.script_monitor_get(workspace_id, monitor_id, owner)
+    }
+
+    fn script_archive<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+        script_ids: Vec<String>,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.script_archive(workspace_id, script_ids)
+    }
+
+    fn script_restore<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+        script_ids: Vec<String>,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.script_restore(workspace_id, script_ids)
+    }
+
+    fn script_create<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+        params: ScriptCreateParams,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.script_create(workspace_id, params)
+    }
+
+    fn script_remove<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+        script_id: String,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.script_remove(workspace_id, script_id)
+    }
+
+    fn script_monitor<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        script_id: String,
+        options: serde_json::Value,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.script_monitor(workspace_id, agent_id, script_id, options)
+    }
+
+    fn script_monitor_list<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+        agent_id: Option<AgentId>,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.script_monitor_list(workspace_id, agent_id)
+    }
+
+    fn script_monitor_cancel<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+        monitor_id: String,
+        owner: Option<AgentId>,
+        stop_run: bool,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.script_monitor_cancel(workspace_id, monitor_id, owner, stop_run)
+    }
+
+    fn script_start<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+        script_id: String,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.script_start(workspace_id, script_id)
+    }
+
+    fn script_start_monitor<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        script_id: String,
+        run_id: String,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.script_start_monitor(workspace_id, agent_id, script_id, run_id)
+    }
+
+    fn script_stop<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+        script_id: String,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.script_stop(workspace_id, script_id)
+    }
+
+    fn script_restart<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+        script_id: String,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.script_restart(workspace_id, script_id)
+    }
+
+    fn script_output<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+        script_id: String,
+        max_lines: Option<i64>,
+        paginate: Option<bool>,
+        page_token: Option<String>,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.script_output(
+            workspace_id,
+            script_id,
+            max_lines,
+            paginate,
+            page_token,
+        )
+    }
+
+    fn script_status<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+        script_id: String,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.script_status(workspace_id, script_id)
+    }
+
+    fn script_run<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+        script_id: String,
+        max_lines: Option<i64>,
+        timeout_seconds: Option<i64>,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.script_run(workspace_id, script_id, max_lines, timeout_seconds)
+    }
+
+    fn hook_schedule<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        params: serde_json::Value,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.hook_schedule(workspace_id, agent_id, params)
+    }
+
+    fn hook_list<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+        agent_id: Option<AgentId>,
+        include_retired: bool,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.hook_list(workspace_id, agent_id, include_retired)
+    }
+
+    fn hook_get<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+        hook_id: intent_core::HookId,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.hook_get(workspace_id, hook_id)
+    }
+
+    fn hook_cancel<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+        hook_id: intent_core::HookId,
+        caller: Option<AgentId>,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.hook_cancel(workspace_id, hook_id, caller)
+    }
+
+    fn hook_run_now<'a>(
+        &'a self,
+        _svc: &'a Services,
+        workspace_id: WorkspaceId,
+        hook_id: intent_core::HookId,
+    ) -> BoxFuture<'a, Result<serde_json::Value>> {
+        DEFAULT_WORKSPACE_API.hook_run_now(workspace_id, hook_id)
+    }
+}
+
 /// Typed feature state on [`Services`], keyed by type.
 ///
 /// A feature crate stores its state object here once, when the composition
@@ -419,6 +887,9 @@ feature_port_registry! {
     /// Register the workspace transfer feature. Every clone made afterwards
     /// shares it; clones made before keep the port they had.
     transfer: TransferPort = UnavailableTransfer, with_transfer_port;
+    /// Register the workspace runtime feature (scripts and hooks).
+    /// [`Services::new`] registers the in-crate one.
+    runtime: RuntimePort = UnavailableRuntime, with_runtime_port;
 }
 
 /// Writes `WorkspaceApi` methods that forward to a feature port: each
@@ -474,7 +945,10 @@ mod tests {
 
     use intent_core::{Error, WorkspaceApi, WorkspaceId};
 
-    use super::{FeaturePorts, TransferPort, UnavailableTransfer};
+    use super::{
+        FeaturePorts, RuntimePort, TransferPort, UnavailableRuntime, UnavailableTransfer,
+        DEFAULT_WORKSPACE_API,
+    };
 
     use crate::test_support::fixtures::TempDb;
     use crate::Services;
@@ -539,8 +1013,17 @@ mod tests {
     async fn the_startup_check_names_every_unregistered_port() {
         let tmp = TempDb::new();
         let svc = bare_services(&tmp).await;
-        assert_eq!(svc.unregistered_feature_ports(), FeaturePorts::NAMES);
-        assert_eq!(svc.unregistered_feature_ports(), ["transfer"]);
+        assert_eq!(FeaturePorts::NAMES, ["transfer", "runtime"]);
+        assert_eq!(
+            FeaturePorts::default().unregistered(),
+            FeaturePorts::NAMES,
+            "every declared port, the runtime port included, starts unregistered"
+        );
+        assert_eq!(
+            svc.unregistered_feature_ports(),
+            ["transfer"],
+            "Services::new registers the in-crate runtime feature"
+        );
         assert!(matches!(
             svc.ensure_feature_ports_registered(),
             Err(Error::Internal(m)) if m == "feature ports not registered: transfer"
@@ -564,6 +1047,191 @@ mod tests {
                 .feature_transfer_port()
                 .export_in_progress(ws.as_str()),
             "the forwarders and clones reach the registered object"
+        );
+    }
+
+    #[tokio::test]
+    async fn services_new_registers_one_runtime_feature_shared_by_clones() {
+        let tmp = TempDb::new();
+        let svc = bare_services(&tmp).await;
+        assert!(!svc.unregistered_feature_ports().contains(&"runtime"));
+        let clone = svc.clone();
+        assert!(std::ptr::eq(svc.runtime(), clone.runtime()));
+        assert!(std::ptr::eq(
+            svc.runtime(),
+            svc.feature::<crate::runtime::RuntimeFeature>()
+                .expect("registered")
+        ));
+    }
+
+    #[tokio::test]
+    async fn unregistered_runtime_port_answers_like_the_workspace_api_default() {
+        let tmp = TempDb::new();
+        let svc = bare_services(&tmp)
+            .await
+            .with_runtime_port(Arc::new(UnavailableRuntime) as Arc<dyn RuntimePort>);
+        let api = &DEFAULT_WORKSPACE_API;
+        let ws = WorkspaceId::new();
+        let agent = intent_core::AgentId::new();
+        let hook = intent_core::HookId::new();
+        let same = |method: &str,
+                    got: intent_core::Result<serde_json::Value>,
+                    want: intent_core::Result<serde_json::Value>| {
+            assert_eq!(format!("{got:?}"), format!("{want:?}"), "{method}");
+        };
+        let summary = serde_json::json!({"view": "summary"});
+        let full = serde_json::json!({});
+        same(
+            "script_list",
+            svc.script_list(ws.clone()).await,
+            api.script_list(ws.clone()).await,
+        );
+        for archive in [
+            intent_core::ScriptArchiveFilter::Active,
+            intent_core::ScriptArchiveFilter::Archived,
+        ] {
+            same(
+                "script_list_filtered",
+                svc.script_list_filtered(ws.clone(), archive).await,
+                api.script_list_filtered(ws.clone(), archive).await,
+            );
+        }
+        for options in [&summary, &full] {
+            same(
+                "script_list_view",
+                svc.script_list_view(ws.clone(), options.clone()).await,
+                api.script_list_view(ws.clone(), options.clone()).await,
+            );
+            same(
+                "script_monitor_list_view",
+                svc.script_monitor_list_view(ws.clone(), None, options.clone())
+                    .await,
+                api.script_monitor_list_view(ws.clone(), None, options.clone())
+                    .await,
+            );
+        }
+        same(
+            "script_get",
+            svc.script_get(ws.clone(), "s".into()).await,
+            api.script_get(ws.clone(), "s".into()).await,
+        );
+        same(
+            "script_monitor_get",
+            svc.script_monitor_get(ws.clone(), "m".into(), None).await,
+            api.script_monitor_get(ws.clone(), "m".into(), None).await,
+        );
+        same(
+            "script_archive",
+            svc.script_archive(ws.clone(), vec![]).await,
+            api.script_archive(ws.clone(), vec![]).await,
+        );
+        same(
+            "script_restore",
+            svc.script_restore(ws.clone(), vec![]).await,
+            api.script_restore(ws.clone(), vec![]).await,
+        );
+        let params = intent_core::ScriptCreateParams::default;
+        same(
+            "script_create",
+            svc.script_create(ws.clone(), params()).await,
+            api.script_create(ws.clone(), params()).await,
+        );
+        same(
+            "script_remove",
+            svc.script_remove(ws.clone(), "s".into()).await,
+            api.script_remove(ws.clone(), "s".into()).await,
+        );
+        same(
+            "script_monitor",
+            svc.script_monitor(ws.clone(), agent.clone(), "s".into(), full.clone())
+                .await,
+            api.script_monitor(ws.clone(), agent.clone(), "s".into(), full.clone())
+                .await,
+        );
+        same(
+            "script_monitor_list",
+            svc.script_monitor_list(ws.clone(), None).await,
+            api.script_monitor_list(ws.clone(), None).await,
+        );
+        same(
+            "script_monitor_cancel",
+            svc.script_monitor_cancel(ws.clone(), "m".into(), None, false)
+                .await,
+            api.script_monitor_cancel(ws.clone(), "m".into(), None, false)
+                .await,
+        );
+        same(
+            "script_start",
+            svc.script_start(ws.clone(), "s".into()).await,
+            api.script_start(ws.clone(), "s".into()).await,
+        );
+        same(
+            "script_start_monitor",
+            svc.script_start_monitor(ws.clone(), agent.clone(), "s".into(), "r".into())
+                .await,
+            api.script_start_monitor(ws.clone(), agent.clone(), "s".into(), "r".into())
+                .await,
+        );
+        same(
+            "script_stop",
+            svc.script_stop(ws.clone(), "s".into()).await,
+            api.script_stop(ws.clone(), "s".into()).await,
+        );
+        same(
+            "script_restart",
+            svc.script_restart(ws.clone(), "s".into()).await,
+            api.script_restart(ws.clone(), "s".into()).await,
+        );
+        same(
+            "script_output",
+            svc.script_output(ws.clone(), "s".into(), None, None, None)
+                .await,
+            api.script_output(ws.clone(), "s".into(), None, None, None)
+                .await,
+        );
+        same(
+            "script_status",
+            svc.script_status(ws.clone(), "s".into()).await,
+            api.script_status(ws.clone(), "s".into()).await,
+        );
+        same(
+            "script_run",
+            svc.script_run(ws.clone(), "s".into(), None, None).await,
+            api.script_run(ws.clone(), "s".into(), None, None).await,
+        );
+        same(
+            "hook_schedule",
+            svc.hook_schedule(ws.clone(), agent.clone(), full.clone())
+                .await,
+            api.hook_schedule(ws.clone(), agent.clone(), full.clone())
+                .await,
+        );
+        same(
+            "hook_list",
+            svc.hook_list(ws.clone(), None, false).await,
+            api.hook_list(ws.clone(), None, false).await,
+        );
+        same(
+            "hook_get",
+            svc.hook_get(ws.clone(), hook.clone()).await,
+            api.hook_get(ws.clone(), hook.clone()).await,
+        );
+        same(
+            "hook_cancel",
+            svc.hook_cancel(ws.clone(), hook.clone(), None).await,
+            api.hook_cancel(ws.clone(), hook.clone(), None).await,
+        );
+        same(
+            "hook_run_now",
+            svc.hook_run_now(ws.clone(), hook.clone()).await,
+            api.hook_run_now(ws.clone(), hook.clone()).await,
+        );
+        assert!(
+            matches!(
+                svc.script_list(ws.clone()).await,
+                Err(Error::Internal(m)) if m == "WorkspaceApi::script_list not implemented"
+            ),
+            "the default is the trait's own unavailable answer"
         );
     }
 

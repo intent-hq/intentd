@@ -240,11 +240,6 @@ pub(crate) struct ScriptLocks {
 }
 
 impl ScriptLocks {
-    /// Create an empty lock registry.
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
-
     /// Whether `workspace_id` is being deleted.
     pub(crate) fn is_closing(&self, workspace_id: &WorkspaceId) -> bool {
         self.closing.lock().unwrap().contains(workspace_id)

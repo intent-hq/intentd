@@ -251,6 +251,7 @@ mod rate_limit;
 pub mod repo_config;
 pub mod retention;
 mod rtk;
+mod runtime;
 mod sandbox_ops;
 mod script_monitor;
 mod script_ops;
@@ -740,11 +741,6 @@ pub struct Services {
     /// One bounded-backoff owner per child deferred by a pending script wake
     /// or an unreadable outbox. Generations prevent losing a racing deferral.
     pending_completion_retries: Arc<Mutex<HashMap<AgentId, u64>>>,
-    /// The monitor `ws.script.start` armed by default, per (workspace,
-    /// script). An explicit `ws.script.monitor` by the same owner replaces it
-    /// so the agent's own TTL / output pattern apply. In-memory: after a
-    /// restart the default monitor simply behaves like an explicit one.
-    auto_start_monitors: Arc<Mutex<HashMap<(WorkspaceId, String), String>>>,
     /// Delegation-group ids with an active aggregated-wake retry task.
     completion_group_delivery_retries: Arc<Mutex<HashSet<String>>>,
     /// Per-agent consecutive-identical-terminal-failure streak (monorepo#840):
@@ -922,13 +918,6 @@ pub struct Services {
     /// [`AgentManager`] that builds the ACP terminal adapter — drives the same
     /// terminals.
     pty: Arc<intent_pty::PtyHost>,
-    /// The shared `script.*` registry (definitions + runtime + supervisor tasks),
-    /// keyed by script id. Scripts run on the same [`pty`](Self::pty) host as
-    /// `terminal.*`, so a terminal can attach to a running script (§12.2).
-    scripts: script_ops::ScriptRegistry,
-    /// Shared across clones and manager views: bootstrap serializes per
-    /// workspace; definition replacement serializes per durable script id.
-    script_locks: script_ops::ScriptLocks,
     /// On-disk per-run script output logs (`<data_dir>/script-output`). The
     /// composition root points it at the daemon data dir; until then it uses a
     /// per-instance temp dir so unconfigured instances never share logs.
@@ -1396,11 +1385,6 @@ pub struct Services {
     /// Coalescing only — no cache/TTL, so a call after the flight settles
     /// always runs a fresh build. Shared across clones.
     ac_status_inflight: Arc<ac_status_singleflight::AcStatusSingleFlight>,
-    /// Live per-hook scheduler tasks for the background hook service
-    /// (`hook.*`). Shared across clones so the RPC/MCP front doors and the
-    /// tasks themselves observe the same set; rehydrated from the `hook`
-    /// table at boot via [`Services::rehydrate_hooks`].
-    hook_tasks: hook_manager::HookTasks,
     /// Cap on concurrently active (scheduled/running) hooks per agent
     /// (`[hooks] maxPerAgent`, default 5). Wired from `Config` by the
     /// composition root via [`Services::with_hooks_max_per_agent`].
@@ -1714,7 +1698,6 @@ impl Services {
             provider_preparation: Arc::default(),
             completion_delivery_retries: Arc::new(Mutex::new(HashMap::new())),
             pending_completion_retries: Arc::new(Mutex::new(HashMap::new())),
-            auto_start_monitors: Arc::new(Mutex::new(HashMap::new())),
             completion_group_delivery_retries: Arc::new(Mutex::new(HashSet::new())),
             agent_failure_streaks: Arc::new(Mutex::new(HashMap::new())),
             pending_terminal_error: Arc::new(Mutex::new(HashMap::new())),
@@ -1738,8 +1721,6 @@ impl Services {
             agent_activity: Arc::new(Mutex::new(HashMap::new())),
             pty: Arc::new(intent_pty::PtyHost::new()),
             daemon_boot_id,
-            scripts: Arc::new(Mutex::new(HashMap::new())),
-            script_locks: script_ops::ScriptLocks::new(),
             script_output: script_output_store::ScriptOutputStore::new(
                 &std::env::temp_dir().join(format!("intentd-{}", uuid::Uuid::new_v4())),
                 intent_core::config::DEFAULT_SCRIPT_OUTPUT_MAX_BYTES_PER_RUN,
@@ -1856,7 +1837,6 @@ impl Services {
             git_status_cache: Arc::new(git_status_cache::GitStatusCache::new()),
             git_status_scan_probe: None,
             ac_status_inflight: Arc::new(ac_status_singleflight::AcStatusSingleFlight::default()),
-            hook_tasks: Arc::new(Mutex::new(HashMap::new())),
             hooks_max_per_agent: intent_core::config::DEFAULT_HOOKS_MAX_PER_AGENT,
             hook_eval_timeout: hook_manager::HOOK_EVAL_TIMEOUT,
             hook_clock_skew: None,
@@ -1910,6 +1890,7 @@ impl Services {
             ports: feature_ports::FeaturePorts::default(),
             features: feature_ports::FeatureSet::default(),
         };
+        let services = runtime::register(services);
         services
             .gitlab_credential_gate
             .attach_repository(services.repository_connection_directory(), descriptor)
@@ -2558,8 +2539,8 @@ impl Services {
             self.pty.clone(),
             self.event_bus.clone(),
             self.store.clone(),
-            self.scripts.clone(),
-            self.script_locks.clone(),
+            self.runtime().scripts.clone(),
+            self.runtime().script_locks.clone(),
             self.script_too_fast_ms,
             self.script_parks.clone(),
         )
@@ -3061,14 +3042,14 @@ impl Services {
     /// for `system.status` and a 1 s poll.
     #[must_use]
     pub fn command_script_activity(&self) -> CommandScriptActivity {
-        script_ops::command_activity(&self.scripts, &self.script_locks)
+        script_ops::command_activity(&self.runtime().scripts, &self.runtime().script_locks)
     }
 
     /// Whether `workspace_id` has a command-mode script run in flight — the
     /// [`Self::command_script_activity`] predicate scoped to one workspace,
     /// backing `Workspace.scriptsRunning` (§5.1). One registry lock, no I/O.
     pub(crate) fn workspace_scripts_running(&self, workspace_id: &WorkspaceId) -> bool {
-        script_ops::workspace_command_running(&self.scripts, workspace_id)
+        script_ops::workspace_command_running(&self.runtime().scripts, workspace_id)
     }
 
     /// Clean daemon shutdown (monorepo#1526): flag every managed script with
@@ -7134,7 +7115,7 @@ impl Services {
             .lock()
             .unwrap()
             .clear();
-        self.hook_tasks.lock().unwrap().clear();
+        self.runtime().hook_tasks.lock().unwrap().clear();
         self.event_subscriptions.lock().unwrap().clear();
     }
 
@@ -21094,376 +21075,108 @@ impl WorkspaceApi for Services {
         })
     }
 
-    fn script_list(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let mgr = self.script_manager();
-        Box::pin(async move {
-            self.require_workspace_operator(&workspace_id, "script.list")
-                .await?;
-            mgr.list(&workspace_id).await
-        })
-    }
-
-    fn script_list_filtered(
-        &self,
-        workspace_id: WorkspaceId,
-        archive: intent_core::ScriptArchiveFilter,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let mgr = self.script_manager();
-        Box::pin(async move {
-            self.require_workspace_operator(&workspace_id, "script.list")
-                .await?;
-            mgr.list_filtered(&workspace_id, archive).await
-        })
-    }
-
-    fn script_list_view(
-        &self,
-        workspace_id: WorkspaceId,
-        options: serde_json::Value,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move {
-            self.require_workspace_operator(&workspace_id, "script.list")
-                .await?;
-            let options = intent_core::script_lists::ScriptListOptions::parse(&options, false)?;
-            if options.summary {
-                self.script_manager()
-                    .summary_page(&workspace_id, &options)
-                    .await
-            } else {
-                self.script_manager().list(&workspace_id).await
-            }
-        })
-    }
-    fn script_get(
-        &self,
-        workspace_id: WorkspaceId,
-        script_id: String,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move {
-            self.require_saved_script_operator(&workspace_id, &script_id, "script.get")
-                .await?;
-            let mgr = self.script_manager();
-            let _read = mgr.scoped_read_guard(&workspace_id, &script_id).await?;
-            mgr.get(&workspace_id, &script_id).await
-        })
-    }
-    fn script_monitor_list_view(
-        &self,
-        workspace_id: WorkspaceId,
-        agent_id: Option<AgentId>,
-        options: serde_json::Value,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move {
-            self.require_member(&workspace_id).await?;
-            let options = intent_core::script_lists::ScriptListOptions::parse(&options, true)?;
-            if options.summary {
-                self.store
-                    .script_summary_page(&workspace_id, agent_id.as_ref(), true, &options)
-                    .await
-            } else {
-                self.script_monitor_list(workspace_id, agent_id).await
-            }
-        })
-    }
-    fn script_monitor_get(
-        &self,
-        workspace_id: WorkspaceId,
-        monitor_id: String,
-        owner: Option<AgentId>,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move {
-            self.require_member(&workspace_id).await?;
-            let row = self
-                .store
-                .script_monitor(&workspace_id, &monitor_id)
-                .await?;
-            if owner.is_some_and(|id| id != row.agent_id) {
-                return Err(Error::InvalidParams("unknown monitor ID".into()));
-            }
-            serde_json::to_value(row).map_err(|e| Error::Internal(e.to_string()))
-        })
-    }
-
-    fn script_archive(
-        &self,
-        workspace_id: WorkspaceId,
-        script_ids: Vec<String>,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let mgr = self.script_manager();
-        Box::pin(async move {
-            self.require_workspace_manager(&workspace_id, "script.archive")
-                .await?;
-            self.require_member(&workspace_id).await?;
-            mgr.archive(&workspace_id, script_ids, true).await
-        })
-    }
-
-    fn script_restore(
-        &self,
-        workspace_id: WorkspaceId,
-        script_ids: Vec<String>,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let mgr = self.script_manager();
-        Box::pin(async move {
-            self.require_workspace_manager(&workspace_id, "script.restore")
-                .await?;
-            self.require_member(&workspace_id).await?;
-            mgr.archive(&workspace_id, script_ids, false).await
-        })
-    }
-
-    fn script_create(
-        &self,
-        workspace_id: WorkspaceId,
-        params: ScriptCreateParams,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let mgr = self.script_manager();
-        Box::pin(async move {
-            self.require_workspace_manager(&workspace_id, "script.create")
-                .await?;
-            // Script definitions have no workspace foreign key; refuse member
-            // creation for a missing workspace before persisting or registering.
-            self.require_member(&workspace_id).await?;
-            if capability::gated_collaborator_caller("script.create")?.is_some() {
-                if let Some(id) = params.script_id.as_deref() {
-                    if self
-                        .store
-                        .script_workspace(id)
-                        .await?
-                        .is_some_and(|actual| actual != workspace_id)
-                    {
-                        return Err(Error::NotFound(format!("script {id}")));
-                    }
-                }
-                return mgr.create_in_workspace(workspace_id, params).await;
-            }
-            mgr.create(workspace_id, params).await
-        })
-    }
-
-    fn script_remove(
-        &self,
-        workspace_id: WorkspaceId,
-        script_id: String,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let mgr = self.script_manager();
-        Box::pin(async move {
-            self.require_workspace_manager(&workspace_id, "script.remove")
-                .await?;
-            self.require_member(&workspace_id).await?;
-            if capability::gated_collaborator_caller("script.remove")?.is_some() {
-                return mgr.remove_in_workspace(&workspace_id, &script_id).await;
-            }
-            mgr.remove(&workspace_id, &script_id).await
-        })
-    }
-
-    fn script_monitor(
-        &self,
-        workspace_id: WorkspaceId,
-        agent_id: AgentId,
-        script_id: String,
-        options: serde_json::Value,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move {
-            let _admission = self.workspace_mutations.enter(&workspace_id)?;
-            self.require_member(&workspace_id).await?;
-            let _archive = self.archive_fence.acquire(&workspace_id).await;
-            let retirement = self.agent_retirement_gates.for_agent(&agent_id);
-            let _retirement = retirement.lock().await;
-            let key = (workspace_id.clone(), script_id.clone());
-            let auto = self.auto_start_monitors.lock().unwrap().get(&key).cloned();
-            let reply = self
-                .script_manager()
-                .monitor_replacing(
-                    &workspace_id,
-                    &agent_id,
-                    &script_id,
-                    options,
-                    auto.as_deref(),
-                )
-                .await?;
-            // Once replaced, the default is gone; a stale marker (its monitor
-            // already settled) never matches an active row and is harmless.
-            if let Some(auto) = auto {
-                if reply["ok"] == true && reply["monitor"]["monitorId"].as_str() != Some(&auto) {
-                    let mut autos = self.auto_start_monitors.lock().unwrap();
-                    if autos.get(&key) == Some(&auto) {
-                        autos.remove(&key);
-                    }
-                }
-            }
-            Ok(reply)
-        })
-    }
-    fn script_monitor_list(
-        &self,
-        workspace_id: WorkspaceId,
-        agent_id: Option<AgentId>,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move {
-            self.require_member(&workspace_id).await?;
-            Ok(
-                serde_json::json!({"monitors":self.store.script_monitors(&workspace_id,agent_id.as_ref()).await?}),
-            )
-        })
-    }
-    fn script_monitor_cancel(
-        &self,
-        workspace_id: WorkspaceId,
-        monitor_id: String,
-        owner: Option<AgentId>,
-        stop_run: bool,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move {
-            self.require_workspace_manager(&workspace_id, "script.stop")
-                .await?;
-            self.require_member(&workspace_id).await?;
-            self.script_manager()
-                .cancel_monitor(&workspace_id, &monitor_id, owner.as_ref(), stop_run)
-                .await
-        })
-    }
-
-    fn script_start(
-        &self,
-        workspace_id: WorkspaceId,
-        script_id: String,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let mgr = self.script_manager();
-        Box::pin(async move {
-            self.require_saved_script_operator(&workspace_id, &script_id, "script.start")
-                .await?;
-            mgr.start(&workspace_id, &script_id).await
-        })
-    }
-
-    fn script_start_monitor(
-        &self,
-        workspace_id: WorkspaceId,
-        agent_id: AgentId,
-        script_id: String,
-        run_id: String,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move {
-            match self
-                .store
-                .get_script_in_workspace(&workspace_id, &script_id)
-                .await?
-            {
-                Some(def) if def.mode == intent_core::ScriptMode::Command => {}
-                _ => return Ok(serde_json::Value::Null),
-            }
-            let existing = self
-                .active_script_monitor_ids(&workspace_id, &script_id)
-                .await?;
-            let reply = self
-                .script_monitor(
-                    workspace_id.clone(),
-                    agent_id,
-                    script_id.clone(),
-                    serde_json::json!({"ttlMs": script_ops::AUTO_START_MONITOR_TTL_MS, "runId": run_id}),
-                )
-                .await?;
-            // Remember only a monitor this call created: one the agent armed
-            // itself (or another owner's) must never be replaced later.
-            if let Some(id) = reply["monitor"]["monitorId"].as_str() {
-                if reply["ok"] == true && !existing.iter().any(|e| e == id) {
-                    self.auto_start_monitors
-                        .lock()
-                        .unwrap()
-                        .insert((workspace_id, script_id), id.to_owned());
-                }
-            }
-            Ok(reply)
-        })
-    }
-
-    fn script_stop(
-        &self,
-        workspace_id: WorkspaceId,
-        script_id: String,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let mgr = self.script_manager();
-        Box::pin(async move {
-            self.require_saved_script_operator(&workspace_id, &script_id, "script.stop")
-                .await?;
-            mgr.stop(&workspace_id, &script_id).await
-        })
-    }
-
-    fn script_restart(
-        &self,
-        workspace_id: WorkspaceId,
-        script_id: String,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let mgr = self.script_manager();
-        Box::pin(async move {
-            self.require_saved_script_operator(&workspace_id, &script_id, "script.restart")
-                .await?;
-            mgr.restart(&workspace_id, &script_id).await
-        })
-    }
-
-    fn script_output(
-        &self,
-        workspace_id: WorkspaceId,
-        script_id: String,
-        max_lines: Option<i64>,
-        paginate: Option<bool>,
-        page_token: Option<String>,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let mgr = self.script_manager();
-        Box::pin(async move {
-            self.require_saved_script_operator(&workspace_id, &script_id, "script.output")
-                .await?;
-            mgr.ensure_known(&workspace_id, &script_id).await?;
-            let _read = mgr.scoped_read_guard(&workspace_id, &script_id).await?;
-            mgr.output(
-                &workspace_id,
-                &script_id,
-                max_lines,
-                paginate.unwrap_or(false),
-                page_token.as_ref(),
-            )
-            .await
-        })
-    }
-
-    fn script_status(
-        &self,
-        workspace_id: WorkspaceId,
-        script_id: String,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let mgr = self.script_manager();
-        Box::pin(async move {
-            self.require_saved_script_operator(&workspace_id, &script_id, "script.status")
-                .await?;
-            mgr.ensure_known(&workspace_id, &script_id).await?;
-            let _read = mgr.scoped_read_guard(&workspace_id, &script_id).await?;
-            mgr.status(&workspace_id, &script_id)
-        })
-    }
-
-    fn script_run(
-        &self,
-        workspace_id: WorkspaceId,
-        script_id: String,
-        max_lines: Option<i64>,
-        timeout_seconds: Option<i64>,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let mgr = self.script_manager();
-        Box::pin(async move {
-            self.require_saved_script_operator(&workspace_id, &script_id, "script.run")
-                .await?;
-            let result = mgr
-                .run(&workspace_id, &script_id, max_lines, timeout_seconds)
-                .await?;
-            // A command may finish after the owner downgraded this open socket.
-            self.require_saved_script_operator(&workspace_id, &script_id, "script.run")
-                .await?;
-            Ok(result)
-        })
+    feature_ports::port_forwarders! {
+        runtime {
+            fn script_list(&self, workspace_id: WorkspaceId)
+                -> BoxFuture<'_, Result<serde_json::Value>> => script_list;
+            fn script_list_filtered(
+                &self,
+                workspace_id: WorkspaceId,
+                archive: intent_core::ScriptArchiveFilter,
+            ) -> BoxFuture<'_, Result<serde_json::Value>> => script_list_filtered;
+            fn script_list_view(&self, workspace_id: WorkspaceId, options: serde_json::Value)
+                -> BoxFuture<'_, Result<serde_json::Value>> => script_list_view;
+            fn script_get(&self, workspace_id: WorkspaceId, script_id: String)
+                -> BoxFuture<'_, Result<serde_json::Value>> => script_get;
+            fn script_monitor_list_view(
+                &self,
+                workspace_id: WorkspaceId,
+                agent_id: Option<AgentId>,
+                options: serde_json::Value,
+            ) -> BoxFuture<'_, Result<serde_json::Value>> => script_monitor_list_view;
+            fn script_monitor_get(
+                &self,
+                workspace_id: WorkspaceId,
+                monitor_id: String,
+                owner: Option<AgentId>,
+            ) -> BoxFuture<'_, Result<serde_json::Value>> => script_monitor_get;
+            fn script_archive(&self, workspace_id: WorkspaceId, script_ids: Vec<String>)
+                -> BoxFuture<'_, Result<serde_json::Value>> => script_archive;
+            fn script_restore(&self, workspace_id: WorkspaceId, script_ids: Vec<String>)
+                -> BoxFuture<'_, Result<serde_json::Value>> => script_restore;
+            fn script_create(&self, workspace_id: WorkspaceId, params: ScriptCreateParams)
+                -> BoxFuture<'_, Result<serde_json::Value>> => script_create;
+            fn script_remove(&self, workspace_id: WorkspaceId, script_id: String)
+                -> BoxFuture<'_, Result<serde_json::Value>> => script_remove;
+            fn script_monitor(
+                &self,
+                workspace_id: WorkspaceId,
+                agent_id: AgentId,
+                script_id: String,
+                options: serde_json::Value,
+            ) -> BoxFuture<'_, Result<serde_json::Value>> => script_monitor;
+            fn script_monitor_list(&self, workspace_id: WorkspaceId, agent_id: Option<AgentId>)
+                -> BoxFuture<'_, Result<serde_json::Value>> => script_monitor_list;
+            fn script_monitor_cancel(
+                &self,
+                workspace_id: WorkspaceId,
+                monitor_id: String,
+                owner: Option<AgentId>,
+                stop_run: bool,
+            ) -> BoxFuture<'_, Result<serde_json::Value>> => script_monitor_cancel;
+            fn script_start(&self, workspace_id: WorkspaceId, script_id: String)
+                -> BoxFuture<'_, Result<serde_json::Value>> => script_start;
+            fn script_start_monitor(
+                &self,
+                workspace_id: WorkspaceId,
+                agent_id: AgentId,
+                script_id: String,
+                run_id: String,
+            ) -> BoxFuture<'_, Result<serde_json::Value>> => script_start_monitor;
+            fn script_stop(&self, workspace_id: WorkspaceId, script_id: String)
+                -> BoxFuture<'_, Result<serde_json::Value>> => script_stop;
+            fn script_restart(&self, workspace_id: WorkspaceId, script_id: String)
+                -> BoxFuture<'_, Result<serde_json::Value>> => script_restart;
+            fn script_output(
+                &self,
+                workspace_id: WorkspaceId,
+                script_id: String,
+                max_lines: Option<i64>,
+                paginate: Option<bool>,
+                page_token: Option<String>,
+            ) -> BoxFuture<'_, Result<serde_json::Value>> => script_output;
+            fn script_status(&self, workspace_id: WorkspaceId, script_id: String)
+                -> BoxFuture<'_, Result<serde_json::Value>> => script_status;
+            fn script_run(
+                &self,
+                workspace_id: WorkspaceId,
+                script_id: String,
+                max_lines: Option<i64>,
+                timeout_seconds: Option<i64>,
+            ) -> BoxFuture<'_, Result<serde_json::Value>> => script_run;
+            fn hook_schedule(
+                &self,
+                workspace_id: WorkspaceId,
+                agent_id: AgentId,
+                params: serde_json::Value,
+            ) -> BoxFuture<'_, Result<serde_json::Value>> => hook_schedule;
+            fn hook_list(
+                &self,
+                workspace_id: WorkspaceId,
+                agent_id: Option<AgentId>,
+                include_retired: bool,
+            ) -> BoxFuture<'_, Result<serde_json::Value>> => hook_list;
+            fn hook_get(&self, workspace_id: WorkspaceId, hook_id: intent_core::HookId)
+                -> BoxFuture<'_, Result<serde_json::Value>> => hook_get;
+            fn hook_cancel(
+                &self,
+                workspace_id: WorkspaceId,
+                hook_id: intent_core::HookId,
+                caller: Option<AgentId>,
+            ) -> BoxFuture<'_, Result<serde_json::Value>> => hook_cancel;
+            fn hook_run_now(&self, workspace_id: WorkspaceId, hook_id: intent_core::HookId)
+                -> BoxFuture<'_, Result<serde_json::Value>> => hook_run_now;
+        }
     }
 
     fn list_workspaces(
@@ -36483,81 +36196,6 @@ impl WorkspaceApi for Services {
             self.host_exec_runtime
                 .run_for_workspace(self, workspace_id, params)
                 .await
-        })
-    }
-
-    /// `hook.schedule`: validate + immediate real run + persist + spawn the
-    /// per-hook scheduler task (see `hook_manager`).
-    fn hook_schedule(
-        &self,
-        workspace_id: WorkspaceId,
-        agent_id: AgentId,
-        params: serde_json::Value,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move {
-            self.require_agent_member(&agent_id).await?;
-            self.hook_schedule_op(&workspace_id, &agent_id, &params)
-                .await
-        })
-    }
-
-    /// `hook.list`: hooks in a workspace, optionally one agent's; active
-    /// only by default, retired rows as a light projection on request.
-    fn hook_list(
-        &self,
-        workspace_id: WorkspaceId,
-        agent_id: Option<AgentId>,
-        include_retired: bool,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move {
-            // The workspace is the authorization scope; the agent filter is
-            // just a filter (the wire arm always passes `None`).
-            self.require_member(&workspace_id).await?;
-            self.hook_list_op(&workspace_id, agent_id.as_ref(), include_retired)
-                .await
-        })
-    }
-
-    /// `hook.get` (MCP-only): one hook row (including `code`) by id, active
-    /// or terminal; hooks from other workspaces read as `NotFound`.
-    fn hook_get(
-        &self,
-        workspace_id: WorkspaceId,
-        hook_id: intent_core::HookId,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move {
-            self.require_member(&workspace_id).await?;
-            self.hook_get_op(&workspace_id, &hook_id).await
-        })
-    }
-
-    /// `hook.cancel`: stop an active hook; an agent caller may only cancel
-    /// its own hooks, while the FE path (`caller = None`) cancels any hook
-    /// and wakes the owning agent with a notice.
-    fn hook_cancel(
-        &self,
-        workspace_id: WorkspaceId,
-        hook_id: intent_core::HookId,
-        caller: Option<AgentId>,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move {
-            self.require_workspace_manager(&workspace_id, "hook.cancel")
-                .await?;
-            self.hook_cancel_op(&workspace_id, &hook_id, caller.as_ref())
-                .await
-        })
-    }
-
-    /// `hook.runNow`: trigger an immediate run of an active hook.
-    fn hook_run_now(
-        &self,
-        workspace_id: WorkspaceId,
-        hook_id: intent_core::HookId,
-    ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        Box::pin(async move {
-            self.require_workspace_manager(&workspace_id, "hook.runNow")
-                .await?;
-            self.hook_run_now_op(&workspace_id, &hook_id).await
         })
     }
 

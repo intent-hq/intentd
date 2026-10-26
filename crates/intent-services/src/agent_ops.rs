@@ -8261,7 +8261,7 @@ impl Services {
         self.park_queue_mutation_gate(gate.as_ref()).await;
         // Serialize suppression with notification dispatch/admission. Commit
         // cancellation before removing the local row or acknowledging success.
-        let monitor_lane = self.script_locks.monitor_lane.lock().await;
+        let monitor_lane = self.runtime().script_locks.monitor_lane.lock().await;
         let monitor = {
             let queues = self
                 .agent_queues

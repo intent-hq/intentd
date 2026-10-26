@@ -39,6 +39,7 @@ impl Services {
     }
     pub(crate) fn track_script_monitor_worker(&self, agent: &AgentId, metadata: Option<&Value>) {
         let mut workers = self
+            .runtime()
             .script_locks
             .monitor_workers
             .lock()
@@ -52,6 +53,7 @@ impl Services {
 
     pub(crate) async fn settle_script_monitor_worker(&self, agent: &AgentId) {
         let id = self
+            .runtime()
             .script_locks
             .monitor_workers
             .lock()
@@ -65,6 +67,7 @@ impl Services {
     pub(crate) async fn complete_script_monitor_delivery(&self, agent: &AgentId, id: &str) {
         {
             let mut workers = self
+                .runtime()
                 .script_locks
                 .monitor_workers
                 .lock()
@@ -75,7 +78,8 @@ impl Services {
         }
         // Record the exact finished delivery before awaiting SQL. A temporary
         // marker-write failure must neither lose retry ownership nor re-prompt.
-        self.script_locks
+        self.runtime()
+            .script_locks
             .monitor_completions
             .lock()
             .expect("monitor completion retries")
@@ -86,7 +90,8 @@ impl Services {
     pub(crate) async fn retry_script_monitor_completion(&self, agent: &AgentId, id: &str) {
         match self.store.complete_script_notification(agent, id).await {
             Ok(()) => {
-                self.script_locks
+                self.runtime()
+                    .script_locks
                     .monitor_completions
                     .lock()
                     .expect("monitor completion retries")
@@ -137,6 +142,7 @@ impl Services {
     )]
     pub fn start_script_monitor_maintenance(&self) {
         if self
+            .runtime()
             .script_locks
             .monitor_maintenance
             .swap(true, std::sync::atomic::Ordering::SeqCst)
@@ -155,6 +161,7 @@ impl Services {
                     _ = sweep.tick() => {}
                 }
                 let completions = services
+                    .runtime()
                     .script_locks
                     .monitor_completions
                     .lock()
@@ -204,6 +211,7 @@ impl Services {
                 }
             }
             services
+                .runtime()
                 .script_locks
                 .monitor_maintenance
                 .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -256,7 +264,7 @@ impl Services {
         &self,
         job: &intent_store::ScriptNotificationJob,
     ) -> Result<()> {
-        let lane = self.script_locks.monitor_lane.lock().await;
+        let lane = self.runtime().script_locks.monitor_lane.lock().await;
         if self.script_monitor_export_blocked(Some(&job.metadata)) {
             return Ok(());
         }
@@ -315,7 +323,7 @@ impl Services {
         if monitor_id(metadata).is_none() {
             return Ok(true);
         }
-        let _lane = self.script_locks.monitor_lane.lock().await;
+        let _lane = self.runtime().script_locks.monitor_lane.lock().await;
         if !self
             .script_monitor_delivery_allowed(agent, metadata)
             .await?
@@ -336,6 +344,7 @@ impl Services {
             return Ok(true);
         };
         if self
+            .runtime()
             .script_locks
             .monitor_completions
             .lock()

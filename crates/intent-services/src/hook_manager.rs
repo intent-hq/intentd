@@ -1544,7 +1544,7 @@ impl Services {
             )));
         }
         let control = {
-            let tasks = self.hook_tasks.lock().unwrap();
+            let tasks = self.runtime().hook_tasks.lock().unwrap();
             tasks.get(hook_id).map(|h| h.control.clone())
         };
         let Some(control) = control else {
@@ -1643,12 +1643,16 @@ impl Services {
 
     /// Whether a live scheduler task exists for `hook_id`.
     fn hook_task_alive(&self, hook_id: &HookId) -> bool {
-        self.hook_tasks.lock().unwrap().contains_key(hook_id)
+        self.runtime()
+            .hook_tasks
+            .lock()
+            .unwrap()
+            .contains_key(hook_id)
     }
 
     /// Abort and deregister a hook's scheduler task (no-op when absent).
     fn abort_hook_task(&self, hook_id: &HookId) {
-        if let Some(handle) = self.hook_tasks.lock().unwrap().remove(hook_id) {
+        if let Some(handle) = self.runtime().hook_tasks.lock().unwrap().remove(hook_id) {
             handle.abort.abort();
         }
     }
@@ -1730,11 +1734,16 @@ impl Services {
                     }
                 }
             }
-            services.hook_tasks.lock().unwrap().remove(&hook.hook_id);
+            services
+                .runtime()
+                .hook_tasks
+                .lock()
+                .unwrap()
+                .remove(&hook.hook_id);
         }) else {
             return;
         };
-        self.hook_tasks.lock().unwrap().insert(
+        self.runtime().hook_tasks.lock().unwrap().insert(
             hook_id,
             HookHandle {
                 control: control_tx,
@@ -2826,7 +2835,7 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
-        assert!(svc.hook_tasks.lock().unwrap().is_empty());
+        assert!(svc.runtime().hook_tasks.lock().unwrap().is_empty());
 
         // A rejected chain must not poison the owner or unrelated work.
         let other = AgentId::from("agent-unrelated");
