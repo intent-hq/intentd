@@ -34,9 +34,9 @@
 //! Each version also owns a [`Doctrine`] — its bundled instruction/specialist
 //! markdown set under `resources/agent-instructions/<ver>/` and
 //! `resources/specialists/<ver>/` — and the [`REGISTRY`] maps the stamped
-//! session `harnessVersion` (`"1.0"` through `"3.3"`) to the pair, so a session
-//! keeps assembling the exact doctrine
-//! it was created with even after the binary ships a newer set. All past
+//! session `harnessVersion` (`"1.0"` through `CURRENT_HARNESS_VERSION`) to
+//! the pair, so a session keeps assembling the exact doctrine it was created
+//! with even after the binary ships a newer set. All past
 //! versions stay bundled.
 
 pub(crate) mod review_wake;
@@ -613,7 +613,11 @@ mod tests {
     fn registry_resolves_stamped_current_version() {
         let entry = resolve_entry(intent_core::CURRENT_HARNESS_VERSION);
         assert_eq!(entry.version, intent_core::CURRENT_HARNESS_VERSION);
-        assert_eq!(entry.version, "3.3");
+        assert_eq!(
+            REGISTRY[REGISTRY.len() - 1].version,
+            intent_core::CURRENT_HARNESS_VERSION,
+            "the current version is the newest registry row"
+        );
         let repository_guidance = resolve_entry("3.0");
         let previous = resolve_entry("2.10");
         assert_eq!(previous.version, "2.10");
@@ -640,7 +644,8 @@ mod tests {
 
     /// 3.3 changes only the unknown/default-agent composition flag; text
     /// surfaces, specialists, feature defaults and every instruction body stay
-    /// those of 3.2 (intent-hq/intent#5835).
+    /// those of 3.2 (intent-hq/intent#5835). Pinned to 3.3 on purpose: it
+    /// describes that release, not whichever version is current.
     #[test]
     fn registry_v3_3_only_flips_single_workspace_fallback() {
         let current = resolve_entry("3.3");
@@ -663,7 +668,11 @@ mod tests {
         assert_eq!(a.common, b.common);
         assert_eq!(a.workspace, b.workspace);
         assert_eq!(a.workspace_agent, b.workspace_agent);
-        for entry in REGISTRY.iter().filter(|e| e.version != "3.3") {
+        let introduced = REGISTRY
+            .iter()
+            .position(|e| e.version == "3.3")
+            .expect("3.3 registry row");
+        for entry in &REGISTRY[..introduced] {
             assert!(
                 !entry.doctrine.instructions.single_workspace_fallback,
                 "{} must keep its creation-time composition",
