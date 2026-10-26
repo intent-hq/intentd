@@ -91,10 +91,10 @@ fn select(root: &mut RepositoryRootContext, saved: &SavedReviewSelection) {
 
 #[test]
 fn only_exact_known_stamps_are_eligible() {
-    assert!(eligible_harness_version(Some("3.0")));
-    assert!(eligible_harness_version(Some("3.1")));
-    assert!(eligible_harness_version(Some("3.2")));
-    assert!(eligible_harness_version(Some("3.3")));
+    for version in intent_core::REPOSITORY_GUIDANCE_HARNESS_VERSIONS {
+        assert!(eligible_harness_version(Some(version)), "{version}");
+    }
+    let after_current = intent_core::harness_versions_after_current();
     for version in [
         None,
         Some(""),
@@ -116,10 +116,12 @@ fn only_exact_known_stamps_are_eligible() {
         Some("3.0\n"),
         Some(" 3.0"),
         Some("3.0\0"),
-        Some("3.4"),
         Some("99.0"),
         Some("unknown"),
-    ] {
+    ]
+    .into_iter()
+    .chain(after_current.iter().map(|v| Some(v.as_str())))
+    {
         assert!(!eligible_harness_version(version), "{version:?}");
         assert!(render(
             Some(&session(version)),
@@ -559,7 +561,10 @@ fn over_budget_inventory_keeps_complete_rows_and_reports_omitted_selection() {
 #[test]
 fn monitor_guidance_preserves_old_stamps_and_features() {
     let context = context();
-    for version in ["3.0", "3.1", "3.2", "3.3"] {
+    for version in intent_core::REPOSITORY_GUIDANCE_HARNESS_VERSIONS
+        .iter()
+        .copied()
+    {
         let mut owner = session(Some(version));
         owner.harness_features = Some(json!({"prMonitor":false,"stateSnapshot":false}));
         let before = owner.clone();
@@ -574,7 +579,7 @@ fn monitor_guidance_preserves_old_stamps_and_features() {
         let policy = output.text.split_once(FACTS_HEADER).unwrap().0;
         assert_eq!(
             policy,
-            if matches!(version, "3.2" | "3.3") {
+            if intent_core::harness_uses_repository_monitor_guidance(version) {
                 MONITOR_POLICY
             } else {
                 POLICY
