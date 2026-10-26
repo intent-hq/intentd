@@ -41,13 +41,13 @@ fail() {
   exit 1
 }
 
-for command in bash dirname grep mktemp rm sort python3; do
+for command in bash dirname env grep mktemp rm sort python3; do
   ln -s "$(command -v "$command")" "$bin_dir/$command"
 done
 
 # glibc's en_US.UTF-8 collation ignores '-' and '_' (intentd sorts before
-# intent-services), which is what the locale cases below run the script
-# under. A host that has no compiled en_US.UTF-8 gets a private build in the
+# intent-services, ab before a_z), which is what the locale cases below run
+# the script under. A host that has no compiled en_US.UTF-8 gets a private build in the
 # temp dir, reached through LOCPATH, when localedef and the en_US source
 # exist (glibc ignores an empty LOCPATH). Without either (macOS collates
 # by code point), those cases are skipped with a notice. RUN_LOCALE=<name>
@@ -55,19 +55,19 @@ done
 # LC_ALL on the function would switch this shell too, which cannot see
 # LOCPATH and warns.
 real_env=$(command -v env)
-hyphen_blind() {
-  [[ "$(printf 'intent-services\nintentd\n' | LOCPATH="$1" LC_ALL=en_US.UTF-8 sort 2>/dev/null)" == $'intentd\nintent-services' ]]
+ignores_punctuation() {
+  [[ "$(printf 'intent-services\nintentd\na_z\nab\n' | LOCPATH="$1" LC_ALL=en_US.UTF-8 sort 2>/dev/null)" == $'ab\na_z\nintentd\nintent-services' ]]
 }
 en_us_locpath=""
 en_us=1
-if ! hyphen_blind ""; then
+if ! ignores_punctuation ""; then
   en_us_locpath="$temp_dir/locale"
   mkdir -p "$en_us_locpath"
   localedef -i en_US -f UTF-8 "$en_us_locpath/en_US.UTF-8" >/dev/null 2>&1 || true
-  hyphen_blind "$en_us_locpath" || en_us=""
+  ignores_punctuation "$en_us_locpath" || en_us=""
 fi
 [[ -n "$en_us" ]] ||
-  echo "changed-tests tests: no en_US.UTF-8 locale that ignores '-' (glibc's) is available; en_US.UTF-8 cases skipped"
+  echo "changed-tests tests: no en_US.UTF-8 locale that ignores '-' and '_' (glibc's) is available; en_US.UTF-8 cases skipped"
 
 # git wrapper: the subcommand named by GIT_STUB_FAIL fails like a broken
 # checkout would; everything else reaches the real git.
@@ -231,7 +231,7 @@ commit_all() {
 # fixture checkout); it must find its repo root on its own. Ordinary calls
 # get EOF, even when this suite inherits an open terminal. Only the explicit
 # stdin-drain control supplies finite input through RUN_STDIN, and
-# RUN_LOCALE=en_US.UTF-8 runs it under that locale (see hyphen_blind).
+# RUN_LOCALE=en_US.UTF-8 runs it under that locale (see ignores_punctuation).
 run_script() {
   set +e
   (
@@ -554,7 +554,7 @@ expect_ok
 [[ "$stdout" == "$fixture_edges" ]] || fail "$case_name: edges were"$'\n'"$stdout"$'\n'"expected"$'\n'"$fixture_edges"
 [[ -z "$cargo_log" ]] || fail "$case_name: cargo ran: $cargo_log"
 
-# Byte order whatever the locale (see hyphen_blind).
+# Byte order whatever the locale (see ignores_punctuation).
 if [[ -n "$en_us" ]]; then
   case_name="--print-edges / --print-rdeps sort in byte order under en_US.UTF-8"
   reset_repo
@@ -837,20 +837,21 @@ expect_ok
 expect_runner --plan "-p alpha --test one" --base origin/main --label test-changed
 [[ "$runner_locale_log" == POSIX ]] || fail "$case_name: runner got LC_ALL '$runner_locale_log'"
 
+# A subshell, so this suite's own LC_ALL is untouched afterwards.
 case_name="cargo and the runner get no LC_ALL when the caller set none"
-suite_lc_all=${LC_ALL-}
-suite_lc_all_set=${LC_ALL+1}
-unset LC_ALL
-clear_logs
-run_script
-expect_ok
-expect_cargo "-p alpha --test one"
-[[ "$cargo_locale_log" == "<unset>" ]] || fail "$case_name: cargo got LC_ALL '$cargo_locale_log'"
-clear_logs
-NEXTEST_RUNNER="$bin_dir/runner" run_script
-expect_ok
-[[ "$runner_locale_log" == "<unset>" ]] || fail "$case_name: runner got LC_ALL '$runner_locale_log'"
-[[ -z "$suite_lc_all_set" ]] || export LC_ALL="$suite_lc_all"
+(
+  unset LC_ALL
+  reset_repo
+  edit crates/alpha/tests/one.rs
+  run_script
+  expect_ok
+  expect_cargo "-p alpha --test one"
+  [[ "$cargo_locale_log" == "<unset>" ]] || fail "$case_name: cargo got LC_ALL '$cargo_locale_log'"
+  clear_logs
+  NEXTEST_RUNNER="$bin_dir/runner" run_script
+  expect_ok
+  [[ "$runner_locale_log" == "<unset>" ]] || fail "$case_name: runner got LC_ALL '$runner_locale_log'"
+)
 
 case_name="runner receives every plan in one invocation"
 reset_repo
@@ -1090,9 +1091,10 @@ out, root = map(pathlib.Path, sys.argv[1:])
     ['workspace', 'target', 'profiles', 'temporary', 'home']}))
 PYTHON
 printf 'payload\n' > "$temp_dir/storage-input"
-COVERAGE_STORAGE_DIR="$storage_dir" RUN_STDIN="$temp_dir/storage-input" run_script --instrumented
+LC_ALL=POSIX COVERAGE_STORAGE_DIR="$storage_dir" RUN_STDIN="$temp_dir/storage-input" run_script --instrumented
 expect_ok
 expect_cov "-p alpha --test one" "-p gamma --test smoke"
+[[ "$cargo_locale_log" == $'POSIX\nPOSIX' ]] || fail "$case_name: cargo got LC_ALL '$cargo_locale_log'"
 [[ "$(cat "$temp_dir/cargo-stdin.log")" == payload ]] || fail "$case_name: caller input was changed"
 python3 - "$storage_dir/resources.jsonl" <<'PYTHON'
 import json, sys

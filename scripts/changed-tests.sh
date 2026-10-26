@@ -12,7 +12,8 @@
 # them). The script works from any cwd: it changes to the repo root itself.
 #
 # All test children (including a custom runner) use with-test-policy.sh to
-# enforce INTENTD_ASSERT_BOUND_CALLER=1, even when inherited env disables it.
+# enforce INTENTD_ASSERT_BOUND_CALLER=1, even when inherited env disables it,
+# and run under the caller's LC_ALL; the script itself works in byte order.
 # Without a runner every plan runs as its own `cargo nextest run` from the repo
 # root. With one, the runner (a shell-quoted command line, exec'd once from the
 # caller's working directory) receives every plan instead:
@@ -108,25 +109,20 @@ set -euo pipefail
 # Byte order for every sort, glob and comparison below, whatever the caller's
 # locale: glibc's en_US.UTF-8 collation ignores '-' and '_', which put intentd
 # before intent-services in the crate list and the reverse-dependency note.
-# The tests themselves run under the caller's LC_ALL (restore_caller_locale),
-# as they do under make test and in the merge queue.
-caller_lc_all=${LC_ALL-}
-caller_lc_all_set=${LC_ALL+1}
+# The tests themselves run under the caller's LC_ALL, as they do under make
+# test and in the merge queue: test_policy (below) hands it back through env,
+# so this shell never reloads a locale it may not have.
+if [[ -n "${LC_ALL+1}" ]]; then
+  caller_locale=(env "LC_ALL=$LC_ALL")
+else
+  caller_locale=(env -u LC_ALL)
+fi
 export LC_ALL=C
 
-# Puts the caller's LC_ALL back (unset when the caller had none), for the
-# commands that run tests: call it in the subshell or right before the exec
-# that starts them.
-restore_caller_locale() {
-  if [[ -n "$caller_lc_all_set" ]]; then
-    export LC_ALL="$caller_lc_all"
-  else
-    unset LC_ALL
-  fi
-}
-
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
-test_policy="$repo_root/scripts/with-test-policy.sh"
+# Every test child starts with this: with-test-policy.sh under the caller's
+# LC_ALL.
+test_policy=("${caller_locale[@]}" "$BASH" "$repo_root/scripts/with-test-policy.sh")
 caller_dir=$PWD
 base=${BASE:-origin/main}
 build_jobs=${BUILD_JOBS:-}
@@ -986,8 +982,7 @@ if [[ -n "$runner" ]]; then
   [[ -n "$build_jobs" ]] && set -- "$@" --build-jobs "$build_jobs"
   [[ -n "$test_threads" ]] && set -- "$@" --test-threads "$test_threads"
   cd "$caller_dir"
-  restore_caller_locale
-  exec "$BASH" "$test_policy" "$@"
+  exec "${test_policy[@]}" "$@"
 fi
 
 # The plans are read from fd 3 so cargo keeps the caller's stdin.
@@ -1002,20 +997,14 @@ while IFS= read -r -u 3 plan; do
   scope_index=$((scope_index + 1))
   set +e
   if [[ -n "$instrumented" ]]; then
-    command=("$BASH" "$test_policy" cargo llvm-cov --no-report nextest "$@")
+    command=("${test_policy[@]}" cargo llvm-cov --no-report nextest "$@")
     if [[ -n "${COVERAGE_STORAGE_DIR:-}" ]]; then
       command=(python3 -I -B "$repo_root/scripts/coverage-storage.py" run
         --output "$COVERAGE_STORAGE_DIR" --stage "scope-$scope_index" -- "${command[@]}")
     fi
-    (
-      restore_caller_locale
-      INTENTD_TEST_TIMEOUT_MULTIPLIER=3 exec "${command[@]}"
-    )
+    INTENTD_TEST_TIMEOUT_MULTIPLIER=3 "${command[@]}"
   else
-    (
-      restore_caller_locale
-      exec "$BASH" "$test_policy" cargo nextest run "$@"
-    )
+    "${test_policy[@]}" cargo nextest run "$@"
   fi
   status=$?
   set -e
