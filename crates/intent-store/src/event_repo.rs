@@ -222,6 +222,22 @@ impl Store {
     pub async fn query_events(&self, q: &EventQuery) -> Result<Vec<Event>> {
         let mut qb: QueryBuilder<Sqlite> =
             QueryBuilder::new(format!("SELECT {EVENT_COLUMNS} FROM event WHERE 1=1"));
+        // Desktop event visibility is connection/principal bound, including
+        // administrator reads and durable search. Unbound/agent reads get none.
+        qb.push(" AND (event_type NOT LIKE 'desktop:%'");
+        if let Some(intent_core::Caller::Wire { principal_id, .. }) = intent_core::current_caller()
+        {
+            qb.push(" OR (json_extract(metadata_json,'$.desktopPrincipalId') = ")
+                .push_bind(principal_id.0)
+                .push(" AND (json_extract(metadata_json,'$.desktopConnectionEpoch') IS NULL");
+            if let Some(connection) = intent_core::desktop::current_connection() {
+                qb.push(" OR json_extract(metadata_json,'$.desktopConnectionEpoch') = ")
+                    .push_bind(connection.connection_epoch);
+            }
+            qb.push(")))");
+        } else {
+            qb.push(")");
+        }
         if q.exclude_discussion_events {
             qb.push(" AND event_type NOT GLOB 'discussion:*'");
         }

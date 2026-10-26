@@ -236,7 +236,7 @@ async fn setup_finishes_without_terminal_client_input() {
             });
         }
     }
-    let child = command.spawn().expect("spawn daemon");
+    let child = common::spawn_guarded(&mut command).expect("spawn daemon");
     let _daemon = common::DaemonGuard::process_only(child);
     timeout(common::daemon_startup_timeout(), async {
         loop {

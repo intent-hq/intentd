@@ -17,8 +17,9 @@ use crate::common;
 #[path = "e2e_wss_browser_client_pin/identity_isolation.rs"]
 mod identity_isolation;
 
+use intentd_test_support::GuardedChild;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -39,14 +40,13 @@ use common::TlsWs;
 const TOKEN: &str = "abababababababababababababababababababababababababababababababab";
 
 struct Daemon {
-    child: Child,
+    child: GuardedChild,
     data_dir: PathBuf,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.child.kill_tree();
         let _ = std::fs::remove_dir_all(&self.data_dir);
     }
 }
@@ -57,22 +57,23 @@ fn scratch_dir() -> tempfile::TempDir {
     common::test_tempdir_in("/tmp", "itd-wss-bcpin-")
 }
 
-fn spawn_serve(data_dir: &Path, mut command: Command) -> Child {
+fn spawn_serve(data_dir: &Path, mut command: Command) -> GuardedChild {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     common::enable_ws_api(data_dir);
     common::hermetic_fixture_identity(&mut command, data_dir);
-    command
-        .env_remove("GITLAB_TOKEN")
-        .env("INTENTD_DATA_DIR", data_dir)
-        .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
-        .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
-        .env("INTENTD_AUTH_TOKEN", TOKEN)
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(log))
-        .spawn()
-        .expect("spawn intentd serve")
+    GuardedChild::spawn(
+        command
+            .env_remove("GITLAB_TOKEN")
+            .env("INTENTD_DATA_DIR", data_dir)
+            .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
+            .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
+            .env("INTENTD_AUTH_TOKEN", TOKEN)
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(log)),
+    )
+    .expect("spawn intentd serve")
 }
 
 async fn await_uds(socket: &Path) -> bool {

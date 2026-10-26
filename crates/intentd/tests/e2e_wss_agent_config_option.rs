@@ -39,8 +39,9 @@
 
 use crate::common;
 
+use intentd_test_support::GuardedChild;
 use std::path::Path;
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -59,13 +60,12 @@ use tokio_tungstenite::WebSocketStream;
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
 struct Daemon {
-    child: Child,
+    child: GuardedChild,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.child.kill_tree();
     }
 }
 
@@ -73,7 +73,7 @@ fn temp_data_dir() -> tempfile::TempDir {
     common::test_tempdir_in("/tmp", "itd-cfgopt-")
 }
 
-fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
+fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> GuardedChild {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
@@ -90,7 +90,7 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
         cmd.env(k, v);
     }
     common::hermetic_fixture_identity(&mut cmd, data_dir);
-    cmd.spawn().expect("spawn intentd serve")
+    GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -1007,8 +1007,7 @@ async fn assert_effective_codex_model_selection(
         // The mock resolver has no spawn model. Restart this isolated daemon
         // to force session/load of the persisted selection. The live Codex
         // reproduction separately verified automatic model-change respawn.
-        daemon.child.kill().expect("stop test daemon");
-        daemon.child.wait().expect("reap test daemon");
+        daemon.child.kill_tree().expect("reap test daemon");
         daemon.child = spawn_serve(&data_dir, "both", &env);
         assert!(await_uds(&socket).await, "daemon did not restart");
         let status = common::await_wss_status(&socket).await;
@@ -1081,8 +1080,7 @@ async fn assert_effective_codex_model_selection(
             }),
         )
         .await;
-        daemon.child.kill().expect("stop test daemon");
-        daemon.child.wait().expect("reap test daemon");
+        daemon.child.kill_tree().expect("reap test daemon");
         daemon.child = spawn_serve(&data_dir, "both", &env);
         assert!(await_uds(&socket).await, "daemon did not restart");
         let status = common::await_wss_status(&socket).await;
@@ -2096,8 +2094,7 @@ async fn assert_model_specific_thinking_options(load_session: bool) {
     .enumerate()
     {
         if turn == 3 {
-            daemon.child.kill().expect("stop isolated daemon");
-            daemon.child.wait().expect("reap isolated daemon");
+            daemon.child.kill_tree().expect("reap isolated daemon");
             daemon.child = spawn_serve(data_dir.path(), "both", &env);
             assert!(await_uds(&socket).await, "daemon did not restart");
             let status = common::await_wss_status(&socket).await;
@@ -2587,8 +2584,7 @@ async fn effort_notice_restart_case(load: bool) {
     )
     .await;
 
-    daemon.child.kill().unwrap();
-    daemon.child.wait().unwrap();
+    daemon.child.kill_tree().unwrap();
     behavior["blockUntilCancel"] = json!(false);
     daemon.child = launch(&behavior);
     assert!(await_uds(&socket).await);

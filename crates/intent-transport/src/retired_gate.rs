@@ -55,6 +55,8 @@ pub(crate) const RETIRED_GATED_METHODS: &[&str] = &[
     "comment.delete",
     "comment.resolveThread",
     "comment.respond",
+    "desktop.respondPermission",
+    "desktop.setPermission",
     "discussion.react",
     "discussion.retryAgent",
     "discussion.send",
@@ -165,12 +167,14 @@ pub(crate) const RETIRED_GATED_METHODS: &[&str] = &[
 
 /// Mutations allowed on a retired workspace: delete / cancelDelete, the
 /// revive triggers (`workspace.unarchive`, `workspace.restore`, a user
-/// message via `agent.sendMessage`), the idempotent `workspace.retire`, and
+/// message via `agent.sendMessage`), the idempotent `workspace.retire`,
+/// `desktop.revoke` (ending desktop control must always work), and
 /// per-viewer bookkeeping that changes no workspace content.
 #[cfg_attr(not(test), expect(dead_code))]
 pub(crate) const RETIRED_EXEMPT_METHODS: &[&str] = &[
     "agent.markSeen",
     "agent.sendMessage",
+    "desktop.revoke",
     "workspace.cancelDelete",
     "workspace.delete",
     "workspace.dismissAttention",
@@ -215,6 +219,7 @@ pub(crate) const RETIRED_UNGATED_METHODS: &[&str] = &[
     "crossWorkspace.listSiblings",
     "crossWorkspace.readNote",
     "debug.sampleStacks",
+    "desktop.getState",
     "discussion.conversations",
     "discussion.list",
     "discussion.recipients",

@@ -194,6 +194,7 @@ impl PendingQuestionMutationLocks {
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AgentSnapshot {
+    pub(crate) desktop_control: intent_core::desktop::DesktopState,
     /// Current UTC timestamp (whole-second RFC-3339).
     pub(crate) time: String,
     /// Active (scheduled/running) background hooks owned by this agent.
@@ -356,7 +357,10 @@ impl AgentSnapshot {
     /// `true` when every field other than `time` is zero/absent — the
     /// injection-skip condition (`time` alone never forces an injection).
     pub(crate) fn is_trivial(&self) -> bool {
-        self.hooks == 0
+        matches!(
+            self.desktop_control,
+            intent_core::desktop::DesktopState::Inactive
+        ) && self.hooks == 0
             && self.agent_watches == 0
             && self.queued_messages == 0
             && self.event_subscriptions == 0
@@ -6107,6 +6111,7 @@ impl Services {
         self.pending_delete_test_gate
             .pause("agent-sql", &agent_id.0)
             .await;
+        self.desktop_terminate_agent(&agent_id).await;
         // Route the DELETE through the workspace guard so a stale-caller with the
         // wrong workspace cannot mutate the row even if the pre-check above races
         // with a concurrent workspace move.
@@ -6481,6 +6486,7 @@ impl Services {
         if !transitioned {
             return Ok(None);
         }
+        self.desktop_terminate_agent(&session.id).await;
         // The persisted mark closes new requests before teardown. A wire
         // caller retires another agent, whose current worker must be aborted;
         // MCP self-retirement instead lets its own response unwind normally.
@@ -10283,6 +10289,7 @@ impl Services {
         self.store
             .update_agent_session(&workspace_id, &session)
             .await?;
+        self.desktop_terminate_agent(&caller).await;
         self.publish_agent_mutation_event(
             &session.workspace_id,
             &caller,
@@ -13724,6 +13731,7 @@ impl Services {
             }
         };
         Ok(AgentSnapshot {
+            desktop_control: self.desktop_current_state(agent_id).await,
             time,
             hooks,
             agent_watches,

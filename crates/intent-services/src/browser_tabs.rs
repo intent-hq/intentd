@@ -51,6 +51,9 @@ impl Services {
             Ok(None) | Err(Error::NotFound(_)) => {}
             Err(e) => return Err(e),
         }
+        if let Some(client) = self.desktop.active_client(workspace_id) {
+            return Ok(ReverseTarget::Client(client));
+        }
         let claimed_host = self
             .store
             .list_browser_tabs(workspace_id)
@@ -244,12 +247,14 @@ impl Services {
             .reassign_browser_tab_host(tab_id, &new_host, agent_id)
             .await?
         {
+            self.desktop.assignment_changed(&tab.workspace_id);
             publish_event(
                 self.event_bus.as_ref(),
                 tab_event(BROWSER_TAB_UPDATED, &new_host, &tab, Some(&changes)),
             )
             .await;
         }
+        self.desktop.changed.notify_waiters();
         Ok(())
     }
 
@@ -292,12 +297,14 @@ impl Services {
             .reassign_claimed_browser_tabs(workspace_id, new_host)
             .await?;
         for (tab, changes) in &moved {
+            self.desktop.assignment_changed(&tab.workspace_id);
             publish_event(
                 self.event_bus.as_ref(),
                 tab_event(BROWSER_TAB_UPDATED, new_host, tab, Some(changes)),
             )
             .await;
         }
+        self.desktop.changed.notify_waiters();
         Ok(())
     }
 
@@ -309,6 +316,9 @@ impl Services {
         let _gate = self.browser_tab_gate.lock().await;
         let closed = self.store.close_browser_tab(tab_id).await?;
         if let Some(tab) = &closed {
+            if tab.owner_agent_id.is_some() {
+                self.desktop.assignment_changed(&tab.workspace_id);
+            }
             publish_event(
                 self.event_bus.as_ref(),
                 tab_event(BROWSER_TAB_CLOSED, &tab.host_client_id, tab, None),
@@ -392,6 +402,9 @@ impl Services {
         let outcome = self.store.upsert_browser_tab(&host, tab).await?;
         match &outcome {
             BrowserTabUpsertOutcome::Opened(tab) => {
+                if tab.owner_agent_id.is_some() {
+                    self.desktop.assignment_changed(&tab.workspace_id);
+                }
                 publish_event(
                     self.event_bus.as_ref(),
                     tab_event(BROWSER_TAB_OPENED, &host, tab, None),
@@ -399,6 +412,9 @@ impl Services {
                 .await;
             }
             BrowserTabUpsertOutcome::Updated { tab, changes } => {
+                if changes.get("ownerAgentId").is_some() || changes.get("hostClientId").is_some() {
+                    self.desktop.assignment_changed(&tab.workspace_id);
+                }
                 publish_event(
                     self.event_bus.as_ref(),
                     tab_event(BROWSER_TAB_UPDATED, &host, tab, Some(changes)),
@@ -418,12 +434,16 @@ impl Services {
         }
         let _gate = self.browser_tab_gate.lock().await;
         if let Some(tab) = self.store.remove_browser_tab(&host, &tab_id).await? {
+            if tab.owner_agent_id.is_some() {
+                self.desktop.assignment_changed(&tab.workspace_id);
+            }
             publish_event(
                 self.event_bus.as_ref(),
                 tab_event(BROWSER_TAB_CLOSED, &host, &tab, None),
             )
             .await;
         }
+        self.desktop.changed.notify_waiters();
         Ok(())
     }
 
@@ -453,9 +473,15 @@ impl Services {
         let result = self.store.sync_browser_tabs(&host, tabs).await?;
         let bus = self.event_bus.as_ref();
         for tab in &result.opened {
+            if tab.owner_agent_id.is_some() {
+                self.desktop.assignment_changed(&tab.workspace_id);
+            }
             publish_event(bus, tab_event(BROWSER_TAB_OPENED, &host, tab, None)).await;
         }
         for (tab, changes) in &result.updated {
+            if changes.get("ownerAgentId").is_some() || changes.get("hostClientId").is_some() {
+                self.desktop.assignment_changed(&tab.workspace_id);
+            }
             publish_event(
                 bus,
                 tab_event(BROWSER_TAB_UPDATED, &host, tab, Some(changes)),
@@ -463,6 +489,9 @@ impl Services {
             .await;
         }
         for tab in &result.closed {
+            if tab.owner_agent_id.is_some() {
+                self.desktop.assignment_changed(&tab.workspace_id);
+            }
             publish_event(bus, tab_event(BROWSER_TAB_CLOSED, &host, tab, None)).await;
         }
         Ok(result.drop)

@@ -460,6 +460,15 @@ pub struct Workspace {
     /// `displayStatus`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub scripts_running: bool,
+    /// Daemon-owned orthogonal background-task flag (PROTOCOL §5.1): `true`
+    /// while any agent of the workspace has a §5.5b provider background task
+    /// (e.g. a backgrounded shell command) still running on a supported,
+    /// continuous connection. Read live from the in-memory worker
+    /// projections on the same emit path as `scripts_running`; never
+    /// persisted; omitted (not `false`) when none runs. Feeds neither
+    /// `activity` nor `displayStatus`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub background_tasks_running: bool,
     /// Durable token/credit usage accounting (§5.23 / §19.1), materialized by the
     /// daemon-internal periodic scan job and surfaced by `workspace.getTokenUsage`.
     /// Omitted (not `null`) until the first scan writes a snapshot.
@@ -913,6 +922,7 @@ pub fn chief_workspace() -> Workspace {
         attention_reminder: None,
         waiting: false,
         scripts_running: false,
+        background_tasks_running: false,
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
@@ -7661,6 +7671,7 @@ mod tests {
             attention_reminder: None,
             waiting: false,
             scripts_running: false,
+            background_tasks_running: false,
             token_usage: None,
             cow_supported: None,
             browser_client_id: None,
@@ -7712,6 +7723,18 @@ mod tests {
         assert_eq!(v["scriptsRunning"], serde_json::json!(true));
         let back: Workspace = serde_json::from_value(v).unwrap();
         assert_eq!(back, running_ws);
+
+        // Presence-detected `backgroundTasksRunning`: omitted when false.
+        assert!(serde_json::to_value(&ws)
+            .unwrap()
+            .get("backgroundTasksRunning")
+            .is_none());
+        let mut background_ws = ws.clone();
+        background_ws.background_tasks_running = true;
+        let v = serde_json::to_value(&background_ws).unwrap();
+        assert_eq!(v["backgroundTasksRunning"], serde_json::json!(true));
+        let back: Workspace = serde_json::from_value(v).unwrap();
+        assert_eq!(back, background_ws);
     }
 
     /// The card aggregates serialize with the exact nested field names + casing

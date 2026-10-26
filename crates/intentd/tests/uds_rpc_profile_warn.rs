@@ -12,8 +12,9 @@
 
 use crate::common;
 
+use intentd_test_support::GuardedChild;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -22,15 +23,14 @@ use tokio::net::UnixStream;
 use tokio::time::timeout;
 
 struct Daemon {
-    child: Child,
+    child: GuardedChild,
     /// Swept after `Drop` reaps the child (fields drop after `drop()` runs).
     data_dir: tempfile::TempDir,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.child.kill_tree();
     }
 }
 
@@ -55,7 +55,7 @@ fn spawn_daemon(prefix: &str, envs: &[(&str, &str)]) -> (Daemon, PathBuf, PathBu
         cmd.env(k, v);
     }
     common::hermetic_fixture_identity(&mut cmd, &data_dir);
-    let child = cmd.spawn().expect("spawn intentd serve");
+    let child = GuardedChild::spawn(&mut cmd).expect("spawn intentd serve");
     (
         Daemon {
             child,
@@ -458,8 +458,10 @@ async fn queue_mutations_stay_within_statement_budget_at_depth() {
     // Seed while stopped so no in-memory snapshot can overwrite the fixture.
     // These are genuine automatic entries, not human metadata masquerading as
     // system messages at an authenticated RPC front door.
-    daemon.child.kill().expect("stop daemon before seeding");
-    daemon.child.wait().expect("reap daemon before seeding");
+    daemon
+        .child
+        .kill_tree()
+        .expect("reap daemon before seeding");
     let data_dir = daemon.data_dir.path();
     let store = intent_store::Store::open(&data_dir.join("intentd.db"))
         .await
@@ -491,14 +493,15 @@ async fn queue_mutations_stay_within_statement_budget_at_depth() {
         .append(true)
         .open(&log_path)
         .unwrap();
-    daemon.child = common::hermetic_serve_command(data_dir)
-        .env("INTENTD_DATA_DIR", data_dir)
-        .env("INTENTD_WORKSPACES_DIR", data_dir.join("workspaces"))
-        .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(log))
-        .spawn()
-        .expect("restart seeded daemon");
+    daemon.child = GuardedChild::spawn(
+        common::hermetic_serve_command(data_dir)
+            .env("INTENTD_DATA_DIR", data_dir)
+            .env("INTENTD_WORKSPACES_DIR", data_dir.join("workspaces"))
+            .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(log)),
+    )
+    .expect("restart seeded daemon");
     assert!(
         await_socket(&socket).await,
         "restarted daemon did not start"

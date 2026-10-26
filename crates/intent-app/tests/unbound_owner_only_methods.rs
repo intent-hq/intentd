@@ -197,6 +197,18 @@ fn minimal_params(f: &Fixture) -> Vec<(&'static str, Value)> {
             json!({ "workspaceId": ws, "taskNoteId": "t1", "contextMessage": "c" }),
         ),
         ("debug.sampleStacks", json!({ "durationMs": 1 })),
+        (
+            "desktop.getState",
+            json!({ "workspaceId": ws, "agentId": "a1" }),
+        ),
+        (
+            "desktop.respondPermission",
+            json!({ "workspaceId": ws, "requestId": "r1", "decision": "allow_once" }),
+        ),
+        (
+            "desktop.setPermission",
+            json!({ "workspaceId": ws, "agentId": "a1", "computerId": "physical", "allowed": true }),
+        ),
         ("file-tracking.getAgentLocks", json!({ "workspaceId": ws })),
         ("file-tracking.getChanges", json!({ "workspaceId": ws })),
         ("file-tracking.loadCommits", json!({ "workspaceId": ws })),

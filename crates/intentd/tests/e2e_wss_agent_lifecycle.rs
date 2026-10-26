@@ -19,8 +19,9 @@ mod creation_preferences;
 #[path = "e2e_wss_agent_lifecycle/structured_notices.rs"]
 mod structured_notices;
 
+use intentd_test_support::GuardedChild;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -42,27 +43,13 @@ const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefe
 
 /// Live `intentd serve` process; killed on drop.
 struct Daemon {
-    child: Child,
+    child: GuardedChild,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        // Kill the whole process group (daemon + any Node.js ACP provider
-        // children) BEFORE removing the data dir, so an orphaned child can't
-        // re-create files (e.g. node-compile-cache under a redirected TMPDIR)
-        // after cleanup. The daemon is spawned with process_group(0).
-        #[cfg(unix)]
-        {
-            use nix::sys::signal::{self, Signal};
-            use nix::unistd::Pid;
-            let pid = Pid::from_raw(self.child.id().cast_signed());
-            let _ = signal::killpg(pid, Signal::SIGKILL);
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = self.child.kill();
-        }
-        let _ = self.child.wait();
+        // Kills the daemon's process group (ACP providers run in their own groups).
+        let _ = self.child.kill_tree();
     }
 }
 
@@ -83,12 +70,6 @@ fn lifecycle_command(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> std
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
-    // Group leader so Daemon::drop can killpg the daemon + ACP children.
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -96,10 +77,8 @@ fn lifecycle_command(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> std
     cmd
 }
 
-fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
-    lifecycle_command(data_dir, listen, env)
-        .spawn()
-        .expect("spawn intentd serve")
+fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> GuardedChild {
+    GuardedChild::spawn(&mut lifecycle_command(data_dir, listen, env)).expect("spawn intentd serve")
 }
 
 /// Wait for the daemon's UDS to accept connections, up to the shared
@@ -7159,6 +7138,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         attention_reminder: None,
         waiting: false,
         scripts_running: false,
+        background_tasks_running: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,

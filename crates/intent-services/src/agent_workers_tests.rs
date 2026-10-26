@@ -803,3 +803,69 @@ fn running_worker_agents_lists_only_agents_with_a_running_worker() {
         vec![(AgentId::from("agent-running"), WorkspaceId::from("ws-1"))]
     );
 }
+
+/// The `Workspace.backgroundTasksRunning` roll-up (§5.1): true while any
+/// agent of the workspace vouches for a running worker, scoped per
+/// workspace, and false once every such row ended, disconnected or was
+/// released.
+#[test]
+fn workspace_has_running_workers_rolls_up_agents_per_workspace() {
+    let workers = AgentWorkers::default();
+    let ws1 = WorkspaceId::from("ws-1");
+    let ws2 = WorkspaceId::from("ws-2");
+    assert!(
+        !workers.workspace_has_running_workers(&ws1),
+        "no generation held"
+    );
+
+    let begin = |agent: &str, ws: &str| {
+        let mut s = scope("claude-code");
+        s.agent_id = AgentId::from(agent);
+        s.workspace_id = WorkspaceId::from(ws);
+        workers.begin(s, &identity("claude-code"), true, Weak::new());
+    };
+    begin("agent-a", "ws-1");
+    begin("agent-b", "ws-1");
+    begin("agent-c", "ws-2");
+    assert!(!workers.workspace_has_running_workers(&ws1), "no rows yet");
+
+    workers.ingest(
+        &AgentId::from("agent-a"),
+        "generation-A",
+        &frame(spawn("w"), 1000),
+    );
+    workers.ingest(
+        &AgentId::from("agent-b"),
+        "generation-A",
+        &frame(spawn("w"), 1000),
+    );
+    assert!(workers.workspace_has_running_workers(&ws1));
+    assert!(
+        !workers.workspace_has_running_workers(&ws2),
+        "another workspace's worker never counts"
+    );
+
+    workers.ingest(
+        &AgentId::from("agent-a"),
+        "generation-A",
+        &frame(state("w", "completed"), 2000),
+    );
+    assert!(
+        workers.workspace_has_running_workers(&ws1),
+        "agent-b still runs one"
+    );
+    workers.disconnect(&AgentId::from("agent-b"), "generation-A");
+    assert!(
+        !workers.workspace_has_running_workers(&ws1),
+        "ended and disconnected rows do not count"
+    );
+
+    workers.ingest(
+        &AgentId::from("agent-c"),
+        "generation-A",
+        &frame(spawn("w"), 1000),
+    );
+    assert!(workers.workspace_has_running_workers(&ws2));
+    workers.release(&AgentId::from("agent-c"));
+    assert!(!workers.workspace_has_running_workers(&ws2), "released");
+}

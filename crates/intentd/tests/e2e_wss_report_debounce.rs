@@ -20,8 +20,9 @@
 
 use crate::common;
 
+use intentd_test_support::GuardedChild;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -41,15 +42,14 @@ const TOKEN: &str = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdc
 type TlsWs = WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
 
 struct Daemon {
-    child: Child,
+    child: GuardedChild,
     _data_dir_guard: tempfile::TempDir,
     data_dir: PathBuf,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.child.kill_tree();
         if std::thread::panicking() {
             if let Ok(log) = std::fs::read_to_string(self.data_dir.join("daemon.log")) {
                 eprintln!("=== DAEMON LOG ===\n{log}\n=== END LOG ===");
@@ -62,7 +62,7 @@ fn temp_data_dir() -> tempfile::TempDir {
     common::test_tempdir_in("/tmp", "itd-wss-repdeb-")
 }
 
-fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
+fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> GuardedChild {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
@@ -77,7 +77,7 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
         cmd.env(k, v);
     }
     common::hermetic_fixture_identity(&mut cmd, data_dir);
-    cmd.spawn().expect("spawn intentd serve")
+    GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
 }
 
 async fn await_uds(socket: &Path, deadline: tokio::time::Instant) -> bool {
@@ -307,6 +307,7 @@ async fn seed_workspace_only(data_dir: &Path) -> String {
             attention_reminder: None,
             waiting: false,
             scripts_running: false,
+            background_tasks_running: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,

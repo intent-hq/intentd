@@ -130,6 +130,7 @@ fn make_workspace(id: &str, variant: WorkspaceVariant) -> Workspace {
         attention_reminder: None,
         waiting: false,
         scripts_running: false,
+        background_tasks_running: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,

@@ -332,7 +332,10 @@ views identify the repository in the page heading.
 
 In Home versions with a **Waiting** filter, status grouping separates running work
 from external waits. **Running** covers an agent at work or a running command script
-such as a build or test; a dev server or other service script alone does not count.
+such as a build or test. With a matching app and daemon that support background-task
+activity, it also covers an agent's still-running background task, such as a shell
+command it left running; older apps may not show that activity. A dev server or
+other service script, or an open terminal tab, alone does not count.
 **Waiting** covers workspaces watching something external: a monitored PR, a background
 hook, a delegated agent, a script run monitor, or a PR in the merge queue. The
 **Waiting** filter shows the same workspaces; older apps may not offer that filter.

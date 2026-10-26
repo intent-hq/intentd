@@ -16,8 +16,6 @@
 
 use crate::common;
 
-use std::os::unix::process::CommandExt;
-
 use common::DaemonGuard;
 use std::path::Path;
 use std::process::Stdio;
@@ -222,6 +220,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         attention_reminder: None,
         waiting: false,
         scripts_running: false,
+        background_tasks_running: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
@@ -252,10 +251,7 @@ async fn resolve_interrupted_resume_and_abandon() {
         .stderr(Stdio::from(
             std::fs::File::create(data_dir.join("daemon.log")).unwrap(),
         ));
-    // Spawn in its own process group to prevent ACP mock process leaks
-    #[cfg(unix)]
-    cmd.process_group(0);
-    let child = cmd.spawn().expect("spawn intentd serve");
+    let child = common::spawn_guarded(&mut cmd).expect("spawn intentd serve");
     let mut guard = DaemonGuard::process_only(child);
     assert!(await_uds(&socket).await, "daemon did not start");
 
@@ -550,8 +546,7 @@ async fn resolve_interrupted_resume_and_abandon() {
     assert_eq!(resumed2.len(), 0, "already resolved should not resume");
     assert_eq!(failed2.len(), 1, "already resolved should be in failed");
 
-    guard.child_mut().kill().expect("kill daemon");
-    guard.child_mut().wait().expect("wait daemon");
+    guard.kill_tree().expect("kill daemon");
     drop(guard);
 }
 
@@ -574,9 +569,7 @@ async fn resolve_interrupted_invalid_params_validation() {
         .stderr(Stdio::from(
             std::fs::File::create(data_dir.join("daemon.log")).unwrap(),
         ));
-    #[cfg(unix)]
-    cmd.process_group(0);
-    let child = cmd.spawn().expect("spawn intentd serve");
+    let child = common::spawn_guarded(&mut cmd).expect("spawn intentd serve");
     let mut guard = DaemonGuard::process_only(child);
     assert!(await_uds(&socket).await, "daemon did not start");
 
@@ -715,7 +708,6 @@ async fn resolve_interrupted_invalid_params_validation() {
     assert!(v.get("result").is_some(), "valid params should succeed");
     assert!(v.get("error").is_none(), "valid params should not error");
 
-    guard.child_mut().kill().expect("kill daemon");
-    guard.child_mut().wait().expect("wait daemon");
+    guard.kill_tree().expect("kill daemon");
     drop(guard);
 }

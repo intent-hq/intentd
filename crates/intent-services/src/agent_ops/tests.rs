@@ -148,6 +148,7 @@ pub(super) fn workspace(id: &WorkspaceId) -> Workspace {
         attention_reminder: None,
         waiting: false,
         scripts_running: false,
+        background_tasks_running: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
@@ -21750,6 +21751,17 @@ async fn get_subscriptions_projection_cost_is_batched_and_preview_only() {
     assert_eq!(
         one_count, 4,
         "status + session/preview + hook + PR projections"
+    );
+    let (with_extra_query, extra_count) = crate::test_tracing::count_sqlx_statements(async {
+        sqlx::query("SELECT 1").execute(pool).await.unwrap();
+        svc.agent_get_subscriptions_op(ws.clone(), parent.clone())
+            .await
+    })
+    .await;
+    assert_eq!(with_extra_query.unwrap(), one);
+    assert_eq!(
+        extra_count, 5,
+        "an extra application query must remain visible"
     );
     drop(reserved);
     // An unrelated corrupt row must never be decoded by this targeted read.
@@ -44782,7 +44794,12 @@ async fn agent_snapshot_trivial_omits_fields_and_skips_injection() {
         .await
         .expect("snapshot");
     let obj = v.as_object().expect("object");
-    assert_eq!(obj.len(), 1, "trivial snapshot carries only time: {v}");
+    assert_eq!(
+        obj.len(),
+        2,
+        "trivial snapshot carries time and desktop state: {v}"
+    );
+    assert_eq!(v["desktopControl"], json!({"status":"inactive"}));
     let time = v["time"].as_str().expect("time string");
     assert!(
         time.ends_with('Z') && !time.contains('.'),

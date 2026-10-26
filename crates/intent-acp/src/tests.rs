@@ -7153,6 +7153,7 @@ mod workspace_api_tool_tests {
                 attention_reminder: None,
                 waiting: false,
                 scripts_running: false,
+                background_tasks_running: false,
                 checkout_mode: None,
                 disk_usage: None,
                 pending_delete_at: None,
@@ -8092,10 +8093,13 @@ mod workspace_api_tool_tests {
     #[tokio::test]
     async fn assistant_management_discovery_matches_workspace_scope() {
         for (workspace, is_assistant) in [("amber-forest", false), ("__chief__", true)] {
-            for mcp_tools in [false, true] {
+            for (mcp_tools, desktop_control) in
+                [(false, false), (false, true), (true, false), (true, true)]
+            {
                 let srv = server(workspace, None).with_agent_features(
                     intent_core::settings_file::AgentFeaturesSettings {
                         mcp_tools,
+                        desktop_control,
                         ..Default::default()
                     },
                 );
@@ -8106,6 +8110,7 @@ mod workspace_api_tool_tests {
                 let description = response["result"]["tools"][0]["description"]
                     .as_str()
                     .unwrap();
+                assert_eq!(description.contains("ws.desktop.move("), desktop_control);
                 for (namespace, method) in [("mcp", "createServer"), ("chats", "rename")] {
                     assert_eq!(
                         description.contains(&format!("ws.app.{namespace}.{method}(")),
@@ -8113,14 +8118,14 @@ mod workspace_api_tool_tests {
                     );
                     let response = call_workspace_api(
                         &srv,
-                        &format!("let help; try {{ help = await ws.help('app.{namespace}'); }} catch (_) {{ help = ''; }} return {{ installed: typeof ws.app.{namespace} !== 'undefined', advertised: help.includes('ws.app.{namespace}.{method}(') }};"),
+                        &format!("let help; try {{ help = await ws.help('app.{namespace}'); }} catch (_) {{ help = ''; }} return {{ installed: typeof ws.app.{namespace} !== 'undefined', advertised: help.includes('ws.app.{namespace}.{method}('), desktopMove: typeof ws.desktop?.move === 'function' }};"),
                     )
                     .await;
                     assert_eq!(response["result"]["isError"], false, "{response}");
                     let body: Value = serde_json::from_str(tool_text(&response)).unwrap();
                     assert_eq!(
                         body,
-                        json!({ "installed": is_assistant, "advertised": is_assistant })
+                        json!({ "installed": is_assistant, "advertised": is_assistant, "desktopMove": desktop_control })
                     );
                 }
             }
@@ -13907,6 +13912,7 @@ mod workspace_api_output_limit_tests {
                     attention_reminder: None,
                     waiting: false,
                     scripts_running: false,
+                    background_tasks_running: false,
                     checkout_mode: None,
                     disk_usage: None,
                     pending_delete_at: None,
@@ -14237,6 +14243,7 @@ mod workspace_apply_proposal_tests {
             attention_reminder: None,
             waiting: false,
             scripts_running: false,
+            background_tasks_running: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,

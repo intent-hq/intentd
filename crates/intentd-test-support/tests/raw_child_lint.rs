@@ -7,8 +7,9 @@
 //! GuardedChild` kills the process group on drop; this source-scanning test
 //! fails, naming `file:line`, wherever a test file under
 //! `crates/*/tests/**/*.rs` outside the support crate names `Child` as a type,
-//! so a new suite cannot quietly return a bare `Child`. Files that have not
-//! been migrated yet are listed in [`BASELINE`], which can only shrink.
+//! so a new suite cannot quietly return a bare `Child`. Every suite has been
+//! migrated (the former baseline of unmigrated files is gone), so a hit
+//! anywhere fails.
 //!
 //! The heuristic is deliberately small:
 //!
@@ -23,7 +24,9 @@
 //!   `Option<Child>`, `Result<E, Child>`), as a tuple element (after `(`,
 //!   or after a `,` whose enclosing bracket is `(`: `-> (Child, u16)`,
 //!   `struct LiveProcess(Child)`, `Vec<(u16, Child)>`), or as an array /
-//!   slice element (after `[`: `[Child; 1]`, `Box<[Child]>`). A visibility
+//!   slice element (after `[`: `[Child; 1]`, `Box<[Child]>`), or as the
+//!   target of a type alias (`type Proc = Child;`, which would otherwise
+//!   launder it past every other position). A visibility
 //!   qualifier between the marker and the type — `pub`, `pub(crate)`,
 //!   `pub(super)`, `pub(self)`, `pub(in path)` — is skipped, so tuple-struct
 //!   fields such as `struct P(pub Child)` and `(u16, pub(crate) Child)` are
@@ -44,116 +47,11 @@
 //!   `raw-child: allow`, then whitespace, an em dash or hyphen, and a
 //!   nonempty reason. A malformed marker never suppresses the hit; the
 //!   report says so.
-//! - Baseline ratchet: a file in [`BASELINE`] may have hits today. An entry
-//!   whose file has no hits any more (or no longer exists) fails the lint
-//!   with a "remove from BASELINE" message, so the list only ever shrinks.
 
-use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use intentd_test_support::source_lint::{lex, markers_by_line, rust_files, workspace_root, Marker};
-
-/// Test files (relative to the workspace root, `/`-separated) that still own
-/// a bare `std::process::Child`. Migrate a file onto
-/// `intentd_test_support::GuardedChild`, then delete its entry here; the
-/// lint fails while an entry has no hits, so the list can only shrink.
-const BASELINE: &[&str] = &[
-    "crates/intentd-sitter/tests/install_ps1_owner.rs",
-    "crates/intentd-sitter/tests/install_sh_startup.rs",
-    "crates/intentd/tests/common/mod.rs",
-    "crates/intentd/tests/e2e_agent_features_gating.rs",
-    "crates/intentd/tests/e2e_config_precedence.rs",
-    "crates/intentd/tests/e2e_core_hermetic_workspaces_guard.rs",
-    "crates/intentd/tests/e2e_core_orphan_trash_sweep.rs",
-    "crates/intentd/tests/e2e_hook_lifecycle.rs",
-    "crates/intentd/tests/e2e_startup_ordering.rs",
-    "crates/intentd/tests/e2e_transport.rs",
-    "crates/intentd/tests/e2e_wss_agent_config_option.rs",
-    "crates/intentd/tests/e2e_wss_agent_create_name_explicitly_set.rs",
-    "crates/intentd/tests/e2e_wss_agent_cross_provider_history.rs",
-    "crates/intentd/tests/e2e_wss_agent_idle_timeout.rs",
-    "crates/intentd/tests/e2e_wss_agent_lifecycle.rs",
-    "crates/intentd/tests/e2e_wss_agent_list_active.rs",
-    "crates/intentd/tests/e2e_wss_agent_midturn_failure.rs",
-    "crates/intentd/tests/e2e_wss_agent_quota_failure.rs",
-    "crates/intentd/tests/e2e_wss_agent_rehydration.rs",
-    "crates/intentd/tests/e2e_wss_agent_set_model.rs",
-    "crates/intentd/tests/e2e_wss_agent_spawn_retry.rs",
-    "crates/intentd/tests/e2e_wss_agent_state_snapshot.rs",
-    "crates/intentd/tests/e2e_wss_agent_turn_correlation.rs",
-    "crates/intentd/tests/e2e_wss_agent_watch.rs",
-    "crates/intentd/tests/e2e_wss_archive_from_hook.rs",
-    "crates/intentd/tests/e2e_wss_archive_interrupt.rs",
-    "crates/intentd/tests/e2e_wss_archive_parks_wakes.rs",
-    "crates/intentd/tests/e2e_wss_archive_self.rs",
-    "crates/intentd/tests/e2e_wss_auto_commit_llm.rs",
-    "crates/intentd/tests/e2e_wss_auto_unarchive.rs",
-    "crates/intentd/tests/e2e_wss_browser_client_pin.rs",
-    "crates/intentd/tests/e2e_wss_browser_exec.rs",
-    "crates/intentd/tests/e2e_wss_browser_tabs.rs",
-    "crates/intentd/tests/e2e_wss_change_events.rs",
-    "crates/intentd/tests/e2e_wss_chat_tool_result_ids.rs",
-    "crates/intentd/tests/e2e_wss_chief_workspace.rs",
-    "crates/intentd/tests/e2e_wss_codex_session_title.rs",
-    "crates/intentd/tests/e2e_wss_delegate_batch.rs",
-    "crates/intentd/tests/e2e_wss_delegate_provider_resolution.rs",
-    "crates/intentd/tests/e2e_wss_delegation_group_persist.rs",
-    "crates/intentd/tests/e2e_wss_display_status_hooks.rs",
-    "crates/intentd/tests/e2e_wss_display_status_needs_attention.rs",
-    "crates/intentd/tests/e2e_wss_git_clone.rs",
-    "crates/intentd/tests/e2e_wss_git_discard.rs",
-    "crates/intentd/tests/e2e_wss_git_reads.rs",
-    "crates/intentd/tests/e2e_wss_git_writes.rs",
-    "crates/intentd/tests/e2e_wss_github_device_flow.rs",
-    "crates/intentd/tests/e2e_wss_gitignore_suppression.rs",
-    "crates/intentd/tests/e2e_wss_harness_wake.rs",
-    "crates/intentd/tests/e2e_wss_hook_mcp_tools.rs",
-    "crates/intentd/tests/e2e_wss_host.rs",
-    "crates/intentd/tests/e2e_wss_host_credential_env.rs",
-    "crates/intentd/tests/e2e_wss_last_activity.rs",
-    "crates/intentd/tests/e2e_wss_mcp_oauth_refresh.rs",
-    "crates/intentd/tests/e2e_wss_mcp_servers.rs",
-    "crates/intentd/tests/e2e_wss_pending_questions.rs",
-    "crates/intentd/tests/e2e_wss_poisoned_session_recreate.rs",
-    "crates/intentd/tests/e2e_wss_prompt_error_transcript.rs",
-    "crates/intentd/tests/e2e_wss_question_ask.rs",
-    "crates/intentd/tests/e2e_wss_repo_config.rs",
-    "crates/intentd/tests/e2e_wss_report_debounce.rs",
-    "crates/intentd/tests/e2e_wss_restart_tail_recap.rs",
-    "crates/intentd/tests/e2e_wss_resume_queue_order.rs",
-    "crates/intentd/tests/e2e_wss_rtk.rs",
-    "crates/intentd/tests/e2e_wss_script_persistence.rs",
-    "crates/intentd/tests/e2e_wss_script_restarting.rs",
-    "crates/intentd/tests/e2e_wss_script_run_cancellation.rs",
-    "crates/intentd/tests/e2e_wss_serve_resume_all.rs",
-    "crates/intentd/tests/e2e_wss_settings_atomic_rollback.rs",
-    "crates/intentd/tests/e2e_wss_settings_live_reload.rs",
-    "crates/intentd/tests/e2e_wss_setup_script.rs",
-    "crates/intentd/tests/e2e_wss_specialist_frontmatter_model.rs",
-    "crates/intentd/tests/e2e_wss_specialists_changed.rs",
-    "crates/intentd/tests/e2e_wss_stall_annotation.rs",
-    "crates/intentd/tests/e2e_wss_subscribe_snapshot_warn.rs",
-    "crates/intentd/tests/e2e_wss_system_prompt_fallback.rs",
-    "crates/intentd/tests/e2e_wss_tcp_origin_guard.rs",
-    "crates/intentd/tests/e2e_wss_tilde_paths.rs",
-    "crates/intentd/tests/e2e_wss_tool_payload_retention.rs",
-    "crates/intentd/tests/e2e_wss_truncation_redrive.rs",
-    "crates/intentd/tests/e2e_wss_unblocked_hints.rs",
-    "crates/intentd/tests/e2e_wss_wake_or_create.rs",
-    "crates/intentd/tests/e2e_wss_wake_resume.rs",
-    "crates/intentd/tests/e2e_wss_workspace_activity_debounce.rs",
-    "crates/intentd/tests/e2e_wss_workspace_cow.rs",
-    "crates/intentd/tests/e2e_wss_workspace_create_submodule_progress.rs",
-    "crates/intentd/tests/e2e_wss_workspace_direct_survival.rs",
-    "crates/intentd/tests/e2e_wss_workspace_lifecycle_watchers.rs",
-    "crates/intentd/tests/e2e_wss_workspace_owner_derivation.rs",
-    "crates/intentd/tests/e2e_wss_workspace_worktree.rs",
-    "crates/intentd/tests/uds_agent_runtime.rs",
-    "crates/intentd/tests/uds_control.rs",
-    "crates/intentd/tests/uds_git_credentials.rs",
-    "crates/intentd/tests/uds_rpc_profile_warn.rs",
-];
 
 const OPT_OUT_TAG: &str = "raw-child";
 const CHILD: &str = "Child";
@@ -292,8 +190,49 @@ fn is_type_position(chars: &[char], start: usize) -> bool {
         ':' => k == 0 || chars[k - 1] != ':',
         '<' | '(' | '[' => true,
         ',' => matches!(enclosing_open_bracket(chars, k), Some('<' | '(')),
+        '=' => is_type_alias_eq(chars, k),
         _ => false,
     }
+}
+
+/// Whether the `=` at `eq` is the one in a type alias, `type Name = …` or
+/// `type Name<…> = …`: an alias would otherwise launder a bare `Child`
+/// past every other type position.
+fn is_type_alias_eq(chars: &[char], eq: usize) -> bool {
+    if eq > 0 && matches!(chars[eq - 1], '=' | '!' | '<' | '>') {
+        return false;
+    }
+    let Some(mut k) = last_non_ws_before(chars, eq) else {
+        return false;
+    };
+    if chars[k] == '>' {
+        let mut depth = 0usize;
+        loop {
+            match chars[k] {
+                '>' => depth += 1,
+                '<' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            if k == 0 {
+                return false;
+            }
+            k -= 1;
+        }
+    } else {
+        k += 1;
+    }
+    let Some((name_start, _)) = ident_before(chars, k) else {
+        return false;
+    };
+    let Some((kw_start, kw_end)) = ident_before(chars, name_start) else {
+        return false;
+    };
+    chars[kw_start..=kw_end].iter().collect::<String>() == "type"
 }
 
 fn excerpt(line: &str) -> String {
@@ -377,22 +316,8 @@ fn rel_key(rel: &Path) -> String {
 }
 
 #[test]
-fn baseline_entries_are_unique_and_sorted() {
-    for pair in BASELINE.windows(2) {
-        assert!(
-            pair[0] < pair[1],
-            "BASELINE must be sorted and free of duplicates: {:?} is not before {:?}",
-            pair[0],
-            pair[1]
-        );
-    }
-}
-
-#[test]
 fn no_raw_child_types_in_test_suites() {
     let root = workspace_root();
-    let baseline: BTreeMap<&str, bool> = BASELINE.iter().map(|f| (*f, false)).collect();
-    let mut baseline_seen = baseline;
     let mut failures: Vec<String> = Vec::new();
 
     for rel in test_files(&root) {
@@ -402,15 +327,6 @@ fn no_raw_child_types_in_test_suites() {
         let key = rel_key(&rel);
         let src = fs::read_to_string(root.join(&rel)).expect("read test file");
         let hits = scan_source(&src);
-        if let Some(seen) = baseline_seen.get_mut(key.as_str()) {
-            if hits.is_empty() {
-                failures.push(format!(
-                    "{key}: no raw `Child` type positions remain — remove it from BASELINE"
-                ));
-            }
-            *seen = true;
-            continue;
-        }
         for hit in hits {
             let note = if hit.marker_malformed {
                 " (the `raw-child: allow` marker above it is malformed: it must be exactly \
@@ -421,14 +337,6 @@ fn no_raw_child_types_in_test_suites() {
             failures.push(format!("{key}:{}: {}{note}", hit.line, hit.excerpt));
         }
     }
-    for (file, seen) in &baseline_seen {
-        if !seen {
-            failures.push(format!(
-                "{file}: listed in BASELINE but no such test file exists — remove it"
-            ));
-        }
-    }
-
     assert!(
         failures.is_empty(),
         "\n\nRaw `std::process::Child` in test code leaks the process (and its \
@@ -511,6 +419,18 @@ mod heuristic {
                    fn c() -> ::process::Child { todo!() }\n\
                    fn d() -> ::tokio::process::Child { todo!() }\n\
                    use ::std::process::Child;\n";
+        assert_eq!(hit_lines(src), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn type_alias_targets_hit() {
+        let src = "type Proc = Child;\n\
+                   pub type Proc2 = std::process::Child;\n\
+                   type P3<T> = (T, Child);\n\
+                   type P4<T> = Child;\n\
+                   type Q = GuardedChild;\n\
+                   type R = tokio::process::Child;\n\
+                   fn f(a: u8) -> bool { a == 1 }\n";
         assert_eq!(hit_lines(src), vec![1, 2, 3, 4]);
     }
 

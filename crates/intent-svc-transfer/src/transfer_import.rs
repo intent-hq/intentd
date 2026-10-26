@@ -1218,6 +1218,7 @@ fn workspace_for_materialize(workspace_id: &WorkspaceId, row: &serde_json::Value
         attention_reminder: None,
         waiting: false,
         scripts_running: false,
+        background_tasks_running: false,
         checkout_mode: None,
         disk_usage: None,
         membership: None,

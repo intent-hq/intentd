@@ -17,7 +17,7 @@
 
 use crate::common;
 
-use std::os::unix::process::CommandExt;
+use intentd_test_support::GuardedChild;
 use std::path::{Path, PathBuf};
 
 use std::sync::Arc;
@@ -38,53 +38,41 @@ use tokio_tungstenite::WebSocketStream;
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
 struct Daemon {
-    child: std::process::Child,
+    child: GuardedChild,
     data_dir: PathBuf,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        // Kill the whole process group FIRST (daemon + any Node.js ACP provider
-        // children) BEFORE wait(), so children are reaped before they get reparented.
-        // The daemon was spawned with process_group(0), making it the group leader.
-        #[cfg(unix)]
-        {
-            use nix::errno::Errno;
-            use nix::sys::signal::{self, Signal};
-            use nix::unistd::Pid;
-            // Snapshot descendants BEFORE killing: ACP providers (and their
-            // workspace-mcp bridge children) are spawned into their OWN
-            // process groups (`process_group(0)` in intent-acp), so killpg on
-            // the daemon's group misses them; post-kill they reparent to init
-            // and become invisible to a ppid walk. An orphaned provider waking
-            // from a mock `delayMs` respawns the bridge (an `intentd`
-            // invocation) whose tracing init recreates
-            // `<data_dir>/intentd.<date>.log` after the TempDir sweep,
-            // leaving `itd-delgrp-*` residue under /tmp.
-            let descendants = descendant_pids(self.child.id());
-            let pid = Pid::from_raw(self.child.id().cast_signed());
-            let _ = signal::killpg(pid, Signal::SIGKILL);
-            let _ = self.child.wait();
-            for &d in &descendants {
-                let _ = signal::kill(Pid::from_raw(d), Signal::SIGKILL);
-            }
-            // Bounded wait until the group AND the swept descendants are gone
-            // (signal-0 probes), so nothing can race the TempDir removal.
-            for _ in 0..200 {
-                let group_alive = signal::killpg(pid, None) != Err(Errno::ESRCH);
-                let straggler = descendants
-                    .iter()
-                    .any(|&d| signal::kill(Pid::from_raw(d), None).is_ok());
-                if !group_alive && !straggler {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
+        use nix::sys::signal::{self, Signal};
+        use nix::unistd::Pid;
+        // Snapshot descendants BEFORE killing: ACP providers (and their
+        // workspace-mcp bridge children) are spawned into their OWN process
+        // groups (`process_group(0)` in intent-acp), so the group kill misses
+        // them; post-kill they reparent to init and become invisible to a
+        // ppid walk. An orphaned provider waking from a mock `delayMs`
+        // respawns the bridge (an `intentd` invocation) whose tracing init
+        // recreates `<data_dir>/intentd.<date>.log` after the TempDir sweep,
+        // leaving `itd-delgrp-*` residue under /tmp.
+        let group = self.child.id();
+        let descendants = descendant_pids(group);
+        // Kill the daemon's whole process group (GuardedChild) and reap it.
+        let _ = self.child.kill_tree();
+        for &d in &descendants {
+            let _ = signal::kill(Pid::from_raw(d), Signal::SIGKILL);
         }
-        #[cfg(not(unix))]
-        {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+        // Bounded wait until the group AND the swept descendants are gone, so
+        // nothing can race the TempDir removal. The group check skips zombies:
+        // GuardedChild's watchdog stays an unreaped group member until the
+        // guard itself drops, after this.
+        for _ in 0..200 {
+            let straggler = descendants
+                .iter()
+                .any(|&d| signal::kill(Pid::from_raw(d), None).is_ok());
+            if !straggler && !group_has_live_members(group) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
         // On test panic, print data-dir path + daemon log tail + agent stderr for diagnosability
         if std::thread::panicking() {
@@ -116,6 +104,26 @@ impl Drop for Daemon {
             }
         }
     }
+}
+
+/// Whether any non-zombie process is still in process group `pgid`
+/// (`false` if `ps` cannot be run: teardown then degrades to the descendant
+/// probe alone).
+fn group_has_live_members(pgid: u32) -> bool {
+    let Ok(out) = std::process::Command::new("ps")
+        .args(["-axo", "pgid=,stat="])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+    else {
+        return false;
+    };
+    let pgid = pgid.to_string();
+    String::from_utf8_lossy(&out.stdout).lines().any(|line| {
+        let mut parts = line.split_whitespace();
+        parts.next() == Some(pgid.as_str())
+            && parts.next().is_some_and(|stat| !stat.starts_with('Z'))
+    })
 }
 
 /// Snapshot `root`'s descendant pids (children, grandchildren, …) by walking
@@ -175,7 +183,7 @@ fn descendant_pids(root: u32) -> Vec<i32> {
     pids
 }
 
-fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> std::process::Child {
+fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> GuardedChild {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
@@ -192,11 +200,10 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> std::proc
         cmd.env(k, v);
     }
     common::hermetic_fixture_identity(&mut cmd, data_dir);
-    // Spawn in its own process group (pgid == child pid) so killing the daemon on
-    // test panic/failure also kills spawned Node.js ACP mock providers via killpg.
-    #[cfg(unix)]
-    cmd.process_group(0);
-    cmd.spawn().expect("spawn intentd serve")
+    // GuardedChild: the daemon gets its own process group, killed on drop, panic
+    // or test-process death. ACP providers start their own groups (intent-acp),
+    // so this does not reach them.
+    GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -435,6 +442,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         attention_reminder: None,
         waiting: false,
         scripts_running: false,
+        background_tasks_running: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,

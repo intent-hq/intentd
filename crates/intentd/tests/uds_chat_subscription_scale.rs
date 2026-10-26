@@ -190,6 +190,7 @@ fn seed_workspace(idx: usize) -> Workspace {
         attention_reminder: None,
         waiting: false,
         scripts_running: false,
+        background_tasks_running: false,
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,

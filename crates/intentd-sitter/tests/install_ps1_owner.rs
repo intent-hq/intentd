@@ -25,7 +25,9 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Command, Output, Stdio};
+
+use intentd_test_support::GuardedChild;
 
 fn install_ps1() -> String {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/install.ps1");
@@ -292,29 +294,23 @@ fn write_pid_file(data_dir: &Path, contents: &str) {
 }
 
 /// A live process to stand in for the running daemon, killed on drop.
-struct LiveProcess(Child);
+struct LiveProcess(GuardedChild);
 
 impl LiveProcess {
     fn spawn() -> Self {
         Self(
-            Command::new("sleep")
-                .arg("120")
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .unwrap(),
+            GuardedChild::spawn(
+                Command::new("sleep")
+                    .arg("120")
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null()),
+            )
+            .unwrap(),
         )
     }
 
     fn pid(&self) -> u32 {
         self.0.id()
-    }
-}
-
-impl Drop for LiveProcess {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
     }
 }
 

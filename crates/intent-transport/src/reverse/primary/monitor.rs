@@ -236,13 +236,15 @@ mod tests {
         let identity = ReverseClientIdentity {
             client_id: id.clone(),
             name: Some("Original desktop".into()),
-            capabilities: json!({"browserExec":true}),
+            capabilities: json!({"browserExec":true,"desktopControl":1}),
             host: ClientHostInfo::default(),
         };
         source.bind_device(identity.clone(), principal.clone());
         source.bind(identity);
         let before = registry.authenticated_clients();
         let live_before = registry.live_clients();
+        let desktop_before = registry.desktop_candidates(&principal);
+        assert_eq!(desktop_before.len(), 1);
         let hello = source
             .prepare_ordinary_monitor_source(id.clone(), principal.clone())
             .unwrap();
@@ -266,6 +268,14 @@ mod tests {
         assert_eq!(*first.0.lock().unwrap(), (true, false));
         assert_eq!(registry.authenticated_clients(), before);
         assert_eq!(registry.live_clients(), live_before);
+        assert_eq!(registry.desktop_candidates(&principal), desktop_before);
+        assert_eq!(
+            registry
+                .desktop_resolve(&intent_core::ReverseTarget::Default, &principal)
+                .unwrap(),
+            desktop_before[0],
+            "private monitor attachments never replace the ordinary desktop incarnation"
+        );
         assert!(a.bound_client_id().is_none());
         assert!(b.bound_client_id().is_none());
         drop(a);
