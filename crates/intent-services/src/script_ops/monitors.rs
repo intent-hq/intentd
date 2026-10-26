@@ -110,7 +110,7 @@ impl ScriptManager {
     async fn eligible_monitor_owner(&self, ws: &WorkspaceId, agent: &AgentId) -> Result<()> {
         let owner = self.store.get_agent_session_summary(agent).await?;
         if owner.workspace_id != *ws
-            || crate::agent_ops::is_terminal_status(owner.status)
+            || self.agent_wake.is_terminal_status(owner.status)
             || self
                 .store
                 .get_agent_session_retired_at(agent)

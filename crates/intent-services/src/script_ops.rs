@@ -334,6 +334,9 @@ impl ScriptLocks {
 #[derive(Clone)]
 pub struct ScriptManager {
     owner_services: Option<crate::Services>,
+    /// The owner's agent-wake port, kept apart from `owner_services` so the
+    /// monitor-owner check works on a manager detached from its owner.
+    agent_wake: Arc<dyn crate::feature_ports::AgentWakePort>,
     pty: Arc<PtyHost>,
     bus: Option<EventBus>,
     store: Store,
@@ -499,6 +502,7 @@ impl ScriptManager {
     ) -> Self {
         Self {
             owner_services: None,
+            agent_wake: Arc::new(crate::feature_ports::UnavailableAgentWake),
             pty,
             bus,
             store,
@@ -546,6 +550,7 @@ impl ScriptManager {
     }
 
     pub(crate) fn with_owner_services(mut self, services: crate::Services) -> Self {
+        self.agent_wake = services.ports.agent_wake_port();
         self.owner_services = Some(services);
         self
     }
