@@ -18601,7 +18601,7 @@ mod role_reminder_tests {
 
     use super::*;
     use crate::events::EventBus;
-    use intent_core::{AgentStatus, Workspace, WorkspaceActivity, WorkspaceStatus};
+    use intent_core::{AgentStatus, Workspace};
     use intent_store::Store;
 
     /// Seed a hermetic specialists dir under temp with one `<id>.md`. Keep the
@@ -18618,52 +18618,9 @@ mod role_reminder_tests {
             id: id.clone(),
             title: "WS".to_string(),
             branch: "main".to_string(),
-            base_ref: None,
-            base_commit_sha: None,
-            status: WorkspaceStatus::Active,
-            status_message: None,
-            status_image_asset_id: None,
-            activity: WorkspaceActivity::Idle,
-            attention: WorkspaceAttention::None,
             created_at: ts.clone(),
             updated_at: ts,
-            last_activity: None,
-            last_content_activity: None,
-            tags: vec![],
-            path: None,
-            repository_path: None,
-            repository_owner: None,
-            repository_name: None,
-            worktree_path: None,
-            scope: None,
-            skip_worktree: false,
-            setup_script: None,
-            is_remote: false,
-            default_model: None,
-            pr_number: None,
-            pr_url: None,
-            pr_status: None,
-            active_pull_request: None,
-            pull_requests: None,
-            context_links: None,
-            archived: false,
-            archived_at: None,
-            retired_at: None,
-            task_stats: None,
-            agent_summary: None,
-            diff_summary: None,
-            token_usage: None,
-            cow_supported: None,
-            browser_client_id: None,
-            pull_requests_total: None,
-            display_status: None,
-            waiting: false,
-            scripts_running: false,
-            background_tasks_running: false,
-            checkout_mode: None,
-            disk_usage: None,
-            pending_delete_at: None,
-            membership: None,
+            ..Default::default()
         }
     }
 
@@ -23307,10 +23264,7 @@ mod agent_retry_tests {
     use super::*;
     use crate::events::EventBus;
     use crate::BusEventSink;
-    use intent_core::{
-        AgentSession, AgentStatus, Workspace, WorkspaceActivity, WorkspaceAttention,
-        WorkspaceStatus,
-    };
+    use intent_core::{AgentSession, AgentStatus, Workspace};
     use intent_store::Store;
     use std::sync::Arc;
 
@@ -23320,52 +23274,9 @@ mod agent_retry_tests {
             id: id.clone(),
             title: "Test WS".to_string(),
             branch: "main".to_string(),
-            base_ref: None,
-            base_commit_sha: None,
-            status: WorkspaceStatus::Active,
-            status_message: None,
-            status_image_asset_id: None,
-            activity: WorkspaceActivity::Idle,
-            attention: WorkspaceAttention::None,
             created_at: ts.clone(),
             updated_at: ts.clone(),
-            last_activity: None,
-            last_content_activity: None,
-            tags: vec![],
-            path: None,
-            repository_path: None,
-            repository_owner: None,
-            repository_name: None,
-            worktree_path: None,
-            pull_requests: None,
-            context_links: None,
-            scope: None,
-            skip_worktree: false,
-            setup_script: None,
-            is_remote: false,
-            default_model: None,
-            archived: false,
-            archived_at: None,
-            retired_at: None,
-            active_pull_request: None,
-            pr_number: None,
-            pr_status: None,
-            pr_url: None,
-            agent_summary: None,
-            diff_summary: None,
-            token_usage: None,
-            cow_supported: None,
-            browser_client_id: None,
-            pull_requests_total: None,
-            display_status: None,
-            waiting: false,
-            scripts_running: false,
-            background_tasks_running: false,
-            checkout_mode: None,
-            disk_usage: None,
-            pending_delete_at: None,
-            membership: None,
-            task_stats: None,
+            ..Default::default()
         }
     }
 

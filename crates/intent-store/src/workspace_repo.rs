@@ -2,8 +2,8 @@
 
 use intent_core::{
     now_iso, AgentId, CheckoutMode, ClientId, ContextLink, Error, PullRequestInfo,
-    PullRequestWorkspace, Result, SetupScript, TokenUsage, Workspace, WorkspaceActivity,
-    WorkspaceAttention, WorkspaceId, WorkspaceListFilter, WorkspaceStatus, CHIEF_WORKSPACE_ID,
+    PullRequestWorkspace, Result, SetupScript, TokenUsage, Workspace, WorkspaceAttention,
+    WorkspaceId, WorkspaceListFilter, WorkspaceStatus, CHIEF_WORKSPACE_ID,
 };
 use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
@@ -1877,8 +1877,6 @@ fn map_workspace_row(row: &SqliteRow) -> Result<Workspace> {
         status: enum_from_db::<WorkspaceStatus>(&col::<String>(row, "status")?)?,
         status_message: col(row, "status_message")?,
         status_image_asset_id: col(row, "status_image_asset_id")?,
-        // Derived, read-only; never persisted (§9.9).
-        activity: WorkspaceActivity::Idle,
         attention: enum_from_db::<WorkspaceAttention>(&col::<String>(row, "attention")?)?,
         created_at: col(row, "created_at")?,
         updated_at: col(row, "updated_at")?,
@@ -1904,25 +1902,14 @@ fn map_workspace_row(row: &SqliteRow) -> Result<Workspace> {
         archived: col::<i64>(row, "archived")? != 0,
         archived_at: col(row, "archived_at")?,
         retired_at: col(row, "retired_at")?,
-        // Card aggregates are computed on the workspace.list/get emit path
-        // (intent-services), never persisted.
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        display_status: None,
-        waiting: false,
-        scripts_running: false,
-        background_tasks_running: false,
         token_usage,
-        // cow_supported is computed on the emit path (intent-services), never persisted.
-        cow_supported: None,
         checkout_mode,
         browser_client_id: col::<Option<String>>(row, "browser_client_id")?.map(ClientId),
-        // disk_usage is computed on the emit path (intent-services), never persisted.
-        disk_usage: None,
-        pending_delete_at: None,
-        // pull_requests_total is set by the list-row slimming (intent-core), never persisted.
-        pull_requests_total: None,
-        membership: None,
+        // Everything else is never persisted: `activity` is derived (§9.9),
+        // the card aggregates, `displayStatus`, the wait/script/background
+        // flags, `cowSupported`, and `diskUsage` are filled on the
+        // intent-services emit path, and `pullRequestsTotal` by list-row
+        // slimming (intent-core). A new persisted column must be read above.
+        ..Default::default()
     })
 }

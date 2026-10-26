@@ -270,9 +270,7 @@ fn gate(test: &str) -> Option<String> {
 /// the turn is pure daemon + mock provider). The store handle is dropped before
 /// the daemon opens the same data dir.
 async fn seed_workspace(data_dir: &Path) -> String {
-    use intent_core::{
-        now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
-    };
+    use intent_core::{now_iso, Workspace, WorkspaceId};
     use intent_store::Store;
     let store = Store::open(&data_dir.join("intentd.db"))
         .await
@@ -283,52 +281,9 @@ async fn seed_workspace(data_dir: &Path) -> String {
         id: id.clone(),
         title: "WSS chat block ids".to_string(),
         branch: "main".to_string(),
-        base_ref: None,
-        base_commit_sha: None,
-        status: WorkspaceStatus::Active,
-        status_message: None,
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
-        attention: WorkspaceAttention::None,
         created_at: ts.clone(),
         updated_at: ts,
-        last_activity: None,
-        last_content_activity: None,
-        tags: vec![],
-        path: None,
-        repository_path: None,
-        repository_owner: None,
-        repository_name: None,
-        worktree_path: None,
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
-        default_model: None,
-        pr_number: None,
-        pr_url: None,
-        pr_status: None,
-        active_pull_request: None,
-        pull_requests: None,
-        context_links: None,
-        archived: false,
-        archived_at: None,
-        retired_at: None,
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        pull_requests_total: None,
-        display_status: None,
-        waiting: false,
-        scripts_running: false,
-        background_tasks_running: false,
-        checkout_mode: None,
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
+        ..Default::default()
     };
     store.insert_workspace(&ws).await.expect("insert ws");
     id.0

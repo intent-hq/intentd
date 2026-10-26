@@ -22398,19 +22398,13 @@ impl WorkspaceApi for Services {
                         // raw-equal without FE-side stripping (§7.6).
                         base_ref: input.base_ref.map(|r| canonicalise_base_ref(&r)),
                         base_commit_sha: input.base_commit_sha,
-                        status: WorkspaceStatus::Active,
                         status_message: input.status_message,
-                        status_image_asset_id: None,
-                        // Derived, read-only; never persisted (§9.9).
-                        activity: WorkspaceActivity::Idle,
-                        attention: WorkspaceAttention::None,
                         created_at: now.clone(),
                         updated_at: now.clone(),
                         // Stamp `lastActivity` at create so it is always
                         // populated — the emit path (§9.1) still enriches
                         // with the max of notes / agents / updatedAt.
                         last_activity: Some(now),
-                        last_content_activity: None,
                         tags: input.tags.unwrap_or_default(),
                         path: input.path,
                         repository_path: input.repository_path,
@@ -22419,7 +22413,6 @@ impl WorkspaceApi for Services {
                         worktree_path: input.worktree_path,
                         scope: input.scope,
                         skip_worktree: input.skip_isolation.unwrap_or(false),
-                        setup_script: None,
                         is_remote: input.is_remote.unwrap_or(false),
                         default_model: input.default_model,
                         // PR linkage from a pr-kind contextLink: number/url
@@ -22436,25 +22429,9 @@ impl WorkspaceApi for Services {
                         // Validated pre-insert above; an empty list persists
                         // as absent so the wire shape omits it (§5.1).
                         context_links: input.context_links.filter(|l| !l.is_empty()),
-                        archived: false,
-                        archived_at: None,
-                        retired_at: None,
-                        // Card aggregates are computed on the list/get emit path only.
-                        task_stats: None,
-                        agent_summary: None,
-                        diff_summary: None,
-                        token_usage: None,
-                        cow_supported: None,
-                        browser_client_id: None,
-                        pull_requests_total: None,
-                        display_status: None,
-                        waiting: false,
-                        scripts_running: false,
-                        background_tasks_running: false,
-                        checkout_mode: None,
-                        disk_usage: None,
-                        pending_delete_at: None,
-                        membership: None,
+                        // `activity` is derived (§9.9) and the card aggregates
+                        // are computed on the list/get emit path only.
+                        ..Default::default()
                     };
                     // Provision the workspace checkout (TS `createGitWorktree`
                     // parity): a local workspace created off a local git repo
@@ -24442,12 +24419,6 @@ impl WorkspaceApi for Services {
                 title,
                 branch: new_id.0.clone(),
                 base_ref: source.base_ref.clone(),
-                base_commit_sha: None,
-                status: WorkspaceStatus::Active,
-                status_message: None,
-                status_image_asset_id: None,
-                activity: WorkspaceActivity::Idle,
-                attention: WorkspaceAttention::None,
                 created_at: now.clone(),
                 updated_at: now.clone(),
                 // Stamp the wire `lastActivity` at creation time (parity with
@@ -24456,42 +24427,16 @@ impl WorkspaceApi for Services {
                 // then folds in any copied notes / activity carried over from
                 // the source workspace.
                 last_activity: Some(now.clone()),
-                last_content_activity: None,
                 tags: source.tags.clone(),
                 path: source.path.clone(),
                 repository_path: source.repository_path.clone(),
                 repository_owner: source.repository_owner.clone(),
                 repository_name: source.repository_name.clone(),
-                worktree_path: None,
                 scope: source.scope.clone(),
                 skip_worktree: source.skip_worktree,
-                setup_script: None,
                 is_remote: source.is_remote,
                 default_model: source.default_model.clone(),
-                pr_number: None,
-                pr_url: None,
-                pr_status: None,
-                active_pull_request: None,
-                pull_requests: None,
-                context_links: None,
-                archived: false,
-                archived_at: None,
-                retired_at: None,
-                task_stats: None,
-                agent_summary: None,
-                diff_summary: None,
-                token_usage: None,
-                cow_supported: None,
-                browser_client_id: None,
-                pull_requests_total: None,
-                display_status: None,
-                waiting: false,
-                scripts_running: false,
-                background_tasks_running: false,
-                checkout_mode: None,
-                disk_usage: None,
-                pending_delete_at: None,
-                membership: None,
+                ..Default::default()
             };
             // Provision the checkout for the duplicate (TS
             // `duplicateWorkspace` parity, mirroring the `workspace.create`
