@@ -54,18 +54,16 @@ env:
   LINUX_BIGMEM_BURST_THRESHOLD: ${{ vars.CI_LINUX_BIGMEM_SLOTS || '0' }}
 
 # The heavy jobs share two self-hosted Linux slots, so cancel
-# superseded PR runs instead of letting them back up the queue. Main pushes
-# share one group too, and a newer push cancels the older commit's run even
-# mid-flight: auto-cut-alpha.yml reads only the push run on main's live tip,
-# and main is linear, so the cancelled run is never the tip's. Per-commit
-# Windows proofs therefore cover only commits that reach the tip (each tip's
-# tree contains every superseded commit). A re-run (attempt > 1) gets a group
-# of its own, so re-running an old commit can never cancel the tip's run.
-# Merge-queue refs are unique per entry and never cancelled here
-# (retire-obsolete-merge-runs.yml retires obsolete queue runs).
+# superseded PR runs instead of letting them back up the queue. Each main push
+# run gets a group of its own and concurrency never cancels it: GitHub admits
+# a group's runs in no guaranteed order, so a shared cancelling group could
+# let an older commit's late run cancel the tip's, and a shared queueing group
+# makes the tip wait behind an older run. The `supersede` job retires older
+# push runs by commit ancestry instead. Merge-queue refs are unique per entry
+# and never cancelled here (retire-obsolete-merge-runs.yml retires them).
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}${{ github.event_name == 'push' && github.run_attempt != '1' && format('-rerun-{0}', github.run_id) || '' }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
+  group: ${{ github.workflow }}-${{ github.ref }}${{ github.event_name == 'push' && format('-{0}', github.run_id) || '' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   # Paid-label workloads prefer compatible self-hosted capacity; free standard labels run on GitHub. Keep the probe
@@ -830,6 +828,35 @@ jobs:
   # empty so the retained native step guards never bypass queue validation
   # or main release builds. CI Gate is the only required context; the old
   # per-matrix required-context constraint (intentd#868) no longer applies.
+  # Superseded main pushes (push to main only). auto-cut-alpha.yml reads only
+  # the push run on main's live tip, so per-commit Windows proofs cover only
+  # commits that reach the tip (each tip's tree contains every superseded
+  # commit). scripts/supersede-push-runs.py cancels live push runs whose
+  # commit is a strict ancestor of this one, and reports superseded=true when
+  # main's live tip is already strictly ahead of this commit (an older run
+  # admitted late), which skips this run's Windows post-merge job. Main is
+  # linear, so the tip's run is never cancelled; any API error leaves runs
+  # alone and reports false. Hosted and independent of `route` so it starts at
+  # once; advisory in CI Gate.
+  supersede:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
+      contents: read
+    outputs:
+      superseded: ${{ steps.scan.outputs.superseded }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Retire superseded main-push runs
+        id: scan
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I -B scripts/supersede-push-runs.py --repo "$GITHUB_REPOSITORY" --sha "$GITHUB_SHA" --run-id "$GITHUB_RUN_ID" >> "$GITHUB_OUTPUT"
+
   release-fast-path:
     needs: [route]
     runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
@@ -1164,14 +1191,15 @@ jobs:
   # them (the queue runs only `windows-lint` above). A Windows-only runtime
   # failure therefore lands on main; the push CI Gate goes red and
   # auto-cut-alpha.yml refuses to cut an alpha until a fix (or a re-run)
-  # turns it green. Routed like `windows-lint`. A newer main push cancels a
-  # superseded commit's run (see the workflow `concurrency`), and a
-  # release-metadata push skips this job: release-fast-path reported
-  # release_push=true, and CI Gate accepts the skip only then. A failed or
-  # skipped classifier reports nothing, so the job still runs.
+  # turns it green. Routed like `windows-lint`. It is skipped when this
+  # commit is already superseded (`supersede` reported superseded=true; a
+  # newer push's scan cancels it if it is still running) or is a
+  # release-metadata push (release-fast-path reported release_push=true). CI
+  # Gate accepts the skip only then; a failed or skipped classifier or scan
+  # reports nothing, so the job still runs.
   windows:
-    needs: [route, release-fast-path]
-    if: ${{ !cancelled() && github.event_name == 'push' && needs.release-fast-path.outputs.release_push != 'true' }}
+    needs: [route, release-fast-path, supersede]
+    if: ${{ !cancelled() && github.event_name == 'push' && needs.release-fast-path.outputs.release_push != 'true' && needs.supersede.outputs.superseded != 'true' }}
     strategy:
       matrix:
         include:
@@ -2203,7 +2231,9 @@ jobs:
           python3 -I -B scripts/test-retire-obsolete-merge-runs-caller.py
           python3 -I -B scripts/test-retire-obsolete-merge-runs-workflow.py
       - name: Test native CI routing and gate results
-        run: python3 -I -B scripts/test-ci-native-routing.py
+        run: |
+          python3 -I -B scripts/test-ci-native-routing.py
+          python3 -I -B scripts/test-supersede-push-runs.py
       - name: Install release cache regression compiler
         shell: bash
         run: |
@@ -2477,7 +2507,7 @@ jobs:
     name: CI Gate
     if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
-    needs: [route, pr-static, release-fast-path, cache-smoke, daemon-lifecycle, check, windows-cross-lint, build, windows-lint, windows, macos-services-runtime, coverage-e2e, coverage-all, coverage-changed, pr-title, conflict-markers, monorepo-consumer-checks, deb-packaging, release-scripts, install-ps1, pi-session-paths]
+    needs: [route, pr-static, release-fast-path, supersede, cache-smoke, daemon-lifecycle, check, windows-cross-lint, build, windows-lint, windows, macos-services-runtime, coverage-e2e, coverage-all, coverage-changed, pr-title, conflict-markers, monorepo-consumer-checks, deb-packaging, release-scripts, install-ps1, pi-session-paths]
     steps:
       - name: Check results
         run: |
@@ -2543,11 +2573,14 @@ jobs:
               require pi-session-paths "${{ needs.pi-session-paths.result }}"
               ;;
             push)
-              # Release-metadata pushes skip the Windows post-merge job; the
-              # skip is accepted only when the classifier job succeeded and
-              # reported release_push (see `release-fast-path`).
+              # Release-metadata and superseded pushes skip the Windows
+              # post-merge job; the skip is accepted only when the reporting
+              # job succeeded (see `release-fast-path` and `supersede`).
               windows=require
               if [ "${{ needs.release-fast-path.result }}" = success ] && [ "${{ needs.release-fast-path.outputs.release_push }}" = true ]; then
+                windows=optional
+              fi
+              if [ "${{ needs.supersede.result }}" = success ] && [ "${{ needs.supersede.outputs.superseded }}" = true ]; then
                 windows=optional
               fi
               require route "${{ needs.route.result }}"
