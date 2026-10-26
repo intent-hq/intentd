@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.49] - 2026-10-26
+
+### 🐛 Bug Fixes
+
+- *(mcp)* State when ws.pr.unmonitor may stop a monitor in its summary ([#2694](https://github.com/intent-hq/intentd/pull/2694))
+- Bump claude-agent-acp pin to v0.95.0 ([#2543](https://github.com/intent-hq/intentd/pull/2543))
+
+
 ## [0.11.48] - 2026-10-26
 
 ### 🚀 Features
