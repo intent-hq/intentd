@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.50] - 2026-10-26
+
+### 🚀 Features
+
+- *(pr-monitor)* Report every new review and which commit it covers ([#2695](https://github.com/intent-hq/intentd/pull/2695))
+
+### 🐛 Bug Fixes
+
+- *(harness)* Stop duplicating the workspace block for default agents ([#2698](https://github.com/intent-hq/intentd/pull/2698))
+
+### 🔧 Refactor
+
+- *(services)* Route scripts and hooks through a runtime port ([#2697](https://github.com/intent-hq/intentd/pull/2697))
+- *(services)* Route terminals and browser tabs through the runtime port ([#2702](https://github.com/intent-hq/intentd/pull/2702))
+
+
 ## [0.11.49] - 2026-10-26
 
 ### 🐛 Bug Fixes
