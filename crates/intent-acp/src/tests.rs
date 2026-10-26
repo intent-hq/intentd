@@ -6413,6 +6413,7 @@ mod mcp_bridge_tests {
             // the line before the gate opens, so the race is exercised).
             bridge.send_request(2).await;
             let mut peek = String::new();
+            // fixed-deadline: allow — stays under fast_cfg()'s 2s reconnect_window, after which the bridge may legitimately reject
             let silent = timeout(
                 Duration::from_millis(200),
                 bridge.stdout.read_line(&mut peek),
@@ -6519,6 +6520,7 @@ mod mcp_bridge_tests {
             // to consume the line before the gate opens).
             bridge.send_request(2).await;
             let mut peek = String::new();
+            // fixed-deadline: allow — stays under fast_cfg()'s 2s reconnect_window, after which the bridge may legitimately reject
             let silent = timeout(
                 Duration::from_millis(200),
                 bridge.stdout.read_line(&mut peek),
@@ -6839,6 +6841,7 @@ mod _dead_workspace_metadata_tool_tests {
                 pull_requests: None,
                 archived: false,
                 archived_at: None,
+                retired_at: None,
                 task_stats: None,
                 agent_summary: None,
                 diff_summary: None,
@@ -7138,6 +7141,7 @@ mod workspace_api_tool_tests {
                 context_links: None,
                 archived: false,
                 archived_at: None,
+                retired_at: None,
                 task_stats: None,
                 agent_summary: None,
                 diff_summary: None,
@@ -7147,6 +7151,8 @@ mod workspace_api_tool_tests {
                 pull_requests_total: None,
                 display_status: None,
                 waiting: false,
+                scripts_running: false,
+                background_tasks_running: false,
                 checkout_mode: None,
                 disk_usage: None,
                 pending_delete_at: None,
@@ -8086,10 +8092,13 @@ mod workspace_api_tool_tests {
     #[tokio::test]
     async fn assistant_management_discovery_matches_workspace_scope() {
         for (workspace, is_assistant) in [("amber-forest", false), ("__chief__", true)] {
-            for mcp_tools in [false, true] {
+            for (mcp_tools, desktop_control) in
+                [(false, false), (false, true), (true, false), (true, true)]
+            {
                 let srv = server(workspace, None).with_agent_features(
                     intent_core::settings_file::AgentFeaturesSettings {
                         mcp_tools,
+                        desktop_control,
                         ..Default::default()
                     },
                 );
@@ -8100,6 +8109,7 @@ mod workspace_api_tool_tests {
                 let description = response["result"]["tools"][0]["description"]
                     .as_str()
                     .unwrap();
+                assert_eq!(description.contains("ws.desktop.move("), desktop_control);
                 for (namespace, method) in [("mcp", "createServer"), ("chats", "rename")] {
                     assert_eq!(
                         description.contains(&format!("ws.app.{namespace}.{method}(")),
@@ -8107,14 +8117,14 @@ mod workspace_api_tool_tests {
                     );
                     let response = call_workspace_api(
                         &srv,
-                        &format!("let help; try {{ help = await ws.help('app.{namespace}'); }} catch (_) {{ help = ''; }} return {{ installed: typeof ws.app.{namespace} !== 'undefined', advertised: help.includes('ws.app.{namespace}.{method}(') }};"),
+                        &format!("let help; try {{ help = await ws.help('app.{namespace}'); }} catch (_) {{ help = ''; }} return {{ installed: typeof ws.app.{namespace} !== 'undefined', advertised: help.includes('ws.app.{namespace}.{method}('), desktopMove: typeof ws.desktop?.move === 'function' }};"),
                     )
                     .await;
                     assert_eq!(response["result"]["isError"], false, "{response}");
                     let body: Value = serde_json::from_str(tool_text(&response)).unwrap();
                     assert_eq!(
                         body,
-                        json!({ "installed": is_assistant, "advertised": is_assistant })
+                        json!({ "installed": is_assistant, "advertised": is_assistant, "desktopMove": desktop_control })
                     );
                 }
             }
@@ -9994,6 +10004,7 @@ mod wsapi6_bindings_tests {
     struct FakeApi {
         pr_snapshot_calls: Mutex<Vec<PrSnapshotCall>>,
         cross_list_siblings_calls: Mutex<u32>,
+        cross_list_siblings_include_retired: Mutex<Vec<bool>>,
         cross_read_note_calls: Mutex<Vec<CrossReadCall>>,
         cross_list_notes_calls: Mutex<Vec<String>>,
         browser_exec_calls: Mutex<Vec<BrowserExecCall>>,
@@ -10044,8 +10055,16 @@ mod wsapi6_bindings_tests {
             })
         }
 
-        fn cross_workspace_list_siblings(&self, _ws: WorkspaceId) -> BoxFuture<'_, Result<Value>> {
+        fn cross_workspace_list_siblings(
+            &self,
+            _ws: WorkspaceId,
+            include_retired: bool,
+        ) -> BoxFuture<'_, Result<Value>> {
             *self.cross_list_siblings_calls.lock().unwrap() += 1;
+            self.cross_list_siblings_include_retired
+                .lock()
+                .unwrap()
+                .push(include_retired);
             Box::pin(async {
                 Ok(json!([
                     { "id": "sibling-1", "title": "Sib One", "branch": "b/1", "status": "active" },
@@ -10189,6 +10208,56 @@ mod wsapi6_bindings_tests {
         assert!(v.is_array());
         assert_eq!(v[0]["id"], json!("sibling-1"));
         assert_eq!(*api.cross_list_siblings_calls.lock().unwrap(), 1);
+    }
+
+    /// `includeRetired` is strictly boolean: omission and explicit `false`
+    /// list live siblings, `true` opts in, and any other value (`"true"`,
+    /// `null`, a number, an object) is an invalid-params error that never
+    /// reaches the service.
+    #[tokio::test]
+    async fn cross_workspace_list_siblings_rejects_a_non_boolean_include_retired() {
+        let (srv, api) = server();
+        for (arg, want) in [
+            ("", false),
+            ("{ includeRetired: false }", false),
+            ("{ includeRetired: true }", true),
+        ] {
+            let resp = call(
+                &srv,
+                &format!("return await ws.crossWorkspace.listSiblings({arg});"),
+            )
+            .await;
+            assert_eq!(resp["result"]["isError"], json!(false), "{arg}: {resp}");
+            assert_eq!(
+                api.cross_list_siblings_include_retired
+                    .lock()
+                    .unwrap()
+                    .last(),
+                Some(&want),
+                "{arg}"
+            );
+        }
+        for bad in ["'true'", "null", "1", "{}"] {
+            let resp = call(
+                &srv,
+                &format!(
+                    "return await ws.crossWorkspace.listSiblings({{ includeRetired: {bad} }});"
+                ),
+            )
+            .await;
+            let text = resp.to_string();
+            assert_eq!(resp["result"]["isError"], json!(true), "{bad}: {text}");
+            assert!(
+                text.contains("includeRetired must be a boolean")
+                    || text.contains("`includeRetired` must be a boolean"),
+                "{bad}: {text}"
+            );
+        }
+        assert_eq!(
+            *api.cross_list_siblings_calls.lock().unwrap(),
+            3,
+            "bad values never reach the api"
+        );
     }
 
     #[tokio::test]
@@ -13830,6 +13899,7 @@ mod workspace_api_output_limit_tests {
                     context_links: None,
                     archived: false,
                     archived_at: None,
+                    retired_at: None,
                     task_stats: None,
                     agent_summary: None,
                     diff_summary: None,
@@ -13839,6 +13909,8 @@ mod workspace_api_output_limit_tests {
                     pull_requests_total: None,
                     display_status: None,
                     waiting: false,
+                    scripts_running: false,
+                    background_tasks_running: false,
                     checkout_mode: None,
                     disk_usage: None,
                     pending_delete_at: None,
@@ -14158,6 +14230,7 @@ mod workspace_apply_proposal_tests {
             context_links: None,
             archived: false,
             archived_at: None,
+            retired_at: None,
             task_stats: None,
             agent_summary: None,
             diff_summary: None,
@@ -14166,6 +14239,8 @@ mod workspace_apply_proposal_tests {
             browser_client_id: None,
             display_status: None,
             waiting: false,
+            scripts_running: false,
+            background_tasks_running: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,

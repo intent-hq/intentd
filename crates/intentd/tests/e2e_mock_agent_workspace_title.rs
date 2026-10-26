@@ -14,7 +14,7 @@
 //! an in-process shortcut — it exercises the same wire path production agents
 //! use to rename their workspace on the first turn.
 
-mod common;
+use crate::common;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -68,6 +68,7 @@ fn slug_workspace(id: &WorkspaceId) -> Workspace {
         context_links: None,
         archived: false,
         archived_at: None,
+        retired_at: None,
         task_stats: None,
         agent_summary: None,
         diff_summary: None,
@@ -77,6 +78,8 @@ fn slug_workspace(id: &WorkspaceId) -> Workspace {
         pull_requests_total: None,
         display_status: None,
         waiting: false,
+        scripts_running: false,
+        background_tasks_running: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,

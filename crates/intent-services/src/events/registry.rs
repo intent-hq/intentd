@@ -201,7 +201,10 @@ impl WatcherRegistry {
         // instead of being skipped until the next daemon restart.
         let mut initial: Vec<(WorkspaceId, PathBuf)> = Vec::new();
         let mut missing: HashMap<WorkspaceId, PathBuf> = HashMap::new();
-        match services.list_workspaces(false).await {
+        match services
+            .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+            .await
+        {
             Ok(list) => {
                 for ws in list {
                     let Some(root) = ws.effective_path() else {
@@ -300,9 +303,11 @@ impl WatcherRegistry {
         }
     }
 
-    /// Await every requested shared watch actually being registered with the
-    /// OS. Registration is deferred off the caller's thread (monorepo#1572), so
-    /// tests must wait for it before mutating a watched tree.
+    /// Await every requested shared watch being LIVE with the OS, riding out a
+    /// creation retry and panicking on a dead watch or on `timeout` (see
+    /// [`SharedWatchHub::wait_all_established`]). Registration is deferred off
+    /// the caller's thread (monorepo#1572), so tests must wait for it before
+    /// mutating a watched tree.
     /// `expect_roots` is the number of watched roots the caller expects to
     /// exist, so a wait issued before the registry has subscribed does not
     /// return immediately against an empty hub.
@@ -938,7 +943,7 @@ mod tests {
     impl WorkspaceApi for FakeApi {
         fn list_workspaces(
             &self,
-            _include_archived: bool,
+            _filter: intent_core::WorkspaceListFilter,
         ) -> BoxFuture<'_, Result<Vec<Workspace>>> {
             let ws = self.workspaces.lock().unwrap().clone();
             Box::pin(async move { Ok(ws) })

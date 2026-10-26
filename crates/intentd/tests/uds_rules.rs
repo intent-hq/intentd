@@ -6,7 +6,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -72,6 +72,7 @@ fn sample_ws(id: &WorkspaceId, worktree: &std::path::Path) -> Workspace {
         context_links: None,
         archived: false,
         archived_at: None,
+        retired_at: None,
         task_stats: None,
         agent_summary: None,
         diff_summary: None,
@@ -81,6 +82,8 @@ fn sample_ws(id: &WorkspaceId, worktree: &std::path::Path) -> Workspace {
         pull_requests_total: None,
         display_status: None,
         waiting: false,
+        scripts_running: false,
+        background_tasks_running: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,

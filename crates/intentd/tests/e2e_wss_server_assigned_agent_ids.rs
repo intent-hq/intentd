@@ -8,7 +8,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
@@ -96,7 +96,8 @@ async fn wss_rpc_raw(ws: &mut PlainWs, id: i64, method: &str, params: Value) -> 
 /// Wait up to `secs` for the next `events.event` notification whose payload
 /// `type` matches one of `types`; ignore other frames.
 async fn next_event(ws: &mut PlainWs, types: &[&str], secs: u64) -> Value {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(secs));
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         assert!(!remaining.is_zero(), "timed out waiting for {types:?}");

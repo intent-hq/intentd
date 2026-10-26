@@ -10,10 +10,16 @@
 #[path = "wss_integration/comment_deletion.rs"]
 mod comment_deletion;
 mod common;
+#[path = "wss_integration/desktop_control.rs"]
+mod desktop_control;
 #[path = "wss_integration/discovery_context.rs"]
 mod discovery_context;
+#[path = "wss_integration/discussion.rs"]
+mod discussion;
 #[path = "wss_integration/git_commit_removal.rs"]
 mod git_commit_removal;
+#[path = "wss_integration/guest_roles.rs"]
+mod guest_roles;
 #[path = "wss_integration/host_roles.rs"]
 mod host_roles;
 #[path = "wss_integration/human_attribution.rs"]
@@ -246,7 +252,7 @@ async fn make_services(
         intent_services::SettingsRegistry::load(dir.path().join("config.toml"))
             .expect("load settings registry"),
     );
-    let mut services = Services::new(store.clone())
+    let mut services = intent_app::compose(Services::new(store.clone()))
         .with_assets_root(dir.path().join("assets"))
         .with_workspaces_root(workspaces_root)
         .with_settings_registry(registry.clone())
@@ -4345,36 +4351,42 @@ async fn wss_members_add_delivers_workspace_to_connected_guest() {
         json!({ "added": false, "memberCount": 2 }),
         "{again}"
     );
-    let quiet = tokio::time::timeout(Duration::from_millis(500), async {
-        loop {
-            match ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let v: Value = serde_json::from_str(&text).expect("json");
-                    if v["method"] == "subscription.push" {
-                        return v;
+    let quiet = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(500)),
+        async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v["method"] == "subscription.push" {
+                            return v;
+                        }
                     }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
                 }
-                Some(Ok(_)) => {}
-                other => panic!("expected text frame, got {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await;
     assert!(quiet.is_err(), "idempotent add pushed: {quiet:?}");
-    let quiet_owner = tokio::time::timeout(Duration::from_millis(500), async {
-        loop {
-            match owner_ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let v: Value = serde_json::from_str(&text).expect("json");
-                    if v["method"] == "events.event" {
-                        return v;
+    let quiet_owner = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(500)),
+        async {
+            loop {
+                match owner_ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json");
+                        if v["method"] == "events.event" {
+                            return v;
+                        }
                     }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
                 }
-                Some(Ok(_)) => {}
-                other => panic!("expected text frame, got {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await;
     assert!(
         quiet_owner.is_err(),
@@ -7269,7 +7281,7 @@ async fn wss_presence_channel_join_delta_leave_and_gating() {
     assert_eq!(
         ev["data"]["members"],
         json!([{ "principalId": alice.id.0, "login": "alice", "displayName": null,
-                 "avatarUrl": null, "hostRole": "guest", "focus": [], "typing": [] }]),
+                 "avatarUrl": null, "hostRole": "guest", "focus": [], "typing": [], "discussionTyping": [] }]),
         "{ev}"
     );
 
@@ -7723,7 +7735,7 @@ async fn wss_presence_typing_sources_and_snapshot() {
     }
     let ws = ws_id.0.clone();
     let hello = json!({ "clientId": "cli-alice", "name": "Alice" });
-    let typing = json!({ "focus": [], "typing": { "agentId": "agent-typing" } });
+    let typing = json!({ "focus": [], "typing": { "agentId": "agent-typing" }, "discussionTyping": { "workspaceId": ws } });
     let alice_row = |ev: &Value| -> Value {
         ev["data"]["members"]
             .as_array()
@@ -7784,7 +7796,7 @@ async fn wss_presence_typing_sources_and_snapshot() {
     assert_eq!(
         alice_row(&json!({ "data": v["result"] })),
         json!({ "principalId": alice.id.0, "login": "alice", "displayName": null,
-                "avatarUrl": null, "hostRole": "guest", "focus": [], "typing": [] }),
+                "avatarUrl": null, "hostRole": "guest", "focus": [], "typing": [], "discussionTyping": [] }),
         "snapshot rows match the presence:changed member shape: {v}"
     );
 
@@ -7838,6 +7850,11 @@ async fn wss_presence_typing_sources_and_snapshot() {
         .as_u64()
         .unwrap_or_else(|| panic!("pulse: {ev}"));
 
+    let discussion = &row["discussionTyping"][0];
+    assert_eq!(discussion["source"], s1);
+    assert_eq!(pulse1, 1);
+    assert_eq!(discussion["pulse"], 1, "each typing kind owns its counter");
+
     // A1 keeps typing to the same agent: the pulse advances (the receiver's
     // freshness signal) while `since` stays the episode start.
     let v = a1.call(3, "presence.update", typing.clone()).await;
@@ -7850,7 +7867,11 @@ async fn wss_presence_typing_sources_and_snapshot() {
         let next = row["typing"][0]["pulse"]
             .as_u64()
             .unwrap_or_else(|| panic!("pulse: {ev}"));
-        assert!(next > pulse1, "a repeated pulse is fresher: {ev}");
+        assert_eq!(
+            next,
+            pulse1 + 1,
+            "discussion typing leaves the agent counter unchanged: {ev}"
+        );
         next
     };
 
@@ -14019,6 +14040,7 @@ fn fixture_workspace(id: &WorkspaceId) -> Workspace {
         context_links: None,
         archived: false,
         archived_at: None,
+        retired_at: None,
         task_stats: None,
         agent_summary: None,
         diff_summary: None,
@@ -14028,6 +14050,8 @@ fn fixture_workspace(id: &WorkspaceId) -> Workspace {
         pull_requests_total: None,
         display_status: None,
         waiting: false,
+        scripts_running: false,
+        background_tasks_running: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
@@ -21417,9 +21441,9 @@ async fn wss_workspace_import_commit_materializes_git() {
     src_ws.repository_path = Some(repo.to_string_lossy().into_owned());
     src_ws.repository_name = Some("test-repo".to_string());
     let staging = src.path().join("staging");
-    let intent_services::transfer_git::TransferBundle {
+    let intent_app::transfer::transfer_git::TransferBundle {
         bundle_path, refs, ..
-    } = intent_services::transfer_git::create_transfer_bundle(&src_ws, &[], &staging)
+    } = intent_app::transfer::transfer_git::create_transfer_bundle(&src_ws, &[], &staging)
         .expect("bundle");
     assert!(
         refs.workspace_wip_commit_sha.is_some(),
@@ -23607,7 +23631,15 @@ async fn wss_explicit_blocker_recovery_scope_generation_and_task_states() {
             .await
             .unwrap();
         note.metadata.task.as_mut().unwrap().assigned_agent_ids = vec![agent.clone()];
-        srv.store.update_note_metadata(&note).await.unwrap();
+        srv.store
+            .update_note_metadata(
+                &srv.store
+                    .lock_note_content(&note.workspace_id, &note.id)
+                    .await,
+                &note,
+            )
+            .await
+            .unwrap();
         let mut session = srv.store.get_agent_session(&agent).await.unwrap();
         session.task_note_id = Some(intent_core::NoteId(note_id.into()));
         srv.store.update_agent_session(&ws, &session).await.unwrap();
@@ -23698,7 +23730,15 @@ async fn wss_explicit_blocker_recovery_relink_rejects_prepared_task_write() {
         assert!(marked.get("error").is_none(), "{marked}");
         let mut task = srv.store.get_note(&ws, &note).await.unwrap();
         task.metadata.task.as_mut().unwrap().assigned_agent_ids = vec![agent.clone()];
-        srv.store.update_note_metadata(&task).await.unwrap();
+        srv.store
+            .update_note_metadata(
+                &srv.store
+                    .lock_note_content(&task.workspace_id, &task.id)
+                    .await,
+                &task,
+            )
+            .await
+            .unwrap();
         notes.push(note);
     }
     let old = &notes[0];
@@ -23763,7 +23803,14 @@ async fn wss_explicit_blocker_recovery_relink_rejects_prepared_task_write() {
     );
     let rejected = srv
         .store
-        .update_note_metadata_if_agent_linked(&prepared, before_note.rev, &agent)
+        .update_note_metadata_if_agent_linked(
+            &srv.store
+                .lock_note_content(&prepared.workspace_id, &prepared.id)
+                .await,
+            &prepared,
+            before_note.rev,
+            &agent,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -23805,13 +23852,27 @@ async fn wss_explicit_blocker_recovery_relink_rejects_prepared_task_write() {
     valid.metadata.task.as_mut().unwrap().status = intent_core::TaskStatus::InProgress;
     let accepted = srv
         .store
-        .update_note_metadata_if_agent_linked(&valid, current.rev, &agent)
+        .update_note_metadata_if_agent_linked(
+            &srv.store
+                .lock_note_content(&valid.workspace_id, &valid.id)
+                .await,
+            &valid,
+            current.rev,
+            &agent,
+        )
         .await
         .unwrap();
     assert_eq!(accepted, Some(current.rev + 1));
     assert_eq!(
         srv.store
-            .update_note_metadata_if_agent_linked(&current, current.rev, &agent)
+            .update_note_metadata_if_agent_linked(
+                &srv.store
+                    .lock_note_content(&current.workspace_id, &current.id)
+                    .await,
+                &current,
+                current.rev,
+                &agent
+            )
             .await
             .unwrap(),
         None

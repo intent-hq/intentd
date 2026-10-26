@@ -3,8 +3,8 @@
 use intent_core::repository_resource_pages::{RepositoryKnownQuery, RepositoryKnownSelection};
 
 use super::{
-    denied, entry, unavailable, BoxFuture, Error, Frame, Instant, Ordering, RepositoryReadContext,
-    Result, Services, State, READ,
+    denied, entry, read_limit, unavailable, BoxFuture, Error, Frame, Instant, Ordering,
+    RepositoryReadContext, Result, Services, State,
 };
 
 pub(crate) fn resolve(
@@ -20,7 +20,7 @@ pub(crate) fn resolve(
             }
             let lease = r.lease(&q.read_lifetime_id)?;
             *r.state.lock().map_err(denied)? = State::Reading(lease.clone());
-            let selection = tokio::time::timeout(READ, async {
+            let selection = tokio::time::timeout(read_limit(), async {
                 r.validate(&lease).await?;
                 if !r
                     .base

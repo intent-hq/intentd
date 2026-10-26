@@ -2,10 +2,11 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
+use intentd_test_support::GuardedChild;
 use std::path::Path;
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
@@ -20,18 +21,12 @@ use tokio_tungstenite::tungstenite::Message;
 const TOKEN: &str = "abababababababababababababababababababababababababababababababab";
 
 struct Daemon {
-    child: Child,
+    child: GuardedChild,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        use nix::sys::signal::{self, Signal};
-        use nix::unistd::Pid;
-        let _ = signal::killpg(
-            Pid::from_raw(self.child.id().cast_signed()),
-            Signal::SIGKILL,
-        );
-        let _ = self.child.wait();
+        let _ = self.child.kill_tree();
     }
 }
 
@@ -116,7 +111,6 @@ fn temp_data_dir() -> tempfile::TempDir {
 }
 
 fn spawn_serve(data_dir: &Path, script: &str, behavior: &str) -> Daemon {
-    use std::os::unix::process::CommandExt;
     common::enable_ws_api(data_dir);
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir workspaces dir");
@@ -131,8 +125,7 @@ fn spawn_serve(data_dir: &Path, script: &str, behavior: &str) -> Daemon {
         .env("MOCK_AGENT_BEHAVIOR", behavior)
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
-    command.process_group(0);
-    let child = command.spawn().expect("spawn intentd serve");
+    let child = GuardedChild::spawn(&mut command).expect("spawn intentd serve");
     Daemon { child }
 }
 
@@ -191,6 +184,7 @@ async fn seed_workspace(data_dir: &Path) -> String {
         context_links: None,
         archived: false,
         archived_at: None,
+        retired_at: None,
         task_stats: None,
         agent_summary: None,
         diff_summary: None,
@@ -200,6 +194,8 @@ async fn seed_workspace(data_dir: &Path) -> String {
         pull_requests_total: None,
         display_status: None,
         waiting: false,
+        scripts_running: false,
+        background_tasks_running: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,

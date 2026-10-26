@@ -72,7 +72,11 @@ pub const ASSERT_BOUND_CALLER_ENV: &str = "INTENTD_ASSERT_BOUND_CALLER";
 /// request is refused: `Forbidden`, logged once per `gate` per process so a
 /// missed spawn binding shows up in the daemon log — and, under
 /// [`ASSERT_BOUND_CALLER_ENV`], fatal to the process.
-pub(crate) fn gated_collaborator_caller(gate: &str) -> Result<Option<PrincipalId>> {
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn gated_collaborator_caller(gate: &str) -> Result<Option<PrincipalId>> {
     match current_caller() {
         Some(Caller::Wire {
             principal_id,
@@ -198,7 +202,11 @@ impl Services {
 
     /// Shared host execution and safe host reads. The current durable role,
     /// not a repository identity or the role cached at admission, grants it.
-    pub(crate) async fn require_host_execution(&self, what: &str) -> Result<()> {
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub async fn require_host_execution(&self, what: &str) -> Result<()> {
         let Some(principal_id) = gated_collaborator_caller(what)? else {
             return Ok(());
         };
@@ -211,7 +219,11 @@ impl Services {
     /// Workspace management is independent of daemon administration. Keep
     /// the existing explicit workspace-owner path; inherited host membership
     /// applies only to ordinary workspaces and overrides retained guest rows.
-    pub(crate) async fn require_workspace_manager(
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub async fn require_workspace_manager(
         &self,
         workspace_id: &WorkspaceId,
         what: &str,
@@ -234,14 +246,92 @@ impl Services {
         self.require_owner(workspace_id, what).await
     }
 
+    /// Scoped authority for agent creation and operating saved scripts. Never
+    /// use for terminal access, arbitrary execution, sharing or workspace CRUD.
+    /// Returns whether this is a restricted Manager guest (for field checks).
+    pub(crate) async fn require_workspace_operator(
+        &self,
+        workspace_id: &WorkspaceId,
+        what: &str,
+    ) -> Result<bool> {
+        if let Some(principal_id) = gated_collaborator_caller(what)? {
+            if self.store.get_host_role(&principal_id).await? == HostRole::Guest {
+                match self
+                    .store
+                    .get_workspace_member_role(workspace_id, &principal_id)
+                    .await?
+                {
+                    Some(WorkspaceRole::Manager) => return Ok(true),
+                    Some(WorkspaceRole::Collaborator) => {
+                        return Err(Error::Forbidden(format!(
+                            "{what} requires a workspace Manager"
+                        )))
+                    }
+                    None => return Err(not_a_member(workspace_id)),
+                    Some(WorkspaceRole::Owner) => {}
+                }
+            }
+        }
+        self.require_workspace_manager(workspace_id, what).await?;
+        Ok(false)
+    }
+
+    pub(crate) async fn require_saved_script_operator(
+        &self,
+        workspace_id: &WorkspaceId,
+        script_id: &str,
+        what: &str,
+    ) -> Result<()> {
+        if self.require_workspace_operator(workspace_id, what).await? {
+            let script = self
+                .store
+                .get_script_in_workspace(workspace_id, script_id)
+                .await?
+                .ok_or_else(|| Error::NotFound("script".into()))?;
+            if script.purpose != intent_core::ScriptPurpose::Saved {
+                return Err(Error::Forbidden(format!("{what} requires a saved script")));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn workspace_members_set_role_op(
+        &self,
+        workspace_id: &WorkspaceId,
+        principal_id: &PrincipalId,
+        role: WorkspaceRole,
+    ) -> Result<Value> {
+        self.require_owner(workspace_id, "workspace.members.setRole")
+            .await?;
+        self.store.get_workspace(workspace_id).await?;
+        let actor = gated_collaborator_caller("workspace.members.setRole")?;
+        let changed = self
+            .store
+            .set_workspace_guest_role(workspace_id, principal_id, role, actor.as_ref())
+            .await?;
+        if changed {
+            crate::publish_event(
+                self.event_bus.as_ref(),
+                crate::workspace_updated_event(
+                    workspace_id,
+                    &json!({"members":true,"rolePrincipalId":principal_id,"role":role}),
+                ),
+            )
+            .await;
+        }
+        Ok(
+            json!({"workspaceId":workspace_id,"principalId":principal_id,"role":role,"changed":changed}),
+        )
+    }
+
     /// Owner-only gate. A collaborator member gets `Forbidden`; a non-member
     /// `NotFound`.
     pub(crate) async fn require_owner(&self, workspace_id: &WorkspaceId, what: &str) -> Result<()> {
         match self.collaborator_role(workspace_id, what).await? {
             None | Some((_, Some(WorkspaceRole::Owner))) => Ok(()),
-            Some((_, Some(WorkspaceRole::Collaborator))) => Err(Error::Forbidden(format!(
-                "{what} requires the workspace owner"
-            ))),
+            Some((_, Some(WorkspaceRole::Collaborator | WorkspaceRole::Manager))) => Err(
+                Error::Forbidden(format!("{what} requires the workspace owner")),
+            ),
             Some((_, None)) => Err(not_a_member(workspace_id)),
         }
     }
@@ -328,47 +418,6 @@ impl Services {
         let workspace_id = WorkspaceId::from(info.scope.as_str());
         self.require_workspace_manager(&workspace_id, what).await?;
         self.store.get_workspace(&workspace_id).await.map(|_| ())
-    }
-
-    /// Chunk/session handles never confer another authenticated person's
-    /// transfer authority. Reconnects retain access through the same principal.
-    pub(crate) async fn require_import_actor(&self, id: &str, what: &str) -> Result<()> {
-        self.require_host_execution(what).await?;
-        let Some(principal) = gated_collaborator_caller(what)? else {
-            return Ok(());
-        };
-        let imports = self
-            .transfer_imports
-            .lock()
-            .expect("transfer import registry poisoned");
-        if imports
-            .get(id)
-            .is_some_and(|s| s.initiator.as_ref() != Some(&principal))
-        {
-            return Err(Error::NotFound(format!("import {id}")));
-        }
-        Ok(())
-    }
-
-    pub(crate) async fn require_export_actor(&self, id: &str, what: &str) -> Result<()> {
-        let Some(principal) = gated_collaborator_caller(what)? else {
-            return Ok(());
-        };
-        let session = self
-            .transfer_exports
-            .lock()
-            .expect("transfer export registry poisoned")
-            .get(id)
-            .map(|s| (s.workspace_id.clone(), s.initiator.clone()));
-        let Some((workspace, initiator)) = session else {
-            self.require_host_execution(what).await?;
-            return Ok(());
-        };
-        self.require_workspace_manager(&workspace, what).await?;
-        if initiator.as_ref() != Some(&principal) {
-            return Err(Error::NotFound(format!("export {id}")));
-        }
-        Ok(())
     }
 
     /// Path-based `git.*` gate (`git.getBranches` / `branchStatus` / `pull` /
@@ -822,6 +871,8 @@ impl Services {
 }
 
 #[cfg(test)]
+mod guest_role_tests;
+#[cfg(test)]
 mod sharing_tests;
 
 #[cfg(test)]
@@ -834,7 +885,7 @@ mod tests {
 
     /// The caller roles of the matrix, one column each.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum Role {
+    pub(super) enum Role {
         Administrator,
         Owner,
         Collaborator,
@@ -855,14 +906,14 @@ mod tests {
     /// One workspace with a non-administrator **owner** (the primary is
     /// demoted so the one-owner index admits the promotion), a collaborator
     /// member, and a principal with no membership.
-    struct Fixture {
-        services: Services,
-        ws: WorkspaceId,
-        other_ws: WorkspaceId,
-        primary: PrincipalId,
-        owner: PrincipalId,
-        collaborator: PrincipalId,
-        outsider: PrincipalId,
+    pub(super) struct Fixture {
+        pub(super) services: Services,
+        pub(super) ws: WorkspaceId,
+        pub(super) other_ws: WorkspaceId,
+        pub(super) primary: PrincipalId,
+        pub(super) owner: PrincipalId,
+        pub(super) collaborator: PrincipalId,
+        pub(super) outsider: PrincipalId,
     }
 
     fn principal(login: &str) -> Principal {
@@ -879,7 +930,7 @@ mod tests {
         }
     }
 
-    async fn fixture(tmp: &TempDb) -> Fixture {
+    pub(super) async fn fixture(tmp: &TempDb) -> Fixture {
         let store = Store::open(&tmp.path).await.expect("open store");
         let ws = WorkspaceId::new();
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
@@ -943,7 +994,7 @@ mod tests {
             }
         }
 
-        async fn run<T, F>(&self, role: Role, f: F) -> Result<T>
+        pub(super) async fn run<T, F>(&self, role: Role, f: F) -> Result<T>
         where
             F: Future<Output = Result<T>>,
         {
@@ -1208,7 +1259,10 @@ mod tests {
             ),
             (
                 "workspace.list",
-                f.services.list_workspaces(true).await.map(drop),
+                f.services
+                    .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+                    .await
+                    .map(drop),
             ),
             (
                 "workspace.delete",
@@ -1459,7 +1513,10 @@ mod tests {
         let services = f.services.clone();
         let (tx, rx) = tokio::sync::oneshot::channel();
         drop(tokio::spawn(async move {
-            let outcome = services.list_workspaces(true).await.map(|w| w.len());
+            let outcome = services
+                .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+                .await
+                .map(|w| w.len());
             let _ = tx.send(format!("{outcome:?}"));
         }));
         let outcome = rx.await.expect("detached task reported");
@@ -1537,7 +1594,11 @@ mod tests {
         let f = fixture(&tmp).await;
         for role in ROLES {
             let listed: HashSet<WorkspaceId> = f
-                .run(role, f.services.list_workspaces(true))
+                .run(
+                    role,
+                    f.services
+                        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED),
+                )
                 .await
                 .expect("workspace.list")
                 .into_iter()
@@ -1592,7 +1653,7 @@ mod tests {
                 .run(
                     role,
                     f.services
-                        .find_workspaces_by_pull_request(format!("{PR}/files")),
+                        .find_workspaces_by_pull_request(format!("{PR}/files"), false),
                 )
                 .await
                 .expect("workspace.findByPullRequest")
@@ -1611,8 +1672,10 @@ mod tests {
             let bad = f
                 .run(
                     role,
-                    f.services
-                        .find_workspaces_by_pull_request("https://github.com/o/r/issues/7".into()),
+                    f.services.find_workspaces_by_pull_request(
+                        "https://github.com/o/r/issues/7".into(),
+                        false,
+                    ),
                 )
                 .await;
             assert!(
@@ -1864,9 +1927,12 @@ mod tests {
         let again = add(&f.outsider).await.expect("add again");
         assert_eq!(again, json!({ "added": false, "memberCount": 4 }));
         assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(300), events.recv())
-                .await
-                .is_err(),
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(std::time::Duration::from_millis(300)),
+                events.recv()
+            )
+            .await
+            .is_err(),
             "an idempotent add publishes nothing"
         );
 
@@ -1885,9 +1951,12 @@ mod tests {
             "{seated_revoked:?}"
         );
         assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(300), events.recv())
-                .await
-                .is_err(),
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(std::time::Duration::from_millis(300)),
+                events.recv()
+            )
+            .await
+            .is_err(),
             "a refused add publishes nothing"
         );
         assert_eq!(

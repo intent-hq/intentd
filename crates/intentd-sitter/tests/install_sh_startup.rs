@@ -17,8 +17,10 @@ use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
+
+use intentd_test_support::GuardedChild;
 
 fn install_sh() -> String {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/install.sh");
@@ -330,28 +332,22 @@ fn created_dir(path: &Path) -> PathBuf {
 
 /// A live process to stand in for the running daemon, killed on drop so a
 /// failing test never leaks it.
-struct LiveProcess(Child);
+struct LiveProcess(GuardedChild);
 
 impl LiveProcess {
     fn spawn() -> Self {
-        let child = Command::new("sleep")
-            .arg("120")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+        let child = GuardedChild::spawn(
+            Command::new("sleep")
+                .arg("120")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null()),
+        )
+        .unwrap();
         Self(child)
     }
 
     fn pid(&self) -> u32 {
         self.0.id()
-    }
-}
-
-impl Drop for LiveProcess {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
     }
 }
 

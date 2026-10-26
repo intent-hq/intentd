@@ -135,6 +135,27 @@ pub(crate) fn controlled(f: &LiveFixture, c: Arc<Control>) -> WorkspaceMcpServer
         .with_repository_guidance(&f.session, f.owner.guidance_source())
 }
 pub(crate) async fn tcp(server: WorkspaceMcpServer, code: &str) -> Value {
+    tcp_within(
+        server,
+        code,
+        crate::test_support::fixture_timeout(Duration::from_secs(15)),
+    )
+    .await
+}
+/// [`tcp`] for a 63/64 acquisition control: the served server carries the
+/// shared quota script budget and the reply is guarded against its timer.
+pub(crate) async fn quota_tcp(server: WorkspaceMcpServer, code: &str) -> Value {
+    use crate::test_support::quota_script;
+    let server = quota_script::budget(server);
+    let budget = server.workspace_api_timeout();
+    quota_script::guard(
+        "context-output-quota-tcp",
+        budget,
+        tcp_within(server, code, quota_script::QUOTA_TRANSPORT_WAIT),
+    )
+    .await
+}
+async fn tcp_within(server: WorkspaceMcpServer, code: &str, wait: Duration) -> Value {
     let bridge = intent_acp::mcp_bridge::serve_workspace_mcp_tcp(Arc::new(server))
         .await
         .unwrap();
@@ -144,13 +165,10 @@ pub(crate) async fn tcp(server: WorkspaceMcpServer, code: &str) -> Value {
         .await
         .unwrap();
     let mut line = String::new();
-    tokio::time::timeout(
-        crate::test_support::fixture_timeout(Duration::from_secs(15)),
-        BufReader::new(stream).read_line(&mut line),
-    )
-    .await
-    .unwrap()
-    .unwrap();
+    tokio::time::timeout(wait, BufReader::new(stream).read_line(&mut line))
+        .await
+        .unwrap()
+        .unwrap();
     drop(bridge);
     serde_json::from_str(&line).unwrap()
 }
@@ -1091,9 +1109,12 @@ async fn context_output_mixed_original_worktree_locks_omit_only_optional_and_kee
             holder.await.unwrap();
         } else {
             assert!(
-                tokio::time::timeout(Duration::from_millis(80), &mut task)
-                    .await
-                    .is_err(),
+                tokio::time::timeout(
+                    intentd_test_support::test_timeout(Duration::from_millis(80)),
+                    &mut task
+                )
+                .await
+                .is_err(),
                 "shared required lock cannot be bypassed"
             );
             if mode == "shared-retired" {
@@ -1521,7 +1542,7 @@ async fn monitor_guidance_current_context_continuation_preserves_saved_session()
             .flatten()
             .collect()
     }
-    for version in ["3.0", "3.1", "3.2"] {
+    for version in ["3.0", "3.1", "3.2", "3.3", "3.4"] {
         let http = ReadServer::new().await;
         let f = LiveFixture::with_version(&http, version).await;
         let store = &f.base.auth.service.store;
@@ -1556,7 +1577,7 @@ async fn monitor_guidance_current_context_continuation_preserves_saved_session()
         assert!(first_text.contains("group/project"), "{first}");
         assert_eq!(
             first_text.contains("Qualified monitoring is prepared but production-disabled"),
-            version == "3.2"
+            matches!(version, "3.2" | "3.3" | "3.4")
         );
         f.base.git.git(
             &f.base.git.path,
@@ -1603,7 +1624,7 @@ async fn monitor_guidance_current_context_continuation_preserves_saved_session()
             next_text.contains(
                 "Existing watches and restored history keep their original target and account"
             ),
-            version == "3.2"
+            matches!(version, "3.2" | "3.3" | "3.4")
         );
         let caller = Caller::Agent {
             agent_id: f.session.id.clone(),

@@ -26,7 +26,7 @@ use crate::model::{
     TaskGetMyTaskResult, TaskListResult, TaskMarkAsTaskResult, TaskRemoveAgentFromAllTasksResult,
     TaskSetRelationsResult, TaskUpdateNoteStatusResult, TaskUpdateResult, TaskUpdateStatusResult,
     TokenUsage, Workspace, WorkspaceCreate, WorkspaceCreateResult, WorkspaceEventSummary,
-    WorkspaceSetupStatus, WorkspaceTask, WorkspaceUpdate,
+    WorkspaceListFilter, WorkspaceSetupStatus, WorkspaceTask, WorkspaceUpdate,
 };
 use crate::repo_ref::RepoRef;
 
@@ -43,6 +43,33 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// `intent-services` (§3.2 rule 3). The default bodies return an internal error
 /// so downstream stubs compile until they override these methods.
 pub trait WorkspaceApi: Send + Sync {
+    fn desktop_agent_call(
+        &self,
+        _workspace: WorkspaceId,
+        _method: String,
+        _args: serde_json::Value,
+    ) -> BoxFuture<'_, crate::desktop::DesktopResult<serde_json::Value>> {
+        Box::pin(async {
+            Err(crate::desktop::DesktopError::new(
+                "desktop-unsupported",
+                "Desktop control unavailable",
+            ))
+        })
+    }
+    fn desktop_client_call(
+        &self,
+        _method: String,
+        _args: serde_json::Value,
+        _connection: crate::desktop::DesktopConnection,
+    ) -> BoxFuture<'_, crate::desktop::DesktopResult<serde_json::Value>> {
+        Box::pin(async {
+            Err(crate::desktop::DesktopError::new(
+                "desktop-unsupported",
+                "Desktop control unavailable",
+            ))
+        })
+    }
+
     fn repository_checkout_capture(
         &self,
         _query: crate::repository_checkout::CheckoutCaptureQuery,
@@ -355,9 +382,14 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async { Err(Error::Forbidden("Repository selection unavailable".into())) })
     }
 
-    /// List workspaces, optionally including archived ones (PROTOCOL §5.1).
-    fn list_workspaces(&self, include_archived: bool) -> BoxFuture<'_, Result<Vec<Workspace>>> {
-        let _ = include_archived;
+    /// List workspaces admitted by `filter` (PROTOCOL §5.1). Retired
+    /// workspaces are returned only when `filter.include_retired` is set —
+    /// `include_archived` alone never includes them.
+    fn list_workspaces(
+        &self,
+        filter: WorkspaceListFilter,
+    ) -> BoxFuture<'_, Result<Vec<Workspace>>> {
+        let _ = filter;
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::list_workspaces not implemented".to_string(),
@@ -370,11 +402,14 @@ pub trait WorkspaceApi: Send + Sync {
     /// lookup"): most recently linked first, archived included, narrowed to the
     /// caller's visible workspaces. `Error::InvalidParams` when `url` is not a
     /// pull-request URL.
+    ///
+    /// Retired workspaces are included only with `include_retired`.
     fn find_workspaces_by_pull_request(
         &self,
         url: String,
+        include_retired: bool,
     ) -> BoxFuture<'_, Result<Vec<PullRequestWorkspace>>> {
-        let _ = url;
+        let _ = (url, include_retired);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::find_workspaces_by_pull_request not implemented".to_string(),
@@ -394,9 +429,9 @@ pub trait WorkspaceApi: Send + Sync {
     /// full `list_workspaces`.
     fn list_workspaces_lite(
         &self,
-        include_archived: bool,
+        filter: WorkspaceListFilter,
     ) -> BoxFuture<'_, Result<Vec<Workspace>>> {
-        self.list_workspaces(include_archived)
+        self.list_workspaces(filter)
     }
 
     /// Fetch one workspace by id; `NotFound` if absent (PROTOCOL §5.1).
@@ -700,6 +735,42 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::archive_workspace not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// The retired workspace a call is scoped to, if any (PROTOCOL §5.1
+    /// "Retired workspaces" read-only gate): `workspace_id` when that
+    /// workspace is `Retired`, else the workspace of `agent_id` when it is
+    /// `Retired`, else `None`. One cheap store read; the default (non-store
+    /// impls) reports nothing retired.
+    fn retired_workspace_for(
+        &self,
+        workspace_id: Option<WorkspaceId>,
+        agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<Option<WorkspaceId>>> {
+        let _ = (workspace_id, agent_id);
+        Box::pin(async { Ok(None) })
+    }
+
+    /// Retire a workspace (PROTOCOL §5.1 `workspace.retire`): allowed from
+    /// Active or Archived. An Active workspace gets the archive teardown
+    /// first (interrupt turns, cancel hooks / PR monitors, detach guests);
+    /// then the status flips to `Retired` with `retiredAt`, and the checkout
+    /// folder and git worktree registration are removed in the background.
+    /// The git branch and every DB row (agents, conversations, notes,
+    /// assets, tasks) are kept. Idempotent on an already-retired workspace.
+    /// `caller_agent_id` has the same meaning as on
+    /// [`Self::archive_workspace`].
+    fn retire_workspace(
+        &self,
+        id: WorkspaceId,
+        caller_agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<Workspace>> {
+        let _ = (id, caller_agent_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::retire_workspace not implemented".to_string(),
             ))
         })
     }
@@ -2079,7 +2150,9 @@ pub trait WorkspaceApi: Send + Sync {
     /// a `changes` object (PROTOCOL §5.5). Only the listed fields are touched;
     /// omitted fields are preserved. Write-once (`acpSessionId`) and immutable
     /// (`provider`) invariants are enforced by the store. Emits `agent:updated`
-    /// (or `agent:renamed` when `name` is the only mutated field). Returns
+    /// (or `agent:renamed` with `{ agentId, name, nameExplicitlySet }` when
+    /// `name` is the only mutated field); any event payload carrying `name`
+    /// also carries the persisted `nameExplicitlySet`. Returns
     /// `{ success: true, agent: AgentLite }` on success. `NotFound` when the
     /// session is unknown; `InvalidParams` when `changes` carries an unknown
     /// field or a malformed value.
@@ -5334,6 +5407,94 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// Human-only conversation history with participant authorization.
+    fn discussion_list(
+        &self,
+        workspace_id: WorkspaceId,
+        conversation_id: String,
+        before_sequence: Option<i64>,
+        after_sequence: Option<i64>,
+        limit: u32,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (
+            workspace_id,
+            conversation_id,
+            before_sequence,
+            after_sequence,
+            limit,
+        );
+        Box::pin(async { Err(Error::Internal("discussion.list not implemented".into())) })
+    }
+    /// Atomic first send or participant-authorized append with exact retry semantics.
+    fn discussion_send(
+        &self,
+        workspace_id: WorkspaceId,
+        message_id: String,
+        body: String,
+        target: crate::discussion::DiscussionTarget,
+    ) -> BoxFuture<'_, Result<crate::discussion::DiscussionSendResult>> {
+        let _ = (workspace_id, message_id, body, target);
+        Box::pin(async { Err(Error::Internal("discussion.send not implemented".into())) })
+    }
+    /// Human-only compare-and-swap control of an explicitly addressed invocation.
+    fn discussion_control_agent(
+        &self,
+        request: crate::discussion::DiscussionAgentControl,
+        retry: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (request, retry);
+        Box::pin(async { Err(Error::Internal("discussion control not implemented".into())) })
+    }
+    /// Set one human's desired reaction state; retries are no-ops.
+    fn discussion_react(
+        &self,
+        workspace_id: WorkspaceId,
+        conversation_id: String,
+        message_id: String,
+        reaction: String,
+        active: bool,
+    ) -> BoxFuture<'_, Result<crate::discussion::DiscussionReactionState>> {
+        let _ = (workspace_id, conversation_id, message_id, reaction, active);
+        Box::pin(async { Err(Error::Internal("discussion.react not implemented".into())) })
+    }
+    /// Bounded participant-only discovery.
+    fn discussion_conversations(
+        &self,
+        workspace_id: WorkspaceId,
+        before_id: Option<String>,
+        limit: u32,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, before_id, limit);
+        Box::pin(async {
+            Err(Error::Internal(
+                "discussion.conversations not implemented".into(),
+            ))
+        })
+    }
+    /// Bounded offline-capable effective member picker.
+    fn discussion_recipients(
+        &self,
+        workspace_id: WorkspaceId,
+        query: String,
+        after_id: Option<String>,
+        limit: u32,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, query, after_id, limit);
+        Box::pin(async {
+            Err(Error::Internal(
+                "discussion.recipients not implemented".into(),
+            ))
+        })
+    }
+    /// Delivery-time participant projection, including owners. Fail closed by default.
+    fn discussion_project_event(
+        &self,
+        event: crate::Event,
+    ) -> BoxFuture<'_, Result<Option<crate::Event>>> {
+        let _ = event;
+        Box::pin(async { Ok(None) })
+    }
+
     /// `workspace.members.list` (multiplayer w3): the members of a workspace
     /// → `{ members: [{ principalId, login?, displayName?, avatarUrl?, role,
     /// addedAt }], guestCount, guestLimit }`, owners first. `guestCount` is
@@ -5369,6 +5530,22 @@ pub trait WorkspaceApi: Send + Sync {
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::workspace_members_add not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// Owner-only direct guest role change. Owner and inherited host roles
+    /// are immutable here. Emits workspace:updated only when changed.
+    fn workspace_members_set_role(
+        &self,
+        workspace_id: WorkspaceId,
+        principal_id: PrincipalId,
+        role: crate::WorkspaceRole,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, principal_id, role);
+        Box::pin(async {
+            Err(Error::Internal(
+                "workspace_members_set_role not implemented".into(),
             ))
         })
     }
@@ -5451,8 +5628,8 @@ pub trait WorkspaceApi: Send + Sync {
     }
 
     /// `presence.update({ focus: [{ workspaceId, agentId?, noteId? }],
-    /// typing?: { agentId } })`: replace the connection's focus set (sent
-    /// whole) and typing target → `{ ok: true, typingSource }`, where
+    /// typing?: { agentId } | null, discussionTyping?: { workspaceId } | null })`:
+    /// replace the connection's focus set (sent whole) and typing targets → `{ ok: true, typingSource }`, where
     /// `typingSource` is the connection's own opaque, daemon-minted typing
     /// source handle (the `source` its typing entry carries in
     /// `presence:changed`, so the client can suppress only itself). Every
@@ -5463,7 +5640,9 @@ pub trait WorkspaceApi: Send + Sync {
     /// unchanged. Requires
     /// a hello'd connection; every focused workspace and the typing agent's
     /// workspace must be a member workspace (`NotFound` otherwise). Publishes
-    /// `presence:changed` to each workspace whose aggregate changed.
+    /// `presence:changed` to each workspace whose aggregate changed. Discussion
+    /// typing requires a human member in its target workspace, shares the
+    /// connection source with a separate counter, and clears when omitted or null.
     fn presence_update(
         &self,
         connection_id: String,
@@ -5482,7 +5661,9 @@ pub trait WorkspaceApi: Send + Sync {
     /// with the same member rows the event carries — for a client that
     /// attached its event subscription after its hello (or a second
     /// connection of an already-online principal, whose hello publishes
-    /// nothing). Member+; a non-member sees `NotFound`.
+    /// nothing). Member+; a non-member sees `NotFound`. Human rows include
+    /// `discussionTyping: [{ source, since, pulse }]` (empty when idle);
+    /// agent/daemon snapshots omit that field.
     fn presence_snapshot(
         &self,
         workspace_id: WorkspaceId,
@@ -6566,6 +6747,37 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `providers.profiles.updateDefault` (PROTOCOL §5.54 "Default
+    /// configuration overrides"): `baseProviderId`, optional `name` and
+    /// `env`; returns `{ defaultConfig, revision, activation }` and emits
+    /// `providers:profiles-changed` (`change: "default-updated"`).
+    fn provider_profiles_update_default(
+        &self,
+        params: serde_json::Value,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = params;
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::provider_profiles_update_default not implemented".to_string(),
+            ))
+        })
+    }
+
+    /// `host.providerAuthStatus` entries for Default configurations with
+    /// saved environment overrides (PROTOCOL §5.54): one
+    /// `{ id: baseProviderId, authenticated, identity? }` per such Default,
+    /// probed with its saved overlay; they replace the base sweep's rows.
+    /// `Some(id)` limits it to one base provider. Returns a JSON array
+    /// (empty when no Default has overrides).
+    fn provider_default_auth_status(
+        &self,
+        provider_id: Option<String>,
+        force: bool,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (provider_id, force);
+        Box::pin(async { Ok(serde_json::Value::Array(Vec::new())) })
+    }
+
     /// `host.providerAuthStatus` entries for named profiles (PROTOCOL §5.54):
     /// one `{ id: providerRef, authenticated, identity? }` per profile, probed
     /// with that profile's saved environment. `Some(ref)` checks one profile
@@ -7633,6 +7845,25 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// Default-on completion wake for an agent-started run: after
+    /// `ws.script.start` / `ws.script.restart` by `agent_id` accepts run
+    /// `run_id`, register the same monitor `ws.script.monitor` would (owned by
+    /// the agent) so the agent is woken when a command-mode run finishes even
+    /// if it ends its turn without arming anything. Returns the
+    /// `script.monitor` reply (`{ ok, monitor }` or a refusal), or `null` when
+    /// the script is not command-mode (services keep running by design). The
+    /// default implementation arms nothing.
+    fn script_start_monitor(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        script_id: String,
+        run_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, agent_id, script_id, run_id);
+        Box::pin(async { Ok(serde_json::Value::Null) })
+    }
+
     /// `script.stop`: stop a running script (cancels pending auto-restart);
     /// returns `{ ok, scriptId }` (PROTOCOL §5.8). Workspace-scoped.
     fn script_stop(
@@ -8420,11 +8651,14 @@ pub trait WorkspaceApi: Send + Sync {
     /// `repositoryPath`, excluding self. Bare array of
     /// `{ id, title, branch, status, createdAt, updatedAt }` (`title` defaults
     /// to `"Untitled"`; `status` is the `PascalCase` `WorkspaceStatus`).
+    ///
+    /// Retired siblings are included only with `include_retired`.
     fn cross_workspace_list_siblings(
         &self,
         workspace_id: WorkspaceId,
+        include_retired: bool,
     ) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = workspace_id;
+        let _ = (workspace_id, include_retired);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::cross_workspace_list_siblings not implemented".to_string(),
@@ -8978,6 +9212,51 @@ pub struct ReverseLiveClient {
 /// delivered. `is_connected` is a cheap synchronous probe that lets the
 /// service surface a friendlier error before it composes the forward params.
 pub trait AgentReverseDispatch: Send + Sync {
+    /// Eligible authenticated desktop connections for an unassigned workspace.
+    /// Each candidate remains bound to its execution incarnation.
+    fn desktop_candidates(
+        &self,
+        principal: &crate::PrincipalId,
+    ) -> Vec<crate::desktop::DesktopConnection> {
+        self.desktop_resolve(&ReverseTarget::Default, principal)
+            .into_iter()
+            .collect()
+    }
+    /// Changes to admitted execution connections; consumers re-resolve authority.
+    fn desktop_changes(&self) -> Option<std::sync::Arc<tokio::sync::Notify>> {
+        None
+    }
+
+    /// Resolve the browser primary first, then require desktop capability and
+    /// the exact authenticated principal. Never fall back to another device.
+    ///
+    /// # Errors
+    /// Returns offline, unsupported or forbidden for an ineligible primary.
+    fn desktop_resolve(
+        &self,
+        _target: &ReverseTarget,
+        _principal: &crate::PrincipalId,
+    ) -> crate::desktop::DesktopResult<crate::desktop::DesktopConnection> {
+        Err(crate::desktop::DesktopError::new(
+            "desktop-unsupported",
+            "Desktop control is unavailable",
+        ))
+    }
+
+    /// Dispatch only to this exact incarnation; reconnect never replays work.
+    fn desktop_dispatch(
+        &self,
+        _connection: crate::desktop::DesktopConnection,
+        _params: serde_json::Value,
+    ) -> BoxFuture<'_, crate::desktop::DesktopResult<serde_json::Value>> {
+        Box::pin(async {
+            Err(crate::desktop::DesktopError::new(
+                "desktop-offline",
+                "Desktop connection is unavailable",
+            ))
+        })
+    }
+
     /// Whether at least one eligible client is currently connected (i.e. a
     /// [`ReverseTarget::Default`] dispatch would find a target).
     fn is_connected(&self) -> bool;

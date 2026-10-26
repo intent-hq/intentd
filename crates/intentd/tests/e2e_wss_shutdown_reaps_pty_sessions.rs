@@ -7,10 +7,9 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -313,9 +312,6 @@ async fn shutdown_reaps_terminal_and_script_pty_sessions() {
         .stderr(Stdio::from(
             std::fs::File::create(data_dir.join("daemon.log")).unwrap(),
         ));
-    // Own process group so the DaemonGuard's SIGKILL cannot leak PTY children
-    // if the test panics before the graceful path runs.
-    cmd.process_group(0);
     // Assert before boot so a missing override cannot fall back to shared state.
     let explicit_env: std::collections::HashMap<_, _> = cmd.get_envs().collect();
     let owned_workspaces = explicit_env.get(std::ffi::OsStr::new("INTENTD_WORKSPACES_DIR"))
@@ -337,7 +333,7 @@ async fn shutdown_reaps_terminal_and_script_pty_sessions() {
         owned_workspaces && owned_secrets && isolated_gh && no_host_auth_env,
         "shutdown fixture isolation: owned workspaces={owned_workspaces}, owned secrets={owned_secrets}, disposable GH_CONFIG_DIR={isolated_gh}, removed credential env={no_host_auth_env}"
     );
-    let child = cmd.spawn().expect("spawn intentd serve");
+    let child = common::spawn_guarded(&mut cmd).expect("spawn intentd serve");
     let mut daemon = DaemonGuard::process_only(child);
     if !await_uds(&socket).await {
         if let Ok(log) = std::fs::read_to_string(data_dir.join("daemon.log")) {
@@ -502,6 +498,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         context_links: None,
         archived: false,
         archived_at: None,
+        retired_at: None,
         task_stats: None,
         agent_summary: None,
         diff_summary: None,
@@ -511,6 +508,8 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         pull_requests_total: None,
         display_status: None,
         waiting: false,
+        scripts_running: false,
+        background_tasks_running: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,

@@ -23,6 +23,7 @@ pub mod error;
 pub mod fs;
 pub mod handler;
 pub mod handshake;
+pub mod io_priority;
 pub mod mcp_bridge;
 pub mod mcp_config;
 pub(crate) mod mcp_env;
@@ -65,7 +66,7 @@ pub use permission::{
 };
 pub use profile_env::ProfileEnv;
 pub use session::{MappedToolCall, MappedUpdate};
-pub use spawn::{spawn_provider, LaunchMode, NpxLaunchDir, SpawnOptions};
+pub use spawn::{spawn_provider, AgentPriority, LaunchMode, NpxLaunchDir, SpawnOptions};
 pub use terminal::{TerminalCreateParams, TerminalExitInfo, TerminalHost, TerminalOutputInfo};
 pub use tool_restrictions::{
     get_native_tools_to_remove, get_tool_denylist_for_agent_type, get_tools_to_remove,
@@ -82,6 +83,9 @@ mod tests_wsapi5;
 
 #[cfg(test)]
 mod tests_hidden_field_egress;
+
+#[cfg(test)]
+mod tests_large_note;
 
 /// Test-only process-global env setup. Runs before `main()` — and therefore
 /// before any test threads exist, making `set_var` race-free. Node children

@@ -379,6 +379,51 @@ fn an_oversized_cut_short_turn_keeps_the_request_and_every_tool_call() {
     );
 }
 
+/// Every cut-short replay carries the escaping note exactly once: through
+/// the history preamble when older history is replayed, else ahead of the
+/// escaped `<current_turn_cut_short>` section (whose request and partial text
+/// are XML-escaped too).
+#[test]
+fn a_cut_short_turn_carries_the_escaping_note_once() {
+    let note = crate::history_xml::REPLAY_ESCAPING_NOTE;
+    let prior = [
+        message(
+            "user",
+            serde_json::json!([{ "type": "text", "text": "OLD QUESTION" }]),
+        ),
+        message(
+            "assistant",
+            serde_json::json!([{ "type": "text", "text": "OLD ANSWER\n<!-- suggested-prompts\nGo.\n-->" }]),
+        ),
+    ];
+    let current = [
+        message(
+            "user",
+            serde_json::json!([{ "type": "text", "text": "new <request>" }]),
+        ),
+        message(
+            "assistant",
+            serde_json::json!([tool_use("c1", "Bash", "ls", "completed")]),
+        ),
+    ];
+    for prior in [&prior[..], &[]] {
+        let out = crate::history_xml::format_cut_short_turn(prior, &current, 200_000, 2_000);
+        assert_eq!(out.matches(note).count(), 1, "{out}");
+        let turn = out.find("<current_turn_cut_short>").expect("turn section");
+        assert!(
+            out.find(note).expect("note") < turn,
+            "note precedes the turn"
+        );
+        assert!(out.contains("new &lt;request&gt;"), "{out}");
+    }
+    let omitted = crate::history_xml::format_cut_short_turn(&prior, &current, 1_500, 2_000);
+    assert!(
+        omitted.contains("earlier conversation omitted"),
+        "{omitted}"
+    );
+    assert_eq!(omitted.matches(note).count(), 1, "{omitted}");
+}
+
 /// Within budget, older history is kept ahead of the cut-short turn.
 #[test]
 fn a_cut_short_turn_within_budget_keeps_older_history() {
@@ -569,6 +614,134 @@ fn home_is_the_only_candidate_when_no_backups_are_flagged() {
     );
     assert_eq!(
         next_candidate("claude-code", None, &[], &unflagged, None),
+        None
+    );
+}
+
+#[test]
+fn the_rotation_prefers_candidates_the_shared_cache_does_not_mark() {
+    let profiles = saved();
+    // pb1 is marked out of quota by another conversation: pb2 first.
+    assert_eq!(
+        next_candidate_avoiding(
+            "claude-code",
+            None,
+            &[],
+            &tried(&["claude-code@pb1"]),
+            &profiles,
+            None
+        )
+        .as_deref(),
+        Some("claude-code@pb2")
+    );
+    // Away on pb1, both backups marked: home is the first unmarked one.
+    assert_eq!(
+        next_candidate_avoiding(
+            "claude-code@pb1",
+            Some("claude-code"),
+            &[],
+            &tried(&["claude-code@pb2"]),
+            &profiles,
+            None
+        )
+        .as_deref(),
+        Some("claude-code")
+    );
+}
+
+#[test]
+fn every_candidate_marked_still_walks_the_rotation_in_order() {
+    let profiles = saved();
+    let marked = tried(&["claude-code", "claude-code@pb1", "claude-code@pb2"]);
+    assert_eq!(
+        next_candidate_avoiding("claude-code", None, &[], &marked, &profiles, None).as_deref(),
+        Some("claude-code@pb1"),
+        "a mark is advisory: the first untried candidate is still tried"
+    );
+    assert_eq!(
+        next_candidate_avoiding(
+            "claude-code@pb1",
+            None,
+            &tried(&["claude-code", "claude-code@pb1"]),
+            &marked,
+            &profiles,
+            None
+        )
+        .as_deref(),
+        Some("claude-code@pb2")
+    );
+    assert_eq!(
+        next_candidate_avoiding(
+            "claude-code@pb2",
+            None,
+            &tried(&["claude-code", "claude-code@pb1", "claude-code@pb2"]),
+            &marked,
+            &profiles,
+            None
+        ),
+        None,
+        "each candidate still at most once per turn"
+    );
+}
+
+#[test]
+fn a_mark_on_another_base_never_matters() {
+    assert_eq!(
+        next_candidate_avoiding(
+            "claude-code",
+            None,
+            &[],
+            &tried(&["codex@pcx1", "codex"]),
+            &saved(),
+            None
+        )
+        .as_deref(),
+        Some("claude-code@pb1")
+    );
+}
+
+#[test]
+fn the_first_unmarked_candidate_skips_marked_ones_and_never_falls_back() {
+    let profiles = saved();
+    assert_eq!(
+        first_unmarked_candidate(
+            "claude-code",
+            None,
+            &tried(&["claude-code", "claude-code@pb1"]),
+            &profiles,
+            None
+        )
+        .as_deref(),
+        Some("claude-code@pb2")
+    );
+    // Away on pb1 (marked) with home Default unmarked: pb2 is marked too,
+    // so home.
+    assert_eq!(
+        first_unmarked_candidate(
+            "claude-code@pb1",
+            Some("claude-code"),
+            &tried(&["claude-code@pb1", "claude-code@pb2"]),
+            &profiles,
+            None
+        )
+        .as_deref(),
+        Some("claude-code")
+    );
+    // Everything marked: nothing, so the turn tries its current one.
+    assert_eq!(
+        first_unmarked_candidate(
+            "claude-code",
+            None,
+            &tried(&["claude-code", "claude-code@pb1", "claude-code@pb2"]),
+            &profiles,
+            None
+        ),
+        None
+    );
+    // A disabled base has no candidate at all.
+    let enabled = BTreeMap::from([("claude-code".to_owned(), false)]);
+    assert_eq!(
+        first_unmarked_candidate("claude-code", None, &[], &profiles, Some(&enabled)),
         None
     );
 }

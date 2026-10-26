@@ -22,8 +22,24 @@ pub(crate) fn monitor_id(metadata: Option<&Value>) -> Option<&str> {
 }
 
 impl Services {
+    /// Ids of the active monitors on `script_id` (any owner).
+    pub(crate) async fn active_script_monitor_ids(
+        &self,
+        workspace_id: &WorkspaceId,
+        script_id: &str,
+    ) -> Result<Vec<String>> {
+        Ok(self
+            .store
+            .script_monitors(workspace_id, None)
+            .await?
+            .into_iter()
+            .filter(|m| m.script_id == script_id && m.state == "active")
+            .map(|m| m.monitor_id)
+            .collect())
+    }
     pub(crate) fn track_script_monitor_worker(&self, agent: &AgentId, metadata: Option<&Value>) {
         let mut workers = self
+            .runtime()
             .script_locks
             .monitor_workers
             .lock()
@@ -37,6 +53,7 @@ impl Services {
 
     pub(crate) async fn settle_script_monitor_worker(&self, agent: &AgentId) {
         let id = self
+            .runtime()
             .script_locks
             .monitor_workers
             .lock()
@@ -50,6 +67,7 @@ impl Services {
     pub(crate) async fn complete_script_monitor_delivery(&self, agent: &AgentId, id: &str) {
         {
             let mut workers = self
+                .runtime()
                 .script_locks
                 .monitor_workers
                 .lock()
@@ -60,7 +78,8 @@ impl Services {
         }
         // Record the exact finished delivery before awaiting SQL. A temporary
         // marker-write failure must neither lose retry ownership nor re-prompt.
-        self.script_locks
+        self.runtime()
+            .script_locks
             .monitor_completions
             .lock()
             .expect("monitor completion retries")
@@ -71,7 +90,8 @@ impl Services {
     pub(crate) async fn retry_script_monitor_completion(&self, agent: &AgentId, id: &str) {
         match self.store.complete_script_notification(agent, id).await {
             Ok(()) => {
-                self.script_locks
+                self.runtime()
+                    .script_locks
                     .monitor_completions
                     .lock()
                     .expect("monitor completion retries")
@@ -89,11 +109,9 @@ impl Services {
         let Some(md) = metadata.filter(|md| monitor_id(Some(md)).is_some()) else {
             return false;
         };
-        self.transfer_exports
-            .lock()
-            .expect("export registry")
-            .values()
-            .any(|session| md["workspaceId"].as_str() == Some(session.workspace_id.as_str()))
+        md["workspaceId"]
+            .as_str()
+            .is_some_and(|workspace| self.ports.transfer().export_in_progress(workspace))
     }
 
     pub(crate) fn defer_script_monitor_for_export(
@@ -118,8 +136,13 @@ impl Services {
         );
         true
     }
-    pub(crate) fn start_script_monitor_maintenance(&self) {
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub fn start_script_monitor_maintenance(&self) {
         if self
+            .runtime()
             .script_locks
             .monitor_maintenance
             .swap(true, std::sync::atomic::Ordering::SeqCst)
@@ -138,6 +161,7 @@ impl Services {
                     _ = sweep.tick() => {}
                 }
                 let completions = services
+                    .runtime()
                     .script_locks
                     .monitor_completions
                     .lock()
@@ -187,6 +211,7 @@ impl Services {
                 }
             }
             services
+                .runtime()
                 .script_locks
                 .monitor_maintenance
                 .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -239,7 +264,7 @@ impl Services {
         &self,
         job: &intent_store::ScriptNotificationJob,
     ) -> Result<()> {
-        let lane = self.script_locks.monitor_lane.lock().await;
+        let lane = self.runtime().script_locks.monitor_lane.lock().await;
         if self.script_monitor_export_blocked(Some(&job.metadata)) {
             return Ok(());
         }
@@ -298,7 +323,7 @@ impl Services {
         if monitor_id(metadata).is_none() {
             return Ok(true);
         }
-        let _lane = self.script_locks.monitor_lane.lock().await;
+        let _lane = self.runtime().script_locks.monitor_lane.lock().await;
         if !self
             .script_monitor_delivery_allowed(agent, metadata)
             .await?
@@ -319,6 +344,7 @@ impl Services {
             return Ok(true);
         };
         if self
+            .runtime()
             .script_locks
             .monitor_completions
             .lock()

@@ -25,6 +25,7 @@ pub mod cli_env;
 pub mod clock;
 pub mod config;
 pub mod discovery_cache;
+pub mod discussion;
 pub mod error;
 pub mod events;
 pub mod execution;
@@ -157,8 +158,9 @@ pub use model::{
     WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention,
     WorkspaceCreate, WorkspaceCreateInitialAgent, WorkspaceCreateOrigin, WorkspaceCreateResult,
     WorkspaceDiskUsage, WorkspaceDisplayStatus, WorkspaceEventSummary, WorkspaceGitRoot,
-    WorkspaceGitRootSource, WorkspaceSetupState, WorkspaceSetupStatus, WorkspaceStatus,
-    WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate, SUPPORTED_ASSET_MIME_TYPES,
+    WorkspaceGitRootSource, WorkspaceListFilter, WorkspaceSetupState, WorkspaceSetupStatus,
+    WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
+    SUPPORTED_ASSET_MIME_TYPES,
 };
 pub use model::{AnchorContext, SuggestionDiff, WorkspaceDiffSummary, WorkspaceDiffSummaryFile};
 pub use model::{
@@ -208,3 +210,5 @@ pub use turn_attachments::{
     is_workspace_api_input, new_attachment_id, AttachmentPolicy, TurnAttachment,
     TurnAttachmentRegistry, ATTACHMENT_ID_KEY,
 };
+
+pub mod desktop;

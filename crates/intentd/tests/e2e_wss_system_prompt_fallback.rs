@@ -23,11 +23,12 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
+use intentd_test_support::GuardedChild;
 use std::fmt::Write as _;
 use std::path::Path;
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -48,14 +49,13 @@ const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefe
 
 /// Live `intentd serve` process; killed and its data dir removed on drop.
 struct Daemon {
-    child: Child,
+    child: GuardedChild,
     _data_dir: tempfile::TempDir,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.child.kill_tree();
     }
 }
 
@@ -63,7 +63,7 @@ fn temp_data_dir() -> tempfile::TempDir {
     common::test_tempdir_in("/tmp", "itd-spf-")
 }
 
-fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
+fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> GuardedChild {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
@@ -80,7 +80,7 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
         cmd.env(k, v);
     }
     common::hermetic_fixture_identity(&mut cmd, data_dir);
-    cmd.spawn().expect("spawn intentd serve")
+    GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -378,6 +378,7 @@ async fn seed_workspace_only(data_dir: &Path) -> String {
             context_links: None,
             archived: false,
             archived_at: None,
+            retired_at: None,
             task_stats: None,
             agent_summary: None,
             diff_summary: None,
@@ -387,6 +388,8 @@ async fn seed_workspace_only(data_dir: &Path) -> String {
             pull_requests_total: None,
             display_status: None,
             waiting: false,
+            scripts_running: false,
+            background_tasks_running: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
@@ -885,8 +888,8 @@ async fn assistant_profile_and_reference_survive_restart_over_wss() {
     // The SIGKILL below skips graceful shutdown, which is what normally
     // finishes a post-turn idle write still in flight. Killing before that
     // write lands leaves the session `active`, so the restarted daemon heals
-    // it as a crashed turn and auto-resumes it — the resume prompt then
-    // becomes the second prompt instead of the message sent below.
+    // it as a crashed turn (hermetic daemons pin resume-on-start off, so it
+    // is recorded, not resumed; the stop-reason check below catches it).
     await_durable_idle(&mut sub, &agent).await;
     let before = wss_rpc(&mut rpc, 4, "agent.getSession", json!({"agentId": agent})).await;
     let system = before["session"]["systemPrompt"].as_str().unwrap();
@@ -900,8 +903,7 @@ async fn assistant_profile_and_reference_survive_restart_over_wss() {
         intent_core::CURRENT_HARNESS_VERSION
     );
     wss_rpc(&mut rpc, 5, "agent.stop", json!({"agentId": agent})).await;
-    daemon.child.kill().unwrap();
-    daemon.child.wait().unwrap();
+    daemon.child.kill_tree().unwrap();
     drop(rpc);
     drop(sub);
     daemon.child = spawn_serve(&data_dir, "both", &env);
@@ -920,8 +922,8 @@ async fn assistant_profile_and_reference_survive_restart_over_wss() {
     .await;
     // Startup heals before serving RPCs. A completed first turn misread as a
     // crash carries the heal's stop reason here until a resumed turn clears
-    // it; the prompt check below covers that case (resume runs only on
-    // headless hosts under the default `auto` setting).
+    // it; the prompt check below also guards a resumed turn should a test
+    // opt back into resume-on-start.
     let restarted = wss_rpc(&mut rpc, 7, "agent.getSession", json!({"agentId": agent})).await;
     let stop_reason = restarted["session"]["stopReason"]
         .as_str()

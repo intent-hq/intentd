@@ -9,10 +9,11 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
+use intentd_test_support::GuardedChild;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -37,21 +38,22 @@ fn scratch_dir(prefix: &str) -> tempfile::TempDir {
 
 /// Spawn `intentd serve` with a hermetic HOME so host git config (global
 /// excludes) never leaks into the watcher under test.
-fn spawn_serve(data_dir: &Path, home_dir: &Path) -> Child {
+fn spawn_serve(data_dir: &Path, home_dir: &Path) -> GuardedChild {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     common::enable_ws_api(data_dir);
-    common::hermetic_serve_command(data_dir)
-        .env("INTENTD_DATA_DIR", data_dir)
-        .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
-        .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
-        .env("INTENTD_AUTH_TOKEN", TOKEN)
-        .env("HOME", home_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(log))
-        .spawn()
-        .expect("spawn intentd serve")
+    GuardedChild::spawn(
+        common::hermetic_serve_command(data_dir)
+            .env("INTENTD_DATA_DIR", data_dir)
+            .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
+            .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
+            .env("INTENTD_AUTH_TOKEN", TOKEN)
+            .env("HOME", home_dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(log)),
+    )
+    .expect("spawn intentd serve")
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -242,6 +244,7 @@ async fn expect_suppressed_over_wss<S>(
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let deadline = tokio::time::Instant::now() + common::test_timeout(Duration::from_secs(20));
+    // fixed-deadline: allow — stays fixed: a write pacing interval for the retry loop, not a wait budget (the 20 s deadline above is scaled)
     let write_cadence = Duration::from_secs(1);
     let mut seen_control = false;
     let mut next_write = tokio::time::Instant::now();

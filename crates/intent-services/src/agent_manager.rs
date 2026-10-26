@@ -70,6 +70,7 @@ use crate::agent_session::{
     InterruptedBy, ThoughtLevelOption,
 };
 use crate::events::EventBus;
+use crate::stack_frame::boxed_await;
 use crate::Services;
 
 /// The initialized transport and its captured prompt authority travel together.
@@ -171,6 +172,24 @@ pub(crate) const AUTO_UNARCHIVE_NOTICE_TEXT: &str =
 /// wording). Never replayed on later turns.
 pub(crate) const AUTO_UNARCHIVE_PROMPT_NOTICE: &str =
     "[SYSTEM NOTICE] This workspace was archived; it has been automatically unarchived because this message was sent.";
+
+/// Transcript text of the `workspace_revived` system row persisted when a turn
+/// start revives a RETIRED workspace (PROTOCOL §5.1 "Revive").
+pub(crate) const WORKSPACE_REVIVED_NOTICE_TEXT: &str =
+    "Workspace was retired and has been revived as a fresh, blank checkout because a message was sent to this agent. Files, uncommitted changes, and local git state from before were lost; conversations and notes were kept.";
+
+/// Trailing prompt block injected into the SAME turn that revived a retired
+/// workspace: all prior on-disk state is gone. Names the kept old branch (its
+/// committed work is still in the repository) and the fresh branch.
+pub(crate) fn workspace_revived_prompt_notice(previous_branch: &str, branch: &str) -> String {
+    format!(
+        "[SYSTEM NOTICE] This workspace was retired and its folder was deleted. All files, \
+         uncommitted changes, and local git state from before are gone; you are now in a fresh, \
+         blank checkout of the repository's default branch on the new branch `{branch}`. \
+         Commits on the previous branch `{previous_branch}` are kept in the repository. \
+         Conversation history and notes were kept."
+    )
+}
 
 /// Queued-message size (chars) above which a turn failing with a
 /// context-size error (HTTP 413, [`crate::is_context_size_error`]) is
@@ -381,6 +400,9 @@ async fn annotate_unblocked_hints(
     entries: &mut [QueuedMessage],
 ) {
     use crate::agent_ops::ready_delta;
+    for entry in entries.iter_mut() {
+        services.desktop_refresh_wake(agent_id, entry).await;
+    }
     let candidates: Vec<usize> = entries
         .iter()
         .enumerate()
@@ -2746,7 +2768,7 @@ type Handles = Arc<Mutex<HashMap<AgentId, AgentHandle>>>;
 /// it — after which the rows are gone and a spawn attempt fails `NotFound`
 /// on its own store read.
 #[must_use = "dropping the fence immediately re-opens the lazy-spawn paths"]
-pub(crate) struct TeardownFence {
+pub struct TeardownFence {
     stopping: Arc<Mutex<HashSet<AgentId>>>,
     ids: Vec<AgentId>,
 }
@@ -2775,6 +2797,9 @@ enum TryBeginOutcome {
     Started(TurnAdmission),
     Busy,
     ReapClaimed,
+    /// The claim won, but the workspace is Retired and its revive failed:
+    /// the slot was released again and no turn started.
+    ReviveFailed,
 }
 
 /// Identity of a claimed slot. Teardown invalidates it, so an admitted send
@@ -2863,6 +2888,7 @@ pub struct AgentManager {
     next_admission: AtomicUsize,
     /// Claimed startup side effects must finish before retirement detaches.
     turn_start_gates: crate::agent_ops::AgentRetirementGates,
+    active_discussion_turns: Mutex<HashMap<AgentId, String>>,
     /// Start of the current stretch with no turn in flight: `Some(boot)`
     /// initially, cleared on the `busy` empty → non-empty edge and re-armed
     /// on the non-empty → empty edge. Every access — the two writers AND the
@@ -3012,7 +3038,9 @@ pub struct AgentManager {
     /// turns. A claim that never builds a prompt (harness wake turns) has the
     /// stale flag cleared by [`AgentManager::release_slot_sync`] when the
     /// slot is released. In-memory only, same gap as `recreated`.
-    auto_unarchived: Arc<Mutex<HashSet<AgentId>>>,
+    /// The value is the prompt block to inject (the auto-unarchive or the
+    /// workspace-revived notice).
+    auto_unarchived: Arc<Mutex<HashMap<AgentId, String>>>,
     /// Slot holders that published the terminal `agent:idle` of a completed
     /// turn and have dequeued no new work since. `agent:idle` precedes the
     /// worker's post-turn tail and its `end_turn`, so busy-slot membership
@@ -3133,6 +3161,7 @@ impl AgentManager {
             turn_admissions: Mutex::new(HashMap::new()),
             next_admission: AtomicUsize::new(0),
             turn_start_gates: crate::agent_ops::AgentRetirementGates::default(),
+            active_discussion_turns: Mutex::default(),
             idle_since: Arc::new(Mutex::new(Some(Instant::now()))),
             reap_claims: Arc::new(Mutex::new(HashSet::new())),
             agent_ws: Arc::new(Mutex::new(HashMap::new())),
@@ -3150,7 +3179,7 @@ impl AgentManager {
             retired: Arc::new(Mutex::new(HashSet::new())),
             unsloth: Arc::new(crate::unsloth_server::UnslothServerManager::default()),
             tree_probe: std::sync::OnceLock::new(),
-            auto_unarchived: Arc::new(Mutex::new(HashSet::new())),
+            auto_unarchived: Arc::new(Mutex::new(HashMap::new())),
             settled_turns: Mutex::new(HashSet::new()),
             pending_idle_writes: Mutex::new(HashMap::new()),
             next_idle_write: AtomicU64::new(0),
@@ -3890,6 +3919,16 @@ impl AgentManager {
                 )
                 .await
             }
+            // A Default configuration with no saved overrides is tracked
+            // too, so a later edit reports it as running on earlier settings.
+            None if crate::provider_profiles::is_default_config_ref(opts.provider.id) => {
+                Box::pin(self.services.register_default_process(
+                    &workspace_id,
+                    &agent_id,
+                    opts.provider.id,
+                ))
+                .await
+            }
             None => None,
         };
         let handle = AgentHandle {
@@ -4242,7 +4281,7 @@ impl AgentManager {
         provider: &ProviderConfig,
     ) -> Result<StartedSession> {
         // Boxed: keeps the caller's session-open future frame unchanged.
-        let started = Box::pin(self.start_session_opened(agent_id, cwd, provider)).await?;
+        let started = boxed_await(|| self.start_session_opened(agent_id, cwd, provider)).await?;
         let workers = self.services.agent_workers();
         if let Some(generation) = started
             .turn
@@ -4338,35 +4377,40 @@ impl AgentManager {
         // Load the agent session record once and reuse both `workspace_id` (for
         // the pre-handshake status hint) and `acp_session_id` (for the resume
         // branch decision below) from the same struct.
-        let session_record = self.services.store.get_agent_session(agent_id).await?;
+        let session_record =
+            boxed_await(|| self.services.store.get_agent_session(agent_id)).await?;
         // Pre-first-token turn-startup hint: the ACP `initialize` handshake is
         // about to run for this agent (STAT-1 / PROTOCOL §7). The status payload
         // carries `workspaceId` (the FE routes hints per-agent but callers key
         // the timeline on it).
-        self.services
-            .publish_status_event(
+        boxed_await(|| {
+            self.services.publish_status_event(
                 &session_record.workspace_id,
                 agent_id,
                 "init",
                 "Initializing protocol\u{2026}",
                 "info",
             )
-            .await;
+        })
+        .await;
         let callback_offer = repository_origin.callback_offer(&session_record, provider);
         #[cfg(feature = "repository-test-fixtures")]
         let negotiated = if repository_origin.review_runtime_fixture() {
-            intent_acp::handshake::handshake_with_review_monitoring(
-                conn.clone(),
-                provider,
-                callback_offer,
-                intent_acp::review_monitoring::ReviewMonitoringOffer::V1,
-            )
+            boxed_await(|| {
+                intent_acp::handshake::handshake_with_review_monitoring(
+                    conn.clone(),
+                    provider,
+                    callback_offer,
+                    intent_acp::review_monitoring::ReviewMonitoringOffer::V1,
+                )
+            })
             .await
         } else {
-            handshake_with_callbacks(conn.clone(), provider, callback_offer).await
+            boxed_await(|| handshake_with_callbacks(conn.clone(), provider, callback_offer)).await
         };
         #[cfg(not(feature = "repository-test-fixtures"))]
-        let negotiated = handshake_with_callbacks(conn.clone(), provider, callback_offer).await;
+        let negotiated =
+            boxed_await(|| handshake_with_callbacks(conn.clone(), provider, callback_offer)).await;
         let negotiated =
             negotiated.map_err(|e| Error::Internal(format!("handshake failed: {e}")))?;
         let callbacks = negotiated.callbacks;
@@ -4446,11 +4490,15 @@ impl AgentManager {
         // A failed or unavailable load must not replace it with a new session.
         // The Store also refuses malformed or missing known-private enrollment.
         let private_history = if let Some(session_id) = &stored_id {
-            self.services
-                .store
-                .get_review_context_enrollment(&session_record.workspace_id, agent_id, session_id)
-                .await?
-                .is_some()
+            boxed_await(|| {
+                self.services.store.get_review_context_enrollment(
+                    &session_record.workspace_id,
+                    agent_id,
+                    session_id,
+                )
+            })
+            .await?
+            .is_some()
         } else {
             false
         };
@@ -4473,8 +4521,8 @@ impl AgentManager {
                 session_id: session_id.clone(),
             })
         }) {
-            self.services
-                .resume_repository_acp_session(
+            boxed_await(|| {
+                self.services.resume_repository_acp_session(
                     (conn.as_ref(), callbacks.as_ref()),
                     &handshake.initialize,
                     agent_id,
@@ -4482,21 +4530,23 @@ impl AgentManager {
                     session_mcp_servers.clone(),
                     creation,
                 )
-                .await
-                .map(|opened| {
-                    opened.map(|outcome| repository_origin.accept_session(attempt, &conn, outcome))
-                })
+            })
+            .await
+            .map(|opened| {
+                opened.map(|outcome| repository_origin.accept_session(attempt, &conn, outcome))
+            })
         } else {
-            self.services
-                .resume_acp_session(
+            boxed_await(|| {
+                self.services.resume_acp_session(
                     conn.as_ref(),
                     &handshake.initialize,
                     agent_id,
                     cwd.clone(),
                     session_mcp_servers.clone(),
                 )
-                .await
-                .map(|opened| opened.map(|response| (response, None)))
+            })
+            .await
+            .map(|opened| opened.map(|response| (response, None)))
         } {
             Ok(Some((opened, delivery))) => {
                 // `session/load` replays the prior conversation as a buffered
@@ -4507,47 +4557,52 @@ impl AgentManager {
                 // new/recreate sessions have no buffered replay.
                 {
                     let mut guard = notes.lock().await;
-                    Services::drain_replay_notifications(
-                        &mut guard,
-                        agent_id,
-                        Some(&session_record.workspace_id),
-                    )
+                    let (guard_mut, ws) = (&mut guard, &session_record.workspace_id);
+                    boxed_await(move || {
+                        Services::drain_replay_notifications(guard_mut, agent_id, Some(ws))
+                    })
                     .await;
                 }
-                self.maybe_bypass_permissions(
-                    conn.as_ref(),
-                    provider,
-                    &opened.session_id,
-                    opened.modes.as_ref(),
-                )
+                boxed_await(|| {
+                    self.maybe_bypass_permissions(
+                        conn.as_ref(),
+                        provider,
+                        &opened.session_id,
+                        opened.modes.as_ref(),
+                    )
+                })
                 .await;
-                let model_response = self
-                    .maybe_apply_session_model(
+                let model_response = boxed_await(|| {
+                    self.maybe_apply_session_model(
                         conn.as_ref(),
                         agent_id,
                         provider,
                         &opened.session_id,
                         stored_model.as_deref(),
                     )
-                    .await?;
-                let default = self
-                    .resumed_effort_default(
+                })
+                .await?;
+                let default = boxed_await(|| {
+                    self.resumed_effort_default(
                         agent_id,
                         &session_record.workspace_id,
                         provider,
                         model_response.as_ref(),
                     )
-                    .await;
-                self.install_and_apply_thought_level(
-                    conn.as_ref(),
-                    &session_record,
-                    &opened,
-                    model_response,
-                    stored_effort.as_deref(),
-                    Some(&default),
-                )
+                })
                 .await;
-                let captured = deliver_captured(delivery).await;
+                boxed_await(|| {
+                    self.install_and_apply_thought_level(
+                        conn.as_ref(),
+                        &session_record,
+                        &opened,
+                        model_response,
+                        stored_effort.as_deref(),
+                        Some(&default),
+                    )
+                })
+                .await;
+                let captured = boxed_await(|| deliver_captured(delivery)).await;
                 return Ok(StartedSession {
                     session_id: opened.session_id,
                     turn: OriginalTurn {
@@ -4618,14 +4673,18 @@ impl AgentManager {
                 Ok::<_, Error>((candidate, (prepared, model_response)))
             };
             let ((opened, delivery), model_response) = if let Some((creation, attempt)) = creation {
-                let outcome = creation.initialize_compatible(prepare).await;
+                let outcome = boxed_await(|| creation.initialize_compatible(prepare)).await;
                 let (mut prepared, model_response) = outcome.producer?;
                 let query = prepared.query.take();
                 let canonical = crate::agent_session::compatibility_session_id(outcome.result?);
-                let opened = self
-                    .services
-                    .finish_antigravity_acp_session(prepared, stored_id.as_deref(), canonical)
-                    .await?;
+                let opened = boxed_await(|| {
+                    self.services.finish_antigravity_acp_session(
+                        prepared,
+                        stored_id.as_deref(),
+                        canonical,
+                    )
+                })
+                .await?;
                 (
                     repository_origin.accept_session(
                         attempt,
@@ -4642,9 +4701,11 @@ impl AgentManager {
                 let (_, (prepared, model_response)) = prepare().await?;
                 (
                     (
-                        self.services
-                            .commit_antigravity_acp_session(prepared, stored_id.as_deref())
-                            .await?,
+                        boxed_await(|| {
+                            self.services
+                                .commit_antigravity_acp_session(prepared, stored_id.as_deref())
+                        })
+                        .await?,
                         None,
                     ),
                     model_response,
@@ -4655,16 +4716,18 @@ impl AgentManager {
                 self.recreated.lock().unwrap().insert(agent_id.clone());
             }
             self.arm_first_turn_prepend(agent_id, provider);
-            self.install_and_apply_thought_level(
-                conn.as_ref(),
-                &session_record,
-                &opened,
-                model_response,
-                stored_effort.as_deref(),
-                None,
-            )
+            boxed_await(|| {
+                self.install_and_apply_thought_level(
+                    conn.as_ref(),
+                    &session_record,
+                    &opened,
+                    model_response,
+                    stored_effort.as_deref(),
+                    None,
+                )
+            })
             .await;
-            let captured = deliver_captured(delivery).await;
+            let captured = boxed_await(|| deliver_captured(delivery)).await;
             return Ok(StartedSession {
                 session_id: opened.session_id,
                 turn: OriginalTurn {
@@ -4692,8 +4755,8 @@ impl AgentManager {
                 repository_origin.accept_session(
                     attempt,
                     &conn,
-                    self.services
-                        .create_repository_acp_session(
+                    boxed_await(|| {
+                        self.services.create_repository_acp_session(
                             (conn.as_ref(), callbacks.as_ref()),
                             agent_id,
                             cwd,
@@ -4701,51 +4764,58 @@ impl AgentManager {
                             creation,
                             true,
                         )
-                        .await?,
+                    })
+                    .await?,
                 )
             } else {
                 (
-                    self.services
-                        .recreate_acp_session(
+                    boxed_await(|| {
+                        self.services.recreate_acp_session(
                             conn.as_ref(),
                             agent_id,
                             &expected_old,
                             cwd,
                             session_mcp_servers.clone(),
                         )
-                        .await?,
+                    })
+                    .await?,
                     None,
                 )
             };
             self.force_recreate.lock().unwrap().remove(agent_id);
             self.recreated.lock().unwrap().insert(agent_id.clone());
             self.arm_first_turn_prepend(agent_id, provider);
-            self.maybe_bypass_permissions(
-                conn.as_ref(),
-                provider,
-                &opened.session_id,
-                opened.modes.as_ref(),
-            )
+            boxed_await(|| {
+                self.maybe_bypass_permissions(
+                    conn.as_ref(),
+                    provider,
+                    &opened.session_id,
+                    opened.modes.as_ref(),
+                )
+            })
             .await;
-            let model_response = self
-                .maybe_apply_session_model(
+            let model_response = boxed_await(|| {
+                self.maybe_apply_session_model(
                     conn.as_ref(),
                     agent_id,
                     provider,
                     &opened.session_id,
                     stored_model.as_deref(),
                 )
-                .await?;
-            self.install_and_apply_thought_level(
-                conn.as_ref(),
-                &session_record,
-                &opened,
-                model_response,
-                stored_effort.as_deref(),
-                None,
-            )
+            })
+            .await?;
+            boxed_await(|| {
+                self.install_and_apply_thought_level(
+                    conn.as_ref(),
+                    &session_record,
+                    &opened,
+                    model_response,
+                    stored_effort.as_deref(),
+                    None,
+                )
+            })
             .await;
-            let captured = deliver_captured(delivery).await;
+            let captured = boxed_await(|| deliver_captured(delivery)).await;
             return Ok(StartedSession {
                 session_id: opened.session_id,
                 turn: OriginalTurn {
@@ -4765,8 +4835,8 @@ impl AgentManager {
             repository_origin.accept_session(
                 attempt,
                 &conn,
-                self.services
-                    .create_repository_acp_session(
+                boxed_await(|| {
+                    self.services.create_repository_acp_session(
                         (conn.as_ref(), callbacks.as_ref()),
                         agent_id,
                         cwd,
@@ -4774,44 +4844,56 @@ impl AgentManager {
                         creation,
                         false,
                     )
-                    .await?,
+                })
+                .await?,
             )
         } else {
             (
-                self.services
-                    .open_acp_session(conn.as_ref(), agent_id, cwd, session_mcp_servers)
-                    .await?,
+                boxed_await(|| {
+                    self.services.open_acp_session(
+                        conn.as_ref(),
+                        agent_id,
+                        cwd,
+                        session_mcp_servers,
+                    )
+                })
+                .await?,
                 None,
             )
         };
         self.force_recreate.lock().unwrap().remove(agent_id);
         self.arm_first_turn_prepend(agent_id, provider);
-        self.maybe_bypass_permissions(
-            conn.as_ref(),
-            provider,
-            &opened.session_id,
-            opened.modes.as_ref(),
-        )
+        boxed_await(|| {
+            self.maybe_bypass_permissions(
+                conn.as_ref(),
+                provider,
+                &opened.session_id,
+                opened.modes.as_ref(),
+            )
+        })
         .await;
-        let model_response = self
-            .maybe_apply_session_model(
+        let model_response = boxed_await(|| {
+            self.maybe_apply_session_model(
                 conn.as_ref(),
                 agent_id,
                 provider,
                 &opened.session_id,
                 stored_model.as_deref(),
             )
-            .await?;
-        self.install_and_apply_thought_level(
-            conn.as_ref(),
-            &session_record,
-            &opened,
-            model_response,
-            stored_effort.as_deref(),
-            None,
-        )
+        })
+        .await?;
+        boxed_await(|| {
+            self.install_and_apply_thought_level(
+                conn.as_ref(),
+                &session_record,
+                &opened,
+                model_response,
+                stored_effort.as_deref(),
+                None,
+            )
+        })
         .await;
-        let captured = deliver_captured(delivery).await;
+        let captured = boxed_await(|| deliver_captured(delivery)).await;
         Ok(StartedSession {
             session_id: opened.session_id,
             turn: OriginalTurn {
@@ -5309,7 +5391,11 @@ impl AgentManager {
     /// Legacy Codex slash ids retain their existing parsing. Bracket ids
     /// split only for recognized catalog effort levels; arbitrary/malformed
     /// brackets must reach the adapter unchanged and be rejected there.
-    pub(crate) fn split_codex_model_effort(model: &str) -> (&str, Option<&str>) {
+    #[expect(
+        clippy::must_use_candidate,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub fn split_codex_model_effort(model: &str) -> (&str, Option<&str>) {
         if let Some((base, effort)) = model.split_once('/') {
             return (base, Some(effort));
         }
@@ -5329,7 +5415,7 @@ impl AgentManager {
     /// The explicit field is canonical. Embedded legacy Codex effort is a
     /// fallback only when that field is absent/empty, both at startup and
     /// when reusing a child; otherwise reuse would reset suffix-only effort.
-    pub(crate) fn session_model_effort(
+    pub fn session_model_effort(
         provider: &ProviderConfig,
         model: Option<&str>,
         explicit: Option<&str>,
@@ -5891,8 +5977,9 @@ impl AgentManager {
         // here so only the triggering turn carries it — the persisted
         // `auto_unarchived` system row stays excluded from history replay
         // like every system row.
-        if self.auto_unarchived.lock().unwrap().remove(agent_id) {
-            blocks.extend(text_prompt(AUTO_UNARCHIVE_PROMPT_NOTICE));
+        let notice = self.auto_unarchived.lock().unwrap().remove(agent_id);
+        if let Some(notice) = notice {
+            blocks.extend(text_prompt(&notice));
         }
         Ok(blocks)
     }
@@ -6357,7 +6444,11 @@ impl AgentManager {
     /// concurrent `agent.sendMessage` racing the teardown cannot respawn a
     /// child that would outlive its deleted session as a ghost process.
     #[must_use = "hold the fence until the swept agents' session rows are deleted"]
-    pub(crate) async fn stop_many(&self, agent_ids: &[AgentId]) -> TeardownFence {
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub async fn stop_many(&self, agent_ids: &[AgentId]) -> TeardownFence {
         // Arm the fence BEFORE the first detach: from here on, every lazy
         // spawn for a swept agent is refused (`ensure_started` fast-fail +
         // the `create_agent` install fence), so no replacement child can
@@ -6454,6 +6545,16 @@ impl AgentManager {
             self.retain_finishing_worker(worker);
         }
         if sync_store && !self.is_shutting_down() {
+            let discussion_turn = self
+                .active_discussion_turns
+                .lock()
+                .unwrap()
+                .remove(agent_id);
+            if let Some(turn) = discussion_turn {
+                self.services
+                    .set_discussion_activity(&turn, "stopped", None)
+                    .await;
+            }
             self.services.settle_script_monitor_worker(agent_id).await;
         }
         self.services
@@ -6632,6 +6733,16 @@ impl AgentManager {
         if let Some(worker) = self.workers.lock().unwrap().remove(agent_id) {
             worker.abort();
             self.retain_finishing_worker(worker);
+        }
+        let discussion_turn = self
+            .active_discussion_turns
+            .lock()
+            .unwrap()
+            .remove(agent_id);
+        if let Some(turn) = discussion_turn {
+            self.services
+                .set_discussion_activity(&turn, "stopped", None)
+                .await;
         }
         self.services.settle_script_monitor_worker(agent_id).await;
         // The abort may have landed between the streaming path's terminal-
@@ -7228,13 +7339,31 @@ impl AgentManager {
     ) -> TryBeginOutcome {
         let gate = self.turn_start_gates.for_agent(agent_id);
         let _starting = gate.lock().await;
+        // Archived / Retired workspace: take the archive fence BEFORE the
+        // claim so a retirement teardown (whose `stop_many` releases slots)
+        // can neither clear this admission nor interleave before the revive.
+        let fence = if auto_unarchive {
+            boxed_await(|| self.services.turn_start_archive_fence(workspace_id)).await
+        } else {
+            None
+        };
         match self.claim_slot_sync(agent_id, workspace_id, || {
             Ok::<(), std::convert::Infallible>(())
         }) {
             Ok(((), admission)) => {
-                self.begin_turn_side_effects(agent_id, workspace_id, auto_unarchive)
-                    .await;
-                TryBeginOutcome::Started(admission)
+                if boxed_await(|| {
+                    self.begin_turn_side_effects(agent_id, workspace_id, auto_unarchive, fence)
+                })
+                .await
+                {
+                    TryBeginOutcome::Started(admission)
+                } else {
+                    // Retired workspace whose revive failed: give the slot
+                    // back; the caller treats it as "not started" and keeps
+                    // the message queued.
+                    self.release_slot_sync(agent_id);
+                    TryBeginOutcome::ReviveFailed
+                }
             }
             Err(SlotClaimLoss::Busy) => TryBeginOutcome::Busy,
             Err(SlotClaimLoss::ReapClaimed) => TryBeginOutcome::ReapClaimed,
@@ -7262,6 +7391,7 @@ impl AgentManager {
     ) -> Option<((QueuedMessage, DrainingGuard), TurnAdmission)> {
         let gate = self.turn_start_gates.for_agent(agent_id);
         let _starting = gate.lock().await;
+        let fence = boxed_await(|| self.services.turn_start_archive_fence(workspace_id)).await;
         let claimed = self.claim_slot_sync(agent_id, workspace_id, || {
             match self.services.claim_parked_recovery_send(agent_id) {
                 RecoverySendClaim::Drained(popped) => Ok(*popped),
@@ -7271,9 +7401,19 @@ impl AgentManager {
         });
         match claimed {
             Ok(popped) => {
-                self.begin_turn_side_effects(agent_id, workspace_id, true)
-                    .await;
-                Some(popped)
+                if boxed_await(|| self.begin_turn_side_effects(agent_id, workspace_id, true, fence))
+                    .await
+                {
+                    Some(popped)
+                } else {
+                    // Retired workspace whose revive failed: release the
+                    // slot and put the popped entry back at the queue head.
+                    let ((message, draining), _) = popped;
+                    self.release_slot_sync(agent_id);
+                    self.services.requeue_front(agent_id, message);
+                    drop(draining);
+                    None
+                }
             }
             Err(SlotClaimLoss::Busy | SlotClaimLoss::ReapClaimed) => {
                 // The slot holder's exit re-check probes the marker after
@@ -7414,7 +7554,8 @@ impl AgentManager {
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
         auto_unarchive: bool,
-    ) {
+        archive_fence: Option<crate::ArchiveFenceGuard>,
+    ) -> bool {
         #[cfg(test)]
         {
             let pause = self.turn_start_pause.lock().unwrap().take();
@@ -7434,20 +7575,66 @@ impl AgentManager {
             // triggers this. Suppressed (`auto_unarchive = false`) only by
             // the worker's raced re-claim, whose own post-claim archived
             // re-check parks instead of un-archiving (monorepo#2513).
-            if auto_unarchive
-                && self
-                    .services
-                    .auto_unarchive_on_turn_start(workspace_id, agent_id)
-                    .await
-            {
-                // The flip actually persisted: record the `auto_unarchived`
-                // system transcript row and arm the one-shot prompt-notice
-                // flag so THIS turn's outbound prompt tells the model the
-                // workspace was auto-unarchived. Both best-effort — never
-                // block the turn.
-                self.persist_auto_unarchive_notice(agent_id, workspace_id)
+            let outcome = if auto_unarchive {
+                match boxed_await(|| {
+                    self.services.auto_unarchive_on_turn_start_fenced(
+                        workspace_id,
+                        agent_id,
+                        archive_fence,
+                    )
+                })
+                .await
+                {
+                    Ok(outcome) => outcome,
+                    // A RETIRED workspace whose revive failed has no
+                    // checkout: the turn must not start. No side effect
+                    // has run yet; the caller releases the claim.
+                    Err(_) => return false,
+                }
+            } else {
+                drop(archive_fence);
+                None
+            };
+            // The flip actually persisted: record the system transcript row
+            // (`auto_unarchived`, or `workspace_revived` for a retired
+            // workspace) and arm the one-shot prompt-notice flag so THIS
+            // turn's outbound prompt tells the model. Both best-effort —
+            // never block the turn.
+            match outcome {
+                Some(crate::UnarchiveOutcome::Unarchived) => {
+                    boxed_await(|| {
+                        self.persist_auto_unarchive_notice(
+                            agent_id,
+                            workspace_id,
+                            AUTO_UNARCHIVE_NOTICE_TEXT,
+                            "auto_unarchived",
+                        )
+                    })
                     .await;
-                self.arm_auto_unarchive_flag_if_slot_held(agent_id);
+                    self.arm_auto_unarchive_flag_if_slot_held(
+                        agent_id,
+                        AUTO_UNARCHIVE_PROMPT_NOTICE.to_string(),
+                    );
+                }
+                Some(crate::UnarchiveOutcome::Revived {
+                    previous_branch,
+                    branch,
+                }) => {
+                    boxed_await(|| {
+                        self.persist_auto_unarchive_notice(
+                            agent_id,
+                            workspace_id,
+                            WORKSPACE_REVIVED_NOTICE_TEXT,
+                            "workspace_revived",
+                        )
+                    })
+                    .await;
+                    self.arm_auto_unarchive_flag_if_slot_held(
+                        agent_id,
+                        workspace_revived_prompt_notice(&previous_branch, &branch),
+                    );
+                }
+                None => {}
             }
             // Pre-upgrade pending-questions marker (PROTOCOL §5.5): a session
             // whose marker key was never written derives pendingness from the
@@ -7497,6 +7684,7 @@ impl AgentManager {
             )
             .await;
         }
+        true
     }
 
     /// Release the in-flight slot without persisting agent status (used when
@@ -7701,13 +7889,13 @@ impl AgentManager {
     /// `busy` while inserting closes the window: either this claim still owns
     /// the slot (insert precedes the release's clear) or the slot is gone
     /// (insert is skipped entirely).
-    fn arm_auto_unarchive_flag_if_slot_held(&self, agent_id: &AgentId) {
+    fn arm_auto_unarchive_flag_if_slot_held(&self, agent_id: &AgentId, notice: String) {
         let busy = self.busy.lock().unwrap();
         if busy.contains(agent_id) {
             self.auto_unarchived
                 .lock()
                 .unwrap()
-                .insert(agent_id.clone());
+                .insert(agent_id.clone(), notice);
         }
     }
 
@@ -9615,17 +9803,24 @@ impl AgentManager {
                     Ok(ws) if ws.archived
                 )
             {
-                return self
-                    .send_message(agent_id, workspace_id, content, message_id, options)
-                    .await;
+                return Box::pin(self.send_message(
+                    agent_id,
+                    workspace_id,
+                    content,
+                    message_id,
+                    options,
+                ))
+                .await;
             }
             self.preempt_busy_turn(&agent_id, &mut options).await;
             // The slot was just released (or was never held): the send path claims
             // it and streams the interrupt message right away rather than queueing.
             // If a concurrent send wins the race the message queues instead — it is
             // still delivered by that worker's drain loop, never dropped.
-            self.send_message(agent_id, workspace_id, content, message_id, options)
-                .await
+            // The send can synchronously drain its append-failure fallback. Keep
+            // its large future out of this interrupt frame so the nested drain
+            // also fits on the default thread stack under coverage instrumentation.
+            Box::pin(self.send_message(agent_id, workspace_id, content, message_id, options)).await
         })
         .await
     }
@@ -9768,6 +9963,47 @@ impl AgentManager {
         }
     }
 
+    fn track_discussion_turn(&self, agent: &AgentId, options: &TurnOptions) {
+        let mut active = self.active_discussion_turns.lock().unwrap();
+        if crate::discussion_activity::is_discussion(options.message_metadata.as_ref()) {
+            if let Some(turn) = &options.turn_id {
+                active.insert(agent.clone(), turn.clone());
+            }
+        } else {
+            active.remove(agent);
+        }
+    }
+
+    fn clear_discussion_turn(&self, agent: &AgentId, options: &TurnOptions) {
+        let mut active = self.active_discussion_turns.lock().unwrap();
+        if active.get(agent) == options.turn_id.as_ref() {
+            active.remove(agent);
+        }
+    }
+
+    /// Fence new admissions, then abort only the worker owning this invocation.
+    pub(crate) async fn stop_discussion_turn(&self, agent: &AgentId, turn: &str) {
+        let gate = self.turn_start_gates.for_agent(agent);
+        let _admission = gate.lock().await;
+        {
+            let mut active = self.active_discussion_turns.lock().unwrap();
+            if active.get(agent).map(String::as_str) != Some(turn) {
+                return;
+            }
+            self.services.pin_live_turn(agent);
+            if let Some(worker) = self.workers.lock().unwrap().remove(agent) {
+                worker.abort();
+                self.retain_finishing_worker(worker);
+            }
+            active.remove(agent);
+        }
+        self.interrupt_inner(agent, InterruptReason::UserStop, None)
+            .await;
+        // Explicit stopped invocations can only be resumed with Retry.
+        self.stop_redelivery.lock().unwrap().remove(agent);
+        self.sync_stop_redelivery(agent).await;
+    }
+
     /// Spawn (and track) the background turn worker for an agent. The caller must
     /// already hold the in-flight slot (`try_begin`). `user_persisted` reports
     /// whether the initial turn's user row durably reached the transcript, so a
@@ -9797,6 +10033,7 @@ impl AgentManager {
         if options.turn_id.is_none() {
             options.turn_id = Some(new_message_id());
         }
+        self.track_discussion_turn(&agent_id, &options);
         self.services
             .track_script_monitor_worker(&agent_id, options.message_metadata.as_ref());
         // Consume a pending zero-output stop redelivery
@@ -9821,7 +10058,9 @@ impl AgentManager {
         // flush rebuilds the same aggregate order as this turn (entry
         // prepends in entry order, then the stop redelivery) instead of
         // losing it with the discarded aggregate prepend.
-        let armed = if options.monitor_turn.is_none() {
+        let armed = if options.monitor_turn.is_none()
+            && !crate::discussion_activity::is_discussion(options.message_metadata.as_ref())
+        {
             self.stop_redelivery.lock().unwrap().remove(&agent_id)
         } else {
             None
@@ -9866,15 +10105,17 @@ impl AgentManager {
                 if consumed_redelivery {
                     mgr.sync_stop_redelivery(&id).await;
                 }
-                run_message_worker(
-                    mgr,
-                    id,
-                    workspace_id,
-                    content,
-                    options,
-                    user_persisted,
-                    admission,
-                )
+                boxed_await(move || {
+                    run_message_worker(
+                        mgr,
+                        id,
+                        workspace_id,
+                        content,
+                        options,
+                        user_persisted,
+                        admission,
+                    )
+                })
                 .await;
             },
         ));
@@ -9900,7 +10141,9 @@ impl AgentManager {
     ) -> Option<TurnAdmission> {
         match self.try_begin_outcome(agent_id, workspace_id, true).await {
             TryBeginOutcome::Started(admission) => Some(admission),
-            TryBeginOutcome::Busy | TryBeginOutcome::ReapClaimed => None,
+            TryBeginOutcome::Busy
+            | TryBeginOutcome::ReapClaimed
+            | TryBeginOutcome::ReviveFailed => None,
         }
     }
 
@@ -10093,7 +10336,9 @@ impl AgentManager {
             // notification instead — it is the tail of the dying child's
             // output and would have died with the handle's buffer had the
             // kill won the race to it.
-            TryBeginOutcome::ReapClaimed => return true,
+            // No checkout to run the wake in: drop the notification like a
+            // reap loss.
+            TryBeginOutcome::ReapClaimed | TryBeginOutcome::ReviveFailed => return true,
         };
         // Drive the turn in its own task registered in `workers`, so
         // `interrupt` / `interrupt_send_message` / `stop` abort an open wake
@@ -10871,16 +11116,24 @@ impl AgentManager {
     /// confirmed flip, never on the suppressed re-claim or an unarchive
     /// failure). The row is `role: "system"` — excluded from supervisor-XML
     /// history replay like the model-change notice — with metadata
-    /// `{ type: "auto_unarchived", reason: "agent_activity" }`. Emits
+    /// `{ type: <kind>, reason: "agent_activity" }` — `kind` is
+    /// `auto_unarchived`, or `workspace_revived` when the turn start revived
+    /// a retired workspace (PROTOCOL §5.1 "Revive"). Emits
     /// `agent:message` so clients update live. Entirely best-effort: an
     /// append/publish failure is logged and the turn proceeds.
-    async fn persist_auto_unarchive_notice(&self, agent_id: &AgentId, workspace_id: &WorkspaceId) {
+    async fn persist_auto_unarchive_notice(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        text: &str,
+        kind: &str,
+    ) {
         let content = json!([{
             "type": "text",
-            "text": AUTO_UNARCHIVE_NOTICE_TEXT,
+            "text": text,
         }]);
         let metadata = json!({
-            "type": "auto_unarchived",
+            "type": kind,
             "reason": "agent_activity",
         });
         match self
@@ -11200,7 +11453,7 @@ impl AgentManager {
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
     ) -> Result<String> {
-        self.ensure_started_owned(agent_id, workspace_id)
+        boxed_await(|| self.ensure_started_owned(agent_id, workspace_id))
             .await
             .map(|started| started.session_id)
     }
@@ -11233,17 +11486,22 @@ impl AgentManager {
         // `session.sandbox_path`) and the session read below observes the
         // settled sandbox fields. No-op when no provisioning is in flight —
         // the common case for every turn after the first.
-        self.services.await_sandbox_provisioning(agent_id).await;
-        let mut session = self.services.require_agent_session(agent_id).await?;
+        boxed_await(|| self.services.await_sandbox_provisioning(agent_id)).await;
+        let mut session = boxed_await(|| self.services.require_agent_session(agent_id)).await?;
         // Lazy legacy feature freeze (intent-hq/monorepo#2459): a pre-0096
         // row still carrying harness_features = NULL gets its snapshot
         // materialized at this activation choke point — every turn (first
         // spawn, resume, respawn, wake) funnels through here. One-time and
         // idempotent; a no-op for stamped rows.
-        self.services
-            .materialize_legacy_harness_features(&mut session)
-            .await;
-        let workspace = self.services.store.get_workspace(workspace_id).await.ok();
+        let session_mut = &mut session;
+        boxed_await(move || {
+            self.services
+                .materialize_legacy_harness_features(session_mut)
+        })
+        .await;
+        let workspace = boxed_await(|| self.services.store.get_workspace(workspace_id))
+            .await
+            .ok();
         let settings = self.services.effective_settings();
         // Legacy provider repair: every session pins its provider at create,
         // so a NULL column is a pre-pin row. Pin it once onto the provider its
@@ -11253,16 +11511,18 @@ impl AgentManager {
         // Boxed: keeps the repair's state off `ensure_started`'s future (the
         // deep send/interrupt paths otherwise overflow the test stack).
         let session =
-            Box::pin(self.pin_legacy_session_provider(agent_id, workspace_id, session)).await?;
+            boxed_await(|| self.pin_legacy_session_provider(agent_id, workspace_id, session))
+                .await?;
         // Disabled-provider gate (intent-hq/intent#5737): a session pinned to
         // a provider the user switched off in Settings > Agents never spawns
         // it — re-home onto the usable default (persisted before
         // `resolve_spawn`, so the respawn branch below sees the new identity)
         // or fail the turn with the same "not enabled" rejection the create
         // front doors raise.
-        let (session, rehomed) = self
-            .rehome_if_provider_disabled(agent_id, workspace_id, session, &settings)
-            .await?;
+        let (session, rehomed) = boxed_await(|| {
+            self.rehome_if_provider_disabled(agent_id, workspace_id, session, &settings)
+        })
+        .await?;
         let mut resolved = resolve_spawn(
             &session,
             workspace.as_ref(),
@@ -11315,7 +11575,7 @@ impl AgentManager {
                 // start_session can try session/load for providers that support it).
                 // This is narrower than stop() — only kills the child/handle, no
                 // worker/busy-flag touch, matching the retry-spawn teardown path.
-                self.kill_child_only(agent_id).await;
+                boxed_await(|| self.kill_child_only(agent_id)).await;
             } else if let Some(acp) = session.acp_session_id.clone() {
                 if self.handle_is_live(agent_id) {
                     let original = self.capture_turn(agent_id)?;
@@ -11323,8 +11583,10 @@ impl AgentManager {
                     // session. The notice/commit still runs: the live child may
                     // predate a same-provider model change the reuse tolerates,
                     // and an unchanged identity is a cheap no-op read.
-                    self.maybe_persist_model_change_notice(agent_id, workspace_id, &resolved)
-                        .await;
+                    boxed_await(|| {
+                        self.maybe_persist_model_change_notice(agent_id, workspace_id, &resolved)
+                    })
+                    .await;
                     // A `reasoningEffort` change needs no respawn: re-apply it
                     // on the live session through the `thought_level` config
                     // option discovered at session open, so it takes effect
@@ -11337,26 +11599,39 @@ impl AgentManager {
                             session.model.as_deref(),
                             session.reasoning_effort.as_deref(),
                         );
-                        self.apply_thought_level(conn.as_ref(), agent_id, &acp, effort.as_deref())
-                            .await;
-                    }
-                    self.maybe_persist_effort_change_notice(agent_id, workspace_id, &resolved)
+                        boxed_await(|| {
+                            self.apply_thought_level(
+                                conn.as_ref(),
+                                agent_id,
+                                &acp,
+                                effort.as_deref(),
+                            )
+                        })
                         .await;
-                    Box::pin(self.fill_confirmed_effort(
-                        agent_id,
-                        workspace_id,
-                        &resolved,
-                        session.provider.as_deref(),
-                        session.model.as_deref(),
-                    ))
+                    }
+                    boxed_await(|| {
+                        self.maybe_persist_effort_change_notice(agent_id, workspace_id, &resolved)
+                    })
                     .await;
-                    self.apply_fast_mode(
-                        agent_id,
-                        &acp,
-                        resolved.provider.id,
-                        &resolved.selection,
-                        &original,
-                    )
+                    boxed_await(|| {
+                        self.fill_confirmed_effort(
+                            agent_id,
+                            workspace_id,
+                            &resolved,
+                            session.provider.as_deref(),
+                            session.model.as_deref(),
+                        )
+                    })
+                    .await;
+                    boxed_await(|| {
+                        self.apply_fast_mode(
+                            agent_id,
+                            &acp,
+                            resolved.provider.id,
+                            &resolved.selection,
+                            &original,
+                        )
+                    })
                     .await?;
                     return Ok(StartedSession {
                         session_id: acp,
@@ -11369,7 +11644,7 @@ impl AgentManager {
                 // child and resumes via `session/load` (or the recreate
                 // fallback in `start_session`).
                 tracing::warn!(agent_id = %agent_id, "cached agent child is dead; respawning before turn");
-                self.kill_child_only(agent_id).await;
+                boxed_await(|| self.kill_child_only(agent_id)).await;
             }
         }
         // auggie version gate (monorepo#1045): before a fresh child spawns,
@@ -11406,7 +11681,7 @@ impl AgentManager {
         // (blocking subprocess, ≤3s on a cache miss).
         if let Some(npx) = resolved.npx_fallback_binary.clone() {
             if !self.contains(agent_id) {
-                crate::npx_cli::check_npx_version(&npx).await?;
+                boxed_await(|| crate::npx_cli::check_npx_version(&npx)).await?;
             }
         }
         // unsloth spawn gate (spec "Proposed design" §4): before the child
@@ -11450,15 +11725,15 @@ impl AgentManager {
             // managed-server lifecycle shells out to (NOT the opencode ACP
             // primary, which `resolve_spawn` keys on "opencode").
             let unsloth_cli_override = read_provider_path_setting(&settings, "unsloth");
-            let endpoint = self
-                .unsloth
-                .ensure_endpoint(
+            let endpoint = boxed_await(|| {
+                self.unsloth.ensure_endpoint(
                     &repo_id,
                     unsloth_cli_override.as_deref(),
                     attached_agents,
                     &status_cb,
                 )
-                .await?;
+            })
+            .await?;
             resolved.unsloth_endpoint = Some(endpoint);
         }
         // Bare-command launch is the last-resort tier: nothing resolved a
@@ -11491,8 +11766,8 @@ impl AgentManager {
         // A named profile's saved overlay, read fresh for this new process
         // (it re-checks the profile still exists and its base is enabled).
         // Boxed: keeps this turn-start future's stack frame unchanged.
-        let profile_env = if crate::provider_profiles::is_qualified_ref(&resolved.selection) {
-            Box::pin(self.services.resolve_selected_profile(&resolved.selection)).await?
+        let profile_env = if crate::provider_profiles::may_have_overlay(&resolved.selection) {
+            boxed_await(|| self.services.resolve_selected_profile(&resolved.selection)).await?
         } else {
             None
         };
@@ -11534,11 +11809,15 @@ impl AgentManager {
             .unwrap()
             .insert(agent_id.clone(), resolved.selection.clone());
         let private_history = if let Some(session_id) = &session.acp_session_id {
-            self.services
-                .store
-                .get_review_context_enrollment(workspace_id, agent_id, session_id)
-                .await?
-                .is_some()
+            boxed_await(|| {
+                self.services.store.get_review_context_enrollment(
+                    workspace_id,
+                    agent_id,
+                    session_id,
+                )
+            })
+            .await?
+            .is_some()
         } else {
             false
         };
@@ -11561,20 +11840,23 @@ impl AgentManager {
                 derive_is_orchestrator(&self.services, &session, workspace.as_ref()),
                 &agent_type,
             );
-            self.create_agent(
-                agent_id.clone(),
-                workspace_id.clone(),
-                session.name.clone(),
-                &agent_type,
-                resolved.cwd.clone(),
-                &opts,
-            )
+            boxed_await(|| {
+                self.create_agent(
+                    agent_id.clone(),
+                    workspace_id.clone(),
+                    session.name.clone(),
+                    &agent_type,
+                    resolved.cwd.clone(),
+                    &opts,
+                )
+            })
             .await?;
         }
         let original_attempt = repository_origin::capture(&self.handles, agent_id);
-        let session_result = self
-            .start_session_owned(agent_id, resolved.cwd.clone(), &resolved.provider)
-            .await;
+        let session_result = boxed_await(|| {
+            self.start_session_owned(agent_id, resolved.cwd.clone(), &resolved.provider)
+        })
+        .await;
         let acp_session_id = match session_result {
             Ok(id) => id,
             Err(error) => {
@@ -11583,13 +11865,13 @@ impl AgentManager {
                     // child. Retire only this captured attempt so a later
                     // original-account recovery must load on a fresh child.
                     if let Some(original) = &original_attempt {
-                        self.kill_original_child(agent_id, original).await;
+                        boxed_await(|| self.kill_original_child(agent_id, original)).await;
                     }
                 } else if resolved.provider.id == "antigravity" {
                     // Never let the next turn reuse an unverified child
                     // through the fast path. Fresh candidates are not committed
                     // until confirmation; a failed load keeps its prior ID.
-                    self.kill_child_only(agent_id).await;
+                    boxed_await(|| self.kill_child_only(agent_id)).await;
                 }
                 return Err(error);
             }
@@ -11599,14 +11881,18 @@ impl AgentManager {
         // id (`fill_identity_from_session_open`). The child runs exactly that
         // model, so adopt it as the resolved identity: the notice/commit
         // below and the next turn's respawn comparison see the same id.
-        let filled_model = Box::pin(self.adopt_filled_model(
-            agent_id,
-            workspace_id,
-            &session,
-            workspace.as_ref(),
-            &settings,
-            &mut resolved,
-        ))
+        let (session_ref, workspace_ref, settings_ref, resolved_ref) =
+            (&session, workspace.as_ref(), &settings, &mut resolved);
+        let filled_model = boxed_await(move || {
+            self.adopt_filled_model(
+                agent_id,
+                workspace_id,
+                session_ref,
+                workspace_ref,
+                settings_ref,
+                resolved_ref,
+            )
+        })
         .await;
         // Backup failover: a turn that started on the provider default now
         // runs under the filled model, which the session row also carries.
@@ -11622,27 +11908,31 @@ impl AgentManager {
         // never blocks the turn. A re-home commits the identity but skips the
         // row (the `provider_rehomed` notice already landed) — detected from
         // the transcript, so it holds on a retry after a failed first spawn.
-        self.maybe_persist_model_change_notice(agent_id, workspace_id, &resolved)
+        boxed_await(|| self.maybe_persist_model_change_notice(agent_id, workspace_id, &resolved))
             .await;
-        self.maybe_persist_effort_change_notice(agent_id, workspace_id, &resolved)
+        boxed_await(|| self.maybe_persist_effort_change_notice(agent_id, workspace_id, &resolved))
             .await;
         // The row now carries the session-open fill (if one landed) instead
         // of the turn-start NULL model.
-        Box::pin(self.fill_confirmed_effort(
-            agent_id,
-            workspace_id,
-            &resolved,
-            session.provider.as_deref(),
-            filled_model.as_deref().or(session.model.as_deref()),
-        ))
+        boxed_await(|| {
+            self.fill_confirmed_effort(
+                agent_id,
+                workspace_id,
+                &resolved,
+                session.provider.as_deref(),
+                filled_model.as_deref().or(session.model.as_deref()),
+            )
+        })
         .await;
-        self.apply_fast_mode(
-            agent_id,
-            &acp_session_id.session_id,
-            resolved.provider.id,
-            &resolved.selection,
-            &acp_session_id.turn,
-        )
+        boxed_await(|| {
+            self.apply_fast_mode(
+                agent_id,
+                &acp_session_id.session_id,
+                resolved.provider.id,
+                &resolved.selection,
+                &acp_session_id.turn,
+            )
+        })
         .await?;
         self.spawn_attempt_provider.lock().unwrap().remove(agent_id);
         Ok(acp_session_id)
@@ -11714,6 +12004,18 @@ impl AgentManager {
         // to spawn. Include those workers, not only installed handles, or their
         // resolved interruption row would be lost at this shutdown.
         let in_flight = self.list_busy();
+        // Agents whose provider still runs a background worker (§5.5b): the
+        // teardown after this checkpoint kills the provider tree and the
+        // worker with it, so its completion report never arrives. Capture them
+        // before any await so the restart resume tells each agent its work was
+        // lost — including agents that ended their turn and are idle, which
+        // the in-flight capture below would otherwise skip.
+        let with_workers = self.services.agent_workers().running_worker_agents();
+        let worker_ids: HashSet<&AgentId> = with_workers.iter().map(|(id, _)| id).collect();
+        // Agents the in-flight capture below took responsibility for, whether
+        // or not its row write succeeded: the idle capture must never record
+        // a mid-turn agent as idle.
+        let mut captured_mid_turn: HashSet<AgentId> = HashSet::new();
         // Pin every live slot before aborting any worker: dropping its future
         // drops the LiveTurnGuard, which would otherwise erase partial output.
         for (id, _) in &in_flight {
@@ -11788,9 +12090,10 @@ impl AgentManager {
             // work is only finishing post-turn bookkeeping: recording it would
             // make the next startup deliver a second continuation.
             if self.turn_settled(id) && !self.services.has_ready_to_send(id) {
-                tracing::debug!(agent_id = %id, "graceful shutdown: turn already settled, no interrupted_agent row");
+                tracing::debug!(agent_id = %id, "graceful shutdown: turn already settled, no in-flight interrupted_agent row");
                 continue;
             }
+            captured_mid_turn.insert(id.clone());
             // Read the current persisted status BEFORE end_turn settles it to RuntimeIdle.
             // Use get_agent_session_status (lightweight, skips message log).
             // RACE: try_begin inserts into busy BEFORE persist_status(Active) completes, so
@@ -11838,13 +12141,69 @@ impl AgentManager {
             // Insert the interrupted_agent row (idempotent upsert: if a prior crash captured
             // this agent and the daemon was restarted without the FE resolving it, the row
             // is refreshed to the latest state).
+            let reason = worker_ids
+                .contains(id)
+                .then_some(crate::agent_workers::INTERRUPTED_WITH_WORKERS_REASON);
             if let Err(e) = self
                 .services
                 .store
-                .insert_interrupted_agent(id, workspace_id, &prev_str, &now)
+                .insert_interrupted_agent_with_reason(id, workspace_id, &prev_str, &now, reason)
                 .await
             {
                 tracing::warn!(agent_id = %id, workspace_id = %workspace_id, error = %e, "graceful shutdown: failed to insert interrupted_agent row");
+            }
+        }
+        // Agents outside a turn whose background workers this shutdown kills
+        // (intent-hq/intent#7658). The row's prev_status is the agent's own
+        // (idle) status; the reason tag drives the resume wording. None of
+        // these is mid-turn (busy, unsettled agents were captured above), so
+        // an in-flight status is a post-turn idle write that has not landed
+        // yet and is recorded as idle. Finished agents are left alone: a
+        // deleted, retired or completed agent, or a delegated child that
+        // already reported (its parent owns the follow-up, and a pending row
+        // would hold its delegation group open).
+        for (id, workspace_id) in &with_workers {
+            if captured_mid_turn.contains(id) {
+                continue;
+            }
+            let session = match self.services.store.get_agent_session_summary(id).await {
+                Ok(session) => session,
+                Err(e) => {
+                    tracing::warn!(agent_id = %id, error = %e, "graceful shutdown: could not read an agent with running workers");
+                    continue;
+                }
+            };
+            let finished = matches!(
+                session.status,
+                AgentStatus::Deleted | AgentStatus::Completed
+            ) || session.retired_at.is_some()
+                || (session.parent_agent_id.is_some() && session.completion_report.is_some());
+            if finished {
+                tracing::debug!(agent_id = %id, status = ?session.status, "graceful shutdown: finished agent with running workers, no interrupted_agent row");
+                continue;
+            }
+            let prev_status = if crate::is_stale_in_flight_status(session.status) {
+                AgentStatus::RuntimeIdle
+            } else {
+                session.status
+            };
+            let Ok(serde_json::Value::String(prev_str)) = serde_json::to_value(prev_status) else {
+                tracing::warn!(agent_id = %id, status = ?prev_status, "graceful shutdown: status did not encode to a string, skipping interrupted_agent row");
+                continue;
+            };
+            if let Err(e) = self
+                .services
+                .store
+                .insert_interrupted_agent_with_reason(
+                    id,
+                    workspace_id,
+                    &prev_str,
+                    &now,
+                    Some(crate::agent_workers::INTERRUPTED_WITH_WORKERS_REASON),
+                )
+                .await
+            {
+                tracing::warn!(agent_id = %id, workspace_id = %workspace_id, error = %e, "graceful shutdown: failed to insert interrupted_agent row for an agent with running workers");
             }
         }
     }
@@ -12765,7 +13124,10 @@ fn redelivery_prepend(
     if messages
         .iter()
         .rfind(|message| message.role == "user")
-        .is_some_and(crate::agent_ops::is_qualified_monitor_message)
+        .is_some_and(|message| {
+            crate::agent_ops::is_qualified_monitor_message(message)
+                || crate::discussion_activity::is_discussion(message.metadata.as_ref())
+        })
     {
         return None;
     }
@@ -13191,8 +13553,13 @@ struct ResolvedSpawn {
 }
 
 /// Exercise the real first-turn resolver without starting a provider process.
-#[cfg(test)]
-pub(crate) fn imported_spawn_selection_for_test(
+#[cfg(any(test, feature = "test-hooks"))]
+#[expect(
+    clippy::missing_panics_doc,
+    clippy::must_use_candidate,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn imported_spawn_selection_for_test(
     session: &AgentSession,
     settings: &intent_core::settings_file::SettingsFile,
 ) -> (String, Option<String>, Option<String>) {
@@ -13838,7 +14205,8 @@ fn dequeue_worker_raced_tail(
 ) -> Option<(Vec<QueuedMessage>, DrainingGuard)> {
     // The head was popped before the slot reclaim, so queue selectors can no
     // longer see its monitor identity. Never attach unrelated work to its wake.
-    if next.monitor_turn.is_some()
+    if crate::discussion_activity::is_discussion(next.message_metadata.as_ref())
+        || next.monitor_turn.is_some()
         || crate::script_monitor::monitor_id(next.message_metadata.as_ref()).is_some()
     {
         return None;
@@ -13898,15 +14266,41 @@ async fn run_message_worker(
     // nudge, a stale or requeued redelivery): no timed return home there.
     let mut continuation_turn = false;
     'outer: loop {
+        mgr.track_discussion_turn(&agent_id, &options);
+        if crate::discussion_activity::is_discussion(options.message_metadata.as_ref()) {
+            let turn = options.turn_id.as_deref().expect("discussion turn id");
+            match boxed_await(|| {
+                mgr.services
+                    .store
+                    .discussion_invocation_allowed(turn, &agent_id)
+            })
+            .await
+            {
+                Ok(true) => {
+                    boxed_await(|| mgr.services.set_discussion_activity(turn, "working", None))
+                        .await;
+                }
+                Ok(false) => {
+                    mgr.clear_discussion_turn(&agent_id, &options);
+                    boxed_await(|| mgr.finish_monitor_worker(&agent_id, &workspace_id, admission))
+                        .await;
+                    return;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "retrying discussion admission");
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    continue 'outer;
+                }
+            }
+        }
         if let Some(owner) = options.monitor_turn.take() {
             if let Some(turn) = owner.take() {
                 // Keep the qualified turn future out of the ordinary worker frame.
-                if let Err(error) = Box::pin(turn.run(&mgr, admission)).await {
+                if let Err(error) = boxed_await(|| turn.run(&mgr, admission)).await {
                     tracing::debug!(agent = %agent_id, ?error, "original monitor delivery withheld");
                 }
             }
-            mgr.finish_monitor_worker(&agent_id, &workspace_id, admission)
-                .await;
+            boxed_await(|| mgr.finish_monitor_worker(&agent_id, &workspace_id, admission)).await;
             return;
         }
         mgr.services
@@ -13916,18 +14310,18 @@ async fn run_message_worker(
             &content,
             options.message_metadata.as_ref(),
         ) {
-            mgr.finish_monitor_worker(&agent_id, &workspace_id, admission)
-                .await;
+            boxed_await(|| mgr.finish_monitor_worker(&agent_id, &workspace_id, admission)).await;
             return;
         }
-        match mgr
-            .services
-            .script_monitor_delivery_allowed(&agent_id, options.message_metadata.as_ref())
-            .await
+        match boxed_await(|| {
+            mgr.services
+                .script_monitor_delivery_allowed(&agent_id, options.message_metadata.as_ref())
+        })
+        .await
         {
             Ok(true) => {}
             Ok(false) => {
-                mgr.finish_monitor_worker(&agent_id, &workspace_id, admission)
+                boxed_await(|| mgr.finish_monitor_worker(&agent_id, &workspace_id, admission))
                     .await;
                 return;
             }
@@ -13954,25 +14348,26 @@ async fn run_message_worker(
             // admission variant's `release` spawns its own drain kick, so the
             // kick survives this (abortable) worker being dropped mid-kill.
             let (try_claim, release) = mgr.admission_claim_fns();
-            mgr.registry
-                .acquire_turn_start(&agent_id, try_claim, release)
-                .await;
+            boxed_await(|| {
+                mgr.registry
+                    .acquire_turn_start(&agent_id, try_claim, release)
+            })
+            .await;
         }
         if mgr.services.defer_script_monitor_for_export(
             &agent_id,
             &content,
             options.message_metadata.as_ref(),
         ) {
-            mgr.finish_monitor_worker(&agent_id, &workspace_id, admission)
-                .await;
+            boxed_await(|| mgr.finish_monitor_worker(&agent_id, &workspace_id, admission)).await;
             return;
         }
-        if !mgr
-            .retry_script_monitor_admission(&agent_id, options.message_metadata.as_ref())
-            .await
+        if !boxed_await(|| {
+            mgr.retry_script_monitor_admission(&agent_id, options.message_metadata.as_ref())
+        })
+        .await
         {
-            mgr.finish_monitor_worker(&agent_id, &workspace_id, admission)
-                .await;
+            boxed_await(|| mgr.finish_monitor_worker(&agent_id, &workspace_id, admission)).await;
             return;
         }
         let redrive = std::mem::take(&mut keep_failover_chain);
@@ -13988,17 +14383,17 @@ async fn run_message_worker(
             mgr.services.cancel_provider_return_announcement(&agent_id);
             // Boxed: keeps the return check's state off the worker's future
             // (the deep send/interrupt paths overflow the test stack).
-            Box::pin(mgr.services.begin_provider_return(&workspace_id, &agent_id)).await;
+            boxed_await(|| mgr.services.begin_provider_return(&workspace_id, &agent_id)).await;
         } else if !redrive {
             // A replay or continuation never starts a timed switch, but an
             // owed return already persisted on home (e.g. a retry resumed
             // after a daemon restart lost the in-memory mark) is re-armed so
             // home's first output still announces it and clears the state.
-            Box::pin(mgr.services.rearm_provider_return_if_home(&agent_id)).await;
+            boxed_await(|| mgr.services.rearm_provider_return_if_home(&agent_id)).await;
         }
         // Keep the large session-start future off the worker's inline state;
         // it is still polled and cancelled by this same worker.
-        match Box::pin(retry_spawn_owned(&mgr, &agent_id, &workspace_id)).await {
+        match boxed_await(|| retry_spawn_owned(&mgr, &agent_id, &workspace_id)).await {
             Ok(StartedSession {
                 session_id: acp_session_id,
                 turn,
@@ -14012,8 +14407,10 @@ async fn run_message_worker(
                 // already-delivered report stays queryable via `agent.get` — a
                 // genuine re-report still overwrites it through `reportToParent`.
                 if !options.suppress_report_clear {
-                    mgr.clear_completion_report_if_present(&agent_id, &workspace_id)
-                        .await;
+                    boxed_await(|| {
+                        mgr.clear_completion_report_if_present(&agent_id, &workspace_id)
+                    })
+                    .await;
                 }
                 // A pending attention request retires on a USER-ORIGIN
                 // delivery (sendMessage front door, sendQueuedMessageNow,
@@ -14029,7 +14426,7 @@ async fn run_message_worker(
                 // user has not seen. Fail closed on a session-load error
                 // (leave the request pending).
                 let clear_attention = options.origin.is_user()
-                    || match mgr.services.store.get_agent_session(&agent_id).await {
+                    || match boxed_await(|| mgr.services.store.get_agent_session(&agent_id)).await {
                         Ok(s) => s.parent_agent_id.is_some() || s.is_background,
                         Err(e) => {
                             tracing::warn!(
@@ -14041,8 +14438,10 @@ async fn run_message_worker(
                         }
                     };
                 if clear_attention {
-                    mgr.clear_attention_request_if_present(&agent_id, &workspace_id)
-                        .await;
+                    boxed_await(|| {
+                        mgr.clear_attention_request_if_present(&agent_id, &workspace_id)
+                    })
+                    .await;
                 }
                 // Session establishment may arm both flags. Assembly consumes
                 // them, but a rejected prompt has delivered neither context.
@@ -14057,12 +14456,12 @@ async fn run_message_worker(
                         mgr.recreated.lock().unwrap().insert(agent_id.clone());
                     }
                 };
-                let prepared = async {
+                let prepared = boxed_await(|| async {
                     let prompt = mgr
                         .build_turn_prompt(&agent_id, &workspace_id, &content, &options)
                         .await?;
                     crate::provider_images::PreparedPrompt::new(prompt).await
-                }
+                })
                 .await;
                 let prompt = match prepared {
                     Ok(prompt) => prompt,
@@ -14075,15 +14474,17 @@ async fn run_message_worker(
                         // options (including image references and turn id) feed
                         // the normal durable failure/retry path unchanged.
                         mgr.active_delivery_groups.lock().unwrap().remove(&agent_id);
-                        handle_terminal_turn_failure(
-                            &mgr,
-                            &agent_id,
-                            &workspace_id,
-                            &content,
-                            &options,
-                            user_persisted,
-                            &e,
-                        )
+                        boxed_await(|| {
+                            handle_terminal_turn_failure(
+                                &mgr,
+                                &agent_id,
+                                &workspace_id,
+                                &content,
+                                &options,
+                                user_persisted,
+                                &e,
+                            )
+                        })
                         .await;
                         mgr.release_in_flight_slot(&agent_id);
                         break 'outer;
@@ -14095,21 +14496,22 @@ async fn run_message_worker(
                     options.message_metadata.as_ref(),
                 ) {
                     restore_undelivered_context();
-                    mgr.finish_monitor_worker(&agent_id, &workspace_id, admission)
+                    boxed_await(|| mgr.finish_monitor_worker(&agent_id, &workspace_id, admission))
                         .await;
                     return;
                 }
-                if !mgr
-                    .retry_script_monitor_admission(&agent_id, options.message_metadata.as_ref())
-                    .await
+                if !boxed_await(|| {
+                    mgr.retry_script_monitor_admission(&agent_id, options.message_metadata.as_ref())
+                })
+                .await
                 {
                     restore_undelivered_context();
-                    mgr.finish_monitor_worker(&agent_id, &workspace_id, admission)
+                    boxed_await(|| mgr.finish_monitor_worker(&agent_id, &workspace_id, admission))
                         .await;
                     return;
                 }
-                match mgr
-                    .run_turn_owned(
+                match boxed_await(|| {
+                    mgr.run_turn_owned(
                         &agent_id,
                         &workspace_id,
                         &acp_session_id,
@@ -14117,26 +14519,47 @@ async fn run_message_worker(
                         options.turn_id.as_deref(),
                         turn,
                     )
-                    .await
+                })
+                .await
                 {
-                    Ok(_stop_reason) => {
+                    Ok(stop_reason) => {
+                        mgr.clear_discussion_turn(&agent_id, &options);
+                        boxed_await(|| {
+                            mgr.services.settle_discussion_options(
+                                &options,
+                                if stop_reason == StopReason::Cancelled {
+                                    "stopped"
+                                } else {
+                                    "completed"
+                                },
+                                None,
+                            )
+                        })
+                        .await;
                         if let Some(id) =
                             crate::script_monitor::monitor_id(options.message_metadata.as_ref())
                         {
-                            mgr.services
-                                .complete_script_monitor_delivery(&agent_id, id)
-                                .await;
+                            boxed_await(|| {
+                                mgr.services.complete_script_monitor_delivery(&agent_id, id)
+                            })
+                            .await;
                         }
                         // A successful turn resets the identical-failure
                         // streak (monorepo#840): the session is provably not
                         // poisoned.
                         mgr.services.clear_failure_streak(&agent_id);
+                        // A turn the provider completed proves its quota to
+                        // every conversation (PROTOCOL §5.54 shared quota
+                        // state); a user stop proves nothing.
+                        if stop_reason != StopReason::Cancelled {
+                            mgr.services.note_provider_working(&agent_id);
+                        }
                         // A turn that went back to the home provider and
                         // completed there is home (PROTOCOL §5.54).
-                        Box::pin(
+                        boxed_await(|| {
                             mgr.services
-                                .complete_provider_return(&workspace_id, &agent_id),
-                        )
+                                .complete_provider_return(&workspace_id, &agent_id)
+                        })
                         .await;
                         // A completed turn also resets the consecutive
                         // idle-timeout streak (warn-and-continue).
@@ -14161,17 +14584,19 @@ async fn run_message_worker(
                             let nudge = crate::harness::latest().truncation_redrive_nudge();
                             let nudge_turn_id = new_message_id();
                             let nudge_metadata = json!({ "type": "auto_redrive" });
-                            user_persisted = persist_user(
-                                &mgr,
-                                &agent_id,
-                                &workspace_id,
-                                &nudge,
-                                None,
-                                None,
-                                Some(&nudge_metadata),
-                                Some(&nudge_turn_id),
-                                false,
-                            )
+                            user_persisted = boxed_await(|| {
+                                persist_user(
+                                    &mgr,
+                                    &agent_id,
+                                    &workspace_id,
+                                    &nudge,
+                                    None,
+                                    None,
+                                    Some(&nudge_metadata),
+                                    Some(&nudge_turn_id),
+                                    false,
+                                )
+                            })
                             .await;
                             content = nudge;
                             continuation_turn = true;
@@ -14186,13 +14611,15 @@ async fn run_message_worker(
                             // Fail closed (#547): a nudge row that never
                             // reached the transcript must not drive a turn.
                             if !user_persisted {
-                                handle_drain_persist_failure(
-                                    &mgr,
-                                    &agent_id,
-                                    &workspace_id,
-                                    &content,
-                                    &options,
-                                )
+                                boxed_await(|| {
+                                    handle_drain_persist_failure(
+                                        &mgr,
+                                        &agent_id,
+                                        &workspace_id,
+                                        &content,
+                                        &options,
+                                    )
+                                })
                                 .await;
                                 mgr.release_in_flight_slot(&agent_id);
                                 break 'outer;
@@ -14202,18 +14629,29 @@ async fn run_message_worker(
                     }
                     Err(e) => {
                         if is_benign_turn_error(&e) {
+                            mgr.clear_discussion_turn(&agent_id, &options);
+                            boxed_await(|| {
+                                mgr.services
+                                    .settle_discussion_options(&options, "stopped", None)
+                            })
+                            .await;
                             if let Some(id) =
                                 crate::script_monitor::monitor_id(options.message_metadata.as_ref())
                             {
-                                mgr.services
-                                    .complete_script_monitor_delivery(&agent_id, id)
-                                    .await;
+                                boxed_await(|| {
+                                    mgr.services.complete_script_monitor_delivery(&agent_id, id)
+                                })
+                                .await;
                             }
                             // Concurrent stop/cancel won the turn — not a failure.
                             // Keep draining: any queued message re-spawns lazily.
                             tracing::warn!(agent = %agent_id, error = %e, "agent turn ended (benign)");
                             consecutive_idle_timeouts = 0;
-                        } else if prompt_idle_timeout_error(&e) {
+                        } else if prompt_idle_timeout_error(&e)
+                            && !crate::discussion_activity::is_discussion(
+                                options.message_metadata.as_ref(),
+                            )
+                        {
                             // Warn-and-continue: the turn went the whole idle
                             // window silent. `run_prompt_turn` already flushed
                             // the partial transcript and emitted a NORMAL
@@ -14249,8 +14687,14 @@ async fn run_message_worker(
                                 let since = conn.as_ref().map(|c| c.response_seq());
                                 let settled = match conn.as_deref() {
                                     Some(c) => {
-                                        cancel_and_settle_idle_prompt(c, &agent_id, &acp_session_id)
-                                            .await
+                                        boxed_await(|| {
+                                            cancel_and_settle_idle_prompt(
+                                                c,
+                                                &agent_id,
+                                                &acp_session_id,
+                                            )
+                                        })
+                                        .await
                                     }
                                     None => false,
                                 };
@@ -14308,15 +14752,19 @@ async fn run_message_worker(
                                         .map(|h| h.execution.runtime.notifications());
                                     if let Some(notes) = notes {
                                         let mut guard = notes.lock().await;
-                                        Services::drain_replay_notifications(
-                                            &mut guard,
-                                            &agent_id,
-                                            Some(&workspace_id),
-                                        )
+                                        let (guard_mut, agent, ws) =
+                                            (&mut guard, &agent_id, &workspace_id);
+                                        boxed_await(move || {
+                                            Services::drain_replay_notifications(
+                                                guard_mut,
+                                                agent,
+                                                Some(ws),
+                                            )
+                                        })
                                         .await;
                                     }
                                 } else {
-                                    mgr.kill_child_only(&agent_id).await;
+                                    boxed_await(|| mgr.kill_child_only(&agent_id)).await;
                                 }
                                 tracing::warn!(
                                     agent = %agent_id,
@@ -14335,42 +14783,45 @@ async fn run_message_worker(
                                     intent_acp::session::prompt_idle_timeout(),
                                 );
                                 let warning_turn_id = new_message_id();
-                                user_persisted = persist_user(
-                                    &mgr,
-                                    &agent_id,
-                                    &workspace_id,
-                                    &warning,
-                                    None,
-                                    None,
-                                    None,
-                                    Some(&warning_turn_id),
-                                    false,
-                                )
+                                user_persisted = boxed_await(|| {
+                                    persist_user(
+                                        &mgr,
+                                        &agent_id,
+                                        &workspace_id,
+                                        &warning,
+                                        None,
+                                        None,
+                                        None,
+                                        Some(&warning_turn_id),
+                                        false,
+                                    )
+                                })
                                 .await;
                                 if user_persisted {
                                     if let Some(id) = crate::script_monitor::monitor_id(
                                         options.message_metadata.as_ref(),
                                     ) {
-                                        if let Err(error) = mgr
-                                            .services
-                                            .store
-                                            .continue_script_notification(
+                                        if let Err(error) = boxed_await(|| {
+                                            mgr.services.store.continue_script_notification(
                                                 &agent_id,
                                                 id,
                                                 &warning_turn_id,
                                                 &warning,
                                             )
-                                            .await
+                                        })
+                                        .await
                                         {
-                                            handle_terminal_turn_failure(
-                                                &mgr,
-                                                &agent_id,
-                                                &workspace_id,
-                                                &content,
-                                                &options,
-                                                true,
-                                                &error,
-                                            )
+                                            boxed_await(|| {
+                                                handle_terminal_turn_failure(
+                                                    &mgr,
+                                                    &agent_id,
+                                                    &workspace_id,
+                                                    &content,
+                                                    &options,
+                                                    true,
+                                                    &error,
+                                                )
+                                            })
                                             .await;
                                             mgr.release_in_flight_slot(&agent_id);
                                             break 'outer;
@@ -14391,13 +14842,15 @@ async fn run_message_worker(
                                 // Fail closed (#547): a warning row that never
                                 // reached the transcript must not drive a turn.
                                 if !user_persisted {
-                                    handle_drain_persist_failure(
-                                        &mgr,
-                                        &agent_id,
-                                        &workspace_id,
-                                        &content,
-                                        &options,
-                                    )
+                                    boxed_await(|| {
+                                        handle_drain_persist_failure(
+                                            &mgr,
+                                            &agent_id,
+                                            &workspace_id,
+                                            &content,
+                                            &options,
+                                        )
+                                    })
                                     .await;
                                     mgr.release_in_flight_slot(&agent_id);
                                     break 'outer;
@@ -14424,12 +14877,15 @@ async fn run_message_worker(
                             // persisted Error. `handle_terminal_turn_failure` below
                             // reuses the stash (streak recorded / status written
                             // exactly once, monorepo#840).
-                            let persist = persist_terminal_error_status(
-                                &mgr,
-                                &agent_id,
-                                &workspace_id,
-                                &e.to_string(),
-                            )
+                            let error_text = e.to_string();
+                            let persist = boxed_await(|| {
+                                persist_terminal_error_status(
+                                    &mgr,
+                                    &agent_id,
+                                    &workspace_id,
+                                    &error_text,
+                                )
+                            })
                             .await;
                             mgr.services
                                 .stash_pending_terminal_error(&agent_id, persist);
@@ -14438,23 +14894,26 @@ async fn run_message_worker(
                             if let Some(tid) = options.turn_id.as_deref() {
                                 data["turnId"] = json!(tid);
                             }
-                            mgr.services
-                                .publish_agent_event(
+                            boxed_await(|| {
+                                mgr.services.publish_agent_event(
                                     &workspace_id,
                                     &agent_id,
                                     intent_core::events::AGENT_FAILED,
                                     data,
                                 )
-                                .await;
-                            handle_terminal_turn_failure(
-                                &mgr,
-                                &agent_id,
-                                &workspace_id,
-                                &content,
-                                &options,
-                                user_persisted,
-                                &e,
-                            )
+                            })
+                            .await;
+                            boxed_await(|| {
+                                handle_terminal_turn_failure(
+                                    &mgr,
+                                    &agent_id,
+                                    &workspace_id,
+                                    &content,
+                                    &options,
+                                    user_persisted,
+                                    &e,
+                                )
+                            })
                             .await;
                             mgr.release_in_flight_slot(&agent_id);
                             break 'outer;
@@ -14492,7 +14951,7 @@ async fn run_message_worker(
                             // handle here forces the resume to spawn a fresh
                             // child and reload the persisted session via
                             // `session/load` (or the recreate fallback).
-                            mgr.kill_child_only(&agent_id).await;
+                            boxed_await(|| mgr.kill_child_only(&agent_id)).await;
                             // Do NOT `end_turn` + `break 'outer` here
                             // (intent-hq/intent#4972): the enrollment's
                             // self-heal (and the wake sweep) deliver the
@@ -14529,7 +14988,7 @@ async fn run_message_worker(
                                 error = %e,
                                 "transport closed before output — redriving the prompt once on a fresh child"
                             );
-                            mgr.kill_child_only(&agent_id).await;
+                            boxed_await(|| mgr.kill_child_only(&agent_id)).await;
                             continue 'outer;
                         } else if crate::quota_failover::is_quota_failover_error(&e) {
                             // Backup failover (PROTOCOL §5.54): `run_prompt_turn`
@@ -14546,12 +15005,12 @@ async fn run_message_worker(
                                 error = %e,
                                 "provider quota exhausted — redriving the turn on a backup profile"
                             );
-                            mgr.kill_child_only(&agent_id).await;
+                            boxed_await(|| mgr.kill_child_only(&agent_id)).await;
                             continue 'outer;
                         } else {
                             // STAB-53: on a child-death failure, point at the
                             // captured stderr file so the crash is diagnosable.
-                            match stderr_capture_hint(&mgr, &agent_id, &e).await {
+                            match boxed_await(|| stderr_capture_hint(&mgr, &agent_id, &e)).await {
                                 Some(log) => tracing::warn!(
                                     agent = %agent_id,
                                     error = %e,
@@ -14562,15 +15021,17 @@ async fn run_message_worker(
                                     tracing::warn!(agent = %agent_id, error = %e, "agent turn failed terminally");
                                 }
                             }
-                            handle_terminal_turn_failure(
-                                &mgr,
-                                &agent_id,
-                                &workspace_id,
-                                &content,
-                                &options,
-                                user_persisted,
-                                &e,
-                            )
+                            boxed_await(|| {
+                                handle_terminal_turn_failure(
+                                    &mgr,
+                                    &agent_id,
+                                    &workspace_id,
+                                    &content,
+                                    &options,
+                                    user_persisted,
+                                    &e,
+                                )
+                            })
                             .await;
                             // Release the in-flight slot without overwriting the
                             // Error status just persisted, so `agent.retry` (or a
@@ -14599,16 +15060,17 @@ async fn run_message_worker(
                     .unwrap()
                     .get(&agent_id)
                     .cloned();
-                if intent_acp::message_is_quota_exceeded(&e.to_string())
-                    && mgr
-                        .services
-                        .try_quota_failover(
+                let error_text = e.to_string();
+                if intent_acp::message_is_quota_exceeded(&error_text)
+                    && boxed_await(|| {
+                        mgr.services.try_quota_failover(
                             &workspace_id,
                             &agent_id,
                             attempted.as_deref(),
-                            &e.to_string(),
+                            &error_text,
                         )
-                        .await
+                    })
+                    .await
                 {
                     mgr.spawn_attempt_provider.lock().unwrap().remove(&agent_id);
                     tracing::warn!(
@@ -14617,10 +15079,10 @@ async fn run_message_worker(
                         "provider quota exhausted at session setup — retrying on a backup profile"
                     );
                     keep_failover_chain = true;
-                    mgr.kill_child_only(&agent_id).await;
+                    boxed_await(|| mgr.kill_child_only(&agent_id)).await;
                     continue 'outer;
                 }
-                match stderr_capture_hint(&mgr, &agent_id, &e).await {
+                match boxed_await(|| stderr_capture_hint(&mgr, &agent_id, &e)).await {
                     Some(log) => tracing::warn!(
                         agent = %agent_id,
                         error = %e,
@@ -14631,15 +15093,17 @@ async fn run_message_worker(
                         tracing::warn!(agent = %agent_id, error = %e, "agent spawn failed after all retries");
                     }
                 }
-                handle_terminal_spawn_failure(
-                    &mgr,
-                    &agent_id,
-                    &workspace_id,
-                    &content,
-                    &options,
-                    user_persisted,
-                    &e,
-                )
+                boxed_await(|| {
+                    handle_terminal_spawn_failure(
+                        &mgr,
+                        &agent_id,
+                        &workspace_id,
+                        &content,
+                        &options,
+                        user_persisted,
+                        &e,
+                    )
+                })
                 .await;
                 // Release the in-flight slot without overwriting the Error status
                 // that handle_terminal_spawn_failure just persisted. This allows
@@ -14666,7 +15130,7 @@ async fn run_message_worker(
         // redelivery call mirrors the empty-queue exit arm below (no-op
         // unless the queue is empty and an interim-skipped idle is marked).
         if !workspace_id.is_chief() {
-            match mgr.services.store.get_workspace(&workspace_id).await {
+            match boxed_await(|| mgr.services.store.get_workspace(&workspace_id)).await {
                 Ok(ws) if ws.archived => {
                     tracing::debug!(
                         agent = %agent_id,
@@ -14686,10 +15150,12 @@ async fn run_message_worker(
                     // the turn-end attention raise: the queue parked, the
                     // agent did not finish its work.
                     mgr.clear_worker(&agent_id);
-                    mgr.end_turn(&agent_id).await;
-                    mgr.services
-                        .redeliver_completion_after_queue_mutation(&agent_id)
-                        .await;
+                    boxed_await(|| mgr.end_turn(&agent_id)).await;
+                    boxed_await(|| {
+                        mgr.services
+                            .redeliver_completion_after_queue_mutation(&agent_id)
+                    })
+                    .await;
                     // Close the unarchive strand window (PR #1244 review): an
                     // unarchive that persisted between this gate's row read
                     // and the `end_turn` above had its drain kick bounce off
@@ -14700,9 +15166,11 @@ async fn run_message_worker(
                     // the window → drains), and an unarchive persisting after
                     // ITS row read finds the slot free, so its own kick
                     // proceeds — the window is closed from both sides.
-                    mgr.clone()
-                        .try_drain_queue(agent_id.clone(), workspace_id.clone())
-                        .await;
+                    boxed_await(|| {
+                        mgr.clone()
+                            .try_drain_queue(agent_id.clone(), workspace_id.clone())
+                    })
+                    .await;
                     return;
                 }
                 Ok(_) => {}
@@ -14721,9 +15189,7 @@ async fn run_message_worker(
         // already-running provider turn above. Removal either sweeps first or
         // waits for this instruction to become admitted work.
         let instruction_authority = mgr.services.human_instruction_authority.read().await;
-        if mgr
-            .services
-            .discard_revoked_instructions(&agent_id)
+        if boxed_await(|| mgr.services.discard_revoked_instructions(&agent_id))
             .await
             .is_err()
         {
@@ -14742,7 +15208,11 @@ async fn run_message_worker(
                 .dequeue_ready_batch_draining(&agent_id, false, 2)
             {
                 mgr.clear_turn_settled(&agent_id);
-                match prepare_flush_turn(&mgr, &agent_id, &workspace_id, batch, draining).await {
+                match boxed_await(|| {
+                    prepare_flush_turn(&mgr, &agent_id, &workspace_id, batch, draining)
+                })
+                .await
+                {
                     FlushPrep::Turn {
                         content: c,
                         options: o,
@@ -14767,27 +15237,34 @@ async fn run_message_worker(
             // Durable shrink now; the shrunk `agent:queue:updated` is
             // published only after the user row below is persisted (§6.5
             // drain ordering).
-            mgr.services.persist_queue_snapshot(&agent_id).await;
+            boxed_await(|| mgr.services.persist_queue_snapshot(&agent_id)).await;
             // Stale-redrive check (#576) BEFORE the transcript append so the
             // annotated content reaches both the persisted user row and the
             // provider prompt. Runs before the next iteration's report clear,
             // so `completion_report_timestamp` is still visible here.
-            let stale = mgr.annotate_stale_redrive(&agent_id, &mut next).await;
+            let (worker, agent, next_mut) = (&mgr, &agent_id, &mut next);
+            let stale = boxed_await(move || worker.annotate_stale_redrive(agent, next_mut)).await;
             // Dequeue-wait note: same placement contract as the stale check.
             annotate_dequeue_wait(&mut next);
             // Identity link: same placement as the single-entry drain arm.
             stamp_queued_message_id(&mut next);
             // Delivery-time unblocked hints (monorepo#2044): resolved at
             // render time, same placement as the single-entry drain arm.
-            annotate_unblocked_hints(&mgr.services, &agent_id, std::slice::from_mut(&mut next))
-                .await;
+            let (services, agent, next_mut) =
+                (&mgr.services, &agent_id, std::slice::from_mut(&mut next));
+            boxed_await(move || annotate_unblocked_hints(services, agent, next_mut)).await;
             // Drain-start signal (monorepo#1022): covers redrives that skip
             // the user-row append below. Emitted AFTER the stale-redrive
             // annotation so the payload's `content` matches what is
             // persisted/sent to the provider.
-            mgr.services
-                .publish_queue_processing(&agent_id, &workspace_id, std::slice::from_ref(&next))
-                .await;
+            boxed_await(|| {
+                mgr.services.publish_queue_processing(
+                    &agent_id,
+                    &workspace_id,
+                    std::slice::from_ref(&next),
+                )
+            })
+            .await;
             let next_image_blocks = next.image_blocks.clone();
             let next_file_blocks = next.file_blocks.clone();
             // A terminal-failure requeue whose user row already reached the
@@ -14799,17 +15276,19 @@ async fn run_message_worker(
             user_persisted = if next.monitor_turn.is_some() || next.persisted {
                 true
             } else {
-                persist_user(
-                    &mgr,
-                    &agent_id,
-                    &workspace_id,
-                    &next.content,
-                    next_image_blocks.as_ref(),
-                    next_file_blocks.as_ref(),
-                    next.message_metadata.as_ref(),
-                    Some(&next.turn_id),
-                    next.user_origin,
-                )
+                boxed_await(|| {
+                    persist_user(
+                        &mgr,
+                        &agent_id,
+                        &workspace_id,
+                        &next.content,
+                        next_image_blocks.as_ref(),
+                        next_file_blocks.as_ref(),
+                        next.message_metadata.as_ref(),
+                        Some(&next.turn_id),
+                        next.user_origin,
+                    )
+                })
                 .await
             };
             let queued_submission_ids = next.submission_ids();
@@ -14844,15 +15323,19 @@ async fn run_message_worker(
             // Fail closed (#547): a persist failure that survived the bounded
             // retry parks the agent in Error instead of running the turn.
             if !user_persisted {
-                handle_drain_persist_failure(&mgr, &agent_id, &workspace_id, &content, &options)
-                    .await;
+                boxed_await(|| {
+                    handle_drain_persist_failure(&mgr, &agent_id, &workspace_id, &content, &options)
+                })
+                .await;
                 mgr.release_in_flight_slot(&agent_id);
                 break 'outer;
             }
             drop(draining);
-            mgr.services
-                .publish_queue_updated_after_drain_persist(&agent_id, &workspace_id)
-                .await;
+            boxed_await(|| {
+                mgr.services
+                    .publish_queue_updated_after_drain_persist(&agent_id, &workspace_id)
+            })
+            .await;
             continue;
         }
         // Queue drained: release the slot, then re-check for a message that
@@ -14864,7 +15347,7 @@ async fn run_message_worker(
         // hands it back unchanged (`requeue_front_batch`); its draining guard
         // (§6.5 drain ordering) rides in `raced_draining` and retires the
         // entry from queue snapshots at every exit of this arm.
-        mgr.end_turn(&agent_id).await;
+        boxed_await(|| mgr.end_turn(&agent_id)).await;
         // Provisional pop (intent-hq/intent#4962): it precedes the re-claim
         // below and the lost-claim arm hands the entry back undelivered, so
         // a parked recovery-send marker on it is committed only once the
@@ -14888,13 +15371,15 @@ async fn run_message_worker(
             // interleaving, and the delivery pass's own post-skip re-check
             // covers the complementary ordering (marker recorded after this
             // hook ran ⇒ that re-check observes the released slot).
-            mgr.services
-                .redeliver_completion_after_queue_mutation(&agent_id)
-                .await;
+            boxed_await(|| {
+                mgr.services
+                    .redeliver_completion_after_queue_mutation(&agent_id)
+            })
+            .await;
             break 'outer;
         }
         if let TryBeginOutcome::Started(next_admission) =
-            mgr.try_begin_outcome(&agent_id, &workspace_id, false).await
+            boxed_await(|| mgr.try_begin_outcome(&agent_id, &workspace_id, false)).await
         {
             admission = next_admission;
             // Archived re-check on the raced pop (intent-hq/monorepo#2513):
@@ -14921,7 +15406,7 @@ async fn run_message_worker(
             // error, matching the auto-unarchive's own error path (turn
             // proceeds, workspace stays as-is).
             if !workspace_id.is_chief() {
-                match mgr.services.store.get_workspace(&workspace_id).await {
+                match boxed_await(|| mgr.services.store.get_workspace(&workspace_id)).await {
                     Ok(ws) if ws.archived => {
                         tracing::debug!(
                             agent = %agent_id,
@@ -14933,11 +15418,13 @@ async fn run_message_worker(
                         // same teardown order and rationale as the
                         // pre-release archived arm above.
                         mgr.clear_worker(&agent_id);
-                        mgr.end_turn(&agent_id).await;
+                        boxed_await(|| mgr.end_turn(&agent_id)).await;
                         drop(instruction_authority);
-                        mgr.clone()
-                            .try_drain_queue(agent_id.clone(), workspace_id.clone())
-                            .await;
+                        boxed_await(|| {
+                            mgr.clone()
+                                .try_drain_queue(agent_id.clone(), workspace_id.clone())
+                        })
+                        .await;
                         return;
                     }
                     Ok(_) => {}
@@ -14961,7 +15448,11 @@ async fn run_message_worker(
             if let Some((mut batch, extra_draining)) = extra_batch {
                 batch.insert(0, next);
                 draining.merge(extra_draining);
-                match prepare_flush_turn(&mgr, &agent_id, &workspace_id, batch, draining).await {
+                match boxed_await(|| {
+                    prepare_flush_turn(&mgr, &agent_id, &workspace_id, batch, draining)
+                })
+                .await
+                {
                     FlushPrep::Turn {
                         content: c,
                         options: o,
@@ -14983,25 +15474,32 @@ async fn run_message_worker(
             // Durable shrink now; the shrunk `agent:queue:updated` is
             // published only after the user row below is persisted (§6.5
             // drain ordering).
-            mgr.services.persist_queue_snapshot(&agent_id).await;
+            boxed_await(|| mgr.services.persist_queue_snapshot(&agent_id)).await;
             // Stale-redrive check (#576): same contract as the pre-release
             // drain arm. Runs only after the slot is re-claimed so a message
             // handed back via `requeue_front` below is never annotated here.
-            let stale = mgr.annotate_stale_redrive(&agent_id, &mut next).await;
+            let (worker, agent, next_mut) = (&mgr, &agent_id, &mut next);
+            let stale = boxed_await(move || worker.annotate_stale_redrive(agent, next_mut)).await;
             // Dequeue-wait note: same placement contract as the stale check.
             annotate_dequeue_wait(&mut next);
             // Identity link: same contract as the pre-release drain arm.
             stamp_queued_message_id(&mut next);
             // Delivery-time unblocked hints (monorepo#2044): same contract
             // as the pre-release drain arm.
-            annotate_unblocked_hints(&mgr.services, &agent_id, std::slice::from_mut(&mut next))
-                .await;
+            let (services, agent, next_mut) =
+                (&mgr.services, &agent_id, std::slice::from_mut(&mut next));
+            boxed_await(move || annotate_unblocked_hints(services, agent, next_mut)).await;
             // Drain-start signal (monorepo#1022): same contract as the
             // pre-release drain arm — emitted AFTER the stale-redrive
             // annotation so the payload's `content` matches the turn.
-            mgr.services
-                .publish_queue_processing(&agent_id, &workspace_id, std::slice::from_ref(&next))
-                .await;
+            boxed_await(|| {
+                mgr.services.publish_queue_processing(
+                    &agent_id,
+                    &workspace_id,
+                    std::slice::from_ref(&next),
+                )
+            })
+            .await;
             let next_image_blocks = next.image_blocks.clone();
             let next_file_blocks = next.file_blocks.clone();
             // A stale or already-persisted (requeued) entry replays an
@@ -15010,17 +15508,19 @@ async fn run_message_worker(
             user_persisted = if next.monitor_turn.is_some() || next.persisted {
                 true
             } else {
-                persist_user(
-                    &mgr,
-                    &agent_id,
-                    &workspace_id,
-                    &next.content,
-                    next_image_blocks.as_ref(),
-                    next_file_blocks.as_ref(),
-                    next.message_metadata.as_ref(),
-                    Some(&next.turn_id),
-                    next.user_origin,
-                )
+                boxed_await(|| {
+                    persist_user(
+                        &mgr,
+                        &agent_id,
+                        &workspace_id,
+                        &next.content,
+                        next_image_blocks.as_ref(),
+                        next_file_blocks.as_ref(),
+                        next.message_metadata.as_ref(),
+                        Some(&next.turn_id),
+                        next.user_origin,
+                    )
+                })
                 .await
             };
             let queued_submission_ids = next.submission_ids();
@@ -15053,15 +15553,19 @@ async fn run_message_worker(
             silent_redrive_used = false;
             // Fail closed (#547): same contract as the pre-release drain arm.
             if !user_persisted {
-                handle_drain_persist_failure(&mgr, &agent_id, &workspace_id, &content, &options)
-                    .await;
+                boxed_await(|| {
+                    handle_drain_persist_failure(&mgr, &agent_id, &workspace_id, &content, &options)
+                })
+                .await;
                 mgr.release_in_flight_slot(&agent_id);
                 break 'outer;
             }
             drop(draining);
-            mgr.services
-                .publish_queue_updated_after_drain_persist(&agent_id, &workspace_id)
-                .await;
+            boxed_await(|| {
+                mgr.services
+                    .publish_queue_updated_after_drain_persist(&agent_id, &workspace_id)
+            })
+            .await;
             continue 'outer;
         }
         // A concurrent send won the slot; hand the message(s) back to it in
@@ -15088,18 +15592,18 @@ async fn run_message_worker(
     // runs AFTER `clear_worker` so the worker it spawns is not deregistered
     // by this exit. A no-op on every other exit (marker absent, entry
     // already drained, slot re-claimed by a concurrent send).
-    mgr.redrive_parked_recovery_send(&agent_id, &workspace_id)
-        .await;
+    boxed_await(|| mgr.redrive_parked_recovery_send(&agent_id, &workspace_id)).await;
     // The agent finished its work (queue drained, slot released): raise the
     // server-owned `attention` blue dot so every client surfaces it (§9.9) —
     // but only for TOP-LEVEL FOREGROUND agents (monorepo#1781): a delegated
     // child or background agent's completion is surfaced to its
     // parent/coordinator, not the user.
-    if should_raise_turn_end_unread(&mgr.services, &agent_id).await {
-        if let Err(e) = mgr
-            .services
-            .raise_attention(&workspace_id, WorkspaceAttention::Unread)
-            .await
+    if boxed_await(|| should_raise_turn_end_unread(&mgr.services, &agent_id)).await {
+        if let Err(e) = boxed_await(|| {
+            mgr.services
+                .raise_attention(&workspace_id, WorkspaceAttention::Unread)
+        })
+        .await
         {
             tracing::warn!(agent = %agent_id, error = %e, "failed to raise attention");
         }
@@ -15849,7 +16353,7 @@ async fn retry_spawn_owned(
         // Boxed: the turn-start future (spawn, session open, identity
         // repairs) is large; inlining it into the turn worker's future
         // overflows the stack on deep send/interrupt paths.
-        match Box::pin(mgr.ensure_started_owned(agent_id, workspace_id)).await {
+        match boxed_await(|| mgr.ensure_started_owned(agent_id, workspace_id)).await {
             Ok(session_id) => return Ok(session_id),
             Err(e) => {
                 let retryable = is_retryable_spawn_error(&e);
@@ -15867,12 +16371,13 @@ async fn retry_spawn_owned(
                 let will_retry = retryable
                     && attempt < MAX_SPAWN_ATTEMPTS
                     && !(intent_acp::message_is_quota_exceeded(&error_msg)
-                        && mgr
-                            .services
-                            .has_quota_failover_candidate(agent_id, attempted.as_deref())
-                            .await);
+                        && boxed_await(|| {
+                            mgr.services
+                                .has_quota_failover_candidate(agent_id, attempted.as_deref())
+                        })
+                        .await);
                 let captured = if will_retry {
-                    stderr_capture_hint(mgr, agent_id, &e).await
+                    boxed_await(|| stderr_capture_hint(mgr, agent_id, &e)).await
                 } else {
                     None
                 };
@@ -15908,7 +16413,7 @@ async fn retry_spawn_owned(
                 // (narrower than full stop() — only kills child/handle, no
                 // worker/busy-flag touch). A no-op when the hint above
                 // already swept it.
-                mgr.kill_child_only(agent_id).await;
+                boxed_await(|| mgr.kill_child_only(agent_id)).await;
 
                 // Publish retry status hint with the actual failure kind
                 let retry_num = attempt;
@@ -15925,15 +16430,16 @@ async fn retry_spawn_owned(
                     retry_num + 1,
                     MAX_SPAWN_ATTEMPTS
                 );
-                mgr.services
-                    .publish_status_event(
+                boxed_await(|| {
+                    mgr.services.publish_status_event(
                         workspace_id,
                         agent_id,
                         "spawn-retry",
                         &message,
                         "warning",
                     )
-                    .await;
+                })
+                .await;
 
                 // Backoff before retry — jittered unless the env override
                 // pinned exact delays.
@@ -16329,6 +16835,15 @@ async fn publish_error_status_and_requeue(
     persisted: bool,
     error: PersistedTerminalError,
 ) {
+    mgr.clear_discussion_turn(agent_id, options);
+    if crate::discussion_activity::is_discussion(options.message_metadata.as_ref()) {
+        mgr.services
+            .settle_discussion_options(options, "failed", Some(&error.error_text))
+            .await;
+        publish_terminal_error_status_via_services(&mgr.services, agent_id, workspace_id, &error)
+            .await;
+        return;
+    }
     publish_terminal_error_status_via_services(&mgr.services, agent_id, workspace_id, &error).await;
     let PersistedTerminalError {
         error_text,
@@ -17207,6 +17722,7 @@ async fn handle_terminal_turn_failure(
     persisted: bool,
     error: &Error,
 ) {
+    mgr.services.desktop_terminate_agent(agent_id).await;
     // Tear down the (likely dead) child so the retry path spawns fresh. Safe
     // from within the worker: only kills child/handle, no worker/busy touch.
     mgr.kill_child_only(agent_id).await;
@@ -18132,6 +18648,7 @@ mod role_reminder_tests {
             context_links: None,
             archived: false,
             archived_at: None,
+            retired_at: None,
             task_stats: None,
             agent_summary: None,
             diff_summary: None,
@@ -18141,6 +18658,8 @@ mod role_reminder_tests {
             pull_requests_total: None,
             display_status: None,
             waiting: false,
+            scripts_running: false,
+            background_tasks_running: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
@@ -20262,8 +20781,11 @@ mod disabled_provider_rehome_tests {
 
     async fn drain(sub: &mut crate::events::Subscription) -> Vec<intent_core::Event> {
         let mut events = Vec::new();
-        while let Ok(Some(batch)) =
-            tokio::time::timeout(Duration::from_millis(300), sub.recv()).await
+        while let Ok(Some(batch)) = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            sub.recv(),
+        )
+        .await
         {
             events.extend(batch);
         }
@@ -22824,6 +23346,7 @@ mod agent_retry_tests {
             default_model: None,
             archived: false,
             archived_at: None,
+            retired_at: None,
             active_pull_request: None,
             pr_number: None,
             pr_status: None,
@@ -22836,6 +23359,8 @@ mod agent_retry_tests {
             pull_requests_total: None,
             display_status: None,
             waiting: false,
+            scripts_running: false,
+            background_tasks_running: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
@@ -23181,17 +23706,9 @@ mod agent_retry_tests {
     }
 
     fn park_monitor_export(mgr: &AgentManager, ws: &WorkspaceId) {
-        mgr.services.transfer_exports.lock().unwrap().insert(
-            "monitor-worker-export".into(),
-            crate::transfer_export::ExportSession {
-                initiator: None,
-                workspace_id: ws.clone(),
-                staging_dir: std::env::temp_dir(),
-                state: crate::transfer_export::ExportState::Building { aborted: false },
-                wip_paths: vec![],
-                max_chunk_bytes: 100,
-            },
-        );
+        mgr.services
+            .feature_transfer_port()
+            .park_building_export_for_test("monitor-worker-export", ws, None, std::env::temp_dir());
     }
 
     async fn monitor_worker_exit_releases_slot(exporting: bool) {
@@ -24363,6 +24880,8 @@ mod legacy_identity_tests;
 #[path = "agent_manager/fast_mode_tests.rs"]
 mod fast_mode_tests;
 
+#[cfg(test)]
+mod desktop_lifecycle_tests;
 // Unix-only like its shared mock-agent helpers (`dead_child_respawn_tests`).
 #[cfg(all(test, unix))]
 #[path = "agent_manager/quota_failover_tests.rs"]

@@ -219,7 +219,7 @@ async fn lookup_known_repo_local_path(
     github_url: &str,
 ) -> Option<String> {
     let (owner, repo) = parse_github_owner_repo(github_url)?;
-    let workspaces = api.list_workspaces(true).await.ok()?;
+    let workspaces = api.list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED).await.ok()?;
 
     let mut strict = Vec::new();
     let mut name_only = Vec::new();

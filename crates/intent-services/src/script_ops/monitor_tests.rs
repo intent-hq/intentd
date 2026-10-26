@@ -1065,7 +1065,7 @@ async fn monitor_active_cap_retry_and_failed_registration_leave_no_memory_watch(
     );
     assert_eq!(
         h.services
-            .script_locks
+            .runtime().script_locks
             .monitor_windows
             .lock()
             .unwrap()
@@ -1078,7 +1078,7 @@ async fn monitor_active_cap_retry_and_failed_registration_leave_no_memory_watch(
         .unwrap();
     assert!(h
         .services
-        .script_locks
+        .runtime().script_locks
         .monitor_windows
         .lock()
         .unwrap()
@@ -1097,7 +1097,7 @@ async fn monitor_active_cap_retry_and_failed_registration_leave_no_memory_watch(
         .is_err());
     assert!(h
         .services
-        .script_locks
+        .runtime().script_locks
         .monitor_windows
         .lock()
         .unwrap()
@@ -1229,9 +1229,8 @@ async fn monitor_storage_failure_retries_reserved_trigger_without_duplicate_or_t
         .await
         .unwrap();
     mgr.reconcile_monitor(&h.ws, mid).await.unwrap();
-    let row = monitor_snapshot(&h.services.store, &h.ws, mid)
-        .await
-        .unwrap();
+    // Maintenance may win settlement before its terminal event is published.
+    let row = monitor_row(&h, mid, "triggered").await;
     assert_eq!(row.state, "triggered");
     assert_eq!(row.trigger.unwrap().observed_line_count, 1);
     mgr.stop(&h.ws, &id).await.unwrap();
@@ -1433,17 +1432,9 @@ async fn monitor_export_defers_delivery_and_queue_drain_until_abort() {
     row.reason = Some("ttl-expired".into());
     row.settled_at = Some(now_iso());
     h.services.store.settle_script_monitor(&row).await.unwrap();
-    h.services.transfer_exports.lock().unwrap().insert(
-        "export-test".into(),
-        crate::transfer_export::ExportSession {
-            initiator: None,
-            workspace_id: h.ws.clone(),
-            staging_dir: std::env::temp_dir(),
-            state: crate::transfer_export::ExportState::Building { aborted: false },
-            wip_paths: vec![],
-            max_chunk_bytes: 100,
-        },
-    );
+    h.services
+        .feature_transfer_port()
+        .park_building_export_for_test("export-test", &h.ws, None, std::env::temp_dir());
     h.services.dispatch_script_monitor(&row).await;
     assert!(h
         .services
@@ -1459,10 +1450,8 @@ async fn monitor_export_defers_delivery_and_queue_drain_until_abort() {
     assert!(!h.services.has_ready_to_send(&owner));
     assert!(h.services.dequeue_message(&owner).is_none());
     h.services
-        .transfer_exports
-        .lock()
-        .unwrap()
-        .remove("export-test");
+        .feature_transfer_port()
+        .remove_export_for_test("export-test");
     assert!(h.services.has_ready_to_send(&owner));
     let queued = h.services.dequeue_message(&owner).unwrap();
     assert_eq!(queued.id, format!("script-monitor:{}", row.monitor_id));
@@ -1482,7 +1471,7 @@ async fn script_monitor_maintenance_loop_exits_once_settings_tasks_close() {
     let h = harness().await;
     let running = || {
         h.services
-            .script_locks
+            .runtime().script_locks
             .monitor_maintenance
             .load(Ordering::SeqCst)
     };

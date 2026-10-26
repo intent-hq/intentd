@@ -892,6 +892,7 @@ mod tests {
     /// Extra-generous deadline for awaiting a child's natural exit under
     /// full-suite load (monorepo#573): it bounds only how long a *failure*
     /// takes to surface, never how long a passing run waits.
+    // fixed-deadline: allow — stays under nextest's unscaled 180 s slow-timeout kill: a 60 s base scaled ×3 would reach it (.config/nextest.toml), so a stall still panics naming its step
     const LONG_TIMEOUT: Duration = Duration::from_secs(60);
 
     /// A temp `SQLite` path cleaned up on drop (mirrors `events::bus_tests`).
@@ -1817,6 +1818,7 @@ mod tests {
             context_links: None,
             archived: false,
             archived_at: None,
+            retired_at: None,
             task_stats: None,
             agent_summary: None,
             diff_summary: None,
@@ -1826,6 +1828,8 @@ mod tests {
             pull_requests_total: None,
             display_status: None,
             waiting: false,
+            scripts_running: false,
+            background_tasks_running: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,

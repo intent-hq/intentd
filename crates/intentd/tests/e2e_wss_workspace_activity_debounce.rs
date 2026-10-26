@@ -9,10 +9,11 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
+use intentd_test_support::GuardedChild;
 use std::path::Path;
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,14 +33,13 @@ use tokio_tungstenite::WebSocketStream;
 const TOKEN: &str = "abababababababababababababababababababababababababababababababab";
 
 struct Daemon {
-    child: Child,
+    child: GuardedChild,
     data_dir: tempfile::TempDir,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.child.kill_tree();
     }
 }
 
@@ -65,10 +65,8 @@ fn activity_command(data_dir: &Path, env: &[(&str, &str)]) -> std::process::Comm
     cmd
 }
 
-fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
-    activity_command(data_dir, env)
-        .spawn()
-        .expect("spawn intentd serve")
+fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> GuardedChild {
+    GuardedChild::spawn(&mut activity_command(data_dir, env)).expect("spawn intentd serve")
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -215,23 +213,26 @@ async fn wss_event_opt(
     ws: &mut WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
     deadline_secs: u64,
 ) -> Option<Value> {
-    timeout(Duration::from_secs(deadline_secs), async {
-        loop {
-            match ws.next().await {
-                Some(Ok(Message::Text(txt))) => {
-                    let v: Value = serde_json::from_str(&txt).ok()?;
-                    if v.get("method").and_then(|m| m.as_str()) == Some("events.event") {
-                        return Some(v);
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(deadline_secs)),
+        async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(txt))) => {
+                        let v: Value = serde_json::from_str(&txt).ok()?;
+                        if v.get("method").and_then(|m| m.as_str()) == Some("events.event") {
+                            return Some(v);
+                        }
                     }
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = ws.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(_)) => {}
+                    _ => return None,
                 }
-                Some(Ok(Message::Ping(p))) => {
-                    let _ = ws.send(Message::Pong(p)).await;
-                }
-                Some(Ok(_)) => {}
-                _ => return None,
             }
-        }
-    })
+        },
+    )
     .await
     .ok()
     .flatten()

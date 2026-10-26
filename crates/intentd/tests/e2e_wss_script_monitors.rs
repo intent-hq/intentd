@@ -1,7 +1,7 @@
 //! Real authenticated TLS/WSS script monitor controls and lifecycle events.
 //! Registration uses the service endpoint called by the authenticated MCP helper.
 #![cfg(unix)]
-mod common;
+use crate::common;
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -164,6 +164,7 @@ fn workspace(id: &WorkspaceId) -> Workspace {
         context_links: None,
         archived: false,
         archived_at: None,
+        retired_at: None,
         task_stats: None,
         agent_summary: None,
         diff_summary: None,
@@ -173,6 +174,8 @@ fn workspace(id: &WorkspaceId) -> Workspace {
         pull_requests_total: None,
         display_status: None,
         waiting: false,
+        scripts_running: false,
+        background_tasks_running: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,

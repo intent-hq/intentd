@@ -64,10 +64,10 @@ def coverage_budget_violations(workflow):
             errors.append(f"coverage-changed: {name} must retain its {limit}m phase bound")
     combined = workflow["jobs"]["coverage-all"]
     steps = [step for step in combined["steps"] if step.get("name") == "Run combined coverage"]
-    if type(combined.get("timeout-minutes")) is not int or combined["timeout-minutes"] != 45:
-        errors.append("coverage-all must reserve 2m outside its 43m combined phase")
-    if len(steps) != 1 or type(steps[0].get("timeout-minutes")) is not int or steps[0]["timeout-minutes"] != 43:
-        errors.append("coverage-all must retain its 43m compile/test/report bound")
+    if type(combined.get("timeout-minutes")) is not int or combined["timeout-minutes"] != 55:
+        errors.append("coverage-all must reserve 2m outside its 53m combined phase")
+    if len(steps) != 1 or type(steps[0].get("timeout-minutes")) is not int or steps[0]["timeout-minutes"] != 53:
+        errors.append("coverage-all must retain its 53m compile/test/report bound")
     return errors
 
 
@@ -179,7 +179,7 @@ REQUIRED_TEST_STEPS = {
     ("check", "Real import and public session contract"): 1,
     ("check", "Real Claude adapter utility-session contract"): 1,
     ("check", "Source lints"): 1,
-    ("check", "GitLab auth, invitations and checkout over real sockets with explicit test transports"): 1,
+    ("check", "GitLab auth, invitations and checkout over real sockets with explicit test transports"): 2,
     ("check", "No provider CLIs on the runner"): 1,
     ("check", "Coverage-skipped tests (STAB-40/43)"): 2,
     ("check", "Installer guard tests (install_ps1_owner)"): 1,
@@ -375,7 +375,9 @@ class CiPolicyTests(unittest.TestCase):
                 self.assertIn(f"NEXTEST_TEST_THREADS={expected} (nproc={cpus}, cap 16)", result.stdout)
 
     def test_full_coverage_budget_includes_report_generation(self):
-        self.assertEqual(self.workflow["jobs"]["coverage-all"]["timeout-minutes"], 45)
+        # 53m phase plus 2m: room for an 8-CPU heavy slot (~44 min) under the
+        # merge queue's 60-minute check response timeout.
+        self.assertEqual(self.workflow["jobs"]["coverage-all"]["timeout-minutes"], 55)
 
     def test_coverage_profile_pool_rejects_unbounded_or_unverified_collection(self):
         self.assertEqual(profile_pool_violations(self.workflow), [])
@@ -610,11 +612,11 @@ class TunnelArtifactTests(unittest.TestCase):
         "tunnel::tests::connect_pending_deadline_emits_terminal_open_err",
         "tunnel::tests::connect_reset_preserves_error_before_deadline",
         "tunnel::tests::connect_success_before_deadline_relays",
-        "tunnel_open_echo_eof_close_lifecycle",
-        "tunnel_open_err_for_closed_port_keeps_connection_alive",
-        "tunnel_close_tears_down_and_frees_stream_id",
-        "tunnel_connections_counted_in_health_and_stopped",
-        "tunnel_unauthenticated_upgrade_rejected",
+        "e2e_wss_tunnel::tunnel_open_echo_eof_close_lifecycle",
+        "e2e_wss_tunnel::tunnel_open_err_for_closed_port_keeps_connection_alive",
+        "e2e_wss_tunnel::tunnel_close_tears_down_and_frees_stream_id",
+        "e2e_wss_tunnel::tunnel_connections_counted_in_health_and_stopped",
+        "e2e_wss_tunnel::tunnel_unauthenticated_upgrade_rejected",
     }
 
     @classmethod

@@ -18,7 +18,10 @@ async fn assert_queue(svc: &Services, ws: &WorkspaceId, queued: bool) {
     let expected = queued.then_some(true);
     assert_eq!(row.active_pull_request.unwrap().is_in_merge_queue, expected);
     assert_eq!(row.pull_requests.unwrap()[0].is_in_merge_queue, expected);
-    let rows = svc.list_workspaces(false).await.unwrap();
+    let rows = svc
+        .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+        .await
+        .unwrap();
     let row = rows.iter().find(|row| &row.id == ws).unwrap();
     assert_eq!(
         row.pull_requests.as_ref().unwrap()[0].is_in_merge_queue,
@@ -116,7 +119,10 @@ async fn monitor_only_home_rows_carry_queue_and_clear_it_on_exit() {
     for queued in [true, false] {
         forge.edit_quiet(|s| s.in_merge_queue = Some(queued));
         svc.poll_pr_monitors().await;
-        let rows = svc.list_workspaces(false).await.unwrap();
+        let rows = svc
+            .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+            .await
+            .unwrap();
         let row = rows.iter().find(|row| row.id == ws).unwrap();
         assert_eq!(
             row.pull_requests.as_ref().unwrap()[0].is_in_merge_queue,
@@ -182,7 +188,10 @@ async fn polling_projects_git_root_queue_without_touching_another_repo_or_head()
         .unwrap();
     forge.edit_quiet(|s| s.in_merge_queue = Some(true));
     svc.poll_pr_monitors().await;
-    let list = svc.list_workspaces(false).await.unwrap();
+    let list = svc
+        .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+        .await
+        .unwrap();
     let root_row = list.iter().find(|row| row.id == root_ws).unwrap();
     assert_eq!(
         root_row.pull_requests.as_ref().unwrap()[0].is_in_merge_queue,
@@ -211,7 +220,10 @@ async fn monitor_only_terminal_and_draft_rows_never_claim_to_be_queued() {
             s.draft = state == PrState::Open;
         });
         register(&svc, &ws, &owner).await;
-        let rows = svc.list_workspaces(false).await.unwrap();
+        let rows = svc
+            .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+            .await
+            .unwrap();
         let row = rows.iter().find(|row| row.id == ws).unwrap();
         assert_eq!(
             row.pull_requests.as_ref().unwrap()[0].is_in_merge_queue,

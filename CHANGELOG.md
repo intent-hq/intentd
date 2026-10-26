@@ -2,6 +2,241 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.49] - 2026-10-26
+
+### 🐛 Bug Fixes
+
+- *(mcp)* State when ws.pr.unmonitor may stop a monitor in its summary ([#2694](https://github.com/intent-hq/intentd/pull/2694))
+- Bump claude-agent-acp pin to v0.95.0 ([#2543](https://github.com/intent-hq/intentd/pull/2543))
+
+
+## [0.11.48] - 2026-10-26
+
+### 🚀 Features
+
+- *(workspace)* Add backgroundTasksRunning flag for agent background tasks ([#2688](https://github.com/intent-hq/intentd/pull/2688))
+
+### 🧪 Testing
+
+- *(catalog)* Freeze protocol methods with a golden name list ([#2692](https://github.com/intent-hq/intentd/pull/2692))
+- Own every e2e daemon through GuardedChild so none outlives its test ([#2689](https://github.com/intent-hq/intentd/pull/2689))
+
+
+## [0.11.47] - 2026-10-25
+
+### 🚀 Features
+
+- Add consented desktop control sessions and agent API ([#2245](https://github.com/intent-hq/intentd/pull/2245))
+
+### 🐛 Bug Fixes
+
+- *(workspace-api)* Keep large-note reads and committed writes within the script heap ([#2685](https://github.com/intent-hq/intentd/pull/2685))
+
+
+## [0.11.46] - 2026-10-25
+
+### 🚀 Features
+
+- Add the Retired workspace state and workspace.retire ([#2605](https://github.com/intent-hq/intentd/pull/2605))
+
+### 🔧 Refactor
+
+- *(services)* Add a feature port registry and startup check ([#2682](https://github.com/intent-hq/intentd/pull/2682))
+
+### 🧪 Testing
+
+- *(intent-services)* Put every 64-record budget control on one load-proof script budget ([#2686](https://github.com/intent-hq/intentd/pull/2686))
+
+
+## [0.11.45] - 2026-10-25
+
+### 🐛 Bug Fixes
+
+- *(notes)* Serialize metadata writes on the note write lane ([#2683](https://github.com/intent-hq/intentd/pull/2683))
+
+### 🧪 Testing
+
+- *(intent-services)* Give the 64-record quota controls a load-proof script budget ([#2669](https://github.com/intent-hq/intentd/pull/2669))
+
+
+## [0.11.44] - 2026-10-25
+
+### 🚀 Features
+
+- Refresh PR state when agents go idle ([#2665](https://github.com/intent-hq/intentd/pull/2665))
+- *(agents)* Include nameExplicitlySet in agent:renamed events ([#2668](https://github.com/intent-hq/intentd/pull/2668))
+- *(agents)* Report persisted nameExplicitlySet on name-bearing agent:updated ([#2677](https://github.com/intent-hq/intentd/pull/2677))
+
+### 🔧 Refactor
+
+- *(services)* Move workspace transfer into intent-svc-transfer ([#2660](https://github.com/intent-hq/intentd/pull/2660))
+- *(notes)* Require the note write lock to save note content ([#2673](https://github.com/intent-hq/intentd/pull/2673))
+- *(services)* Add the intent-app composition root ([#2675](https://github.com/intent-hq/intentd/pull/2675))
+
+### 🧪 Testing
+
+- *(events)* Make the live watch wait the default and lint the settle-only one ([#2671](https://github.com/intent-hq/intentd/pull/2671))
+- Stop sitter fake daemons leaking past their tests ([#2667](https://github.com/intent-hq/intentd/pull/2667))
+- Catch fixed test waits held in consts and lets ([#2663](https://github.com/intent-hq/intentd/pull/2663))
+- Pin hermetic test daemons to resume-on-start off ([#2672](https://github.com/intent-hq/intentd/pull/2672))
+
+
+## [0.11.43] - 2026-10-25
+
+### 🐛 Bug Fixes
+
+- *(store)* Retry write-pool acquire timeouts in delete sweeps ([#2658](https://github.com/intent-hq/intentd/pull/2658))
+
+
+## [0.11.42] - 2026-10-25
+
+### 🚀 Features
+
+- *(scripts)* Arm a completion monitor when an agent starts a script ([#2617](https://github.com/intent-hq/intentd/pull/2617))
+
+### 📚 Documentation
+
+- *(guide)* Finished-agent toast skips the chat you're viewing ([#2654](https://github.com/intent-hq/intentd/pull/2654))
+
+### 🧪 Testing
+
+- *(intentd)* Wait for persisted idle before SIGKILL in codex effort e2e ([#2652](https://github.com/intent-hq/intentd/pull/2652))
+
+
+## [0.11.41] - 2026-10-24
+
+### 🐛 Bug Fixes
+
+- *(notes)* Serialize content writes per note so parallel edits stop conflicting ([#2649](https://github.com/intent-hq/intentd/pull/2649))
+
+### 🔧 Refactor
+
+- *(services)* Expose a feature API and test-hooks feature ([#2650](https://github.com/intent-hq/intentd/pull/2650))
+
+### 🧪 Testing
+
+- *(intent-services)* Share the liveness budget with git-metadata event waits ([#2655](https://github.com/intent-hq/intentd/pull/2655))
+
+
+## [0.11.40] - 2026-10-24
+
+### 🚀 Features
+
+- *(profiles)* Name and environment overrides for the Codex/Claude Code Default configuration ([#2640](https://github.com/intent-hq/intentd/pull/2640))
+
+### 🐛 Bug Fixes
+
+- Keep embedded arrows from ending a previewed prompts block ([#2625](https://github.com/intent-hq/intentd/pull/2625))
+
+### 🧪 Testing
+
+- *(intent-services)* Wait for live watches through a creation retry ([#2648](https://github.com/intent-hq/intentd/pull/2648))
+
+
+## [0.11.39] - 2026-10-24
+
+### 🚀 Features
+
+- *(failover)* Share provider quota state across conversations ([#2624](https://github.com/intent-hq/intentd/pull/2624))
+- *(workspace)* Add scriptsRunning flag and count script monitors as waiting ([#2637](https://github.com/intent-hq/intentd/pull/2637))
+
+### 🔧 Refactor
+
+- *(services)* Route workspace transfer through a feature port ([#2647](https://github.com/intent-hq/intentd/pull/2647))
+
+### ⚡ Performance
+
+- Shrink agent-turn poll frames to restore stack headroom ([#2642](https://github.com/intent-hq/intentd/pull/2642))
+
+### ⚙️ Miscellaneous Tasks
+
+- *(intentd)* Build integration tests as a few suite executables ([#2635](https://github.com/intent-hq/intentd/pull/2635))
+
+
+## [0.11.38] - 2026-10-23
+
+### 🐛 Bug Fixes
+
+- *(agents)* Interrupt idle agents whose background workers a restart kills ([#2638](https://github.com/intent-hq/intentd/pull/2638))
+
+
+## [0.11.37] - 2026-10-23
+
+### 🚀 Features
+
+- *(acp)* Lower agent IO priority and demote ephemeral adapter runs ([#2634](https://github.com/intent-hq/intentd/pull/2634))
+
+
+## [0.11.36] - 2026-10-23
+
+### 📚 Documentation
+
+- *(guide)* Mention the in-app agent-finished notification ([#2629](https://github.com/intent-hq/intentd/pull/2629))
+
+### 🧪 Testing
+
+- Scale native request acquire and frame waits with the test timeout multiplier ([#2626](https://github.com/intent-hq/intentd/pull/2626))
+
+
+## [0.11.35] - 2026-10-23
+
+### 🐛 Bug Fixes
+
+- Report skipped PR checks separately from passed ([#2623](https://github.com/intent-hq/intentd/pull/2623))
+- *(store)* Create the database file before the write pool connects ([#2633](https://github.com/intent-hq/intentd/pull/2633))
+
+### 📚 Documentation
+
+- *(guide)* Drop the removed Collapse tool activity setting ([#2628](https://github.com/intent-hq/intentd/pull/2628))
+
+
+## [0.11.34] - 2026-10-23
+
+### 🐛 Bug Fixes
+
+- *(pr-monitor)* Report merge-queue ejections on cheap polls ([#2622](https://github.com/intent-hq/intentd/pull/2622))
+
+
+## [0.11.33] - 2026-10-23
+
+### 🚀 Features
+
+- *(sitter)* Send weekly/monthly/install flags and install age ([#2600](https://github.com/intent-hq/intentd/pull/2600))
+
+### 🐛 Bug Fixes
+
+- *(pr-monitor)* Ignore merge-queue ejections older than the current queue entry ([#2595](https://github.com/intent-hq/intentd/pull/2595))
+
+### 🧪 Testing
+
+- Classify every fixed test wait and empty the fixed-deadline baseline ([#2603](https://github.com/intent-hq/intentd/pull/2603))
+
+
+## [0.11.32] - 2026-10-23
+
+### 🐛 Bug Fixes
+
+- *(history)* Tell replayed models the XML escaping is not part of the text ([#2614](https://github.com/intent-hq/intentd/pull/2614))
+
+### 🧪 Testing
+
+- Check the quota classifier against real ACP adapter errors ([#2612](https://github.com/intent-hq/intentd/pull/2612))
+
+
+## [0.11.31] - 2026-10-23
+
+### 🚀 Features
+
+- *(pr-monitor)* Flag a PR head on which CI never started ([#2604](https://github.com/intent-hq/intentd/pull/2604))
+
+
+## [0.11.30] - 2026-10-22
+
+### 🚀 Features
+
+- Add workspace discussions, agent messaging and guest roles ([#2432](https://github.com/intent-hq/intentd/pull/2432))
+
+
 ## [0.11.29] - 2026-10-22
 
 ### 🐛 Bug Fixes

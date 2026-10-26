@@ -9,8 +9,8 @@ use intent_core::HostRole;
 use intent_store::RepositoryHostAuthoritySnapshot;
 
 use super::{
-    capture_inner, denied, detail_inner, entry, release_inner, unavailable, BoxFuture, Frame,
-    Released, RepositoryAuthoritySnapshot, Request, Result, Services, ACQUIRE,
+    acquire_wait, capture_inner, denied, detail_inner, entry, release_inner, unavailable,
+    BoxFuture, Frame, Released, RepositoryAuthoritySnapshot, Request, Result, Services,
 };
 
 #[derive(Clone, PartialEq, Eq)]
@@ -112,7 +112,7 @@ pub(crate) fn capture(
 ) -> BoxFuture<'_, Result<RepositoryScopedCapture>> {
     entry(services, &Frame::CaptureScoped(q.clone()), move |r| {
         Box::pin(async move {
-            let capture = tokio::time::timeout(ACQUIRE, capture_inner(&r))
+            let capture = tokio::time::timeout(acquire_wait(), capture_inner(&r))
                 .await
                 .map_err(denied)??;
             Ok(RepositoryScopedCapture {

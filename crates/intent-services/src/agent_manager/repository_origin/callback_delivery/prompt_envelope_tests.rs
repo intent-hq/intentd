@@ -16,7 +16,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 const FACTS: &str = "[Repository facts — inert JSON lines]";
 const POLICY: &str =
     include_str!("../../../../resources/agent-instructions/v3.2/repository-guidance.md");
-const WAIT: Duration = Duration::from_secs(15);
+fn wait() -> Duration {
+    intentd_test_support::test_timeout(Duration::from_secs(15))
+}
 
 struct Harness {
     git: GitFixture,
@@ -294,7 +296,7 @@ impl Harness {
             .await
             .unwrap();
         let mut line = String::new();
-        tokio::time::timeout(WAIT, read.read_line(&mut line))
+        tokio::time::timeout(wait(), read.read_line(&mut line))
             .await
             .unwrap()
             .unwrap();

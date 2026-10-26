@@ -1809,7 +1809,9 @@ async fn private_history_bootstrap_mutation_joins_original_transfer_and_preserve
     });
     mutation_started.recv().unwrap();
     assert!(joined_result
-        .recv_timeout(std::time::Duration::from_millis(30))
+        .recv_timeout(intentd_test_support::test_timeout(
+            std::time::Duration::from_millis(30)
+        ))
         .is_err());
     release.send(()).unwrap();
     transfer.join().unwrap().unwrap();
@@ -2711,11 +2713,12 @@ async fn services_original_history_case(variant: &'static str) {
         manager.begin_shutdown();
         drop(resume);
         let mut shutdown = Box::pin(manager.shutdown_with_native_outcome());
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(50), &mut shutdown)
-                .await
-                .is_err()
-        );
+        assert!(tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_millis(50)),
+            &mut shutdown
+        )
+        .await
+        .is_err());
         assert!(
             connection.is_alive(),
             "shutdown closed pending LOAD transport"
@@ -2723,11 +2726,12 @@ async fn services_original_history_case(variant: &'static str) {
         if variant == "shutdown-load-cancelled" {
             drop(shutdown);
             shutdown = Box::pin(manager.shutdown_with_native_outcome());
-            assert!(
-                tokio::time::timeout(std::time::Duration::from_millis(50), &mut shutdown)
-                    .await
-                    .is_err()
-            );
+            assert!(tokio::time::timeout(
+                intentd_test_support::test_timeout(std::time::Duration::from_millis(50)),
+                &mut shutdown
+            )
+            .await
+            .is_err());
         }
         release.send(()).unwrap();
         tokio::time::timeout(
@@ -2738,9 +2742,12 @@ async fn services_original_history_case(variant: &'static str) {
         .unwrap()
         .unwrap();
         assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(50), &mut shutdown)
-                .await
-                .is_err(),
+            tokio::time::timeout(
+                intentd_test_support::test_timeout(std::time::Duration::from_millis(50)),
+                &mut shutdown
+            )
+            .await
+            .is_err(),
             "shutdown completed before exact retirement response"
         );
         assert!(connection.is_alive());

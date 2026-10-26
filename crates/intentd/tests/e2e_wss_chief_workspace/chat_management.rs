@@ -283,7 +283,11 @@ async fn assistant_chat_management_roundtrip_over_wss() {
     assert_eq!(renamed["type"], "agent:renamed");
     assert_eq!(
         renamed["data"],
-        json!({ "agentId": target, "name": "Renamed Assistant chat" })
+        json!({
+            "agentId": target,
+            "name": "Renamed Assistant chat",
+            "nameExplicitlySet": true,
+        })
     );
     let scheduled = next_chat_event(&mut events, &subscription, &target).await;
     assert_eq!(scheduled["type"], "agent:delete-scheduled");

@@ -17,11 +17,11 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
-use std::os::unix::process::CommandExt;
+use intentd_test_support::GuardedChild;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -197,7 +197,22 @@ async fn wss_rpc(
     }
 }
 
-fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)], resume_all: bool) -> Child {
+fn spawn_serve(
+    data_dir: &Path,
+    listen: &str,
+    env: &[(&str, &str)],
+    resume_all: bool,
+) -> GuardedChild {
+    spawn_serve_with(data_dir, listen, env, resume_all, false)
+}
+
+fn spawn_serve_with(
+    data_dir: &Path,
+    listen: &str,
+    env: &[(&str, &str)],
+    resume_all: bool,
+    opt_in: bool,
+) -> GuardedChild {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
@@ -219,12 +234,14 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)], resume_all: 
     for (k, v) in env {
         cmd.env(k, v);
     }
+    if opt_in {
+        common::opt_into_resume_on_start(&mut cmd);
+    }
     common::hermetic_fixture_identity(&mut cmd, data_dir);
-    // Spawn in its own process group (pgid == child pid) so killing the daemon on
-    // test panic/failure also kills spawned Node.js ACP mock providers via killpg.
-    #[cfg(unix)]
-    cmd.process_group(0);
-    cmd.spawn().expect("spawn intentd serve")
+    // GuardedChild: the daemon gets its own process group, killed on drop, panic
+    // or test-process death. ACP providers start their own groups (intent-acp),
+    // so this does not reach them.
+    GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
 }
 
 fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
@@ -264,6 +281,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         context_links: None,
         archived: false,
         archived_at: None,
+        retired_at: None,
         task_stats: None,
         agent_summary: None,
         token_usage: None,
@@ -272,6 +290,8 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         pull_requests_total: None,
         display_status: None,
         waiting: false,
+        scripts_running: false,
+        background_tasks_running: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
@@ -281,27 +301,14 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
 }
 
 struct Daemon {
-    child: Child,
+    child: GuardedChild,
     data_dir: PathBuf,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        // Kill the whole process group FIRST (daemon + any Node.js ACP provider
-        // children) BEFORE wait(), so children are reaped before they get reparented.
-        // The daemon was spawned with process_group(0), making it the group leader.
-        #[cfg(unix)]
-        {
-            use nix::sys::signal::{self, Signal};
-            use nix::unistd::Pid;
-            let pid = Pid::from_raw(self.child.id().cast_signed());
-            let _ = signal::killpg(pid, Signal::SIGKILL);
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = self.child.kill();
-        }
-        let _ = self.child.wait();
+        // Kills the daemon's process group (ACP providers run in their own groups).
+        let _ = self.child.kill_tree();
         // On test panic, print data-dir path + daemon log tail for diagnosability
         if std::thread::panicking() {
             eprintln!("\n=== DAEMON CLEANUP (test panicked) ===");
@@ -753,14 +760,8 @@ impl RecoveryFixture {
                 created["result"]["agent"]["id"].as_str().unwrap(),
             ));
         }
-        let setting = uds_rpc(
-            &socket,
-            2,
-            "settings.update",
-            json!({"changes": [{"path": "agents.resumeInterruptedOnStart", "value": "off"}]}),
-        )
-        .await;
-        assert!(setting["error"].is_null(), "{setting}");
+        // No explicit resume setting: hermetic daemons pin resume-on-start
+        // off, so `start(false)` proves the pin and `start_opted_in` the opt-in.
         drop(daemon);
         for agent in &agents {
             store
@@ -781,6 +782,19 @@ impl RecoveryFixture {
     }
 
     fn start_mode(&self, resume: bool, mode: &str) -> (Daemon, tokio::net::UnixListener) {
+        self.start_with(resume, mode, false)
+    }
+
+    fn start_opted_in(&self) -> (Daemon, tokio::net::UnixListener) {
+        self.start_with(false, "both", true)
+    }
+
+    fn start_with(
+        &self,
+        resume: bool,
+        mode: &str,
+        opt_in: bool,
+    ) -> (Daemon, tokio::net::UnixListener) {
         let data_dir = self.root.path();
         let gate_path = data_dir.join("recovery-gate.sock");
         let gate = tokio::net::UnixListener::bind(&gate_path).unwrap();
@@ -794,7 +808,7 @@ impl RecoveryFixture {
         ];
         (
             Daemon {
-                child: spawn_serve(data_dir, mode, &env, resume),
+                child: spawn_serve_with(data_dir, mode, &env, resume, opt_in),
                 data_dir: data_dir.to_owned(),
             },
             gate,
@@ -871,6 +885,8 @@ async fn startup_recovery_serves_rpcs_while_sweep_is_held() {
     fixture.store.close().await;
 }
 
+/// No flag and no `config.toml` value: the hermetic launcher's `off` pin
+/// replaces the display-dependent `auto` default, on every host.
 #[tokio::test]
 async fn startup_recovery_disabled_keeps_candidates_visible() {
     let fixture = RecoveryFixture::new().await;
@@ -880,6 +896,49 @@ async fn startup_recovery_disabled_keeps_candidates_visible() {
     assert_eq!(pending["agents"].as_array().unwrap().len(), 2);
     let log = std::fs::read_to_string(fixture.root.path().join("daemon.log")).unwrap();
     assert!(!log.contains("resume-on-start: resuming interrupted agents"));
+    let decision = log
+        .lines()
+        .find(|line| line.contains("startup interrupted-agent resume decision"))
+        .expect("startup logs its resume decision");
+    assert!(
+        decision.contains("setting=\"off\"")
+            && decision.contains("test_default_applied=true")
+            && decision.contains("resume=false"),
+        "{decision}"
+    );
+    fixture.store.close().await;
+}
+
+/// `common::opt_into_resume_on_start` restores the startup sweep without
+/// `--resume-all` or a `config.toml` value, regardless of display.
+#[tokio::test]
+async fn startup_recovery_opt_in_resumes_without_flag_or_setting() {
+    let fixture = RecoveryFixture::new().await;
+    let (_daemon, gate) = fixture.start_opted_in();
+    let (mut release, _) = timeout(common::daemon_startup_timeout(), gate.accept())
+        .await
+        .expect("opted-in sweep reached gate")
+        .unwrap();
+    release.write_u8(1).await.unwrap();
+    wait_for_sweep(fixture.root.path()).await;
+    assert!(fixture
+        .store
+        .list_interrupted_agents()
+        .await
+        .unwrap()
+        .is_empty());
+    let log = std::fs::read_to_string(fixture.root.path().join("daemon.log")).unwrap();
+    let decision = log
+        .lines()
+        .find(|line| line.contains("startup interrupted-agent resume decision"))
+        .expect("startup logs its resume decision");
+    assert!(
+        decision.contains("resume_all=false")
+            && decision.contains("setting=\"on\"")
+            && decision.contains("test_default_applied=true")
+            && decision.contains("resume=true"),
+        "{decision}"
+    );
     fixture.store.close().await;
 }
 

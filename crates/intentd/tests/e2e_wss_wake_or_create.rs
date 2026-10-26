@@ -26,14 +26,15 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 #[path = "e2e_wss_wake_or_create/daemon_exit.rs"]
 mod daemon_exit;
 #[path = "e2e_wss_wake_or_create/fixture_identity.rs"]
 mod fixture_identity;
 
+use intentd_test_support::GuardedChild;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -51,7 +52,7 @@ use tokio_tungstenite::WebSocketStream;
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
 struct Daemon {
-    child: Child,
+    child: GuardedChild,
     /// Kept alive for the daemon's lifetime; the store lives under it.
     data_dir: daemon_exit::FixtureDir,
 }
@@ -61,7 +62,7 @@ impl Drop for Daemon {
         use std::panic::{catch_unwind, AssertUnwindSafe};
         let was_panicking = std::thread::panicking();
         let started = std::time::Instant::now();
-        let deadline = started + daemon_exit::BOUND;
+        let deadline = started + daemon_exit::bound();
         let pid = self.child.id();
         let mut events = vec![json!({"event": "TeardownEntered", "pid": pid})];
         let mut wait_attempted = false;
@@ -109,7 +110,14 @@ impl Drop for Daemon {
                 let cleanup = catch_unwind(AssertUnwindSafe(|| -> std::io::Result<()> {
                     events.push(json!({"event": "FailureCleanupKillAttempt", "pid": pid}));
 
-                    let killed = self.child.kill();
+                    // The whole group, not just the leader: reaping a lone
+                    // leader below would leave GuardedChild's Drop nothing
+                    // to sweep the group with.
+                    let killed = self
+                        .child
+                        .signal_group(nix::sys::signal::Signal::SIGKILL)
+                        .or_else(|_| self.child.signal(nix::sys::signal::Signal::SIGKILL))
+                        .map_err(std::io::Error::from);
 
                     events.push(
                         json!({"event": "FailureCleanupKillResult", "ok": killed.is_ok(),
@@ -195,10 +203,8 @@ fn temp_data_dir() -> tempfile::TempDir {
     common::test_tempdir_in("/tmp", "itd-wss-woc-")
 }
 
-fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
-    fixture_command(data_dir, listen, env)
-        .spawn()
-        .expect("spawn intentd serve")
+fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> GuardedChild {
+    GuardedChild::spawn(&mut fixture_command(data_dir, listen, env)).expect("spawn intentd serve")
 }
 
 fn fixture_command(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Command {
@@ -412,6 +418,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         context_links: None,
         archived: false,
         archived_at: None,
+        retired_at: None,
         task_stats: None,
         agent_summary: None,
         diff_summary: None,
@@ -421,6 +428,8 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         pull_requests_total: None,
         display_status: None,
         waiting: false,
+        scripts_running: false,
+        background_tasks_running: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
@@ -513,9 +522,12 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     loop {
-        let next = timeout(Duration::from_secs(secs), ws.next())
-            .await
-            .expect("wss event timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(secs)),
+            ws.next(),
+        )
+        .await
+        .expect("wss event timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");

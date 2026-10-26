@@ -29,7 +29,7 @@ use crate::Store;
 ///    predicate, or to [`TRANSFER_EXCLUDED_TABLES`] with a rationale.
 /// 2. Does any column hold machine-local values (absolute paths, client ids,
 ///    daemon-local ids)? If so, add an import-side transformation in
-///    `intent-services/src/transfer_import.rs` (see its path/ID rewriting).
+///    `intent-svc-transfer/src/transfer_import.rs` (see its path/ID rewriting).
 /// 3. Is there matching non-DB state? Assets dir and git bundle ride the
 ///    archive separately (`transfer_export.rs` / `transfer_git.rs`); runtime
 ///    state (hooks, PR monitors, agent queues) is rehydrated from these rows
@@ -46,6 +46,12 @@ pub const TRANSFER_TABLES: &[(&str, &str)] = &[
     ("note_version", "workspace_id = ?1"),
     ("note_line_attribution", "workspace_id = ?1"),
     ("comment", "workspace_id = ?1"),
+    // Historical human identity is immutable attribution, not a grant or a
+    // principal FK. Import clears the private retry principal to avoid rebinding.
+    ("discussion_conversation", "workspace_id = ?1"),
+    ("discussion_participant", "workspace_id = ?1"),
+    ("workspace_discussion_message", "workspace_id = ?1"),
+    ("discussion_reaction", "workspace_id = ?1"),
     ("draft", "workspace_id = ?1"),
     ("agent_session", "workspace_id = ?1"),
     // Ownership must precede queue restoration; history is imported separately
@@ -70,7 +76,7 @@ pub const TRANSFER_TABLES: &[(&str, &str)] = &[
     ),
     (
         "agent_queue",
-        "agent_id IN (SELECT id FROM agent_session WHERE workspace_id = ?1) AND NOT EXISTS (SELECT 1 FROM agent_queue_admission d WHERE d.id=agent_queue.id AND d.phase='completed')",
+        "agent_id IN (SELECT id FROM agent_session WHERE workspace_id = ?1) AND NOT EXISTS (SELECT 1 FROM agent_queue_admission d WHERE d.id=agent_queue.id AND d.phase='completed') AND NOT EXISTS (SELECT 1 FROM json_tree(payload) ref WHERE ref.key='discussionMessageId')",
     ),
     ("interrupted_agent", "workspace_id = ?1"),
     ("agent_flipped_completion", "workspace_id = ?1"),
@@ -112,6 +118,9 @@ pub const TRANSFER_TABLES: &[(&str, &str)] = &[
 /// new table cannot silently skip the transfer decision.
 #[cfg(test)]
 pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
+    ("discussion_agent_grant", "local explicit addressing authority is never restored on import"),
+    ("discussion_agent_activity", "local invocation receipts are not restored on import"),
+    ("discussion_agent_delivery", "pending addressed messages must not replay on a destination"),
     ("pull_request_workspace_candidate", "write-only trigger funnel; its BEFORE INSERT trigger ignores every row, so it never holds data"),
     ("review_context_private_family", "installation-private denial history; never imported or transferred"),
     ("review_context_enrollment", "installation-private native family; never imported or transferred"),
@@ -684,13 +693,17 @@ impl Store {
                     "{verb} INTO \"{table}\" ({}) VALUES ({placeholders})",
                     columns.join(",")
                 );
+                let empty_activity = serde_json::json!("[]");
                 let mut query = sqlx::query(&sql);
                 for (key, value) in map {
                     query = bind_json_value(
                         query,
                         table,
                         key,
-                        if history_metadata.is_some() && key == "metadata" {
+                        if *table == "workspace_discussion_message" && key == "agent_activity_json"
+                        {
+                            &empty_activity
+                        } else if history_metadata.is_some() && key == "metadata" {
                             &serde_json::Value::Null
                         } else {
                             value
@@ -1453,6 +1466,10 @@ mod tests {
             format!("INSERT INTO note_version (note_id, workspace_id, v, date, author_id, author_name, author_type, title, content) VALUES ('n1', '{ws}', 1, '{t}', 'u', 'U', 'user', 'N', 'body')"),
             format!("INSERT INTO note_line_attribution (note_id, workspace_id, computed_at, attributions_json) VALUES ('n1', '{ws}', '{t}', '[]')"),
             format!("INSERT INTO comment (id, thread_id, note_id, workspace_id, kind, content, author, author_type, anchor_json, created_at, updated_at) VALUES ('c-{ws}', 'th', 'n1', '{ws}', 'comment', 'hi', 'u', 'user', '{{}}', '{t}', '{t}')"),
+            format!("INSERT INTO discussion_conversation(id,workspace_id,kind,participants_json,created_at) VALUES ('conversation-{ws}','{ws}','direct','[]','{t}')"),
+            format!("INSERT INTO discussion_participant(conversation_id,workspace_id,source_principal_id,principal_id) VALUES ('conversation-{ws}','{ws}','human-{ws}','human-{ws}')"),
+            format!(r#"INSERT INTO workspace_discussion_message (id,workspace_id,sequence,principal_id,client_message_id,body,author_json,created_at) VALUES ('discussion-{ws}','{ws}',1,'human-{ws}','retry','hello','{{"principalId":"human-{ws}","login":"human","displayName":null,"avatarUrl":null}}','{t}')"#),
+            format!("INSERT INTO discussion_reaction(id,workspace_id,message_id,principal_id,reaction) VALUES ('reaction-{ws}','{ws}','discussion-{ws}','human-{ws}','👍')"),
             format!("INSERT INTO draft (workspace_id, agent_id, client_id, text, updated_at) VALUES ('{ws}', '{agent}', '{client}', 'd', '{t}')"),
             format!("INSERT INTO agent_message (id, agent_id, seq, role, content, created_at, usage_model, usage_origin) VALUES ('m-{ws}', '{agent}', 1, 'user', '[]', '{t}', 'test-model', 'human')"),
             format!("INSERT INTO agent_message_payload (message_id, agent_id, block_ordinal, kind, encoding, body) VALUES ('m-{ws}', '{agent}', 0, 'tool_result_output', 'none', X'227822')"),
@@ -1985,7 +2002,7 @@ mod tests {
              If it transfers and any column holds machine-local values \
              (absolute paths, client ids, daemon-local ids), also add an \
              import-side transformation in \
-             intent-services/src/transfer_import.rs, and update the column \
+             intent-svc-transfer/src/transfer_import.rs, and update the column \
              snapshot in transferred_table_columns_match_snapshot. See the \
              'Transfer checklist' on TRANSFER_TABLES."
         );
@@ -2008,11 +2025,15 @@ mod tests {
     /// `transferred_table_columns_match_snapshot` after deciding what the
     /// column change means for transfer (see that test's message).
     const TRANSFERRED_COLUMNS: &str = "\
-workspace: id, title, branch, base_ref, base_commit_sha, status, status_message, attention, repository_owner, repository_name, worktree_path, scope, skip_worktree, is_remote, default_model, pr_number, pr_url, archived, archived_at, tags, created_at, updated_at, last_activity, pr_status, active_pull_request, path, repository_path, token_usage, setup_script, branch_auto_generated, pull_requests, checkout_mode, status_image_asset_id, auto_commit_enabled, context_links, browser_client_id, legacy_author_principal_id, owner_principal_id, last_content_activity, scripts_initialized
+workspace: id, title, branch, base_ref, base_commit_sha, status, status_message, attention, repository_owner, repository_name, worktree_path, scope, skip_worktree, is_remote, default_model, pr_number, pr_url, archived, archived_at, tags, created_at, updated_at, last_activity, pr_status, active_pull_request, path, repository_path, token_usage, setup_script, branch_auto_generated, pull_requests, checkout_mode, status_image_asset_id, auto_commit_enabled, context_links, browser_client_id, legacy_author_principal_id, owner_principal_id, last_content_activity, scripts_initialized, retired_at
 note: id, workspace_id, title, content, content_type, tags, is_pinned, is_archived, is_default, parent_id, visibility, task_json, created_at, updated_at, rev
 note_version: note_id, workspace_id, v, date, author_id, author_name, author_type, title, content, rev
 note_line_attribution: note_id, workspace_id, computed_at, attributions_json
 comment: id, thread_id, note_id, workspace_id, kind, content, author, author_type, status, parent_id, anchor_json, anchor_text, extra_json, created_at, updated_at
+discussion_conversation: id, workspace_id, kind, participants_json, created_at
+discussion_participant: conversation_id, workspace_id, source_principal_id, principal_id
+workspace_discussion_message: id, workspace_id, conversation_id, sequence, principal_id, client_message_id, body, author_json, created_at, reply_to_message_id, reply_to_json, reactions_json, reaction_version, agent_id, recipient_agent_ids_json, agent_activity_json, agent_mentions_json
+discussion_reaction: id, workspace_id, message_id, principal_id, agent_id, reaction, author_json
 draft: workspace_id, agent_id, client_id, text, updated_at, attachments
 agent_session: id, workspace_id, backend_session_id, acp_session_id, name, name_explicitly_set, model, provider, status, is_active, system_prompt, created_at, updated_at, parent_agent_id, specialist, task_note_id, skip_auto_commit, completion_report, completion_report_timestamp, delegation_depth, initial_message, context_references, image_blocks, is_background, metadata, sandbox_id, sandbox_path, sandbox_branch, stop_reason, token_usage, token_usage_baseline, resolved_model, last_turn_model, last_turn_provider, last_assistant_preview, last_user_preview, attention_request_kind, attention_request_reason, attention_request_timestamp, last_message_role, stop_reason_timestamp, reasoning_effort, effort_levels, last_message_id, file_blocks, task_graph_enabled, harness_version, harness_features, last_tool_use_preview, retired_at, message_count, assistant_message_count, conversation_bytes, notifications_muted, last_turn_effort, reasoning_effort_auto
 script_monitor: id, workspace_id, agent_id, script_id, run_id, state, row_json, created_at, cancel_intent
@@ -2069,7 +2090,7 @@ pull_request_workspace: pr_key, workspace_id, source, linked_at";
              transfer:\n\
              - does the new column hold machine-local values (absolute paths, \
              client ids, daemon-local ids)? If so, add an import-side \
-             transformation in intent-services/src/transfer_import.rs (see \
+             transformation in intent-svc-transfer/src/transfer_import.rs (see \
              its existing path/ID rewriting);\n\
              - exported archives created before this change lack the column — \
              make sure the import path tolerates its absence (or defaults it);\n\

@@ -15,7 +15,9 @@ use crate::mcp_server::repository_guidance::{
     GuidanceCandidate, GuidanceLease, RepositoryGuidanceFence, RepositoryGuidanceSource,
 };
 
-const WAIT: Duration = Duration::from_secs(10);
+fn wait() -> Duration {
+    intentd_test_support::test_timeout(Duration::from_secs(10))
+}
 const GUIDANCE: &str =
     "[Repository guidance — harness 3.0]\nTransport fixture, not an adapter role.";
 
@@ -109,7 +111,7 @@ async fn send(write: &mut OwnedWriteHalf, message: &Value) {
 async fn read(reader: &mut BufReader<OwnedReadHalf>) -> Value {
     let mut line = String::new();
     assert!(
-        timeout(WAIT, reader.read_line(&mut line))
+        timeout(wait(), reader.read_line(&mut line))
             .await
             .unwrap()
             .unwrap()
@@ -259,7 +261,7 @@ async fn drain_writer(responses: Vec<BridgeResponse>, connection: ConnectionToke
     drop(tx);
     let writer = tokio::spawn(write_responses(write, rx, connection));
     let mut output = String::new();
-    timeout(WAIT, read.read_to_string(&mut output))
+    timeout(wait(), read.read_to_string(&mut output))
         .await
         .unwrap()
         .unwrap();
@@ -289,7 +291,7 @@ async fn actual_writer_rechecks_already_queued_sidecars_after_revision_and_conne
     let connection = ConnectionLifetime::new();
     let writer = tokio::spawn(write_responses(write, rx, connection.token()));
     let mut output = String::new();
-    timeout(WAIT, read.read_to_string(&mut output))
+    timeout(wait(), read.read_to_string(&mut output))
         .await
         .unwrap()
         .unwrap();
@@ -385,7 +387,7 @@ async fn real_tcp_late_results_cannot_regress_revision_or_epoch_across_connectio
         let (mut old_reader, mut old_write) = connect(&bridge).await;
         let (mut new_reader, mut new_write) = connect(&bridge).await;
         send(&mut old_write, &json!({"id":1,"method":"slow"})).await;
-        timeout(WAIT, dispatch.entered.notified()).await.unwrap();
+        timeout(wait(), dispatch.entered.notified()).await.unwrap();
         send(&mut old_write, &json!({"id":99,"method":"ping"})).await;
         assert_eq!(read(&mut old_reader).await["id"], 99);
         send(&mut new_write, &json!({"id":2,"method":"new"})).await;
@@ -410,7 +412,7 @@ async fn retired_endpoint_preserves_pending_operation_without_guidance() {
     let bridge = serve_mcp_tcp(dispatch.clone()).await.unwrap();
     let (mut reader, mut write) = connect(&bridge).await;
     send(&mut write, &json!({"id":1,"method":"slow"})).await;
-    timeout(WAIT, dispatch.entered.notified()).await.unwrap();
+    timeout(wait(), dispatch.entered.notified()).await.unwrap();
 
     // The existing connection retains its ordinary response behavior when the
     // endpoint handle drops. Its prepared guidance must retire with the owner.
@@ -504,7 +506,7 @@ async fn completed_operation_survives_watchdog_while_optional_guidance_is_pendin
     send(&mut write, &message).await;
     // Source entry occurs only after the original operation has completed and
     // all result shaping is done. Advance the operation deadline at that point.
-    timeout(WAIT, source.entered.notified()).await.unwrap();
+    timeout(wait(), source.entered.notified()).await.unwrap();
     tokio::time::pause();
     tokio::time::advance(Duration::from_millis(501)).await;
     assert_eq!(read(&mut reader).await, expected);
@@ -520,13 +522,14 @@ async fn pending_guidance_preserves_ping_response_and_cancels_on_peer_disconnect
     let ping = json!({"jsonrpc":"2.0","id":99,"method":"ping"});
     let expected = server(api()).handle_message(&ping).await.unwrap();
     send(&mut write, &call(1, "return 'completed-operation';")).await;
-    timeout(WAIT, source.entered.notified()).await.unwrap();
+    timeout(wait(), source.entered.notified()).await.unwrap();
     send(&mut write, &ping).await;
     assert_eq!(read(&mut reader).await, expected);
     drop(write);
     drop(reader);
     // Observe cancellation before the independent one-second guidance budget,
     // proving disconnect tears down the producer task rather than detaching it.
+    // fixed-deadline: allow — stays under the 1s guidance PREPARE_TIMEOUT (mcp_server/repository_guidance.rs) so only the disconnect can cancel
     timeout(Duration::from_millis(500), source.cancelled.notified())
         .await
         .unwrap();

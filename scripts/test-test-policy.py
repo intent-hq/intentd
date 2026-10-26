@@ -98,7 +98,7 @@ class PolicyTests(unittest.TestCase):
                         self.assertEqual(len(tests), 1)
                         self.assertEqual(tests[0][1:], ["1", "3"])
                         expected = ["llvm-cov", "--no-report", "nextest"]
-                        expected += (["--workspace"] if script == "coverage-all.sh" else ["-p", "intentd", "-E", "kind(test) and not binary(intentd) and not binary(auggie_context_e2e)"])
+                        expected += (["--workspace"] if script == "coverage-all.sh" else ["-p", "intentd", "-E", "kind(test) and not binary(intentd) and not test(/^auggie_context_e2e::/)"])
                         self.assertEqual(tests[0][0], expected)
                         for args, policy, multiplier in calls:
                             if "nextest" not in args:

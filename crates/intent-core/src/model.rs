@@ -25,15 +25,75 @@ fn repo_ref_from_parts(owner: Option<&str>, name: Option<&str>) -> Option<RepoRe
 
 /// Workspace lifecycle (§9.1; TS `WorkspaceStatus` in `src/shared/types.ts`).
 /// Wire values are the `PascalCase` variant names (`Active`/`Inactive`/`Archived`/
-/// `Deleted`), matching the TS string enum exactly; these are also the stored DB
-/// words (the column DEFAULT is unused — inserts always bind explicitly).
+/// `Retired`/`Deleted`), matching the TS string enum exactly; these are also the
+/// stored DB words (the column DEFAULT is unused — inserts always bind explicitly).
+///
+/// `Retired` (§5.1 `workspace.retire`): the checkout folder on disk was deleted
+/// to free space, but every DB row (agents, conversations, notes, assets,
+/// tasks) is kept and readable. A retired row stays `archived` and is hidden
+/// from every workspace list unless the caller opts in with
+/// [`WorkspaceListFilter::include_retired`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum WorkspaceStatus {
     #[default]
     Active,
     Inactive,
     Archived,
+    Retired,
     Deleted,
+}
+
+/// Which lifecycle states a workspace list includes (§5.1 `workspace.list`
+/// `includeArchived` / `includeRetired`). Retired workspaces are opt-in only:
+/// [`Self::include_archived`] alone never includes them, so a caller sees a
+/// retired row only when it explicitly sets [`Self::include_retired`]. Every
+/// list surface (store, service, RPC, subscription, MCP bindings, internal
+/// sweeps) takes this type rather than a bare `bool` so no call site can pick
+/// up retired rows by accident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WorkspaceListFilter {
+    /// Include archived (non-retired) workspaces.
+    pub include_archived: bool,
+    /// Include retired workspaces (independent of `include_archived`).
+    pub include_retired: bool,
+}
+
+impl WorkspaceListFilter {
+    /// Live (non-archived, non-retired) workspaces only.
+    pub const ACTIVE: Self = Self {
+        include_archived: false,
+        include_retired: false,
+    };
+    /// Live and archived workspaces; retired ones stay excluded.
+    pub const WITH_ARCHIVED: Self = Self {
+        include_archived: true,
+        include_retired: false,
+    };
+    /// Every workspace row, retired included. Only for callers that must see
+    /// retired rows on purpose (explicit `includeRetired: true`, lifecycle
+    /// sweeps that act on retired rows).
+    pub const ALL: Self = Self {
+        include_archived: true,
+        include_retired: true,
+    };
+
+    /// Build from the wire flags (`includeArchived`, `includeRetired`).
+    #[must_use]
+    pub const fn new(include_archived: bool, include_retired: bool) -> Self {
+        Self {
+            include_archived,
+            include_retired,
+        }
+    }
+
+    /// Whether `ws` passes this filter.
+    #[must_use]
+    pub fn admits(&self, ws: &Workspace) -> bool {
+        if ws.is_retired() {
+            return self.include_retired;
+        }
+        self.include_archived || !ws.archived
+    }
 }
 
 /// Derived in-flight agent state (green dot; read-only, not persisted) (§9.9).
@@ -336,6 +396,10 @@ pub struct Workspace {
     pub archived: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_at: Option<String>,
+    /// When the workspace was retired (§5.1 `workspace.retire`; RFC 3339).
+    /// Present only while `status` is `Retired`; omitted otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retired_at: Option<String>,
     /// Card-aggregate rollups (§9.1). Populated only on the `workspace.list` /
     /// `workspace.get` emit paths (omitted elsewhere, e.g. `create`/`update`).
     /// The iOS coverflow cards read `taskStats`, `agentSummary`, and
@@ -368,6 +432,23 @@ pub struct Workspace {
     /// when no wait signal is live.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub waiting: bool,
+    /// Daemon-owned orthogonal script flag (PROTOCOL §5.1): `true` while the
+    /// workspace has a command-mode script run in flight (service-mode
+    /// scripts never count). Read live from the in-memory script registry on
+    /// the same emit path as `waiting`; never persisted; omitted (not
+    /// `false`) when nothing runs. Feeds neither `activity` nor
+    /// `displayStatus`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub scripts_running: bool,
+    /// Daemon-owned orthogonal background-task flag (PROTOCOL §5.1): `true`
+    /// while any agent of the workspace has a §5.5b provider background task
+    /// (e.g. a backgrounded shell command) still running on a supported,
+    /// continuous connection. Read live from the in-memory worker
+    /// projections on the same emit path as `scripts_running`; never
+    /// persisted; omitted (not `false`) when none runs. Feeds neither
+    /// `activity` nor `displayStatus`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub background_tasks_running: bool,
     /// Durable token/credit usage accounting (§5.23 / §19.1), materialized by the
     /// daemon-internal periodic scan job and surfaced by `workspace.getTokenUsage`.
     /// Omitted (not `null`) until the first scan writes a snapshot.
@@ -551,6 +632,7 @@ pub const WORKSPACE_LIST_ROW_KEYS: &[&str] = &[
     "pullRequestsTotal",
     "archived",
     "archivedAt",
+    "retiredAt",
     "taskStats",
     "agentSummary",
     "diffSummary",
@@ -589,6 +671,14 @@ pub const WORKSPACE_LIST_PR_KEYS: &[&str] = &[
 ];
 
 impl Workspace {
+    /// Whether the workspace is retired (§5.1 `workspace.retire`): its
+    /// checkout folder is gone and disk-backed mutations are refused with
+    /// [`crate::Error::WorkspaceRetired`].
+    #[must_use]
+    pub fn is_retired(&self) -> bool {
+        self.status == WorkspaceStatus::Retired
+    }
+
     /// List-frame slimming for `workspace.list` and the lite
     /// `workspace.subscribe` seq-0 snapshot (monorepo#3041, extended): drop
     /// the detail-only fields so a list row stays within the documented
@@ -803,11 +893,14 @@ pub fn chief_workspace() -> Workspace {
         context_links: None,
         archived: false,
         archived_at: None,
+        retired_at: None,
         task_stats: None,
         agent_summary: None,
         diff_summary: None,
         display_status: None,
         waiting: false,
+        scripts_running: false,
+        background_tasks_running: false,
         token_usage: None,
         cow_supported: None,
         browser_client_id: None,
@@ -5915,7 +6008,10 @@ impl Principal {
 #[serde(rename_all = "lowercase")]
 pub enum WorkspaceRole {
     Owner,
+    /// Participant in the UI; retain the original wire/database word.
     Collaborator,
+    /// A guest allowed to create agents and operate saved scripts, not an owner.
+    Manager,
 }
 
 impl WorkspaceRole {
@@ -5925,6 +6021,7 @@ impl WorkspaceRole {
         match self {
             WorkspaceRole::Owner => "owner",
             WorkspaceRole::Collaborator => "collaborator",
+            WorkspaceRole::Manager => "manager",
         }
     }
 }
@@ -7493,6 +7590,7 @@ mod tests {
             (WorkspaceStatus::Active, "\"Active\""),
             (WorkspaceStatus::Inactive, "\"Inactive\""),
             (WorkspaceStatus::Archived, "\"Archived\""),
+            (WorkspaceStatus::Retired, "\"Retired\""),
             (WorkspaceStatus::Deleted, "\"Deleted\""),
         ] {
             assert_eq!(serde_json::to_string(&variant).unwrap(), wire);
@@ -7543,11 +7641,14 @@ mod tests {
             context_links: None,
             archived: false,
             archived_at: None,
+            retired_at: None,
             task_stats: None,
             agent_summary: None,
             diff_summary: None,
             display_status: None,
             waiting: false,
+            scripts_running: false,
+            background_tasks_running: false,
             token_usage: None,
             cow_supported: None,
             browser_client_id: None,
@@ -7587,6 +7688,30 @@ mod tests {
         assert_eq!(v["waiting"], serde_json::json!(true));
         let back: Workspace = serde_json::from_value(v).unwrap();
         assert_eq!(back, waiting_ws);
+
+        // Presence-detected `scriptsRunning`: omitted when false.
+        assert!(serde_json::to_value(&ws)
+            .unwrap()
+            .get("scriptsRunning")
+            .is_none());
+        let mut running_ws = ws.clone();
+        running_ws.scripts_running = true;
+        let v = serde_json::to_value(&running_ws).unwrap();
+        assert_eq!(v["scriptsRunning"], serde_json::json!(true));
+        let back: Workspace = serde_json::from_value(v).unwrap();
+        assert_eq!(back, running_ws);
+
+        // Presence-detected `backgroundTasksRunning`: omitted when false.
+        assert!(serde_json::to_value(&ws)
+            .unwrap()
+            .get("backgroundTasksRunning")
+            .is_none());
+        let mut background_ws = ws.clone();
+        background_ws.background_tasks_running = true;
+        let v = serde_json::to_value(&background_ws).unwrap();
+        assert_eq!(v["backgroundTasksRunning"], serde_json::json!(true));
+        let back: Workspace = serde_json::from_value(v).unwrap();
+        assert_eq!(back, background_ws);
     }
 
     /// The card aggregates serialize with the exact nested field names + casing

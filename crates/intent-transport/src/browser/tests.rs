@@ -130,7 +130,11 @@ async fn exec_rejects_missing_actions_before_forwarding() {
     assert!(err.to_string().contains("actions"));
     // Nothing was written to the outbound queue — validation short-circuits.
     assert!(matches!(
-        tokio::time::timeout(Duration::from_millis(20), out_rx.recv()).await,
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(20)),
+            out_rx.recv()
+        )
+        .await,
         Err(_) | Ok(None)
     ));
 }
@@ -147,7 +151,11 @@ async fn exec_rejects_empty_actions_before_forwarding() {
     assert_eq!(err.code(), browser_ops::INVALID_PARAMS);
     assert!(err.to_string().contains("empty"));
     assert!(matches!(
-        tokio::time::timeout(Duration::from_millis(20), out_rx.recv()).await,
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(20)),
+            out_rx.recv()
+        )
+        .await,
         Err(_) | Ok(None)
     ));
 }

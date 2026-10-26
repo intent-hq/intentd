@@ -2,7 +2,7 @@
 //! cursor query. Run on Windows for the native regression; Unix is a control.
 //! Export `setup-headless-evidence.json` with `INTENTD_SETUP_EVIDENCE_DIR`.
 
-mod common;
+use crate::common;
 
 use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
@@ -236,7 +236,7 @@ async fn setup_finishes_without_terminal_client_input() {
             });
         }
     }
-    let child = command.spawn().expect("spawn daemon");
+    let child = common::spawn_guarded(&mut command).expect("spawn daemon");
     let _daemon = common::DaemonGuard::process_only(child);
     timeout(common::daemon_startup_timeout(), async {
         loop {

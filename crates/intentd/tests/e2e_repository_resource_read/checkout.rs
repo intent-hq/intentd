@@ -150,7 +150,14 @@ async fn checkout_default_provider_self_heal_keeps_original_pages_but_gitlab_set
                     ["projectPath"],
                 PROJECT
             );
-            assert_eq!(h.store.list_workspaces(true).await.unwrap().len(), 0);
+            assert_eq!(
+                h.store
+                    .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+                    .await
+                    .unwrap()
+                    .len(),
+                0
+            );
             owner.close().await;
             client.close().await;
             h.finish().await;
@@ -281,7 +288,11 @@ async fn checkout_pagination_reaches_beyond_retained_history_without_losing_curr
 async fn checkout_preworkspace_real_owner_and_member_page_two_restore_and_cursor_isolation() {
     let h = Harness::with_workspace(false).await;
     assert_eq!(
-        h.store.list_workspaces(true).await.unwrap().len(),
+        h.store
+            .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .unwrap()
+            .len(),
         0,
         "browsing requires no workspace"
     );
@@ -480,12 +491,12 @@ async fn checkout_private_reply_after_host_revocation_is_denied_on_original_sock
         client.close().await;
         result
     });
-    tokio::time::timeout(ACQUIRE, server.state.entered.notified())
+    tokio::time::timeout(acquire(), server.state.entered.notified())
         .await
         .unwrap();
     h.store.remove_host_member(&h.member).await.unwrap();
     server.state.release.notify_one();
-    let response = tokio::time::timeout(ACQUIRE, pending)
+    let response = tokio::time::timeout(acquire(), pending)
         .await
         .unwrap()
         .unwrap();
@@ -562,7 +573,7 @@ async fn checkout_public_tls_auth_settings_transition_and_cancel_preserve_full_p
         starter.close().await;
         result
     });
-    tokio::time::timeout(ACQUIRE, server.state.entered.notified())
+    tokio::time::timeout(acquire(), server.state.entered.notified())
         .await
         .unwrap();
     assert_eq!(
@@ -586,7 +597,7 @@ async fn checkout_public_tls_auth_settings_transition_and_cancel_preserve_full_p
         true
     );
     server.state.release.notify_one();
-    let cancelled = tokio::time::timeout(ACQUIRE, pending)
+    let cancelled = tokio::time::timeout(acquire(), pending)
         .await
         .unwrap()
         .unwrap();

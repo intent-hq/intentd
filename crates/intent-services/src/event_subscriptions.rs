@@ -28,12 +28,18 @@ use crate::Services;
 
 /// Subscribe-time guard for AGENT callers (monorepo#1229): every explicit
 /// `agent:`-prefixed entry (exact types, the `agent:*` wildcard, and the
-/// observability events), `chat:stream:delta` and the UI-only
-/// `prMonitor:refreshed` hint is rejected with `InvalidParams` — agents watch other agents via `ws.agent.watch`, not the
-/// event bus. A bare `*` passes: it is silently narrowed to the non-agent
-/// categories at resolution time ([`events::resolve_event_types_for_agent`]).
+/// observability events), `discussion:`-prefixed entries, `chat:stream:delta`,
+/// and the UI-only `prMonitor:refreshed` hint are rejected with `InvalidParams`.
+/// Agents watch other agents via `ws.agent.watch`, not the event bus. A bare `*`
+/// passes: it is silently narrowed to the non-agent categories at resolution time
+/// ([`events::resolve_event_types_for_agent`]).
 pub(crate) fn validate_agent_event_types(event_types: &[String]) -> Result<()> {
     for t in event_types {
+        if t.starts_with("discussion:") {
+            return Err(Error::InvalidParams(format!(
+                "\"{t}\" is not subscribable by agents: workspace discussions are human-only."
+            )));
+        }
         if t == intent_core::events::PR_MONITOR_REFRESHED {
             return Err(Error::InvalidParams(format!(
                 "\"{t}\" is not subscribable by agents: it is a UI-only re-read hint for \
@@ -351,7 +357,7 @@ impl Services {
             )),
             // Match-time guard (monorepo#1229): agent-owned subscriptions —
             // including rehydrated rows persisted before the subscribe-time
-            // guard existed — never match agent events or `chat:stream:delta`.
+            // guard existed — never match restricted streams or human discussions.
             exclude_agent_events: true,
             ..Default::default()
         };
@@ -364,7 +370,13 @@ impl Services {
                 if batch.is_empty() {
                     continue;
                 }
-                let refs: Vec<&Event> = batch.iter().collect();
+                let refs: Vec<&Event> = batch
+                    .iter()
+                    .filter(|event| !event.event_type.starts_with("desktop:"))
+                    .collect();
+                if refs.is_empty() {
+                    continue;
+                }
                 let wake = format_event_subscription_wake(&refs);
                 let metadata = crate::build_event_notification_metadata(&refs);
                 if let Err(e) = services

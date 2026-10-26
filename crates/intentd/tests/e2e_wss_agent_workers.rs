@@ -5,19 +5,21 @@
 //! `agent.workers.stop` (forwarded to the provider as
 //! `_session/async_task/stop`), and a between-turn completion updates the
 //! projection without opening a turn. Envelope, ownership, generation-fence,
-//! capacity and teardown errors are asserted on the wire.
+//! capacity and teardown errors are asserted on the wire. A graceful restart
+//! that kills a running worker interrupts its idle agent and tells it on
+//! resume (intent-hq/intent#7658).
 //!
 //! Hermetic setup (shared with the npx isolation suite): the daemon child's
 //! `PATH` starts with a scratch `bin/` holding a fake `node`, a fake `npx`
 //! that execs the deterministic mock ACP fixture, and a version-only `claude`
-//! CLI. The mock answers `initialize` with the reviewed claude-agent-acp
+//! CLI. The mock answers `initialize` with the pinned claude-agent-acp
 //! identity (`agentInfo`), records the client capabilities it was offered
 //! (`MOCK_AGENT_INIT_LOG`) and every stop request (`MOCK_AGENT_STOP_LOG`).
 //! Nothing is downloaded. Gated on `node`, `git` and the mock script.
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -224,9 +226,12 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     loop {
-        let next = timeout(Duration::from_secs(secs), ws.next())
-            .await
-            .expect("wss event timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(secs)),
+            ws.next(),
+        )
+        .await
+        .expect("wss event timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -468,6 +473,53 @@ where
     events
 }
 
+/// The next `workspace:backgroundTasksRunning-changed` payload for
+/// `workspace_id` on a connection subscribed to that type (§5.1 / §6.5).
+async fn background_tasks_flag<S>(ws: &mut WebSocketStream<S>, workspace_id: &str) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    loop {
+        let frame = wss_event(ws, 60).await;
+        let ev = &frame["params"]["event"];
+        if ev["type"] == "workspace:backgroundTasksRunning-changed"
+            && ev["data"]["workspaceId"] == json!(workspace_id)
+        {
+            return ev["data"].clone();
+        }
+    }
+}
+
+/// The served `Workspace.backgroundTasksRunning`, asserting it is
+/// presence-detected: `true` or absent, never `false`.
+async fn served_background_tasks<S>(
+    ws: &mut WebSocketStream<S>,
+    id: i64,
+    workspace_id: &str,
+) -> bool
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let got = wss_rpc(
+        ws,
+        id,
+        "workspace.get",
+        json!({ "workspaceId": workspace_id }),
+    )
+    .await;
+    match got["workspace"].get("backgroundTasksRunning") {
+        None => false,
+        Some(v) => {
+            assert_eq!(v, &json!(true), "presence-detected flag: {got}");
+            assert!(
+                got["workspace"].get("scriptsRunning").is_none(),
+                "a worker never moves scriptsRunning: {got}"
+            );
+            true
+        }
+    }
+}
+
 fn read_jsonl(path: &Path) -> Vec<Value> {
     std::fs::read_to_string(path)
         .unwrap_or_default()
@@ -595,6 +647,21 @@ async fn provider_workers_are_listed_streamed_and_stopped_over_wss() {
     let agent_id = agent["agent"]["id"].as_str().expect("agent id").to_string();
     let target = json!({ "workspaceId": ws_id, "agentId": agent_id });
 
+    // The workspace roll-up (§5.1): a dedicated firehose for its transitions.
+    let mut flags = connect_ws(port, cfg.clone()).await;
+    let flag_sub = wss_rpc(
+        &mut flags,
+        11,
+        "events.subscribe",
+        json!({ "eventTypes": ["workspace:backgroundTasksRunning-changed"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(flag_sub["subscriptionId"].is_string(), "{flag_sub}");
+    assert!(
+        !served_background_tasks(&mut rpc, 12, &ws_id).await,
+        "nothing runs before the first turn"
+    );
+
     // Subscribe before the agent has a provider process: ack, then seq-0.
     let mut workers = connect_ws(port, cfg.clone()).await;
     let ack = wss_call(&mut workers, 20, "agent.workers.subscribe", target.clone()).await;
@@ -690,6 +757,14 @@ async fn provider_workers_are_listed_streamed_and_stopped_over_wss() {
     assert_eq!(listed["workers"], running["workers"]);
     assert_eq!(listed["connectionGeneration"], json!(generation));
 
+    // The running shell raises the workspace flag: one self-sufficient
+    // transition event, and the served row carries it.
+    assert_eq!(
+        background_tasks_flag(&mut flags, &ws_id).await,
+        json!({ "workspaceId": ws_id, "backgroundTasksRunning": true })
+    );
+    assert!(served_background_tasks(&mut rpc, 24, &ws_id).await);
+
     // Error envelopes (§9): the stop answers are decided before any provider call.
     let stop = |id: i64, generation: &str, task: &str| {
         (
@@ -760,6 +835,12 @@ async fn provider_workers_are_listed_streamed_and_stopped_over_wss() {
     })
     .await;
     assert_eq!(ended["workers"][0]["providerState"], "stopped");
+    // Its last running worker ended, so the workspace flag drops.
+    assert_eq!(
+        background_tasks_flag(&mut flags, &ws_id).await,
+        json!({ "workspaceId": ws_id, "backgroundTasksRunning": false })
+    );
+    assert!(!served_background_tasks(&mut rpc, 37, &ws_id).await);
     assert!(ended["workers"][0]["observedAt"].as_u64() >= row["observedAt"].as_u64());
     let firehose = events_within(&mut sub, &agent_id, Duration::from_secs(2)).await;
     assert!(
@@ -1000,4 +1081,235 @@ async fn idle_reap_keeps_an_agent_with_a_running_worker_over_wss() {
     }
     let evicted = evicted.expect("the agent is reaped once its worker ended");
     assert_eq!(evicted["data"]["reason"], "idle-ttl", "{evicted}");
+}
+
+/// intent-hq/intent#7658 end to end: a claude-code agent ends its turn with
+/// a background shell still running, and the daemon is stopped gracefully
+/// (SIGTERM). The shutdown kills the provider and the worker with it, so the
+/// worker's completion report can never arrive. The idle agent must still be
+/// captured as interrupted, tagged `background_workers`, and resuming it
+/// after the restart must deliver the harness-interruption continuation with
+/// the lost-background-task note to the new provider process.
+#[tokio::test]
+async fn restart_interrupts_an_idle_agent_with_a_running_worker_over_wss() {
+    let Some(script) = gate("WSS restart with running worker E2E") else {
+        return;
+    };
+    let data_dir_guard = temp_data_dir();
+    let data_dir = data_dir_guard.path().to_path_buf();
+    let bin_dir = data_dir.join("bin");
+    let home_dir = data_dir.join("home");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    std::fs::create_dir_all(&home_dir).unwrap();
+    write_fake_npx(&bin_dir, &data_dir.join("npx-report"), &script);
+    let source_repo = make_source_repo(&data_dir);
+    let prompt_log = data_dir.join("prompts.jsonl");
+    let path = format!("{}:/usr/bin:/bin", bin_dir.display());
+    let behavior = json!({
+        "response": "RESTART_WORKER_E2E_REPLY",
+        "agentInfo": {
+            "name": "@agentclientprotocol/claude-agent-acp",
+            "version": intent_providers::CLAUDE_AGENT_ACP_VERSION,
+        },
+        "asyncTasks": { "spawnOn": "RUN_BG", "command": "npm run dev" },
+    })
+    .to_string();
+    let env: [(&str, &str); 7] = [
+        ("INTENTD_AUTH_TOKEN", TOKEN),
+        ("PATH", path.as_str()),
+        ("HOME", home_dir.to_str().unwrap()),
+        ("SHELL", "/bin/sh"),
+        ("MOCK_AGENT_SCRIPT_PATH", &script),
+        ("MOCK_AGENT_BEHAVIOR", &behavior),
+        ("MOCK_AGENT_PROMPT_LOG", prompt_log.to_str().unwrap()),
+    ];
+    let socket = data_dir.join("intentd.sock");
+
+    // Phase 1: the agent ends its turn with a running background shell.
+    let mut first = spawn_serve(&data_dir, &env);
+    assert!(await_uds(&socket).await, "daemon did not start");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let cfg = client_config(
+        status["result"]["fingerprint"]
+            .as_str()
+            .expect("fingerprint"),
+    );
+    let mut sub = connect_ws(port, cfg.clone()).await;
+    let created = wss_rpc(
+        &mut sub,
+        1,
+        "workspace.create",
+        json!({
+            "title": "Restart Worker E2E",
+            "repositoryPath": source_repo.to_string_lossy(),
+            "repositoryName": "source-repo",
+            "baseRef": "main",
+            "noPrompt": true,
+        }),
+    )
+    .await;
+    let ws_id = created["workspace"]["id"]
+        .as_str()
+        .expect("workspace id")
+        .to_string();
+    let subscribed = wss_rpc(
+        &mut sub,
+        2,
+        "events.subscribe",
+        json!({ "eventTypes": ["agent:*"], "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(subscribed["subscriptionId"].is_string(), "{subscribed}");
+    let mut rpc = connect_ws(port, cfg.clone()).await;
+    let agent = wss_rpc(
+        &mut rpc,
+        10,
+        "agent.create",
+        json!({ "workspaceId": ws_id, "name": "Restart Worker E2E", "model": "mock-model", "provider": "claude-code" }),
+    )
+    .await;
+    let agent_id = agent["agent"]["id"].as_str().expect("agent id").to_string();
+    let sent = wss_rpc(
+        &mut rpc,
+        11,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": "please RUN_BG now" }),
+    )
+    .await;
+    assert_eq!(sent["success"], true, "{sent}");
+    turn_events(&mut sub, &agent_id).await;
+    let listed = wss_rpc(
+        &mut rpc,
+        12,
+        "agent.workers.list",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    assert_eq!(listed["continuity"], "continuous", "{listed}");
+    assert_eq!(listed["workers"][0]["status"], "running", "{listed}");
+    // `agent:stream:end` precedes the persisted idle status and the release
+    // of the turn slot; stop only once the agent is fully idle, or the
+    // shutdown would capture it mid-turn.
+    let mut idle = false;
+    for id in 0..240 {
+        let got = wss_rpc(
+            &mut rpc,
+            100 + id,
+            "agent.get",
+            json!({ "workspaceId": ws_id, "agentId": agent_id }),
+        )
+        .await;
+        if got["agent"]["status"] == "idle" && got["agent"]["isActive"] == false {
+            idle = true;
+            break;
+        }
+        // timing-guard: poll interval while the post-turn idle write is pending
+        tokio::time::sleep(Duration::from_millis(125)).await;
+    }
+    assert!(idle, "the agent settles to idle after its turn");
+
+    // Graceful stop: the idle agent is captured with the worker tag.
+    drop((sub, rpc));
+    first.signal(nix::sys::signal::Signal::SIGTERM).unwrap();
+    assert!(first
+        .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(30)))
+        .unwrap()
+        .expect("graceful shutdown")
+        .success());
+    drop(first);
+    {
+        let store = intent_store::Store::open(&data_dir.join("intentd.db"))
+            .await
+            .expect("open store");
+        let row = store
+            .get_interrupted_agent(&intent_core::AgentId(agent_id.clone()))
+            .await
+            .unwrap()
+            .expect("the idle agent with a running worker is captured");
+        assert_eq!(row.reason.as_deref(), Some("background_workers"));
+        assert_eq!(row.prev_status, "idle", "the agent was idle: {row:?}");
+        store.close().await;
+    }
+
+    // Phase 2: restart, list and resume the agent.
+    let second = spawn_serve(&data_dir, &env);
+    let _daemon = Daemon {
+        child: second,
+        data_dir: data_dir_guard,
+    };
+    assert!(await_uds(&socket).await, "daemon did not restart");
+    let status = common::await_wss_status(&socket).await;
+    let port =
+        u16::try_from(status["result"]["port"].as_u64().expect("port")).expect("value fits in u16");
+    let cfg = client_config(
+        status["result"]["fingerprint"]
+            .as_str()
+            .expect("fingerprint"),
+    );
+    let mut rpc = connect_ws(port, cfg).await;
+    let pending = wss_rpc(&mut rpc, 20, "agent.listInterrupted", json!({})).await;
+    assert!(
+        pending["agents"]
+            .as_array()
+            .is_some_and(|a| a.iter().any(|x| x["agentId"] == json!(agent_id))),
+        "the agent is pending interrupted after restart: {pending}"
+    );
+    let resolved = wss_rpc(
+        &mut rpc,
+        21,
+        "agent.resolveInterrupted",
+        json!({ "resume": [agent_id.clone()] }),
+    )
+    .await;
+    assert_eq!(
+        resolved["resumed"].as_array().map(Vec::len),
+        Some(1),
+        "resume failed: {resolved}"
+    );
+
+    // The new provider process receives the continuation with the note.
+    let continuation = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(60)),
+        async {
+            loop {
+                if let Some(line) = read_jsonl(&prompt_log).into_iter().find(|l| {
+                    l["text"].as_str().is_some_and(|t| {
+                        t.contains("harness shutdown and restart")
+                            && t.contains("will not report back")
+                    })
+                }) {
+                    return line;
+                }
+                // timing-guard: poll interval while the prompt log line is pending
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        },
+    )
+    .await
+    .expect("the resumed agent receives the lost-background-task continuation");
+    assert!(
+        continuation["text"]
+            .as_str()
+            .unwrap()
+            .contains("Background tasks you started before the shutdown"),
+        "{continuation}"
+    );
+
+    let store = intent_store::Store::open(&data_dir.join("intentd.db"))
+        .await
+        .expect("open store");
+    let session = store
+        .get_agent_session(&intent_core::AgentId(agent_id.clone()))
+        .await
+        .expect("get agent session");
+    assert!(
+        session.messages.iter().any(|m| m.role == "system"
+            && m.content.to_string().contains(
+                "The harness shut down while background tasks were running, which stopped them."
+            )),
+        "the transcript carries the background-task interruption marker"
+    );
+    store.close().await;
 }

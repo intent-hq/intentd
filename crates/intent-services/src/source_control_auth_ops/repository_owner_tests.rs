@@ -869,7 +869,7 @@ async fn cancelled_pat_persistence_retains_gate_and_publishes_from_original_owne
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
     assert!(timeout(
-        Duration::from_millis(20),
+        intentd_test_support::test_timeout(Duration::from_millis(20)),
         f.svc.gitlab_credential_gate.lock()
     )
     .await
@@ -928,7 +928,7 @@ async fn abandoned_refresh_settles_only_from_the_actual_persistence_owner() {
         Err(RepositoryCredentialError::Mutating)
     );
     assert!(timeout(
-        Duration::from_millis(20),
+        intentd_test_support::test_timeout(Duration::from_millis(20)),
         f.svc.gitlab_credential_gate.lock()
     )
     .await

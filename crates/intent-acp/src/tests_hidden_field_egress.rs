@@ -250,6 +250,7 @@ fn stub_workspace(id: &str) -> Workspace {
         context_links: None,
         archived: false,
         archived_at: None,
+        retired_at: None,
         task_stats: None,
         agent_summary: None,
         diff_summary: None,
@@ -258,6 +259,8 @@ fn stub_workspace(id: &str) -> Workspace {
         browser_client_id: None,
         display_status: None,
         waiting: false,
+        scripts_running: false,
+        background_tasks_running: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
@@ -387,7 +390,10 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
-    fn list_workspaces(&self, _include_archived: bool) -> BoxFuture<'_, Result<Vec<Workspace>>> {
+    fn list_workspaces(
+        &self,
+        _filter: intent_core::WorkspaceListFilter,
+    ) -> BoxFuture<'_, Result<Vec<Workspace>>> {
         Box::pin(async move { Ok(vec![stub_workspace(WS)]) })
     }
 

@@ -699,7 +699,7 @@ impl Store {
         let rows = sqlx::query(
             "WITH people AS (SELECT principal_id FROM workspace_member WHERE workspace_id = ? \
                  UNION SELECT principal_id FROM host_member WHERE ? <> ?) \
-             SELECT p.*, h.principal_id IS NOT NULL AS is_host_member, \
+             SELECT p.*, m.role AS direct_role, h.principal_id IS NOT NULL AS is_host_member, \
                  CASE WHEN h.principal_id IS NOT NULL AND w.id <> ? THEN h.added_at \
                       ELSE m.added_at END AS member_added_at \
              FROM people x JOIN principal p ON p.id = x.principal_id \
@@ -716,15 +716,16 @@ impl Store {
         .fetch_all(self.read_pool())
         .await
         .map_err(|e| Error::Internal(format!("effective workspace roster failed: {e}")))?;
-        Ok(rows
-            .iter()
+        rows.iter()
             .map(|r| {
                 let principal = map_principal_row(r);
-                EffectiveWorkspaceMember {
+                Ok(EffectiveWorkspaceMember {
                     role: if principal.is_primary {
                         WorkspaceRole::Owner
-                    } else {
+                    } else if r.get::<bool, _>("is_host_member") {
                         WorkspaceRole::Collaborator
+                    } else {
+                        enum_from_db(r.get::<String, _>("direct_role").as_str())?
                     },
                     host_role: if principal.is_primary {
                         intent_core::HostRole::Owner
@@ -735,9 +736,9 @@ impl Store {
                     },
                     principal,
                     added_at: r.get("member_added_at"),
-                }
+                })
             })
-            .collect())
+            .collect()
     }
 
     /// IDs for presence fan-out. Members inherit ordinary workspaces; direct
@@ -1029,6 +1030,72 @@ impl Store {
             Ok(())
         })
         .await
+    }
+
+    /// Change only a direct guest role, preserving ownership and inherited host
+    /// authority. Check the actor and target under the same write transaction.
+    ///
+    /// # Errors
+    /// Returns `Forbidden` for a non-owner actor, `InvalidParams` for immutable
+    /// roles or inherited membership, and `NotFound` for an absent member.
+    pub async fn set_workspace_guest_role(
+        &self,
+        workspace_id: &WorkspaceId,
+        principal_id: &PrincipalId,
+        role: WorkspaceRole,
+        actor: Option<&PrincipalId>,
+    ) -> Result<bool> {
+        if role == WorkspaceRole::Owner {
+            return Err(Error::InvalidParams("the owner role is immutable".into()));
+        }
+        let mut lifecycle = self.repository_lifecycle_write().await?;
+        let mut tx = self
+            .write_pool()
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| Error::Internal(format!("set guest role begin failed: {e}")))?;
+        if let Some(actor) = actor {
+            let allowed: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM principal WHERE id = ? AND is_primary = 1) OR EXISTS(SELECT 1 FROM workspace_member WHERE workspace_id = ? AND principal_id = ? AND role = 'owner')"
+            ).bind(actor.as_str()).bind(workspace_id.as_str()).bind(actor.as_str())
+                .fetch_one(&mut *tx).await
+                .map_err(|e| Error::Internal(format!("set guest role actor failed: {e}")))?;
+            if !allowed {
+                return Err(Error::Forbidden(
+                    "workspace.members.setRole requires the workspace owner".into(),
+                ));
+            }
+        }
+        let previous = member_role_in_txn(&mut tx, workspace_id, principal_id)
+            .await?
+            .ok_or_else(|| Error::NotFound(format!("workspace member {principal_id}")))?;
+        if previous == "owner" {
+            return Err(Error::InvalidParams("the owner role is immutable".into()));
+        }
+        let inherited: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM host_member WHERE principal_id = ?) OR EXISTS(SELECT 1 FROM principal WHERE id = ? AND is_primary = 1)")
+            .bind(principal_id.as_str()).bind(principal_id.as_str()).fetch_one(&mut *tx).await
+            .map_err(|e| Error::Internal(format!("set guest role target failed: {e}")))?;
+        if inherited {
+            return Err(Error::HostMembershipRequired);
+        }
+        let changed = previous != role.as_str();
+        if changed {
+            lifecycle.begin(&[crate::RepositoryLifecycleKey::WireAuthority])?;
+            sqlx::query(
+                "UPDATE workspace_member SET role = ? WHERE workspace_id = ? AND principal_id = ?",
+            )
+            .bind(role.as_str())
+            .bind(workspace_id.as_str())
+            .bind(principal_id.as_str())
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| Error::Internal(format!("set guest role failed: {e}")))?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| Error::Internal(format!("set guest role commit failed: {e}")))?;
+        lifecycle.settle_after_retirement().await?;
+        Ok(changed)
     }
 
     /// Remove a principal from a workspace. Returns whether a row was
@@ -1590,6 +1657,16 @@ impl Store {
             let archived: Option<bool> = sqlx::query_scalar("SELECT archived FROM workspace WHERE id=?")
                 .bind(&id.0).fetch_optional(&mut *conn).await
                 .map_err(|e| Error::Internal(format!("read archive binding failed: {e}")))?;
+            // Read under the same IMMEDIATE transaction as the flip below, so a
+            // concurrent `workspace.retire` cannot land between this check and
+            // the write: a retired row is never flipped back to Archived.
+            let retired: Option<bool> = sqlx::query_scalar("SELECT status = ? FROM workspace WHERE id=?")
+                .bind(enum_to_db(&WorkspaceStatus::Retired)?)
+                .bind(&id.0).fetch_optional(&mut *conn).await
+                .map_err(|e| Error::Internal(format!("read archive status failed: {e}")))?;
+            if retired == Some(true) {
+                return Err(Error::WorkspaceRetired { workspace_id: id.0.clone() });
+            }
             if archived == Some(false) {
                 lifecycle.begin(&[crate::RepositoryLifecycleKey::Workspace(id.clone())])?;
             }

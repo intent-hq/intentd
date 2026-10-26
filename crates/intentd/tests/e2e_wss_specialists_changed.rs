@@ -10,11 +10,12 @@
 
 #[path = "wss_integration/claude_agents.rs"]
 mod claude_agents;
-mod common;
+use crate::common;
 
+use intentd_test_support::GuardedChild;
 use std::io::Write;
 use std::path::Path;
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -39,7 +40,7 @@ fn scratch_dir(prefix: &str) -> tempfile::TempDir {
 
 /// Spawn `intentd serve` with a hermetic HOME so the user-tier specialists
 /// directory (`~/.intent/specialists`) never touches the real home.
-fn spawn_serve(data_dir: &Path, home_dir: &Path) -> Child {
+fn spawn_serve(data_dir: &Path, home_dir: &Path) -> GuardedChild {
     spawn_serve_with_claude_config(data_dir, home_dir, None)
 }
 
@@ -47,7 +48,7 @@ fn spawn_serve_with_claude_config(
     data_dir: &Path,
     home_dir: &Path,
     claude_config: Option<&Path>,
-) -> Child {
+) -> GuardedChild {
     // Keep both boots' logs so restart teardown can be diagnosed.
     let log = std::fs::OpenOptions::new()
         .create(true)
@@ -93,7 +94,7 @@ fn spawn_serve_with_claude_config(
             "specialist fixture must remove inherited {key} before spawning"
         );
     }
-    cmd.spawn().expect("spawn intentd serve")
+    GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -276,7 +277,8 @@ async fn next_event<S>(ws: &mut WebSocketStream<S>, types: &[&str], secs: u64) -
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(secs));
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         assert!(!remaining.is_zero(), "timed out waiting for {types:?}");
@@ -317,29 +319,32 @@ async fn drain_extra<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    timeout(Duration::from_millis(window_ms), async {
-        loop {
-            match ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let v: Value = match serde_json::from_str(&text) {
-                        Ok(x) => x,
-                        Err(_) => continue,
-                    };
-                    if v["method"] == json!("events.event")
-                        && v["params"]["event"]["type"] == json!(event_type)
-                    {
-                        return v;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(window_ms)),
+        async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = match serde_json::from_str(&text) {
+                            Ok(x) => x,
+                            Err(_) => continue,
+                        };
+                        if v["method"] == json!("events.event")
+                            && v["params"]["event"]["type"] == json!(event_type)
+                        {
+                            return v;
+                        }
                     }
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = ws.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => panic!("subscription socket errored during drain: {e:?}"),
+                    None => panic!("subscription socket closed during drain"),
                 }
-                Some(Ok(Message::Ping(p))) => {
-                    let _ = ws.send(Message::Pong(p)).await;
-                }
-                Some(Ok(_)) => {}
-                Some(Err(e)) => panic!("subscription socket errored during drain: {e:?}"),
-                None => panic!("subscription socket closed during drain"),
             }
-        }
-    })
+        },
+    )
     .await
     .ok()
 }

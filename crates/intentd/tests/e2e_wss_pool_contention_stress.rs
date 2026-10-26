@@ -6,7 +6,7 @@
 //! (fix/sqlite-pool-contention) prevents pool exhaustion and
 //! `database is locked` errors.
 
-mod common;
+use crate::common;
 
 use std::net::Ipv4Addr;
 use std::sync::Arc;

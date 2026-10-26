@@ -992,7 +992,7 @@ async fn qwen_40_unchanged_full_refreshes_stay_quiet_across_read_paths() {
         .unwrap();
     let baseline = check_map(&monitor);
     assert_eq!(baseline.len(), 32);
-    assert_eq!(baseline["review-pr"], "passed");
+    assert_eq!(baseline["review-pr"], "skipped");
     assert_eq!(baseline["Test (ubuntu-latest, Node 22.x)"], "failed");
     for mode in [
         ReadMode::Folded,
@@ -1197,7 +1197,7 @@ async fn qwen_newer_failure_recovery_and_required_changes_are_reported_once() {
         (
             "FAILURE",
             "2026-09-25T06:00:00Z",
-            "check review-pr: passed → failed",
+            "check review-pr: skipped → failed",
         ),
         (
             "SUCCESS",
@@ -1304,7 +1304,7 @@ async fn qwen_recovery_reports_a_real_failure_after_holding_intermediate_checks(
     assert_quiet(&svc, &monitor, &owner).await;
     mock.edit(|s| s.mode = ReadMode::Rest);
     full_poll(&svc, &mock).await;
-    let transition = "check review-pr: passed → failed";
+    let transition = "check review-pr: skipped → failed";
     assert_eq!(row(&svc, &monitor).await.pending_changes, vec![transition]);
     svc.pr_monitor_flush_op(&ws, &monitor.monitor_id, false)
         .await
@@ -1435,7 +1435,7 @@ async fn qwen_initial_unreadable_checks_seed_silently_on_recovery() {
     full_poll(&svc, &mock).await;
     assert_eq!(
         row(&svc, &monitor).await.pending_changes,
-        vec!["check review-pr: passed → failed"]
+        vec!["check review-pr: skipped → failed"]
     );
 }
 
@@ -1480,7 +1480,7 @@ async fn qwen_preserves_pending_failure_through_degradation_and_reregistration()
     let failing = row(&svc, &monitor).await;
     assert_eq!(
         failing.pending_changes,
-        vec!["check review-pr: passed → failed"]
+        vec!["check review-pr: skipped → failed"]
     );
     mock.edit(|s| s.mode = ReadMode::Degraded);
     for _ in 0..2 {
@@ -1503,7 +1503,7 @@ async fn qwen_preserves_pending_failure_through_degradation_and_reregistration()
     assert_eq!(
         owner_messages(&svc, &owner)
             .await
-            .matches("check review-pr: passed → failed")
+            .matches("check review-pr: skipped → failed")
             .count(),
         1
     );

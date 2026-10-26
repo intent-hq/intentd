@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Cargo builds the normal intent-services lib test. The compile-time revision
+# Cargo builds the normal intent-svc-transfer lib test. The compile-time revision
 # makes an old test binary unable to claim provenance from a newer checkout.
 set -euo pipefail
 component_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
@@ -18,4 +18,4 @@ if [[ $# != 0 && -n "$(git status --porcelain --untracked-files=all)" ]]; then
   echo 'Export requires clean committed intentd source; checking never rewrites fixtures.' >&2
   exit 1
 fi
-cargo test -p intent-services --lib transfer_selection_contract::public_import_matches_contract -- --exact --nocapture
+cargo test -p intent-svc-transfer --lib transfer_selection_contract::public_import_matches_contract -- --exact --nocapture

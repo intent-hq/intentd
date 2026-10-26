@@ -986,9 +986,15 @@ pub struct MergeRequirementCheck {
 #[serde(rename_all = "camelCase")]
 pub struct MergeRequirementsChecks {
     pub total: i64,
+    /// Checks that ran and passed; skipped checks are counted in `skipped`.
     pub passed: i64,
     pub failed: i64,
     pub pending: i64,
+    /// Checks the forge skipped without running. They do not block merge.
+    /// Serde-defaulted so persisted monitor baselines written before the
+    /// field existed still parse (without phantom diff lines).
+    #[serde(default)]
+    pub skipped: i64,
     /// Every check, in rollup order, each with its own `required` flag.
     pub items: Vec<MergeRequirementCheck>,
     /// Names of the required checks that are failing.
@@ -1018,11 +1024,21 @@ impl MergeRequirementsChecks {
             passed: tally("passed"),
             failed: tally("failed"),
             pending: tally("pending"),
+            skipped: tally("skipped"),
             failing_required: names("failed"),
             pending_required: names("pending"),
             required_known,
             items,
         }
+    }
+
+    /// Names of the checks reporting `status`, in rollup order.
+    pub(crate) fn names_with(&self, status: &str) -> Vec<&str> {
+        self.items
+            .iter()
+            .filter(|c| c.status == status)
+            .map(|c| c.name.as_str())
+            .collect()
     }
 
     /// REST observes check runs but neither legacy statuses nor required flags.
@@ -1087,6 +1103,128 @@ pub struct MergeRequirementsApprovals {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub needed: Option<u32>,
     pub changes_requested: i64,
+    /// Each reviewer's latest review ([`latest_reviews`]), newest first — so a consumer
+    /// can tell a fresh review from an old one with the same verdict, and
+    /// whether it covers the current head. Presence-detected: `None` (key
+    /// omitted) when the review read degraded, never an empty fabrication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_reviews: Option<Vec<LatestReview>>,
+}
+
+/// One reviewer's latest submitted review in
+/// [`MergeRequirementsApprovals::latest_reviews`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LatestReview {
+    pub reviewer: String,
+    /// `approved` / `changes_requested` / `commented` (GitHub `DISMISSED`
+    /// collapses to `commented`, as in [`aggregate_reviews`]).
+    pub state: String,
+    pub submitted_at: String,
+    /// The commit the review covers; omitted when the host does not report it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_sha: Option<String>,
+    /// Whether `commit_sha` is the PR's current head; omitted when either is
+    /// unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_current_head: Option<bool>,
+    /// The forge's review identity, when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+}
+
+impl LatestReview {
+    /// The identity the monitor diff keys "new review submitted" on: the
+    /// submission time. Not the forge id — the GraphQL observation selects
+    /// none (see `parse_observed_reviews`), so an id-based key would flip
+    /// whenever a poll switched between the folded and per-signal reads.
+    pub(crate) fn identity(&self) -> &str {
+        &self.submitted_at
+    }
+
+    /// Recompute [`Self::on_current_head`] against `head` (empty = unknown).
+    pub(crate) fn reanchor(&mut self, head: Option<&str>) {
+        let head = head.filter(|h| !h.is_empty());
+        self.on_current_head = self
+            .commit_sha
+            .as_deref()
+            .zip(head)
+            .map(|(commit, head)| commit == head);
+    }
+}
+
+/// The wire word for a review verdict in [`LatestReview::state`].
+fn latest_review_state(verdict: ReviewVerdict) -> &'static str {
+    match verdict {
+        ReviewVerdict::Approve => "approved",
+        ReviewVerdict::RequestChanges => "changes_requested",
+        ReviewVerdict::Comment => "commented",
+    }
+}
+
+/// Each reviewer's latest review, newest first.
+///
+/// - A reviewer's latest approve / request-changes review wins over any
+///   later comment-only review: on GitHub every inline thread reply is
+///   stored as its own `COMMENTED` review, which must neither mask a
+///   standing change request nor read as a fresh review. A reviewer with
+///   no actionable review is represented by their latest comment review.
+/// - The PR author (`pr_author`) is skipped: their reviews are thread
+///   replies (an author cannot approve their own PR), often posted by the
+///   very agent that owns the monitor.
+/// - Comment reviews without a submission time (GitHub's author-only
+///   `PENDING`) are skipped; actionable ones are kept (GitLab approvals may
+///   lack `approved_at`), so the list agrees with the approval counts.
+/// - On equal timestamps the EARLIER list entry wins, as in
+///   [`aggregate_reviews`], so both derivations pick the same review.
+pub(crate) fn latest_reviews(
+    reviews: &[Review],
+    head_sha: Option<&str>,
+    pr_author: Option<&str>,
+) -> Vec<LatestReview> {
+    let actionable = |r: &Review| {
+        matches!(
+            r.verdict,
+            ReviewVerdict::Approve | ReviewVerdict::RequestChanges
+        )
+    };
+    let mut latest: HashMap<&str, &Review> = HashMap::new();
+    for r in reviews.iter().filter(|r| {
+        Some(r.author.as_str()) != pr_author && (actionable(r) || !r.submitted_at.is_empty())
+    }) {
+        let replace = match latest.get(r.author.as_str()) {
+            None => true,
+            Some(prev) => match (actionable(prev), actionable(r)) {
+                (false, true) => true,
+                (true, false) => false,
+                _ => r.submitted_at > prev.submitted_at,
+            },
+        };
+        if replace {
+            latest.insert(r.author.as_str(), r);
+        }
+    }
+    let mut out: Vec<LatestReview> = latest
+        .into_values()
+        .map(|r| {
+            let mut review = LatestReview {
+                reviewer: r.author.clone(),
+                state: latest_review_state(r.verdict).to_string(),
+                submitted_at: r.submitted_at.clone(),
+                commit_sha: r.commit_sha.clone(),
+                on_current_head: None,
+                id: r.id.clone(),
+            };
+            review.reanchor(head_sha);
+            review
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        b.submitted_at
+            .cmp(&a.submitted_at)
+            .then_with(|| a.reviewer.cmp(&b.reviewer))
+    });
+    out
 }
 
 /// The `mergeQueueEjection` block: the PR's latest merge-queue removal event
@@ -1133,6 +1271,32 @@ impl MergeQueueEjection {
                 .reason
                 .as_deref()
                 .is_some_and(|reason| reason.eq_ignore_ascii_case("merged"))
+    }
+
+    /// Whether the PR's CURRENT merge-queue entry began after this ejection,
+    /// i.e. the PR was re-queued since and the ejection no longer applies
+    /// (intent-hq/intent#7523: an ejection first observed after the re-queue
+    /// was reported as news while the queue was about to land the PR). True
+    /// only when `requirements` reports the PR queued with an `enqueuedAt`
+    /// strictly later than [`Self::at`]; a missing entry, missing or
+    /// unparseable timestamp is not proof of staleness and returns false.
+    /// The PR monitor adopts a superseded ejection into its baselines
+    /// silently, so it never becomes a change line.
+    pub(crate) fn superseded_by_queue_entry(&self, requirements: &MergeRequirements) -> bool {
+        if requirements.is_in_merge_queue != Some(true) {
+            return false;
+        }
+        let Some(enqueued_at) = requirements
+            .merge_queue
+            .as_ref()
+            .and_then(|entry| entry.enqueued_at.as_deref())
+        else {
+            return false;
+        };
+        match (parse_iso(enqueued_at), parse_iso(&self.at)) {
+            (Some(enqueued_at), Some(ejected_at)) => enqueued_at > ejected_at,
+            _ => false,
+        }
     }
 }
 
@@ -1216,6 +1380,112 @@ pub struct MergeRequirements {
     /// Serde-defaulted so persisted baselines predating it still parse.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge_queue: Option<intent_sourcecontrol::MergeQueueEntry>,
+    /// Present when CI never started on the current head: zero check runs
+    /// and statuses [`CHECKS_NOT_STARTED_AFTER`] past the head's commit time
+    /// (see [`checks_not_started`]). Derived when the checklist is served or
+    /// polled — never by [`merge_requirements`] — so a cached read still
+    /// crosses the threshold. Serde-defaulted so persisted baselines
+    /// predating it still parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checks_not_started: Option<ChecksNotStarted>,
+}
+
+/// How long a PR head may carry no check runs at all before the checklist
+/// flags that CI never started on it (intentd#2531: a head re-pushed right
+/// before a merge-queue ejection got no workflow runs for five hours).
+pub(crate) const CHECKS_NOT_STARTED_AFTER: time::Duration = time::Duration::minutes(15);
+
+/// The `checksNotStarted` checklist entry: the head on which no check run or
+/// status appeared within [`CHECKS_NOT_STARTED_AFTER`] of its commit time.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChecksNotStarted {
+    /// The PR head the flag is about — the monitor's one-wake-per-head key.
+    pub head_sha: String,
+    /// The head commit's forge-reported commit time (RFC 3339): the host
+    /// exposes no push time, so this is the stall clock's anchor.
+    pub head_committed_at: String,
+    /// The wait applied before flagging, in whole minutes.
+    pub threshold_minutes: i64,
+}
+
+/// What the never-started-CI derivation needs beyond the checklist itself,
+/// captured from one forge read and kept with the cached snapshot so the
+/// verdict can be re-derived at any later `now`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ChecksStartEvidence {
+    /// The head the commit time belongs to — only set when the probe's head
+    /// matches the PR record's.
+    pub(crate) head_sha: Option<String>,
+    /// The head commit's commit time (RFC 3339), when the host reports it.
+    pub(crate) head_committed_at: Option<String>,
+    /// Whether the base branch's rules were readable and require at least
+    /// one status check — the guard that keeps repositories without required
+    /// CI from ever flagging.
+    pub(crate) checks_required: bool,
+}
+
+impl ChecksStartEvidence {
+    /// The evidence a probe carries for the PR record `pr`.
+    pub(crate) fn from_signals(
+        pr: &PullRequest,
+        signals: Option<&MergeRequirementSignals>,
+    ) -> Self {
+        let Some(signals) = signals else {
+            return Self::default();
+        };
+        let same_head = signals.checks_head_sha.is_some() && signals.checks_head_sha == pr.head_sha;
+        Self {
+            head_sha: pr.head_sha.clone().filter(|_| same_head),
+            head_committed_at: signals.head_committed_at.clone().filter(|_| same_head),
+            checks_required: signals
+                .branch_rules
+                .as_ref()
+                .is_some_and(|r| !r.required_status_checks.is_empty()),
+        }
+    }
+}
+
+/// Whether CI never started on the PR head: the PR is open and ready (a
+/// draft may legitimately run nothing until `ready_for_review`) and KNOWN
+/// to be conflict-free (GitHub starts no `pull_request` workflow on a
+/// conflicting head, and an unknown verdict may be hiding one), its checks were freshly observed and number zero, the base
+/// branch requires status checks, and [`CHECKS_NOT_STARTED_AFTER`] has
+/// passed since the head's commit time. Every unknown input — no commit
+/// time, unreadable rules, unobserved checks — yields `None`: absence means
+/// "not flagged or unknown", never "CI is running".
+pub(crate) fn checks_not_started(
+    requirements: &MergeRequirements,
+    checks_observed: bool,
+    evidence: &ChecksStartEvidence,
+    now: OffsetDateTime,
+) -> Option<ChecksNotStarted> {
+    // Positive conflict-free evidence: `has_conflicts == false` alone also
+    // holds while GitHub recomputes mergeability (`mergeable: None`,
+    // `mergeStateStatus: UNKNOWN`) — and conflicts are themselves a reason
+    // `pull_request` CI never starts.
+    let conflict_free = requirements.mergeable == Some(true)
+        && !requirements.has_conflicts
+        && requirements
+            .merge_state_status
+            .as_deref()
+            .is_none_or(|s| !s.eq_ignore_ascii_case("UNKNOWN") && !s.eq_ignore_ascii_case("DIRTY"));
+    if requirements.state != "open"
+        || !conflict_free
+        || !checks_observed
+        || requirements.checks.total != 0
+        || !evidence.checks_required
+    {
+        return None;
+    }
+    let head_sha = evidence.head_sha.as_ref().filter(|s| !s.is_empty())?;
+    let committed_at = evidence.head_committed_at.as_ref()?;
+    let committed = parse_iso(committed_at)?;
+    (now - committed >= CHECKS_NOT_STARTED_AFTER).then(|| ChecksNotStarted {
+        head_sha: head_sha.clone(),
+        head_committed_at: committed_at.clone(),
+        threshold_minutes: CHECKS_NOT_STARTED_AFTER.whole_minutes(),
+    })
 }
 
 /// The checklist word for a rollup check's state.
@@ -1223,6 +1493,7 @@ fn check_status_word(state: CheckState) -> &'static str {
     match state {
         CheckState::Pending => "pending",
         CheckState::Success | CheckState::Neutral => "passed",
+        CheckState::Skipped => "skipped",
         CheckState::Failure | CheckState::Cancelled => "failed",
     }
 }
@@ -1274,7 +1545,9 @@ impl NameEvidence {
     }
 }
 
-/// How far a check outcome is from letting the PR merge.
+/// How far a check outcome is from letting the PR merge. A skipped check
+/// counts as passed here: GitHub treats a skipped required check as
+/// satisfied.
 fn outcome_severity(state: CheckState) -> u8 {
     match check_status_word(state) {
         "failed" => 2,
@@ -1286,13 +1559,14 @@ fn outcome_severity(state: CheckState) -> u8 {
 /// Last resort among same-name runs with equal (or equally unknown) starts:
 /// a real failure over a success, and a `cancelled` run last — a
 /// `concurrency`-cancelled duplicate must never shadow the run that actually
-/// completed.
+/// completed, and a `skipped` twin ranks below every run that ran.
 fn check_state_rank(state: CheckState) -> u8 {
     match state {
-        CheckState::Pending => 4,
-        CheckState::Failure => 3,
-        CheckState::Success => 2,
-        CheckState::Neutral => 1,
+        CheckState::Pending => 5,
+        CheckState::Failure => 4,
+        CheckState::Success => 3,
+        CheckState::Neutral => 2,
+        CheckState::Skipped => 1,
         CheckState::Cancelled => 0,
     }
 }
@@ -1451,6 +1725,7 @@ pub(crate) fn merge_requirements(
         have: agg.approval_count,
         needed: rules.and_then(|r| r.required_approving_review_count),
         changes_requested: agg.changes_requested_count,
+        latest_reviews: None,
     };
     let threads = MergeRequirementsThreads {
         unresolved: unresolved_threads,
@@ -1476,6 +1751,7 @@ pub(crate) fn merge_requirements(
             .and_then(|s| s.merge_queue_removal.as_ref())
             .and_then(|r| MergeQueueEjection::from_removal(r, state)),
         merge_queue: signals.and_then(queued_merge_queue_entry),
+        checks_not_started: None,
     }
 }
 
@@ -1602,6 +1878,9 @@ pub(crate) struct MergeRequirementsRead {
     /// `MergeRequirements::is_in_merge_queue`, this keeps the reported
     /// `false` — what `GithubPullRequest.isInMergeQueue` carries.
     pub(crate) merge_queue_reported: Option<bool>,
+    /// The inputs [`checks_not_started`] re-derives the never-started-CI
+    /// flag from at serve / poll time.
+    pub(crate) checks_start: ChecksStartEvidence,
 }
 
 /// [`merge_requirements_for_pr`] reporting per-sub-read completeness (see
@@ -1638,7 +1917,7 @@ pub(crate) async fn merge_requirements_for_pr_detailed(
     // stub `signals` for a failed probe.
     let ejection_known = signals.is_some();
     let mut complete = ejection_known && reviews.is_some();
-    let agg = aggregate_reviews(&reviews.unwrap_or_default());
+    let agg = aggregate_reviews(reviews.as_deref().unwrap_or_default());
 
     // The probe carries the forge's `reviewDecision`; when it did not — no
     // probe at all, or a host reporting the rest without the verdict — the
@@ -1670,7 +1949,11 @@ pub(crate) async fn merge_requirements_for_pr_detailed(
     complete &= threads_complete;
 
     let merge_queue_reported = signals.as_ref().and_then(|s| s.is_in_merge_queue);
-    let requirements = merge_requirements(pr, signals.as_ref(), &fallback_runs, &agg, unresolved);
+    let mut requirements =
+        merge_requirements(pr, signals.as_ref(), &fallback_runs, &agg, unresolved);
+    requirements.approvals.latest_reviews = reviews
+        .as_deref()
+        .map(|r| latest_reviews(r, pr.head_sha.as_deref(), Some(pr.author.as_str())));
     Ok(MergeRequirementsRead {
         requirements,
         review_comment_count: review_comments,
@@ -1679,6 +1962,7 @@ pub(crate) async fn merge_requirements_for_pr_detailed(
         check_runs_known: runs_complete,
         status_checks: status_checks(signals.as_ref()),
         merge_queue_reported,
+        checks_start: ChecksStartEvidence::from_signals(pr, signals.as_ref()),
     })
 }
 
@@ -1712,7 +1996,7 @@ pub(crate) async fn merge_requirements_from_observation(
         complete &= reviews.is_some();
         reviews
     };
-    let agg = aggregate_reviews(&reviews.unwrap_or_default());
+    let agg = aggregate_reviews(reviews.as_deref().unwrap_or_default());
 
     let (fallback_runs, runs_complete) =
         fallback_check_runs(sc, repo_ref, pr, Some(&signals)).await?;
@@ -1725,6 +2009,9 @@ pub(crate) async fn merge_requirements_from_observation(
 
     let merge_queue_reported = signals.is_in_merge_queue;
     let mut requirements = merge_requirements(pr, Some(&signals), &fallback_runs, &agg, unresolved);
+    requirements.approvals.latest_reviews = reviews
+        .as_deref()
+        .map(|r| latest_reviews(r, pr.head_sha.as_deref(), Some(pr.author.as_str())));
     if let Some(identity) = observation.ancestry_identity.as_ref().filter(|identity| {
         pr.state == PrState::Open
             && identity.is_valid()
@@ -1745,6 +2032,7 @@ pub(crate) async fn merge_requirements_from_observation(
         check_runs_known: runs_complete,
         status_checks: status_checks(Some(&signals)),
         merge_queue_reported,
+        checks_start: ChecksStartEvidence::from_signals(pr, Some(&signals)),
     })
 }
 
@@ -1874,6 +2162,8 @@ mod tests {
             verdict,
             body: None,
             submitted_at: at.into(),
+            id: None,
+            commit_sha: None,
         }
     }
 
@@ -2542,6 +2832,187 @@ mod tests {
         assert_eq!(agg.changes_requested_count, 1);
     }
 
+    fn review_on(
+        author: &str,
+        verdict: ReviewVerdict,
+        at: &str,
+        id: Option<&str>,
+        commit: Option<&str>,
+    ) -> Review {
+        Review {
+            id: id.map(String::from),
+            commit_sha: commit.map(String::from),
+            ..review(author, verdict, at)
+        }
+    }
+
+    /// intentd#2605: two `CHANGES_REQUESTED` reviews by the same bot on
+    /// different commits — only the newer one is the bot's latest review,
+    /// and it is the one that covers the head.
+    #[test]
+    fn latest_review_per_reviewer_tracks_newest_review_and_its_commit() {
+        let reviews = vec![
+            review_on(
+                "bot",
+                ReviewVerdict::RequestChanges,
+                "2026-10-24T09:00:00Z",
+                Some("1"),
+                Some("old0000000"),
+            ),
+            review_on(
+                "alice",
+                ReviewVerdict::Approve,
+                "2026-10-24T10:00:00Z",
+                Some("2"),
+                Some("old0000000"),
+            ),
+            review_on(
+                "bot",
+                ReviewVerdict::RequestChanges,
+                "2026-10-24T17:01:00Z",
+                Some("5639064405"),
+                Some("c0f1e6f11"),
+            ),
+            review_on(
+                "pending",
+                ReviewVerdict::Comment,
+                "",
+                Some("3"),
+                Some("c0f1e6f11"),
+            ),
+        ];
+        let latest = latest_reviews(&reviews, Some("c0f1e6f11"), Some("author"));
+        assert_eq!(latest.len(), 2, "a pending (unsubmitted) review is skipped");
+        assert_eq!(latest[0].reviewer, "bot", "newest first");
+        assert_eq!(latest[0].state, "changes_requested");
+        assert_eq!(latest[0].id.as_deref(), Some("5639064405"));
+        assert_eq!(latest[0].on_current_head, Some(true));
+        assert_eq!(latest[1].reviewer, "alice");
+        assert_eq!(latest[1].state, "approved");
+        assert_eq!(latest[1].on_current_head, Some(false));
+    }
+
+    #[test]
+    fn latest_review_keeps_a_standing_verdict_over_later_comment_reviews() {
+        let reviews = vec![
+            review_on(
+                "bot",
+                ReviewVerdict::RequestChanges,
+                "2026-10-24T09:00:00Z",
+                None,
+                Some("aaa"),
+            ),
+            // A thread reply: GitHub stores it as a COMMENTED review.
+            review_on(
+                "bot",
+                ReviewVerdict::Comment,
+                "2026-10-24T09:05:00Z",
+                None,
+                Some("aaa"),
+            ),
+            review_on(
+                "commenter",
+                ReviewVerdict::Comment,
+                "2026-10-24T09:10:00Z",
+                None,
+                Some("aaa"),
+            ),
+            // The PR author's own thread reply (often the owning agent).
+            review_on(
+                "author",
+                ReviewVerdict::Comment,
+                "2026-10-24T09:20:00Z",
+                None,
+                Some("aaa"),
+            ),
+            // GitLab approvals can lack `approved_at`.
+            review("gitlab-approver", ReviewVerdict::Approve, ""),
+        ];
+        let latest = latest_reviews(&reviews, Some("aaa"), Some("author"));
+        let names: Vec<_> = latest.iter().map(|r| r.reviewer.as_str()).collect();
+        assert_eq!(
+            names,
+            ["commenter", "bot", "gitlab-approver"],
+            "author skipped; untimed approval kept"
+        );
+        assert_eq!(
+            latest[1].state, "changes_requested",
+            "a later comment review does not mask a standing change request"
+        );
+        assert_eq!(latest[1].identity(), "2026-10-24T09:00:00Z");
+        assert_eq!(latest[0].state, "commented", "comment-only reviewer kept");
+        assert_eq!(latest[2].commit_sha, None);
+        assert_eq!(
+            latest[2].on_current_head, None,
+            "unknown commit stays unknown"
+        );
+        assert_eq!(
+            latest_reviews(&reviews, None, None)[0].on_current_head,
+            None,
+            "unknown head stays unknown"
+        );
+        assert_eq!(aggregate_reviews(&reviews).changes_requested_count, 1);
+        assert_eq!(aggregate_reviews(&reviews).approval_count, 1);
+    }
+
+    #[test]
+    fn latest_review_ties_pick_the_same_review_as_the_aggregate() {
+        let at = "2026-10-24T09:00:00Z";
+        let reviews = vec![
+            review("bot", ReviewVerdict::RequestChanges, at),
+            review("bot", ReviewVerdict::Approve, at),
+        ];
+        let agg = aggregate_reviews(&reviews);
+        let latest = latest_reviews(&reviews, None, None);
+        assert_eq!(agg.changes_requested_count, 1);
+        assert_eq!(latest[0].state, "changes_requested");
+    }
+
+    #[test]
+    fn latest_reviews_serialize_presence_detected() {
+        let mut approvals = MergeRequirementsApprovals {
+            decision: "none".into(),
+            have: 0,
+            needed: None,
+            changes_requested: 0,
+            latest_reviews: None,
+        };
+        let wire = serde_json::to_value(&approvals).unwrap();
+        assert!(
+            wire.get("latestReviews").is_none(),
+            "absent = unknown, never null"
+        );
+        approvals.latest_reviews = Some(latest_reviews(
+            &[review_on(
+                "bot",
+                ReviewVerdict::RequestChanges,
+                "2026-10-24T17:01:00Z",
+                Some("9"),
+                Some("c0f1e6f11"),
+            )],
+            Some("c0f1e6f11"),
+            None,
+        ));
+        let wire = serde_json::to_value(&approvals).unwrap();
+        assert_eq!(
+            wire["latestReviews"],
+            serde_json::json!([{
+                "reviewer": "bot",
+                "state": "changes_requested",
+                "submittedAt": "2026-10-24T17:01:00Z",
+                "commitSha": "c0f1e6f11",
+                "onCurrentHead": true,
+                "id": "9",
+            }])
+        );
+        // A persisted checklist from before the field existed still parses.
+        let old: MergeRequirementsApprovals = serde_json::from_value(serde_json::json!({
+            "decision": "none", "have": 0, "changesRequested": 0
+        }))
+        .unwrap();
+        assert_eq!(old.latest_reviews, None);
+    }
+
     #[test]
     fn aggregate_empty_has_zero_counts() {
         let agg = aggregate_reviews(&[]);
@@ -2748,6 +3219,99 @@ mod tests {
         }
     }
 
+    /// Incident: intentd#2581 at 6c92d3256 (run 39724275631) had 23 green
+    /// checks plus `coverage-all` / `coverage-e2e` skipped, and the snapshot
+    /// reported 25/25 passed. Skipped checks are counted on their own.
+    fn skipped_incident_signals(required: bool) -> MergeRequirementSignals {
+        let mut checks: Vec<RollupCheck> = (1..=23)
+            .map(|i| rollup(&format!("job-{i:02}"), CheckState::Success, required))
+            .collect();
+        checks.insert(5, rollup("coverage-all", CheckState::Skipped, required));
+        checks.push(rollup("coverage-e2e", CheckState::Skipped, required));
+        MergeRequirementSignals {
+            checks,
+            checks_known: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn skipped_checks_are_counted_apart_from_passed() {
+        let p = pr(PrState::Open, false, Some(true), Some("clean"));
+        let req = merge_requirements(
+            &p,
+            Some(&skipped_incident_signals(false)),
+            &[],
+            &agg(0, 0),
+            Some(0),
+        );
+        let c = &req.checks;
+        assert_eq!(
+            (c.total, c.passed, c.skipped, c.failed, c.pending),
+            (25, 23, 2, 0, 0)
+        );
+        assert_eq!(
+            c.names_with("skipped"),
+            vec!["coverage-all", "coverage-e2e"]
+        );
+        let wire = serde_json::to_value(c).unwrap();
+        assert_eq!(wire["skipped"], 2);
+        assert_eq!(wire["passed"], 23);
+    }
+
+    #[test]
+    fn skipped_required_checks_do_not_block_merge() {
+        let p = pr(PrState::Open, false, Some(true), Some("clean"));
+        let req = merge_requirements(
+            &p,
+            Some(&skipped_incident_signals(true)),
+            &[],
+            &agg(0, 0),
+            Some(0),
+        );
+        assert_eq!(req.checks.skipped, 2);
+        assert!(req.checks.failing_required.is_empty(), "{:?}", req.checks);
+        assert!(req.checks.pending_required.is_empty(), "{:?}", req.checks);
+    }
+
+    #[test]
+    fn a_real_run_beats_a_skipped_same_name_duplicate() {
+        let p = pr(PrState::Open, false, Some(true), Some("clean"));
+        for order in [
+            vec![
+                rollup("gate", CheckState::Skipped, true),
+                rollup("gate", CheckState::Success, true),
+            ],
+            vec![
+                rollup("gate", CheckState::Success, true),
+                rollup("gate", CheckState::Skipped, true),
+            ],
+        ] {
+            let signals = MergeRequirementSignals {
+                checks: order,
+                checks_known: true,
+                ..Default::default()
+            };
+            let req = merge_requirements(&p, Some(&signals), &[], &agg(0, 0), Some(0));
+            assert_eq!(
+                (req.checks.total, req.checks.passed, req.checks.skipped),
+                (1, 1, 0)
+            );
+            assert_eq!(req.checks.items[0].status, "passed");
+        }
+    }
+
+    #[test]
+    fn checks_without_a_skipped_count_still_deserialize() {
+        let legacy = serde_json::json!({
+            "total": 1, "passed": 1, "failed": 0, "pending": 0,
+            "items": [{"name": "build", "status": "passed", "required": true}],
+            "failingRequired": [], "pendingRequired": [], "requiredKnown": true,
+        });
+        let checks: MergeRequirementsChecks = serde_json::from_value(legacy).unwrap();
+        assert_eq!((checks.passed, checks.skipped), (1, 0));
+    }
+
     #[test]
     fn merge_requirements_full_checklist_names_required_checks() {
         let p = pr(PrState::Open, false, Some(false), Some("blocked"));
@@ -2762,6 +3326,7 @@ mod tests {
             ],
             checks_head_sha: None,
             checks_known: true,
+            head_committed_at: None,
             branch_rules: Some(intent_sourcecontrol::BranchRules {
                 required_approving_review_count: Some(2),
                 required_conversation_resolution: Some(true),
@@ -2825,6 +3390,7 @@ mod tests {
             checks: vec![rollup("build", CheckState::Success, false)],
             checks_head_sha: None,
             checks_known: true,
+            head_committed_at: None,
             branch_rules: None,
             is_in_merge_queue: None,
             merge_queue_removal: None,
@@ -3448,5 +4014,228 @@ mod tests {
             MergeMethod::Rebase
         );
         assert!(validate_merge_method(Some("bad")).is_err());
+    }
+
+    // ── checksNotStarted (intentd#2531) ─────────────────────────────────
+
+    const STALL_HEAD: &str = "8c0e5137c0000000000000000000000000000000";
+
+    fn stall_now() -> OffsetDateTime {
+        parse_iso("2026-10-21T04:00:00Z").unwrap()
+    }
+
+    /// The checklist and evidence of the intentd#2531 head: open, no
+    /// conflicts, zero check runs on a base branch that requires checks.
+    fn stall_inputs(
+        committed_at: &str,
+        checks: Vec<RollupCheck>,
+    ) -> (MergeRequirements, ChecksStartEvidence) {
+        let mut p = pr(PrState::Open, false, Some(true), Some("blocked"));
+        p.head_sha = Some(STALL_HEAD.into());
+        let signals = MergeRequirementSignals {
+            checks,
+            checks_known: true,
+            checks_head_sha: Some(STALL_HEAD.into()),
+            head_committed_at: Some(committed_at.into()),
+            branch_rules: Some(intent_sourcecontrol::BranchRules {
+                required_status_checks: vec!["build".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let req = merge_requirements(&p, Some(&signals), &[], &agg(0, 0), Some(0));
+        (req, ChecksStartEvidence::from_signals(&p, Some(&signals)))
+    }
+
+    #[test]
+    fn checks_not_started_flags_a_zero_run_head_past_the_threshold() {
+        let (req, evidence) = stall_inputs("2026-10-20T23:12:00Z", vec![]);
+        // `merge_requirements` itself never derives it: it is clock-bound.
+        assert_eq!(req.checks_not_started, None);
+        assert_eq!(
+            checks_not_started(&req, true, &evidence, stall_now()),
+            Some(ChecksNotStarted {
+                head_sha: STALL_HEAD.into(),
+                head_committed_at: "2026-10-20T23:12:00Z".into(),
+                threshold_minutes: 15,
+            })
+        );
+    }
+
+    #[test]
+    fn checks_not_started_never_flags_a_head_with_runs() {
+        for state in [
+            CheckState::Pending,
+            CheckState::Success,
+            CheckState::Failure,
+        ] {
+            let (req, evidence) =
+                stall_inputs("2026-10-20T23:12:00Z", vec![rollup("build", state, true)]);
+            assert_eq!(
+                checks_not_started(&req, true, &evidence, stall_now()),
+                None,
+                "{state:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn checks_not_started_waits_out_the_threshold_on_a_fresh_head() {
+        let (req, evidence) = stall_inputs("2026-10-21T03:50:00Z", vec![]);
+        // Ten minutes after the push: inside the threshold, not flagged.
+        assert_eq!(checks_not_started(&req, true, &evidence, stall_now()), None);
+        // One second short of fifteen minutes: still not flagged.
+        let almost = parse_iso("2026-10-21T04:04:59Z").unwrap();
+        assert_eq!(checks_not_started(&req, true, &evidence, almost), None);
+        // The same cached read at the threshold: flagged.
+        let at = parse_iso("2026-10-21T04:05:00Z").unwrap();
+        assert!(checks_not_started(&req, true, &evidence, at).is_some());
+    }
+
+    #[test]
+    fn checks_not_started_never_guesses_from_unknown_or_excusing_inputs() {
+        let (base, evidence) = stall_inputs("2026-10-20T23:12:00Z", vec![]);
+        let flag = |req: &MergeRequirements, observed: bool, ev: &ChecksStartEvidence| {
+            checks_not_started(req, observed, ev, stall_now())
+        };
+        assert!(flag(&base, true, &evidence).is_some(), "control");
+
+        // Checks unobserved (degraded read): unknown, not zero.
+        assert_eq!(flag(&base, false, &evidence), None);
+        // Conflicts: GitHub starts no pull_request workflow on such a head.
+        let mut conflicted = base.clone();
+        conflicted.has_conflicts = true;
+        assert_eq!(flag(&conflicted, true, &evidence), None);
+        // Merged / closed PRs need no CI.
+        for state in ["merged", "closed"] {
+            let mut done = base.clone();
+            done.state = state.into();
+            assert_eq!(flag(&done, true, &evidence), None, "{state}");
+        }
+        // Drafts: workflows may only trigger on `ready_for_review`.
+        let mut draft = base.clone();
+        draft.state = "draft".into();
+        assert_eq!(flag(&draft, true, &evidence), None);
+        // No required checks on the base (or unreadable rules): a repo
+        // without required CI never flags.
+        let no_ci = ChecksStartEvidence {
+            checks_required: false,
+            ..evidence.clone()
+        };
+        assert_eq!(flag(&base, true, &no_ci), None);
+        // No commit time (GitLab, REST-only) or an unparsable one.
+        for committed in [None, Some("not a date".to_string())] {
+            let ev = ChecksStartEvidence {
+                head_committed_at: committed,
+                ..evidence.clone()
+            };
+            assert_eq!(flag(&base, true, &ev), None);
+        }
+        // No head identity.
+        let headless = ChecksStartEvidence {
+            head_sha: None,
+            ..evidence.clone()
+        };
+        assert_eq!(flag(&base, true, &headless), None);
+    }
+
+    #[test]
+    fn checks_not_started_requires_known_conflict_free_mergeability() {
+        let (base, evidence) = stall_inputs("2026-10-20T23:12:00Z", vec![]);
+        let flag = |req: &MergeRequirements| checks_not_started(req, true, &evidence, stall_now());
+        assert!(flag(&base).is_some(), "control: mergeable, BLOCKED-free");
+        // GitHub recomputing: no verdict yet, or an UNKNOWN merge state.
+        let mut recomputing = base.clone();
+        recomputing.mergeable = None;
+        assert_eq!(flag(&recomputing), None);
+        let mut unknown_state = base.clone();
+        unknown_state.merge_state_status = Some("UNKNOWN".into());
+        assert_eq!(flag(&unknown_state), None);
+        // Contradictory inputs never read as conflict-free.
+        let mut not_mergeable = base.clone();
+        not_mergeable.mergeable = Some(false);
+        assert_eq!(flag(&not_mergeable), None);
+        let mut dirty_but_mergeable = base.clone();
+        dirty_but_mergeable.merge_state_status = Some("DIRTY".into());
+        assert_eq!(flag(&dirty_but_mergeable), None);
+        // A known BLOCKED (waiting on the missing required checks) is the
+        // intentd#2531 shape and still flags.
+        let mut blocked = base.clone();
+        blocked.merge_state_status = Some("BLOCKED".into());
+        assert!(flag(&blocked).is_some());
+    }
+
+    #[test]
+    fn checks_start_evidence_requires_the_probe_head_to_match_the_pr() {
+        let mut p = pr(PrState::Open, false, Some(true), None);
+        p.head_sha = Some(STALL_HEAD.into());
+        let signals =
+            |probe_head: Option<&str>, rules: Option<Vec<&str>>| MergeRequirementSignals {
+                checks_head_sha: probe_head.map(String::from),
+                head_committed_at: Some("2026-10-20T23:12:00Z".into()),
+                branch_rules: rules.map(|names| intent_sourcecontrol::BranchRules {
+                    required_status_checks: names.into_iter().map(String::from).collect(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+        let matching = ChecksStartEvidence::from_signals(
+            &p,
+            Some(&signals(Some(STALL_HEAD), Some(vec!["build"]))),
+        );
+        assert_eq!(matching.head_sha.as_deref(), Some(STALL_HEAD));
+        assert_eq!(
+            matching.head_committed_at.as_deref(),
+            Some("2026-10-20T23:12:00Z")
+        );
+        assert!(matching.checks_required);
+        // A probe that observed another head lends no commit time.
+        for probe in [Some("ffffffff"), None] {
+            let other =
+                ChecksStartEvidence::from_signals(&p, Some(&signals(probe, Some(vec!["build"]))));
+            assert_eq!(
+                (other.head_sha, other.head_committed_at),
+                (None, None),
+                "{probe:?}"
+            );
+        }
+        // Rules without required checks, unreadable rules, or no probe.
+        assert!(
+            !ChecksStartEvidence::from_signals(&p, Some(&signals(Some(STALL_HEAD), Some(vec![]))))
+                .checks_required
+        );
+        assert!(
+            !ChecksStartEvidence::from_signals(&p, Some(&signals(Some(STALL_HEAD), None)))
+                .checks_required
+        );
+        assert_eq!(
+            ChecksStartEvidence::from_signals(&p, None),
+            ChecksStartEvidence::default()
+        );
+    }
+
+    #[test]
+    fn checks_not_started_is_presence_detected_on_the_wire() {
+        let (mut req, evidence) = stall_inputs("2026-10-20T23:12:00Z", vec![]);
+        let wire = serde_json::to_value(&req).unwrap();
+        assert!(
+            wire.get("checksNotStarted").is_none(),
+            "omitted, never null"
+        );
+        req.checks_not_started = checks_not_started(&req, true, &evidence, stall_now());
+        let wire = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            wire["checksNotStarted"],
+            serde_json::json!({
+                "headSha": STALL_HEAD,
+                "headCommittedAt": "2026-10-20T23:12:00Z",
+                "thresholdMinutes": 15,
+            })
+        );
+        // A checklist persisted before the field existed still parses.
+        let mut old = wire;
+        old.as_object_mut().unwrap().remove("checksNotStarted");
+        let parsed: MergeRequirements = serde_json::from_value(old).unwrap();
+        assert_eq!(parsed.checks_not_started, None);
     }
 }

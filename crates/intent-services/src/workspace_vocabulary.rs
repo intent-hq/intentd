@@ -374,6 +374,7 @@ mod tests {
             context_links: None,
             archived: false,
             archived_at: None,
+            retired_at: None,
             task_stats: None,
             agent_summary: None,
             diff_summary: None,
@@ -383,6 +384,8 @@ mod tests {
             pull_requests_total: None,
             display_status: None,
             waiting: false,
+            scripts_running: false,
+            background_tasks_running: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,
@@ -563,8 +566,12 @@ mod tests {
             .await
             .contains(&"Zorblatt".to_string()));
 
+        let spec = spec_note(&ws, "Plan the Quuxify rollout.");
         store
-            .update_note(&spec_note(&ws, "Plan the Quuxify rollout."))
+            .update_note(
+                &store.lock_note_content(&spec.workspace_id, &spec.id).await,
+                &spec,
+            )
             .await
             .expect("update spec");
         let terms = cache.vocabulary(&store, &ws).await;

@@ -6,10 +6,11 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
+use intentd_test_support::GuardedChild;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,7 +32,7 @@ fn scratch_dir(prefix: &str) -> tempfile::TempDir {
     common::test_tempdir_in("/tmp", &format!("itd-wss-scr-{prefix}-"))
 }
 
-fn spawn_serve(data_dir: &Path) -> Child {
+fn spawn_serve(data_dir: &Path) -> GuardedChild {
     let log = std::fs::File::options()
         .create(true)
         .append(true)
@@ -40,15 +41,16 @@ fn spawn_serve(data_dir: &Path) -> Child {
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     common::enable_ws_api(data_dir);
-    common::hermetic_serve_command(data_dir)
-        .env("INTENTD_DATA_DIR", data_dir)
-        .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
-        .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
-        .env("INTENTD_AUTH_TOKEN", TOKEN)
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(log))
-        .spawn()
-        .expect("spawn intentd serve")
+    GuardedChild::spawn(
+        common::hermetic_serve_command(data_dir)
+            .env("INTENTD_DATA_DIR", data_dir)
+            .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
+            .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
+            .env("INTENTD_AUTH_TOKEN", TOKEN)
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(log)),
+    )
+    .expect("spawn intentd serve")
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -241,7 +243,7 @@ async fn next_script_change<S>(
 
 /// Boot (or re-boot) a daemon over an existing data dir, returning the child
 /// and a pinned-TLS WSS client config for its live port.
-async fn boot(data_dir: &Path) -> (Child, u16, Arc<ClientConfig>) {
+async fn boot(data_dir: &Path) -> (GuardedChild, u16, Arc<ClientConfig>) {
     let child = spawn_serve(data_dir);
     let socket = data_dir.join("intentd.sock");
     assert!(await_uds(&socket).await, "daemon did not start");
@@ -255,9 +257,8 @@ async fn boot(data_dir: &Path) -> (Child, u16, Arc<ClientConfig>) {
     (child, port, client_config(&fingerprint))
 }
 
-fn stop(mut child: Child) {
-    let _ = child.kill();
-    let _ = child.wait();
+fn stop(mut child: GuardedChild) {
+    let _ = child.kill_tree();
 }
 
 /// A minimal committed git repo for `workspace.create` (the store row is what
@@ -807,7 +808,7 @@ async fn boot_with_command_script(
     title: &str,
     script_id: &str,
 ) -> (
-    Child,
+    GuardedChild,
     u16,
     Arc<ClientConfig>,
     WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>,
@@ -1093,8 +1094,7 @@ async fn durable_command_evidence_survives_daemon_restart_over_wss() {
     .await
     .expect("command ready");
     drop(ws);
-    daemon.child_mut().kill().unwrap();
-    daemon.child_mut().wait().unwrap();
+    daemon.kill_tree().unwrap();
     drop(daemon);
     let (child, port, cfg) = boot(data.path()).await;
     let _daemon = common::DaemonGuard::process_only(child);

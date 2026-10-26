@@ -9,7 +9,9 @@ use intent_core::{AgentId, Caller, TurnAttachmentRegistry, Workspace, WorkspaceA
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use tokio::sync::{Notify, Semaphore};
 
-pub(crate) const WAIT: Duration = Duration::from_secs(5);
+pub(crate) fn wait() -> Duration {
+    intentd_test_support::test_timeout(Duration::from_secs(5))
+}
 pub(crate) const SECRET: &str = "private-fixture-payload";
 tokio::task_local! { static HOST: McpHostCall; }
 
@@ -30,7 +32,7 @@ impl Gate {
         self.release.acquire().await.unwrap().forget();
     }
     pub(crate) async fn reached(&self) {
-        tokio::time::timeout(WAIT, self.entered.notified())
+        tokio::time::timeout(wait(), self.entered.notified())
             .await
             .unwrap();
     }
@@ -863,7 +865,7 @@ fn cancelled_filesystem_work_can_have_a_late_effect_without_a_replacement_or_ret
                 .handle_message_for_delivery(&call(1, "return await ws.git.listRoots();"), context)
                 .await
         });
-        tokio::time::timeout(WAIT, async {
+        tokio::time::timeout(wait(), async {
             while accounting.outcome() != ArtifactOutcome::Unknown {
                 tokio::task::yield_now().await;
             }
@@ -876,7 +878,7 @@ fn cancelled_filesystem_work_can_have_a_late_effect_without_a_replacement_or_ret
         release.send(()).unwrap();
         worker.await.unwrap();
         let folder = dir.path().join("tool-outputs");
-        tokio::time::timeout(WAIT, async {
+        tokio::time::timeout(wait(), async {
             while !folder.exists() {
                 tokio::task::yield_now().await;
             }
@@ -1727,7 +1729,7 @@ pub(crate) mod optional {
         gate.reached().await;
         task.abort();
         assert!(matches!(task.await, Err(error) if error.is_cancelled()));
-        tokio::time::timeout(WAIT, state.leaf_dropped.notified())
+        tokio::time::timeout(wait(), state.leaf_dropped.notified())
             .await
             .unwrap();
         assert!(state.required.live.load(Ordering::SeqCst));
@@ -2137,7 +2139,7 @@ mod captured_scope_lifetime {
             } else {
                 drop(delivery);
             }
-            tokio::time::timeout(WAIT, state.leaf_dropped.notified())
+            tokio::time::timeout(wait(), state.leaf_dropped.notified())
                 .await
                 .unwrap();
             probe.released();

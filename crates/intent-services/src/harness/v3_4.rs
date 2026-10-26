@@ -1,4 +1,6 @@
-//! Persistent development-only inline visuals; existing sessions retain their doctrine.
+//! Harness v3.4 adds persistent development-only inline visual guidance on top
+//! of v3.3, keeping its single workspace fallback; existing sessions retain
+//! their doctrine.
 
 use super::{Doctrine, HarnessEntry};
 

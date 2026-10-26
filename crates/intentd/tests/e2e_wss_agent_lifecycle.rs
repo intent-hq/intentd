@@ -19,8 +19,9 @@ mod creation_preferences;
 #[path = "e2e_wss_agent_lifecycle/structured_notices.rs"]
 mod structured_notices;
 
+use intentd_test_support::GuardedChild;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -42,27 +43,13 @@ const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefe
 
 /// Live `intentd serve` process; killed on drop.
 struct Daemon {
-    child: Child,
+    child: GuardedChild,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        // Kill the whole process group (daemon + any Node.js ACP provider
-        // children) BEFORE removing the data dir, so an orphaned child can't
-        // re-create files (e.g. node-compile-cache under a redirected TMPDIR)
-        // after cleanup. The daemon is spawned with process_group(0).
-        #[cfg(unix)]
-        {
-            use nix::sys::signal::{self, Signal};
-            use nix::unistd::Pid;
-            let pid = Pid::from_raw(self.child.id().cast_signed());
-            let _ = signal::killpg(pid, Signal::SIGKILL);
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = self.child.kill();
-        }
-        let _ = self.child.wait();
+        // Kills the daemon's process group (ACP providers run in their own groups).
+        let _ = self.child.kill_tree();
     }
 }
 
@@ -83,12 +70,6 @@ fn lifecycle_command(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> std
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
-    // Group leader so Daemon::drop can killpg the daemon + ACP children.
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -96,10 +77,8 @@ fn lifecycle_command(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> std
     cmd
 }
 
-fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
-    lifecycle_command(data_dir, listen, env)
-        .spawn()
-        .expect("spawn intentd serve")
+fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> GuardedChild {
+    GuardedChild::spawn(&mut lifecycle_command(data_dir, listen, env)).expect("spawn intentd serve")
 }
 
 /// Wait for the daemon's UDS to accept connections, up to the shared
@@ -247,9 +226,12 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     loop {
-        let next = timeout(Duration::from_secs(secs), ws.next())
-            .await
-            .expect("wss event timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(secs)),
+            ws.next(),
+        )
+        .await
+        .expect("wss event timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -275,7 +257,8 @@ async fn wss_event_opt<S>(ws: &mut WebSocketStream<S>, secs: u64) -> Option<Valu
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(secs));
     wss_event_opt_until(ws, deadline).await
 }
 
@@ -320,9 +303,12 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     loop {
-        let next = timeout(Duration::from_secs(secs), ws.next())
-            .await
-            .expect("wss push timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(secs)),
+            ws.next(),
+        )
+        .await
+        .expect("wss push timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -7140,6 +7126,7 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         context_links: None,
         archived: false,
         archived_at: None,
+        retired_at: None,
         task_stats: None,
         agent_summary: None,
         diff_summary: None,
@@ -7149,6 +7136,8 @@ fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
         pull_requests_total: None,
         display_status: None,
         waiting: false,
+        scripts_running: false,
+        background_tasks_running: false,
         checkout_mode: None,
         disk_usage: None,
         pending_delete_at: None,
@@ -8353,7 +8342,7 @@ async fn oversized_request_head_rejected_over_wss() {
     // upgrade success; it either drops silently or returns a non-101 status.
     let mut buf = [0u8; 1024];
     let mut total = Vec::new();
-    let deadline = Duration::from_secs(2);
+    let deadline = common::test_timeout(Duration::from_secs(2));
     loop {
         match timeout(deadline, tls.read(&mut buf)).await {
             Ok(Ok(0) | Err(_)) | Err(_) => break,
@@ -18242,22 +18231,25 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     F: FnMut(&Value) -> bool,
 {
-    timeout(Duration::from_secs(secs), async {
-        loop {
-            let frame = wss_push(chat, secs).await;
-            assert_eq!(frame["params"]["kind"], "delta", "push: {frame}");
-            let delta = frame["params"]["delta"].clone();
-            if let Some(entity) = delta["added"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .chain(delta["updated"].as_array().into_iter().flatten())
-                .find(|e| pred(e))
-            {
-                return (entity.clone(), delta);
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(secs)),
+        async {
+            loop {
+                let frame = wss_push(chat, secs).await;
+                assert_eq!(frame["params"]["kind"], "delta", "push: {frame}");
+                let delta = frame["params"]["delta"].clone();
+                if let Some(entity) = delta["added"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .chain(delta["updated"].as_array().into_iter().flatten())
+                    .find(|e| pred(e))
+                {
+                    return (entity.clone(), delta);
+                }
             }
-        }
-    })
+        },
+    )
     .await
     .expect("matching chat delta entity arrived in time")
 }

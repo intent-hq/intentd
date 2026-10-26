@@ -2,7 +2,7 @@
 //! This is not a normal spawned-daemon or production provider-TLS positive.
 //! No hosted provider, user account, adapter, model or installed daemon.
 #![cfg(unix)]
-mod common;
+use crate::common;
 use futures_util::{SinkExt, StreamExt};
 use intent_core::WorkspaceApi;
 use intent_core::{
@@ -499,7 +499,11 @@ impl Harness {
             .unwrap();
         startup_roles.returned();
         let startup_services = startup_milestones::begin(startup_milestones::Phase::Services);
-        std::fs::write(dir.path().join("config.toml"),"[providers]\nenabled = {}\n[mcp]\nenableUserServers = false\n[agents]\nresumeInterruptedOnStart = \"off\"\n").unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[providers]\nenabled = {}\n[mcp]\nenableUserServers = false\n",
+        )
+        .unwrap();
         let mut config = std::fs::OpenOptions::new()
             .append(true)
             .open(dir.path().join("config.toml"))
@@ -807,7 +811,11 @@ async fn run_in_tls_process(name: &str) -> bool {
     make_fixture_certificate(directory.path());
     let mut command = std::process::Command::new(std::env::current_exe().unwrap());
     command
-        .args(["--exact", name, "--nocapture"])
+        .args([
+            "--exact",
+            &common::exact_test_name(module_path!(), name),
+            "--nocapture",
+        ])
         .env("INTENT_REVIEW_TLS_TEST", name)
         .env("INTENT_REVIEW_TLS_FIXTURE", directory.path())
         .env("SSL_CERT_FILE", directory.path().join("ca.pem"))
@@ -2040,6 +2048,7 @@ async fn driver_loop(descriptor: &DriverDescriptor) -> DriverResult<()> {
         }
         Ok::<(), anyhow::Error>(())
     };
+    // fixed-deadline: allow — stays under the review descriptor's server-set lifetime_seconds, after which the daemon revokes it
     let outcome = timeout(
         Duration::from_secs(descriptor.lifetime_seconds.saturating_sub(10))
             .saturating_sub(started.elapsed()),
@@ -2075,6 +2084,12 @@ async fn driver_loop(descriptor: &DriverDescriptor) -> DriverResult<()> {
         "identity":driver_identity(),"terminal":terminal,"cleanup":exits,"success":true}),
     )?;
     Ok(())
+}
+
+/// The `--exact` name of [`native_review_fixture_driver`], computed in its module.
+#[cfg(target_os = "linux")]
+fn fixture_driver_test_name() -> String {
+    common::exact_test_name(module_path!(), "native_review_fixture_driver")
 }
 
 #[test]
@@ -2245,7 +2260,7 @@ impl DriverTest {
             .args([
                 "--ignored",
                 "--exact",
-                "native_review_fixture_driver",
+                &fixture_driver_test_name(),
                 "--nocapture",
                 "--test-threads=1",
             ])
@@ -2838,7 +2853,8 @@ mod driver_ownership {
     use std::process::{ChildStdin, Command, ExitStatus};
     use std::time::Instant;
 
-    const ENTRY: &str = "native_review_fixture_driver";
+    static ENTRY: std::sync::LazyLock<String> =
+        std::sync::LazyLock::new(super::fixture_driver_test_name);
     const OBSERVE: WaitPidFlag =
         WaitPidFlag::from_bits_retain(libc::WEXITED | libc::WNOHANG | libc::WNOWAIT);
 
@@ -3077,7 +3093,7 @@ mod driver_ownership {
         let expected = [
             "--ignored",
             "--exact",
-            ENTRY,
+            ENTRY.as_str(),
             "--nocapture",
             "--test-threads=1",
         ];
@@ -3105,6 +3121,7 @@ mod driver_ownership {
             matches!(waitid(Id::PIDFd(own.as_fd()), OBSERVE), Err(Errno::ECHILD)),
             "pidfd wait support"
         );
+        // process-global: allow — runs only in the isolated `--exact` re-exec preflight() checks
         nix::sys::prctl::set_child_subreaper(true)?;
         anyhow::ensure!(
             nix::sys::prctl::get_child_subreaper()?,
@@ -3316,7 +3333,7 @@ mod driver_ownership {
             .args([
                 "--ignored",
                 "--exact",
-                ENTRY,
+                ENTRY.as_str(),
                 "--nocapture",
                 "--test-threads=1",
             ])
@@ -3505,7 +3522,7 @@ while True:signal.pause()
             .args([
                 "--ignored",
                 "--exact",
-                ENTRY,
+                ENTRY.as_str(),
                 "--nocapture",
                 "--test-threads=1",
             ])

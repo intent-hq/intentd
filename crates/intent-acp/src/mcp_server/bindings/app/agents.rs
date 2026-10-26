@@ -158,7 +158,10 @@ async fn list(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, String
         vec![ws]
     } else {
         // All non-chief workspaces
-        let all = api.list_workspaces(true).await.map_err(map_err)?;
+        let all = api
+            .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .map_err(map_err)?;
         all.into_iter()
             .filter(|ws| {
                 !ws.id.is_chief() && format!("{:?}", ws.status).to_lowercase() != "deleted"
@@ -616,7 +619,7 @@ mod tests {
     impl WorkspaceApi for FakeApi {
         fn list_workspaces(
             &self,
-            _include_archived: bool,
+            _filter: intent_core::WorkspaceListFilter,
         ) -> BoxFuture<'_, Result<Vec<Workspace>>> {
             let workspaces = self.workspaces.lock().unwrap().clone();
             Box::pin(async move { Ok(workspaces) })
@@ -809,6 +812,7 @@ mod tests {
             context_links: None,
             archived: false,
             archived_at: None,
+            retired_at: None,
             task_stats: None,
             agent_summary: None,
             diff_summary: None,
@@ -818,6 +822,8 @@ mod tests {
             pull_requests_total: None,
             display_status: None,
             waiting: false,
+            scripts_running: false,
+            background_tasks_running: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,

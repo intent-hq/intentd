@@ -14,10 +14,11 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
+use intentd_test_support::GuardedChild;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -49,15 +50,14 @@ const SHELL_SHADOW_VALUE: &str = "shell-shadow-value";
 
 /// Live `intentd serve` process; killed and its data dir removed on drop.
 struct Daemon {
-    child: Child,
+    child: GuardedChild,
     _data_dir_guard: tempfile::TempDir,
     data_dir: PathBuf,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.child.kill_tree();
     }
 }
 
@@ -83,7 +83,7 @@ fn write_fake_shell(data_dir: &Path) -> PathBuf {
 /// Spawn `intentd serve` with `SHELL` pointing at the fake login shell, the
 /// daemon-env sentinel set, and the gap sentinel scrubbed from the inherited
 /// env so only the login-shell capture can supply it.
-fn spawn_serve(data_dir: &Path, fake_shell: &Path) -> Child {
+fn spawn_serve(data_dir: &Path, fake_shell: &Path) -> GuardedChild {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
@@ -99,7 +99,7 @@ fn spawn_serve(data_dir: &Path, fake_shell: &Path) -> Child {
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
     common::hermetic_fixture_identity(&mut cmd, data_dir);
-    cmd.spawn().expect("spawn intentd serve")
+    GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
 }
 
 async fn await_uds(socket: &Path) -> bool {

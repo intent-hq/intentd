@@ -18,7 +18,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::path::Path;
 use std::process::Stdio;
@@ -255,7 +255,8 @@ async fn wss_event_opt<S>(ws: &mut WebSocketStream<S>, secs: u64) -> Option<Valu
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(secs));
     loop {
         let next = tokio::time::timeout_at(deadline, ws.next()).await.ok()?;
         match next {
@@ -382,6 +383,7 @@ async fn seed_workspace_and_note(data_dir: &Path) -> (String, String) {
             context_links: None,
             archived: false,
             archived_at: None,
+            retired_at: None,
             task_stats: None,
             agent_summary: None,
             diff_summary: None,
@@ -391,6 +393,8 @@ async fn seed_workspace_and_note(data_dir: &Path) -> (String, String) {
             pull_requests_total: None,
             display_status: None,
             waiting: false,
+            scripts_running: false,
+            background_tasks_running: false,
             checkout_mode: None,
             disk_usage: None,
             pending_delete_at: None,

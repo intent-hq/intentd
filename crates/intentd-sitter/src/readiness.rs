@@ -434,6 +434,7 @@ mod tests {
         budget.observe(&ProbeStatus::Starting {
             attempt_id: "a".into(),
         });
+        // fixed-deadline: allow — not a wait: a synthetic deadline input that must stay under the 1s StartupBudget so the renewal assertion means something
         budget.deadline = Instant::now() + Duration::from_millis(100);
         let before_restart = budget.deadline;
         budget.observe(&ProbeStatus::Starting {

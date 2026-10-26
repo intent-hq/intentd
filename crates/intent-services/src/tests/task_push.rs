@@ -67,7 +67,15 @@ async fn task_push_has_complete_rows_and_changed_only_statistics() {
     assert!(data["note"]["rev"].as_i64().unwrap() > 0);
     let mut updated = store.get_note(&ws, &task.id).await.unwrap();
     updated.title = "Renamed".into();
-    store.update_note_metadata(&updated).await.unwrap();
+    store
+        .update_note_metadata(
+            &store
+                .lock_note_content(&updated.workspace_id, &updated.id)
+                .await,
+            &updated,
+        )
+        .await
+        .unwrap();
     bus.publish(&note_change_event(
         &ws,
         &task.id,
@@ -164,7 +172,13 @@ async fn task_push_first_body_write_does_not_publish_statistics() {
     store.insert_note(&task).await.unwrap();
     let bus = EventBus::new(store.clone());
     task.content = "new body".into();
-    store.update_note(&task).await.unwrap();
+    store
+        .update_note(
+            &store.lock_note_content(&task.workspace_id, &task.id).await,
+            &task,
+        )
+        .await
+        .unwrap();
     bus.publish(&note_change_event(
         &ws,
         &task.id,
@@ -227,7 +241,13 @@ async fn task_push_spec_links_dependents_deletion_and_duplicate_notifications() 
     );
     spec = store.get_note(&ws, &spec.id).await.unwrap();
     spec.content = "[B](intent://local/task/b)".into();
-    store.update_note(&spec).await.unwrap();
+    store
+        .update_note(
+            &store.lock_note_content(&spec.workspace_id, &spec.id).await,
+            &spec,
+        )
+        .await
+        .unwrap();
     let notification = note_change_event(&ws, &spec.id, &spec.title, NOTE_UPDATED, "update");
     bus.publish(&notification).await.unwrap();
     let pushes = events(&store, "task:updated").await;

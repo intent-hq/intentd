@@ -454,10 +454,13 @@ async fn deletion_indexes_upgrade_preserves_existing_data() {
     let store = Store {
         task_event_baselines: std::sync::Arc::default(),
         task_events_enabled: std::sync::Arc::default(),
+        note_write_lanes: std::sync::Arc::default(),
         _daemon_owner: None,
         write_pool: pool.into(),
         read_pool: crate::connect_read(&tmp.path).await.unwrap().into(),
         browser_tab_displayed: crate::browser_tab_repo::DisplayedOverlay::default(),
+        desktop_writes: crate::desktop_repo::DesktopWrites::default(),
+        desktop_delete_barrier: std::sync::Arc::default(),
         export_author_barrier: std::sync::Arc::default(),
         repository_lifecycle: crate::repository_lifecycle::domain_for(&tmp.path).unwrap(),
     };
