@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.51] - 2026-10-26
+
+### 🔧 Refactor
+
+- *(core)* Build Workspace rows with a shared Default ([#2699](https://github.com/intent-hq/intentd/pull/2699))
+
+
 ## [0.11.50] - 2026-10-26
 
 ### 🚀 Features
