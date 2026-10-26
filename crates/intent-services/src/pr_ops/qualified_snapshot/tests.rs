@@ -94,6 +94,8 @@ fn review(author: &str, verdict: ReviewVerdict, submitted_at: &str) -> Review {
         verdict,
         body: None,
         submitted_at: submitted_at.into(),
+        id: None,
+        commit_sha: None,
     }
 }
 fn project(observation: &ReviewObservation) -> Value {
@@ -116,12 +118,12 @@ fn complete_flat_snapshot_and_native_detail_have_exact_contract() {
             "repo":"Team/SubGroup/Project","prNumber":17,"title":"Actual title","url":observation().details.review.url,
             "state":"open","isDraft":false,"isMerged":false,"isClosed":false,"headSha":"actual-head",
             "updatedAt":"2026-09-28T00:00:00Z","mergeable":true,"mergeableState":"clean","mergeBlockedReason":null,
-            "checks":{"total":1,"passed":1,"failed":0,"pending":0,"failedNames":[]},
+            "checks":{"total":1,"passed":1,"failed":0,"pending":0,"skipped":0,"failedNames":[],"skippedNames":[]},
             "reviews":{"decision":"approved","approvals":1,"changesRequested":0},
             "comments":{"conversationCount":3,"reviewCommentCount":2,"totalCount":5,"unresolvedThreadCount":0},
             "requirements":{"state":"open","isDraft":false,"hasConflicts":false,"isBehind":false,
                 "mergeable":true,"mergeStateStatus":"mergeable","rulesKnown":true,
-                "checks":{"total":1,"passed":1,"failed":0,"pending":0,"items":[{"name":"build","status":"passed","required":true}],
+                "checks":{"total":1,"passed":1,"failed":0,"pending":0,"skipped":0,"items":[{"name":"build","status":"passed","required":true}],
                     "failingRequired":[],"pendingRequired":[],"requiredKnown":true},
                 "approvals":{"decision":"approved","have":1,"changesRequested":0,"needed":1},
                 "threads":{"unresolved":0,"resolutionRequired":true}},
@@ -292,7 +294,15 @@ fn unknown_checks_differ_from_a_known_empty_rollup() {
     ] {
         o.availability.checks = state;
         let v = project(&o);
-        for key in ["total", "passed", "failed", "pending", "failedNames"] {
+        for key in [
+            "total",
+            "passed",
+            "failed",
+            "pending",
+            "skipped",
+            "failedNames",
+            "skippedNames",
+        ] {
             assert_eq!(v["checks"][key], Value::Null);
         }
         for key in ["items", "failingRequired", "pendingRequired"] {
@@ -505,6 +515,23 @@ fn queue_removal_reason_merged_is_not_an_ejection() {
 }
 
 #[test]
+fn skipped_checks_are_projected_apart_from_passed() {
+    let mut o = observation();
+    o.signals.checks = vec![
+        check("build", CheckState::Success, true),
+        check("coverage-all", CheckState::Skipped, true),
+    ];
+    let v = project(&o);
+    assert_eq!(
+        v["checks"],
+        json!({"total":2,"passed":1,"failed":0,"pending":0,"skipped":1,
+            "failedNames":[],"skippedNames":["coverage-all"]})
+    );
+    assert_eq!(v["requirements"]["checks"]["skipped"], 1);
+    assert_eq!(v["requirements"]["checks"]["failingRequired"], json!([]));
+}
+
+#[test]
 fn live_check_attempts_and_required_failures_share_the_legacy_pure_fold() {
     let mut o = observation();
     o.signals.checks = vec![
@@ -515,7 +542,8 @@ fn live_check_attempts_and_required_failures_share_the_legacy_pure_fold() {
     let v = project(&o);
     assert_eq!(
         v["checks"],
-        json!({"total":2,"passed":0,"failed":1,"pending":1,"failedNames":["lint"]})
+        json!({"total":2,"passed":0,"failed":1,"pending":1,"skipped":0,
+            "failedNames":["lint"],"skippedNames":[]})
     );
     assert_eq!(v["requirements"]["checks"]["failingRequired"], json!([]));
     assert_eq!(

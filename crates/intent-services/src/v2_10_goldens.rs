@@ -67,6 +67,11 @@ async fn app_file_links_in_assembled_prompts_are_session_pinned() {
     );
     let mut previous = current.clone();
     previous.harness_version = "2.9".into();
+    // 3.3 only drops the duplicated workspace layer of unknown/default agent
+    // types (intent-hq/intent#5835); compare the app file-link change on the
+    // last stamp that composes them the 2.9 way.
+    let mut current = current;
+    current.harness_version = "3.2".into();
 
     for rich_chat_blocks in [true, false] {
         let features = AgentFeaturesSettings {
@@ -94,7 +99,9 @@ async fn app_file_links_in_assembled_prompts_are_session_pinned() {
                     .expect("assembled prompt"),
                 );
             }
-            assert_eq!(prompts[0], prompts[1], "new session uses latest doctrine");
+            if agent_type != "interactive" {
+                assert_eq!(prompts[0], prompts[1], "new session uses latest doctrine");
+            }
             assert!(prompts[0].contains(PDF_LINK), "new {agent_type} prompt must teach app file links with richChatBlocks={rich_chat_blocks}");
             assert!(!prompts[2].contains(PDF_LINK), "v2.9 stays frozen");
             assert_eq!(

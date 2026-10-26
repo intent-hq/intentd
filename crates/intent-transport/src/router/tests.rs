@@ -9,119 +9,14 @@ use intent_core::{
     NoteEditInput, NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteId, NoteMetadata,
     NoteSetContentResult, NoteTaskRow, NoteUpdateInput, NoteUpdateMetadataResult, NoteVisibility,
     ReadAssetResult, RepoConfig, Result, ScriptCreateParams, ScriptMode, TaskUpdateResult,
-    Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceCreate,
-    WorkspaceEventSummary, WorkspaceId, WorkspaceStatus, WorkspaceUpdate,
+    Workspace, WorkspaceApi, WorkspaceAttention, WorkspaceCreate, WorkspaceEventSummary,
+    WorkspaceId, WorkspaceStatus, WorkspaceUpdate,
 };
 use serde_json::Value;
 
 use super::handle_message;
 
 struct FakeApi;
-
-#[tokio::test]
-async fn annotation_pages_select_strict_scopes_and_bound_frames_without_legacy_fallback() {
-    use intent_core::note_annotation::{AnnotationMethod, AnnotationReadRequest};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    struct AnnotationApi(AtomicUsize);
-    impl WorkspaceApi for AnnotationApi {
-        fn get_note_annotation_page(
-            &self,
-            method: AnnotationMethod,
-            request: AnnotationReadRequest,
-            _rpc_id: Value,
-        ) -> BoxFuture<'_, Result<Value>> {
-            self.0.fetch_add(1, Ordering::Relaxed);
-            Box::pin(async move {
-                match request.note_id.as_str() {
-                    "error" => Err(Error::Internal("private annotation".repeat(8192))),
-                    "large" => Ok(serde_json::json!({"private":"x".repeat(8192)})),
-                    _ => Ok(serde_json::json!({"kind":format!("{method:?}")})),
-                }
-            })
-        }
-        fn get_note_page(
-            &self,
-            _workspace: WorkspaceId,
-            _note: NoteId,
-            _request: intent_core::note_page::NotePageRequest,
-            _rpc_id: Value,
-        ) -> BoxFuture<'_, Result<Value>> {
-            Box::pin(async { Ok(serde_json::json!({"kind":"sourceFallback"})) })
-        }
-    }
-    let api = AnnotationApi(AtomicUsize::new(0));
-    let base = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"comment.list",
-        "params":{"backendId":"backend","workspaceId":"workspace","noteId":"note",
-        "noteInstanceId":"instance","sourceRevision":"revision",
-        "page":{"kind":"comments","maxWireBytes":4096}}});
-    for (method, kind, expected) in [
-        ("comment.list", "comments", "Comments"),
-        ("comment.getThread", "replies", "Replies"),
-        ("note.lineAttribution.load", "attribution", "Attribution"),
-        ("note.get", "context", "Context"),
-    ] {
-        let mut request = base.clone();
-        request["method"] = method.into();
-        request["params"]["page"]["kind"] = kind.into();
-        if kind == "replies" {
-            request["params"]["threadId"] = "thread".into();
-        }
-        if kind == "context" {
-            request["params"]["page"]["contextRef"] = "na1:ref".into();
-            request["params"]["commentRevision"] = "epoch".into();
-        }
-        let frame = handle_message(&api, &request.to_string()).await.unwrap();
-        assert_eq!(
-            serde_json::from_str::<Value>(&frame).unwrap()["result"]["kind"],
-            expected
-        );
-    }
-    assert_eq!(api.0.load(Ordering::Relaxed), 4);
-    let invalid = [
-        ("page", Value::Null),
-        ("page", serde_json::json!({"kind":"source"})),
-        ("includeComments", Value::Bool(true)),
-        ("commentRevision", Value::Null),
-        ("unknown", Value::Bool(true)),
-        ("workspaceId", Value::String("x".repeat(70_000))),
-    ];
-    for (field, value) in invalid {
-        let mut request = base.clone();
-        request["params"][field] = value;
-        let frame = handle_message(&api, &request.to_string()).await.unwrap();
-        assert!(frame.len() <= 4096);
-        assert!(serde_json::from_str::<Value>(&frame).unwrap()["error"].is_object());
-    }
-    let mut context = base.clone();
-    context["method"] = "note.get".into();
-    context["params"]["page"] =
-        serde_json::json!({"kind":"context","contextRef":"na1:missing-epoch"});
-    let frame = handle_message(&api, &context.to_string()).await.unwrap();
-    assert!(serde_json::from_str::<Value>(&frame).unwrap()["error"].is_object());
-    assert!(!frame.contains("sourceFallback"));
-    for id in [
-        Value::Null,
-        serde_json::json!("x".repeat(65)),
-        serde_json::json!(9_007_199_254_740_992_u64),
-    ] {
-        let mut request = base.clone();
-        request["id"] = id;
-        let frame = handle_message(&api, &request.to_string()).await.unwrap();
-        assert_eq!(
-            serde_json::from_str::<Value>(&frame).unwrap()["id"],
-            Value::Null
-        );
-    }
-    assert_eq!(api.0.load(Ordering::Relaxed), 4);
-    for note in ["large", "error"] {
-        let mut request = base.clone();
-        request["params"]["noteId"] = note.into();
-        let frame = handle_message(&api, &request.to_string()).await.unwrap();
-        assert!(frame.len() <= 4096);
-        assert!(serde_json::from_str::<Value>(&frame).unwrap()["error"].is_object());
-        assert!(!frame.contains("private"));
-    }
-}
 
 #[test]
 fn execution_authorization_errors_preserve_typed_codes_and_drop_provider_bodies() {
@@ -183,49 +78,9 @@ fn sample_ws() -> Workspace {
         id: WorkspaceId::from("ws-1"),
         title: "WS One".to_string(),
         branch: "main".to_string(),
-        base_ref: None,
-        base_commit_sha: None,
-        status: WorkspaceStatus::Active,
-        status_message: None,
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
-        attention: WorkspaceAttention::None,
         created_at: "t0".to_string(),
         updated_at: "t0".to_string(),
-        last_activity: None,
-        last_content_activity: None,
-        tags: vec![],
-        path: None,
-        repository_path: None,
-        repository_owner: None,
-        repository_name: None,
-        worktree_path: None,
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
-        default_model: None,
-        pr_number: None,
-        pr_url: None,
-        pr_status: None,
-        active_pull_request: None,
-        pull_requests: None,
-        context_links: None,
-        archived: false,
-        archived_at: None,
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        pull_requests_total: None,
-        display_status: None,
-        waiting: false,
-        checkout_mode: None,
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
+        ..Default::default()
     }
 }
 
@@ -286,8 +141,23 @@ impl WorkspaceApi for FakeApi {
         })
     }
 
-    fn list_workspaces(&self, _include_archived: bool) -> BoxFuture<'_, Result<Vec<Workspace>>> {
-        Box::pin(async { Ok(vec![sample_ws()]) })
+    fn list_workspaces(
+        &self,
+        filter: intent_core::WorkspaceListFilter,
+    ) -> BoxFuture<'_, Result<Vec<Workspace>>> {
+        // A retired row stands in for the store: present only when the
+        // caller opted in with `includeRetired`.
+        Box::pin(async move {
+            let mut rows = vec![sample_ws()];
+            if filter.include_retired {
+                let mut retired = ws_with(&WorkspaceId::from("ws-retired"));
+                retired.status = WorkspaceStatus::Retired;
+                retired.archived = true;
+                retired.retired_at = Some("2026-10-22T00:00:00Z".to_string());
+                rows.push(retired);
+            }
+            Ok(rows)
+        })
     }
     fn get_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
         Box::pin(async move {
@@ -497,6 +367,23 @@ impl WorkspaceApi for FakeApi {
             Ok(ws)
         })
     }
+    fn retire_workspace(
+        &self,
+        id: WorkspaceId,
+        caller_agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<Workspace>> {
+        assert!(caller_agent_id.is_none(), "router passes no caller agent");
+        Box::pin(async move {
+            if id.as_str() == "missing" {
+                return Err(Error::NotFound("workspace".to_string()));
+            }
+            let mut ws = ws_with(&id);
+            ws.status = WorkspaceStatus::Retired;
+            ws.archived = true;
+            ws.retired_at = Some("2026-10-22T00:00:00Z".to_string());
+            Ok(ws)
+        })
+    }
     fn unarchive_workspace(&self, id: WorkspaceId) -> BoxFuture<'_, Result<Workspace>> {
         Box::pin(async move {
             if id.as_str() == "missing" {
@@ -541,17 +428,27 @@ impl WorkspaceApi for FakeApi {
     fn find_workspaces_by_pull_request(
         &self,
         url: String,
+        include_retired: bool,
     ) -> BoxFuture<'_, Result<Vec<intent_core::PullRequestWorkspace>>> {
         Box::pin(async move {
             if !url.contains("/pull/") {
                 return Err(Error::InvalidParams("url is not a pull-request URL".into()));
             }
-            Ok(vec![intent_core::PullRequestWorkspace {
+            let mut rows = vec![intent_core::PullRequestWorkspace {
                 id: WorkspaceId("ws-1".into()),
                 title: url,
                 archived: true,
                 linked_at: "2026-10-18T04:40:00.000Z".into(),
-            }])
+            }];
+            if include_retired {
+                rows.push(intent_core::PullRequestWorkspace {
+                    id: WorkspaceId("ws-retired".into()),
+                    title: "retired".into(),
+                    archived: true,
+                    linked_at: "2026-10-17T04:40:00.000Z".into(),
+                });
+            }
+            Ok(rows)
         })
     }
     fn initialize_repository(&self, path: String) -> BoxFuture<'_, Result<()>> {
@@ -2011,11 +1908,13 @@ impl WorkspaceApi for FakeApi {
     fn cross_workspace_list_siblings(
         &self,
         workspace_id: WorkspaceId,
+        include_retired: bool,
     ) -> BoxFuture<'_, Result<Value>> {
         Box::pin(async move {
             Ok(serde_json::json!([{
                 "id": "sib-1", "title": "Untitled", "branch": "b", "status": "Active",
                 "createdAt": "t0", "updatedAt": "t1", "caller": workspace_id.as_str(),
+                "includeRetired": include_retired,
             }]))
         })
     }
@@ -3428,6 +3327,189 @@ async fn agent_cancel_delete_returns_cancelled_flag() {
         .await
         .unwrap();
     assert_eq!(err_code(&v), -32602, "{v}");
+}
+
+/// `workspace.list` returns retired workspaces only with an explicit
+/// `includeRetired: true` — `includeArchived: true` alone never includes
+/// them — and rejects a non-boolean `includeRetired` (§5.1).
+#[tokio::test]
+async fn workspace_list_include_retired_is_opt_in() {
+    let ids = |v: &Value| -> Vec<String> {
+        v["result"]["workspaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|w| w["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    for params in [
+        "{}",
+        r#"{"includeArchived":true}"#,
+        r#"{"includeRetired":false}"#,
+    ] {
+        let v = call(&format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"workspace.list","params":{params}}}"#
+        ))
+        .await
+        .unwrap();
+        assert!(
+            !ids(&v).contains(&"ws-retired".to_string()),
+            "{params}: {v}"
+        );
+    }
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.list","params":{"includeRetired":true}}"#,
+    )
+    .await
+    .unwrap();
+    assert!(ids(&v).contains(&"ws-retired".to_string()), "{v}");
+    let retired = v["result"]["workspaces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["id"] == "ws-retired")
+        .unwrap();
+    assert_eq!(retired["status"], "Retired");
+    assert_eq!(retired["retiredAt"], "2026-10-22T00:00:00Z");
+
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.list","params":{"includeRetired":"yes"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602, "{v}");
+    assert_eq!(v["error"]["data"]["code"], "invalid-params", "{v}");
+}
+
+/// `workspace.findByPullRequest` and `crossWorkspace.listSiblings` pass
+/// `includeRetired` through (default false) and reject a non-boolean.
+#[tokio::test]
+async fn find_by_pull_request_and_list_siblings_include_retired_is_opt_in() {
+    let pr = "https://github.com/o/r/pull/7";
+    let v = call(&format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"workspace.findByPullRequest","params":{{"url":"{pr}"}}}}"#
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        v["result"]["workspaces"].as_array().unwrap().len(),
+        1,
+        "{v}"
+    );
+    let v = call(&format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"workspace.findByPullRequest","params":{{"url":"{pr}","includeRetired":true}}}}"#
+    ))
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["workspaces"][1]["id"], "ws-retired", "{v}");
+    let v = call(&format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"workspace.findByPullRequest","params":{{"url":"{pr}","includeRetired":1}}}}"#
+    ))
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602, "{v}");
+
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"crossWorkspace.listSiblings","params":{"workspaceId":"ws-1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"][0]["includeRetired"], false, "{v}");
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"crossWorkspace.listSiblings","params":{"workspaceId":"ws-1","includeRetired":true}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"][0]["includeRetired"], true, "{v}");
+}
+
+/// Every raw-RPC `includeRetired` surface treats only omission as `false`:
+/// any supplied non-boolean — `null` included — is `-32602`
+/// `invalid-params` (PROTOCOL §5.1).
+#[tokio::test]
+async fn include_retired_rejects_null_and_non_booleans_on_every_rpc_surface() {
+    let pr = "https://github.com/o/r/pull/7";
+    for bad in ["null", r#""true""#, "1"] {
+        for (method, base) in [
+            ("workspace.list", String::new()),
+            ("workspace.findByPullRequest", format!(r#""url":"{pr}","#)),
+            (
+                "crossWorkspace.listSiblings",
+                r#""workspaceId":"ws-1","#.to_string(),
+            ),
+        ] {
+            let v = call(&format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":{{{base}"includeRetired":{bad}}}}}"#
+            ))
+            .await
+            .unwrap();
+            assert_eq!(err_code(&v), -32602, "{method} {bad}: {v}");
+            assert_eq!(
+                v["error"]["data"]["code"], "invalid-params",
+                "{method} {bad}: {v}"
+            );
+        }
+    }
+}
+
+/// `workspace.retire` returns the updated `workspace` record, and an
+/// unknown id is the standard `not-found`.
+#[tokio::test]
+async fn workspace_retire_returns_workspace() {
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":1,"method":"workspace.retire","params":{"workspaceId":"ws-1"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(v["result"]["workspace"]["id"], "ws-1", "{v}");
+    assert_eq!(v["result"]["workspace"]["status"], "Retired", "{v}");
+    assert_eq!(v["result"]["workspace"]["archived"], true, "{v}");
+    assert!(v["result"]["workspace"]["retiredAt"].is_string(), "{v}");
+
+    let v = call(
+        r#"{"jsonrpc":"2.0","id":2,"method":"workspace.retire","params":{"workspaceId":"missing"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(err_code(&v), -32602, "{v}");
+    assert_eq!(v["error"]["data"]["code"], "not-found", "{v}");
+    let v = call(r#"{"jsonrpc":"2.0","id":3,"method":"workspace.retire","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(err_code(&v), -32602, "{v}");
+}
+
+/// [`Error::WorkspaceRetired`] surfaces as `-32602` with
+/// `error.data = { code: "workspace-retired", workspaceId }`.
+#[test]
+fn workspace_retired_error_maps_to_machine_readable_code() {
+    let rpc = super::domain_to_rpc(Error::WorkspaceRetired {
+        workspace_id: "ws-1".to_string(),
+    });
+    assert_eq!(rpc.code, -32602);
+    assert_eq!(
+        rpc.data,
+        Some(serde_json::json!({ "code": "workspace-retired", "workspaceId": "ws-1" }))
+    );
+    assert!(rpc.message.contains("retired"), "{}", rpc.message);
+
+    let rpc = super::domain_to_rpc(Error::RetireUnsupported {
+        workspace_id: "ws-1".to_string(),
+        checkout_mode: Some(intent_core::CheckoutMode::Cow),
+    });
+    assert_eq!(rpc.code, -32602);
+    assert_eq!(
+        rpc.data,
+        Some(serde_json::json!({ "code": "retire-unsupported", "checkoutMode": "cow" }))
+    );
+    let rpc = super::domain_to_rpc(Error::RetireUnsupported {
+        workspace_id: "ws-1".to_string(),
+        checkout_mode: None,
+    });
+    assert_eq!(
+        rpc.data,
+        Some(serde_json::json!({ "code": "retire-unsupported" }))
+    );
 }
 
 /// `workspace.archive` and `workspace.unarchive` return the updated
@@ -8042,34 +8124,5 @@ async fn invitation_account_search_routes_and_rejects_malformed_params() {
         }
         let frame=call(&serde_json::json!({"jsonrpc":"2.0","id":71,"method":"host.invite.searchAccounts","params":invalid}).to_string()).await.unwrap();
         assert_eq!(err_code(&frame), -32602, "{invalid}");
-    }
-}
-
-#[tokio::test]
-async fn paginated_viewing_does_not_dispatch_retired_edit_operations() {
-    let api = FakeApi;
-    for method in [
-        "note.applySplices",
-        "note.operationStatus",
-        "note.operation.begin",
-        "note.operation.append",
-        "note.operation.seal",
-        "note.operation.commit",
-        "note.operation.cancel",
-        "note.operation.read",
-    ] {
-        let raw = handle_message(
-            &api,
-            &serde_json::json!({
-                "jsonrpc":"2.0", "id":7, "method":method,
-                "params":{"workspaceId":"w","noteId":"n"}
-            })
-            .to_string(),
-        )
-        .await
-        .unwrap();
-        let response: Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(response["id"], 7);
-        assert_eq!(err_code(&response), -32601, "{method}: {response}");
     }
 }

@@ -12,7 +12,9 @@ use serde_json::{json, Value};
 use tokio::time::timeout;
 
 const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(1);
-const WATCHDOG: Duration = Duration::from_secs(10);
+fn watchdog() -> Duration {
+    intentd_test_support::test_timeout(Duration::from_secs(10))
+}
 const UPDATED_AT: &str = "2026-09-27T00:00:00Z";
 
 async fn setup() -> (TempDb, Store, WorkspaceId, AgentId) {
@@ -47,7 +49,7 @@ async fn shorten_acquire_timeout(store: &mut Store, tmp: &TempDb) {
 }
 
 async fn wait_for_timeout(observed: &AtomicUsize) {
-    timeout(WATCHDOG, async {
+    timeout(watchdog(), async {
         while observed.load(Ordering::SeqCst) == 0 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -98,7 +100,7 @@ async fn recovers_after_real_pool_timeout_preserving_newer_sibling_metadata() {
                 .await
                 .expect("write newer sibling using held connection");
             drop(held);
-            timeout(WATCHDOG, &mut write).await.expect("bounded recovery")
+            timeout(watchdog(), &mut write).await.expect("bounded recovery")
         }
     };
     result.expect("JSON metadata setter must recover from the real pool timeout");
@@ -133,7 +135,7 @@ async fn permanent_pool_contention_returns_last_error_after_existing_deadline() 
     // extend past the retry deadline by ACQUIRE_TIMEOUT; the outer guard
     // detects an unbounded retry without shortening the production policy.
     let error = timeout(
-        crate::BUSY_RETRY_DEADLINE + WATCHDOG,
+        crate::BUSY_RETRY_DEADLINE + watchdog(),
         POOL_TIMEOUT_OBSERVER.scope(
             Arc::clone(&observed),
             store.set_agent_session_metadata_key_json(
@@ -254,7 +256,7 @@ async fn missing_agent_and_wrong_workspace_remain_not_found_without_mutation() {
     let before = store.get_agent_session(&id).await.expect("read before");
     for (workspace, agent) in [(&other_ws, &id), (&ws, &other_id)] {
         let error = timeout(
-            WATCHDOG,
+            watchdog(),
             store.set_agent_session_metadata_key_json(
                 workspace,
                 agent,
@@ -278,7 +280,7 @@ async fn malformed_json_and_closed_pool_fail_without_retry_or_mutation() {
     let (_tmp, store, ws, id) = setup().await;
     let before = store.get_agent_session(&id).await.expect("read before");
     let error = timeout(
-        WATCHDOG,
+        watchdog(),
         store.set_agent_session_metadata_key_json(
             &ws,
             &id,
@@ -307,7 +309,7 @@ async fn malformed_json_and_closed_pool_fail_without_retry_or_mutation() {
         .await
         .expect("seed malformed column");
     let error = timeout(
-        WATCHDOG,
+        watchdog(),
         store.set_agent_session_metadata_key_json(&ws, &id, "pendingProposals", "[]", UPDATED_AT),
     )
     .await
@@ -328,7 +330,7 @@ async fn malformed_json_and_closed_pool_fail_without_retry_or_mutation() {
 
     store.write_pool().close().await;
     let error = timeout(
-        WATCHDOG,
+        watchdog(),
         store.set_agent_session_metadata_key_json(&ws, &id, "pendingProposals", "[]", UPDATED_AT),
     )
     .await

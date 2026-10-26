@@ -28,7 +28,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 #[path = "common/invitation_fixture_lifecycle.rs"]
 mod fixture_lifecycle;
 
@@ -859,7 +859,8 @@ fn github_identity(id: u64) -> Value {
 /// Wait up to `secs` for the next `events.event` notification of type
 /// `event_type` on `ws` (other frames are skipped); returns the event object.
 async fn next_event(ws: &mut Ws, event_type: &str, secs: u64) -> Value {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(secs));
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         assert!(!remaining.is_zero(), "timed out waiting for {event_type}");
@@ -885,25 +886,28 @@ async fn next_event(ws: &mut Ws, event_type: &str, secs: u64) -> Value {
 /// `window_ms` (a negative assertion: the socket stayed quiet).
 #[cfg(feature = "repository-test-fixtures")]
 async fn stays_quiet(ws: &mut Ws, event_type: &str, window_ms: u64) -> bool {
-    timeout(Duration::from_millis(window_ms), async {
-        loop {
-            match ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let v: Value = serde_json::from_str(&text).expect("json frame");
-                    if v["method"] == json!("events.event")
-                        && v["params"]["event"]["type"] == json!(event_type)
-                    {
-                        return v;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(window_ms)),
+        async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = serde_json::from_str(&text).expect("json frame");
+                        if v["method"] == json!("events.event")
+                            && v["params"]["event"]["type"] == json!(event_type)
+                        {
+                            return v;
+                        }
                     }
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = ws.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("expected text frame, got {other:?}"),
                 }
-                Some(Ok(Message::Ping(p))) => {
-                    let _ = ws.send(Message::Pong(p)).await;
-                }
-                Some(Ok(_)) => {}
-                other => panic!("expected text frame, got {other:?}"),
             }
-        }
-    })
+        },
+    )
     .await
     .is_err()
 }

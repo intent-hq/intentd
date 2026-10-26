@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use intent_core::Error;
+use intent_core::{Error, WorkspaceApi as _};
 use intent_store::Store;
 use serde_json::{json, Value};
 
@@ -16,6 +16,9 @@ use crate::tests::TempDb;
 use crate::{Services, SettingsRegistry};
 
 const SECRET: &str = "sk-very-secret-value-1234";
+
+#[path = "provider_profiles_default_tests.rs"]
+mod default_overrides;
 
 struct Fixture {
     _db: TempDb,
@@ -182,6 +185,7 @@ fn name_rules() {
         name: "Work".into(),
         created_at: String::new(),
         updated_at: String::new(),
+        backup: false,
     }];
     let check = |raw: &str, base: &str, self_id: Option<&str>| {
         let mut errors = Vec::new();
@@ -478,7 +482,7 @@ async fn create_masks_values_and_keeps_set_empty_and_unset_distinct() {
             "revision": 1,
             "change": "created",
             "profileId": id,
-            "profile": { "id": id, "providerRef": format!("codex@{id}"), "baseProviderId": "codex", "name": "Work" },
+            "profile": { "id": id, "providerRef": format!("codex@{id}"), "baseProviderId": "codex", "name": "Work", "backup": false },
         })
     );
     assert_eq!(ev["workspaceId"], "");
@@ -522,7 +526,8 @@ async fn create_reports_every_field_error_and_writes_nothing() {
     );
     assert!(!fx.profiles_file().exists());
     let list = fx.svc.provider_profiles_list_impl(None).await.unwrap();
-    assert_eq!(list, json!({ "profiles": [], "revision": 0 }));
+    assert_eq!(list["profiles"], json!([]));
+    assert_eq!(list["revision"], 0);
 
     fx.create("codex", "Work", json!([])).await;
     let dup = fx
@@ -1576,6 +1581,7 @@ fn readable_selection_never_calls_a_profile_removed_when_the_list_is_unreadable(
         name: "Work".into(),
         created_at: String::new(),
         updated_at: String::new(),
+        backup: false,
     };
     let saved = [work];
     assert_eq!(readable_selection("codex", Some(&saved)), "codex");
@@ -1588,4 +1594,343 @@ fn readable_selection_never_calls_a_profile_removed_when_the_list_is_unreadable(
         "codex (removed profile)"
     );
     assert_eq!(readable_selection("codex@pwork", None), "codex");
+}
+
+// ---------------------------------------------------------------------------
+// Backup flag and saved order
+// ---------------------------------------------------------------------------
+
+fn meta(id: &str, base: &str) -> ProfileMeta {
+    ProfileMeta {
+        id: id.into(),
+        base_provider: base.into(),
+        name: id.into(),
+        created_at: String::new(),
+        updated_at: String::new(),
+        backup: false,
+    }
+}
+
+fn ids(list: &Value) -> Vec<String> {
+    list["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+fn order_codes(err: Vec<FieldError>) -> Vec<(String, &'static str)> {
+    err.into_iter().map(|e| (e.field, e.code)).collect()
+}
+
+#[test]
+fn reorder_validation_requires_exactly_the_base_profiles() {
+    let saved = [
+        meta("pa", "codex"),
+        meta("px", "claude-code"),
+        meta("pb", "codex"),
+        meta("pc", "codex"),
+    ];
+    let owned = |ids: &[&str]| ids.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+
+    // Other bases keep their slots; the base's slots take the new order.
+    let after = reorder_profiles(&saved, "codex", &owned(&["pc", "pa", "pb"])).unwrap();
+    let order: Vec<&str> = after.iter().map(|p| p.id.as_str()).collect();
+    assert_eq!(order, ["pc", "px", "pa", "pb"]);
+
+    // A one-profile base accepts its single id unchanged.
+    assert_eq!(
+        reorder_profiles(&saved, "claude-code", &owned(&["px"])).unwrap(),
+        saved
+    );
+
+    let err = |base: &str, ids: &[&str]| {
+        order_codes(reorder_profiles(&saved, base, &owned(ids)).unwrap_err())
+    };
+    assert_eq!(
+        err("auggie", &[]),
+        [("baseProviderId".to_string(), "base-provider-unsupported")]
+    );
+    assert_eq!(
+        err("codex", &["pa", "pb"]),
+        [("profileIds".to_string(), "profile-order-incomplete")]
+    );
+    assert_eq!(
+        err("codex", &["pa", "pb", "pc", "pa"]),
+        [("profileIds[3]".to_string(), "profile-order-duplicate")]
+    );
+    assert_eq!(
+        err("codex", &["pa", "px", "pb", "pc"]),
+        [("profileIds[1]".to_string(), "profile-order-unknown")]
+    );
+    assert_eq!(
+        err("codex", &["pa", "pb", "pzz"]),
+        [
+            ("profileIds[2]".to_string(), "profile-order-unknown"),
+            ("profileIds".to_string(), "profile-order-incomplete"),
+        ]
+    );
+}
+
+#[intent_test_macros::daemon_test]
+async fn backup_round_trips_through_create_update_list_and_catalog() {
+    let fx = Fixture::new().await;
+    let mut sub = fx.subscribe();
+    let plain = fx.create("codex", "Plain", json!([])).await;
+    assert_eq!(
+        plain["profile"]["backup"], false,
+        "backup defaults to false"
+    );
+    let _ = recv_profiles_event(&mut sub).await;
+
+    let spare = fx
+        .svc
+        .provider_profiles_create_impl(
+            json!({ "baseProviderId": "codex", "name": "Spare", "backup": true }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(spare["profile"]["backup"], true);
+    let spare_id = spare["profile"]["id"].as_str().unwrap().to_string();
+    let ev = recv_profiles_event(&mut sub).await;
+    assert_eq!(ev["data"]["profile"]["backup"], true);
+
+    // The file stores the flag only when set.
+    let file: Value =
+        serde_json::from_str(&std::fs::read_to_string(fx.profiles_file()).unwrap()).unwrap();
+    assert!(file["profiles"][0].get("backup").is_none(), "{file}");
+    assert_eq!(file["profiles"][1]["backup"], true, "{file}");
+
+    // A backup-only update is a real change: one `updated` event, envChanged false.
+    let plain_id = plain["profile"]["id"].as_str().unwrap().to_string();
+    let updated = fx
+        .svc
+        .provider_profiles_update_impl(plain_id.clone(), json!({ "backup": true }))
+        .await
+        .unwrap();
+    assert_eq!(updated["profile"]["backup"], true);
+    assert_eq!(updated["profile"]["name"], "Plain");
+    assert_eq!(updated["activation"]["envChanged"], false);
+    assert_eq!(updated["revision"], 3);
+    let ev = recv_profiles_event(&mut sub).await;
+    assert_eq!(ev["data"]["change"], "updated");
+    assert_eq!(ev["data"]["envChanged"], false);
+    assert_eq!(ev["data"]["profile"]["backup"], true);
+
+    // Same value again: no-op, no revision bump.
+    let same = fx
+        .svc
+        .provider_profiles_update_impl(plain_id.clone(), json!({ "backup": true }))
+        .await
+        .unwrap();
+    assert_eq!(same["revision"], 3);
+
+    // Omitting backup on update leaves it unchanged.
+    let renamed = fx
+        .svc
+        .provider_profiles_update_impl(spare_id.clone(), json!({ "name": "Spare 2" }))
+        .await
+        .unwrap();
+    assert_eq!(renamed["profile"]["backup"], true);
+
+    // Non-boolean backup (explicit null included) is a malformed request;
+    // only an absent member means "default" / "keep".
+    for bad in [json!("yes"), json!(1), Value::Null, json!([]), json!({})] {
+        let err = fx
+            .svc
+            .provider_profiles_create_impl(
+                json!({ "baseProviderId": "codex", "name": "Bad", "backup": bad }),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), -32602);
+        let err = fx
+            .svc
+            .provider_profiles_update_impl(plain_id.clone(), json!({ "backup": bad }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), -32602);
+    }
+
+    let catalog = fx.svc.providers_catalog().await.unwrap();
+    let flags: Vec<bool> = catalog["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["backup"].as_bool().unwrap())
+        .collect();
+    assert_eq!(flags, [true, true]);
+
+    let fx = fx.restart().await;
+    let list = fx.svc.provider_profiles_list_impl(None).await.unwrap();
+    let flags: Vec<bool> = list["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["backup"].as_bool().unwrap())
+        .collect();
+    assert_eq!(flags, [true, true], "backup survives a restart");
+}
+
+#[intent_test_macros::daemon_test]
+async fn files_written_before_the_backup_field_load_as_not_backup() {
+    let fx = Fixture::new().await;
+    std::fs::write(
+        fx.profiles_file(),
+        json!({ "version": 1, "profiles": [{ "id": "pold", "baseProvider": "codex", "name": "Old", "createdAt": "", "updatedAt": "" }] }).to_string(),
+    )
+    .unwrap();
+    let fx = fx.restart().await;
+    let catalog = fx.svc.providers_catalog().await.unwrap();
+    assert_eq!(catalog["profiles"][0]["id"], "pold");
+    assert_eq!(catalog["profiles"][0]["backup"], false);
+}
+
+#[intent_test_macros::daemon_test]
+async fn reorder_persists_the_order_bumps_revision_and_emits_one_event_per_call() {
+    let fx = Fixture::new().await;
+    let mut names = Vec::new();
+    for (base, name) in [
+        ("codex", "A"),
+        ("claude-code", "X"),
+        ("codex", "B"),
+        ("codex", "C"),
+    ] {
+        let created = fx.create(base, name, json!([])).await;
+        names.push(created["profile"]["id"].as_str().unwrap().to_string());
+    }
+    let (a, x, b, c) = (&names[0], &names[1], &names[2], &names[3]);
+    let mut sub = fx.subscribe();
+
+    let result = fx
+        .svc
+        .provider_profiles_reorder_impl(
+            json!({ "baseProviderId": "codex", "profileIds": [c, a, b] }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result["revision"], 5);
+    assert_eq!(ids(&result), [c.clone(), a.clone(), b.clone()]);
+    assert_eq!(result["profiles"][0]["baseProviderId"], "codex");
+    assert!(
+        result["profiles"][0].get("env").is_some(),
+        "full Profile rows"
+    );
+
+    let ev = recv_profiles_event(&mut sub).await;
+    assert_eq!(
+        ev["data"],
+        json!({ "revision": 5, "change": "reordered", "baseProviderId": "codex" })
+    );
+    assert_eq!(ev["workspaceId"], "");
+
+    let list = fx.svc.provider_profiles_list_impl(None).await.unwrap();
+    assert_eq!(ids(&list), [c.clone(), x.clone(), a.clone(), b.clone()]);
+
+    // An unchanged order still commits: revision bump and one event.
+    let again = fx
+        .svc
+        .provider_profiles_reorder_impl(
+            json!({ "baseProviderId": "codex", "profileIds": [c, a, b] }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(again["revision"], 6);
+    let ev = recv_profiles_event(&mut sub).await;
+    assert_eq!(
+        ev["data"],
+        json!({ "revision": 6, "change": "reordered", "baseProviderId": "codex" })
+    );
+
+    // Invalid sets are field errors and write nothing.
+    let err = fx
+        .svc
+        .provider_profiles_reorder_impl(json!({ "baseProviderId": "codex", "profileIds": [a, b] }))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), -32602);
+    assert_eq!(
+        field_codes(&err),
+        [(
+            "profileIds".to_string(),
+            "profile-order-incomplete".to_string()
+        )]
+    );
+    for malformed in [
+        json!({ "profileIds": [] }),
+        json!({ "baseProviderId": "codex" }),
+        json!({ "baseProviderId": "codex", "profileIds": "a" }),
+        json!({ "baseProviderId": "codex", "profileIds": [1] }),
+    ] {
+        let err = fx
+            .svc
+            .provider_profiles_reorder_impl(malformed.clone())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidParams(_)),
+            "{malformed}: {err:?}"
+        );
+    }
+
+    // A failed reorder changes nothing: the next event is the next mutation.
+    fx.create("codex", "D", json!([])).await;
+    let ev = recv_profiles_event(&mut sub).await;
+    assert_eq!(ev["data"]["change"], "created");
+    assert_eq!(ev["data"]["revision"], 7);
+
+    let fx = fx.restart().await;
+    let list = fx
+        .svc
+        .provider_profiles_list_impl(Some("codex".into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        &ids(&list)[..3],
+        [c.clone(), a.clone(), b.clone()],
+        "order survives a restart"
+    );
+}
+
+#[intent_test_macros::daemon_test]
+async fn failed_reorder_response_read_changes_nothing() {
+    let fx = Fixture::new().await;
+    let a = fx.create("codex", "A", json!([])).await["profile"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let b = fx.create("codex", "B", json!([])).await["profile"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // An unreadable environment document makes the response rows fail.
+    SecretStore::store(&*fx.secrets, &env_account(&a), "{ not json").unwrap();
+    let before = std::fs::read(fx.profiles_file()).unwrap();
+    let revision = fx.svc.provider_profiles.revision();
+    let mut sub = fx.subscribe();
+
+    let err = fx
+        .svc
+        .provider_profiles_reorder_impl(json!({ "baseProviderId": "codex", "profileIds": [b, a] }))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), -32603, "{err:?}");
+
+    assert_eq!(std::fs::read(fx.profiles_file()).unwrap(), before);
+    assert_eq!(fx.svc.provider_profiles.revision(), revision);
+    let order: Vec<String> = fx
+        .svc
+        .provider_profiles
+        .profiles()
+        .unwrap()
+        .iter()
+        .map(|p| p.id.clone())
+        .collect();
+    assert_eq!(order, [a.clone(), b.clone()]);
+    // No `reordered` event: the next event is the next mutation.
+    fx.create("codex", "C", json!([])).await;
+    let ev = recv_profiles_event(&mut sub).await;
+    assert_eq!(ev["data"]["change"], "created");
+    assert_eq!(ev["data"]["revision"], revision + 1);
 }

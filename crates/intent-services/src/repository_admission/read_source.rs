@@ -47,6 +47,115 @@ pub(crate) fn refused() -> intent_core::Error {
     intent_core::Error::Forbidden(REFUSAL.into())
 }
 
+/// The step of a repo-less review read or monitor start that refused. Only
+/// ever logged on the daemon side; agents keep receiving the generic
+/// [`REFUSAL`] (intent-hq/intent#7449).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RefusalStage {
+    Capture,
+    Membership,
+    MembershipRecheck,
+    RootLookup,
+    SelectionRead,
+    LocalObservation,
+    SelectionRecheck,
+    TargetSelection,
+    ProjectPath,
+    HostCheck,
+    ReadChild,
+    ManagedRead,
+    CacheRead,
+    MonitorOwner,
+    MonitorAuthority,
+    OwnerMismatch,
+    OutputReservation,
+    AuthorityValidation,
+    SavedBinding,
+    AuthorityRegistry,
+}
+
+/// A staged admission failure, collapsed to [`refused`] at the wire edge by
+/// [`refused_with`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReadRefusal {
+    pub(crate) stage: RefusalStage,
+    pub(crate) error: AdmissionError,
+}
+
+trait Staged<T> {
+    fn at(self, stage: RefusalStage) -> Result<T, ReadRefusal>;
+}
+
+impl<T> Staged<T> for AdmissionResult<T> {
+    fn at(self, stage: RefusalStage) -> Result<T, ReadRefusal> {
+        self.map_err(|error| ReadRefusal { stage, error })
+    }
+}
+
+/// The reason a refusal is logged with: the admission error, the variant
+/// name of a non-provider cache failure, or a static description of a local
+/// check. Never an inner message.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum RefusalReason {
+    Admission(AdmissionError),
+    Cache(&'static str),
+    Detail(&'static str),
+}
+
+impl From<AdmissionError> for RefusalReason {
+    fn from(error: AdmissionError) -> Self {
+        Self::Admission(error)
+    }
+}
+
+impl From<&crate::pr_monitor::qualified_cache::CacheError> for RefusalReason {
+    fn from(error: &crate::pr_monitor::qualified_cache::CacheError) -> Self {
+        Self::Cache(error.kind())
+    }
+}
+
+impl std::fmt::Display for RefusalReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Admission(error) => write!(f, "{error:?}"),
+            Self::Cache(kind) => write!(f, "Cache{kind}"),
+            Self::Detail(detail) => f.write_str(detail),
+        }
+    }
+}
+
+/// Log why a repo-less review read or monitor start refused, then return the
+/// unchanged generic [`refused`]. Only static facts are logged: no URL,
+/// project path, token or provider payload.
+pub(crate) fn refused_with(
+    operation: &'static str,
+    workspace: &WorkspaceId,
+    number: u64,
+    stage: RefusalStage,
+    reason: impl Into<RefusalReason>,
+) -> intent_core::Error {
+    let reason = reason.into();
+    tracing::warn!(
+        workspace_id = %workspace,
+        operation,
+        pr_number = number,
+        stage = ?stage,
+        error = %reason,
+        "repository read refused"
+    );
+    refused()
+}
+
+/// [`refused_with`] for a [`ReadRefusal`].
+pub(crate) fn refused_at(
+    operation: &'static str,
+    workspace: &WorkspaceId,
+    number: u64,
+    refusal: ReadRefusal,
+) -> intent_core::Error {
+    refused_with(operation, workspace, number, refusal.stage, refusal.error)
+}
+
 pub(crate) fn unsupported() -> intent_core::Error {
     intent_core::Error::Unsupported("Addressed review monitoring unavailable".into())
 }
@@ -361,7 +470,16 @@ impl CapturedReview {
         Ok(captured)
     }
 
-    pub(crate) async fn resolve(mut self, services: &Services) -> AdmissionResult<ResolvedReview> {
+    pub(crate) async fn resolve(self, services: &Services) -> AdmissionResult<ResolvedReview> {
+        self.resolve_staged(services).await.map_err(|r| r.error)
+    }
+
+    /// As [`Self::resolve`], also naming the stage that refused.
+    pub(crate) async fn resolve_staged(
+        mut self,
+        services: &Services,
+    ) -> Result<ResolvedReview, ReadRefusal> {
+        use RefusalStage as Stage;
         if self.addressed
             && !self
                 .host
@@ -373,12 +491,15 @@ impl CapturedReview {
         services
             .require_member(&self.workspace)
             .await
-            .map_err(|e| local(&e))?;
+            .map_err(|e| local(&e))
+            .at(Stage::Membership)?;
         let root_id = RepositoryRootId {
             workspace_id: self.workspace.clone(),
             kind: self.root_kind.clone(),
         };
-        let root = RootRecord::read(&services.store, &root_id).await?;
+        let root = RootRecord::read(&services.store, &root_id)
+            .await
+            .at(Stage::RootLookup)?;
         if let Ok(child) = self.child.as_mut() {
             if let Err(error) =
                 child.subscribe(&[RepositoryLifecycleKey::Database, root.lifecycle_key()])
@@ -386,32 +507,42 @@ impl CapturedReview {
                 self.child = Err(error);
             }
         }
-        let selection = SelectionFacts::read(services, &root_id).await?;
+        let selection = SelectionFacts::read(services, &root_id)
+            .await
+            .at(Stage::SelectionRead)?;
         let observed = root
             .observe_local(
                 &services.store,
                 &services.worktree_locks,
-                resolver(self.settled.as_ref().ok())?,
+                resolver(self.settled.as_ref().ok()).at(Stage::LocalObservation)?,
             )
-            .await?;
+            .await
+            .at(Stage::LocalObservation)?;
         services
             .require_member(&self.workspace)
             .await
-            .map_err(|e| local(&e))?;
-        if SelectionFacts::read(services, &root_id).await? != selection {
-            return Err(AdmissionError::BindingChanged);
+            .map_err(|e| local(&e))
+            .at(Stage::MembershipRecheck)?;
+        if SelectionFacts::read(services, &root_id)
+            .await
+            .at(Stage::SelectionRecheck)?
+            != selection
+        {
+            return Err(AdmissionError::BindingChanged).at(Stage::SelectionRecheck);
         }
         let selected = selected_target(
             &observed,
             &selection,
             self.explicit.as_ref(),
             self.settled.as_ref().ok(),
-        )?;
+        )
+        .at(Stage::TargetSelection)?;
         if selected.provider == RepositoryProvider::Github {
             let (owner, name) = selected
                 .project_path
                 .rsplit_once('/')
-                .ok_or(AdmissionError::Unavailable)?;
+                .ok_or(AdmissionError::Unavailable)
+                .at(Stage::ProjectPath)?;
             return Ok(ResolvedReview::Github(RepoRef::new(owner, name)));
         }
         if !self
@@ -421,8 +552,8 @@ impl CapturedReview {
         {
             return Ok(ResolvedReview::Unsupported);
         }
-        let host = self.host?;
-        host.check_current()?;
+        let host = self.host.at(Stage::HostCheck)?;
+        host.check_current().at(Stage::HostCheck)?;
         Ok(ResolvedReview::Managed(Box::new(PreparedReview {
             host,
             workspace: self.workspace,
@@ -431,17 +562,25 @@ impl CapturedReview {
                 kind: RepositoryResourceKind::MergeRequest,
                 number: self.number,
             },
-            child: self.child?,
+            child: self.child.at(Stage::ReadChild)?,
             settled: self.settled,
             original: (root, GitFacts::from(observed), selection, self.explicit),
         })))
     }
 
+    #[cfg(test)]
     pub(crate) async fn read(self, services: &Services) -> AdmissionResult<ReadOutcome> {
-        match self.resolve(services).await? {
+        self.read_staged(services).await.map_err(|r| r.error)
+    }
+
+    /// As [`Self::read`], also naming the stage that refused.
+    pub(crate) async fn read_staged(self, services: &Services) -> Result<ReadOutcome, ReadRefusal> {
+        match self.resolve_staged(services).await? {
             ResolvedReview::Unsupported => Ok(ReadOutcome::Unsupported),
             ResolvedReview::Github(repo) => Ok(ReadOutcome::Github(repo)),
-            ResolvedReview::Managed(prepared) => prepared.read().await,
+            ResolvedReview::Managed(prepared) => {
+                prepared.read().await.at(RefusalStage::ManagedRead)
+            }
         }
     }
 }

@@ -211,12 +211,17 @@ pub const GIT_ROOT_REGISTERED: &str = "gitRoot:registered";
 pub const GIT_ROOT_UPDATED: &str = "gitRoot:updated";
 pub const GIT_ROOT_UNREGISTERED: &str = "gitRoot:unregistered";
 
+/// Versioned activity of an explicitly addressed discussion invocation.
+pub const DISCUSSION_ACTIVITY: &str = "discussion:activity";
+/// A newly persisted discussion message.
+pub const DISCUSSION_MESSAGE: &str = "discussion:message";
+/// Transient committed reaction metadata; never a new message.
+pub const DISCUSSION_REACTION: &str = "discussion:reaction";
+
 // Note events.
 pub const NOTE_CREATED: &str = "note:created";
 pub const NOTE_UPDATED: &str = "note:updated";
 pub const NOTE_DELETED: &str = "note:deleted";
-/// Bounded grace deletion registry invalidation, scoped to its workspace.
-pub const NOTE_DELETE_OPERATION: &str = "note:delete-operation";
 
 // Line-attribution events (new in intentd; PROTOCOL §5.2.1). Emitted after the
 // daemon recomputes per-line attributions for a note (post-mutation,
@@ -355,6 +360,16 @@ pub const WORKSPACE_DISPLAY_STATUS_CHANGED: &str = "workspace:displayStatus-chan
 // `{ workspaceId, waiting }` (§6.7) flips the workspace wait indicator with
 // no follow-up fetch.
 pub const WORKSPACE_WAITING_CHANGED: &str = "workspace:waiting-changed";
+// Orthogonal `Workspace.scriptsRunning` flag transition (PROTOCOL §5.1 /
+// §6.5): a command-mode script run entered or left flight. Self-sufficient
+// payload `{ workspaceId, scriptsRunning }` (§6.7).
+pub const WORKSPACE_SCRIPTS_RUNNING_CHANGED: &str = "workspace:scriptsRunning-changed";
+// Orthogonal `Workspace.backgroundTasksRunning` flag transition (PROTOCOL
+// §5.1 / §6.5): an agent of the workspace reported its first, or the
+// workspace lost its last, still-running §5.5b provider background task.
+// Self-sufficient payload `{ workspaceId, backgroundTasksRunning }` (§6.7).
+pub const WORKSPACE_BACKGROUND_TASKS_RUNNING_CHANGED: &str =
+    "workspace:backgroundTasksRunning-changed";
 /// Changed-only authoritative workspace task counts.
 pub const WORKSPACE_TASK_STATS_CHANGED: &str = "workspace:task-stats-changed";
 // Token/credit usage recomputed by the daemon-internal scan job (§5.23 / §19.1).
@@ -578,7 +593,16 @@ pub fn is_client_event_type(event_type: &str) -> bool {
 
 /// Every canonical event-type string in the taxonomy above. Useful for
 /// validation and the filter/subscription wiring added in later M2 tasks.
+pub const DESKTOP_PERMISSION_REQUESTED: &str = "desktop:permission-requested";
+pub const DESKTOP_PERMISSION_RESOLVED: &str = "desktop:permission-resolved";
+pub const DESKTOP_PERMISSION_CHANGED: &str = "desktop:permission-changed";
+pub const DESKTOP_SESSION_CHANGED: &str = "desktop:session-changed";
+
 pub const ALL_EVENT_TYPES: &[&str] = &[
+    DESKTOP_PERMISSION_REQUESTED,
+    DESKTOP_PERMISSION_RESOLVED,
+    DESKTOP_PERMISSION_CHANGED,
+    DESKTOP_SESSION_CHANGED,
     FILE_CHANGED,
     FILE_CREATED,
     FILE_DELETED,
@@ -639,10 +663,12 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     GIT_ROOT_REGISTERED,
     GIT_ROOT_UPDATED,
     GIT_ROOT_UNREGISTERED,
+    DISCUSSION_MESSAGE,
+    DISCUSSION_ACTIVITY,
+    DISCUSSION_REACTION,
     NOTE_CREATED,
     NOTE_UPDATED,
     NOTE_DELETED,
-    NOTE_DELETE_OPERATION,
     LINE_ATTRIBUTION_UPDATED,
     TASK_CREATED,
     TASK_UPDATED,
@@ -694,6 +720,8 @@ pub const ALL_EVENT_TYPES: &[&str] = &[
     WORKSPACE_ATTENTION_CHANGED,
     WORKSPACE_DISPLAY_STATUS_CHANGED,
     WORKSPACE_WAITING_CHANGED,
+    WORKSPACE_SCRIPTS_RUNNING_CHANGED,
+    WORKSPACE_BACKGROUND_TASKS_RUNNING_CHANGED,
     WORKSPACE_TASK_STATS_CHANGED,
     WORKSPACE_TOKEN_USAGE_CHANGED,
     WORKSPACE_CONTEXT_CHANGED,
@@ -824,6 +852,8 @@ pub const EVENT_DISCRIMINATORS: &[EventDiscriminator] = &[
             "repositoryName",
             "repositoryOwner",
             "repositoryPath",
+            "retiredAt",
+            "revived",
             "scope",
             "setupScript",
             "skipIsolation",
@@ -914,6 +944,13 @@ pub const COLLABORATOR_EVENT_TYPES: &[(&str, &str)] = &[
     (COMMENT_ADDED, "Comment: a comment landed on a note."),
     (COMMENT_DELETED, "Comment: a comment was deleted from a note."),
     (COMMENT_RESOLVED, "Comment: a thread was resolved."),
+    (DESKTOP_PERMISSION_CHANGED, "Desktop authority: only the retained granting principal with workspace access; live and durable delivery also enforce the exact authorized connection incarnation."),
+    (DESKTOP_PERMISSION_REQUESTED, "Desktop authority: only the retained granting principal with workspace access; live and durable delivery also enforce the exact authorized connection incarnation."),
+    (DESKTOP_PERMISSION_RESOLVED, "Desktop authority: only the retained granting principal with workspace access; live and durable delivery also enforce the exact authorized connection incarnation."),
+    (DESKTOP_SESSION_CHANGED, "Desktop authority: only the retained granting principal with workspace access; live and durable delivery also enforce the exact authorized connection incarnation."),
+    (DISCUSSION_ACTIVITY, "Discussion: versioned activity for one explicitly addressed invocation."),
+    (DISCUSSION_MESSAGE, "Human discussion: authenticated member message in the workspace."),
+    (DISCUSSION_REACTION, "Human discussion: participant-visible reaction metadata update."),
     (DRAFT_CHANGED, "Draft: a client's composer draft exists or was cleared; { workspaceId, agentId, clientId, hasDraft } — never the text."),
     (FILE_CHANGED, "File: a watched file changed; payload paths are workspace-relative (`events::watcher::relative_path`), never absolute."),
     (FILE_CREATED, "File: a watched file was created; workspace-relative path."),
@@ -932,7 +969,6 @@ pub const COLLABORATOR_EVENT_TYPES: &[(&str, &str)] = &[
     (HOOK_SCHEDULED, "Hook lifecycle: a hook was registered; hook id, name and schedule."),
     (LINE_ATTRIBUTION_UPDATED, "Note: per-line authorship of a note changed."),
     (NOTE_CREATED, "Note: a note was created."),
-    (NOTE_DELETE_OPERATION, "Note: a cancellable deletion changed state."),
     (NOTE_DELETED, "Note: a note was deleted."),
     (NOTE_PRESENCE, "Presence: a member joined / moved its caret in / left a note the guest is a member of; principal profile fields and a caret position (rev/anchor/head) only. Transient."),
     (NOTE_UPDATED, "Note: note content or metadata changed."),
@@ -965,6 +1001,7 @@ pub const COLLABORATOR_EVENT_TYPES: &[(&str, &str)] = &[
     (WORKSPACE_ACTIVITY, "Workspace: activity heartbeat of a workspace the guest is a member of."),
     (WORKSPACE_ACTIVITY_CHANGED, "Workspace: the aggregated activity marker changed (workspace channel delta)."),
     (WORKSPACE_ATTENTION_CHANGED, "Workspace: the attention marker changed (workspace channel delta)."),
+    (WORKSPACE_BACKGROUND_TASKS_RUNNING_CHANGED, "Workspace: the agent-background-tasks-running marker changed (workspace channel delta)."),
     (WORKSPACE_CLOSED, "Workspace: a workspace was closed; id only."),
     (WORKSPACE_CONTEXT_CHANGED, "Workspace: context items (note/link references) changed."),
     (WORKSPACE_CREATED, "Workspace: a workspace row was created (workspace channel delta; rows are membership-filtered in the service layer)."),
@@ -973,6 +1010,7 @@ pub const COLLABORATOR_EVENT_TYPES: &[(&str, &str)] = &[
     (WORKSPACE_DELETED, "Workspace: a workspace row was deleted; id only."),
     (WORKSPACE_DISPLAY_STATUS_CHANGED, "Workspace: the display status changed (workspace channel delta)."),
     (WORKSPACE_OPENED, "Workspace: a workspace was opened; id only."),
+    (WORKSPACE_SCRIPTS_RUNNING_CHANGED, "Workspace: the command-scripts-running marker changed (workspace channel delta)."),
     (WORKSPACE_SETUP_COMPLETED, "Workspace: setup finished; id and outcome."),
     (WORKSPACE_SETUP_STARTED, "Workspace: setup started; id only."),
     (WORKSPACE_TASK_STATS_CHANGED, "Workspace: authoritative task statistics changed."),

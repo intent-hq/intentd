@@ -10,7 +10,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
@@ -19,8 +19,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use intent_core::{
-    now_iso, PullRequestStatus, Result as CoreResult, Workspace, WorkspaceActivity, WorkspaceApi,
-    WorkspaceAttention, WorkspaceId, WorkspaceStatus,
+    now_iso, PullRequestStatus, Result as CoreResult, Workspace, WorkspaceApi, WorkspaceId,
 };
 use intent_services::{AgentManager, BusEventSink, EventBus, Services};
 use intent_sourcecontrol::{
@@ -379,49 +378,12 @@ async fn boot(forge: StubForge, linkable: bool, pr_status: Option<PullRequestSta
         } else {
             String::new()
         },
-        base_ref: None,
-        base_commit_sha: None,
-        status: WorkspaceStatus::Active,
-        status_message: None,
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
-        attention: WorkspaceAttention::None,
         created_at: ts.clone(),
         updated_at: ts,
-        last_activity: None,
-        last_content_activity: None,
-        tags: vec![],
-        path: None,
-        repository_path: None,
         repository_owner: linkable.then(|| "o".into()),
         repository_name: linkable.then(|| "r".into()),
-        worktree_path: None,
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
-        default_model: None,
-        pr_number: None,
-        pr_url: None,
         pr_status,
-        active_pull_request: None,
-        pull_requests: None,
-        context_links: None,
-        archived: false,
-        archived_at: None,
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        pull_requests_total: None,
-        display_status: None,
-        waiting: false,
-        checkout_mode: None,
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
+        ..Default::default()
     };
     store.insert_workspace(&ws).await.expect("seed workspace");
 
@@ -524,24 +486,28 @@ async fn next_event(ws: &mut TlsWs, event_type: &str) -> Value {
 /// Assert no `workspace:displayStatus-changed` notification arrives within the
 /// window (transition-only emission — no spam on no-op recomputes).
 async fn assert_no_display_status_event(ws: &mut TlsWs) {
-    let res = timeout(Duration::from_millis(500), async {
-        loop {
-            match ws.next().await.unwrap().unwrap() {
-                Message::Text(text) => {
-                    let v: Value = serde_json::from_str(&text).unwrap();
-                    if v["method"] == json!("events.event")
-                        && v["params"]["event"]["type"] == json!("workspace:displayStatus-changed")
-                    {
-                        return v["params"]["event"].clone();
+    let res = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(500)),
+        async {
+            loop {
+                match ws.next().await.unwrap().unwrap() {
+                    Message::Text(text) => {
+                        let v: Value = serde_json::from_str(&text).unwrap();
+                        if v["method"] == json!("events.event")
+                            && v["params"]["event"]["type"]
+                                == json!("workspace:displayStatus-changed")
+                        {
+                            return v["params"]["event"].clone();
+                        }
                     }
+                    Message::Ping(p) => {
+                        let _ = ws.send(Message::Pong(p)).await;
+                    }
+                    _ => {}
                 }
-                Message::Ping(p) => {
-                    let _ = ws.send(Message::Pong(p)).await;
-                }
-                _ => {}
             }
-        }
-    })
+        },
+    )
     .await;
     assert!(res.is_err(), "unexpected displayStatus event: {res:?}");
 }

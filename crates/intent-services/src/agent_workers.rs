@@ -18,6 +18,14 @@ use intent_acp::workers::WorkerFrame;
 use intent_core::{AgentId, WorkspaceId};
 use serde_json::{json, Map, Value};
 
+/// `interrupted_agent.reason` for an agent that a graceful shutdown captured
+/// while its provider still ran a background worker. The shutdown kills the
+/// provider tree and every worker with it, so the worker's completion report
+/// never arrives; the tag lets the restart resume tell the agent so. Not an
+/// `InterruptReason` wire value, and not resumed by the wake orchestrator
+/// (which takes only `system_suspend` rows).
+pub(crate) const INTERRUPTED_WITH_WORKERS_REASON: &str = "background_workers";
+
 /// Rows retained per generation.
 pub(crate) const MAX_ROWS: usize = 256;
 /// Distinct task IDs admitted per generation (tombstones included).
@@ -27,7 +35,7 @@ const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
 const SUBAGENT_TASK_TYPES: [&str; 2] = ["agent", "local_agent"];
 const TERMINAL: [&str; 3] = ["completed", "failed", "stopped"];
 
-/// One reviewed adapter pin.
+/// One supported adapter, at the version the daemon pins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Adapter {
     /// Base provider ID (profiles `id@name` share it).
@@ -40,20 +48,46 @@ pub(crate) struct Adapter {
     pub source: &'static str,
 }
 
-/// The reviewed adapter allowlist (§5.5b table). Any other provider or version
-/// is unsupported until reviewed; `claude_allowlist_tracks_the_pinned_adapter`
-/// fails when the Claude adapter pin moves without a review here.
+/// Split a pinned npm package spec (`@scope/name@1.2.3`) into its name and
+/// version at the last `@`; a spec without a version fails the build.
+const fn split_package_spec(spec: &'static str) -> (&'static str, &'static str) {
+    let bytes = spec.as_bytes();
+    let mut at = bytes.len();
+    while at > 1 {
+        at -= 1;
+        if bytes[at] == b'@' {
+            let (name, rest) = bytes.split_at(at);
+            let (_, version) = rest.split_at(1);
+            if version.is_empty() {
+                break;
+            }
+            return match (std::str::from_utf8(name), std::str::from_utf8(version)) {
+                (Ok(name), Ok(version)) => (name, version),
+                _ => panic!("adapter package spec is not UTF-8"),
+            };
+        }
+    }
+    panic!("adapter package spec has no `@<version>`");
+}
+
+const CODEX_PIN: (&str, &str) = split_package_spec(intent_providers::CODEX_ACP_NPX_PACKAGE);
+const CLAUDE_PIN: (&str, &str) = split_package_spec(intent_providers::CLAUDE_AGENT_ACP_NPX_PACKAGE);
+
+/// The supported adapters (§5.5b table), each at the version the daemon pins,
+/// so an adapter pin bump moves worker support with it. A session whose
+/// adapter reports any other name or version is `adapter-version` unsupported;
+/// other providers stay unsupported until reviewed and listed here.
 pub(crate) const SUPPORTED_ADAPTERS: [Adapter; 2] = [
     Adapter {
         provider: "codex",
-        name: "@agentclientprotocol/codex-acp",
-        version: "2.2.2",
+        name: CODEX_PIN.0,
+        version: CODEX_PIN.1,
         source: "codex-air",
     },
     Adapter {
         provider: "claude-code",
-        name: "@agentclientprotocol/claude-agent-acp",
-        version: "0.81.1",
+        name: CLAUDE_PIN.0,
+        version: CLAUDE_PIN.1,
         source: "claude-air",
     },
 ];
@@ -679,6 +713,31 @@ impl AgentWorkers {
         self.lock()
             .get(agent_id)
             .is_some_and(|e| e.projection.has_running_workers())
+    }
+
+    /// Whether any agent of `workspace_id` has a current generation that
+    /// vouches for a running worker ([`Projection::has_running_workers`]) —
+    /// the `Workspace.backgroundTasksRunning` roll-up (PROTOCOL §5.1). One
+    /// leaf lock, no I/O.
+    pub(crate) fn workspace_has_running_workers(&self, workspace_id: &WorkspaceId) -> bool {
+        self.lock().values().any(|e| {
+            e.projection.scope.workspace_id == *workspace_id && e.projection.has_running_workers()
+        })
+    }
+
+    /// Every agent whose current generation vouches for a running worker
+    /// ([`Projection::has_running_workers`]), with its workspace, sorted by
+    /// agent ID. Graceful shutdown enrolls these as interrupted before it
+    /// tears their providers (and so their workers) down.
+    pub(crate) fn running_worker_agents(&self) -> Vec<(AgentId, WorkspaceId)> {
+        let mut agents: Vec<(AgentId, WorkspaceId)> = self
+            .lock()
+            .iter()
+            .filter(|(_, e)| e.projection.has_running_workers())
+            .map(|(id, e)| (id.clone(), e.projection.scope.workspace_id.clone()))
+            .collect();
+        agents.sort();
+        agents
     }
 
     /// Resolve a stop request. `None` is not-found.

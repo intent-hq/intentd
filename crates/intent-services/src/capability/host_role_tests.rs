@@ -84,8 +84,12 @@ async fn scoped_owner_projection_matches_service_rights_and_role_loss() {
         };
         assert_owner(&svc.get_workspace(owned.clone()).await.unwrap());
         for rows in [
-            svc.list_workspaces(true).await.unwrap(),
-            svc.list_workspaces_lite(true).await.unwrap(),
+            svc.list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+                .await
+                .unwrap(),
+            svc.list_workspaces_lite(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+                .await
+                .unwrap(),
         ] {
             assert_eq!(rows.len(), 1);
             assert_owner(&rows[0]);
@@ -137,7 +141,11 @@ async fn scoped_owner_projection_matches_service_rights_and_role_loss() {
             svc.get_workspace(owned.clone()).await,
             Err(Error::NotFound(_))
         ));
-        assert!(svc.list_workspaces_lite(true).await.unwrap().is_empty());
+        assert!(svc
+            .list_workspaces_lite(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .unwrap()
+            .is_empty());
     })
     .await;
 }
@@ -454,7 +462,11 @@ async fn host_member_reads_current_and_future_workspaces_without_direct_grants()
     let tmp = TempDb::new();
     let (svc, owner, member) = fixture(&tmp).await;
     with_caller(caller(&member), async {
-        assert!(svc.list_workspaces(true).await.unwrap().is_empty());
+        assert!(svc
+            .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .unwrap()
+            .is_empty());
         for id in ["existing", "future"] {
             let ws = workspace(&WorkspaceId::from(id));
             svc.store.insert_workspace(&ws).await.unwrap();
@@ -464,8 +476,12 @@ async fn host_member_reads_current_and_future_workspaces_without_direct_grants()
             assert_eq!(got["canManage"], true);
         }
         for rows in [
-            svc.list_workspaces(true).await.unwrap(),
-            svc.list_workspaces_lite(true).await.unwrap(),
+            svc.list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+                .await
+                .unwrap(),
+            svc.list_workspaces_lite(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+                .await
+                .unwrap(),
         ] {
             assert_eq!(rows.len(), 2);
             for row in rows {
@@ -566,8 +582,18 @@ async fn host_member_lifecycle_uses_existing_archive_and_incremental_delete() {
             .unwrap();
         assert!(archived.archived);
         assert!(archived.membership.unwrap().can_manage);
-        assert!(svc.list_workspaces(false).await.unwrap().is_empty());
-        assert_eq!(svc.list_workspaces(true).await.unwrap().len(), 1);
+        assert!(svc
+            .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            svc.list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
         let restored = svc.unarchive_workspace(created.id.clone()).await.unwrap();
         assert!(!restored.archived);
         assert!(restored.membership.unwrap().can_manage);
@@ -626,7 +652,10 @@ async fn workspace_guests_unknown_and_unbound_cannot_gain_host_capabilities() {
     // Deliberately retain the old admitted member role: only durable grants count.
     with_caller(caller(&member), async {
         assert_execution_reads_refused(&svc).await;
-        let rows = svc.list_workspaces(true).await.unwrap();
+        let rows = svc
+            .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, shared);
         assert!(!rows[0].membership.as_ref().unwrap().can_manage);
@@ -662,7 +691,10 @@ async fn workspace_guests_unknown_and_unbound_cannot_gain_host_capabilities() {
     .await;
     with_caller(caller(&PrincipalId::new()), async {
         assert_execution_reads_refused(&svc).await;
-        assert!(svc.list_workspaces(true).await.is_err());
+        assert!(svc
+            .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .is_err());
         assert!(svc.principal_me().await.is_err());
         assert!(svc
             .require_workspace_creator("workspace.create")
@@ -724,7 +756,11 @@ async fn removed_member_cannot_reuse_admitted_role_or_reconnect_credential() {
                 .can_manage
         );
         svc.store.remove_host_member(&member).await.unwrap();
-        assert!(svc.list_workspaces(true).await.unwrap().is_empty());
+        assert!(svc
+            .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .unwrap()
+            .is_empty());
         assert!(matches!(
             svc.get_workspace(ws.clone()).await,
             Err(Error::NotFound(_))
@@ -828,9 +864,13 @@ async fn host_member_list_authority_cost_does_not_grow_per_workspace() {
     // would otherwise enter a later measured span.
     crate::test_tracing::warm_sqlx_pool(svc.store.read_pool()).await;
     with_caller(caller(&member), async {
-        svc.list_workspaces_lite(true).await.unwrap();
-        let (first, small) =
-            crate::test_tracing::count_sqlx_statements(svc.list_workspaces_lite(true)).await;
+        svc.list_workspaces_lite(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .unwrap();
+        let (first, small) = crate::test_tracing::count_sqlx_statements(
+            svc.list_workspaces_lite(intent_core::WorkspaceListFilter::WITH_ARCHIVED),
+        )
+        .await;
         assert_eq!(first.unwrap().len(), 1);
         for i in 0..40 {
             svc.store
@@ -838,9 +878,13 @@ async fn host_member_list_authority_cost_does_not_grow_per_workspace() {
                 .await
                 .unwrap();
         }
-        svc.list_workspaces_lite(true).await.unwrap();
-        let (many, large) =
-            crate::test_tracing::count_sqlx_statements(svc.list_workspaces_lite(true)).await;
+        svc.list_workspaces_lite(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .unwrap();
+        let (many, large) = crate::test_tracing::count_sqlx_statements(
+            svc.list_workspaces_lite(intent_core::WorkspaceListFilter::WITH_ARCHIVED),
+        )
+        .await;
         let many = many.unwrap();
         assert_eq!(many.len(), 41);
         assert!(many
@@ -1026,9 +1070,12 @@ async fn member_execution_enablement_projects_complete_canonical_policy() {
         "an empty effective list is still present"
     );
     assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(25), forge.accept())
-            .await
-            .is_err(),
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(std::time::Duration::from_millis(25)),
+            forge.accept()
+        )
+        .await
+        .is_err(),
         "policy/configured reads must not probe repository authorization"
     );
 }
@@ -1120,11 +1167,12 @@ async fn member_execution_enablement_events_follow_committed_changes_and_reset()
         .unwrap();
         assert_eq!(noop["revision"], update["revision"]);
         assert_eq!(noop["applied"], json!([]));
-        assert!(
-            tokio::time::timeout(Duration::from_millis(25), events.recv())
-                .await
-                .is_err()
-        );
+        assert!(tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(25)),
+            events.recv()
+        )
+        .await
+        .is_err());
     }
     let reset = with_caller(
         Caller::Daemon,
@@ -1153,11 +1201,12 @@ async fn member_execution_enablement_events_follow_committed_changes_and_reset()
         .await
         .unwrap();
     assert_eq!(noop["revision"], reset["revision"]);
-    assert!(
-        tokio::time::timeout(Duration::from_millis(75), events.recv())
-            .await
-            .is_err()
-    );
+    assert!(tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(75)),
+        events.recv()
+    )
+    .await
+    .is_err());
     worker.abort();
     let _ = worker.await;
 }
@@ -1334,7 +1383,7 @@ async fn member_terminal_ids_resolve_the_workspace_and_recheck_revocation() {
 
 #[tokio::test]
 async fn member_execution_errors_are_classified_and_sanitized_without_changing_owner_errors() {
-    use crate::host_execution::{ai_authorization_error, forge_error, git_error};
+    use crate::execution_call::{ai_authorization_error, forge_error, git_error};
     use intent_core::execution::ExecutionAuthorizationReason as Reason;
     use intent_sourcecontrol::Error as ScError;
     let tmp = TempDb::new();
@@ -1538,7 +1587,7 @@ async fn member_execution_context_events_cover_policy_setup_and_unchanged_config
     with_caller(
         caller(&member),
         svc.execution_call(async {
-            let _ = crate::host_execution::forge_error(intent_sourcecontrol::Error::Auth(
+            let _ = crate::execution_call::forge_error(intent_sourcecontrol::Error::Auth(
                 "private response".into(),
             ));
             Ok(())
@@ -1595,107 +1644,6 @@ async fn member_execution_context_events_cover_policy_setup_and_unchanged_config
     assert!(!batch[0].data.to_string().contains("no-leak"));
     worker.abort();
     let _ = worker.await;
-}
-
-#[tokio::test]
-async fn member_import_handles_remain_owned_by_the_authenticated_initiator() {
-    use base64::Engine as _;
-    let tmp = TempDb::new();
-    let (svc, _, member) = fixture(&tmp).await;
-    let manifest = json!({"formatVersion":intent_core::transfer::TRANSFER_FORMAT_VERSION,
-        "creatingIntentdVersion":intent_core::transfer::CREATING_INTENTD_VERSION,"workspaceId":"member-import",
-        "createdAt":now_iso(),"tables":[],"assets":[],"attachments":[],
-        "git":{"hasRepository":false,"dirtyFiles":[],"sandboxBranches":[]}});
-    let started = with_caller(
-        caller(&member),
-        svc.workspace_import_begin(manifest, 3, "0".repeat(64)),
-    )
-    .await
-    .unwrap();
-    let id = started["importId"].as_str().unwrap().to_string();
-    let data = base64::engine::general_purpose::STANDARD.encode(b"abc");
-    let mut second = svc.store.get_primary_principal().await.unwrap();
-    second.id = PrincipalId::new();
-    second.is_primary = false;
-    svc.store.upsert_principal(&second).await.unwrap();
-    sqlx::query("INSERT INTO host_member(principal_id,added_at) VALUES (?,?)")
-        .bind(second.id.as_str())
-        .bind(now_iso())
-        .execute(svc.store.write_pool())
-        .await
-        .unwrap();
-    with_caller(caller(&second.id), async {
-        assert!(matches!(
-            svc.workspace_import_chunk(id.clone(), 0, data.clone())
-                .await,
-            Err(Error::NotFound(_))
-        ));
-        assert!(matches!(
-            svc.workspace_import_commit(id.clone()).await,
-            Err(Error::NotFound(_))
-        ));
-        assert!(matches!(
-            svc.workspace_import_abort(id.clone()).await,
-            Err(Error::NotFound(_))
-        ));
-    })
-    .await;
-    with_caller(caller(&member), async {
-        svc.workspace_import_chunk(id.clone(), 0, data.clone())
-            .await
-            .unwrap();
-        svc.workspace_import_abort(id.clone()).await.unwrap();
-    })
-    .await;
-}
-
-#[tokio::test]
-async fn member_export_handles_remain_owned_by_the_authenticated_initiator() {
-    use crate::transfer_export::{ExportSession, ExportState};
-    let tmp = TempDb::new();
-    let (svc, _, member) = fixture(&tmp).await;
-    let ws = WorkspaceId::new();
-    svc.store.insert_workspace(&workspace(&ws)).await.unwrap();
-    let export_id = "member-export".to_string();
-    svc.transfer_exports.lock().unwrap().insert(
-        export_id.clone(),
-        ExportSession {
-            initiator: Some(member.clone()),
-            workspace_id: ws,
-            staging_dir: tmp.path.with_extension("export"),
-            state: ExportState::Building { aborted: false },
-            wip_paths: vec![],
-            max_chunk_bytes: 16,
-        },
-    );
-    let mut other = svc.store.get_principal(&member).await.unwrap();
-    other.id = PrincipalId::new();
-    svc.store.upsert_principal(&other).await.unwrap();
-    sqlx::query("INSERT INTO host_member(principal_id,added_at) VALUES (?,?)")
-        .bind(other.id.as_str())
-        .bind(now_iso())
-        .execute(svc.store.write_pool())
-        .await
-        .unwrap();
-    with_caller(caller(&other.id), async {
-        assert!(matches!(
-            svc.workspace_export_read(export_id.clone(), 0).await,
-            Err(Error::NotFound(_))
-        ));
-        assert!(matches!(
-            svc.workspace_export_finalize(export_id.clone(), false, None)
-                .await,
-            Err(Error::NotFound(_))
-        ));
-        assert!(matches!(
-            svc.workspace_export_abort(export_id.clone()).await,
-            Err(Error::NotFound(_))
-        ));
-    })
-    .await;
-    with_caller(caller(&member), svc.workspace_export_abort(export_id))
-        .await
-        .unwrap();
 }
 
 #[tokio::test]

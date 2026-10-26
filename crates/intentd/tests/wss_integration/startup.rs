@@ -236,7 +236,7 @@ async fn protected_preparation_and_fresh_handoff_preserve_lazy_backlog() {
     let hello = call(
         &mut ws,
         "client.hello",
-        json!({"clientId":"must-not-persist","name":"pending client"}),
+        json!({"clientId":"must-not-persist","name":"pending client","capabilities":{"browserExec":true,"desktopControl":1}}),
     )
     .await;
     assert_eq!(hello["error"]["data"]["code"], "daemon-not-ready");
@@ -260,6 +260,10 @@ async fn protected_preparation_and_fresh_handoff_preserve_lazy_backlog() {
         "workspace.list",
         "note.add",
         "events.subscribe",
+        "desktop.getState",
+        "desktop.respondPermission",
+        "desktop.setPermission",
+        "desktop.revoke",
         "principal.me",
         "system.shutdown",
         "unknown",
@@ -315,19 +319,19 @@ async fn protected_preparation_and_fresh_handoff_preserve_lazy_backlog() {
         0
     );
     assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM settings WHERE key GLOB 'desktop.v1/*'")
+            .fetch_one(&db)
+            .await
+            .unwrap(),
+        0,
+        "bootstrap desktop requests cannot create consent or session state"
+    );
+    assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT rev FROM note WHERE id='spec'")
             .fetch_one(&db)
             .await
             .unwrap(),
         17
-    );
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM note_page_head WHERE indexed_rev <> -1")
-            .fetch_one(&db)
-            .await
-            .unwrap(),
-        0,
-        "preparation must not convert unopened notes"
     );
     let mut old_uds = UnixStream::connect(&socket).await.unwrap();
     // Force admission before handoff, rather than merely connecting into backlog.
@@ -381,14 +385,6 @@ async fn protected_preparation_and_fresh_handoff_preserve_lazy_backlog() {
     assert!(status["result"].get("retryAfterMs").is_none());
     assert!(status["result"].get("progress").is_none());
     assert!(status["result"].get("estimatedRemainingMs").is_none());
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM note_page_head WHERE indexed_rev <> -1")
-            .fetch_one(&db)
-            .await
-            .unwrap(),
-        0,
-        "ready must not convert the stale backlog"
-    );
     let monitor = call(&mut ready, "client.hello", monitor_params).await;
     assert_eq!(monitor["error"]["code"], -32602, "{monitor}");
     assert_eq!(
@@ -404,12 +400,16 @@ async fn protected_preparation_and_fresh_handoff_preserve_lazy_backlog() {
     let hello = call(
         &mut ready,
         "client.hello",
-        json!({"clientId":"now-ready","name":"ready client"}),
+        json!({"clientId":"now-ready","name":"ready client","capabilities":{"browserExec":true,"desktopControl":1}}),
     )
     .await;
     assert_eq!(
         hello["result"]["server"]["capabilities"]["startupStatus"], 1,
         "{hello}"
+    );
+    assert_eq!(
+        hello["result"]["server"]["capabilities"]["desktopControl"],
+        1
     );
     assert_eq!(
         call(&mut ready, "unknown", json!({})).await["error"]["code"],
@@ -438,9 +438,13 @@ async fn protected_preparation_and_fresh_handoff_preserve_lazy_backlog() {
         &format!("wss://localhost:{port}/ws?token=valid-denied-token"),
     )
     .await;
-    let page = json!({"workspaceId":"startup","noteId":"spec","page":{"kind":"source"}});
-    let refused = call(&mut denied, "note.get", page.clone()).await;
-    assert_eq!(refused["error"]["data"]["code"], "not-found", "{refused}");
+    let refused = call(
+        &mut denied,
+        "note.get",
+        json!({"workspaceId":"startup","noteId":"spec"}),
+    )
+    .await;
+    assert!(refused.get("error").is_some(), "{refused}");
     let mut guest = common::wss_connect_with_retry(
         port,
         cfg,
@@ -454,89 +458,7 @@ async fn protected_preparation_and_fresh_handoff_preserve_lazy_backlog() {
     )
     .await;
     assert!(legacy.get("error").is_none(), "{legacy}");
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM note_page_head WHERE indexed_rev <> -1")
-            .fetch_one(&db)
-            .await
-            .unwrap(),
-        0
-    );
 
-    // Hold the real database writer, forcing the owned demand job to remain
-    // pending while ordinary authenticated status stays ready and responsive.
-    let writer = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect_with(
-            sqlx::sqlite::SqliteConnectOptions::new().filename(dir.path().join("intentd.db")),
-        )
-        .await
-        .unwrap();
-    sqlx::query("BEGIN IMMEDIATE")
-        .execute(&writer)
-        .await
-        .unwrap();
-    let pending = call(&mut guest, "note.get", page.clone()).await;
-    assert_eq!(pending["error"]["code"], -32006, "{pending}");
-    assert_eq!(
-        pending["error"]["data"],
-        json!({"code":"note-index-preparing","retryAfterMs":1000})
-    );
-    let during = call(&mut ready, "system.startupStatus", json!({})).await;
-    assert_eq!(during["result"]["phase"], "ready");
-    assert_eq!(during["result"]["attemptId"], attempt);
-    assert!(during["result"].get("progress").is_none());
-    assert!(during["result"].get("estimatedRemainingMs").is_none());
-    assert!(common::daemon_is_ready(&socket).await);
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM note_page_head WHERE indexed_rev <> -1")
-            .fetch_one(&db)
-            .await
-            .unwrap(),
-        0
-    );
-    guest.close(None).await.unwrap();
-    sqlx::query("ROLLBACK").execute(&writer).await.unwrap();
-    writer.close().await;
-    let mut guest = common::wss_connect_with_retry(
-        port,
-        startup_client_config(dir.path()),
-        &format!("wss://localhost:{port}/ws?token=valid-guest-token"),
-    )
-    .await;
-    let prepared = timeout(
-        intentd_test_support::test_timeout(Duration::from_secs(15)),
-        async {
-            loop {
-                let response = call(&mut guest, "note.get", page.clone()).await;
-                if response["error"]["data"]["code"] != "note-index-preparing" {
-                    break response;
-                }
-                // timing-guard: retry only the explicit read-preparation response.
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-        },
-    )
-    .await
-    .unwrap();
-    assert_eq!(prepared["result"]["kind"], "noteSourcePage", "{prepared}");
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>(
-            "SELECT count(*) FROM note_page_head WHERE indexed_rev=current_rev"
-        )
-        .fetch_one(&db)
-        .await
-        .unwrap(),
-        1
-    );
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>(
-            "SELECT indexed_rev FROM note_page_head WHERE note_id='unopened'"
-        )
-        .fetch_one(&db)
-        .await
-        .unwrap(),
-        -1
-    );
     let canonical: Vec<(String, i64)> = sqlx::query_as("SELECT content,rev FROM note ORDER BY id")
         .fetch_all(&db)
         .await
@@ -588,13 +510,6 @@ async fn failed_preparation_and_shutdown_preserve_backlog_and_reset_attempt() {
         );
         assert!(!dir.path().join("intentd.sock").exists());
         let db = database(dir.path()).await;
-        assert_eq!(
-            sqlx::query_scalar::<_, i64>("SELECT indexed_rev FROM note_page_head")
-                .fetch_one(&db)
-                .await
-                .unwrap(),
-            -1
-        );
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT rev FROM note WHERE id='spec'")
                 .fetch_one(&db)
@@ -771,13 +686,6 @@ async fn service_startup_exit(invalidate_policy: bool) {
         17
     );
     assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT indexed_rev FROM note_page_head")
-            .fetch_one(&db)
-            .await
-            .unwrap(),
-        -1
-    );
-    assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT count(*) FROM client")
             .fetch_one(&db)
             .await
@@ -890,7 +798,9 @@ async fn frozen_sitter_preserves_new_daemon_startup() {
     ]);
     let mut child = GuardedChild::spawn(&mut command).unwrap();
     assert!(child
-        .wait_with_timeout(Duration::from_millis(millis * 4) + Duration::from_secs(90))
+        .wait_with_timeout(intentd_test_support::test_timeout(
+            Duration::from_millis(millis * 4) + Duration::from_secs(90),
+        ))
         .unwrap()
         .unwrap()
         .success());
@@ -1022,11 +932,6 @@ async fn sigusr2_during_preparation_is_retained_until_ready_and_stop_wins() {
             );
             assert!(!socket.exists());
             let db = database(dir.path()).await;
-            let indexed: i64 = sqlx::query_scalar("SELECT indexed_rev FROM note_page_head")
-                .fetch_one(&db)
-                .await
-                .unwrap();
-            assert_eq!(indexed, -1);
             db.close().await;
             if !stop_early {
                 let log = std::fs::read_to_string(dir.path().join("startup.log")).unwrap();

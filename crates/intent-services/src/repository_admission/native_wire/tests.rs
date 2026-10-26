@@ -1613,7 +1613,7 @@ async fn native_wire_queued_frame_expires_without_slot_or_service_entry() {
     .await;
     let request = request.unwrap();
     tokio::time::timeout(
-        FRAME_TTL + Duration::from_secs(2),
+        frame_ttl() + intentd_test_support::test_timeout(Duration::from_secs(2)),
         request
             .lifetime
             .as_ref()
@@ -2787,4 +2787,43 @@ async fn native_wire_sidebar_member_exact_projection_and_unattested_facts() {
         Some(fixture.server.descriptor.instance().as_str()),
     );
     assert_eq!(fixture.server.control.requests.lock().unwrap().len(), calls);
+}
+
+// Production keeps the 5s acquire, 10s read and 15s frame bounds; tests stretch
+// them like every other test budget, so coverage CI's
+// INTENTD_TEST_TIMEOUT_MULTIPLIER=3 cannot refuse a slow but healthy request,
+// up to x4 so they still elapse before the fixed timers they race.
+#[test]
+fn native_request_waits_keep_production_bounds_and_stretch_with_the_test_multiplier() {
+    assert_eq!(ACQUIRE_BASE, Duration::from_secs(5));
+    assert_eq!(READ_TIMEOUT_BASE, Duration::from_secs(10));
+    assert_eq!(FRAME_TTL_BASE, Duration::from_secs(15));
+    let setting = std::env::var(intentd_test_support::TIMEOUT_MULTIPLIER_ENV).ok();
+    for (wait, base) in [
+        (acquire_wait(), ACQUIRE_BASE),
+        (read_timeout(), READ_TIMEOUT_BASE),
+        (frame_ttl(), FRAME_TTL_BASE),
+    ] {
+        assert_eq!(wait, stretched_request_wait(base, setting.as_deref()));
+    }
+    // The 10s read, work and admission limits stretch by the same factor, so
+    // tests keep production's order: acquire (5s) < limit (10s) < frame (15s).
+    assert!(acquire_wait() < read_timeout() && read_timeout() < frame_ttl());
+    // Unset, the base; coverage CI's x3 stretches in full; the supported x20
+    // stops at x4, so the acquire wait stays under the GitLab client's fixed
+    // 30s request timeout and the frame wait under STAGE_TTL (120s), LEASE_TTL
+    // (300s) and nextest's 180s kill.
+    assert_eq!(stretched_request_wait(ACQUIRE_BASE, None), ACQUIRE_BASE);
+    assert_eq!(
+        stretched_request_wait(FRAME_TTL_BASE, Some("3")),
+        Duration::from_secs(45)
+    );
+    assert_eq!(
+        stretched_request_wait(ACQUIRE_BASE, Some("20")),
+        Duration::from_secs(20)
+    );
+    assert_eq!(
+        stretched_request_wait(FRAME_TTL_BASE, Some("20")),
+        Duration::from_secs(60)
+    );
 }

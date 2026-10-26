@@ -8,12 +8,6 @@
 /// Domain error type for intentd.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// Bounded cancellable deletion control failure.
-    #[error("{}", .0.wire_code())]
-    NoteDelete(crate::note_delete::NoteDeleteError),
-    /// Bounded note page failure; never carries source content.
-    #[error("{}", .0.wire_code())]
-    NotePage(crate::note_page::NotePageError),
     /// Safe member recovery for a classified execution authorization error.
     /// The source preserves the owner's established error contract internally.
     #[error("{}", authorization.message())]
@@ -37,6 +31,27 @@ pub enum Error {
     /// A requested entity does not exist.
     #[error("not found: {0}")]
     NotFound(String),
+
+    /// The workspace is retired (§5.1 `workspace.retire`): its checkout
+    /// folder was deleted, so a call that needs disk state (file write,
+    /// script start, terminal, git ops, commit) is refused. Surfaces as
+    /// `-32602` with machine-readable
+    /// `error.data = { code: "workspace-retired", workspaceId }`.
+    #[error("workspace {workspace_id} is retired; its folder on disk was deleted")]
+    WorkspaceRetired { workspace_id: String },
+
+    /// `workspace.retire` on a workspace whose folder is not a daemon-owned
+    /// git worktree (§5.1): a `cow` / `direct` checkout (the folder IS the
+    /// repository, so deleting it loses the branch), a `skipIsolation`
+    /// workspace (the folder is the user's repository), a remote workspace,
+    /// or one without a checkout. Nothing is changed. Surfaces as `-32602`
+    /// with `error.data = { code: "retire-unsupported", checkoutMode? }`.
+    /// Kept small (no owned reason string) so [`Error`] does not grow.
+    #[error("workspace {workspace_id} cannot be retired: only git worktree workspaces can retire")]
+    RetireUnsupported {
+        workspace_id: String,
+        checkout_mode: Option<crate::model::CheckoutMode>,
+    },
 
     /// libgit2 classified an authentication failure. Legacy wire rendering
     /// matches Internal; shared execution may attach safe recovery.
@@ -69,6 +84,18 @@ pub enum Error {
     /// stop matching on prose (monorepo#761).
     #[error("invalid params: cannot resolve base ref '{base_ref}'")]
     BaseRefUnresolvable { base_ref: String },
+
+    /// A guarded whole-content note write (`note.setContent` / the content
+    /// arm of `note.update` carrying `baseContentBytes`) whose base size does
+    /// not match the base the daemon resolved, or whose base is unknown
+    /// (`resolved_base_bytes: None`). Nothing is written. Surfaces as
+    /// `-32602` with `error.data = { code: "content-base-mismatch",
+    /// baseContentBytes, resolvedBaseBytes }` (protocol "Truncated note reads").
+    #[error("Content base does not match the stored note; re-read the full note and retry.")]
+    ContentBaseMismatch {
+        base_content_bytes: u64,
+        resolved_base_bytes: Option<u64>,
+    },
 
     /// A named provider profile request failed (PROTOCOL §5.54). `data`
     /// carries the machine-readable discriminator (`data.code`, e.g.
@@ -545,7 +572,6 @@ impl Error {
     #[must_use]
     pub fn code(&self) -> i32 {
         match self {
-            Error::NoteDelete(kind) => kind.rpc_code(),
             Error::ExecutionAuthorization { source, .. } => match source.as_ref() {
                 Error::CloneFailed { .. } | Error::SourceControlUnauthorized { .. } => source.code(),
                 _ => -32603,
@@ -558,18 +584,17 @@ impl Error {
                     -32602
                 }
             }
-            Error::NotePage(crate::note_page::NotePageError::Preparing | crate::note_page::NotePageError::ResourceLimit) => -32006,
-            Error::NotePage(crate::note_page::NotePageError::Stale)
-            | Error::Conflict { .. } => -32005,
             Error::IdentityMismatch
             | Error::IdentityInUse
             | Error::HostMembershipRequired
             | Error::InvalidParams(_)
             | Error::NotFound(_)
+            | Error::WorkspaceRetired { .. }
+            | Error::RetireUnsupported { .. }
             | Error::InvalidInput(_)
             | Error::BaseRefUnresolvable { .. }
-            | Error::NotAFile { .. }
-            | Error::NotePage(_) => -32602,
+            | Error::ContentBaseMismatch { .. }
+            | Error::NotAFile { .. } => -32602,
             Error::CloneFailed { category, .. } => match category {
                 CloneErrorCategory::PathInvalid | CloneErrorCategory::DestinationExistsNonEmpty => {
                     -32602
@@ -596,6 +621,7 @@ impl Error {
             | Error::IdentityUnverifiable { .. }
             // Unsupported: map to internal error for now
             | Error::Unsupported(_) => -32603,
+            Error::Conflict { .. } => -32005,
             Error::Forbidden(_) => -32003,
             Error::Invite(kind) => kind.code(),
         }

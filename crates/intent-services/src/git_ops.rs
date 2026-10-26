@@ -142,7 +142,7 @@ pub(crate) fn reject_submodule_internal_files(worktree: &Path, files: &[String])
 
 /// Resolve a workspace's worktree path: the explicit `worktreePath`, else the
 /// `repositoryPath` (TS parity). `None` when neither is set.
-pub(crate) fn worktree_path(ws: &Workspace) -> Option<PathBuf> {
+pub fn worktree_path(ws: &Workspace) -> Option<PathBuf> {
     ws.worktree_path
         .as_ref()
         .or(ws.repository_path.as_ref())

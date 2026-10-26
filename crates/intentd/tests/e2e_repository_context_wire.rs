@@ -1,7 +1,7 @@
 //! Cold ordinary repository-context reads over actual UDS and authenticated WSS.
 //! All stores, Git roots, credentials and TLS endpoints belong to this fixture.
 #![cfg(unix)]
-mod common;
+use crate::common;
 #[path = "e2e_repository_context_wire/monitor_attachment.rs"]
 mod monitor_attachment;
 #[cfg(feature = "repository-test-fixtures")]
@@ -244,7 +244,11 @@ impl Harness {
             .await
             .unwrap();
         drop(store);
-        std::fs::write(dir.path().join("config.toml"),"[providers]\nenabled = {}\n[mcp]\nenableUserServers = false\n[agents]\nresumeInterruptedOnStart = \"off\"\n").unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[providers]\nenabled = {}\n[mcp]\nenableUserServers = false\n",
+        )
+        .unwrap();
         if let Some((_, endpoint)) = history {
             let config = dir.path().join("config.toml");
             let text = std::fs::read_to_string(&config).unwrap();

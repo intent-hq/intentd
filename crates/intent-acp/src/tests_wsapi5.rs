@@ -13,9 +13,9 @@ use std::time::Duration;
 
 use intent_core::{
     AgentId, AgentLite, AgentMetadata, AgentStatus, BoxFuture, Error, GitAgentCommitResult, NoteId,
-    Result, SaveAssetResult, ScriptCreateParams, Workspace, WorkspaceActivity, WorkspaceApi,
-    WorkspaceAttention, WorkspaceId, WorkspaceSetupState, WorkspaceSetupStatus, WorkspaceStatus,
-    WorkspaceUpdate, CHIEF_WORKSPACE_ID,
+    Result, SaveAssetResult, ScriptCreateParams, Workspace, WorkspaceApi, WorkspaceId,
+    WorkspaceSetupState, WorkspaceSetupStatus, WorkspaceStatus, WorkspaceUpdate,
+    CHIEF_WORKSPACE_ID,
 };
 use serde_json::{json, Value};
 
@@ -34,6 +34,7 @@ struct FakeApi {
     script_monitor_calls: Mutex<Vec<Value>>,
     script_create_calls: Mutex<Vec<ScriptCreateParams>>,
     script_start_calls: Mutex<Vec<String>>,
+    script_start_monitor_calls: Mutex<Vec<Value>>,
     script_output_calls: Mutex<Vec<(String, Option<i64>)>>,
     script_run_calls: Mutex<Vec<(String, Option<i64>)>>,
     terminal_list_calls: Mutex<u32>,
@@ -87,49 +88,13 @@ fn make_workspace(id: &str, variant: WorkspaceVariant) -> Workspace {
         id: WorkspaceId::from_string(id),
         title,
         branch: "main".to_string(),
-        base_ref: None,
-        base_commit_sha: None,
-        status: WorkspaceStatus::Active,
         status_message: Some("hi".to_string()),
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
-        attention: WorkspaceAttention::None,
         created_at: "2026-01-01T00:00:00Z".to_string(),
         updated_at: "2026-01-01T00:00:00Z".to_string(),
-        last_activity: None,
-        last_content_activity: None,
         tags: vec!["red".to_string()],
-        path: None,
-        repository_path: None,
-        repository_owner: None,
         repository_name: Some("intentd".to_string()),
         worktree_path: worktree,
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
-        default_model: None,
-        pr_number: None,
-        pr_url: None,
-        pr_status: None,
-        active_pull_request: None,
-        pull_requests: None,
-        context_links: None,
-        archived: false,
-        archived_at: None,
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        pull_requests_total: None,
-        display_status: None,
-        waiting: false,
-        checkout_mode: None,
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
+        ..Default::default()
     }
 }
 
@@ -409,7 +374,20 @@ impl WorkspaceApi for FakeApi {
 
     fn script_start(&self, _id: WorkspaceId, script_id: String) -> BoxFuture<'_, Result<Value>> {
         self.script_start_calls.lock().unwrap().push(script_id);
-        Box::pin(async { Ok(json!({ "ok": true, "scriptId": "s-1" })) })
+        Box::pin(async { Ok(json!({ "ok": true, "scriptId": "s-1", "runId": "run-1" })) })
+    }
+
+    fn script_start_monitor(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: AgentId,
+        script_id: String,
+        run_id: String,
+    ) -> BoxFuture<'_, Result<Value>> {
+        self.script_start_monitor_calls.lock().unwrap().push(
+            json!({"workspaceId":workspace_id,"agentId":agent_id,"scriptId":script_id,"runId":run_id}),
+        );
+        Box::pin(async { Ok(json!({"ok":true,"monitor":{"monitorId":"m-auto","state":"active"}})) })
     }
 
     fn script_output(
@@ -1303,6 +1281,30 @@ async fn script_start_forwards_script_id() {
     let resp = call(&srv, "return await ws.script.start('s-1');").await;
     assert_eq!(resp["result"]["isError"], json!(false));
     assert_eq!(api.script_start_calls.lock().unwrap()[0], "s-1");
+}
+
+#[tokio::test]
+async fn script_start_by_agent_arms_monitor_and_reports_it() {
+    let (srv, api) = server_with_caller("agent-7");
+    let resp = call(&srv, "return await ws.script.start('s-1');").await;
+    assert_eq!(resp["result"]["isError"], json!(false));
+    assert_eq!(
+        *api.script_start_monitor_calls.lock().unwrap(),
+        vec![json!({"workspaceId":"ws-1","agentId":"agent-7","scriptId":"s-1","runId":"run-1"})]
+    );
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("m-auto"),
+        "start reply carries autoMonitor: {text}"
+    );
+}
+
+#[tokio::test]
+async fn script_start_without_agent_caller_arms_no_monitor() {
+    let (srv, api) = server();
+    let resp = call(&srv, "return await ws.script.start('s-1');").await;
+    assert_eq!(resp["result"]["isError"], json!(false));
+    assert!(api.script_start_monitor_calls.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

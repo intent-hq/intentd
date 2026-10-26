@@ -120,6 +120,7 @@ async fn mints_client_id_when_omitted() {
         "omitted capabilities normalize to an empty object"
     );
     assert!(!bound.browser_exec());
+    assert_eq!(bound.capabilities.get("desktopControl"), None);
     assert_eq!(
         bound.host,
         ClientHostInfo::default(),
@@ -131,6 +132,12 @@ async fn mints_client_id_when_omitted() {
         "explicit top-level protocolVersion in the hello result"
     );
     let server = &resp["result"]["server"];
+    // Advertising these APIs does not grant capabilities to the connecting client.
+    assert_eq!(server["capabilities"]["desktopControl"], 1);
+    assert_eq!(server["capabilities"]["workspaceMembershipEvents"], 1);
+    assert_eq!(server["capabilities"]["gitlabCheckoutRepoConfig"], 1);
+    assert_eq!(server["capabilities"]["scriptMonitors"], 2);
+    assert_eq!(server["capabilities"]["scriptActiveLists"], 1);
     assert_eq!(server["locality"], json!("local"));
     assert_eq!(
         server["version"],
@@ -531,33 +538,4 @@ fn monitor_test_host_support_requires_explicit_opt_in() {
         enabled, ordinary,
         "test support changes no other host claims"
     );
-}
-
-#[tokio::test]
-async fn paging_only_api_does_not_advertise_delete_grace() {
-    struct PagingOnly;
-    impl WorkspaceApi for PagingOnly {
-        fn note_paging_backend_id(&self) -> Option<String> {
-            Some("paging-only".into())
-        }
-        fn upsert_client(
-            &self,
-            _id: ClientId,
-            _name: Option<String>,
-            _capabilities: Option<Value>,
-            _host: ClientHostInfo,
-        ) -> BoxFuture<'_, Result<()>> {
-            Box::pin(async { Ok(()) })
-        }
-    }
-    let req =
-        classify(&json!({"jsonrpc":"2.0","id":1,"method":"client.hello","params":{}})).unwrap();
-    let result = parsed(handle(req, &PagingOnly, &mut None, true, TEST_DAEMON_VERSION).await);
-    assert_eq!(
-        result["result"]["server"]["capabilities"]["notePagingRead"],
-        1
-    );
-    assert!(result["result"]["server"]["capabilities"]
-        .get("noteDeleteGrace")
-        .is_none());
 }

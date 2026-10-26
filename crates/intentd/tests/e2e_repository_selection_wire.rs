@@ -1,7 +1,7 @@
 //! Original-socket selection intent through actual cold UDS/authenticated WSS.
 //! Disposable databases, empty roots and credentials; no Git or provider action.
 #![cfg(unix)]
-mod common;
+use crate::common;
 use futures_util::{SinkExt, StreamExt};
 use intent_core::{
     now_iso, Principal, PrincipalId, WorkspaceGitRootId, WorkspaceId, WorkspaceRole,
@@ -165,7 +165,11 @@ impl Harness {
             .await
             .unwrap();
         drop(store);
-        std::fs::write(dir.path().join("config.toml"),"[providers]\nenabled = {}\n[mcp]\nenableUserServers = false\n[agents]\nresumeInterruptedOnStart = \"off\"\n").unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[providers]\nenabled = {}\n[mcp]\nenableUserServers = false\n",
+        )
+        .unwrap();
         common::enable_ws_api(dir.path());
         let bins = dir.path().join("bin");
         std::fs::create_dir(&bins).unwrap();

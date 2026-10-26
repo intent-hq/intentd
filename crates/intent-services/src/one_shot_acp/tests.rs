@@ -588,7 +588,10 @@ async fn response_pending_at_a_phase_boundary_is_carried_into_the_next_phase() {
     serve_requests_while(
         &mut responder,
         &mut requests,
-        tokio::time::timeout(Duration::from_millis(50), std::future::pending::<()>()),
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(50)),
+            std::future::pending::<()>(),
+        ),
     )
     .await
     .expect_err("the phase clock ends the first phase");
@@ -650,6 +653,7 @@ async fn phase_resolves_on_budget_while_a_response_send_is_pending_on_writer_cap
     )
     .await;
 
+    // fixed-deadline: allow — stays fixed: it is the phase clock under test, and `elapsed` is asserted against it
     let budget = Duration::from_millis(300);
     let margin = Duration::from_secs(2);
     let started = std::time::Instant::now();

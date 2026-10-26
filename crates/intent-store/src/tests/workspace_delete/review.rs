@@ -3,7 +3,8 @@
 use super::{seed_heavy_workspace_children, seed_tab_and_draft, seed_workspace, TempDb};
 use crate::agent_repo::{delete_agent_metadata_batch_statements, DELETE_AGENT_SESSION_SQL};
 use crate::workspace_repo::{
-    CLEAR_NOTE_PARENT_BATCH_SQL, DELETE_WORKSPACE_BROWSER_BATCH_SQL, DELETE_WORKSPACE_SQL,
+    CLEAR_NOTE_PARENT_BATCH_SQL, DELETE_NOTE_COMMENT_BATCH_SQL, DELETE_WORKSPACE_BROWSER_BATCH_SQL,
+    DELETE_WORKSPACE_SQL,
 };
 use crate::Store;
 use intent_core::{ClientHostInfo, ClientId, Error};
@@ -243,17 +244,9 @@ async fn note_cleanup_does_not_rescan_processed_prefixes() {
     ).execute(store.write_pool()).await.unwrap();
     let parents = measure_batch(&store, CLEAR_NOTE_PARENT_BATCH_SQL).await;
     let empty_parents = measure_batch(&store, CLEAR_NOTE_PARENT_BATCH_SQL).await;
-    crate::workspace_annotation_cleanup::begin_retirement(&store, "doomed")
-        .await
-        .unwrap();
     let mut comments = Vec::new();
     loop {
-        let counter = count_steps(&store).await;
-        let rows = crate::workspace_annotation_cleanup::delete_comment_batch(&store, "doomed")
-            .await
-            .unwrap();
-        stop_counting(&store).await;
-        let batch = (rows, counter.load(Ordering::SeqCst));
+        let batch = measure_batch(&store, DELETE_NOTE_COMMENT_BATCH_SQL).await;
         comments.push(batch);
         if batch.0 == 0 {
             break;
@@ -264,9 +257,7 @@ async fn note_cleanup_does_not_rescan_processed_prefixes() {
     assert_eq!(empty_parents.0, 0);
     assert_eq!(
         comments.iter().map(|batch| batch.0).collect::<Vec<_>>(),
-        std::iter::repeat_n(32, 31)
-            .chain([9, 0])
-            .collect::<Vec<_>>()
+        [500, 500, 1, 0]
     );
     let no_note: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM comment WHERE note_id IS NULL")
         .fetch_one(store.read_pool())
@@ -463,13 +454,13 @@ async fn deletion_indexes_upgrade_preserves_existing_data() {
     let store = Store {
         task_event_baselines: std::sync::Arc::default(),
         task_events_enabled: std::sync::Arc::default(),
-        note_pages: std::sync::Arc::default(),
-        note_index_jobs: std::sync::Arc::default(),
-        note_index_owner: std::sync::Arc::default(),
+        note_write_lanes: std::sync::Arc::default(),
         _daemon_owner: None,
         write_pool: pool.into(),
         read_pool: crate::connect_read(&tmp.path).await.unwrap().into(),
         browser_tab_displayed: crate::browser_tab_repo::DisplayedOverlay::default(),
+        desktop_writes: crate::desktop_repo::DesktopWrites::default(),
+        desktop_delete_barrier: std::sync::Arc::default(),
         export_author_barrier: std::sync::Arc::default(),
         repository_lifecycle: crate::repository_lifecycle::domain_for(&tmp.path).unwrap(),
     };

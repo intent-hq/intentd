@@ -189,6 +189,7 @@ impl RepositoryGuidanceSource for InertSource {
 fn immutable_session_gating_does_not_consult_features_or_parent_stamp() {
     let workspace = WorkspaceId::from("workspace-1");
     let caller = AgentId::from("agent-1");
+    let after_current = intent_core::harness_versions_after_current();
     for version in [
         None,
         Some(""),
@@ -209,8 +210,10 @@ fn immutable_session_gating_does_not_consult_features_or_parent_stamp() {
         Some(" 3.0"),
         Some("3.0\n"),
         Some("unknown"),
-        Some("3.3"),
-    ] {
+    ]
+    .into_iter()
+    .chain(after_current.iter().map(|v| Some(v.as_str())))
+    {
         assert!(
             GuidanceBinding::new(
                 &session(version),
@@ -219,6 +222,21 @@ fn immutable_session_gating_does_not_consult_features_or_parent_stamp() {
                 Arc::new(InertSource::default())
             )
             .is_none(),
+            "{version:?}"
+        );
+    }
+    for version in intent_core::REPOSITORY_GUIDANCE_HARNESS_VERSIONS
+        .iter()
+        .copied()
+    {
+        assert!(
+            GuidanceBinding::new(
+                &session(Some(version)),
+                &workspace,
+                Some(&caller),
+                Arc::new(InertSource::default())
+            )
+            .is_some(),
             "{version:?}"
         );
     }

@@ -7,10 +7,9 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -313,9 +312,6 @@ async fn shutdown_reaps_terminal_and_script_pty_sessions() {
         .stderr(Stdio::from(
             std::fs::File::create(data_dir.join("daemon.log")).unwrap(),
         ));
-    // Own process group so the DaemonGuard's SIGKILL cannot leak PTY children
-    // if the test panics before the graceful path runs.
-    cmd.process_group(0);
     // Assert before boot so a missing override cannot fall back to shared state.
     let explicit_env: std::collections::HashMap<_, _> = cmd.get_envs().collect();
     let owned_workspaces = explicit_env.get(std::ffi::OsStr::new("INTENTD_WORKSPACES_DIR"))
@@ -337,7 +333,7 @@ async fn shutdown_reaps_terminal_and_script_pty_sessions() {
         owned_workspaces && owned_secrets && isolated_gh && no_host_auth_env,
         "shutdown fixture isolation: owned workspaces={owned_workspaces}, owned secrets={owned_secrets}, disposable GH_CONFIG_DIR={isolated_gh}, removed credential env={no_host_auth_env}"
     );
-    let child = cmd.spawn().expect("spawn intentd serve");
+    let child = common::spawn_guarded(&mut cmd).expect("spawn intentd serve");
     let mut daemon = DaemonGuard::process_only(child);
     if !await_uds(&socket).await {
         if let Ok(log) = std::fs::read_to_string(data_dir.join("daemon.log")) {
@@ -466,55 +462,15 @@ async fn shutdown_reaps_terminal_and_script_pty_sessions() {
 }
 
 fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
-    use intent_core::{now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus};
+    use intent_core::{now_iso, Workspace};
     let ts = now_iso();
     Workspace {
         id: id.clone(),
         title: "WSS-PTY-REAP".to_string(),
         branch: "main".to_string(),
-        base_ref: None,
-        base_commit_sha: None,
-        status: WorkspaceStatus::Active,
-        status_message: None,
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
-        attention: WorkspaceAttention::None,
         created_at: ts.clone(),
         updated_at: ts,
-        last_activity: None,
-        last_content_activity: None,
-        tags: vec![],
-        path: None,
-        repository_path: None,
-        repository_owner: None,
-        repository_name: None,
-        worktree_path: None,
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
-        default_model: None,
-        pr_number: None,
-        pr_url: None,
-        pr_status: None,
-        active_pull_request: None,
-        pull_requests: None,
-        context_links: None,
-        archived: false,
-        archived_at: None,
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        pull_requests_total: None,
-        display_status: None,
-        waiting: false,
-        checkout_mode: None,
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
+        ..Default::default()
     }
 }
 

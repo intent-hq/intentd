@@ -60,10 +60,11 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
+use intentd_test_support::GuardedChild;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -84,14 +85,13 @@ const TOKEN: &str = "abcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabc
 
 /// Live `intentd serve` process; killed and its data dir removed on drop.
 struct Daemon {
-    child: Child,
+    child: GuardedChild,
     data_dir: PathBuf,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.child.kill_tree();
         let log_path = self.data_dir.join("daemon.log");
         if std::thread::panicking() {
             if let Ok(log) = std::fs::read_to_string(&log_path) {
@@ -105,7 +105,7 @@ fn temp_data_dir() -> tempfile::TempDir {
     common::test_tempdir_in("/tmp", "itd-wss-hook-")
 }
 
-fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
+fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> GuardedChild {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
@@ -120,7 +120,7 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
         cmd.env(k, v);
     }
     common::hermetic_fixture_identity(&mut cmd, data_dir);
-    cmd.spawn().expect("spawn intentd serve")
+    GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -356,10 +356,7 @@ fn gate(test: &str) -> Option<String> {
 /// Pre-seed the daemon's DB with a workspace + watched note. The store is
 /// closed before the daemon boots so it gets a clean handle.
 async fn seed_workspace_and_note(data_dir: &Path) -> (String, String) {
-    use intent_core::{
-        now_iso, NoteCreate, Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention,
-        WorkspaceId, WorkspaceStatus,
-    };
+    use intent_core::{now_iso, NoteCreate, Workspace, WorkspaceApi, WorkspaceId};
     use intent_services::Services;
     use intent_store::Store;
     let db_path = data_dir.join("intentd.db");
@@ -372,49 +369,9 @@ async fn seed_workspace_and_note(data_dir: &Path) -> (String, String) {
         id: ws_id.clone(),
         title: "WSS-HOOKS".to_string(),
         branch: "main".to_string(),
-        base_ref: None,
-        base_commit_sha: None,
-        status: WorkspaceStatus::Active,
-        status_message: None,
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
-        attention: WorkspaceAttention::None,
         created_at: ts.clone(),
         updated_at: ts,
-        last_activity: None,
-        last_content_activity: None,
-        tags: vec![],
-        path: None,
-        repository_path: None,
-        repository_owner: None,
-        repository_name: None,
-        worktree_path: None,
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
-        default_model: None,
-        pr_number: None,
-        pr_url: None,
-        pr_status: None,
-        active_pull_request: None,
-        pull_requests: None,
-        context_links: None,
-        archived: false,
-        archived_at: None,
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        pull_requests_total: None,
-        display_status: None,
-        waiting: false,
-        checkout_mode: None,
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
+        ..Default::default()
     };
     store.insert_workspace(&ws).await.expect("insert ws");
     let note = services

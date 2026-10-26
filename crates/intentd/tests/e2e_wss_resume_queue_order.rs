@@ -17,11 +17,11 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
-use std::os::unix::process::CommandExt;
+use intentd_test_support::GuardedChild;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -207,17 +207,18 @@ async fn wss_rpc(
     }
 }
 
-fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)], resume_all: bool) -> Child {
+fn spawn_serve(
+    data_dir: &Path,
+    listen: &str,
+    env: &[(&str, &str)],
+    resume_all: bool,
+) -> GuardedChild {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
     if listen != "uds" {
         common::enable_ws_api(data_dir);
     }
-    // Pin resumeInterruptedOnStart=off: this suite asserts pending rows stay
-    // inert until the explicit resume path (`--resume-all` still forces the
-    // sweep over the pin), but the `auto` default resumes on headless hosts.
-    common::disable_resume_on_start(data_dir);
     let mut cmd = common::hermetic_serve_command(data_dir);
     cmd.env("INTENTD_DATA_DIR", data_dir)
         .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
@@ -231,11 +232,10 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)], resume_all: 
         cmd.env(k, v);
     }
     common::hermetic_fixture_identity(&mut cmd, data_dir);
-    // Spawn in its own process group (pgid == child pid) so killing the daemon
-    // also kills spawned Node.js ACP mock providers via killpg.
-    #[cfg(unix)]
-    cmd.process_group(0);
-    cmd.spawn().expect("spawn intentd serve")
+    // GuardedChild: the daemon gets its own process group, killed on drop, panic
+    // or test-process death. ACP providers start their own groups (intent-acp),
+    // so this does not reach them.
+    GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
 }
 
 async fn seed_workspace_with_guest(data_dir: &Path) -> (String, intent_core::Principal) {
@@ -284,79 +284,27 @@ async fn seed_workspace_with_guest(data_dir: &Path) -> (String, intent_core::Pri
 }
 
 fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
-    use intent_core::{now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus};
+    use intent_core::{now_iso, Workspace};
     let ts = now_iso();
     Workspace {
         id: id.clone(),
         title: "QUEUE-ORDER-E2E".to_string(),
         branch: "main".to_string(),
-        base_ref: None,
-        base_commit_sha: None,
-        status: WorkspaceStatus::Active,
-        status_message: None,
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
-        attention: WorkspaceAttention::None,
         created_at: ts.clone(),
         updated_at: ts,
-        last_activity: None,
-        last_content_activity: None,
-        tags: vec![],
-        path: None,
-        repository_path: None,
-        repository_owner: None,
-        repository_name: None,
-        worktree_path: None,
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
-        default_model: None,
-        pr_number: None,
-        pr_url: None,
-        pr_status: None,
-        active_pull_request: None,
-        pull_requests: None,
-        context_links: None,
-        archived: false,
-        archived_at: None,
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        pull_requests_total: None,
-        display_status: None,
-        waiting: false,
-        checkout_mode: None,
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
+        ..Default::default()
     }
 }
 
 struct Daemon {
-    child: Child,
+    child: GuardedChild,
     data_dir: PathBuf,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        // Kill the whole process group FIRST (daemon + any Node.js ACP provider
-        // children) BEFORE wait(), so children are reaped before reparenting.
-        #[cfg(unix)]
-        {
-            use nix::sys::signal::{self, Signal};
-            use nix::unistd::Pid;
-            let pid = Pid::from_raw(self.child.id().cast_signed());
-            let _ = signal::killpg(pid, Signal::SIGKILL);
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = self.child.kill();
-        }
-        let _ = self.child.wait();
+        // Kills the daemon's process group (ACP providers run in their own groups).
+        let _ = self.child.kill_tree();
         // On test panic, print data-dir path + daemon log tail for diagnosability
         if std::thread::panicking() {
             eprintln!("\n=== DAEMON CLEANUP (test panicked) ===");

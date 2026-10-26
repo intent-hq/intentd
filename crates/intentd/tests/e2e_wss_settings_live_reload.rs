@@ -25,10 +25,11 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
+use intentd_test_support::GuardedChild;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -52,17 +53,17 @@ const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefe
 /// only has to outlast a genuine wedge (fs-event registration/delivery
 /// stalls under full-suite parallel load), never a passing run. Negative
 /// assertions keep their short bounds.
+// fixed-deadline: allow — stays fixed: already past nextest's 180 s kill, so scaling it would change nothing; clamping it below the kill is a separate change
 const LIVENESS: Duration = Duration::from_secs(300);
 
 struct Daemon {
-    child: Child,
+    child: GuardedChild,
     data_dir: PathBuf,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.child.kill_tree();
         let log_path = self.data_dir.join("daemon.log");
         if let Ok(log) = std::fs::read_to_string(&log_path) {
             eprintln!("=== DAEMON LOG ===\n{log}\n=== END LOG ===");
@@ -74,7 +75,7 @@ fn temp_data_dir() -> tempfile::TempDir {
     common::test_tempdir_in("/tmp", "itd-wss-livereload-")
 }
 
-fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
+fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> GuardedChild {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
@@ -101,7 +102,7 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
         cmd.env(k, v);
     }
     common::hermetic_fixture_identity(&mut cmd, data_dir);
-    cmd.spawn().expect("spawn intentd serve")
+    GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -254,7 +255,8 @@ async fn next_settings_event(ws: &mut Wss) -> Value {
 /// within `secs` (bounded negative wait; covers the 300ms watcher debounce
 /// with a wide margin).
 async fn assert_no_settings_event(ws: &mut Wss, secs: u64) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(secs));
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         match timeout(remaining, ws.next()).await {
@@ -1264,4 +1266,89 @@ async fn quick_action_effort_persists_emits_changes_and_resets_over_wss() {
     let blank_reloaded = settings_snapshot(&mut rpc, &paths).await;
     assert_eq!(blank_reloaded[0]["value"], Value::Null);
     assert_eq!(blank_reloaded[1]["value"], values[1]);
+}
+
+/// `workspace.autoRetireArchivedAfterDays` (§5.12) over WSS: advertised as an
+/// optional number with `min: 1` and no `defaultValue`, reads `null` (off)
+/// until set, persists a positive integer to config.toml with a
+/// `settings:changed` event, rejects zero / negative / fractional days with
+/// `-32602`, and `null` turns it off again by removing the key.
+#[tokio::test]
+async fn auto_retire_setting_validates_persists_and_clears_over_wss() {
+    let dir = temp_data_dir();
+    let (_daemon, mut rpc, mut sub) = boot_with_wss(dir.path()).await;
+    await_config_watcher_ready(dir.path()).await;
+    let path = "workspace.autoRetireArchivedAfterDays";
+
+    let list = wss_rpc(&mut rpc, 30, "settings.list", json!({})).await;
+    let def = list["result"]["settings"]
+        .as_array()
+        .expect("settings array")
+        .iter()
+        .find(|d| d["path"] == json!(path))
+        .cloned()
+        .unwrap_or_else(|| panic!("{path} not advertised: {list}"));
+    assert_eq!(def["type"], json!("number"), "{def}");
+    assert_eq!(def["min"], json!(1.0), "{def}");
+    assert!(def.get("defaultValue").is_none(), "{def}");
+    assert_eq!(def["value"], Value::Null, "{def}");
+
+    let initial = settings_snapshot(&mut rpc, &[path]).await;
+    assert_eq!(initial[0]["value"], Value::Null);
+    assert_eq!(initial[0]["origin"], json!("default"));
+    let revision = initial[0]["revision"].as_u64().unwrap();
+
+    let update = wss_rpc(
+        &mut rpc,
+        31,
+        "settings.update",
+        json!({"changes":[{"path":path,"value":7}]}),
+    )
+    .await;
+    let applied = json!([{"path":path,"value":7.0,"origin":"file"}]);
+    assert_eq!(
+        update,
+        json!({"jsonrpc":"2.0","id":31,"result":{"applied":applied,"revision":revision+1}})
+    );
+    assert_settings_change(&mut sub, &applied, revision + 1).await;
+    let text = std::fs::read_to_string(dir.path().join("config.toml")).expect("config.toml");
+    assert!(
+        text.lines()
+            .any(|l| l.trim() == "autoRetireArchivedAfterDays = 7"),
+        "{text}"
+    );
+
+    for invalid in [json!(0), json!(-1), json!(1.5)] {
+        let rejected = wss_rpc(
+            &mut rpc,
+            32,
+            "settings.update",
+            json!({"changes":[{"path":path,"value":invalid}]}),
+        )
+        .await;
+        assert_eq!(rejected["error"]["code"], -32602, "{invalid}: {rejected}");
+    }
+    assert_eq!(
+        settings_snapshot(&mut rpc, &[path]).await[0]["value"],
+        json!(7.0)
+    );
+
+    let cleared = wss_rpc(
+        &mut rpc,
+        33,
+        "settings.update",
+        json!({"changes":[{"path":path,"value":null}]}),
+    )
+    .await;
+    assert!(cleared.get("error").is_none(), "{cleared}");
+    let after = settings_snapshot(&mut rpc, &[path]).await;
+    assert_eq!(after[0]["value"], Value::Null);
+    assert_eq!(after[0]["origin"], json!("default"));
+    let text = std::fs::read_to_string(dir.path().join("config.toml")).expect("config.toml");
+    assert!(
+        !text
+            .lines()
+            .any(|l| l.trim_start().starts_with("autoRetireArchivedAfterDays")),
+        "{text}"
+    );
 }

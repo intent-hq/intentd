@@ -3,7 +3,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 // Port setting tests don't need actual TCP listeners
 use std::path::PathBuf;

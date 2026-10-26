@@ -1,0 +1,1514 @@
+//! Functional end-to-end round-trip test for the workspace transfer relay:
+//! two in-process daemon service stacks (two Stores, two temp roots) relay a
+//! seeded workspace exactly the way the FE will — `transfer.plan` →
+//! `export.start` → chunked `export.read` on the source, piped into
+//! `import.begin`/`chunk`/`commit` on the target, then `export.finalize`
+//! back on the source — plus a mid-relay abort case proving both sides
+//! clean up.
+
+use std::path::{Path, PathBuf};
+
+use intent_core::transfer::TransferManifest;
+use intent_core::{
+    now_iso, AgentId, AgentSession, AgentStatus, ClientHostInfo, ClientId, Error, Hook, HookId,
+    HookState, Note, NoteId, PrMonitor, PrMonitorId, PrMonitorState, Script, ScriptMode,
+    WorkspaceId, WorkspaceStatus,
+};
+use intent_store::{AgentQueueRow, PersistedEventSubscription, Sandbox, SandboxStatus, Store};
+
+use crate::transfer::TransferPlanExt;
+use crate::transfer::TransferStateExt;
+use crate::transfer_export::ExportState;
+use crate::transfer_export::TransferExportExt;
+use crate::transfer_import::TransferImportExt;
+use intent_services::feature_api::test_support::test_tempdir;
+use intent_services::feature_api::Services;
+
+#[intent_test_macros::daemon_test]
+async fn transfer_human_authors_survive_member_export_and_return_without_grants() {
+    use intent_core::{
+        with_caller, Caller, HostRole, Principal, PrincipalId, PrincipalIdentity, WorkspaceApi,
+    };
+    use serde_json::json;
+    let a = TempDir::new("author-a");
+    let b = TempDir::new("author-b");
+    let source = fresh_services(&a.0, &a.0.join("workspaces"), &a.0.join("assets")).await;
+    let target = fresh_services(&b.0, &b.0.join("workspaces"), &b.0.join("assets")).await;
+    let mut owner_a = source.store().get_primary_principal().await.unwrap();
+    owner_a.login = Some("panghy".into());
+    owner_a.identity = Some(PrincipalIdentity::github(7));
+    source.store().upsert_principal(&owner_a).await.unwrap();
+    let mut owner_b = target.store().get_primary_principal().await.unwrap();
+    owner_b.login = Some("shared-instance-github-handle".into());
+    owner_b.identity = Some(PrincipalIdentity::github(8));
+    target.store().upsert_principal(&owner_b).await.unwrap();
+    let contributor = Principal {
+        id: PrincipalId::new(),
+        github_user_id: None,
+        identity: Some(PrincipalIdentity {
+            provider: "gitlab".into(),
+            host: "gitlab.example".into(),
+            external_user_id: "7".into(),
+        }),
+        login: Some("panghy".into()),
+        display_name: None,
+        avatar_url: None,
+        is_primary: false,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+    };
+    source.store().upsert_principal(&contributor).await.unwrap();
+    source
+        .store()
+        .insert_principal_credential(&contributor.id, "member-credential")
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO host_member(principal_id, added_at) VALUES (?,?)")
+        .bind(contributor.id.as_str())
+        .bind(now_iso())
+        .execute(source.store().write_pool())
+        .await
+        .unwrap();
+    let ws = WorkspaceId::new();
+    source
+        .store()
+        .insert_workspace(&intent_services::feature_api::tests::workspace(&ws))
+        .await
+        .unwrap();
+    let agent = AgentId::new();
+    source
+        .store()
+        .insert_agent_session(&session(&agent, &ws, AgentStatus::RuntimeIdle))
+        .await
+        .unwrap();
+    for (id, metadata) in [
+        ("legacy-a", None),
+        ("stamped-a", Some(json!({"fromPrincipalId":owner_a.id}))),
+        (
+            "contributor",
+            Some(json!({"fromPrincipalId":contributor.id})),
+        ),
+        (
+            "missing-person",
+            Some(json!({"fromPrincipalId":"deleted-person"})),
+        ),
+    ] {
+        source
+            .store()
+            .append_agent_message_with_id(
+                &agent,
+                id,
+                "user",
+                &json!([{"type":"text","text":id}]),
+                metadata.as_ref(),
+                "2026-09-20T00:00:00Z",
+            )
+            .await
+            .unwrap();
+    }
+    let originals = intent_services::feature_api::human_attribution_tests::legacy_metadata_values();
+    let mut queued = Vec::new();
+    for (i, metadata) in originals.iter().enumerate() {
+        for role in ["user", "assistant"] {
+            source
+                .store()
+                .append_agent_message_with_id(
+                    &agent,
+                    &format!("legacy-{role}-{i}"),
+                    role,
+                    &json!([{"type":"text","text":"retained"}]),
+                    metadata.as_ref(),
+                    "2020-01-01T00:00:00Z",
+                )
+                .await
+                .unwrap();
+        }
+        let id = format!("legacy-queue-{i}");
+        let mut payload = json!({"id":id,"content":"pending legacy input","queuedAt":"2020-01-01T00:00:00Z","userOrigin":true});
+        if let Some(metadata) = metadata {
+            payload["messageMetadata"] = metadata.clone();
+        }
+        queued.push(AgentQueueRow {
+            id: id.clone(),
+            agent_id: agent.clone(),
+            position: i64::try_from(i).unwrap(),
+            payload,
+            created_at: "2020-01-01T00:00:00Z".into(),
+            turn_id: id,
+        });
+    }
+    source
+        .store()
+        .replace_agent_queue(&agent, &queued)
+        .await
+        .unwrap();
+    source
+        .store()
+        .append_agent_message_with_id(
+            &agent,
+            "assistant",
+            "assistant",
+            &json!([{"type":"text","text":"reply"}]),
+            None,
+            "2026-09-20T00:00:01Z",
+        )
+        .await
+        .unwrap();
+    let exported = with_caller(
+        Caller::Wire {
+            principal_id: contributor.id.clone(),
+            host_role: HostRole::Member,
+        },
+        source.workspace_export_start(ws.clone()),
+    )
+    .await
+    .unwrap();
+    let export = exported["exportId"].as_str().unwrap();
+    assert!(wait_ready(&source, export).await);
+    let (size, sha, manifest) = ready_meta(&source, export);
+    let committed = relay(&source, &target, export, &manifest, size, &sha).await;
+    assert_eq!(committed["workspace"]["id"], ws.0);
+    // Reopen the destination database before reading or exporting its history.
+    drop(target);
+    let target = fresh_services(&b.0, &b.0.join("workspaces"), &b.0.join("assets")).await;
+    assert_eq!(
+        target.rehydrate_agent_queues().await.unwrap(),
+        originals.len()
+    );
+    let view = target
+        .agent_get_conversation(
+            agent.clone(),
+            None,
+            Some(ws.clone()),
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    let rows = view["messages"].as_array().unwrap();
+    for (i, original) in originals.iter().enumerate() {
+        let id = format!("legacy-user-{i}");
+        let row = rows.iter().find(|r| r["id"] == id).unwrap();
+        assert_eq!(row["author"]["login"], "panghy");
+        let metadata = &row["metadata"];
+        match original {
+            Some(serde_json::Value::Object(object)) => {
+                for (key, value) in object {
+                    assert_eq!(&metadata[key], value);
+                }
+            }
+            Some(value) => assert_eq!(metadata.get("humanAuthorOriginalMetadata"), Some(value)),
+            None => assert!(metadata.get("humanAuthorOriginalMetadata").is_none()),
+        }
+        let bot = rows
+            .iter()
+            .find(|r| r["id"] == format!("legacy-assistant-{i}"))
+            .unwrap();
+        assert_eq!(
+            bot.get("metadata").filter(|v| !v.is_null()),
+            original.as_ref().filter(|v| !v.is_null())
+        );
+        assert!(bot.get("author").is_none());
+        let pending = target
+            .find_queued_message(&agent, &format!("legacy-queue-{i}"))
+            .unwrap();
+        assert_eq!(pending.message_metadata.as_ref(), Some(metadata));
+        assert!(!pending.ready_to_send());
+        assert_eq!(
+            intent_core::queue_attribution_with(
+                pending.message_metadata.as_ref(),
+                Some(&owner_b.id)
+            ),
+            intent_core::QueueAttribution::UnknownHuman
+        );
+    }
+    assert!(target.dequeue_message(&agent).is_none());
+    for id in ["legacy-a", "stamped-a"] {
+        let row = rows.iter().find(|r| r["id"] == id).unwrap();
+        assert_eq!(
+            row["author"]["login"], "panghy",
+            "source owner must survive: {row}"
+        );
+        assert_eq!(row["author"]["identity"]["provider"], "github");
+        assert!(row["author"]["principalId"].is_null());
+        assert!(row["metadata"].get("fromPrincipalId").is_none());
+    }
+    let other = rows.iter().find(|r| r["id"] == "contributor").unwrap();
+    assert_eq!(other["author"]["identity"]["host"], "gitlab.example");
+    let unknown = rows.iter().find(|r| r["id"] == "missing-person").unwrap();
+    assert!(unknown["author"]["login"].is_null());
+    assert!(unknown["metadata"].get("humanAuthor").is_some());
+    assert!(rows
+        .iter()
+        .find(|r| r["id"] == "assistant")
+        .unwrap()
+        .get("author")
+        .is_none());
+    assert!(target.store().get_principal(&contributor.id).await.is_err());
+    assert!(target
+        .store()
+        .list_workspace_members(&ws)
+        .await
+        .unwrap()
+        .iter()
+        .all(|m| m.principal_id != contributor.id));
+    assert_eq!(manifest.format_version, 2);
+
+    target
+        .store()
+        .append_agent_message_with_id(
+            &agent,
+            "new-b",
+            "user",
+            &json!([{"type":"text","text":"new-b"}]),
+            Some(&json!({"fromPrincipalId":owner_b.id})),
+            "2026-09-21T00:00:00Z",
+        )
+        .await
+        .unwrap();
+    target
+        .store()
+        .append_agent_message_with_id(
+            &agent,
+            "new-b-array",
+            "user",
+            &json!([]),
+            Some(&json!(["B", null])),
+            "2026-09-21T00:00:01Z",
+        )
+        .await
+        .unwrap();
+    source
+        .workspace_export_abort_op(export.to_string())
+        .await
+        .unwrap();
+    source.store().delete_workspace(&ws).await.unwrap();
+    let exported = target.workspace_export_start_op(ws.clone()).await.unwrap();
+    let export = exported["exportId"].as_str().unwrap();
+    assert!(wait_ready(&target, export).await);
+    let (size, sha, manifest) = ready_meta(&target, export);
+    relay(&target, &source, export, &manifest, size, &sha).await;
+    target
+        .workspace_export_abort_op(export.to_string())
+        .await
+        .unwrap();
+    let returned = source
+        .agent_get_conversation(agent.clone(), None, Some(ws), None, None, None, None, false)
+        .await
+        .unwrap();
+    for original in rows {
+        let row = returned["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == original["id"])
+            .unwrap();
+        assert_eq!(row["author"], original["author"]);
+        assert_eq!(row["contentBlocks"], original["contentBlocks"]);
+        assert_eq!(row["timestamp"], original["timestamp"]);
+        assert_eq!(
+            row["metadata"], original["metadata"],
+            "re-export must not wrap again"
+        );
+    }
+    let new_b = returned["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == "new-b")
+        .unwrap();
+    assert_eq!(new_b["author"]["login"], "shared-instance-github-handle");
+    assert!(new_b["author"]["principalId"].is_null());
+    let new_b_array = returned["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == "new-b-array")
+        .unwrap();
+    assert_eq!(new_b_array["author"], new_b["author"]);
+    assert_eq!(
+        new_b_array["metadata"]["humanAuthorOriginalMetadata"],
+        json!(["B", null])
+    );
+    for i in 0..originals.len() {
+        let id = format!("legacy-queue-{i}");
+        let expected = target.find_queued_message(&agent, &id).unwrap();
+        let actual = source.find_queued_message(&agent, &id).unwrap();
+        assert_eq!(actual.message_metadata, expected.message_metadata);
+        assert!(!actual.ready_to_send());
+    }
+}
+
+/// Temp directory swept on drop (see [`test_tempdir`]).
+struct TempDir(PathBuf, #[expect(dead_code)] tempfile::TempDir);
+impl TempDir {
+    fn new(prefix: &str) -> Self {
+        let guard = test_tempdir(&format!("{prefix}-"));
+        Self(guard.path().to_path_buf(), guard)
+    }
+}
+
+/// One in-process daemon stack: its own `SQLite` store (under `db_root`),
+/// workspaces root, and assets root — the same wiring the export/import unit
+/// suites use.
+async fn fresh_services(db_root: &Path, workspaces_root: &Path, assets_root: &Path) -> Services {
+    let db = db_root.join("roundtrip.db");
+    let store = Store::open(&db).await.expect("open store");
+    crate::register(Services::new(store))
+        .with_workspaces_root(workspaces_root.to_path_buf())
+        .with_assets_root(assets_root.to_path_buf())
+}
+
+/// [`fresh_services`] with a settings registry whose `model.defaultProvider`
+/// is `default_provider` — the two stacks of the round trip deliberately
+/// disagree on it (intent-hq/intent#5815).
+async fn fresh_services_with_default_provider(
+    db_root: &Path,
+    workspaces_root: &Path,
+    assets_root: &Path,
+    default_provider: &str,
+) -> Services {
+    let registry = std::sync::Arc::new(
+        intent_services::feature_api::SettingsRegistry::load(db_root.join("config.toml"))
+            .expect("load registry"),
+    );
+    registry
+        .apply(&[
+            (
+                "providers.paths".to_string(),
+                serde_json::json!({
+                    "auggie": std::env::current_exe().unwrap()
+                }),
+            ),
+            (
+                "model.defaultProvider".to_string(),
+                serde_json::json!(default_provider),
+            ),
+            (
+                "model.default".to_string(),
+                serde_json::json!(format!("{default_provider}-settings-default")),
+            ),
+            (
+                "model.providerDefaults".to_string(),
+                serde_json::json!({default_provider: format!("{default_provider}-settings-model")}),
+            ),
+            (
+                "model.defaultReasoningEffort".to_string(),
+                serde_json::json!("low"),
+            ),
+        ])
+        .expect("apply settings");
+    fresh_services(db_root, workspaces_root, assets_root)
+        .await
+        .with_settings_registry(registry)
+}
+
+fn session(agent_id: &AgentId, ws: &WorkspaceId, status: AgentStatus) -> AgentSession {
+    AgentSession {
+        harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+        harness_features: None,
+        id: agent_id.clone(),
+        workspace_id: ws.clone(),
+        backend_session_id: None,
+        acp_session_id: None,
+        name: "a".to_string(),
+        name_explicitly_set: false,
+        model: None,
+        reasoning_effort: None,
+        effort_levels: None,
+        provider: None,
+        status,
+        is_active: matches!(status, AgentStatus::Active),
+        system_prompt: None,
+        messages: vec![],
+        created_at: now_iso(),
+        updated_at: now_iso(),
+        parent_agent_id: None,
+        specialist: None,
+        task_note_id: None,
+        skip_auto_commit: false,
+        completion_report: None,
+        completion_report_timestamp: None,
+        attention_request_kind: None,
+        attention_request_reason: None,
+        attention_request_timestamp: None,
+        delegation_depth: None,
+        initial_message: None,
+        context_references: None,
+        image_blocks: None,
+        file_blocks: None,
+        is_background: false,
+        metadata: None,
+        stats: None,
+        sandbox_id: None,
+        sandbox_path: None,
+        sandbox_branch: None,
+        stop_reason: None,
+        stop_reason_timestamp: None,
+        session_corrupted: false,
+        pending_delete_at: None,
+        retired_at: None,
+        notifications_muted: false,
+    }
+}
+
+fn note(ws: &WorkspaceId, id: &str, content: &str) -> Note {
+    Note {
+        id: NoteId::from(id),
+        workspace_id: ws.clone(),
+        title: "N".to_string(),
+        content: content.to_string(),
+        content_type: intent_core::ContentType::Markdown,
+        tags: vec![],
+        is_pinned: false,
+        is_archived: false,
+        is_default: false,
+        parent_id: None,
+        visibility: intent_core::NoteVisibility::Workspace,
+        metadata: intent_core::NoteMetadata::default(),
+        created_at: now_iso(),
+        rev: 0,
+        updated_at: now_iso(),
+    }
+}
+
+// ---- git fixtures ---------------------------------------------------------
+
+fn init_repo(repo_path: &Path) {
+    std::fs::create_dir_all(repo_path).unwrap();
+    let repo = git2::Repository::init_opts(
+        repo_path,
+        git2::RepositoryInitOptions::new().initial_head("main"),
+    )
+    .unwrap();
+    std::fs::write(repo_path.join("README.md"), "hello\n").unwrap();
+    let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+    let tree_id = {
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("README.md")).unwrap();
+        index.write().unwrap();
+        index.write_tree().unwrap()
+    };
+    let tree = repo.find_tree(tree_id).unwrap();
+    repo.commit(Some("HEAD"), &sig, &sig, "Initial commit", &tree, &[])
+        .unwrap();
+}
+
+fn commit_file(repo_path: &Path, file: &str, content: &str, message: &str) -> String {
+    let repo = git2::Repository::open(repo_path).unwrap();
+    std::fs::write(repo_path.join(file), content).unwrap();
+    let mut index = repo.index().unwrap();
+    index.add_path(Path::new(file)).unwrap();
+    index.write().unwrap();
+    let tree_oid = index.write_tree().unwrap();
+    let tree = repo.find_tree(tree_oid).unwrap();
+    let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+    let parent = repo.head().unwrap().peel_to_commit().unwrap();
+    repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &[&parent])
+        .unwrap()
+        .to_string()
+}
+
+fn repo_head(repo_path: &Path) -> String {
+    let repo = git2::Repository::open(repo_path).unwrap();
+    let head = repo.head().unwrap().target().unwrap().to_string();
+    head
+}
+
+fn is_untracked(repo_path: &Path, file: &str) -> bool {
+    let repo = git2::Repository::open(repo_path).unwrap();
+    let statuses = repo
+        .statuses(Some(git2::StatusOptions::new().include_untracked(true)))
+        .unwrap();
+    statuses
+        .iter()
+        .any(|s| s.path().unwrap_or_default() == file && s.status() == git2::Status::WT_NEW)
+}
+
+/// Wait until the background export build settles (Ready) or the session
+/// disappears (failed build). Returns true when Ready.
+async fn wait_ready(svc: &Services, export_id: &str) -> bool {
+    for _ in 0..400 {
+        {
+            let exports = svc.transfer_state().exports.lock().unwrap();
+            match exports.get(export_id) {
+                Some(s) if matches!(s.state, ExportState::Ready(_)) => return true,
+                Some(_) => {}
+                None => return false,
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    false
+}
+
+/// Pull the sealed archive metadata off a Ready session: (size, sha, manifest).
+fn ready_meta(svc: &Services, export_id: &str) -> (u64, String, TransferManifest) {
+    let exports = svc.transfer_state().exports.lock().unwrap();
+    match &exports.get(export_id).expect("session").state {
+        ExportState::Ready(r) => (r.size_bytes, r.sha256.clone(), r.manifest.clone()),
+        ExportState::Building { .. } => panic!("session not ready"),
+    }
+}
+
+/// What the seed produced (paths the assertions need).
+struct Seeded {
+    repo: PathBuf,
+    sandbox: PathBuf,
+    main_tip: String,
+    sandbox_tip: String,
+}
+
+const AGENT_LIVE: &str = "agent-live";
+const AGENT_IDLE: &str = "agent-idle";
+const AGENT_SB: &str = "agent-sb";
+/// The source stack's `model.defaultProvider`; the target's is
+/// [`TARGET_DEFAULT_PROVIDER`], so an unpinned selection would re-resolve.
+const SOURCE_DEFAULT_PROVIDER: &str = "auggie";
+const TARGET_DEFAULT_PROVIDER: &str = "codex";
+const SOURCE_MODEL: &str = "gpt6-astra";
+
+/// Seed the source stack with the full transfer inventory: two notes, three
+/// agents (one in-flight with nulled-on-import session ids, one with message
+/// history + a queued message, one owning the sandbox), a hook, an event
+/// subscription, a PR monitor, a script with an absolute cwd, a draft, an
+/// asset, some events, a dirty git worktree, and one dirty sandbox clone.
+async fn seed_source(
+    svc: &Services,
+    ws_root: &Path,
+    assets_root: &Path,
+    id: &WorkspaceId,
+) -> Seeded {
+    let t = now_iso();
+
+    // Dirty workspace repo on `main`: one extra commit, one staged file, one
+    // untracked file.
+    let repo = ws_root.join(&id.0).join("repo");
+    init_repo(&repo);
+    let main_tip = commit_file(&repo, "second.txt", "second\n", "feat: second commit");
+    std::fs::write(repo.join("staged.txt"), "staged\n").unwrap();
+    {
+        let r = git2::Repository::open(&repo).unwrap();
+        let mut index = r.index().unwrap();
+        index.add_path(Path::new("staged.txt")).unwrap();
+        index.write().unwrap();
+    }
+    std::fs::write(repo.join("dirty.txt"), "uncommitted\n").unwrap();
+
+    // Sandbox clone on `sb/agent-sb` with one commit and one dirty file.
+    let sb_branch = format!("sb/{AGENT_SB}");
+    let sandbox = ws_root
+        .join(&id.0)
+        .join("sandboxes")
+        .join(AGENT_SB)
+        .join("sb-clone");
+    std::fs::create_dir_all(sandbox.parent().unwrap()).unwrap();
+    let out = std::process::Command::new("git")
+        .arg("clone")
+        .arg("--quiet")
+        .arg(&repo)
+        .arg(&sandbox)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "sandbox clone failed");
+    {
+        let r = git2::Repository::open(&sandbox).unwrap();
+        let head = r.head().unwrap().peel_to_commit().unwrap();
+        r.branch(&sb_branch, &head, false).unwrap();
+        r.set_head(&format!("refs/heads/{sb_branch}")).unwrap();
+    }
+    let sandbox_tip = commit_file(&sandbox, "sb.txt", "sandbox work\n", "feat: sandbox commit");
+    std::fs::write(sandbox.join("sb-dirty.txt"), "sandbox wip\n").unwrap();
+
+    let mut ws = intent_services::feature_api::tests::workspace(id);
+    ws.repository_path = Some(repo.to_string_lossy().into_owned());
+    ws.repository_name = Some("test-repo".to_string());
+    svc.store().insert_workspace(&ws).await.expect("workspace");
+
+    svc.store()
+        .insert_note(&note(id, "note-spec", "the spec"))
+        .await
+        .expect("note 1");
+    svc.store()
+        .insert_note(&note(id, "note-progress", "progress log"))
+        .await
+        .expect("note 2");
+
+    // Agents: in-flight (with live session ids), idle with history + queue,
+    // and the sandbox owner.
+    let live = AgentId::from(AGENT_LIVE);
+    let mut live_session = session(&live, id, AgentStatus::Active);
+    live_session.acp_session_id = Some("acp-live".to_string());
+    live_session.backend_session_id = Some(AgentId::from("backend-live"));
+    svc.store()
+        .insert_agent_session(&live_session)
+        .await
+        .expect("live session");
+    // Next-turn selections (intent-hq/intent#5815): the idle agent inherits
+    // the source default provider with an explicit model + effort and one
+    // committed turn; the sandbox owner picked its provider explicitly; the
+    // live agent is all-Auto.
+    let idle = AgentId::from(AGENT_IDLE);
+    let mut idle_session = session(&idle, id, AgentStatus::RuntimeIdle);
+    idle_session.model = Some(SOURCE_MODEL.to_string());
+    idle_session.reasoning_effort = Some("high".to_string());
+    svc.store()
+        .insert_agent_session(&idle_session)
+        .await
+        .expect("idle session");
+    svc.store()
+        .set_agent_session_last_turn_model(id, &idle, Some(SOURCE_MODEL), SOURCE_DEFAULT_PROVIDER)
+        .await
+        .expect("idle last turn");
+    let sb_agent = AgentId::from(AGENT_SB);
+    let mut sb_session = session(&sb_agent, id, AgentStatus::RuntimeIdle);
+    sb_session.provider = Some("claude-code".to_string());
+    sb_session.model = Some("claude-fable-5".to_string());
+    svc.store()
+        .insert_agent_session(&sb_session)
+        .await
+        .expect("sb session");
+
+    // Message history + a queued message (the queue rides the archive and
+    // rehydrates on the target).
+    for (agent, role, text) in [
+        (&idle, "user", "hello"),
+        (&idle, "assistant", "hi there"),
+        (&live, "user", "do the thing"),
+    ] {
+        svc.store()
+            .append_agent_message(
+                agent,
+                role,
+                &serde_json::json!([{ "type": "text", "text": text }]),
+                &t,
+            )
+            .await
+            .expect("message");
+    }
+    svc.store()
+        .replace_agent_queue(
+            &live,
+            &[AgentQueueRow {
+                id: "qm-1".to_string(),
+                agent_id: live.clone(),
+                position: 0,
+                payload: serde_json::json!({
+                    "id": "qm-1", "turnId": "qm-1",
+                    "content": "queued while busy", "queuedAt": t
+                }),
+                created_at: t.clone(),
+                turn_id: "qm-1".to_string(),
+            }],
+        )
+        .await
+        .expect("queue");
+
+    // Hook (scheduled, far-future expiry so target rehydration resumes it).
+    svc.store()
+        .insert_hook(&Hook {
+            hook_id: HookId::from("hook-rt"),
+            workspace_id: id.clone(),
+            agent_id: idle.clone(),
+            name: "watcher".to_string(),
+            code: "return { dispatch: false }".to_string(),
+            delay_ms: 10_000,
+            cron: None,
+            run_at: None,
+            state: HookState::Scheduled,
+            created_at: t.clone(),
+            last_run_at: None,
+            next_run_at: Some("2999-01-01T00:00:00Z".to_string()),
+            run_count: 0,
+            last_error: None,
+            last_logs: None,
+            last_state: None,
+            expires_at: Some("2999-01-01T00:30:00Z".to_string()),
+            perpetual: false,
+            dispatch_count: 0,
+        })
+        .await
+        .expect("hook");
+
+    // Event subscription + PR monitor + script (absolute cwd → rewritten).
+    svc.store()
+        .upsert_event_subscription(&PersistedEventSubscription {
+            id: "sub-rt".to_string(),
+            workspace_id: id.clone(),
+            subscriber_agent_id: idle.clone(),
+            event_types: vec!["note:*".to_string()],
+            exclude_self: true,
+            batch_window_ms: 500,
+            created_at: t.clone(),
+        })
+        .await
+        .expect("subscription");
+    svc.store()
+        .insert_pr_monitor(&PrMonitor {
+            monitor_id: PrMonitorId::from("prmon-rt"),
+            workspace_id: id.clone(),
+            agent_id: idle.clone(),
+            repo_owner: "intent-hq".to_string(),
+            repo_name: "intentd".to_string(),
+            pr_number: 42,
+            state: PrMonitorState::Active,
+            last_snapshot: None,
+            baseline_snapshot: None,
+            pending_changes: vec![],
+            pending_since: None,
+            last_change_at: None,
+            last_polled_at: None,
+            last_error: None,
+            created_at: t.clone(),
+            updated_at: t.clone(),
+        })
+        .await
+        .expect("pr monitor");
+    svc.store()
+        .upsert_script(&Script {
+            purpose: intent_core::ScriptPurpose::Saved,
+            archived_at: None,
+            last_run: None,
+            id: "script-rt".to_string(),
+            workspace_id: id.0.clone(),
+            name: "build".to_string(),
+            command: "true".to_string(),
+            cwd: Some(repo.to_string_lossy().into_owned()),
+            env: None,
+            mode: ScriptMode::Command,
+            category: None,
+            source: "user".to_string(),
+            auto_start: None,
+            created_at: t.clone(),
+            updated_at: None,
+        })
+        .await
+        .expect("script");
+
+    // Sandbox row for the clone above.
+    svc.store()
+        .insert_sandbox(&Sandbox {
+            id: "sb-rt".to_string(),
+            workspace_id: id.clone(),
+            agent_id: sb_agent.clone(),
+            path: sandbox.to_string_lossy().into_owned(),
+            branch: sb_branch,
+            base_commit_sha: main_tip.clone(),
+            snapshot_commit_sha: None,
+            status: SandboxStatus::Created,
+            retry_count: 0,
+            created_at: t.clone(),
+            updated_at: t.clone(),
+        })
+        .await
+        .expect("sandbox");
+
+    // Draft (FKs onto client; dropped by the import transform).
+    let client = ClientId::from("client-rt");
+    svc.store()
+        .upsert_client(&client, None, None, &ClientHostInfo::default())
+        .await
+        .expect("client");
+    svc.store()
+        .upsert_draft(id, &live, &client, "half-typed message", None)
+        .await
+        .expect("draft");
+
+    // One asset + events (events must NOT transfer).
+    let dir = assets_root.join(&id.0);
+    std::fs::create_dir_all(&dir).expect("assets dir");
+    std::fs::write(dir.join("img.png"), b"asset-bytes").expect("asset");
+
+    // Two attachment-registry rows: one with its stored file present in the
+    // git-ignored `.intent/attachments/` store, one whose file was deleted
+    // out-of-band (deleted-is-deleted — the row transfers, no file rides).
+    let att_dir = repo.join(".intent/attachments");
+    std::fs::create_dir_all(&att_dir).expect("attachments dir");
+    std::fs::write(att_dir.join(".gitignore"), "*\n").expect("marker");
+    std::fs::write(att_dir.join("doc.pdf"), b"attachment-bytes").expect("attachment");
+    for (att_id, name) in [("att-live", "doc.pdf"), ("att-gone", "gone.txt")] {
+        svc.store()
+            .insert_attachment(&intent_store::AttachmentRecord {
+                id: att_id.to_string(),
+                workspace_id: id.clone(),
+                file_name: name.to_string(),
+                mime_type: None,
+                size: 16,
+                uploaded_at: t.clone(),
+                stored_path: format!(".intent/attachments/{name}"),
+            })
+            .await
+            .expect("attachment row");
+    }
+    for i in 0..3 {
+        svc.store()
+            .insert_event(&intent_store::NewEvent {
+                workspace_id: id.clone(),
+                timestamp: t.clone(),
+                event_type: format!("note:updated:{i}"),
+                actor: intent_services::feature_api::system_actor(),
+                session_id: None,
+                correlation_id: None,
+                parent_event_id: None,
+                metadata: None,
+                data: serde_json::json!({ "i": i }),
+            })
+            .await
+            .expect("event");
+    }
+
+    Seeded {
+        repo,
+        sandbox,
+        main_tip,
+        sandbox_tip,
+    }
+}
+
+/// Relay one sealed export archive from `source` to `target` the way the FE
+/// does: read every chunk off `workspace.export.read` and pipe it straight
+/// into `workspace.import.chunk`. Returns the target's commit result.
+async fn relay(
+    source: &Services,
+    target: &Services,
+    export_id: &str,
+    manifest: &TransferManifest,
+    size: u64,
+    sha: &str,
+) -> serde_json::Value {
+    let begin = target
+        .workspace_import_begin_op(
+            serde_json::to_value(manifest).expect("manifest json"),
+            size,
+            sha.to_string(),
+        )
+        .await
+        .expect("import begin");
+    let import_id = begin["importId"].as_str().expect("importId").to_string();
+
+    let first = source
+        .workspace_export_read_op(export_id.to_string(), 0)
+        .await
+        .expect("read 0");
+    let total_chunks = first["totalChunks"].as_u64().expect("totalChunks");
+    for seq in 0..total_chunks {
+        let chunk = if seq == 0 {
+            first.clone()
+        } else {
+            source
+                .workspace_export_read_op(export_id.to_string(), seq)
+                .await
+                .expect("read chunk")
+        };
+        target
+            .workspace_import_chunk_op(
+                import_id.clone(),
+                seq,
+                chunk["data"].as_str().expect("chunk data").to_string(),
+            )
+            .await
+            .expect("import chunk");
+    }
+    target
+        .workspace_import_commit_op(import_id)
+        .await
+        .expect("import commit")
+}
+
+/// Supply canonical CLI discovery only to the roundtrip worker, without
+/// exposing its sentinel to unrelated tests in a parallel libtest process.
+#[cfg(unix)]
+fn round_trip_with_installed_cli() {
+    use intent_providers::installed_cli::InstalledCli;
+    use intentd_test_support::GuardedChild;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    let root = test_tempdir("transfer-installed-cli-");
+    let bin = root.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    // Use explicit directories for the absence control: enhanced discovery can
+    // find a user's CLI outside PATH. An adapter name must not satisfy it.
+    let dirs = [bin.clone()];
+    let legacy = bin.join("claude-code");
+    std::fs::write(
+        &legacy,
+        r#"#!/bin/sh
+{
+    printf 'sentinel=%s pid=%s ppid=%s argc=%s\n' "$0" "$$" "$PPID" "$#"
+    if [ -r "/proc/$PPID/comm" ]; then
+        IFS= read -r parent_name < "/proc/$PPID/comm"
+        printf 'parent_name=%s\n' "$parent_name"
+        printf 'parent_exe='
+        /usr/bin/readlink "/proc/$PPID/exe" || true
+    fi
+    index=0
+    for arg do
+        index=$((index + 1))
+        [ "$index" -le 8 ] || break
+        case "$arg" in
+            -v|--version|-h|--help|-p|--print|-e|--eval|--input-type=module|process.execPath|process.version|process.versions.node)
+                printf 'argv[%s]=%s\n' "$index" "$arg" ;;
+            *) printf 'argv[%s]=<redacted:%s bytes>\n' "$index" "${#arg}" ;;
+        esac
+    done
+} >> "$INTENT_TRANSFER_CLI_ROOT/${0##*/}-launched"
+exit 91
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(InstalledCli::Claude.resolve_in_dirs(&dirs, false).is_err());
+    let canonical = bin.join("claude");
+    std::fs::rename(&legacy, &canonical).unwrap();
+    assert_eq!(
+        InstalledCli::Claude
+            .resolve_in_dirs(&dirs, false)
+            .unwrap()
+            .path(),
+        canonical
+    );
+    // The pinned adapter also needs npx. Its lookup prefers the sibling of
+    // the detected node, so fixture both without invoking either program.
+    for command in ["node", "npx"] {
+        std::fs::copy(&canonical, bin.join(command)).unwrap();
+    }
+    // Enhanced discovery captures a login shell even when PATH already has the
+    // CLI. Keep host startup scripts from running programs during that capture.
+    let shell = root.path().join("shell");
+    std::fs::write(
+        &shell,
+        "#!/bin/sh\nprintf 'captured\\n' >> \"$INTENT_TRANSFER_CLI_ROOT/shell-captured\"\nprintf '__INTENT_PATH_S__%s__INTENT_PATH_E__' \"$PATH\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let log_path = root.path().join("worker.log");
+    let log = std::fs::File::create(&log_path).unwrap();
+    // Coordinate the inherited PATH snapshot with existing env-mutating tests,
+    // but change only the child environment, never the parent or other tests.
+    let env_lock = intent_services::feature_api::agent_manager::tests::EnvGuard::apply(&[]);
+    let mut paths = vec![bin];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "transfer_roundtrip::transfer_round_trip_between_two_stacks",
+            "--nocapture",
+        ])
+        .env("PATH", std::env::join_paths(paths).unwrap())
+        .env("SHELL", &shell)
+        .env("INTENT_TRANSFER_CLI_ROOT", root.path())
+        // The parent owns every worker tempdir even if timeout kills the worker
+        // before its own TempDir destructors can run.
+        .env("TMPDIR", root.path())
+        .env_remove("MOCK_AGENT_SCRIPT_PATH")
+        .stdin(Stdio::null())
+        .stdout(log.try_clone().unwrap())
+        .stderr(log);
+    let mut child = GuardedChild::spawn(&mut command).unwrap();
+    drop(env_lock);
+    let status = child
+        .wait_with_timeout(intentd_test_support::test_timeout(Duration::from_secs(120)))
+        .unwrap();
+    drop(child); // Kill/reap a timed-out worker before inspecting or removing its files.
+    let worker_log = std::fs::read_to_string(&log_path).unwrap();
+    let shell_receipt = std::fs::read_to_string(root.path().join("shell-captured"));
+    eprintln!(
+        "roundtrip worker status={status:?} completed={} shell_capture={shell_receipt:?}\n{worker_log}",
+        root.path().join("completed").exists()
+    );
+    // Print every sentinel receipt before asserting so panic cleanup cannot
+    // erase the caller evidence for a later sentinel in this list.
+    for command in ["claude", "node", "npx"] {
+        if let Ok(receipt) =
+            std::fs::read_to_string(root.path().join(format!("{command}-launched")))
+        {
+            eprintln!("unexpected {command} invocation:\n{receipt}");
+        }
+    }
+    for command in ["claude", "node", "npx"] {
+        assert!(
+            !root.path().join(format!("{command}-launched")).exists(),
+            "transfer must not launch {command}"
+        );
+    }
+    assert!(
+        status.is_some_and(|status| status.success()) && root.path().join("completed").exists(),
+        "roundtrip worker failed ({status:?}):\n{worker_log}"
+    );
+    assert!(
+        shell_receipt.is_ok_and(|receipt| receipt.lines().any(|line| line == "captured")),
+        "enhanced discovery must capture the fixture shell"
+    );
+    std::fs::remove_file(canonical).unwrap();
+    assert!(InstalledCli::Claude.resolve_in_dirs(&dirs, false).is_err());
+}
+
+/// The full FE-shaped relay over two in-process stacks: plan on the source,
+/// export → chunked read → staged import → commit on the target →
+/// finalize on the source. Asserts the plan's size estimate is a sane
+/// predictor of the actual archive, the target's per-table row counts
+/// (events zero, drafts dropped), path rewrites, nulled ACP session ids,
+/// interrupted-agent capture, git worktree + sandbox dirty state, the
+/// rehydration counts, and the finalized (archived) source.
+#[intent_test_macros::daemon_test]
+async fn transfer_round_trip_between_two_stacks() {
+    #[cfg(unix)]
+    {
+        let Some(root) = std::env::var_os("INTENT_TRANSFER_CLI_ROOT") else {
+            round_trip_with_installed_cli();
+            return;
+        };
+        assert_eq!(std::env::temp_dir(), Path::new(&root));
+        assert_eq!(
+            std::env::var_os("SHELL"),
+            Some(Path::new(&root).join("shell").into_os_string())
+        );
+        eprintln!(
+            "roundtrip worker pid={}: canonical CLI discovery",
+            std::process::id()
+        );
+        assert_eq!(
+            intent_providers::installed_cli::InstalledCli::Claude
+                .resolve()
+                .unwrap()
+                .path(),
+            Path::new(&root).join("bin/claude"),
+            "the roundtrip must discover its sentinel, not a host CLI"
+        );
+        eprintln!("roundtrip worker: node discovery");
+        assert_eq!(
+            intent_providers::discover::find_node(),
+            Some(Path::new(&root).join("bin/node")),
+            "adapter discovery must select the fixture node"
+        );
+        eprintln!("roundtrip worker: provider availability");
+        let availability =
+            intent_providers::discover::provider_availability_for("claude-code", &|_| None)
+                .unwrap();
+        assert!(
+            availability.installed,
+            "fixture must supply CLI and adapter readiness"
+        );
+        assert_eq!(
+            availability.resolved_path,
+            // npx discovery prefers the canonicalized node's sibling, including
+            // when the system temp root itself is a symlink (e.g. macOS /var).
+            Some(std::fs::canonicalize(Path::new(&root).join("bin/npx")).unwrap()),
+            "the adapter must resolve through the fixture, not host npx"
+        );
+        eprintln!("roundtrip worker: original transfer body");
+    }
+    let src_db = TempDir::new("rt-src-db");
+    let src_ws_root = TempDir::new("rt-src-ws");
+    let src_assets_root = TempDir::new("rt-src-assets");
+    let dst_db = TempDir::new("rt-dst-db");
+    let dst_ws_root = TempDir::new("rt-dst-ws");
+    let dst_assets_root = TempDir::new("rt-dst-assets");
+    let source = fresh_services_with_default_provider(
+        &src_db.0,
+        &src_ws_root.0,
+        &src_assets_root.0,
+        SOURCE_DEFAULT_PROVIDER,
+    )
+    .await;
+    let target = fresh_services_with_default_provider(
+        &dst_db.0,
+        &dst_ws_root.0,
+        &dst_assets_root.0,
+        TARGET_DEFAULT_PROVIDER,
+    )
+    .await;
+
+    let id = WorkspaceId("ws-roundtrip".to_string());
+    let seeded = seed_source(&source, &src_ws_root.0, &src_assets_root.0, &id).await;
+
+    // ---- plan (source): the FE preview before starting -------------------
+    let plan = source
+        .workspace_transfer_plan_op(id.clone())
+        .await
+        .expect("plan");
+    assert!(plan.manifest.git.has_repository);
+    assert_eq!(plan.manifest.git.branch.as_deref(), Some("main"));
+    assert!(plan
+        .manifest
+        .git
+        .sandbox_branches
+        .contains(&format!("sb/{AGENT_SB}")));
+    assert!(!plan.manifest.git.dirty_files.is_empty());
+    let plan_rows = |n: &str| {
+        plan.manifest
+            .tables
+            .iter()
+            .find(|t| t.name == n)
+            .map_or(-1, |t| t.row_count)
+    };
+    assert_eq!(plan_rows("agent_session"), 3);
+    assert_eq!(plan_rows("agent_message"), 3);
+    assert_eq!(plan_rows("agent_queue"), 1);
+    assert!(plan.total_size_bytes > 0);
+
+    // ---- export (source) --------------------------------------------------
+    let started = source
+        .workspace_export_start_op(id.clone())
+        .await
+        .expect("export start");
+    let export_id = started["exportId"].as_str().expect("exportId").to_string();
+    assert!(wait_ready(&source, &export_id).await, "build must succeed");
+
+    // Multi-chunk relay with a tiny archive: shrink the chunk budget.
+    {
+        let mut exports = source.transfer_state().exports.lock().unwrap();
+        exports.get_mut(&export_id).unwrap().max_chunk_bytes = 4096;
+    }
+    let (size, sha, manifest) = ready_meta(&source, &export_id);
+    assert!(size > 4096, "archive should span multiple chunks");
+
+    // Plan estimate vs. actual archive size: within a sane factor. The
+    // estimate skips zip compression and WIP snapshot deltas, so allow a
+    // generous band rather than pinning a ratio.
+    let estimate = plan.total_size_bytes;
+    assert!(
+        estimate >= size / 10 && estimate <= size.saturating_mul(10),
+        "plan estimate {estimate} should be within 10x of actual archive {size}"
+    );
+
+    // ---- relay + commit (target) -------------------------------------------
+    let committed = relay(&source, &target, &export_id, &manifest, size, &sha).await;
+
+    // ---- target row counts --------------------------------------------------
+    let stats = target
+        .store()
+        .transfer_table_stats(&id)
+        .await
+        .expect("stats");
+    let rows = |n: &str| {
+        stats
+            .iter()
+            .find(|s| s.name == n)
+            .map_or(-1, |s| s.row_count)
+    };
+    assert_eq!(rows("workspace"), 1);
+    assert_eq!(rows("note"), 2);
+    assert_eq!(rows("agent_session"), 3);
+    assert_eq!(rows("agent_message"), 3);
+    assert_eq!(rows("agent_queue"), 1);
+    assert_eq!(rows("hook"), 1);
+    assert_eq!(rows("event_subscription"), 1);
+    assert_eq!(rows("pr_monitor"), 1);
+    assert_eq!(rows("script"), 1);
+    assert_eq!(rows("sandbox"), 1);
+    assert_eq!(rows("draft"), 0, "drafts never transfer");
+    // Event history stays on the source.
+    let events = target
+        .store()
+        .query_events(&intent_store::EventQuery {
+            workspace_id: Some(id.clone()),
+            event_type_prefix: Some("note:".to_string()),
+            ..Default::default()
+        })
+        .await
+        .expect("target events");
+    assert!(events.is_empty(), "events must not transfer: {events:?}");
+
+    // ---- interrupted agents + session scrub ---------------------------------
+    assert_eq!(
+        committed["interruptedAgents"],
+        serde_json::json!([AGENT_LIVE])
+    );
+    let live = target
+        .store()
+        .get_agent_session(&AgentId::from(AGENT_LIVE))
+        .await
+        .expect("live session on target");
+    assert_eq!(live.status, AgentStatus::RuntimeIdle);
+    assert!(live.acp_session_id.is_none(), "acp session id nulled");
+    assert!(
+        live.backend_session_id.is_none(),
+        "backend session id nulled"
+    );
+    assert!(!live.is_active);
+    assert!(live
+        .stop_reason
+        .as_deref()
+        .unwrap_or_default()
+        .contains("transferred"));
+    let interrupted = target
+        .store()
+        .list_interrupted_agents()
+        .await
+        .expect("interrupted");
+    assert_eq!(interrupted.len(), 1);
+    assert_eq!(interrupted[0].agent_id.0, AGENT_LIVE);
+    assert_eq!(interrupted[0].prev_status, "active");
+
+    // ---- next-turn selections survive the default-provider mismatch ---------
+    // (intent-hq/intent#5815) The target defaults to another provider; every
+    // session still carries the selection it had on the source.
+    assert_eq!(
+        live.provider.as_deref(),
+        Some(SOURCE_DEFAULT_PROVIDER),
+        "all-Auto session pinned to its source provider"
+    );
+    assert_eq!(live.model, None, "Auto model stays Auto");
+    assert_eq!(live.reasoning_effort, None);
+    let idle = target
+        .store()
+        .get_agent_session(&AgentId::from(AGENT_IDLE))
+        .await
+        .expect("idle session on target");
+    assert_eq!(idle.provider.as_deref(), Some(SOURCE_DEFAULT_PROVIDER));
+    assert_eq!(idle.model.as_deref(), Some(SOURCE_MODEL));
+    assert_eq!(idle.reasoning_effort.as_deref(), Some("high"));
+    assert_eq!(
+        target
+            .store()
+            .get_agent_session_last_turn_model(&id, &AgentId::from(AGENT_IDLE))
+            .await
+            .expect("idle last turn on target"),
+        (
+            Some(SOURCE_MODEL.to_string()),
+            Some(SOURCE_DEFAULT_PROVIDER.to_string())
+        ),
+        "last-turn history rides separately from the selection"
+    );
+    let sb = target
+        .store()
+        .get_agent_session(&AgentId::from(AGENT_SB))
+        .await
+        .expect("sb session on target");
+    assert_eq!(sb.provider.as_deref(), Some("claude-code"));
+    assert_eq!(sb.model.as_deref(), Some("claude-fable-5"));
+    assert_eq!(sb.reasoning_effort, None);
+    // The source rows were never written by the export.
+    let src_idle = source
+        .store()
+        .get_agent_session(&AgentId::from(AGENT_IDLE))
+        .await
+        .expect("idle session on source");
+    assert_eq!(src_idle.provider, None, "source row untouched");
+    assert_eq!(src_idle.model.as_deref(), Some(SOURCE_MODEL));
+
+    // ---- path rewrites + git materialization ---------------------------------
+    let imported = target.store().get_workspace(&id).await.expect("workspace");
+    let checkout = dst_ws_root.0.join(&id.0).join("test-repo");
+    assert_eq!(
+        imported.repository_path.as_deref(),
+        Some(checkout.to_str().unwrap()),
+        "repository re-rooted under the target workspaces root"
+    );
+    assert_eq!(imported.worktree_path, None);
+    assert_eq!(imported.branch, "main");
+    // Worktree: right tip, dirty state restored (WIP snapshot unwound).
+    assert_eq!(repo_head(&checkout), seeded.main_tip);
+    assert_eq!(
+        std::fs::read_to_string(checkout.join("dirty.txt")).unwrap(),
+        "uncommitted\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(checkout.join("staged.txt")).unwrap(),
+        "staged\n"
+    );
+    assert!(
+        is_untracked(&checkout, "dirty.txt"),
+        "dirty.txt untracked again"
+    );
+
+    // Sandbox: row rewritten, clone materialized with its commit + dirty file.
+    let sandboxes = target.store().list_sandboxes(&id).await.expect("sandboxes");
+    assert_eq!(sandboxes.len(), 1);
+    let expected_sb = dst_ws_root
+        .0
+        .join(&id.0)
+        .join("sandboxes")
+        .join(AGENT_SB)
+        .join("test-repo");
+    assert_eq!(sandboxes[0].path, expected_sb.to_string_lossy());
+    assert_eq!(repo_head(&expected_sb), seeded.sandbox_tip);
+    assert_eq!(
+        std::fs::read_to_string(expected_sb.join("sb-dirty.txt")).unwrap(),
+        "sandbox wip\n"
+    );
+
+    // Script cwd re-rooted under the target workspace dir.
+    let scripts = target.store().list_all_scripts().await.expect("scripts");
+    let script = scripts
+        .iter()
+        .find(|s| s.id == "script-rt")
+        .expect("script");
+    let expected_cwd = dst_ws_root.0.join(&id.0).join("repo");
+    assert_eq!(script.cwd.as_deref(), Some(expected_cwd.to_str().unwrap()));
+
+    // Asset placed.
+    assert_eq!(
+        std::fs::read(dst_assets_root.0.join(&id.0).join("img.png")).expect("asset"),
+        b"asset-bytes"
+    );
+
+    // Attachments: both registry rows landed; the live file materialized in
+    // the re-rooted checkout's git-ignored store (with the ignore-all
+    // marker), the deleted one imported as a row without a file.
+    let atts = target
+        .store()
+        .list_attachments(&id)
+        .await
+        .expect("attachments");
+    assert_eq!(atts.len(), 2);
+    let att_dir = checkout.join(".intent/attachments");
+    assert_eq!(
+        std::fs::read(att_dir.join("doc.pdf")).expect("attachment file"),
+        b"attachment-bytes"
+    );
+    assert_eq!(
+        std::fs::read_to_string(att_dir.join(".gitignore")).expect("marker"),
+        "*\n"
+    );
+    assert!(!att_dir.join("gone.txt").exists(), "deleted-is-deleted");
+
+    // ---- rehydration counts ---------------------------------------------------
+    assert_eq!(committed["rehydrated"]["hooks"], 1);
+    assert_eq!(committed["rehydrated"]["eventSubscriptions"], 1);
+    assert_eq!(committed["rehydrated"]["prMonitors"], 1);
+    assert_eq!(committed["rehydrated"]["agentQueues"], 1);
+
+    // ---- finalize (source) ------------------------------------------------------
+    let finalized = source
+        .workspace_export_finalize_op(
+            export_id.clone(),
+            true,
+            Some("Transferred to another machine".to_string()),
+        )
+        .await
+        .expect("finalize");
+    assert_eq!(finalized["finalized"], true);
+    let src_ws = source.store().get_workspace(&id).await.expect("source ws");
+    assert_eq!(src_ws.status, WorkspaceStatus::Archived);
+    assert_eq!(
+        src_ws.status_message.as_deref(),
+        Some("Transferred to another machine")
+    );
+    assert!(
+        !src_ws_root
+            .0
+            .join(".export-staging")
+            .join(&export_id)
+            .exists(),
+        "export staging cleaned"
+    );
+    // Finalize unwound the source WIP snapshots: dirty state restored.
+    assert_eq!(repo_head(&seeded.repo), seeded.main_tip);
+    assert!(seeded.repo.join("dirty.txt").exists());
+    assert!(is_untracked(&seeded.repo, "dirty.txt"));
+    assert_eq!(repo_head(&seeded.sandbox), seeded.sandbox_tip);
+    assert!(seeded.sandbox.join("sb-dirty.txt").exists());
+    #[cfg(unix)]
+    std::fs::write(
+        PathBuf::from(std::env::var_os("INTENT_TRANSFER_CLI_ROOT").unwrap()).join("completed"),
+        "all roundtrip assertions passed",
+    )
+    .unwrap();
+}
+
+/// Failure injection: abort the relay mid-chunk. The source stays intact
+/// (its export abort unwinds WIP snapshots and cleans staging), and the
+/// target's import abort cleans its staging with nothing committed.
+#[tokio::test]
+async fn transfer_abort_mid_relay_cleans_both_sides() {
+    let src_db = TempDir::new("rt-abort-src-db");
+    let src_ws_root = TempDir::new("rt-abort-src-ws");
+    let src_assets_root = TempDir::new("rt-abort-src-assets");
+    let dst_db = TempDir::new("rt-abort-dst-db");
+    let dst_ws_root = TempDir::new("rt-abort-dst-ws");
+    let dst_assets_root = TempDir::new("rt-abort-dst-assets");
+    let source = fresh_services(&src_db.0, &src_ws_root.0, &src_assets_root.0).await;
+    let target = fresh_services(&dst_db.0, &dst_ws_root.0, &dst_assets_root.0).await;
+
+    let id = WorkspaceId("ws-roundtrip-abort".to_string());
+    let seeded = seed_source(&source, &src_ws_root.0, &src_assets_root.0, &id).await;
+
+    let started = source
+        .workspace_export_start_op(id.clone())
+        .await
+        .expect("export start");
+    let export_id = started["exportId"].as_str().expect("exportId").to_string();
+    assert!(wait_ready(&source, &export_id).await, "build must succeed");
+    {
+        let mut exports = source.transfer_state().exports.lock().unwrap();
+        exports.get_mut(&export_id).unwrap().max_chunk_bytes = 4096;
+    }
+    let (size, sha, manifest) = ready_meta(&source, &export_id);
+
+    // Begin the import and deliver only the FIRST chunk, then abort.
+    let begin = target
+        .workspace_import_begin_op(
+            serde_json::to_value(&manifest).expect("manifest json"),
+            size,
+            sha.clone(),
+        )
+        .await
+        .expect("import begin");
+    let import_id = begin["importId"].as_str().expect("importId").to_string();
+    let chunk0 = source
+        .workspace_export_read_op(export_id.clone(), 0)
+        .await
+        .expect("read 0");
+    assert!(
+        chunk0["totalChunks"].as_u64().unwrap() > 1,
+        "mid-relay abort needs >1 chunk"
+    );
+    target
+        .workspace_import_chunk_op(
+            import_id.clone(),
+            0,
+            chunk0["data"].as_str().unwrap().to_string(),
+        )
+        .await
+        .expect("chunk 0");
+
+    // Abort both sides.
+    let target_staging = dst_ws_root.0.join(".import-staging").join(&import_id);
+    assert!(target_staging.exists());
+    let aborted = target
+        .workspace_import_abort_op(import_id.clone())
+        .await
+        .expect("import abort");
+    assert_eq!(aborted["aborted"], true);
+    assert!(!target_staging.exists(), "target staging cleaned");
+    assert!(matches!(
+        target.store().get_workspace(&id).await,
+        Err(Error::NotFound(_))
+    ));
+
+    let source_staging = src_ws_root.0.join(".export-staging").join(&export_id);
+    assert!(source_staging.exists());
+    let aborted = source
+        .workspace_export_abort_op(export_id.clone())
+        .await
+        .expect("export abort");
+    assert_eq!(aborted["aborted"], true);
+    assert!(!source_staging.exists(), "source staging cleaned");
+
+    // Source intact: workspace still active, WIP snapshots unwound so the
+    // dirty state is exactly as seeded.
+    let src_ws = source.store().get_workspace(&id).await.expect("source ws");
+    assert_eq!(src_ws.status, WorkspaceStatus::Active);
+    assert_eq!(repo_head(&seeded.repo), seeded.main_tip);
+    assert!(is_untracked(&seeded.repo, "dirty.txt"));
+    assert_eq!(
+        std::fs::read_to_string(seeded.repo.join("staged.txt")).unwrap(),
+        "staged\n"
+    );
+    assert_eq!(repo_head(&seeded.sandbox), seeded.sandbox_tip);
+    assert_eq!(
+        std::fs::read_to_string(seeded.sandbox.join("sb-dirty.txt")).unwrap(),
+        "sandbox wip\n"
+    );
+}

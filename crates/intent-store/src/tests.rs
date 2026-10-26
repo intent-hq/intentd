@@ -9,8 +9,8 @@ use intent_core::{
     ClientId, Comment, CommentAnchor, CommentAnchorType, CommentStatus, CommentType, ContentType,
     Error, EventActor, Hook, HookId, HookListRow, HookState, Note, NoteId, NoteMetadata,
     NoteVersionAuthor, NoteVisibility, Principal, PrincipalId, PrincipalIdentity, TaskMetadata,
-    TaskStatus, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceId, WorkspaceInvite,
-    WorkspaceRole, WorkspaceStatus,
+    TaskStatus, Workspace, WorkspaceAttention, WorkspaceId, WorkspaceInvite, WorkspaceRole,
+    WorkspaceStatus,
 };
 use serde_json::json;
 use sqlx::Row;
@@ -23,14 +23,15 @@ mod script_initialization;
 mod script_monitors;
 mod sharing;
 mod workspace_delete;
+mod workspace_retired;
 
 mod metadata_key_json;
-mod note_annotations;
-mod note_index_profile;
 mod note_line_attribution;
-mod note_pages;
+mod note_paging_removal;
 mod note_search;
+mod note_write_lock;
 mod pull_request_workspace;
+mod workspace_pr_settled;
 mod write_acquire_retry;
 
 #[tokio::test]
@@ -96,52 +97,26 @@ fn sample_workspace(id: &WorkspaceId, title: &str, archived: bool) -> Workspace 
         title: title.to_string(),
         branch: "feature/test".to_string(),
         base_ref: Some("main".to_string()),
-        base_commit_sha: None,
         status: if archived {
             WorkspaceStatus::Archived
         } else {
             WorkspaceStatus::Active
         },
         status_message: Some("working".to_string()),
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
         attention: WorkspaceAttention::Unread,
         created_at: ts.clone(),
         updated_at: ts.clone(),
         last_activity: Some(ts),
-        last_content_activity: None,
         tags: vec!["alpha".to_string(), "beta".to_string()],
         path: Some("/tmp/ws-meta".to_string()),
         repository_path: Some("/tmp/repo".to_string()),
         repository_owner: Some("intent-hq".to_string()),
         repository_name: Some("intentd".to_string()),
-        worktree_path: None,
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
         default_model: Some("opus".to_string()),
         pr_number: Some(42),
-        pr_url: None,
-        pr_status: None,
-        active_pull_request: None,
-        pull_requests: None,
-        context_links: None,
         archived,
         archived_at: if archived { Some(now_iso()) } else { None },
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        pull_requests_total: None,
-        display_status: None,
-        waiting: false,
-        checkout_mode: None,
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
+        ..Default::default()
     }
 }
 
@@ -365,10 +340,16 @@ async fn workspace_round_trip_and_archive_filter() {
         .await
         .expect("insert archived");
 
-    let all = store.list_workspaces(true).await.expect("list all");
+    let all = store
+        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await
+        .expect("list all");
     assert_eq!(all.len(), 2);
 
-    let visible = store.list_workspaces(false).await.expect("list visible");
+    let visible = store
+        .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+        .await
+        .expect("list visible");
     assert_eq!(visible.len(), 1);
     assert_eq!(visible[0].id, active_id);
 
@@ -1347,7 +1328,11 @@ async fn note_version_records_rev_and_looks_up_base_by_rev() {
     // matches what the row now carries.
     note.content = "one".to_string();
     let rev1 = store
-        .update_note_versioned(&note, Some(0))
+        .update_note_versioned(
+            &store.lock_note_content(&note.workspace_id, &note.id).await,
+            &note,
+            Some(0),
+        )
         .await
         .expect("versioned update");
     assert_eq!(rev1, 1);
@@ -1362,7 +1347,13 @@ async fn note_version_records_rev_and_looks_up_base_by_rev() {
 
     // Unconditional write: same contract (1 → 2).
     note.content = "two".to_string();
-    let rev2 = store.update_note(&note).await.expect("update");
+    let rev2 = store
+        .update_note(
+            &store.lock_note_content(&note.workspace_id, &note.id).await,
+            &note,
+        )
+        .await
+        .expect("update");
     assert_eq!(rev2, 2);
     store
         .append_note_version(&note, &author, &ts, rev2)
@@ -1388,7 +1379,13 @@ async fn note_version_records_rev_and_looks_up_base_by_rev() {
     // A metadata-only write bumps rev without a snapshot (2 → 3): the
     // content as of rev 3 is the last content-write snapshot at or below it.
     note.is_pinned = true;
-    let rev3 = store.update_note(&note).await.expect("metadata update");
+    let rev3 = store
+        .update_note(
+            &store.lock_note_content(&note.workspace_id, &note.id).await,
+            &note,
+        )
+        .await
+        .expect("metadata update");
     assert_eq!(rev3, 3);
     assert_eq!(
         by_rev(3).await.expect("metadata-only rev 3"),
@@ -1412,7 +1409,13 @@ async fn note_version_records_rev_and_looks_up_base_by_rev() {
     // gone: `None`, not an error.
     for _ in 0..MAX_NOTE_VERSIONS {
         note.content = "churn".to_string();
-        let rev = store.update_note(&note).await.expect("churn update");
+        let rev = store
+            .update_note(
+                &store.lock_note_content(&note.workspace_id, &note.id).await,
+                &note,
+            )
+            .await
+            .expect("churn update");
         store
             .append_note_version(&note, &author, &ts, rev)
             .await
@@ -1747,14 +1750,26 @@ async fn note_rev_increments_on_update() {
     // First update bumps rev → 1 (the bump is store-owned, ignoring the stale
     // in-memory `rev` carried by the passed-in note).
     note.content = "# Hello v2".to_string();
-    store.update_note(&note).await.expect("update note");
+    store
+        .update_note(
+            &store.lock_note_content(&note.workspace_id, &note.id).await,
+            &note,
+        )
+        .await
+        .expect("update note");
     let after_first = store.get_note(&ws_id, &note.id).await.expect("get note");
     assert_eq!(after_first.rev, 1);
     assert_eq!(after_first.content, "# Hello v2");
 
     // A second update bumps again → 2 (monotonic).
     note.content = "# Hello v3".to_string();
-    store.update_note(&note).await.expect("update note");
+    store
+        .update_note(
+            &store.lock_note_content(&note.workspace_id, &note.id).await,
+            &note,
+        )
+        .await
+        .expect("update note");
     let after_second = store.get_note(&ws_id, &note.id).await.expect("get note");
     assert_eq!(after_second.rev, 2);
 }
@@ -1793,7 +1808,11 @@ async fn update_note_versioned_hit_miss_and_absent() {
     // HIT: expected_version matches the stored rev (0) → write + bump to 1.
     note.content = "v1".to_string();
     store
-        .update_note_versioned(&note, Some(0))
+        .update_note_versioned(
+            &store.lock_note_content(&note.workspace_id, &note.id).await,
+            &note,
+            Some(0),
+        )
         .await
         .expect("versioned hit");
     let after_hit = store.get_note(&ws_id, &note.id).await.expect("get note");
@@ -1803,7 +1822,13 @@ async fn update_note_versioned_hit_miss_and_absent() {
     // MISS: stale expected_version (0, but stored rev is now 1) → Conflict
     // carrying the current entity under `current` (rev 1, unchanged content).
     note.content = "v2-should-not-persist".to_string();
-    let conflict = store.update_note_versioned(&note, Some(0)).await;
+    let conflict = store
+        .update_note_versioned(
+            &store.lock_note_content(&note.workspace_id, &note.id).await,
+            &note,
+            Some(0),
+        )
+        .await;
     match conflict {
         Err(intent_core::Error::Conflict { current }) => {
             assert_eq!(current["rev"], 1);
@@ -1820,7 +1845,11 @@ async fn update_note_versioned_hit_miss_and_absent() {
     // ABSENT: no expected_version → last-writer-wins (unconditional bump → 2).
     note.content = "v2".to_string();
     store
-        .update_note_versioned(&note, None)
+        .update_note_versioned(
+            &store.lock_note_content(&note.workspace_id, &note.id).await,
+            &note,
+            None,
+        )
         .await
         .expect("absent degrades to last-writer-wins");
     let after_absent = store.get_note(&ws_id, &note.id).await.expect("get note");
@@ -1830,7 +1859,16 @@ async fn update_note_versioned_hit_miss_and_absent() {
     // A versioned write against a missing row is NotFound (not Conflict).
     let mut ghost = note.clone();
     ghost.id = NoteId::new();
-    match store.update_note_versioned(&ghost, Some(5)).await {
+    match store
+        .update_note_versioned(
+            &store
+                .lock_note_content(&ghost.workspace_id, &ghost.id)
+                .await,
+            &ghost,
+            Some(5),
+        )
+        .await
+    {
         Err(intent_core::Error::NotFound(_)) => {}
         other => panic!("expected NotFound for absent row, got {other:?}"),
     }
@@ -2272,7 +2310,15 @@ async fn task_metadata_round_trip_and_list_tasks() {
     let read = store.get_note(&ws_id, &projected.id).await.expect("get B");
     assert!(read.metadata.task.unwrap().unmet_depends_on.is_empty());
     projected.metadata.task.as_mut().unwrap().unmet_depends_on = vec![NoteId::from("dep-2")];
-    store.update_note(&projected).await.expect("update B");
+    store
+        .update_note(
+            &store
+                .lock_note_content(&projected.workspace_id, &projected.id)
+                .await,
+            &projected,
+        )
+        .await
+        .expect("update B");
     let read = store
         .get_note(&ws_id, &projected.id)
         .await
@@ -2439,7 +2485,13 @@ async fn update_note_with_comment_is_atomic_and_returns_rev() {
     note.content = "with <!--anchor:c1:start-->markers<!--anchor:c1:end-->".to_string();
     let c1 = sample_comment(&note.id, "c1", "c1");
     let rev = store
-        .update_note_with_comment(&note, Some(0), &c1, &author)
+        .update_note_with_comment(
+            &store.lock_note_content(&note.workspace_id, &note.id).await,
+            &note,
+            Some(0),
+            &c1,
+            &author,
+        )
         .await
         .expect("atomic update+insert");
     assert_eq!(rev, 1);
@@ -2458,7 +2510,13 @@ async fn update_note_with_comment_is_atomic_and_returns_rev() {
     note.content = "rewrite-that-must-roll-back".to_string();
     let dup = sample_comment(&note.id, "c1", "c1");
     assert!(store
-        .update_note_with_comment(&note, None, &dup, &author)
+        .update_note_with_comment(
+            &store.lock_note_content(&note.workspace_id, &note.id).await,
+            &note,
+            None,
+            &dup,
+            &author
+        )
         .await
         .is_err());
     let after_fail = store.get_note(&ws_id, &note.id).await.expect("get note");
@@ -2473,7 +2531,13 @@ async fn update_note_with_comment_is_atomic_and_returns_rev() {
     // current entity; neither the rewrite nor the comment persists.
     let c3 = sample_comment(&note.id, "c3", "c3");
     match store
-        .update_note_with_comment(&note, Some(0), &c3, &author)
+        .update_note_with_comment(
+            &store.lock_note_content(&note.workspace_id, &note.id).await,
+            &note,
+            Some(0),
+            &c3,
+            &author,
+        )
         .await
     {
         Err(intent_core::Error::Conflict { current }) => {
@@ -2493,7 +2557,15 @@ async fn update_note_with_comment_is_atomic_and_returns_rev() {
     ghost.id = NoteId::new();
     let c2 = sample_comment(&ghost.id, "c2", "c2");
     match store
-        .update_note_with_comment(&ghost, None, &c2, &author)
+        .update_note_with_comment(
+            &store
+                .lock_note_content(&ghost.workspace_id, &ghost.id)
+                .await,
+            &ghost,
+            None,
+            &c2,
+            &author,
+        )
         .await
     {
         Err(intent_core::Error::NotFound(_)) => {}
@@ -2525,7 +2597,13 @@ async fn update_note_with_version_is_atomic_and_gates_on_expected_version() {
 
     note.content = "one".to_string();
     let (rev, v) = store
-        .update_note_with_version(&note, Some(0), &author, &ts)
+        .update_note_with_version(
+            &store.lock_note_content(&note.workspace_id, &note.id).await,
+            &note,
+            Some(0),
+            &author,
+            &ts,
+        )
         .await
         .expect("gated write");
     assert_eq!((rev, v), (1, 1));
@@ -2546,7 +2624,13 @@ async fn update_note_with_version_is_atomic_and_gates_on_expected_version() {
     // Unconditional write: rev and v both advance.
     note.content = "two".to_string();
     let (rev, v) = store
-        .update_note_with_version(&note, None, &author, &ts)
+        .update_note_with_version(
+            &store.lock_note_content(&note.workspace_id, &note.id).await,
+            &note,
+            None,
+            &author,
+            &ts,
+        )
         .await
         .expect("unconditional write");
     assert_eq!((rev, v), (2, 2));
@@ -2554,7 +2638,13 @@ async fn update_note_with_version_is_atomic_and_gates_on_expected_version() {
     // Stale gate: Conflict carrying the current row; nothing persisted.
     note.content = "stale".to_string();
     match store
-        .update_note_with_version(&note, Some(1), &author, &ts)
+        .update_note_with_version(
+            &store.lock_note_content(&note.workspace_id, &note.id).await,
+            &note,
+            Some(1),
+            &author,
+            &ts,
+        )
         .await
     {
         Err(intent_core::Error::Conflict { current }) => {
@@ -2574,7 +2664,15 @@ async fn update_note_with_version_is_atomic_and_gates_on_expected_version() {
     let mut ghost = note.clone();
     ghost.id = NoteId::new();
     match store
-        .update_note_with_version(&ghost, None, &author, &ts)
+        .update_note_with_version(
+            &store
+                .lock_note_content(&ghost.workspace_id, &ghost.id)
+                .await,
+            &ghost,
+            None,
+            &author,
+            &ts,
+        )
         .await
     {
         Err(intent_core::Error::NotFound(_)) => {}
@@ -2665,6 +2763,9 @@ async fn update_note_with_version_and_children_is_all_or_nothing() {
     parent.content = format!("- [ ] [Child](intent://local/task/{})", child.id.0);
     let (rev, v) = store
         .update_note_with_version_and_children(
+            &store
+                .lock_note_content(&parent.workspace_id, &parent.id)
+                .await,
             &parent,
             Some(0),
             std::slice::from_ref(&child),
@@ -2706,6 +2807,9 @@ async fn update_note_with_version_and_children_is_all_or_nothing() {
     parent.content = "stale rewrite".to_string();
     match store
         .update_note_with_version_and_children(
+            &store
+                .lock_note_content(&parent.workspace_id, &parent.id)
+                .await,
             &parent,
             Some(0),
             std::slice::from_ref(&ghost_child),
@@ -2770,6 +2874,9 @@ async fn update_note_with_version_and_children_rolls_back_on_mid_body_child_erro
     parent.content = "rewritten parent".to_string();
     let result = store
         .update_note_with_version_and_children(
+            &store
+                .lock_note_content(&parent.workspace_id, &parent.id)
+                .await,
             &parent,
             Some(0),
             &[child.clone(), child.clone()],
@@ -2812,7 +2919,15 @@ async fn update_note_with_version_and_children_rolls_back_on_mid_body_child_erro
     );
 
     let (rev, v) = store
-        .update_note_with_version(&parent, Some(0), &author, &ts)
+        .update_note_with_version(
+            &store
+                .lock_note_content(&parent.workspace_id, &parent.id)
+                .await,
+            &parent,
+            Some(0),
+            &author,
+            &ts,
+        )
         .await
         .expect("pool usable after rollback");
     assert_eq!((rev, v), (1, 2));
@@ -2849,7 +2964,13 @@ async fn update_note_with_comment_detaches_conn_on_failed_body_error_rollback() 
     note.content = "rewrite-that-must-roll-back".to_string();
     let c1 = sample_comment(&note.id, "c1", "c1");
     let err = store
-        .update_note_with_comment(&note, None, &c1, &version_author())
+        .update_note_with_comment(
+            &store.lock_note_content(&note.workspace_id, &note.id).await,
+            &note,
+            None,
+            &c1,
+            &version_author(),
+        )
         .await
         .expect_err("UPDATE must fail on the rollback trigger");
     assert!(
@@ -2872,7 +2993,13 @@ async fn update_note_with_comment_detaches_conn_on_failed_body_error_rollback() 
         .await
         .expect("drop trap trigger");
     let rev = store
-        .update_note_with_comment(&note, None, &c1, &version_author())
+        .update_note_with_comment(
+            &store.lock_note_content(&note.workspace_id, &note.id).await,
+            &note,
+            None,
+            &c1,
+            &version_author(),
+        )
         .await
         .expect("update after detach");
     assert_eq!(rev, 1);
@@ -6559,49 +6686,11 @@ async fn concurrent_writes_no_sqlite_busy() {
                     id: ws_id.clone(),
                     title: format!("Workspace {i}"),
                     branch: format!("main-{i}"),
-                    base_ref: None,
-                    base_commit_sha: None,
-                    status: WorkspaceStatus::Active,
-                    status_message: None,
-                    status_image_asset_id: None,
-                    activity: WorkspaceActivity::Idle,
                     attention: WorkspaceAttention::Unread,
                     created_at: ts.clone(),
                     updated_at: ts.clone(),
-                    last_activity: None,
-                    last_content_activity: None,
-                    tags: vec![],
                     path: Some(format!("/tmp/ws-{i}")),
-                    repository_path: None,
-                    repository_owner: None,
-                    repository_name: None,
-                    worktree_path: None,
-                    scope: None,
-                    skip_worktree: false,
-                    setup_script: None,
-                    is_remote: false,
-                    default_model: None,
-                    pr_number: None,
-                    pr_url: None,
-                    pr_status: None,
-                    active_pull_request: None,
-                    pull_requests: None,
-                    context_links: None,
-                    archived: false,
-                    archived_at: None,
-                    task_stats: None,
-                    agent_summary: None,
-                    diff_summary: None,
-                    token_usage: None,
-                    cow_supported: None,
-                    browser_client_id: None,
-                    pull_requests_total: None,
-                    display_status: None,
-                    waiting: false,
-                    checkout_mode: None,
-                    disk_usage: None,
-                    pending_delete_at: None,
-                    membership: None,
+                    ..Default::default()
                 };
                 store.insert_workspace(&workspace).await
             })
@@ -6617,7 +6706,10 @@ async fn concurrent_writes_no_sqlite_busy() {
             let store = store.clone();
             let started = std::time::Instant::now();
             tokio::spawn(async move {
-                let result = store.list_workspaces(false).await.map(|ws| ws.len());
+                let result = store
+                    .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+                    .await
+                    .map(|ws| ws.len());
                 (result, started.elapsed())
             })
         })
@@ -6652,7 +6744,10 @@ async fn concurrent_writes_no_sqlite_busy() {
     );
 
     // Verify all 50 workspaces were written
-    let all_workspaces = store.list_workspaces(false).await.unwrap();
+    let all_workspaces = store
+        .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+        .await
+        .unwrap();
     assert_eq!(
         all_workspaces.len(),
         50,
@@ -6690,7 +6785,10 @@ async fn periodic_wal_checkpoint_runs_and_stops() {
     // Verify the store still works after aborting the checkpoint task
     let ws = sample_workspace(&WorkspaceId::new(), "Test", false);
     store.insert_workspace(&ws).await.unwrap();
-    let loaded = store.list_workspaces(false).await.unwrap();
+    let loaded = store
+        .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+        .await
+        .unwrap();
     assert_eq!(loaded.len(), 1);
 }
 
@@ -7359,7 +7457,9 @@ async fn append_agent_message_survives_write_pool_acquire_timeout() {
     // Upper bound on how long the holder keeps the connection if the append
     // never reports a timeout; the test then fails on the observer assertion
     // instead of hanging. Also bounds the pool-open retries below.
-    const WATCHDOG: Duration = Duration::from_secs(15);
+    fn watchdog() -> Duration {
+        intentd_test_support::test_timeout(Duration::from_secs(15))
+    }
     let tmp = TempDb::new();
     // Migrate with the ordinary store, then reopen with a short acquire
     // timeout on the write pool. sqlx opens the pool's first connection
@@ -7368,7 +7468,7 @@ async fn append_agent_message_survives_write_pool_acquire_timeout() {
     // until the watchdog deadline; once it succeeds the connection stays idle
     // in the pool and the hold below reuses it without a fresh open.
     drop(Store::open(&tmp.path).await.expect("open store"));
-    let open_deadline = tokio::time::Instant::now() + WATCHDOG;
+    let open_deadline = tokio::time::Instant::now() + watchdog();
     let write_pool = loop {
         match crate::connect_write_with_acquire_timeout(&tmp.path, ACQUIRE_TIMEOUT).await {
             Ok(pool) => break pool,
@@ -7384,9 +7484,7 @@ async fn append_agent_message_survives_write_pool_acquire_timeout() {
     let store = Store {
         task_event_baselines: std::sync::Arc::default(),
         task_events_enabled: std::sync::Arc::default(),
-        note_pages: std::sync::Arc::default(),
-        note_index_jobs: std::sync::Arc::default(),
-        note_index_owner: std::sync::Arc::default(),
+        note_write_lanes: std::sync::Arc::default(),
         _daemon_owner: None,
         write_pool: write_pool.into(),
         read_pool: crate::connect_read(&tmp.path)
@@ -7394,6 +7492,8 @@ async fn append_agent_message_survives_write_pool_acquire_timeout() {
             .expect("open read pool")
             .into(),
         browser_tab_displayed: crate::browser_tab_repo::DisplayedOverlay::default(),
+        desktop_writes: crate::desktop_repo::DesktopWrites::default(),
+        desktop_delete_barrier: std::sync::Arc::default(),
         export_author_barrier: std::sync::Arc::default(),
         repository_lifecycle: crate::repository_lifecycle::domain_for(&tmp.path).unwrap(),
     };
@@ -7419,7 +7519,7 @@ async fn append_agent_message_survives_write_pool_acquire_timeout() {
     let holder = {
         let observed = Arc::clone(&observed);
         tokio::spawn(async move {
-            let deadline = tokio::time::Instant::now() + WATCHDOG;
+            let deadline = tokio::time::Instant::now() + watchdog();
             while observed.load(Ordering::SeqCst) == 0 && tokio::time::Instant::now() < deadline {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -11168,6 +11268,9 @@ async fn gitlab_upgrade_from_populated_main_preserves_shipped_data_and_checksums
     }
 }
 
+#[path = "discussion_tests.rs"]
+mod discussion;
+
 /// 0162 backfills legacy rows' NULL / blank provider, model and reasoning
 /// effort from the identity their last turn ran under — fill-only, skipping
 /// rows without evidence, legacy provider aliases, malformed JSON, the
@@ -11554,4 +11657,128 @@ async fn never_saved_default_upgrade_repairs_only_metadata_history() {
     assert_eq!(replay.rows_affected(), 0, "replaying the repair is a no-op");
     store.read_pool().close().await;
     store.write_pool().close().await;
+}
+
+#[tokio::test]
+async fn guest_roles_upgrade_preserves_grants_counts_and_authority_triggers() {
+    let tmp = TempDb::new();
+    let pool = crate::connect_write(&tmp.path).await.unwrap();
+    let prefix = sqlx::migrate::Migrator {
+        migrations: std::borrow::Cow::Owned(
+            crate::MIGRATOR
+                .iter()
+                .filter(|m| m.version < 171)
+                .cloned()
+                .collect(),
+        ),
+        ..sqlx::migrate::Migrator::DEFAULT
+    };
+    prefix.run(&pool).await.unwrap();
+    sqlx::raw_sql("INSERT INTO principal(id,created_at,updated_at) VALUES('role-guest','original','original');
+        INSERT INTO workspace(id,title,branch,created_at,updated_at,repository_path,repository_owner,repository_name)
+        VALUES('role-workspace','Roles','main','original','original','/owned/repository','Owner','Project');
+        INSERT INTO workspace_member VALUES('role-workspace','role-guest','collaborator','original');")
+        .execute(&pool).await.unwrap();
+    let revision: i64 = sqlx::query_scalar("SELECT revision FROM repository_authority_revision WHERE kind='workspace_member' AND subject_id='role-workspace' AND member_id='role-guest'").fetch_one(&pool).await.unwrap();
+    pool.close().await;
+    let store = Store::open(&tmp.path).await.unwrap();
+    let ws = WorkspaceId::from("role-workspace");
+    let guest = PrincipalId::from("role-guest");
+    let owner = store.get_primary_principal().await.unwrap();
+    assert_eq!(
+        store.get_workspace_member_role(&ws, &guest).await.unwrap(),
+        Some(WorkspaceRole::Collaborator)
+    );
+    assert_eq!(
+        store.count_workspace_guests(&ws).await.unwrap().committed(),
+        1
+    );
+    assert!(store
+        .set_workspace_guest_role(&ws, &guest, WorkspaceRole::Manager, Some(&owner.id))
+        .await
+        .unwrap());
+    assert!(!store
+        .set_workspace_guest_role(&ws, &guest, WorkspaceRole::Manager, Some(&owner.id))
+        .await
+        .unwrap());
+    assert_eq!(
+        store.count_workspace_guests(&ws).await.unwrap().committed(),
+        1
+    );
+    let now: i64 = sqlx::query_scalar("SELECT revision FROM repository_authority_revision WHERE kind='workspace_member' AND subject_id='role-workspace' AND member_id='role-guest'").fetch_one(store.read_pool()).await.unwrap();
+    assert_eq!(
+        now,
+        revision + 1,
+        "only the meaningful role change advances authority"
+    );
+    assert!(matches!(
+        store
+            .set_workspace_guest_role(&ws, &owner.id, WorkspaceRole::Manager, Some(&owner.id))
+            .await,
+        Err(Error::InvalidParams(_))
+    ));
+    assert!(matches!(
+        store
+            .set_workspace_guest_role(&ws, &guest, WorkspaceRole::Collaborator, Some(&guest))
+            .await,
+        Err(Error::Forbidden(_))
+    ));
+    sqlx::query("INSERT INTO host_member(principal_id,added_at) VALUES(?,?)")
+        .bind(guest.as_str())
+        .bind(now_iso())
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        store.count_workspace_guests(&ws).await.unwrap().committed(),
+        0
+    );
+    assert!(matches!(
+        store
+            .set_workspace_guest_role(&ws, &guest, WorkspaceRole::Collaborator, Some(&owner.id))
+            .await,
+        Err(Error::HostMembershipRequired)
+    ));
+    sqlx::query("DELETE FROM host_member WHERE principal_id=?")
+        .bind(guest.as_str())
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        store.count_workspace_guests(&ws).await.unwrap().committed(),
+        1
+    );
+    store.close().await;
+    let store = Store::open(&tmp.path).await.unwrap();
+    let row = store
+        .list_workspace_members(&ws)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|m| m.principal_id == guest)
+        .unwrap();
+    assert_eq!(row.role, WorkspaceRole::Manager);
+    assert_eq!(row.added_at, "original");
+    let revoked = store.revoke_principal_access(&guest).await.unwrap();
+    assert_eq!(revoked.workspaces, vec![ws.clone()]);
+    assert_eq!(
+        store.get_workspace_member_role(&ws, &guest).await.unwrap(),
+        None
+    );
+    assert_eq!(
+        store.count_workspace_guests(&ws).await.unwrap().committed(),
+        0
+    );
+    let next = WorkspaceId::new();
+    store
+        .insert_workspace(&sample_workspace(&next, "owner trigger", false))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_workspace_member_role(&next, &owner.id)
+            .await
+            .unwrap(),
+        Some(WorkspaceRole::Owner)
+    );
 }

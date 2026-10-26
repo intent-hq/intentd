@@ -10,7 +10,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 #[path = "e2e_wss_server_pairing/personal_pairing.rs"]
 mod personal_pairing;
 
@@ -673,7 +673,11 @@ async fn fresh_daemon_does_not_import_legacy_workspaces() {
     let store = intent_store::Store::open(&data_dir.path().join("intentd.db"))
         .await
         .unwrap();
-    assert!(store.list_workspaces(true).await.unwrap().is_empty());
+    assert!(store
+        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await
+        .unwrap()
+        .is_empty());
     store.close().await;
     assert_eq!(
         std::fs::read_to_string(metadata.join("workspace.json")).unwrap(),

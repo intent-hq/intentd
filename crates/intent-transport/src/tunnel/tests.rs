@@ -1467,6 +1467,7 @@ async fn zero_credit_stream_with_nothing_waiting_survives_past_idle_timeout() {
     let mut t = starved_relay(window, u32::try_from(window).unwrap()).await;
     recv_data_bytes(&mut t.out_rx, window).await;
     assert_eq!(t.credit.available(), 0, "the window is spent");
+    // fixed-deadline: allow — stays a fixed multiple of STARVATION_IDLE, the idle timer this window must outlast
     let next = tokio::time::timeout(STARVATION_IDLE * 5, t.out_rx.recv())
         .await
         .ok()
@@ -1490,6 +1491,7 @@ async fn half_closed_zero_credit_stream_survives_and_forwards_eof_on_grant() {
     let mut t = starved_relay_with(window, u32::try_from(window).unwrap(), true).await;
     recv_data_bytes(&mut t.out_rx, window).await;
     assert_eq!(t.credit.available(), 0, "the window is spent");
+    // fixed-deadline: allow — stays a fixed multiple of STARVATION_IDLE, the idle timer this window must outlast
     let next = tokio::time::timeout(STARVATION_IDLE * 5, t.out_rx.recv())
         .await
         .ok()
@@ -1508,6 +1510,7 @@ async fn half_closed_zero_credit_stream_survives_and_forwards_eof_on_grant() {
     .expect("deferred EOF forwarded once credit returns")
     .expect("relay alive");
     assert_eq!(eof.frame, Frame::Eof { stream_id: 1 });
+    // fixed-deadline: allow — stays a fixed multiple of STARVATION_IDLE, the idle timer this window must outlast
     let next = tokio::time::timeout(STARVATION_IDLE * 2, t.out_rx.recv())
         .await
         .ok()
@@ -1530,10 +1533,13 @@ async fn starved_stream_with_waiting_output_closes_after_idle_timeout() {
     recv_data_bytes(&mut t.out_rx, window).await;
     let exhausted_at = Instant::now();
     assert_eq!(t.credit.available(), 0, "the window is spent");
-    let closed = tokio::time::timeout(STARVATION_IDLE * 5, t.out_rx.recv())
-        .await
-        .expect("starved stream closed within the deadline")
-        .expect("relay alive");
+    let closed = tokio::time::timeout(
+        intentd_test_support::test_timeout(STARVATION_IDLE * 5),
+        t.out_rx.recv(),
+    )
+    .await
+    .expect("starved stream closed within the deadline")
+    .expect("relay alive");
     assert_eq!(closed.frame, Frame::Close { stream_id: 1 });
     assert!(
         exhausted_at.elapsed() >= STARVATION_IDLE / 2,
@@ -1566,10 +1572,13 @@ async fn credit_grant_clears_the_starvation_deadline() {
         recv_data_bytes(&mut t.out_rx, 1).await;
         assert!(!t.relay.is_finished(), "grant did not clear the deadline");
     }
-    let closed = tokio::time::timeout(STARVATION_IDLE * 5, t.out_rx.recv())
-        .await
-        .expect("stream closes once grants stop")
-        .expect("relay alive");
+    let closed = tokio::time::timeout(
+        intentd_test_support::test_timeout(STARVATION_IDLE * 5),
+        t.out_rx.recv(),
+    )
+    .await
+    .expect("stream closes once grants stop")
+    .expect("relay alive");
     assert_eq!(closed.frame, Frame::Close { stream_id: 1 });
 }
 

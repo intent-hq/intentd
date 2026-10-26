@@ -11,8 +11,8 @@ use intent_acp::{
     PermissionOutcome, PermissionPolicy, PermissionRequestData,
 };
 use intent_core::{
-    now_iso, AgentId, AgentSession, AgentStatus, Error, MessageOrigin, Workspace,
-    WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
+    now_iso, AgentId, AgentSession, AgentStatus, Error, MessageOrigin, Workspace, WorkspaceApi,
+    WorkspaceId, WorkspaceStatus,
 };
 use intent_store::Store;
 use serde_json::{json, Value};
@@ -156,73 +156,7 @@ impl TempDb {
     }
 }
 
-/// Serializes env-mutating tests: process env is global, so a test that SETS
-/// `MOCK_AGENT_SCRIPT_PATH` (or a retry-backoff knob) must not interleave
-/// with one that unsets it. Crate-wide (via the `pub(crate)` [`EnvGuard`]):
-/// tests in OTHER modules that mutate the same vars (e.g. `agent_session`'s
-/// idle-timeout tests and this module's worker redrive tests both pin
-/// `INTENTD_PROMPT_IDLE_TIMEOUT_MS`) must serialize through the same lock or
-/// one test's Drop-restore races another's live window.
-static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-/// Pins env vars for the guard's lifetime — holding [`ENV_LOCK`] so
-/// env-mutating tests serialize — and restores the prior values on drop so
-/// tests stay hermetic (mirrors `intent-acp`'s test `EnvGuard`).
-///
-/// The lock is held until the guard drops, so a test must use exactly ONE
-/// guard: constructing a second before the first drops deadlocks the test
-/// thread. Mutate every var (sets AND unsets) through a single
-/// [`EnvGuard::apply`] call instead.
-pub(crate) struct EnvGuard {
-    saved: Vec<(&'static str, Option<String>)>,
-    _lock: std::sync::MutexGuard<'static, ()>,
-}
-
-impl EnvGuard {
-    fn acquire() -> std::sync::MutexGuard<'static, ()> {
-        // A panicked test already restored its env in Drop before poisoning.
-        ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    /// Apply every `(key, value)` mutation under one guard: `Some(v)` sets
-    /// the var, `None` unsets it. Prior values are restored on drop.
-    pub(crate) fn apply(pairs: &[(&'static str, Option<&str>)]) -> Self {
-        let lock = Self::acquire();
-        let mut saved = Vec::new();
-        for (key, value) in pairs {
-            saved.push((*key, std::env::var(key).ok()));
-            match value {
-                Some(v) => std::env::set_var(key, v),
-                None => std::env::remove_var(key),
-            }
-        }
-        Self { saved, _lock: lock }
-    }
-
-    fn unset(key: &'static str) -> Self {
-        Self::apply(&[(key, None)])
-    }
-
-    /// Set every `(key, value)` pair for the guard's lifetime.
-    pub(crate) fn set_all(pairs: &[(&'static str, &str)]) -> Self {
-        let pairs: Vec<(&'static str, Option<&str>)> =
-            pairs.iter().map(|(k, v)| (*k, Some(*v))).collect();
-        Self::apply(&pairs)
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        for (key, prev) in &self.saved {
-            match prev {
-                Some(v) => std::env::set_var(key, v),
-                None => std::env::remove_var(key),
-            }
-        }
-    }
-}
+pub(crate) use crate::test_support::fixtures::EnvGuard;
 
 /// A kill callback that records the agents it was invoked for (the registry
 /// itself performs the follow-up `deregister`).
@@ -342,8 +276,12 @@ async fn acquire_queues_until_a_process_goes_idle() {
 
     let reg2 = reg.clone();
     let acquired = tokio::spawn(async move { reg2.acquire(&b, claim_all, release_none).await });
-    // All processes active → the acquire must block.
-    assert!(timeout(Duration::from_millis(50), async {}).await.is_ok());
+    // All processes active → the acquire must block. Give the spawned
+    // acquire time to run before checking it is still parked.
+    tokio::time::sleep(intentd_test_support::test_timeout(Duration::from_millis(
+        50,
+    )))
+    .await;
     assert!(!acquired.is_finished(), "acquire blocks while all active");
 
     // Becoming idle wakes the queued spawn, which evicts `a` and proceeds.
@@ -634,13 +572,13 @@ async fn over_budget_tree_with_host_headroom_admits_without_queueing() {
     reg.register(warm.clone(), recording_kill(warm.clone(), log.clone()));
 
     timeout(
-        Duration::from_millis(200),
+        intentd_test_support::test_timeout(Duration::from_millis(200)),
         reg.acquire(&spawning, claim_all, release_none),
     )
     .await
     .expect("over-budget tree with host headroom admits the spawn");
     timeout(
-        Duration::from_millis(200),
+        intentd_test_support::test_timeout(Duration::from_millis(200)),
         reg.acquire_turn_start(&warm, claim_all, release_none),
     )
     .await
@@ -733,7 +671,7 @@ async fn admission_reads_tree_bytes_and_host_headroom_from_one_sweep() {
     reg.register(idle.clone(), recording_kill(idle.clone(), log.clone()));
 
     timeout(
-        Duration::from_millis(200),
+        intentd_test_support::test_timeout(Duration::from_millis(200)),
         reg.acquire(&first, claim_all, release_none),
     )
     .await
@@ -742,7 +680,7 @@ async fn admission_reads_tree_bytes_and_host_headroom_from_one_sweep() {
     reg.register(first.clone(), recording_kill(first.clone(), log.clone()));
 
     timeout(
-        Duration::from_millis(200),
+        intentd_test_support::test_timeout(Duration::from_millis(200)),
         reg.acquire(&second, claim_all, release_none),
     )
     .await
@@ -776,7 +714,7 @@ async fn budget_is_off_by_default_and_inert_before_the_first_sample() {
         reg.register(a.clone(), recording_kill(a.clone(), log.clone()));
 
         timeout(
-            Duration::from_millis(200),
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
             reg.acquire(&b, claim_all, release_none),
         )
         .await
@@ -988,7 +926,7 @@ async fn provisional_charge_stops_a_burst_clearing_one_stale_sample() {
     for n in 0..6 {
         let id = AgentId::from(format!("burst-{n}").as_str());
         if timeout(
-            Duration::from_millis(50),
+            intentd_test_support::test_timeout(Duration::from_millis(50)),
             reg.acquire(&id, claim_all, release_none),
         )
         .await
@@ -1012,7 +950,7 @@ async fn provisional_charge_stops_a_burst_clearing_one_stale_sample() {
     probe.set(gb);
     let next = AgentId::from("after-fresh-sample");
     timeout(
-        Duration::from_millis(50),
+        intentd_test_support::test_timeout(Duration::from_millis(50)),
         reg.acquire(&next, claim_all, release_none),
     )
     .await
@@ -1033,7 +971,7 @@ async fn deregister_credits_back_the_provisional_charge() {
 
     let first = AgentId::from("first");
     timeout(
-        Duration::from_millis(50),
+        intentd_test_support::test_timeout(Duration::from_millis(50)),
         reg.acquire(&first, claim_all, release_none),
     )
     .await
@@ -1046,7 +984,7 @@ async fn deregister_credits_back_the_provisional_charge() {
     let second = AgentId::from("second");
     assert!(
         timeout(
-            Duration::from_millis(50),
+            intentd_test_support::test_timeout(Duration::from_millis(50)),
             reg.acquire(&second, claim_all, release_none),
         )
         .await
@@ -1058,7 +996,7 @@ async fn deregister_credits_back_the_provisional_charge() {
     // back rather than waiting a full sampling period for the truth.
     reg.deregister(&first);
     timeout(
-        Duration::from_millis(50),
+        intentd_test_support::test_timeout(Duration::from_millis(50)),
         reg.acquire(&second, claim_all, release_none),
     )
     .await
@@ -1369,14 +1307,14 @@ async fn turn_start_never_gates_active_or_unregistered_agents() {
     reg.mark_active(&busy);
 
     timeout(
-        Duration::from_millis(200),
+        intentd_test_support::test_timeout(Duration::from_millis(200)),
         reg.acquire_turn_start(&busy, claim_all, release_none),
     )
     .await
     .expect("an active process is never gated mid-turn");
 
     timeout(
-        Duration::from_millis(200),
+        intentd_test_support::test_timeout(Duration::from_millis(200)),
         reg.acquire_turn_start(&AgentId::from("unregistered"), claim_all, release_none),
     )
     .await
@@ -1668,13 +1606,13 @@ async fn immediate_admission_emits_no_process_events() {
     reg.register(warm.clone(), recording_kill(warm.clone(), log.clone()));
 
     timeout(
-        Duration::from_millis(200),
+        intentd_test_support::test_timeout(Duration::from_millis(200)),
         reg.acquire(&spawning, claim_all, release_none),
     )
     .await
     .expect("under budget with a slot free admits immediately");
     timeout(
-        Duration::from_millis(200),
+        intentd_test_support::test_timeout(Duration::from_millis(200)),
         reg.acquire_turn_start(&warm, claim_all, release_none),
     )
     .await
@@ -2054,49 +1992,9 @@ async fn process_cap_events_queued_resumed_evicted() {
         id: ws_id.clone(),
         title: "Test".into(),
         branch: "main".into(),
-        base_ref: None,
-        base_commit_sha: None,
-        status: WorkspaceStatus::Active,
-        status_message: None,
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
-        attention: WorkspaceAttention::None,
         created_at: ts.clone(),
         updated_at: ts,
-        last_activity: None,
-        last_content_activity: None,
-        tags: vec![],
-        path: None,
-        repository_path: None,
-        repository_owner: None,
-        repository_name: None,
-        worktree_path: None,
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
-        default_model: None,
-        pr_number: None,
-        pr_url: None,
-        pr_status: None,
-        active_pull_request: None,
-        pull_requests: None,
-        context_links: None,
-        archived: false,
-        archived_at: None,
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        pull_requests_total: None,
-        display_status: None,
-        waiting: false,
-        checkout_mode: None,
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
+        ..Default::default()
     };
     store.insert_workspace(&ws).await.unwrap();
     let (a, b) = (AgentId::from("a"), AgentId::from("b"));
@@ -2271,7 +2169,12 @@ async fn process_cap_events_queued_resumed_evicted() {
     // Collect the eviction event with bounded wait (event emission is async).
     let mut evict_event = None;
     for _ in 0..50 {
-        match timeout(Duration::from_millis(100), sub.recv()).await {
+        match timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(100)),
+            sub.recv(),
+        )
+        .await
+        {
             Ok(Some(batch)) => {
                 for ev in batch {
                     if ev.event_type == AGENT_PROCESS_EVICTED && ev.data["agentId"] == a.0 {
@@ -2369,7 +2272,12 @@ async fn process_cap_events_queued_resumed_evicted() {
     // Collect queue event with bounded wait (event emission is async).
     let mut queue_event = None;
     for _ in 0..50 {
-        match timeout(Duration::from_millis(100), sub.recv()).await {
+        match timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(100)),
+            sub.recv(),
+        )
+        .await
+        {
             Ok(Some(batch)) => {
                 for ev in batch {
                     if ev.event_type == AGENT_PROCESS_QUEUED && ev.data["agentId"] == d.0 {
@@ -2405,7 +2313,12 @@ async fn process_cap_events_queued_resumed_evicted() {
     // Collect resume event with bounded wait (event emission is async).
     let mut resume_event = None;
     for _ in 0..50 {
-        match timeout(Duration::from_millis(100), sub.recv()).await {
+        match timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(100)),
+            sub.recv(),
+        )
+        .await
+        {
             Ok(Some(batch)) => {
                 for ev in batch {
                     if ev.event_type == AGENT_PROCESS_RESUMED && ev.data["agentId"] == d.0 {
@@ -2443,14 +2356,23 @@ pub(super) async fn manager() -> (TempDb, AgentManager) {
 /// Like [`manager`] but also returns the [`EventBus`] so a test can subscribe and
 /// assert which lifecycle events the manager publishes.
 async fn manager_with_bus() -> (TempDb, AgentManager, EventBus) {
+    manager_with_bus_in(None).await
+}
+
+/// [`manager_with_bus`] whose services provision under `root` (the
+/// daemon-owned workspaces root that retire / revive ownership checks use).
+async fn manager_with_bus_in(root: Option<&std::path::Path>) -> (TempDb, AgentManager, EventBus) {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
-    let services = Services::new_with_file_secrets(
+    let mut services = Services::new_with_file_secrets(
         store,
         intent_core::FileSecretStore::with_path(tmp.path.with_extension("secrets.json")),
     )
     .with_event_bus(bus.clone());
+    if let Some(root) = root {
+        services = services.with_workspaces_root(root.to_path_buf());
+    }
     let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
     (tmp, AgentManager::new(services, sink, 8), bus)
 }
@@ -3216,7 +3138,12 @@ async fn send_after_ttl_reap_restores_instead_of_silently_dropping() {
     // The eviction is observable: agent:process:evicted with reason idle-ttl.
     let mut evict_event = None;
     for _ in 0..50 {
-        match timeout(Duration::from_millis(100), sub.recv()).await {
+        match timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(100)),
+            sub.recv(),
+        )
+        .await
+        {
             Ok(Some(batch)) => {
                 if let Some(ev) = batch
                     .into_iter()
@@ -3503,7 +3430,12 @@ async fn winning_try_begin_auto_unarchives_the_workspace() {
     assert!(after.archived_at.is_none());
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let delta = events
@@ -3571,6 +3503,334 @@ async fn winning_try_begin_auto_unarchives_the_workspace() {
             .unwrap()
             .contains("automatically unarchived"),
         "the notice must not replay on later turns"
+    );
+    mgr.end_turn(&id).await;
+}
+
+/// A git repo with one commit on `main` plus the kept branch `feat-old`, and
+/// a retired worktree workspace row pointing at a (deleted) checkout path.
+fn init_revive_repo(dir: &std::path::Path) {
+    let repo = git2::Repository::init(dir).expect("init repo");
+    {
+        let mut cfg = repo.config().unwrap();
+        cfg.set_str("user.name", "Tester").unwrap();
+        cfg.set_str("user.email", "t@e.dev").unwrap();
+    }
+    std::fs::write(dir.join("README.md"), "init\n").unwrap();
+    let mut index = repo.index().unwrap();
+    index
+        .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+        .unwrap();
+    index.write().unwrap();
+    let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+    let sig = git2::Signature::now("Tester", "t@e.dev").unwrap();
+    let commit = repo
+        .commit(Some("HEAD"), &sig, &sig, "chore: init", &tree, &[])
+        .unwrap();
+    let commit = repo.find_commit(commit).unwrap();
+    repo.branch("feat-old", &commit, false).unwrap();
+}
+
+/// A turn start in a RETIRED workspace whose revive fails (the source
+/// repository is gone) does not start the turn: the claim is released, the
+/// session never goes `Active`, no checkout appears, and the row stays
+/// Retired. (A merely Archived workspace's unarchive stays best-effort.)
+#[tokio::test]
+async fn failed_revive_of_a_retired_workspace_does_not_start_the_turn() {
+    let root = test_tempdir("intentd-revive-fail-root-");
+    let (_tmp, mgr, _bus) = manager_with_bus_in(Some(root.path())).await;
+    let ws = WorkspaceId::from("ws-revive-fail");
+    let id = AgentId::from("a-revive-fail");
+    seed_agent(&mgr, &ws, &id).await;
+    let missing_repo = root.path().join("no-such-repo");
+    let wt = root.path().join(ws.as_str()).join("repo");
+    let mut row = mgr.services.store.get_workspace(&ws).await.unwrap();
+    row.repository_path = Some(missing_repo.to_string_lossy().into_owned());
+    row.worktree_path = Some(wt.to_string_lossy().into_owned());
+    row.checkout_mode = Some(intent_core::CheckoutMode::Worktree);
+    mgr.services
+        .store
+        .update_workspace_with_branch(&row, Some("feat-old"))
+        .await
+        .unwrap();
+    mgr.services
+        .store
+        .archive_workspace_detaching_guests(&ws, &now_iso())
+        .await
+        .expect("archive row");
+    assert!(mgr
+        .services
+        .store
+        .retire_workspace_if_archived(&ws, &now_iso())
+        .await
+        .expect("retire row"));
+    let status_before = mgr
+        .services
+        .store
+        .get_agent_session(&id)
+        .await
+        .unwrap()
+        .status;
+
+    assert!(
+        !mgr.try_begin(&id, &ws).await,
+        "no turn starts when the revive fails"
+    );
+    assert!(
+        !mgr.busy.lock().unwrap().contains(&id),
+        "the claimed slot was released"
+    );
+    let after = mgr.services.store.get_workspace(&ws).await.unwrap();
+    assert!(after.is_retired(), "row stays Retired: {:?}", after.status);
+    assert!(!wt.exists(), "nothing provisioned");
+    let session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(session.status, status_before, "session never went Active");
+    assert_ne!(session.status, AgentStatus::Active);
+}
+
+/// A winning `try_begin` in a RETIRED workspace revives it: a fresh blank
+/// checkout is provisioned at the same path on a new branch, the row flips
+/// to Active, ONE `workspace_revived` system row lands in the transcript,
+/// and THIS turn's prompt — and only this turn's — carries the notice that
+/// all prior on-disk state is gone.
+#[tokio::test]
+async fn winning_try_begin_revives_a_retired_workspace() {
+    let root = test_tempdir("intentd-revive-root-");
+    let (_tmp, mgr, bus) = manager_with_bus_in(Some(root.path())).await;
+    let ws = WorkspaceId::from("ws-revive");
+    let id = AgentId::from("a-revive");
+    seed_agent(&mgr, &ws, &id).await;
+    let repo_dir = test_tempdir("intentd-revive-repo-");
+    init_revive_repo(repo_dir.path());
+    let wt = root.path().join(ws.as_str()).join("repo");
+    let mut row = mgr.services.store.get_workspace(&ws).await.unwrap();
+    row.repository_path = Some(repo_dir.path().to_string_lossy().into_owned());
+    row.worktree_path = Some(wt.to_string_lossy().into_owned());
+    row.checkout_mode = Some(intent_core::CheckoutMode::Worktree);
+    mgr.services
+        .store
+        .update_workspace_with_branch(&row, Some("feat-old"))
+        .await
+        .unwrap();
+    assert_eq!(
+        mgr.services.store.get_workspace(&ws).await.unwrap().branch,
+        "feat-old"
+    );
+    mgr.services
+        .store
+        .archive_workspace_detaching_guests(&ws, &now_iso())
+        .await
+        .expect("archive row");
+    assert!(mgr
+        .services
+        .store
+        .retire_workspace_if_archived(&ws, &now_iso())
+        .await
+        .expect("retire row"));
+    assert!(!wt.exists());
+
+    let mut sub = bus.subscribe(SubscriptionFilter::default());
+    assert!(
+        mgr.try_begin(&id, &ws).await,
+        "the claim wins despite the retired workspace"
+    );
+
+    let after = mgr.services.store.get_workspace(&ws).await.unwrap();
+    assert_eq!(after.status, WorkspaceStatus::Active, "revived to Active");
+    assert!(!after.archived);
+    assert!(after.retired_at.is_none());
+    assert_ne!(after.branch, "feat-old", "revive uses a new branch");
+    assert!(wt.join("README.md").is_file(), "fresh checkout provisioned");
+
+    let mut events = Vec::new();
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
+        events.extend(batch);
+    }
+    let delta = events
+        .iter()
+        .find(|e| e.event_type == "workspace:updated")
+        .expect("revive published workspace:updated");
+    assert_eq!(
+        delta.data["changes"]["revived"],
+        json!({ "reason": "agent_activity", "agentId": id.0, "agentName": "Builder" })
+    );
+    assert!(delta.data["changes"].get("autoUnarchive").is_none());
+
+    let messages = mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .unwrap();
+    assert_eq!(messages.len(), 1, "exactly one notice row");
+    let notice = &messages[0];
+    assert_eq!(notice.role, "system");
+    assert_eq!(
+        notice.content,
+        json!([{ "type": "text", "text": super::WORKSPACE_REVIVED_NOTICE_TEXT }])
+    );
+    assert_eq!(
+        notice.metadata,
+        Some(json!({ "type": "workspace_revived", "reason": "agent_activity" }))
+    );
+
+    let prompt = mgr
+        .build_turn_prompt(&id, &ws, "hello", &super::TurnOptions::default())
+        .await
+        .unwrap();
+    let last = serde_json::to_value(prompt.last().expect("non-empty prompt")).unwrap();
+    let text = last["text"].as_str().expect("text block");
+    assert!(
+        text.starts_with("[SYSTEM NOTICE] This workspace was retired"),
+        "{text}"
+    );
+    assert!(text.contains("are gone"), "{text}");
+    assert!(
+        text.contains("feat-old"),
+        "names the kept old branch: {text}"
+    );
+    assert!(text.contains(&after.branch), "names the new branch: {text}");
+    assert!(
+        !text.contains("automatically unarchived"),
+        "a revive is not reported as a plain unarchive: {text}"
+    );
+    mgr.end_turn(&id).await;
+
+    assert!(mgr.try_begin(&id, &ws).await, "second claim wins");
+    let next = mgr
+        .build_turn_prompt(&id, &ws, "hello", &super::TurnOptions::default())
+        .await
+        .unwrap();
+    assert!(
+        !serde_json::to_string(&next)
+            .unwrap()
+            .contains("was retired"),
+        "the notice must not replay on later turns"
+    );
+    mgr.end_turn(&id).await;
+    assert_eq!(
+        mgr.services
+            .store
+            .get_agent_messages(&id, None)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "no second notice row"
+    );
+}
+
+/// A turn start that races a retirement teardown must not be lost
+/// (verifier finding on intentd#2605): retire holds the archive fence from
+/// its Retired flip through `stop_many`, which releases in-flight slots. The
+/// turn start must therefore take the fence BEFORE claiming its slot, so the
+/// teardown's stop cannot clear the admission; once the teardown releases
+/// the fence the claim wins, revives the workspace, and THIS turn's prompt
+/// carries the one-shot revive notice. Deterministic: the test plays the
+/// retire tail itself — it holds the fence, waits until the turn start is
+/// parked (on the fence, or — the old bug — holding a claimed slot), runs
+/// the same `stop_many` retire runs, then releases.
+#[tokio::test]
+async fn turn_start_during_retire_teardown_keeps_its_admission_and_notice() {
+    let root = test_tempdir("intentd-revive-race-root-");
+    let (_tmp, mgr, _bus) = manager_with_bus_in(Some(root.path())).await;
+    let ws = WorkspaceId::from("ws-revive-race");
+    let id = AgentId::from("a-revive-race");
+    seed_agent(&mgr, &ws, &id).await;
+    let repo_dir = test_tempdir("intentd-revive-race-repo-");
+    init_revive_repo(repo_dir.path());
+    let wt = root.path().join(ws.as_str()).join("repo");
+    let mut row = mgr.services.store.get_workspace(&ws).await.unwrap();
+    row.repository_path = Some(repo_dir.path().to_string_lossy().into_owned());
+    row.worktree_path = Some(wt.to_string_lossy().into_owned());
+    row.checkout_mode = Some(intent_core::CheckoutMode::Worktree);
+    mgr.services
+        .store
+        .update_workspace_with_branch(&row, Some("feat-old"))
+        .await
+        .unwrap();
+    mgr.services
+        .store
+        .archive_workspace_detaching_guests(&ws, &now_iso())
+        .await
+        .expect("archive row");
+
+    // Retire's flip + teardown hold: fence first, then the Retired flip.
+    let fence = mgr.services.archive_fence.acquire(&ws).await;
+    assert!(mgr
+        .services
+        .store
+        .retire_workspace_if_archived(&ws, &now_iso())
+        .await
+        .expect("retire row"));
+
+    let teardown = async {
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_secs(5));
+        loop {
+            let parked_on_fence = mgr
+                .services
+                .archive_fence
+                .locks
+                .lock()
+                .unwrap()
+                .get(&ws)
+                .is_some_and(|lock| Arc::strong_count(lock) >= 3);
+            let claimed = mgr.busy.lock().unwrap().contains(&id);
+            if parked_on_fence || claimed {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "turn start never reached the retirement fence"
+            );
+            tokio::task::yield_now().await;
+        }
+        // The retire tail's agent stop, then the fence release (the folder
+        // sweep is a no-op: the retired checkout never existed here).
+        drop(mgr.stop_many(std::slice::from_ref(&id)).await);
+        drop(fence);
+    };
+    let (won, ()) = tokio::join!(mgr.try_begin(&id, &ws), teardown);
+    assert!(won, "the claim wins once the teardown releases the fence");
+    assert!(
+        mgr.busy.lock().unwrap().contains(&id),
+        "the triggering turn still holds its slot — the teardown did not clear it"
+    );
+
+    let after = mgr.services.store.get_workspace(&ws).await.unwrap();
+    assert_eq!(after.status, WorkspaceStatus::Active, "revived to Active");
+    assert!(wt.join("README.md").is_file(), "fresh checkout provisioned");
+
+    let prompt = mgr
+        .build_turn_prompt(&id, &ws, "hello", &super::TurnOptions::default())
+        .await
+        .unwrap();
+    let last = serde_json::to_value(prompt.last().expect("non-empty prompt")).unwrap();
+    let text = last["text"].as_str().expect("text block");
+    assert!(
+        text.starts_with("[SYSTEM NOTICE] This workspace was retired"),
+        "the triggering turn carries the revive notice: {text}"
+    );
+    mgr.end_turn(&id).await;
+
+    assert!(mgr.try_begin(&id, &ws).await, "second claim wins");
+    let next = mgr
+        .build_turn_prompt(&id, &ws, "hello", &super::TurnOptions::default())
+        .await
+        .unwrap();
+    let next = serde_json::to_value(next.last().expect("non-empty prompt")).unwrap();
+    assert!(
+        !next["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("[SYSTEM NOTICE] This workspace was retired"),
+        "the notice is one-shot"
     );
     mgr.end_turn(&id).await;
 }
@@ -3703,22 +3963,22 @@ async fn auto_unarchive_flag_arm_skipped_when_slot_released() {
 
     // Slot held: the arm lands.
     assert!(mgr.try_begin(&id, &ws).await);
-    mgr.arm_auto_unarchive_flag_if_slot_held(&id);
+    mgr.arm_auto_unarchive_flag_if_slot_held(&id, super::AUTO_UNARCHIVE_PROMPT_NOTICE.to_string());
     assert!(
-        mgr.auto_unarchived.lock().unwrap().contains(&id),
+        mgr.auto_unarchived.lock().unwrap().contains_key(&id),
         "the arm lands while the claim holds the slot"
     );
     mgr.end_turn(&id).await;
     assert!(
-        !mgr.auto_unarchived.lock().unwrap().contains(&id),
+        !mgr.auto_unarchived.lock().unwrap().contains_key(&id),
         "the release clears the armed flag"
     );
 
     // The race: the slot was released (concurrent stop/teardown) before the
     // arm ran — the late arm must be skipped, not inserted after the clear.
-    mgr.arm_auto_unarchive_flag_if_slot_held(&id);
+    mgr.arm_auto_unarchive_flag_if_slot_held(&id, super::AUTO_UNARCHIVE_PROMPT_NOTICE.to_string());
     assert!(
-        !mgr.auto_unarchived.lock().unwrap().contains(&id),
+        !mgr.auto_unarchived.lock().unwrap().contains_key(&id),
         "a late arm after the slot release must be skipped"
     );
 
@@ -5012,55 +5272,16 @@ fn file_tracking_workspace(
     ws_id: &intent_core::WorkspaceId,
     worktree: &std::path::Path,
 ) -> intent_core::Workspace {
-    use intent_core::{now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus};
+    use intent_core::{now_iso, Workspace};
     let ts = now_iso();
     Workspace {
         id: ws_id.clone(),
         title: "WS".to_string(),
         branch: "main".to_string(),
-        base_ref: None,
-        base_commit_sha: None,
-        status: WorkspaceStatus::Active,
-        status_message: None,
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
-        attention: WorkspaceAttention::None,
         created_at: ts.clone(),
         updated_at: ts,
-        last_activity: None,
-        last_content_activity: None,
-        tags: vec![],
-        path: None,
-        repository_path: None,
-        repository_owner: None,
-        repository_name: None,
         worktree_path: Some(worktree.display().to_string()),
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
-        default_model: None,
-        pr_number: None,
-        pr_url: None,
-        pr_status: None,
-        active_pull_request: None,
-        pull_requests: None,
-        context_links: None,
-        archived: false,
-        archived_at: None,
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        pull_requests_total: None,
-        display_status: None,
-        waiting: false,
-        checkout_mode: None,
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
+        ..Default::default()
     }
 }
 
@@ -5923,49 +6144,9 @@ async fn seed_agent_with_task_graph(
         id: ws.clone(),
         title: "WS".to_string(),
         branch: "main".to_string(),
-        base_ref: None,
-        base_commit_sha: None,
-        status: WorkspaceStatus::Active,
-        status_message: None,
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
-        attention: WorkspaceAttention::None,
         created_at: ts.clone(),
         updated_at: ts.clone(),
-        last_activity: None,
-        last_content_activity: None,
-        tags: vec![],
-        path: None,
-        repository_path: None,
-        repository_owner: None,
-        repository_name: None,
-        worktree_path: None,
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
-        default_model: None,
-        pr_number: None,
-        pr_url: None,
-        pr_status: None,
-        active_pull_request: None,
-        pull_requests: None,
-        context_links: None,
-        archived: false,
-        archived_at: None,
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        pull_requests_total: None,
-        display_status: None,
-        waiting: false,
-        checkout_mode: None,
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
+        ..Default::default()
     };
     let session = AgentSession {
         harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
@@ -8522,7 +8703,12 @@ async fn terminal_failure_events_carry_turn_id() {
     .await;
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let failed = events
@@ -8550,7 +8736,12 @@ async fn terminal_failure_events_carry_turn_id() {
     )
     .await;
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     for ty in ["agent:failed", "agent:stream:end"] {
@@ -8635,7 +8826,12 @@ async fn quota_failed_payload(
     )
     .await;
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     events
@@ -8823,7 +9019,12 @@ async fn terminal_failure_persists_error_before_publishing_events() {
     handler.await.unwrap();
 
     // Wire order is unchanged by the persist reorder.
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let order: Vec<&str> = events
@@ -8972,7 +9173,12 @@ async fn drain_emits_queue_processing_with_turn_id() {
     .expect("drained turn completes");
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let processing = events
@@ -9354,7 +9560,12 @@ async fn interrupt_emits_terminal_stream_end_and_idle_when_no_queue() {
 
     // Drain the published events within a bounded window.
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
@@ -9439,7 +9650,12 @@ async fn interrupt_suppresses_idle_when_queue_has_ready_to_send() {
 
     // Drain the published events within a bounded window.
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
@@ -9495,7 +9711,13 @@ async fn wedged_connection() -> (
                 let probe = tokio::spawn(async move {
                     let _ = conn.notify("wedge/probe", payload).await;
                 });
-                if timeout(Duration::from_millis(100), probe).await.is_err() {
+                if timeout(
+                    intentd_test_support::test_timeout(Duration::from_millis(100)),
+                    probe,
+                )
+                .await
+                .is_err()
+                {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -9515,7 +9737,12 @@ async fn wedged_connection() -> (
         let _ = confirm_conn.notify("wedge/confirm", confirm_payload).await;
     });
     assert!(
-        timeout(Duration::from_millis(500), confirm).await.is_err(),
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(500)),
+            confirm
+        )
+        .await
+        .is_err(),
         "saturation loop broke early: the confirming notify still found channel capacity"
     );
     (conn, agent_r, agent_w)
@@ -9590,7 +9817,12 @@ async fn interrupt_on_wedged_transport_still_emits_terminal_events() {
     assert!(found, "interrupt finds the live agent");
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
@@ -9693,7 +9925,12 @@ async fn interrupt_send_message_preempts_busy_turn_without_kill() {
     assert!(result["messageId"].is_string());
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
@@ -9752,7 +9989,12 @@ async fn interrupt_kills_child_for_provider_with_kill_quirk() {
     // The terminal stream:end is still emitted (the teardown happens after
     // the cancel, before the terminal emits — same shape as keep-alive).
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
@@ -9842,7 +10084,12 @@ async fn preemption_by_agent_sender_stamps_agent_attribution() {
 
     // The terminal stream:end mirrors both fields.
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let end = events
@@ -9961,7 +10208,12 @@ async fn interrupt_zero_output_persists_empty_interrupted_row_with_message_id() 
     );
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let end = events
@@ -10045,7 +10297,12 @@ async fn interrupt_after_worker_persisted_full_row_emits_normal_completion_end()
     );
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let ends: Vec<_> = events
@@ -10142,7 +10399,12 @@ async fn interrupt_colliding_with_suspend_enrollment_row_keeps_interrupted_end()
     );
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let ends: Vec<_> = events
@@ -10318,7 +10580,11 @@ async fn user_retire_waits_for_claimed_turn_start_before_detaching() {
     .expect("retirement fences the target");
     // Before the fix this finishes teardown while startup is paused. After
     // the fix retirement waits for startup, then balances its activity edge.
-    let early_retirement = timeout(Duration::from_millis(100), &mut retiring).await;
+    let early_retirement = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(100)),
+        &mut retiring,
+    )
+    .await;
     pause.resume.notify_one();
     let admission = starting.await.unwrap().unwrap();
     match early_retirement {
@@ -12090,7 +12356,12 @@ async fn preemption_by_agent_sender_without_name_omits_name_field() {
     );
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let end = events
@@ -12193,7 +12464,12 @@ async fn interrupt_send_message_suppresses_synthetic_idle() {
             break;
         }
     }
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
@@ -13069,49 +13345,9 @@ async fn delete_workspace_stops_live_agents_and_leaves_no_ghost_state() {
         id: ws.clone(),
         title: "WS".to_string(),
         branch: "main".to_string(),
-        base_ref: None,
-        base_commit_sha: None,
-        status: WorkspaceStatus::Active,
-        status_message: None,
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
-        attention: WorkspaceAttention::None,
         created_at: ts.clone(),
         updated_at: ts,
-        last_activity: None,
-        last_content_activity: None,
-        tags: vec![],
-        path: None,
-        repository_path: None,
-        repository_owner: None,
-        repository_name: None,
-        worktree_path: None,
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
-        default_model: None,
-        pr_number: None,
-        pr_url: None,
-        pr_status: None,
-        active_pull_request: None,
-        pull_requests: None,
-        context_links: None,
-        archived: false,
-        archived_at: None,
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        pull_requests_total: None,
-        display_status: None,
-        waiting: false,
-        checkout_mode: None,
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
+        ..Default::default()
     };
     store
         .insert_workspace(&workspace)
@@ -13229,7 +13465,12 @@ async fn archive_workspace_interrupts_in_flight_turns_keepalive() {
 
     // Drain the published events within a bounded window.
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
@@ -13318,7 +13559,12 @@ async fn archive_workspace_skips_the_calling_agents_turn() {
     assert!(archived.archived, "workspace archived");
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let interrupted: Vec<&str> = events
@@ -13486,7 +13732,7 @@ async fn archived_wake_park_self_heals_when_unarchived_during_enqueue() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
-    let park = Arc::new(crate::script_ops::SupervisePark::default());
+    let park = Arc::new(crate::runtime_config::SupervisePark::default());
     let services = Services::new(store)
         .with_event_bus(bus.clone())
         .with_wake_archived_park(park.clone());
@@ -13675,7 +13921,12 @@ async fn archived_workspace_parks_automatic_send_until_unarchive() {
 
     // No workspace:updated unarchive delta was published.
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     assert!(
@@ -13848,7 +14099,12 @@ async fn archived_workspace_user_send_still_auto_unarchives() {
     assert_eq!(row.status, WorkspaceStatus::Active);
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     assert!(
@@ -14198,7 +14454,12 @@ async fn try_begin_persists_active_status_and_emits_event() {
     assert!(stored.is_active);
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let status_event = events
@@ -14229,7 +14490,12 @@ async fn end_turn_persists_runtime_idle_and_emits_event() {
     assert!(!stored.is_active);
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let status_event = events
@@ -15099,7 +15365,12 @@ async fn send_message_direct_response_and_user_echo_carry_turn_id() {
     .expect("direct turn completes");
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let echo = events
@@ -16203,7 +16474,12 @@ async fn drain_persist_failure_for_vanished_session_discards_message() {
         "no front requeue for a vanished session"
     );
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     assert!(
@@ -16255,7 +16531,12 @@ async fn terminal_turn_failure_for_vanished_session_discards_message() {
         "no front requeue for a vanished session"
     );
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     assert!(
@@ -16356,9 +16637,12 @@ async fn wake_delivery_fails_closed_when_session_lookup_fails() {
         "the pre-existing queue entry survives (only NotFound drops the queue)"
     );
     assert!(
-        timeout(Duration::from_millis(200), events.recv())
-            .await
-            .is_err(),
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            events.recv()
+        )
+        .await
+        .is_err(),
         "nothing is published under the caller's (or any) workspace"
     );
 }
@@ -16845,7 +17129,12 @@ async fn assert_cross_workspace_send_binds_to_session_workspace(
     // The user-row echo for the delivered message is scoped to the target's
     // home workspace, never the sender's.
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let echo = events
@@ -17043,7 +17332,12 @@ async fn cross_workspace_interrupt_archived_gate_keys_on_target_workspace() {
     );
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
@@ -17159,7 +17453,12 @@ async fn failed_drain_persist_parks_error_without_starting_turn() {
     // until quiet — pre-fix the turn started and the mock agent's response
     // chunk reached subscribers before the terminal failure parked the agent.
     let mut streamed_chunks = 0;
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         for ev in batch {
             if ev.event_type == intent_core::events::CHAT_STREAM_DELTA {
                 streamed_chunks += 1;
@@ -17409,7 +17708,12 @@ async fn pre_output_transport_failure_redrives_silently_once() {
     // No user-visible failure surfaced for the redriven attempt.
     let mut saw_failed = false;
     let mut stream_ends = 0;
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         for ev in batch {
             match ev.event_type.as_str() {
                 "agent:failed" => saw_failed = true,
@@ -17546,7 +17850,12 @@ async fn assert_auth_prompt_failure_surfaces_login_remedy(rpc_error: serde_json:
 
     let mut failed_payloads = Vec::new();
     let mut stream_ends = 0;
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         for ev in batch {
             match ev.event_type.as_str() {
                 "agent:failed" => failed_payloads.push(ev.data["error"].clone()),
@@ -17647,8 +17956,38 @@ async fn worker_driven_streaming_failure_records_streak_exactly_once() {
 /// Error status, the terminal `agent:failed` + `agent:stream:end` pair
 /// (emitted by the terminal-failure path, since `run_prompt_turn` suppressed
 /// it for the marker error), and the message requeued for `agent.retry`.
-#[tokio::test]
-async fn second_pre_output_transport_failure_takes_terminal_path() {
+///
+/// Also the stack-headroom guard for the agent-turn path, so it runs on a
+/// reduced 1 MiB stack instead of the 2 MiB default. The scenario nests the
+/// deepest turn-path poll frames on one thread (`run_message_worker` →
+/// `retry_spawn_owned` → `ensure_started_owned` → `start_session_owned` →
+/// `start_session_opened` → session load, twice, then the terminal-failure
+/// path). Debug poll frames there once filled the whole default stack (the
+/// scenario needed ~2.08 MB, so any small addition overflowed); with the
+/// turn path's await sites built off-frame by
+/// [`crate::stack_frame::boxed_await`] it needs ~570 KiB. A stack overflow
+/// here (the process aborts with SIGSEGV) means a new large future is being
+/// awaited inline on the turn path — build it with `boxed_await` instead of
+/// raising this budget.
+#[test]
+fn second_pre_output_transport_failure_takes_terminal_path() {
+    const TURN_PATH_STACK_BUDGET: usize = 1024 * 1024;
+    std::thread::Builder::new()
+        .name("turn-path-stack-guard".into())
+        .stack_size(TURN_PATH_STACK_BUDGET)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("current-thread runtime")
+                .block_on(second_pre_output_transport_failure_scenario());
+        })
+        .expect("spawn the reduced-stack thread")
+        .join()
+        .expect("the scenario's assertions hold");
+}
+
+async fn second_pre_output_transport_failure_scenario() {
     let script = mock_agent_script();
     let scratch = test_tempdir("itd-764-twice-");
     let attempt_file = scratch.path().join("attempts");
@@ -17710,7 +18049,12 @@ async fn second_pre_output_transport_failure_takes_terminal_path() {
     // the first attempt stayed silent) — the STAB-6 Retry surface intact.
     let mut failed = 0;
     let mut stream_ends = 0;
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         for ev in batch {
             match ev.event_type.as_str() {
                 "agent:failed" => failed += 1,
@@ -17810,7 +18154,12 @@ async fn idle_timeout_injects_warning_and_redrives() {
 
     // No failure surface anywhere in the sequence.
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     assert!(
@@ -17975,7 +18324,12 @@ async fn idle_timeout_cap_exceeded_takes_terminal_path() {
     // Exactly one agent:failed (the worker's cap-exceeded emit) and it names
     // the idle timeout.
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let failed: Vec<_> = events
@@ -18075,7 +18429,12 @@ async fn send_message_direct_branch_emits_agent_message_with_row_id() {
     );
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(300)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     let msg_event = events
@@ -18553,49 +18912,10 @@ async fn resolve_spawn_prefers_existing_workspace_path() {
         id: WorkspaceId::from("ws-rs"),
         title: "WS".to_string(),
         branch: "main".to_string(),
-        base_ref: None,
-        base_commit_sha: None,
-        status: WorkspaceStatus::Active,
-        status_message: None,
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
-        attention: WorkspaceAttention::None,
         created_at: now_iso(),
         updated_at: now_iso(),
-        last_activity: None,
-        last_content_activity: None,
-        tags: vec![],
         path: Some(ws_dir.display().to_string()),
-        repository_path: None,
-        repository_owner: None,
-        repository_name: None,
-        worktree_path: None,
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
-        default_model: None,
-        pr_number: None,
-        pr_url: None,
-        pr_status: None,
-        active_pull_request: None,
-        pull_requests: None,
-        context_links: None,
-        archived: false,
-        archived_at: None,
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        pull_requests_total: None,
-        display_status: None,
-        waiting: false,
-        checkout_mode: None,
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
+        ..Default::default()
     };
     let resolved = resolve_spawn(&session, Some(&workspace), &settings, None)
         .expect("existing workspace path resolves");
@@ -18671,49 +18991,11 @@ async fn resolve_spawn_falls_back_to_repository_path() {
         id: WorkspaceId::from("ws-repo-fb"),
         title: "WS".to_string(),
         branch: "main".to_string(),
-        base_ref: None,
-        base_commit_sha: None,
-        status: WorkspaceStatus::Active,
-        status_message: None,
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
-        attention: WorkspaceAttention::None,
         created_at: now_iso(),
         updated_at: now_iso(),
-        last_activity: None,
-        last_content_activity: None,
-        tags: vec![],
-        path: None,
         repository_path: Some(repo_dir.display().to_string()),
-        repository_owner: None,
-        repository_name: None,
-        worktree_path: None,
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
-        default_model: None,
-        pr_number: None,
-        pr_url: None,
-        pr_status: None,
-        active_pull_request: None,
-        pull_requests: None,
-        context_links: None,
-        archived: false,
-        archived_at: None,
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        pull_requests_total: None,
-        display_status: None,
-        waiting: false,
         checkout_mode: Some(intent_core::CheckoutMode::Direct),
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
+        ..Default::default()
     };
     let resolved = resolve_spawn(&session, Some(&workspace), &settings, None)
         .expect("repository_path fallback resolves");
@@ -19079,7 +19361,7 @@ async fn validate_image_block_refs_enforces_aggregate_cap() {
 #[tokio::test]
 async fn resolve_image_block_refs_inlines_attachment_bytes() {
     use base64::Engine as _;
-    use intent_core::{Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus};
+    use intent_core::Workspace;
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let root = tempfile::Builder::new()
@@ -19092,49 +19374,10 @@ async fn resolve_image_block_refs_inlines_attachment_bytes() {
         id: ws_id.clone(),
         title: "WS".into(),
         branch: "main".into(),
-        base_ref: None,
-        base_commit_sha: None,
-        status: WorkspaceStatus::Active,
-        status_message: None,
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
-        attention: WorkspaceAttention::None,
         created_at: ts.clone(),
         updated_at: ts,
-        last_activity: None,
-        last_content_activity: None,
-        tags: vec![],
-        path: None,
-        repository_path: None,
-        repository_owner: None,
-        repository_name: None,
         worktree_path: Some(root.path().display().to_string()),
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
-        default_model: None,
-        pr_number: None,
-        pr_url: None,
-        pr_status: None,
-        active_pull_request: None,
-        pull_requests: None,
-        context_links: None,
-        archived: false,
-        archived_at: None,
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        pull_requests_total: None,
-        display_status: None,
-        waiting: false,
-        checkout_mode: None,
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
+        ..Default::default()
     };
     store.insert_workspace(&ws).await.unwrap();
 
@@ -19416,7 +19659,12 @@ async fn image_reference_assembly_failure_preserves_retry_and_releases_worker() 
     );
 
     let mut events = Vec::new();
-    while let Ok(Some(batch)) = timeout(Duration::from_millis(100), sub.recv()).await {
+    while let Ok(Some(batch)) = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(100)),
+        sub.recv(),
+    )
+    .await
+    {
         events.extend(batch);
     }
     for kind in ["agent:failed", "agent:stream:end"] {
@@ -19762,49 +20010,10 @@ async fn derive_agent_type_uses_workspace_project_specialists_dir() {
         id: WorkspaceId::from("ws-dat"),
         title: "WS".to_string(),
         branch: "main".to_string(),
-        base_ref: None,
-        base_commit_sha: None,
-        status: WorkspaceStatus::Active,
-        status_message: None,
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
-        attention: WorkspaceAttention::None,
         created_at: now_iso(),
         updated_at: now_iso(),
-        last_activity: None,
-        last_content_activity: None,
-        tags: vec![],
         path: Some(ws_dir.display().to_string()),
-        repository_path: None,
-        repository_owner: None,
-        repository_name: None,
-        worktree_path: None,
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
-        default_model: None,
-        pr_number: None,
-        pr_url: None,
-        pr_status: None,
-        active_pull_request: None,
-        pull_requests: None,
-        context_links: None,
-        archived: false,
-        archived_at: None,
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        pull_requests_total: None,
-        display_status: None,
-        waiting: false,
-        checkout_mode: None,
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
+        ..Default::default()
     };
 
     assert_eq!(
@@ -19953,14 +20162,12 @@ async fn build_turn_prompt_uses_context_references_when_stdin_context_is_absent(
     assert!(!text.contains("ignored"));
 }
 
-/// `noteIds` (PROTOCOL §5.5): the resolver loads workspace-asset
-/// images referenced by each note's markdown content, appends them as
-/// ACP `image` content blocks, and adds a system text notice so the
-/// agent knows the images are inlined (parity with the FE extraction
-/// in `agent-backend-handler.service.ts`).
+/// `noteIds` (PROTOCOL §5.5): each note is attached by reference — one
+/// text notice with its id, title and the in-workspace `workspace-asset://`
+/// image URLs its markdown embeds. No image block is emitted and the asset
+/// bytes are never read.
 #[tokio::test]
-async fn build_turn_prompt_resolves_note_ids_to_image_blocks() {
-    use base64::Engine as _;
+async fn build_turn_prompt_note_ids_render_reference_notice() {
     use intent_core::{ContentType, Note, NoteId, NoteMetadata, NoteVisibility};
 
     let tmp = TempDb::new();
@@ -20020,18 +20227,23 @@ async fn build_turn_prompt_resolves_note_ids_to_image_blocks() {
         .unwrap();
     let wire = serde_json::to_value(&prompt).unwrap();
     let arr = wire.as_array().unwrap();
-    // Expect: original text prompt, image block, system notice.
-    assert_eq!(arr.len(), 3, "text + image + notice");
+    // Expect: original text prompt, then the note's reference notice.
+    assert_eq!(arr.len(), 2, "text + note notice: {wire}");
     assert_eq!(arr[0]["type"], json!("text"));
     assert!(arr[0]["text"].as_str().unwrap().contains("look"));
-    assert_eq!(arr[1]["type"], json!("image"));
-    let expected_b64 = base64::engine::general_purpose::STANDARD.encode(asset_bytes);
-    assert_eq!(arr[1]["data"], json!(expected_b64));
-    assert_eq!(arr[1]["mimeType"], json!("image/png"));
-    assert_eq!(arr[2]["type"], json!("text"));
-    assert!(arr[2]["text"].as_str().unwrap().contains("1 image(s)"));
+    assert_eq!(arr[1]["type"], json!("text"));
+    assert_eq!(
+        arr[1]["text"],
+        json!(super::note_reference_notice(
+            "Spec",
+            &note_id.to_string(),
+            &[format!("workspace-asset://{}/{asset_id}", ws.0)],
+            0,
+        ))
+    );
 
-    // A cross-workspace URL is silently skipped (no image, no notice).
+    // A cross-workspace URL is skipped: the note is still referenced, with
+    // no image list.
     let stray_id = NoteId::new();
     let stray = Note {
         id: stray_id.clone(),
@@ -20051,7 +20263,220 @@ async fn build_turn_prompt_resolves_note_ids_to_image_blocks() {
         .unwrap();
     let arr_json = serde_json::to_value(&prompt).unwrap();
     let arr = arr_json.as_array().unwrap();
-    assert_eq!(arr.len(), 1, "only text; stray URL is skipped");
+    assert_eq!(arr.len(), 2, "text + note notice");
+    let notice = arr[1]["text"].as_str().unwrap();
+    assert!(!notice.contains("workspace-asset://"), "{notice}");
+    assert!(!notice.contains("image(s)"), "{notice}");
+
+    // Past the per-note cap, the first 50 distinct URLs are listed and the
+    // rest counted.
+    let many_id = NoteId::new();
+    let many_urls: Vec<String> = (0..53)
+        .map(|i| format!("workspace-asset://{}/shot-{i}.png", ws.0))
+        .collect();
+    let many = Note {
+        id: many_id.clone(),
+        content: many_urls.iter().fold(String::new(), |mut acc, url| {
+            use std::fmt::Write as _;
+            let _ = writeln!(acc, "![s]({url})");
+            acc
+        }),
+        ..note.clone()
+    };
+    store.insert_note(&many).await.expect("insert many");
+    let options = super::TurnOptions {
+        note_ids: Some(json!([many_id.to_string()])),
+        ..super::TurnOptions::default()
+    };
+    let prompt = mgr
+        .build_turn_prompt(&id, &ws, "look", &options)
+        .await
+        .unwrap();
+    let wire = serde_json::to_value(&prompt).unwrap();
+    assert_eq!(
+        wire[1]["text"],
+        json!(super::note_reference_notice(
+            "Spec",
+            &many_id.to_string(),
+            &many_urls[..50],
+            3,
+        ))
+    );
+
+    // Only the destination of a markdown image target is a URL: a title is
+    // dropped, `<…>` is unwrapped, and a target that is not a plain asset
+    // file name (here an unclosed image swallowing prose) is not listed.
+    // A repeated note id is referenced once.
+    let tricky_id = NoteId::new();
+    let tricky = Note {
+        id: tricky_id.clone(),
+        content: format!(
+            "![a](workspace-asset://{ws}/a.png \"caption\")\n\
+             ![b](<workspace-asset://{ws}/b.png>)\n\
+             ![c](workspace-asset://{ws}/\n\nSecret paragraph text)\n",
+            ws = ws.0,
+        ),
+        ..note.clone()
+    };
+    store.insert_note(&tricky).await.expect("insert tricky");
+    let options = super::TurnOptions {
+        note_ids: Some(json!([tricky_id.to_string(), tricky_id.to_string()])),
+        ..super::TurnOptions::default()
+    };
+    let prompt = mgr
+        .build_turn_prompt(&id, &ws, "look", &options)
+        .await
+        .unwrap();
+    let wire = serde_json::to_value(&prompt).unwrap();
+    assert_eq!(
+        wire.as_array().unwrap().len(),
+        2,
+        "one notice per note: {wire}"
+    );
+    assert_eq!(
+        wire[1]["text"],
+        json!(super::note_reference_notice(
+            "Spec",
+            &tricky_id.to_string(),
+            &[
+                format!("workspace-asset://{}/a.png", ws.0),
+                format!("workspace-asset://{}/b.png", ws.0),
+            ],
+            0,
+        ))
+    );
+}
+
+/// Regression: a note in chat context whose screenshots together exceed the
+/// 8 MiB provider image budget must not fail the turn. The note is attached
+/// by reference — its ID plus each image's `workspace-asset://` URL — so the
+/// prepared prompt carries no image blocks and the agent opens what it needs
+/// with `ws.note.read` / `ws.note.readAsset`.
+#[tokio::test]
+async fn note_ids_attach_large_image_notes_by_reference() {
+    use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
+    use intent_core::{ContentType, Note, NoteId, NoteMetadata, NoteVisibility};
+
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let bus = EventBus::new(store.clone());
+    let assets_dir = crate::tests::test_tempdir("intentd-note-ref-");
+    let services = Services::new(store.clone())
+        .with_event_bus(bus.clone())
+        .with_assets_root(assets_dir.path().to_path_buf());
+    let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus.clone()));
+    let mgr = AgentManager::new(services, sink, 8);
+
+    let ws = WorkspaceId::from("ws-note-ref");
+    let id = AgentId::from("a-note-ref");
+    seed_agent(&mgr, &ws, &id).await;
+
+    // An incompressible 1000x1000 screenshot is ~3 MB of PNG (~4 MB base64):
+    // under the per-image limits, so three of them overflow only the 8 MiB
+    // aggregate budget — the reported failure.
+    let mut state = 0x1234_5678_u32;
+    let shot = DynamicImage::ImageRgb8(RgbImage::from_fn(1000, 1000, |_, _| {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        let [r, g, b, _] = state.to_le_bytes();
+        Rgb([r, g, b])
+    }));
+    let mut png = std::io::Cursor::new(Vec::new());
+    shot.write_to(&mut png, ImageFormat::Png)
+        .expect("encode png");
+    let ws_dir = assets_dir.path().join(&ws.0);
+    std::fs::create_dir_all(&ws_dir).expect("asset dir");
+    let asset_ids = ["shot-1.png", "shot-2.png", "shot-3.png"];
+    for asset in asset_ids {
+        std::fs::write(ws_dir.join(asset), png.get_ref()).expect("write asset");
+    }
+    let urls: Vec<String> = asset_ids
+        .iter()
+        .map(|asset| format!("workspace-asset://{}/{asset}", ws.0))
+        .collect();
+
+    let note_id = NoteId::new();
+    let ts = now_iso();
+    let mut content = "# Walkthrough\n\nIntro text that is not inlined.\n".to_string();
+    {
+        use std::fmt::Write as _;
+        for url in &urls {
+            let _ = write!(content, "\n![step]({url})\n");
+        }
+        // A repeated reference is listed once.
+        let _ = write!(content, "\n![again]({})\n", urls[0]);
+    }
+    store
+        .insert_note(&Note {
+            id: note_id.clone(),
+            workspace_id: ws.clone(),
+            title: "Walkthrough".to_string(),
+            content,
+            content_type: ContentType::Markdown,
+            tags: vec![],
+            is_pinned: false,
+            is_archived: false,
+            is_default: false,
+            parent_id: None,
+            visibility: NoteVisibility::Workspace,
+            metadata: NoteMetadata::default(),
+            created_at: ts.clone(),
+            rev: 0,
+            updated_at: ts,
+        })
+        .await
+        .expect("insert note");
+
+    let options = super::TurnOptions {
+        note_ids: Some(json!([note_id.to_string()])),
+        ..super::TurnOptions::default()
+    };
+    let prompt = mgr
+        .build_turn_prompt(&id, &ws, "look", &options)
+        .await
+        .unwrap();
+    let prepared = crate::provider_images::PreparedPrompt::new(prompt)
+        .await
+        .expect("a large-image note must not exceed the provider image budget")
+        .into_blocks();
+    let wire = serde_json::to_value(&prepared).unwrap();
+    let arr = wire.as_array().unwrap();
+    assert!(
+        arr.iter().all(|block| block["type"] == json!("text")),
+        "note images are referenced, never inlined: {wire}"
+    );
+    let text: String = arr
+        .iter()
+        .filter_map(|block| block["text"].as_str())
+        .collect();
+    assert!(text.contains("look"));
+    assert!(!text.contains("Intro text"), "note content is not inlined");
+    assert!(
+        text.contains(&format!("ws.note.read(\"{note_id}\")")),
+        "{text}"
+    );
+    assert!(text.contains("\"Walkthrough\""), "{text}");
+    for url in &urls {
+        assert_eq!(
+            text.matches(url.as_str()).count(),
+            1,
+            "each image URL is listed exactly once: {text}"
+        );
+    }
+    assert!(text.contains("ws.note.readAsset("), "{text}");
+
+    // A deleted (missing) note contributes nothing.
+    let options = super::TurnOptions {
+        note_ids: Some(json!(["note-that-was-deleted"])),
+        ..super::TurnOptions::default()
+    };
+    let prompt = mgr
+        .build_turn_prompt(&id, &ws, "look", &options)
+        .await
+        .unwrap();
+    let wire = serde_json::to_value(&prompt).unwrap();
+    assert_eq!(wire.as_array().unwrap().len(), 1, "only the message text");
 }
 
 /// A10 — daemon-side merge of user MCP servers into the agent spawn config.
@@ -21744,7 +22169,12 @@ mod draining_overlay_tests {
 
     async fn drain_bus(sub: &mut crate::events::Subscription) -> Vec<intent_core::Event> {
         let mut events = Vec::new();
-        while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        while let Ok(Some(batch)) = timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            sub.recv(),
+        )
+        .await
+        {
             events.extend(batch);
         }
         events
@@ -22775,6 +23205,7 @@ mod harness_wake_tests {
             .await;
             assert!(events.iter().any(|e| e.event_type == "agent:tool:call"));
             assert!(
+                // fixed-deadline: allow — stays under the 800ms open-tool silence limit (INTENTD_OPEN_TOOL_CALL_TERMINAL_MS above), after which stream:end is legitimate
                 timeout(Duration::from_millis(500), async {
                     loop {
                         let events = sub.recv().await.unwrap();
@@ -23261,9 +23692,12 @@ mod harness_wake_tests {
         assert!(mgr.wake_listener_tick(&id, &ws).await);
 
         assert!(
-            timeout(Duration::from_millis(150), sub.recv())
-                .await
-                .is_err(),
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(150)),
+                sub.recv()
+            )
+            .await
+            .is_err(),
             "no events published for an unmappable burst"
         );
         assert!(
@@ -23300,9 +23734,12 @@ mod harness_wake_tests {
             })
             .unwrap();
         assert!(mgr.wake_listener_tick(&id, &ws).await);
-        assert!(timeout(Duration::from_millis(50), sub.recv())
-            .await
-            .is_err());
+        assert!(timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(50)),
+            sub.recv()
+        )
+        .await
+        .is_err());
         assert!(mgr
             .services
             .store
@@ -23341,9 +23778,12 @@ mod harness_wake_tests {
         assert!(mgr.wake_listener_tick(&id, &ws).await);
 
         assert!(
-            timeout(Duration::from_millis(150), sub.recv())
-                .await
-                .is_err(),
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(150)),
+                sub.recv()
+            )
+            .await
+            .is_err(),
             "no events published for a name-less tool-call first-sight"
         );
         assert!(
@@ -23447,9 +23887,12 @@ mod harness_wake_tests {
         assert!(mgr.wake_listener_tick(&id, &ws).await);
 
         assert!(
-            timeout(Duration::from_millis(150), sub.recv())
-                .await
-                .is_err(),
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(150)),
+                sub.recv()
+            )
+            .await
+            .is_err(),
             "no wake turn driven against the handle being killed"
         );
         assert!(
@@ -23543,7 +23986,12 @@ mod harness_wake_tests {
         tokio::time::sleep(crate::agent_manager::HARNESS_WAKE_SETTLE + Duration::from_millis(100))
             .await;
         let mut late: Vec<intent_core::Event> = Vec::new();
-        while let Ok(Some(batch)) = timeout(Duration::from_millis(50), sub.recv()).await {
+        while let Ok(Some(batch)) = timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(50)),
+            sub.recv(),
+        )
+        .await
+        {
             late.extend(batch);
         }
         assert!(
@@ -23587,9 +24035,12 @@ mod harness_wake_tests {
         note_tx.send(chunk_note("replay")).unwrap();
         assert!(mgr.wake_listener_tick(&id, &ws).await);
         assert!(
-            timeout(Duration::from_millis(150), sub.recv())
-                .await
-                .is_err(),
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(150)),
+                sub.recv()
+            )
+            .await
+            .is_err(),
             "gated tick consumes nothing and emits nothing"
         );
 
@@ -25258,7 +25709,12 @@ mod attention_request_clear_gates {
     /// `attentionRequestCleared: true` was published.
     async fn saw_cleared_event(sub: &mut crate::events::Subscription) -> bool {
         let mut cleared = false;
-        while let Ok(Some(batch)) = timeout(Duration::from_millis(300), sub.recv()).await {
+        while let Ok(Some(batch)) = timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            sub.recv(),
+        )
+        .await
+        {
             for e in batch {
                 if e.event_type == intent_core::events::AGENT_UPDATED
                     && e.data["attentionRequestCleared"] == json!(true)
@@ -27030,6 +27486,212 @@ async fn shutdown_captures_startup_turn_before_provider_handle_exists() {
         "late provider startup remains fenced"
     );
     assert!(!mgr.contains(&id));
+}
+
+/// Give `id` a current §5.5b worker generation with one running worker, as a
+/// Claude `run_in_background` shell reports it.
+fn start_running_worker(mgr: &AgentManager, ws: &WorkspaceId, id: &AgentId) {
+    let adapter = crate::agent_workers::SUPPORTED_ADAPTERS
+        .iter()
+        .find(|a| a.provider == "claude-code")
+        .expect("claude adapter allowlisted");
+    let generation = format!("generation-{id}");
+    let workers = mgr.services.agent_workers();
+    workers.begin(
+        crate::agent_workers::Scope {
+            workspace_id: ws.clone(),
+            agent_id: id.clone(),
+            provider: "claude-code".into(),
+            acp_session_id: Some(format!("session-{id}")),
+            connection_generation: Some(generation.clone()),
+        },
+        &crate::agent_workers::AdapterIdentity {
+            name: Some(adapter.name.into()),
+            version: Some(adapter.version.into()),
+        },
+        true,
+        std::sync::Weak::new(),
+    );
+    workers.ingest(
+        id,
+        &generation,
+        &intent_acp::workers::WorkerFrame {
+            session_id: Some(format!("session-{id}")),
+            update: json!({
+                "sessionUpdate": "async_task_spawned", "asyncTaskId": "bg-1",
+                "taskType": "shell", "name": "npm run dev", "toolCallId": "call-1",
+                "canStop": true, "showInTranscript": false,
+            }),
+            received_at_ms: 1000,
+        },
+    );
+    assert!(workers.has_running_workers(id));
+}
+
+/// Regression: an agent that finished its turn while its provider still ran a
+/// background worker was not captured at graceful shutdown, so after the
+/// restart it never received the harness-interruption continuation and waited
+/// forever for a completion report from a worker the shutdown had killed.
+/// Every agent with a running worker is now enrolled, tagged
+/// `background_workers`; agents without one are unchanged.
+#[tokio::test]
+async fn checkpoint_shutdown_enrolls_agents_with_running_workers() {
+    let (_tmp, mgr) = manager().await;
+    let idle_worker = AgentId::from("idle-with-worker");
+    let busy_worker = AgentId::from("busy-with-worker");
+    let busy_plain = AgentId::from("busy-plain");
+    let idle_plain = AgentId::from("idle-plain");
+    let stale_worker = AgentId::from("stale-active-with-worker");
+    let completed_worker = AgentId::from("completed-with-worker");
+    let reported_child = AgentId::from("reported-child-with-worker");
+    // `seed_agent` inserts the workspace row, so each agent gets its own.
+    let ws_of = |id: &AgentId| WorkspaceId::from(format!("ws-{id}"));
+    for id in [
+        &idle_worker,
+        &busy_worker,
+        &busy_plain,
+        &idle_plain,
+        &stale_worker,
+        &completed_worker,
+        &reported_child,
+    ] {
+        seed_agent(&mgr, &ws_of(id), id).await;
+    }
+    // Finished agents keep their workers but are not interrupted: a completed
+    // agent, and a delegated child that already reported to its parent.
+    start_running_worker(&mgr, &ws_of(&completed_worker), &completed_worker);
+    mgr.services
+        .store
+        .set_agent_session_status(
+            &ws_of(&completed_worker),
+            &completed_worker,
+            AgentStatus::Completed,
+            false,
+            &now_iso(),
+            None,
+        )
+        .await
+        .unwrap();
+    start_running_worker(&mgr, &ws_of(&reported_child), &reported_child);
+    let mut child = mgr
+        .services
+        .store
+        .get_agent_session(&reported_child)
+        .await
+        .unwrap();
+    child.parent_agent_id = Some(AgentId::from("agent-parent"));
+    child.completion_report = Some("work done".to_string());
+    child.completion_report_timestamp = Some(now_iso());
+    mgr.services
+        .store
+        .update_agent_session(&ws_of(&reported_child), &child)
+        .await
+        .unwrap();
+    start_running_worker(&mgr, &ws_of(&idle_worker), &idle_worker);
+    start_running_worker(&mgr, &ws_of(&busy_worker), &busy_worker);
+    // Not busy, but its post-turn idle write has not landed: still `active`.
+    start_running_worker(&mgr, &ws_of(&stale_worker), &stale_worker);
+    mgr.services
+        .store
+        .set_agent_session_status(
+            &ws_of(&stale_worker),
+            &stale_worker,
+            AgentStatus::Active,
+            true,
+            &now_iso(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(mgr.try_begin(&busy_worker, &ws_of(&busy_worker)).await);
+    assert!(mgr.try_begin(&busy_plain, &ws_of(&busy_plain)).await);
+    let idle_status = mgr
+        .services
+        .store
+        .get_agent_session_status(&idle_worker)
+        .await
+        .unwrap();
+
+    for _ in 0..2 {
+        mgr.checkpoint_shutdown().await;
+        let store = &mgr.services.store;
+        let row = store
+            .get_interrupted_agent(&idle_worker)
+            .await
+            .unwrap()
+            .expect("idle agent with a running worker is enrolled");
+        assert_eq!(row.workspace_id, ws_of(&idle_worker));
+        assert_eq!(
+            row.reason.as_deref(),
+            Some(crate::agent_workers::INTERRUPTED_WITH_WORKERS_REASON)
+        );
+        assert_eq!(
+            row.prev_status,
+            serde_json::to_value(idle_status).unwrap().as_str().unwrap()
+        );
+
+        let row = store
+            .get_interrupted_agent(&busy_worker)
+            .await
+            .unwrap()
+            .expect("mid-turn agent is enrolled");
+        assert_eq!(
+            row.reason.as_deref(),
+            Some(crate::agent_workers::INTERRUPTED_WITH_WORKERS_REASON),
+            "a mid-turn agent's lost workers are tagged too"
+        );
+        assert_eq!(row.prev_status, "active");
+
+        let row = store
+            .get_interrupted_agent(&stale_worker)
+            .await
+            .unwrap()
+            .expect("an idle agent with a running worker is enrolled");
+        assert_eq!(row.prev_status, "idle", "not mid-turn: recorded as idle");
+
+        let row = store
+            .get_interrupted_agent(&busy_plain)
+            .await
+            .unwrap()
+            .expect("mid-turn agent is enrolled");
+        assert_eq!(row.reason, None, "no workers: today's untagged row");
+
+        for (id, why) in [
+            (&idle_plain, "an idle agent without workers"),
+            (&completed_worker, "a completed agent"),
+            (&reported_child, "a delegated child that already reported"),
+        ] {
+            assert!(
+                store.get_interrupted_agent(id).await.unwrap().is_none(),
+                "{why} is not enrolled"
+            );
+        }
+    }
+    // A kill before teardown leaves in-flight statuses for the startup heal,
+    // which must keep the tagged rows rather than re-upsert them untagged.
+    mgr.services.heal_stale_agent_sessions().await.unwrap();
+    for (id, prev) in [(&stale_worker, "idle"), (&busy_worker, "active")] {
+        let row = mgr
+            .services
+            .store
+            .get_interrupted_agent(id)
+            .await
+            .unwrap()
+            .expect("still enrolled after heal");
+        assert_eq!(
+            row.reason.as_deref(),
+            Some(crate::agent_workers::INTERRUPTED_WITH_WORKERS_REASON),
+            "heal keeps the tag of {id}"
+        );
+        assert_eq!(row.prev_status, prev, "heal keeps the status of {id}");
+    }
+    let candidates = mgr.services.prepare_startup_resume().await.unwrap();
+    let mut ids = candidates.ids().to_vec();
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec![busy_plain, busy_worker, idle_worker, stale_worker]
+    );
 }
 
 /// Holding the first persistence await must not leave later workers alive to

@@ -1,0 +1,5 @@
+error: cannot construct `NoteWriteLock` with struct literal syntax due to private fields
+ --> tests/ui/note_write_lock_forged.rs:2:5
+  |
+2 |     intent_store::NoteWriteLock {}
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^

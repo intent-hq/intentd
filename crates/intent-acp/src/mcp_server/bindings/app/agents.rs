@@ -158,7 +158,10 @@ async fn list(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, String
         vec![ws]
     } else {
         // All non-chief workspaces
-        let all = api.list_workspaces(true).await.map_err(map_err)?;
+        let all = api
+            .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .map_err(map_err)?;
         all.into_iter()
             .filter(|ws| {
                 !ws.id.is_chief() && format!("{:?}", ws.status).to_lowercase() != "deleted"
@@ -591,10 +594,7 @@ fn has_returned_content(message: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use intent_core::{
-        AgentLite, AgentMetadata, AgentStatus, BoxFuture, Error, Result, Workspace,
-        WorkspaceActivity, WorkspaceAttention, WorkspaceStatus,
-    };
+    use intent_core::{AgentLite, AgentMetadata, AgentStatus, BoxFuture, Error, Result, Workspace};
     use serde_json::json;
     use std::sync::{Arc, Mutex};
 
@@ -616,7 +616,7 @@ mod tests {
     impl WorkspaceApi for FakeApi {
         fn list_workspaces(
             &self,
-            _include_archived: bool,
+            _filter: intent_core::WorkspaceListFilter,
         ) -> BoxFuture<'_, Result<Vec<Workspace>>> {
             let workspaces = self.workspaces.lock().unwrap().clone();
             Box::pin(async move { Ok(workspaces) })
@@ -779,49 +779,9 @@ mod tests {
             id: WorkspaceId::from_string(id),
             title: title.to_string(),
             branch: "main".to_string(),
-            base_ref: None,
-            base_commit_sha: None,
-            status: WorkspaceStatus::Active,
-            status_message: None,
-            status_image_asset_id: None,
-            activity: WorkspaceActivity::Idle,
-            attention: WorkspaceAttention::None,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
-            last_activity: None,
-            last_content_activity: None,
-            tags: vec![],
-            path: None,
-            repository_path: None,
-            repository_owner: None,
-            repository_name: None,
-            worktree_path: None,
-            scope: None,
-            skip_worktree: false,
-            setup_script: None,
-            is_remote: false,
-            default_model: None,
-            pr_number: None,
-            pr_url: None,
-            pr_status: None,
-            active_pull_request: None,
-            pull_requests: None,
-            context_links: None,
-            archived: false,
-            archived_at: None,
-            task_stats: None,
-            agent_summary: None,
-            diff_summary: None,
-            token_usage: None,
-            cow_supported: None,
-            browser_client_id: None,
-            pull_requests_total: None,
-            display_status: None,
-            waiting: false,
-            checkout_mode: None,
-            disk_usage: None,
-            pending_delete_at: None,
-            membership: None,
+            ..Default::default()
         }
     }
 

@@ -423,7 +423,8 @@ pub(crate) fn derive_check_state(status: &str, conclusion: Option<&str>) -> Chec
     }
     match conclusion {
         Some("success") => CheckState::Success,
-        Some("neutral" | "skipped") => CheckState::Neutral,
+        Some("neutral") => CheckState::Neutral,
+        Some("skipped") => CheckState::Skipped,
         Some("cancelled") => CheckState::Cancelled,
         _ => CheckState::Failure,
     }
@@ -733,6 +734,8 @@ pub(crate) fn map_review(value: Value) -> Result<Review> {
         verdict: verdict_from_state(r.state.as_deref().unwrap_or_default()),
         body: r.body,
         submitted_at: r.submitted_at.unwrap_or_default(),
+        id: r.id.map(|id| id.to_string()),
+        commit_sha: r.commit_id.filter(|sha| !sha.is_empty()),
     })
 }
 
@@ -984,10 +987,14 @@ mod dto {
 
     #[derive(Deserialize)]
     pub(super) struct Review {
+        #[serde(default)]
+        pub id: Option<u64>,
         pub user: Option<User>,
         pub state: Option<String>,
         pub body: Option<String>,
         pub submitted_at: Option<String>,
+        #[serde(default)]
+        pub commit_id: Option<String>,
     }
 
     #[derive(Deserialize)]
@@ -1102,6 +1109,7 @@ query GetMergeRequirements($owner: String!, $repo: String!, $prNumber: Int!, $ch
         nodes {
           commit {
             oid
+            committedDate
             statusCheckRollup {
               contexts(first: 100, after: $checksCursor) {
                 pageInfo { hasNextPage endCursor }
@@ -1239,6 +1247,7 @@ query GetPrObservation($owner: String!, $repo: String!, $prNumber: Int!, $checks
         nodes {
           commit {
             oid
+            committedDate
             statusCheckRollup {
               contexts(first: 100, after: $checksCursor) {
                 pageInfo { hasNextPage endCursor }
@@ -1267,7 +1276,7 @@ query GetPrObservation($owner: String!, $repo: String!, $prNumber: Int!, $checks
       }
       reviews(last: 100) {
         pageInfo { hasPreviousPage }
-        nodes { author { login } state submittedAt }
+        nodes { author { login } state submittedAt commit { oid } }
       }
       reviewThreads(first: 100) {
         pageInfo { hasNextPage }
@@ -1396,6 +1405,7 @@ fn parse_merge_requirement_signals(data: &Value) -> MergeRequirementSignals {
             .and_then(|p| p.get("headRefOid"))
             .and_then(Value::as_str)
             .map(String::from),
+        head_committed_at: parse_head_committed_at(data),
         branch_rules: None,
         // Absent on hosts that do not report it: degrades to `None`.
         is_in_merge_queue: pr
@@ -1431,6 +1441,16 @@ fn parse_observed_reviews(pr: &Value) -> Option<Vec<Review>> {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string(),
+                // `databaseId` is a 32-bit GraphQL Int that current review
+                // ids overflow, and `fullDatabaseId` is missing on older GHES
+                // schemas, so this window carries no id; consumers key
+                // reviews on `submitted_at`, which both read paths report.
+                id: None,
+                commit_sha: r
+                    .pointer("/commit/oid")
+                    .and_then(Value::as_str)
+                    .filter(|sha| !sha.is_empty())
+                    .map(String::from),
             })
             .collect(),
     )
@@ -1539,6 +1559,27 @@ fn parse_merge_queue_removal(pr: Option<&Value>) -> Option<MergeQueueRemoval> {
             reason: node.get("reason").and_then(Value::as_str).map(String::from),
         })
     })
+}
+
+/// The PR's last commit in the merge-requirements-shaped GraphQL payload.
+const HEAD_COMMIT_POINTER: &str = "/repository/pullRequest/commits/nodes/0/commit";
+
+/// The head commit's `committedDate`, only when the commit node IS the PR's
+/// head (`oid == headRefOid`): a commit time read off any other commit would
+/// start the never-started-CI clock for the wrong head.
+fn parse_head_committed_at(data: &Value) -> Option<String> {
+    let head = data
+        .pointer("/repository/pullRequest/headRefOid")
+        .and_then(Value::as_str)?;
+    let commit = data.pointer(HEAD_COMMIT_POINTER)?;
+    if commit.get("oid").and_then(Value::as_str) != Some(head) {
+        return None;
+    }
+    commit
+        .get("committedDate")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
 }
 
 /// The GraphQL pointer to the PR's status-check rollup contexts (the last
@@ -2985,6 +3026,10 @@ mod tests {
         );
         assert_eq!(
             derive_check_state("completed", Some("skipped")),
+            CheckState::Skipped
+        );
+        assert_eq!(
+            derive_check_state("completed", Some("neutral")),
             CheckState::Neutral
         );
         assert_eq!(
@@ -3029,6 +3074,21 @@ mod tests {
         .unwrap();
         assert_eq!(r.author, "rev");
         assert_eq!(r.verdict, ReviewVerdict::RequestChanges);
+        assert_eq!(
+            (r.id, r.commit_sha),
+            (None, None),
+            "absent fields stay unknown"
+        );
+        let r = map_review(json!({
+            "id": 5_639_064_405_u64,
+            "user": { "login": "rev" },
+            "state": "CHANGES_REQUESTED",
+            "submitted_at": "2026-10-24T17:01:00Z",
+            "commit_id": "c0f1e6f11"
+        }))
+        .unwrap();
+        assert_eq!(r.id.as_deref(), Some("5639064405"));
+        assert_eq!(r.commit_sha.as_deref(), Some("c0f1e6f11"));
         assert_eq!(verdict_from_state("APPROVED"), ReviewVerdict::Approve);
         assert_eq!(verdict_from_state("COMMENTED"), ReviewVerdict::Comment);
     }
@@ -3118,6 +3178,8 @@ mod tests {
     #[test]
     fn pr_observation_query_embeds_the_probe_and_strips_the_same_way() {
         assert!(PR_OBSERVATION_QUERY.contains("baseRef { target { oid } }"));
+        // `databaseId` is a 32-bit Int that current review ids overflow.
+        assert!(!PR_OBSERVATION_QUERY.contains("databaseId"));
         assert!(!PR_OBSERVATION_QUERY.contains("baseRefOid"));
         // The folded read carries every probe selection verbatim (so the
         // same parser serves both) and the schema fallback strips exactly
@@ -3200,7 +3262,7 @@ mod tests {
             "reviews": {
                 "pageInfo": { "hasPreviousPage": false },
                 "nodes": [
-                    { "author": { "login": "a" }, "state": "APPROVED", "submittedAt": "2026-01-01T00:00:00Z" },
+                    { "author": { "login": "a" }, "state": "APPROVED", "submittedAt": "2026-01-01T00:00:00Z", "commit": { "oid": "abc123" } },
                     { "author": null, "state": "COMMENTED", "submittedAt": null },
                 ]
             },
@@ -3215,6 +3277,15 @@ mod tests {
         let reviews = parse_observed_reviews(&pr).expect("window complete");
         assert_eq!(reviews.len(), 2);
         assert_eq!(reviews[0].verdict, ReviewVerdict::Approve);
+        assert_eq!(
+            reviews[0].id, None,
+            "the GraphQL window selects no review id"
+        );
+        assert_eq!(reviews[0].commit_sha.as_deref(), Some("abc123"));
+        assert_eq!(
+            (reviews[1].id.as_deref(), reviews[1].commit_sha.as_deref()),
+            (None, None)
+        );
         assert_eq!(reviews[1].author, "unknown");
         assert_eq!(reviews[1].verdict, ReviewVerdict::Comment);
         assert_eq!(
@@ -3443,6 +3514,7 @@ mod tests {
             }],
             checks_head_sha: None,
             checks_known: true,
+            head_committed_at: None,
             branch_rules: Some(BranchRules {
                 required_approving_review_count: Some(1),
                 required_conversation_resolution: Some(true),
@@ -3534,6 +3606,51 @@ mod tests {
                 .map(|e| e.position),
             Some(2)
         );
+    }
+
+    #[test]
+    fn parses_head_committed_at_only_for_the_head_commit() {
+        let head = "8c0e5137c0000000000000000000000000000000";
+        let data = |oid: &str, date: Value| {
+            json!({ "repository": { "pullRequest": {
+                "headRefOid": head,
+                "commits": { "nodes": [ { "commit": {
+                    "oid": oid,
+                    "committedDate": date,
+                    "statusCheckRollup": null
+                } } ] }
+            } } })
+        };
+        // The intentd#2531 head: its commit time anchors the stall clock.
+        assert_eq!(
+            parse_merge_requirement_signals(&data(head, json!("2026-10-20T23:12:00Z")))
+                .head_committed_at
+                .as_deref(),
+            Some("2026-10-20T23:12:00Z")
+        );
+        // A commit node that is not the head, a null or empty date, or no
+        // commit node at all: unknown, never a stale anchor.
+        for (oid, date) in [
+            (
+                "ffffffffffffffffffffffffffffffffffffffff",
+                json!("2026-10-20T23:12:00Z"),
+            ),
+            (head, Value::Null),
+            (head, json!("")),
+        ] {
+            assert_eq!(
+                parse_merge_requirement_signals(&data(oid, date)).head_committed_at,
+                None
+            );
+        }
+        let no_commits = json!({ "repository": { "pullRequest": { "headRefOid": head } } });
+        assert_eq!(
+            parse_merge_requirement_signals(&no_commits).head_committed_at,
+            None
+        );
+        // Both folded queries select it.
+        assert!(MERGE_REQUIREMENTS_QUERY.contains("committedDate"));
+        assert!(PR_OBSERVATION_QUERY.contains("committedDate"));
     }
 
     #[test]

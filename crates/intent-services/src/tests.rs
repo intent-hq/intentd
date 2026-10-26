@@ -9,13 +9,16 @@ use intent_core::{
     now_iso, AgentId, AgentSession, AgentStatus, BoxFuture, ContentType, Error, MessageOrigin,
     Note, NoteAddInput, NoteCreate, NoteEditInput, NoteEditLinesInput, NoteId, NoteMetadata,
     NoteUpdateInput, NoteVisibility, Workspace, WorkspaceActivity, WorkspaceApi,
-    WorkspaceAttention, WorkspaceId, WorkspaceStatus, WorkspaceUpdate,
+    WorkspaceAttention, WorkspaceId, WorkspaceUpdate,
 };
 use intent_store::Store;
 
 use crate::{repository_backfill_probe_count, BackfillCandidate, Services};
 
 mod line_attribution_retry;
+mod note_write_lock;
+mod orphan_flag_race;
+mod retire_workspace;
 mod skill_list;
 mod task_list_latency;
 mod task_push;
@@ -76,20 +79,7 @@ impl Drop for DebounceEnvGuard {
 
 pub(crate) use crate::test_support::test_tempdir;
 
-/// `SQLite` db inside an RAII temp dir (see [`test_tempdir`]): the dir sweep on
-/// drop also covers the `-wal`/`-shm` sidecars and the `.config.toml` sibling.
-pub(crate) struct TempDb {
-    pub(crate) path: PathBuf,
-    _dir: tempfile::TempDir,
-}
-
-impl TempDb {
-    pub(crate) fn new() -> Self {
-        let dir = test_tempdir("intentd-svc-");
-        let path = dir.path().join("svc.db");
-        Self { path, _dir: dir }
-    }
-}
+pub(crate) use crate::test_support::fixtures::TempDb;
 
 /// A settings registry (backed by a config file next to the temp db, swept
 /// with [`TempDb`]'s dir) seeding `model.defaultProvider = "auggie"`: since
@@ -136,57 +126,7 @@ impl WorkspacesRoot {
     }
 }
 
-pub(crate) fn workspace(id: &WorkspaceId) -> Workspace {
-    let ts = now_iso();
-    Workspace {
-        id: id.clone(),
-        title: "WS".to_string(),
-        branch: "main".to_string(),
-        base_ref: None,
-        base_commit_sha: None,
-        status: WorkspaceStatus::Active,
-        status_message: None,
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
-        attention: WorkspaceAttention::None,
-        created_at: ts.clone(),
-        updated_at: ts,
-        last_activity: None,
-        last_content_activity: None,
-        tags: vec![],
-        path: None,
-        repository_path: None,
-        repository_owner: None,
-        repository_name: None,
-        worktree_path: None,
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
-        default_model: None,
-        pr_number: None,
-        pr_url: None,
-        pr_status: None,
-        active_pull_request: None,
-        pull_requests: None,
-        context_links: None,
-        archived: false,
-        archived_at: None,
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        pull_requests_total: None,
-        display_status: None,
-        waiting: false,
-        checkout_mode: None,
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
-    }
-}
+pub(crate) use crate::test_support::fixtures::workspace;
 
 fn note(ws: &WorkspaceId, id: &str, content: &str) -> Note {
     let ts = now_iso();
@@ -547,7 +487,10 @@ async fn workspace_list_and_get_populate_card_aggregates() {
     assert!(got.diff_summary.is_none());
 
     // workspace.list carries the same aggregates; assert the nested wire shape.
-    let list = svc.list_workspaces(false).await.expect("list");
+    let list = svc
+        .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+        .await
+        .expect("list");
     let v = serde_json::to_value(&list[0]).unwrap();
     assert_eq!(v["taskStats"]["total"], 4);
     assert_eq!(v["taskStats"]["completed"], 1);
@@ -733,7 +676,10 @@ async fn workspace_list_slims_token_usage_and_archived_agent_summary() {
     let svc = Services::new(store).with_workspaces_root(root.path().to_path_buf());
 
     // Full list: tokenUsage never present; agentSummary only on active rows.
-    let list = svc.list_workspaces(true).await.expect("list");
+    let list = svc
+        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await
+        .expect("list");
     let row_active = list.iter().find(|w| w.id == ws_active).expect("active row");
     let row_archived = list
         .iter()
@@ -791,7 +737,10 @@ async fn workspace_list_slims_token_usage_and_archived_agent_summary() {
     assert_eq!(v["activePullRequest"]["mergeableState"], "clean");
 
     // Lite list (workspace.subscribe seq-0): slimmed the same way.
-    let lite = svc.list_workspaces_lite(true).await.expect("lite list");
+    let lite = svc
+        .list_workspaces_lite(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await
+        .expect("lite list");
     assert!(lite.iter().all(|w| w.token_usage.is_none()));
     for row in &lite {
         assert_detail_stripped(row, "lite");
@@ -1013,9 +962,12 @@ async fn worst_case_workspace_list_row() -> Workspace {
         principal_id: primary.id,
         host_role: intent_core::HostRole::Owner,
     };
-    let list = intent_core::with_caller(caller, svc.list_workspaces(true))
-        .await
-        .expect("list");
+    let list = intent_core::with_caller(
+        caller,
+        svc.list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED),
+    )
+    .await
+    .expect("list");
     let mut served = list
         .into_iter()
         .find(|w| w.id == ws)
@@ -1093,8 +1045,8 @@ async fn workspace_list_row_stays_within_row_budget() {
 /// populates every allowlisted field — each allowlisted key is present, so
 /// a stale allowlist entry fails too. The only allowlisted keys an active,
 /// idle row legitimately lacks are the state-conditional ones:
-/// `archivedAt` (archived rows), `pendingDeleteAt` (a running delete grace
-/// window) and `waiting` (omitted when `false`).
+/// `archivedAt` (archived rows), `retiredAt` (retired rows), `pendingDeleteAt`
+/// (a running delete grace window) and `waiting` (omitted when `false`).
 #[tokio::test]
 async fn workspace_list_row_keys_match_allowlist_golden() {
     use std::collections::BTreeSet;
@@ -1104,7 +1056,8 @@ async fn workspace_list_row_keys_match_allowlist_golden() {
         WORKSPACE_LIST_ROW_KEYS,
     };
 
-    const STATE_CONDITIONAL_KEYS: &[&str] = &["archivedAt", "pendingDeleteAt", "waiting"];
+    const STATE_CONDITIONAL_KEYS: &[&str] =
+        &["archivedAt", "retiredAt", "pendingDeleteAt", "waiting"];
 
     let row = worst_case_workspace_list_row().await;
     let measured = serde_json::to_value(&row).unwrap();
@@ -1323,8 +1276,14 @@ async fn workspace_list_caps_pull_requests_get_keeps_full_pool() {
     let root = tempfile::tempdir().expect("temp workspaces root");
     let svc = Services::new(store).with_workspaces_root(root.path().to_path_buf());
 
-    let list = svc.list_workspaces(true).await.expect("list");
-    let lite = svc.list_workspaces_lite(true).await.expect("lite list");
+    let list = svc
+        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await
+        .expect("list");
+    let lite = svc
+        .list_workspaces_lite(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await
+        .expect("lite list");
     // Entry `n` was updated `n` minutes into the hour on every source (a
     // snapshotless monitor's entry carries the monitor row's `updated_at`),
     // so the cap keeps the five newest on each; `get` serves the source's
@@ -1438,8 +1397,12 @@ async fn workspace_list_keeps_unfinished_root_prs_ahead_of_merged_active() {
     let root = tempfile::tempdir().expect("workspaces root");
     let svc = Services::new(store).with_workspaces_root(root.path().to_path_buf());
     for rows in [
-        svc.list_workspaces(true).await.unwrap(),
-        svc.list_workspaces_lite(true).await.unwrap(),
+        svc.list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .unwrap(),
+        svc.list_workspaces_lite(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .unwrap(),
     ] {
         let listed = rows.iter().find(|ws| ws.id == id).unwrap();
         let pool = listed.pull_requests.as_ref().unwrap();
@@ -1597,7 +1560,10 @@ async fn workspace_list_of_130_realistic_rows_stays_under_1mib() {
     let root = tempfile::tempdir().expect("temp workspaces root");
     let svc = Services::new(store).with_workspaces_root(root.path().to_path_buf());
 
-    let list = svc.list_workspaces(true).await.expect("list");
+    let list = svc
+        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await
+        .expect("list");
     assert_eq!(list.len(), WORKSPACES);
     let payload = serde_json::to_string(&serde_json::json!({ "workspaces": list })).unwrap();
     assert!(
@@ -1915,9 +1881,12 @@ async fn workspace_batch_projection_failures_are_isolated_per_workspace() {
             .expect("workspace.get");
         gets.insert(workspace_id, row);
     }
-    let list = svc.list_workspaces(false).await.expect("workspace.list");
+    let list = svc
+        .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+        .await
+        .expect("workspace.list");
     let lite = svc
-        .list_workspaces_lite(false)
+        .list_workspaces_lite(intent_core::WorkspaceListFilter::ACTIVE)
         .await
         .expect("workspace.subscribe snapshot");
 
@@ -2002,7 +1971,7 @@ async fn lite_list_is_self_sufficient_for_status_rendering() {
     // A cold read awaits the single budgeted probe once for the whole snapshot,
     // then fans the capability out to every row.
     let list = svc
-        .list_workspaces_lite(true)
+        .list_workspaces_lite(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
         .await
         .expect("cold lite list");
     assert!(
@@ -2065,7 +2034,10 @@ async fn bulk_workspace_list_serialization_matches_per_workspace_shape() {
         .workspaces_with_unread_top_level_sessions()
         .await
         .unwrap();
-    let mut expected = store.list_workspaces(true).await.unwrap();
+    let mut expected = store
+        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await
+        .unwrap();
     for row in &mut expected {
         row.activity = svc.workspace_activity(&row.id);
         row.pending_delete_at = svc
@@ -2084,7 +2056,10 @@ async fn bulk_workspace_list_serialization_matches_per_workspace_shape() {
         svc.attach_workspace_membership(row).await;
     }
 
-    let actual = svc.list_workspaces(true).await.unwrap();
+    let actual = svc
+        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await
+        .unwrap();
     assert_eq!(
         serde_json::to_vec(&actual).unwrap(),
         serde_json::to_vec(&expected).unwrap(),
@@ -2398,9 +2373,15 @@ async fn list_paths_merge_git_root_and_monitor_prs_into_pull_requests() {
         );
     };
 
-    let full = svc.list_workspaces(false).await.expect("full list");
+    let full = svc
+        .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+        .await
+        .expect("full list");
     assert_merged(&full, "workspace.list");
-    let lite = svc.list_workspaces_lite(false).await.expect("lite list");
+    let lite = svc
+        .list_workspaces_lite(intent_core::WorkspaceListFilter::ACTIVE)
+        .await
+        .expect("lite list");
     assert_merged(&lite, "lite list");
     // The detail read merges the same pool per workspace (scoped reads).
     let mut gets = Vec::new();
@@ -2411,7 +2392,10 @@ async fn list_paths_merge_git_root_and_monitor_prs_into_pull_requests() {
 
     // Archived-inclusive list: the archived row's git-root PR merges in —
     // and `get`, which serves archived workspaces regardless, merges it too.
-    let all = svc.list_workspaces_lite(true).await.expect("archived list");
+    let all = svc
+        .list_workspaces_lite(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await
+        .expect("archived list");
     let r5 = all.iter().find(|w| w.id == ws5).expect("ws5 row");
     let prs5 = r5.pull_requests.as_ref().expect("ws5 pullRequests");
     assert_eq!(prs5.len(), 1);
@@ -2530,8 +2514,14 @@ async fn display_status_folds_git_root_prs_on_every_read_surface() {
 
     let svc = Services::new(store.clone()).with_workspaces_root(root.path().to_path_buf());
 
-    let full = svc.list_workspaces(false).await.expect("full list");
-    let lite = svc.list_workspaces_lite(false).await.expect("lite list");
+    let full = svc
+        .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+        .await
+        .expect("full list");
+    let lite = svc
+        .list_workspaces_lite(intent_core::WorkspaceListFilter::ACTIVE)
+        .await
+        .expect("lite list");
     let row = |list: &[Workspace], id: &WorkspaceId| {
         list.iter()
             .find(|w| &w.id == id)
@@ -2791,8 +2781,14 @@ async fn served_pr_fields_carry_the_lifecycle_display_status_selected() {
     }
 
     let svc = Services::new(store.clone()).with_workspaces_root(root.path().to_path_buf());
-    let full = svc.list_workspaces(false).await.expect("full list");
-    let lite = svc.list_workspaces_lite(false).await.expect("lite list");
+    let full = svc
+        .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+        .await
+        .expect("full list");
+    let lite = svc
+        .list_workspaces_lite(intent_core::WorkspaceListFilter::ACTIVE)
+        .await
+        .expect("lite list");
     let row = |list: &[Workspace], id: &WorkspaceId| {
         list.iter()
             .find(|w| &w.id == id)
@@ -3135,11 +3131,15 @@ async fn merged_pr_pool_status_ladder_upgrades_stale_entries() {
 
     for (list, path) in [
         (
-            svc.list_workspaces(false).await.expect("full list"),
+            svc.list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+                .await
+                .expect("full list"),
             "workspace.list",
         ),
         (
-            svc.list_workspaces_lite(false).await.expect("lite list"),
+            svc.list_workspaces_lite(intent_core::WorkspaceListFilter::ACTIVE)
+                .await
+                .expect("lite list"),
             "lite list",
         ),
     ] {
@@ -3238,7 +3238,7 @@ async fn cross_workspace_list_siblings_scopes_to_repository() {
 
     let svc = Services::new(store);
     let v = svc
-        .cross_workspace_list_siblings(caller.clone())
+        .cross_workspace_list_siblings(caller.clone(), false)
         .await
         .expect("siblings");
     let arr = v.as_array().expect("array");
@@ -3326,7 +3326,7 @@ async fn cross_workspace_list_siblings_matches_github_identity_across_paths() {
 
     let svc = Services::new(store);
     let v = svc
-        .cross_workspace_list_siblings(caller.clone())
+        .cross_workspace_list_siblings(caller.clone(), false)
         .await
         .expect("siblings");
     let mut ids: Vec<String> = v
@@ -3419,7 +3419,7 @@ async fn cross_workspace_list_siblings_falls_back_to_repository_path() {
     };
 
     let v = svc
-        .cross_workspace_list_siblings(caller.clone())
+        .cross_workspace_list_siblings(caller.clone(), false)
         .await
         .expect("siblings");
     assert_eq!(list_ids(v), vec!["ws-partial", "ws-unbackfilled"]);
@@ -3429,13 +3429,13 @@ async fn cross_workspace_list_siblings_falls_back_to_repository_path() {
 
     // The relation is symmetric: the un-backfilled row sees the caller too.
     let v = svc
-        .cross_workspace_list_siblings(unbackfilled)
+        .cross_workspace_list_siblings(unbackfilled, false)
         .await
         .expect("siblings");
     assert_eq!(list_ids(v), vec!["ws-caller", "ws-partial"]);
 
     let v = svc
-        .cross_workspace_list_siblings(local_a.clone())
+        .cross_workspace_list_siblings(local_a.clone(), false)
         .await
         .expect("siblings");
     assert_eq!(list_ids(v), vec!["ws-local-b"]);
@@ -3468,7 +3468,7 @@ async fn cross_workspace_list_siblings_requires_repository() {
     store.insert_workspace(&w).await.unwrap();
     let svc = Services::new(store);
     let err = svc
-        .cross_workspace_list_siblings(caller.clone())
+        .cross_workspace_list_siblings(caller.clone(), false)
         .await
         .expect_err("should error");
     match err {
@@ -3486,7 +3486,7 @@ async fn cross_workspace_list_siblings_requires_repository() {
     }
     // A GitHub identity without a local path is enough to list.
     let v = svc
-        .cross_workspace_list_siblings(identity_only)
+        .cross_workspace_list_siblings(identity_only, false)
         .await
         .expect("identity-only caller lists");
     assert!(v.as_array().expect("array").is_empty());
@@ -4760,8 +4760,13 @@ async fn convert_blocks_rederives_onto_completed_user_save() {
     let mut user = other.get_note(&ws, &id).await.expect("get note");
     user.content = "intro TYPED\n\n@@@task\n# Do it\nbody\n@@@\n".into();
     user.updated_at = now_iso();
+    // A separately opened store has its own lock registry, so this external
+    // writer does not queue behind the parked op's lane: it is the
+    // out-of-band save the op's CAS retry must absorb.
+    let user_lock = other.lock_note_content(&ws, &id).await;
     let (rev, _) = other
         .update_note_with_version(
+            &user_lock,
             &user,
             Some(0),
             &crate::user_version_author(),
@@ -4769,6 +4774,7 @@ async fn convert_blocks_rederives_onto_completed_user_save() {
         )
         .await
         .expect("user save");
+    drop(user_lock);
     assert_eq!(rev, 1);
     drop(held);
 
@@ -7291,7 +7297,15 @@ async fn convert_blocks_warns_on_tree_ancestor_rejected_edge() {
         status: TaskStatus::NotStarted,
         ..Default::default()
     });
-    svc.store.update_note(&parent).await.expect("mark as task");
+    svc.store
+        .update_note(
+            &svc.store
+                .lock_note_content(&parent.workspace_id, &parent.id)
+                .await,
+            &parent,
+        )
+        .await
+        .expect("mark as task");
 
     let r = svc
         .convert_task_blocks(ws.clone(), id.clone(), None)
@@ -7890,6 +7904,7 @@ async fn update_note_full_content_with_task_block_auto_converts() {
                 title: None,
                 tags: None,
                 expected_version: None,
+                base_content_bytes: None,
             },
         )
         .await
@@ -10459,7 +10474,7 @@ mod change_event_parity {
     /// armed, so race tests can hold an attention path immediately before
     /// its scoped attention write (the former read-modify-write window).
     async fn harness_with_attention_park(
-        park: Option<std::sync::Arc<crate::script_ops::SupervisePark>>,
+        park: Option<std::sync::Arc<crate::runtime_config::SupervisePark>>,
     ) -> Harness {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -10487,7 +10502,7 @@ mod change_event_parity {
     /// projection park armed, so a race test can hold the first attempt
     /// between the linked-line projection and the gated parent write.
     async fn harness_with_task_update_park(
-        park: std::sync::Arc<crate::script_ops::SupervisePark>,
+        park: std::sync::Arc<crate::runtime_config::SupervisePark>,
     ) -> Harness {
         let mut h = harness().await;
         h.services = h.services.clone().with_task_update_projection_park(park);
@@ -10617,7 +10632,11 @@ mod change_event_parity {
         assert_eq!(second.id.0, first.id.0, "replay returns the original note");
 
         // No second event is published (the replay short-circuits before mutate).
-        let none = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
+        let none = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            sub.recv(),
+        )
+        .await;
         assert!(none.is_err(), "replay must not publish a second event");
     }
 
@@ -10939,8 +10958,11 @@ mod change_event_parity {
     /// batches into one ordered list of wire-JSON envelopes.
     async fn drain_events(sub: &mut Subscription) -> Vec<Value> {
         let mut out = Vec::new();
-        while let Ok(Some(batch)) =
-            tokio::time::timeout(Duration::from_millis(400), sub.recv()).await
+        while let Ok(Some(batch)) = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(400)),
+            sub.recv(),
+        )
+        .await
         {
             for ev in batch {
                 out.push(serde_json::to_value(&ev).expect("serialize event"));
@@ -12043,7 +12065,11 @@ mod change_event_parity {
         assert_eq!(comments.len(), 1, "replay must not duplicate the comment");
 
         // No second event is published (the replay short-circuits before mutate).
-        let none = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
+        let none = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            sub.recv(),
+        )
+        .await;
         assert!(none.is_err(), "replay must not publish a second event");
     }
 
@@ -12096,7 +12122,11 @@ mod change_event_parity {
             json!({ "noteId": "n-1", "commentId": reply.comment.id })
         );
         // Cardinality exactly 1: no additional publishes fire.
-        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
+        let quiet = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            sub.recv(),
+        )
+        .await;
         assert!(
             quiet.is_err(),
             "comment.respond must publish exactly one event, got extra: {quiet:?}"
@@ -12455,7 +12485,11 @@ mod change_event_parity {
                 }
             })
         );
-        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
+        let quiet = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            sub.recv(),
+        )
+        .await;
         assert!(
             quiet.is_err(),
             "archive_workspace must publish exactly one event, got extra: {quiet:?}"
@@ -12591,7 +12625,11 @@ mod change_event_parity {
                 }
             })
         );
-        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
+        let quiet = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            sub.recv(),
+        )
+        .await;
         assert!(quiet.is_err(), "unexpected extra event: {quiet:?}");
 
         // Store: only the owner row survives; the invite is closed.
@@ -12681,7 +12719,11 @@ mod change_event_parity {
             .expect("invites");
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].id, invite.id);
-        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
+        let quiet = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            sub.recv(),
+        )
+        .await;
         assert!(
             quiet.is_err(),
             "a rolled-back archive publishes nothing: {quiet:?}"
@@ -12763,7 +12805,11 @@ mod change_event_parity {
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &h.ws.0, "workspace:updated");
         assert_eq!(ev["data"]["changes"]["archived"], true);
-        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
+        let quiet = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            sub.recv(),
+        )
+        .await;
         assert!(quiet.is_err(), "unexpected extra event: {quiet:?}");
 
         let members = h
@@ -12854,7 +12900,11 @@ mod change_event_parity {
                 }
             })
         );
-        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
+        let quiet = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            sub.recv(),
+        )
+        .await;
         assert!(quiet.is_err(), "unexpected extra event: {quiet:?}");
 
         let members = h
@@ -12887,7 +12937,7 @@ mod change_event_parity {
     async fn archive_tail_fence_orders_unarchive_and_readd_behind_the_guest_drop() {
         use intent_core::{InviteErrorKind, MessageOrigin, WorkspaceApi, WorkspaceRole};
         use std::sync::Arc;
-        let park = Arc::new(crate::script_ops::SupervisePark::default());
+        let park = Arc::new(crate::runtime_config::SupervisePark::default());
         let mut h = harness().await;
         h.services = h.services.clone().with_archive_tail_park(park.clone());
         let guest = seat_collaborator(&h, "guest").await;
@@ -12935,7 +12985,11 @@ mod change_event_parity {
             let ws = h.ws.clone();
             async move { svc.unarchive_workspace(ws).await }
         });
-        let pending = tokio::time::timeout(Duration::from_millis(200), &mut unarchive).await;
+        let pending = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            &mut unarchive,
+        )
+        .await;
         assert!(
             pending.is_err(),
             "unarchive must stay fenced behind the archive tail"
@@ -13023,19 +13077,22 @@ mod change_event_parity {
         assert_eq!(lifecycle[0]["removedPrincipalId"], guest.0, "{lifecycle:?}");
         assert_eq!(lifecycle[1]["archived"], false, "{lifecycle:?}");
         assert_eq!(lifecycle[2]["addedPrincipalId"], guest.0, "{lifecycle:?}");
-        let quiet = tokio::time::timeout(Duration::from_millis(200), async {
-            loop {
-                let batch = sub.recv().await.expect("subscription open");
-                for ev in batch {
-                    let ev = serde_json::to_value(&ev).expect("serialize event");
-                    if ev["type"] == "workspace:updated"
-                        && ev["data"]["changes"].get("archived").is_some()
-                    {
-                        return ev;
+        let quiet = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            async {
+                loop {
+                    let batch = sub.recv().await.expect("subscription open");
+                    for ev in batch {
+                        let ev = serde_json::to_value(&ev).expect("serialize event");
+                        if ev["type"] == "workspace:updated"
+                            && ev["data"]["changes"].get("archived").is_some()
+                        {
+                            return ev;
+                        }
                     }
                 }
-            }
-        })
+            },
+        )
         .await;
         assert!(
             quiet.is_err(),
@@ -13061,7 +13118,7 @@ mod change_event_parity {
             WorkspaceUpdate,
         };
         use std::sync::Arc;
-        let park = Arc::new(crate::script_ops::SupervisePark::default());
+        let park = Arc::new(crate::runtime_config::SupervisePark::default());
         let mut h = harness().await;
         h.services = h.services.clone().with_archive_predrop_park(park.clone());
         let guest = seat_collaborator(&h, "guest").await;
@@ -13121,7 +13178,11 @@ mod change_event_parity {
                 .await
             }
         });
-        let pending = tokio::time::timeout(Duration::from_millis(200), &mut update).await;
+        let pending = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            &mut update,
+        )
+        .await;
         assert!(
             pending.is_err(),
             "workspace.update {{ archived: false }} must stay fenced behind the archive tail"
@@ -13217,19 +13278,22 @@ mod change_event_parity {
         assert_eq!(lifecycle[0]["removedPrincipalId"], guest.0, "{lifecycle:?}");
         assert_eq!(lifecycle[1]["archived"], false, "{lifecycle:?}");
         assert_eq!(lifecycle[2]["addedPrincipalId"], guest.0, "{lifecycle:?}");
-        let quiet = tokio::time::timeout(Duration::from_millis(200), async {
-            loop {
-                let batch = sub.recv().await.expect("subscription open");
-                for ev in batch {
-                    let ev = serde_json::to_value(&ev).expect("serialize event");
-                    if ev["type"] == "workspace:updated"
-                        && ev["data"]["changes"].get("archived").is_some()
-                    {
-                        return ev;
+        let quiet = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            async {
+                loop {
+                    let batch = sub.recv().await.expect("subscription open");
+                    for ev in batch {
+                        let ev = serde_json::to_value(&ev).expect("serialize event");
+                        if ev["type"] == "workspace:updated"
+                            && ev["data"]["changes"].get("archived").is_some()
+                        {
+                            return ev;
+                        }
                     }
                 }
-            }
-        })
+            },
+        )
         .await;
         assert!(
             quiet.is_err(),
@@ -13252,7 +13316,7 @@ mod change_event_parity {
             InviteErrorKind, MessageOrigin, WorkspaceApi, WorkspaceStatus, WorkspaceUpdate,
         };
         use std::sync::Arc;
-        let park = Arc::new(crate::script_ops::SupervisePark::default());
+        let park = Arc::new(crate::runtime_config::SupervisePark::default());
         let mut h = harness().await;
         h.services = h.services.clone().with_archive_predrop_park(park.clone());
         let guest = seat_collaborator(&h, "guest").await;
@@ -13416,7 +13480,11 @@ mod change_event_parity {
                 }
             })
         );
-        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
+        let quiet = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            sub.recv(),
+        )
+        .await;
         assert!(
             quiet.is_err(),
             "unarchive_workspace must publish exactly one event, got extra: {quiet:?}"
@@ -13497,7 +13565,11 @@ mod change_event_parity {
             .services
             .auto_unarchive_on_turn_start(&h.ws, &agent_id)
             .await;
-        assert!(flipped, "a persisted flip reports true");
+        assert_eq!(
+            flipped,
+            Some(crate::UnarchiveOutcome::Unarchived),
+            "a persisted flip reports Unarchived"
+        );
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &h.ws.0, "workspace:updated");
         assert_eq!(
@@ -13516,7 +13588,11 @@ mod change_event_parity {
                 }
             })
         );
-        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
+        let quiet = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            sub.recv(),
+        )
+        .await;
         assert!(
             quiet.is_err(),
             "auto-unarchive must publish exactly one event, got extra: {quiet:?}"
@@ -13539,8 +13615,12 @@ mod change_event_parity {
             .services
             .auto_unarchive_on_turn_start(&h.ws, &agent_id)
             .await;
-        assert!(!flipped, "no flip on an active workspace");
-        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
+        assert!(flipped.is_none(), "no flip on an active workspace");
+        let quiet = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            sub.recv(),
+        )
+        .await;
         assert!(
             quiet.is_err(),
             "active workspace must emit nothing, got: {quiet:?}"
@@ -13564,8 +13644,12 @@ mod change_event_parity {
             .services
             .auto_unarchive_on_turn_start(&missing, &agent_id)
             .await;
-        assert!(!flipped, "a failed read reports no flip");
-        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
+        assert!(flipped.is_none(), "a failed read reports no flip");
+        let quiet = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            sub.recv(),
+        )
+        .await;
         assert!(
             quiet.is_err(),
             "failed read must emit nothing, got: {quiet:?}"
@@ -13597,9 +13681,16 @@ mod change_event_parity {
             .unarchive_workspace_inner(h.ws.clone(), Some(stamp))
             .await
             .expect("losing racer still succeeds");
-        assert!(!flipped, "the losing racer must not claim the flip");
+        assert!(
+            flipped.is_none(),
+            "the losing racer must not claim the flip"
+        );
         assert!(!ws.archived, "the returned row reflects the Active state");
-        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
+        let quiet = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            sub.recv(),
+        )
+        .await;
         assert!(
             quiet.is_err(),
             "the losing racer must emit nothing, got: {quiet:?}"
@@ -13648,7 +13739,10 @@ mod change_event_parity {
             .services
             .auto_unarchive_on_turn_start(&h.ws, &agent_id)
             .await;
-        assert!(flipped, "the flip persists despite the missing session row");
+        assert!(
+            flipped.is_some(),
+            "the flip persists despite the missing session row"
+        );
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &h.ws.0, "workspace:updated");
         assert_eq!(
@@ -14248,7 +14342,7 @@ mod change_event_parity {
     async fn mark_seen_race_preserves_concurrent_row_mutation() {
         use intent_core::{WorkspaceApi, WorkspaceAttention};
         use std::sync::Arc;
-        let park = Arc::new(crate::script_ops::SupervisePark::default());
+        let park = Arc::new(crate::runtime_config::SupervisePark::default());
         let h = harness_with_attention_park(Some(park.clone())).await;
         // Seed attention via the store (the armed park would hold the
         // service-path raise too).
@@ -14297,7 +14391,7 @@ mod change_event_parity {
     async fn dismiss_attention_race_preserves_concurrent_row_mutation() {
         use intent_core::{WorkspaceApi, WorkspaceAttention};
         use std::sync::Arc;
-        let park = Arc::new(crate::script_ops::SupervisePark::default());
+        let park = Arc::new(crate::runtime_config::SupervisePark::default());
         let h = harness_with_attention_park(Some(park.clone())).await;
         let mut seeded = h.store.get_workspace(&h.ws).await.expect("load");
         seeded.attention = WorkspaceAttention::ReviewRequired;
@@ -14346,7 +14440,7 @@ mod change_event_parity {
     async fn raise_attention_race_preserves_concurrent_title_change() {
         use intent_core::WorkspaceAttention;
         use std::sync::Arc;
-        let park = Arc::new(crate::script_ops::SupervisePark::default());
+        let park = Arc::new(crate::runtime_config::SupervisePark::default());
         let h = harness_with_attention_park(Some(park.clone())).await;
 
         let services = h.services.clone();
@@ -14844,7 +14938,11 @@ mod change_event_parity {
         );
 
         // No further events are published (the replay short-circuits the op).
-        let none = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
+        let none = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            sub.recv(),
+        )
+        .await;
         assert!(none.is_err(), "replay must not publish a second event");
     }
 
@@ -15047,7 +15145,11 @@ mod change_event_parity {
         assert_eq!(ev["data"]["title"], "Spec");
 
         // No further events fire — reseed publishes exactly once.
-        let quiet = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
+        let quiet = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            sub.recv(),
+        )
+        .await;
         assert!(
             quiet.is_err(),
             "reseed must publish exactly one event, got extra: {quiet:?}"
@@ -15074,7 +15176,11 @@ mod change_event_parity {
         let event = recv_one(&mut sub).await;
         assert_envelope(&event, &h.ws.0, "note:created");
         assert_eq!(event["data"]["noteId"], "spec");
-        let quiet = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
+        let quiet = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            sub.recv(),
+        )
+        .await;
         assert!(quiet.is_err(), "concurrent reseed must emit exactly once");
 
         let versions = h
@@ -15133,7 +15239,11 @@ mod change_event_parity {
         assert_eq!(spec_row.created_at, spec_before.created_at);
 
         // No further events fire for the untouched-spec list call.
-        let none = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
+        let none = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            sub.recv(),
+        )
+        .await;
         assert!(none.is_err(), "list must not publish for existing spec");
 
         // Version count unchanged.
@@ -15211,7 +15321,11 @@ mod change_event_parity {
             other => panic!("expected NotFound, got: {other:?}"),
         }
 
-        let none = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
+        let none = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            sub.recv(),
+        )
+        .await;
         assert!(
             none.is_err(),
             "unknown-workspace list must not publish a reseed event"
@@ -15266,7 +15380,11 @@ mod change_event_parity {
             "expected workspace NotFound, got: {err:?}"
         );
 
-        let none = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
+        let none = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            sub.recv(),
+        )
+        .await;
         assert!(
             none.is_err(),
             "deleted-workspace list must not publish a reseed event"
@@ -15286,7 +15404,11 @@ mod change_event_parity {
         let notes = h.services.list_notes(&chief).await.expect("list");
         assert!(notes.is_empty());
 
-        let none = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
+        let none = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            sub.recv(),
+        )
+        .await;
         assert!(none.is_err(), "chief list must not publish a reseed event");
     }
 
@@ -15522,7 +15644,11 @@ mod change_event_parity {
         // Idempotency: a second `note.list` is a no-op — no further events,
         // no additional version snapshots.
         let _ = h.services.list_notes(&h.ws).await.expect("list again");
-        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
+        let quiet = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            sub.recv(),
+        )
+        .await;
         assert!(
             quiet.is_err(),
             "second list must not republish after adoption"
@@ -15581,7 +15707,11 @@ mod change_event_parity {
         let ev = recv_one(&mut sub).await;
         assert_envelope(&ev, &h.ws.0, "note:created");
         assert_eq!(ev["data"]["noteId"], "spec");
-        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
+        let quiet = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            sub.recv(),
+        )
+        .await;
         assert!(quiet.is_err(), "no adoption events on ambiguous fallback");
     }
 
@@ -15691,7 +15821,11 @@ mod change_event_parity {
             .expect("stray present");
         assert_eq!(stray_now.content, "stray body");
 
-        let quiet = tokio::time::timeout(Duration::from_millis(200), sub.recv()).await;
+        let quiet = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            sub.recv(),
+        )
+        .await;
         assert!(quiet.is_err(), "healthy workspace must not fire adoption");
     }
 
@@ -15721,7 +15855,13 @@ mod change_event_parity {
             .await
             .expect("get task note");
         tn.metadata.task.as_mut().expect("task metadata").status = status;
-        h.store.update_note(&tn).await.expect("update task note");
+        h.store
+            .update_note(
+                &h.store.lock_note_content(&tn.workspace_id, &tn.id).await,
+                &tn,
+            )
+            .await
+            .expect("update task note");
     }
 
     async fn note_content(h: &Harness, id: &str) -> (String, i64) {
@@ -15903,7 +16043,15 @@ mod change_event_parity {
         // An editor save lands in the same window.
         let mut edited = h.store.get_note(&h.ws, &spec_id()).await.expect("get spec");
         edited.content = format!("{}\n- [ ] added by editor", body("[x]", "[ ]"));
-        h.store.update_note(&edited).await.expect("editor save");
+        h.store
+            .update_note(
+                &h.store
+                    .lock_note_content(&edited.workspace_id, &edited.id)
+                    .await,
+                &edited,
+            )
+            .await
+            .expect("editor save");
         let (_, rev_before) = note_content(&h, "spec").await;
 
         let mut sub = subscribe(&h);
@@ -16953,13 +17101,19 @@ mod change_event_parity {
     /// `task.update` (text + `todo`) projects `[ ]` from a read that saw the
     /// task `in_progress`; before its parent write lands, another caller
     /// completes the task and materialization rewrites the line to `[x]`.
-    /// The stale projection must not be three-way-merged onto the current
+    /// The stale projection must never be three-way-merged onto the current
     /// text (`[/]` → `[x]` vs `[/]` → `[ ]` char-interleave into `[x ]`, no
-    /// longer a checkbox): the gate miss re-derives from the fresh parent,
-    /// where the guard now refuses `todo` and the line projects `[x]`.
+    /// longer a checkbox). Since intent-hq/intent#7184 the completion's
+    /// materialization takes the parent's write lane, which the parked
+    /// `task.update` holds: the task note completes inside the window but its
+    /// line rewrite queues behind the parked write, so the parent is never
+    /// rewritten under the writer. The writer lands its line (text + the
+    /// marker it projected), releases the lane, and the queued
+    /// materialization re-projects the terminal `[x]` onto the renamed line
+    /// (the writer's own `todo` redirect is refused by the terminal guard).
     #[intent_test_macros::daemon_test]
-    async fn linked_line_write_re_derives_after_concurrent_completion() {
-        let park = std::sync::Arc::new(crate::script_ops::SupervisePark::default());
+    async fn linked_line_write_serializes_with_concurrent_completion() {
+        let park = std::sync::Arc::new(crate::runtime_config::SupervisePark::default());
         let h = harness_with_task_update_park(park.clone()).await;
         insert_task_note(&h, T1, TaskStatus::InProgress).await;
         // Versioned write so a snapshot exists at the writer's read rev: the
@@ -16974,7 +17128,15 @@ mod change_event_parity {
         spec.content = linked("[/]", "T", T1);
         spec.updated_at = now_iso();
         h.store
-            .update_note_with_version(&spec, None, &crate::user_version_author(), &spec.updated_at)
+            .update_note_with_version(
+                &h.store
+                    .lock_note_content(&spec.workspace_id, &spec.id)
+                    .await,
+                &spec,
+                None,
+                &crate::user_version_author(),
+                &spec.updated_at,
+            )
             .await
             .expect("versioned spec write");
         let agent = AgentId::from("agent-linked");
@@ -17012,13 +17174,37 @@ mod change_event_parity {
         .await
         .expect("task.update parks before its parent write");
 
-        // Another caller completes the task inside the window; materialization
-        // rewrites the linked line to `[x]`.
-        set_status(&h, T1, "complete").await;
+        // Another caller completes the task inside the window. The task note
+        // write lands, but its materialization waits on the parent's lane.
+        let completer = {
+            let services = h.services.clone();
+            let ws = h.ws.clone();
+            intent_core::spawn_daemon(async move {
+                services
+                    .task_update_note_status(
+                        ws,
+                        intent_core::NoteId::from(T1),
+                        "complete".to_string(),
+                        None,
+                        None,
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            async {
+                while task_status(&h, T1).await != TaskStatus::Complete {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            },
+        )
+        .await
+        .expect("the task note completes inside the window");
         assert_eq!(
             note_content(&h, "spec").await.0,
-            linked("[x]", "T", T1),
-            "completion materialized before the stale write"
+            linked("[/]", "T", T1),
+            "the completion's line rewrite queues behind the parked writer's lane"
         );
 
         park.release.notify_one();
@@ -17030,14 +17216,25 @@ mod change_event_parity {
         .expect("writer finishes")
         .expect("writer task")
         .expect("task.update");
+        tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(2)),
+            completer,
+        )
+        .await
+        .expect("completer finishes")
+        .expect("completer task")
+        .expect("updateNoteStatus");
 
         assert_eq!(task_status(&h, T1).await, TaskStatus::Complete);
         assert_eq!(
             note_content(&h, "spec").await.0,
             format!("- [x] {new_text}"),
-            "re-derived line carries the terminal marker, not a merged `[x ]`"
+            "the queued materialization re-projects the terminal marker onto the renamed line, never a merged `[x ]`"
         );
-        assert_eq!(r.status, "done", "echoes the projected marker");
+        assert_eq!(
+            r.status, "todo",
+            "echoes the marker the writer projected and wrote"
+        );
         assert_eq!(r.new_text, new_text);
     }
 }
@@ -17772,6 +17969,7 @@ pub(crate) mod pr {
     mod accept_member;
     mod automatic_refresh;
     mod discovery_http;
+    mod idle_refresh;
 
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -18355,6 +18553,8 @@ pub(crate) mod pr {
                 verdict,
                 body,
                 submitted_at: "2026-06-17T05:00:00.000Z".into(),
+                id: None,
+                commit_sha: None,
             })
         }
         async fn review_decision(&self, _: &RepoRef, _: u64) -> ScResult<Option<ReviewDecision>> {
@@ -18373,12 +18573,16 @@ pub(crate) mod pr {
                     verdict: ReviewVerdict::Approve,
                     body: None,
                     submitted_at: "2026-01-01".into(),
+                    id: None,
+                    commit_sha: None,
                 },
                 Review {
                     author: "bob".into(),
                     verdict: ReviewVerdict::Comment,
                     body: None,
                     submitted_at: "2026-01-02".into(),
+                    id: None,
+                    commit_sha: None,
                 },
             ])
         }
@@ -18721,6 +18925,7 @@ pub(crate) mod pr {
                 ],
                 checks_head_sha: None,
                 checks_known: true,
+                head_committed_at: None,
                 branch_rules: Some(BranchRules {
                     required_approving_review_count: Some(2),
                     required_conversation_resolution: Some(true),
@@ -19808,6 +20013,8 @@ pub(crate) mod pr {
         assert_eq!(v["checks"]["failed"], 1);
         assert_eq!(v["checks"]["pending"], 1);
         assert_eq!(v["checks"]["failedNames"], json!(["test"]));
+        assert_eq!(v["checks"]["skipped"], 0);
+        assert_eq!(v["checks"]["skippedNames"], json!([]));
         // Review decision from the aggregated actionable reviews.
         assert_eq!(v["reviews"]["decision"], "approved");
         assert_eq!(v["reviews"]["approvals"], 1);
@@ -22217,7 +22424,10 @@ pub(crate) mod pr {
 
         // Seed the last-observed baseline at `complete` via a list read (a
         // seed never emits).
-        let list = svc.list_workspaces(false).await.unwrap();
+        let list = svc
+            .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+            .await
+            .unwrap();
         let row = list.iter().find(|w| w.id == ws.id).expect("row");
         assert_eq!(
             row.display_status,
@@ -22276,7 +22486,10 @@ pub(crate) mod pr {
             .unwrap();
 
         // Seed the baseline at `complete` via a list read (never emits).
-        let list = svc.list_workspaces(false).await.unwrap();
+        let list = svc
+            .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+            .await
+            .unwrap();
         let row = list.iter().find(|w| w.id == ws.id).expect("row");
         assert_eq!(
             row.display_status,
@@ -22690,7 +22903,10 @@ pub(crate) mod pr {
         svc: &Services,
         ws_id: &WorkspaceId,
     ) -> Option<intent_core::WorkspaceDisplayStatus> {
-        let list = svc.list_workspaces(false).await.unwrap();
+        let list = svc
+            .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+            .await
+            .unwrap();
         let row = list.iter().find(|w| &w.id == ws_id).expect("row");
         assert!(display_status_events(svc, ws_id).await.is_empty());
         row.display_status
@@ -23535,7 +23751,7 @@ pub(crate) mod pr {
     #[intent_test_macros::daemon_test]
     async fn hit_projection_lands_on_a_same_head_refresh_committed_mid_window() {
         let (_t, _root, svc, ws_id) = cached_hover_setup(queue_signal_forge(true), None).await;
-        let park = Arc::new(crate::script_ops::SupervisePark::default());
+        let park = Arc::new(crate::runtime_config::SupervisePark::default());
         let svc = svc.with_fold_hit_park(park.clone());
         assert_eq!(
             seed_display_status(&svc, &ws_id).await,
@@ -23596,7 +23812,7 @@ pub(crate) mod pr {
     #[intent_test_macros::daemon_test]
     async fn hit_projection_writes_nothing_when_the_head_moved_mid_window() {
         let (_t, _root, svc, ws_id) = cached_hover_setup(queue_signal_forge(true), None).await;
-        let park = Arc::new(crate::script_ops::SupervisePark::default());
+        let park = Arc::new(crate::runtime_config::SupervisePark::default());
         let svc = svc.with_fold_hit_park(park.clone());
         assert_eq!(
             seed_display_status(&svc, &ws_id).await,
@@ -23645,7 +23861,7 @@ pub(crate) mod pr {
         super::WorkspacesRoot,
         Services,
         WorkspaceId,
-        Arc<crate::script_ops::SupervisePark>,
+        Arc<crate::runtime_config::SupervisePark>,
         SweepRepo,
     ) {
         let (t, wsroot, svc, ws_id) = fold_setup_with(queue_signal_forge(true), |_| {}).await;
@@ -23657,7 +23873,7 @@ pub(crate) mod pr {
             "",
         )]);
         svc.store().upsert_workspace_git_root(&root).await.unwrap();
-        let park = Arc::new(crate::script_ops::SupervisePark::default());
+        let park = Arc::new(crate::runtime_config::SupervisePark::default());
         let svc = svc.with_fold_hit_park(park.clone());
         assert_eq!(
             seed_display_status(&svc, &ws_id).await,
@@ -31461,49 +31677,14 @@ mod rules {
             id: intent_core::WorkspaceId::from("ws-1"),
             title: "Test".into(),
             branch: "main".into(),
-            base_ref: None,
-            base_commit_sha: None,
-            status: intent_core::WorkspaceStatus::Active,
-            status_message: None,
-            status_image_asset_id: None,
-            activity: intent_core::WorkspaceActivity::Idle,
-            attention: intent_core::WorkspaceAttention::None,
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
-            last_activity: None,
-            last_content_activity: None,
-            tags: vec![],
             path: Some("/test/path".into()),
             repository_path: Some("/test/repo".into()),
-            repository_owner: None,
             repository_name: Some("test-repo".into()),
-            worktree_path: None,
-            scope: None,
             skip_worktree: true,
-            setup_script: None,
-            is_remote: false,
-            default_model: None,
-            pr_number: None,
-            pr_url: None,
-            pr_status: None,
-            active_pull_request: None,
-            pull_requests: None,
-            context_links: None,
-            archived: false,
-            archived_at: None,
-            task_stats: None,
-            agent_summary: None,
-            diff_summary: None,
-            token_usage: None,
             cow_supported: Some(true),
-            browser_client_id: None,
-            pull_requests_total: None,
-            display_status: None,
-            waiting: false,
-            checkout_mode: None,
-            disk_usage: None,
-            pending_delete_at: None,
-            membership: None,
+            ..Default::default()
         };
 
         // Create a mock agent session with sandbox fields
@@ -31612,49 +31793,14 @@ mod rules {
             id: intent_core::WorkspaceId::from("ws-1"),
             title: "Test".into(),
             branch: "main".into(),
-            base_ref: None,
-            base_commit_sha: None,
-            status: intent_core::WorkspaceStatus::Active,
-            status_message: None,
-            status_image_asset_id: None,
-            activity: intent_core::WorkspaceActivity::Idle,
-            attention: intent_core::WorkspaceAttention::None,
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
-            last_activity: None,
-            last_content_activity: None,
-            tags: vec![],
             path: Some("/test/path".into()),
             repository_path: Some("/test/repo".into()),
-            repository_owner: None,
             repository_name: Some("test-repo".into()),
-            worktree_path: None,
-            scope: None,
             skip_worktree: true,
-            setup_script: None,
-            is_remote: false,
-            default_model: None,
-            pr_number: None,
-            pr_url: None,
-            pr_status: None,
-            active_pull_request: None,
-            pull_requests: None,
-            context_links: None,
-            archived: false,
-            archived_at: None,
-            task_stats: None,
-            agent_summary: None,
-            diff_summary: None,
-            token_usage: None,
             cow_supported: Some(true),
-            browser_client_id: None,
-            pull_requests_total: None,
-            display_status: None,
-            waiting: false,
-            checkout_mode: None,
-            disk_usage: None,
-            pending_delete_at: None,
-            membership: None,
+            ..Default::default()
         };
 
         // Coordinator session (no sandbox fields — coordinators don't run in sandboxes)
@@ -31754,49 +31900,14 @@ mod rules {
             id: intent_core::WorkspaceId::from("ws-1"),
             title: "Test".into(),
             branch: "main".into(),
-            base_ref: None,
-            base_commit_sha: None,
-            status: intent_core::WorkspaceStatus::Active,
-            status_message: None,
-            status_image_asset_id: None,
-            activity: intent_core::WorkspaceActivity::Idle,
-            attention: intent_core::WorkspaceAttention::None,
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
-            last_activity: None,
-            last_content_activity: None,
-            tags: vec![],
             path: Some("/test/worktree".into()),
             repository_path: Some("/test/repo".into()),
-            repository_owner: None,
             repository_name: Some("test-repo".into()),
             worktree_path: Some("/test/worktree".into()), // Worktree mode!
-            scope: None,
-            skip_worktree: false,
-            setup_script: None,
-            is_remote: false,
-            default_model: None,
-            pr_number: None,
-            pr_url: None,
-            pr_status: None,
-            active_pull_request: None,
-            pull_requests: None,
-            context_links: None,
-            archived: false,
-            archived_at: None,
-            task_stats: None,
-            agent_summary: None,
-            diff_summary: None,
-            token_usage: None,
             cow_supported: Some(true), // Capability reported even in worktree mode; hints stay off
-            browser_client_id: None,
-            pull_requests_total: None,
-            display_status: None,
-            waiting: false,
-            checkout_mode: None,
-            disk_usage: None,
-            pending_delete_at: None,
-            membership: None,
+            ..Default::default()
         };
 
         let agent_session = intent_core::AgentSession {
@@ -31891,49 +32002,14 @@ mod rules {
             id: intent_core::WorkspaceId::from("ws-1"),
             title: "Test".into(),
             branch: "main".into(),
-            base_ref: None,
-            base_commit_sha: None,
-            status: intent_core::WorkspaceStatus::Active,
-            status_message: None,
-            status_image_asset_id: None,
-            activity: intent_core::WorkspaceActivity::Idle,
-            attention: intent_core::WorkspaceAttention::None,
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
-            last_activity: None,
-            last_content_activity: None,
-            tags: vec![],
             path: Some("/test/path".into()),
             repository_path: Some("/test/repo".into()),
-            repository_owner: None,
             repository_name: Some("test-repo".into()),
-            worktree_path: None,
-            scope: None,
             skip_worktree: true,
-            setup_script: None,
-            is_remote: false,
-            default_model: None,
-            pr_number: None,
-            pr_url: None,
-            pr_status: None,
-            active_pull_request: None,
-            pull_requests: None,
-            context_links: None,
-            archived: false,
-            archived_at: None,
-            task_stats: None,
-            agent_summary: None,
-            diff_summary: None,
-            token_usage: None,
             cow_supported: Some(false), // CoW not supported!
-            browser_client_id: None,
-            pull_requests_total: None,
-            display_status: None,
-            waiting: false,
-            checkout_mode: None,
-            disk_usage: None,
-            pending_delete_at: None,
-            membership: None,
+            ..Default::default()
         };
 
         let agent_session = intent_core::AgentSession {
@@ -32027,49 +32103,14 @@ mod rules {
             id: intent_core::WorkspaceId::from("ws-1"),
             title: "Test".into(),
             branch: "main".into(),
-            base_ref: None,
-            base_commit_sha: None,
-            status: intent_core::WorkspaceStatus::Active,
-            status_message: None,
-            status_image_asset_id: None,
-            activity: intent_core::WorkspaceActivity::Idle,
-            attention: intent_core::WorkspaceAttention::None,
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
-            last_activity: None,
-            last_content_activity: None,
-            tags: vec![],
             path: Some("/test/path".into()),
             repository_path: Some("/test/repo".into()),
-            repository_owner: None,
             repository_name: Some("test-repo".into()),
-            worktree_path: None,
-            scope: None,
             skip_worktree: true,
-            setup_script: None,
-            is_remote: false,
-            default_model: None,
-            pr_number: None,
-            pr_url: None,
-            pr_status: None,
-            active_pull_request: None,
-            pull_requests: None,
-            context_links: None,
-            archived: false,
-            archived_at: None,
-            task_stats: None,
-            agent_summary: None,
-            diff_summary: None,
-            token_usage: None,
             cow_supported: Some(true), // CoW capable!
-            browser_client_id: None,
-            pull_requests_total: None,
-            display_status: None,
-            waiting: false,
-            checkout_mode: None,
-            disk_usage: None,
-            pending_delete_at: None,
-            membership: None,
+            ..Default::default()
         };
 
         // Agent session WITHOUT sandbox fields (explicit isolation:"shared" override)
@@ -32168,49 +32209,14 @@ mod rules {
             id: intent_core::WorkspaceId::from("ws-1"),
             title: "Test".into(),
             branch: "main".into(),
-            base_ref: None,
-            base_commit_sha: None,
-            status: intent_core::WorkspaceStatus::Active,
-            status_message: None,
-            status_image_asset_id: None,
-            activity: intent_core::WorkspaceActivity::Idle,
-            attention: intent_core::WorkspaceAttention::None,
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
-            last_activity: None,
-            last_content_activity: None,
-            tags: vec![],
             path: Some("/test/path".into()),
             repository_path: Some("/test/repo".into()),
-            repository_owner: None,
             repository_name: Some("test-repo".into()),
-            worktree_path: None,
-            scope: None,
             skip_worktree: true,
-            setup_script: None,
-            is_remote: false,
-            default_model: None,
-            pr_number: None,
-            pr_url: None,
-            pr_status: None,
-            active_pull_request: None,
-            pull_requests: None,
-            context_links: None,
-            archived: false,
-            archived_at: None,
-            task_stats: None,
-            agent_summary: None,
-            diff_summary: None,
-            token_usage: None,
             cow_supported: Some(true), // Setting could be OFF, but session is sandboxed
-            browser_client_id: None,
-            pull_requests_total: None,
-            display_status: None,
-            waiting: false,
-            checkout_mode: None,
-            disk_usage: None,
-            pending_delete_at: None,
-            membership: None,
+            ..Default::default()
         };
 
         // Agent session WITH sandbox fields (explicit isolation:"cow" override)
@@ -33032,49 +33038,10 @@ mod known_repo {
             id: id.clone(),
             title: "Backfill Test".to_string(),
             branch: "main".to_string(),
-            base_ref: None,
-            base_commit_sha: None,
-            status: WorkspaceStatus::Active,
-            status_message: None,
-            status_image_asset_id: None,
-            activity: WorkspaceActivity::Idle,
-            attention: WorkspaceAttention::None,
             created_at: now.clone(),
             updated_at: now.clone(),
-            last_activity: None,
-            last_content_activity: None,
-            tags: vec![],
-            path: None,
             repository_path: Some(repo_path.0.to_string_lossy().to_string()),
-            repository_owner: None,
-            repository_name: None,
-            worktree_path: None,
-            scope: None,
-            skip_worktree: false,
-            setup_script: None,
-            is_remote: false,
-            default_model: None,
-            pr_number: None,
-            pr_url: None,
-            pr_status: None,
-            active_pull_request: None,
-            pull_requests: None,
-            context_links: None,
-            archived: false,
-            archived_at: None,
-            token_usage: None,
-            task_stats: None,
-            agent_summary: None,
-            diff_summary: None,
-            cow_supported: None,
-            browser_client_id: None,
-            pull_requests_total: None,
-            display_status: None,
-            waiting: false,
-            checkout_mode: None,
-            disk_usage: None,
-            pending_delete_at: None,
-            membership: None,
+            ..Default::default()
         };
         store.insert_workspace(&ws).await.expect("insert workspace");
 
@@ -33091,7 +33058,10 @@ mod known_repo {
                 });
 
         let probes_before = repository_backfill_probe_count(&repo_path.0);
-        let listed = svc.list_workspaces(false).await.expect("list workspaces");
+        let listed = svc
+            .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+            .await
+            .expect("list workspaces");
         assert!(listed.iter().any(|workspace| workspace.id == id));
         tokio::task::yield_now().await;
         assert_eq!(
@@ -33105,11 +33075,16 @@ mod known_repo {
 
         // Wait for the backfill to complete and emit workspace:updated
         let mut updated_event = None;
-        for _ in 0..100 {
+        let deadline = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(tokio::time::Duration::from_secs(6));
+        while tokio::time::Instant::now() < deadline {
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
             // Try to receive batched events (could be empty or timeout)
-            if let Ok(Some(batch)) =
-                tokio::time::timeout(tokio::time::Duration::from_millis(10), sub.recv()).await
+            if let Ok(Some(batch)) = tokio::time::timeout(
+                intentd_test_support::test_timeout(tokio::time::Duration::from_millis(10)),
+                sub.recv(),
+            )
+            .await
             {
                 for evt in batch {
                     if evt.event_type == "workspace:updated"
@@ -33520,7 +33495,11 @@ mod worktree_provisioning {
             "got: {err}"
         );
         assert_eq!(err.code(), -32603);
-        assert!(store.list_workspaces(true).await.expect("list").is_empty());
+        assert!(store
+            .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .expect("list")
+            .is_empty());
     }
 
     /// intent-hq/monorepo#962: `isNewRepo: true` on an already-initialized
@@ -33641,7 +33620,11 @@ mod worktree_provisioning {
                     .starts_with(&format!("{repo_name}.deleting-"))
             });
         assert!(!trashed, "no trash rename of the user repository folder");
-        assert!(store.list_workspaces(true).await.expect("list").is_empty());
+        assert!(store
+            .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .expect("list")
+            .is_empty());
     }
 
     /// The standalone-checkout ownership gate is root-anchored, not
@@ -33694,7 +33677,11 @@ mod worktree_provisioning {
             repo_dir.parent().unwrap().exists(),
             "the <parent>/<wsId>/ directory must not be swept outside daemon roots"
         );
-        assert!(store.list_workspaces(true).await.expect("list").is_empty());
+        assert!(store
+            .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .expect("list")
+            .is_empty());
     }
 
     /// An `isNewRepo` create on an already-initialized repo honors a
@@ -33814,7 +33801,11 @@ mod worktree_provisioning {
             );
             assert_eq!(err.code(), -32602);
         }
-        assert!(store.list_workspaces(true).await.expect("list").is_empty());
+        assert!(store
+            .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .expect("list")
+            .is_empty());
     }
 
     /// intent-hq/monorepo#962 review hardening: a mid-init failure can leave
@@ -34365,7 +34356,11 @@ mod worktree_provisioning {
             matches!(err, Error::BaseRefUnresolvable { ref base_ref } if base_ref == "no-such-ref"),
             "got: {err}"
         );
-        assert!(store.list_workspaces(true).await.expect("list").is_empty());
+        assert!(store
+            .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .expect("list")
+            .is_empty());
         assert!(
             std::fs::read_dir(&root.0)
                 .expect("read workspaces root")
@@ -35646,7 +35641,11 @@ mod setup_lifecycle_events {
     }
 
     async fn assert_quiet(sub: &mut Subscription) {
-        let quiet = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
+        let quiet = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            sub.recv(),
+        )
+        .await;
         assert!(quiet.is_err(), "no further setup events, got: {quiet:?}");
     }
 
@@ -35881,7 +35880,10 @@ mod setup_lifecycle_events {
             "infrastructure failure is -32603, got {err:?}"
         );
 
-        let rows = store.list_workspaces(true).await.expect("workspaces");
+        let rows = store
+            .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .expect("workspaces");
         assert_eq!(rows.len(), 1, "the workspace row was inserted first");
         assert!(
             rows[0]
@@ -38352,8 +38354,11 @@ mod initial_agent_orchestration {
     /// quiet, flattening batches into one ordered list of event types.
     async fn drain_event_types(sub: &mut crate::Subscription) -> Vec<String> {
         let mut types = Vec::new();
-        while let Ok(Some(batch)) =
-            tokio::time::timeout(Duration::from_millis(400), sub.recv()).await
+        while let Ok(Some(batch)) = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(400)),
+            sub.recv(),
+        )
+        .await
         {
             for ev in batch {
                 types.push(ev.event_type);
@@ -38762,8 +38767,11 @@ mod clone_orchestration {
 
     async fn drain_event_types(sub: &mut crate::Subscription) -> Vec<String> {
         let mut types = Vec::new();
-        while let Ok(Some(batch)) =
-            tokio::time::timeout(Duration::from_millis(400), sub.recv()).await
+        while let Ok(Some(batch)) = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(400)),
+            sub.recv(),
+        )
+        .await
         {
             for ev in batch {
                 types.push(ev.event_type);
@@ -38924,7 +38932,7 @@ mod clone_orchestration {
                 "{label}: distinct checkout path"
             );
             let v = svc
-                .cross_workspace_list_siblings(ws.id.clone())
+                .cross_workspace_list_siblings(ws.id.clone(), false)
                 .await
                 .expect("siblings");
             let ids: Vec<&str> = v
@@ -38952,7 +38960,7 @@ mod clone_orchestration {
             }
         }
         let v = svc
-            .cross_workspace_list_siblings(github)
+            .cross_workspace_list_siblings(github, false)
             .await
             .expect("siblings");
         assert!(
@@ -38993,7 +39001,10 @@ mod clone_orchestration {
             format!("{err}").contains("clone"),
             "error mentions clone: {err}"
         );
-        let list = store.list_workspaces(true).await.expect("list");
+        let list = store
+            .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .expect("list");
         assert!(list.is_empty(), "no row persisted on clone failure");
     }
 
@@ -39333,7 +39344,10 @@ mod clone_orchestration {
             matches!(err, intent_core::Error::CloneFailed { .. }),
             "typed clone failure: {err}"
         );
-        let list = store.list_workspaces(true).await.expect("list");
+        let list = store
+            .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .expect("list");
         assert!(list.is_empty(), "no row persisted on hydration failure");
     }
 
@@ -39448,8 +39462,11 @@ mod clone_orchestration {
     /// Drain the subscription and return the full `git:clone:*` events.
     async fn drain_clone_frames(sub: &mut crate::Subscription) -> Vec<intent_core::Event> {
         let mut frames = Vec::new();
-        while let Ok(Some(batch)) =
-            tokio::time::timeout(Duration::from_millis(400), sub.recv()).await
+        while let Ok(Some(batch)) = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(400)),
+            sub.recv(),
+        )
+        .await
         {
             for ev in batch {
                 if ev.event_type.starts_with("git:clone:") {
@@ -39812,7 +39829,10 @@ mod clone_orchestration {
             "both callers observe the same workspace"
         );
 
-        let rows = store.list_workspaces(true).await.expect("list workspaces");
+        let rows = store
+            .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+            .await
+            .expect("list workspaces");
         assert_eq!(
             rows.len(),
             1,
@@ -42890,9 +42910,12 @@ mod last_activity_events {
         assert_envelope(&ev, &h.ws.0, "workspace:activity-changed");
         assert_eq!(ev["data"]["activity"], "agent_running");
         assert!(
-            timeout(Duration::from_millis(200), sub.recv())
-                .await
-                .is_err(),
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(200)),
+                sub.recv()
+            )
+            .await
+            .is_err(),
             "no idle event on the suppressed-fire path"
         );
     }
@@ -42967,9 +42990,12 @@ mod last_activity_events {
         assert_envelope(&ev, &h.ws.0, "workspace:activity-changed");
         assert_eq!(ev["data"]["activity"], "agent_running");
         assert!(
-            timeout(Duration::from_millis(200), sub.recv())
-                .await
-                .is_err(),
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(200)),
+                sub.recv()
+            )
+            .await
+            .is_err(),
             "no idle event for a deleted workspace"
         );
     }
@@ -43040,7 +43066,12 @@ mod last_activity_events {
         assert_envelope(&ev1, &h.ws.0, "workspace:attention-changed");
 
         tokio::time::sleep(Duration::from_millis(200)).await;
-        while let Ok(Some(batch)) = timeout(Duration::from_millis(50), sub.recv()).await {
+        while let Ok(Some(batch)) = timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(50)),
+            sub.recv(),
+        )
+        .await
+        {
             for ev in &batch {
                 let ev = serde_json::to_value(ev).expect("serialize event");
                 assert_eq!(
@@ -43058,9 +43089,12 @@ mod last_activity_events {
 
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(
-            timeout(Duration::from_millis(50), sub.recv())
-                .await
-                .is_err(),
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(50)),
+                sub.recv()
+            )
+            .await
+            .is_err(),
             "no event on idempotent dismiss"
         );
     }
@@ -43125,7 +43159,8 @@ mod last_activity_events {
         // No second workspace:updated (coalesced) within a quiet window after
         // the first. One absolute deadline bounds the whole window, so a
         // stream of unrelated events cannot keep extending it.
-        let quiet_until = tokio::time::Instant::now() + Duration::from_millis(100);
+        let quiet_until = tokio::time::Instant::now()
+            + intentd_test_support::test_timeout(Duration::from_millis(100));
         while let Ok(Some(batch)) = tokio::time::timeout_at(quiet_until, sub.recv()).await {
             for ev in &batch {
                 let ev = serde_json::to_value(ev).expect("serialize event");
@@ -43192,7 +43227,7 @@ mod last_activity_events {
         // The lite list (seq-0 snapshot source) serves it without deriving.
         let lite = h
             .services
-            .list_workspaces_lite(true)
+            .list_workspaces_lite(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
             .await
             .expect("lite list");
         let row = lite
@@ -43231,7 +43266,7 @@ mod last_activity_events {
             .expect("stale bump"));
         let lite = h
             .services
-            .list_workspaces_lite(true)
+            .list_workspaces_lite(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
             .await
             .expect("lite list");
         let row = lite
@@ -43324,7 +43359,7 @@ mod last_activity_events {
         // The lite list (seq-0 snapshot source) serves it without deriving.
         let lite = h
             .services
-            .list_workspaces_lite(true)
+            .list_workspaces_lite(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
             .await
             .expect("lite list");
         let row = lite
@@ -43470,9 +43505,12 @@ mod last_activity_events {
         assert_envelope(&ev, &h.ws.0, "workspace:tokenUsage-changed");
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(
-            timeout(Duration::from_millis(50), sub.recv())
-                .await
-                .is_err(),
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(50)),
+                sub.recv()
+            )
+            .await
+            .is_err(),
             "token recompute must not emit a lastActivity workspace:updated"
         );
 
@@ -43488,9 +43526,12 @@ mod last_activity_events {
         // idempotent re-scan.
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(
-            timeout(Duration::from_millis(50), sub.recv())
-                .await
-                .is_err(),
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(50)),
+                sub.recv()
+            )
+            .await
+            .is_err(),
             "no event on idempotent token scan"
         );
     }
@@ -43836,9 +43877,12 @@ mod last_activity_events {
 
         // No idle event should have been emitted.
         assert!(
-            timeout(Duration::from_millis(50), sub.recv())
-                .await
-                .is_err(),
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(50)),
+                sub.recv()
+            )
+            .await
+            .is_err(),
             "no idle event when re-begin cancels the debounce"
         );
 
@@ -43870,6 +43914,7 @@ mod last_activity_events {
         // Before the window expires, no idle event yet.
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
+            // fixed-deadline: allow — stays under the 100ms idle debounce (50ms sleep + this window), after which the idle event is legitimate
             timeout(Duration::from_millis(20), sub.recv())
                 .await
                 .is_err(),
@@ -43882,10 +43927,13 @@ mod last_activity_events {
         tokio::time::sleep(Duration::from_millis(80)).await;
         let mut events = Vec::new();
         while events.len() < 2 {
-            let batch = timeout(Duration::from_secs(2), sub.recv())
-                .await
-                .expect("debounced events delivered")
-                .expect("subscription open");
+            let batch = timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(2)),
+                sub.recv(),
+            )
+            .await
+            .expect("debounced events delivered")
+            .expect("subscription open");
             for ev in &batch {
                 events.push(serde_json::to_value(ev).expect("serialize event"));
             }
@@ -43922,9 +43970,12 @@ mod last_activity_events {
 
         // No duplicate events.
         assert!(
-            timeout(Duration::from_millis(50), sub.recv())
-                .await
-                .is_err(),
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(50)),
+                sub.recv()
+            )
+            .await
+            .is_err(),
             "no duplicate idle event"
         );
     }
@@ -44898,9 +44949,12 @@ mod turn_token_usage {
             .persist_turn_token_usage(&agent, &h.ws, Some(&acp_usage(10, 5, 0, 0)), None)
             .await;
         assert!(
-            timeout(Duration::from_millis(100), sub.recv())
-                .await
-                .is_err(),
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(100)),
+                sub.recv()
+            )
+            .await
+            .is_err(),
             "no event when the tally is unchanged"
         );
     }
@@ -44988,9 +45042,12 @@ mod turn_token_usage {
             .expect("scan ok");
         assert!(!changed, "zero recount must not overwrite the live tally");
         assert!(
-            timeout(Duration::from_millis(100), sub.recv())
-                .await
-                .is_err(),
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(100)),
+                sub.recv()
+            )
+            .await
+            .is_err(),
             "no event when the guard skips the write"
         );
         let reloaded = h.store.get_workspace(&h.ws).await.expect("reload");
@@ -45083,9 +45140,12 @@ mod turn_token_usage {
             .persist_turn_token_usage(&AgentId::new(), &h.ws, Some(&acp_usage(1, 1, 0, 0)), None)
             .await;
         assert!(
-            timeout(Duration::from_millis(100), sub.recv())
-                .await
-                .is_err(),
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(100)),
+                sub.recv()
+            )
+            .await
+            .is_err(),
             "no event when the session row is absent"
         );
         let ws = h.store.get_workspace(&h.ws).await.expect("reload");
@@ -45268,9 +45328,12 @@ mod turn_token_usage {
             .expect("scan ok");
         assert!(!changed, "scan agrees with the live tally");
         assert!(
-            timeout(Duration::from_millis(100), sub.recv())
-                .await
-                .is_err(),
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(100)),
+                sub.recv()
+            )
+            .await
+            .is_err(),
             "no event when scan matches the live tally"
         );
         let scanned = h
@@ -45599,7 +45662,12 @@ mod turn_token_usage {
         // Every emitted event carries a committed snapshot value — never a
         // torn/mixed aggregate.
         let mut seen = 0usize;
-        while let Ok(Some(batch)) = timeout(Duration::from_millis(200), sub.recv()).await {
+        while let Ok(Some(batch)) = timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(200)),
+            sub.recv(),
+        )
+        .await
+        {
             for ev in batch {
                 let data = serde_json::to_value(&ev).expect("serialize event");
                 let input = data["data"]["tokenUsage"]["totals"]["inputTokens"]
@@ -47693,7 +47761,11 @@ mod delete_grace_window {
         // Row still served while pending, carrying the deadline.
         let got = h.services.get_workspace(h.ws.clone()).await.expect("get");
         assert_eq!(got.pending_delete_at.as_deref(), Some(delete_at.as_str()));
-        let listed = h.services.list_workspaces(false).await.expect("list");
+        let listed = h
+            .services
+            .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
+            .await
+            .expect("list");
         let row = listed.iter().find(|w| w.id == h.ws).expect("row listed");
         assert_eq!(row.pending_delete_at.as_deref(), Some(delete_at.as_str()));
 
@@ -48714,8 +48786,11 @@ mod agent_delete_grace_window {
         // The cascade emits `agent:deleted` + `workspace:deleted`; no
         // `agent:delete-cancelled` sneaks in.
         let mut seen = Vec::new();
-        while let Ok(Some(batch)) =
-            tokio::time::timeout(Duration::from_millis(500), sub.recv()).await
+        while let Ok(Some(batch)) = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(500)),
+            sub.recv(),
+        )
+        .await
         {
             for ev in batch {
                 seen.push(serde_json::to_value(&ev).expect("serialize"));
@@ -48815,7 +48890,6 @@ mod harness_versioning {
         let (_tmp, svc, ws) = setup().await;
         let created = create_agent(&svc, &ws, None).await;
         let agent = &created["agent"];
-        assert_eq!(agent["harnessVersion"], "3.2");
         assert_eq!(
             agent["harnessVersion"],
             intent_core::CURRENT_HARNESS_VERSION,
@@ -48841,7 +48915,7 @@ mod harness_versioning {
         assert_eq!(persisted["taskGraph"], serde_json::json!(true));
         assert_eq!(persisted["peerAgents"], serde_json::json!(true));
         let full = svc.agent_get_session_op(id).await.expect("getSession");
-        assert_eq!(full.harness_version, "3.2");
+        assert_eq!(full.harness_version, intent_core::CURRENT_HARNESS_VERSION);
         assert_eq!(full.harness_features.as_ref(), Some(&persisted));
         assert_eq!(agent["harnessFeatures"], persisted);
     }
@@ -48863,19 +48937,28 @@ mod harness_versioning {
         .await
         .unwrap();
         let child = create_agent(&svc, &ws, Some(parent_id.clone())).await;
-        assert_eq!(child["agent"]["harnessVersion"], "3.2");
+        assert_eq!(
+            child["agent"]["harnessVersion"],
+            intent_core::CURRENT_HARNESS_VERSION
+        );
         assert_eq!(child["agent"]["harnessFeatures"]["hostExec"], true);
         assert_eq!(child["agent"]["harnessFeatures"]["peerAgents"], true);
         let child_id = AgentId::from(child["agent"]["id"].as_str().unwrap());
         let child_row = svc.store().get_agent_session(&child_id).await.unwrap();
-        assert_eq!(child_row.harness_version, "3.2");
+        assert_eq!(
+            child_row.harness_version,
+            intent_core::CURRENT_HARNESS_VERSION
+        );
         assert_eq!(child_row.parent_agent_id.as_ref(), Some(&parent_id));
         assert_eq!(
             child_row.harness_features.as_ref(),
             Some(&child["agent"]["harnessFeatures"])
         );
         let child_full = svc.agent_get_session_op(child_id).await.unwrap();
-        assert_eq!(child_full.harness_version, "3.2");
+        assert_eq!(
+            child_full.harness_version,
+            intent_core::CURRENT_HARNESS_VERSION
+        );
         assert_eq!(child_full.harness_features, child_row.harness_features);
         let parent = svc.store().get_agent_session(&parent_id).await.unwrap();
         assert_eq!(parent.harness_version, "2.9");
@@ -49334,7 +49417,7 @@ mod derived_workspace_unread {
     /// armed, so settle-race tests can hold the settlement immediately
     /// before its atomic clear (the probe→write gap).
     async fn harness_with_park(
-        park: Option<std::sync::Arc<crate::script_ops::SupervisePark>>,
+        park: Option<std::sync::Arc<crate::runtime_config::SupervisePark>>,
     ) -> Harness {
         harness_with_parks(park, None).await
     }
@@ -49343,8 +49426,8 @@ mod derived_workspace_unread {
     /// ENTRY park, which holds a settle after the caller's write and before
     /// its unread probe (see `Services::with_unread_settle_entry_park`).
     async fn harness_with_parks(
-        attention_write_park: Option<std::sync::Arc<crate::script_ops::SupervisePark>>,
-        settle_entry_park: Option<std::sync::Arc<crate::script_ops::SupervisePark>>,
+        attention_write_park: Option<std::sync::Arc<crate::runtime_config::SupervisePark>>,
+        settle_entry_park: Option<std::sync::Arc<crate::runtime_config::SupervisePark>>,
     ) -> Harness {
         let tmp = TempDb::new();
         let store = Store::open(&tmp.path).await.expect("open store");
@@ -49471,7 +49554,11 @@ mod derived_workspace_unread {
     }
 
     async fn assert_silent(sub: &mut Subscription) {
-        let res = tokio::time::timeout(Duration::from_millis(300), sub.recv()).await;
+        let res = tokio::time::timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(300)),
+            sub.recv(),
+        )
+        .await;
         assert!(res.is_err(), "expected no attention event: {res:?}");
     }
 
@@ -49558,7 +49645,7 @@ mod derived_workspace_unread {
         // list_workspaces serves the same derivation.
         let listed = h
             .services
-            .list_workspaces(false)
+            .list_workspaces(intent_core::WorkspaceListFilter::ACTIVE)
             .await
             .expect("list workspaces");
         let row = listed.iter().find(|w| w.id == h.ws).expect("row");
@@ -49849,7 +49936,7 @@ mod derived_workspace_unread {
     #[intent_test_macros::daemon_test]
     async fn settle_race_new_message_in_gap_never_clears() {
         use std::sync::Arc;
-        let park = Arc::new(crate::script_ops::SupervisePark::default());
+        let park = Arc::new(crate::runtime_config::SupervisePark::default());
         let h = harness_with_park(Some(park.clone())).await;
         let last_a = seed_session(&h, "agent-a", &["user", "assistant"]).await;
         // Stored flag raised as the turn-end gate would have left it (seeded
@@ -50081,8 +50168,8 @@ mod derived_workspace_unread {
     #[intent_test_macros::daemon_test]
     async fn agent_retire_concurrent_unread_sessions_settle_exactly_once() {
         use std::sync::Arc;
-        let entry = Arc::new(crate::script_ops::SupervisePark::default());
-        let park = Arc::new(crate::script_ops::SupervisePark::default());
+        let entry = Arc::new(crate::runtime_config::SupervisePark::default());
+        let park = Arc::new(crate::runtime_config::SupervisePark::default());
         let h = harness_with_parks(Some(park.clone()), Some(entry.clone())).await;
         seed_session(&h, "agent-a", &["user", "assistant"]).await;
         seed_session(&h, "agent-b", &["user", "assistant"]).await;

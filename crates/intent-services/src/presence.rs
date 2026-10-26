@@ -23,6 +23,9 @@
 //!   restarts its expiry timer on a `(source, pulse)` it has not seen and
 //!   never compares wall clocks; `since` is the episode start only. The
 //!   connection learns its own handle from the `presence.update` reply.
+//!   Human rosters also carry `discussionTyping` entries for the workspace
+//!   discussion, sharing the same source with a separate pulse counter. Agent/daemon
+//!   snapshots omit that human-only field.
 //!   Emitted per workspace on every transition that can change the
 //!   roster: a principal's first hello'd connection / last connection gone
 //!   (to every member workspace), and a `presence.update` (to the workspaces
@@ -184,6 +187,15 @@ struct Typing {
     pulse: u64,
 }
 
+/// A connection typing in a workspace discussion; no draft text is retained.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiscussionTyping {
+    workspace: String,
+    conversation: String,
+    since: String,
+    pulse: u64,
+}
+
 /// One live connection's presence row.
 #[derive(Debug)]
 struct Conn {
@@ -193,10 +205,13 @@ struct Conn {
     /// The connection's opaque typing source handle: a fresh random id per
     /// connection, unrelated to the client id, host or device.
     typing_source: String,
-    /// `presence.update`s naming a typing agent seen on this connection.
+    /// Agent activity counter, unchanged by discussion typing.
     typing_pulses: u64,
+    /// Discussion activity counter, never reset on clearing or workspace changes.
+    discussion_typing_pulses: u64,
     focus: Vec<Focus>,
     typing: Option<Typing>,
+    discussion_typing: Option<DiscussionTyping>,
     /// Note-presence leases held by this connection: lease id → note.
     leases: HashMap<String, (WorkspaceId, NoteId)>,
 }
@@ -208,8 +223,10 @@ impl Conn {
             hello: false,
             typing_source: format!("ts-{}", uuid::Uuid::new_v4().simple()),
             typing_pulses: 0,
+            discussion_typing_pulses: 0,
             focus: Vec::new(),
             typing: None,
+            discussion_typing: None,
             leases: HashMap::new(),
         }
     }
@@ -220,13 +237,18 @@ impl Conn {
             .iter()
             .map(|f| f.workspace.clone())
             .chain(self.typing.iter().map(|t| t.workspace.clone()))
+            .chain(self.discussion_typing.iter().map(|t| t.workspace.clone()))
             .collect()
     }
 
     /// Whether the row carries nothing worth keeping once its last lease
     /// is gone (an anonymous, never-hello'd connection).
     fn is_empty(&self) -> bool {
-        !self.hello && self.focus.is_empty() && self.typing.is_none() && self.leases.is_empty()
+        !self.hello
+            && self.focus.is_empty()
+            && self.typing.is_none()
+            && self.discussion_typing.is_none()
+            && self.leases.is_empty()
     }
 }
 
@@ -299,6 +321,7 @@ impl State {
         &self,
         workspace_id: &str,
         members: &[intent_store::EffectiveWorkspaceMember],
+        include_discussion_typing: bool,
     ) -> Vec<Value> {
         members
             .iter()
@@ -307,6 +330,7 @@ impl State {
                 let p = &m.principal.id;
                 let mut focus: Vec<Focus> = Vec::new();
                 let mut typing: Vec<(&str, &Typing)> = Vec::new();
+                let mut discussion_typing: Vec<(&str, &DiscussionTyping)> = Vec::new();
                 for c in self.conns.values().filter(|c| &c.principal == p) {
                     for f in c.focus.iter().filter(|f| f.workspace == workspace_id) {
                         if !focus.contains(f) {
@@ -315,6 +339,15 @@ impl State {
                     }
                     if let Some(t) = c.typing.as_ref().filter(|t| t.workspace == workspace_id) {
                         typing.push((c.typing_source.as_str(), t));
+                    }
+                    if include_discussion_typing {
+                        if let Some(t) = c
+                            .discussion_typing
+                            .as_ref()
+                            .filter(|t| t.workspace == workspace_id)
+                        {
+                            discussion_typing.push((c.typing_source.as_str(), t));
+                        }
                     }
                 }
                 typing.sort_by(|a, b| a.0.cmp(b.0));
@@ -339,6 +372,15 @@ impl State {
                     "focus": focus.iter().map(Focus::to_json).collect::<Vec<_>>(),
                     "typing": typing,
                 });
+                if include_discussion_typing {
+                    discussion_typing.sort_by(|a, b| a.0.cmp(b.0));
+                    row["discussionTyping"] = json!(discussion_typing
+                        .into_iter()
+                        .map(|(source, t)| {
+                            json!({"source":source,"since":t.since,"pulse":t.pulse,"conversationId":t.conversation})
+                        })
+                        .collect::<Vec<_>>());
+                }
                 if let Some(identity) = &profile.identity {
                     row["identity"] = json!(identity);
                 }
@@ -517,6 +559,29 @@ fn parse_update(params: &Value) -> Result<(Vec<Focus>, Option<String>)> {
     Ok((items, typing))
 }
 
+/// Discussion typing replaces the connection's prior target on every update.
+fn parse_discussion_typing(params: &Value) -> Result<Option<(String, String)>> {
+    let Some(target) = params.get("discussionTyping").filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    let workspace = target
+        .get("workspaceId")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            Error::InvalidParams("discussionTyping.workspaceId must be a non-empty string".into())
+        })?;
+    let conversation = match target.get("conversationId") {
+        None => "default",
+        Some(value) => value.as_str().filter(|s| !s.is_empty()).ok_or_else(|| {
+            Error::InvalidParams(
+                "discussionTyping.conversationId must be a non-empty string".into(),
+            )
+        })?,
+    };
+    Ok(Some((workspace.into(), conversation.into())))
+}
+
 /// Parse a `note.presence.update` caret: `{ rev, anchor, head }`, each a
 /// non-negative integer.
 fn parse_cursor(params: &Value) -> Result<Value> {
@@ -661,7 +726,7 @@ impl Services {
                 return;
             }
         };
-        let roster = self.presence.lock().roster(workspace_id, &members);
+        let roster = self.presence.lock().roster(workspace_id, &members, true);
         self.publish_presence(&presence_changed_event(workspace_id, &roster));
     }
 
@@ -712,6 +777,7 @@ impl Services {
     ) -> Result<Value> {
         let principal = wire_principal("presence.update")?;
         let (focus, typing) = parse_update(&params)?;
+        let discussion_typing = parse_discussion_typing(&params)?;
         let hello = self
             .presence
             .lock()
@@ -734,8 +800,15 @@ impl Services {
             }
             None => None,
         };
+        if let Some((workspace, _)) = &discussion_typing {
+            targets.insert(workspace.clone());
+        }
         for workspace_id in &targets {
             self.require_member(&WorkspaceId::from(workspace_id.as_str()))
+                .await?;
+        }
+        if let Some((workspace, conversation)) = &discussion_typing {
+            self.discussion_access(&WorkspaceId::from(workspace.as_str()), conversation)
                 .await?;
         }
         let (affected, typing_source): (HashSet<String>, String) = {
@@ -763,6 +836,21 @@ impl Services {
                     workspace,
                     since,
                     pulse: conn.typing_pulses,
+                }
+            });
+            conn.discussion_typing = discussion_typing.map(|(workspace, conversation)| {
+                conn.discussion_typing_pulses += 1;
+                let since = match &conn.discussion_typing {
+                    Some(t) if t.workspace == workspace && t.conversation == conversation => {
+                        t.since.clone()
+                    }
+                    _ => now_iso(),
+                };
+                DiscussionTyping {
+                    workspace,
+                    conversation,
+                    since,
+                    pulse: conn.discussion_typing_pulses,
                 }
             });
             (
@@ -827,8 +915,15 @@ impl Services {
             .store
             .list_effective_workspace_members(&workspace_id)
             .await?;
-        let roster = self.presence.lock().roster(workspace_id.as_str(), &members);
-        Ok(json!({ "workspaceId": workspace_id.as_str(), "members": roster }))
+        let human = matches!(current_caller(), Some(Caller::Wire { .. }));
+        let roster = self
+            .presence
+            .lock()
+            .roster(workspace_id.as_str(), &members, human);
+        let mut data = json!({ "workspaceId": workspace_id.as_str(), "members": roster });
+        self.project_discussion_typing(&workspace_id, &mut data)
+            .await?;
+        Ok(data)
     }
 
     /// See [`intent_core::WorkspaceApi::presence_disconnect`].

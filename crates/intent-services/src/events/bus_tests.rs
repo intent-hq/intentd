@@ -358,7 +358,11 @@ async fn non_matching_events_are_filtered_out_silently() {
         .expect("publish");
 
     // Nothing matches → recv must time out rather than deliver a stray batch.
-    let got = timeout(Duration::from_millis(150), sub.recv()).await;
+    let got = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(150)),
+        sub.recv(),
+    )
+    .await;
     assert!(
         got.is_err(),
         "non-matching events must not be delivered: {got:?}"
@@ -686,7 +690,11 @@ async fn insert_events_failure_resolves_oneshots_with_error() {
     }
 
     // Verify nothing was broadcast to subscribers (no events succeed on failure).
-    let got = timeout(Duration::from_millis(150), sub.recv()).await;
+    let got = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(150)),
+        sub.recv(),
+    )
+    .await;
     assert!(
         got.is_err(),
         "no events should be broadcast on insert_events failure"

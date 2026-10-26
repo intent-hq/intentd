@@ -51,7 +51,7 @@ async fn script_snapshots_cover_committed_results_and_restore() {
         );
         let durable = h
             .services
-            .store
+            .store()
             .get_script_in_workspace(&h.ws, &id)
             .await
             .unwrap()
@@ -78,7 +78,7 @@ async fn script_snapshot_recovery_installs_matching_runtime_before_publication()
     let h = harness().await;
     let id = one_off(&h, "true").await;
     h.services
-        .store
+        .store()
         .admit_script_run(&h.ws, &id, "crashed")
         .await
         .unwrap();
@@ -162,7 +162,7 @@ async fn script_snapshot_replacement_fences_captured_terminal_publication() {
                 .unwrap();
             let events = h
                 .services
-                .store
+                .store()
                 .query_events(&EventQuery {
                     workspace_id: Some(h.ws.clone()),
                     event_types: vec![SCRIPT_STATE.to_string()],
@@ -254,7 +254,7 @@ async fn script_snapshot_detached_completion_cannot_clear_successor_marker() {
         .unwrap();
     assert_eq!(
         h.services
-            .store
+            .store()
             .list_was_running_script_ids()
             .await
             .unwrap(),
@@ -262,7 +262,7 @@ async fn script_snapshot_detached_completion_cannot_clear_successor_marker() {
     );
     let events = h
         .services
-        .store
+        .store()
         .query_events(&EventQuery {
             workspace_id: Some(h.ws.clone()),
             event_types: vec![SCRIPT_STATE.to_string()],
@@ -370,7 +370,7 @@ async fn script_snapshot_finished_stop_publishes_idle_without_changing_history()
         mgr.run(&h.ws, &id, None, Some(5)).await.unwrap();
         let before = h
             .services
-            .store
+            .store()
             .get_script_in_workspace(&h.ws, &id)
             .await
             .unwrap()
@@ -378,7 +378,7 @@ async fn script_snapshot_finished_stop_publishes_idle_without_changing_history()
         mgr.stop(&h.ws, &id).await.unwrap();
         let events = h
             .services
-            .store
+            .store()
             .query_events(&EventQuery {
                 workspace_id: Some(h.ws.clone()),
                 event_types: vec![SCRIPT_STATE.to_string()],
@@ -392,7 +392,7 @@ async fn script_snapshot_finished_stop_publishes_idle_without_changing_history()
         );
         let after = h
             .services
-            .store
+            .store()
             .get_script_in_workspace(&h.ws, &id)
             .await
             .unwrap()
@@ -403,7 +403,7 @@ async fn script_snapshot_finished_stop_publishes_idle_without_changing_history()
         mgr.stop(&h.ws, &id).await.unwrap();
         let after_noop = h
             .services
-            .store
+            .store()
             .query_events(&EventQuery {
                 workspace_id: Some(h.ws.clone()),
                 event_types: vec![SCRIPT_STATE.to_string()],

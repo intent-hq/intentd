@@ -11,7 +11,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -295,9 +295,13 @@ async fn provider_profiles_crud_contract_over_wss() {
 
     // Empty list.
     let list = rpc(&mut ws, 1, "providers.profiles.list", json!({})).await;
+    assert_eq!(list["id"], 1);
+    assert_eq!(list["result"]["profiles"], json!([]));
+    assert_eq!(list["result"]["revision"], 0);
     assert_eq!(
-        list,
-        json!({ "jsonrpc": "2.0", "id": 1, "result": { "profiles": [], "revision": 0 } })
+        list["result"]["defaults"].as_array().map(Vec::len),
+        Some(2),
+        "one Default row per profile base: {list}"
     );
 
     // Validation: every failure listed, nothing written.
@@ -354,6 +358,7 @@ async fn provider_profiles_crud_contract_over_wss() {
     assert_eq!(profile["providerRef"], reference.as_str());
     assert_eq!(profile["baseProviderId"], "codex");
     assert_eq!(profile["name"], "Work");
+    assert_eq!(profile["backup"], false);
     assert_eq!(
         profile["env"],
         json!([
@@ -368,6 +373,7 @@ async fn provider_profiles_crud_contract_over_wss() {
         keys,
         vec![
             "activation",
+            "backup",
             "baseProviderId",
             "createdAt",
             "env",
@@ -385,7 +391,7 @@ async fn provider_profiles_crud_contract_over_wss() {
     assert_eq!(
         ev["data"],
         json!({ "revision": 1, "change": "created", "profileId": id,
-                "profile": { "id": id, "providerRef": reference, "baseProviderId": "codex", "name": "Work" } })
+                "profile": { "id": id, "providerRef": reference, "baseProviderId": "codex", "name": "Work", "backup": false } })
     );
 
     // Values stay out of the metadata file and settings.list.
@@ -563,6 +569,209 @@ async fn provider_profiles_crud_contract_over_wss() {
     drop(daemon);
 }
 
+/// Backup flag and saved order over the wire (PROTOCOL §5.54): `backup`
+/// round-trips through create/update/list/catalog, `providers.profiles.reorder`
+/// validates the id set, returns the base's rows in the new order, emits one
+/// `reordered` event, and the order and flags survive a daemon restart.
+#[tokio::test]
+async fn provider_profiles_backup_and_reorder_contract_over_wss() {
+    let root = scratch_dir("reorder");
+    let (mut daemon, _port, _cfg) = boot(root.path()).await;
+    let data_dir = daemon.data_dir.clone();
+    let (mut ws, mut sub) = connect(&data_dir).await;
+    let ack = rpc(
+        &mut sub,
+        100,
+        "events.subscribe",
+        json!({ "eventTypes": ["providers:profiles-changed"] }),
+    )
+    .await;
+    assert!(ack.get("error").is_none(), "{ack}");
+
+    let mut ids = Vec::new();
+    for (id, (base, name, backup)) in (1_i64..).zip([
+        ("claude-code", "Main", None),
+        ("claude-code", "Spare", Some(true)),
+        ("codex", "Other", None),
+        ("claude-code", "Spare 2", Some(false)),
+    ]) {
+        let mut params = json!({ "baseProviderId": base, "name": name });
+        if let Some(backup) = backup {
+            params["backup"] = json!(backup);
+        }
+        let created = ok(&mut ws, id, "providers.profiles.create", params).await;
+        assert_eq!(created["profile"]["backup"], backup.unwrap_or(false));
+        let ev = next_event(&mut sub, "providers:profiles-changed").await;
+        assert_eq!(ev["data"]["profile"]["backup"], backup.unwrap_or(false));
+        ids.push(created["profile"]["id"].as_str().unwrap().to_string());
+    }
+    let (main, spare, other, spare2) = (&ids[0], &ids[1], &ids[2], &ids[3]);
+
+    // A backup-only update.
+    let updated = ok(
+        &mut ws,
+        10,
+        "providers.profiles.update",
+        json!({ "profileId": spare2, "backup": true }),
+    )
+    .await;
+    assert_eq!(updated["profile"]["backup"], true);
+    assert_eq!(
+        updated["activation"],
+        json!({ "envChanged": false, "runningProcesses": 0 })
+    );
+    let ev = next_event(&mut sub, "providers:profiles-changed").await;
+    assert_eq!(ev["data"]["change"], "updated");
+    assert_eq!(ev["data"]["envChanged"], false);
+    assert_eq!(ev["data"]["profile"]["backup"], true);
+    for (id, value) in (40_i64..).zip([json!("yes"), Value::Null]) {
+        let bad = rpc(
+            &mut ws,
+            id,
+            "providers.profiles.update",
+            json!({ "profileId": spare2, "backup": value }),
+        )
+        .await;
+        assert_eq!(bad["error"]["code"], -32602, "{bad}");
+        assert!(bad["error"]["data"].get("fieldErrors").is_none(), "{bad}");
+    }
+    let bad = rpc(
+        &mut ws,
+        30,
+        "providers.profiles.create",
+        json!({ "baseProviderId": "codex", "name": "Null", "backup": null }),
+    )
+    .await;
+    assert_eq!(bad["error"]["code"], -32602, "{bad}");
+
+    // Invalid id sets are field errors.
+    let bad = rpc(
+        &mut ws,
+        12,
+        "providers.profiles.reorder",
+        json!({ "baseProviderId": "claude-code", "profileIds": [spare, other] }),
+    )
+    .await;
+    assert_eq!(bad["error"]["code"], -32602, "{bad}");
+    assert_eq!(bad["error"]["data"]["code"], "invalid-params");
+    let codes: Vec<(&str, &str)> = bad["error"]["data"]["fieldErrors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| (e["field"].as_str().unwrap(), e["code"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        codes,
+        vec![
+            ("profileIds[1]", "profile-order-unknown"),
+            ("profileIds", "profile-order-incomplete"),
+        ]
+    );
+    let malformed = rpc(
+        &mut ws,
+        13,
+        "providers.profiles.reorder",
+        json!({ "baseProviderId": "claude-code" }),
+    )
+    .await;
+    assert_eq!(malformed["error"]["code"], -32602, "{malformed}");
+
+    // Reorder.
+    let reordered = rpc(
+        &mut ws,
+        14,
+        "providers.profiles.reorder",
+        json!({ "baseProviderId": "claude-code", "profileIds": [spare2, main, spare] }),
+    )
+    .await;
+    assert_eq!(reordered["jsonrpc"], "2.0");
+    assert_eq!(reordered["id"], 14);
+    let result = &reordered["result"];
+    assert_eq!(result["revision"], 6);
+    let order: Vec<&str> = result["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(order, [spare2.as_str(), main.as_str(), spare.as_str()]);
+    let mut keys: Vec<&String> = result["profiles"][0].as_object().unwrap().keys().collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        vec![
+            "activation",
+            "backup",
+            "baseProviderId",
+            "createdAt",
+            "env",
+            "id",
+            "name",
+            "providerRef",
+            "settingsFingerprint",
+            "updatedAt"
+        ]
+    );
+    let ev = next_event(&mut sub, "providers:profiles-changed").await;
+    assert_eq!(ev["workspaceId"], "");
+    assert_eq!(
+        ev["data"],
+        json!({ "revision": 6, "change": "reordered", "baseProviderId": "claude-code" })
+    );
+
+    // Claude Code's slots (0, 1, 3) take the new order; Codex keeps slot 2.
+    let catalog = ok(&mut ws, 15, "providers.catalog", json!({})).await;
+    let rows: Vec<(String, bool)> = catalog["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| {
+            (
+                p["id"].as_str().unwrap().to_string(),
+                p["backup"].as_bool().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            (spare2.clone(), true),
+            (main.clone(), false),
+            (other.clone(), false),
+            (spare.clone(), true),
+        ]
+    );
+
+    // Persistence across a real restart.
+    daemon.child.kill().unwrap();
+    daemon.child.wait().unwrap();
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
+    daemon.child = spawn_serve(&data_dir, &env);
+    let (mut ws, _sub) = connect(&data_dir).await;
+    let list = ok(
+        &mut ws,
+        20,
+        "providers.profiles.list",
+        json!({ "baseProviderId": "claude-code" }),
+    )
+    .await;
+    let rows: Vec<(&str, bool)> = list["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| (p["id"].as_str().unwrap(), p["backup"].as_bool().unwrap()))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            (spare2.as_str(), true),
+            (main.as_str(), false),
+            (spare.as_str(), true),
+        ]
+    );
+    drop(daemon);
+}
+
 /// Selection surfaces over the wire (PROTOCOL §5.54): the catalog offers
 /// profiles beside one row per provider type, a profile's auth status is
 /// keyed by its reference, and a missing reference needs a replacement on
@@ -607,6 +816,7 @@ async fn provider_profile_selection_surfaces_over_wss() {
             "providerRef": reference,
             "baseProviderId": "codex",
             "name": "Work",
+            "backup": false,
         }])
     );
 
@@ -711,5 +921,181 @@ async fn provider_profile_selection_surfaces_over_wss() {
             .contains(&reference),
         "{sent}"
     );
+    drop(daemon);
+}
+
+/// Default configuration overrides over the wire (PROTOCOL §5.54 "Default
+/// configuration overrides"): `providers.profiles.list` `defaults`,
+/// `providers.profiles.updateDefault` envelopes and field errors, the
+/// `default-updated` event, the catalog `defaultNames`, persistence across
+/// a restart, and that values never leave the daemon.
+#[tokio::test]
+async fn provider_default_overrides_contract_over_wss() {
+    let root = scratch_dir("default");
+    let (mut daemon, _port, _cfg) = boot(root.path()).await;
+    let data_dir = daemon.data_dir.clone();
+    let (mut ws, mut sub) = connect(&data_dir).await;
+    let ack = rpc(
+        &mut sub,
+        100,
+        "events.subscribe",
+        json!({ "eventTypes": ["providers:profiles-changed"] }),
+    )
+    .await;
+    assert!(ack.get("error").is_none(), "{ack}");
+
+    let unrenamed = |base: &str| {
+        json!({
+            "baseProviderId": base,
+            "providerRef": base,
+            "name": "Default",
+            "env": [],
+            "settingsFingerprint": "",
+            "activation": { "runningProcesses": 0 },
+        })
+    };
+    let list = ok(&mut ws, 1, "providers.profiles.list", json!({})).await;
+    assert_eq!(
+        list["defaults"],
+        json!([unrenamed("codex"), unrenamed("claude-code")])
+    );
+
+    // Validation: field errors in the profile envelope, nothing written.
+    let bad = rpc(
+        &mut ws,
+        2,
+        "providers.profiles.updateDefault",
+        json!({ "baseProviderId": "codex", "env": [
+            { "key": "PATH", "kind": "set", "value": "/x" },
+            { "key": "MISSING", "kind": "keep" },
+        ] }),
+    )
+    .await;
+    assert_eq!(bad["error"]["code"], -32602, "{bad}");
+    assert_eq!(bad["error"]["data"]["code"], "invalid-params");
+    let codes: Vec<(&str, &str)> = bad["error"]["data"]["fieldErrors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| (e["field"].as_str().unwrap(), e["code"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        codes,
+        vec![
+            ("env[0].key", "env-key-reserved"),
+            ("env[1].kind", "env-keep-missing"),
+        ]
+    );
+    let unsupported = rpc(
+        &mut ws,
+        3,
+        "providers.profiles.updateDefault",
+        json!({ "baseProviderId": "auggie", "name": "x" }),
+    )
+    .await;
+    assert_eq!(
+        unsupported["error"]["data"]["fieldErrors"][0]["code"], "base-provider-unsupported",
+        "{unsupported}"
+    );
+
+    // Rename and save overrides.
+    let saved = rpc(
+        &mut ws,
+        4,
+        "providers.profiles.updateDefault",
+        json!({ "baseProviderId": "codex", "name": "Personal", "env": [
+            { "key": "OPENAI_API_KEY", "kind": "set", "value": SECRET },
+            { "key": "OPENAI_BASE_URL", "kind": "unset" },
+        ] }),
+    )
+    .await;
+    assert!(!saved.to_string().contains(SECRET), "{saved}");
+    let result = &saved["result"];
+    let fingerprint = result["defaultConfig"]["settingsFingerprint"]
+        .as_str()
+        .expect("fingerprint")
+        .to_owned();
+    assert!(!fingerprint.is_empty());
+    assert_eq!(
+        *result,
+        json!({
+            "defaultConfig": {
+                "baseProviderId": "codex",
+                "providerRef": "codex",
+                "name": "Personal",
+                "env": [
+                    { "key": "OPENAI_API_KEY", "kind": "set", "value": "********" },
+                    { "key": "OPENAI_BASE_URL", "kind": "unset" },
+                ],
+                "settingsFingerprint": fingerprint,
+                "activation": { "runningProcesses": 0 },
+            },
+            "revision": 1,
+            "activation": { "envChanged": true, "runningProcesses": 0 },
+        })
+    );
+    let ev = next_event(&mut sub, "providers:profiles-changed").await;
+    assert_eq!(
+        ev["data"],
+        json!({
+            "revision": 1,
+            "change": "default-updated",
+            "baseProviderId": "codex",
+            "envChanged": true,
+        })
+    );
+    let catalog = ok(&mut ws, 5, "providers.catalog", json!({})).await;
+    assert_eq!(catalog["defaultNames"], json!({ "codex": "Personal" }));
+
+    // A rename-only update keeps the environment.
+    let renamed = ok(
+        &mut ws,
+        6,
+        "providers.profiles.updateDefault",
+        json!({ "baseProviderId": "codex", "name": "Home" }),
+    )
+    .await;
+    assert_eq!(renamed["activation"]["envChanged"], false);
+    assert_eq!(
+        renamed["defaultConfig"]["settingsFingerprint"],
+        fingerprint.as_str()
+    );
+    let ev = next_event(&mut sub, "providers:profiles-changed").await;
+    assert_eq!(ev["data"]["change"], "default-updated");
+    assert_eq!(ev["data"]["envChanged"], false);
+
+    // A profile cannot take the renamed Default's name.
+    let clash = rpc(
+        &mut ws,
+        7,
+        "providers.profiles.create",
+        json!({ "baseProviderId": "codex", "name": "home" }),
+    )
+    .await;
+    assert_eq!(
+        clash["error"]["data"]["fieldErrors"][0]["code"], "name-duplicate",
+        "{clash}"
+    );
+
+    // Persistence across a real restart.
+    daemon.child.kill().unwrap();
+    daemon.child.wait().unwrap();
+    let env: [(&str, &str); 1] = [("INTENTD_AUTH_TOKEN", TOKEN)];
+    daemon.child = spawn_serve(&data_dir, &env);
+    let (mut ws, _sub) = connect(&data_dir).await;
+    let list = ok(
+        &mut ws,
+        8,
+        "providers.profiles.list",
+        json!({ "baseProviderId": "codex" }),
+    )
+    .await;
+    assert_eq!(list["defaults"], json!([renamed["defaultConfig"]]));
+
+    // Values never reach the profile file, settings file or daemon log.
+    for file in ["provider-profiles.json", "config.toml", "daemon.log"] {
+        let text = std::fs::read_to_string(data_dir.join(file)).unwrap_or_default();
+        assert!(!text.contains(SECRET), "a Default value reached {file}");
+    }
     drop(daemon);
 }

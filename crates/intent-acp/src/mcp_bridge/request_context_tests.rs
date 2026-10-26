@@ -15,7 +15,9 @@ use crate::mcp_server::repository_guidance::{
 };
 use crate::mcp_server::request_context::{McpContextFuture, McpRequestContext, McpRequestScope};
 
-const WAIT: Duration = Duration::from_secs(10);
+fn wait() -> Duration {
+    intentd_test_support::test_timeout(Duration::from_secs(10))
+}
 const GUIDANCE: &str = "original request guidance";
 
 struct Origin {
@@ -235,7 +237,7 @@ async fn send(write: &mut OwnedWriteHalf, message: &Value) {
 async fn read(reader: &mut BufReader<OwnedReadHalf>) -> Value {
     let mut line = String::new();
     assert!(
-        timeout(WAIT, reader.read_line(&mut line))
+        timeout(wait(), reader.read_line(&mut line))
             .await
             .unwrap()
             .unwrap()
@@ -245,7 +247,7 @@ async fn read(reader: &mut BufReader<OwnedReadHalf>) -> Value {
 }
 
 async fn receive<T>(receiver: &mut UnboundedReceiver<T>) -> T {
-    timeout(WAIT, receiver.recv()).await.unwrap().unwrap()
+    timeout(wait(), receiver.recv()).await.unwrap().unwrap()
 }
 
 fn assert_original(response: &Value) {

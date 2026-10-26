@@ -409,7 +409,13 @@ impl Services {
                     .store
                     .get_workspace_member_role(workspace_id, &principal_id)
                     .await?;
-                if role != Some(intent_core::WorkspaceRole::Collaborator) {
+                if !matches!(
+                    role,
+                    Some(
+                        intent_core::WorkspaceRole::Collaborator
+                            | intent_core::WorkspaceRole::Manager
+                    )
+                ) {
                     return Ok(None);
                 }
                 false
@@ -1058,7 +1064,11 @@ impl Services {
 
     /// The bound GitLab instance (`sourceControl.gitlab.host`) when it
     /// parses.
-    pub(crate) fn bound_gitlab_host(&self) -> Option<GitlabHost> {
+    #[expect(
+        clippy::must_use_candidate,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub fn bound_gitlab_host(&self) -> Option<GitlabHost> {
         self.resolve_source_control_target("gitlab", None)
             .ok()
             .and_then(|t| match t {

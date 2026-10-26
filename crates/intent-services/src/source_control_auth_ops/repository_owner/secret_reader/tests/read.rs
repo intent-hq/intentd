@@ -15,6 +15,7 @@ use intent_core::{
     ExecutionScope, RepositoryProvider, RepositoryResourceKind, RepositoryTarget, ReviewTarget,
 };
 use intent_sourcecontrol::{error::ProviderFailureKind, Error as ScError, ProviderAvailability};
+use intentd_test_support::test_timeout;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -209,7 +210,7 @@ impl ReadServer {
         *self.replies.pause.lock().unwrap() = Some(path.into());
     }
     async fn entered(&self) {
-        timeout(BUDGET, self.replies.entered.notified())
+        timeout(test_timeout(BUDGET), self.replies.entered.notified())
             .await
             .unwrap();
     }
@@ -914,9 +915,12 @@ async fn actual_file_read_cancellation_retains_lease_and_never_dispatches() {
         .unwrap();
     paused.resume();
     drop(
-        timeout(BUDGET, f.auth.service.gitlab_credential_gate.lock())
-            .await
-            .unwrap(),
+        timeout(
+            test_timeout(BUDGET),
+            f.auth.service.gitlab_credential_gate.lock(),
+        )
+        .await
+        .unwrap(),
     );
     assert_eq!(e.check(), Err(Error::Retired));
     assert_eq!(s.count(), 0);
@@ -1166,7 +1170,7 @@ async fn batch_reversed_directories_progress_with_all_owner_locks_held() {
         }));
     }
     for task in tasks {
-        timeout(BUDGET, task).await.unwrap().unwrap();
+        timeout(test_timeout(BUDGET), task).await.unwrap().unwrap();
     }
     assert_eq!(calls.load(Ordering::SeqCst), 8);
     assert_eq!(s.count(), 0);
@@ -1422,7 +1426,9 @@ impl SettledWritePause {
         Self { entered, released }
     }
     async fn entered(&self) {
-        timeout(BUDGET, self.entered.notified()).await.unwrap();
+        timeout(test_timeout(BUDGET), self.entered.notified())
+            .await
+            .unwrap();
     }
     fn resume(&self) {
         *self.released.0.lock().unwrap() = true;
@@ -1593,7 +1599,11 @@ async fn settled_pat_reservation_stays_ready_then_actual_effect_retires_old_fact
         Error::Mutating,
     );
     pause.resume();
-    timeout(BUDGET, write).await.unwrap().unwrap().unwrap();
+    timeout(test_timeout(BUDGET), write)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     settled_error(original.reobserve(), Error::Retired);
     let next = f.service.gitlab_repository_settled_connection().unwrap();
     assert_eq!(next.selected().binding.account.account_id, "43");
@@ -1630,7 +1640,11 @@ async fn settled_refresh_accepts_new_actual_proof_without_mutating_old_observati
         Error::Mutating,
     );
     s.fixture.control.release.notify_one();
-    timeout(BUDGET, refresh).await.unwrap().unwrap().unwrap();
+    timeout(test_timeout(BUDGET), refresh)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     let next = original.reobserve().unwrap();
     let fresh_proof = next
         .owner
@@ -2014,7 +2028,11 @@ async fn settled_reobservation_never_reattributes_an_old_acquired_401() {
     f.refresh(&s).await;
     let next = original.reobserve().unwrap();
     s.resume();
-    let (result, quota, receipt) = timeout(BUDGET, call).await.unwrap().unwrap().into_parts();
+    let (result, quota, receipt) = timeout(test_timeout(BUDGET), call)
+        .await
+        .unwrap()
+        .unwrap()
+        .into_parts();
     denial(&result, ProviderFailureKind::CredentialRejected, 401);
     assert_eq!(applied(&e, &receipt, &target).unwrap(), D::NotApplied);
     assert_eq!(quota.remaining, Some(23));
@@ -2051,11 +2069,11 @@ async fn settled_actual_ready_before_proof_publication_does_not_attest_a_snapsho
         let _ = locked.send(());
         let _ = hold.recv();
     });
-    timeout(BUDGET, ready).await.unwrap().unwrap();
+    timeout(test_timeout(BUDGET), ready).await.unwrap().unwrap();
     let service = f.auth.service.clone();
     let observation =
         tokio::task::spawn_blocking(move || service.gitlab_repository_settled_connection());
-    timeout(BUDGET, async {
+    timeout(test_timeout(BUDGET), async {
         loop {
             let config_held = matches!(
                 original.owner.settings.get().unwrap().config.try_lock(),
@@ -2070,7 +2088,7 @@ async fn settled_actual_ready_before_proof_publication_does_not_attest_a_snapsho
     .await
     .unwrap();
     pause.resume();
-    timeout(BUDGET, async {
+    timeout(test_timeout(BUDGET), async {
         loop {
             match original.owner.directory.binding() {
                 Ok(binding) => {
@@ -2088,10 +2106,17 @@ async fn settled_actual_ready_before_proof_publication_does_not_attest_a_snapsho
     drop(release);
     holder.join().unwrap();
     settled_error(
-        timeout(BUDGET, observation).await.unwrap().unwrap(),
+        timeout(test_timeout(BUDGET), observation)
+            .await
+            .unwrap()
+            .unwrap(),
         Error::Unverified,
     );
-    timeout(BUDGET, refresh).await.unwrap().unwrap().unwrap();
+    timeout(test_timeout(BUDGET), refresh)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     let settled = original.reobserve().unwrap();
     assert!(settled.selected().secret_revision > original.selected().secret_revision);
     assert_eq!(settled.selected().binding, original.selected().binding);
@@ -2298,7 +2323,11 @@ async fn facts_reservation_then_actual_pat_replace_preserves_old_observation() {
     unready(&begun, Error::Mutating);
     assert_eq!(begun.descriptor(), Some(&s.descriptor));
     pause.resume();
-    timeout(BUDGET, write).await.unwrap().unwrap().unwrap();
+    timeout(test_timeout(BUDGET), write)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     let next = connection_facts(&f.service);
     assert_eq!(
         next.settled()
@@ -2330,7 +2359,11 @@ async fn facts_oauth_refresh_reports_actual_mutation_and_new_settled_revision() 
     assert_eq!(pending.lifecycle(), Lifecycle::Mutating);
     unready(&pending, Error::Mutating);
     s.fixture.control.release.notify_one();
-    timeout(BUDGET, refresh).await.unwrap().unwrap().unwrap();
+    timeout(test_timeout(BUDGET), refresh)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     let fresh = connection_facts(&f.auth.service);
     assert_eq!(
         fresh.settled().unwrap().selected().binding,
@@ -2393,12 +2426,15 @@ async fn facts_cancelled_pat_stays_unavailable_until_retained_owner_completes() 
     pause.resume();
     // Receiver cancellation does not cancel main's registered completion owner.
     // Join that real owner, including its publication and secret receipt tail.
-    timeout(BUDGET, f.service.shutdown_settings())
+    timeout(test_timeout(BUDGET), f.service.shutdown_settings())
         .await
         .unwrap();
-    let _gate = timeout(BUDGET, f.service.gitlab_credential_gate.lock())
-        .await
-        .unwrap();
+    let _gate = timeout(
+        test_timeout(BUDGET),
+        f.service.gitlab_credential_gate.lock(),
+    )
+    .await
+    .unwrap();
     let completed = connection_facts(&f.service);
     assert_eq!(completed.lifecycle(), Lifecycle::Ready);
     let next = completed.settled().unwrap();
@@ -2734,10 +2770,10 @@ async fn facts_actual_ready_before_proof_interval_is_not_settled() {
         let _ = locked.send(());
         let _ = hold.recv();
     });
-    timeout(BUDGET, ready).await.unwrap().unwrap();
+    timeout(test_timeout(BUDGET), ready).await.unwrap().unwrap();
     let service = f.auth.service.clone();
     let observation = tokio::task::spawn_blocking(move || connection_facts(&service));
-    timeout(BUDGET, async {
+    timeout(test_timeout(BUDGET), async {
         loop {
             if matches!(
                 original.owner.settings.get().unwrap().config.try_lock(),
@@ -2751,7 +2787,7 @@ async fn facts_actual_ready_before_proof_interval_is_not_settled() {
     .await
     .unwrap();
     pause.resume();
-    timeout(BUDGET, async {
+    timeout(test_timeout(BUDGET), async {
         loop {
             match original.owner.directory.binding() {
                 Ok(_) => break,
@@ -2765,10 +2801,17 @@ async fn facts_actual_ready_before_proof_interval_is_not_settled() {
     assert!(original.owner.evidence.published.lock().unwrap().is_none());
     drop(release);
     holder.join().unwrap();
-    let gap = timeout(BUDGET, observation).await.unwrap().unwrap();
+    let gap = timeout(test_timeout(BUDGET), observation)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(gap.lifecycle(), Lifecycle::Ready);
     unready(&gap, Error::Unverified);
-    timeout(BUDGET, refresh).await.unwrap().unwrap().unwrap();
+    timeout(test_timeout(BUDGET), refresh)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     let next = connection_facts(&f.auth.service);
     assert!(
         next.settled().unwrap().selected().secret_revision > original.selected().secret_revision
@@ -2791,7 +2834,7 @@ async fn facts_disconnect_reservation_and_begun_effect_have_distinct_metadata() 
     let host = s.host.clone();
     let disconnect =
         intent_core::spawn_daemon(async move { service.gitlab_revoke_owned(host).await });
-    timeout(BUDGET, async {
+    timeout(test_timeout(BUDGET), async {
         loop {
             let facts = connection_facts(&f.service);
             if facts.preflight_pending() {
@@ -2815,7 +2858,11 @@ async fn facts_disconnect_reservation_and_begun_effect_have_distinct_metadata() 
     assert_eq!(begun.mutation(), Some(MutationKind::Disconnect));
     unready(&begun, Error::Mutating);
     pause.resume();
-    timeout(BUDGET, disconnect).await.unwrap().unwrap().unwrap();
+    timeout(test_timeout(BUDGET), disconnect)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     let final_facts = connection_facts(&f.service);
     assert_eq!(final_facts.lifecycle(), Lifecycle::Disconnected);
     assert_eq!(final_facts.mutation(), None);
@@ -2996,7 +3043,7 @@ async fn hold_output_rank(original: Arc<RepositoryReadEligibility>, rank: usize)
         release: Some(release),
         worker: Some(worker),
     };
-    timeout(BUDGET, ready).await.unwrap().unwrap();
+    timeout(test_timeout(BUDGET), ready).await.unwrap().unwrap();
     held
 }
 
@@ -3062,7 +3109,7 @@ async fn optional_output_busy_optional_locks_never_delay_required_at_any_rank() 
         let admission =
             tokio::task::spawn_blocking(move || optional_choice(&[&good], Some(&captured)));
         // Required output must finish BEFORE releasing the additional busy lock.
-        let result = timeout(BUDGET, admission).await;
+        let result = timeout(test_timeout(BUDGET), admission).await;
         drop(held);
         assert!(!result.unwrap().unwrap().unwrap(), "rank {rank}");
         assert!(optional_only(Some(&facts)));
@@ -3169,7 +3216,7 @@ async fn optional_output_reversed_owner_and_directory_orders_make_progress() {
         }));
     }
     for task in work {
-        timeout(BUDGET, task).await.unwrap().unwrap();
+        timeout(test_timeout(BUDGET), task).await.unwrap().unwrap();
     }
     assert_eq!(s.count(), 0);
 }
@@ -3526,10 +3573,10 @@ async fn optional_output_ready_before_proof_cannot_reuse_old_settled_facts() {
         entered.send(()).unwrap();
         let _ = wait.recv();
     });
-    timeout(BUDGET, ready).await.unwrap().unwrap();
+    timeout(test_timeout(BUDGET), ready).await.unwrap().unwrap();
     let service = f.auth.service.clone();
     let observation = tokio::task::spawn_blocking(move || connection_facts(&service));
-    timeout(BUDGET, async {
+    timeout(test_timeout(BUDGET), async {
         loop {
             if matches!(
                 e.owner.settings.get().unwrap().config.try_lock(),
@@ -3543,7 +3590,7 @@ async fn optional_output_ready_before_proof_cannot_reuse_old_settled_facts() {
     .await
     .unwrap();
     pause.resume();
-    timeout(BUDGET, async {
+    timeout(test_timeout(BUDGET), async {
         loop {
             match e.owner.directory.binding() {
                 Ok(_) => break,
@@ -3559,10 +3606,17 @@ async fn optional_output_ready_before_proof_cannot_reuse_old_settled_facts() {
     assert!(!optional_only(Some(&original)));
     drop(release);
     holder.join().unwrap();
-    let gap = timeout(BUDGET, observation).await.unwrap().unwrap();
+    let gap = timeout(test_timeout(BUDGET), observation)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(gap.lifecycle(), Lifecycle::Ready);
     assert!(gap.settled().is_none());
-    timeout(BUDGET, refresh).await.unwrap().unwrap().unwrap();
+    timeout(test_timeout(BUDGET), refresh)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     assert!(!optional_choice(&[&e], Some(&gap)).unwrap());
     assert!(!optional_choice(&[&e], Some(&original)).unwrap());
     assert!(optional_choice(&[&e], Some(&connection_facts(&f.auth.service))).unwrap());
@@ -3593,12 +3647,15 @@ async fn optional_output_cancelled_auth_changes_only_after_retained_completion()
     );
     let requests = s.control.requests.lock().unwrap().len();
     pause.resume();
-    timeout(BUDGET, f.service.shutdown_settings())
+    timeout(test_timeout(BUDGET), f.service.shutdown_settings())
         .await
         .unwrap();
-    let _gate = timeout(BUDGET, f.service.gitlab_credential_gate.lock())
-        .await
-        .unwrap();
+    let _gate = timeout(
+        test_timeout(BUDGET),
+        f.service.gitlab_credential_gate.lock(),
+    )
+    .await
+    .unwrap();
     let completed = connection_facts(&f.service);
     assert_eq!(completed.lifecycle(), Lifecycle::Ready);
     assert_eq!(
@@ -3694,7 +3751,7 @@ async fn prompt_facts_busy_optional_lock_omits_before_release() {
         .unwrap();
         selected.unwrap()
     });
-    let result = timeout(BUDGET, admission).await;
+    let result = timeout(test_timeout(BUDGET), admission).await;
     drop(held);
     assert!(!result.unwrap().unwrap());
     RepositoryConnectionFacts::with_prompt_current(Some(&facts), |include| {
@@ -3812,7 +3869,7 @@ async fn native_facts_busy_optional_lock_omits_before_release() {
         .unwrap();
         selected.unwrap()
     });
-    let result = timeout(BUDGET, admission).await;
+    let result = timeout(test_timeout(BUDGET), admission).await;
     drop(held);
     assert!(!result.unwrap().unwrap());
     RepositoryConnectionFacts::with_native_context_current(Some(&facts), |include| {

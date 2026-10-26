@@ -18,7 +18,9 @@ use std::collections::HashMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Notify;
 use tokio::time::timeout;
-const BUDGET: Duration = Duration::from_secs(10);
+fn budget() -> Duration {
+    intentd_test_support::test_timeout(Duration::from_secs(10))
+}
 const MR: &str = "/api/v4/projects/group%2Fproject/merge_requests/4";
 const PROJECT: &str = "/api/v4/projects/group%2Fproject";
 
@@ -223,7 +225,7 @@ pub(crate) fn call(code: &str) -> Value {
 }
 
 pub(crate) async fn run(server: &WorkspaceMcpServer, code: &str) -> Value {
-    timeout(BUDGET, server.handle_message(&call(code)))
+    timeout(budget(), server.handle_message(&call(code)))
         .await
         .unwrap()
         .unwrap()
@@ -1457,6 +1459,84 @@ async fn implicit_github_read_refuses_unresolved_historical_selection() {
     .await;
 }
 
+/// intent-hq/intent#7449: the agent-facing refusal is deliberately generic,
+/// so the daemon log must name the failing stage and admission reason. A
+/// repo-less snapshot and monitor start over unresolved historical selection
+/// return the unchanged Forbidden refusal and log exactly one record each,
+/// without the remote URL.
+#[intent_test_macros::daemon_test]
+async fn unresolved_history_refusal_logs_stage_and_reason() {
+    let warnings = crate::test_tracing::Warnings::default();
+    let _guard = warnings.install();
+    let git = GitFixture::new().await;
+    GitFixture::seed_unresolved_history(&git.store, &git.workspace.id).await;
+    git.git(
+        &git.path,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/Actual/Repository.git",
+        ],
+    );
+    let services = Services::new(git.store.clone());
+    let agent = AgentId::new();
+    let session: AgentSession = serde_json::from_value(json!({
+        "id":agent,"workspaceId":git.workspace.id,"name":"refusal-log",
+        "status":"active","createdAt":"2026-10-22T00:00:00Z","updatedAt":"2026-10-22T00:00:00Z"
+    }))
+    .unwrap();
+    git.store.insert_agent_session(&session).await.unwrap();
+
+    for operation in ["pr.snapshot", "pr.monitor"] {
+        let result = if operation == "pr.snapshot" {
+            services.pr_state(git.workspace.id.clone(), 4, None).await
+        } else {
+            services
+                .pr_monitor_start(git.workspace.id.clone(), agent.clone(), 4, None)
+                .await
+        };
+        let Err(intent_core::Error::Forbidden(message)) = result else {
+            panic!("{operation}: expected the generic refusal, got {result:?}");
+        };
+        assert_eq!(message, REFUSAL, "{operation}");
+        let records: Vec<_> = warnings
+            .containing("repository read refused")
+            .into_iter()
+            .filter(|line| line.contains(&format!("operation=\"{operation}\"")))
+            .collect();
+        assert_eq!(records.len(), 1, "{operation}: {records:?}");
+        let record = &records[0];
+        for needle in [
+            format!("operation=\"{operation}\""),
+            "stage=TargetSelection".to_string(),
+            "error=Unavailable".to_string(),
+            format!("workspace_id={}", git.workspace.id),
+        ] {
+            assert!(
+                record.contains(&needle),
+                "{operation}: {needle} in {record}"
+            );
+        }
+        let lower = record.to_ascii_lowercase();
+        assert!(
+            !lower.contains("github.com") && !lower.contains("actual/repository"),
+            "{operation}: remote leaked into {record}"
+        );
+    }
+    assert_eq!(
+        warnings.containing("repository read refused").len(),
+        2,
+        "one record per refused call"
+    );
+    assert!(git
+        .store
+        .list_pr_monitors_by_agent(&agent)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
 /// Unresolved historical intent over a mappable GitLab remote keeps the strict
 /// refusal for snapshot and monitor, without any provider traffic or monitor
 /// registration.
@@ -1721,7 +1801,7 @@ impl ReadServer {
         *self.replies.pause.lock().unwrap() = Some(path.into());
     }
     pub(crate) async fn entered(&self) {
-        timeout(BUDGET, self.replies.entered.notified())
+        timeout(budget(), self.replies.entered.notified())
             .await
             .unwrap();
     }
@@ -1788,9 +1868,14 @@ async fn detached_actual_file_read_cancellation_keeps_lease_and_never_dispatches
     assert!(task.await.unwrap_err().is_cancelled());
     let gate = f.auth.service.gitlab_credential_gate.lock();
     tokio::pin!(gate);
-    assert!(timeout(Duration::from_millis(40), &mut gate).await.is_err());
+    assert!(timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(40)),
+        &mut gate
+    )
+    .await
+    .is_err());
     file.resume();
-    drop(timeout(BUDGET, gate).await.unwrap());
+    drop(timeout(budget(), gate).await.unwrap());
     assert_eq!(http.count(), 0);
     let fresh = run(&f.server(), "return await ws.pr.snapshot(4);").await;
     assert!(fresh.to_string().contains("actual review"), "{fresh}");

@@ -13,7 +13,7 @@ use intent_core::{
 };
 use serde_json::{json, Value};
 
-use crate::mcp_server::bindings::{map_err, opt_bool, opt_str, opt_vec_str};
+use crate::mcp_server::bindings::{map_err, opt_bool, opt_str, opt_strict_bool, opt_vec_str};
 
 pub(crate) const PRELUDE: &str = r"
     globalThis.ws = globalThis.ws || {};
@@ -86,9 +86,20 @@ async fn list(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, String
     let include_deleted = filter_obj
         .and_then(|f| opt_bool(f, "includeDeleted"))
         .unwrap_or(false);
+    // Retired workspaces are opt-in only (PROTOCOL §5.1): listed only with
+    // an explicit `filter.includeRetired: true`, never via a status filter
+    // alone.
+    let include_retired = match filter_obj {
+        Some(f) => opt_strict_bool(f, "includeRetired")?,
+        None => None,
+    }
+    .unwrap_or(false);
 
     // Fetch all workspaces (include archived so we can apply status filter)
-    let workspaces = api.list_workspaces(true).await.map_err(map_err)?;
+    let workspaces = api
+        .list_workspaces(intent_core::WorkspaceListFilter::new(true, include_retired))
+        .await
+        .map_err(map_err)?;
 
     // Filter and summarize
     let mut results = Vec::new();
@@ -760,7 +771,10 @@ async fn lookup_known_repo_local_path(
     github_url: &str,
 ) -> Option<String> {
     let wanted = GitRemoteUrl::parse(github_url)?.github_repo()?;
-    let workspaces = api.list_workspaces(true).await.ok()?;
+    let workspaces = api
+        .list_workspaces(intent_core::WorkspaceListFilter::WITH_ARCHIVED)
+        .await
+        .ok()?;
 
     let mut strict = Vec::new();
     let mut name_only = Vec::new();
@@ -981,8 +995,11 @@ async fn archive(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, Str
 
     assert_mutable_workspace_id(id)?;
 
-    // Validate workspace exists
-    let workspaces = api.list_workspaces(true).await.map_err(map_err)?;
+    // Validate workspace exists (id validation, not a listing: retired ids stay deletable)
+    let workspaces = api
+        .list_workspaces(intent_core::WorkspaceListFilter::ALL)
+        .await
+        .map_err(map_err)?;
     let workspace = workspaces
         .iter()
         .find(|w| w.id.as_str() == id)
@@ -1026,8 +1043,11 @@ async fn delete(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value, Stri
 
     assert_mutable_workspace_id(id)?;
 
-    // Validate workspace exists
-    let workspaces = api.list_workspaces(true).await.map_err(map_err)?;
+    // Validate workspace exists (id validation, not a listing: retired ids stay deletable)
+    let workspaces = api
+        .list_workspaces(intent_core::WorkspaceListFilter::ALL)
+        .await
+        .map_err(map_err)?;
     let workspace = workspaces
         .iter()
         .find(|w| w.id.as_str() == id)
@@ -1083,8 +1103,11 @@ async fn bulk_archive(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value
         }
     }
 
-    // Validate all workspaces exist
-    let workspaces = api.list_workspaces(true).await.map_err(map_err)?;
+    // Validate all workspaces exist (id validation, not a listing: retired ids stay deletable)
+    let workspaces = api
+        .list_workspaces(intent_core::WorkspaceListFilter::ALL)
+        .await
+        .map_err(map_err)?;
     let mut bulk_items = Vec::new();
 
     for id_val in ids {
@@ -1146,8 +1169,11 @@ async fn bulk_delete(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value,
         }
     }
 
-    // Validate all workspaces exist
-    let workspaces = api.list_workspaces(true).await.map_err(map_err)?;
+    // Validate all workspaces exist (id validation, not a listing: retired ids stay deletable)
+    let workspaces = api
+        .list_workspaces(intent_core::WorkspaceListFilter::ALL)
+        .await
+        .map_err(map_err)?;
     let mut bulk_items = Vec::new();
 
     for id_val in ids {
@@ -1194,9 +1220,7 @@ async fn bulk_delete(api: &Arc<dyn WorkspaceApi>, args: &Value) -> Result<Value,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use intent_core::{
-        BoxFuture, Error, Result, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus,
-    };
+    use intent_core::{BoxFuture, Error, Result, Workspace, WorkspaceStatus};
     use serde_json::json;
     use std::sync::{Arc, Mutex};
 
@@ -1217,9 +1241,16 @@ mod tests {
     impl WorkspaceApi for FakeApi {
         fn list_workspaces(
             &self,
-            _include_archived: bool,
+            filter: intent_core::WorkspaceListFilter,
         ) -> BoxFuture<'_, Result<Vec<Workspace>>> {
-            let workspaces = self.workspaces.lock().unwrap().clone();
+            let workspaces: Vec<Workspace> = self
+                .workspaces
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|w| filter.admits(w))
+                .cloned()
+                .collect();
             Box::pin(async move { Ok(workspaces) })
         }
 
@@ -1270,49 +1301,134 @@ mod tests {
             id: WorkspaceId::from_string(id),
             title: title.to_string(),
             branch: "main".to_string(),
-            base_ref: None,
-            base_commit_sha: None,
-            status: WorkspaceStatus::Active,
-            status_message: None,
-            status_image_asset_id: None,
-            activity: WorkspaceActivity::Idle,
-            attention: WorkspaceAttention::None,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
-            last_activity: None,
-            last_content_activity: None,
-            tags: vec![],
-            path: None,
             repository_path: Some("/repo".to_string()),
             repository_owner: Some("owner".to_string()),
             repository_name: Some("repo".to_string()),
-            worktree_path: None,
-            scope: None,
-            skip_worktree: false,
-            setup_script: None,
-            is_remote: false,
-            default_model: None,
-            pr_number: None,
-            pr_url: None,
-            pr_status: None,
-            active_pull_request: None,
-            pull_requests: None,
-            context_links: None,
-            archived: false,
-            archived_at: None,
-            task_stats: None,
-            agent_summary: None,
-            diff_summary: None,
-            token_usage: None,
-            cow_supported: None,
-            browser_client_id: None,
-            pull_requests_total: None,
-            display_status: None,
-            waiting: false,
-            checkout_mode: None,
-            disk_usage: None,
-            pending_delete_at: None,
-            membership: None,
+            ..Default::default()
+        }
+    }
+
+    /// `app.workspaces.delete` / `bulkDelete` validate ids against every
+    /// row, retired included: a retired workspace stays deletable (its id is
+    /// not reported as not found just because lists hide it).
+    #[tokio::test]
+    async fn delete_accepts_retired_workspace_ids() {
+        let fake = Arc::new(FakeApi::default());
+        let mut retired = make_workspace("ws-retired", "Retired");
+        retired.status = WorkspaceStatus::Retired;
+        retired.archived = true;
+        fake.workspaces.lock().unwrap().push(retired);
+        let api: Arc<dyn WorkspaceApi> = fake;
+        let chief = WorkspaceId::chief();
+        let one = dispatch(&api, &chief, None, "delete", &json!({ "id": "ws-retired" })).await;
+        assert!(
+            one.as_ref().err().is_none_or(|e| !e.contains("not found")),
+            "{one:?}"
+        );
+        let bulk = dispatch(
+            &api,
+            &chief,
+            None,
+            "bulkDelete",
+            &json!({ "ids": ["ws-retired"] }),
+        )
+        .await;
+        assert!(
+            bulk.as_ref().err().is_none_or(|e| !e.contains("not found")),
+            "{bulk:?}"
+        );
+    }
+
+    /// `app.workspaces.list` (the ws.app.* MCP binding) hides retired
+    /// workspaces unless `filter.includeRetired: true` — even a
+    /// `status: "retired"` filter alone does not surface them.
+    #[tokio::test]
+    async fn list_hides_retired_unless_include_retired() {
+        let fake = Arc::new(FakeApi::default());
+        let live = make_workspace("ws-live", "Live");
+        let mut retired = make_workspace("ws-retired", "Retired");
+        retired.status = WorkspaceStatus::Retired;
+        retired.archived = true;
+        retired.retired_at = Some("2026-10-22T00:00:00Z".to_string());
+        fake.workspaces.lock().unwrap().extend([live, retired]);
+        let api: Arc<dyn WorkspaceApi> = fake;
+        let chief = WorkspaceId::chief();
+        let ids = |v: Value| -> Vec<String> {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .map(|w| w["id"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        let default = dispatch(&api, &chief, None, "list", &json!({}))
+            .await
+            .unwrap();
+        assert_eq!(ids(default), vec!["ws-live"]);
+        let by_status = dispatch(
+            &api,
+            &chief,
+            None,
+            "list",
+            &json!({ "filter": { "status": "retired" } }),
+        )
+        .await
+        .unwrap();
+        assert!(ids(by_status).is_empty());
+        let opted_in = dispatch(
+            &api,
+            &chief,
+            None,
+            "list",
+            &json!({ "filter": { "includeRetired": true } }),
+        )
+        .await
+        .unwrap();
+        let mut got = ids(opted_in);
+        got.sort();
+        assert_eq!(got, vec!["ws-live", "ws-retired"]);
+    }
+
+    /// `filter.includeRetired` is strictly boolean: explicit `false` behaves
+    /// like omission, and a non-boolean value is an invalid-params error
+    /// instead of silently meaning `false`.
+    #[tokio::test]
+    async fn list_rejects_a_non_boolean_include_retired() {
+        let fake = Arc::new(FakeApi::default());
+        let mut retired = make_workspace("ws-retired", "Retired");
+        retired.status = WorkspaceStatus::Retired;
+        retired.archived = true;
+        fake.workspaces
+            .lock()
+            .unwrap()
+            .extend([make_workspace("ws-live", "Live"), retired]);
+        let api: Arc<dyn WorkspaceApi> = fake;
+        let chief = WorkspaceId::chief();
+        let list = |filter: Value| {
+            let api = api.clone();
+            let chief = chief.clone();
+            async move { dispatch(&api, &chief, None, "list", &json!({ "filter": filter })).await }
+        };
+        let count = |v: Value| v.as_array().unwrap().len();
+
+        assert_eq!(
+            count(list(json!({ "includeRetired": false })).await.unwrap()),
+            1
+        );
+        assert_eq!(
+            count(list(json!({ "includeRetired": true })).await.unwrap()),
+            2
+        );
+        for bad in [json!("true"), Value::Null, json!(1), json!({})] {
+            let err = list(json!({ "includeRetired": bad.clone() }))
+                .await
+                .expect_err("non-boolean includeRetired must be rejected");
+            assert!(
+                err.contains("invalid params") && err.contains("includeRetired"),
+                "{bad}: {err}"
+            );
         }
     }
 

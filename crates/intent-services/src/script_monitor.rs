@@ -1,29 +1,31 @@
 //! Durable script-monitor wake delivery and lifecycle suppression.
 use crate::Services;
-use intent_core::{AgentId, MessageOrigin, Result, ScriptMonitor, WorkspaceId};
+use std::sync::Arc;
+
+use intent_core::{AgentId, Result, ScriptMonitor, WorkspaceId};
 use serde_json::{json, Value};
 
-pub(crate) fn wake_id(metadata: Option<&Value>) -> Option<String> {
-    let md = metadata?;
-    (md["type"] == "script_monitor_wake")
-        .then(|| {
-            md["monitorId"]
-                .as_str()
-                .map(|id| format!("script-monitor:{id}"))
-        })
-        .flatten()
-}
-
-pub(crate) fn monitor_id(metadata: Option<&Value>) -> Option<&str> {
-    let md = metadata?;
-    (md["type"] == "script_monitor_wake")
-        .then(|| md["monitorId"].as_str())
-        .flatten()
-}
+use crate::feature_ports::{monitor_id, wake_id};
 
 impl Services {
+    /// Ids of the active monitors on `script_id` (any owner).
+    pub(crate) async fn active_script_monitor_ids(
+        &self,
+        workspace_id: &WorkspaceId,
+        script_id: &str,
+    ) -> Result<Vec<String>> {
+        Ok(self
+            .store()
+            .script_monitors(workspace_id, None)
+            .await?
+            .into_iter()
+            .filter(|m| m.script_id == script_id && m.state == "active")
+            .map(|m| m.monitor_id)
+            .collect())
+    }
     pub(crate) fn track_script_monitor_worker(&self, agent: &AgentId, metadata: Option<&Value>) {
         let mut workers = self
+            .runtime()
             .script_locks
             .monitor_workers
             .lock()
@@ -37,6 +39,7 @@ impl Services {
 
     pub(crate) async fn settle_script_monitor_worker(&self, agent: &AgentId) {
         let id = self
+            .runtime()
             .script_locks
             .monitor_workers
             .lock()
@@ -50,6 +53,7 @@ impl Services {
     pub(crate) async fn complete_script_monitor_delivery(&self, agent: &AgentId, id: &str) {
         {
             let mut workers = self
+                .runtime()
                 .script_locks
                 .monitor_workers
                 .lock()
@@ -60,7 +64,8 @@ impl Services {
         }
         // Record the exact finished delivery before awaiting SQL. A temporary
         // marker-write failure must neither lose retry ownership nor re-prompt.
-        self.script_locks
+        self.runtime()
+            .script_locks
             .monitor_completions
             .lock()
             .expect("monitor completion retries")
@@ -69,9 +74,10 @@ impl Services {
     }
 
     pub(crate) async fn retry_script_monitor_completion(&self, agent: &AgentId, id: &str) {
-        match self.store.complete_script_notification(agent, id).await {
+        match self.store().complete_script_notification(agent, id).await {
             Ok(()) => {
-                self.script_locks
+                self.runtime()
+                    .script_locks
                     .monitor_completions
                     .lock()
                     .expect("monitor completion retries")
@@ -89,11 +95,9 @@ impl Services {
         let Some(md) = metadata.filter(|md| monitor_id(Some(md)).is_some()) else {
             return false;
         };
-        self.transfer_exports
-            .lock()
-            .expect("export registry")
-            .values()
-            .any(|session| md["workspaceId"].as_str() == Some(session.workspace_id.as_str()))
+        md["workspaceId"]
+            .as_str()
+            .is_some_and(|workspace| self.feature_transfer_port().export_in_progress(workspace))
     }
 
     pub(crate) fn defer_script_monitor_for_export(
@@ -105,21 +109,23 @@ impl Services {
         if !self.script_monitor_export_blocked(metadata) {
             return false;
         }
-        self.enqueue_message_with_id(
+        // The queued entry is what matters; its receipt is not needed here.
+        let _receipt = self.feature_agent_wake().enqueue_automatic_message(
+            self,
             agent,
             wake_id(metadata),
             content.to_owned(),
-            None,
-            None,
             metadata.cloned(),
-            None,
-            false,
-            MessageOrigin::Automatic,
         );
         true
     }
-    pub(crate) fn start_script_monitor_maintenance(&self) {
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub fn start_script_monitor_maintenance(&self) {
         if self
+            .runtime()
             .script_locks
             .monitor_maintenance
             .swap(true, std::sync::atomic::Ordering::SeqCst)
@@ -134,10 +140,11 @@ impl Services {
                 // closes; stop here so no tick writes to a closing store.
                 tokio::select! {
                     biased;
-                    () = services.settings_tasks.closed() => break,
+                    () = services.feature_settings_tasks().closed() => break,
                     _ = sweep.tick() => {}
                 }
                 let completions = services
+                    .runtime()
                     .script_locks
                     .monitor_completions
                     .lock()
@@ -149,13 +156,13 @@ impl Services {
                     services.retry_script_monitor_completion(&agent, &id).await;
                 }
                 if let Err(error) = services
-                    .store
+                    .store()
                     .cleanup_completed_script_notifications()
                     .await
                 {
                     tracing::warn!(%error, "completed notification cleanup will retry");
                 }
-                if let Ok(rows) = services.store.pending_script_monitors().await {
+                if let Ok(rows) = services.store().pending_script_monitors().await {
                     for (row, _) in rows {
                         if row.state == "active" {
                             if let Err(error) = services
@@ -170,23 +177,24 @@ impl Services {
                         }
                     }
                 }
-                if let Ok(jobs) = services.store.script_notification_jobs().await {
+                if let Ok(jobs) = services.store().script_notification_jobs().await {
                     for job in jobs {
                         if let Err(error) = services.dispatch_script_notification(&job).await {
                             tracing::warn!(%error, wake=%job.wake_id, "script notification remains pending");
                         }
                     }
                 }
-                if let (Some(manager), Ok(owners)) = (
-                    services.agent_manager(),
-                    services.store.script_notification_delivery_owners().await,
+                if let (Some(drainer), Ok(owners)) = (
+                    services.feature_agent_wake().queue_drainer(&services),
+                    services.store().script_notification_delivery_owners().await,
                 ) {
                     for (agent, ws) in owners {
-                        manager.clone().try_drain_queue(agent, ws).await;
+                        Arc::clone(&drainer).try_drain_queue(agent, ws).await;
                     }
                 }
             }
             services
+                .runtime()
                 .script_locks
                 .monitor_maintenance
                 .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -194,7 +202,7 @@ impl Services {
     }
 
     pub(crate) async fn active_script_monitors_for_agent(&self, agent: &AgentId) -> Vec<Value> {
-        self.store
+        self.store()
             .script_monitor_waiting(None, Some(agent))
             .await
             .unwrap_or_default()
@@ -224,7 +232,7 @@ impl Services {
 
     async fn dispatch_script_monitor_inner(&self, row: &ScriptMonitor) -> Result<()> {
         if let Some(job) = self
-            .store
+            .store()
             .script_notification_jobs()
             .await?
             .into_iter()
@@ -239,52 +247,39 @@ impl Services {
         &self,
         job: &intent_store::ScriptNotificationJob,
     ) -> Result<()> {
-        let lane = self.script_locks.monitor_lane.lock().await;
+        let lane = self.runtime().script_locks.monitor_lane.lock().await;
         if self.script_monitor_export_blocked(Some(&job.metadata)) {
             return Ok(());
         }
         let Some(id) = monitor_id(Some(&job.metadata)) else {
             return Ok(());
         };
-        if !self.store.script_monitor_wake_pending(id).await? {
+        if !self.store().script_monitor_wake_pending(id).await? {
             return Ok(());
         }
         if !self
             .script_monitor_delivery_allowed(&job.agent_id, Some(&job.metadata))
             .await?
         {
-            self.store.finish_script_monitor_wake(id, true).await?;
+            self.store().finish_script_monitor_wake(id, true).await?;
             return Ok(());
         }
-        let Some(manager) = self.agent_manager() else {
+        let agents = self.feature_agent_wake();
+        let Some(drainer) = agents.queue_drainer(self) else {
             return Ok(());
         };
-        let (queued, position) = self.enqueue_message_with_id(
+        let receipt = agents.enqueue_automatic_message(
+            self,
             &job.agent_id,
             Some(job.wake_id.clone()),
             job.body.clone(),
-            None,
-            None,
             Some(job.metadata.clone()),
-            None,
-            false,
-            MessageOrigin::Automatic,
-        );
-        let receipt = intent_store::AgentQueueRow {
-            id: queued.id.clone(),
-            agent_id: job.agent_id.clone(),
-            position: i64::try_from(position).unwrap_or(i64::MAX),
-            payload: serde_json::to_value(&queued)
-                .map_err(|e| intent_core::Error::Internal(e.to_string()))?,
-            created_at: queued.queued_at.clone(),
-            turn_id: queued.turn_id.clone(),
-        };
+        )?;
         // This transaction, not the transcript or best-effort snapshot, transfers ownership.
-        self.store.admit_script_notification(&receipt).await?;
-        self.publish_queue_updated(&job.agent_id).await;
+        self.store().admit_script_notification(&receipt).await?;
+        agents.publish_queue_updated(self, &job.agent_id).await;
         drop(lane);
-        manager
-            .clone()
+        drainer
             .try_drain_queue(job.agent_id.clone(), job.workspace_id.clone())
             .await;
         Ok(())
@@ -298,14 +293,14 @@ impl Services {
         if monitor_id(metadata).is_none() {
             return Ok(true);
         }
-        let _lane = self.script_locks.monitor_lane.lock().await;
+        let _lane = self.runtime().script_locks.monitor_lane.lock().await;
         if !self
             .script_monitor_delivery_allowed(agent, metadata)
             .await?
         {
             return Ok(false);
         }
-        self.store
+        self.store()
             .accept_script_notification(agent, monitor_id(metadata).expect("monitor checked"))
             .await
     }
@@ -319,6 +314,7 @@ impl Services {
             return Ok(true);
         };
         if self
+            .runtime()
             .script_locks
             .monitor_completions
             .lock()
@@ -327,7 +323,7 @@ impl Services {
         {
             return Ok(false);
         }
-        let owner = match self.store.get_agent_session_summary(agent).await {
+        let owner = match self.store().get_agent_session_summary(agent).await {
             Ok(owner) => owner,
             Err(intent_core::Error::NotFound(_)) => return Ok(false),
             Err(error) => return Err(error),
@@ -337,12 +333,12 @@ impl Services {
                 .and_then(|md| md["agentId"].as_str())
                 .is_some_and(|id| id != agent.as_str())
             || self
-                .store
+                .store()
                 .get_agent_session_retired_at(agent)
                 .await?
                 .is_some()
             || (!owner.workspace_id.is_chief()
-                && match self.store.get_workspace(&owner.workspace_id).await {
+                && match self.store().get_workspace(&owner.workspace_id).await {
                     Ok(workspace) => workspace.archived,
                     Err(intent_core::Error::NotFound(_)) => true,
                     Err(error) => return Err(error),
@@ -350,7 +346,7 @@ impl Services {
         {
             return Ok(false);
         }
-        self.store
+        self.store()
             .script_monitor_wake_allowed_for_agent(id, agent, &owner.workspace_id)
             .await
     }
@@ -366,7 +362,7 @@ impl Services {
             .cleanup_monitors(ws, agent, reason)
             .await?;
         {
-            let mut queues = self.agent_queues.lock().expect("queue registry");
+            let mut queues = self.feature_agent_queues().lock().expect("queue registry");
             for (id, queue) in queues.iter_mut() {
                 if agent.is_some_and(|a| a != id) {
                     continue;

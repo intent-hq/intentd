@@ -11,7 +11,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -21,9 +21,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use intent_core::{
-    now_iso, PullRequestInfo, PullRequestStatus, Result as CoreResult, Workspace,
-    WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceGitRoot, WorkspaceGitRootId,
-    WorkspaceGitRootSource, WorkspaceId, WorkspaceStatus,
+    now_iso, PullRequestInfo, PullRequestStatus, Result as CoreResult, Workspace, WorkspaceApi,
+    WorkspaceGitRoot, WorkspaceGitRootId, WorkspaceGitRootSource, WorkspaceId,
 };
 use intent_services::{EventBus, Services};
 use intent_sourcecontrol::{
@@ -387,49 +386,16 @@ async fn boot() -> Fixture {
         id: ws_id.clone(),
         title: "Pulls get fold".into(),
         branch: "feature".into(),
-        base_ref: None,
-        base_commit_sha: None,
-        status: WorkspaceStatus::Active,
-        status_message: None,
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
-        attention: WorkspaceAttention::None,
         created_at: ts.clone(),
         updated_at: ts.clone(),
-        last_activity: None,
-        last_content_activity: None,
-        tags: vec![],
-        path: None,
-        repository_path: None,
         repository_owner: Some("o".into()),
         repository_name: Some("r".into()),
-        worktree_path: None,
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
-        default_model: None,
         pr_number: Some(42),
         pr_url: Some(PR_URL.into()),
         pr_status: Some(PullRequestStatus::Open),
         active_pull_request: Some(open_pr_info()),
         pull_requests: Some(vec![open_pr_info()]),
-        context_links: None,
-        archived: false,
-        archived_at: None,
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        pull_requests_total: None,
-        display_status: None,
-        waiting: false,
-        checkout_mode: None,
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
+        ..Default::default()
     };
     store.insert_workspace(&ws).await.expect("seed workspace");
     let root_id = WorkspaceGitRootId::new();
@@ -555,22 +521,25 @@ async fn next_events(ws: &mut TlsWs, n: usize) -> Vec<Value> {
 /// Assert no further `events.event` notification arrives within a short
 /// window (the fold writes nothing for a PR nobody references).
 async fn assert_no_events(ws: &mut TlsWs) {
-    let idle = timeout(Duration::from_millis(600), async {
-        loop {
-            match ws.next().await.unwrap().unwrap() {
-                Message::Text(text) => {
-                    let v: Value = serde_json::from_str(&text).unwrap();
-                    if v["method"] == json!("events.event") {
-                        return v["params"]["event"].clone();
+    let idle = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(600)),
+        async {
+            loop {
+                match ws.next().await.unwrap().unwrap() {
+                    Message::Text(text) => {
+                        let v: Value = serde_json::from_str(&text).unwrap();
+                        if v["method"] == json!("events.event") {
+                            return v["params"]["event"].clone();
+                        }
                     }
+                    Message::Ping(p) => {
+                        let _ = ws.send(Message::Pong(p)).await;
+                    }
+                    _ => {}
                 }
-                Message::Ping(p) => {
-                    let _ = ws.send(Message::Pong(p)).await;
-                }
-                _ => {}
             }
-        }
-    })
+        },
+    )
     .await;
     if let Ok(evt) = idle {
         panic!("unexpected event: {evt}");

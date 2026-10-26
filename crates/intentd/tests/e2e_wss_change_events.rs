@@ -10,10 +10,11 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
+use intentd_test_support::GuardedChild;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -33,15 +34,14 @@ use tokio_tungstenite::WebSocketStream;
 const TOKEN: &str = "abababababababababababababababababababababababababababababababab";
 
 struct Daemon {
-    child: Child,
+    child: GuardedChild,
     data_dir: PathBuf,
     _data_dir_guard: tempfile::TempDir,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.child.kill_tree();
     }
 }
 
@@ -49,7 +49,7 @@ fn scratch_dir(prefix: &str) -> tempfile::TempDir {
     common::test_tempdir_in("/tmp", &format!("itd-wss-events-{prefix}-"))
 }
 
-fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
+fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> GuardedChild {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
@@ -68,7 +68,7 @@ fn spawn_serve(data_dir: &Path, env: &[(&str, &str)]) -> Child {
         cmd.env(k, v);
     }
     common::hermetic_fixture_identity(&mut cmd, data_dir);
-    cmd.spawn().expect("spawn intentd serve")
+    GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -256,7 +256,8 @@ async fn next_event<S>(ws: &mut WebSocketStream<S>, types: &[&str], secs: u64) -
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(secs));
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         assert!(!remaining.is_zero(), "timed out waiting for {types:?}");
@@ -1311,32 +1312,35 @@ async fn note_list_reseeds_missing_spec_over_wss() {
     // The reseed publishes exactly one `note:created`; drain the socket for a
     // short window and fail if a second one arrives. Non-matching frames
     // (heartbeats, other event types) are ignored.
-    let extra = timeout(Duration::from_millis(500), async {
-        loop {
-            match sub.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let v: Value = match serde_json::from_str(&text) {
-                        Ok(x) => x,
-                        Err(_) => continue,
-                    };
-                    if v["method"] == json!("events.event")
-                        && v["params"]["event"]["type"] == json!("note:created")
-                    {
-                        return Some(v);
+    let extra = timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(500)),
+        async {
+            loop {
+                match sub.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = match serde_json::from_str(&text) {
+                            Ok(x) => x,
+                            Err(_) => continue,
+                        };
+                        if v["method"] == json!("events.event")
+                            && v["params"]["event"]["type"] == json!("note:created")
+                        {
+                            return Some(v);
+                        }
                     }
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = sub.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(_)) => {}
+                    // Stream close / error during the "should be quiet" window is
+                    // not the condition this drain is guarding against; surface
+                    // it instead of spinning silently until the timeout.
+                    Some(Err(e)) => panic!("subscription socket errored during drain: {e:?}"),
+                    None => panic!("subscription socket closed during drain"),
                 }
-                Some(Ok(Message::Ping(p))) => {
-                    let _ = sub.send(Message::Pong(p)).await;
-                }
-                Some(Ok(_)) => {}
-                // Stream close / error during the "should be quiet" window is
-                // not the condition this drain is guarding against; surface
-                // it instead of spinning silently until the timeout.
-                Some(Err(e)) => panic!("subscription socket errored during drain: {e:?}"),
-                None => panic!("subscription socket closed during drain"),
             }
-        }
-    })
+        },
+    )
     .await;
     assert!(
         extra.is_err(),
@@ -1419,29 +1423,32 @@ async fn drain_extra<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    timeout(Duration::from_millis(window_ms), async {
-        loop {
-            match ws.next().await {
-                Some(Ok(Message::Text(text))) => {
-                    let v: Value = match serde_json::from_str(&text) {
-                        Ok(x) => x,
-                        Err(_) => continue,
-                    };
-                    if v["method"] == json!("events.event")
-                        && v["params"]["event"]["type"] == json!(event_type)
-                    {
-                        return v;
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(window_ms)),
+        async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        let v: Value = match serde_json::from_str(&text) {
+                            Ok(x) => x,
+                            Err(_) => continue,
+                        };
+                        if v["method"] == json!("events.event")
+                            && v["params"]["event"]["type"] == json!(event_type)
+                        {
+                            return v;
+                        }
                     }
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = ws.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => panic!("subscription socket errored during drain: {e:?}"),
+                    None => panic!("subscription socket closed during drain"),
                 }
-                Some(Ok(Message::Ping(p))) => {
-                    let _ = ws.send(Message::Pong(p)).await;
-                }
-                Some(Ok(_)) => {}
-                Some(Err(e)) => panic!("subscription socket errored during drain: {e:?}"),
-                None => panic!("subscription socket closed during drain"),
             }
-        }
-    })
+        },
+    )
     .await
     .ok()
 }
@@ -2949,7 +2956,8 @@ async fn next_subscription_push<S>(ws: &mut WebSocketStream<S>, secs: u64) -> Va
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(secs));
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         assert!(

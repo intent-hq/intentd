@@ -11,7 +11,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::net::Ipv4Addr;
 use std::path::Path;
@@ -129,7 +129,8 @@ fn seed_repo(tag: &str) -> tempfile::TempDir {
 /// `secs` of quiet, whichever comes first.
 async fn drain_progress_events(ws: &mut PlainWs, progress_id: &str, secs: u64) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(secs));
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {

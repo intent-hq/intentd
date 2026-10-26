@@ -72,6 +72,7 @@ const SCAN_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Bound on the teardown sweep for adopted orphans; they reparent within
 /// milliseconds of their parent's death, so this is margin, not expectation.
+// fixed-deadline: allow — stays under nextest's 180 s kill: part of the unscaled TEST_BUDGET + PING + REAP_TIMEOUT = 165 s sum above
 const REAP_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn self_pid() -> i32 {
@@ -839,8 +840,7 @@ mod helper_tests {
 
     /// Set on the re-invoked test binary that runs `orphan_scenario`.
     const ORPHAN_CHILD_ENV: &str = "INTENTD_PTY_JC_ORPHAN_CHILD";
-    const ORPHAN_TEST: &str =
-        "helper_tests::reap_adopted_kills_and_reaps_orphan_inherited_as_subreaper";
+    const ORPHAN_TEST: &str = "reap_adopted_kills_and_reaps_orphan_inherited_as_subreaper";
 
     /// The P2 leak: a detached grandchild whose parent died before teardown
     /// is reachable neither by ancestry nor by session. As subreaper we
@@ -871,7 +871,12 @@ mod helper_tests {
         }
         let exe = std::env::current_exe().expect("current_exe");
         let out = Command::new(exe)
-            .args(["--exact", ORPHAN_TEST, "--nocapture", "--test-threads=1"])
+            .args([
+                "--exact",
+                &common::exact_test_name(module_path!(), ORPHAN_TEST),
+                "--nocapture",
+                "--test-threads=1",
+            ])
             .env(ORPHAN_CHILD_ENV, "1")
             .stdin(Stdio::null())
             .output()

@@ -23,7 +23,11 @@ use serde_json::Value;
 /// act on their own authority (their reads are governed by the agent
 /// subscription rules, not the collaborator allowlist); an unbound request is
 /// never a collaborator here because the transport binds every wire caller.
-pub(crate) fn is_collaborator_caller() -> bool {
+#[expect(
+    clippy::must_use_candidate,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn is_collaborator_caller() -> bool {
     matches!(
         intent_core::current_caller(),
         Some(Caller::Wire {
@@ -75,6 +79,9 @@ impl crate::Services {
         &self,
         q: &mut EventQuery,
     ) -> intent_core::Result<bool> {
+        // Discussion history is participant-scoped in its own store. Legacy
+        // event copies cannot bypass that boundary, even for host owners.
+        q.exclude_discussion_events = true;
         let member = match intent_core::current_caller() {
             Some(Caller::Wire { principal_id, .. }) if is_collaborator_caller() => {
                 let member = matches!(

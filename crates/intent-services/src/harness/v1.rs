@@ -45,6 +45,7 @@ pub(crate) const FEATURE_LABELS: &[(&str, &str)] = &[
     ("scripts", "Saved scripts (ws.script.*)"),
     ("terminalAccess", "Terminal read access (ws.terminal.*)"),
     ("browserAutomation", "Browser automation (ws.browser.*)"),
+    ("desktopControl", "Desktop control (ws.desktop.*)"),
     ("richChatBlocks", "Rich chat block guidance"),
     (
         "structuredQuestions",
@@ -166,6 +167,60 @@ fn attention_verb(kind: &str) -> &str {
     }
 }
 
+/// Per-reviewer review changes (intentd#2605: a repeated `changes
+/// requested` left the decision and counts unchanged, so no wake fired).
+/// Reported only when BOTH snapshots carry `latestReviews`, so a baseline
+/// persisted before the field existed is adopted silently. Two lines:
+/// a reviewer's latest review identity moved ("new review"), and an
+/// approve / changes-requested review is now known to be on an older
+/// commit and was not already reported so ("older commit"; a baseline whose
+/// head was unknown counts as not yet reported).
+fn diff_latest_reviews(old: &PrMonitorSnapshot, new: &PrMonitorSnapshot) -> Vec<String> {
+    let (Some(before), Some(after)) = (
+        old.requirements.approvals.latest_reviews.as_ref(),
+        new.requirements.approvals.latest_reviews.as_ref(),
+    ) else {
+        return Vec::new();
+    };
+    let short = |sha: &str| -> String { sha.chars().take(8).collect() };
+    let head = new.head_sha.as_deref().filter(|h| !h.is_empty());
+    let mut changes = Vec::new();
+    // Oldest first, so a wake reads chronologically.
+    for review in after.iter().rev() {
+        let prior = before.iter().find(|b| b.reviewer == review.reviewer);
+        let state = review.state.replace('_', " ");
+        if prior.is_none_or(|p| p.identity() != review.identity()) {
+            let place = match (review.commit_sha.as_deref(), review.on_current_head) {
+                (Some(commit), Some(true)) => format!(" on {} (current head)", short(commit)),
+                (Some(commit), Some(false)) => format!(
+                    " on {} (older commit; head is {})",
+                    short(commit),
+                    head.map_or_else(|| "unknown".to_string(), short)
+                ),
+                (Some(commit), None) => format!(" on {}", short(commit)),
+                (None, _) => String::new(),
+            };
+            changes.push(format!(
+                "new review from {}: {state}{place}",
+                review.reviewer
+            ));
+        } else if matches!(review.state.as_str(), "approved" | "changes_requested")
+            && review.on_current_head == Some(false)
+            && prior.is_some_and(|p| p.on_current_head != Some(false))
+        {
+            if let (Some(commit), Some(head)) = (review.commit_sha.as_deref(), head) {
+                changes.push(format!(
+                    "{}'s latest review ({state}) is on an older commit {}; head is {}",
+                    review.reviewer,
+                    short(commit),
+                    short(head)
+                ));
+            }
+        }
+    }
+    changes
+}
+
 fn describe_opt<T: std::fmt::Display>(v: Option<T>) -> String {
     v.map_or_else(|| "unknown".to_string(), |v| v.to_string())
 }
@@ -191,7 +246,7 @@ fn plural(n: i64) -> &'static str {
 /// name's required flag, independently of uncertainty for other check names.
 ///
 /// Normal success transitions are suppressed: a check going `pending` →
-/// `passed`, or appearing already green, is expected progress rather than a
+/// `passed` or `skipped`, or appearing already green or skipped, is expected progress rather than a
 /// reportable change — the suite-completion summary in
 /// [`V1::pr_diff_lines`] covers the "everything finished" moment. A
 /// `failed` → `passed` recovery IS reported, since it resolves a previously
@@ -214,13 +269,14 @@ fn diff_checks(old: &PrMonitorSnapshot, new: &PrMonitorSnapshot) -> Vec<String> 
     for check in &n.items {
         match before.get(&check.name) {
             None => {
-                if check.status != "passed" {
+                if !matches!(check.status.as_str(), "passed" | "skipped") {
                     changes.push(format!("check started: {} ({})", check.name, check.status));
                 }
             }
             Some(prev) => {
                 if prev.status != check.status
-                    && !(check.status == "passed" && prev.status == "pending")
+                    && !(matches!(check.status.as_str(), "passed" | "skipped")
+                        && prev.status == "pending")
                 {
                     changes.push(format!(
                         "check {}: {} → {}",
@@ -577,8 +633,37 @@ impl Harness for V1 {
             .to_string()
     }
 
-    fn note_images_notice(&self, n: usize) -> String {
-        format!("[System: {n} image(s) from the referenced note(s) are attached to this message.]")
+    fn note_reference_notice(
+        &self,
+        title: &str,
+        id: &str,
+        image_urls: &[String],
+        omitted: usize,
+    ) -> String {
+        let (title, id) = (notice_field(title), notice_field(id));
+        let mut notice = format!(
+            "[Note in context: \"{title}\" (ID: {id}). Its content is NOT inlined in this \
+             message; read it with ws.note.read(\"{id}\")."
+        );
+        if !image_urls.is_empty() {
+            let total = image_urls.len() + omitted;
+            let _ = write!(
+                notice,
+                " It embeds {total} image(s), also NOT inlined; view one with \
+                 ws.note.readAsset(\"<url>\"):"
+            );
+            for url in image_urls {
+                let _ = write!(notice, "\n- {url}");
+            }
+            if omitted > 0 {
+                let _ = write!(
+                    notice,
+                    "\n- …and {omitted} more (listed in the note content)"
+                );
+            }
+        }
+        notice.push(']');
+        notice
     }
 
     fn attachment_reference_notice(
@@ -965,8 +1050,20 @@ impl Harness for V1 {
     }
 
     fn pr_checklist(&self, s: &PrMonitorSnapshot) -> String {
+        let mut requirements =
+            serde_json::to_value(&s.requirements).expect("serialize requirements");
+        // A carried-forward list is bookkeeping, not this read's observation:
+        // render the row as unknown rather than as fresh data.
+        if s.latest_reviews_carried {
+            if let Some(approvals) = requirements
+                .get_mut("approvals")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                approvals.remove("latestReviews");
+            }
+        }
         super::review_wake::checklist(
-            &serde_json::to_value(&s.requirements).expect("serialize requirements"),
+            &requirements,
             crate::pr_monitor::requirements_ready(&s.requirements),
         )
     }
@@ -1022,6 +1119,7 @@ impl Harness for V1 {
                 describe_opt(n.approvals.needed)
             ));
         }
+        changes.extend(diff_latest_reviews(old, new));
 
         // Comments + threads.
         if old.conversation_count != new.conversation_count {
@@ -1074,14 +1172,35 @@ impl Harness for V1 {
             && n.checks.pending == 0
             && n.checks.total > 0
         {
-            changes.push(if n.checks.failed == 0 {
-                format!("all checks passed ({})", n.checks.total)
-            } else {
-                format!(
-                    "all checks completed: {} passed, {} failed",
-                    n.checks.passed, n.checks.failed
-                )
-            });
+            changes.push(super::review_wake::checks_completed(
+                n.checks.total,
+                n.checks.passed,
+                n.checks.failed,
+                &n.checks.names_with("skipped"),
+            ));
+        }
+
+        // CI never started on the head (intentd#2531): reported once per
+        // head, keyed on the flagged SHA. Its clearing is silent — arriving
+        // checks, a new head or conflicts report themselves.
+        if let Some(stall) = &n.checks_not_started {
+            let flagged_before = o
+                .checks_not_started
+                .as_ref()
+                .is_some_and(|s| s.head_sha == stall.head_sha)
+                || [old, new].iter().any(|s| {
+                    s.checks_not_started_delivered.as_deref() == Some(stall.head_sha.as_str())
+                });
+            if !flagged_before {
+                let short: String = stall.head_sha.chars().take(8).collect();
+                changes.push(format!(
+                    "no checks reported for head {short} after {}+ min — CI may never have \
+                     started; push again (e.g. an empty commit) or rebase to trigger it \
+                     (expected only if the required checks are path-filtered or run only in \
+                     the merge queue)",
+                    stall.threshold_minutes
+                ));
+            }
         }
 
         // Mergeability + residual signals. `unknown` is a transient GitHub
@@ -1314,4 +1433,21 @@ impl Harness for V1 {
              your other work or end your turn."
         )
     }
+}
+
+/// A user-controlled value (note title / id) made safe to quote inside a
+/// bracketed prompt notice: control characters (newlines included) become
+/// spaces, `"` becomes `'`, and `[` / `]` become `(` / `)`, so the value
+/// cannot close the notice or forge a separate system note.
+fn notice_field(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| match c {
+            c if c.is_control() => ' ',
+            '"' => '\'',
+            '[' => '(',
+            ']' => ')',
+            c => c,
+        })
+        .collect()
 }

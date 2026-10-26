@@ -3,9 +3,10 @@ on:
   # Push-to-main runs the macOS release build, packaging and runtime
   # checks, and the Windows runtime validation (the `windows` job, install-ps1
   # and the Windows pi-session-paths legs). Windows never runs on
-  # pull_request; the merge queue runs only the Windows lint (`windows-lint`:
-  # native check + target-gated Clippy), so a Windows-only compile or lint
-  # error cannot reach main. The runtime proofs are post-merge only, and a red
+  # pull_request (PRs get only `windows-cross-lint`, Clippy for the Windows
+  # GNU target on Linux); the merge queue runs only the Windows lint
+  # (`windows-lint`: native check + target-gated Clippy), so a Windows-only
+  # compile or lint error cannot reach main. The runtime proofs are post-merge only, and a red
   # or unfinished push CI Gate on the main tip blocks the next alpha cut
   # (auto-cut-alpha.yml checks it before merging the Release PR). The main ruleset routes every merge
   # through the merge queue (see `merge_group` below) and blocks direct
@@ -22,8 +23,10 @@ on:
   # are completely unaffected.
   pull_request:
   # PRs run Linux metadata, formatting, routing-policy and static consumer
-  # checks plus the Linux `check` job (clippy, source lints) and
-  # `coverage-changed` (the PR's changed tests). The queue reruns both and
+  # checks plus the Linux `check` job (clippy, source lints),
+  # `windows-cross-lint` (Windows GNU-target Clippy on Linux) and
+  # `coverage-changed` (the PR's changed tests). The queue reruns `check` and
+  # `coverage-changed` (its native `windows-lint` replaces the cross lint) and
   # adds the Linux/macOS runtime matrices, the Windows lint and full
   # instrumented coverage on the merged tree (no Windows runtime proofs —
   # see `push` above); CI Gate enforces each
@@ -44,11 +47,11 @@ env:
   # stop counting, so routing returns to the slots as they free up.
   LINUX_BURST_THRESHOLD: ${{ vars.CI_LINUX_HEAVY_SLOTS || '2' }}
   # Same for the xl pool (intent-cache-xl, 16 threads per slot), which serves
-  # gh-linux-16x jobs before they overflow to intent-cache; 0 disables it.
+  # gh-linux-16x jobs before they overflow to the bigmem heavy slots; 0 disables it.
   LINUX_XL_BURST_THRESHOLD: ${{ vars.CI_LINUX_XL_SLOTS || '0' }}
-  # Same for the fast pool (intent-cache-small, one core per slot), which
-  # serves the jobs that ask for a standard ubuntu-* label.
-  LINUX_SMALL_BURST_THRESHOLD: ${{ vars.CI_LINUX_SMALL_SLOTS || '6' }}
+  # The bigmem heavy slots (intent-cache-bigmem, 30 GB or more): the only heavy
+  # slots gh-linux-16x jobs overflow to; 0 sends that overflow to WarpBuild.
+  LINUX_BIGMEM_BURST_THRESHOLD: ${{ vars.CI_LINUX_BIGMEM_SLOTS || '0' }}
 
 # The heavy jobs share two self-hosted Linux slots, so cancel
 # superseded PR runs instead of letting them back up the queue (push-to-main
@@ -58,8 +61,8 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # All workloads prefer compatible self-hosted capacity. Keep the probe
-  # hosted so unavailable self-hosted runners cannot block the GitHub-hosted fallback.
+  # Paid-label workloads prefer compatible self-hosted capacity; free standard labels run on GitHub. Keep the probe
+  # hosted so unavailable self-hosted runners cannot block the burst fallback (WarpBuild; GitHub's larger runners are off).
   route:
     if: github.event_name == 'push' || github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
     permissions:
@@ -72,6 +75,7 @@ jobs:
     outputs:
       runners: ${{ steps.decide.outputs.runners }}
       slots: ${{ steps.decide.outputs.slots }}
+      cloud: ${{ steps.decide.outputs.cloud }}
       linux_labels: ${{ steps.heavy.outputs.linux_labels }}
       check_labels: ${{ steps.heavy.outputs.check_labels }}
       linux_burst: ${{ steps.heavy.outputs.linux_burst }}
@@ -85,23 +89,45 @@ jobs:
         env:
           THRESHOLD: ${{ env.LINUX_BURST_THRESHOLD }}
           XL_THRESHOLD: ${{ env.LINUX_XL_BURST_THRESHOLD }}
-          SMALL_THRESHOLD: ${{ env.LINUX_SMALL_BURST_THRESHOLD }}
+          BIGMEM_THRESHOLD: ${{ env.LINUX_BIGMEM_BURST_THRESHOLD }}
           # Pooled jobs that start together once routing finishes; each reads
-          # outputs.slots[key] (see runner-route.yml for the fields). The
-          # heavy Rust jobs list pull_request only: the merge queue keeps them
-          # on GitHub-hosted larger runners (see the `heavy` step below).
+          # outputs.slots[key] (see runner-route.yml for the fields).
+          # coverage-changed lists pull_request only: the merge queue keeps it
+          # on its burst runner, WarpBuild (on an 8-CPU slot its p90 of 38 min
+          # would outlast coverage-all, which sets the queue's pace).
+          # coverage-all, coverage-e2e and the Linux daemon-lifecycle leg run
+          # only in the queue and take a free xl or bigmem slot there (longest
+          # first, so coverage-all gets the xl slot), or burst to WarpBuild.
+          # check asks for gh-linux-16x (WarpBuild measured it at p90 97% of 8
+          # CPUs and 19.7 GB), so it takes an xl slot when one is left after
+          # coverage-changed, else a bigmem heavy slot (30 GB or more; one of its
+          # rustc processes passed 12 GB), else a 16x burst. It does the same
+          # in the queue, where it ranks after coverage-all and coverage-e2e:
+          # on a bigmem slot it slows down least (queue check on WarpBuild 16x
+          # p50 15 / p90 18 min; PR timings put it at roughly p50 16 / p90 22
+          # there, against coverage-all's p50 20 / p90 23 on xl), while
+          # coverage-e2e would grow from p90 9 to 23 min. Its minutes
+          # (10, its xl time) stay below coverage-changed's (15.5 min on xl,
+          # ~33 on heavy), so coverage-changed always picks first within a PR run. Two corners: with
+          # no xl slot and one bigmem slot free, coverage-changed takes the
+          # bigmem slot and check bursts; and the ranking is per run, so a
+          # concurrent PR's check can take the last xl slot before this run's
+          # coverage-changed asks, leaving it a bigmem slot.
           # Minutes are typical PR / merge-queue durations. release-fast-path
           # (release branches only) and the gate keep the `runners` mapping.
           SLOT_JOBS: >-
             [
-            {"key":"check","label":"gh-linux-8x","rust":true,"minutes":15,"events":["pull_request"]},
+            {"key":"check","label":"gh-linux-16x","rust":true,"minutes":10,"events":["pull_request","merge_group"]},
             {"key":"coverage-changed","label":"gh-linux-16x","rust":true,"minutes":13,"events":["pull_request"]},
             {"key":"release-scripts","label":"ubuntu-24.04","minutes":6},
             {"key":"pr-static","label":"ubuntu-24.04","minutes":1,"events":["pull_request"]},
             {"key":"pr-title","label":"ubuntu-24.04","events":["pull_request"]},
             {"key":"conflict-markers","label":"ubuntu-24.04","events":["pull_request"]},
             {"key":"deb-packaging","label":"ubuntu-24.04","events":["merge_group","push"]},
-            {"key":"pi-session-paths","label":"ubuntu-24.04","minutes":1,"legs":[22,24],"events":["merge_group","push"]}
+            {"key":"pi-session-paths","label":"ubuntu-24.04","minutes":1,"legs":[22,24],"events":["merge_group","push"]},
+            {"key":"coverage-all","label":"gh-linux-16x","rust":true,"minutes":22,"events":["merge_group"]},
+            {"key":"coverage-e2e","label":"gh-linux-16x","rust":true,"minutes":11,"events":["merge_group"]},
+            {"key":"daemon-lifecycle-linux","label":"gh-linux-16x","rust":true,"minutes":4,"events":["merge_group"]}
             ]
           LINUX_RUNNER_DISABLED: ${{ vars.CI_LINUX_RUNNER_DISABLED }}
           WINDOWS_RUNNER_DISABLED: ${{ vars.CI_WINDOWS_RUNNER_DISABLED }}
@@ -112,32 +138,73 @@ jobs:
             // No checkout: routing never executes code from a pull request.
             // Org runners with these labels must be in groups shared with all three CI repos.
             const fleets = {
-              // Heavy jobs (compile Rust or run over ~5 minutes): 8 cores / 48 GB per slot.
+              // Heavy jobs (compile Rust or run over ~5 minutes): 8 threads, 12-36 GB per slot.
               linux: ['self-hosted', 'linux', 'x64', 'intent-cache'],
               // 16-core jobs: 16 threads per slot.
               xl: ['self-hosted', 'linux', 'x64', 'intent-cache-xl'],
-              // Fast jobs: 1 core / 3 GB per slot.
-              small: ['self-hosted', 'linux', 'x64', 'intent-cache-small'],
+              // Heavy slots with 30 GB or more: the only heavy slots 16-core jobs overflow to
+              // (one of their rustc processes needs over 12 GB).
+              bigmem: ['self-hosted', 'linux', 'x64', 'intent-cache', 'intent-cache-bigmem'],
               arm: ['self-hosted', 'Linux', 'ARM64'],
               windows: ['self-hosted', 'Windows', 'X64'],
               macos: ['self-hosted', 'macOS', 'ARM64'],
-              intel: ['self-hosted', 'macOS', 'X64'],
             };
             const disabled = {
               linux: process.env.LINUX_RUNNER_DISABLED === 'true',
               xl: process.env.LINUX_RUNNER_DISABLED === 'true',
-              small: process.env.LINUX_RUNNER_DISABLED === 'true',
+              bigmem: process.env.LINUX_RUNNER_DISABLED === 'true',
               arm: process.env.LINUX_RUNNER_DISABLED === 'true',
               windows: process.env.WINDOWS_RUNNER_DISABLED === 'true',
               macos: process.env.MACOS_RUNNER_DISABLED === 'true',
-              intel: process.env.MACOS_RUNNER_DISABLED === 'true',
             };
+            // Standard GitHub-hosted runners are free for public repositories, so
+            // jobs asking for them always run there and never take a self-hosted slot.
+            const free = ['ubuntu-22.04', 'ubuntu-24.04', 'ubuntu-latest', 'ubuntu-24.04-arm', 'windows-2022', 'windows-2025'];
+            // The paid sizes jobs ask for and the WarpBuild runner each bursts to.
+            // GitHub's larger runners are off, so a paid size never runs on GitHub
+            // (same cores except Macs, which get 12 because every Mac job is CPU-bound;
+            // Windows stays on Server 2022, macOS 15 keeps signed builds off macOS 26).
+            const warp = {
+              'gh-linux-8x': 'warp-ubuntu-2404-x64-8x',
+              'gh-linux-16x': 'warp-ubuntu-2404-x64-16x',
+              'gh-linux-arm64-8x': 'warp-ubuntu-2404-arm64-8x',
+              'gh-windows-8x': 'warp-windows-2022-x64-8x',
+              'gh-windows-16x': 'warp-windows-2022-x64-16x',
+              'macos-26-xlarge': 'warp-macos-26-arm64-12x',
+              'macos-15-xlarge': 'warp-macos-15-arm64-12x',
+            };
+            // Fork pull requests never spend WarpBuild minutes: a paid size runs on
+            // the free standard runner of its OS instead.
+            const forkRunner = {
+              'gh-linux-8x': 'ubuntu-24.04',
+              'gh-linux-16x': 'ubuntu-24.04',
+              'gh-linux-arm64-8x': 'ubuntu-24.04-arm',
+              'gh-windows-8x': 'windows-2022',
+              'gh-windows-16x': 'windows-2022',
+              'macos-26-xlarge': 'macos-latest',
+              'macos-15-xlarge': 'macos-15',
+            };
+            // WarpBuild health is tracked per OS and architecture (ubuntu-x64, ubuntu-arm64, windows-x64, macos-arm64).
+            const family = (label) => {
+              const m = /^warp-(ubuntu|windows|macos)-.*-(x64|arm64)-/.exec(String(label).toLowerCase());
+              return m ? `${m[1]}-${m[2]}` : null;
+            };
+            // A queued job older than `minutes`; `unknownIsOld` decides a job whose age is unreadable.
+            const queuedOver = (j, minutes, unknownIsOld) => j.status === 'queued' &&
+              (Number.isFinite(Date.parse(j.created_at)) ? Date.parse(j.created_at) < Date.now() - minutes * 60 * 1000 : unknownIsOld);
             const burst = Object.fromEntries(Object.keys(fleets).map(k => [k, true]));
             const reasons = Object.fromEntries(Object.keys(fleets).map(k => [k, 'availability not established']));
             // Free slots per Linux pool: online slots (capped by the threshold) minus jobs queued or running on them.
-            const free = {};
+            const slotsFree = {};
+            // A pool whose slots are also slots of another pool: a grant needs a free slot in both and takes one from each.
+            const within = {bigmem: 'linux'};
+            const hasSlot = (key) => slotsFree[key] > 0 && (!within[key] || slotsFree[within[key]] > 0);
             const pr = context.payload?.pull_request;
             const fork = context.eventName === 'pull_request' && pr?.head?.repo?.full_name !== `${context.repo.owner}/${context.repo.repo}`;
+            const warpOn = !fork;
+            // A WarpBuild OS/architecture whose jobs sit queued for 10 minutes is
+            // reported as a warning; with no other burst runner, jobs still go there.
+            const warpStuck = Object.fromEntries(Object.values(warp).map(label => [family(label), false]));
             try {
               if (fork) throw new Error('fork pull request requires an isolated hosted runner');
               let runners;
@@ -151,7 +218,8 @@ jobs:
                 runners.filter(r => r.status === 'online' && labels.every(l => (r.labels || []).some(x => x.name?.toLowerCase() === l.toLowerCase()))),
               ]));
               const jobs = [];
-              // A missing sibling view is unknown demand, not zero demand. Fail open to GitHub-hosted runners.
+              // A missing sibling view is unknown demand, not zero demand. Fail open to burst runners.
+              // With no self-hosted runner online there is no demand to weigh, so skip the listing.
               if (Object.values(online).some(rs => rs.length)) {
                 for (const repo of new Set(['intent', 'intentd', 'cloudlands-fe', context.repo.repo])) {
                   const seen = new Set();
@@ -165,76 +233,103 @@ jobs:
                   }
                 }
               }
-              const thresholds = {linux: Number(process.env.THRESHOLD || '2'), xl: Number(process.env.XL_THRESHOLD || '0'), small: Number(process.env.SMALL_THRESHOLD || '6')};
+              for (const j of jobs) {
+                if (!queuedOver(j, 10, false)) continue;
+                for (const label of j.labels || []) if (family(label) in warpStuck) warpStuck[family(label)] = true;
+              }
+              const thresholds = {linux: Number(process.env.THRESHOLD || '2'), xl: Number(process.env.XL_THRESHOLD || '0'), bigmem: Number(process.env.BIGMEM_THRESHOLD || '0')};
               if (Object.values(thresholds).some(n => !Number.isInteger(n) || n < 0)) throw new Error('invalid queue threshold');
+              const asks = (j, labels) => labels.every(l => (j.labels || []).some(x => x.toLowerCase() === l.toLowerCase()));
               for (const [key, labels] of Object.entries(fleets)) {
-                const demand = jobs.filter(j => ['queued', 'in_progress'].includes(j.status) && labels.every(l => (j.labels || []).some(x => x.toLowerCase() === l.toLowerCase())));
-                const stale = demand.some(j => j.status === 'queued' && (!Number.isFinite(Date.parse(j.created_at)) || Date.parse(j.created_at) < Date.now() - 15 * 60 * 1000));
+                const demand = jobs.filter(j => ['queued', 'in_progress'].includes(j.status) && asks(j, labels));
+                // A job waiting on a sub-pool (bigmem) stalls only that sub-pool; the rest of its parent pool may be idle.
+                const stale = demand.some(j => queuedOver(j, 15, true) && !Object.keys(within).some(sub => within[sub] === key && asks(j, fleets[sub])));
                 const native = !(key in thresholds);
                 const capacity = native ? online[key].filter(r => r.busy === false).length : online[key].length;
                 const limit = native ? capacity - 1 : Math.min(thresholds[key], capacity);
                 const depth = native ? demand.filter(j => j.status === 'queued').length : demand.length;
                 burst[key] = disabled[key] || capacity === 0 || stale || (native ? depth > limit : depth >= limit);
-                if (!native) free[key] = burst[key] ? 0 : limit - depth;
-                reasons[key] = disabled[key] ? 'disabled for maintenance' : capacity === 0 ? 'no available compatible runner' : stale ? 'stalled or unknown-age queue' : `queue depth=${depth} threshold=${limit} online=${online[key].length}${native ? '' : ` free=${free[key]}`}`;
+                if (!native) slotsFree[key] = burst[key] ? 0 : limit - depth;
+                // Jobs asking only for the parent pool's labels can run on a sub-pool's
+                // runners without counting as its demand, so a sub-pool grant also
+                // needs a runner that is idle and not already claimed by a queued job.
+                const idle = within[key] ? Math.max(0, online[key].filter(r => r.busy === false).length - demand.filter(j => j.status === 'queued').length) : null;
+                if (idle !== null) slotsFree[key] = Math.min(slotsFree[key], idle);
+                reasons[key] = disabled[key] ? 'disabled for maintenance' : capacity === 0 ? 'no available compatible runner' : stale ? 'stalled or unknown-age queue' : `queue depth=${depth} threshold=${limit} online=${online[key].length}${idle === null ? '' : ` idle=${idle}`}${native ? '' : ` free=${slotsFree[key]}`}`;
               }
             } catch (error) {
               for (const key of Object.keys(fleets)) reasons[key] = `probe failed (${error.message})`;
-              for (const key of Object.keys(free)) free[key] = 0;
+              for (const key of Object.keys(slotsFree)) slotsFree[key] = 0;
             }
-            // Keys are the GitHub-hosted fallback labels jobs ask for; values are
-            // the self-hosted fleet labels, or the key itself when the fleet bursts.
+            // Where a label runs when it does not take a self-hosted slot: a paid
+            // size's WarpBuild runner (its free standard runner on a fork), a free
+            // label itself.
+            const cloud = (label) => warp[label] ? [warpOn ? warp[label] : forkRunner[label]] : [label];
+            // Keys are the GitHub labels jobs ask for; values are the self-hosted
+            // fleet labels, or the burst runner when the fleet bursts.
             // A label listed under several pools takes the first with a free slot.
             const hosted = {
-              // 16-core jobs prefer xl slots and overflow to heavy slots before
-              // going hosted, so with no xl slot free they route as they did
-              // before xl existed. 8-core jobs never take an xl slot.
+              // 16-core jobs prefer xl slots and overflow only to bigmem heavy
+              // slots before bursting: a 12 GB heavy slot OOM-kills their rustc.
+              // 8-core jobs never take an xl slot and use every heavy slot.
               xl: ['gh-linux-16x'],
-              // Larger runners carry the heavy jobs; standard runners the fast ones.
-              linux: ['gh-linux-8x', 'gh-linux-16x'],
-              small: ['ubuntu-22.04', 'ubuntu-24.04'],
-              arm: ['ubuntu-24.04-arm', 'gh-linux-arm64-8x'],
-              windows: ['windows-2022', 'windows-2025', 'gh-windows-16x'],
+              bigmem: ['gh-linux-16x'],
+              linux: ['gh-linux-8x'],
+              arm: ['gh-linux-arm64-8x'],
+              windows: ['gh-windows-16x'],
               macos: ['macos-26-xlarge'],
-              intel: ['macos-latest-large'],
             };
             // Free slots go to the caller's listed jobs one at a time: Rust-compiling
             // jobs first (they reuse the slot's local cache), then the longest, then
             // list order. Listed jobs that do not fit, or that skip this event, get
-            // their hosted label directly; matrix legs are ranked separately.
+            // their burst runner directly, sized by `burst` when set (a CPU-bound
+            // job keeps its slot size but bursts bigger); matrix legs are ranked
+            // separately.
             // Concurrent runs read the same free count before either job is queued,
             // so a pool may briefly run a job or two over its slot count.
             let requests = [];
             try {
               requests = JSON.parse(process.env.SLOT_JOBS || '[]').flatMap(j => (j.legs || (j.shards ? Array.from({length: j.shards}, (_, n) => n + 1) : null))?.map(leg => ({...j, key: `${j.key}-${leg}`})) ?? [j]);
             } catch (error) {
-              core.info(`slot list unreadable (${error.message}); listed jobs use hosted labels`);
+              core.info(`slot list unreadable (${error.message}); listed jobs use burst runners`);
             }
             const slots = {};
-            const granted = Object.fromEntries(Object.keys(free).map(k => [k, 0]));
+            const granted = Object.fromEntries(Object.keys(slotsFree).map(k => [k, 0]));
             const ranked = requests.map((r, i) => ({...r, i})).sort((a, b) => (b.rust === true) - (a.rust === true) || (b.minutes || 0) - (a.minutes || 0) || a.i - b.i);
             for (const r of ranked) {
               const runs = !Array.isArray(r.events) || r.events.includes(context.eventName);
-              const key = runs && Object.keys(hosted).find(k => k in free && hosted[k].includes(r.label) && free[k] > 0);
+              const key = runs && Object.keys(hosted).find(k => k in slotsFree && hosted[k].includes(r.label) && hasSlot(k));
               if (key) {
-                free[key] -= 1;
+                slotsFree[key] -= 1;
                 granted[key] += 1;
+                if (within[key]) {
+                  slotsFree[within[key]] -= 1;
+                  granted[within[key]] += 1;
+                }
                 slots[r.key] = fleets[key];
-              } else slots[r.key] = [r.label];
+              } else slots[r.key] = cloud(r.burst || r.label);
             }
             // Unlisted jobs (single-job workflows, jobs that start after the listed
             // ones) use a pool only while a slot is still free.
-            for (const key of Object.keys(free)) {
-              burst[key] = free[key] <= 0;
+            for (const key of Object.keys(slotsFree)) {
+              burst[key] = !hasSlot(key);
               if (granted[key]) reasons[key] += ` granted=${granted[key]}`;
             }
-            const mapping = {};
+            const mapping = Object.fromEntries(free.map(label => [label, [label]]));
             for (const [key, labels] of Object.entries(hosted)) {
-              for (const label of labels) if (!mapping[label] || mapping[label][0] === label) mapping[label] = burst[key] ? [label] : fleets[key];
+              for (const label of labels) if (!mapping[label] || mapping[label][0] !== 'self-hosted') mapping[label] = burst[key] ? cloud(label) : fleets[key];
             }
+            // Jobs that must not use a self-hosted runner (sudo, Docker, release signing) read `cloud`.
+            const clouds = Object.fromEntries([...free, ...Object.keys(warp)].map(label => [label, cloud(label)]));
             for (const key of Object.keys(fleets)) core.info(`${key} routing: burst=${burst[key]} (${reasons[key]})`);
+            for (const key of Object.keys(warpStuck)) {
+              if (!warpOn) core.info(`warpbuild ${key}: off (fork pull request: free standard runners)`);
+              else if (warpStuck[key]) core.warning(`warpbuild ${key}: jobs queued over 10 minutes; bursts still go to WarpBuild`);
+              else core.info(`warpbuild ${key}: on`);
+            }
             core.setOutput('runners', JSON.stringify(mapping));
             core.setOutput('slots', JSON.stringify(slots));
+            core.setOutput('cloud', JSON.stringify(clouds));
             const linuxLabels = mapping[`gh-linux-${process.env.LINUX_SIZE || '8'}x`];
             core.setOutput('linux_labels', JSON.stringify(linuxLabels));
             core.setOutput('linux_burst', String(linuxLabels[0] !== 'self-hosted'));
@@ -242,13 +337,16 @@ jobs:
             core.setOutput('windows_labels', JSON.stringify(mapping['gh-windows-16x']));
             core.setOutput('macos_labels', JSON.stringify(mapping['macos-26-xlarge']));
             for (const key of ['windows', 'macos']) core.setOutput(`${key}_burst`, String(burst[key]));
-      # The heavy Rust jobs (check and coverage-changed through `slots`, which
-      # list pull_request only; the other coverage-* jobs and daemon-lifecycle
-      # through linux_labels) all stay hosted in the merge queue. In the merge
-      # queue they stay on GitHub-hosted larger runners: one queue run starts ~4 of them at once,
-      # sized for 16 CPUs, and the route decision is made before any of them
-      # is queued, so all would land on the two 8-CPU intent-cache slots and
-      # run one after another past the queue's time budget. PR and push
+      # coverage-changed (through `slots`, which lists it for pull_request
+      # only) takes its burst runner (WarpBuild) in the merge queue.
+      # check, coverage-all, coverage-e2e and the Linux daemon-lifecycle leg read
+      # their own merge_group `slots` entries, so only as many take a slot as
+      # are free and the rest burst to WarpBuild (the slot hosts raise
+      # fs.inotify.max_user_instances to 32768 for their parallel daemons).
+      # Nothing reads this step's linux_labels or check_labels any more. Before slot fitting existed, one queue run started ~4 heavy jobs at once,
+      # sized for 16 CPUs, and the shared mapping sent all of them to the
+      # same two 8-CPU intent-cache slots, one after another, past the
+      # queue's time budget. PR and push
       # runs, and the light jobs routed through `runners`, keep the probe's
       # choice. This override stays out of the probe script above, which is
       # kept identical to runner-route.yml across intent, intentd and
@@ -259,12 +357,24 @@ jobs:
           LINUX_LABELS: ${{ steps.decide.outputs.linux_labels }}
           CHECK_LABELS: ${{ steps.decide.outputs.check_labels }}
           LINUX_BURST: ${{ steps.decide.outputs.linux_burst }}
+          CLOUD: ${{ steps.decide.outputs.cloud }}
         run: |
+          # The burst runner for a paid size: its WarpBuild runner from `cloud`, or
+          # the same WarpBuild label when `cloud` is unreadable (GitHub's larger
+          # runners are off).
+          burst_runner() {
+            jq -ce --arg label "$1" '.[$label] // empty' <<< "${CLOUD:-{\}}" 2>/dev/null && return
+            case "$1" in
+              gh-linux-8x) echo '["warp-ubuntu-2404-x64-8x"]' ;;
+              gh-linux-16x) echo '["warp-ubuntu-2404-x64-16x"]' ;;
+              *) printf '["%s"]\n' "$1" ;;
+            esac
+          }
           if [[ "$EVENT" == merge_group ]]; then
-            LINUX_LABELS="[\"gh-linux-${LINUX_SIZE}x\"]"
-            CHECK_LABELS='["gh-linux-8x"]'
+            LINUX_LABELS=$(burst_runner "gh-linux-${LINUX_SIZE}x")
+            CHECK_LABELS=$(burst_runner gh-linux-8x)
             LINUX_BURST=true
-            echo "heavy linux routing: burst=true (merge queue keeps heavy Rust jobs on GitHub-hosted larger runners)"
+            echo "heavy linux routing: burst=true (merge queue: the shared linux_labels mapping takes the burst runner $LINUX_LABELS; listed jobs use their own slots)"
           fi
           {
             echo "linux_labels=$LINUX_LABELS"
@@ -292,6 +402,39 @@ jobs:
           node-version: '24'
       - name: Check CI routing and gate failures
         run: python3 -I -B scripts/test-ci-native-routing.py
+      # The suggested-prompts cases are an exact-byte copy of the monorepo
+      # contract (docs/protocol/suggested-prompts.md); an edited copy fails here.
+      - name: Read pinned suggested-prompts case revision
+        id: suggested-prompts-cases
+        run: |
+          node --input-type=module <<'NODE'
+          import { readFileSync, appendFileSync } from 'node:fs';
+          const lock = JSON.parse(readFileSync('crates/intent-services/tests/fixtures/suggested-prompts.lock.json', 'utf8'));
+          if (lock.sourceRepository !== 'intent-hq/intent' || !/^[0-9a-f]{40}$/.test(lock.sourceCommit)) {
+            throw new Error('suggested-prompts case lock must pin a full intent-hq/intent commit');
+          }
+          appendFileSync(process.env.GITHUB_OUTPUT, `source-commit=${lock.sourceCommit}\n`);
+          NODE
+      - name: Checkout exact canonical suggested-prompts cases
+        uses: actions/checkout@v7
+        with:
+          repository: intent-hq/intent
+          ref: ${{ steps.suggested-prompts-cases.outputs.source-commit }}
+          path: .suggested-prompts-contract-source
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /scripts/suggested-prompts-contract.mjs
+            /docs/protocol/fixtures/suggested-prompts/v1/
+      - name: Verify suggested-prompts case provenance
+        env:
+          SOURCE_COMMIT: ${{ steps.suggested-prompts-cases.outputs.source-commit }}
+        run: |
+          set -euo pipefail
+          node .suggested-prompts-contract-source/scripts/suggested-prompts-contract.mjs verify \
+            --source-root "$GITHUB_WORKSPACE/.suggested-prompts-contract-source" \
+            --source-commit "$SOURCE_COMMIT" --component intentd --component-root "$GITHUB_WORKSPACE" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
       # Release PRs run this job too: a release that would split the intentd
       # version_group (intent-hq/intentd#2461) fails here before it merges.
       - name: Check release-plz version groups stay in lockstep
@@ -324,11 +467,14 @@ jobs:
     # Every other PR still runs it, and the merge queue always does.
     if: ${{ !cancelled() && needs.route.result == 'success' && (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && needs.release-fast-path.outputs.fast_path != 'true')) }}
     needs: [route, release-fast-path]
-    runs-on: ${{ fromJSON(needs.route.outputs.slots || '{}')['check'] || fromJSON('["gh-linux-8x"]') }}
+    runs-on: ${{ fromJSON(needs.route.outputs.slots || '{}')['check'] || fromJSON('["warp-ubuntu-2404-x64-16x"]') }}
     # The cold-cache check job exhausted its 20-minute budget after its tests
     # passed in run 37305697722. Allow completion/cache margin without changing
-    # individual test timeouts.
-    timeout-minutes: 25
+    # individual test timeouts. In the merge queue it may now run on an 8-CPU
+    # bigmem slot (PR p90 19 min there, plus the queue-only GitLab feature
+    # build), so it gets the slot budget, still under the queue's 60-minute
+    # check response timeout (coverage-all 55, coverage-e2e 45).
+    timeout-minutes: 40
     env:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
@@ -379,7 +525,7 @@ jobs:
       - name: Real import and public session contract
         env:
           INTENTD_ASSERT_BOUND_CALLER: "1"
-        run: "cargo test -p intent-services --lib transfer_selection_contract::"
+        run: "cargo test -p intent-svc-transfer --lib transfer_selection_contract::"
       # Real claude-agent-acp contract (claude_adapter_contract): the pinned
       # adapter moves by auto-merging rolling PRs (auto-pin-acp-adapters.yml),
       # so every PR and merge-queue run installs the exact pin and checks that
@@ -432,7 +578,11 @@ jobs:
         if: github.event_name == 'merge_group'
         env:
           INTENTD_ASSERT_BOUND_CALLER: "1"
-        run: cargo test --locked -p intentd --features repository-test-fixtures --test e2e_wss_gitlab_auth --test e2e_wss_invite_join_gitlab --test e2e_repository_resource_read -- --test-threads=2
+        # The invitation and checkout files are modules of suite targets
+        # (tests/suite_*.rs); the module filter keeps the run to their tests.
+        run: |
+          cargo test --locked -p intentd --features repository-test-fixtures --test e2e_wss_gitlab_auth -- --test-threads=2
+          cargo test --locked -p intentd --features repository-test-fixtures --test suite_wss_g_r --test suite_wss_repo -- --test-threads=2 e2e_wss_invite_join_gitlab:: e2e_repository_resource_read::
 
       - uses: taiki-e/install-action@cargo-shear
       # Blocking unused-dependency gate: fails when any crate declares a
@@ -444,6 +594,33 @@ jobs:
       # each with a comment explaining why.
       - name: Unused dependencies (cargo-shear)
         run: cargo shear --deny-warnings
+      # intent-services' `test-hooks` feature compiles test seams and
+      # fixtures into the library for feature-crate tests. Only
+      # dev-dependencies may enable it; fail if the production feature graph
+      # of a shipped binary does. The regression test runs the check against
+      # throwaway workspaces first (path dependencies only, a few seconds).
+      - name: No test-hooks in the production feature graph
+        run: |
+          ./scripts/test-check-test-hooks-feature.sh
+          ./scripts/check-test-hooks-feature.sh
+      # Services feature crates (intent-svc-*) sit above intent-services with
+      # intent-app on top. Fail on a wrong-way edge: core or intent-transport
+      # depending on a feature (dev-dependencies too), or a feature-to-feature
+      # edge the split plan does not allow. Metadata only, under a second.
+      - name: Services feature-crate dependency graph
+        run: |
+          ./scripts/test-check-feature-crate-deps.sh
+          python3 -I -B scripts/check-feature-crate-deps.py
+      # scripts/changed-tests.sh (make test-changed, coverage-changed) reads
+      # crates/*/Cargo.toml with a line scanner, because test selection runs
+      # before a toolchain is installed. Fail when it disagrees with cargo
+      # metadata, naming the missing or extra crates: a missed manifest style
+      # silently drops intent-core dependents from the run (intentd#2704,
+      # c0ac2a532). Metadata only, under a second.
+      - name: changed-tests.sh dependency scanner matches cargo metadata
+        run: |
+          ./scripts/test-check-rdeps-parity.sh
+          python3 -I -B scripts/check-rdeps-parity.py
       # CI is the guard against host-dependent tests: a test that relies on
       # an installed provider CLI passes locally and fails here only while
       # runners have none. Fail loudly if a runner image starts shipping one.
@@ -566,6 +743,83 @@ jobs:
         run: |
           echo "pwsh: $(command -v pwsh) ($(pwsh --version)); XDG_CACHE_HOME=$XDG_CACHE_HOME; ulimit -s: $(ulimit -s)"
           cargo test -p intentd-sitter --test install_ps1_owner
+  # Windows cross lint, pull requests only: the native `windows-lint` job's
+  # two steps for the Windows GNU target on a Linux runner, so a Windows-only lint error (an import only
+  # `#[cfg(unix)]` code uses, a `#[cfg(windows)]`-only warning) fails the PR
+  # instead of ejecting it from the merge queue an hour later (intentd#2672,
+  # merge-group run 40178615896; earlier #2555, #2556, #2579). PRs still never
+  # wait on a Windows runner. The build scripts that compile C for the target
+  # (libz-sys and friends, see the `build` job's Clippy comment) only need
+  # MinGW-w64 for the GNU target, an apt package. intentd has no
+  # `target_env = "msvc"` code, so the GNU target lints the same Windows code
+  # as MSVC; the queue-only native `windows-lint` job stays the final
+  # authority and catches any GNU/MSVC difference. Local equivalent:
+  # `make check-windows` from the monorepo root. Same `if` as `check`:
+  # same-repo PRs only (route success), skipped on release-metadata PRs.
+  # Runs on the 8-core WarpBuild runner from route's `cloud` mapping, never a
+  # self-hosted slot (the apt install needs sudo, which the slots lack).
+  windows-cross-lint:
+    if: ${{ !cancelled() && needs.route.result == 'success' && github.event_name == 'pull_request' && needs.release-fast-path.outputs.fast_path != 'true' }}
+    needs: [route, release-fast-path]
+    name: Windows cross lint (x86_64-pc-windows-gnu)
+    runs-on: ${{ fromJSON(needs.route.outputs.cloud || '{}')['gh-linux-8x'] || fromJSON('["warp-ubuntu-2404-x64-8x"]') }}
+    # A cold compile (sccache miss, lockfile bump) on 8 cores builds the
+    # workspace twice for a new target; the native windows-lint has 45.
+    timeout-minutes: 40
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - uses: actions/checkout@v7
+      - name: Configure the self-hosted compiler cache
+        shell: bash
+        env:
+          INTENT_SCCACHE_ENDPOINT: ${{ vars.INTENT_SCCACHE_ENDPOINT }}
+          INTENT_SCCACHE_TOKEN: ${{ secrets.INTENT_SCCACHE_TOKEN }}
+          INTENT_SCCACHE_MODE: ${{ vars.INTENT_SCCACHE_MODE }}
+        run: python3 scripts/setup-sccache.py
+      # The host build scripts need OpenSSL headers (as in `check`) and the
+      # target's C compiler. Retries cover concurrent apt runs (see `check`).
+      - name: Install MinGW-w64 and libssl-dev if missing
+        run: |
+          missing=()
+          command -v x86_64-w64-mingw32-gcc >/dev/null || missing+=(gcc-mingw-w64-x86-64)
+          pkg-config --exists openssl || missing+=(libssl-dev)
+          if [ "${#missing[@]}" -gt 0 ]; then
+            if ! sudo -n true 2>/dev/null; then
+              echo "::error::${RUNNER_NAME:-this runner} lacks ${missing[*]} and passwordless sudo to install them; windows-cross-lint needs a runner from route's cloud map (never a self-hosted slot)."
+              exit 1
+            fi
+            for i in 1 2 3; do
+              if sudo -n apt-get -o DPkg::Lock::Timeout=300 update -qq; then break; fi
+              if [ "$i" -eq 3 ]; then exit 1; fi
+              sleep $((i * 15))
+            done
+            sudo -n apt-get -o DPkg::Lock::Timeout=300 install -y -qq --no-install-recommends "${missing[@]}"
+          fi
+          x86_64-w64-mingw32-gcc --version | head -n1
+      - name: Resolve pinned Rust channel
+        id: toolchain
+        shell: bash
+        run: |
+          channel=$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n1)
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-11 (PR 185, --force-non-host)
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+          targets: x86_64-pc-windows-gnu
+          components: clippy
+      # Non-test production configuration first: --all-targets enables test
+      # fixture features and skips their production arms (see the `build`
+      # job's comment), so Clippy alone would miss those Windows errors.
+      - name: Check (Windows GNU production configuration)
+        run: cargo check --workspace --target x86_64-pc-windows-gnu
+      - name: Clippy (Windows GNU target)
+        run: cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu -- -D warnings
   # Release metadata classification (intent-hq/monorepo#1374): retain the
   # audited diff-shape output and fail-safe script behavior. Native builds
   # and full coverage are now job-skipped on every PR, independent of this
@@ -636,7 +890,7 @@ jobs:
           # use the latest hosted ARM64 image. Empty route output also falls back to
           # hosted. Keep the check name independent of the runner.
           - target: aarch64-apple-darwin
-            os: ${{ fromJSON(needs.route.outputs.macos_labels || '["macos-26-xlarge"]') }}
+            os: ${{ fromJSON(needs.route.outputs.macos_labels || '["warp-macos-26-arm64-12x"]') }}
             name: build (aarch64-apple-darwin)
     # Explicit per-entry names keep check history stable across runner changes.
     name: ${{ matrix.name }}
@@ -710,7 +964,9 @@ jobs:
       # closes the gap. It runs on merge-queue runs, not on push: the queue
       # tests the actual merged tree, and main's push run builds a tree the
       # queue already linted. (The Windows equivalent is the queue-only
-      # `windows-lint` job.) It runs on the
+      # `windows-lint` job; PRs get a Linux pre-filter for it,
+      # `windows-cross-lint`, because the Windows GNU target needs only
+      # MinGW-w64.) It runs on the
       # native runners rather than as Linux cross-target runs because
       # `cargo clippy --target <triple>` still executes the native build
       # scripts (libz-sys and friends try-compile C for the target even when
@@ -746,12 +1002,12 @@ jobs:
                   "tunnel::tests::connect_reset_preserves_error_before_deadline",
                   "tunnel::tests::connect_success_before_deadline_relays",
               ]),
-              (["-p", "intentd", "--test", "e2e_wss_tunnel"], [
-                  "tunnel_open_echo_eof_close_lifecycle",
-                  "tunnel_open_err_for_closed_port_keeps_connection_alive",
-                  "tunnel_close_tears_down_and_frees_stream_id",
-                  "tunnel_connections_counted_in_health_and_stopped",
-                  "tunnel_unauthenticated_upgrade_rejected",
+              (["-p", "intentd", "--test", "suite_wss_s_z"], [
+                  "e2e_wss_tunnel::tunnel_open_echo_eof_close_lifecycle",
+                  "e2e_wss_tunnel::tunnel_open_err_for_closed_port_keeps_connection_alive",
+                  "e2e_wss_tunnel::tunnel_close_tears_down_and_frees_stream_id",
+                  "e2e_wss_tunnel::tunnel_connections_counted_in_health_and_stopped",
+                  "e2e_wss_tunnel::tunnel_unauthenticated_upgrade_rejected",
               ]),
           ]
 
@@ -828,11 +1084,11 @@ jobs:
   # merged tree before it lands (a unix-only test helper from #2574 turned
   # main's push gate red when this ran post-merge). Pull requests still never
   # wait on a Windows runner, and the push run does not repeat it: main's
-  # tree is one the queue just linted. ~9 minutes on hosted gh-windows-16x,
+  # tree is one the queue just linted. ~9 minutes on WarpBuild Windows 16x,
   # in parallel with the ~25-minute queue run.
   # Routed by the route job (intent-hq/intent#5518): the self-hosted 5090pc
-  # runner when the probe confirms it idle, the org-hosted
-  # gh-windows-16x runner otherwise. The self-hosted labels are
+  # runner when the probe confirms it idle, the WarpBuild
+  # gh-windows-16x burst runner otherwise. The self-hosted labels are
   # selected ONLY when route positively emitted them: an empty output —
   # route failed, timed out, or was skipped (`!cancelled()` still runs this
   # job) — falls back to the hosted label, never to a runner nothing
@@ -845,7 +1101,7 @@ jobs:
       matrix:
         include:
           - target: x86_64-pc-windows-msvc
-            os: ${{ fromJSON(needs.route.outputs.windows_labels || '["gh-windows-16x"]') }}
+            os: ${{ fromJSON(needs.route.outputs.windows_labels || '["warp-windows-2022-x64-16x"]') }}
     name: Windows lint (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
@@ -907,7 +1163,7 @@ jobs:
       matrix:
         include:
           - target: x86_64-pc-windows-msvc
-            os: ${{ fromJSON(needs.route.outputs.windows_labels || '["gh-windows-16x"]') }}
+            os: ${{ fromJSON(needs.route.outputs.windows_labels || '["warp-windows-2022-x64-16x"]') }}
     name: Windows post-merge (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     # Runtime proofs + lifecycle proof + release build share one warm target
@@ -969,7 +1225,7 @@ jobs:
           INTENTD_SETUP_TOOLCHAIN: ${{ steps.toolchain.outputs.channel }}
         run: |
           rustup run "$INTENTD_SETUP_TOOLCHAIN" cargo test --locked -p intent-pty --lib --target ${{ matrix.target }} conpty_startup::tests -- --nocapture
-          rustup run "$INTENTD_SETUP_TOOLCHAIN" cargo test -p intentd --test e2e_wss_setup_headless --target ${{ matrix.target }} -- --nocapture
+          rustup run "$INTENTD_SETUP_TOOLCHAIN" cargo test -p intentd --test suite_wss_s_z --target ${{ matrix.target }} e2e_wss_setup_headless:: -- --nocapture
       - uses: actions/upload-artifact@v7
         if: always()
         with:
@@ -1015,7 +1271,7 @@ jobs:
       matrix:
         include:
           - target: aarch64-apple-darwin
-            os: ${{ fromJSON(needs.route.outputs.macos_labels || '["macos-26-xlarge"]') }}
+            os: ${{ fromJSON(needs.route.outputs.macos_labels || '["warp-macos-26-arm64-12x"]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     env:
@@ -1070,13 +1326,13 @@ jobs:
             exit 1
           fi
           rustup run "$INTENTD_DIAGNOSTIC_TOOLCHAIN" cargo test -p intent-services --lib --target ${{ matrix.target }} "$filter" -- --nocapture
-          listed=$(rustup run "$INTENTD_DIAGNOSTIC_TOOLCHAIN" cargo test -p intentd --test e2e_doctor_codex --target ${{ matrix.target }} -- --list)
+          listed=$(rustup run "$INTENTD_DIAGNOSTIC_TOOLCHAIN" cargo test -p intentd --test suite_e2e --target ${{ matrix.target }} e2e_doctor_codex:: -- --list)
           printf '%s\n' "$listed"
           if ! grep -F 'macos_catalog_rejection_precedes_npm_authentication_and_probe_state: test' <<< "$listed" > /dev/null; then
             echo '::error::macOS doctor command regression was not selected.'
             exit 1
           fi
-          rustup run "$INTENTD_DIAGNOSTIC_TOOLCHAIN" cargo test -p intentd --test e2e_doctor_codex --target ${{ matrix.target }} -- --nocapture
+          rustup run "$INTENTD_DIAGNOSTIC_TOOLCHAIN" cargo test -p intentd --test suite_e2e --target ${{ matrix.target }} e2e_doctor_codex:: -- --nocapture
       # These retained workspace fixtures used to skip on Linux before reaching
       # their unbound caller. Require native CoW operations and original oracles.
       - name: Retained workspace CoW fixtures (macOS runtime)
@@ -1144,8 +1400,9 @@ jobs:
     # the repo's own ruleset, so no same-repo fork guard applies.
     needs: route
     if: ${{ !cancelled() && github.event_name == 'merge_group' && needs.route.result == 'success' }}
-    runs-on: ${{ fromJSON(needs.route.outputs.linux_labels) }}
-    timeout-minutes: 30
+    runs-on: ${{ fromJSON(needs.route.outputs.slots || '{}')['coverage-e2e'] || fromJSON('["warp-ubuntu-2404-x64-16x"]') }}
+    # ~11 min on gh-linux-16x; an 8-CPU heavy slot (xl busy) takes about twice that.
+    timeout-minutes: 45
     env:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
@@ -1284,10 +1541,18 @@ jobs:
     # empty output on merge_group).
     needs: route
     if: ${{ !cancelled() && github.event_name == 'merge_group' && needs.route.result == 'success' }}
-    runs-on: ${{ fromJSON(needs.route.outputs.linux_labels) }}
+    runs-on: ${{ fromJSON(needs.route.outputs.slots || '{}')['coverage-all'] || fromJSON('["warp-ubuntu-2404-x64-16x"]') }}
     # Include LLVM report generation after the full suite on shared runners.
-    timeout-minutes: 45
+    # ~22 min on gh-linux-16x or the xl slot; an 8-CPU heavy slot (xl busy)
+    # takes about twice that. Stay under the merge queue's 60-minute check
+    # response timeout: CI Gate requires this job, so a later finish ejects
+    # the entry anyway.
+    timeout-minutes: 55
     env:
+      # WarpBuild runners preset NODE_OPTIONS (GitHub-hosted runners do not), and
+      # the ACP callback fixture refuses any NODE_OPTIONS injection; clear it so
+      # the job behaves the same on every runner it bursts to.
+      NODE_OPTIONS: ''
       # Merge each binary's executions into eight locked raw profiles instead
       # of retaining a multi-megabyte profile for every nextest process.
       LLVM_PROFILE_FILE_NAME: "intent-%8m.profraw"
@@ -1336,10 +1601,14 @@ jobs:
       # metadata, skills, specialists), so the kernel default of 128
       # instances can exhaust mid-run — watcher starts in unrelated tests
       # then fail with EMFILE "Too many open files" (intentd PR #882).
-      # Needs passwordless sudo: this merge-queue-only job always runs on
-      # a GitHub-hosted runner (see the route job's `heavy` step), never on intent-cache.
+      # Hosted runners need passwordless sudo for it. The intent-cache slots
+      # have no sudo, and their hosts already set 32768
+      # (infra/runners/sysctl.conf), so the raise is skipped there.
       - name: Raise inotify instance limit
-        run: sudo -n sysctl -q -w fs.inotify.max_user_instances=4096
+        run: |
+          if ! [ "$(cat /proc/sys/fs/inotify/max_user_instances)" -ge 4096 ]; then
+            sudo -n sysctl -q -w fs.inotify.max_user_instances=4096
+          fi
       - name: Resolve pinned Rust channel
         id: toolchain
         shell: bash
@@ -1369,7 +1638,7 @@ jobs:
       - name: Verify bounded coverage profile pooling
         run: python3 -I -B scripts/test-coverage-profile-pool.py
       - name: Run combined coverage
-        timeout-minutes: 43
+        timeout-minutes: 53
         # Armed bound-caller seam — see coverage-e2e's run step.
         env:
           INTENTD_ASSERT_BOUND_CALLER: "1"
@@ -1410,11 +1679,15 @@ jobs:
     # Skipped on release-metadata PRs for the same reason as `check`.
     needs: [route, release-fast-path]
     if: ${{ !cancelled() && needs.route.result == 'success' && (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && needs.release-fast-path.outputs.fast_path != 'true')) }}
-    runs-on: ${{ fromJSON(needs.route.outputs.slots || '{}')['coverage-changed'] || fromJSON('["gh-linux-16x"]') }}
+    runs-on: ${{ fromJSON(needs.route.outputs.slots || '{}')['coverage-changed'] || fromJSON('["warp-ubuntu-2404-x64-16x"]') }}
     # A multi-crate selection compiles and runs each scope sequentially.
     # Shared-runner coverage can exceed 30 minutes while still making progress.
     timeout-minutes: 60
     env:
+      # WarpBuild runners preset NODE_OPTIONS (GitHub-hosted runners do not), and
+      # the ACP callback fixture refuses any NODE_OPTIONS injection; clear it so
+      # the job behaves the same on every runner it bursts to.
+      NODE_OPTIONS: ''
       # Share the full-coverage pool: nextest launches one process per test.
       # Bound retained raw profiles per binary without dropping execution counts.
       LLVM_PROFILE_FILE_NAME: "intent-%8m.profraw"
@@ -1836,11 +2109,14 @@ jobs:
   # genuine lint fails fast), plus the
   # stubbed-cargo harness for scripts/changed-tests.sh (the changed-tests
   # selection the monorepo's `make test-changed` delegates to, and its
-  # --instrumented llvm-cov form; intent-hq/intentd#1947), and the stub-root
+  # --instrumented llvm-cov form; intent-hq/intentd#1947) plus a check that
+  # every entry of its end-to-end map (.config/e2e-test-map.txt) still names
+  # an existing source path, test binary and module, and the stub-root
   # harness for the repo-root Makefile (every gate target forwards to the
   # monorepo root make with its command-line variables; a standalone clone or
-  # an unrelated parent Makefile gets the exit-2 refusal). Seconds-long like
-  # the other utility jobs, it uses the shared self-hosted-first route.
+  # an unrelated parent Makefile gets the exit-2 refusal). It also rejects
+  # tracked Python bytecode (scripts/check-no-python-cache.sh). Seconds-long
+  # like the other utility jobs, it uses the shared self-hosted-first route.
   release-scripts:
     needs: [route]
     runs-on: ${{ fromJSON(needs.route.outputs.slots || '{}')['release-scripts'] || fromJSON('["ubuntu-24.04"]') }}
@@ -1860,6 +2136,12 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.11'
+      # .gitignore covers new caches, but `git add -f` bypasses it; this job
+      # also runs in the merge queue and on main, unlike pr-static.
+      - name: Reject tracked Python bytecode
+        run: ./scripts/check-no-python-cache.sh
+      - name: Test the tracked Python bytecode check
+        run: ./scripts/test-check-no-python-cache.sh
       - name: Test release metadata and auto-cut guards (offline)
         run: |
           python3 -S scripts/test-release-pr-fast-path.py
@@ -1876,6 +2158,7 @@ jobs:
           python3 -B scripts/test-prerelease-cleanup-workflow.py
           python3 -B scripts/test-release-rust-cache.py
           python3 -I -B scripts/test-optional-intel-release.py
+          python3 -B scripts/test-release-host-network.py
           python3 -B scripts/test-setup-sccache.py
           python3 -I -B scripts/test-coverage-storage.py
           python3 -B scripts/test-hosted-runners.py
@@ -1937,19 +2220,38 @@ jobs:
           python3 -I -B scripts/test-macos-ci-workflows.py
       - name: Test changed-tests.sh
         run: python3 -S scripts/test-changed-tests-stdin.py
+      # A renamed or deleted test module or source file would otherwise leave
+      # a map entry that silently selects nothing (intentd#2617).
+      - name: Check the end-to-end test map
+        run: ./scripts/changed-tests.sh --check-map
       - name: Test the Makefile gate forwarder
         run: ./scripts/test-makefile-forwarder.sh
       - name: Test the ACP adapter rolling pin PR automation
         run: |
           python3 -S scripts/test-auto-pin-acp-adapter.py
           python3 -S scripts/test-provider-cli-metadata.py
+          python3 -S scripts/test-check-provider-error-corpus.py
+      # Downloads the pinned claude-agent-acp, Claude Agent SDK and codex-acp
+      # packages and fails when they emit an error kind (or a usage-limit
+      # wording) the quota classifier's corpus does not cover, so a rolling
+      # adapter pin PR cannot add a limit failover silently misses
+      # (intent-hq/intent#7615). An npm outage (exit 75) only warns, so a
+      # registry blip cannot fail unrelated PRs or eject merge-queue entries;
+      # any corpus drift still fails the job.
+      - name: Check the provider error corpus against the pinned adapters
+        run: |
+          status=0
+          python3 -S scripts/check-provider-error-corpus.py || status=$?
+          if [ "$status" -eq 75 ]; then
+            echo "::warning::npm was unreachable; the provider error corpus was not checked against the pinned adapters."
+          elif [ "$status" -ne 0 ]; then
+            exit "$status"
+          fi
       - name: Test the release-plz no-op baseline
         run: python3 -S scripts/test-release-plz-noop.py
       - uses: taiki-e/install-action@v2
         with:
           tool: release-plz@0.3.162
-      - name: Test Cargo packaging and historical baseline compatibility
-        run: python3 -S scripts/test-release-plz-packaging.py
       - name: Test new-package release baseline and retirement
         run: python3 -S scripts/test-release-plz-baseline.py
       - name: Test daemon and sitter changelog separation
@@ -2106,10 +2408,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # The Linux leg takes its own slot (listed in the route job's
+          # SLOT_JOBS); macOS keeps the shared mapping.
           - platform: linux
-            os: ${{ fromJSON(needs.route.outputs.linux_labels || '["gh-linux-16x"]') }}
+            os: ${{ fromJSON(needs.route.outputs.slots || '{}')['daemon-lifecycle-linux'] || fromJSON('["warp-ubuntu-2404-x64-16x"]') }}
           - platform: macos
-            os: ${{ fromJSON(needs.route.outputs.macos_labels || '["macos-26-xlarge"]') }}
+            os: ${{ fromJSON(needs.route.outputs.macos_labels || '["warp-macos-26-arm64-12x"]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     env:
@@ -2160,7 +2464,7 @@ jobs:
     name: CI Gate
     if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
-    needs: [route, pr-static, release-fast-path, cache-smoke, daemon-lifecycle, check, build, windows-lint, windows, macos-services-runtime, coverage-e2e, coverage-all, coverage-changed, pr-title, conflict-markers, monorepo-consumer-checks, deb-packaging, release-scripts, install-ps1, pi-session-paths]
+    needs: [route, pr-static, release-fast-path, cache-smoke, daemon-lifecycle, check, windows-cross-lint, build, windows-lint, windows, macos-services-runtime, coverage-e2e, coverage-all, coverage-changed, pr-title, conflict-markers, monorepo-consumer-checks, deb-packaging, release-scripts, install-ps1, pi-session-paths]
     steps:
       - name: Check results
         run: |
@@ -2176,7 +2480,8 @@ jobs:
               require pr-static "${{ needs.pr-static.result }}"
               # release-fast-path itself is advisory: a failed classifier must
               # degrade to full CI, never block the PR. Release-metadata PRs
-              # skip the two slow test jobs (see `check`); the skip is accepted
+              # skip the three slow compile jobs (`check`, `windows-cross-lint`,
+              # `coverage-changed`; see `check`); the skip is accepted
               # only when the classifier job succeeded and reported the fast
               # path. Any other PR must run them.
               slow=require
@@ -2186,6 +2491,7 @@ jobs:
               optional cache-smoke "${{ needs.cache-smoke.result }}"
               optional daemon-lifecycle "${{ needs.daemon-lifecycle.result }}"
               "$slow" check "${{ needs.check.result }}"
+              "$slow" windows-cross-lint "${{ needs.windows-cross-lint.result }}"
               optional build "${{ needs.build.result }}"
               optional windows-lint "${{ needs.windows-lint.result }}"
               optional windows "${{ needs.windows.result }}"
@@ -2207,6 +2513,7 @@ jobs:
               require cache-smoke "${{ needs.cache-smoke.result }}"
               require daemon-lifecycle "${{ needs.daemon-lifecycle.result }}"
               require check "${{ needs.check.result }}"
+              optional windows-cross-lint "${{ needs.windows-cross-lint.result }}"
               require build "${{ needs.build.result }}"
               require windows-lint "${{ needs.windows-lint.result }}"
               optional windows "${{ needs.windows.result }}"
@@ -2228,6 +2535,7 @@ jobs:
               optional cache-smoke "${{ needs.cache-smoke.result }}"
               optional daemon-lifecycle "${{ needs.daemon-lifecycle.result }}"
               optional check "${{ needs.check.result }}"
+              optional windows-cross-lint "${{ needs.windows-cross-lint.result }}"
               require build "${{ needs.build.result }}"
               optional windows-lint "${{ needs.windows-lint.result }}"
               require windows "${{ needs.windows.result }}"

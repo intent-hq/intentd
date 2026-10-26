@@ -23,8 +23,10 @@ use intent_core::events::{
     COMMENT_DELETED, GIT_ROOT_REGISTERED, GIT_ROOT_UNREGISTERED, GIT_ROOT_UPDATED, NOTE_CREATED,
     NOTE_DELETED, NOTE_PRESENCE, NOTE_UPDATED, PR_LINKED, PR_MONITOR_CANCELLED, PR_MONITOR_CHANGED,
     PR_MONITOR_COMPLETED, PR_MONITOR_REGISTERED, PR_UNLINKED, PR_UPDATED, TASK_STATUS_CHANGED,
-    WORKSPACE_ACTIVITY_CHANGED, WORKSPACE_ATTENTION_CHANGED, WORKSPACE_CREATED, WORKSPACE_DELETED,
-    WORKSPACE_DISPLAY_STATUS_CHANGED, WORKSPACE_UPDATED, WORKSPACE_WAITING_CHANGED,
+    WORKSPACE_ACTIVITY_CHANGED, WORKSPACE_ATTENTION_CHANGED,
+    WORKSPACE_BACKGROUND_TASKS_RUNNING_CHANGED, WORKSPACE_CREATED, WORKSPACE_DELETED,
+    WORKSPACE_DISPLAY_STATUS_CHANGED, WORKSPACE_SCRIPTS_RUNNING_CHANGED, WORKSPACE_UPDATED,
+    WORKSPACE_WAITING_CHANGED,
 };
 use intent_core::{
     extract_spec_task_ids, note_list_slim_row, now_iso, AgentId, AgentLite, ConversationProjection,
@@ -92,13 +94,22 @@ pub(crate) struct NoteSubscribeParams {
     pub workspace_id: String,
     pub replace_group: Option<String>,
     pub projection: Option<NoteListProjection>,
+    /// Note-channel-only `maxContentBytes` (truncated note reads): fixed for
+    /// the subscription's lifetime, it bounds every full row's `content`
+    /// with [`intent_core::note_bounded_row`]. `None` keeps rows unchanged.
+    pub max_content_bytes: Option<usize>,
 }
 
 /// Parsed `workspace.subscribe` params (§6.1). The workspace channel is global
-/// (per-user, no `workspaceId` scope); only `replaceGroup` is honored.
+/// (per-user, no `workspaceId` scope); `replaceGroup` and `includeRetired`
+/// are honored.
 #[derive(Debug)]
 pub(crate) struct WorkspaceSubscribeParams {
     pub replace_group: Option<String>,
+    /// `includeRetired` (default `false`): retired workspaces appear in the
+    /// seq-0 snapshot and deltas only when the subscriber opts in; without
+    /// it a retire transition is delivered as a `removedIds` removal.
+    pub include_retired: bool,
 }
 
 /// Parsed `comment.subscribe` params (§6.1). The comment channel is per-resource:
@@ -252,6 +263,7 @@ pub(crate) fn parse_subscribe_params(
         workspace_id,
         replace_group: replace_group(params),
         projection: None,
+        max_content_bytes: None,
     })
 }
 
@@ -271,17 +283,26 @@ pub(crate) fn parse_note_subscribe_params(
         Some(Value::String(s)) if s == "slim" => Some(NoteListProjection::Slim),
         Some(_) => return Err("projection must be \"slim\" or \"full\"".to_string()),
     };
+    parsed.max_content_bytes =
+        crate::router::max_content_bytes_param(params).map_err(str::to_string)?;
     Ok(parsed)
 }
 
 /// Validate `workspace.subscribe` params. The channel is global, so only the
-/// optional `replaceGroup` is read (§6.2).
-#[expect(clippy::unnecessary_wraps)] // params parser; keeps the uniform Result shape of its siblings
+/// optional `replaceGroup` and `includeRetired` (strict boolean: only
+/// omission means `false`; `null` or any non-boolean is `-32602`) are read
+/// (§6.2).
 pub(crate) fn parse_workspace_subscribe_params(
     params: &Map<String, Value>,
 ) -> Result<WorkspaceSubscribeParams, String> {
+    let include_retired = match params.get("includeRetired") {
+        None => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return Err("includeRetired must be a boolean".to_string()),
+    };
     Ok(WorkspaceSubscribeParams {
         replace_group: replace_group(params),
+        include_retired,
     })
 }
 
@@ -559,6 +580,7 @@ pub(crate) async fn note_delta(
     workspace_id: &WorkspaceId,
     event: &Event,
     projection: Option<NoteListProjection>,
+    max_content_bytes: Option<usize>,
 ) -> Option<Value> {
     let note_id = event.data.get("noteId").and_then(Value::as_str)?;
     match event.event_type.as_str() {
@@ -567,14 +589,14 @@ pub(crate) async fn note_delta(
                 .get_note(workspace_id.clone(), NoteId::from(note_id))
                 .await
                 .ok()?;
-            Some(json!({ "added": [note_row(note, projection)?] }))
+            Some(json!({ "added": [note_row(note, projection, max_content_bytes)?] }))
         }
         NOTE_UPDATED => {
             let note = api
                 .get_note(workspace_id.clone(), NoteId::from(note_id))
                 .await
                 .ok()?;
-            Some(json!({ "updated": [note_row(note, projection)?] }))
+            Some(json!({ "updated": [note_row(note, projection, max_content_bytes)?] }))
         }
         NOTE_DELETED => Some(json!({ "removedIds": [note_id] })),
         _ => None,
@@ -584,11 +606,19 @@ pub(crate) async fn note_delta(
 /// Serialize one note-channel row under the subscription's projection: full
 /// (`None`) keeps the complete wire `Note` byte-identical to before;
 /// [`NoteListProjection::Slim`] serves the bounded `note.list` slim row
-/// (`content` → `contentPreview` + `contentLength`, §5.2).
-fn note_row(note: Note, projection: Option<NoteListProjection>) -> Option<Value> {
-    match projection {
-        Some(NoteListProjection::Slim) => Some(note_list_slim_row(note)),
-        None => serde_json::to_value(note).ok(),
+/// (`content` → `contentPreview` + `contentLength`, §5.2). A full row under
+/// `maxContentBytes` is cut by the truncated-read rule
+/// ([`intent_core::note_bounded_row`]); slim rows carry no `content`, so the
+/// limit has no effect on them.
+fn note_row(
+    note: Note,
+    projection: Option<NoteListProjection>,
+    max_content_bytes: Option<usize>,
+) -> Option<Value> {
+    match (projection, max_content_bytes) {
+        (Some(NoteListProjection::Slim), _) => Some(note_list_slim_row(note)),
+        (None, Some(limit)) => Some(intent_core::note_bounded_row(note, limit)),
+        (None, None) => serde_json::to_value(note).ok(),
     }
 }
 
@@ -850,6 +880,8 @@ pub(crate) fn channel_event_types(channel: Channel) -> Vec<String> {
             WORKSPACE_ATTENTION_CHANGED,
             WORKSPACE_DISPLAY_STATUS_CHANGED,
             WORKSPACE_WAITING_CHANGED,
+            WORKSPACE_SCRIPTS_RUNNING_CHANGED,
+            WORKSPACE_BACKGROUND_TASKS_RUNNING_CHANGED,
             PR_LINKED,
             PR_UPDATED,
             PR_UNLINKED,
@@ -915,10 +947,10 @@ pub(crate) async fn channel_snapshot(
         // Lite list: cheap status aggregates (taskStats/displayStatus/
         // cowSupported) only — no notes/sessions enrichment. Full list was
         // multi-MB.
-        Channel::Workspace => match api.list_workspaces_lite(true).await {
-            Ok(workspaces) => serde_json::to_value(workspaces).unwrap_or_else(|_| empty()),
-            Err(_) => empty(),
-        },
+        // Retired workspaces are opt-in: the generic path never includes
+        // them; `workspace.subscribe { includeRetired: true }` routes
+        // through [`workspace_snapshot`] directly.
+        Channel::Workspace => workspace_snapshot(api, false).await,
         Channel::Comment => match note_id {
             Some(note_id) => match api
                 .comment_list(
@@ -942,6 +974,20 @@ pub(crate) async fn channel_snapshot(
         // note-presence channel's snapshot is the join's return value
         // (`note_presence_join`, served by `forward_note_presence_subscription`).
         Channel::Chat | Channel::NotePresence | Channel::PresenceFocus => empty(),
+    }
+}
+
+/// The `workspace` channel's seq-0 snapshot: the lite list with archived
+/// rows (clients filter by `status`, intent-hq/monorepo#775) and retired rows
+/// only when the subscriber passed `includeRetired: true`. On a read error
+/// the snapshot degrades to the empty array.
+pub(crate) async fn workspace_snapshot(api: &dyn WorkspaceApi, include_retired: bool) -> Value {
+    let filter = intent_core::WorkspaceListFilter::new(true, include_retired);
+    match api.list_workspaces_lite(filter).await {
+        Ok(workspaces) => {
+            serde_json::to_value(workspaces).unwrap_or_else(|_| Value::Array(Vec::new()))
+        }
+        Err(_) => Value::Array(Vec::new()),
     }
 }
 
@@ -2086,12 +2132,12 @@ pub(crate) async fn channel_delta(
         // The note channel uses the dedicated `forward_note_subscription`
         // path (which threads the subscription's v8.2 projection), so this
         // generic arm is unreachable for `Note`; full rows keep it faithful.
-        Channel::Note => note_delta(api, workspace_id, event, None).await,
+        Channel::Note => note_delta(api, workspace_id, event, None, None).await,
         Channel::Agent => agent_delta(api, event).await,
         // The workspace channel's tombstone scoping is stateful (the
         // forwarder threads the subscriber's visible-id set); this generic
         // arm is the unscoped administrator form.
-        Channel::Workspace => workspace_delta(api, event, None).await,
+        Channel::Workspace => workspace_delta(api, event, None, false).await,
         Channel::Comment => comment_delta(api, workspace_id, note_id?, event).await,
         // The task channel uses the stateful [`task_delta`] mapper directly in
         // the forwarder: it tracks the spec's task-link set across deltas so a
@@ -2397,10 +2443,17 @@ pub(crate) fn visible_workspace_ids(snapshot: &Value) -> HashSet<String> {
 /// succeeds for a previously invisible workspace: it upserts as an
 /// `updated` delta (the channel's documented upsert semantics), which is
 /// how a connected guest's list gains the workspace without a reconnect.
+///
+/// Retired workspaces are opt-in (`include_retired`, from
+/// `workspace.subscribe { includeRetired }`): for a subscriber that did not
+/// opt in, a re-read that finds the workspace `Retired` is delivered as a
+/// `removedIds` removal (retire = removal for them), and no later event
+/// re-adds it.
 pub(crate) async fn workspace_delta(
     api: &dyn WorkspaceApi,
     event: &Event,
     visible: Option<&mut HashSet<String>>,
+    include_retired: bool,
 ) -> Option<Value> {
     let workspace_id = WorkspaceId::from(
         event
@@ -2423,6 +2476,9 @@ pub(crate) async fn workspace_delta(
         }
         WORKSPACE_CREATED => {
             let ws = api.get_workspace(workspace_id.clone()).await.ok()?;
+            if ws.is_retired() && !include_retired {
+                return None;
+            }
             if let Some(visible) = visible {
                 visible.insert(workspace_id.as_str().to_string());
             }
@@ -2444,6 +2500,8 @@ pub(crate) async fn workspace_delta(
         | WORKSPACE_ATTENTION_CHANGED
         | WORKSPACE_DISPLAY_STATUS_CHANGED
         | WORKSPACE_WAITING_CHANGED
+        | WORKSPACE_SCRIPTS_RUNNING_CHANGED
+        | WORKSPACE_BACKGROUND_TASKS_RUNNING_CHANGED
         | PR_LINKED
         | PR_UPDATED
         | PR_UNLINKED
@@ -2467,6 +2525,18 @@ pub(crate) async fn workspace_delta(
                 return Some(json!({ "removedIds": [workspace_id.as_str()] }));
             }
             let ws = api.get_workspace(workspace_id.clone()).await.ok()?;
+            if ws.is_retired() && !include_retired {
+                // Retire = removal for a subscriber that did not opt in. A
+                // non-administrator only gets the tombstone for a workspace
+                // it was shown; the administrator path emits it like
+                // `workspace:deleted` does.
+                if let Some(visible) = visible {
+                    if !visible.remove(workspace_id.as_str()) {
+                        return None;
+                    }
+                }
+                return Some(json!({ "removedIds": [workspace_id.as_str()] }));
+            }
             if let Some(visible) = visible {
                 visible.insert(workspace_id.as_str().to_string());
             }

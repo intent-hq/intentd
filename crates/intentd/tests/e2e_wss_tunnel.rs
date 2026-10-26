@@ -6,7 +6,7 @@
 //! the concurrent-stream cap, protocol violations, and the 401 auth gate that
 //! `/tunnel` shares with `/ws`.
 
-mod common;
+use crate::common;
 
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};

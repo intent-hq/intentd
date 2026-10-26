@@ -16,16 +16,14 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
+use intentd_test_support::GuardedChild;
 use std::path::PathBuf;
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 
-use intent_core::{
-    now_iso, NoteCreate, Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention,
-    WorkspaceId, WorkspaceStatus,
-};
+use intent_core::{now_iso, NoteCreate, Workspace, WorkspaceApi, WorkspaceId};
 use intent_services::Services;
 use intent_store::Store;
 use serde_json::{json, Value};
@@ -42,60 +40,19 @@ fn workspace(id: &WorkspaceId) -> Workspace {
         id: id.clone(),
         title: "OTW".to_string(),
         branch: "main".to_string(),
-        base_ref: None,
-        base_commit_sha: None,
-        status: WorkspaceStatus::Active,
-        status_message: None,
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
-        attention: WorkspaceAttention::None,
         created_at: ts.clone(),
         updated_at: ts,
-        last_activity: None,
-        last_content_activity: None,
-        tags: vec![],
-        path: None,
-        repository_path: None,
-        repository_owner: None,
-        repository_name: None,
-        worktree_path: None,
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
-        default_model: None,
-        pr_number: None,
-        pr_url: None,
-        pr_status: None,
-        active_pull_request: None,
-        pull_requests: None,
-        context_links: None,
-        archived: false,
-        archived_at: None,
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        pull_requests_total: None,
-        display_status: None,
-        waiting: false,
-        checkout_mode: None,
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
+        ..Default::default()
     }
 }
 
 struct Daemon {
-    child: Child,
+    child: GuardedChild,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.child.kill_tree();
     }
 }
 
@@ -129,10 +86,13 @@ async fn send(write_half: &mut (impl AsyncWriteExt + Unpin), frame: Value) {
 
 async fn read_json(reader: &mut BufReader<OwnedReadHalf>, secs: u64) -> Value {
     let mut line = String::new();
-    let n = timeout(Duration::from_secs(secs), reader.read_line(&mut line))
-        .await
-        .expect("timed out waiting for a frame")
-        .expect("read failed");
+    let n = timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(secs)),
+        reader.read_line(&mut line),
+    )
+    .await
+    .expect("timed out waiting for a frame")
+    .expect("read failed");
     assert!(n > 0, "connection closed unexpectedly");
     serde_json::from_str(line.trim_end()).expect("invalid JSON frame")
 }
@@ -145,16 +105,17 @@ async fn launch_daemon(data_dir: &PathBuf, script: &str, behavior: &str) -> (Dae
     let log = std::fs::File::create(&log_path).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
-    let child = common::hermetic_serve_command(data_dir)
-        .env("INTENTD_DATA_DIR", data_dir)
-        .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
-        .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
-        .env("MOCK_AGENT_SCRIPT_PATH", script)
-        .env("MOCK_AGENT_BEHAVIOR", behavior)
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(log))
-        .spawn()
-        .expect("spawn intentd serve");
+    let child = GuardedChild::spawn(
+        common::hermetic_serve_command(data_dir)
+            .env("INTENTD_DATA_DIR", data_dir)
+            .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
+            .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
+            .env("MOCK_AGENT_SCRIPT_PATH", script)
+            .env("MOCK_AGENT_BEHAVIOR", behavior)
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(log)),
+    )
+    .expect("spawn intentd serve");
     let mut daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     common::await_daemon_listening(&mut daemon.child, &socket, &log_path).await;
@@ -256,16 +217,17 @@ async fn daemon_drives_agent_turn_and_mcp_tool_call_over_uds() {
     let log = std::fs::File::create(&log_path).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
-    let child = common::hermetic_serve_command(&data_dir)
-        .env("INTENTD_DATA_DIR", &data_dir)
-        .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
-        .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
-        .env("MOCK_AGENT_SCRIPT_PATH", &script)
-        .env("MOCK_AGENT_BEHAVIOR", &behavior)
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(log))
-        .spawn()
-        .expect("spawn intentd serve");
+    let child = GuardedChild::spawn(
+        common::hermetic_serve_command(&data_dir)
+            .env("INTENTD_DATA_DIR", &data_dir)
+            .env("INTENTD_WORKSPACES_DIR", &workspaces_dir)
+            .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
+            .env("MOCK_AGENT_SCRIPT_PATH", &script)
+            .env("MOCK_AGENT_BEHAVIOR", &behavior)
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(log)),
+    )
+    .expect("spawn intentd serve");
     let mut daemon = Daemon { child };
     let socket = data_dir.join("intentd.sock");
     common::await_daemon_listening(&mut daemon.child, &socket, &log_path).await;

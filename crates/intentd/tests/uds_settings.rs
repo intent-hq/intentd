@@ -7,7 +7,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -68,9 +68,12 @@ async fn read_json(reader: &mut BufReader<OwnedReadHalf>) -> Value {
 async fn assert_no_frame(reader: &mut BufReader<OwnedReadHalf>) {
     let mut line = String::new();
     assert!(
-        timeout(Duration::from_millis(100), reader.read_line(&mut line))
-            .await
-            .is_err(),
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_millis(100)),
+            reader.read_line(&mut line)
+        )
+        .await
+        .is_err(),
         "unexpected event frame: {line}"
     );
 }

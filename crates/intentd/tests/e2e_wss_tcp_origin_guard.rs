@@ -18,10 +18,11 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
+use intentd_test_support::GuardedChild;
 use std::path::Path;
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -41,14 +42,13 @@ use tokio_tungstenite::WebSocketStream;
 const TOKEN: &str = "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f";
 
 struct Daemon {
-    child: Child,
+    child: GuardedChild,
     _data_dir: tempfile::TempDir,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.child.kill_tree();
     }
 }
 
@@ -56,7 +56,7 @@ fn temp_data_dir() -> tempfile::TempDir {
     common::test_tempdir_in("/tmp", "itd-tcp-guard-")
 }
 
-fn spawn_serve(data_dir: &Path) -> Child {
+fn spawn_serve(data_dir: &Path) -> GuardedChild {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
@@ -69,7 +69,7 @@ fn spawn_serve(data_dir: &Path) -> Child {
         .env("MOCK_ACP_HOST", "localhost:0")
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
-    cmd.spawn().expect("spawn intentd serve")
+    GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -265,7 +265,7 @@ async fn tcp_client_refused_server_rotate_token_fast_path() {
         "error message should mention local-only: {response}"
     );
 
-    daemon.child.kill().ok();
+    daemon.child.kill_tree().ok();
 }
 
 /// Adversarial test: remote WSS client attempts to disable `server.wsApi.enabled` via
@@ -307,7 +307,7 @@ async fn tcp_client_refused_settings_disable_wss_slow_path() {
         "error message should mention TCP connection: {response}"
     );
 
-    daemon.child.kill().ok();
+    daemon.child.kill_tree().ok();
 }
 
 /// Positive control: UDS client CAN disable `server.wsApi.enabled` (local origin).
@@ -341,7 +341,7 @@ async fn uds_client_allowed_settings_disable_wss() {
         "settings.update disable from UDS must return applied array: {response}"
     );
 
-    daemon.child.kill().ok();
+    daemon.child.kill_tree().ok();
 }
 
 /// Regression test for --mode local: TCP clients must STILL be refused even when
@@ -368,7 +368,7 @@ async fn tcp_client_refused_settings_disable_wss_when_mode_local() {
         .env("MOCK_ACP_HOST", "localhost:0")
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
-    let child = cmd.spawn().expect("spawn intentd serve");
+    let child = GuardedChild::spawn(&mut cmd).expect("spawn intentd serve");
 
     let mut daemon = Daemon {
         child,
@@ -404,5 +404,5 @@ async fn tcp_client_refused_settings_disable_wss_when_mode_local() {
         "error message should mention TCP connection: {response}"
     );
 
-    daemon.child.kill().ok();
+    daemon.child.kill_tree().ok();
 }

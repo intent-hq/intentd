@@ -91,6 +91,8 @@ debug = "line-tables-only"
 # Preserve line-tables-only for workspace crates (panic backtraces)
 [profile.dev.package.intent-acp]
 debug = "line-tables-only"
+[profile.dev.package.intent-app]
+debug = "line-tables-only"
 [profile.dev.package.intent-context]
 debug = "line-tables-only"
 [profile.dev.package.intent-core]
@@ -116,6 +118,8 @@ debug = "line-tables-only"
 [profile.dev.package.intent-sourcecontrol]
 debug = "line-tables-only"
 [profile.dev.package.intent-store]
+debug = "line-tables-only"
+[profile.dev.package.intent-svc-transfer]
 debug = "line-tables-only"
 [profile.dev.package.intent-transport]
 debug = "line-tables-only"

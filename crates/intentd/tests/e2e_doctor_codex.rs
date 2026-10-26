@@ -3,7 +3,7 @@
 
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 
-mod common;
+use crate::common;
 
 use std::fmt::Write;
 use std::fs;
@@ -266,7 +266,11 @@ impl Fixture {
         // install outranks a fixture, fail rather than touching that installation.
         let mut preflight = self.command(&std::env::current_exe().unwrap());
         preflight
-            .args(["--exact", "fixture_launch_is_selected", "--nocapture"])
+            .args([
+                "--exact",
+                &common::exact_test_name(module_path!(), "fixture_launch_is_selected"),
+                "--nocapture",
+            ])
             .env(SELECTION, self.selection);
         assert!(
             self.run_command(preflight).0,

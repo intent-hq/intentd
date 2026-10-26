@@ -8,10 +8,11 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
+use intentd_test_support::GuardedChild;
 use std::path::Path;
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -30,13 +31,12 @@ use tokio_tungstenite::WebSocketStream;
 const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef";
 
 struct Daemon {
-    child: Child,
+    child: GuardedChild,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.child.kill_tree();
     }
 }
 
@@ -44,7 +44,7 @@ fn temp_data_dir() -> tempfile::TempDir {
     common::test_tempdir_in("/tmp", "itd-wss-setmodel-")
 }
 
-fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
+fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> GuardedChild {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
@@ -61,7 +61,7 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
         cmd.env(k, v);
     }
     common::hermetic_fixture_identity(&mut cmd, data_dir);
-    cmd.spawn().expect("spawn intentd serve")
+    GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -337,8 +337,7 @@ async fn antigravity_catalog_override_change_and_restart_use_current_executable_
     )
     .await;
     drop(rpc);
-    daemon.child.kill().unwrap();
-    daemon.child.wait().unwrap();
+    daemon.child.kill_tree().unwrap();
     daemon.child = spawn_serve(&data_dir, "both", &env);
     assert!(await_uds(&socket).await);
     let status = common::await_wss_status(&socket).await;

@@ -46,7 +46,11 @@ fn unavailable() -> Error {
 }
 
 /// Pure canonical identity validation. A transport override is NOT identity.
-pub(crate) fn logical_instance(config: &GitlabSettings) -> Result<GitlabInstance> {
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn logical_instance(config: &GitlabSettings) -> Result<GitlabInstance> {
     let bare = super::super::parse_gitlab_host(&config.host)
         .map_err(|_| Error::InvalidParams("invalid sourceControl.gitlab.host".into()))?;
     let instance =

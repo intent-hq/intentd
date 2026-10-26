@@ -19,8 +19,9 @@ mod creation_preferences;
 #[path = "e2e_wss_agent_lifecycle/structured_notices.rs"]
 mod structured_notices;
 
+use intentd_test_support::GuardedChild;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -42,27 +43,13 @@ const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefe
 
 /// Live `intentd serve` process; killed on drop.
 struct Daemon {
-    child: Child,
+    child: GuardedChild,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        // Kill the whole process group (daemon + any Node.js ACP provider
-        // children) BEFORE removing the data dir, so an orphaned child can't
-        // re-create files (e.g. node-compile-cache under a redirected TMPDIR)
-        // after cleanup. The daemon is spawned with process_group(0).
-        #[cfg(unix)]
-        {
-            use nix::sys::signal::{self, Signal};
-            use nix::unistd::Pid;
-            let pid = Pid::from_raw(self.child.id().cast_signed());
-            let _ = signal::killpg(pid, Signal::SIGKILL);
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = self.child.kill();
-        }
-        let _ = self.child.wait();
+        // Kills the daemon's process group (ACP providers run in their own groups).
+        let _ = self.child.kill_tree();
     }
 }
 
@@ -83,12 +70,6 @@ fn lifecycle_command(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> std
         .env("INTENTD_ASSERT_HERMETIC_ROOT", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::from(log));
-    // Group leader so Daemon::drop can killpg the daemon + ACP children.
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -96,10 +77,8 @@ fn lifecycle_command(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> std
     cmd
 }
 
-fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
-    lifecycle_command(data_dir, listen, env)
-        .spawn()
-        .expect("spawn intentd serve")
+fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> GuardedChild {
+    GuardedChild::spawn(&mut lifecycle_command(data_dir, listen, env)).expect("spawn intentd serve")
 }
 
 /// Wait for the daemon's UDS to accept connections, up to the shared
@@ -247,9 +226,12 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     loop {
-        let next = timeout(Duration::from_secs(secs), ws.next())
-            .await
-            .expect("wss event timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(secs)),
+            ws.next(),
+        )
+        .await
+        .expect("wss event timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -275,7 +257,8 @@ async fn wss_event_opt<S>(ws: &mut WebSocketStream<S>, secs: u64) -> Option<Valu
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(secs));
     wss_event_opt_until(ws, deadline).await
 }
 
@@ -320,9 +303,12 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     loop {
-        let next = timeout(Duration::from_secs(secs), ws.next())
-            .await
-            .expect("wss push timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(secs)),
+            ws.next(),
+        )
+        .await
+        .expect("wss push timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -7104,55 +7090,15 @@ async fn seed_queue_collaborator(data_dir: &Path, workspace_id: &str) -> &'stati
 }
 
 fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
-    use intent_core::{now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus};
+    use intent_core::{now_iso, Workspace};
     let ts = now_iso();
     Workspace {
         id: id.clone(),
         title: "WSS-E2E".to_string(),
         branch: "main".to_string(),
-        base_ref: None,
-        base_commit_sha: None,
-        status: WorkspaceStatus::Active,
-        status_message: None,
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
-        attention: WorkspaceAttention::None,
         created_at: ts.clone(),
         updated_at: ts,
-        last_activity: None,
-        last_content_activity: None,
-        tags: vec![],
-        path: None,
-        repository_path: None,
-        repository_owner: None,
-        repository_name: None,
-        worktree_path: None,
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
-        default_model: None,
-        pr_number: None,
-        pr_url: None,
-        pr_status: None,
-        active_pull_request: None,
-        pull_requests: None,
-        context_links: None,
-        archived: false,
-        archived_at: None,
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        pull_requests_total: None,
-        display_status: None,
-        waiting: false,
-        checkout_mode: None,
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
+        ..Default::default()
     }
 }
 
@@ -8353,7 +8299,7 @@ async fn oversized_request_head_rejected_over_wss() {
     // upgrade success; it either drops silently or returns a non-101 status.
     let mut buf = [0u8; 1024];
     let mut total = Vec::new();
-    let deadline = Duration::from_secs(2);
+    let deadline = common::test_timeout(Duration::from_secs(2));
     loop {
         match timeout(deadline, tls.read(&mut buf)).await {
             Ok(Ok(0) | Err(_)) | Err(_) => break,
@@ -12845,10 +12791,51 @@ async fn image_jpg_alias_reaches_acp_unchanged_over_wss() {
     image_prompt_preparation_over_wss(ImagePreparationCase::JpegAlias).await;
 }
 
+#[intent_test_macros::daemon_test]
+async fn image_mime_parameters_reach_acp_over_wss() {
+    image_prompt_preparation_over_wss(ImagePreparationCase::MimeParameters).await;
+}
+
+/// Legacy image payloads must deliver unsupported formats as retrievable files.
+#[intent_test_macros::daemon_test]
+async fn unsupported_images_become_file_notices_over_wss() {
+    for (mime, name, bytes) in [
+        (
+            "image/svg+xml",
+            "drawing.png",
+            br#"<svg xmlns="http://www.w3.org/2000/svg"><rect width="10" height="10"/></svg>"#
+                .as_slice(),
+        ),
+        (
+            "image/bmp",
+            "drawing.bmp",
+            b"BMunsupported bitmap".as_slice(),
+        ),
+        (
+            "image/tiff",
+            "drawing.tiff",
+            b"IIunsupported tiff".as_slice(),
+        ),
+        ("image/avif", "drawing.avif", b"unsupported avif".as_slice()),
+        ("image/heic", "drawing.heic", b"unsupported heic".as_slice()),
+    ] {
+        image_prompt_preparation_over_wss(ImagePreparationCase::Unsupported(mime, name, bytes))
+            .await;
+    }
+}
+
+#[intent_test_macros::daemon_test]
+async fn cross_workspace_unsupported_image_is_retrievable_over_wss() {
+    image_prompt_preparation_over_wss(ImagePreparationCase::CrossWorkspaceSvg).await;
+}
+
 enum ImagePreparationCase {
     LargePng,
     CorruptPng,
     JpegAlias,
+    MimeParameters,
+    CrossWorkspaceSvg,
+    Unsupported(&'static str, &'static str, &'static [u8]),
 }
 
 async fn image_prompt_preparation_over_wss(case: ImagePreparationCase) {
@@ -12858,9 +12845,21 @@ async fn image_prompt_preparation_over_wss(case: ImagePreparationCase) {
     let Some(script) = gate("image prompt preparation E2E") else {
         return;
     };
+    let cross_workspace = matches!(case, ImagePreparationCase::CrossWorkspaceSvg);
+    let unsupported = cross_workspace || matches!(case, ImagePreparationCase::Unsupported(..));
     let corrupt = matches!(case, ImagePreparationCase::CorruptPng);
     let jpeg_alias = matches!(case, ImagePreparationCase::JpegAlias);
-    let (format, mime, file_name) = if jpeg_alias {
+    let (format, mime, file_name) = if let ImagePreparationCase::Unsupported(mime, name, _) = case {
+        (image::ImageFormat::Png, mime, name)
+    } else if cross_workspace {
+        (image::ImageFormat::Png, "image/svg+xml", "original.svg")
+    } else if matches!(case, ImagePreparationCase::MimeParameters) {
+        (
+            image::ImageFormat::Png,
+            " IMAGE/PNG ; charset=binary ",
+            "image.png",
+        )
+    } else if jpeg_alias {
         (image::ImageFormat::Jpeg, "image/jpg", "image.jpg")
     } else {
         (image::ImageFormat::Png, "image/png", "image.png")
@@ -12869,10 +12868,10 @@ async fn image_prompt_preparation_over_wss(case: ImagePreparationCase) {
     // Deterministic high-entropy pixels defeat PNG compression. This fixture
     // exceeds 5 MiB and the 2000-pixel long-edge limit, but its inline base64
     // still fits the existing 8 MiB prompt cap before preparation.
-    let (width, height) = if corrupt || jpeg_alias {
-        (20, 10)
-    } else {
+    let (width, height) = if matches!(case, ImagePreparationCase::LargePng) {
         (3000, 640)
+    } else {
+        (20, 10)
     };
     let mut state = 0x1234_5678_u32;
     let pixels = image::RgbImage::from_fn(width, height, |_, _| {
@@ -12887,10 +12886,15 @@ async fn image_prompt_preparation_over_wss(case: ImagePreparationCase) {
         .write_to(&mut encoded, format)
         .expect("encode genuine fixture image");
     let mut original = encoded.into_inner();
-    if corrupt {
+    if let ImagePreparationCase::Unsupported(_, _, bytes) = case {
+        original = bytes.to_vec();
+    } else if cross_workspace {
+        original = br#"<svg xmlns="http://www.w3.org/2000/svg"><text>foreign source</text></svg>"#
+            .to_vec();
+    } else if corrupt {
         original.truncate(33); // PNG signature + valid IHDR; no IDAT pixel data.
         assert!(image::load_from_memory(&original).is_err());
-    } else if !jpeg_alias {
+    } else if matches!(case, ImagePreparationCase::LargePng) {
         assert!(original.len() > 5 * 1024 * 1024, "fixture exceeds 5 MiB");
     }
     let image_b64 = base64::engine::general_purpose::STANDARD.encode(&original);
@@ -12904,7 +12908,7 @@ async fn image_prompt_preparation_over_wss(case: ImagePreparationCase) {
     // The workspace needs a real filesystem root: `file.placeAttachment`
     // lands bytes under `.intent/attachments/` and the reference resolution
     // reads them back from the same root.
-    let ws_id = {
+    let (ws_id, source_ws_id) = {
         use intent_store::Store;
         let store = Store::open(&data_dir.join("intentd.db"))
             .await
@@ -12918,12 +12922,30 @@ async fn image_prompt_preparation_over_wss(case: ImagePreparationCase) {
         let mut seed = workspace_seed(&ws);
         seed.worktree_path = Some(root.to_string_lossy().into_owned());
         store.insert_workspace(&seed).await.expect("insert ws");
-        ws.0
+        if cross_workspace {
+            let destination = intent_core::WorkspaceId::new();
+            let root = data_dir.join("receiving-root");
+            std::fs::create_dir_all(&root).expect("mkdir receiving root");
+            let mut seed = workspace_seed(&destination);
+            seed.worktree_path = Some(root.to_string_lossy().into_owned());
+            store
+                .insert_workspace(&seed)
+                .await
+                .expect("insert receiving workspace");
+            (destination.0, ws.0)
+        } else {
+            (ws.0.clone(), ws.0)
+        }
     };
     let prompt_log = data_dir.join("prompts.jsonl");
     let prompt_log_str = prompt_log.to_string_lossy().into_owned();
     let session_log = data_dir.join("sessions.jsonl");
-    let behavior = json!({ "response": "seen", "loadSession": corrupt }).to_string();
+    let retrieval_log = data_dir.join("retrievals.jsonl");
+    let mut behavior = json!({ "response": "seen", "loadSession": corrupt });
+    if cross_workspace {
+        behavior["attachmentRetrievalLog"] = json!(retrieval_log);
+    }
+    let behavior = behavior.to_string();
     let env: [(&str, &str); 5] = [
         ("INTENTD_AUTH_TOKEN", TOKEN),
         ("MOCK_AGENT_SCRIPT_PATH", &script),
@@ -12962,7 +12984,7 @@ async fn image_prompt_preparation_over_wss(case: ImagePreparationCase) {
         10,
         "file.placeAttachment",
         json!({
-            "workspaceId": &ws_id,
+            "workspaceId": &source_ws_id,
             "fileName": file_name,
             "data": &image_b64,
             "mimeType": mime,
@@ -12975,7 +12997,8 @@ async fn image_prompt_preparation_over_wss(case: ImagePreparationCase) {
         .to_string();
 
     let mut outbound = Vec::new();
-    for (name, input) in [
+    let mut inline_file_id = None;
+    let mut inputs = vec![
         (
             "ImgRef",
             json!({ "type": "image", "attachmentId": &attachment_id }),
@@ -12984,7 +13007,25 @@ async fn image_prompt_preparation_over_wss(case: ImagePreparationCase) {
             "ImgInline",
             json!({ "type": "image", "data": &image_b64, "mimeType": mime }),
         ),
-    ] {
+    ];
+    if cross_workspace {
+        inputs = vec![
+            (
+                "ImgRef",
+                json!({ "type": "image", "attachmentId": &attachment_id }),
+            ),
+            (
+                "ImgRefAgain",
+                json!({ "type": "image", "attachmentId": &attachment_id }),
+            ),
+        ];
+    } else if unsupported {
+        inputs.push((
+            "ImgInlineAgain",
+            json!({ "type": "image", "data": &image_b64, "mimeType": mime }),
+        ));
+    }
+    for (name, input) in inputs {
         // Separate agents ensure each path has its own first-turn prompt,
         // with no history replay or previous turn's image in the comparison.
         let created = wss_rpc(
@@ -13213,46 +13254,127 @@ async fn image_prompt_preparation_over_wss(case: ImagePreparationCase) {
             assert_eq!(matching.len(), 1, "exactly one provider prompt for {name}");
             let blocks = matching[0]["blocks"].as_array().expect("logged ACP blocks");
             let images: Vec<_> = blocks.iter().filter(|b| b["type"] == "image").collect();
-            assert_eq!(images.len(), 1, "exactly one outgoing image for {name}");
-            let data = images[0]["data"].as_str().expect("inline ACP image data");
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(data)
-                .expect("provider image is base64");
-            assert!(
-                bytes.len() <= 3 * 1024 * 1024,
-                "provider image exceeds 3 MiB: {} bytes",
-                bytes.len()
-            );
-            let format = image::guess_format(&bytes).expect("provider image format");
-            if jpeg_alias {
-                assert_eq!(format, image::ImageFormat::Jpeg);
-                assert_eq!(images[0]["mimeType"], "image/jpg");
-                assert!(bytes == original, "small JPEG bytes remain unchanged");
-            } else {
-                assert_eq!(
-                    images[0]["mimeType"],
-                    format.to_mime_type(),
-                    "MIME matches outgoing bytes"
+            if unsupported {
+                assert!(
+                    images.is_empty(),
+                    "unsupported image never reaches vision: {blocks:?}"
                 );
+                let notice = blocks
+                    .iter()
+                    .filter_map(|b| b["text"].as_str())
+                    .find(|text| text.starts_with("[Attachment:"))
+                    .expect("retrievable file notice");
+                assert!(notice.contains(mime));
+                let id = notice
+                    .split("attachmentId: ")
+                    .nth(1)
+                    .expect("attachment id")
+                    .split('.')
+                    .next()
+                    .expect("id terminator");
+                if cross_workspace {
+                    assert_ne!(
+                        id, attachment_id,
+                        "foreign reference gets receiving-workspace identity"
+                    );
+                    if let Some(previous) = &inline_file_id {
+                        assert_eq!(id, previous, "repeat delivery reuses receiving file");
+                    } else {
+                        inline_file_id = Some(id.to_owned());
+                    }
+                    let retrievals: Vec<Value> = std::fs::read_to_string(&retrieval_log)
+                        .expect("actual MCP retrieval log")
+                        .lines()
+                        .map(|line| serde_json::from_str(line).expect("retrieval JSON"))
+                        .collect();
+                    assert_eq!(retrievals.len(), if name == "ImgRef" { 1 } else { 2 });
+                    let retrieval = retrievals.last().expect("retrieval");
+                    assert_eq!(retrieval["attachmentId"], id);
+                    assert_ne!(
+                        retrieval["result"]["isError"], true,
+                        "receiving agent can retrieve source: {retrieval}"
+                    );
+                } else if name == "ImgRef" {
+                    assert_eq!(id, attachment_id);
+                } else if let Some(previous) = &inline_file_id {
+                    assert_eq!(
+                        id, previous,
+                        "repeated inline delivery reuses the source file"
+                    );
+                } else {
+                    inline_file_id = Some(id.to_owned());
+                }
+                let source = wss_rpc(
+                    &mut rpc,
+                    40,
+                    "file.getAttachmentInfo",
+                    json!({ "workspaceId": &ws_id, "attachmentId": id }),
+                )
+                .await;
+                assert_eq!(source["exists"], true);
+                let read = wss_rpc(&mut rpc, 41, "file.readChunk",
+                    json!({ "workspaceId": &ws_id, "path": source["path"], "offset": 0, "length": original.len() })).await;
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(read["content"].as_str().expect("original file bytes"))
+                    .expect("base64 file");
+                assert_eq!(
+                    bytes, original,
+                    "file fallback preserves exact source bytes"
+                );
+                let queue = wss_rpc(
+                    &mut rpc,
+                    42,
+                    "agent.getQueue",
+                    json!({ "agentId": agent_id }),
+                )
+                .await;
+                assert!(
+                    queue["queue"].as_array().expect("queue").is_empty(),
+                    "no failed retry remains"
+                );
+            } else {
+                assert_eq!(images.len(), 1, "exactly one outgoing image for {name}");
+                let data = images[0]["data"].as_str().expect("inline ACP image data");
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(data)
+                    .expect("provider image is base64");
+                assert!(
+                    bytes.len() <= 3 * 1024 * 1024,
+                    "provider image exceeds 3 MiB: {} bytes",
+                    bytes.len()
+                );
+                let format = image::guess_format(&bytes).expect("provider image format");
+                if jpeg_alias {
+                    assert_eq!(format, image::ImageFormat::Jpeg);
+                    assert_eq!(images[0]["mimeType"], "image/jpeg");
+                    assert!(bytes == original, "small JPEG bytes remain unchanged");
+                } else {
+                    assert_eq!(
+                        images[0]["mimeType"],
+                        format.to_mime_type(),
+                        "MIME matches outgoing bytes"
+                    );
+                }
+                let decoded = image::load_from_memory(&bytes).expect("provider image decodes");
+                assert!(
+                    decoded.width().max(decoded.height()) <= 2000,
+                    "provider image long edge exceeds 2000 pixels"
+                );
+                assert!(
+                    decoded.width() > decoded.height(),
+                    "landscape orientation preserved"
+                );
+                assert!(
+                    images[0].get("attachmentId").is_none(),
+                    "provider receives bytes, not registry references"
+                );
+                outbound.push((images[0]["mimeType"].clone(), bytes));
             }
-            let decoded = image::load_from_memory(&bytes).expect("provider image decodes");
-            assert!(
-                decoded.width().max(decoded.height()) <= 2000,
-                "provider image long edge exceeds 2000 pixels"
-            );
-            assert!(
-                decoded.width() > decoded.height(),
-                "landscape orientation preserved"
-            );
-            assert!(
-                images[0].get("attachmentId").is_none(),
-                "provider receives bytes, not registry references"
-            );
-            outbound.push((images[0]["mimeType"].clone(), bytes));
         }
 
-        if name == "ImgRef" {
-            // Preparation must never write its derived bytes onto the user row.
+        if name == "ImgRef" || !matches!(case, ImagePreparationCase::LargePng) {
+            // Large inline images are intentionally projected as thumbnails on reads.
+            // References and small inline sources must retain their submitted payload.
             let conv = wss_rpc(
                 &mut rpc,
                 14,
@@ -13270,18 +13392,15 @@ async fn image_prompt_preparation_over_wss(case: ImagePreparationCase) {
                 .collect();
             assert_eq!(images.len(), 1, "one persisted image reference");
             let mut reference = images[0].clone();
-            // Conversation reads add a stable block id, not image payload.
-            reference
-                .as_object_mut()
-                .expect("image object")
-                .remove("id");
-            assert_eq!(
-                reference, input,
-                "transcript keeps the submitted reference unchanged"
-            );
+            // Conversation reads enrich inline images with layout metadata.
+            let object = reference.as_object_mut().expect("image object");
+            object.remove("id");
+            object.remove("width");
+            object.remove("height");
+            assert_eq!(reference, input, "transcript keeps the submitted source");
         }
     }
-    if !corrupt {
+    if !corrupt && !unsupported {
         assert_eq!(outbound.len(), 2);
         assert!(
             outbound[0] == outbound[1],
@@ -13295,7 +13414,7 @@ async fn image_prompt_preparation_over_wss(case: ImagePreparationCase) {
         &mut rpc,
         15,
         "file.getAttachmentInfo",
-        json!({ "workspaceId": &ws_id, "attachmentId": &attachment_id }),
+        json!({ "workspaceId": &source_ws_id, "attachmentId": &attachment_id }),
     )
     .await;
     assert_eq!(info["exists"], true);
@@ -13306,7 +13425,7 @@ async fn image_prompt_preparation_over_wss(case: ImagePreparationCase) {
         &mut rpc,
         16,
         "file.readChunk",
-        json!({ "workspaceId": &ws_id, "path": info["path"], "offset": 0, "length": original.len() }),
+        json!({ "workspaceId": &source_ws_id, "path": info["path"], "offset": 0, "length": original.len() }),
     )
     .await;
     assert_eq!(read["size"], json!(original.len()));
@@ -18069,22 +18188,25 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     F: FnMut(&Value) -> bool,
 {
-    timeout(Duration::from_secs(secs), async {
-        loop {
-            let frame = wss_push(chat, secs).await;
-            assert_eq!(frame["params"]["kind"], "delta", "push: {frame}");
-            let delta = frame["params"]["delta"].clone();
-            if let Some(entity) = delta["added"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .chain(delta["updated"].as_array().into_iter().flatten())
-                .find(|e| pred(e))
-            {
-                return (entity.clone(), delta);
+    timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(secs)),
+        async {
+            loop {
+                let frame = wss_push(chat, secs).await;
+                assert_eq!(frame["params"]["kind"], "delta", "push: {frame}");
+                let delta = frame["params"]["delta"].clone();
+                if let Some(entity) = delta["added"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .chain(delta["updated"].as_array().into_iter().flatten())
+                    .find(|e| pred(e))
+                {
+                    return (entity.clone(), delta);
+                }
             }
-        }
-    })
+        },
+    )
     .await
     .expect("matching chat delta entity arrived in time")
 }

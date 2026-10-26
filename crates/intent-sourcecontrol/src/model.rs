@@ -125,6 +125,9 @@ pub enum CheckState {
     Failure,
     Neutral,
     Cancelled,
+    /// The check was skipped without running (GitHub conclusion / GitLab job
+    /// status `skipped`). Distinct from [`CheckState::Neutral`], which ran.
+    Skipped,
 }
 
 /// A pull/merge/change request, normalized across hosts.
@@ -256,6 +259,16 @@ pub struct Review {
     pub verdict: ReviewVerdict,
     pub body: Option<String>,
     pub submitted_at: String,
+    /// The forge's review identity (GitHub REST `id` / GraphQL
+    /// `databaseId`), when reported. Distinguishes two reviews by the same
+    /// author with the same verdict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// The commit the review was submitted against (GitHub `commit_id` /
+    /// GraphQL `commit.oid`); `None` when the host does not report it
+    /// (GitLab approvals).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_sha: Option<String>,
 }
 
 /// One changed PR file; absent patches include binary or forge-omitted diffs.
@@ -622,6 +635,13 @@ pub struct MergeRequirementSignals {
     /// This is adapter bookkeeping, not an addition to the public wire payload.
     #[serde(skip)]
     pub checks_head_sha: Option<String>,
+    /// When the PR head commit was committed (GitHub GraphQL
+    /// `Commit.committedDate`, RFC 3339) — the clock anchor for flagging a
+    /// head on which CI never started. The host exposes no push time, so the
+    /// commit time is the closest available evidence. `None` when the host
+    /// does not report it (GitLab, REST-only reads).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_committed_at: Option<String>,
     /// Base-branch rules, or `None` when they are unreadable (missing scope,
     /// unsupported endpoint) — a degraded but non-fatal probe. Quota
     /// exhaustion on that read is never folded into `None`; it fails the

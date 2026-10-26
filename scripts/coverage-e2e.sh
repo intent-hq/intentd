@@ -3,7 +3,7 @@ set -euo pipefail
 
 # E2E coverage script
 # Measures line coverage from ALL daemon-level integration tests in crates/intentd/tests/
-# Explicitly skips auggie_context_e2e via the nextest filterset below (requires real auggie binary)
+# Explicitly skips the auggie_context_e2e module (a suite_e2e module) via the nextest filterset below (requires real auggie binary)
 
 cd "$(dirname "$0")/.."
 
@@ -30,8 +30,10 @@ echo "Running e2e tests with coverage instrumentation (nextest)..."
 # STAB-40, STAB-42, STAB-44 fixed (monitoring-only, multi-threaded runtime, timeout multiplier)
 # Note: capture_login_shell_path_with_fake_shell (STAB-43) is an intent-core unit test,
 # not an intentd integration test, so it runs in coverage-all.sh but not here
-INTENTD_TEST_TIMEOUT_MULTIPLIER=3 "$BASH" scripts/with-test-policy.sh cargo llvm-cov --no-report nextest -p intentd \
-    -E 'kind(test) and not binary(intentd) and not binary(auggie_context_e2e)'
+# --max-fail=25: report every failing test in one run, bounded, as
+# coverage-all.sh explains.
+INTENTD_TEST_TIMEOUT_MULTIPLIER=3 "$BASH" scripts/with-test-policy.sh cargo llvm-cov --no-report nextest --max-fail=25 -p intentd \
+    -E 'kind(test) and not binary(intentd) and not test(/^auggie_context_e2e::/)'
 
 # Generate lcov.info if requested (for CI artifact upload)
 # Do this BEFORE the floor check so the artifact is available even on failure

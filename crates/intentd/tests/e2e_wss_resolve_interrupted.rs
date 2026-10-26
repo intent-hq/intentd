@@ -14,9 +14,7 @@
 
 #![cfg(unix)]
 
-mod common;
-
-use std::os::unix::process::CommandExt;
+use crate::common;
 
 use common::DaemonGuard;
 use std::path::Path;
@@ -174,55 +172,15 @@ where
 }
 
 fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
-    use intent_core::{now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus};
+    use intent_core::{now_iso, Workspace};
     let ts = now_iso();
     Workspace {
         id: id.clone(),
         title: "WSS-RESOLVE".to_string(),
         branch: "main".to_string(),
-        base_ref: None,
-        base_commit_sha: None,
-        status: WorkspaceStatus::Active,
-        status_message: None,
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
-        attention: WorkspaceAttention::None,
         created_at: ts.clone(),
         updated_at: ts,
-        last_activity: None,
-        last_content_activity: None,
-        tags: vec![],
-        path: None,
-        repository_path: None,
-        repository_owner: None,
-        repository_name: None,
-        worktree_path: None,
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
-        default_model: None,
-        pr_number: None,
-        pr_url: None,
-        pr_status: None,
-        active_pull_request: None,
-        pull_requests: None,
-        context_links: None,
-        archived: false,
-        archived_at: None,
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        pull_requests_total: None,
-        display_status: None,
-        waiting: false,
-        checkout_mode: None,
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
+        ..Default::default()
     }
 }
 
@@ -249,10 +207,7 @@ async fn resolve_interrupted_resume_and_abandon() {
         .stderr(Stdio::from(
             std::fs::File::create(data_dir.join("daemon.log")).unwrap(),
         ));
-    // Spawn in its own process group to prevent ACP mock process leaks
-    #[cfg(unix)]
-    cmd.process_group(0);
-    let child = cmd.spawn().expect("spawn intentd serve");
+    let child = common::spawn_guarded(&mut cmd).expect("spawn intentd serve");
     let mut guard = DaemonGuard::process_only(child);
     assert!(await_uds(&socket).await, "daemon did not start");
 
@@ -547,8 +502,7 @@ async fn resolve_interrupted_resume_and_abandon() {
     assert_eq!(resumed2.len(), 0, "already resolved should not resume");
     assert_eq!(failed2.len(), 1, "already resolved should be in failed");
 
-    guard.child_mut().kill().expect("kill daemon");
-    guard.child_mut().wait().expect("wait daemon");
+    guard.kill_tree().expect("kill daemon");
     drop(guard);
 }
 
@@ -571,9 +525,7 @@ async fn resolve_interrupted_invalid_params_validation() {
         .stderr(Stdio::from(
             std::fs::File::create(data_dir.join("daemon.log")).unwrap(),
         ));
-    #[cfg(unix)]
-    cmd.process_group(0);
-    let child = cmd.spawn().expect("spawn intentd serve");
+    let child = common::spawn_guarded(&mut cmd).expect("spawn intentd serve");
     let mut guard = DaemonGuard::process_only(child);
     assert!(await_uds(&socket).await, "daemon did not start");
 
@@ -712,7 +664,6 @@ async fn resolve_interrupted_invalid_params_validation() {
     assert!(v.get("result").is_some(), "valid params should succeed");
     assert!(v.get("error").is_none(), "valid params should not error");
 
-    guard.child_mut().kill().expect("kill daemon");
-    guard.child_mut().wait().expect("wait daemon");
+    guard.kill_tree().expect("kill daemon");
     drop(guard);
 }

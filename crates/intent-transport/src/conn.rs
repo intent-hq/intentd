@@ -22,7 +22,6 @@ use tokio::sync::{mpsc, OwnedSemaphorePermit};
 use tokio::task::JoinHandle;
 use tracing::Instrument;
 
-mod page_state;
 mod presence_focus;
 pub(crate) mod recovery;
 
@@ -568,24 +567,6 @@ async fn process_captured_frame(
                 };
                 return out_tx.send_priority(frame).await.is_ok();
             }
-        }
-        // Admit opt-in state subscriptions before classifiers clone params/id.
-        if matches!(
-            value["method"].as_str(),
-            Some("note.subscribe" | "comment.subscribe")
-        ) && value["params"]["projection"] == "pageState"
-            && (raw.len() > 65_536 || !page_state::valid_id(value.get("id")))
-        {
-            let id = value.get("id").filter(|id| page_state::valid_id(Some(id)));
-            return send_fast_path_error(
-                events::IdInfo {
-                    present: value.get("id").is_some(),
-                    echo: id.cloned().unwrap_or(Value::Null),
-                },
-                "Invalid pageState subscription",
-                out_tx,
-            )
-            .await;
         }
         // A reply to a daemon-initiated reverse request (FE-served intents such
         // as `host.openExternal`, §12.4) — route it to the awaiting caller and
@@ -1584,6 +1565,7 @@ pub(crate) async fn handle_fast_path(
                     fences.push(membership.fence_handle());
                 }
                 let handle = spawn_forwarder(recovery::forward(
+                    Arc::clone(api),
                     subscription,
                     gate.map(|gate| (gate, membership_events.expect("paired with gate"))),
                     scoped_workspace,
@@ -1649,38 +1631,6 @@ pub(crate) async fn handle_sub_fast_path(
     out_tx: &OutboundSender,
     subs: &mut ConnSubs,
 ) -> bool {
-    let sub = match sub {
-        SubFastPath::Subscribe {
-            id,
-            channel,
-            params,
-        } if matches!(channel, Channel::Note | Channel::Comment) => {
-            let kind = if channel == Channel::Note {
-                crate::annotation_subscription::PageStateChannel::Note
-            } else {
-                crate::annotation_subscription::PageStateChannel::Comment
-            };
-            let value = Value::Object(params);
-            match crate::annotation_subscription::parse_page_state_subscription(kind, &value) {
-                Ok(Some(request)) => {
-                    return page_state::subscribe(id, channel, request, api, bus, out_tx, subs)
-                        .await
-                }
-                Ok(None) => {
-                    let Value::Object(params) = value else {
-                        unreachable!()
-                    };
-                    SubFastPath::Subscribe {
-                        id,
-                        channel,
-                        params,
-                    }
-                }
-                Err(message) => return send_fast_path_error(id, &message, out_tx).await,
-            }
-        }
-        other => other,
-    };
     match sub {
         SubFastPath::Subscribe {
             id,
@@ -1697,6 +1647,7 @@ pub(crate) async fn handle_sub_fast_path(
                     workspace_id,
                     replace_group,
                     projection,
+                    max_content_bytes,
                 } = p;
                 // Time the request-to-snapshot interval (intent-hq/intent#3707):
                 // the fast-path never enters the `rpc_dispatch` span, so this
@@ -1740,6 +1691,7 @@ pub(crate) async fn handle_sub_fast_path(
                     api.clone(),
                     WorkspaceId::from(workspace_id),
                     projection,
+                    max_content_bytes,
                     subscription,
                     membership,
                     subscription_id.clone(),
@@ -1961,6 +1913,7 @@ pub(crate) async fn handle_sub_fast_path(
                     workspace_id,
                     note_id,
                     replace_group,
+                    include_retired,
                 }) => {
                     // Time the request-to-snapshot interval (intent-hq/intent#3707),
                     // started before the replace-group cleanup so a costly
@@ -2012,6 +1965,7 @@ pub(crate) async fn handle_sub_fast_path(
                         subscription_id.clone(),
                         out_tx.clone(),
                         timer,
+                        include_retired,
                     ));
                     subs.insert(subscription_id, handle, replace_group, None);
                     true
@@ -2046,11 +2000,12 @@ where
     let is_tcp = crate::context::is_tcp_connection();
     let caller = crate::context::current_caller();
     let credential = intent_core::caller::current_wire_credential();
+    let desktop = intent_core::desktop::current_connection();
     // Heap-pin before composing task-local scopes: large chat forwarders would
     // otherwise be copied through each wrapper on the subscribing task's stack.
     let forwarder = Box::pin(forwarder);
     tokio::spawn(crate::context::with_credential_context(
-        is_tcp, caller, credential, forwarder,
+        is_tcp, caller, credential, desktop, forwarder,
     ))
 }
 
@@ -2156,6 +2111,7 @@ async fn forward_note_subscription(
     api: Arc<dyn WorkspaceApi>,
     workspace_id: WorkspaceId,
     projection: Option<intent_core::NoteListProjection>,
+    max_content_bytes: Option<usize>,
     mut subscription: Subscription,
     mut membership: Option<ChannelMembership>,
     subscription_id: String,
@@ -2170,7 +2126,15 @@ async fn forward_note_subscription(
                     .map(intent_core::note_list_slim_row)
                     .collect(),
             ),
-            None => serde_json::to_value(notes).unwrap_or_else(|_| Value::Array(Vec::new())),
+            None => match max_content_bytes {
+                Some(limit) => Value::Array(
+                    notes
+                        .into_iter()
+                        .map(|note| intent_core::note_bounded_row(note, limit))
+                        .collect(),
+                ),
+                None => serde_json::to_value(notes).unwrap_or_else(|_| Value::Array(Vec::new())),
+            },
         },
         Err(_) => Value::Array(Vec::new()),
     };
@@ -2182,8 +2146,14 @@ async fn forward_note_subscription(
     let mut seq: u64 = 1;
     while let Some(batch) = recv_visible(&mut subscription, &mut membership).await {
         for event in batch {
-            if let Some(delta) =
-                subscriptions::note_delta(api.as_ref(), &workspace_id, &event, projection).await
+            if let Some(delta) = subscriptions::note_delta(
+                api.as_ref(),
+                &workspace_id,
+                &event,
+                projection,
+                max_content_bytes,
+            )
+            .await
             {
                 let frame = subscriptions::build_delta_push(&subscription_id, seq, &delta);
                 if out_tx.send_bulk(frame).await.is_err() {
@@ -2830,6 +2800,8 @@ struct ChannelParams {
     workspace_id: Option<String>,
     note_id: Option<String>,
     replace_group: Option<String>,
+    /// `workspace.subscribe { includeRetired }`; always `false` elsewhere.
+    include_retired: bool,
 }
 
 /// Parse a TB-5 channel's subscribe params into the common [`ChannelParams`]
@@ -2845,6 +2817,7 @@ fn parse_channel_params(
                 workspace_id: None,
                 note_id: None,
                 replace_group: p.replace_group,
+                include_retired: p.include_retired,
             })
         }
         Channel::Comment => {
@@ -2853,6 +2826,7 @@ fn parse_channel_params(
                 workspace_id: Some(p.workspace_id),
                 note_id: Some(p.note_id),
                 replace_group: p.replace_group,
+                include_retired: false,
             })
         }
         // `note`/`task`/`agent` are all workspace-scoped collections.
@@ -2862,6 +2836,7 @@ fn parse_channel_params(
                 workspace_id: Some(p.workspace_id),
                 note_id: None,
                 replace_group: p.replace_group,
+                include_retired: false,
             })
         }
     }
@@ -2925,6 +2900,7 @@ async fn forward_channel_subscription(
     subscription_id: String,
     out_tx: OutboundSender,
     timer: subscriptions::SnapshotTimer,
+    include_retired: bool,
 ) {
     // The task channel's delta mapper is stateful: it tracks the spec's
     // task-link set so a spec-body edit can re-emit the rows whose
@@ -2950,7 +2926,7 @@ async fn forward_channel_subscription(
             oversized_replacement = tracing::field::Empty,
             encode_failed = tracing::field::Empty,
         );
-        subscriptions::channel_snapshot(api.as_ref(), channel, &workspace_id, note_id.as_ref())
+        subscriptions::workspace_snapshot(api.as_ref(), include_retired)
             .instrument(span)
             .await
     } else {
@@ -2975,7 +2951,13 @@ async fn forward_channel_subscription(
             if channel == Channel::Workspace
                 && event.event_type == intent_core::events::HOST_MEMBERS_CHANGED
             {
-                let Ok(rows) = api.list_workspaces_lite(true).await else {
+                let Ok(rows) = api
+                    .list_workspaces_lite(intent_core::WorkspaceListFilter::new(
+                        true,
+                        include_retired,
+                    ))
+                    .await
+                else {
                     continue;
                 };
                 let snapshot = serde_json::to_value(rows).unwrap_or_else(|_| json!([]));
@@ -3017,8 +2999,14 @@ async fn forward_channel_subscription(
             let delta = if channel == Channel::Task {
                 subscriptions::task_delta(api.as_ref(), &workspace_id, &event, &mut spec_links)
                     .await
-            } else if let Some(visible) = visible_workspaces.as_mut() {
-                subscriptions::workspace_delta(api.as_ref(), &event, Some(visible)).await
+            } else if channel == Channel::Workspace {
+                subscriptions::workspace_delta(
+                    api.as_ref(),
+                    &event,
+                    visible_workspaces.as_mut(),
+                    include_retired,
+                )
+                .await
             } else {
                 subscriptions::channel_delta(
                     api.as_ref(),
@@ -3064,7 +3052,7 @@ mod tests {
         impl WorkspaceApi for HeldWriter {
             fn list_workspaces(
                 &self,
-                _: bool,
+                _: intent_core::WorkspaceListFilter,
             ) -> intent_core::BoxFuture<'_, intent_core::Result<Vec<intent_core::Workspace>>>
             {
                 Box::pin(async {

@@ -11,11 +11,12 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
+use intentd_test_support::GuardedChild;
 use std::net::Ipv4Addr;
 use std::path::Path;
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -154,13 +155,12 @@ async fn disabled_gh_credentials_survive_settings_and_revoke_over_wss() {
 }
 
 struct Daemon {
-    child: Child,
+    child: GuardedChild,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.child.kill_tree();
     }
 }
 
@@ -227,9 +227,8 @@ fn mock_device_flow_command(
     cmd
 }
 
-fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
-    mock_device_flow_command(data_dir, listen, env)
-        .spawn()
+fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> GuardedChild {
+    GuardedChild::spawn(&mut mock_device_flow_command(data_dir, listen, env))
         .expect("spawn intentd serve")
 }
 
@@ -367,7 +366,8 @@ async fn await_auth_changed<S>(ws: &mut WebSocketStream<S>, status: &str, secs: 
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    let deadline =
+        tokio::time::Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(secs));
     loop {
         let remaining = deadline
             .checked_duration_since(tokio::time::Instant::now())

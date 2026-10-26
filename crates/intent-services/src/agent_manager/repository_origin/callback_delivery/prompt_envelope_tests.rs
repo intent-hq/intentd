@@ -16,7 +16,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 const FACTS: &str = "[Repository facts — inert JSON lines]";
 const POLICY: &str =
     include_str!("../../../../resources/agent-instructions/v3.2/repository-guidance.md");
-const WAIT: Duration = Duration::from_secs(15);
+fn wait() -> Duration {
+    intentd_test_support::test_timeout(Duration::from_secs(15))
+}
 
 struct Harness {
     git: GitFixture,
@@ -142,7 +144,10 @@ impl Harness {
                 )
                 .await
                 .unwrap();
-            assert_eq!(created["agent"]["harnessVersion"], "3.2");
+            assert_eq!(
+                created["agent"]["harnessVersion"],
+                intent_core::CURRENT_HARNESS_VERSION
+            );
             services
                 .store
                 .get_agent_session(&AgentId::from(created["agent"]["id"].as_str().unwrap()))
@@ -172,7 +177,7 @@ impl Harness {
         &self,
         body: impl std::future::Future<Output = T> + Send + 'static,
     ) -> T {
-        intent_core::spawn_daemon(crate::host_execution::background_execution(
+        intent_core::spawn_daemon(crate::execution_call::background_execution(
             self.services.as_ref().clone(),
             None,
             body,
@@ -291,7 +296,7 @@ impl Harness {
             .await
             .unwrap();
         let mut line = String::new();
-        tokio::time::timeout(WAIT, read.read_line(&mut line))
+        tokio::time::timeout(wait(), read.read_line(&mut line))
             .await
             .unwrap()
             .unwrap();
@@ -800,7 +805,10 @@ let SESSION_ID = `config-session-${process.pid}`;
                 )
                 .await
                 .unwrap();
-            assert_eq!(created["agent"]["harnessVersion"], "3.2");
+            assert_eq!(
+                created["agent"]["harnessVersion"],
+                intent_core::CURRENT_HARNESS_VERSION
+            );
             services
                 .store
                 .get_agent_session(&AgentId::from(created["agent"]["id"].as_str().unwrap()))
@@ -917,7 +925,7 @@ let SESSION_ID = `config-session-${process.pid}`;
             (state.endpoint.is_none(), state.prompt_context.clone())
         };
         assert!(endpoint_absent);
-        if stored.harness_version == "3.2" {
+        if intent_core::harness_uses_repository_monitor_guidance(&stored.harness_version) {
             let context = context.expect("initialized original prompt owner");
             assert!(!context.acknowledged.load(Ordering::SeqCst));
             assert!(!context.requires_callback_ack);

@@ -23,9 +23,15 @@ use std::sync::Mutex;
 
 use intent_core::{AgentId, WorkspaceId};
 
-/// The profile id inside a qualified reference (`None` for a bare id).
-fn profile_id_of(reference: &str) -> Option<&str> {
-    crate::provider_profiles::parse_profile_ref(reference).map(|(_, id)| id)
+/// The registry key of a reference: the profile id inside a qualified
+/// reference, `default:<base>` for the Default configuration of a
+/// profile-capable base (PROTOCOL §5.54 "Default configuration overrides"),
+/// and `None` for any other bare id.
+fn profile_id_of(reference: &str) -> Option<String> {
+    if crate::provider_profiles::is_default_config_ref(reference) {
+        return Some(crate::provider_profiles::default_activation_key(reference));
+    }
+    crate::provider_profiles::parse_profile_ref(reference).map(|(_, id)| id.to_owned())
 }
 
 /// A profile's `runningProcesses` count and each of its agents' workspace
@@ -130,7 +136,7 @@ impl ProfileActivation {
         reference: &str,
         fingerprint: &str,
     ) -> Option<(u64, ActivationChanges)> {
-        let profile_id = profile_id_of(reference)?.to_owned();
+        let profile_id = profile_id_of(reference)?;
         let mut state = self.state.lock().unwrap();
         let mut touched: BTreeSet<String> = BTreeSet::from([profile_id.clone()]);
         if let Some(previous) = state.live.get(agent_id) {
@@ -230,7 +236,7 @@ impl ProfileActivation {
         state
             .live
             .get(agent_id)
-            .filter(|p| p.profile_id == profile_id)
+            .filter(|p| p.profile_id == *profile_id)
             .map(|p| p.fingerprint.clone())
     }
 }
@@ -369,15 +375,39 @@ mod tests {
     }
 
     #[test]
-    fn default_and_deleted_profiles_never_report_earlier_settings() {
+    fn other_providers_and_deleted_profiles_never_report_earlier_settings() {
         let reg = ProfileActivation::default();
         let a = AgentId::from("a-1");
-        assert!(reg.register(&ws(), &a, "codex", "f1").is_none());
+        assert!(reg.register(&ws(), &a, "auggie", "f1").is_none());
         reg.register(&ws(), &a, "codex@pwork", "f1").unwrap();
         reg.saved_changed("pwork", Some("f2"));
         assert!(reg.uses_earlier_settings(&a));
         let changes = reg.saved_changed("pwork", None);
         assert_eq!(changes.agents, vec![(ws(), a.clone(), false)]);
         assert_eq!(reg.running_processes("pwork"), 0);
+    }
+
+    /// The Default configuration of a profile base (PROTOCOL §5.54 "Default
+    /// configuration overrides") is tracked under its own key: a saved edit
+    /// marks its running processes, never a profile's.
+    #[test]
+    fn a_default_edit_marks_only_default_processes() {
+        for base in BASES {
+            let reg = ProfileActivation::default();
+            let key = crate::provider_profiles::default_activation_key(base);
+            let d = AgentId::from("a-default");
+            let p = AgentId::from("a-profile");
+            reg.register(&ws(), &d, base, "").unwrap();
+            reg.register(&ws(), &p, &format!("{base}@pwork"), "f1")
+                .unwrap();
+            let changes = reg.saved_changed(&key, Some("fdef"));
+            assert_eq!(changes.profiles, BTreeSet::from([key.clone()]), "{base}");
+            assert_eq!(changes.agents, vec![(ws(), d.clone(), true)], "{base}");
+            assert_eq!(reg.running_processes(&key), 1);
+            assert_eq!(reg.running_processes("pwork"), 0);
+            assert!(!reg.uses_earlier_settings(&p));
+            assert_eq!(reg.live_fingerprint(&d, base).as_deref(), Some(""));
+            assert_eq!(reg.live_fingerprint(&d, "auggie"), None);
+        }
     }
 }

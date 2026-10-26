@@ -1,6 +1,6 @@
 //! Public consumer checks use the actual Services API and original policy.
 use crate::repository_context_live::tests::LiveFixture;
-use crate::repository_context_output::tests::{controlled, tcp, Control, Hold, FACTS};
+use crate::repository_context_output::tests::{controlled, quota_tcp, tcp, Control, Hold, FACTS};
 use crate::repository_read_source::tests::{run, ReadServer};
 use intent_core::WorkspaceApi;
 use intent_store::RepositorySelectionChange;
@@ -205,7 +205,7 @@ async fn context_consumer_ledger_counts_distinct_calls_at_sixty_four_and_sixty_f
         let http = ReadServer::new().await;
         let f = LiveFixture::new(&http).await;
         let control = Arc::new(Control::default());
-        let reply=tcp(controlled(&f,control.clone()),&format!("for(let i=0;i<{count};i++) {{ try {{await ws.pr.snapshot(4);}} catch(e) {{}} }} return 'all-calls-kept';")).await;
+        let reply=quota_tcp(controlled(&f,control.clone()),&format!("for(let i=0;i<{count};i++) {{ try {{await ws.pr.snapshot(4);}} catch(e) {{}} }} return 'all-calls-kept';")).await;
         if count == 63 {
             assert!(reply.to_string().contains("all-calls-kept"), "{reply}");
             assert!(reply.to_string().contains(FACTS), "{reply}");

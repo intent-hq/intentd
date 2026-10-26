@@ -25,6 +25,7 @@ pub mod cli_env;
 pub mod clock;
 pub mod config;
 pub mod discovery_cache;
+pub mod discussion;
 pub mod error;
 pub mod events;
 pub mod execution;
@@ -35,9 +36,6 @@ pub mod ids;
 pub mod model;
 pub mod native_review;
 pub mod nodes;
-pub mod note_annotation;
-pub mod note_delete;
-pub mod note_page;
 pub mod path_utils;
 pub mod process_policy;
 pub mod pull_request_key;
@@ -104,6 +102,9 @@ pub use ids::{
 pub use model::asset_extension_from_mime;
 pub use model::extract_spec_task_ids;
 pub use model::harness_supports_repository_guidance;
+pub use model::harness_uses_repository_monitor_guidance;
+#[doc(hidden)]
+pub use model::harness_versions_after_current;
 pub use model::token_usage_reported;
 pub use model::MessageOrigin;
 pub use model::CURRENT_HARNESS_VERSION;
@@ -115,16 +116,19 @@ pub use model::PENDING_QUESTIONS_MESSAGE_ID_KEY;
 pub use model::PROPOSAL_OUTCOME_APPLIED;
 pub use model::PROPOSAL_OUTCOME_DISMISSED;
 pub use model::PROPOSAL_RESOLUTIONS_KEY;
+pub use model::REPOSITORY_GUIDANCE_HARNESS_VERSIONS;
+pub use model::REPOSITORY_MONITOR_GUIDANCE_HARNESS_VERSIONS;
 pub use model::WORKSPACE_STATUS_MESSAGE_MAX_LENGTH;
 pub use model::{
     cap_json_value, fit_agent_list_frame, format_key_bytes_table, last_tool_use_preview,
-    note_list_slim_row, serialized_key_bytes, slim_body_size, slim_heavy_body,
-    AgentDelegatedCounts, AgentListFrameFit, AgentListRowScope, AgentOrphanedDelegatedCounts,
-    AgentParentDelegatedCounts, AgentScopeCounts, ConversationProjection, NoteListProjection,
-    AGENT_LIST_FRAME_BUDGET_BYTES, AGENT_LIST_NAME_CAP_BYTES, AGENT_LIST_PATH_CAP_BYTES,
-    AGENT_LIST_PREVIEW_BUDGET_BYTES, AGENT_LIST_PREVIEW_FLOOR_BYTES, AGENT_LIST_ROW_BUDGET_BYTES,
-    AGENT_LIST_ROW_KEYS, AGENT_LIST_ROW_METADATA_KEYS, NOTE_LIST_PREVIEW_CHARS,
-    SLIM_PAGE_BUDGET_BYTES, SLIM_PROJECTION_BUDGET_BYTES,
+    note_bounded_row, note_list_slim_row, serialized_key_bytes, slim_body_size, slim_heavy_body,
+    truncated_content_len, AgentDelegatedCounts, AgentListFrameFit, AgentListRowScope,
+    AgentOrphanedDelegatedCounts, AgentParentDelegatedCounts, AgentScopeCounts,
+    ConversationProjection, NoteListProjection, AGENT_LIST_FRAME_BUDGET_BYTES,
+    AGENT_LIST_NAME_CAP_BYTES, AGENT_LIST_PATH_CAP_BYTES, AGENT_LIST_PREVIEW_BUDGET_BYTES,
+    AGENT_LIST_PREVIEW_FLOOR_BYTES, AGENT_LIST_ROW_BUDGET_BYTES, AGENT_LIST_ROW_KEYS,
+    AGENT_LIST_ROW_METADATA_KEYS, NOTE_LIST_PREVIEW_CHARS, SLIM_PAGE_BUDGET_BYTES,
+    SLIM_PROJECTION_BUDGET_BYTES,
 };
 pub use model::{chief_prompt_version, CHIEF_PROMPT_VERSION_KEY};
 pub use model::{chief_workspace, CHIEF_WORKSPACE_TIMESTAMP};
@@ -159,8 +163,9 @@ pub use model::{
     WorkspaceActivity, WorkspaceAgentInfo, WorkspaceAgentSummary, WorkspaceAttention,
     WorkspaceCreate, WorkspaceCreateInitialAgent, WorkspaceCreateOrigin, WorkspaceCreateResult,
     WorkspaceDiskUsage, WorkspaceDisplayStatus, WorkspaceEventSummary, WorkspaceGitRoot,
-    WorkspaceGitRootSource, WorkspaceSetupState, WorkspaceSetupStatus, WorkspaceStatus,
-    WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate, SUPPORTED_ASSET_MIME_TYPES,
+    WorkspaceGitRootSource, WorkspaceListFilter, WorkspaceSetupState, WorkspaceSetupStatus,
+    WorkspaceStatus, WorkspaceTask, WorkspaceTaskStats, WorkspaceUpdate,
+    SUPPORTED_ASSET_MIME_TYPES,
 };
 pub use model::{AnchorContext, SuggestionDiff, WorkspaceDiffSummary, WorkspaceDiffSummaryFile};
 pub use model::{
@@ -210,3 +215,5 @@ pub use turn_attachments::{
     is_workspace_api_input, new_attachment_id, AttachmentPolicy, TurnAttachment,
     TurnAttachmentRegistry, ATTACHMENT_ID_KEY,
 };
+
+pub mod desktop;

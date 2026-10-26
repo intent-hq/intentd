@@ -55,7 +55,6 @@ fn disable_node_compile_cache() {
 
 mod accept_backoff;
 mod agent_workers;
-mod annotation_subscription;
 pub mod auth;
 pub(crate) mod browser;
 pub mod catalog;
@@ -76,6 +75,7 @@ pub mod pairing;
 mod panic_guard;
 mod presence;
 mod private_output;
+mod retired_gate;
 pub use private_output::OutboundFrame;
 mod protocol;
 mod provider_setup;

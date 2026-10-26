@@ -28,7 +28,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use intentd_test_support::GuardedChild;
 use std::path::{Path, PathBuf};
@@ -396,9 +396,12 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     loop {
-        let next = timeout(Duration::from_secs(secs), ws.next())
-            .await
-            .expect("wss event timed out");
+        let next = timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(secs)),
+            ws.next(),
+        )
+        .await
+        .expect("wss event timed out");
         match next {
             Some(Ok(Message::Text(text))) => {
                 let v: Value = serde_json::from_str(&text).expect("json frame");
@@ -482,55 +485,15 @@ async fn seed_workspace_with_guest(data_dir: &Path) -> (String, intent_core::Pri
 }
 
 fn workspace_seed(id: &intent_core::WorkspaceId) -> intent_core::Workspace {
-    use intent_core::{now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceStatus};
+    use intent_core::{now_iso, Workspace};
     let ts = now_iso();
     Workspace {
         id: id.clone(),
         title: "WSS-FLUSH-E2E".to_string(),
         branch: "main".to_string(),
-        base_ref: None,
-        base_commit_sha: None,
-        status: WorkspaceStatus::Active,
-        status_message: None,
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
-        attention: WorkspaceAttention::None,
         created_at: ts.clone(),
         updated_at: ts,
-        last_activity: None,
-        last_content_activity: None,
-        tags: vec![],
-        path: None,
-        repository_path: None,
-        repository_owner: None,
-        repository_name: None,
-        worktree_path: None,
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
-        default_model: None,
-        pr_number: None,
-        pr_url: None,
-        pr_status: None,
-        active_pull_request: None,
-        pull_requests: None,
-        context_links: None,
-        archived: false,
-        archived_at: None,
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        pull_requests_total: None,
-        display_status: None,
-        waiting: false,
-        checkout_mode: None,
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
+        ..Default::default()
     }
 }
 
@@ -555,15 +518,6 @@ fn seed_flush_mode(data_dir: &Path, mode: &str) {
         ),
     )
     .expect("seed config.toml with flushQueuedMessages mode");
-}
-
-/// Restart/retry fixtures drive recovery explicitly over WSS. Headless CI's
-/// default auto-resume would add a provider turn before their manual action.
-fn seed_manual_restart(data_dir: &Path) {
-    let path = data_dir.join("config.toml");
-    assert!(!path.exists(), "seed manual restart before daemon boot");
-    std::fs::write(&path, "[agents]\nresumeInterruptedOnStart = \"off\"\n")
-        .expect("seed manual restart policy");
 }
 
 /// Boot a daemon with the slow-first-turn mock, create an agent, start the
@@ -2898,7 +2852,6 @@ async fn failed_attachment_batch_keeps_groups_through_restart_and_retry_over_wss
     };
     let tmp = temp_data_dir();
     let data_dir = tmp.path();
-    seed_manual_restart(data_dir);
     let (workspace_id, _) = seed_workspace_with_guest(data_dir).await;
     let release = data_dir.join("release-group-failure");
     let failure = json!({"ifPromptContains":"durable first group","promptRpcError":{"code":-32603,"message":"group fixture failure"}});
@@ -3161,7 +3114,6 @@ async fn identity_carry_over_over_wss(legacy: bool) {
     };
     let tmp = temp_data_dir();
     let data_dir = tmp.path();
-    seed_manual_restart(data_dir);
     let (workspace_id, _) = seed_workspace_with_guest(data_dir).await;
     let release = data_dir.join("identity-kickoff");
     let held = data_dir.join("identity-held");
@@ -3452,7 +3404,6 @@ async fn context_recovery_groups_over_wss(
     };
     let tmp = temp_data_dir();
     let data_dir = tmp.path();
-    seed_manual_restart(data_dir);
     let (workspace_id, _) = seed_workspace_with_guest(data_dir).await;
     let release = data_dir.join("recovery-kickoff");
     let held = data_dir.join("recovery-held");
@@ -3775,7 +3726,6 @@ async fn fresh_direct_context_recovery_over_wss(oversized_current: bool) {
     };
     let tmp = temp_data_dir();
     let data_dir = tmp.path();
-    seed_manual_restart(data_dir);
     let (workspace_id, _) = seed_workspace_with_guest(data_dir).await;
     let held = data_dir.join("fresh-source-held");
     let source = format!("fresh-direct-source {}", "S".repeat(33 * 1024));

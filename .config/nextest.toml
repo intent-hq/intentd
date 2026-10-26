@@ -96,6 +96,10 @@
 # spreads them through the lighter phase rather than the unit-test burst.
 # Priority tiers are distinct on purpose — at a shared priority the 68s test
 # would sort before the exclusive binaries and re-create the head-of-line stall.
+# intentd's integration-test files are modules of a few suite targets
+# (crates/intentd/tests/suite_*.rs), so the tests of one file are selected as
+# `binary_id(=intentd::<suite>) & test(/^<file>::/)`, and one test as
+# `test(=<file>::<test>)`; the overrides below name them that way.
 [profile.default]
 retries = 1
 slow-timeout = { period = "90s", terminate-after = 2 }
@@ -104,17 +108,24 @@ slow-timeout = { period = "90s", terminate-after = 2 }
 timing-serial = { max-threads = 1 }
 
 [[profile.default.overrides]]
-filter = 'binary_id(=intentd::e2e_wss_delegation_group_persist) | binary_id(=intentd::e2e_wss_interrupted_agents) | binary_id(=intentd::e2e_wss_resolve_interrupted) | binary_id(=intentd::e2e_wss_serve_resume_all) | binary_id(=intentd::e2e_wss_pool_contention_stress) | binary_id(=intentd::e2e_wss_mcp_servers) | binary_id(=intentd::e2e_wss_mcp_oauth_refresh) | binary_id(=intentd::e2e_pty_job_control)'
+filter = '(binary_id(=intentd::suite_wss_agents) & test(/^e2e_wss_delegation_group_persist::/)) | (binary_id(=intentd::suite_wss_g_r) & test(/^e2e_wss_interrupted_agents::/)) | (binary_id(=intentd::suite_wss_g_r) & test(/^e2e_wss_resolve_interrupted::/)) | (binary_id(=intentd::suite_wss_s_z) & test(/^e2e_wss_serve_resume_all::/)) | (binary_id(=intentd::suite_wss_g_r) & test(/^e2e_wss_pool_contention_stress::/)) | (binary_id(=intentd::suite_wss_g_r) & test(/^e2e_wss_mcp_servers::/)) | (binary_id(=intentd::suite_wss_g_r) & test(/^e2e_wss_mcp_oauth_refresh::/)) | binary_id(=intentd::e2e_pty_job_control)'
 threads-required = 'num-test-threads'
 priority = 100
 
 # These seven controls deliberately perform 63/64 fresh repository acquisitions
 # through owned Git/ACP fixtures. Reserve the test slots for each control, as for
 # the real-daemon controls above; their deadline and quota assertions stay exact.
+# Each 63/64 script runs under the shared 150s quota script budget with a 180s
+# hang guard (intent-services test_support::quota_script; one call can take
+# ~0.9s on a loaded host, so the production 30s cut the loop short). Two passes
+# need more than the default 180s kill, so these seven are terminated at 540s
+# (3 × 180s). Keep this an exact name list: script_ops' liveness guard test
+# rejects broader slow-timeout overrides.
 [[profile.default.overrides]]
 filter = 'binary_id(=intent-services) & (test(=agent_manager::repository_origin::callback_delivery::tests::confirmed_aliases::confirmed_alias_mixed_names_share_one_acquisition_budget) | test(=agent_manager::repository_origin::callback_delivery::tests::confirmed_read_caught_discarded_shared_root_and_budget_bind_every_original_read) | test(=agent_manager::repository_origin::callback_delivery::tests::live_context::confirmed_context_successful_zero_pending_absent_and_failed_never_conflate) | test(=agent_manager::repository_origin::callback_delivery::tests::normal_launch::normal_callback_launch_optional_and_required_keep_completed_effect_truth) | test(=repository_read_policy::tests::aliases::mixed_names_and_raw_dispatch_have_one_sixty_four_record_acquisition_budget) | test(=repository_read_policy::tests::original_ledger_counts_cache_hits_and_lazy_read_at_sixty_four_and_sixty_five) | test(=repository_read_policy::tests::context_consumer::context_consumer_ledger_counts_distinct_calls_at_sixty_four_and_sixty_five))'
 threads-required = 'num-test-threads'
 priority = 100
+slow-timeout = { period = "180s", terminate-after = 3 }
 
 # Long wall-clock tests (>= 20s under coverage): the installer's literal 60s
 # crash-window replay (66s), a hook scheduled at the 60s delayMs minimum (68s),
@@ -122,7 +133,7 @@ priority = 100
 # Matched by exact (binary, test) so a renamed test drops out of the tier
 # instead of silently widening it.
 [[profile.default.overrides]]
-filter = '(binary_id(=intentd::e2e_hook_lifecycle) & test(=hook_lifecycle_over_wss)) | (binary_id(=intentd-sitter::install_sh_startup) & test(=a_crash_after_the_old_sixty_second_window_is_still_reported)) | (binary_id(=intentd::e2e_wss_agent_watch) & test(=report_progress_keeps_original_watch_for_terminal_completion_over_wss)) | (binary_id(=intentd::e2e_wss_sticky_reverse) & test(=agent_screenshot_timeout_returns_before_outer_deadline)) | (binary_id(=intentd::e2e_wss_browser_exec) & test(=browser_exec_screenshot_timeout_returns_before_outer_deadline_over_wss))'
+filter = '(binary_id(=intentd::suite_e2e) & test(=e2e_hook_lifecycle::hook_lifecycle_over_wss)) | (binary_id(=intentd-sitter::install_sh_startup) & test(=a_crash_after_the_old_sixty_second_window_is_still_reported)) | (binary_id(=intentd::suite_wss_agents) & test(=e2e_wss_agent_watch::report_progress_keeps_original_watch_for_terminal_completion_over_wss)) | (binary_id(=intentd::suite_wss_s_z) & test(=e2e_wss_sticky_reverse::agent_screenshot_timeout_returns_before_outer_deadline)) | (binary_id(=intentd::suite_wss_a_f) & test(=e2e_wss_browser_exec::browser_exec_screenshot_timeout_returns_before_outer_deadline_over_wss))'
 priority = 90
 
 [[profile.default.overrides]]

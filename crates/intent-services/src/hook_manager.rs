@@ -59,6 +59,9 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
 
+use crate::feature_ports::CancelSettlement;
+#[cfg(test)]
+use crate::runtime_config::HookStoreFault;
 use crate::{publish_event, system_actor, Services};
 
 /// Minimum inter-run delay (spec decision 5): `delayMs` below this floor is
@@ -83,11 +86,6 @@ pub(crate) const RUN_AT_GRACE_MS: i64 = 3_600_000;
 /// Maximum hook name length (spec: name > 50 chars fails validation).
 pub(crate) const MAX_HOOK_NAME_LEN: usize = 50;
 
-/// Wall-clock budget for one hook script run (spec: any run exceeding 60 s is
-/// killed and the hook evicted). Tests compress it via the `#[cfg(test)]`-only
-/// [`Services::with_hook_eval_timeout`].
-pub(crate) const HOOK_EVAL_TIMEOUT: Duration = Duration::from_secs(60);
-
 // Validation runs are inline: their ws.hook.schedule calls re-enter the
 // service before any hook is persisted. Bound the evaluation chain, allowing
 // a running hook to validate one replacement, but not another generation.
@@ -107,14 +105,7 @@ tokio::task_local! {
 /// up and evicts the hook. Only the failing persistence step is retried — the
 /// script never re-runs and a dispatch is never re-delivered.
 pub(crate) const HOOK_STORE_RETRY_ATTEMPTS: u32 = 5;
-pub(crate) const HOOK_STORE_RETRY_BASE: Duration = Duration::from_secs(1);
 const HOOK_STORE_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(16);
-
-/// Test-only fault injector for hook-run persistence steps: called with the
-/// step name before each attempt; `Some(err)` fails that attempt in place of
-/// the real store call (see [`Services::with_hook_store_fault`]).
-#[cfg(test)]
-pub(crate) type HookStoreFault = Arc<Mutex<Box<dyn FnMut(&str) -> Option<Error> + Send>>>;
 
 /// Per-run console-capture caps: the in-envelope `console.*` shim buffers at
 /// most this many lines / bytes, dropping from the head (with a marker line)
@@ -133,28 +124,6 @@ const HOOK_WAKE_LOGS_CAP: usize = crate::harness::v1::HOOK_WAKE_LOGS_CAP;
 /// `state` is dropped (the previous state is kept) with a warning line
 /// appended to that run's logs.
 const HOOK_STATE_MAX_BYTES: usize = 16 * 1024;
-
-/// How a cancel transition ([`Services::cancel_active_hook`],
-/// [`Services::cancel_active_pr_monitor`]) settles the owner's deferred
-/// completion watches. A completion watch on an idle owner defers while the
-/// owner has active hooks / PR monitors, so cancelling the LAST one must
-/// re-run the deferral backstop
-/// ([`Services::redeliver_completion_after_queue_mutation`]) — either
-/// through a wake or directly — or the watch strands forever.
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum CancelSettlement<'a> {
-    /// Wake the owner with this notice; the wake runs the backstop itself
-    /// after the delivery attempt (FE/app cancel).
-    Notify(&'a str),
-    /// No wake; run the backstop directly (owner-side cancel, retire sweep).
-    Resettle,
-    /// Neither: the caller sweeps several items and runs the backstop ONCE
-    /// per owner after queueing its consolidated wake (archive sweep). The
-    /// per-item backstop would otherwise see an empty queue and no remaining
-    /// watches on the final item and synthesize a genuine completion,
-    /// consuming a parent's watch BEFORE the consolidated notice is queued.
-    Deferred,
-}
 
 /// Cap (in chars) on the `message` a dispatching run returns and on the error
 /// text an eviction wake carries. Longer text is head-kept and tail-marked
@@ -889,7 +858,7 @@ impl Services {
     /// still requires a live turn registry for `question.ask`, so nothing is
     /// exposed by treating an orphan as top-level.
     async fn hook_owner_is_sub_agent(&self, agent_id: &AgentId) -> bool {
-        match self.store.get_agent_session_summary(agent_id).await {
+        match self.store().get_agent_session_summary(agent_id).await {
             Ok(session) => session.parent_agent_id.is_some() || session.is_background,
             Err(_) => false,
         }
@@ -972,9 +941,9 @@ impl Services {
             }
         };
         // Per-agent cap on active hooks (`[hooks] maxPerAgent`).
-        let cap = self.hooks_max_per_agent as usize;
+        let cap = self.feature_hooks_max_per_agent() as usize;
         let active = self
-            .store
+            .store()
             .list_hooks_by_agent(agent_id)
             .await?
             .into_iter()
@@ -1041,11 +1010,11 @@ impl Services {
         let outcome = run_hook_script(
             api,
             &hook,
-            self.hook_eval_timeout,
+            self.feature_hook_eval_timeout(),
             &agent_features,
             is_sub_agent,
             (HOOK_EVAL_DEPTH.try_with(|depth| *depth).unwrap_or(0) > 0)
-                .then(|| self.delivery_tasks.cancellation_flag()),
+                .then(|| self.feature_delivery_tasks().cancellation_flag()),
         )
         .await;
         // A failed validation has no durable outcome or notification to own.
@@ -1058,7 +1027,7 @@ impl Services {
         // cancelling that parent cannot discard a committed child notification.
         let services = self.clone();
         let (finished, result) = tokio::sync::oneshot::channel();
-        self.delivery_tasks
+        self.feature_delivery_tasks()
             .spawn_draining(async move {
                 let outcome = crate::workspace_mutations::boxed(
                     services.commit_hook_validation(hook, kind, outcome),
@@ -1079,8 +1048,8 @@ impl Services {
         outcome: RunOutcome,
     ) -> Result<Value> {
         let workspace_id = &hook.workspace_id.clone();
-        let _mutation = self.workspace_mutations.enter(workspace_id)?;
-        self.store.get_workspace(workspace_id).await?;
+        let _mutation = self.feature_workspace_mutations().enter(workspace_id)?;
+        self.store().get_workspace(workspace_id).await?;
         match outcome {
             RunOutcome::Failed { error, .. } => Err(Error::InvalidParams(format!(
                 "hook.schedule: first run failed: {error}"
@@ -1123,7 +1092,7 @@ impl Services {
                         initial_delay = Some(sleep);
                         Some(next)
                     };
-                    self.store.insert_hook(&hook).await?;
+                    self.store().insert_hook(&hook).await?;
                     self.emit_hook_event(HOOK_RUN_COMPLETED, &hook, None).await;
                     let message = with_wake_logs(&message, hook.last_logs.as_deref());
                     self.wake_hook_owner(&hook, &message, "dispatched").await;
@@ -1144,7 +1113,7 @@ impl Services {
                 }
                 hook.state = HookState::Dispatched;
                 hook.dispatch_count = 1;
-                self.store.insert_hook(&hook).await?;
+                self.store().insert_hook(&hook).await?;
                 self.emit_hook_event(HOOK_RUN_COMPLETED, &hook, None).await;
                 let message = with_wake_logs(&message, hook.last_logs.as_deref());
                 self.wake_hook_owner(&hook, &message, "dispatched").await;
@@ -1172,7 +1141,7 @@ impl Services {
                 // instead of scheduling (the in-flight-run-at-expiry rule).
                 if is_expired(hook.expires_at.as_deref(), self.hook_clock_skew_ms()) {
                     hook.state = HookState::Expired;
-                    self.store.insert_hook(&hook).await?;
+                    self.store().insert_hook(&hook).await?;
                     self.emit_hook_event(HOOK_RUN_COMPLETED, &hook, None).await;
                     self.finish_expiry(&hook).await;
                     return Ok(json!({ "hook": hook, "dispatched": false }));
@@ -1180,7 +1149,7 @@ impl Services {
                 hook.state = HookState::Scheduled;
                 let (next, initial_delay) = kind_next_fire(&kind)?;
                 hook.next_run_at = Some(next);
-                self.store.insert_hook(&hook).await?;
+                self.store().insert_hook(&hook).await?;
                 self.emit_hook_event(HOOK_RUN_COMPLETED, &hook, hook.next_run_at.clone())
                     .await;
                 self.emit_hook_event(HOOK_SCHEDULED, &hook, hook.next_run_at.clone())
@@ -1214,7 +1183,7 @@ impl Services {
         include_retired: bool,
     ) -> Result<Value> {
         let hooks = self
-            .store
+            .store()
             .list_hook_rows(workspace_id, agent_id, include_retired)
             .await?;
         Ok(json!({ "hooks": hooks }))
@@ -1230,7 +1199,7 @@ impl Services {
         workspace_id: &WorkspaceId,
         hook_id: &HookId,
     ) -> Result<Value> {
-        let hook = self.store.get_hook(hook_id).await?;
+        let hook = self.store().get_hook(hook_id).await?;
         if &hook.workspace_id != workspace_id {
             return Err(Error::NotFound(format!("hook {} not found", hook_id.0)));
         }
@@ -1245,7 +1214,7 @@ impl Services {
     /// empty (visibility is best-effort and must never block an idle emit or
     /// wake delivery).
     pub(crate) async fn active_hooks_for_agent(&self, agent_id: &AgentId) -> Vec<Value> {
-        let hooks = match self.store.active_hook_metadata_by_agent(agent_id).await {
+        let hooks = match self.store().active_hook_metadata_by_agent(agent_id).await {
             Ok(hooks) => hooks,
             Err(e) => {
                 tracing::warn!(
@@ -1269,7 +1238,7 @@ impl Services {
         workspace_id: &WorkspaceId,
     ) -> HashMap<String, Vec<Value>> {
         let hooks = match self
-            .store
+            .store()
             .active_hook_metadata_by_workspace(workspace_id)
             .await
         {
@@ -1292,34 +1261,6 @@ impl Services {
                 .push(waiting_on_hooks_entry(h));
         }
         by_agent
-    }
-
-    /// Whether the workspace owns any ACTIVE (`scheduled`/`running`) hook —
-    /// a `Workspace.waiting` signal (§5.1, via
-    /// [`Services::workspace_is_waiting`]): an idle agent still watching via
-    /// a background hook reads as waiting, without promoting the
-    /// `displayStatus` rollup. SQL-side count-only aggregate — no row
-    /// hydration and no dependence on how many terminal rows the workspace
-    /// accumulated. Best-effort: a store read failure is logged
-    /// and fails open to `false` (mirrors
-    /// [`Services::workspace_attention_signals`]) so list/get emission is
-    /// never wedged and activity is never fabricated.
-    pub(crate) async fn workspace_has_active_hooks(&self, workspace_id: &WorkspaceId) -> bool {
-        match self
-            .store
-            .count_active_hooks_by_workspace(workspace_id)
-            .await
-        {
-            Ok(n) => n > 0,
-            Err(e) => {
-                tracing::warn!(
-                    workspace = %workspace_id.0,
-                    error = %e,
-                    "active-hooks displayStatus lookup failed; reads as none"
-                );
-                false
-            }
-        }
     }
 
     /// Stamp `waitingOnHooks` onto an `agent:idle`-style event `data` object
@@ -1355,7 +1296,7 @@ impl Services {
         hook_id: &HookId,
         caller: Option<&AgentId>,
     ) -> Result<Value> {
-        let hook = self.store.get_hook(hook_id).await?;
+        let hook = self.store().get_hook(hook_id).await?;
         if &hook.workspace_id != workspace_id {
             return Err(Error::NotFound(format!("hook {} not found", hook_id.0)));
         }
@@ -1399,10 +1340,12 @@ impl Services {
         settlement: CancelSettlement<'_>,
     ) -> Result<Hook> {
         self.abort_hook_task(&hook.hook_id);
-        self.store
+        self.store()
             .update_hook_state(&hook.hook_id, HookState::Cancelled)
             .await?;
-        self.store.update_hook_next_run(&hook.hook_id, None).await?;
+        self.store()
+            .update_hook_next_run(&hook.hook_id, None)
+            .await?;
         hook.state = HookState::Cancelled;
         hook.next_run_at = None;
         self.emit_hook_event(HOOK_CANCELLED, &hook, None).await;
@@ -1445,7 +1388,7 @@ impl Services {
         workspace_id: &WorkspaceId,
     ) -> BTreeMap<AgentId, Vec<(String, HookId)>> {
         let mut cancelled: BTreeMap<AgentId, Vec<(String, HookId)>> = BTreeMap::new();
-        let hooks = match self.store.list_hooks_by_workspace(workspace_id).await {
+        let hooks = match self.store().list_hooks_by_workspace(workspace_id).await {
             Ok(hooks) => hooks,
             Err(e) => {
                 tracing::warn!(
@@ -1495,7 +1438,7 @@ impl Services {
     /// is logged and the sweep moves on — retiring must not fail because
     /// one hook row would not update.
     pub(crate) async fn cancel_agent_hooks(&self, agent_id: &AgentId) {
-        let hooks = match self.store.list_hooks_by_agent(agent_id).await {
+        let hooks = match self.store().list_hooks_by_agent(agent_id).await {
             Ok(hooks) => hooks,
             Err(e) => {
                 tracing::warn!(
@@ -1534,7 +1477,7 @@ impl Services {
     /// Best-effort: a list failure is logged and skipped (the lazy
     /// next-tick exit still applies).
     pub(crate) async fn abort_workspace_hook_tasks(&self, workspace_id: &WorkspaceId) {
-        let hooks = match self.store.list_hooks_by_workspace(workspace_id).await {
+        let hooks = match self.store().list_hooks_by_workspace(workspace_id).await {
             Ok(hooks) => hooks,
             Err(e) => {
                 tracing::warn!(
@@ -1561,7 +1504,7 @@ impl Services {
         workspace_id: &WorkspaceId,
         hook_id: &HookId,
     ) -> Result<Value> {
-        let hook = self.store.get_hook(hook_id).await?;
+        let hook = self.store().get_hook(hook_id).await?;
         if &hook.workspace_id != workspace_id {
             return Err(Error::NotFound(format!("hook {} not found", hook_id.0)));
         }
@@ -1572,7 +1515,7 @@ impl Services {
             )));
         }
         let control = {
-            let tasks = self.hook_tasks.lock().unwrap();
+            let tasks = self.runtime().hook_tasks.lock().unwrap();
             tasks.get(hook_id).map(|h| h.control.clone())
         };
         let Some(control) = control else {
@@ -1611,7 +1554,7 @@ impl Services {
     ///
     /// Returns `Error::Internal` if loading the persisted hooks or an owner status lookup fails.
     pub async fn rehydrate_hooks(&self) -> Result<usize> {
-        let hooks = self.store.load_active_hooks().await?;
+        let hooks = self.store().load_active_hooks().await?;
         let mut resumed = 0;
         for mut hook in hooks {
             if self.hook_task_alive(&hook.hook_id) {
@@ -1621,7 +1564,7 @@ impl Services {
             // their session row with status `deleted`) or is soft-retired —
             // the retire-time sweep ([`Services::cancel_agent_hooks`]) could
             // have been missed by a crash window.
-            let owner_gone = match self.store.get_agent_session_summary(&hook.agent_id).await {
+            let owner_gone = match self.store().get_agent_session_summary(&hook.agent_id).await {
                 Ok(session) => {
                     session.status == AgentStatus::Deleted || session.retired_at.is_some()
                 }
@@ -1630,10 +1573,10 @@ impl Services {
             };
             if owner_gone {
                 let _ = self
-                    .store
+                    .store()
                     .update_hook_state(&hook.hook_id, HookState::Cancelled)
                     .await;
-                let _ = self.store.update_hook_next_run(&hook.hook_id, None).await;
+                let _ = self.store().update_hook_next_run(&hook.hook_id, None).await;
                 hook.state = HookState::Cancelled;
                 hook.next_run_at = None;
                 self.emit_hook_event(HOOK_CANCELLED, &hook, None).await;
@@ -1652,12 +1595,12 @@ impl Services {
             // branches on `Running` (interrupted mid-run ⇒ fresh countdown).
             let (next_run_at, initial_delay) = resumed_next_run(&hook);
             if hook.state == HookState::Running {
-                self.store
+                self.store()
                     .update_hook_state(&hook.hook_id, HookState::Scheduled)
                     .await?;
                 hook.state = HookState::Scheduled;
             }
-            self.store
+            self.store()
                 .update_hook_next_run(&hook.hook_id, Some(&next_run_at))
                 .await?;
             hook.next_run_at = Some(next_run_at.clone());
@@ -1671,12 +1614,16 @@ impl Services {
 
     /// Whether a live scheduler task exists for `hook_id`.
     fn hook_task_alive(&self, hook_id: &HookId) -> bool {
-        self.hook_tasks.lock().unwrap().contains_key(hook_id)
+        self.runtime()
+            .hook_tasks
+            .lock()
+            .unwrap()
+            .contains_key(hook_id)
     }
 
     /// Abort and deregister a hook's scheduler task (no-op when absent).
     fn abort_hook_task(&self, hook_id: &HookId) {
-        if let Some(handle) = self.hook_tasks.lock().unwrap().remove(hook_id) {
+        if let Some(handle) = self.runtime().hook_tasks.lock().unwrap().remove(hook_id) {
             handle.abort.abort();
         }
     }
@@ -1698,7 +1645,7 @@ impl Services {
         let (control_tx, mut control_rx) = mpsc::channel::<HookControl>(4);
         let services = self.clone();
         let hook_id = hook.hook_id.clone();
-        let Some(join) = self.delivery_tasks.spawn_draining(async move {
+        let Some(join) = self.feature_delivery_tasks().spawn_draining(async move {
             let mut hook = hook;
             let mut delay = initial_delay
                 .unwrap_or_else(|| Duration::from_millis(hook.delay_ms.max(0).cast_unsigned()));
@@ -1715,10 +1662,10 @@ impl Services {
                 };
                 tokio::select! {
                     biased;
-                    () = services.delivery_tasks.closed() => break,
+                    () = services.feature_delivery_tasks().closed() => break,
                     () = tokio::time::sleep(delay) => {}
                     () = expiry => {
-                        if services.delivery_tasks.is_closed() { break; }
+                        if services.feature_delivery_tasks().is_closed() { break; }
                         services.expire_hook(&mut hook).await;
                         break;
                     }
@@ -1732,7 +1679,7 @@ impl Services {
                         }
                     }
                 }
-                if services.delivery_tasks.is_closed() {
+                if services.feature_delivery_tasks().is_closed() {
                     break;
                 }
                 // Never start a run at/after expiresAt (guards a `runNow`
@@ -1758,11 +1705,16 @@ impl Services {
                     }
                 }
             }
-            services.hook_tasks.lock().unwrap().remove(&hook.hook_id);
+            services
+                .runtime()
+                .hook_tasks
+                .lock()
+                .unwrap()
+                .remove(&hook.hook_id);
         }) else {
             return;
         };
-        self.hook_tasks.lock().unwrap().insert(
+        self.runtime().hook_tasks.lock().unwrap().insert(
             hook_id,
             HookHandle {
                 control: control_tx,
@@ -1781,7 +1733,7 @@ impl Services {
         // transient store/pool error must not evict a healthy hook —
         // intent-hq/intent#5035). The closures capture plain references so
         // the in-memory hook stays mutable between steps.
-        let store = &self.store;
+        let store = &self.store();
         let hook_id = hook.hook_id.clone();
         let id = &hook_id;
         // A cancel can race the sleep expiry: re-read the persisted state and
@@ -1816,17 +1768,17 @@ impl Services {
         let is_sub_agent = self.hook_owner_is_sub_agent(&hook.agent_id).await;
         let evaluation = async {
             #[cfg(test)]
-            if let Some(park) = &self.hook_eval_park {
+            if let Some(park) = self.feature_hook_eval_park() {
                 park.entered.notify_one();
                 park.release.notified().await;
             }
             run_hook_script(
                 api,
                 hook,
-                self.hook_eval_timeout,
+                self.feature_hook_eval_timeout(),
                 &agent_features,
                 is_sub_agent,
-                Some(self.delivery_tasks.cancellation_flag()),
+                Some(self.feature_delivery_tasks().cancellation_flag()),
             )
             .await
         };
@@ -1835,12 +1787,12 @@ impl Services {
         // owns its durable handoff and must finish queueing any wake.
         let outcome = tokio::select! {
             biased;
-            () = self.delivery_tasks.closed() => return Ok(None),
+            () = self.feature_delivery_tasks().closed() => return Ok(None),
             outcome = evaluation => outcome,
         };
         // A non-yielding script can finish its interrupt handler in the same
         // poll that observes shutdown. Cancellation is not a failed hook run.
-        if self.delivery_tasks.is_closed() {
+        if self.feature_delivery_tasks().is_closed() {
             return Ok(None);
         }
         let last_run_at = now_iso();
@@ -2123,12 +2075,11 @@ impl Services {
         F: FnMut() -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
     {
-        let mut backoff = self.hook_store_retry_base;
+        let mut backoff = self.feature_hook_store_retry_base();
         for attempt in 1..=HOOK_STORE_RETRY_ATTEMPTS {
             #[cfg(test)]
             let injected = self
-                .hook_store_fault
-                .as_ref()
+                .feature_hook_store_fault()
                 .and_then(|fault| (fault.lock().unwrap())(step));
             #[cfg(not(test))]
             let injected: Option<Error> = None;
@@ -2175,7 +2126,7 @@ impl Services {
         if hook.last_error == exec_error {
             return Ok(());
         }
-        let store = &self.store;
+        let store = &self.store();
         let id = &hook.hook_id;
         let error = exec_error.as_deref();
         self.hook_store_retry(id, "update_hook_last_error", move || {
@@ -2189,7 +2140,7 @@ impl Services {
     /// Apply a run's [`StateUpdate`] to the persisted row and the in-memory
     /// hook (`Keep` writes nothing).
     async fn persist_hook_state(&self, hook: &mut Hook, state: StateUpdate) -> Result<()> {
-        let store = &self.store;
+        let store = &self.store();
         let id = &hook.hook_id;
         match state {
             StateUpdate::Keep => {}
@@ -2220,14 +2171,14 @@ impl Services {
         let error = format!("scheduler stopped after a store error: {cause}");
         tracing::warn!(hook = %hook.hook_id.0, error = %error, "evicting hook after store error");
         if let Err(e) = self
-            .store
+            .store()
             .update_hook_last_error(&hook.hook_id, Some(&error))
             .await
         {
             tracing::warn!(hook = %hook.hook_id.0, error = %e, "failed to persist hook lastError");
         }
         if let Err(e) = self
-            .store
+            .store()
             .update_hook_state(&hook.hook_id, HookState::Evicted)
             .await
         {
@@ -2256,14 +2207,14 @@ impl Services {
     /// `evict_hook_after_store_error`): the scheduler task is exiting either
     /// way, so log rather than propagate.
     async fn expire_hook(&self, hook: &mut Hook) {
-        match self.store.get_hook(&hook.hook_id).await {
+        match self.store().get_hook(&hook.hook_id).await {
             Ok(h) if matches!(h.state, HookState::Scheduled | HookState::Running) => {}
             Ok(_) | Err(Error::NotFound(_)) => return,
             Err(e) => {
                 tracing::warn!(hook = %hook.hook_id.0, error = %e, "expiry state re-read failed");
             }
         }
-        if let Err(e) = self.store.expire_hook(&hook.hook_id).await {
+        if let Err(e) = self.store().expire_hook(&hook.hook_id).await {
             tracing::warn!(hook = %hook.hook_id.0, error = %e, "failed to persist hook expiry");
         }
         hook.state = HookState::Expired;
@@ -2359,7 +2310,7 @@ impl Services {
     /// consumers can tell the two apart without parsing the note text.
     async fn wake_hook_owner(&self, hook: &Hook, message: &str, reason: &str) {
         #[cfg(test)]
-        if let Some(park) = &self.hook_wake_park {
+        if let Some(park) = self.feature_hook_wake_park() {
             park.entered.notify_one();
             park.release.notified().await;
         }
@@ -2389,7 +2340,9 @@ impl Services {
         };
         let content = harness.hook_wake_framing(&hook.name, message, state_note.as_deref());
         if let Err(e) = self
+            .feature_agent_wake()
             .deliver_wake_message(
+                self,
                 &hook.workspace_id,
                 &hook.agent_id,
                 &content,
@@ -2443,7 +2396,7 @@ impl Services {
             metadata: None,
             data,
         };
-        publish_event(self.event_bus.as_ref(), event).await;
+        publish_event(self.feature_event_bus(), event).await;
     }
 }
 
@@ -2451,10 +2404,7 @@ impl Services {
 mod tests {
     use std::path::PathBuf;
 
-    use intent_core::{
-        AgentSession, AgentStatus, Workspace, WorkspaceActivity, WorkspaceAttention,
-        WorkspaceStatus,
-    };
+    use intent_core::{AgentSession, AgentStatus, Workspace, WorkspaceStatus};
     use intent_store::Store;
 
     use super::*;
@@ -2487,49 +2437,9 @@ mod tests {
             id: id.clone(),
             title: "WS".to_string(),
             branch: "main".to_string(),
-            base_ref: None,
-            base_commit_sha: None,
-            status: WorkspaceStatus::Active,
-            status_message: None,
-            status_image_asset_id: None,
-            activity: WorkspaceActivity::Idle,
-            attention: WorkspaceAttention::None,
             created_at: ts.clone(),
             updated_at: ts,
-            last_activity: None,
-            last_content_activity: None,
-            tags: vec![],
-            path: None,
-            repository_path: None,
-            repository_owner: None,
-            repository_name: None,
-            worktree_path: None,
-            scope: None,
-            skip_worktree: false,
-            setup_script: None,
-            is_remote: false,
-            default_model: None,
-            pr_number: None,
-            pr_url: None,
-            pr_status: None,
-            active_pull_request: None,
-            pull_requests: None,
-            context_links: None,
-            archived: false,
-            archived_at: None,
-            task_stats: None,
-            agent_summary: None,
-            diff_summary: None,
-            token_usage: None,
-            cow_supported: None,
-            browser_client_id: None,
-            pull_requests_total: None,
-            display_status: None,
-            waiting: false,
-            checkout_mode: None,
-            disk_usage: None,
-            pending_delete_at: None,
-            membership: None,
+            ..Default::default()
         }
     }
 
@@ -2645,7 +2555,7 @@ mod tests {
             intent_core::MessageOrigin::Automatic,
         );
         {
-            let mut queues = svc.agent_queues.lock().unwrap();
+            let mut queues = svc.feature_agent_queues().lock().unwrap();
             queues.get_mut(&owner).unwrap()[0].queued_at = "2020-01-01T00:00:00Z".into();
         }
         let before = svc.queue_snapshot(&owner);
@@ -2680,14 +2590,16 @@ mod tests {
     /// under a loaded host (e.g. a parallel `cargo build`) persistence can
     /// lag far behind the happy path, and a short deadline fails
     /// otherwise-passing tests (intent-hq/monorepo#1358).
-    const POLL_DEADLINE: Duration = Duration::from_secs(10);
+    fn poll_deadline() -> Duration {
+        intentd_test_support::test_timeout(Duration::from_secs(10))
+    }
 
     /// Poll the persisted hook until `pred` holds or the timeout elapses.
     async fn wait_for_hook<F>(svc: &Services, id: &HookId, pred: F) -> Hook
     where
         F: Fn(&Hook) -> bool,
     {
-        let deadline = std::time::Instant::now() + POLL_DEADLINE;
+        let deadline = std::time::Instant::now() + poll_deadline();
         loop {
             let hook = svc.store().get_hook(id).await.expect("get hook");
             if pred(&hook) {
@@ -2706,7 +2618,7 @@ mod tests {
     /// terminal state persists BEFORE the loop exits, so asserting
     /// `!hook_task_alive` right after a state wait races the teardown.
     async fn wait_for_task_exit(svc: &Services, id: &HookId) {
-        let deadline = std::time::Instant::now() + POLL_DEADLINE;
+        let deadline = std::time::Instant::now() + poll_deadline();
         while svc.hook_task_alive(id) {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -2720,7 +2632,7 @@ mod tests {
     /// `needle`, returning the serialized messages. The wake lands after the
     /// terminal state persists, so a plain read can race it.
     async fn wait_for_wake(svc: &Services, owner: &AgentId, needle: &str) -> String {
-        let deadline = std::time::Instant::now() + POLL_DEADLINE;
+        let deadline = std::time::Instant::now() + poll_deadline();
         loop {
             let session = svc.store().get_agent_session(owner).await.unwrap();
             let text = serde_json::to_string(&session.messages).unwrap();
@@ -2741,7 +2653,7 @@ mod tests {
     /// helper polls until all are present (on deadline it returns whatever
     /// was seen — the caller's asserts then report the shortfall).
     async fn hook_event_types(svc: &Services, ws: &WorkspaceId, expected: &[&str]) -> Vec<String> {
-        let deadline = std::time::Instant::now() + POLL_DEADLINE;
+        let deadline = std::time::Instant::now() + poll_deadline();
         loop {
             let mut evs = svc
                 .store()
@@ -2844,16 +2756,16 @@ mod tests {
             "{err}"
         );
         assert!(svc
-            .store
+            .store()
             .list_hooks_by_agent(&owner)
             .await
             .unwrap()
             .is_empty());
-        assert!(svc.hook_tasks.lock().unwrap().is_empty());
+        assert!(svc.runtime().hook_tasks.lock().unwrap().is_empty());
 
         // A rejected chain must not poison the owner or unrelated work.
         let other = AgentId::from("agent-unrelated");
-        svc.store
+        svc.store()
             .insert_agent_session(&agent(&ws, &other.0))
             .await
             .unwrap();
@@ -2906,7 +2818,7 @@ mod tests {
             wait_for_hook(&svc, &current.hook_id, |h| h.state == HookState::Dispatched).await;
             wait_for_task_exit(&svc, &current.hook_id).await;
             let active: Vec<_> = svc
-                .store
+                .store()
                 .list_hooks_by_agent(&owner)
                 .await
                 .unwrap()
@@ -2928,7 +2840,7 @@ mod tests {
     async fn shutdown_cancels_nested_inline_validation_before_poll() {
         let (_db, _root, svc, ws, owner) = setup().await;
         let svc = svc.with_hook_eval_timeout(Duration::from_millis(500));
-        svc.delivery_tasks.close();
+        svc.feature_delivery_tasks().close();
         // The same task-local depth used by a scheduled parent's ws.hook.schedule
         // binding. Pre-close removes the host-return/loop-entry scheduling race.
         let error = HOOK_EVAL_DEPTH
@@ -2949,7 +2861,7 @@ mod tests {
             "nested validation ignored closure: {error}"
         );
         assert!(svc
-            .store
+            .store()
             .list_hooks_by_agent(&owner)
             .await
             .unwrap()
@@ -2963,7 +2875,7 @@ mod tests {
         let svc = svc.with_hook_eval_timeout(Duration::from_secs(5));
         let mgr = Arc::new(AgentManager::new(
             svc.clone(),
-            Arc::new(BusEventSink::new(svc.event_bus.clone().unwrap())),
+            Arc::new(BusEventSink::new(svc.feature_event_bus().cloned().unwrap())),
             8,
         ));
         svc.attach_agent_manager(&mgr);
@@ -2980,10 +2892,10 @@ mod tests {
             .unwrap();
         let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
         svc.hook_run_now_op(&ws, &hook.hook_id).await.unwrap();
-        tokio::time::timeout(POLL_DEADLINE, async {
+        tokio::time::timeout(poll_deadline(), async {
             loop {
                 if svc
-                    .store
+                    .store()
                     .get_workspace(&ws)
                     .await
                     .unwrap()
@@ -3010,7 +2922,7 @@ mod tests {
         .await
         .is_ok();
         if !timely {
-            tokio::time::timeout(POLL_DEADLINE, shutdown)
+            tokio::time::timeout(poll_deadline(), shutdown)
                 .await
                 .unwrap()
                 .unwrap();
@@ -3020,7 +2932,7 @@ mod tests {
             timely,
             "nested validation must observe scheduled hook shutdown, not its five-second budget"
         );
-        let hooks = svc.store.list_hooks_by_agent(&owner).await.unwrap();
+        let hooks = svc.store().list_hooks_by_agent(&owner).await.unwrap();
         assert_eq!(
             hooks.len(),
             1,
@@ -3033,7 +2945,7 @@ mod tests {
     async fn hook_validation_scope_survives_cancellation_and_parallel_work() {
         let (_db, _root, svc, ws, owner) = setup().await;
         let other = AgentId::from("agent-parallel");
-        svc.store
+        svc.store()
             .insert_agent_session(&agent(&ws, &other.0))
             .await
             .unwrap();
@@ -3057,7 +2969,7 @@ mod tests {
                     result = &mut pending => panic!("pending validation completed: {result:?}"),
                     () = async {
                         loop {
-                            if svc.store.get_workspace(&ws).await.unwrap().status_message.as_deref()
+                            if svc.store().get_workspace(&ws).await.unwrap().status_message.as_deref()
                                 == Some("validation entered") { break; }
                             tokio::time::sleep(Duration::from_millis(10)).await;
                         }
@@ -3070,7 +2982,7 @@ mod tests {
         .unwrap();
         drop(pending);
         assert!(svc
-            .store
+            .store()
             .list_hooks_by_agent(&owner)
             .await
             .unwrap()
@@ -3080,7 +2992,7 @@ mod tests {
             .await
             .unwrap();
         for id in [&owner, &other] {
-            let hooks = svc.store.list_hooks_by_agent(id).await.unwrap();
+            let hooks = svc.store().list_hooks_by_agent(id).await.unwrap();
             assert_eq!(hooks.len(), 2);
             for hook in hooks {
                 assert!(hook.name.starts_with("healthy-"));
@@ -3773,7 +3685,15 @@ mod tests {
         assert_eq!(hook.state, HookState::Scheduled);
         assert_eq!(hook.dispatch_count, 0);
         probe.content = "go".to_string();
-        svc.store().update_note(&probe).await.unwrap();
+        svc.store()
+            .update_note(
+                &svc.store()
+                    .lock_note_content(&probe.workspace_id, &probe.id)
+                    .await,
+                &probe,
+            )
+            .await
+            .unwrap();
 
         for fire in 1..=2 {
             svc.hook_run_now_op(&ws, &hook.hook_id)
@@ -3838,7 +3758,15 @@ mod tests {
         wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Running).await;
         skew.store(120_000, std::sync::atomic::Ordering::SeqCst);
         gate.content = "go".to_string();
-        svc.store().update_note(&gate).await.unwrap();
+        svc.store()
+            .update_note(
+                &svc.store()
+                    .lock_note_content(&gate.workspace_id, &gate.id)
+                    .await,
+                &gate,
+            )
+            .await
+            .unwrap();
         let expired = wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Expired).await;
         assert_eq!(expired.run_count, 1);
         assert_eq!(expired.dispatch_count, 1, "the fire still counted");
@@ -3866,7 +3794,7 @@ mod tests {
         assert!(types.contains(&HOOK_DISPATCHED.to_string()), "{types:?}");
         assert!(types.contains(&HOOK_EXPIRED.to_string()), "{types:?}");
         // Task deregistered after the terminal outcome.
-        let deadline = std::time::Instant::now() + POLL_DEADLINE;
+        let deadline = std::time::Instant::now() + poll_deadline();
         while svc.hook_task_alive(&hook.hook_id) {
             assert!(std::time::Instant::now() < deadline, "task not removed");
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -4094,7 +4022,15 @@ mod tests {
         let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
         assert_eq!(hook.state, HookState::Scheduled);
         probe.content = "go".to_string();
-        svc.store().update_note(&probe).await.unwrap();
+        svc.store()
+            .update_note(
+                &svc.store()
+                    .lock_note_content(&probe.workspace_id, &probe.id)
+                    .await,
+                &probe,
+            )
+            .await
+            .unwrap();
         svc.hook_run_now_op(&ws, &hook.hook_id)
             .await
             .expect("runNow");
@@ -4113,7 +4049,7 @@ mod tests {
         );
         assert!(text.contains(r#""hookStillActive":false"#), "{text}");
         // Task deregistered after the terminal outcome.
-        let deadline = std::time::Instant::now() + POLL_DEADLINE;
+        let deadline = std::time::Instant::now() + poll_deadline();
         while svc.hook_task_alive(&hook.hook_id) {
             assert!(std::time::Instant::now() < deadline, "task not removed");
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -4138,15 +4074,15 @@ mod tests {
             svc = svc.with_hook_clock_skew(Arc::new(std::sync::atomic::AtomicI64::new(20_000)));
         }
         let park = Arc::new(crate::CompletionClassifyPark::default());
-        svc.hook_wake_park = Some(park.clone());
+        svc.set_hook_wake_park_for_test(park.clone());
         let mgr = Arc::new(AgentManager::new(
             svc.clone(),
-            Arc::new(BusEventSink::new(svc.event_bus.clone().unwrap())),
+            Arc::new(BusEventSink::new(svc.feature_event_bus().cloned().unwrap())),
             8,
         ));
         svc.attach_agent_manager(&mgr);
         let mut probe = note(&ws, "nested-shutdown-probe", "wait");
-        svc.store.insert_note(&probe).await.unwrap();
+        svc.store().insert_note(&probe).await.unwrap();
         let code = r#"
             const n = await ws.note.read('nested-shutdown-probe');
             if (!n.content.includes('go')) return {dispatch:false};
@@ -4170,13 +4106,21 @@ mod tests {
             .unwrap();
         let parent: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
         probe.content = "go".into();
-        svc.store.update_note(&probe).await.unwrap();
+        svc.store()
+            .update_note(
+                &svc.store()
+                    .lock_note_content(&probe.workspace_id, &probe.id)
+                    .await,
+                &probe,
+            )
+            .await
+            .unwrap();
         svc.hook_run_now_op(&ws, &parent.hook_id).await.unwrap();
-        tokio::time::timeout(POLL_DEADLINE, park.entered.notified())
+        tokio::time::timeout(poll_deadline(), park.entered.notified())
             .await
             .unwrap();
         let child = svc
-            .store
+            .store()
             .list_hooks_by_agent(&owner)
             .await
             .unwrap()
@@ -4199,17 +4143,17 @@ mod tests {
         park.release.notify_one();
         if expired_perpetual {
             // Expired perpetual validation sends a dispatch and an expiry notice.
-            tokio::time::timeout(POLL_DEADLINE, park.entered.notified())
+            tokio::time::timeout(poll_deadline(), park.entered.notified())
                 .await
                 .unwrap();
             park.release.notify_one();
         }
-        tokio::time::timeout(POLL_DEADLINE, shutdown)
+        tokio::time::timeout(poll_deadline(), shutdown)
             .await
             .unwrap()
             .unwrap();
         mgr.shutdown().await;
-        let restarted = Services::new(svc.store.clone());
+        let restarted = Services::new(svc.store().clone());
         restarted.rehydrate_agent_queues().await.unwrap();
         let queue = restarted.queue_snapshot(&owner);
         assert_eq!(
@@ -4233,7 +4177,7 @@ mod tests {
                 .count(),
             1
         );
-        let recovered = restarted.store.get_hook(&child.hook_id).await.unwrap();
+        let recovered = restarted.store().get_hook(&child.hook_id).await.unwrap();
         assert_eq!(recovered.state, terminal);
         assert_eq!(
             recovered.run_count, 1,
@@ -4247,10 +4191,10 @@ mod tests {
         use std::sync::Arc;
         let (_tmp, _root, mut svc, ws, owner) = setup().await;
         let park = Arc::new(crate::CompletionClassifyPark::default());
-        svc.hook_wake_park = Some(park.clone());
+        svc.set_hook_wake_park_for_test(park.clone());
         let mgr = Arc::new(AgentManager::new(
             svc.clone(),
-            Arc::new(BusEventSink::new(svc.event_bus.clone().unwrap())),
+            Arc::new(BusEventSink::new(svc.feature_event_bus().cloned().unwrap())),
             8,
         ));
         svc.attach_agent_manager(&mgr);
@@ -4263,9 +4207,17 @@ mod tests {
         })).await.unwrap();
         let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
         probe.content = "go".into();
-        svc.store().update_note(&probe).await.unwrap();
+        svc.store()
+            .update_note(
+                &svc.store()
+                    .lock_note_content(&probe.workspace_id, &probe.id)
+                    .await,
+                &probe,
+            )
+            .await
+            .unwrap();
         svc.hook_run_now_op(&ws, &hook.hook_id).await.unwrap();
-        tokio::time::timeout(POLL_DEADLINE, park.entered.notified())
+        tokio::time::timeout(poll_deadline(), park.entered.notified())
             .await
             .unwrap();
         assert_eq!(
@@ -4295,37 +4247,37 @@ mod tests {
         mgr.begin_shutdown();
         // A committed tail may still be waiting on event publication. Recovery
         // must already be durable before shutdown awaits that tail.
-        tokio::time::timeout(POLL_DEADLINE, mgr.checkpoint_shutdown())
+        tokio::time::timeout(poll_deadline(), mgr.checkpoint_shutdown())
             .await
             .unwrap();
         assert!(svc
-            .store
+            .store()
             .get_interrupted_agent(&owner)
             .await
             .unwrap()
             .is_some());
         assert!(svc
-            .store
+            .store()
             .get_agent_message_by_id(&owner, "committed-hook-partial")
             .await
             .unwrap()
             .is_some());
-        assert_eq!(svc.store.load_all_agent_queues().await.unwrap().len(), 1);
+        assert_eq!(svc.store().load_all_agent_queues().await.unwrap().len(), 1);
         let shutdown_svc = svc.clone();
         let shutdown = tokio::spawn(async move {
             shutdown_svc.shutdown_agent_deliveries().await;
         });
-        while !svc.delivery_tasks.is_closed() {
+        while !svc.feature_delivery_tasks().is_closed() {
             tokio::task::yield_now().await;
         }
         park.release.notify_one();
-        tokio::time::timeout(POLL_DEADLINE, shutdown)
+        tokio::time::timeout(poll_deadline(), shutdown)
             .await
             .unwrap()
             .unwrap();
         mgr.shutdown().await;
         drop(draining);
-        let restarted = Services::new(svc.store.clone());
+        let restarted = Services::new(svc.store().clone());
         restarted.rehydrate_agent_queues().await.unwrap();
         let queue = restarted.queue_snapshot(&owner);
         assert_eq!(
@@ -4351,10 +4303,10 @@ mod tests {
         use std::sync::Arc;
         let (_tmp, _root, mut svc, ws, owner) = setup().await;
         let park = Arc::new(crate::CompletionClassifyPark::default());
-        svc.hook_eval_park = Some(park.clone());
+        svc.set_hook_eval_park_for_test(park.clone());
         let mgr = Arc::new(AgentManager::new(
             svc.clone(),
-            Arc::new(BusEventSink::new(svc.event_bus.clone().unwrap())),
+            Arc::new(BusEventSink::new(svc.feature_event_bus().cloned().unwrap())),
             8,
         ));
         svc.attach_agent_manager(&mgr);
@@ -4370,7 +4322,7 @@ mod tests {
             .unwrap();
         let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
         svc.hook_run_now_op(&ws, &hook.hook_id).await.unwrap();
-        tokio::time::timeout(POLL_DEADLINE, park.entered.notified())
+        tokio::time::timeout(poll_deadline(), park.entered.notified())
             .await
             .unwrap();
         assert!(mgr.try_begin_turn(&owner, &ws).await.is_some());
@@ -4406,7 +4358,7 @@ mod tests {
         // Always release the fixture before asserting the expected baseline failure.
         park.release.notify_one();
         if !timely {
-            tokio::time::timeout(POLL_DEADLINE, shutdown)
+            tokio::time::timeout(poll_deadline(), shutdown)
                 .await
                 .unwrap()
                 .unwrap();
@@ -4416,26 +4368,26 @@ mod tests {
             timely,
             "shutdown must cancel evaluation before waiting out the hook budget"
         );
-        let restarted = Services::new(svc.store.clone());
+        let restarted = Services::new(svc.store().clone());
         restarted.rehydrate_agent_queues().await.unwrap();
         assert_eq!(
             restarted.queue_snapshot(&owner)[0]["id"],
             "hook-shutdown-queue"
         );
         assert!(svc
-            .store
+            .store()
             .get_interrupted_agent(&owner)
             .await
             .unwrap()
             .is_some());
         assert!(svc
-            .store
+            .store()
             .get_agent_message_by_id(&owner, "hook-shutdown-partial")
             .await
             .unwrap()
             .is_some());
         assert_eq!(
-            svc.store.get_hook(&hook.hook_id).await.unwrap().state,
+            svc.store().get_hook(&hook.hook_id).await.unwrap().state,
             HookState::Running
         );
     }
@@ -4652,7 +4604,15 @@ mod tests {
             .await
             .expect("gate note");
         gate.content = "go".to_string();
-        svc.store().update_note(&gate).await.unwrap();
+        svc.store()
+            .update_note(
+                &svc.store()
+                    .lock_note_content(&gate.workspace_id, &gate.id)
+                    .await,
+                &gate,
+            )
+            .await
+            .unwrap();
     }
 
     /// Number of the owner's persisted messages containing `needle`.
@@ -4669,7 +4629,7 @@ mod tests {
     /// (the wake lands after the state a test gated on), then return the
     /// count so the caller can assert it is exactly `n`.
     async fn wait_for_wake_count(svc: &Services, owner: &AgentId, needle: &str, n: usize) -> usize {
-        let deadline = std::time::Instant::now() + POLL_DEADLINE;
+        let deadline = std::time::Instant::now() + poll_deadline();
         loop {
             let count = wake_count(svc, owner, needle).await;
             if count >= n || std::time::Instant::now() >= deadline {
@@ -5179,6 +5139,54 @@ mod tests {
         assert!(text.contains("cancelled"), "{text}");
     }
 
+    /// `workspace.retire` on an Active workspace runs the archive teardown
+    /// first, so every ACTIVE hook is cancelled exactly as on archive: task
+    /// aborted, row `cancelled`, `hook:cancelled` emitted.
+    #[intent_test_macros::daemon_test]
+    async fn workspace_retire_from_active_cancels_active_hooks() {
+        let (_tmp, _root, svc, ws, owner) = setup().await;
+        let out = svc
+            .hook_schedule_op(
+                &ws,
+                &owner,
+                &json!({
+                    "name": "watching",
+                    "code": "return { dispatch: false };",
+                    "delayMs": 600_000,
+                }),
+            )
+            .await
+            .expect("schedule active");
+        let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
+        assert!(svc.hook_task_alive(&hook.hook_id));
+        // Retire only admits a git worktree checkout: give the row one.
+        let scratch = crate::test_support::test_tempdir("intentd-retire-wt-");
+        let mut row = svc.store().get_workspace(&ws).await.unwrap();
+        row.repository_path = Some(scratch.path().join("repo").to_string_lossy().into_owned());
+        row.worktree_path = Some(
+            svc.feature_workspaces_root()
+                .expect("test workspaces root")
+                .join(ws.as_str())
+                .join("wt")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        row.checkout_mode = Some(intent_core::CheckoutMode::Worktree);
+        svc.store().update_workspace(&row).await.unwrap();
+
+        let retired = svc
+            .retire_workspace(ws.clone(), None)
+            .await
+            .expect("retire");
+        assert_eq!(retired.status, intent_core::WorkspaceStatus::Retired);
+
+        assert!(!svc.hook_task_alive(&hook.hook_id), "hook task aborted");
+        let stored = svc.store().get_hook(&hook.hook_id).await.unwrap();
+        assert_eq!(stored.state, HookState::Cancelled);
+        let types = hook_event_types(&svc, &ws, &[HOOK_CANCELLED]).await;
+        assert!(types.contains(&HOOK_CANCELLED.to_string()), "{types:?}");
+    }
+
     /// Retire sweep (`ws.agent.retire`): the retiring agent's ACTIVE hooks
     /// are cancelled through the shared transition — task aborted, row
     /// `cancelled`, `nextRunAt` cleared, `hook:cancelled` emitted — with NO
@@ -5391,13 +5399,21 @@ mod tests {
         let archiver: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
         assert_eq!(archiver.state, HookState::Scheduled);
         probe.content = "go".to_string();
-        svc.store().update_note(&probe).await.unwrap();
+        svc.store()
+            .update_note(
+                &svc.store()
+                    .lock_note_content(&probe.workspace_id, &probe.id)
+                    .await,
+                &probe,
+            )
+            .await
+            .unwrap();
         svc.hook_run_now_op(&ws, &archiver.hook_id)
             .await
             .expect("runNow");
 
         // The archive lands in the store...
-        let deadline = std::time::Instant::now() + POLL_DEADLINE;
+        let deadline = std::time::Instant::now() + poll_deadline();
         loop {
             let row = svc.store().get_workspace(&ws).await.expect("get workspace");
             if row.archived {
@@ -5412,7 +5428,7 @@ mod tests {
         }
 
         // ...and the §6.5 delta is published exactly once, in full.
-        let deadline = std::time::Instant::now() + POLL_DEADLINE;
+        let deadline = std::time::Instant::now() + poll_deadline();
         let deltas = loop {
             let deltas = archive_delta_events(&svc, &ws).await;
             if !deltas.is_empty() {
@@ -5503,7 +5519,7 @@ mod tests {
     #[tokio::test]
     async fn active_hook_sets_waiting_without_promoting_display_status() {
         let (_tmp, _root, svc, ws, owner) = setup().await;
-        assert!(!svc.workspace_has_active_hooks(&ws).await);
+        assert!(!svc.workspace_has_active_hooks_or_script_monitors(&ws).await);
         let out = svc
             .hook_schedule_op(
                 &ws,
@@ -5517,7 +5533,7 @@ mod tests {
             .await
             .expect("schedule");
         let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
-        assert!(svc.workspace_has_active_hooks(&ws).await);
+        assert!(svc.workspace_has_active_hooks_or_script_monitors(&ws).await);
         let mut row = svc.store().get_workspace(&ws).await.unwrap();
         svc.enrich_workspace_aggregates(&mut row).await;
         assert!(
@@ -5534,7 +5550,7 @@ mod tests {
         svc.hook_cancel_op(&ws, &hook.hook_id, Some(&owner))
             .await
             .expect("cancel");
-        assert!(!svc.workspace_has_active_hooks(&ws).await);
+        assert!(!svc.workspace_has_active_hooks_or_script_monitors(&ws).await);
         let mut row = svc.store().get_workspace(&ws).await.unwrap();
         svc.enrich_workspace_aggregates(&mut row).await;
         assert!(!row.waiting, "terminal hooks never read waiting");
@@ -5632,14 +5648,22 @@ mod tests {
             .expect("schedule");
         let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
         probe.content = "go".to_string();
-        svc.store().update_note(&probe).await.unwrap();
+        svc.store()
+            .update_note(
+                &svc.store()
+                    .lock_note_content(&probe.workspace_id, &probe.id)
+                    .await,
+                &probe,
+            )
+            .await
+            .unwrap();
         svc.hook_run_now_op(&ws, &hook.hook_id)
             .await
             .expect("runNow");
         wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Dispatched).await;
         // The settled dispatch drops the waiting flag without any
         // displayStatus transition.
-        let deadline = std::time::Instant::now() + POLL_DEADLINE;
+        let deadline = std::time::Instant::now() + poll_deadline();
         loop {
             if !svc.workspace_is_waiting(&ws).await {
                 break;
@@ -5749,7 +5773,7 @@ mod tests {
             .await
             .expect("runNow");
         wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Expired).await;
-        let deadline = std::time::Instant::now() + POLL_DEADLINE;
+        let deadline = std::time::Instant::now() + poll_deadline();
         loop {
             if waiting_events(&svc, &ws).await == vec![true, false] {
                 break;
@@ -6665,7 +6689,7 @@ mod tests {
 
     /// Poll the persisted transcript until it holds `want` assistant rows and
     /// the manager reports the owner idle (the mock ACP turn is a real child
-    /// process, so allow well past `POLL_DEADLINE`).
+    /// process, so allow well past `poll_deadline()`).
     async fn wait_for_assistant_rows(
         svc: &Services,
         mgr: &crate::agent_manager::AgentManager,
@@ -6824,7 +6848,15 @@ mod tests {
         );
         // A recovered run clears the warning.
         probe.content = "ok".to_string();
-        svc.store().update_note(&probe).await.unwrap();
+        svc.store()
+            .update_note(
+                &svc.store()
+                    .lock_note_content(&probe.workspace_id, &probe.id)
+                    .await,
+                &probe,
+            )
+            .await
+            .unwrap();
         svc.hook_run_now_op(&ws, &hook.hook_id)
             .await
             .expect("runNow");
@@ -6889,7 +6921,15 @@ mod tests {
         assert_eq!(hook.last_state.as_deref(), Some("{\"armed\":true}"));
         // `state: null` clears it.
         probe.content = "clear".to_string();
-        svc.store().update_note(&probe).await.unwrap();
+        svc.store()
+            .update_note(
+                &svc.store()
+                    .lock_note_content(&probe.workspace_id, &probe.id)
+                    .await,
+                &probe,
+            )
+            .await
+            .unwrap();
         svc.hook_run_now_op(&ws, &hook.hook_id)
             .await
             .expect("runNow again");
@@ -7268,7 +7308,7 @@ mod tests {
         assert!(!text.contains("retired"), "{text}");
         assert!(!text.contains("hookStillActive"), "{text}");
         // Task deregistered after the terminal outcome.
-        let deadline = std::time::Instant::now() + POLL_DEADLINE;
+        let deadline = std::time::Instant::now() + poll_deadline();
         while svc.hook_task_alive(&hook.hook_id) {
             assert!(std::time::Instant::now() < deadline, "task not removed");
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -7371,7 +7411,15 @@ mod tests {
         wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Running).await;
         skew.store(120_000, std::sync::atomic::Ordering::SeqCst);
         gate.content = "go".to_string();
-        svc.store().update_note(&gate).await.unwrap();
+        svc.store()
+            .update_note(
+                &svc.store()
+                    .lock_note_content(&gate.workspace_id, &gate.id)
+                    .await,
+                &gate,
+            )
+            .await
+            .unwrap();
         let expired = wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Expired).await;
         assert_eq!(expired.run_count, 1, "the in-flight run completed");
         assert!(expired.last_run_at.is_some());
@@ -7435,7 +7483,15 @@ mod tests {
         wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Running).await;
         skew.store(120_000, std::sync::atomic::Ordering::SeqCst);
         gate.content = "go".to_string();
-        svc.store().update_note(&gate).await.unwrap();
+        svc.store()
+            .update_note(
+                &svc.store()
+                    .lock_note_content(&gate.workspace_id, &gate.id)
+                    .await,
+                &gate,
+            )
+            .await
+            .unwrap();
         let hook = wait_for_hook(&svc, &hook.hook_id, |h| h.state == HookState::Dispatched).await;
         assert_eq!(hook.run_count, 1);
         wait_for_wake(&svc, &owner, "made it in time").await;

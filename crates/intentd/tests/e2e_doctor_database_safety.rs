@@ -3,7 +3,7 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use intent_core::AgentId;
 use intent_store::Store;
@@ -146,7 +146,11 @@ impl Fixture {
     fn preflight(&self) {
         let mut probe = self.command(&std::env::current_exe().unwrap());
         probe
-            .args(["--exact", "diagnostic_fixture_is_isolated", "--nocapture"])
+            .args([
+                "--exact",
+                &common::exact_test_name(module_path!(), "diagnostic_fixture_is_isolated"),
+                "--nocapture",
+            ])
             .env(ISOLATION_PROBE, self.root.path());
         self.run(probe, "isolation");
     }
@@ -305,6 +309,92 @@ async fn doctor_preserves_live_staged_and_finalized_full_bodies() {
         (true, true, true),
         "doctor must preserve staged bytes, finalized bytes, and subsequent full-fidelity finalization"
     );
+}
+
+#[tokio::test]
+async fn doctor_preserves_desktop_journal_and_owned_deletion_cleans_it() {
+    let fixture = Fixture::new();
+    let db = fixture.data_dir().join("intentd.db");
+    let writer = Store::open_for_daemon(&db).await.unwrap();
+    let _slim = seed(&writer).await;
+    let workspace = intent_core::WorkspaceId::from("synthetic-workspace");
+    let principal = writer.get_primary_principal().await.unwrap().id;
+    let binding = json!({"principalId": principal, "requestId": "desktop-request"});
+    writer
+        .desktop_set_permission(&principal, &workspace, &agent(), "synthetic-computer", true)
+        .await
+        .unwrap();
+    writer
+        .desktop_insert_request("desktop-request", &workspace, &agent(), &binding)
+        .await
+        .unwrap();
+    writer
+        .desktop_insert_terminal(
+            "desktop-session",
+            &workspace,
+            &agent(),
+            &binding,
+            "synthetic-hash",
+        )
+        .await
+        .unwrap();
+    assert!(writer
+        .desktop_resolve_request(
+            "desktop-request",
+            &workspace,
+            &agent(),
+            "granted",
+            &json!({"sessionId":"desktop-session"})
+        )
+        .await
+        .unwrap());
+    let before: Vec<(String, String)> =
+        sqlx::query_as("SELECT key,value FROM settings WHERE key GLOB 'desktop.v1/*' ORDER BY key")
+            .fetch_all(writer.read_pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        before.len(),
+        4,
+        "consent, request, terminal and durable wake"
+    );
+    fixture.doctor();
+    let after: Vec<(String, String)> =
+        sqlx::query_as("SELECT key,value FROM settings WHERE key GLOB 'desktop.v1/*' ORDER BY key")
+            .fetch_all(writer.read_pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        after, before,
+        "diagnostics cannot terminate or consume desktop state"
+    );
+    assert!(writer
+        .desktop_terminal("desktop-session")
+        .await
+        .unwrap()
+        .unwrap()["reason"]
+        .is_null());
+    assert!(
+        Store::open_for_daemon(&db).await.is_err(),
+        "doctor must not release database ownership"
+    );
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(10)),
+        writer.clone().delete_workspace(&workspace),
+    )
+    .await
+    .expect("owned desktop deletion must not deadlock")
+    .unwrap();
+    let remaining: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM settings WHERE key GLOB 'desktop.v1/*'")
+            .fetch_one(writer.read_pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        remaining, 0,
+        "owned workspace deletion must clean private state"
+    );
+    writer.close().await;
 }
 
 #[tokio::test]

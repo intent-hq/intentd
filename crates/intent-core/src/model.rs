@@ -25,15 +25,75 @@ fn repo_ref_from_parts(owner: Option<&str>, name: Option<&str>) -> Option<RepoRe
 
 /// Workspace lifecycle (§9.1; TS `WorkspaceStatus` in `src/shared/types.ts`).
 /// Wire values are the `PascalCase` variant names (`Active`/`Inactive`/`Archived`/
-/// `Deleted`), matching the TS string enum exactly; these are also the stored DB
-/// words (the column DEFAULT is unused — inserts always bind explicitly).
+/// `Retired`/`Deleted`), matching the TS string enum exactly; these are also the
+/// stored DB words (the column DEFAULT is unused — inserts always bind explicitly).
+///
+/// `Retired` (§5.1 `workspace.retire`): the checkout folder on disk was deleted
+/// to free space, but every DB row (agents, conversations, notes, assets,
+/// tasks) is kept and readable. A retired row stays `archived` and is hidden
+/// from every workspace list unless the caller opts in with
+/// [`WorkspaceListFilter::include_retired`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum WorkspaceStatus {
     #[default]
     Active,
     Inactive,
     Archived,
+    Retired,
     Deleted,
+}
+
+/// Which lifecycle states a workspace list includes (§5.1 `workspace.list`
+/// `includeArchived` / `includeRetired`). Retired workspaces are opt-in only:
+/// [`Self::include_archived`] alone never includes them, so a caller sees a
+/// retired row only when it explicitly sets [`Self::include_retired`]. Every
+/// list surface (store, service, RPC, subscription, MCP bindings, internal
+/// sweeps) takes this type rather than a bare `bool` so no call site can pick
+/// up retired rows by accident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WorkspaceListFilter {
+    /// Include archived (non-retired) workspaces.
+    pub include_archived: bool,
+    /// Include retired workspaces (independent of `include_archived`).
+    pub include_retired: bool,
+}
+
+impl WorkspaceListFilter {
+    /// Live (non-archived, non-retired) workspaces only.
+    pub const ACTIVE: Self = Self {
+        include_archived: false,
+        include_retired: false,
+    };
+    /// Live and archived workspaces; retired ones stay excluded.
+    pub const WITH_ARCHIVED: Self = Self {
+        include_archived: true,
+        include_retired: false,
+    };
+    /// Every workspace row, retired included. Only for callers that must see
+    /// retired rows on purpose (explicit `includeRetired: true`, lifecycle
+    /// sweeps that act on retired rows).
+    pub const ALL: Self = Self {
+        include_archived: true,
+        include_retired: true,
+    };
+
+    /// Build from the wire flags (`includeArchived`, `includeRetired`).
+    #[must_use]
+    pub const fn new(include_archived: bool, include_retired: bool) -> Self {
+        Self {
+            include_archived,
+            include_retired,
+        }
+    }
+
+    /// Whether `ws` passes this filter.
+    #[must_use]
+    pub fn admits(&self, ws: &Workspace) -> bool {
+        if ws.is_retired() {
+            return self.include_retired;
+        }
+        self.include_archived || !ws.archived
+    }
 }
 
 /// Derived in-flight agent state (green dot; read-only, not persisted) (§9.9).
@@ -244,10 +304,19 @@ pub enum WorkspaceDisplayStatus {
 }
 
 /// Workspace entity (§9.1).
+///
+/// `Default` is the one shared constructor: every field takes its type's
+/// default (a fresh [`WorkspaceId`], empty strings and timestamps, `Active`,
+/// `Idle`, no attention, `false`, `None`). Build rows with struct-update
+/// syntax — `Workspace { id, title, ..Default::default() }` — and set only
+/// the fields that matter, so a new optional field needs no edits outside
+/// this type. `workspace_literal_lint` rejects a full literal anywhere.
+/// Because the id is a fresh UUID, two default-built rows never compare
+/// equal; a test that compares or looks up rows should set `id` explicitly.
 // The bool fields mirror the protocol's wire shape; grouping them would
 // change the serialized contract.
 #[expect(clippy::struct_excessive_bools)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Workspace {
     pub id: WorkspaceId,
@@ -336,6 +405,10 @@ pub struct Workspace {
     pub archived: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_at: Option<String>,
+    /// When the workspace was retired (§5.1 `workspace.retire`; RFC 3339).
+    /// Present only while `status` is `Retired`; omitted otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retired_at: Option<String>,
     /// Card-aggregate rollups (§9.1). Populated only on the `workspace.list` /
     /// `workspace.get` emit paths (omitted elsewhere, e.g. `create`/`update`).
     /// The iOS coverflow cards read `taskStats`, `agentSummary`, and
@@ -368,6 +441,23 @@ pub struct Workspace {
     /// when no wait signal is live.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub waiting: bool,
+    /// Daemon-owned orthogonal script flag (PROTOCOL §5.1): `true` while the
+    /// workspace has a command-mode script run in flight (service-mode
+    /// scripts never count). Read live from the in-memory script registry on
+    /// the same emit path as `waiting`; never persisted; omitted (not
+    /// `false`) when nothing runs. Feeds neither `activity` nor
+    /// `displayStatus`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub scripts_running: bool,
+    /// Daemon-owned orthogonal background-task flag (PROTOCOL §5.1): `true`
+    /// while any agent of the workspace has a §5.5b provider background task
+    /// (e.g. a backgrounded shell command) still running on a supported,
+    /// continuous connection. Read live from the in-memory worker
+    /// projections on the same emit path as `scripts_running`; never
+    /// persisted; omitted (not `false`) when none runs. Feeds neither
+    /// `activity` nor `displayStatus`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub background_tasks_running: bool,
     /// Durable token/credit usage accounting (§5.23 / §19.1), materialized by the
     /// daemon-internal periodic scan job and surfaced by `workspace.getTokenUsage`.
     /// Omitted (not `null`) until the first scan writes a snapshot.
@@ -551,6 +641,7 @@ pub const WORKSPACE_LIST_ROW_KEYS: &[&str] = &[
     "pullRequestsTotal",
     "archived",
     "archivedAt",
+    "retiredAt",
     "taskStats",
     "agentSummary",
     "diffSummary",
@@ -589,6 +680,14 @@ pub const WORKSPACE_LIST_PR_KEYS: &[&str] = &[
 ];
 
 impl Workspace {
+    /// Whether the workspace is retired (§5.1 `workspace.retire`): its
+    /// checkout folder is gone and disk-backed mutations are refused with
+    /// [`crate::Error::WorkspaceRetired`].
+    #[must_use]
+    pub fn is_retired(&self) -> bool {
+        self.status == WorkspaceStatus::Retired
+    }
+
     /// List-frame slimming for `workspace.list` and the lite
     /// `workspace.subscribe` seq-0 snapshot (monorepo#3041, extended): drop
     /// the detail-only fields so a list row stays within the documented
@@ -771,50 +870,10 @@ pub fn chief_workspace() -> Workspace {
     Workspace {
         id: WorkspaceId::chief(),
         title: "Assistant".to_string(),
-        branch: String::new(),
-        base_ref: None,
-        base_commit_sha: None,
-        status: WorkspaceStatus::Active,
-        status_message: None,
-        status_image_asset_id: None,
-        activity: WorkspaceActivity::Idle,
-        attention: WorkspaceAttention::None,
         created_at: CHIEF_WORKSPACE_TIMESTAMP.to_string(),
         updated_at: CHIEF_WORKSPACE_TIMESTAMP.to_string(),
         last_activity: Some(CHIEF_WORKSPACE_TIMESTAMP.to_string()),
-        last_content_activity: None,
-        tags: Vec::new(),
-        path: None,
-        repository_path: None,
-        repository_owner: None,
-        repository_name: None,
-        worktree_path: None,
-        scope: None,
-        skip_worktree: false,
-        setup_script: None,
-        is_remote: false,
-        default_model: None,
-        pr_number: None,
-        pr_url: None,
-        pr_status: None,
-        active_pull_request: None,
-        pull_requests: None,
-        pull_requests_total: None,
-        context_links: None,
-        archived: false,
-        archived_at: None,
-        task_stats: None,
-        agent_summary: None,
-        diff_summary: None,
-        display_status: None,
-        waiting: false,
-        token_usage: None,
-        cow_supported: None,
-        browser_client_id: None,
-        checkout_mode: None,
-        disk_usage: None,
-        pending_delete_at: None,
-        membership: None,
+        ..Default::default()
     }
 }
 
@@ -1828,6 +1887,11 @@ pub struct NoteUpdateInput {
     /// Optimistic-concurrency gate: when `Some`, the write only succeeds if the
     /// note's current `rev` matches; absent → last-writer-wins (PROTOCOL §5.6).
     pub expected_version: Option<i64>,
+    /// Truncated-read write guard (`baseContentBytes`): on the content arm,
+    /// the UTF-8 size of the writer's base text; a mismatch with the stored
+    /// content refuses the write (`Error::ContentBaseMismatch`). Ignored on
+    /// the metadata arm.
+    pub base_content_bytes: Option<u64>,
 }
 
 /// Wire input for `note.add` (PROTOCOL §5.2).
@@ -3208,6 +3272,62 @@ pub fn note_list_slim_row(mut note: Note) -> serde_json::Value {
     value
 }
 
+/// Byte length of the longest prefix of `content` that the truncated-read
+/// cut rule keeps under `limit` UTF-8 bytes, or `None` when the whole
+/// `content` fits (the row is then served unchanged).
+///
+/// The prefix ends right after the last line feed within the limit; with no
+/// line feed in range it ends on the last UTF-8 character boundary, stepping
+/// back one byte so a `\r\n` pair is never split (protocol `note.get`
+/// "Truncated note reads", fixtures `notes/truncated-read.json`).
+#[must_use]
+pub fn truncated_content_len(content: &str, limit: usize) -> Option<usize> {
+    let bytes = content.as_bytes();
+    if bytes.len() <= limit {
+        return None;
+    }
+    if let Some(lf) = bytes[..limit].iter().rposition(|&b| b == b'\n') {
+        return Some(lf + 1);
+    }
+    let mut end = limit;
+    while end > 0 && !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    if end > 0 && bytes[end - 1] == b'\r' && bytes[end] == b'\n' {
+        end -= 1;
+    }
+    Some(end)
+}
+
+/// Serialize one `Note` for a read that opted in with `maxContentBytes`
+/// (`note.get`, `note.subscribe`): a note whose content fits serializes
+/// exactly as the unbounded row; a larger one carries the
+/// [`truncated_content_len`] prefix plus `contentTruncated: true` and
+/// `contentBytes` (the full stored UTF-8 size). Every other field is
+/// unchanged. The content is cut in place, so the full body is never copied.
+#[must_use]
+pub fn note_bounded_row(mut note: Note, max_content_bytes: usize) -> serde_json::Value {
+    let full_bytes = note.content.len();
+    let cut = truncated_content_len(&note.content, max_content_bytes);
+    if let Some(end) = cut {
+        note.content.truncate(end);
+    }
+    let mut value = serde_json::to_value(&note).unwrap_or_else(|e| {
+        tracing::warn!(note_id = %note.id.0, error = %e, "note_bounded_row: serializing note failed; serving null row");
+        serde_json::Value::Null
+    });
+    if cut.is_some() {
+        if let serde_json::Value::Object(map) = &mut value {
+            map.insert(
+                "contentTruncated".to_string(),
+                serde_json::Value::Bool(true),
+            );
+            map.insert("contentBytes".to_string(), serde_json::json!(full_bytes));
+        }
+    }
+    value
+}
+
 /// `agent.list { scope }` row scope (§5.5): which bin of the workspace's
 /// NON-retired sessions a scoped read serves. The three bins partition the
 /// `retired_at IS NULL` rows exactly — `topLevel ∪ delegated ∪ background`
@@ -3717,12 +3837,126 @@ pub fn lift_from_principal_id(metadata: Option<&serde_json::Value>) -> Option<Pr
 /// doctrine text or feature defaults change materially; existing sessions keep their stamped version
 /// for life (no upgrade/migration path). Pre-feature rows backfill to "1.0"
 /// (migration 0096).
-pub const CURRENT_HARNESS_VERSION: &str = "3.2";
+pub const CURRENT_HARNESS_VERSION: &str = "3.3";
+
+/// Harness versions that receive repository guidance, oldest first. The single
+/// source for every admission gate and boundary test: bumping
+/// [`CURRENT_HARNESS_VERSION`] means appending the new version here (and to
+/// [`REPOSITORY_MONITOR_GUIDANCE_HARNESS_VERSIONS`]), and the compile-time
+/// check below fails the build until that is done. Exact strings only, so
+/// malformed or unknown stamps are never admitted.
+pub const REPOSITORY_GUIDANCE_HARNESS_VERSIONS: &[&str] = &["3.0", "3.1", "3.2", "3.3"];
+
+/// Harness versions that receive monitor-style repository guidance and the
+/// repository-callback prompt envelope, oldest first. Always the newest part
+/// of [`REPOSITORY_GUIDANCE_HARNESS_VERSIONS`] (checked at compile time).
+pub const REPOSITORY_MONITOR_GUIDANCE_HARNESS_VERSIONS: &[&str] = &["3.2", "3.3"];
+
+const fn const_str_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+const fn ends_with_current(versions: &[&str]) -> bool {
+    !versions.is_empty() && const_str_eq(versions[versions.len() - 1], CURRENT_HARNESS_VERSION)
+}
+
+const fn is_suffix_of(suffix: &[&str], list: &[&str]) -> bool {
+    if suffix.len() > list.len() {
+        return false;
+    }
+    let offset = list.len() - suffix.len();
+    let mut i = 0;
+    while i < suffix.len() {
+        if !const_str_eq(suffix[i], list[offset + i]) {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+const fn is_major_minor(version: &str) -> bool {
+    let bytes = version.as_bytes();
+    let (mut i, mut dots, mut digits_in_part) = (0, 0, 0);
+    while i < bytes.len() {
+        match bytes[i] {
+            b'0'..=b'9' => digits_in_part += 1,
+            b'.' if digits_in_part > 0 => {
+                dots += 1;
+                digits_in_part = 0;
+            }
+            _ => return false,
+        }
+        i += 1;
+    }
+    dots == 1 && digits_in_part > 0
+}
+
+const _: () = {
+    assert!(
+        is_major_minor(CURRENT_HARNESS_VERSION),
+        "CURRENT_HARNESS_VERSION must be MAJOR.MINOR (e.g. \"3.3\")"
+    );
+    assert!(
+        ends_with_current(REPOSITORY_GUIDANCE_HARNESS_VERSIONS),
+        "CURRENT_HARNESS_VERSION changed: append it to REPOSITORY_GUIDANCE_HARNESS_VERSIONS"
+    );
+    assert!(
+        ends_with_current(REPOSITORY_MONITOR_GUIDANCE_HARNESS_VERSIONS),
+        "CURRENT_HARNESS_VERSION changed: append it to REPOSITORY_MONITOR_GUIDANCE_HARNESS_VERSIONS"
+    );
+    assert!(
+        is_suffix_of(
+            REPOSITORY_MONITOR_GUIDANCE_HARNESS_VERSIONS,
+            REPOSITORY_GUIDANCE_HARNESS_VERSIONS
+        ),
+        "REPOSITORY_MONITOR_GUIDANCE_HARNESS_VERSIONS must be the newest part of REPOSITORY_GUIDANCE_HARNESS_VERSIONS"
+    );
+};
 
 /// Explicit admission preserves repository guidance without admitting unknown versions.
 #[must_use]
 pub fn harness_supports_repository_guidance(version: &str) -> bool {
-    matches!(version, "3.0" | "3.1" | "3.2")
+    REPOSITORY_GUIDANCE_HARNESS_VERSIONS.contains(&version)
+}
+
+/// Whether a session stamped with `version` gets monitor-style repository
+/// guidance and the repository-callback prompt envelope. Exact match against
+/// [`REPOSITORY_MONITOR_GUIDANCE_HARNESS_VERSIONS`].
+#[must_use]
+pub fn harness_uses_repository_monitor_guidance(version: &str) -> bool {
+    REPOSITORY_MONITOR_GUIDANCE_HARNESS_VERSIONS.contains(&version)
+}
+
+/// Test support: the next minor and next major harness version after
+/// [`CURRENT_HARNESS_VERSION`] (for "3.3": `["3.4", "4.0"]`). Boundary tests
+/// use these as "not yet admitted" stamps instead of hard-coding a version
+/// that a bump would silently admit.
+#[doc(hidden)]
+#[must_use]
+pub fn harness_versions_after_current() -> [String; 2] {
+    harness_versions_after(CURRENT_HARNESS_VERSION)
+        .expect("CURRENT_HARNESS_VERSION is MAJOR.MINOR (checked at compile time)")
+}
+
+fn harness_versions_after(version: &str) -> Option<[String; 2]> {
+    let (major, minor) = version.split_once('.')?;
+    let (major, minor): (u32, u32) = (major.parse().ok()?, minor.parse().ok()?);
+    Some([
+        format!("{major}.{}", minor.checked_add(1)?),
+        format!("{}.0", major.checked_add(1)?),
+    ])
 }
 
 /// Serde default for [`AgentSession::harness_version`]: payloads persisted or
@@ -5854,7 +6088,10 @@ impl Principal {
 #[serde(rename_all = "lowercase")]
 pub enum WorkspaceRole {
     Owner,
+    /// Participant in the UI; retain the original wire/database word.
     Collaborator,
+    /// A guest allowed to create agents and operate saved scripts, not an owner.
+    Manager,
 }
 
 impl WorkspaceRole {
@@ -5864,6 +6101,7 @@ impl WorkspaceRole {
         match self {
             WorkspaceRole::Owner => "owner",
             WorkspaceRole::Collaborator => "collaborator",
+            WorkspaceRole::Manager => "manager",
         }
     }
 }
@@ -7432,6 +7670,7 @@ mod tests {
             (WorkspaceStatus::Active, "\"Active\""),
             (WorkspaceStatus::Inactive, "\"Inactive\""),
             (WorkspaceStatus::Archived, "\"Archived\""),
+            (WorkspaceStatus::Retired, "\"Retired\""),
             (WorkspaceStatus::Deleted, "\"Deleted\""),
         ] {
             assert_eq!(serde_json::to_string(&variant).unwrap(), wire);
@@ -7452,49 +7691,9 @@ mod tests {
             id: WorkspaceId::from("ws-1"),
             title: "WS".to_string(),
             branch: "main".to_string(),
-            base_ref: None,
-            base_commit_sha: None,
-            status: WorkspaceStatus::Active,
-            status_message: None,
-            status_image_asset_id: None,
-            activity: WorkspaceActivity::Idle,
-            attention: WorkspaceAttention::None,
             created_at: ts.clone(),
             updated_at: ts.clone(),
-            last_activity: None,
-            last_content_activity: None,
-            tags: vec![],
-            path: None,
-            repository_path: None,
-            repository_owner: None,
-            repository_name: None,
-            worktree_path: None,
-            scope: None,
-            skip_worktree: false,
-            setup_script: None,
-            is_remote: false,
-            default_model: None,
-            pr_number: None,
-            pr_url: None,
-            pr_status: None,
-            active_pull_request: None,
-            pull_requests: None,
-            context_links: None,
-            archived: false,
-            archived_at: None,
-            task_stats: None,
-            agent_summary: None,
-            diff_summary: None,
-            display_status: None,
-            waiting: false,
-            token_usage: None,
-            cow_supported: None,
-            browser_client_id: None,
-            pull_requests_total: None,
-            checkout_mode: None,
-            disk_usage: None,
-            pending_delete_at: None,
-            membership: None,
+            ..Default::default()
         };
         let v = serde_json::to_value(&ws).unwrap();
         assert_eq!(v["status"], "Active");
@@ -7526,6 +7725,30 @@ mod tests {
         assert_eq!(v["waiting"], serde_json::json!(true));
         let back: Workspace = serde_json::from_value(v).unwrap();
         assert_eq!(back, waiting_ws);
+
+        // Presence-detected `scriptsRunning`: omitted when false.
+        assert!(serde_json::to_value(&ws)
+            .unwrap()
+            .get("scriptsRunning")
+            .is_none());
+        let mut running_ws = ws.clone();
+        running_ws.scripts_running = true;
+        let v = serde_json::to_value(&running_ws).unwrap();
+        assert_eq!(v["scriptsRunning"], serde_json::json!(true));
+        let back: Workspace = serde_json::from_value(v).unwrap();
+        assert_eq!(back, running_ws);
+
+        // Presence-detected `backgroundTasksRunning`: omitted when false.
+        assert!(serde_json::to_value(&ws)
+            .unwrap()
+            .get("backgroundTasksRunning")
+            .is_none());
+        let mut background_ws = ws.clone();
+        background_ws.background_tasks_running = true;
+        let v = serde_json::to_value(&background_ws).unwrap();
+        assert_eq!(v["backgroundTasksRunning"], serde_json::json!(true));
+        let back: Workspace = serde_json::from_value(v).unwrap();
+        assert_eq!(back, background_ws);
     }
 
     /// The card aggregates serialize with the exact nested field names + casing
@@ -8770,6 +8993,115 @@ mod tests {
             assert!(v["metadata"].get(CHIEF_PROMPT_VERSION_KEY).is_none());
         }
         assert!(legacy["metadata"].get(CHIEF_PROMPT_VERSION_KEY).is_none());
+    }
+
+    #[test]
+    fn harness_guidance_version_sets_admit_exact_listed_versions() {
+        for version in REPOSITORY_GUIDANCE_HARNESS_VERSIONS {
+            assert!(harness_supports_repository_guidance(version), "{version}");
+        }
+        for version in REPOSITORY_MONITOR_GUIDANCE_HARNESS_VERSIONS {
+            assert!(
+                harness_uses_repository_monitor_guidance(version),
+                "{version}"
+            );
+            assert!(REPOSITORY_GUIDANCE_HARNESS_VERSIONS.contains(version));
+        }
+        assert!(harness_supports_repository_guidance(
+            CURRENT_HARNESS_VERSION
+        ));
+        assert!(harness_uses_repository_monitor_guidance(
+            CURRENT_HARNESS_VERSION
+        ));
+        let first_monitor = REPOSITORY_MONITOR_GUIDANCE_HARNESS_VERSIONS[0];
+        for version in REPOSITORY_GUIDANCE_HARNESS_VERSIONS
+            .iter()
+            .take_while(|v| **v != first_monitor)
+        {
+            assert!(
+                !harness_uses_repository_monitor_guidance(version),
+                "{version}"
+            );
+        }
+    }
+
+    #[test]
+    fn harness_guidance_version_sets_reject_unknown_and_malformed_stamps() {
+        let after = harness_versions_after_current();
+        let malformed = [
+            "", "1.0", "2.9", "2.10", "3", "3.0.0", " 3.0", "3.0 ", "v3.0", "03.0", "unknown",
+        ];
+        for version in after.iter().map(String::as_str).chain(malformed) {
+            assert!(
+                !harness_supports_repository_guidance(version),
+                "{version:?}"
+            );
+            assert!(
+                !harness_uses_repository_monitor_guidance(version),
+                "{version:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn harness_versions_after_are_next_minor_and_major() {
+        let after = |v: &str| harness_versions_after(v).map(|[a, b]| (a, b));
+        assert_eq!(after("3.3"), Some(("3.4".into(), "4.0".into())));
+        assert_eq!(after("3.9"), Some(("3.10".into(), "4.0".into())));
+        assert_eq!(after("12.0"), Some(("12.1".into(), "13.0".into())));
+        for malformed in ["", "3", "3.", ".3", "3.3.1", "v3.3", "3.x"] {
+            assert_eq!(after(malformed), None, "{malformed:?}");
+        }
+        assert_eq!(
+            harness_versions_after_current(),
+            harness_versions_after(CURRENT_HARNESS_VERSION).unwrap()
+        );
+        for version in harness_versions_after_current() {
+            assert!(!REPOSITORY_GUIDANCE_HARNESS_VERSIONS.contains(&version.as_str()));
+        }
+    }
+
+    /// Versions that already shipped with guidance keep it for life: sessions
+    /// stamped with them persist. These literals are history, not the
+    /// current version, so a bump only appends to the lists and never
+    /// edits this test; dropping an entry fails it.
+    #[test]
+    fn harness_guidance_never_drops_shipped_versions() {
+        for version in ["3.0", "3.1", "3.2", "3.3"] {
+            assert!(harness_supports_repository_guidance(version), "{version}");
+        }
+        for version in ["3.2", "3.3"] {
+            assert!(
+                harness_uses_repository_monitor_guidance(version),
+                "{version}"
+            );
+        }
+        for version in ["3.0", "3.1"] {
+            assert!(
+                !harness_uses_repository_monitor_guidance(version),
+                "{version}"
+            );
+        }
+    }
+
+    #[test]
+    fn harness_version_set_const_helpers_compare_exactly() {
+        assert!(const_str_eq("3.3", "3.3"));
+        assert!(!const_str_eq("3.3", "3.30"));
+        assert!(!const_str_eq("3.3", "3.4"));
+        assert!(ends_with_current(&["2.9", CURRENT_HARNESS_VERSION]));
+        assert!(!ends_with_current(&[]));
+        assert!(!ends_with_current(&[CURRENT_HARNESS_VERSION, "9.9"]));
+        assert!(is_suffix_of(&["b", "c"], &["a", "b", "c"]));
+        assert!(is_suffix_of(&[], &["a"]));
+        assert!(!is_suffix_of(&["a", "b"], &["a", "b", "c"]));
+        assert!(!is_suffix_of(&["a", "b", "c", "d"], &["b", "c", "d"][..]));
+        for valid in ["3.3", "10.0", "3.10"] {
+            assert!(is_major_minor(valid), "{valid}");
+        }
+        for invalid in ["", "3", "3.", ".3", "3.3.1", "v3.3", "3.x", " 3.3"] {
+            assert!(!is_major_minor(invalid), "{invalid:?}");
+        }
     }
 
     #[test]

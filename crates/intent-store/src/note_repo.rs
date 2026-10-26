@@ -348,11 +348,15 @@ impl Store {
     /// [`Store::update_note_metadata`] / [`Store::update_note_metadata_versioned`],
     /// which leave `content` alone. This method remains for fixtures.
     ///
+    /// Takes `note`'s [`NoteWriteLock`](crate::NoteWriteLock) from this store;
+    /// any other lock is refused with `Error::Internal` before anything is
+    /// written.
+    ///
     /// # Errors
     ///
     /// Returns `Error::NotFound` if the note does not exist in the workspace; `Error::Internal` if encoding fields or the update fails.
-    pub async fn update_note(&self, note: &Note) -> Result<i64> {
-        self.update_note_versioned(note, None).await
+    pub async fn update_note(&self, lock: &crate::NoteWriteLock, note: &Note) -> Result<i64> {
+        self.update_note_versioned(lock, note, None).await
     }
 
     /// Update an existing note, optionally gating on `expected_version`
@@ -373,14 +377,20 @@ impl Store {
     /// [`Store::update_note_with_version`], which runs this same conditional
     /// UPDATE and the snapshot in one transaction.
     ///
+    /// Takes `note`'s [`NoteWriteLock`](crate::NoteWriteLock) from this store;
+    /// any other lock is refused with `Error::Internal` before anything is
+    /// written.
+    ///
     /// # Errors
     ///
     /// Returns `Error::Conflict` (carrying the current entity) when `expected_version` is supplied and does not match the stored `rev`; `Error::NotFound` if the note does not exist in the workspace; `Error::Internal` if encoding fields or the update fails.
     pub async fn update_note_versioned(
         &self,
+        lock: &crate::NoteWriteLock,
         note: &Note,
         expected_version: Option<i64>,
     ) -> Result<i64> {
+        lock.ensure_covers(self, note)?;
         self.exec_note_update(note, expected_version, NoteUpdateScope::FullRow)
             .await
     }
@@ -394,25 +404,38 @@ impl Store {
     /// content snapshot at or below it, which is the content the row still
     /// holds. Returns the post-write `rev`.
     ///
+    /// Takes `note`'s [`NoteWriteLock`](crate::NoteWriteLock) from this store
+    /// like the content writers: a metadata write that bumped `rev` outside
+    /// the lane could land inside a laned writer's read→persist window, be
+    /// reverted by a whole-row writer's stale copy, or burn a gated writer's
+    /// bounded retries. Any other lock is refused with `Error::Internal`.
+    ///
     /// # Errors
     ///
     /// Returns `Error::NotFound` if the note does not exist in the workspace; `Error::Internal` if encoding fields or the update fails.
-    pub async fn update_note_metadata(&self, note: &Note) -> Result<i64> {
-        self.update_note_metadata_versioned(note, None).await
+    pub async fn update_note_metadata(
+        &self,
+        lock: &crate::NoteWriteLock,
+        note: &Note,
+    ) -> Result<i64> {
+        self.update_note_metadata_versioned(lock, note, None).await
     }
 
     /// [`Store::update_note_metadata`] optionally gated on `expected_version`,
     /// with the same conflict / not-found classification as
-    /// [`Store::update_note_versioned`].
+    /// [`Store::update_note_versioned`]. Takes `note`'s
+    /// [`NoteWriteLock`](crate::NoteWriteLock), like [`Store::update_note_metadata`].
     ///
     /// # Errors
     ///
     /// Returns `Error::Conflict` (carrying the current entity) when `expected_version` is supplied and does not match the stored `rev`; `Error::NotFound` if the note does not exist in the workspace; `Error::Internal` if encoding fields or the update fails.
     pub async fn update_note_metadata_versioned(
         &self,
+        lock: &crate::NoteWriteLock,
         note: &Note,
         expected_version: Option<i64>,
     ) -> Result<i64> {
+        lock.ensure_covers(self, note)?;
         self.exec_note_update(note, expected_version, NoteUpdateScope::Metadata)
             .await
     }
@@ -421,39 +444,28 @@ impl Store {
     /// note in the same workspace. The revision and session link are checked
     /// in one `SQLite` UPDATE, so a session-only relink cannot slip past the CAS.
     /// Returns None on a stale revision, missing note, or changed agent link.
+    /// Takes `note`'s [`NoteWriteLock`](crate::NoteWriteLock), like
+    /// [`Store::update_note_metadata`].
     ///
     /// # Errors
     /// Returns `Error::Internal` if encoding or the database write fails.
     pub async fn update_note_metadata_if_agent_linked(
         &self,
+        lock: &crate::NoteWriteLock,
         note: &Note,
         expected_version: i64,
         agent_id: &AgentId,
     ) -> Result<Option<i64>> {
+        lock.ensure_covers(self, note)?;
         self.prepare_task_events(&note.workspace_id).await;
         let mut conn = crate::note_write_connection::NoteWriteConnection::begin(self).await?;
-        let result = async {
-            let revision = exec_update_note_with_link_guard(
-                &mut conn,
-                note,
-                Some(expected_version),
-                NoteUpdateScope::Metadata,
-                Some(agent_id),
-            )
-            .await?;
-            if revision.is_some() {
-                // Recovery metadata can omit the body. Finalize against the
-                // persisted source on the same writer as the guarded update.
-                crate::note_annotation_repo::rebuild_note_anchors(
-                    &mut conn,
-                    &note.workspace_id,
-                    &note.id,
-                    None,
-                )
-                .await?;
-            }
-            Ok(revision)
-        }
+        let result = exec_update_note_with_link_guard(
+            &mut conn,
+            note,
+            Some(expected_version),
+            NoteUpdateScope::Metadata,
+            Some(agent_id),
+        )
         .await;
         conn.finish(result, "commit linked note metadata update")
             .await
@@ -467,22 +479,7 @@ impl Store {
     ) -> Result<i64> {
         self.prepare_task_events(&note.workspace_id).await;
         let mut conn = crate::note_write_connection::NoteWriteConnection::begin(self).await?;
-        let result = async {
-            let revision = exec_update_note(&mut conn, note, expected_version, scope).await?;
-            if revision.is_some() && scope == NoteUpdateScope::Metadata {
-                // Metadata inputs may deliberately omit the body. Resolve the
-                // persisted source on this same writer, after the final update.
-                crate::note_annotation_repo::rebuild_note_anchors(
-                    &mut conn,
-                    &note.workspace_id,
-                    &note.id,
-                    None,
-                )
-                .await?;
-            }
-            Ok(revision)
-        }
-        .await;
+        let result = exec_update_note(&mut conn, note, expected_version, scope).await;
         match conn.finish(result, "commit note update").await? {
             Some(rev) => Ok(rev),
             None => Err(self.note_update_miss(note).await),
@@ -534,17 +531,6 @@ impl Store {
         self.prepare_task_events(workspace_id).await;
         let mut conn = crate::note_write_connection::NoteWriteConnection::begin(self).await?;
         let result = async {
-            // Retain only the IDs detached by the legacy same-workspace trigger.
-            // Immediate deletion has no grace-path child cardinality limit.
-            let child_ids: Vec<String> = sqlx::query_scalar(
-                "SELECT id FROM note WHERE workspace_id=? AND parent_id=? AND id!=? ORDER BY id",
-            )
-            .bind(workspace_id.as_str())
-            .bind(id.as_str())
-            .bind(id.as_str())
-            .fetch_all(&mut *conn)
-            .await
-            .map_err(|e| Error::Internal(format!("note delete children: {e}")))?;
             let res = match expected_version {
                 Some(rev) => {
                     sqlx::query("DELETE FROM note WHERE id = ? AND workspace_id = ? AND rev = ?")
@@ -562,19 +548,6 @@ impl Store {
                     .await
                     .map_err(|e| Error::Internal(format!("delete note failed: {e}")))?,
             };
-            if res.rows_affected() > 0 {
-                for child in child_ids {
-                    crate::note_page_index::rebuild_one(&mut conn, workspace_id.as_str(), &child)
-                        .await?;
-                    crate::note_annotation_repo::rebuild_note_anchors(
-                        &mut conn,
-                        workspace_id,
-                        &NoteId::from(child),
-                        None,
-                    )
-                    .await?;
-                }
-            }
             Ok(res)
         }
         .await;
@@ -955,28 +928,18 @@ impl Store {
                 .execute(&mut *conn)
                 .await
                 .map_err(|e| Error::Internal(format!("move spec comments failed: {e}")))?;
-                // The direct children's parent update also invalidates their
-                // annotation heads. Finalize after every identity/root move.
-                let affected: Vec<String> = sqlx::query_scalar(
-                    "SELECT id FROM note WHERE workspace_id=? AND (id='spec' OR parent_id='spec') ORDER BY id",
-                ).bind(workspace_id.as_str()).fetch_all(&mut *conn).await
-                    .map_err(|e| Error::Internal(format!("read adopted note scopes: {e}")))?;
-                for id in affected {
-                    crate::note_page_index::rebuild_one(&mut conn, workspace_id.as_str(), &id).await?;
-                    crate::note_annotation_repo::rebuild_note_anchors(&mut conn, &workspace_id, &NoteId(id), None).await?;
-                }
-
                 Ok(Some((NoteId(old_id), title)))
             }
             .await;
 
-            conn.finish(body_result, "commit adopt_spec tx failed").await
+            conn.finish(body_result, "commit adopt_spec tx failed")
+                .await
         })
         .await
     }
 }
 
-/// The one note INSERT statement and derived indexes, on a connection in an open
+/// The one note INSERT statement, on a connection in an open
 /// transaction alongside the initial version snapshot
 /// ([`Store::insert_note_with_version`]).
 pub(crate) async fn exec_insert_note(
@@ -1010,7 +973,7 @@ pub(crate) async fn exec_insert_note(
         .execute(&mut *executor)
         .await
         .map_err(|e| Error::Internal(format!("insert note failed: {e}")))?;
-    crate::note_page_index::rebuild(executor, note, note.rev, true).await
+    Ok(())
 }
 
 /// Which columns a note UPDATE rewrites.
@@ -1053,15 +1016,6 @@ async fn exec_update_note_with_link_guard(
         .as_ref()
         .map(encode_task_json)
         .transpose()?;
-    // A metadata-only mutation cannot bless a retired or incomplete content
-    // projection. Capture readiness before the canonical update invalidates it.
-    let keep_content = if scope == NoteUpdateScope::Metadata {
-        sqlx::query_scalar::<_, bool>("SELECT indexed_rev=current_rev AND profile_revision=? FROM note_page_head WHERE workspace_id=? AND note_id=?")
-            .bind(crate::note_page_index::profile_revision()).bind(note.workspace_id.as_str()).bind(note.id.as_str())
-            .fetch_optional(&mut *executor).await.map_err(|e| Error::Internal(format!("note index readiness: {e}")))?.unwrap_or(false)
-    } else {
-        true
-    };
     let mut sql = String::from("UPDATE note SET title=?, ");
     if scope == NoteUpdateScope::FullRow {
         sql.push_str("content=?, content_type=?, ");
@@ -1109,12 +1063,7 @@ async fn exec_update_note_with_link_guard(
         .fetch_optional(&mut *executor)
         .await
         .map_err(|e| Error::Internal(format!("update note failed: {e}")))?;
-    let rev = row.as_ref().map(|r| col(r, "rev")).transpose()?;
-    if let Some(rev) = rev.filter(|_| keep_content) {
-        crate::note_page_index::rebuild(executor, note, rev, scope == NoteUpdateScope::FullRow)
-            .await?;
-    }
-    Ok(rev)
+    row.as_ref().map(|r| col(r, "rev")).transpose()
 }
 
 fn col<'r, T>(row: &'r SqliteRow, name: &str) -> Result<T>

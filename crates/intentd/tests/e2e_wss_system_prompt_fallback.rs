@@ -23,11 +23,12 @@
 
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
+use intentd_test_support::GuardedChild;
 use std::fmt::Write as _;
 use std::path::Path;
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -48,14 +49,13 @@ const TOKEN: &str = "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefe
 
 /// Live `intentd serve` process; killed and its data dir removed on drop.
 struct Daemon {
-    child: Child,
+    child: GuardedChild,
     _data_dir: tempfile::TempDir,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.child.kill_tree();
     }
 }
 
@@ -63,7 +63,7 @@ fn temp_data_dir() -> tempfile::TempDir {
     common::test_tempdir_in("/tmp", "itd-spf-")
 }
 
-fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
+fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> GuardedChild {
     let log = std::fs::File::create(data_dir.join("daemon.log")).expect("create daemon log");
     let workspaces_dir = data_dir.join("workspaces");
     std::fs::create_dir_all(&workspaces_dir).expect("mkdir hermetic workspaces dir");
@@ -80,7 +80,7 @@ fn spawn_serve(data_dir: &Path, listen: &str, env: &[(&str, &str)]) -> Child {
         cmd.env(k, v);
     }
     common::hermetic_fixture_identity(&mut cmd, data_dir);
-    cmd.spawn().expect("spawn intentd serve")
+    GuardedChild::spawn(&mut cmd).expect("spawn intentd serve")
 }
 
 async fn await_uds(socket: &Path) -> bool {
@@ -335,9 +335,7 @@ fn app_guide_revision() -> String {
 /// Pre-seed the daemon's `SQLite` store with a workspace (the daemon opens the
 /// same data dir on launch).
 async fn seed_workspace_only(data_dir: &Path) -> String {
-    use intent_core::{
-        now_iso, Workspace, WorkspaceActivity, WorkspaceAttention, WorkspaceId, WorkspaceStatus,
-    };
+    use intent_core::{now_iso, Workspace, WorkspaceId};
     use intent_store::Store;
     let db_path = data_dir.join("intentd.db");
     let store = Store::open(&db_path).await.expect("open store");
@@ -348,49 +346,9 @@ async fn seed_workspace_only(data_dir: &Path) -> String {
             id: ws.clone(),
             title: "SPF-E2E".to_string(),
             branch: "main".to_string(),
-            base_ref: None,
-            base_commit_sha: None,
-            status: WorkspaceStatus::Active,
-            status_message: None,
-            status_image_asset_id: None,
-            activity: WorkspaceActivity::Idle,
-            attention: WorkspaceAttention::None,
             created_at: ts.clone(),
             updated_at: ts,
-            last_activity: None,
-            last_content_activity: None,
-            tags: vec![],
-            path: None,
-            repository_path: None,
-            repository_owner: None,
-            repository_name: None,
-            worktree_path: None,
-            scope: None,
-            skip_worktree: false,
-            setup_script: None,
-            is_remote: false,
-            default_model: None,
-            pr_number: None,
-            pr_url: None,
-            pr_status: None,
-            active_pull_request: None,
-            pull_requests: None,
-            context_links: None,
-            archived: false,
-            archived_at: None,
-            task_stats: None,
-            agent_summary: None,
-            diff_summary: None,
-            token_usage: None,
-            cow_supported: None,
-            browser_client_id: None,
-            pull_requests_total: None,
-            display_status: None,
-            waiting: false,
-            checkout_mode: None,
-            disk_usage: None,
-            pending_delete_at: None,
-            membership: None,
+            ..Default::default()
         })
         .await
         .expect("insert ws");
@@ -885,8 +843,8 @@ async fn assistant_profile_and_reference_survive_restart_over_wss() {
     // The SIGKILL below skips graceful shutdown, which is what normally
     // finishes a post-turn idle write still in flight. Killing before that
     // write lands leaves the session `active`, so the restarted daemon heals
-    // it as a crashed turn and auto-resumes it — the resume prompt then
-    // becomes the second prompt instead of the message sent below.
+    // it as a crashed turn (hermetic daemons pin resume-on-start off, so it
+    // is recorded, not resumed; the stop-reason check below catches it).
     await_durable_idle(&mut sub, &agent).await;
     let before = wss_rpc(&mut rpc, 4, "agent.getSession", json!({"agentId": agent})).await;
     let system = before["session"]["systemPrompt"].as_str().unwrap();
@@ -895,10 +853,12 @@ async fn assistant_profile_and_reference_survive_restart_over_wss() {
     assert!(!system.contains("WORKSPACE_ONLY_MARKER"));
     assert!(!system.contains("## Commit Policy"));
     assert!(!system.contains("## Delegating Tasks"));
-    assert_eq!(before["session"]["harnessVersion"], "3.2");
+    assert_eq!(
+        before["session"]["harnessVersion"],
+        intent_core::CURRENT_HARNESS_VERSION
+    );
     wss_rpc(&mut rpc, 5, "agent.stop", json!({"agentId": agent})).await;
-    daemon.child.kill().unwrap();
-    daemon.child.wait().unwrap();
+    daemon.child.kill_tree().unwrap();
     drop(rpc);
     drop(sub);
     daemon.child = spawn_serve(&data_dir, "both", &env);
@@ -917,8 +877,8 @@ async fn assistant_profile_and_reference_survive_restart_over_wss() {
     .await;
     // Startup heals before serving RPCs. A completed first turn misread as a
     // crash carries the heal's stop reason here until a resumed turn clears
-    // it; the prompt check below covers that case (resume runs only on
-    // headless hosts under the default `auto` setting).
+    // it; the prompt check below also guards a resumed turn should a test
+    // opt back into resume-on-start.
     let restarted = wss_rpc(&mut rpc, 7, "agent.getSession", json!({"agentId": agent})).await;
     let stop_reason = restarted["session"]["stopReason"]
         .as_str()

@@ -1,12 +1,19 @@
 [package]
 name = "intentd"
-version = "0.11.24"
+version = "0.11.54"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 license.workspace = true
 homepage.workspace = true
 description = "Intent backend daemon — local-first JSON-RPC daemon for the Intent domain model"
+# Integration tests are grouped into a few suite targets (tests/suite_*.rs)
+# instead of one executable per tests/*.rs file: each test executable links the
+# whole daemon (180-360 MiB), so ~200 per-file targets made one test build
+# ~50 GiB. Every target is listed below; `test_target_registration_lint`
+# (intent-core) fails when a tests/*.rs file is neither a target nor a module
+# of one, so a new file cannot be silently left out of the build.
+autotests = false
 
 [dependencies]
 # Keep this requirement major-only ("0", not "0.1.N"). release-plz 0.3.162
@@ -29,16 +36,17 @@ tracing-appender = { workspace = true }
 directories = { workspace = true }
 sqlx = { workspace = true }
 
-intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.11.24", optional = true }
-intent-core = { path = "../intent-core", version = "0.11.24" }
-intent-store = { path = "../intent-store", version = "0.11.24" }
-intent-services = { path = "../intent-services", version = "0.11.24" }
-intent-acp = { path = "../intent-acp", version = "0.11.24" }
-intent-providers = { path = "../intent-providers", version = "0.11.24" }
-intent-git = { path = "../intent-git", version = "0.11.24" }
-intent-context = { path = "../intent-context", version = "0.11.24" }
-intent-transport = { path = "../intent-transport", version = "0.11.24" }
-intent-js = { path = "../intent-js", version = "0.11.24", optional = true }
+intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.11.54", optional = true }
+intent-core = { path = "../intent-core", version = "0.11.54" }
+intent-store = { path = "../intent-store", version = "0.11.54" }
+intent-services = { path = "../intent-services", version = "0.11.54" }
+intent-app = { path = "../intent-app", version = "0.11.54" }
+intent-acp = { path = "../intent-acp", version = "0.11.54" }
+intent-providers = { path = "../intent-providers", version = "0.11.54" }
+intent-git = { path = "../intent-git", version = "0.11.54" }
+intent-context = { path = "../intent-context", version = "0.11.54" }
+intent-transport = { path = "../intent-transport", version = "0.11.54" }
+intent-js = { path = "../intent-js", version = "0.11.54", optional = true }
 qrcode = "0.14.1"
 image = { version = "0.25.6", default-features = false, features = ["png"] }
 sysinfo = { version = "0.39.6", default-features = false, features = ["system", "disk"] }
@@ -52,6 +60,93 @@ js-engine = ["dep:intent-js"]
 # Packaging and ordinary daemon builds must leave this feature disabled.
 repository-test-fixtures = ["intent-services/repository-test-fixtures", "intent-transport/repository-test-fixtures", "dep:intent-sourcecontrol"]
 
+# Suites: each file listed in tests/suite_<name>.rs is one module of it.
+[[test]]
+name = "suite_e2e"
+
+[[test]]
+name = "suite_uds"
+
+[[test]]
+name = "suite_wss_a_f"
+
+[[test]]
+name = "suite_wss_agents"
+
+[[test]]
+name = "suite_wss_g_r"
+
+[[test]]
+name = "suite_wss_repo"
+
+[[test]]
+name = "suite_wss_s_z"
+
+# Standalone targets. The two largest files are each as big as a suite, so
+# merging them would only serialize compilation; source lints must keep the
+# `_lint` target-name suffix (`cargo test --workspace --test '*_lint'`);
+# caller_binding_guard and the lints do not compile `common`, whose ctor sets
+# process-wide test env, so they must not share an executable with it.
+[[test]]
+name = "wss_integration"
+
+[[test]]
+name = "e2e_wss_agent_lifecycle"
+
+[[test]]
+name = "caller_binding_guard"
+
+[[test]]
+name = "repo_cache_path_lint"
+
+[[test]]
+name = "serve_spawn_lint"
+
+[[test]]
+name = "tmp_hygiene_lint"
+
+[[test]]
+name = "workflow_grep_quiet_lint"
+
+# Mutate process-global state in-process (environment variables read by
+# Config::resolve or by an in-process daemon, PR_SET_CHILD_SUBREAPER), each with
+# at most a file-local lock. nextest isolates every test in its own process, but
+# plain `cargo test` runs a whole executable's tests as threads of one process,
+# where a suite would let these race with other files' tests.
+[[test]]
+name = "e2e_core_daemon_control"
+
+[[test]]
+name = "e2e_core_slug_and_config"
+
+[[test]]
+name = "e2e_pty_job_control"
+
+[[test]]
+name = "e2e_wss_panic_safety"
+
+[[test]]
+name = "uds_chief_workspace"
+
+[[test]]
+name = "uds_files"
+
+[[test]]
+name = "uds_git"
+
+[[test]]
+name = "uds_github"
+
+[[test]]
+name = "uds_integration"
+
+[[test]]
+name = "uds_linear"
+
+[[test]]
+name = "uds_sentry"
+
+# Needs the fixture feature, which a suite cannot require for only one module.
 [[test]]
 name = "e2e_wss_gitlab_auth"
 required-features = ["repository-test-fixtures"]
@@ -60,17 +155,17 @@ required-features = ["repository-test-fixtures"]
 # Portable source-lint utilities and Unix process guards; never a runtime dependency.
 intentd-test-support = { path = "../intentd-test-support" }
 uuid = { workspace = true }
-intent-services = { path = "../intent-services", version = "0.11.24", features = ["repository-test-fixtures"] }
-intent-acp = { path = "../intent-acp", version = "0.11.24" }
-intent-providers = { path = "../intent-providers", version = "0.11.24", features = ["test-support"] }
-intent-core = { path = "../intent-core", version = "0.11.24" }
-intent-store = { path = "../intent-store", version = "0.11.24" }
+intent-services = { path = "../intent-services", version = "0.11.54", features = ["repository-test-fixtures"] }
+intent-acp = { path = "../intent-acp", version = "0.11.54" }
+intent-providers = { path = "../intent-providers", version = "0.11.54", features = ["test-support"] }
+intent-core = { path = "../intent-core", version = "0.11.54" }
+intent-store = { path = "../intent-store", version = "0.11.54" }
 # `uds_linear.rs` injects a stub `LinearEngine` so the `linear.*` e2e slice
 # never touches the network (no `LINEAR_API_KEY`, no GraphQL call).
-intent-linear = { path = "../intent-linear", version = "0.11.24" }
+intent-linear = { path = "../intent-linear", version = "0.11.54" }
 # `uds_sentry.rs` injects a stub `SentryEngine` so the `sentry.*` e2e slice
 # never touches the network (no token, no REST call).
-intent-sentry = { path = "../intent-sentry", version = "0.11.24" }
+intent-sentry = { path = "../intent-sentry", version = "0.11.54" }
 # `e2e_wss_voice_transcribe.rs` injects a stub `VoiceEngine` so the
 # `voice.transcribe` e2e slice never touches the network (no key, no HTTP).
 intent-voice = { path = "../intent-voice", version = "0.4.1" }
@@ -92,7 +187,7 @@ chrono = "0.4"
 ctor = "1.0.10"
 tempfile = "3"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
-intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.11.24" }
+intent-sourcecontrol = { path = "../intent-sourcecontrol", version = "0.11.54" }
 # `e2e_pty_job_control.rs` boots the daemon inside a real PTY session as a
 # member of a background process group (intent-hq/intent#4231 hazard class).
 portable-pty = { workspace = true }

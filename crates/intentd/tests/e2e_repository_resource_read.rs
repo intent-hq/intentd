@@ -1,7 +1,7 @@
 //! Original listeners, private Store membership and managed cache on real UDS/WSS.
 //! Controlled provider only; checkout controls also use disposable Git and TLS peers.
 #![cfg(unix)]
-mod common;
+use crate::common;
 use futures_util::{SinkExt, StreamExt};
 use intent_core::{now_iso, Principal, PrincipalId, WorkspaceApi, WorkspaceId, WorkspaceRole};
 use intent_services::{EventBus, Services, SettingsRegistry};
@@ -25,7 +25,9 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::Notify;
 use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
-const ACQUIRE: Duration = Duration::from_secs(5);
+fn acquire() -> Duration {
+    intentd_test_support::test_timeout(Duration::from_secs(5))
+}
 const TOKEN: &str = "cececececececececececececececececececececececececececececececece";
 const MEMBER: &str = "edededededededededededededededededededededededededededededededed";
 const GUEST: &str = "abababababababababababababababababababababababababababababababab";
@@ -138,7 +140,7 @@ impl Server {
     async fn finish(mut self) {
         self.state.release.notify_waiters();
         self.stop.take().unwrap().send(()).unwrap();
-        tokio::time::timeout(ACQUIRE, self.task.take().unwrap())
+        tokio::time::timeout(acquire(), self.task.take().unwrap())
             .await
             .unwrap()
             .unwrap();
@@ -459,7 +461,7 @@ impl Harness {
             })
             .await
         });
-        tokio::time::timeout(ACQUIRE, async {
+        tokio::time::timeout(acquire(), async {
             loop {
                 if dir.path().join("intentd.sock").exists() {
                     break;
@@ -524,7 +526,7 @@ impl Harness {
     }
     async fn finish(mut self) {
         self.shutdown.take().unwrap().send(()).unwrap();
-        tokio::time::timeout(ACQUIRE, self.listener.take().unwrap())
+        tokio::time::timeout(acquire(), self.listener.take().unwrap())
             .await
             .unwrap()
             .unwrap()
@@ -565,7 +567,7 @@ struct Client {
 }
 impl Client {
     async fn next(&mut self) -> Value {
-        tokio::time::timeout(ACQUIRE, async {
+        tokio::time::timeout(acquire(), async {
             loop {
                 match &mut self.socket {
                     Socket::Uds(s) => {

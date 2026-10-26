@@ -780,7 +780,7 @@ impl Services {
     /// common no-watch case costs no store read; otherwise this is one
     /// message-free session-summaries read. Best-effort: a store read
     /// failure is logged and fails open to `false` (mirrors
-    /// [`Services::workspace_has_active_hooks`]) so list/get emission is
+    /// [`Services::workspace_has_active_hooks_or_script_monitors`]) so list/get emission is
     /// never wedged and activity is never fabricated.
     pub(crate) async fn workspace_has_waiting_agent_subscriptions(
         &self,
@@ -1485,7 +1485,7 @@ impl Services {
             .get_or_init(|| GroupPersistLane::new(self.store.clone()))
     }
 
-    pub(crate) async fn shutdown_group_persistence(&self) {
+    pub async fn shutdown_group_persistence(&self) {
         // Initialize even an unused lane so later calls cannot reopen admission.
         self.group_persist_lane().shutdown().await;
     }
@@ -1944,10 +1944,17 @@ impl Services {
                         // sender-watches that get no report-time wake).
                         if settled
                             && matches!(call_site, WatchReconcileCallSite::Registration)
-                            && (!self.active_hooks_for_agent(child_id).await.is_empty()
+                            && (!self
+                                .ports
+                                .runtime()
+                                .active_hooks_for_agent(self, child_id)
+                                .await
+                                .is_empty()
                                 || (!self.active_pr_monitors_for_agent(child_id).await.is_empty()
                                     || !self
-                                        .active_script_monitors_for_agent(child_id)
+                                        .ports
+                                        .runtime()
+                                        .active_script_monitors_for_agent(self, child_id)
                                         .await
                                         .is_empty())
                                 || !self.list_event_subscriptions_for_agent(child_id).is_empty())
@@ -2038,7 +2045,10 @@ impl Services {
                 data["completionReport"] = serde_json::Value::String(report.clone());
                 data["report"] = serde_json::Value::String(report.clone());
             }
-            self.annotate_waiting_on_hooks(child_id, &mut data).await;
+            self.ports
+                .runtime()
+                .annotate_waiting_on_hooks(self, child_id, &mut data)
+                .await;
             self.annotate_waiting_on_pr_monitors(child_id, &mut data)
                 .await;
             data["isWaitingForOtherAgents"] =
@@ -2309,7 +2319,9 @@ impl Services {
                         // Failed/deleted children record regardless.
                         if event_type == intent_core::events::AGENT_IDLE
                             && !self
-                                .annotate_waiting_on_hooks(&child_id, &mut data)
+                                .ports
+                                .runtime()
+                                .annotate_waiting_on_hooks(self, &child_id, &mut data)
                                 .await
                                 .is_empty()
                             && !completion_reported
@@ -2515,7 +2527,9 @@ impl Services {
         if !completion_reported
             && (!self.active_pr_monitors_for_agent(agent_id).await.is_empty()
                 || !self
-                    .active_script_monitors_for_agent(agent_id)
+                    .ports
+                    .runtime()
+                    .active_script_monitors_for_agent(self, agent_id)
                     .await
                     .is_empty())
         {
@@ -2772,10 +2786,7 @@ fn persisted_to_delegation_group(p: &PersistedDelegationGroup) -> Result<Delegat
 mod tests {
     use std::path::PathBuf;
 
-    use intent_core::{
-        AgentSession, AgentStatus, Workspace, WorkspaceActivity, WorkspaceAttention,
-        WorkspaceDisplayStatus, WorkspaceStatus,
-    };
+    use intent_core::{AgentSession, AgentStatus, Workspace, WorkspaceDisplayStatus};
     use intent_store::Store;
 
     use super::*;
@@ -2807,49 +2818,9 @@ mod tests {
             id: id.clone(),
             title: "WS".to_string(),
             branch: "main".to_string(),
-            base_ref: None,
-            base_commit_sha: None,
-            status: WorkspaceStatus::Active,
-            status_message: None,
-            status_image_asset_id: None,
-            activity: WorkspaceActivity::Idle,
-            attention: WorkspaceAttention::None,
             created_at: ts.clone(),
             updated_at: ts,
-            last_activity: None,
-            last_content_activity: None,
-            tags: vec![],
-            path: None,
-            repository_path: None,
-            repository_owner: None,
-            repository_name: None,
-            worktree_path: None,
-            scope: None,
-            skip_worktree: false,
-            setup_script: None,
-            is_remote: false,
-            default_model: None,
-            pr_number: None,
-            pr_url: None,
-            pr_status: None,
-            active_pull_request: None,
-            pull_requests: None,
-            context_links: None,
-            archived: false,
-            archived_at: None,
-            task_stats: None,
-            agent_summary: None,
-            diff_summary: None,
-            token_usage: None,
-            cow_supported: None,
-            browser_client_id: None,
-            pull_requests_total: None,
-            display_status: None,
-            waiting: false,
-            checkout_mode: None,
-            disk_usage: None,
-            pending_delete_at: None,
-            membership: None,
+            ..Default::default()
         }
     }
 

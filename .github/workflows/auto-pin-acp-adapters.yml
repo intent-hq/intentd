@@ -112,7 +112,12 @@ jobs:
 
   # Disable auto-merge as soon as a rolling PR is held (hold-release label)
   # or changed by anyone other than the PR's bot author. The PR's own script is
-  # never run here, and no publication token is used.
+  # never run here, and no publication token is used: pull_request runs take
+  # this file from the PR head, so a secret here would reach any branch editor.
+  # GITHUB_TOKEN needs contents: write as well as pull-requests: write for
+  # disablePullRequestAutoMerge; with contents: read it fails "Resource not
+  # accessible by integration" (intentd#2543). The job then re-reads the PR and
+  # fails loudly if auto-merge is still armed.
   stand-down:
     needs: [runner-route]
     if: >-
@@ -128,7 +133,7 @@ jobs:
     runs-on: ${{ fromJSON(needs.runner-route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
     timeout-minutes: 5
     permissions:
-      contents: read
+      contents: write
       pull-requests: write
     steps:
       - name: Disable auto-merge on the rolling ACP adapter PR
@@ -138,5 +143,14 @@ jobs:
           ACTION: ${{ github.event.action }}
           ACTOR: ${{ github.actor }}
         run: |
-          gh pr merge "$PR" --repo "$GITHUB_REPOSITORY" --disable-auto
+          # A refusal (e.g. auto-merge already off) is judged by the re-read below.
+          gh pr merge "$PR" --repo "$GITHUB_REPOSITORY" --disable-auto || true
+          if ! armed=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json autoMergeRequest --jq '.autoMergeRequest != null'); then
+            echo "::error::Could not confirm auto-merge is off for #$PR ($ACTION by $ACTOR); check it by hand."
+            exit 1
+          fi
+          if [ "$armed" != false ]; then
+            echo "::error::Auto-merge is still armed on #$PR after --disable-auto ($ACTION by $ACTOR); disable it by hand."
+            exit 1
+          fi
           echo "Disabled auto-merge for #$PR ($ACTION by $ACTOR)."

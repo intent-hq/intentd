@@ -144,7 +144,15 @@ async fn wss_task_list_filtered_dependencies_and_spec_fallback() {
                 .await
                 .unwrap()
             {
-                srv.store.update_note(&note).await.unwrap();
+                srv.store
+                    .update_note(
+                        &srv.store
+                            .lock_note_content(&note.workspace_id, &note.id)
+                            .await,
+                        &note,
+                    )
+                    .await
+                    .unwrap();
             } else {
                 srv.store.insert_note(&note).await.unwrap();
             }

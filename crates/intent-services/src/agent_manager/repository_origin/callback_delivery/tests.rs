@@ -8,6 +8,7 @@ use crate::repository_admission::lifecycle::RepositorySourceLifetime;
 use crate::repository_admission::read_request::RepositoryReadRequest;
 use crate::repository_admission::request_context::{current_read_request, current_source_lifetime};
 use crate::repository_admission::AdmissionError;
+use crate::test_support::quota_script;
 use intent_acp::callback_registration::CallbackOffer;
 use intent_acp::mcp_server::request_context::{McpRequestContext, McpRequestScope};
 use intent_acp::{Connection, ConnectionHooks, IncomingNotification};
@@ -18,7 +19,9 @@ use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex as TokioMutex};
 
-const WAIT: Duration = Duration::from_secs(15);
+fn fixture_wait() -> Duration {
+    intentd_test_support::test_timeout(Duration::from_secs(15))
+}
 
 const METHOD: &str = "_intent/session/register_mcp_callback";
 
@@ -143,7 +146,7 @@ impl McpRequestContext for ObservedPendingContext {
 }
 
 async fn wait_count(counter: &AtomicUsize, changed: &Notify, wanted: usize) {
-    tokio::time::timeout(WAIT, async {
+    tokio::time::timeout(fixture_wait(), async {
         loop {
             let notification = changed.notified();
             tokio::pin!(notification);
@@ -190,7 +193,7 @@ impl PeerWriterGate {
         self.blocked.store(true, Ordering::SeqCst);
     }
     async fn reached(&self) {
-        tokio::time::timeout(WAIT, self.entered.notified())
+        tokio::time::timeout(fixture_wait(), self.entered.notified())
             .await
             .unwrap();
     }
@@ -414,7 +417,7 @@ if (capability === "missing-receipt") delete response._meta?.intentCallbackRegis
 
     async fn call(&self, method: &str, params: Value) -> Value {
         self.connection
-            .request_timeout(method, params, crate::test_support::fixture_timeout(WAIT))
+            .request_timeout(method, params, fixture_wait())
             .await
             .unwrap_or_else(|error| {
                 panic!("{method}: {error}: {:?}", self.connection.recent_stderr())
@@ -823,7 +826,7 @@ async fn uncertain_sdk_completion_keeps_the_committed_response_without_retry_or_
     let task = start_task(&h);
     h.node.call("fixture/entered", json!({})).await;
     let captured = callback(&h.origin).unwrap().capture();
-    let id = tokio::time::timeout(WAIT, task)
+    let id = tokio::time::timeout(fixture_wait(), task)
         .await
         .unwrap()
         .unwrap()
@@ -1061,7 +1064,7 @@ async fn pending_request_queued_before_permit_never_adopts_new_endpoint_authorit
                 .request_timeout(
                     "fixture/call",
                     json!({"name":"workspace-mcp","code":format!("return 'queued-{i}'")}),
-                    WAIT,
+                    fixture_wait(),
                 )
                 .await
                 .unwrap()
@@ -1238,12 +1241,12 @@ async fn metadata_delivery_ordering(replace_handle: bool, install_before_old: bo
             };
             if let Some((entered, resume)) = gate {
                 let _ = entered.send(());
-                let _ = resume.recv_timeout(WAIT);
+                let _ = resume.recv_timeout(fixture_wait());
             }
         });
     drop(writer);
     let original = start_task(&h);
-    tokio::time::timeout(WAIT, model_wait)
+    tokio::time::timeout(fixture_wait(), model_wait)
         .await
         .unwrap()
         .unwrap();
@@ -1313,7 +1316,7 @@ async fn metadata_delivery_ordering(replace_handle: bool, install_before_old: bo
         assert!(delivery.is_some());
         deliver_optional(delivery).await;
     }
-    tokio::time::timeout(WAIT, effort_wait)
+    tokio::time::timeout(fixture_wait(), effort_wait)
         .await
         .unwrap()
         .unwrap();
@@ -1544,7 +1547,7 @@ async fn idle_wake_and_zero_settle_transcripts_keep_captured_connection_routes()
             .wake_listener_tick(&h.f.row.id, &h.f.row.workspace_id)
             .await
     );
-    tokio::time::timeout(WAIT, async {
+    tokio::time::timeout(fixture_wait(), async {
         loop {
             if !h.f.manager.is_busy(&h.f.row.id) && !transcript_tools(&h).await.is_empty() {
                 break;
@@ -1674,13 +1677,13 @@ async fn hard_stop_joins_real_source_dispatch_before_dropping_confirmed_bridge()
             Ok(())
         })
     });
-    inside.recv_timeout(WAIT).unwrap();
+    inside.recv_timeout(fixture_wait()).unwrap();
     let endpoint = h.origin.state.lock().unwrap().endpoint.clone().unwrap();
     let fixture = h.f.clone();
     let runtime = tokio::runtime::Handle::current();
     let stopping =
         std::thread::spawn(move || runtime.block_on(fixture.manager.stop(&fixture.row.id)));
-    tokio::time::timeout(WAIT, async {
+    tokio::time::timeout(fixture_wait(), async {
         loop {
             if h.origin.state.lock().unwrap().retired {
                 break;
@@ -1950,7 +1953,7 @@ impl NativeHold {
     }
 
     async fn reached(&self) {
-        tokio::time::timeout(WAIT, self.entered.notified())
+        tokio::time::timeout(fixture_wait(), self.entered.notified())
             .await
             .unwrap();
     }
@@ -2008,17 +2011,10 @@ struct BudgetRequestTrace<'a> {
 
 impl<'a> BudgetRequestTrace<'a> {
     fn new(control: &'a NativeControl, subcase: &'static str, count: usize) -> Self {
-        let override_ms = std::env::var("INTENTD_WORKSPACE_API_TIMEOUT_MS").ok();
-        let budget_ms = override_ms
-            .as_deref()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .filter(|ms| *ms > 0)
-            .unwrap_or(30_000);
-        assert_eq!(
-            budget_ms, 30_000,
-            "these controls preserve the original server budget"
+        eprintln!(
+            "budget-request begin subcase={subcase} iterations={count} fixture_wait_ms={}",
+            fixture_wait().as_millis()
         );
-        eprintln!("budget-request begin subcase={subcase} iterations={count} fixture_wait_ms={} server_budget_ms={budget_ms}", WAIT.as_millis());
         Self {
             control,
             subcase,
@@ -2266,9 +2262,52 @@ struct NativeHarness {
     user: McpBridge,
 }
 
+/// The `workspace_api` budget of the confirmed server `origin` actually serves.
+fn served_budget(origin: &RepositoryOrigin) -> Duration {
+    origin
+        .state
+        .lock()
+        .unwrap()
+        .endpoint
+        .as_ref()
+        .expect("a delivered callback endpoint")
+        .served_workspace_api_timeout
+        .lock()
+        .unwrap()
+        .expect("the endpoint served a confirmed server")
+}
+
+/// One 63/64 acquisition-budget control script over the fixture peer's
+/// `fixture/call`, guarded by the shared quota script budget.
+async fn quota_fixture_call(
+    subcase: &str,
+    origin: &RepositoryOrigin,
+    connection: Arc<Connection>,
+    query: usize,
+    name: &str,
+    code: &str,
+) -> Value {
+    let params = json!({"query":query,"name":name,"code":code});
+    quota_script::guard(subcase, served_budget(origin), async move {
+        connection
+            .request_timeout("fixture/call", params, quota_script::QUOTA_TRANSPORT_WAIT)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("fixture/call: {error}: {:?}", connection.recent_stderr())
+            })
+    })
+    .await
+}
+
 impl NativeHarness {
     async fn new(stamp: &str, opt_in: bool, failed_anchor: bool) -> Self {
         Self::observed(stamp, opt_in, failed_anchor, None, None).await
+    }
+
+    /// A harness for a 63/64 acquisition control: every server its blueprint
+    /// builds carries the shared quota script budget; use [`Self::quota_call`].
+    async fn quota(control: Option<Arc<NativeControl>>) -> Self {
+        Self::build("3.0", true, false, control, None, true).await
     }
 
     async fn observed(
@@ -2277,6 +2316,25 @@ impl NativeHarness {
         failed_anchor: bool,
         control: Option<Arc<NativeControl>>,
         pending_control: Option<Arc<NativeControl>>,
+    ) -> Self {
+        Self::build(
+            stamp,
+            opt_in,
+            failed_anchor,
+            control,
+            pending_control,
+            false,
+        )
+        .await
+    }
+
+    async fn build(
+        stamp: &str,
+        opt_in: bool,
+        failed_anchor: bool,
+        control: Option<Arc<NativeControl>>,
+        pending_control: Option<Arc<NativeControl>>,
+        quota: bool,
     ) -> Self {
         use crate::agent_manager::{AgentManager, BusEventSink};
         use crate::events::EventBus;
@@ -2394,6 +2452,9 @@ impl NativeHarness {
                 .with_turn_attachments(Some(attachments.clone()))
         })
         .with_original_services(original.clone(), f.row.clone());
+        if quota {
+            blueprint.workspace_api_timeout = Some(quota_script::QUOTA_SCRIPT_BUDGET);
+        }
         if let Some(control) = control {
             blueprint.context_decorator = Some(Arc::new(move |context| control.wrap(context)));
         }
@@ -2499,7 +2560,7 @@ impl NativeHarness {
         let params = json!({"query":query,"name":name,"code":code});
         tokio::spawn(async move {
             connection
-                .request_timeout("fixture/call", params, WAIT)
+                .request_timeout("fixture/call", params, fixture_wait())
                 .await
                 .unwrap()
         })
@@ -2610,6 +2671,11 @@ impl NativeHarness {
                 json!({"query":query,"name":name,"code":code}),
             )
             .await
+    }
+
+    async fn quota_call(&self, subcase: &str, query: usize, name: &str, code: &str) -> Value {
+        let connection = self.node.connection.clone();
+        quota_fixture_call(subcase, &self.origin, connection, query, name, code).await
     }
 
     async fn finish(self) {
@@ -2882,7 +2948,7 @@ async fn confirmed_read_escaped_handles_retire_only_after_their_original_scope()
     drop(cloned);
     gate.release.add_permits(1);
     assert!(first.await.unwrap().to_string().contains("actual review"));
-    tokio::time::timeout(WAIT, async {
+    tokio::time::timeout(fixture_wait(), async {
         while source.retirement().check_current().is_ok() {
             tokio::task::yield_now().await;
         }
@@ -2983,12 +3049,12 @@ async fn confirmed_read_caught_discarded_shared_root_and_budget_bind_every_origi
             budget_hosts: Some(Arc::new(BudgetHosts::default())),
             ..NativeControl::default()
         });
-        let h = NativeHarness::observed("3.0", true, false, Some(control.clone()), None).await;
+        let h = NativeHarness::quota(Some(control.clone())).await;
         h.start().await;
         let code = format!("for(let i=0;i<{count};i++) {{await ws.pr.snapshot(4);}} return 'bounded original success';");
         let name = h.confirmed(0).await;
         let mut trace = BudgetRequestTrace::new(&control, "original-read-budget", count);
-        let reply = h.call(0, &name, &code).await;
+        let reply = h.quota_call("original-read-budget", 0, &name, &code).await;
         trace.returned = true;
         drop(trace);
         assert_eq!(
@@ -3205,7 +3271,7 @@ async fn confirmed_read_claimed_delete_retires_original_manager_before_late_outp
             .schedule_workspace_delete(h.git.workspace.id.clone(), 0)
             .await
             .unwrap();
-        tokio::time::timeout(WAIT, async {
+        tokio::time::timeout(fixture_wait(), async {
             while h
                 .original
                 .pending_workspace_deletes
@@ -3227,7 +3293,7 @@ async fn confirmed_read_claimed_delete_retires_original_manager_before_late_outp
     .await;
     // Taking the pending-delete claim precedes manager retirement. Wait for the
     // original endpoint to retire before releasing its held response.
-    tokio::time::timeout(WAIT, async {
+    tokio::time::timeout(fixture_wait(), async {
         while !h.origin.state.lock().unwrap().retired
             || !endpoint.cancelled.load(Ordering::Acquire)
             || endpoint.bridge.lock().unwrap().is_some()
@@ -3245,7 +3311,7 @@ async fn confirmed_read_claimed_delete_retires_original_manager_before_late_outp
             .contains("Private result delivery refused"),
         "{reply}"
     );
-    tokio::time::timeout(WAIT, async {
+    tokio::time::timeout(fixture_wait(), async {
         while h
             .original
             .store
@@ -3375,12 +3441,12 @@ async fn native_metadata_delivery_ordering(replace_handle: bool, install_before_
             };
             if let Some((entered, resume)) = gate {
                 let _ = entered.send(());
-                let _ = resume.recv_timeout(WAIT);
+                let _ = resume.recv_timeout(fixture_wait());
             }
         });
     drop(writer);
     let original = h.start_task();
-    tokio::time::timeout(WAIT, model_wait)
+    tokio::time::timeout(fixture_wait(), model_wait)
         .await
         .unwrap()
         .unwrap();
@@ -3448,7 +3514,7 @@ async fn native_metadata_delivery_ordering(replace_handle: bool, install_before_
         assert!(delivery.is_some());
         deliver_optional(delivery).await;
     }
-    tokio::time::timeout(WAIT, effort_wait)
+    tokio::time::timeout(fixture_wait(), effort_wait)
         .await
         .unwrap()
         .unwrap();
@@ -3628,7 +3694,7 @@ async fn confirmed_read_registration_failure_cancel_and_uncertainty_never_replay
             start.abort();
             assert!(start.await.unwrap_err().is_cancelled());
         } else {
-            let id = tokio::time::timeout(WAIT, start)
+            let id = tokio::time::timeout(fixture_wait(), start)
                 .await
                 .unwrap()
                 .unwrap()
@@ -4031,7 +4097,7 @@ async fn confirmed_read_idle_wake_and_zero_settle_transcripts_keep_captured_conn
             .wake_listener_tick(&h.f.row.id, &h.f.row.workspace_id)
             .await
     );
-    tokio::time::timeout(WAIT, async {
+    tokio::time::timeout(fixture_wait(), async {
         loop {
             if !h.f.manager.is_busy(&h.f.row.id) && !native_transcript_tools(&h).await.is_empty() {
                 break;
@@ -4304,7 +4370,7 @@ mod confirmed_aliases {
                 budget_hosts: Some(Arc::new(BudgetHosts::default())),
                 ..NativeControl::default()
             });
-            let h = NativeHarness::observed("3.0", true, false, Some(control.clone()), None).await;
+            let h = NativeHarness::quota(Some(control.clone())).await;
             no_spill(&h);
             h.start().await;
             let code = format!(
@@ -4321,7 +4387,7 @@ mod confirmed_aliases {
             );
             let name = h.confirmed(0).await;
             let mut trace = BudgetRequestTrace::new(&control, "mixed-alias-budget", count);
-            let reply = h.call(0, &name, &code).await;
+            let reply = h.quota_call("mixed-alias-budget", 0, &name, &code).await;
             trace.returned = true;
             drop(trace);
             if count == 63 {
@@ -4592,7 +4658,7 @@ mod live_context {
         h: &NativeHarness,
         body: impl std::future::Future<Output = T> + Send + 'static,
     ) -> T {
-        intent_core::spawn_daemon(crate::host_execution::background_execution(
+        intent_core::spawn_daemon(crate::execution_call::background_execution(
             h.original.as_ref().clone(),
             None,
             body,
@@ -4667,7 +4733,7 @@ mod live_context {
             )
             .await
             .unwrap();
-        tokio::time::timeout(WAIT, async {
+        tokio::time::timeout(fixture_wait(), async {
             loop {
                 if !h.f.manager.is_busy(&row.id) && h.f.manager.workers.lock().unwrap().is_empty() {
                     break;
@@ -4774,11 +4840,12 @@ mod live_context {
         assert_eq!(failed.http.count(), 0);
         failed.finish().await;
 
-        let qualified = selected(None).await;
+        let qualified = NativeHarness::quota(None).await;
+        select(&qualified, RepositorySelectionChange::Automatic).await;
         qualified.start().await;
         // One lazy read plus 64 calls overflows the real original ledger.
         // Catching the acquisition error cannot manufacture a successful zero.
-        let refused = qualified.call(0, &qualified.confirmed(0).await,
+        let refused = qualified.quota_call("context-failed-seal", 0, &qualified.confirmed(0).await,
             "for(let i=0;i<64;i++){try{await ws.pr.snapshot(4);}catch(e){}} return 'must-not-escape-failed-seal';").await;
         assert!(
             refused
@@ -4842,7 +4909,10 @@ mod live_context {
     async fn confirmed_context_actual_created_3_2_reaches_original_guidance_boundary() {
         let h = NativeHarness::observed("<created>", true, false, None, None).await;
         let created = h.f.stored().await;
-        assert_eq!(created.harness_version, "3.2");
+        assert_eq!(
+            created.harness_version,
+            intent_core::CURRENT_HARNESS_VERSION
+        );
         assert!(created.harness_features.is_some());
         select(&h, RepositorySelectionChange::Automatic).await;
         let id = h.start().await;
@@ -4875,7 +4945,7 @@ mod live_context {
             .agent_get_session_op(created.id.clone())
             .await
             .unwrap();
-        assert_eq!(full.harness_version, "3.2");
+        assert_eq!(full.harness_version, intent_core::CURRENT_HARNESS_VERSION);
         assert_eq!(full.harness_features, created.harness_features);
         h.finish().await;
     }
@@ -5297,7 +5367,7 @@ mod live_context {
             let f = h.f.clone();
             let session = id.clone();
             let (entered, ready) = tokio::sync::oneshot::channel();
-            let task = intent_core::spawn_daemon(crate::host_execution::background_execution(
+            let task = intent_core::spawn_daemon(crate::execution_call::background_execution(
                 h.original.as_ref().clone(),
                 None,
                 async move {
@@ -5438,7 +5508,9 @@ mod live_context {
         .await;
         held.release();
         holder.await.unwrap();
-        tokio::time::timeout(WAIT, draining).await.unwrap();
+        tokio::time::timeout(fixture_wait(), draining)
+            .await
+            .unwrap();
         dispatch(&h, &id, capture(&h).await, "fresh after real drain")
             .await
             .unwrap();
@@ -5619,7 +5691,7 @@ mod normal_launch {
                 _ => {}
             }
             h.rpc("fixture/release-prompt", json!({})).await;
-            tokio::time::timeout(WAIT, async {
+            tokio::time::timeout(fixture_wait(), async {
                 while h.f.manager.is_busy(&h.f.row.id)
                     || h.f.manager.services.has_ready_to_send(&h.f.row.id)
                     || !h.f.manager.workers.lock().unwrap().is_empty()
@@ -5779,7 +5851,7 @@ mod normal_launch {
             }
         })
         .await;
-        tokio::time::timeout(WAIT, async {
+        tokio::time::timeout(fixture_wait(), async {
             while h.f.manager.is_busy(&h.f.row.id)
                 || h.f.manager.services.has_ready_to_send(&h.f.row.id)
             {
@@ -6085,7 +6157,7 @@ mod normal_launch {
             "freshly admitted native Check and Flush must use the original destination: {result:?}"
         );
         assert_eq!(result.unwrap()["flushed"], true);
-        tokio::time::timeout(WAIT, async {
+        tokio::time::timeout(fixture_wait(), async {
             while h.f.manager.is_busy(&h.f.row.id)
                 || h.f.manager.services.has_ready_to_send(&h.f.row.id)
             {
@@ -6208,7 +6280,7 @@ mod normal_launch {
                 _ => {}
             }
             h.rpc("fixture/release-prompt", json!({})).await;
-            tokio::time::timeout(WAIT, async {
+            tokio::time::timeout(fixture_wait(), async {
                 while h.f.manager.is_busy(&h.f.row.id)
                     || h.f.manager.services.has_ready_to_send(&h.f.row.id)
                     || !h.f.manager.workers.lock().unwrap().is_empty()
@@ -6300,7 +6372,7 @@ mod normal_launch {
                 .unwrap()["flushed"],
             true
         );
-        tokio::time::timeout(WAIT, async {
+        tokio::time::timeout(fixture_wait(), async {
             while h.f.manager.is_busy(&h.f.row.id)
                 || h.f.manager.services.has_ready_to_send(&h.f.row.id)
                 || !h.f.manager.workers.lock().unwrap().is_empty()
@@ -6581,7 +6653,7 @@ mod normal_launch {
             .await;
         assert!(result.is_ok(),"explicit recovery requires fresh original admission, not the current remote: {result:?}");
         assert_eq!(result.unwrap()["flushed"], !no_net_change);
-        tokio::time::timeout(WAIT, async {
+        tokio::time::timeout(fixture_wait(), async {
             while h.f.manager.is_busy(&h.f.row.id)
                 || h.f.manager.services.has_ready_to_send(&h.f.row.id)
                 || !h.f.manager.workers.lock().unwrap().is_empty()
@@ -6718,7 +6790,7 @@ mod normal_launch {
                 }
             })
             .await;
-            tokio::time::timeout(WAIT, async {
+            tokio::time::timeout(fixture_wait(), async {
                 while h.f.manager.is_busy(&h.f.row.id)
                     || h.f.manager.services.has_ready_to_send(&h.f.row.id)
                 {
@@ -6768,7 +6840,7 @@ mod normal_launch {
                 }
             })
             .await;
-            tokio::time::timeout(WAIT, async {
+            tokio::time::timeout(fixture_wait(), async {
                 while h.f.manager.is_busy(&h.f.row.id)
                     || h.f.manager.services.has_ready_to_send(&h.f.row.id)
                 {
@@ -7037,7 +7109,7 @@ mod normal_launch {
                                 .clone()
                                 .try_drain_queue(agent.clone(), workspace.clone())
                                 .await;
-                            tokio::time::timeout(WAIT, async {
+                            tokio::time::timeout(fixture_wait(), async {
                                 while manager.is_busy(&agent)
                                     || manager.services.has_ready_to_send(&agent)
                                 {
@@ -7477,13 +7549,13 @@ mod normal_launch {
             .set_commit_hook(move || {
                 if let Some(wait) = wait.take() {
                     signal.notify_one();
-                    wait.recv_timeout(WAIT).unwrap();
+                    wait.recv_timeout(fixture_wait()).unwrap();
                 }
                 !abort_commit
             });
         drop(writer);
         let completed = completion.clone();
-        let write = intent_core::spawn_daemon(crate::host_execution::background_execution(
+        let write = intent_core::spawn_daemon(crate::execution_call::background_execution(
             h.original.as_ref().clone(),
             None,
             async move {
@@ -7502,7 +7574,7 @@ mod normal_launch {
                     .map(|message| message.is_some())
             },
         ));
-        tokio::time::timeout(WAIT, entered.notified())
+        tokio::time::timeout(fixture_wait(), entered.notified())
             .await
             .expect("actual monitor SQL COMMIT entered");
         if drop_caller {
@@ -7511,7 +7583,7 @@ mod normal_launch {
         let origin = h.origin();
         let probe = origin.state.lock().unwrap().retirement.clone().unwrap();
         let retired = tokio::task::spawn_blocking(move || origin.retire());
-        tokio::time::timeout(WAIT, async {
+        tokio::time::timeout(fixture_wait(), async {
             while !probe.detached_for_test() {
                 tokio::task::yield_now().await;
             }
@@ -7538,8 +7610,11 @@ mod normal_launch {
             before
         );
         release.send(()).unwrap();
-        tokio::time::timeout(WAIT, retired).await.unwrap().unwrap();
-        let outcome = tokio::time::timeout(WAIT, write).await.unwrap();
+        tokio::time::timeout(fixture_wait(), retired)
+            .await
+            .unwrap()
+            .unwrap();
+        let outcome = tokio::time::timeout(fixture_wait(), write).await.unwrap();
         if drop_caller {
             assert!(outcome.unwrap_err().is_cancelled());
         } else if abort_commit {
@@ -7547,7 +7622,7 @@ mod normal_launch {
         } else {
             assert!(outcome.unwrap().unwrap());
         }
-        let mut writer = tokio::time::timeout(WAIT, pool.acquire())
+        let mut writer = tokio::time::timeout(fixture_wait(), pool.acquire())
             .await
             .unwrap()
             .unwrap();
@@ -7569,7 +7644,7 @@ mod normal_launch {
         if acknowledge && !abort_commit {
             assert!(saved.pending_changes.is_empty());
             assert_eq!(saved.baseline_snapshot, saved.last_snapshot);
-            tokio::time::timeout(WAIT, async {
+            tokio::time::timeout(fixture_wait(), async {
                 while !completion.acknowledged() {
                     tokio::task::yield_now().await;
                 }
@@ -7698,7 +7773,7 @@ mod normal_launch {
                 let pool = original.store.write_pool();
                 let writer = pool.acquire().await.unwrap();
                 let row_for_write = row.clone();
-                let write = intent_core::spawn_daemon(crate::host_execution::background_execution(
+                let write = intent_core::spawn_daemon(crate::execution_call::background_execution(
                     h.original.as_ref().clone(),
                     None,
                     async move {
@@ -7712,7 +7787,9 @@ mod normal_launch {
                             .await
                     },
                 ));
-                tokio::time::timeout(WAIT, ready.notified()).await.unwrap();
+                tokio::time::timeout(fixture_wait(), ready.notified())
+                    .await
+                    .unwrap();
                 assert!(
                     !write.is_finished(),
                     "original writer reservation is blocked"
@@ -7726,14 +7803,14 @@ mod normal_launch {
                     _ => unreachable!(),
                 }
                 drop(writer);
-                let outcome = tokio::time::timeout(WAIT, write).await.unwrap();
+                let outcome = tokio::time::timeout(fixture_wait(), write).await.unwrap();
                 if mode == "waiting-cancel" {
                     assert!(outcome.unwrap_err().is_cancelled());
                 } else {
                     assert!(outcome.unwrap().is_err());
                 }
                 drop(
-                    tokio::time::timeout(WAIT, pool.acquire())
+                    tokio::time::timeout(fixture_wait(), pool.acquire())
                         .await
                         .unwrap()
                         .unwrap(),
@@ -8015,7 +8092,7 @@ mod normal_launch {
                         let mut byte = [0];
                         assert!(
                             tokio::time::timeout(
-                                std::time::Duration::from_millis(30),
+                                intentd_test_support::test_timeout(std::time::Duration::from_millis(30)),
                                 tokio::io::AsyncReadExt::read(&mut foreign_reader, &mut byte)
                             )
                             .await
@@ -8312,7 +8389,10 @@ if(frame.method==='session/prompt' && promptErrors.length) {
                     )
                     .await
                     .unwrap();
-                assert_eq!(result["agent"]["harnessVersion"], "3.2");
+                assert_eq!(
+                    result["agent"]["harnessVersion"],
+                    intent_core::CURRENT_HARNESS_VERSION
+                );
                 original
                     .store
                     .get_agent_session(&intent_core::AgentId::from(
@@ -8383,7 +8463,7 @@ if(frame.method==='session/prompt' && promptErrors.length) {
             &self,
             body: impl std::future::Future<Output = T> + Send + 'static,
         ) -> T {
-            intent_core::spawn_daemon(crate::host_execution::background_execution(
+            intent_core::spawn_daemon(crate::execution_call::background_execution(
                 self.original.as_ref().clone(),
                 None,
                 body,
@@ -8452,7 +8532,7 @@ if(frame.method==='session/prompt' && promptErrors.length) {
         }
         async fn rpc(&self, method: &str, params: Value) -> Value {
             let c = self.connection();
-            c.request_timeout(method, params, crate::test_support::fixture_timeout(WAIT))
+            c.request_timeout(method, params, fixture_wait())
                 .await
                 .unwrap_or_else(|e| panic!("{method}: {e}; {:?}", c.recent_stderr()))
         }
@@ -8508,6 +8588,20 @@ if(frame.method==='session/prompt' && promptErrors.length) {
         }
         async fn prompts(&self) -> Vec<Value> {
             serde_json::from_value(self.rpc("fixture/prompts", json!({})).await).unwrap()
+        }
+        /// Serve this launch's confirmed servers with the shared quota script
+        /// budget (before `start`); use [`Self::quota_call`].
+        fn quota_budget(&self) {
+            let origin = self.origin();
+            let mut state = origin.state.lock().unwrap();
+            Arc::get_mut(state.blueprint.as_mut().unwrap())
+                .unwrap()
+                .server
+                .workspace_api_timeout = Some(quota_script::QUOTA_SCRIPT_BUDGET);
+        }
+        async fn quota_call(&self, subcase: &str, query: usize, name: &str, code: &str) -> Value {
+            let origin = self.origin();
+            quota_fixture_call(subcase, &origin, self.connection(), query, name, code).await
         }
         fn decorate(&self, control: Arc<NativeControl>) {
             let origin = self.origin();
@@ -8606,7 +8700,7 @@ if(frame.method==='session/prompt' && promptErrors.length) {
             )
             .await
             .unwrap();
-        tokio::time::timeout(WAIT, async {
+        tokio::time::timeout(fixture_wait(), async {
             while h.f.manager.is_busy(&h.f.row.id)
                 || !h.f.manager.workers.lock().unwrap().is_empty()
             {
@@ -8622,7 +8716,10 @@ if(frame.method==='session/prompt' && promptErrors.length) {
             .all(|p| p.to_string().contains(FACTS) && p["params"]["sessionId"] == s.session_id));
         assert_ne!(prompts[0]["id"], prompts[1]["id"]);
         assert_eq!(h.f.writes().await, 1);
-        assert_eq!(h.f.stored().await.harness_version, "3.2");
+        assert_eq!(
+            h.f.stored().await.harness_version,
+            intent_core::CURRENT_HARNESS_VERSION
+        );
         {
             let origin = h.origin();
             let state = origin.state.lock().unwrap();
@@ -8882,6 +8979,7 @@ if(frame.method==='session/prompt' && promptErrors.length) {
             h.create_only().await;
             let control = Arc::new(NativeControl::default());
             h.decorate(control.clone());
+            h.quota_budget();
             h.start().await.unwrap();
             let name = h.confirmed(0).await;
             let zero = h.call(0, &name, "return 'authentic zero';").await;
@@ -8891,7 +8989,7 @@ if(frame.method==='session/prompt' && promptErrors.length) {
             let gate = control.at(Boundary::TcpResponse, false);
             let conn = h.connection();
             let task = tokio::spawn(async move {
-                conn.request_timeout("fixture/call",json!({"query":0,"name":name,"code":"await ws.workspace.setStatusMessage('completed original effect'); await ws.pr.snapshot(4); return 'completed private result';"}),WAIT).await.unwrap()
+                conn.request_timeout("fixture/call",json!({"query":0,"name":name,"code":"await ws.workspace.setStatusMessage('completed original effect'); await ws.pr.snapshot(4); return 'completed private result';"}),fixture_wait()).await.unwrap()
             });
             gate.reached().await;
             if required {
@@ -8929,7 +9027,8 @@ if(frame.method==='session/prompt' && promptErrors.length) {
                     .contains("Private result delivery refused"));
                 h.select(RepositorySelectionChange::Automatic).await;
                 let failed = h
-                    .call(
+                    .quota_call(
+                        "normal-launch-failed-seal",
                         0,
                         &h.confirmed(0).await,
                         "for(let i=0;i<64;i++){try{await ws.pr.snapshot(4)}catch(e){}} return 'caught is not zero';",
@@ -9000,7 +9099,7 @@ if(frame.method==='session/prompt' && promptErrors.length) {
         .await;
         held.release();
         holder.await.unwrap();
-        tokio::time::timeout(WAIT, drain).await.unwrap();
+        tokio::time::timeout(fixture_wait(), drain).await.unwrap();
         assert_eq!(h.http.count(), 0);
         h.finish().await;
     }
@@ -9032,7 +9131,7 @@ if(frame.method==='session/prompt' && promptErrors.length) {
         let f = h.f.clone();
         let id = fresh.session_id.clone();
         let conn = turn.connection.clone();
-        let task = intent_core::spawn_daemon(crate::host_execution::background_execution(
+        let task = intent_core::spawn_daemon(crate::execution_call::background_execution(
             h.original.as_ref().clone(),
             None,
             async move {
@@ -9456,7 +9555,10 @@ mod genuine_native_startup {
                     )
                     .await
                     .unwrap();
-                assert_eq!(created["agent"]["harnessVersion"], "3.2");
+                assert_eq!(
+                    created["agent"]["harnessVersion"],
+                    intent_core::CURRENT_HARNESS_VERSION
+                );
                 services
                     .store
                     .get_agent_session(&intent_core::AgentId::from(
@@ -9490,7 +9592,7 @@ mod genuine_native_startup {
             let row = self.row.clone();
             let execution = self.services.as_ref().clone();
             let subscriber = tracing_subscriber::registry().with(self.acknowledgments.clone());
-            intent_core::spawn_daemon(crate::host_execution::background_execution(
+            intent_core::spawn_daemon(crate::execution_call::background_execution(
                 execution,
                 None,
                 async move {
@@ -9517,7 +9619,14 @@ mod genuine_native_startup {
                 stored.acp_session_id.as_deref(),
                 Some(first.session_id.as_str())
             );
-            assert_eq!(stored.harness_version, if legacy { "2.9" } else { "3.2" });
+            assert_eq!(
+                stored.harness_version,
+                if legacy {
+                    "2.9"
+                } else {
+                    intent_core::CURRENT_HARNESS_VERSION
+                }
+            );
             let (origin, pending, pid) = {
                 let handles = self.manager.handles.lock().unwrap();
                 let handle = &handles[&self.row.id];
