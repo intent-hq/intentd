@@ -29,6 +29,7 @@
         "server_error": { "expect": "not-quota" },
         "unknown": { "expect": "not-quota" },
         "no_result": { "expect": "not-quota" },
+        "incomplete_tool_call": { "expect": "not-quota" },
         "transport_lost": { "expect": "not-quota" },
         "worker_shutdown": { "expect": "not-quota" }
       }
@@ -294,6 +295,13 @@
       "source": "claude-agent-acp TURN_NO_RESULT_MESSAGE",
       "message": "Internal error: The turn ended without a result: the agent went idle while this prompt was still in flight (e.g. the model stream dropped mid-turn). Any partial output may be incomplete; please retry.",
       "data": { "errorKind": "no_result" },
+      "expect": "not-quota"
+    },
+    {
+      "adapter": "claude-code",
+      "source": "claude-agent-acp 0.95.0 stuck tool calls: Claude ended the turn while dispatched tool calls had no results (the adapter files it as internal_error)",
+      "message": "Internal error: Claude ended the turn without returning results for tool calls: toolu_01AbCdEfGhIjKlMnOpQrStUv",
+      "data": { "errorKind": "incomplete_tool_call" },
       "expect": "not-quota"
     },
     {

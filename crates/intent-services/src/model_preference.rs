@@ -1,7 +1,7 @@
 //! Port of the Claude Code ACP adapter's model-name resolution
 //! (`resolveModelPreference` in `@agentclientprotocol/claude-agent-acp`
-//! `dist/session-model.js`, mirrored at 0.81.1 — a drift test fails when the
-//! adapter pin moves), used by the unknown-model guard
+//! `dist/session-model.js`, mirrored at 0.95.0 — unchanged since 0.81.1; a
+//! drift test fails when the adapter pin moves), used by the unknown-model guard
 //! (intent-hq/intent#7121). The adapter applies a caller's model through
 //! `session/set_config_option` and resolves it against its picker rows with
 //! these tiers: exact / canonical id or display name, substring containment
@@ -249,7 +249,7 @@ mod tests {
 
     /// The claude-agent-acp release whose `resolveModelPreference` this
     /// module mirrors.
-    const MIRRORED_CLAUDE_AGENT_ACP_VERSION: &str = "0.81.1";
+    const MIRRORED_CLAUDE_AGENT_ACP_VERSION: &str = "0.95.0";
 
     /// Drift guard: the port mirrors one adapter release. When the
     /// claude-agent-acp pin moves, re-read the new adapter's
@@ -268,7 +268,8 @@ mod tests {
 
     // Expected values below were cross-checked by running the pinned
     // adapter's own `resolveModelPreference` (claude-agent-acp 0.81.1) on
-    // the same inputs.
+    // the same inputs. In 0.95.0 that function and every helper it calls are
+    // byte-identical, so the expectations still hold.
     #[test]
     fn helpers_match_the_adapter_regexes() {
         assert_eq!(canonicalize(" Opus-1M "), "opus[1m]");
