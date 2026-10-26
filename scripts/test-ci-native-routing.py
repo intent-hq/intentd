@@ -827,10 +827,12 @@ class RunnerAvailabilityTests(unittest.TestCase):
                 self.assertEqual(outputs["linux_burst"], "true")
                 self.assertEqual(outputs["windows_burst"], "true")
 
-    def test_merge_queue_keeps_heavy_linux_jobs_on_github_hosted(self):
-        # The queue starts ~4 heavy 16-CPU Rust jobs at once, more than the two
-        # 8-CPU intent-cache slots absorb in the queue's time budget. Light
-        # jobs, PRs and pushes keep the probe's choice.
+    def test_merge_queue_heavy_jobs_read_their_own_slots(self):
+        # The queue's heavy 16-CPU Rust jobs take only the slots their own
+        # merge_group entries win; the shared linux_labels mapping bursts there.
+        # Here the one bigmem slot goes to coverage-all, so check bursts too
+        # (test_merge_queue_check_takes_a_slot_after_the_coverage_suites covers
+        # check on a slot). Light jobs, PRs and pushes keep the probe's choice.
         same_repo = {"pull_request": {"head": {"repo": {"full_name": "intent-hq/intentd"}}}}
         for idle in (True, False):
             fleet = [slot(), small_slot(), runner("Windows", "X64"), runner()] if idle else []
@@ -842,7 +844,7 @@ class RunnerAvailabilityTests(unittest.TestCase):
                     hosted = event == "merge_group" or not idle
                     slots = json.loads(outputs["slots"])
                     # The one free heavy slot goes to `coverage-changed` on a PR (it ranks
-                    # above check); the queue lists no heavy job. check bursts to its 16x WarpBuild runner.
+                    # above check) and to coverage-all in the queue. check bursts to its 16x WarpBuild runner.
                     self.assertEqual(slots["check"], ["warp-ubuntu-2404-x64-16x"])
                     self.assertEqual(slots["coverage-changed"], BIG if event == "pull_request" and idle else ["warp-ubuntu-2404-x64-16x"])
                     # Free standard labels never take a self-hosted slot, even an idle one.
@@ -976,9 +978,37 @@ class RunnerAvailabilityTests(unittest.TestCase):
                                    jobs=jobs, xlThreshold="2")
                 slots = json.loads(result["outputs"]["slots"])
                 self.assertEqual((slots["coverage-changed"], slots["check"]), (coverage, check))
-        # In the merge queue check is unlisted for the event and bursts at 16x.
+        # In the merge queue check also takes a free slot (see the next test).
         result = run_route(self.workflow, org=fleet, eventName="merge_group", xlThreshold="2")
-        self.assertEqual(json.loads(result["outputs"]["slots"])["check"], ["warp-ubuntu-2404-x64-16x"])
+        self.assertEqual(json.loads(result["outputs"]["slots"])["check"], BIG)
+
+    def test_merge_queue_check_takes_a_slot_after_the_coverage_suites(self):
+        # The queue builds one entry at a time and coverage-all on xl (~20 min)
+        # sets its pace. check takes a free xl or bigmem slot after coverage-all
+        # and coverage-e2e (it slows down least on 8 CPUs), else bursts at 16x.
+        # coverage-changed stays on WarpBuild in the queue.
+        fleet = [xl_slot(), xl_slot(), slot(), slot()]
+        warp16 = ["warp-ubuntu-2404-x64-16x"]
+        def busy(labels):
+            return {"status": "in_progress", "labels": labels, "created_at": "2099-01-01T00:00:00Z"}
+        for xl_free, big_free, expected in (
+                (2, 2, {"coverage-all": XL, "coverage-e2e": XL, "check": BIG, "daemon-lifecycle-linux": BIG}),
+                (1, 2, {"coverage-all": XL, "coverage-e2e": BIG, "check": BIG, "daemon-lifecycle-linux": warp16}),
+                (0, 2, {"coverage-all": BIG, "coverage-e2e": BIG, "check": warp16, "daemon-lifecycle-linux": warp16}),
+                (2, 0, {"coverage-all": XL, "coverage-e2e": XL, "check": warp16, "daemon-lifecycle-linux": warp16}),
+                (0, 0, {"coverage-all": warp16, "coverage-e2e": warp16, "check": warp16, "daemon-lifecycle-linux": warp16})):
+            with self.subTest(xl_free=xl_free, big_free=big_free):
+                jobs = [busy(XL)] * (2 - xl_free) + [busy(BIG)] * (2 - big_free)
+                result = run_route(self.workflow, org=fleet, eventName="merge_group", jobs=jobs, xlThreshold="2")
+                slots = json.loads(result["outputs"]["slots"])
+                self.assertEqual({key: slots[key] for key in expected}, expected)
+                self.assertEqual(slots["coverage-changed"], warp16)
+        # A queue run with only 12 GB heavy slots free never puts check there.
+        result = run_route(self.workflow, org=[small_heavy_slot(), small_heavy_slot()], eventName="merge_group")
+        self.assertEqual(json.loads(result["outputs"]["slots"])["check"], warp16)
+        # The kill switch sends it back to WarpBuild with every other listed job.
+        result = run_route(self.workflow, org=fleet, eventName="merge_group", xlThreshold="2", linuxDisabled="true")
+        self.assertEqual(json.loads(result["outputs"]["slots"])["check"], warp16)
 
     def test_16_core_jobs_never_overflow_to_small_heavy_slots(self):
         # intent-ci3's 12 GB heavy slots OOM-killed check and coverage-changed
