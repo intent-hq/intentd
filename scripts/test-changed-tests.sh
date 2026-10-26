@@ -500,6 +500,63 @@ expect_cargo "$core_rdeps_lib" "-p intentd --bins --tests"
 [[ "$stdout" != *"not selected"* ]] || fail "$case_name: misleading note: $stdout"
 [[ "$(grep -c 'note:' <<<"$stdout")" -eq 1 ]] || fail "$case_name: expected one note: $stdout"
 
+# --print-edges / --print-rdeps expose the scanner's view for
+# scripts/check-rdeps-parity.py, which compares it with cargo metadata in CI.
+fixture_edges=$'alpha\tintent-core\ndelta\talpha\ngamma\tintent-core\nintent-app\tintent-services\nintent-services\tintent-core\nintent-svc-transfer\tintent-services\nintentd\tintent-services'
+fixture_rdeps=$'intent-core\talpha delta gamma intent-app intent-services intent-svc-transfer intentd'
+
+case_name="--print-edges prints every workspace dependency, sorted"
+reset_repo
+run_script --print-edges
+expect_ok
+[[ "$stdout" == "$fixture_edges" ]] || fail "$case_name: edges were"$'\n'"$stdout"$'\n'"expected"$'\n'"$fixture_edges"
+[[ -z "$cargo_log" ]] || fail "$case_name: cargo ran: $cargo_log"
+
+case_name="--print-rdeps prints intent-core's transitive dependents"
+reset_repo
+run_script --print-rdeps
+expect_ok
+[[ "$stdout" == "$fixture_rdeps" ]] || fail "$case_name: rdeps were '$stdout', expected '$fixture_rdeps'"
+
+case_name="--print-edges follows a renamed workspace dependency without a path"
+reset_repo
+write crates/gamma/Cargo.toml $'[package]\nname = "gamma"\n\n[dev-dependencies]\ncore = { package = "intent-core", workspace = true }'
+write crates/beta/Cargo.toml $'[package]\nname = "beta"\n\n[dependencies.core]\npackage = "intent-core"\nworkspace = true'
+run_script --print-edges
+expect_ok
+[[ "$stdout" == $'alpha\tintent-core\nbeta\tintent-core\n'* ]] || fail "$case_name: beta edge missing: $stdout"
+[[ "$stdout" == *$'\ngamma\tintent-core\n'* ]] || fail "$case_name: gamma edge missing: $stdout"
+run_script --print-rdeps
+expect_ok
+[[ "$stdout" == $'intent-core\talpha beta delta gamma intent-app intent-services intent-svc-transfer intentd' ]] ||
+  fail "$case_name: rdeps were '$stdout'"
+
+case_name="print modes need no git checkout, BASE or valid end-to-end map"
+reset_repo
+nogit="$temp_dir/nogit"
+rm -rf "$nogit"
+mkdir -p "$nogit/scripts"
+cp -R "$repo/crates" "$nogit/"
+cp "$script" "$nogit/scripts/"
+mkdir -p "$nogit/.config"
+printf 'not a valid map line\n' >"$nogit/.config/e2e-test-map.txt"
+set +e
+stdout=$(cd "$nogit" && PATH="$bin_dir" BASE=no-such-ref "$script_bash" "$nogit/scripts/changed-tests.sh" --print-rdeps 2>"$temp_dir/stderr")
+status=$?
+set -e
+stderr=$(<"$temp_dir/stderr")
+expect_ok
+[[ "$stdout" == "$fixture_rdeps" ]] || fail "$case_name: rdeps were '$stdout'"
+rm -rf "$nogit"
+
+case_name="a print mode combined with another flag is a usage error"
+reset_repo
+for args in "--print-edges --print-rdeps" "--print-rdeps --dry-run" "--instrumented --print-edges" "--print-edges --base origin/main"; do
+  # shellcheck disable=SC2086 # split the flag list on purpose
+  run_script $args
+  [[ "$status" -eq 2 && "$stderr" == *"Usage:"* ]] || fail "$case_name: '$args' exited $status: $stderr"
+done
+
 case_name="a crate other than intent-core does not propagate to its dependents"
 reset_repo
 edit crates/alpha/src/lib.rs
