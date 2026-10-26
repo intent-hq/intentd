@@ -788,6 +788,7 @@ fn merge_requirements(
             have: approvals_have,
             needed: Some(1),
             changes_requested: 0,
+            latest_reviews: None,
         },
         threads: crate::pr_ops::MergeRequirementsThreads {
             unresolved: Some(unresolved),

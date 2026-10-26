@@ -734,6 +734,8 @@ pub(crate) fn map_review(value: Value) -> Result<Review> {
         verdict: verdict_from_state(r.state.as_deref().unwrap_or_default()),
         body: r.body,
         submitted_at: r.submitted_at.unwrap_or_default(),
+        id: r.id.map(|id| id.to_string()),
+        commit_sha: r.commit_id.filter(|sha| !sha.is_empty()),
     })
 }
 
@@ -985,10 +987,14 @@ mod dto {
 
     #[derive(Deserialize)]
     pub(super) struct Review {
+        #[serde(default)]
+        pub id: Option<u64>,
         pub user: Option<User>,
         pub state: Option<String>,
         pub body: Option<String>,
         pub submitted_at: Option<String>,
+        #[serde(default)]
+        pub commit_id: Option<String>,
     }
 
     #[derive(Deserialize)]
@@ -1270,7 +1276,7 @@ query GetPrObservation($owner: String!, $repo: String!, $prNumber: Int!, $checks
       }
       reviews(last: 100) {
         pageInfo { hasPreviousPage }
-        nodes { author { login } state submittedAt }
+        nodes { databaseId author { login } state submittedAt commit { oid } }
       }
       reviewThreads(first: 100) {
         pageInfo { hasNextPage }
@@ -1435,6 +1441,15 @@ fn parse_observed_reviews(pr: &Value) -> Option<Vec<Review>> {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string(),
+                id: r
+                    .get("databaseId")
+                    .and_then(Value::as_u64)
+                    .map(|id| id.to_string()),
+                commit_sha: r
+                    .pointer("/commit/oid")
+                    .and_then(Value::as_str)
+                    .filter(|sha| !sha.is_empty())
+                    .map(String::from),
             })
             .collect(),
     )
@@ -3058,6 +3073,21 @@ mod tests {
         .unwrap();
         assert_eq!(r.author, "rev");
         assert_eq!(r.verdict, ReviewVerdict::RequestChanges);
+        assert_eq!(
+            (r.id, r.commit_sha),
+            (None, None),
+            "absent fields stay unknown"
+        );
+        let r = map_review(json!({
+            "id": 5_639_064_405_u64,
+            "user": { "login": "rev" },
+            "state": "CHANGES_REQUESTED",
+            "submitted_at": "2026-10-24T17:01:00Z",
+            "commit_id": "c0f1e6f11"
+        }))
+        .unwrap();
+        assert_eq!(r.id.as_deref(), Some("5639064405"));
+        assert_eq!(r.commit_sha.as_deref(), Some("c0f1e6f11"));
         assert_eq!(verdict_from_state("APPROVED"), ReviewVerdict::Approve);
         assert_eq!(verdict_from_state("COMMENTED"), ReviewVerdict::Comment);
     }
@@ -3229,7 +3259,7 @@ mod tests {
             "reviews": {
                 "pageInfo": { "hasPreviousPage": false },
                 "nodes": [
-                    { "author": { "login": "a" }, "state": "APPROVED", "submittedAt": "2026-01-01T00:00:00Z" },
+                    { "databaseId": 42, "author": { "login": "a" }, "state": "APPROVED", "submittedAt": "2026-01-01T00:00:00Z", "commit": { "oid": "abc123" } },
                     { "author": null, "state": "COMMENTED", "submittedAt": null },
                 ]
             },
@@ -3244,6 +3274,12 @@ mod tests {
         let reviews = parse_observed_reviews(&pr).expect("window complete");
         assert_eq!(reviews.len(), 2);
         assert_eq!(reviews[0].verdict, ReviewVerdict::Approve);
+        assert_eq!(reviews[0].id.as_deref(), Some("42"));
+        assert_eq!(reviews[0].commit_sha.as_deref(), Some("abc123"));
+        assert_eq!(
+            (reviews[1].id.as_deref(), reviews[1].commit_sha.as_deref()),
+            (None, None)
+        );
         assert_eq!(reviews[1].author, "unknown");
         assert_eq!(reviews[1].verdict, ReviewVerdict::Comment);
         assert_eq!(

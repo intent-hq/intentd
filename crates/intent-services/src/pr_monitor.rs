@@ -678,6 +678,21 @@ impl SharedPrSnapshot {
             // a probe actually answers.
             previous.is_some_and(|p| p.ejection_tracked)
         };
+        // A degraded review read keeps the previously observed per-reviewer
+        // reviews (re-anchored to this read's head) rather than dropping
+        // them: an emit baseline without them would let the next answered
+        // read adopt a review submitted in between silently.
+        if requirements.approvals.latest_reviews.is_none() {
+            let head = self.head_sha.as_deref().filter(|h| !h.is_empty());
+            requirements.approvals.latest_reviews = previous
+                .and_then(|p| p.requirements.approvals.latest_reviews.clone())
+                .map(|mut reviews| {
+                    for r in &mut reviews {
+                        r.on_current_head = r.commit_sha.as_deref().zip(head).map(|(c, h)| c == h);
+                    }
+                    reviews
+                });
+        }
         // Only THIS read's own answered check runs count as observed — a
         // carried-forward empty list may be stale (CI may have started since)
         // — and only a head an earlier poll already saw may flag: the head's
@@ -5126,6 +5141,9 @@ mod tests {
         mergeable_state: String,
         conversation_comments: usize,
         approvals: Vec<String>,
+        /// Reviews served after the `approvals` stand-ins, verbatim (ids,
+        /// commits, verdicts) — the per-reviewer latest-review tests.
+        extra_reviews: Vec<Review>,
         threads: Vec<ReviewThread>,
         checks: Vec<RollupCheck>,
         merge_queue_removal: Option<intent_sourcecontrol::MergeQueueRemoval>,
@@ -5224,6 +5242,7 @@ mod tests {
                 mergeable_state: "clean".into(),
                 conversation_comments: 0,
                 approvals: vec![],
+                extra_reviews: vec![],
                 threads: vec![],
                 checks: vec![RollupCheck {
                     name: "build".into(),
@@ -5290,7 +5309,10 @@ mod tests {
                     verdict: ReviewVerdict::Approve,
                     body: None,
                     submitted_at: "2026-01-01T00:00:00Z".into(),
+                    id: None,
+                    commit_sha: None,
                 })
+                .chain(self.extra_reviews.iter().cloned())
                 .collect()
         }
 
@@ -6115,6 +6137,7 @@ mod tests {
                     have: 0,
                     needed: Some(1),
                     changes_requested: 0,
+                    latest_reviews: None,
                 },
                 threads: pr_ops::MergeRequirementsThreads {
                     unresolved: Some(1),
@@ -8560,6 +8583,221 @@ mod tests {
             forge.fetches() - before,
             1,
             "one shared fetch for the case-variant pair"
+        );
+    }
+
+    fn sc_review(author: &str, verdict: ReviewVerdict, at: &str, id: &str, commit: &str) -> Review {
+        Review {
+            author: author.into(),
+            verdict,
+            body: None,
+            submitted_at: at.into(),
+            id: Some(id.into()),
+            commit_sha: Some(commit.into()),
+        }
+    }
+
+    /// Regression for intentd#2605 (review 5639064405): the bot requested
+    /// changes again on a newer commit. The decision and counts stayed
+    /// `changes_requested` / 1, so the monitor used to report nothing; it now
+    /// reports the second review and the commit it covers.
+    #[tokio::test]
+    async fn a_repeated_changes_requested_review_on_a_new_commit_wakes_the_owner() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        forge.edit(|s| {
+            s.head_sha = "c0f1e6f11".into();
+            s.extra_reviews = vec![sc_review(
+                "review-bot",
+                ReviewVerdict::RequestChanges,
+                "2026-10-24T09:00:00Z",
+                "5638000000",
+                "8c0e5137c",
+            )];
+        });
+        let monitor = register(&svc, &ws, &owner).await;
+        let baseline = monitor.baseline_snapshot.clone().expect("baseline");
+        assert!(
+            baseline.contains("\"latestReviews\""),
+            "the checklist carries per-reviewer reviews: {baseline}"
+        );
+
+        forge.edit(|s| {
+            s.extra_reviews.push(sc_review(
+                "review-bot",
+                ReviewVerdict::RequestChanges,
+                "2026-10-24T17:01:00Z",
+                "5639064405",
+                "c0f1e6f11",
+            ));
+        });
+        assert!(svc
+            .pr_monitor_check_and_flush(&ws, &monitor.monitor_id)
+            .await
+            .expect("check"));
+        let text = owner_messages(&svc, &owner).await;
+        assert!(
+            text.contains(
+                "new review from review-bot: changes requested on c0f1e6f1 (current head)"
+            ),
+            "{text}"
+        );
+        assert!(
+            !text.contains("review decision:"),
+            "the decision did not change: {text}"
+        );
+        assert!(
+            text.contains(
+                "latest reviews: review-bot changes requested on c0f1e6f1 (current head)"
+            ),
+            "the wake checklist shows the latest review: {text}"
+        );
+
+        // A quiet re-check reports nothing more.
+        assert!(!svc
+            .pr_monitor_check_and_flush(&ws, &monitor.monitor_id)
+            .await
+            .expect("re-check"));
+    }
+
+    /// A push leaves an approval behind: reported once as an older-commit
+    /// review, not on every poll.
+    #[tokio::test]
+    async fn a_push_past_an_approval_reports_the_review_as_on_an_older_commit() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        forge.edit(|s| {
+            s.extra_reviews = vec![sc_review(
+                "alice",
+                ReviewVerdict::Approve,
+                "2026-10-24T09:00:00Z",
+                "1",
+                "aaaaaaaa",
+            )];
+        });
+        let monitor = register(&svc, &ws, &owner).await;
+        forge.edit(|s| s.head_sha = "bbbbbbbb".into());
+        assert!(svc
+            .pr_monitor_check_and_flush(&ws, &monitor.monitor_id)
+            .await
+            .expect("check"));
+        let text = owner_messages(&svc, &owner).await;
+        assert!(
+            text.contains(
+                "alice's latest review (approved) is on an older commit aaaaaaaa; head is bbbbbbbb"
+            ),
+            "{text}"
+        );
+        assert_eq!(text.matches("is on an older commit").count(), 1, "{text}");
+        assert!(!svc
+            .pr_monitor_check_and_flush(&ws, &monitor.monitor_id)
+            .await
+            .expect("re-check"));
+    }
+
+    /// A degraded review read keeps the observed reviews in the snapshot, so
+    /// a wake delivered meanwhile (which moves the emit baseline) cannot make
+    /// the next answered read adopt a review submitted in between silently.
+    #[tokio::test]
+    async fn a_degraded_review_read_does_not_swallow_a_later_review() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        forge.edit(|s| {
+            s.extra_reviews = vec![sc_review(
+                "review-bot",
+                ReviewVerdict::RequestChanges,
+                "2026-10-24T09:00:00Z",
+                "1",
+                "aaaaaaaa",
+            )];
+        });
+        let monitor = register(&svc, &ws, &owner).await;
+
+        forge.edit(|s| {
+            s.fail_list_reviews = true;
+            s.conversation_comments = 1;
+            s.extra_reviews.push(sc_review(
+                "review-bot",
+                ReviewVerdict::RequestChanges,
+                "2026-10-24T17:01:00Z",
+                "2",
+                "aaaaaaaa",
+            ));
+        });
+        assert!(svc
+            .pr_monitor_check_and_flush(&ws, &monitor.monitor_id)
+            .await
+            .expect("degraded check"));
+        let before = owner_messages(&svc, &owner).await;
+        assert!(before.contains("conversation comment"), "{before}");
+        assert!(
+            !before.contains("new review from"),
+            "reviews unreadable: {before}"
+        );
+
+        forge.edit(|s| s.fail_list_reviews = false);
+        assert!(svc
+            .pr_monitor_check_and_flush(&ws, &monitor.monitor_id)
+            .await
+            .expect("recovered check"));
+        let after = owner_messages(&svc, &owner).await;
+        assert!(
+            after.contains(
+                "new review from review-bot: changes requested on aaaaaaaa (current head)"
+            ),
+            "{after}"
+        );
+    }
+
+    #[test]
+    fn latest_review_lines_need_both_sides_and_stay_quiet_when_unchanged() {
+        let reviews = |id: &str, commit: &str, on_head: bool| {
+            Some(vec![pr_ops::LatestReview {
+                reviewer: "review-bot".into(),
+                state: "changes_requested".into(),
+                submitted_at: format!("2026-10-24T17:0{id}:00Z"),
+                commit_sha: Some(commit.into()),
+                on_current_head: Some(on_head),
+                id: Some(id.into()),
+            }])
+        };
+        let legacy = snapshot(|_| {});
+        let tracked =
+            snapshot(|s| s.requirements.approvals.latest_reviews = reviews("1", "aaaaaaaa", true));
+        assert!(
+            !diff_snapshots(&legacy, &tracked)
+                .iter()
+                .any(|l| l.contains("review")),
+            "a baseline persisted before the field existed is adopted silently"
+        );
+        assert!(
+            !diff_snapshots(&tracked, &legacy)
+                .iter()
+                .any(|l| l.contains("review")),
+            "unreadable reviews are not a change"
+        );
+        assert!(diff_snapshots(&tracked, &tracked).is_empty());
+
+        let newer =
+            snapshot(|s| s.requirements.approvals.latest_reviews = reviews("2", "aaaaaaaa", true));
+        assert_eq!(
+            diff_snapshots(&tracked, &newer),
+            vec!["new review from review-bot: changes requested on aaaaaaaa (current head)"]
+        );
+        let on_older = snapshot(|s| {
+            s.head_sha = Some("bbbbbbbbbb".into());
+            s.requirements.approvals.latest_reviews = reviews("2", "aaaaaaaa", false);
+        });
+        assert!(diff_snapshots(&tracked, &on_older).iter().any(|l| l
+            == "new review from review-bot: changes requested on aaaaaaaa (older commit; head is bbbbbbbb)"));
+        let stale = snapshot(|s| {
+            s.head_sha = Some("bbbbbbbbbb".into());
+            s.requirements.approvals.latest_reviews = reviews("1", "aaaaaaaa", false);
+        });
+        assert!(diff_snapshots(&tracked, &stale).iter().any(|l| l
+            == "review-bot's latest review (changes requested) is on an older commit aaaaaaaa; head is bbbbbbbb"));
+        assert!(
+            !diff_snapshots(&stale, &stale)
+                .iter()
+                .any(|l| l.contains("older commit")),
+            "reported once per transition"
         );
     }
 

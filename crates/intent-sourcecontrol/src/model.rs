@@ -259,6 +259,16 @@ pub struct Review {
     pub verdict: ReviewVerdict,
     pub body: Option<String>,
     pub submitted_at: String,
+    /// The forge's review identity (GitHub REST `id` / GraphQL
+    /// `databaseId`), when reported. Distinguishes two reviews by the same
+    /// author with the same verdict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// The commit the review was submitted against (GitHub `commit_id` /
+    /// GraphQL `commit.oid`); `None` when the host does not report it
+    /// (GitLab approvals).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_sha: Option<String>,
 }
 
 /// One changed PR file; absent patches include binary or forge-omitted diffs.

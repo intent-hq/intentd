@@ -1103,6 +1103,90 @@ pub struct MergeRequirementsApprovals {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub needed: Option<u32>,
     pub changes_requested: i64,
+    /// Each reviewer's latest submitted review, newest first — so a consumer
+    /// can tell a fresh review from an old one with the same verdict, and
+    /// whether it covers the current head. Presence-detected: `None` (key
+    /// omitted) when the review read degraded, never an empty fabrication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_reviews: Option<Vec<LatestReview>>,
+}
+
+/// One reviewer's latest submitted review in
+/// [`MergeRequirementsApprovals::latest_reviews`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LatestReview {
+    pub reviewer: String,
+    /// `approved` / `changes_requested` / `commented` (GitHub `DISMISSED`
+    /// collapses to `commented`, as in [`aggregate_reviews`]).
+    pub state: String,
+    pub submitted_at: String,
+    /// The commit the review covers; omitted when the host does not report it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_sha: Option<String>,
+    /// Whether `commit_sha` is the PR's current head; omitted when either is
+    /// unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_current_head: Option<bool>,
+    /// The forge's review identity, when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+}
+
+impl LatestReview {
+    /// The identity the monitor diff keys "new review submitted" on: the
+    /// forge id when reported, else the submission time.
+    pub(crate) fn identity(&self) -> &str {
+        self.id.as_deref().unwrap_or(&self.submitted_at)
+    }
+}
+
+/// The wire word for a review verdict in [`LatestReview::state`].
+fn latest_review_state(verdict: ReviewVerdict) -> &'static str {
+    match verdict {
+        ReviewVerdict::Approve => "approved",
+        ReviewVerdict::RequestChanges => "changes_requested",
+        ReviewVerdict::Comment => "commented",
+    }
+}
+
+/// Each reviewer's latest SUBMITTED review (any verdict), newest first.
+/// Reviews without a submission time (GitHub's author-only `PENDING`) are
+/// skipped. On equal timestamps the later list entry wins (the forge lists
+/// chronologically). `on_current_head` compares the review's commit with
+/// `head_sha` when both are known.
+pub(crate) fn latest_reviews(reviews: &[Review], head_sha: Option<&str>) -> Vec<LatestReview> {
+    let mut latest: HashMap<&str, &Review> = HashMap::new();
+    for r in reviews.iter().filter(|r| !r.submitted_at.is_empty()) {
+        match latest.get(r.author.as_str()) {
+            Some(prev) if r.submitted_at < prev.submitted_at => {}
+            _ => {
+                latest.insert(r.author.as_str(), r);
+            }
+        }
+    }
+    let head = head_sha.filter(|h| !h.is_empty());
+    let mut out: Vec<LatestReview> = latest
+        .into_values()
+        .map(|r| LatestReview {
+            reviewer: r.author.clone(),
+            state: latest_review_state(r.verdict).to_string(),
+            submitted_at: r.submitted_at.clone(),
+            commit_sha: r.commit_sha.clone(),
+            on_current_head: r
+                .commit_sha
+                .as_deref()
+                .zip(head)
+                .map(|(commit, head)| commit == head),
+            id: r.id.clone(),
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        b.submitted_at
+            .cmp(&a.submitted_at)
+            .then_with(|| a.reviewer.cmp(&b.reviewer))
+    });
+    out
 }
 
 /// The `mergeQueueEjection` block: the PR's latest merge-queue removal event
@@ -1603,6 +1687,7 @@ pub(crate) fn merge_requirements(
         have: agg.approval_count,
         needed: rules.and_then(|r| r.required_approving_review_count),
         changes_requested: agg.changes_requested_count,
+        latest_reviews: None,
     };
     let threads = MergeRequirementsThreads {
         unresolved: unresolved_threads,
@@ -1794,7 +1879,7 @@ pub(crate) async fn merge_requirements_for_pr_detailed(
     // stub `signals` for a failed probe.
     let ejection_known = signals.is_some();
     let mut complete = ejection_known && reviews.is_some();
-    let agg = aggregate_reviews(&reviews.unwrap_or_default());
+    let agg = aggregate_reviews(reviews.as_deref().unwrap_or_default());
 
     // The probe carries the forge's `reviewDecision`; when it did not — no
     // probe at all, or a host reporting the rest without the verdict — the
@@ -1826,7 +1911,11 @@ pub(crate) async fn merge_requirements_for_pr_detailed(
     complete &= threads_complete;
 
     let merge_queue_reported = signals.as_ref().and_then(|s| s.is_in_merge_queue);
-    let requirements = merge_requirements(pr, signals.as_ref(), &fallback_runs, &agg, unresolved);
+    let mut requirements =
+        merge_requirements(pr, signals.as_ref(), &fallback_runs, &agg, unresolved);
+    requirements.approvals.latest_reviews = reviews
+        .as_deref()
+        .map(|r| latest_reviews(r, pr.head_sha.as_deref()));
     Ok(MergeRequirementsRead {
         requirements,
         review_comment_count: review_comments,
@@ -1869,7 +1958,7 @@ pub(crate) async fn merge_requirements_from_observation(
         complete &= reviews.is_some();
         reviews
     };
-    let agg = aggregate_reviews(&reviews.unwrap_or_default());
+    let agg = aggregate_reviews(reviews.as_deref().unwrap_or_default());
 
     let (fallback_runs, runs_complete) =
         fallback_check_runs(sc, repo_ref, pr, Some(&signals)).await?;
@@ -1882,6 +1971,9 @@ pub(crate) async fn merge_requirements_from_observation(
 
     let merge_queue_reported = signals.is_in_merge_queue;
     let mut requirements = merge_requirements(pr, Some(&signals), &fallback_runs, &agg, unresolved);
+    requirements.approvals.latest_reviews = reviews
+        .as_deref()
+        .map(|r| latest_reviews(r, pr.head_sha.as_deref()));
     if let Some(identity) = observation.ancestry_identity.as_ref().filter(|identity| {
         pr.state == PrState::Open
             && identity.is_valid()
@@ -2032,6 +2124,8 @@ mod tests {
             verdict,
             body: None,
             submitted_at: at.into(),
+            id: None,
+            commit_sha: None,
         }
     }
 
@@ -2698,6 +2792,154 @@ mod tests {
         let agg = aggregate_reviews(&reviews);
         assert_eq!(agg.approval_count, 1);
         assert_eq!(agg.changes_requested_count, 1);
+    }
+
+    fn review_on(
+        author: &str,
+        verdict: ReviewVerdict,
+        at: &str,
+        id: Option<&str>,
+        commit: Option<&str>,
+    ) -> Review {
+        Review {
+            id: id.map(String::from),
+            commit_sha: commit.map(String::from),
+            ..review(author, verdict, at)
+        }
+    }
+
+    /// intentd#2605: two `CHANGES_REQUESTED` reviews by the same bot on
+    /// different commits — only the newer one is the bot's latest review,
+    /// and it is the one that covers the head.
+    #[test]
+    fn latest_review_per_reviewer_tracks_newest_review_and_its_commit() {
+        let reviews = vec![
+            review_on(
+                "bot",
+                ReviewVerdict::RequestChanges,
+                "2026-10-24T09:00:00Z",
+                Some("1"),
+                Some("old0000000"),
+            ),
+            review_on(
+                "alice",
+                ReviewVerdict::Approve,
+                "2026-10-24T10:00:00Z",
+                Some("2"),
+                Some("old0000000"),
+            ),
+            review_on(
+                "bot",
+                ReviewVerdict::RequestChanges,
+                "2026-10-24T17:01:00Z",
+                Some("5639064405"),
+                Some("c0f1e6f11"),
+            ),
+            review_on(
+                "pending",
+                ReviewVerdict::Comment,
+                "",
+                Some("3"),
+                Some("c0f1e6f11"),
+            ),
+        ];
+        let latest = latest_reviews(&reviews, Some("c0f1e6f11"));
+        assert_eq!(latest.len(), 2, "a pending (unsubmitted) review is skipped");
+        assert_eq!(latest[0].reviewer, "bot", "newest first");
+        assert_eq!(latest[0].state, "changes_requested");
+        assert_eq!(latest[0].id.as_deref(), Some("5639064405"));
+        assert_eq!(latest[0].on_current_head, Some(true));
+        assert_eq!(latest[1].reviewer, "alice");
+        assert_eq!(latest[1].state, "approved");
+        assert_eq!(latest[1].on_current_head, Some(false));
+    }
+
+    #[test]
+    fn latest_review_includes_comment_only_follow_ups_and_unknown_commits() {
+        let reviews = vec![
+            review_on(
+                "bot",
+                ReviewVerdict::RequestChanges,
+                "2026-10-24T09:00:00Z",
+                None,
+                Some("aaa"),
+            ),
+            review_on(
+                "bot",
+                ReviewVerdict::Comment,
+                "2026-10-24T09:05:00Z",
+                None,
+                Some("aaa"),
+            ),
+            review(
+                "gitlab-approver",
+                ReviewVerdict::Approve,
+                "2026-10-24T08:00:00Z",
+            ),
+        ];
+        let latest = latest_reviews(&reviews, Some("aaa"));
+        assert_eq!(latest[0].state, "commented", "any verdict counts as latest");
+        assert_eq!(
+            latest[0].identity(),
+            "2026-10-24T09:05:00Z",
+            "time keys a review without an id"
+        );
+        assert_eq!(latest[1].commit_sha, None);
+        assert_eq!(
+            latest[1].on_current_head, None,
+            "unknown commit stays unknown"
+        );
+        assert_eq!(
+            latest_reviews(&reviews, None)[0].on_current_head,
+            None,
+            "unknown head stays unknown"
+        );
+        // The aggregate is unchanged: the bot's actionable review still counts.
+        assert_eq!(aggregate_reviews(&reviews).changes_requested_count, 1);
+    }
+
+    #[test]
+    fn latest_reviews_serialize_presence_detected() {
+        let mut approvals = MergeRequirementsApprovals {
+            decision: "none".into(),
+            have: 0,
+            needed: None,
+            changes_requested: 0,
+            latest_reviews: None,
+        };
+        let wire = serde_json::to_value(&approvals).unwrap();
+        assert!(
+            wire.get("latestReviews").is_none(),
+            "absent = unknown, never null"
+        );
+        approvals.latest_reviews = Some(latest_reviews(
+            &[review_on(
+                "bot",
+                ReviewVerdict::RequestChanges,
+                "2026-10-24T17:01:00Z",
+                Some("9"),
+                Some("c0f1e6f11"),
+            )],
+            Some("c0f1e6f11"),
+        ));
+        let wire = serde_json::to_value(&approvals).unwrap();
+        assert_eq!(
+            wire["latestReviews"],
+            serde_json::json!([{
+                "reviewer": "bot",
+                "state": "changes_requested",
+                "submittedAt": "2026-10-24T17:01:00Z",
+                "commitSha": "c0f1e6f11",
+                "onCurrentHead": true,
+                "id": "9",
+            }])
+        );
+        // A persisted checklist from before the field existed still parses.
+        let old: MergeRequirementsApprovals = serde_json::from_value(serde_json::json!({
+            "decision": "none", "have": 0, "changesRequested": 0
+        }))
+        .unwrap();
+        assert_eq!(old.latest_reviews, None);
     }
 
     #[test]
