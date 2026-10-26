@@ -525,6 +525,13 @@ pub(crate) struct PrMonitorSnapshot {
     /// never part of the public projection or the change diff on its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checks_not_started_delivered: Option<String>,
+    /// `requirements.approvals.latestReviews` was carried forward from the
+    /// previous snapshot because this read's review fetch degraded. The
+    /// carried list keeps the emit anchor able to report a review submitted
+    /// meanwhile, but it is not an observation: the rendered checklist omits
+    /// it. Internal persisted bookkeeping only.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub latest_reviews_carried: bool,
 }
 
 impl PrMonitorSnapshot {
@@ -682,17 +689,19 @@ impl SharedPrSnapshot {
         // reviews (re-anchored to this read's head) rather than dropping
         // them: an emit baseline without them would let the next answered
         // read adopt a review submitted in between silently.
-        if requirements.approvals.latest_reviews.is_none() {
-            let head = self.head_sha.as_deref().filter(|h| !h.is_empty());
+        let latest_reviews_carried = requirements.approvals.latest_reviews.is_none();
+        if latest_reviews_carried {
             requirements.approvals.latest_reviews = previous
                 .and_then(|p| p.requirements.approvals.latest_reviews.clone())
                 .map(|mut reviews| {
                     for r in &mut reviews {
-                        r.on_current_head = r.commit_sha.as_deref().zip(head).map(|(c, h)| c == h);
+                        r.reanchor(self.head_sha.as_deref());
                     }
                     reviews
                 });
         }
+        let latest_reviews_carried =
+            latest_reviews_carried && requirements.approvals.latest_reviews.is_some();
         // Only THIS read's own answered check runs count as observed — a
         // carried-forward empty list may be stale (CI may have started since)
         // — and only a head an earlier poll already saw may flag: the head's
@@ -725,6 +734,7 @@ impl SharedPrSnapshot {
             status_checks: Some(status_checks),
             required_check_names,
             observed_at: None,
+            latest_reviews_carried,
             checks_not_started_delivered: same_head
                 .and_then(|p| p.checks_not_started_delivered.clone()),
         }
@@ -4003,6 +4013,18 @@ impl Services {
             if fresh.skipped_tracked && !s.skipped_tracked {
                 adopt_skipped_encoding(s, &fresh);
             }
+            // An anchor persisted before per-reviewer reviews were tracked
+            // (or registered on a degraded review read) has none: adopt the
+            // fresh list silently so the NEXT review is reportable, instead
+            // of the both-sides guard in the diff staying silent forever.
+            if s.requirements.approvals.latest_reviews.is_none()
+                && fresh.requirements.approvals.latest_reviews.is_some()
+            {
+                s.requirements
+                    .approvals
+                    .latest_reviews
+                    .clone_from(&fresh.requirements.approvals.latest_reviews);
+            }
             if fresh.ejection_tracked && !s.ejection_tracked {
                 s.requirements
                     .merge_queue_ejection
@@ -6159,6 +6181,7 @@ mod tests {
             required_check_names: None,
             observed_at: None,
             checks_not_started_delivered: None,
+            latest_reviews_carried: false,
         };
         f(&mut s);
         s
@@ -8657,6 +8680,137 @@ mod tests {
             .pr_monitor_check_and_flush(&ws, &monitor.monitor_id)
             .await
             .expect("re-check"));
+    }
+
+    /// A monitor registered before per-reviewer reviews were tracked has an
+    /// emit baseline without `latestReviews`. The first poll adopts the
+    /// current reviews silently; the NEXT review is reported (the review
+    /// finding on the intentd#2605 fix: without the adoption the both-sides
+    /// guard kept every upgraded monitor silent).
+    #[tokio::test]
+    async fn an_upgraded_monitor_without_latest_reviews_reports_the_next_review() {
+        let (_db, _root, svc, forge, ws, owner) = setup().await;
+        forge.edit(|s| {
+            s.extra_reviews = vec![sc_review(
+                "review-bot",
+                ReviewVerdict::RequestChanges,
+                "2026-10-24T09:00:00Z",
+                "1",
+                "aaaaaaaa",
+            )];
+        });
+        let monitor = register(&svc, &ws, &owner).await;
+        let row = svc
+            .store()
+            .get_pr_monitor(&monitor.monitor_id)
+            .await
+            .unwrap();
+        let strip = |col: &Option<String>| -> Option<String> {
+            let mut v: Value = serde_json::from_str(col.as_deref()?).ok()?;
+            v.pointer_mut("/requirements/approvals")?
+                .as_object_mut()?
+                .remove("latestReviews");
+            serde_json::to_string(&v).ok()
+        };
+        let (last, baseline) = (strip(&row.last_snapshot), strip(&row.baseline_snapshot));
+        assert!(!baseline.as_deref().unwrap().contains("latestReviews"));
+        assert!(svc
+            .store()
+            .update_pr_monitor_poll(
+                &monitor.monitor_id,
+                PrMonitorPollUpdate {
+                    last_snapshot: last.as_deref(),
+                    baseline_snapshot: baseline.as_deref(),
+                    pending_changes: &[],
+                    pending_since: None,
+                    last_change_at: None,
+                    last_polled_at: row.last_polled_at.as_deref(),
+                    last_error: None,
+                    updated_at: &now_iso(),
+                    expected_updated_at: &row.updated_at,
+                },
+            )
+            .await
+            .unwrap());
+
+        assert!(
+            !svc.pr_monitor_check_and_flush(&ws, &monitor.monitor_id)
+                .await
+                .expect("adopting check"),
+            "existing reviews are history to an upgraded baseline"
+        );
+        forge.edit(|s| {
+            s.extra_reviews.push(sc_review(
+                "review-bot",
+                ReviewVerdict::RequestChanges,
+                "2026-10-24T17:01:00Z",
+                "2",
+                "aaaaaaaa",
+            ));
+        });
+        assert!(svc
+            .pr_monitor_check_and_flush(&ws, &monitor.monitor_id)
+            .await
+            .expect("check"));
+        let text = owner_messages(&svc, &owner).await;
+        assert!(
+            text.contains("new review from review-bot: changes requested on aaaaaaaa"),
+            "{text}"
+        );
+    }
+
+    /// A baseline whose head was unknown still gets the older-commit line once
+    /// the review is known to be behind the head.
+    #[test]
+    fn an_older_commit_review_is_reported_after_an_unknown_head() {
+        let review = |on_head: Option<bool>| {
+            Some(vec![pr_ops::LatestReview {
+                reviewer: "review-bot".into(),
+                state: "changes_requested".into(),
+                submitted_at: "2026-10-24T09:00:00Z".into(),
+                commit_sha: Some("aaaaaaaa".into()),
+                on_current_head: on_head,
+                id: None,
+            }])
+        };
+        let unknown = snapshot(|s| {
+            s.head_sha = None;
+            s.requirements.approvals.latest_reviews = review(None);
+        });
+        let behind = snapshot(|s| {
+            s.head_sha = Some("bbbbbbbb".into());
+            s.requirements.approvals.latest_reviews = review(Some(false));
+        });
+        assert!(diff_snapshots(&unknown, &behind).iter().any(|l| l
+            == "review-bot's latest review (changes requested) is on an older commit aaaaaaaa; head is bbbbbbbb"));
+        assert!(
+            !diff_snapshots(&behind, &behind)
+                .iter()
+                .any(|l| l.contains("older commit")),
+            "reported once"
+        );
+    }
+
+    /// A carried-forward list (degraded review read) keeps the emit anchor
+    /// but is not rendered as if freshly read.
+    #[test]
+    fn a_carried_latest_review_list_is_not_rendered_in_the_checklist() {
+        let mut s = snapshot(|s| {
+            s.requirements.approvals.latest_reviews = Some(vec![pr_ops::LatestReview {
+                reviewer: "alice".into(),
+                state: "approved".into(),
+                submitted_at: "2026-10-24T09:00:00Z".into(),
+                commit_sha: Some("aaaaaaaa".into()),
+                on_current_head: Some(true),
+                id: None,
+            }]);
+        });
+        let harness = crate::harness::latest();
+        assert!(harness
+            .pr_checklist(&s)
+            .contains("latest reviews: alice approved"));
+        s.latest_reviews_carried = true;
+        assert!(!harness.pr_checklist(&s).contains("latest reviews"));
     }
 
     /// A push leaves an approval behind: reported once as an older-commit

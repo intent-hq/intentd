@@ -820,6 +820,7 @@ pub(crate) fn pr_snapshot(state: &str) -> crate::pr_monitor::PrMonitorSnapshot {
         required_check_names: None,
         observed_at: None,
         checks_not_started_delivered: None,
+        latest_reviews_carried: false,
     }
 }
 

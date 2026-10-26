@@ -172,8 +172,9 @@ fn attention_verb(kind: &str) -> &str {
 /// Reported only when BOTH snapshots carry `latestReviews`, so a baseline
 /// persisted before the field existed is adopted silently. Two lines:
 /// a reviewer's latest review identity moved ("new review"), and an
-/// approve / changes-requested review that covered the head no longer does
-/// because the head moved ("older commit").
+/// approve / changes-requested review is now known to be on an older
+/// commit and was not already reported so ("older commit"; a baseline whose
+/// head was unknown counts as not yet reported).
 fn diff_latest_reviews(old: &PrMonitorSnapshot, new: &PrMonitorSnapshot) -> Vec<String> {
     let (Some(before), Some(after)) = (
         old.requirements.approvals.latest_reviews.as_ref(),
@@ -205,7 +206,7 @@ fn diff_latest_reviews(old: &PrMonitorSnapshot, new: &PrMonitorSnapshot) -> Vec<
             ));
         } else if matches!(review.state.as_str(), "approved" | "changes_requested")
             && review.on_current_head == Some(false)
-            && prior.is_some_and(|p| p.on_current_head == Some(true))
+            && prior.is_some_and(|p| p.on_current_head != Some(false))
         {
             if let (Some(commit), Some(head)) = (review.commit_sha.as_deref(), head) {
                 changes.push(format!(
@@ -1020,8 +1021,20 @@ impl Harness for V1 {
     }
 
     fn pr_checklist(&self, s: &PrMonitorSnapshot) -> String {
+        let mut requirements =
+            serde_json::to_value(&s.requirements).expect("serialize requirements");
+        // A carried-forward list is bookkeeping, not this read's observation:
+        // render the row as unknown rather than as fresh data.
+        if s.latest_reviews_carried {
+            if let Some(approvals) = requirements
+                .get_mut("approvals")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                approvals.remove("latestReviews");
+            }
+        }
         super::review_wake::checklist(
-            &serde_json::to_value(&s.requirements).expect("serialize requirements"),
+            &requirements,
             crate::pr_monitor::requirements_ready(&s.requirements),
         )
     }

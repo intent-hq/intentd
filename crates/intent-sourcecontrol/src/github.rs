@@ -1276,7 +1276,7 @@ query GetPrObservation($owner: String!, $repo: String!, $prNumber: Int!, $checks
       }
       reviews(last: 100) {
         pageInfo { hasPreviousPage }
-        nodes { databaseId author { login } state submittedAt commit { oid } }
+        nodes { author { login } state submittedAt commit { oid } }
       }
       reviewThreads(first: 100) {
         pageInfo { hasNextPage }
@@ -1441,10 +1441,11 @@ fn parse_observed_reviews(pr: &Value) -> Option<Vec<Review>> {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string(),
-                id: r
-                    .get("databaseId")
-                    .and_then(Value::as_u64)
-                    .map(|id| id.to_string()),
+                // `databaseId` is a 32-bit GraphQL Int that current review
+                // ids overflow, and `fullDatabaseId` is missing on older GHES
+                // schemas, so this window carries no id; consumers key
+                // reviews on `submitted_at`, which both read paths report.
+                id: None,
                 commit_sha: r
                     .pointer("/commit/oid")
                     .and_then(Value::as_str)
@@ -3177,6 +3178,8 @@ mod tests {
     #[test]
     fn pr_observation_query_embeds_the_probe_and_strips_the_same_way() {
         assert!(PR_OBSERVATION_QUERY.contains("baseRef { target { oid } }"));
+        // `databaseId` is a 32-bit Int that current review ids overflow.
+        assert!(!PR_OBSERVATION_QUERY.contains("databaseId"));
         assert!(!PR_OBSERVATION_QUERY.contains("baseRefOid"));
         // The folded read carries every probe selection verbatim (so the
         // same parser serves both) and the schema fallback strips exactly
@@ -3259,7 +3262,7 @@ mod tests {
             "reviews": {
                 "pageInfo": { "hasPreviousPage": false },
                 "nodes": [
-                    { "databaseId": 42, "author": { "login": "a" }, "state": "APPROVED", "submittedAt": "2026-01-01T00:00:00Z", "commit": { "oid": "abc123" } },
+                    { "author": { "login": "a" }, "state": "APPROVED", "submittedAt": "2026-01-01T00:00:00Z", "commit": { "oid": "abc123" } },
                     { "author": null, "state": "COMMENTED", "submittedAt": null },
                 ]
             },
@@ -3274,7 +3277,10 @@ mod tests {
         let reviews = parse_observed_reviews(&pr).expect("window complete");
         assert_eq!(reviews.len(), 2);
         assert_eq!(reviews[0].verdict, ReviewVerdict::Approve);
-        assert_eq!(reviews[0].id.as_deref(), Some("42"));
+        assert_eq!(
+            reviews[0].id, None,
+            "the GraphQL window selects no review id"
+        );
         assert_eq!(reviews[0].commit_sha.as_deref(), Some("abc123"));
         assert_eq!(
             (reviews[1].id.as_deref(), reviews[1].commit_sha.as_deref()),

@@ -1103,7 +1103,7 @@ pub struct MergeRequirementsApprovals {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub needed: Option<u32>,
     pub changes_requested: i64,
-    /// Each reviewer's latest submitted review, newest first — so a consumer
+    /// Each reviewer's latest review ([`latest_reviews`]), newest first — so a consumer
     /// can tell a fresh review from an old one with the same verdict, and
     /// whether it covers the current head. Presence-detected: `None` (key
     /// omitted) when the review read degraded, never an empty fabrication.
@@ -1135,9 +1135,21 @@ pub struct LatestReview {
 
 impl LatestReview {
     /// The identity the monitor diff keys "new review submitted" on: the
-    /// forge id when reported, else the submission time.
+    /// submission time. Not the forge id — the GraphQL observation selects
+    /// none (see `parse_observed_reviews`), so an id-based key would flip
+    /// whenever a poll switched between the folded and per-signal reads.
     pub(crate) fn identity(&self) -> &str {
-        self.id.as_deref().unwrap_or(&self.submitted_at)
+        &self.submitted_at
+    }
+
+    /// Recompute [`Self::on_current_head`] against `head` (empty = unknown).
+    pub(crate) fn reanchor(&mut self, head: Option<&str>) {
+        let head = head.filter(|h| !h.is_empty());
+        self.on_current_head = self
+            .commit_sha
+            .as_deref()
+            .zip(head)
+            .map(|(commit, head)| commit == head);
     }
 }
 
@@ -1150,35 +1162,61 @@ fn latest_review_state(verdict: ReviewVerdict) -> &'static str {
     }
 }
 
-/// Each reviewer's latest SUBMITTED review (any verdict), newest first.
-/// Reviews without a submission time (GitHub's author-only `PENDING`) are
-/// skipped. On equal timestamps the later list entry wins (the forge lists
-/// chronologically). `on_current_head` compares the review's commit with
-/// `head_sha` when both are known.
-pub(crate) fn latest_reviews(reviews: &[Review], head_sha: Option<&str>) -> Vec<LatestReview> {
+/// Each reviewer's latest review, newest first.
+///
+/// - A reviewer's latest approve / request-changes review wins over any
+///   later comment-only review: on GitHub every inline thread reply is
+///   stored as its own `COMMENTED` review, which must neither mask a
+///   standing change request nor read as a fresh review. A reviewer with
+///   no actionable review is represented by their latest comment review.
+/// - The PR author (`pr_author`) is skipped: their reviews are thread
+///   replies (an author cannot approve their own PR), often posted by the
+///   very agent that owns the monitor.
+/// - Comment reviews without a submission time (GitHub's author-only
+///   `PENDING`) are skipped; actionable ones are kept (GitLab approvals may
+///   lack `approved_at`), so the list agrees with the approval counts.
+/// - On equal timestamps the EARLIER list entry wins, as in
+///   [`aggregate_reviews`], so both derivations pick the same review.
+pub(crate) fn latest_reviews(
+    reviews: &[Review],
+    head_sha: Option<&str>,
+    pr_author: Option<&str>,
+) -> Vec<LatestReview> {
+    let actionable = |r: &Review| {
+        matches!(
+            r.verdict,
+            ReviewVerdict::Approve | ReviewVerdict::RequestChanges
+        )
+    };
     let mut latest: HashMap<&str, &Review> = HashMap::new();
-    for r in reviews.iter().filter(|r| !r.submitted_at.is_empty()) {
-        match latest.get(r.author.as_str()) {
-            Some(prev) if r.submitted_at < prev.submitted_at => {}
-            _ => {
-                latest.insert(r.author.as_str(), r);
-            }
+    for r in reviews.iter().filter(|r| {
+        Some(r.author.as_str()) != pr_author && (actionable(r) || !r.submitted_at.is_empty())
+    }) {
+        let replace = match latest.get(r.author.as_str()) {
+            None => true,
+            Some(prev) => match (actionable(prev), actionable(r)) {
+                (false, true) => true,
+                (true, false) => false,
+                _ => r.submitted_at > prev.submitted_at,
+            },
+        };
+        if replace {
+            latest.insert(r.author.as_str(), r);
         }
     }
-    let head = head_sha.filter(|h| !h.is_empty());
     let mut out: Vec<LatestReview> = latest
         .into_values()
-        .map(|r| LatestReview {
-            reviewer: r.author.clone(),
-            state: latest_review_state(r.verdict).to_string(),
-            submitted_at: r.submitted_at.clone(),
-            commit_sha: r.commit_sha.clone(),
-            on_current_head: r
-                .commit_sha
-                .as_deref()
-                .zip(head)
-                .map(|(commit, head)| commit == head),
-            id: r.id.clone(),
+        .map(|r| {
+            let mut review = LatestReview {
+                reviewer: r.author.clone(),
+                state: latest_review_state(r.verdict).to_string(),
+                submitted_at: r.submitted_at.clone(),
+                commit_sha: r.commit_sha.clone(),
+                on_current_head: None,
+                id: r.id.clone(),
+            };
+            review.reanchor(head_sha);
+            review
         })
         .collect();
     out.sort_by(|a, b| {
@@ -1915,7 +1953,7 @@ pub(crate) async fn merge_requirements_for_pr_detailed(
         merge_requirements(pr, signals.as_ref(), &fallback_runs, &agg, unresolved);
     requirements.approvals.latest_reviews = reviews
         .as_deref()
-        .map(|r| latest_reviews(r, pr.head_sha.as_deref()));
+        .map(|r| latest_reviews(r, pr.head_sha.as_deref(), Some(pr.author.as_str())));
     Ok(MergeRequirementsRead {
         requirements,
         review_comment_count: review_comments,
@@ -1973,7 +2011,7 @@ pub(crate) async fn merge_requirements_from_observation(
     let mut requirements = merge_requirements(pr, Some(&signals), &fallback_runs, &agg, unresolved);
     requirements.approvals.latest_reviews = reviews
         .as_deref()
-        .map(|r| latest_reviews(r, pr.head_sha.as_deref()));
+        .map(|r| latest_reviews(r, pr.head_sha.as_deref(), Some(pr.author.as_str())));
     if let Some(identity) = observation.ancestry_identity.as_ref().filter(|identity| {
         pr.state == PrState::Open
             && identity.is_valid()
@@ -2843,7 +2881,7 @@ mod tests {
                 Some("c0f1e6f11"),
             ),
         ];
-        let latest = latest_reviews(&reviews, Some("c0f1e6f11"));
+        let latest = latest_reviews(&reviews, Some("c0f1e6f11"), Some("author"));
         assert_eq!(latest.len(), 2, "a pending (unsubmitted) review is skipped");
         assert_eq!(latest[0].reviewer, "bot", "newest first");
         assert_eq!(latest[0].state, "changes_requested");
@@ -2855,7 +2893,7 @@ mod tests {
     }
 
     #[test]
-    fn latest_review_includes_comment_only_follow_ups_and_unknown_commits() {
+    fn latest_review_keeps_a_standing_verdict_over_later_comment_reviews() {
         let reviews = vec![
             review_on(
                 "bot",
@@ -2864,6 +2902,7 @@ mod tests {
                 None,
                 Some("aaa"),
             ),
+            // A thread reply: GitHub stores it as a COMMENTED review.
             review_on(
                 "bot",
                 ReviewVerdict::Comment,
@@ -2871,31 +2910,62 @@ mod tests {
                 None,
                 Some("aaa"),
             ),
-            review(
-                "gitlab-approver",
-                ReviewVerdict::Approve,
-                "2026-10-24T08:00:00Z",
+            review_on(
+                "commenter",
+                ReviewVerdict::Comment,
+                "2026-10-24T09:10:00Z",
+                None,
+                Some("aaa"),
             ),
+            // The PR author's own thread reply (often the owning agent).
+            review_on(
+                "author",
+                ReviewVerdict::Comment,
+                "2026-10-24T09:20:00Z",
+                None,
+                Some("aaa"),
+            ),
+            // GitLab approvals can lack `approved_at`.
+            review("gitlab-approver", ReviewVerdict::Approve, ""),
         ];
-        let latest = latest_reviews(&reviews, Some("aaa"));
-        assert_eq!(latest[0].state, "commented", "any verdict counts as latest");
+        let latest = latest_reviews(&reviews, Some("aaa"), Some("author"));
+        let names: Vec<_> = latest.iter().map(|r| r.reviewer.as_str()).collect();
         assert_eq!(
-            latest[0].identity(),
-            "2026-10-24T09:05:00Z",
-            "time keys a review without an id"
+            names,
+            ["commenter", "bot", "gitlab-approver"],
+            "author skipped; untimed approval kept"
         );
-        assert_eq!(latest[1].commit_sha, None);
         assert_eq!(
-            latest[1].on_current_head, None,
+            latest[1].state, "changes_requested",
+            "a later comment review does not mask a standing change request"
+        );
+        assert_eq!(latest[1].identity(), "2026-10-24T09:00:00Z");
+        assert_eq!(latest[0].state, "commented", "comment-only reviewer kept");
+        assert_eq!(latest[2].commit_sha, None);
+        assert_eq!(
+            latest[2].on_current_head, None,
             "unknown commit stays unknown"
         );
         assert_eq!(
-            latest_reviews(&reviews, None)[0].on_current_head,
+            latest_reviews(&reviews, None, None)[0].on_current_head,
             None,
             "unknown head stays unknown"
         );
-        // The aggregate is unchanged: the bot's actionable review still counts.
         assert_eq!(aggregate_reviews(&reviews).changes_requested_count, 1);
+        assert_eq!(aggregate_reviews(&reviews).approval_count, 1);
+    }
+
+    #[test]
+    fn latest_review_ties_pick_the_same_review_as_the_aggregate() {
+        let at = "2026-10-24T09:00:00Z";
+        let reviews = vec![
+            review("bot", ReviewVerdict::RequestChanges, at),
+            review("bot", ReviewVerdict::Approve, at),
+        ];
+        let agg = aggregate_reviews(&reviews);
+        let latest = latest_reviews(&reviews, None, None);
+        assert_eq!(agg.changes_requested_count, 1);
+        assert_eq!(latest[0].state, "changes_requested");
     }
 
     #[test]
@@ -2921,6 +2991,7 @@ mod tests {
                 Some("c0f1e6f11"),
             )],
             Some("c0f1e6f11"),
+            None,
         ));
         let wire = serde_json::to_value(&approvals).unwrap();
         assert_eq!(
