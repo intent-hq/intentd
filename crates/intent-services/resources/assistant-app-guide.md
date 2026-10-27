@@ -894,8 +894,8 @@ Assistant chat can show an image from any workspace on the connected computer wh
 
 With the newer daemon guidance, agents can link another workspace by its title. Assistant
 chat opens these links beside the conversation. Opening a workspace link from an agent chat
-or note requires a supporting app version; this behavior is currently available in test
-builds pending its frontend release. Older apps do not support workspace links in those views.
+or note is supported in alpha v2.245.0; use an app version with that support. Older apps do
+not support workspace links in those views.
 
 <!-- Sources: packages/cloudlands-fe/src/lib/utils/workspaces-link-handler.ts (workspace links outside Assistant chat); packages/intentd/crates/intent-services/resources/agent-instructions/v3.4/common.md. -->
 
