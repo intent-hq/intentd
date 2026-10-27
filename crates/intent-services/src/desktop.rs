@@ -1932,7 +1932,7 @@ fn validate_windows(result: &Value, display: &Value) -> Result<(), ()> {
     let pid = |v: &Value| {
         v["pid"]
             .as_u64()
-            .is_some_and(|n| n > 0 && n <= u64::from(u32::MAX))
+            .is_some_and(|n| n > 0 && u32::try_from(n).is_ok())
     };
     let only = |v: &Value, allowed: &[&str]| {
         v.as_object()

@@ -1907,6 +1907,8 @@ fn windowed_screenshot() -> Value {
     })
 }
 
+type Mutation = Box<dyn Fn(&mut Value)>;
+
 #[test]
 fn screenshot_window_metadata_is_validated_and_passed_through() {
     let ws = WorkspaceId::from("workspace");
@@ -1934,7 +1936,7 @@ fn screenshot_window_metadata_is_validated_and_passed_through() {
     offscreen_focus["windows"][0]["focused"] = false.into();
     validate_result(&offscreen_focus, &action, &ws).unwrap();
 
-    let broken: Vec<(&str, Box<dyn Fn(&mut Value)>)> = vec![
+    let broken: Vec<(&str, Mutation)> = vec![
         ("windows not array", Box::new(|v| v["windows"] = json!({}))),
         ("windows null", Box::new(|v| v["windows"] = Value::Null)),
         ("frontmost null", Box::new(|v| v["frontmost"] = Value::Null)),
