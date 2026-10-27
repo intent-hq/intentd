@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.59] - 2026-10-27
+
+### 🧪 Testing
+
+- *(core)* Lint against hard-coded current harness version literals ([#2726](https://github.com/intent-hq/intentd/pull/2726))
+
+
 ## [0.11.58] - 2026-10-26
 
 ### 🚀 Features
