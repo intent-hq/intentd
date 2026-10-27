@@ -1,10 +1,7 @@
-//! Integration tests for sandbox merge-back on agent completion (completion-interception path).
-//!
-//! These tests exercise the `handle_completion_event` → `handle_sandbox_merge_on_completion` wiring:
-//! - (a) Clean merge → completion propagates with merged status; sandbox:cow:merged event; commits in canonical
-//! - (b) Conflict → completion NOT delivered; bounce message queued; canonical pristine; `retry_count` incremented
-//! - (c) Retry cap exhausted → completion propagates with merge-pending
-//! - (d) Bounce refreshes sandbox with canonical HEAD without re-provisioning
+//! The merge-pending sweep's caller-abort/shutdown ordering against the
+//! runtime test double. The completion-interception and sweep tests that
+//! provision a real sandbox live with the runtime
+//! (intent-svc-runtime `sandbox_ops::completion_interception_tests`).
 
 #[cfg(test)]
 mod tests {
@@ -12,15 +9,10 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use git2::Repository;
-    use intent_core::{
-        now_iso, ActorType, AgentId, AgentSession, AgentStatus, Event, EventActor, WorkspaceId,
-    };
-    use intent_git::{cow_probe, CowSupport};
+    use intent_core::{now_iso, AgentId, AgentSession, AgentStatus, WorkspaceId};
     use intent_store::{SandboxStatus, Store};
-    use serde_json::json;
 
-    use crate::events::{EventBus, SubscriptionFilter};
-    use crate::sandbox_ops::{provision_sandbox, ProvisionConfig, ProvisionOutcome};
+    use crate::events::EventBus;
     use crate::Services;
 
     /// `SQLite` db inside an RAII temp dir; the dir sweep on drop also covers
@@ -262,5 +254,4 @@ mod tests {
         );
         reopened.close().await;
     }
-
 }

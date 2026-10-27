@@ -1,4 +1,144 @@
+//! Sandbox merge-back on agent completion (completion-interception path)
+//! and the merge-pending sweep, against the real runtime: each test
+//! provisions a real `CoW` sandbox and merges it back through this crate.
+//!
+//! - (a) Clean merge → completion propagates with merged status; sandbox:cow:merged event; commits in canonical
+//! - (b) Conflict → completion NOT delivered; bounce message queued; canonical pristine; `retry_count` incremented
+//! - (c) Retry cap exhausted → completion propagates with merge-pending
+//! - (d) Bounce refreshes sandbox with canonical HEAD without re-provisioning
+//! - the merge-pending sweep: stranded merges, retry cap, busy agents, conflicts, blocked merges, recovery
+//!
+//! Moved from intent-services' `completion_interception_tests`, whose
+//! fake-runtime merge-sweep test stays in core.
 
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use git2::Repository;
+use intent_core::{
+    now_iso, with_caller, ActorType, AgentId, AgentSession, AgentStatus, Caller, Event, EventActor,
+    WorkspaceApi, WorkspaceId,
+};
+use intent_git::{cow_probe, CowSupport};
+use intent_services::feature_api::{EventBus, SubscriptionFilter};
+use intent_services::Services;
+use intent_store::{SandboxStatus, Store};
+use serde_json::json;
+
+use crate::sandbox_ops::{provision_sandbox, ProvisionConfig, ProvisionOutcome};
+
+/// Core's `SANDBOX_MERGE_SWEEP_RETRY_CAP` (crate-private there). Seeding this
+/// many retries must make the sweep skip the sandbox; raising core's cap makes
+/// `test_sweep_skips_sandbox_at_retry_cap` fail rather than pass silently.
+const SANDBOX_MERGE_SWEEP_RETRY_CAP: i64 = 5;
+
+// Copy of core's `completion_interception_tests::TempDb` (and the helpers
+// below through `create_agent_session`), kept in core for the fake-runtime
+// merge-sweep test.
+/// `SQLite` db inside an RAII temp dir; the dir sweep on drop also covers
+/// the `-wal`/`-shm` sidecars.
+struct TempDb {
+    path: PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+impl TempDb {
+    fn new() -> Self {
+        let dir = intent_services::feature_api::test_support::test_tempdir("completion-test-");
+        let path = dir.path().join("completion.db");
+        Self { path, _dir: dir }
+    }
+}
+
+async fn temp_store() -> (Store, TempDb) {
+    let db = TempDb::new();
+    let store = Store::open(&db.path).await.unwrap();
+    (store, db)
+}
+
+fn init_test_repo(repo_path: &Path) {
+    fs::create_dir_all(repo_path).unwrap();
+    let repo = Repository::init(repo_path).unwrap();
+    let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+    let tree_id = {
+        let mut index = repo.index().unwrap();
+        index.write_tree().unwrap()
+    };
+    let tree = repo.find_tree(tree_id).unwrap();
+    repo.commit(Some("HEAD"), &sig, &sig, "Initial commit", &tree, &[])
+        .unwrap();
+}
+
+fn workspace_for_repo(repo_path: &Path) -> intent_core::Workspace {
+    let now = now_iso();
+    intent_core::Workspace {
+        id: WorkspaceId::new(),
+        title: "Test WS".to_string(),
+        branch: "main".to_string(),
+        created_at: now.clone(),
+        updated_at: now,
+        repository_path: Some(repo_path.to_string_lossy().to_string()),
+        repository_name: Some("test-repo".to_string()),
+        skip_worktree: true,
+        ..Default::default()
+    }
+}
+
+async fn create_agent_session(
+    store: &Store,
+    ws_id: &WorkspaceId,
+    agent_id: &AgentId,
+    parent_id: Option<&AgentId>,
+    sandbox_path: Option<String>,
+) {
+    let agent = AgentSession {
+        harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+        harness_features: None,
+        id: agent_id.clone(),
+        workspace_id: ws_id.clone(),
+        parent_agent_id: parent_id.cloned(),
+        backend_session_id: None,
+        acp_session_id: None,
+        name: "Test Agent".to_string(),
+        name_explicitly_set: false,
+        model: None,
+        reasoning_effort: None,
+        effort_levels: None,
+        provider: None,
+        system_prompt: None,
+        specialist: None,
+        status: AgentStatus::Active,
+        is_active: true,
+        messages: vec![],
+        stats: None,
+        task_note_id: None,
+        skip_auto_commit: false,
+        completion_report: None,
+        completion_report_timestamp: None,
+        attention_request_kind: None,
+        attention_request_reason: None,
+        attention_request_timestamp: None,
+        delegation_depth: None,
+        initial_message: None,
+        context_references: None,
+        image_blocks: None,
+        file_blocks: None,
+        is_background: false,
+        metadata: None,
+        created_at: now_iso(),
+        updated_at: now_iso(),
+        sandbox_id: None,
+        sandbox_path: sandbox_path.clone(),
+        sandbox_branch: sandbox_path.as_ref().map(|_| format!("sb/{}", agent_id.0)),
+        stop_reason: None,
+        stop_reason_timestamp: None,
+        session_corrupted: false,
+        pending_delete_at: None,
+        retired_at: None,
+        notifications_muted: false,
+    };
+    store.insert_agent_session(&agent).await.unwrap();
+}
 
 /// Create a test repo under target/ for same-volume `CoW`.
 fn temp_repo_in_target(name: &str) -> (PathBuf, PathBuf) {
@@ -45,7 +185,7 @@ fn completion_event(ws_id: &WorkspaceId, agent_id: &AgentId) -> Event {
 fn subscribe_to_sandbox_merged(
     bus: &EventBus,
     ws_id: &WorkspaceId,
-) -> crate::events::Subscription {
+) -> intent_services::feature_api::events::Subscription {
     let filter = SubscriptionFilter {
         event_types: vec!["sandbox:cow:merged".to_string()],
         workspace_id: Some(ws_id.0.clone()),
@@ -127,28 +267,34 @@ async fn test_clean_merge_propagates_completion_and_emits_event() {
 
     // Wire up Services with EventBus
     let bus = EventBus::new(store.clone());
-    let services = Services::new(store.clone())
+    let services = crate::test_runtime::with_runtime(Services::new(store.clone()))
         .with_event_bus(bus.clone())
         .with_workspaces_root(workspaces_root.clone());
 
     // Register a completion watch: parent watches child
-    services
-        .register_completion_watch(
-            &ws.id,
-            &ws.id,
+    // Public `app.agents.waitFor` (immediate): the same ungrouped watch the
+    // core original registered through the crate-private
+    // `register_completion_watch`, here also persisted.
+    with_caller(
+        Caller::Agent {
+            agent_id: parent_id.clone(),
+        },
+        services.app_agents_wait(
+            ws.id.clone(),
             parent_id.clone(),
-            "Parent".to_string(),
-            child_id.clone(),
-            None, // no group
-        )
-        .expect("register watch");
+            vec![child_id.0.clone()],
+            Some("immediate".to_string()),
+        ),
+    )
+    .await
+    .expect("register watch");
 
     // Subscribe to sandbox:cow:merged events
     let mut merged_sub = subscribe_to_sandbox_merged(&bus, &ws.id);
 
     // Trigger the completion-interception path
     let event = completion_event(&ws.id, &child_id);
-    services.handle_completion_event(&event).await;
+    services.handle_completion_event_for_test(&event).await;
 
     // Assert: completion WAS delivered to parent (clean merge allows propagation)
     // The parent should have received a wake message
@@ -291,21 +437,27 @@ async fn test_conflict_suppresses_completion_and_bounces_agent() {
 
     // Wire up Services with EventBus
     let bus = EventBus::new(store.clone());
-    let services = Services::new(store.clone())
+    let services = crate::test_runtime::with_runtime(Services::new(store.clone()))
         .with_event_bus(bus.clone())
         .with_workspaces_root(workspaces_root.clone());
 
     // Register a completion watch: parent watches child
-    services
-        .register_completion_watch(
-            &ws.id,
-            &ws.id,
+    // Public `app.agents.waitFor` (immediate): the same ungrouped watch the
+    // core original registered through the crate-private
+    // `register_completion_watch`, here also persisted.
+    with_caller(
+        Caller::Agent {
+            agent_id: parent_id.clone(),
+        },
+        services.app_agents_wait(
+            ws.id.clone(),
             parent_id.clone(),
-            "Parent".to_string(),
-            child_id.clone(),
-            None,
-        )
-        .expect("register watch");
+            vec![child_id.0.clone()],
+            Some("immediate".to_string()),
+        ),
+    )
+    .await
+    .expect("register watch");
 
     // Count parent messages before
     let parent_messages_before = store.get_agent_messages(&parent_id, None).await.unwrap();
@@ -316,7 +468,7 @@ async fn test_conflict_suppresses_completion_and_bounces_agent() {
 
     // Trigger the completion-interception path
     let event = completion_event(&ws.id, &child_id);
-    services.handle_completion_event(&event).await;
+    services.handle_completion_event_for_test(&event).await;
 
     // Assert: completion was NOT delivered (conflict suppresses propagation)
     // Parent should NOT have received a new wake message
@@ -464,25 +616,31 @@ async fn test_retry_cap_exhausted_propagates_with_merge_pending() {
 
     // Wire up Services
     let bus = EventBus::new(store.clone());
-    let services = Services::new(store.clone())
+    let services = crate::test_runtime::with_runtime(Services::new(store.clone()))
         .with_event_bus(bus.clone())
         .with_workspaces_root(workspaces_root.clone());
 
     // Register a completion watch: parent watches child
-    services
-        .register_completion_watch(
-            &ws.id,
-            &ws.id,
+    // Public `app.agents.waitFor` (immediate): the same ungrouped watch the
+    // core original registered through the crate-private
+    // `register_completion_watch`, here also persisted.
+    with_caller(
+        Caller::Agent {
+            agent_id: parent_id.clone(),
+        },
+        services.app_agents_wait(
+            ws.id.clone(),
             parent_id.clone(),
-            "Parent".to_string(),
-            child_id.clone(),
-            None,
-        )
-        .expect("register watch");
+            vec![child_id.0.clone()],
+            Some("immediate".to_string()),
+        ),
+    )
+    .await
+    .expect("register watch");
 
     // Trigger completion
     let event = completion_event(&ws.id, &child_id);
-    services.handle_completion_event(&event).await;
+    services.handle_completion_event_for_test(&event).await;
 
     // Assert: completion WAS delivered (retry cap forces propagation)
     // The parent should have received a wake message
@@ -599,13 +757,13 @@ async fn test_bounce_refreshes_sandbox_without_reprovisioning() {
 
     // Wire up Services
     let bus = EventBus::new(store.clone());
-    let services = Services::new(store.clone())
+    let services = crate::test_runtime::with_runtime(Services::new(store.clone()))
         .with_event_bus(bus.clone())
         .with_workspaces_root(workspaces_root.clone());
 
     // Trigger completion (will conflict and bounce)
     let event = completion_event(&ws.id, &child_id);
-    services.handle_completion_event(&event).await;
+    services.handle_completion_event_for_test(&event).await;
 
     // Assert: sandbox path still exists (not re-provisioned)
     assert!(sandbox_path.exists(), "Sandbox path should still exist");
@@ -701,7 +859,7 @@ async fn setup_merge_pending_sandbox(
         .unwrap();
 
     let bus = EventBus::new(store.clone());
-    let services = Services::new(store.clone())
+    let services = crate::test_runtime::with_runtime(Services::new(store.clone()))
         .with_event_bus(bus.clone())
         .with_workspaces_root(workspaces_root);
 
@@ -762,7 +920,7 @@ async fn test_sweep_skips_sandbox_at_retry_cap() {
         return;
     };
 
-    for _ in 0..crate::SANDBOX_MERGE_SWEEP_RETRY_CAP {
+    for _ in 0..SANDBOX_MERGE_SWEEP_RETRY_CAP {
         store
             .increment_sandbox_retry_count(&ws.id, &agent_id)
             .await

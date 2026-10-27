@@ -1072,6 +1072,9 @@ mod test_hook_tests {
 }
 
 #[cfg(test)]
+mod completion_interception_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

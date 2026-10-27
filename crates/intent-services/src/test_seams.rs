@@ -10,7 +10,7 @@
 use std::future::Future;
 use std::sync::Arc;
 
-use intent_core::{AgentId, BoxFuture, MessageOrigin, Result, Workspace, WorkspaceId};
+use intent_core::{AgentId, BoxFuture, Event, MessageOrigin, Result, Workspace, WorkspaceId};
 use serde_json::Value;
 
 use crate::agent_manager::AgentManager;
@@ -23,6 +23,11 @@ use crate::{CompletionClassifyPark, Services};
 
 #[doc(hidden)]
 impl Services {
+    /// Test seam: `handle_completion_event`.
+    pub async fn handle_completion_event_for_test(&self, event: &Event) {
+        self.handle_completion_event(event).await;
+    }
+
     /// Test seam: `agent_retire_op`.
     pub async fn agent_retire_op_for_test(
         &self,
