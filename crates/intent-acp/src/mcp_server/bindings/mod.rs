@@ -200,6 +200,7 @@ pub(crate) const RETIRED_ALLOWED_METHODS: &[&str] = &[
     "agent.snapshot",
     "agent.status",
     "agent.summary",
+    "browser.clients",
     "browser.docs",
     "browser.listTabs",
     "comment.getThread",

@@ -5006,6 +5006,44 @@ impl Services {
         Ok(serde_json::Value::Object(out))
     }
 
+    /// The `ws.browser.clients()` payload for `id` (see
+    /// [`WorkspaceApi::browser_clients`]): one registry snapshot carrying
+    /// every client's live connections, the unpinned (`Default`) route and
+    /// this workspace's driving-client route with its `source`. Without a
+    /// dispatcher no client is listed and both routes report `no client
+    /// connected`.
+    async fn browser_clients_state(&self, id: &WorkspaceId) -> Result<serde_json::Value> {
+        use intent_core::{ReverseConnectionSnapshot, ReverseDispatchError, ReverseRoute};
+
+        let (target, source) = self.driving_client_route(id).await?;
+        let targets = [intent_core::ReverseTarget::Default, target];
+        let snapshot = self.reverse_dispatch.as_ref().map_or_else(
+            || ReverseConnectionSnapshot {
+                clients: Vec::new(),
+                routes: targets
+                    .iter()
+                    .map(|_| ReverseRoute::failed(&ReverseDispatchError::NoClient))
+                    .collect(),
+            },
+            |d| d.connection_snapshot(id, &targets),
+        );
+        let mut routes = snapshot.routes.into_iter();
+        let mut route = || {
+            let route = routes
+                .next()
+                .unwrap_or_else(|| ReverseRoute::failed(&ReverseDispatchError::NoClient));
+            serde_json::to_value(route).map_err(|e| Error::Internal(e.to_string()))
+        };
+        let unpinned = route()?;
+        let mut workspace = route()?;
+        workspace["source"] = source.into();
+        Ok(serde_json::json!({
+            "clients": snapshot.clients,
+            "unpinned": unpinned,
+            "workspace": workspace,
+        }))
+    }
+
     /// Attach the runtime [`ServerControl`] so `settings.update` can start/stop
     /// the WSS listener on `server.wsApi.enabled` changes (server settings
     /// apply hooks, §5.12).
@@ -25187,6 +25225,13 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             self.require_member(&id).await?;
             self.browser_client_state(&id).await
+        })
+    }
+
+    fn browser_clients(&self, id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.require_member(&id).await?;
+            self.browser_clients_state(&id).await
         })
     }
 

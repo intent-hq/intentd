@@ -44,8 +44,9 @@ use std::sync::{Arc, Mutex};
 
 pub use intent_core::ResolvedClient;
 use intent_core::{
-    now_iso, AgentReverseDispatch, BoxFuture, ClientHostInfo, ClientId, ReverseDispatchError,
-    ReverseLiveClient, ReverseTarget, WorkspaceApi, WorkspaceId,
+    now_iso, AgentReverseDispatch, BoxFuture, ClientHostInfo, ClientId, ReverseClientConnections,
+    ReverseConnectionInfo, ReverseConnectionSnapshot, ReverseDispatchError, ReverseLiveClient,
+    ReverseRoute, ReverseTarget, WorkspaceApi, WorkspaceId,
 };
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -453,6 +454,13 @@ fn newest_eligible_of<'a>(
         .find(|e| e.is_eligible() && e.has_client(client_id) && allowed(e))
 }
 
+/// Whether a `browser.exec` scoped to `workspace_id` may go to member
+/// connections; Chief (and an unscoped request) selects administrator
+/// connections only.
+fn member_scoped(workspace_id: &str) -> bool {
+    !workspace_id.is_empty() && !WorkspaceId::from(workspace_id).is_chief()
+}
+
 /// The connection a reverse request went to, captured cheaply under the
 /// registry lock and formatted only if the request times out.
 struct ConnectionLabel {
@@ -647,6 +655,87 @@ impl PrimaryReverseRegistry {
         clients
     }
 
+    /// Every live hello'd connection grouped by `clientId` (first-connection
+    /// order, connections oldest first; un-hello'd connections omitted, as
+    /// in [`Self::live_clients`]) plus where each of `targets` would be
+    /// delivered for a `browser.exec` scoped to `workspace_id` — the same
+    /// eligibility, scope and newest-connection rules as `dispatch`. One
+    /// lock acquisition, so the routes always name a listed connection.
+    /// Read-only: nothing is sent to any client.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
+    #[must_use]
+    pub fn connection_snapshot(
+        &self,
+        workspace_id: &WorkspaceId,
+        targets: &[ReverseTarget],
+    ) -> ReverseConnectionSnapshot {
+        let member_scope = member_scoped(workspace_id.as_str());
+        let state = self.inner.lock();
+        let mut clients: Vec<(ReverseClientConnections, u64)> = Vec::new();
+        for entry in &state.entries {
+            let Some(identity) = &entry.identity else {
+                continue;
+            };
+            let connection = ReverseConnectionInfo {
+                connection_id: entry.id,
+                transport: entry.transport.as_str().to_string(),
+                connected_at: entry.connected_at.clone(),
+                can_host_browser: entry.is_eligible(),
+            };
+            match clients
+                .iter_mut()
+                .find(|(c, _)| c.client_id == identity.client_id)
+            {
+                Some((client, newest_hello)) => {
+                    client.can_host_browser |= connection.can_host_browser;
+                    client.connections.push(connection);
+                    if entry.hello_seq > *newest_hello {
+                        *newest_hello = entry.hello_seq;
+                        client.name.clone_from(&identity.name);
+                    }
+                }
+                None => clients.push((
+                    ReverseClientConnections {
+                        client_id: identity.client_id.clone(),
+                        name: identity.name.clone(),
+                        can_host_browser: connection.can_host_browser,
+                        connections: vec![connection],
+                    },
+                    entry.hello_seq,
+                )),
+            }
+        }
+        let routes = targets
+            .iter()
+            .map(|target| {
+                match resolve_entry_matching(&state.entries, target, |entry| {
+                    member_scope || entry.channel.is_administrator()
+                }) {
+                    Ok(entry) => {
+                        let identity = entry
+                            .identity
+                            .as_ref()
+                            .expect("an eligible entry always carries an identity");
+                        ReverseRoute {
+                            client_id: Some(identity.client_id.clone()),
+                            name: identity.name.clone(),
+                            connection_id: Some(entry.id),
+                            error: None,
+                        }
+                    }
+                    Err(error) => ReverseRoute::failed(&error),
+                }
+            })
+            .collect();
+        ReverseConnectionSnapshot {
+            clients: clients.into_iter().map(|(c, _)| c).collect(),
+            routes,
+        }
+    }
+
     /// Presence of the given logical clients: one O(1) index lookup per
     /// distinct id under a single lock acquisition, independent of how many
     /// connections the daemon holds. Absent keys are offline. This is the
@@ -819,6 +908,14 @@ impl AgentReverseDispatch for PrimaryReverseRegistry {
             .collect()
     }
 
+    fn connection_snapshot(
+        &self,
+        workspace_id: &WorkspaceId,
+        targets: &[ReverseTarget],
+    ) -> ReverseConnectionSnapshot {
+        PrimaryReverseRegistry::connection_snapshot(self, workspace_id, targets)
+    }
+
     fn authenticated_clients(&self) -> Vec<ReverseLiveClient> {
         self.inner.lock().devices.clone()
     }
@@ -858,10 +955,8 @@ impl AgentReverseDispatch for PrimaryReverseRegistry {
         params: Value,
         target: ReverseTarget,
     ) -> BoxFuture<'a, Result<Value, ReverseDispatchError>> {
-        let member_scope = method == "browser.exec"
-            && params["workspaceId"]
-                .as_str()
-                .is_some_and(|ws| !ws.is_empty() && !intent_core::WorkspaceId::from(ws).is_chief());
+        let member_scope =
+            method == "browser.exec" && params["workspaceId"].as_str().is_some_and(member_scoped);
         let resolved = resolve_entry_matching(&self.inner.lock().entries, &target, |entry| {
             member_scope || entry.channel.is_administrator()
         })

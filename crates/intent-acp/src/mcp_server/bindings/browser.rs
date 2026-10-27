@@ -7,7 +7,10 @@
 //! and echoes the FE's reshaped result. `browser.listTabs` is the registry
 //! read (REV-2 Model 5): a one-action `listTabs` batch through the same seam,
 //! which the daemon answers from its tab registry — every host of the
-//! workspace aggregated — unwrapped to the bare tab array. `browser.docs` is
+//! workspace aggregated — unwrapped to the bare tab array. `browser.clients`
+//! is a read-only view of the connected clients, their live connections and
+//! where a browser request would go ([`WorkspaceApi::browser_clients`]); a
+//! timed-out `browser.exec` points to it. `browser.docs` is
 //! offline: it returns the ported `BROWSER_DOCS` topic text verbatim,
 //! matching the reference `BrowserDocsTool` in `browser-tools.ts`.
 
@@ -30,6 +33,7 @@ pub(crate) const PRELUDE: &str = r"
     ws.browser = {
         exec: (actions, tabId) => host({ method: 'browser.exec', args: { actions, tabId } }),
         listTabs: (scope) => host({ method: 'browser.listTabs', args: { scope } }),
+        clients: () => host({ method: 'browser.clients', args: {} }),
         docs: (topic) => host({ method: 'browser.docs', args: { topic } }),
     };
 ";
@@ -44,6 +48,7 @@ pub(crate) async fn dispatch(
     match method {
         "exec" => exec(api, ws, caller_agent_id, args).await,
         "listTabs" => list_tabs(api, ws, caller_agent_id, args).await,
+        "clients" => api.browser_clients(ws.clone()).await.map_err(map_err),
         "docs" => docs(args),
         other => Err(format!("host: unknown method `browser.{other}`")),
     }
@@ -71,7 +76,23 @@ async fn exec(
         .map(str::to_string);
     api.browser_exec(ws.clone(), actions, tab_id, caller_agent_id.cloned())
         .await
-        .map_err(map_err)
+        .map_err(|e| with_timeout_hint(map_err(e)))
+}
+
+/// The transport's wording for a reverse request that got no answer.
+const TIMEOUT_MARKER: &str = "reverse request timed out: browser.exec";
+
+/// Point a timed-out `browser.exec` at the read that shows which connection
+/// received it; other errors pass through unchanged.
+fn with_timeout_hint(message: String) -> String {
+    if message.contains(TIMEOUT_MARKER) {
+        format!(
+            "{message}. Call ws.browser.clients() to see this client's live connections and \
+             which one received the request."
+        )
+    } else {
+        message
+    }
 }
 
 async fn list_tabs(

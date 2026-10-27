@@ -329,26 +329,37 @@ impl Services {
     /// The [`ReverseTarget`] every agent `browser.exec` (and every routed
     /// claimed-tab request) for `workspace_id` dispatches to — the
     /// workspace's **driving client** (REV-2 Model 10): the explicit pin
-    /// (`Pinned`), else the host of the workspace's existing claimed tabs
-    /// (`Client`), else the first-connected eligible client (`Default`).
+    /// (`Pinned`), else the client actively controlling this workspace's
+    /// desktop (`Client`), else the host of the workspace's existing claimed
+    /// tabs (`Client`), else the first-connected eligible client (`Default`).
     /// Chief and workspaces the store does not know are unpinned.
     #[doc(hidden)]
     pub async fn driving_client_target(
         &self,
         workspace_id: &WorkspaceId,
     ) -> intent_core::Result<intent_core::ReverseTarget> {
+        Ok(self.driving_client_route(workspace_id).await?.0)
+    }
+
+    /// [`Self::driving_client_target`] plus which rule chose it:
+    /// `"workspace"` (the pin), `"desktop"` (active desktop control),
+    /// `"tabs"` (host of claimed tabs) or `"default"`.
+    pub(crate) async fn driving_client_route(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> intent_core::Result<(intent_core::ReverseTarget, &'static str)> {
         use intent_core::{Error, ReverseTarget};
 
         if workspace_id.is_chief() {
-            return Ok(ReverseTarget::Default);
+            return Ok((ReverseTarget::Default, "default"));
         }
         match self.store().workspace_browser_client(workspace_id).await {
-            Ok(Some(client_id)) => return Ok(ReverseTarget::Pinned(client_id)),
+            Ok(Some(client_id)) => return Ok((ReverseTarget::Pinned(client_id), "workspace")),
             Ok(None) | Err(Error::NotFound(_)) => {}
             Err(e) => return Err(e),
         }
         if let Some(client) = self.feature_desktop().active_client(workspace_id) {
-            return Ok(ReverseTarget::Client(client));
+            return Ok((ReverseTarget::Client(client), "desktop"));
         }
         let claimed_host = self
             .store()
@@ -357,7 +368,11 @@ impl Services {
             .into_iter()
             .find(|tab| tab.owner_agent_id.is_some())
             .map(|tab| tab.host_client_id);
-        Ok(claimed_host.map_or(ReverseTarget::Default, ReverseTarget::Client))
+        Ok(
+            claimed_host.map_or((ReverseTarget::Default, "default"), |host| {
+                (ReverseTarget::Client(host), "tabs")
+            }),
+        )
     }
 }
 
