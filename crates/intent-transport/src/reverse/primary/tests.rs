@@ -297,7 +297,7 @@ async fn dispatch_timeout_names_the_silent_client_and_connection() {
         "names the client: {message}"
     );
     assert!(
-        message.contains("within 30s"),
+        message.contains("answer the request within 30s"),
         "states the deadline: {message}"
     );
     assert!(
@@ -307,6 +307,68 @@ async fn dispatch_timeout_names_the_silent_client_and_connection() {
     assert!(
         message.contains("on connection 0"),
         "names the connection: {message}"
+    );
+}
+
+/// A client that *answers* with an error whose text happens to match the
+/// daemon's timeout wording is not relabeled as silent, and a hello name with
+/// quotes is escaped in the timeout diagnostic.
+#[tokio::test]
+async fn client_error_replies_are_never_relabeled_as_timeouts() {
+    let reg = PrimaryReverseRegistry::new();
+    let (a, mut rx_a) = idle_channel();
+    let g_a = reg.register(a.clone(), ReverseTransport::Uds);
+    g_a.bind(identity("a", true));
+    let dispatch = tokio::spawn({
+        let reg = reg.clone();
+        async move {
+            reg.dispatch(
+                "browser.exec",
+                json!({ "actions": [] }),
+                ReverseTarget::Default,
+            )
+            .await
+        }
+    });
+    let frame = rx_a.recv().await.expect("frame");
+    let value: serde_json::Value = serde_json::from_str(&frame).expect("json");
+    a.route_response(&json!({
+        "jsonrpc": "2.0",
+        "id": value["id"],
+        "error": { "code": -32603, "message": "reverse request timed out: browser.exec" },
+    }));
+    let err = dispatch.await.expect("join").expect_err("client error");
+    assert_eq!(
+        err,
+        ReverseDispatchError::Transport {
+            code: -32603,
+            message: "reverse request timed out: browser.exec".to_string(),
+        }
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn dispatch_timeout_escapes_the_hello_name() {
+    let reg = PrimaryReverseRegistry::new();
+    let (a, _rx_a) = idle_channel();
+    let g_a = reg.register(a, ReverseTransport::Wss);
+    let mut quoted = identity("a", true);
+    quoted.name = Some("Bob\" (admin) on connection 9".to_string());
+    g_a.bind(quoted);
+    let err = reg
+        .dispatch(
+            "browser.exec",
+            json!({ "actions": [] }),
+            ReverseTarget::Default,
+        )
+        .await
+        .expect_err("times out");
+    let message = err.to_string();
+    assert!(
+        message.contains(
+            r#"browser client "Bob\" (admin) on connection 9" (a) on connection 0 over wss"#
+        ),
+        "escapes the name: {message}"
     );
 }
 

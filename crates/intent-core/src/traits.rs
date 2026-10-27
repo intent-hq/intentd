@@ -9104,8 +9104,9 @@ pub trait ContextEngine: Send + Sync {
 ///   [`ReverseDispatchError::ClientOffline`] (with `pinned` set for `Pinned`).
 ///   `Client` is what tab-host routing uses, `Pinned` what the per-workspace
 ///   browser-client pin uses — same lookup, distinct error wording.
-/// - [`Default`](Self::Default): the **first-connected** eligible connection;
-///   none ⇒ [`ReverseDispatchError::NoClient`].
+/// - [`Default`](Self::Default): the **first-connected** eligible client,
+///   via its **newest** eligible connection (the same per-client rule as
+///   `Client` / `Pinned`); none ⇒ [`ReverseDispatchError::NoClient`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReverseTarget {
     /// A specific logical client (e.g. the host of a browser tab).
