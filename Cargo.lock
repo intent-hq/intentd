@@ -2311,6 +2311,9 @@ name = "intent-nodes"
 version = "0.11.62"
 dependencies = [
  "intent-core",
+ "serde",
+ "serde_json",
+ "tempfile",
  "tokio",
 ]
 
@@ -2577,6 +2580,7 @@ dependencies = [
  "intent-git",
  "intent-js",
  "intent-linear",
+ "intent-nodes",
  "intent-providers",
  "intent-sentry",
  "intent-services",

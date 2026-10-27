@@ -41,6 +41,8 @@ mod exact_update;
 mod git_credential;
 #[cfg(unix)]
 mod git_remote_intent;
+#[cfg(unix)]
+mod node;
 mod provider;
 mod rpc_profile;
 mod shutdown;
@@ -91,6 +93,12 @@ enum Command {
     #[command(hide = true)]
     #[command(name = "command-worker")]
     EvidenceWorker { directory: PathBuf },
+    /// Run an execution node: listen for this user's head daemon over the
+    /// authenticated node link and run the agents it launches with this
+    /// machine's provider CLIs (Unix). Configured by hand with a private
+    /// config file; experimental and not yet used by head.
+    #[cfg(unix)]
+    Node(node::Args),
     /// Provider authentication and internal ACP launch helpers.
     Provider {
         #[command(subcommand)]
@@ -361,6 +369,10 @@ async fn async_main(cli: Cli) -> ExitCode {
             // signal. Do not initialize file logging or touch daemon state.
             return provider::run(command).await;
         }
+        // The node has its own composition root and stderr-only logging; it
+        // never touches the head's data directory or log files.
+        #[cfg(unix)]
+        Command::Node(args) => return to_exit(node::run(args).await),
         command => command,
     };
     init_tracing(matches!(command, Command::Serve { .. }));
@@ -391,6 +403,8 @@ async fn async_main(cli: Cli) -> ExitCode {
             | Command::EvidenceWorker { .. } => {
                 unreachable!("command evidence helpers run before the async runtime")
             }
+            #[cfg(unix)]
+            Command::Node(_) => unreachable!("intentd node returns before daemon setup"),
             Command::Provider { command } => provider::run(command).await,
             Command::Serve {
                 mode,
