@@ -2007,6 +2007,146 @@ fn pr_monitor_wire(m: &PrMonitor, paused_until: Option<&str>) -> Value {
     out
 }
 
+/// Upgrade backfill for a persisted anchor (the emit baseline or the last
+/// poll's snapshot) about to be diffed against `fresh`: an anchor persisted
+/// before a field was tracked lacks it, so the first poll that reads the
+/// field would either misreport history as news (a false post-upgrade wake)
+/// or, behind a both-sides guard in [`diff_snapshots`], stay silent forever.
+/// Each tracked-later field is adopted from `fresh` silently here, so only
+/// changes observed after tracking began are reported. `last_observed` is
+/// the last poll's snapshot before its own backfill.
+///
+/// Every optional persisted field is exercised by the
+/// `every_optional_field_dropped_from_an_upgraded_baseline_still_reports_changes`
+/// test: a new field that needs adoption here fails it.
+fn backfill_upgraded_anchor(
+    s: &mut PrMonitorSnapshot,
+    fresh: &PrMonitorSnapshot,
+    last_observed: Option<&PrMonitorSnapshot>,
+) {
+    // Freeze old combined evidence before adopting any fresh signals.
+    // Both persisted anchors must retain their own original subset.
+    if s.status_checks.is_none() {
+        s.status_checks = Some(s.requirements.checks.items.clone());
+    }
+    // An initial unreadable result is not an observed empty suite.
+    // Adopt its first complete checks silently, just like registration.
+    if !fresh.checks_unobserved && s.checks_seed_pending && s.head_sha == fresh.head_sha {
+        s.requirements.checks.clone_from(&fresh.requirements.checks);
+        s.checks_unobserved = false;
+        s.checks_seed_pending = false;
+        s.status_checks.clone_from(&fresh.status_checks);
+        s.required_check_names
+            .clone_from(&fresh.required_check_names);
+    }
+    if fresh.head_sha.as_ref().is_some_and(|h| !h.is_empty()) && s.head_sha == fresh.head_sha {
+        // Learning a formerly unknown flag is silent. Store that first
+        // known value in the emit anchor too, so a later real flip is
+        // reportable even if no unrelated wake advanced the anchor.
+        let mut known = s.known_required_checks();
+        for observed in last_observed
+            .filter(|p| p.head_sha == fresh.head_sha)
+            .into_iter()
+            .chain(std::iter::once(fresh))
+        {
+            let observed_known = observed.known_required_checks();
+            // A check first seen passing (or skipped) is silent too.
+            // Retain it even while its flag is unknown. Copy only
+            // missing passing/skipped names, keeping failures/removals
+            // pending for delivery.
+            let names: HashSet<_> = s
+                .requirements
+                .checks
+                .items
+                .iter()
+                .map(|c| c.name.clone())
+                .collect();
+            s.requirements.checks.items.extend(
+                observed
+                    .requirements
+                    .checks
+                    .items
+                    .iter()
+                    .filter(|c| {
+                        matches!(c.status.as_str(), "passed" | "skipped")
+                            && !names.contains(&c.name)
+                    })
+                    .cloned(),
+            );
+            let by_name: HashMap<_, _> = observed
+                .requirements
+                .checks
+                .items
+                .iter()
+                .map(|c| (&c.name, c.required))
+                .collect();
+            for check in &mut s.requirements.checks.items {
+                if !known.contains(&check.name) && observed_known.contains(&check.name) {
+                    if let Some(&required) = by_name.get(&check.name) {
+                        check.required = required;
+                        known.insert(check.name.clone());
+                    }
+                }
+            }
+        }
+        let required_known = if s.requirements.checks.items.is_empty() {
+            s.requirements.checks.required_known
+        } else {
+            s.requirements
+                .checks
+                .items
+                .iter()
+                .all(|c| known.contains(&c.name))
+        };
+        s.requirements.checks = pr_ops::MergeRequirementsChecks::from_items(
+            std::mem::take(&mut s.requirements.checks.items),
+            required_known,
+        );
+        s.required_check_names = Some(known);
+    }
+    if fresh.skipped_tracked && !s.skipped_tracked {
+        adopt_skipped_encoding(s, fresh);
+    }
+    // An anchor persisted before per-reviewer reviews were tracked
+    // (or registered on a degraded review read) has none: adopt the
+    // fresh list silently so the NEXT review is reportable, instead
+    // of the both-sides guard in the diff staying silent forever.
+    if s.requirements.approvals.latest_reviews.is_none()
+        && fresh.requirements.approvals.latest_reviews.is_some()
+    {
+        s.requirements
+            .approvals
+            .latest_reviews
+            .clone_from(&fresh.requirements.approvals.latest_reviews);
+    }
+    // An anchor persisted before ejection tracking has no event field at
+    // all: adopt whatever historical removal event the probe now reports,
+    // so only ejections observed after tracking began are reportable.
+    if fresh.ejection_tracked && !s.ejection_tracked {
+        s.requirements
+            .merge_queue_ejection
+            .clone_from(&fresh.requirements.merge_queue_ejection);
+        s.ejection_tracked = true;
+    }
+    // An ejection that predates the PR's current queue entry is
+    // history, not news (intent-hq/intent#7523: first observed
+    // after the re-queue, it was reported while the queue was about
+    // to land the PR). Adopt it silently, like the backfill above;
+    // persisting it in the baseline keeps the decision once a later
+    // poll loses the queue state (degraded probe, queue exit,
+    // terminal wake).
+    if fresh
+        .requirements
+        .merge_queue_ejection
+        .as_ref()
+        .is_some_and(|e| e.superseded_by_queue_entry(&fresh.requirements))
+    {
+        s.requirements
+            .merge_queue_ejection
+            .clone_from(&fresh.requirements.merge_queue_ejection);
+    }
+}
+
 /// Re-encode a baseline persisted before skipped checks were told apart:
 /// a check it recorded as `passed` that the tracked `fresh` snapshot reports
 /// as `skipped` was a skipped check under the old encoding, not a change.
@@ -3919,138 +4059,8 @@ impl Services {
         // values, which may have changed again in the meantime.
         let last_observed = previous.clone();
 
-        // Upgrade backfill: an anchor persisted before ejection tracking
-        // existed has no event field at all, so the first tracked poll would
-        // misread whatever historical removal event the probe now reports as
-        // news and emit a false post-upgrade wake. Adopt the fresh event
-        // into UNTRACKED anchors silently (persisted via the baseline
-        // write-back below) — only ejections observed after tracking began
-        // are reportable.
-        let backfill = |s: &mut PrMonitorSnapshot| {
-            // Freeze old combined evidence before adopting any fresh signals.
-            // Both persisted anchors must retain their own original subset.
-            if s.status_checks.is_none() {
-                s.status_checks = Some(s.requirements.checks.items.clone());
-            }
-            // An initial unreadable result is not an observed empty suite.
-            // Adopt its first complete checks silently, just like registration.
-            if !fresh.checks_unobserved && s.checks_seed_pending && s.head_sha == fresh.head_sha {
-                s.requirements.checks.clone_from(&fresh.requirements.checks);
-                s.checks_unobserved = false;
-                s.checks_seed_pending = false;
-                s.status_checks.clone_from(&fresh.status_checks);
-                s.required_check_names
-                    .clone_from(&fresh.required_check_names);
-            }
-            if fresh.head_sha.as_ref().is_some_and(|h| !h.is_empty())
-                && s.head_sha == fresh.head_sha
-            {
-                // Learning a formerly unknown flag is silent. Store that first
-                // known value in the emit anchor too, so a later real flip is
-                // reportable even if no unrelated wake advanced the anchor.
-                let mut known = s.known_required_checks();
-                for observed in last_observed
-                    .as_ref()
-                    .filter(|p| p.head_sha == fresh.head_sha)
-                    .into_iter()
-                    .chain(std::iter::once(&fresh))
-                {
-                    let observed_known = observed.known_required_checks();
-                    // A check first seen passing (or skipped) is silent too.
-                    // Retain it even while its flag is unknown. Copy only
-                    // missing passing/skipped names, keeping failures/removals
-                    // pending for delivery.
-                    let names: HashSet<_> = s
-                        .requirements
-                        .checks
-                        .items
-                        .iter()
-                        .map(|c| c.name.clone())
-                        .collect();
-                    s.requirements.checks.items.extend(
-                        observed
-                            .requirements
-                            .checks
-                            .items
-                            .iter()
-                            .filter(|c| {
-                                matches!(c.status.as_str(), "passed" | "skipped")
-                                    && !names.contains(&c.name)
-                            })
-                            .cloned(),
-                    );
-                    let by_name: HashMap<_, _> = observed
-                        .requirements
-                        .checks
-                        .items
-                        .iter()
-                        .map(|c| (&c.name, c.required))
-                        .collect();
-                    for check in &mut s.requirements.checks.items {
-                        if !known.contains(&check.name) && observed_known.contains(&check.name) {
-                            if let Some(&required) = by_name.get(&check.name) {
-                                check.required = required;
-                                known.insert(check.name.clone());
-                            }
-                        }
-                    }
-                }
-                let required_known = if s.requirements.checks.items.is_empty() {
-                    s.requirements.checks.required_known
-                } else {
-                    s.requirements
-                        .checks
-                        .items
-                        .iter()
-                        .all(|c| known.contains(&c.name))
-                };
-                s.requirements.checks = pr_ops::MergeRequirementsChecks::from_items(
-                    std::mem::take(&mut s.requirements.checks.items),
-                    required_known,
-                );
-                s.required_check_names = Some(known);
-            }
-            if fresh.skipped_tracked && !s.skipped_tracked {
-                adopt_skipped_encoding(s, &fresh);
-            }
-            // An anchor persisted before per-reviewer reviews were tracked
-            // (or registered on a degraded review read) has none: adopt the
-            // fresh list silently so the NEXT review is reportable, instead
-            // of the both-sides guard in the diff staying silent forever.
-            if s.requirements.approvals.latest_reviews.is_none()
-                && fresh.requirements.approvals.latest_reviews.is_some()
-            {
-                s.requirements
-                    .approvals
-                    .latest_reviews
-                    .clone_from(&fresh.requirements.approvals.latest_reviews);
-            }
-            if fresh.ejection_tracked && !s.ejection_tracked {
-                s.requirements
-                    .merge_queue_ejection
-                    .clone_from(&fresh.requirements.merge_queue_ejection);
-                s.ejection_tracked = true;
-            }
-            // An ejection that predates the PR's current queue entry is
-            // history, not news (intent-hq/intent#7523: first observed
-            // after the re-queue, it was reported while the queue was about
-            // to land the PR). Adopt it silently, like the backfill above;
-            // persisting it in the baseline keeps the decision once a later
-            // poll loses the queue state (degraded probe, queue exit,
-            // terminal wake).
-            if fresh
-                .requirements
-                .merge_queue_ejection
-                .as_ref()
-                .is_some_and(|e| e.superseded_by_queue_entry(&fresh.requirements))
-            {
-                s.requirements
-                    .merge_queue_ejection
-                    .clone_from(&fresh.requirements.merge_queue_ejection);
-            }
-        };
         if let Some(prev) = previous.as_mut() {
-            backfill(prev);
+            backfill_upgraded_anchor(prev, &fresh, last_observed.as_ref());
         }
 
         // Per-poll activity (fresh vs the LAST POLL's snapshot) anchors the
@@ -4075,7 +4085,7 @@ impl Services {
             .and_then(|s| serde_json::from_str(s).ok())
             .or(previous);
         if let Some(base) = baseline.as_mut() {
-            backfill(base);
+            backfill_upgraded_anchor(base, &fresh, last_observed.as_ref());
         }
 
         // The coalesced net set: REPLACED (never accumulated) each poll, so
@@ -8717,6 +8727,762 @@ mod tests {
             text.contains("new review from review-bot: changes requested on aaaaaaaa"),
             "{text}"
         );
+    }
+
+    /// One of two fully populated [`PrMonitorSnapshot`]s for
+    /// [`every_optional_field_dropped_from_an_upgraded_baseline_still_reports_changes`]:
+    /// `b` gives every field a different value. Plain struct literals with
+    /// no `..Default::default()`, so adding a persisted field anywhere in
+    /// the snapshot is a compile error here until both samples give it a
+    /// value (and the test then checks the upgrade path for it).
+    fn upgrade_sample(b: bool) -> PrMonitorSnapshot {
+        fn pick<T>(b: bool, a: T, other: T) -> T {
+            if b {
+                other
+            } else {
+                a
+            }
+        }
+        let head = pick(b, "aaaaaaaa", "bbbbbbbb");
+        PrMonitorSnapshot {
+            title: pick(b, "Add thing", "Add other thing").into(),
+            url: pick(
+                b,
+                "https://github.com/o/r/pull/42",
+                "https://github.com/o/r/pull/43",
+            )
+            .into(),
+            head_sha: Some(head.into()),
+            conversation_count: pick(b, 1, 3),
+            review_comment_count: pick(b, 2, 5),
+            requirements: MergeRequirements {
+                state: pick(b, "open", "closed").into(),
+                is_draft: b,
+                has_conflicts: b,
+                is_behind: b,
+                ancestry: intent_sourcecontrol::PrAncestry::Known {
+                    base_sha: pick(b, "base1", "base2").into(),
+                    head_sha: head.into(),
+                    behind_by: pick(b, 0, 4),
+                },
+                branch_update_required: Some(b),
+                mergeable: Some(!b),
+                checks: pr_ops::MergeRequirementsChecks {
+                    total: pick(b, 1, 2),
+                    passed: pick(b, 1, 0),
+                    failed: pick(b, 0, 1),
+                    pending: pick(b, 0, 1),
+                    skipped: pick(b, 1, 0),
+                    items: vec![pr_ops::MergeRequirementCheck {
+                        name: "build".into(),
+                        status: pick(b, "passed", "failed").into(),
+                        required: !b,
+                        url: Some(pick(b, "https://ci/1", "https://ci/2").into()),
+                    }],
+                    failing_required: vec![pick(b, "lint", "build").into()],
+                    pending_required: vec![pick(b, "docs", "lint").into()],
+                    required_known: !b,
+                },
+                approvals: pr_ops::MergeRequirementsApprovals {
+                    decision: pick(b, "approved", "changes_requested").into(),
+                    have: pick(b, 1, 0),
+                    needed: Some(pick(b, 1, 2)),
+                    changes_requested: pick(b, 0, 1),
+                    latest_reviews: Some(vec![pr_ops::LatestReview {
+                        reviewer: pick(b, "alice", "bob").into(),
+                        state: pick(b, "approved", "changes_requested").into(),
+                        submitted_at: pick(b, "2026-10-24T09:00:00Z", "2026-10-25T09:00:00Z")
+                            .into(),
+                        commit_sha: Some(head.into()),
+                        on_current_head: Some(!b),
+                        id: Some(pick(b, "1", "2").into()),
+                    }]),
+                },
+                threads: pr_ops::MergeRequirementsThreads {
+                    unresolved: Some(pick(b, 0, 2)),
+                    resolution_required: Some(!b),
+                },
+                merge_state_status: Some(pick(b, "CLEAN", "BLOCKED").into()),
+                merge_blocked_reason: Some(pick(b, "none", "checks failing").into()),
+                rules_known: !b,
+                is_in_merge_queue: Some(!b),
+                merge_queue_ejection: Some(pr_ops::MergeQueueEjection {
+                    at: pick(b, "2026-10-24T10:00:00Z", "2026-10-25T10:00:00Z").into(),
+                    reason: Some(pick(b, "failed_checks", "conflict").into()),
+                }),
+                merge_queue: Some(intent_sourcecontrol::MergeQueueEntry {
+                    position: pick(b, 1, 3),
+                    queue_size: Some(pick(b, 2, 4)),
+                    state: Some(pick(b, "QUEUED", "AWAITING_CHECKS").into()),
+                    // Before `a`'s ejection: an ejection that predates the
+                    // queue entry is adopted as history regardless of upgrades.
+                    enqueued_at: Some(
+                        pick(b, "2026-10-24T09:30:00Z", "2026-10-25T09:30:00Z").into(),
+                    ),
+                    estimated_time_to_merge: Some(pick(b, 60, 120)),
+                }),
+                checks_not_started: Some(pr_ops::ChecksNotStarted {
+                    head_sha: head.into(),
+                    head_committed_at: pick(b, "2026-10-24T08:00:00Z", "2026-10-25T08:00:00Z")
+                        .into(),
+                    threshold_minutes: pick(b, 10, 20),
+                }),
+            },
+            ejection_tracked: !b,
+            skipped_tracked: !b,
+            checks_unobserved: !b,
+            checks_seed_pending: !b,
+            status_checks: Some(vec![pr_ops::MergeRequirementCheck {
+                name: pick(b, "legacy", "legacy-2").into(),
+                status: "passed".into(),
+                required: false,
+                url: Some(pick(b, "https://ci/legacy", "https://ci/legacy-2").into()),
+            }]),
+            required_check_names: Some(BTreeSet::from([pick(b, "build", "lint").into()])),
+            observed_at: Some(pick(b, "2026-10-24T12:00:00Z", "2026-10-25T12:00:00Z").into()),
+            checks_not_started_delivered: Some(head.into()),
+            latest_reviews_carried: !b,
+        }
+    }
+
+    /// The JSON pointers of every field a value's `Serialize` impl leaves
+    /// out (`skip_serializing_if`) or writes as `null`, and of every empty
+    /// list or map (whose item fields would go unvisited). Read from the
+    /// TYPE's own serializer, so it covers fields a sample forgot to fill.
+    /// Limit: `#[serde(flatten)]` fields serialize as map entries, so a
+    /// skipped field inside one is not seen (none of the snapshot's types
+    /// flatten today).
+    mod field_paths {
+        use std::cell::RefCell;
+        use std::collections::BTreeSet;
+
+        use serde::ser::{self, Serialize};
+
+        pub fn empty<T: Serialize>(value: &T) -> BTreeSet<String> {
+            let rec = Rec {
+                path: RefCell::new(Vec::new()),
+                empty: RefCell::new(BTreeSet::new()),
+            };
+            value.serialize(&rec).expect("record fields");
+            rec.empty.into_inner()
+        }
+
+        struct Rec {
+            path: RefCell<Vec<String>>,
+            empty: RefCell<BTreeSet<String>>,
+        }
+
+        impl Rec {
+            fn pointer(&self, key: &str) -> String {
+                let path = self.path.borrow();
+                let mut segments: Vec<&str> = path.iter().map(String::as_str).collect();
+                segments.push(key);
+                format!("/{}", segments.join("/"))
+            }
+            fn field<T: ?Sized + Serialize>(&self, key: &str, value: &T) -> Result<(), Error> {
+                if value.serialize(Probe).is_err_and(|e| e.0 == NULL) {
+                    self.skip(key);
+                }
+                self.nested(key, value)
+            }
+            fn empty_here(&self, len: Option<usize>) {
+                if len == Some(0) {
+                    let pointer: String = self
+                        .path
+                        .borrow()
+                        .iter()
+                        .map(|s| format!("/{s}"))
+                        .collect::<Vec<_>>()
+                        .concat();
+                    self.empty.borrow_mut().insert(pointer);
+                }
+            }
+            fn nested<T: ?Sized + Serialize>(&self, key: &str, value: &T) -> Result<(), Error> {
+                self.path.borrow_mut().push(key.to_owned());
+                let r = value.serialize(self);
+                self.path.borrow_mut().pop();
+                r
+            }
+            fn skip(&self, key: &str) {
+                let pointer = self.pointer(key);
+                self.empty.borrow_mut().insert(pointer);
+            }
+        }
+
+        #[derive(Debug)]
+        pub struct Error(String);
+        impl std::fmt::Display for Error {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+        impl std::error::Error for Error {}
+        impl ser::Error for Error {
+            fn custom<T: std::fmt::Display>(msg: T) -> Self {
+                Self(msg.to_string())
+            }
+        }
+
+        const NULL: &str = "null";
+
+        /// Errs with [`NULL`] only on a top-level `null` (looking through
+        /// newtypes), telling an empty `Option` apart. Compound values err
+        /// otherwise and count as written; [`Rec`] checks their contents.
+        struct Probe;
+
+        macro_rules! leaves {
+            ($($name:ident: $ty:ty),* $(,)?) => {
+                $(fn $name(self, _: $ty) -> Result<(), Error> { Ok(()) })*
+            };
+        }
+
+        impl ser::Serializer for Probe {
+            type Ok = ();
+            type Error = Error;
+            type SerializeSeq = ser::Impossible<(), Error>;
+            type SerializeTuple = ser::Impossible<(), Error>;
+            type SerializeTupleStruct = ser::Impossible<(), Error>;
+            type SerializeTupleVariant = ser::Impossible<(), Error>;
+            type SerializeMap = ser::Impossible<(), Error>;
+            type SerializeStruct = ser::Impossible<(), Error>;
+            type SerializeStructVariant = ser::Impossible<(), Error>;
+            leaves!(serialize_bool: bool, serialize_i8: i8, serialize_i16: i16, serialize_i32: i32,
+                serialize_i64: i64, serialize_u8: u8, serialize_u16: u16, serialize_u32: u32,
+                serialize_u64: u64, serialize_f32: f32, serialize_f64: f64, serialize_char: char,
+                serialize_str: &str, serialize_bytes: &[u8]);
+            fn serialize_none(self) -> Result<(), Error> {
+                Err(ser::Error::custom(NULL))
+            }
+            fn serialize_some<T: ?Sized + Serialize>(self, _: &T) -> Result<(), Error> {
+                Ok(())
+            }
+            fn serialize_unit(self) -> Result<(), Error> {
+                Ok(())
+            }
+            fn serialize_unit_struct(self, _: &'static str) -> Result<(), Error> {
+                Ok(())
+            }
+            fn serialize_unit_variant(
+                self,
+                _: &'static str,
+                _: u32,
+                _: &'static str,
+            ) -> Result<(), Error> {
+                Ok(())
+            }
+            fn serialize_newtype_struct<T: ?Sized + Serialize>(
+                self,
+                _: &'static str,
+                v: &T,
+            ) -> Result<(), Error> {
+                v.serialize(self)
+            }
+            fn serialize_newtype_variant<T: ?Sized + Serialize>(
+                self,
+                _: &'static str,
+                _: u32,
+                _: &'static str,
+                _: &T,
+            ) -> Result<(), Error> {
+                Ok(())
+            }
+            fn serialize_seq(self, _: Option<usize>) -> Result<Self::SerializeSeq, Error> {
+                Err(ser::Error::custom("compound"))
+            }
+            fn serialize_tuple(self, _: usize) -> Result<Self::SerializeTuple, Error> {
+                Err(ser::Error::custom("compound"))
+            }
+            fn serialize_tuple_struct(
+                self,
+                _: &'static str,
+                _: usize,
+            ) -> Result<Self::SerializeTupleStruct, Error> {
+                Err(ser::Error::custom("compound"))
+            }
+            fn serialize_tuple_variant(
+                self,
+                _: &'static str,
+                _: u32,
+                _: &'static str,
+                _: usize,
+            ) -> Result<Self::SerializeTupleVariant, Error> {
+                Err(ser::Error::custom("compound"))
+            }
+            fn serialize_map(self, _: Option<usize>) -> Result<Self::SerializeMap, Error> {
+                Err(ser::Error::custom("compound"))
+            }
+            fn serialize_struct(
+                self,
+                _: &'static str,
+                _: usize,
+            ) -> Result<Self::SerializeStruct, Error> {
+                Err(ser::Error::custom("compound"))
+            }
+            fn serialize_struct_variant(
+                self,
+                _: &'static str,
+                _: u32,
+                _: &'static str,
+                _: usize,
+            ) -> Result<Self::SerializeStructVariant, Error> {
+                Err(ser::Error::custom("compound"))
+            }
+        }
+
+        impl ser::Serializer for &Rec {
+            type Ok = ();
+            type Error = Error;
+            type SerializeSeq = Self;
+            type SerializeTuple = Self;
+            type SerializeTupleStruct = Self;
+            type SerializeTupleVariant = Self;
+            type SerializeMap = Self;
+            type SerializeStruct = Self;
+            type SerializeStructVariant = Self;
+            leaves!(serialize_bool: bool, serialize_i8: i8, serialize_i16: i16, serialize_i32: i32,
+                serialize_i64: i64, serialize_u8: u8, serialize_u16: u16, serialize_u32: u32,
+                serialize_u64: u64, serialize_f32: f32, serialize_f64: f64, serialize_char: char,
+                serialize_str: &str, serialize_bytes: &[u8]);
+            fn serialize_none(self) -> Result<(), Error> {
+                Ok(())
+            }
+            fn serialize_some<T: ?Sized + Serialize>(self, v: &T) -> Result<(), Error> {
+                v.serialize(self)
+            }
+            fn serialize_unit(self) -> Result<(), Error> {
+                Ok(())
+            }
+            fn serialize_unit_struct(self, _: &'static str) -> Result<(), Error> {
+                Ok(())
+            }
+            fn serialize_unit_variant(
+                self,
+                _: &'static str,
+                _: u32,
+                _: &'static str,
+            ) -> Result<(), Error> {
+                Ok(())
+            }
+            fn serialize_newtype_struct<T: ?Sized + Serialize>(
+                self,
+                _: &'static str,
+                v: &T,
+            ) -> Result<(), Error> {
+                v.serialize(self)
+            }
+            fn serialize_newtype_variant<T: ?Sized + Serialize>(
+                self,
+                _: &'static str,
+                _: u32,
+                variant: &'static str,
+                v: &T,
+            ) -> Result<(), Error> {
+                self.field(variant, v)
+            }
+            fn serialize_seq(self, len: Option<usize>) -> Result<Self, Error> {
+                self.empty_here(len);
+                Ok(self)
+            }
+            fn serialize_tuple(self, _: usize) -> Result<Self, Error> {
+                Ok(self)
+            }
+            fn serialize_tuple_struct(self, _: &'static str, _: usize) -> Result<Self, Error> {
+                Ok(self)
+            }
+            fn serialize_tuple_variant(
+                self,
+                _: &'static str,
+                _: u32,
+                _: &'static str,
+                _: usize,
+            ) -> Result<Self, Error> {
+                Ok(self)
+            }
+            fn serialize_map(self, len: Option<usize>) -> Result<Self, Error> {
+                self.empty_here(len);
+                Ok(self)
+            }
+            fn serialize_struct(self, _: &'static str, _: usize) -> Result<Self, Error> {
+                Ok(self)
+            }
+            fn serialize_struct_variant(
+                self,
+                _: &'static str,
+                _: u32,
+                _: &'static str,
+                _: usize,
+            ) -> Result<Self, Error> {
+                Ok(self)
+            }
+        }
+
+        macro_rules! seq_like {
+            ($($tr:ident :: $m:ident),*) => {$(
+                impl ser::$tr for &Rec {
+                    type Ok = ();
+                    type Error = Error;
+                    fn $m<T: ?Sized + Serialize>(&mut self, v: &T) -> Result<(), Error> {
+                        self.nested("*", v)
+                    }
+                    fn end(self) -> Result<(), Error> {
+                        Ok(())
+                    }
+                }
+            )*};
+        }
+        seq_like!(
+            SerializeSeq::serialize_element,
+            SerializeTuple::serialize_element,
+            SerializeTupleStruct::serialize_field,
+            SerializeTupleVariant::serialize_field
+        );
+
+        impl ser::SerializeMap for &Rec {
+            type Ok = ();
+            type Error = Error;
+            fn serialize_key<T: ?Sized + Serialize>(&mut self, _: &T) -> Result<(), Error> {
+                Ok(())
+            }
+            fn serialize_value<T: ?Sized + Serialize>(&mut self, v: &T) -> Result<(), Error> {
+                self.nested("*", v)
+            }
+            fn end(self) -> Result<(), Error> {
+                Ok(())
+            }
+        }
+
+        macro_rules! struct_like {
+            ($($tr:ident),*) => {$(
+                impl ser::$tr for &Rec {
+                    type Ok = ();
+                    type Error = Error;
+                    fn serialize_field<T: ?Sized + Serialize>(&mut self, key: &'static str, v: &T) -> Result<(), Error> {
+                        self.field(key, v)
+                    }
+                    fn skip_field(&mut self, key: &'static str) -> Result<(), Error> {
+                        self.skip(key);
+                        Ok(())
+                    }
+                    fn end(self) -> Result<(), Error> {
+                        Ok(())
+                    }
+                }
+            )*};
+        }
+        struct_like!(SerializeStruct, SerializeStructVariant);
+    }
+
+    /// Every JSON pointer under `v` that names an object key (array items
+    /// by index), depth-first.
+    fn json_key_pointers(v: &Value, at: &str, out: &mut Vec<String>) {
+        match v {
+            Value::Object(map) => {
+                for (k, child) in map {
+                    let p = format!("{at}/{k}");
+                    out.push(p.clone());
+                    json_key_pointers(child, &p, out);
+                }
+            }
+            Value::Array(items) => {
+                for (i, child) in items.iter().enumerate() {
+                    json_key_pointers(child, &format!("{at}/{i}"), out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn remove_json_key(v: &mut Value, pointer: &str) {
+        let (parent, key) = pointer.rsplit_once('/').unwrap();
+        v.pointer_mut(parent)
+            .and_then(Value::as_object_mut)
+            .unwrap_or_else(|| panic!("{pointer}: parent is not an object"))
+            .remove(key);
+    }
+
+    /// Persisted fields that never produce a change line of their own
+    /// (internal bookkeeping, or state the diff deliberately ignores). For
+    /// these the test only checks that an upgrade neither wakes falsely nor
+    /// diverges from a monitor that always had the field. Matches the field
+    /// pointer or anything under it (array indices written as `*`).
+    const UPGRADE_FIELDS_WITHOUT_CHANGE_LINES: &[(&str, &str)] = &[
+        (
+            "/requirements/ancestry",
+            "feeds the behind/branch-update lines, never its own",
+        ),
+        (
+            "/requirements/checks/skipped",
+            "a tally; per-check status lines carry the change",
+        ),
+        ("/requirements/checks/items/*/url", "a link, not PR state"),
+        (
+            "/requirements/approvals/latestReviews/*/commitSha",
+            "rendered within the review line",
+        ),
+        (
+            "/requirements/approvals/latestReviews/*/id",
+            "identity only; new reviews key on time",
+        ),
+        (
+            "/requirements/threads/resolutionRequired",
+            "a rule flag; unresolved counts report",
+        ),
+        (
+            "/requirements/mergeQueueEjection/reason",
+            "detail of the ejection event line",
+        ),
+        (
+            "/requirements/mergeQueue",
+            "informational queue movement, never a change line",
+        ),
+        ("/ejectionTracked", "persistence marker"),
+        ("/skippedTracked", "persistence marker"),
+        ("/checksUnobserved", "internal bookkeeping"),
+        ("/checksSeedPending", "internal bookkeeping"),
+        ("/statusChecks", "frozen legacy evidence, internal"),
+        ("/requiredCheckNames", "internal required-flag evidence"),
+        ("/observedAt", "freshness anchor; never diffed"),
+        (
+            "/checksNotStartedDelivered",
+            "internal stall-wake bookkeeping",
+        ),
+        ("/latestReviewsCarried", "internal degraded-read marker"),
+    ];
+
+    /// Fields whose ABSENCE is a real persisted state, "unknown" (a degraded
+    /// or pre-field read), and whose unknown → known transition the diff
+    /// reports by design. An upgrade reads like a recovered degraded read:
+    /// at most one wake, after which the baseline holds the field and later
+    /// changes report normally (still checked). A new field must not be
+    /// added here to paper over silence; only over that one wake.
+    const UPGRADE_FIELDS_UNKNOWN_WHEN_ABSENT: &[(&str, &str)] = &[
+        (
+            "/headSha",
+            "unknown head; a known head reports as pushed commits",
+        ),
+        (
+            "/requirements/branchUpdateRequired",
+            "reported when it becomes available",
+        ),
+        ("/requirements/mergeable", "unknown → known mergeability"),
+        (
+            "/requirements/approvals/needed",
+            "unknown → known required approvals",
+        ),
+        ("/requirements/threads/unresolved", "threads readable again"),
+        (
+            "/requirements/mergeStateStatus",
+            "unknown → known merge state",
+        ),
+        (
+            "/requirements/mergeBlockedReason",
+            "reported when it becomes known",
+        ),
+        ("/requirements/isInMergeQueue", "unknown queue membership"),
+    ];
+
+    /// Fields shipped together with a persistence flag that reads `false`
+    /// on state saved before them. Removed alone, such a field reads as a
+    /// genuine "tracked, nothing yet" state whose next event IS news, so it
+    /// is tested removed together with its flags, as older state has it.
+    const UPGRADE_FIELDS_WITH_FLAGS: &[(&str, &[&str], &str)] = &[(
+        "/requirements/mergeQueueEjection",
+        &["/ejectionTracked"],
+        "ejection tracking (intentd#1519)",
+    )];
+
+    fn upgrade_field_listed(list: &[(&str, &str)], field: &str) -> bool {
+        list.iter().any(|(prefix, _)| {
+            field == *prefix
+                || field
+                    .strip_prefix(prefix)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })
+    }
+
+    /// The field-by-field generalization of the hand-written upgrade tests
+    /// (intentd#1519 ejections, intentd#2623 skipped checks, intentd#2695
+    /// latest reviews): a monitor persisted before a field existed must
+    /// neither wake on the upgrade itself nor go quiet about later changes
+    /// to that field. Each optional field (one the snapshot still loads
+    /// without) is removed from a saved baseline in turn; the test then
+    /// runs the same backfill and diff as two polls of an upgraded monitor
+    /// and compares the change lines with a monitor that always had it.
+    /// The field list is read from the types, so a new field is covered
+    /// as soon as the samples above compile. Not covered: an upgrade that
+    /// re-encodes an existing value instead of adding a field (intentd#2623
+    /// stored skipped checks as `passed`); its own test guards that.
+    #[test]
+    fn every_optional_field_dropped_from_an_upgraded_baseline_still_reports_changes() {
+        let (a, b) = (upgrade_sample(false), upgrade_sample(true));
+        let (a_json, b_json) = (
+            serde_json::to_value(&a).unwrap(),
+            serde_json::to_value(&b).unwrap(),
+        );
+        // `a` is the saved state the fields are removed from, so it must
+        // write every field the types declare; `b` only supplies new values
+        // (a flag that is omitted while false is a valid one).
+        let empty = field_paths::empty(&a);
+        assert!(
+            empty.is_empty(),
+            "upgrade_sample(false) leaves {empty:?} empty: give every field (and every list) a \
+             value so the upgrade test covers it"
+        );
+        let generic = |p: &str| {
+            p.split('/')
+                .map(|s| if s.parse::<usize>().is_ok() { "*" } else { s })
+                .collect::<Vec<_>>()
+                .join("/")
+        };
+
+        let mut pointers = Vec::new();
+        json_key_pointers(&a_json, "", &mut pointers);
+        let strip = |pointers: &[&String]| {
+            let mut stripped = a_json.clone();
+            for p in pointers {
+                remove_json_key(&mut stripped, p);
+            }
+            serde_json::from_value::<PrMonitorSnapshot>(stripped).ok()
+        };
+        let optional: Vec<String> = pointers
+            .into_iter()
+            .filter(|p| strip(&[p]).is_some())
+            .collect();
+        let mut failures = Vec::new();
+        let mut unknown_used = BTreeSet::new();
+        for pointer in &optional {
+            let field = generic(pointer);
+            if strip(&[pointer]).as_ref() == Some(&a) {
+                failures.push(format!(
+                    "{pointer}: removing it changes nothing, so the upgrade is not exercised. \
+                     Give it a non-default value in upgrade_sample(false)"
+                ));
+                continue;
+            }
+            let flags = UPGRADE_FIELDS_WITH_FLAGS
+                .iter()
+                .find(|(f, _, _)| *f == field)
+                .map_or(&[][..], |(_, flags, _)| *flags);
+            let mut removed = vec![pointer.clone()];
+            removed.extend(flags.iter().map(|f| (*f).to_owned()));
+            let old = strip(&removed.iter().collect::<Vec<_>>())
+                .unwrap_or_else(|| panic!("{removed:?}: the stripped snapshot does not load"));
+
+            // Upgrade poll: the PR still reads as `a`. Nothing changed, so
+            // nothing may be pending against the backfilled baseline.
+            let mut base = old.clone();
+            backfill_upgraded_anchor(&mut base, &a, Some(&old));
+            let false_wake = diff_snapshots(&base, &a);
+            if !false_wake.is_empty() {
+                if !upgrade_field_listed(UPGRADE_FIELDS_UNKNOWN_WHEN_ABSENT, &field) {
+                    failures.push(format!(
+                        "{pointer}: the upgrade poll itself reports {false_wake:?}. Adopt the \
+                         field silently in backfill_upgraded_anchor (if it ships with a \
+                         persistence flag, list both in UPGRADE_FIELDS_WITH_FLAGS)"
+                    ));
+                    continue;
+                }
+                if false_wake.len() != 1 {
+                    failures.push(format!(
+                        "{pointer}: an unknown → known field may cost one wake line, the \
+                         upgrade poll reports {false_wake:?}"
+                    ));
+                    continue;
+                }
+                unknown_used.insert(field.clone());
+                // That wake is delivered: the baseline advances to the read.
+                base = a.clone();
+            }
+
+            // Change poll: the field now reads as in `b`.
+            let mut changed_json = a_json.clone();
+            match b_json.pointer(pointer) {
+                Some(v) => *changed_json.pointer_mut(pointer).unwrap() = v.clone(),
+                None => remove_json_key(&mut changed_json, pointer),
+            }
+            let changed: PrMonitorSnapshot = serde_json::from_value(changed_json)
+                .unwrap_or_else(|e| panic!("{pointer}: b's value does not load: {e}"));
+            let mut reference = a.clone();
+            backfill_upgraded_anchor(&mut reference, &changed, Some(&a));
+            let expected = diff_snapshots(&reference, &changed);
+            backfill_upgraded_anchor(&mut base, &changed, Some(&a));
+            let reported = diff_snapshots(&base, &changed);
+
+            let silent = upgrade_field_listed(UPGRADE_FIELDS_WITHOUT_CHANGE_LINES, &field);
+            if expected.is_empty() != silent {
+                failures.push(if silent {
+                    format!(
+                        "{pointer} is in UPGRADE_FIELDS_WITHOUT_CHANGE_LINES but a change \
+                         reports {expected:?}: remove it from the list"
+                    )
+                } else {
+                    format!(
+                        "{pointer}: changing it from upgrade_sample(false) to \
+                         upgrade_sample(true) reports nothing even without an upgrade. Give \
+                         the samples values the diff reports, or list the field in \
+                         UPGRADE_FIELDS_WITHOUT_CHANGE_LINES with a reason"
+                    )
+                });
+            } else if reported != expected {
+                failures.push(format!(
+                    "{pointer}: an upgraded monitor reports {reported:?}, one that always had \
+                     the field reports {expected:?}. Adopt the field in \
+                     backfill_upgraded_anchor"
+                ));
+            }
+        }
+        assert!(
+            optional
+                .iter()
+                .any(|p| p == "/requirements/approvals/latestReviews"),
+            "enumeration found {optional:?}"
+        );
+        // Every list entry must still name an optional field and still be
+        // needed, so an exemption cannot outlive its reason.
+        let fields: Vec<String> = optional.iter().map(|p| generic(p)).collect();
+        let listed = UPGRADE_FIELDS_WITHOUT_CHANGE_LINES
+            .iter()
+            .chain(UPGRADE_FIELDS_UNKNOWN_WHEN_ABSENT)
+            .map(|(f, _)| *f)
+            .chain(
+                UPGRADE_FIELDS_WITH_FLAGS
+                    .iter()
+                    .flat_map(|(f, flags, _)| std::iter::once(*f).chain(flags.iter().copied())),
+            );
+        for prefix in listed {
+            if !fields
+                .iter()
+                .any(|f| upgrade_field_listed(&[(prefix, "")], f))
+            {
+                failures.push(format!("{prefix} is listed but is no optional field"));
+            }
+        }
+        for (prefix, _) in UPGRADE_FIELDS_UNKNOWN_WHEN_ABSENT {
+            if !unknown_used
+                .iter()
+                .any(|f| upgrade_field_listed(&[(prefix, "")], f))
+            {
+                failures.push(format!(
+                    "{prefix} is in UPGRADE_FIELDS_UNKNOWN_WHEN_ABSENT but its upgrade no \
+                     longer wakes: remove it from the list"
+                ));
+            }
+        }
+        for (field, _, _) in UPGRADE_FIELDS_WITH_FLAGS {
+            let pointer = (*field).to_owned();
+            let Some(alone) = strip(&[&pointer]) else {
+                continue;
+            };
+            let mut base = alone.clone();
+            backfill_upgraded_anchor(&mut base, &a, Some(&alone));
+            if diff_snapshots(&base, &a).is_empty() {
+                failures.push(format!(
+                    "{field} is in UPGRADE_FIELDS_WITH_FLAGS but upgrades cleanly without its \
+                     flags: remove it from the list"
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     /// A baseline whose head was unknown still gets the older-commit line once
