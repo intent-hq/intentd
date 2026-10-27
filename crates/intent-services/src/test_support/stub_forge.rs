@@ -1,167 +1,180 @@
+//! A scripted `SourceControl` for PR tests: each flag or hook makes one
+//! forge call fail, park or answer a canned value.
+
+use async_trait::async_trait;
+use intent_sourcecontrol::{
+    AuthStatus, Branch, CheckRun, CheckState, Comment, CommentAnchor,
+    Error as ScError, Issue, IssueQuery, MergeMethod, MergeOptions, MergeOutcome,
+    MergeRequirementSignals, Mergeability, NewPullRequest, Page, PageParams, PrPatch, PrQuery,
+    PrState, PullRequest, RateLimitStatus, Repo, RepoRef, Result as ScResult, Review,
+    ReviewComment, ReviewDecision, ReviewThread, ReviewThreadComment, ReviewVerdict,
+    ScCapabilities, SourceControl, UserIdentity,
+};
+
 // Test stub: one independent bool per scripted scenario.
 #[expect(clippy::struct_excessive_bools)]
 #[derive(Default)]
-pub(crate) struct StubForge {
-    fail_threads: bool,
+pub struct StubForge {
+    pub fail_threads: bool,
     /// When set, `get_review_threads` fails with `RateLimited` (the
     /// GraphQL quota is exhausted), exercising the checklist's
     /// quota-exhaustion propagation instead of the REST fallback.
-    rate_limited_threads: bool,
+    pub rate_limited_threads: bool,
     /// When set, `list_review_comments` fails too, so a `fail_threads`
     /// checklist has no comment source at all.
-    fail_review_comments: bool,
+    pub fail_review_comments: bool,
     /// When set, `list_prs` returns the sample PR so PR-refresh discovery can
     /// link an unlinked workspace by head ref.
-    discover: bool,
+    pub discover: bool,
     /// When set, `get_pr` returns the sample PR as merged, so refresh sees a
     /// linked PR whose lifecycle ended (relink-after-merge tests).
-    merged_linked: bool,
+    pub merged_linked: bool,
     /// When set, `list_prs` also returns an *open* PR with this number (same
     /// head ref as the sample), simulating a newer PR on the same branch.
-    open_pr_number: Option<u64>,
+    pub open_pr_number: Option<u64>,
     /// When set, `list_prs` fails, simulating a transient forge error
     /// during relink discovery.
-    fail_list_prs: bool,
+    pub fail_list_prs: bool,
     /// When set, `list_repos` emits a two-page sequence driven by the opaque
     /// cursor, exercising the §5.5 multi-page round-trip end to end.
-    paginate: bool,
+    pub paginate: bool,
     /// When >0, `get_review_threads` emits this many single-thread pages
     /// driven by a numeric cursor (unresolved thread `RT{n}` on page `n`),
     /// exercising the exhaustive `pr.listReviewComments` fetch.
-    thread_pages: u64,
+    pub thread_pages: u64,
     /// When >0, `list_review_comments` emits this many single-comment pages
     /// driven by a numeric cursor (comment id `n` on page `n`, no reply
     /// parent), exercising the multi-page REST fallback.
-    review_comment_pages: u64,
+    pub review_comment_pages: u64,
     /// When set, overrides the advertised [`ScCapabilities`] (default is
     /// all-true), exercising the `pr.capabilities` surface + runtime
     /// gating of `pr.merge` / `pr.createReview` / `pr.listCheckRuns`.
-    capabilities: Option<ScCapabilities>,
+    pub capabilities: Option<ScCapabilities>,
     /// What `get_file_content` returns for any path (`None` → the file is
     /// absent at that ref), exercising `github.repoConfig.get`.
-    file_content: Option<String>,
+    pub file_content: Option<String>,
     /// When true, `get_file_content` fails with a decode error (mis-shaped
     /// contents payload: directory, non-base64/non-UTF-8), exercising the
     /// tolerant fold of `github.repoConfig.get`.
-    file_content_decode_error: bool,
+    pub file_content_decode_error: bool,
     /// When set, `get_pr` returns `NotFound` for this PR number,
     /// exercising the `pr_state` nonexistent-PR error path.
-    missing_pr: Option<u64>,
+    pub missing_pr: Option<u64>,
     /// When true, `get_pr` reports the sample PR as unmergeable with
     /// conflicts (`mergeable: false`, `mergeableState: "dirty"`),
     /// exercising the `pr_state` `mergeBlockedReason` wiring.
-    dirty_pr: bool,
+    pub dirty_pr: bool,
     /// When true, `get_pr` reports the sample PR with
     /// `mergeableState: "blocked"` (required checks / merge queue /
     /// token without push access), exercising the `pr_state` decision
     /// regression (intent-hq/monorepo#1524).
-    blocked_pr: bool,
+    pub blocked_pr: bool,
     /// When true, `list_reviews` returns no reviews at all.
-    no_reviews: bool,
+    pub no_reviews: bool,
     /// The forge's authoritative `reviewDecision` (`None` mirrors an
     /// unprotected base / host without the signal).
-    review_decision: Option<ReviewDecision>,
+    pub review_decision: Option<ReviewDecision>,
     /// When true, `review_decision` fails, exercising the degrade-to-
     /// aggregate path of `pr_state`.
-    fail_review_decision: bool,
+    pub fail_review_decision: bool,
     /// What the merge-requirements probe reports. `None` mirrors a host
     /// without the signals (the trait default `Unsupported`), exercising
     /// the degraded checklist path.
-    merge_signals: Option<MergeRequirementSignals>,
+    pub merge_signals: Option<MergeRequirementSignals>,
     /// PR number whose `get_pr` pends forever (hung-connection
     /// regression, intent-hq/monorepo#1988 lineage).
-    hang_get_pr: Option<u64>,
+    pub hang_get_pr: Option<u64>,
     /// PR numbers `get_pr` was called with, in call order (sweep
     /// stale-pool heal tests assert cap + ordering).
-    seen_get_pr: std::sync::Mutex<Vec<u64>>,
+    pub seen_get_pr: std::sync::Mutex<Vec<u64>>,
     /// Issue numbers `get_issue` was called with, in call order (the
     /// issue cache tests assert a hit costs no forge read).
-    seen_get_issue: std::sync::Mutex<Vec<u64>>,
+    pub seen_get_issue: std::sync::Mutex<Vec<u64>>,
     /// Issue number whose `get_issue` fails with `NotFound`, exercising
     /// the issue cache's never-cache-errors rule.
-    missing_issue: Option<u64>,
+    pub missing_issue: Option<u64>,
     /// When true, `get_pr` and `list_prs` fail with `RateLimited`
     /// (exhausted GitHub core quota, monorepo#2961), exercising the
     /// global sweep pause.
-    rate_limited: bool,
+    pub rate_limited: bool,
     /// When true, only `list_prs` fails with `RateLimited` (the linked
     /// `get_pr` still succeeds), exercising the merged/closed relink
     /// discovery hitting the quota mid-refresh (monorepo#2961).
-    rate_limited_list_prs: bool,
+    pub rate_limited_list_prs: bool,
     /// The reset `rate_limit_status` reports (`None` mirrors a host
     /// without the signal → fallback pause).
-    rate_limit_reset: Option<u64>,
+    pub rate_limit_reset: Option<u64>,
     /// The `remaining` / `limit` `rate_limit_status` reports (`None`
     /// mirrors a host without the signal → the pause runs its window).
-    rate_limit_remaining: Option<u64>,
-    rate_limit_limit: Option<u64>,
+    pub rate_limit_remaining: Option<u64>,
+    pub rate_limit_limit: Option<u64>,
     /// How many times `rate_limit_status` was probed.
-    seen_reset_probes: std::sync::Mutex<u64>,
+    pub seen_reset_probes: std::sync::Mutex<u64>,
     /// Every [`PrQuery`] handed to `list_prs`, in call order (the
     /// `github.pulls.search` `repos` tests assert `extra_repos`).
-    seen_pr_queries: std::sync::Mutex<Vec<PrQuery>>,
+    pub seen_pr_queries: std::sync::Mutex<Vec<PrQuery>>,
     /// Every [`IssueQuery`] handed to `list_issues`, in call order.
-    seen_issue_queries: std::sync::Mutex<Vec<IssueQuery>>,
+    pub seen_issue_queries: std::sync::Mutex<Vec<IssueQuery>>,
     /// Runs at the start of every `list_comments` (the last forge read
     /// of `pr_state`), so a test can move daemon state mid-snapshot.
-    on_list_comments: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    pub on_list_comments: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     /// Every `(query, limit)` handed to `search_users`, in call order
     /// (the `github.users.search` tests assert trimming, the clamp and
     /// the blank-query short-circuit).
-    seen_user_searches: std::sync::Mutex<Vec<(String, u8)>>,
+    pub seen_user_searches: std::sync::Mutex<Vec<(String, u8)>>,
     /// When true, `check_auth` reports no working credential (a revoked
     /// or missing token), exercising the invite-create live auth gate
     /// (multiplayer w4).
-    unauthenticated: bool,
+    pub unauthenticated: bool,
     /// Accounts `get_user_by_login` knows (keyed by lowercase login);
     /// any other login is `NotFound`. Empty → the trait default
     /// (`Unsupported`), so unrelated tests keep their behaviour.
-    pub(crate) users_by_login: std::collections::HashMap<String, UserIdentity>,
+    pub users_by_login: std::collections::HashMap<String, UserIdentity>,
     /// What `get_proof_gist` answers per gist id: `Ok(view)` or the
     /// scripted error (`Err("not-found")` → `NotFound`,
     /// `Err("anonymous")` → `Decode` — a gist without `owner.login` /
     /// `created_at` — anything else → `Api`). An unknown id is
     /// `NotFound`. Exercises `invite.prove`.
-    pub(crate) proof_gists: std::collections::HashMap<
+    pub proof_gists: std::collections::HashMap<
         String,
         std::result::Result<intent_sourcecontrol::identity_proof::ProofGistView, String>,
     >,
     /// Every gist id handed to `get_proof_gist`, in call order.
-    pub(crate) seen_proof_gists: std::sync::Mutex<Vec<String>>,
+    pub seen_proof_gists: std::sync::Mutex<Vec<String>>,
     /// How many times `get_user` was called (the primary identity
     /// refresh tests assert exactly one spawn per interval). Counted
     /// before [`Self::get_user_gate`] is awaited, so a held call is
     /// still visible.
-    pub(crate) get_user_calls: std::sync::atomic::AtomicU64,
+    pub get_user_calls: std::sync::atomic::AtomicU64,
     /// How many times `check_auth` was called (the unauthenticated
     /// refresh tests wait on the auth-gate probe, then assert no
     /// `get_user` followed).
-    pub(crate) check_auth_calls: std::sync::atomic::AtomicU64,
+    pub check_auth_calls: std::sync::atomic::AtomicU64,
     /// When set, `get_user` holds until the test releases a permit
     /// (`add_permits(1)`): the caller proves the read it triggered from
     /// returned while `GET /user` was still in flight.
-    pub(crate) get_user_gate: Option<std::sync::Arc<tokio::sync::Semaphore>>,
+    pub get_user_gate: Option<std::sync::Arc<tokio::sync::Semaphore>>,
     /// When set, the FIRST `get_pr` signals `entered` and holds until
     /// `release` is notified, so a test can land a concurrent
     /// signal-bearing fold while a REST refresh's read is in flight
     /// (intent-hq/intent#5654).
-    pub(crate) get_pr_park: Option<std::sync::Arc<GetPrPark>>,
-    get_pr_error: Option<fn() -> ScError>,
-    create_pr_error: Option<fn() -> ScError>,
-    create_pr_calls: std::sync::atomic::AtomicU64,
+    pub get_pr_park: Option<std::sync::Arc<GetPrPark>>,
+    pub get_pr_error: Option<fn() -> ScError>,
+    pub create_pr_error: Option<fn() -> ScError>,
+    pub create_pr_calls: std::sync::atomic::AtomicU64,
 }
 
 /// One-shot park for [`StubForge::get_pr`]: `entered` fires when the
 /// held read begins, `release` lets it return.
 #[derive(Default)]
-pub(crate) struct GetPrPark {
+pub struct GetPrPark {
     claimed: std::sync::atomic::AtomicBool,
-    pub(crate) entered: tokio::sync::Notify,
-    pub(crate) release: tokio::sync::Notify,
+    pub entered: tokio::sync::Notify,
+    pub release: tokio::sync::Notify,
 }
 
 impl StubForge {
-    pub(crate) fn with_get_pr_error(error: fn() -> ScError) -> Self {
+    pub fn with_get_pr_error(error: fn() -> ScError) -> Self {
         Self {
             get_pr_error: Some(error),
             ..Default::default()
@@ -171,7 +184,7 @@ impl StubForge {
     /// A forge whose `check_auth` reports `authenticated: false` and
     /// whose `get_user` rejects the credential (`Auth`), as the real
     /// client does on a 401.
-    pub(crate) fn unauthenticated() -> Self {
+    pub fn unauthenticated() -> Self {
         Self {
             unauthenticated: true,
             ..Default::default()
@@ -179,7 +192,7 @@ impl StubForge {
     }
 
     /// A forge whose `get_user` holds until `gate` has a permit.
-    pub(crate) fn with_get_user_gate(gate: std::sync::Arc<tokio::sync::Semaphore>) -> Self {
+    pub fn with_get_user_gate(gate: std::sync::Arc<tokio::sync::Semaphore>) -> Self {
         Self {
             get_user_gate: Some(gate),
             ..Default::default()
@@ -191,7 +204,7 @@ impl StubForge {
 /// `extra_repos` is non-empty: one hit per scoped repo (the addressed
 /// `repo` first, then the extras), each hit's URL naming ITS OWN repo,
 /// newest-updated first, with a continuation cursor.
-fn multi_repo_hits(repo: &RepoRef, extra_repos: &[RepoRef]) -> Vec<(u64, String, String)> {
+pub fn multi_repo_hits(repo: &RepoRef, extra_repos: &[RepoRef]) -> Vec<(u64, String, String)> {
     std::iter::once(repo)
         .chain(extra_repos.iter())
         .enumerate()
@@ -206,7 +219,7 @@ fn multi_repo_hits(repo: &RepoRef, extra_repos: &[RepoRef]) -> Vec<(u64, String,
         .collect()
 }
 
-fn sample_pr() -> PullRequest {
+pub fn sample_pr() -> PullRequest {
     PullRequest {
         number: 42,
         url: "https://github.com/o/r/pull/42".into(),
@@ -834,5 +847,18 @@ impl SourceControl for StubForge {
             items: vec![stub_issue()],
             next_cursor: None,
         })
+    }
+}
+
+pub fn stub_issue() -> Issue {
+    Issue {
+        number: 11,
+        title: "Bug report".into(),
+        body: Some("something broke".into()),
+        state: "open".into(),
+        url: "https://github.com/o/r/issues/11".into(),
+        author: "reporter".into(),
+        created_at: "2026-01-01T00:00:00Z".into(),
+        updated_at: "2026-01-02T00:00:00Z".into(),
     }
 }

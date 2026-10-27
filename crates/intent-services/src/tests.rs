@@ -17923,34 +17923,17 @@ pub(crate) mod pr {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use async_trait::async_trait;
     use intent_core::{now_iso, Error, WorkspaceApi, WorkspaceId};
     use intent_sourcecontrol::{
-        AuthStatus, Branch, BranchRules, CheckRun, CheckState, Comment, CommentAnchor,
-        Error as ScError, Issue, IssueQuery, MergeMethod, MergeOptions, MergeOutcome,
-        MergeRequirementSignals, Mergeability, NewPullRequest, Page, PageParams, PrPatch, PrQuery,
-        PrState, PullRequest, RateLimitStatus, Repo, RepoRef, Result as ScResult, Review,
-        ReviewComment, ReviewDecision, ReviewThread, ReviewThreadComment, ReviewVerdict,
-        RollupCheck, RollupCheckKind, ScCapabilities, SourceControl, UserIdentity,
+        BranchRules, CheckState, Error as ScError, MergeRequirementSignals, PrState, RepoRef,
+        ReviewDecision, RollupCheck, RollupCheckKind, SourceControl,
     };
     use intent_store::Store;
     use serde_json::json;
 
     use super::{test_tempdir, workspace, TempDb};
+    pub(crate) use crate::test_support::stub_forge::{sample_pr, GetPrPark, StubForge};
     use crate::{github_ops, Services};
-
-    fn stub_issue() -> Issue {
-        Issue {
-            number: 11,
-            title: "Bug report".into(),
-            body: Some("something broke".into()),
-            state: "open".into(),
-            url: "https://github.com/o/r/issues/11".into(),
-            author: "reporter".into(),
-            created_at: "2026-01-01T00:00:00Z".into(),
-            updated_at: "2026-01-02T00:00:00Z".into(),
-        }
-    }
 
     async fn setup(fail_threads: bool, with_pr: bool) -> (TempDb, Services, WorkspaceId) {
         setup_with(
