@@ -4,6 +4,7 @@
 //
 //   --exit-on-start <code>  exit immediately with <code>
 //   --hang-setup            never answer session/new
+//   --detached-helper       start the `sleep` child in its own process group
 //
 // On start it writes `agent.pid` (its pid and a same-group `sleep` child's
 // pid) into its working directory, so tests can check that stop kills the
@@ -19,8 +20,9 @@ const argv = process.argv.slice(2);
 const exitAt = argv.indexOf('--exit-on-start');
 if (exitAt >= 0) process.exit(Number(argv[exitAt + 1] ?? 1));
 const hangSetup = argv.includes('--hang-setup');
+const detachedHelper = argv.includes('--detached-helper');
 
-const sleeper = spawn('sleep', ['300'], { stdio: 'ignore' });
+const sleeper = spawn('sleep', ['300'], { stdio: 'ignore', detached: detachedHelper });
 fs.writeFileSync('agent.pid', JSON.stringify({ agent: process.pid, child: sleeper.pid }));
 
 const SESSION = 'node-test-session';

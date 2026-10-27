@@ -48,6 +48,10 @@ pub(super) mod codes {
 
 /// How long a stopped provider gets to exit after SIGTERM before SIGKILL.
 const TERM_GRACE: Duration = Duration::from_secs(2);
+/// How often a running provider's descendants are snapshotted, so helpers
+/// that left its process group can still be found after it exits (its
+/// children are reparented the moment it exits).
+const TRACK_INTERVAL: Duration = Duration::from_secs(1);
 /// How long shutdown waits for stopped agents to be cleaned up and their
 /// queued records (each one fsync'd) to be journaled.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(30);
@@ -110,6 +114,8 @@ struct Agent {
     busy: Mutex<bool>,
     marks: mpsc::UnboundedSender<Mark>,
     activity: ActivityTracker,
+    /// The provider's descendants at the last snapshot.
+    descendants: Arc<Mutex<Vec<i32>>>,
 }
 
 /// A provider session that finished its ACP setup.
@@ -227,17 +233,18 @@ impl Runner {
         }
     }
 
-    fn record_detached(&self, entry: JournalEntry) {
-        let this = self.clone();
-        // caller-binding: allow — node-local journal write; the node has no service layer
-        tokio::spawn(async move {
-            this.append(entry).await;
-        });
+    /// Start `command`'s agent. A refusal (capacity, unknown provider) is
+    /// journaled before this returns, so refusals keep the order of the
+    /// frames that caused them; a failed start is journaled as the agent's
+    /// exit with an error code.
+    pub(super) async fn launch(&self, command: LaunchCommand) {
+        if let Some(refusal) = self.begin_launch(command) {
+            self.append(refusal).await;
+        }
     }
 
-    /// Start `command`'s agent. A refusal (capacity, unknown provider) or a
-    /// failed start is journaled as the agent's exit with an error code.
-    pub(super) fn launch(&self, command: LaunchCommand) {
+    /// Admit and start a launch, or return the refusal to journal.
+    fn begin_launch(&self, command: LaunchCommand) -> Option<JournalEntry> {
         let LaunchCommand {
             agent_id,
             workspace_id,
@@ -259,27 +266,25 @@ impl Runner {
             // The running agent's own records are what head should see; a
             // duplicate launch is not journaled as its exit.
             tracing::warn!(agent = %agent_id, "node: launch for an agent that is already running");
-            return;
+            return None;
         }
         if state.agents.len() >= self.inner.max_agents {
             let running = state.agents.len();
             drop(state);
-            self.record_detached(exited(format!(
+            return Some(exited(format!(
                 "{}: this node is running {running} of {} agents",
                 codes::CAPACITY,
                 self.inner.max_agents
             )));
-            return;
         }
         let Some(launch) = self.inner.providers.get(&provider).cloned() else {
             drop(state);
             let configured: Vec<&str> = self.inner.providers.keys().map(String::as_str).collect();
-            self.record_detached(exited(format!(
+            return Some(exited(format!(
                 "{}: provider {provider:?} is not configured on this node (configured: {})",
                 codes::PROVIDER,
                 configured.join(", ")
             )));
-            return;
         };
         let (stop_tx, stop_rx) = oneshot::channel();
         let (ready_tx, ready_rx) = watch::channel(None);
@@ -291,6 +296,7 @@ impl Runner {
             stop: Mutex::new(Some(stop_tx)),
             ready: ready_rx,
             busy: Mutex::new(false),
+            descendants: Arc::new(Mutex::new(Vec::new())),
             marks: marks_tx,
             activity: ActivityTracker::new(),
         });
@@ -314,6 +320,7 @@ impl Runner {
             self.clone()
                 .run_agent(agent, launch, model, notes_tx, ready_tx, stop_rx),
         );
+        None
     }
 
     /// Journal the agent's notifications and marks in arrival order. A mark
@@ -387,12 +394,30 @@ impl Runner {
                 // Read before waiting: a reaped child no longer reports it,
                 // and its process group can outlive it.
                 let pid = child.id();
+                let tracker = pid.map(|pid| {
+                    let descendants = agent.descendants.clone();
+                    // caller-binding: allow — node-local process snapshot; the node has no service layer
+                    tokio::spawn(async move {
+                        let mut tick = tokio::time::interval(TRACK_INTERVAL);
+                        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                        loop {
+                            tick.tick().await;
+                            let found = intent_acp::descendant_pids(pid).await;
+                            *lock(&descendants) = found;
+                        }
+                    })
+                });
                 let outcome = self
                     .supervise(&launch, &connection, &mut child, &mut stop, &ready, &cwd)
                     .await;
-                // Whatever the provider left in its process group goes too,
-                // also when it exited by itself.
-                kill_tree(child, pid).await;
+                if let Some(tracker) = tracker {
+                    tracker.abort();
+                }
+                // Whatever the provider left behind goes too, also when it
+                // exited by itself: its process group, and the helpers last
+                // seen as its descendants (and theirs).
+                let known = lock(&agent.descendants).clone();
+                kill_tree(child, pid, &known).await;
                 let result = match outcome {
                     Outcome::Exited(code) => (code, None),
                     Outcome::Stopped => (None, None),
@@ -496,8 +521,21 @@ impl Runner {
     }
 
     /// Run a turn. Its output streams as notifications; its end (or why it
-    /// could not run) is journaled as a turn end.
-    pub(super) fn prompt(&self, agent_id: &AgentId, turn_id: String, prompt: Vec<Value>) {
+    /// could not run) is journaled as a turn end, a refusal before this
+    /// returns.
+    pub(super) async fn prompt(&self, agent_id: &AgentId, turn_id: String, prompt: Vec<Value>) {
+        if let Some(refusal) = self.begin_prompt(agent_id, turn_id, prompt) {
+            self.append(refusal).await;
+        }
+    }
+
+    /// Start a turn, or return the refusal to journal.
+    fn begin_prompt(
+        &self,
+        agent_id: &AgentId,
+        turn_id: String,
+        prompt: Vec<Value>,
+    ) -> Option<JournalEntry> {
         let (agent, workspace) = {
             let state = lock(&self.inner.state);
             (
@@ -516,27 +554,21 @@ impl Runner {
             },
         };
         let Some(agent) = agent else {
-            if let Some(workspace) = workspace {
-                self.record_detached(refuse(
-                    workspace,
-                    codes::NOT_RUNNING,
-                    "the agent has exited",
-                ));
-            } else {
+            if workspace.is_none() {
                 tracing::warn!(agent = %agent_id, "node: prompt for an unknown agent");
             }
-            return;
+            return workspace
+                .map(|workspace| refuse(workspace, codes::NOT_RUNNING, "the agent has exited"));
         };
         {
             let mut busy = lock(&agent.busy);
             if *busy {
                 drop(busy);
-                self.record_detached(refuse(
+                return Some(refuse(
                     agent.workspace_id.clone(),
                     codes::BUSY,
                     "a turn is already running",
                 ));
-                return;
             }
             *busy = true;
         }
@@ -550,6 +582,7 @@ impl Runner {
             });
             *lock(&agent.busy) = false;
         });
+        None
     }
 
     /// Ask the agent's provider to cancel its running turn.
@@ -565,6 +598,16 @@ impl Runner {
                 tracing::info!(agent = %agent_id, %error, "node: cancel was not delivered");
             }
         }
+    }
+
+    /// The provider descendants the agent's tracker last saw.
+    #[cfg(test)]
+    pub(super) fn tracked_descendants(&self, agent_id: &AgentId) -> Vec<i32> {
+        lock(&self.inner.state)
+            .agents
+            .get(agent_id)
+            .map(|agent| lock(&agent.descendants).clone())
+            .unwrap_or_default()
     }
 
     /// Stop the agent's provider process tree. Its exit is journaled.
@@ -656,16 +699,27 @@ async fn run_turn(agent: &Agent, turn_id: &str, prompt: Vec<Value>) -> (String, 
 /// then sweep descendants that moved to their own process groups.
 /// `spawn_pid` is the pid read at spawn: once the child has been reaped it
 /// no longer reports one, but members of its process group may remain (the
-/// group id cannot be reused while any member is alive).
-async fn kill_tree(mut child: Child, spawn_pid: Option<u32>) {
+/// group id cannot be reused while any member is alive). `known` are
+/// descendants seen while it ran: after it exits, helpers in their own
+/// process groups are no longer its descendants, so they and their own
+/// descendants are swept from that snapshot. Like every pid-based sweep
+/// this is best effort: a helper started after the last snapshot of a
+/// provider that exits by itself is missed.
+async fn kill_tree(mut child: Child, spawn_pid: Option<u32>, known: &[i32]) {
     use nix::sys::signal::{killpg, Signal};
     use nix::unistd::Pid;
     let Some(pid) = child.id().or(spawn_pid) else {
         let _ = child.start_kill();
         let _ = child.wait().await;
+        intent_acp::sweep_escaped_descendants(known).await;
         return;
     };
-    let descendants = intent_acp::descendant_pids(pid).await;
+    let mut roots: Vec<u32> = vec![pid];
+    roots.extend(known.iter().filter_map(|&p| u32::try_from(p).ok()));
+    let mut descendants = intent_acp::descendant_pids_many(&roots).await;
+    descendants.extend_from_slice(known);
+    descendants.sort_unstable();
+    descendants.dedup();
     let group = Pid::from_raw(pid.cast_signed());
     let _ = killpg(group, Signal::SIGTERM);
     let _ = tokio::time::timeout(TERM_GRACE, child.wait()).await;

@@ -189,9 +189,10 @@ async fn assert_gone(pid: i32) {
 #[tokio::test]
 async fn node_runner_runs_a_turn_and_stop_kills_the_process_tree() {
     let Some(h) = harness(2, &[]) else { return };
-    h.runner.launch(launch("a1"));
+    h.runner.launch(launch("a1")).await;
     h.runner
-        .prompt(&AgentId::from("a1"), "t1".into(), text("hello"));
+        .prompt(&AgentId::from("a1"), "t1".into(), text("hello"))
+        .await;
     let all = wait_for(&h.runner, "turn end", turn_ended("a1", "t1")).await;
     // The turn's output is journaled before its end, tagged with the turn.
     let output = all
@@ -223,8 +224,8 @@ async fn node_runner_runs_a_turn_and_stop_kills_the_process_tree() {
 #[tokio::test]
 async fn node_runner_enforces_capacity_and_frees_the_slot_on_exit() {
     let Some(h) = harness(1, &[]) else { return };
-    h.runner.launch(launch("a1"));
-    h.runner.launch(launch("a2"));
+    h.runner.launch(launch("a1")).await;
+    h.runner.launch(launch("a2")).await;
     let all = wait_for(&h.runner, "capacity refusal", exited("a2")).await;
     let error = exit_error(find(&all, exited("a2"))).unwrap();
     assert!(error.starts_with(codes::CAPACITY), "{error}");
@@ -233,9 +234,10 @@ async fn node_runner_enforces_capacity_and_frees_the_slot_on_exit() {
 
     h.runner.stop(&AgentId::from("a1"));
     wait_for(&h.runner, "first exit", exited("a1")).await;
-    h.runner.launch(launch("a3"));
+    h.runner.launch(launch("a3")).await;
     h.runner
-        .prompt(&AgentId::from("a3"), "t1".into(), text("hi"));
+        .prompt(&AgentId::from("a3"), "t1".into(), text("hi"))
+        .await;
     let all = wait_for(&h.runner, "turn on freed slot", turn_ended("a3", "t1")).await;
     assert_eq!(
         turn_end(find(&all, turn_ended("a3", "t1"))),
@@ -250,7 +252,7 @@ async fn node_runner_refuses_an_unconfigured_provider_by_name() {
     let Some(h) = harness(2, &[]) else { return };
     let mut command = launch("a1");
     command.provider = "codex".into();
-    h.runner.launch(command);
+    h.runner.launch(command).await;
     let all = wait_for(&h.runner, "provider refusal", exited("a1")).await;
     let error = exit_error(find(&all, exited("a1"))).unwrap();
     assert!(error.starts_with(codes::PROVIDER), "{error}");
@@ -264,7 +266,7 @@ async fn node_runner_journals_a_provider_that_dies_at_start() {
     let Some(h) = harness(1, &["--exit-on-start", "3"]) else {
         return;
     };
-    h.runner.launch(launch("a1"));
+    h.runner.launch(launch("a1")).await;
     let all = wait_for(&h.runner, "exit", exited("a1")).await;
     let record = find(&all, exited("a1"));
     match &record.body {
@@ -286,10 +288,11 @@ async fn node_runner_stop_during_setup_ends_waiting_turns() {
     let Some(h) = harness(1, &["--hang-setup"]) else {
         return;
     };
-    h.runner.launch(launch("a1"));
+    h.runner.launch(launch("a1")).await;
     let (agent, child) = agent_pids(&h.storage, "a1").await;
     h.runner
-        .prompt(&AgentId::from("a1"), "t1".into(), text("hello"));
+        .prompt(&AgentId::from("a1"), "t1".into(), text("hello"))
+        .await;
     h.runner.stop(&AgentId::from("a1"));
     let all = wait_for(&h.runner, "waiting turn end", turn_ended("a1", "t1")).await;
     let (stop_reason, error) = turn_end(find(&all, turn_ended("a1", "t1")));
@@ -304,15 +307,17 @@ async fn node_runner_stop_during_setup_ends_waiting_turns() {
 #[tokio::test]
 async fn node_runner_refuses_a_second_turn_and_cancels_the_first() {
     let Some(h) = harness(1, &[]) else { return };
-    h.runner.launch(launch("a1"));
+    h.runner.launch(launch("a1")).await;
     h.runner
-        .prompt(&AgentId::from("a1"), "t1".into(), text("block"));
+        .prompt(&AgentId::from("a1"), "t1".into(), text("block"))
+        .await;
     wait_for(&h.runner, "first turn output", |r| {
         r.turn_id.as_deref() == Some("t1") && matches!(r.body, JournalBody::Notification { .. })
     })
     .await;
     h.runner
-        .prompt(&AgentId::from("a1"), "t2".into(), text("second"));
+        .prompt(&AgentId::from("a1"), "t2".into(), text("second"))
+        .await;
     let all = wait_for(&h.runner, "busy refusal", turn_ended("a1", "t2")).await;
     let (stop_reason, error) = turn_end(find(&all, turn_ended("a1", "t2")));
     assert_eq!(stop_reason, "refusal");
@@ -327,7 +332,8 @@ async fn node_runner_refuses_a_second_turn_and_cancels_the_first() {
 
     // The agent takes turns again after the cancelled one.
     h.runner
-        .prompt(&AgentId::from("a1"), "t3".into(), text("again"));
+        .prompt(&AgentId::from("a1"), "t3".into(), text("again"))
+        .await;
     let all = wait_for(&h.runner, "next turn", turn_ended("a1", "t3")).await;
     assert_eq!(
         turn_end(find(&all, turn_ended("a1", "t3"))),
@@ -339,18 +345,20 @@ async fn node_runner_refuses_a_second_turn_and_cancels_the_first() {
 #[tokio::test]
 async fn node_runner_answers_a_prompt_for_an_exited_agent() {
     let Some(h) = harness(1, &[]) else { return };
-    h.runner.launch(launch("a1"));
+    h.runner.launch(launch("a1")).await;
     h.runner.stop(&AgentId::from("a1"));
     wait_for(&h.runner, "exit", exited("a1")).await;
     h.runner
-        .prompt(&AgentId::from("a1"), "t9".into(), text("late"));
+        .prompt(&AgentId::from("a1"), "t9".into(), text("late"))
+        .await;
     let all = wait_for(&h.runner, "late turn end", turn_ended("a1", "t9")).await;
     let (_, error) = turn_end(find(&all, turn_ended("a1", "t9")));
     assert!(error.unwrap().starts_with(codes::NOT_RUNNING), "{error:?}");
     // An agent never launched here is not journaled at all.
     let before = records(&h.runner).await.len();
     h.runner
-        .prompt(&AgentId::from("ghost"), "t1".into(), text("?"));
+        .prompt(&AgentId::from("ghost"), "t1".into(), text("?"))
+        .await;
     h.runner.stop(&AgentId::from("ghost"));
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(records(&h.runner).await.len(), before);
@@ -359,14 +367,16 @@ async fn node_runner_answers_a_prompt_for_an_exited_agent() {
 #[tokio::test]
 async fn node_runner_tags_every_chunk_of_a_turn_even_when_the_journal_lags() {
     let Some(h) = harness(1, &[]) else { return };
-    h.runner.launch(launch("a1"));
+    h.runner.launch(launch("a1")).await;
     // 201 notifications arrive faster than they are fsync'd; the turn ends
     // (and the next one starts) while most are still queued.
     h.runner
-        .prompt(&AgentId::from("a1"), "t1".into(), text("many"));
+        .prompt(&AgentId::from("a1"), "t1".into(), text("many"))
+        .await;
     wait_for(&h.runner, "first turn end", turn_ended("a1", "t1")).await;
     h.runner
-        .prompt(&AgentId::from("a1"), "t2".into(), text("next"));
+        .prompt(&AgentId::from("a1"), "t2".into(), text("next"))
+        .await;
     let all = wait_for(&h.runner, "second turn end", turn_ended("a1", "t2")).await;
     let tag = |r: &JournalRecord| match &r.body {
         JournalBody::Notification { notification } => {
@@ -400,10 +410,11 @@ async fn node_runner_tags_every_chunk_of_a_turn_even_when_the_journal_lags() {
 #[tokio::test]
 async fn node_runner_kills_leftover_children_when_the_provider_exits_by_itself() {
     let Some(h) = harness(1, &[]) else { return };
-    h.runner.launch(launch("a1"));
+    h.runner.launch(launch("a1")).await;
     let (agent, child) = agent_pids(&h.storage, "a1").await;
     h.runner
-        .prompt(&AgentId::from("a1"), "t1".into(), text("exit"));
+        .prompt(&AgentId::from("a1"), "t1".into(), text("exit"))
+        .await;
     let all = wait_for(&h.runner, "exit", exited("a1")).await;
     match &find(&all, exited("a1")).body {
         JournalBody::Exited { exit_code, error } => {
@@ -417,11 +428,41 @@ async fn node_runner_kills_leftover_children_when_the_provider_exits_by_itself()
 }
 
 #[tokio::test]
+async fn node_runner_kills_a_helper_in_its_own_process_group_after_a_natural_exit() {
+    let Some(h) = harness(1, &["--detached-helper"]) else {
+        return;
+    };
+    h.runner.launch(launch("a1")).await;
+    let (agent, helper) = agent_pids(&h.storage, "a1").await;
+    // Once the provider exits, the helper is reparented and no longer its
+    // descendant; the runner must already know it.
+    let deadline = tokio::time::Instant::now() + wait();
+    while !h
+        .runner
+        .tracked_descendants(&AgentId::from("a1"))
+        .contains(&helper)
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "helper never tracked"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    h.runner
+        .prompt(&AgentId::from("a1"), "t1".into(), text("exit"))
+        .await;
+    wait_for(&h.runner, "exit", exited("a1")).await;
+    assert_gone(agent).await;
+    assert_gone(helper).await;
+}
+
+#[tokio::test]
 async fn node_runner_shutdown_waits_until_queued_output_and_exit_are_journaled() {
     let Some(h) = harness(1, &[]) else { return };
-    h.runner.launch(launch("a1"));
+    h.runner.launch(launch("a1")).await;
     h.runner
-        .prompt(&AgentId::from("a1"), "t1".into(), text("many"));
+        .prompt(&AgentId::from("a1"), "t1".into(), text("many"))
+        .await;
     // Stop as soon as the burst starts arriving, with most of it queued.
     wait_for(&h.runner, "first output", |r| {
         matches!(r.body, JournalBody::Notification { .. })

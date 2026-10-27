@@ -98,12 +98,12 @@ async fn apply(
         return Applied::Stale;
     }
     match frame {
-        LinkFrame::Launch(command) => runner.launch(command),
+        LinkFrame::Launch(command) => runner.launch(command).await,
         LinkFrame::Prompt {
             agent_id,
             turn_id,
             prompt,
-        } => runner.prompt(&agent_id, turn_id, prompt),
+        } => runner.prompt(&agent_id, turn_id, prompt).await,
         LinkFrame::Cancel { agent_id } => runner.cancel(&agent_id).await,
         LinkFrame::Stop { agent_id } => runner.stop(&agent_id),
         LinkFrame::Ack { seq } => {
