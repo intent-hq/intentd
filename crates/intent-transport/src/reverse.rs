@@ -56,6 +56,9 @@ pub struct ReverseError {
     pub code: i64,
     pub message: String,
     pub data: Option<Value>,
+    /// Set only when the daemon gave up waiting (no reply within the
+    /// deadline), never for an error the client itself returned.
+    pub timed_out: bool,
 }
 
 type PendingSender = oneshot::Sender<Result<Value, ReverseError>>;
@@ -217,6 +220,7 @@ impl ReverseChannel {
     ) -> Result<Value, ReverseError> {
         if !self.administrator && !self.member_may_receive(method, &params).await {
             return Err(ReverseError {
+                timed_out: false,
                 data: None,
                 code: i64::from(crate::catalog::FORBIDDEN_ERROR_CODE),
                 message: format!(
@@ -231,6 +235,7 @@ impl ReverseChannel {
             let mut state = self.pending.lock().expect("reverse pending poisoned");
             if state.closed {
                 return Err(ReverseError {
+                    timed_out: false,
                     data: None,
                     code: 0,
                     message: "client connection closed".to_string(),
@@ -250,17 +255,20 @@ impl ReverseChannel {
         match tokio::time::timeout(timeout, async {
             tokio::select! {
                 result = &mut rx => return result.unwrap_or_else(|_| Err(ReverseError {
+                timed_out: false,
                 data: None,
                     code: 0,
                     message: "client connection closed".to_string(),
                 })),
                 result = self.out_tx.send(frame.into()) => result.map_err(|_| ReverseError {
+                timed_out: false,
                 data: None,
                     code: 0,
                     message: "client connection closed".to_string(),
                 })?,
             }
             rx.await.map_err(|_| ReverseError {
+                timed_out: false,
                 data: None,
                 code: 0,
                 message: "reverse response channel dropped".to_string(),
@@ -270,6 +278,7 @@ impl ReverseChannel {
         {
             Ok(result) => result,
             Err(_) => Err(ReverseError {
+                timed_out: true,
                 data: None,
                 code: 0,
                 message: format!("reverse request timed out: {method}"),
@@ -302,6 +311,7 @@ impl ReverseChannel {
         };
         if let Some(err) = obj.get("error") {
             let _ = sender.send(Err(ReverseError {
+                timed_out: false,
                 data: err.get("data").cloned(),
                 code: err.get("code").and_then(Value::as_i64).unwrap_or(0),
                 message: err
@@ -326,6 +336,7 @@ impl ReverseChannel {
         };
         for (_, sender) in pending {
             let _ = sender.send(Err(ReverseError {
+                timed_out: false,
                 data: None,
                 code: 0,
                 message: "client connection closed".to_string(),
