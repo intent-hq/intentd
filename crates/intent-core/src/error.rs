@@ -97,6 +97,14 @@ pub enum Error {
         resolved_base_bytes: Option<u64>,
     },
 
+    /// No node can run the requested agent placement. Surfaces as `-32602`
+    /// with [`crate::placement::PlacementUnavailable::message`] and the
+    /// documented `error.data = { code: "placement-unavailable", requested,
+    /// reason, availablePlatforms, supportedPlatforms, availableOs,
+    /// retryable, observedAt }`. The text form carries the data too, for MCP.
+    #[error("{0}")]
+    PlacementUnavailable(Box<crate::placement::PlacementUnavailable>),
+
     /// A named provider profile request failed (PROTOCOL §5.54). `data`
     /// carries the machine-readable discriminator (`data.code`, e.g.
     /// `invalid-params` + `fieldErrors`, `provider-profile-in-use` + `inUse`,
@@ -593,6 +601,7 @@ impl Error {
             | Error::RetireUnsupported { .. }
             | Error::InvalidInput(_)
             | Error::BaseRefUnresolvable { .. }
+            | Error::PlacementUnavailable(_)
             | Error::ContentBaseMismatch { .. }
             | Error::NotAFile { .. } => -32602,
             Error::CloneFailed { category, .. } => match category {

@@ -37,6 +37,11 @@ pub use intent_services::feature_api::RuntimeServicesExt;
 #[must_use]
 pub fn compose(services: Services) -> Services {
     let services = intent_svc_transfer::register(services);
+    // No daemon runs agents on an execution node yet: every remote launch
+    // fails as `placement-unavailable` until the remote feature registers.
+    let services = services.with_remote_launch_port(std::sync::Arc::new(
+        intent_services::feature_api::feature_ports::UnavailableRemoteLaunch,
+    ));
     assert_feature_ports_registered(&services);
     services
 }

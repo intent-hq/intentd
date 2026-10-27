@@ -206,6 +206,13 @@ fn domain_to_rpc(e: Error) -> RpcErr {
         // Provider profile failure (§5.54): -32602 (or -32603 for an
         // unreadable profile file) with the service-built `data` verbatim —
         // `data.code` plus `fieldErrors` / `inUse` / `providerRef`.
+        // No node can run the requested placement: the documented -32602
+        // with `data.code: "placement-unavailable"` and the alternatives.
+        ref e @ Error::PlacementUnavailable(ref failure) => RpcErr {
+            code: e.code(),
+            message: failure.message(),
+            data: Some(failure.data()),
+        },
         ref e @ Error::ProviderProfile(ref failure) => RpcErr {
             code: e.code(),
             message: failure.message.clone(),

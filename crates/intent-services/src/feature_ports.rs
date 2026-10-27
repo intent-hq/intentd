@@ -26,6 +26,8 @@ use std::sync::Arc;
 #[cfg(any(test, feature = "test-hooks"))]
 use std::sync::Mutex;
 
+use intent_core::placement::PlatformAvailability;
+use intent_core::remote_launch::{RemoteLaunchRequest, RemoteLaunchStarted};
 use intent_core::transfer::TransferPlan;
 
 use intent_core::execution::HostExecutionContext;
@@ -1153,6 +1155,59 @@ impl AgentWakePort for UnavailableAgentWake {
     }
 }
 
+/// The remote-launch feature: start agents on a configured execution node.
+/// `placements` is the platform discovery behind tool help and
+/// `placement-unavailable` errors; `launch` starts an already created agent
+/// on the node; `stop` stops a remote agent's process.
+pub trait RemoteLaunchPort: Send + Sync + 'static {
+    /// The configured node's supported platforms, and those that can take
+    /// an agent now. Nothing when no node is configured.
+    fn placements<'a>(&'a self, svc: &'a Services) -> BoxFuture<'a, Result<PlatformAvailability>>;
+
+    /// Launch `request.agent_id` on a node matching `request.placement`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::PlacementUnavailable`] when no node can run the placement.
+    fn launch<'a>(
+        &'a self,
+        svc: &'a Services,
+        request: RemoteLaunchRequest,
+    ) -> BoxFuture<'a, Result<RemoteLaunchStarted>>;
+
+    /// Stop the remote agent `agent_id`.
+    fn stop<'a>(&'a self, svc: &'a Services, agent_id: &'a AgentId) -> BoxFuture<'a, Result<()>>;
+}
+
+/// The remote-launch port of a daemon with no execution node: nothing is
+/// supported, every launch fails as `placement-unavailable`
+/// (`unsupported-platform`, no alternatives) and no agent runs remotely.
+/// The composition root registers it until the remote feature exists.
+#[derive(Default)]
+pub struct UnavailableRemoteLaunch;
+
+impl RemoteLaunchPort for UnavailableRemoteLaunch {
+    fn placements<'a>(&'a self, _svc: &'a Services) -> BoxFuture<'a, Result<PlatformAvailability>> {
+        Box::pin(async { Ok(PlatformAvailability::none(intent_core::now_iso())) })
+    }
+
+    fn launch<'a>(
+        &'a self,
+        _svc: &'a Services,
+        request: RemoteLaunchRequest,
+    ) -> BoxFuture<'a, Result<RemoteLaunchStarted>> {
+        Box::pin(async move {
+            let failure =
+                PlatformAvailability::none(intent_core::now_iso()).unavailable(request.placement);
+            Err(Error::PlacementUnavailable(Box::new(failure)))
+        })
+    }
+
+    fn stop<'a>(&'a self, _svc: &'a Services, agent_id: &'a AgentId) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move { Err(Error::NotFound(format!("remote agent {agent_id}"))) })
+    }
+}
+
 /// A `WorkspaceApi` with no overrides: every method is the trait default.
 struct DefaultWorkspaceApi;
 
@@ -2013,6 +2068,10 @@ feature_port_registry! {
     /// Register the agent-wake feature runtime code wakes agents through.
     /// [`Services::new`] registers the in-crate one.
     agent_wake: AgentWakePort = UnavailableAgentWake, with_agent_wake_port;
+    /// Register the remote-launch feature. Until a daemon can run agents on
+    /// an execution node, the composition root registers
+    /// [`UnavailableRemoteLaunch`].
+    remote_launch: RemoteLaunchPort = UnavailableRemoteLaunch, with_remote_launch_port;
 }
 
 /// Writes `WorkspaceApi` methods that forward to a feature port: each
@@ -2078,8 +2137,9 @@ mod tests {
     use intent_core::{Error, WorkspaceApi, WorkspaceId};
 
     use super::{
-        AgentWakePort, FeaturePorts, RuntimePort, TransferPort, UnavailableAgentWake,
-        UnavailableRuntime, UnavailableTransfer, DEFAULT_WORKSPACE_API,
+        AgentWakePort, FeaturePorts, RemoteLaunchPort, RuntimePort, TransferPort,
+        UnavailableAgentWake, UnavailableRemoteLaunch, UnavailableRuntime, UnavailableTransfer,
+        DEFAULT_WORKSPACE_API,
     };
 
     use crate::test_support::fixtures::TempDb;
@@ -2145,7 +2205,10 @@ mod tests {
     async fn the_startup_check_names_every_unregistered_port() {
         let tmp = TempDb::new();
         let svc = bare_services(&tmp).await;
-        assert_eq!(FeaturePorts::NAMES, ["transfer", "runtime", "agent_wake"]);
+        assert_eq!(
+            FeaturePorts::NAMES,
+            ["transfer", "runtime", "agent_wake", "remote_launch"]
+        );
         assert_eq!(
             FeaturePorts::default().unregistered(),
             FeaturePorts::NAMES,
@@ -2153,12 +2216,12 @@ mod tests {
         );
         assert_eq!(
             svc.unregistered_feature_ports(),
-            ["transfer"],
+            ["transfer", "remote_launch"],
             "Services::new registers the in-crate runtime and agent-wake features"
         );
         assert!(matches!(
             svc.ensure_feature_ports_registered(),
-            Err(Error::Internal(m)) if m == "feature ports not registered: transfer"
+            Err(Error::Internal(m)) if m == "feature ports not registered: transfer, remote_launch"
         ));
     }
 
@@ -2166,9 +2229,13 @@ mod tests {
     async fn a_registered_port_passes_the_startup_check_and_receives_calls() {
         let tmp = TempDb::new();
         let port = Arc::new(UnavailableTransfer::default());
-        let svc = bare_services(&tmp)
-            .await
-            .with_transfer_port(Arc::clone(&port) as Arc<dyn TransferPort>);
+        let svc =
+            bare_services(&tmp)
+                .await
+                .with_transfer_port(Arc::clone(&port) as Arc<dyn TransferPort>)
+                .with_remote_launch_port(
+                    Arc::new(UnavailableRemoteLaunch) as Arc<dyn RemoteLaunchPort>
+                );
         assert!(svc.unregistered_feature_ports().is_empty());
         svc.ensure_feature_ports_registered()
             .expect("every port registered");
@@ -2194,6 +2261,55 @@ mod tests {
             svc.feature::<crate::runtime::RuntimeFeature>()
                 .expect("registered")
         ));
+    }
+
+    #[tokio::test]
+    async fn the_unavailable_remote_launch_port_supports_no_platform() {
+        use intent_core::placement::{AgentPlacement, PlacementUnavailableReason};
+        use intent_core::remote_launch::RemoteLaunchRequest;
+        let tmp = TempDb::new();
+        let svc = bare_services(&tmp).await;
+        let port = svc.feature_remote_launch_port();
+
+        let placements = port.placements(&svc).await.expect("discovery");
+        assert!(placements.supported_platforms.is_empty());
+        assert!(placements.available_platforms.is_empty());
+        assert!(placements.available_os.is_empty());
+
+        let placement: AgentPlacement =
+            serde_json::from_str(r#"{"target":"remote","os":"linux"}"#).unwrap();
+        let agent = intent_core::AgentId::new();
+        let launched = port
+            .launch(
+                &svc,
+                RemoteLaunchRequest {
+                    workspace_id: WorkspaceId::new(),
+                    agent_id: agent.clone(),
+                    placement: placement.clone(),
+                    provider: "claude".into(),
+                    model: None,
+                },
+            )
+            .await;
+        let Err(Error::PlacementUnavailable(failure)) = launched else {
+            panic!("expected placement-unavailable, got {launched:?}");
+        };
+        assert_eq!(failure.requested, placement);
+        assert_eq!(
+            failure.reason,
+            PlacementUnavailableReason::UnsupportedPlatform
+        );
+        assert_eq!(
+            failure.message(),
+            "Unsupported linux; available: none; supported: none"
+        );
+        assert_eq!(failure.data()["retryable"], false);
+
+        let stopped = port.stop(&svc, &agent).await;
+        assert!(
+            matches!(&stopped, Err(Error::NotFound(m)) if m.contains(agent.as_str())),
+            "{stopped:?}"
+        );
     }
 
     #[tokio::test]
