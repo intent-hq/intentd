@@ -517,6 +517,16 @@ pub(crate) struct PrMonitorSnapshot {
     /// participates in the change diff.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_at: Option<String>,
+    /// The forge's own `updatedAt` for the PR (RFC 3339) as of the read that
+    /// produced this snapshot. The workspace PR pool reports it as a
+    /// monitor-derived entry's `updatedAt`, so same-state recency ordering
+    /// compares PR activity rather than monitor bookkeeping
+    /// ([`pr_monitor_pr_info`]). Absent on snapshots persisted before the
+    /// field existed. Internal persisted evidence only: never part of the
+    /// change diff (a bare `updatedAt` bump is not news) and omitted from
+    /// the public `lastSnapshot` projection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_updated_at: Option<String>,
     /// The head whose never-started-CI wake was already DELIVERED: stamped
     /// on the snapshot that becomes the emit baseline and carried forward on
     /// the same head, so a degraded read that clears the flag (and an
@@ -565,6 +575,9 @@ pub struct SharedPrSnapshot {
     pub(crate) title: String,
     pub(crate) url: String,
     pub(crate) head_sha: Option<String>,
+    /// The forge's `updatedAt` for the PR (`None` when the forge reported
+    /// none); materialized into [`PrMonitorSnapshot::pr_updated_at`].
+    pub(crate) pr_updated_at: Option<String>,
     pub(crate) conversation_count: Option<i64>,
     pub(crate) review_comment_count: i64,
     pub(crate) requirements: MergeRequirements,
@@ -734,6 +747,10 @@ impl SharedPrSnapshot {
             status_checks: Some(status_checks),
             required_check_names,
             observed_at: None,
+            pr_updated_at: self
+                .pr_updated_at
+                .clone()
+                .or_else(|| previous.and_then(|p| p.pr_updated_at.clone())),
             latest_reviews_carried,
             checks_not_started_delivered: same_head
                 .and_then(|p| p.checks_not_started_delivered.clone()),
@@ -1132,6 +1149,7 @@ async fn shared_snapshot_from_observation(
         title: observation.pr.title.clone(),
         url: observation.pr.url.clone(),
         head_sha: observation.pr.head_sha.clone(),
+        pr_updated_at: forge_updated_at(&observation.pr),
         conversation_count: Some(observation.conversation_count),
         review_comment_count: read.review_comment_count,
         requirements: read.requirements,
@@ -1402,6 +1420,11 @@ async fn fetch_shared_snapshot_for(
     finish_shared_snapshot(sc, repo_ref, number, pr, read).await
 }
 
+/// The forge's `updatedAt` for `pr`, `None` when it reported none.
+fn forge_updated_at(pr: &PullRequest) -> Option<String> {
+    Some(pr.updated_at.clone()).filter(|at| !at.is_empty())
+}
+
 /// The conversation-comment read that completes a [`SharedPrSnapshot`]
 /// once the checklist is composed.
 async fn finish_shared_snapshot(
@@ -1430,6 +1453,7 @@ async fn finish_shared_snapshot(
         title: pr.title.clone(),
         url: pr.url.clone(),
         head_sha: pr.head_sha.clone(),
+        pr_updated_at: forge_updated_at(&pr),
         conversation_count,
         review_comment_count: read.review_comment_count,
         requirements: read.requirements,
@@ -1796,6 +1820,9 @@ pub(crate) fn waiting_on_pr_monitors_entry(m: &PrMonitor) -> Value {
 /// the repo identity when the monitor has no snapshot yet, and status
 /// resolved as snapshot state → draft flag → `completed` ⇒ closed (terminal
 /// covers both merged and closed; don't falsely claim merged) → open.
+/// `updatedAt` deliberately diverges from the FE: it is the snapshot's
+/// forge `prUpdatedAt` when persisted (the FE only sees the monitor row's
+/// time, and uses it solely for a monitor not yet in the daemon pool).
 pub(crate) fn pr_monitor_pr_info(m: &PrMonitorListEntry) -> PullRequestInfo {
     let status = match m.snapshot_state.as_deref() {
         Some("merged") => PullRequestStatus::Merged,
@@ -1821,10 +1848,17 @@ pub(crate) fn pr_monitor_pr_info(m: &PrMonitorListEntry) -> PullRequestInfo {
         url,
         title,
         status,
-        // Monitor-row timestamps stand in for the PR's own (the snapshot
-        // does not carry them), mirroring the FE merge.
+        // The snapshot's forge `updatedAt` when it carries one, so the
+        // pool's same-state recency order compares PR activity: the
+        // monitor row's own `updated_at` advances on every poll write and
+        // would rank a monitor-only PR as the freshest. Snapshots persisted
+        // before the field existed fall back to the row's timestamps. The
+        // snapshot carries no `createdAt`; the row's stands in.
         created_at: m.created_at.clone(),
-        updated_at: m.updated_at.clone(),
+        updated_at: m
+            .snapshot_pr_updated_at
+            .clone()
+            .unwrap_or_else(|| m.updated_at.clone()),
         base_ref: None,
         head_ref: None,
         head_sha: m.snapshot_head_sha.clone(),
@@ -6150,6 +6184,7 @@ mod tests {
             status_checks: Some(Vec::new()),
             required_check_names: None,
             observed_at: None,
+            pr_updated_at: None,
             checks_not_started_delivered: None,
             latest_reviews_carried: false,
         };
@@ -6724,6 +6759,7 @@ mod tests {
             title: s.title.clone(),
             url: s.url.clone(),
             head_sha: s.head_sha.clone(),
+            pr_updated_at: s.pr_updated_at.clone(),
             conversation_count: Some(s.conversation_count),
             review_comment_count: s.review_comment_count,
             requirements: s.requirements.clone(),
@@ -6734,6 +6770,118 @@ mod tests {
             merge_queue_reported: s.requirements.is_in_merge_queue,
             checks_start: pr_ops::ChecksStartEvidence::default(),
         }
+    }
+
+    // ── prUpdatedAt: the PR's own recency for the workspace PR pool ──
+
+    fn list_entry(updated_at: &str, pr_updated_at: Option<&str>) -> PrMonitorListEntry {
+        PrMonitorListEntry {
+            workspace_id: WorkspaceId::from("ws-1"),
+            repo_owner: "intent-hq".into(),
+            repo_name: "intent".into(),
+            pr_number: 7906,
+            state: PrMonitorState::Active,
+            created_at: "2026-10-27T01:25:13Z".into(),
+            updated_at: updated_at.into(),
+            snapshot_url: Some("https://github.com/intent-hq/intent/pull/7906".into()),
+            snapshot_title: Some("docs: routing".into()),
+            snapshot_head_sha: None,
+            snapshot_state: Some("open".into()),
+            snapshot_is_draft: Some(false),
+            snapshot_mergeable: Some(true),
+            snapshot_is_in_merge_queue: None,
+            snapshot_pr_updated_at: pr_updated_at.map(Into::into),
+        }
+    }
+
+    /// Regression: a monitor-only PR's pool entry used the monitor ROW's
+    /// `updated_at`, which advances on every poll write, so it out-ranked a
+    /// git-root PR GitHub had updated more recently on the same-state
+    /// recency tie-break (intentd#2733 lost the workspace card to
+    /// intent#7906). The entry now reports the forge's own `updatedAt`.
+    #[test]
+    fn monitor_pool_entry_reports_the_prs_updated_at_not_the_rows() {
+        let info = pr_monitor_pr_info(&list_entry(
+            "2026-10-27T08:45:53.044912803Z",
+            Some("2026-10-27T01:34:23Z"),
+        ));
+        assert_eq!(info.updated_at, "2026-10-27T01:34:23Z");
+        assert_eq!(info.created_at, "2026-10-27T01:25:13Z");
+    }
+
+    /// A snapshot persisted before `prUpdatedAt` existed (or a snapshotless
+    /// row) keeps the monitor row's timestamp — the pre-fix behavior.
+    #[test]
+    fn monitor_pool_entry_falls_back_to_the_row_without_a_forge_timestamp() {
+        let info = pr_monitor_pr_info(&list_entry("2026-10-27T08:45:53Z", None));
+        assert_eq!(info.updated_at, "2026-10-27T08:45:53Z");
+    }
+
+    /// The forge `updatedAt` is materialized into the persisted snapshot, a
+    /// read without one keeps the previous value, and a bare bump is never
+    /// a reportable change.
+    #[test]
+    fn pr_updated_at_is_materialized_and_never_diffed() {
+        let base = snapshot(|_| {});
+        let mut read = shared_from(&base, true);
+        read.pr_updated_at = Some("2026-10-27T01:00:00Z".into());
+        let first = read.materialize(None);
+        assert_eq!(first.pr_updated_at.as_deref(), Some("2026-10-27T01:00:00Z"));
+
+        read.pr_updated_at = Some("2026-10-27T02:00:00Z".into());
+        let bumped = read.materialize(Some(&first));
+        assert_eq!(
+            bumped.pr_updated_at.as_deref(),
+            Some("2026-10-27T02:00:00Z")
+        );
+        assert!(
+            diff_snapshots(&first, &bumped).is_empty(),
+            "a bare updatedAt bump is not news"
+        );
+
+        read.pr_updated_at = None;
+        let carried = read.materialize(Some(&bumped));
+        assert_eq!(
+            carried.pr_updated_at.as_deref(),
+            Some("2026-10-27T02:00:00Z"),
+            "a read without a forge timestamp keeps the previous one"
+        );
+    }
+
+    /// `prUpdatedAt` round-trips through the persisted JSON (absent on old
+    /// snapshots) and stays out of the public `lastSnapshot` projection.
+    #[test]
+    fn pr_updated_at_persists_but_is_not_on_the_wire() {
+        let s = snapshot(|s| s.pr_updated_at = Some("2026-10-27T01:34:23Z".into()));
+        let json = serde_json::to_value(&s).unwrap();
+        assert_eq!(json["prUpdatedAt"], json!("2026-10-27T01:34:23Z"));
+        let old: PrMonitorSnapshot =
+            serde_json::from_value(serde_json::to_value(snapshot(|_| {})).unwrap()).unwrap();
+        assert_eq!(old.pr_updated_at, None);
+
+        let ts = "2026-01-01T00:00:00Z".to_string();
+        let m = PrMonitor {
+            monitor_id: PrMonitorId::new(),
+            workspace_id: WorkspaceId::from("ws-1"),
+            agent_id: AgentId::from("agent-1"),
+            repo_owner: "o".into(),
+            repo_name: "r".into(),
+            pr_number: 42,
+            state: PrMonitorState::Active,
+            last_snapshot: Some(json.to_string()),
+            baseline_snapshot: None,
+            pending_changes: Vec::new(),
+            pending_since: None,
+            last_change_at: None,
+            last_polled_at: None,
+            last_error: None,
+            created_at: ts.clone(),
+            updated_at: ts,
+        };
+        let wire = pr_monitor_wire(&m, None);
+        assert!(wire["lastSnapshot"].is_object());
+        assert!(wire["lastSnapshot"].get("prUpdatedAt").is_none());
+        assert!(!wire.to_string().contains("prUpdatedAt"));
     }
 
     // ── checksNotStarted: CI never started on the head (intentd#2531) ──
@@ -8831,6 +8979,7 @@ mod tests {
             }]),
             required_check_names: Some(BTreeSet::from([pick(b, "build", "lint").into()])),
             observed_at: Some(pick(b, "2026-10-24T12:00:00Z", "2026-10-25T12:00:00Z").into()),
+            pr_updated_at: Some(pick(b, "2026-10-24T11:00:00Z", "2026-10-25T11:00:00Z").into()),
             checks_not_started_delivered: Some(head.into()),
             latest_reviews_carried: !b,
         }
@@ -9233,6 +9382,10 @@ mod tests {
         ("/statusChecks", "frozen legacy evidence, internal"),
         ("/requiredCheckNames", "internal required-flag evidence"),
         ("/observedAt", "freshness anchor; never diffed"),
+        (
+            "/prUpdatedAt",
+            "forge recency for pool ordering; never diffed",
+        ),
         (
             "/checksNotStartedDelivered",
             "internal stall-wake bookkeeping",
@@ -10977,7 +11130,9 @@ mod tests {
 
         let folded = StubForge::new();
         folded.edit(busy_pr);
-        folded.edit(|s| s.folded = Some(FoldedRead::default()));
+        // Turning on the folded host capability is not a PR change: keep the
+        // PR record's `updatedAt` equal to the per-signal forge's.
+        folded.edit_quiet(|s| s.folded = Some(FoldedRead::default()));
         let snapshot = fetch_shared_snapshot(&folded, &repo, 42)
             .await
             .expect("folded fetch");
@@ -11409,7 +11564,7 @@ mod tests {
 
         let forge = StubForge::new();
         forge.edit(busy_pr);
-        forge.edit(|s| {
+        forge.edit_quiet(|s| {
             s.folded = Some(FoldedRead {
                 overflow_reviews: true,
                 ..FoldedRead::default()
@@ -11428,7 +11583,7 @@ mod tests {
 
         let forge = StubForge::new();
         forge.edit(busy_pr);
-        forge.edit(|s| {
+        forge.edit_quiet(|s| {
             s.folded = Some(FoldedRead {
                 overflow_threads: true,
                 ..FoldedRead::default()
@@ -11456,7 +11611,7 @@ mod tests {
     async fn a_failing_folded_read_falls_back_and_a_rate_limited_one_propagates() {
         let repo = RepoRef::new("o", "r");
         let forge = StubForge::new();
-        forge.edit(|s| {
+        forge.edit_quiet(|s| {
             s.folded = Some(FoldedRead {
                 fail: true,
                 ..FoldedRead::default()
@@ -11475,7 +11630,7 @@ mod tests {
         // the failed observation attempt precedes the per-signal REST
         // fallback's eight reads, so this host pays nine, not eight.
         let forge = StubForge::new();
-        forge.edit(|s| {
+        forge.edit_quiet(|s| {
             s.folded = Some(FoldedRead {
                 fail: true,
                 ..FoldedRead::default()
@@ -11532,9 +11687,9 @@ mod tests {
             s.folded = Some(FoldedRead::default());
         });
         let folded = fetch_shared_snapshot(&forge, &repo, 42).await.unwrap();
-        forge.edit(|s| s.folded.as_mut().unwrap().fail = true);
+        forge.edit_quiet(|s| s.folded.as_mut().unwrap().fail = true);
         let fallback = fetch_shared_snapshot(&forge, &repo, 42).await.unwrap();
-        forge.edit(|s| s.folded.as_mut().unwrap().fail = false);
+        forge.edit_quiet(|s| s.folded.as_mut().unwrap().fail = false);
         let folded_again = fetch_shared_snapshot(&forge, &repo, 42).await.unwrap();
         assert_eq!(forge.sub_fetches("pr_observation"), 3);
         assert_eq!(forge.sub_fetches("list_comments"), 1);

@@ -2176,6 +2176,7 @@ async fn list_paths_merge_git_root_and_monitor_prs_into_pull_requests() {
         "title": "Monitored PR",
         "url": "https://github.com/o/r/pull/2",
         "headSha": "abc123",
+        "prUpdatedAt": "2026-01-01T12:34:56Z",
         "conversationCount": 0,
         "reviewCommentCount": 0,
         "requirements": {
@@ -2296,9 +2297,17 @@ async fn list_paths_merge_git_root_and_monitor_prs_into_pull_requests() {
             "{path}: headSha slimmed off list rows only"
         );
         assert_eq!(prs[1].is_draft, Some(false), "{path}");
+        // The entry's recency is the PR's own forge `updatedAt` from the
+        // snapshot, not the monitor row's bookkeeping timestamp
+        // (2026-01-02T00:00:01Z), so same-state ordering compares PR activity.
+        assert_eq!(prs[1].updated_at, "2026-01-01T12:34:56Z", "{path}");
         // Snapshotless completed monitor: URL/title synthesized from the
         // repo identity; terminal without a verdict reads closed, not merged.
         assert_eq!(prs[2].title, "o2/r2#7", "{path}");
+        assert_eq!(
+            prs[2].updated_at, "2026-01-02T00:00:01Z",
+            "{path}: no snapshot timestamp falls back to the monitor row"
+        );
         assert_eq!(
             prs[2].status,
             intent_core::PullRequestStatus::Closed,
