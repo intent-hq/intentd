@@ -3414,11 +3414,14 @@ mod tests {
         timeout(
             intentd_test_support::test_timeout(Duration::from_secs(10)),
             async {
+                // The sweep claims `MergePending -> Merging` before it merges,
+                // and marks `Merged` only once the merge has landed in the
+                // checkout; wait for that mark (or the discarded row).
                 while store
                     .get_sandbox(&ws.id, &agent)
                     .await
                     .unwrap()
-                    .is_some_and(|sb| sb.status == SandboxStatus::MergePending)
+                    .is_some_and(|sb| sb.status != SandboxStatus::Merged)
                 {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
