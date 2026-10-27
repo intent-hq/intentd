@@ -308,6 +308,26 @@ def gate_errors(workflow):
     return errors
 
 
+def queue_fail_fast_errors(workflow):
+    """The fail-fast watcher cancels on any failed merge_group job, which is
+    safe only while every such job's failure already fails CI Gate."""
+    errors = []
+    jobs = scheduled(workflow, "merge_group")
+    ran = {name for name, result in jobs.items() if result == "success"} - {"gate"}
+    needs = set(workflow["jobs"]["gate"]["needs"])
+    if ran - needs != QUEUE_WATCHERS:
+        errors.append(f"merge_group jobs outside CI Gate's needs must be exactly the watchers: {sorted(ran - needs)}")
+    baseline = {name: jobs.get(name, "skipped") for name in needs}
+    if not gate_passes(workflow, "merge_group", baseline):
+        errors.append("merge_group: baseline rejected")
+    for name in sorted(ran & needs):
+        if workflow["jobs"][name].get("continue-on-error"):
+            errors.append(f"{name}: a continue-on-error job's failure would cancel a passing run")
+        if gate_passes(workflow, "merge_group", {**baseline, name: "failure"}):
+            errors.append(f"{name}: CI Gate accepts its failure, so the watcher would eject a passing entry")
+    return errors
+
+
 def release_push_gate_errors(workflow, expected):
     """The push gate accepts a skipped Windows job only on a reported skip.
 
@@ -1244,6 +1264,17 @@ class NativeRoutingTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
+
+    def test_every_queue_job_failure_already_fails_the_gate(self):
+        self.assertEqual(queue_fail_fast_errors(self.workflow), [])
+        workflow = copy.deepcopy(self.workflow)
+        body = next(st for st in workflow["jobs"]["gate"]["steps"] if st.get("name") == "Check results")
+        # A gate that stops reading a queue job would accept its failure.
+        merge_group = body["run"].index("merge_group)")
+        line = 'require deb-packaging "${{ needs.deb-packaging.result }}"\n'
+        at = body["run"].index(line, merge_group)
+        body["run"] = body["run"][:at] + body["run"][at + len(line):]
+        self.assertTrue(any(e.startswith("deb-packaging:") for e in queue_fail_fast_errors(workflow)))
 
     def test_job_selection_and_route_failures(self):
         self.assertEqual(routing_errors(self.workflow), [])

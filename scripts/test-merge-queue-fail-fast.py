@@ -31,13 +31,15 @@ def running(name):
 class FakeApi:
     """Serves one jobs snapshot per poll (the last repeats); records POSTs."""
 
-    def __init__(self, snapshots, fail_reads=0, fail_posts=0):
+    def __init__(self, snapshots, fail_reads=0, fail_posts=0, events=None):
         self.snapshots, self.fail_reads, self.fail_posts = list(snapshots), fail_reads, fail_posts
         self.reads, self.posts, self.paths = 0, [], []
+        self.events = events if events is not None else []
 
     def __call__(self, method, path):
         self.paths.append((method, path))
         if method == 'POST':
+            self.events.append('POST')
             if self.fail_posts:
                 self.fail_posts -= 1
                 raise subprocess.CalledProcessError(1, ['gh', 'api', path])
@@ -48,8 +50,9 @@ class FakeApi:
             raise subprocess.CalledProcessError(1, ['gh', 'api', path])
         jobs = self.snapshots[min(self.reads, len(self.snapshots) - 1)]
         page = int(parse_qs(urlsplit(path).query).get('page', ['1'])[0])
-        self.reads += page == 1
         chunk = jobs[(page - 1) * 100:page * 100]
+        if page * 100 >= len(jobs):
+            self.reads += 1  # every page of one poll comes from the same snapshot
         return {'total_count': len(jobs), 'jobs': chunk}
 
 
@@ -78,7 +81,16 @@ class DecideTests(unittest.TestCase):
                          ('continue', None))
 
     def test_gate_visible_means_everything_else_finished(self):
-        self.assertEqual(fail_fast.decide([job('route'), job(GATE, 'queued')]), ('done', None))
+        for status in ('queued', 'in_progress', 'completed'):
+            with self.subTest(status=status):
+                self.assertEqual(fail_fast.decide([job('route'), job(GATE, status)]), ('done', None))
+
+    def test_a_listed_but_blocked_gate_does_not_end_the_watch(self):
+        for status in ('pending', 'waiting', 'requested'):
+            with self.subTest(status=status):
+                self.assertEqual(fail_fast.decide([running('check'), job(GATE, status)]), ('continue', None))
+                action, _ = fail_fast.decide([job('check', conclusion='failure'), job(GATE, status)])
+                self.assertEqual(action, 'cancel')
 
     def test_every_fatal_conclusion_cancels(self):
         for conclusion in ('failure', 'timed_out', 'cancelled', 'startup_failure'):
@@ -125,10 +137,37 @@ class WatchTests(unittest.TestCase):
         self.assertEqual(api.posts, [f'repos/{REPO}/actions/runs/{RUN}/cancel'])
         self.assertTrue(any(l.startswith('::error::') and "'check'" in l for l in lines), lines)
 
+    def test_explanation_is_written_before_the_cancel_request(self):
+        # Cancelling the run cancels this step too, so later output can be lost.
+        events = []
+        api = FakeApi([[job('check', conclusion='failure')]], events=events)
+        fail_fast.watch(api, REPO, RUN, 1, log=lambda m: events.append(m.split('::')[1] if m.startswith('::') else 'log'),
+                        clock=Clock().time, sleep=lambda _s: None)
+        self.assertLess(events.index('error'), events.index('POST'), events)
+
     def test_reads_only_the_current_attempt(self):
         api, clock = FakeApi([[job(GATE, 'queued')]]), Clock()
         fail_fast.watch(api, REPO, RUN, 3, log=lambda _m: None, clock=clock.time, sleep=clock.sleep)
         self.assertTrue(all(f'/runs/{RUN}/attempts/3/jobs' in p for m, p in api.paths if m == 'GET'), api.paths)
+
+    def test_pages_of_one_poll_come_from_one_snapshot(self):
+        first = [running('check')] + [job(f'leg {i}') for i in range(150)]
+        second = [job('check', conclusion='failure')] + [job(f'leg {i}') for i in range(150)]
+        api = FakeApi([first, second])
+        result, _, clock = watch(api)
+        self.assertEqual(result, 'cancelled')
+        self.assertEqual(clock.sleeps, [fail_fast.POLL_SECONDS])
+        self.assertEqual(api.reads, 2)
+
+    def test_malformed_jobs_page_counts_as_a_read_error(self):
+        class Malformed(FakeApi):
+            def __call__(self, method, path):
+                if method == 'GET' and self.fail_reads:
+                    self.fail_reads -= 1
+                    return {'total_count': 1, 'jobs': ['not a job']}
+                return super().__call__(method, path)
+        api = Malformed([[job('check', conclusion='failure')]], fail_reads=2)
+        self.assertEqual(watch(api)[0], 'cancelled')
 
     def test_paginates_beyond_one_hundred_jobs(self):
         jobs = [job(f'leg {i}') for i in range(150)] + [job('late failure', conclusion='failure')]
@@ -166,7 +205,9 @@ class WatchTests(unittest.TestCase):
 
     def test_cancel_post_is_retried_then_abandoned(self):
         api = FakeApi([[job('check', conclusion='failure')]], fail_posts=1)
-        self.assertEqual(watch(api)[0], 'cancelled')
+        result, _, clock = watch(api)
+        self.assertEqual(result, 'cancelled')
+        self.assertEqual(clock.sleeps, [fail_fast.CANCEL_BACKOFF_SECONDS[0]], 'retries back off, not back to back')
         api = FakeApi([[job('check', conclusion='failure')]], fail_posts=fail_fast.MAX_POST_ATTEMPTS)
         result, lines, _ = watch(api)
         self.assertEqual(result, 'gave-up')
@@ -195,6 +236,21 @@ class MainTests(unittest.TestCase):
             with self.subTest(api=api.snapshots):
                 self.assertEqual(self.run_main(base, api)[0], 0)
 
+    def test_an_unexpected_bug_still_exits_zero_with_a_warning(self):
+        def broken(_method, _path):
+            raise RuntimeError('boom')
+        code, output = self.run_main(['--repo', REPO, '--run-id', str(RUN), '--attempt', '1'], broken)
+        self.assertEqual(code, 0)
+        self.assertIn('::warning::', output)
+        self.assertIn('outcome=error', output)
+
+    def test_gh_failures_carry_stderr(self):
+        import unittest.mock
+        err = subprocess.CalledProcessError(1, ['gh'], stderr='HTTP 403: Resource not accessible by integration')
+        with unittest.mock.patch.object(fail_fast.subprocess, 'run', side_effect=err):
+            with self.assertRaisesRegex(subprocess.SubprocessError, 'HTTP 403'):
+                fail_fast.gh_api('POST', 'repos/x/y/actions/runs/1/cancel')
+
     def test_dry_run_flag_reaches_watch(self):
         api = FakeApi([[job('check', conclusion='failure')]])
         code, output = self.run_main(['--repo', REPO, '--run-id', str(RUN), '--attempt', '1', '--once', '--dry-run'], api)
@@ -216,7 +272,26 @@ class MainTests(unittest.TestCase):
                     os.environ.pop('GITHUB_STEP_SUMMARY')
                 else:
                     os.environ['GITHUB_STEP_SUMMARY'] = old
-            self.assertIn('check', summary.read())
+            text = summary.read()
+        self.assertIn('`check`', text)
+
+    def test_summary_lists_jobs_cut_short(self):
+        import os
+        import tempfile
+        with tempfile.NamedTemporaryFile('r', suffix='.md') as summary:
+            old = os.environ.get('GITHUB_STEP_SUMMARY')
+            os.environ['GITHUB_STEP_SUMMARY'] = summary.name
+            try:
+                self.run_main(['--repo', REPO, '--run-id', str(RUN), '--attempt', '1'],
+                              FakeApi([[job('check', conclusion='failure'), running('coverage-all'), running(SELF)]]))
+            finally:
+                if old is None:
+                    os.environ.pop('GITHUB_STEP_SUMMARY')
+                else:
+                    os.environ['GITHUB_STEP_SUMMARY'] = old
+            text = summary.read()
+        self.assertIn('`coverage-all`', text)
+        self.assertNotIn(f'`{SELF}`', text)
 
 
 class WorkflowTests(unittest.TestCase):

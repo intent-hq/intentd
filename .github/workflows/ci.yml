@@ -879,7 +879,7 @@ jobs:
     name: Merge queue fail-fast
     if: github.event_name == 'merge_group'
     runs-on: ubuntu-24.04
-    timeout-minutes: 75
+    timeout-minutes: 120
     permissions:
       actions: write
       contents: read
