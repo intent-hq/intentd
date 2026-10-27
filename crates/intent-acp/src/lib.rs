@@ -64,7 +64,7 @@ pub use mcp_server::{
 pub use permission::{
     PermissionOutcome, PermissionPolicy, PermissionRegistry, PermissionRequestData,
 };
-pub use profile_env::ProfileEnv;
+pub use profile_env::{NodeAccountDirMissing, ProfileEnv};
 pub use session::{MappedToolCall, MappedUpdate};
 pub use spawn::{spawn_provider, AgentPriority, LaunchMode, NpxLaunchDir, SpawnOptions};
 pub use terminal::{TerminalCreateParams, TerminalExitInfo, TerminalHost, TerminalOutputInfo};

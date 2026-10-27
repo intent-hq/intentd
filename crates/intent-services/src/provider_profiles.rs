@@ -499,30 +499,11 @@ fn is_valid_key(key: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || *b == b'_')
 }
 
-/// Account-directory variables whose leading `~` the daemon expands.
-const TILDE_EXPANDED_KEYS: [&str; 2] = ["CLAUDE_CONFIG_DIR", "CODEX_HOME"];
-
-/// Expand a leading `~` in an account-directory value at resolution time:
-/// for `CLAUDE_CONFIG_DIR` and `CODEX_HOME` only (keys compared ignoring
-/// ASCII case), a value of exactly `~` or
-/// one starting with `~/` is joined onto `home` (the daemon user's home).
-/// `~user`, variables and every other key stay literal, and without a home
-/// the value is used as typed. The saved value is never rewritten.
+/// Expand a leading `~` in an account-directory value at resolution time
+/// against the daemon user's home ([`intent_acp::profile_env::expand_account_dir`]).
+/// The saved value is never rewritten.
 pub(crate) fn expand_account_dir(key: &str, value: &str, home: Option<&Path>) -> String {
-    let Some(home) = home.and_then(Path::to_str) else {
-        return value.to_owned();
-    };
-    if !TILDE_EXPANDED_KEYS
-        .iter()
-        .any(|k| k.eq_ignore_ascii_case(key))
-    {
-        return value.to_owned();
-    }
-    match value.strip_prefix('~') {
-        Some("") => home.to_owned(),
-        Some(rest) if rest.starts_with('/') => format!("{}{rest}", home.trim_end_matches('/')),
-        _ => value.to_owned(),
-    }
+    intent_acp::profile_env::expand_account_dir(key, value, home)
 }
 
 /// The daemon user's home directory, as the installed-CLI context resolves
@@ -1348,17 +1329,22 @@ fn native_session_binding(stored: &intent_core::AgentSession) -> Option<&str> {
 
 /// Build the launch overlay of a saved environment document. Reserved keys
 /// are dropped even if the stored document was edited outside the daemon,
-/// and `~` in an account directory expands here, before account-home lookup,
-/// isolation and fingerprinting, so every path agrees.
-fn overlay_from(reference: &str, base: &str, doc: EnvDoc) -> intent_acp::ProfileEnv {
-    let home = daemon_home();
+/// and `~` in an account directory expands against `home` here, before
+/// account-home lookup, isolation and fingerprinting, so every path agrees.
+/// `None` keeps values as typed (a remote node expands against its own home).
+fn overlay_from(
+    reference: &str,
+    base: &str,
+    doc: EnvDoc,
+    home: Option<&Path>,
+) -> intent_acp::ProfileEnv {
     let entries = doc
         .entries
         .into_iter()
         .filter(|e| reserved_key_reason(e.key(), base).is_none())
         .map(|e| match e {
             StoredEnv::Set { key, value } => {
-                let value = expand_account_dir(&key, &value, home.as_deref());
+                let value = expand_account_dir(&key, &value, home);
                 (key, Some(value))
             }
             StoredEnv::Unset { key } => (key, None),
@@ -1415,8 +1401,35 @@ impl Services {
         &self,
         reference: &str,
     ) -> Result<Option<intent_acp::ProfileEnv>> {
+        self.resolve_profile_env_for(reference, daemon_home().as_deref())
+            .await
+    }
+
+    /// The overlay a remote node launch for `reference` must run with, under
+    /// the same selection gate as a local launch (a missing profile or a
+    /// disabled base fails with `provider-profile-replacement-required` and
+    /// never falls back). `None` means no overrides: the node uses its own
+    /// login. Account directories are returned as typed; the node expands a
+    /// leading `~` against its own home ([`intent_acp::ProfileEnv::for_node`]).
+    ///
+    /// # Errors
+    /// Replacement-required for an unselectable reference; an unreadable
+    /// environment document fails closed.
+    pub async fn resolve_remote_profile_env(
+        &self,
+        reference: &str,
+    ) -> Result<Option<intent_acp::ProfileEnv>> {
+        self.ensure_provider_ref_selectable(reference)?;
+        self.resolve_profile_env_for(reference, None).await
+    }
+
+    async fn resolve_profile_env_for(
+        &self,
+        reference: &str,
+        home: Option<&Path>,
+    ) -> Result<Option<intent_acp::ProfileEnv>> {
         if !is_qualified_ref(reference) {
-            return self.resolve_default_env(reference).await;
+            return self.resolve_default_env(reference, home).await;
         }
         let missing = || replacement_required(reference, "profile-missing");
         let (base, id) = parse_profile_ref(reference).ok_or_else(missing)?;
@@ -1434,7 +1447,7 @@ impl Services {
                 "provider profile {reference} environment is unavailable"
             ))
         })?;
-        Ok(Some(overlay_from(reference, base, doc)))
+        Ok(Some(overlay_from(reference, base, doc, home)))
     }
 
     /// The Default configuration's saved overlay (PROTOCOL §5.54 "Default
@@ -1443,7 +1456,11 @@ impl Services {
     /// profile file is unreadable (bare references keep today's behavior
     /// then). A recorded environment whose secret cannot be read fails
     /// closed: the Default never silently runs without its overrides.
-    async fn resolve_default_env(&self, reference: &str) -> Result<Option<intent_acp::ProfileEnv>> {
+    async fn resolve_default_env(
+        &self,
+        reference: &str,
+        home: Option<&Path>,
+    ) -> Result<Option<intent_acp::ProfileEnv>> {
         let Some(base) = PROFILE_BASE_PROVIDERS
             .iter()
             .copied()
@@ -1464,7 +1481,7 @@ impl Services {
                 "the {base} Default configuration environment is unavailable"
             ))
         })?;
-        Ok(Some(overlay_from(reference, base, doc)))
+        Ok(Some(overlay_from(reference, base, doc, home)))
     }
 
     /// Selection gate for a provider reference about to be persisted or
