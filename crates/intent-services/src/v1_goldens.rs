@@ -25,7 +25,6 @@ use intent_store::Store;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use crate::hook_manager::HookServicesExt;
 use crate::Services;
 
 fn sha256_hex(s: &str) -> String {

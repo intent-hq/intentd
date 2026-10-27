@@ -1,5 +1,4 @@
 use super::*;
-use crate::host_execution::HostExecutionExt;
 use crate::test_support::capability_fixtures::host_role::{caller, fixture};
 use crate::tests::{workspace, TempDb};
 use intent_core::{now_iso, with_caller, WorkspaceApi, WorkspaceCreate, WorkspaceUpdate};

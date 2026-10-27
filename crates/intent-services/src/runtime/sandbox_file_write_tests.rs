@@ -1,3 +1,12 @@
+//! Sandboxed agent file writes stay inside the sandbox (moved from
+//! `tests.rs`).
+
+use intent_core::{now_iso, WorkspaceApi, WorkspaceId};
+use intent_store::Store;
+
+use crate::test_support::fixtures::{workspace, TempDb};
+use crate::Services;
+
 #[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// Containment integration test: delegate an agent with isolation=cow, perform a
 /// file write through the agent-scoped ops path (`caller_agent_id` → `resolve_root`),
