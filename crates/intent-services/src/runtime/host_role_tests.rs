@@ -7,8 +7,8 @@ use intent_core::{
 use intent_store::Store;
 use serde_json::json;
 
+use super::test_fixtures::host_role::{caller, fixture};
 use crate::host_execution::HostExecutionExt;
-use crate::test_support::capability_fixtures::host_role::{caller, fixture};
 use crate::test_support::fixtures::{workspace, TempDb};
 use crate::Services;
 
@@ -777,7 +777,7 @@ async fn member_execution_context_events_cover_policy_setup_and_unchanged_config
     registry
         .apply(&[("sourceControl.github.tokenSource".into(), json!("explicit"))])
         .unwrap();
-    let bus = EventBus::new(svc.store.clone());
+    let bus = EventBus::new(svc.store().clone());
     let svc = svc
         .with_settings_registry(registry)
         .with_event_bus(bus.clone());
@@ -789,8 +789,8 @@ async fn member_execution_context_events_cover_policy_setup_and_unchanged_config
     let before = svc.execution_context_snapshot().await.unwrap();
     with_caller(
         caller(&member),
-        svc.execution_call(async {
-            let _ = crate::execution_call::forge_error(intent_sourcecontrol::Error::Auth(
+        svc.execution_call_for_test(async {
+            let _ = crate::execution_call::forge_error_for_test(intent_sourcecontrol::Error::Auth(
                 "private response".into(),
             ));
             Ok(())
@@ -852,7 +852,7 @@ async fn member_execution_context_events_cover_policy_setup_and_unchanged_config
 #[tokio::test]
 async fn member_pr_status_rejection_publishes_durable_safe_context() {
     use crate::events::{EventBus, SubscriptionFilter};
-    use crate::tests::pr::StubForge;
+    use crate::test_support::stub_forge::StubForge;
     use intent_core::events::HOST_EXECUTION_CONTEXT_CHANGED;
     use std::{sync::Arc, time::Duration};
     let tmp = TempDb::new();
@@ -862,8 +862,8 @@ async fn member_pr_status_rejection_publishes_durable_safe_context() {
     row.repository_owner = Some("o".into());
     row.repository_name = Some("r".into());
     row.pr_number = Some(42);
-    svc.store.insert_workspace(&row).await.unwrap();
-    let bus = EventBus::new(svc.store.clone());
+    svc.store().insert_workspace(&row).await.unwrap();
+    let bus = EventBus::new(svc.store().clone());
     let svc = svc
         .with_event_bus(bus.clone())
         .with_source_control(Arc::new(StubForge::with_get_pr_error(|| {

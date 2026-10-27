@@ -590,7 +590,7 @@ async fn orphan_sweep_keeps_every_folder_when_the_store_cannot_be_read() {
             .store()
             .get_workspace(&h.ws)
             .await
-            .is_err_and(|e| !matches!(e, crate::Error::NotFound(_))),
+            .is_err_and(|e| !matches!(e, intent_core::Error::NotFound(_))),
         "the closed store fails reads with a non-NotFound error"
     );
 

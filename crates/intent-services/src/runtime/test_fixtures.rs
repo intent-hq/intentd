@@ -1,7 +1,8 @@
-//! Fixtures the runtime's tests share. These three mirror helpers in
-//! core's `test_support` that stay `cfg(test)` there: their hang guards go
-//! through the dev-only `intentd_test_support::test_timeout`, which core's
-//! `test-hooks` build cannot use.
+//! Fixtures the runtime's tests share: copies of core `test_support`
+//! helpers that stay `cfg(test)` there because they need dev-only crates
+//! (`intentd_test_support::test_timeout` for hang guards, `sqlx` for raw
+//! seeding), which core's `test-hooks` build cannot use. Keep each copy in
+//! step with the original it names.
 
 use std::time::Duration;
 
@@ -10,6 +11,8 @@ use serde_json::Value;
 
 use crate::{Services, Subscription};
 
+/// Copy of `test_support::goldens::wake_texts_when`.
+///
 /// All persisted message texts for an agent (each message's text blocks
 /// joined), oldest-first — the wake-delivery capture used by the goldens.
 /// Wake persistence can lag the op return, so poll until at least `expected`
@@ -43,6 +46,8 @@ pub(crate) async fn wake_texts_when(svc: &Services, id: &AgentId, expected: usiz
     }
 }
 
+/// Copy of `test_support::setup_lifecycle::recv_setup`.
+///
 /// Receive one setup event (generous timeout: script paths cross a PTY
 /// spawn + reap poll), serialized to wire JSON.
 pub(crate) async fn recv_setup(sub: &mut Subscription) -> Value {
@@ -57,6 +62,7 @@ pub(crate) async fn recv_setup(sub: &mut Subscription) -> Value {
     serde_json::to_value(&batch[0]).expect("serialize event")
 }
 
+/// Copy of `test_support::setup_lifecycle::assert_quiet`.
 pub(crate) async fn assert_quiet(sub: &mut Subscription) {
     let quiet = tokio::time::timeout(
         intentd_test_support::test_timeout(Duration::from_millis(300)),
@@ -64,4 +70,52 @@ pub(crate) async fn assert_quiet(sub: &mut Subscription) {
     )
     .await;
     assert!(quiet.is_err(), "no further setup events, got: {quiet:?}");
+}
+
+/// Copy of `test_support::capability_fixtures::host_role` (`cfg(test)` there:
+/// seeding the host member needs the dev-only `sqlx`).
+pub(crate) mod host_role {
+    use intent_core::{now_iso, Caller, Principal, PrincipalId};
+    use intent_store::Store;
+
+    use crate::test_support::fixtures::TempDb;
+    use crate::Services;
+
+    pub(crate) async fn fixture(tmp: &TempDb) -> (Services, PrincipalId, PrincipalId) {
+        let store = Store::open(&tmp.path).await.unwrap();
+        let owner = store.get_primary_principal().await.unwrap();
+        assert!(owner.identity_key().is_none(), "no forge account is needed");
+        let member = Principal {
+            id: PrincipalId::new(),
+            identity: None,
+            github_user_id: None,
+            login: None,
+            display_name: None,
+            avatar_url: None,
+            is_primary: false,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+        };
+        store.upsert_principal(&member).await.unwrap();
+        sqlx::query("INSERT INTO host_member (principal_id, added_at) VALUES (?, ?)")
+            .bind(&member.id.0)
+            .bind(now_iso())
+            .execute(store.write_pool())
+            .await
+            .unwrap();
+        let root = tmp.path.parent().unwrap().join("workspaces");
+        (
+            Services::new(store).with_workspaces_root(root),
+            owner.id,
+            member.id,
+        )
+    }
+
+    #[must_use]
+    pub(crate) fn caller(id: &PrincipalId) -> Caller {
+        Caller::Wire {
+            principal_id: id.clone(),
+            host_role: intent_core::HostRole::Member,
+        }
+    }
 }

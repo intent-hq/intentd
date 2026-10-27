@@ -163,7 +163,6 @@ pub async fn wake_texts_when(svc: &Services, id: &AgentId, expected: usize) -> V
 pub const PREFIX: &str = "[SYSTEM NOTICE] This workspace was archived and has since been \
     unarchived. While it was archived, ";
 
-pub const RE_ARM_HOOKS: &str =
-    "ws.hook.get(hookId) recovers a hook's script for ws.hook.schedule";
+pub const RE_ARM_HOOKS: &str = "ws.hook.get(hookId) recovers a hook's script for ws.hook.schedule";
 
 pub const RE_ARM_MONITORS: &str = "ws.pr.monitor re-registers a PR";

@@ -17,7 +17,7 @@ async fn auto_retire_skips_a_workspace_whose_script_result_cannot_be_settled() {
 
     let out = f
         .svc
-        .auto_retire_workspace_op(ws.id.clone(), days_from_now(8))
+        .auto_retire_workspace_op_for_test(ws.id.clone(), days_from_now(8))
         .await;
     assert!(matches!(out, Err(Error::Internal(_))), "{out:?}");
     assert_still_archived_and_unsettled(&f, &ws, &id).await;

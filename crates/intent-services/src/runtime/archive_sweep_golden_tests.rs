@@ -4,8 +4,8 @@
 use intent_core::{AgentId, HookState, PrMonitorState, WorkspaceApi};
 use serde_json::json;
 
-use crate::hook_manager::HookServicesExt;
 use super::test_fixtures::wake_texts_when;
+use crate::hook_manager::HookServicesExt;
 use crate::test_support::goldens::{pr_monitor_row, seed_agent, setup};
 use crate::test_support::goldens::{PREFIX, RE_ARM_HOOKS, RE_ARM_MONITORS};
 

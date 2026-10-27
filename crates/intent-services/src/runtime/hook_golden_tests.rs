@@ -4,8 +4,8 @@
 use intent_core::{now_iso, AgentId};
 use serde_json::json;
 
-use crate::hook_manager::HookServicesExt;
 use super::test_fixtures::wake_texts_when;
+use crate::hook_manager::HookServicesExt;
 use crate::test_support::goldens::{pr_monitor_row, seed_agent, setup};
 
 /// FE-cancel notices for hooks and PR monitors: exact wake bytes delivered

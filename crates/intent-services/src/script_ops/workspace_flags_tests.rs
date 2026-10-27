@@ -141,7 +141,7 @@ async fn scripts_running_drops_when_running_command_is_removed() {
         .await
         .expect("remove command");
     await_flag_events(vec![true, false], || scripts_running_events(&h)).await;
-    assert!(!h.services.workspace_scripts_running(&h.ws));
+    assert!(!h.services.workspace_scripts_running_for_test(&h.ws));
 }
 
 /// An active script run monitor is a `waiting` signal: registration raises
@@ -165,7 +165,7 @@ async fn active_script_monitor_sets_and_clears_waiting() {
         .await
         .expect("register monitor")["monitor"]
         .clone();
-    assert!(h.services.workspace_is_waiting(&h.ws).await);
+    assert!(h.services.workspace_is_waiting_for_test(&h.ws).await);
     assert_eq!(waiting_flag_events(&h).await, vec![true]);
     let ws = intent_core::WorkspaceApi::get_workspace(&h.services, h.ws.clone())
         .await
@@ -175,7 +175,7 @@ async fn active_script_monitor_sets_and_clears_waiting() {
     mgr.cancel_monitor(&h.ws, row["monitorId"].as_str().unwrap(), None, false)
         .await
         .expect("cancel monitor");
-    assert!(!h.services.workspace_is_waiting(&h.ws).await);
+    assert!(!h.services.workspace_is_waiting_for_test(&h.ws).await);
     assert_eq!(waiting_flag_events(&h).await, vec![true, false]);
     h.services.script_stop(h.ws.clone(), id).await.unwrap();
 }
@@ -197,7 +197,7 @@ async fn scripts_running_stale_recompute_cannot_override_newer_start() {
         .expect("start a");
     await_flag_events(vec![true], || scripts_running_events(&h)).await;
 
-    let park = h.services.arm_scripts_running_park();
+    let park = h.services.arm_scripts_running_park_for_test();
     let stop_a = {
         let services = h.services.clone();
         let ws = h.ws.clone();
@@ -206,7 +206,7 @@ async fn scripts_running_stale_recompute_cannot_override_newer_start() {
     tokio::time::timeout(LIVENESS, park.entered.notified())
         .await
         .expect("a's settling recompute parked");
-    assert!(!h.services.workspace_scripts_running(&h.ws), "a settled");
+    assert!(!h.services.workspace_scripts_running_for_test(&h.ws), "a settled");
 
     let start_b = {
         let services = h.services.clone();
@@ -215,7 +215,7 @@ async fn scripts_running_stale_recompute_cannot_override_newer_start() {
         intent_core::spawn_daemon(async move { services.script_start(ws, b).await })
     };
     let deadline = tokio::time::Instant::now() + LIVENESS;
-    while !h.services.workspace_scripts_running(&h.ws) {
+    while !h.services.workspace_scripts_running_for_test(&h.ws) {
         assert!(tokio::time::Instant::now() < deadline, "b never started");
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -247,7 +247,7 @@ async fn scripts_running_stale_recompute_cannot_override_newer_start() {
         .expect("start b settled")
         .expect("start task")
         .expect("start b");
-    assert!(h.services.workspace_scripts_running(&h.ws), "b runs");
+    assert!(h.services.workspace_scripts_running_for_test(&h.ws), "b runs");
     let events = scripts_running_events(&h).await;
     assert_eq!(
         events.last(),

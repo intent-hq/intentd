@@ -3,12 +3,11 @@
 
 use async_trait::async_trait;
 use intent_sourcecontrol::{
-    AuthStatus, Branch, CheckRun, CheckState, Comment, CommentAnchor,
-    Error as ScError, Issue, IssueQuery, MergeMethod, MergeOptions, MergeOutcome,
-    MergeRequirementSignals, Mergeability, NewPullRequest, Page, PageParams, PrPatch, PrQuery,
-    PrState, PullRequest, RateLimitStatus, Repo, RepoRef, Result as ScResult, Review,
-    ReviewComment, ReviewDecision, ReviewThread, ReviewThreadComment, ReviewVerdict,
-    ScCapabilities, SourceControl, UserIdentity,
+    AuthStatus, Branch, CheckRun, CheckState, Comment, CommentAnchor, Error as ScError, Issue,
+    IssueQuery, MergeMethod, MergeOptions, MergeOutcome, MergeRequirementSignals, Mergeability,
+    NewPullRequest, Page, PageParams, PrPatch, PrQuery, PrState, PullRequest, RateLimitStatus,
+    Repo, RepoRef, Result as ScResult, Review, ReviewComment, ReviewDecision, ReviewThread,
+    ReviewThreadComment, ReviewVerdict, ScCapabilities, SourceControl, UserIdentity,
 };
 
 // Test stub: one independent bool per scripted scenario.
@@ -607,11 +606,7 @@ impl SourceControl for StubForge {
             },
         ])
     }
-    async fn merge_requirements(
-        &self,
-        _: &RepoRef,
-        _: u64,
-    ) -> ScResult<MergeRequirementSignals> {
+    async fn merge_requirements(&self, _: &RepoRef, _: u64) -> ScResult<MergeRequirementSignals> {
         match &self.merge_signals {
             Some(signals) => Ok(signals.clone()),
             None => Err(ScError::Unsupported("merge requirements probe".into())),

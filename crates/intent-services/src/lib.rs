@@ -272,6 +272,8 @@ mod stack_frame;
 pub(crate) mod stack_sample;
 mod task_effort;
 mod terminal_ops;
+#[cfg(any(test, feature = "test-hooks"))]
+mod test_seams;
 pub mod tool_block;
 #[cfg(test)]
 mod truncated_read_guard_tests;
@@ -2636,7 +2638,7 @@ impl Services {
     /// before the durable wake is sent) so a concurrent delivery pass for
     /// the same child inside that window is deterministic. Production
     /// wiring keeps `None` (no parking).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn with_completion_claim_park(mut self, park: Arc<CompletionClassifyPark>) -> Self {
         self.completion_claim_park = Some(park);
         self

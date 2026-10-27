@@ -6,10 +6,9 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use intent_core::{
-    now_iso, AgentId, AgentSession, AgentStatus, BoxFuture, Error, MessageOrigin,
-    Note, NoteAddInput, NoteCreate, NoteEditInput, NoteEditLinesInput, NoteId,
-    NoteUpdateInput, Workspace, WorkspaceActivity, WorkspaceApi,
-    WorkspaceAttention, WorkspaceId, WorkspaceUpdate,
+    now_iso, AgentId, AgentSession, AgentStatus, BoxFuture, Error, MessageOrigin, Note,
+    NoteAddInput, NoteCreate, NoteEditInput, NoteEditLinesInput, NoteId, NoteUpdateInput,
+    Workspace, WorkspaceActivity, WorkspaceApi, WorkspaceAttention, WorkspaceId, WorkspaceUpdate,
 };
 use intent_store::Store;
 
@@ -86,8 +85,8 @@ pub(crate) use crate::test_support::fixtures::{
     test_registry_with_default_provider, WorkspacesRoot,
 };
 
-pub(crate) use crate::test_support::fixtures::workspace;
 use crate::test_support::fixtures::note;
+pub(crate) use crate::test_support::fixtures::workspace;
 
 pub(super) async fn setup(content: &str) -> (TempDb, Services, WorkspaceId, NoteId) {
     let tmp = TempDb::new();
@@ -40263,8 +40262,8 @@ mod idle_workspace_archived_stamp {
     use serde_json::{json, Value};
     use tokio::time::timeout;
 
-    use crate::test_support::fixtures::session;
     use super::{workspace, TempDb};
+    use crate::test_support::fixtures::session;
     use crate::{EventBus, Services, Subscription, SubscriptionFilter};
 
     struct Harness {
@@ -45217,8 +45216,8 @@ mod agent_summary_excludes_deleted {
     use intent_core::{now_iso, AgentId, AgentStatus, WorkspaceId};
     use intent_store::Store;
 
-    use crate::test_support::fixtures::session;
     use super::{workspace, TempDb};
+    use crate::test_support::fixtures::session;
     use crate::Services;
 
     /// A workspace with one active + one soft-deleted session yields an

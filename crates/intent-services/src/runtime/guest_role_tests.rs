@@ -277,7 +277,7 @@ async fn guest_roles_script_list_cannot_import_repository_commands() {
     assert_eq!(list["scripts"], json!([]));
     assert!(!f
         .services
-        .store
+        .store()
         .workspace_scripts_initialized(&f.ws)
         .await
         .unwrap());
