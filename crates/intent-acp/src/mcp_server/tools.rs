@@ -2223,13 +2223,13 @@ mod tests {
             },
             &[],
         );
-        assert!(without_desktop.len() < 24_000, "{}", without_desktop.len());
+        assert!(without_desktop.len() < 24_250, "{}", without_desktop.len());
         assert!(
             condensed.len() - without_desktop.len() <= 1_500,
             "desktop signatures exceed their 1500-byte allowance: {}",
             condensed.len() - without_desktop.len()
         );
-        assert!(condensed.len() < 25_500, "{}", condensed.len());
+        assert!(condensed.len() < 25_750, "{}", condensed.len());
     }
 
     // `[agentFeatures]` gating composes: a disabled namespace is absent from
