@@ -202,10 +202,11 @@ fn many_agent_refs(repository: &Path, count: usize) {
     let head = String::from_utf8(head.stdout).unwrap();
     let mut input = String::new();
     for n in 0..count {
-        input.push_str(&format!(
-            "create refs/intent/ws/ws-1/agents/agent-1/r{n} {}\n",
-            head.trim()
-        ));
+        input += "create refs/intent/ws/ws-1/agents/agent-1/r";
+        input += &n.to_string();
+        input += " ";
+        input += head.trim();
+        input += "\n";
     }
     let mut child = Command::new("git")
         .arg("-C")
