@@ -176,14 +176,18 @@ pub(crate) const AUTO_UNARCHIVE_PROMPT_NOTICE: &str =
 /// Transcript text of the `workspace_revived` system row persisted when a turn
 /// start revives a RETIRED workspace (PROTOCOL §5.1 "Revive").
 pub(crate) const WORKSPACE_REVIVED_NOTICE_TEXT: &str =
-    "Workspace was retired and has been revived as a fresh, blank checkout because a message was sent to this agent. Files, uncommitted changes, and local git state from before were lost; conversations and notes were kept.";
+    "The workspace folder was purged while the workspace was archived. It has been unarchived as a fresh, blank checkout because a message was sent to this agent. Files, uncommitted changes, and local git state from before were lost; conversations and notes were kept.";
 
-/// Trailing prompt block injected into the SAME turn that revived a retired
-/// workspace: all prior on-disk state is gone. Names the kept old branch (its
-/// committed work is still in the repository) and the fresh branch.
+/// Trailing prompt block telling the model a retired ("purged") workspace
+/// was revived: all prior on-disk state is gone. Names the kept old branch
+/// (its committed work is still in the repository) and the fresh branch.
+/// Injected into the SAME turn that revived the workspace, and left pending
+/// ([`intent_core::PENDING_WORKSPACE_PURGE_NOTICE_KEY`]) for every other
+/// agent's next turn.
 pub(crate) fn workspace_revived_prompt_notice(previous_branch: &str, branch: &str) -> String {
     format!(
-        "[SYSTEM NOTICE] This workspace was retired and its folder was deleted. All files, \
+        "[SYSTEM NOTICE] This workspace's folder was purged to free disk space while the \
+         workspace was archived, and the workspace has since been unarchived. All files, \
          uncommitted changes, and local git state from before are gone; you are now in a fresh, \
          blank checkout of the repository's default branch on the new branch `{branch}`. \
          Commits on the previous branch `{previous_branch}` are kept in the repository. \
@@ -5969,7 +5973,27 @@ impl AgentManager {
         // `auto_unarchived` system row stays excluded from history replay
         // like every system row.
         let notice = self.auto_unarchived.lock().unwrap().remove(agent_id);
-        if let Some(notice) = notice {
+        // Folder-purged notice left pending by a revive this agent did not
+        // trigger (a manual unarchive, or another agent's turn): taken
+        // exactly once. When this turn already carries its own revive
+        // notice the pending copy is dropped, never sent twice.
+        let pending = match self
+            .services
+            .store
+            .take_agent_session_metadata_key(
+                workspace_id,
+                agent_id,
+                intent_core::PENDING_WORKSPACE_PURGE_NOTICE_KEY,
+            )
+            .await
+        {
+            Ok(pending) => pending,
+            Err(e) => {
+                tracing::warn!(agent = %agent_id, error = %e, "pending purge notice read failed");
+                None
+            }
+        };
+        if let Some(notice) = notice.or(pending) {
             blocks.extend(text_prompt(&notice));
         }
         Ok(blocks)

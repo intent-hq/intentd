@@ -40,8 +40,8 @@ Workspace owners and managers can rename discussions; only workspace owners can
 delete them, including the default discussion. Open the discussion, then use the
 discussion panel's **…** menu for **Rename discussion** or **Delete discussion**.
 These controls require discussion-management support from the connected daemon.
-Retired workspaces keep discussions read-only; restore the workspace before renaming
-or deleting a discussion.
+Archived workspaces whose folder was purged keep discussions read-only; unarchive the
+workspace before renaming or deleting a discussion.
 Existing private history remains
 visible only to its original participants and is read-only; new private discussions
 are unavailable. Discussions support reactions 👍 👎 👀 ✅ 🙈. The emoji picker has no tooltips;
@@ -576,27 +576,35 @@ The grouping choice is remembered with Home's settings for the current signed-in
 user and connected backend. **Activity** remains the default; existing saved
 grouping choices keep their behavior.
 
-## Retire and restore workspaces
+## Archive, auto-archive and disk cleanup
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{home-workspace-menu.ts,HomeWorkspaceControls.svelte}; src/lib/components/workspace/RetiredWorkspaceBanner.svelte; src/lib/components/settings/GitWorkspaceSettings.svelte; messages/en.json. Daemon: workspace.retire, packages/intentd/crates/intent-services/src/{retire,auto_retire}.rs. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{home-workspace-menu.ts,HomeWorkspaceControls.svelte}; src/lib/components/modals/RetireWorkspaceConfirmDialog.svelte; src/lib/components/settings/GitWorkspaceSettings.svelte; messages/en.json. Daemon: workspace.archive, workspace.retire, packages/intentd/crates/intent-services/src/{auto_archive,retire,auto_retire}.rs. -->
 
-Retiring frees disk space: it deletes the workspace's folder, including uncommitted
-changes and untracked files, but keeps its conversations, notes, tasks, and git
-branch. In **Home → Workspaces**, right-click a workspace and choose **Retire**, then
-confirm. An active workspace is archived first. Workspaces whose folder is the
-repository itself (not a separate checkout) and remote workspaces cannot be retired.
+Archive is the one way to put a workspace away. In **Home → Workspaces**,
+right-click a workspace and choose **Archive**. Archiving stops its agents, hooks
+and PR monitors and keeps its folder. Archived workspaces appear under the
+**Archived** filter. Choose **Unarchive**, or send an agent a message, to continue.
 
-Retired workspaces appear only under the **Retired** filter in Home. Opening one
-shows its history read-only. To keep working, choose **Restore as blank workspace**
-from its menu or banner, or send it a message: Intent recreates it from a fresh
-checkout of the default branch on a new branch. The old branch still holds the
-earlier work.
+Intent archives idle workspaces automatically: a workspace with no messages, note
+edits or agent activity for 7 days is archived, unless an agent, script, hook or PR
+monitor is still running or it is shared with guests. Change or turn this off in
+**Workspace setup → Archive idle workspaces** (`/settings?tab=setup#git-workspace`),
+or set `autoArchiveIdleAfterDays` (`0` = off) under `[workspace]` in `config.toml`.
 
-To retire archived workspaces automatically, turn on **Workspace setup →
-Automatically retire archived workspaces** (`/settings?tab=setup#git-workspace`) and
-set **Retire after (days)** (7 when first turned on). Intent checks about once an
-hour. It is off by default, and it skips remote, shared, and non-retirable
-workspaces.
+To free disk space, right-click an archived workspace and choose **Purge workspace
+folder**, then confirm. This deletes the folder, including uncommitted changes and
+untracked files, but keeps conversations, notes, tasks and the git branch. The
+workspace card's status then reads "Workspace folder purged to free disk space."
+Workspaces whose folder is the repository itself and remote workspaces cannot be
+purged. To purge automatically, turn on **Workspace setup → Free disk space for
+archived workspaces** and set the number of days (7 when first turned on), or set
+`purgeArchivedAfterDays` in `config.toml`. It is off by default, runs about once an
+hour, and skips workspaces with uncommitted changes.
+
+A purged workspace still shows as archived and its history stays readable.
+Unarchiving it, or sending a message, recreates it from a fresh checkout of the
+default branch on a new branch; the old branch still holds the earlier work, and
+the agents are told the folder was purged.
 
 ## Home workspace status icons
 

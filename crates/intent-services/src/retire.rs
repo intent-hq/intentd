@@ -48,6 +48,8 @@ pub(crate) struct RevivedCheckout {
     pub(crate) previous_branch: String,
     pub(crate) branch: String,
     pub(crate) base_commit_sha: String,
+    /// The revive flip cleared the unchanged purge `statusMessage`.
+    pub(crate) cleared_purge_status: bool,
 }
 
 impl Services {
@@ -242,6 +244,7 @@ impl Services {
                             "retiredAt": ws.retired_at,
                             "archived": true,
                             "archivedAt": ws.archived_at,
+                            "statusMessage": ws.status_message,
                         }),
                     ),
                 )
@@ -403,7 +406,50 @@ impl Services {
             previous_branch,
             branch,
             base_commit_sha: sha,
+            cleared_purge_status: ws.status_message.as_deref()
+                == Some(intent_core::WORKSPACE_PURGED_STATUS_MESSAGE),
         }))
+    }
+
+    /// Leave the one-time folder-purged prompt notice
+    /// ([`crate::agent_manager::workspace_revived_prompt_notice`]) pending on
+    /// every agent session of a just-revived workspace except
+    /// `triggering_agent`, whose own turn already carries it. Best-effort per
+    /// session: a failed write is logged and skipped.
+    pub(crate) async fn record_pending_purge_notices(
+        &self,
+        id: &WorkspaceId,
+        previous_branch: &str,
+        branch: &str,
+        triggering_agent: Option<&str>,
+    ) {
+        let notice = crate::agent_manager::workspace_revived_prompt_notice(previous_branch, branch);
+        let sessions = match self.store.list_agent_session_summaries(id).await {
+            Ok(sessions) => sessions,
+            Err(e) => {
+                tracing::warn!(workspace = %id.as_str(), error = %e, "revive: pending purge notice listing failed");
+                return;
+            }
+        };
+        for session in sessions {
+            if Some(session.id.0.as_str()) == triggering_agent {
+                continue;
+            }
+            if let Err(e) = self
+                .store
+                .set_agent_session_metadata_key(
+                    id,
+                    &session.id,
+                    intent_core::PENDING_WORKSPACE_PURGE_NOTICE_KEY,
+                    &notice,
+                    None,
+                    None,
+                )
+                .await
+            {
+                tracing::warn!(agent = %session.id, error = %e, "revive: pending purge notice write failed");
+            }
+        }
     }
 
     /// Ownership proof before anything is deleted (the `workspace.delete`
