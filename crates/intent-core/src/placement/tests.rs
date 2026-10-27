@@ -164,6 +164,17 @@ fn remote_launch_supports_the_documented_subset_only() {
         local.check_remote_supported(),
         Err(Error::InvalidParams(m)) if m.contains("target")
     ));
+    for raw in [r#"{"checkout":"shared"}"#, r#"{"checkout":"worktree"}"#] {
+        let placement: AgentPlacement = serde_json::from_str(raw).unwrap();
+        placement
+            .validate()
+            .unwrap_or_else(|e| panic!("{raw}: {e}"));
+        let err = placement.check_remote_supported().unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidParams(m) if m.contains("isolated checkout")),
+            "{raw}: {err:?}"
+        );
+    }
     let built = AgentPlacement {
         node_id: Some(String::new()),
         ..AgentPlacement::default()

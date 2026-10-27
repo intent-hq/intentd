@@ -173,7 +173,8 @@ impl AgentPlacement {
     }
 
     /// The subset this daemon's remote launch supports: a valid placement
-    /// that is not explicitly local and does not ask for an exclusive node.
+    /// that is not explicitly local, uses an isolated checkout (also when
+    /// `target` is omitted) and does not ask for an exclusive node.
     ///
     /// # Errors
     ///
@@ -184,6 +185,11 @@ impl AgentPlacement {
         if self.target == Some(PlacementTarget::Local) {
             return Err(Error::InvalidParams(
                 "remote launch requires placement.target \"remote\", not \"local\"".into(),
+            ));
+        }
+        if self.effective_checkout() != PlacementCheckout::Isolated {
+            return Err(Error::InvalidParams(
+                "remote placement requires isolated checkout".into(),
             ));
         }
         if self.exclusive == Some(true) {
