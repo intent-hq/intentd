@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.65] - 2026-10-27
+
+### 🧪 Testing
+
+- *(services)* Prepare runtime-side tests for the runtime crate move ([#2761](https://github.com/intent-hq/intentd/pull/2761))
+
+
 ## [0.11.64] - 2026-10-27
 
 ### 🚀 Features
