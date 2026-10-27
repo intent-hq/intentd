@@ -11,7 +11,7 @@ use intent_core::{AgentId, BrowserTab, ClientId, Error, ReverseTarget, Workspace
 use serde_json::{json, Value};
 
 use super::browser_client_pin_tests::{setup, FakeRegistry};
-use crate::{EventBus, Services, SubscriptionFilter};
+use intent_services::feature_api::{EventBus, Services, SubscriptionFilter};
 
 fn agent(id: &str) -> AgentId {
     AgentId::from_string(id)
@@ -31,7 +31,7 @@ pub(super) async fn register_tab(
 ) -> BrowserTab {
     if svc.store().get_workspace(ws).await.is_err() {
         svc.store()
-            .insert_workspace(&crate::test_support::fixtures::workspace(ws))
+            .insert_workspace(&intent_services::feature_api::test_support::fixtures::workspace(ws))
             .await
             .unwrap();
     }
@@ -496,12 +496,12 @@ async fn claim_reply_with_tab_id_migrates_through_browser_exec() {
         }
     }
 
-    let tmp = crate::test_support::fixtures::TempDb::new();
-    let root = crate::test_support::fixtures::WorkspacesRoot::new();
+    let tmp = intent_services::feature_api::test_support::fixtures::TempDb::new();
+    let root = intent_services::feature_api::test_support::fixtures::WorkspacesRoot::new();
     let store = intent_store::Store::open(&tmp.path).await.unwrap();
     let ws = WorkspaceId::new();
     store
-        .insert_workspace(&crate::test_support::fixtures::workspace(&ws))
+        .insert_workspace(&intent_services::feature_api::test_support::fixtures::workspace(&ws))
         .await
         .unwrap();
     // The driving client has hello'd (its `client` row exists).
@@ -616,12 +616,12 @@ async fn claim_completing_after_a_pin_switch_commits_to_the_new_driving_client()
         }
     }
 
-    let tmp = crate::test_support::fixtures::TempDb::new();
-    let root = crate::test_support::fixtures::WorkspacesRoot::new();
+    let tmp = intent_services::feature_api::test_support::fixtures::TempDb::new();
+    let root = intent_services::feature_api::test_support::fixtures::WorkspacesRoot::new();
     let store = intent_store::Store::open(&tmp.path).await.unwrap();
     let ws = WorkspaceId::new();
     store
-        .insert_workspace(&crate::test_support::fixtures::workspace(&ws))
+        .insert_workspace(&intent_services::feature_api::test_support::fixtures::workspace(&ws))
         .await
         .unwrap();
     for (id, name) in [("desktop-a", "Desktop A"), ("desktop-b", "Desktop B")] {
@@ -760,7 +760,9 @@ async fn set_browser_client_migrates_claimed_tabs() {
     register_tab(&svc, &ws, "mine-2", "desktop-a", Some("agent-2")).await;
     let other_ws = WorkspaceId::new();
     svc.store()
-        .insert_workspace(&crate::test_support::fixtures::workspace(&other_ws))
+        .insert_workspace(
+            &intent_services::feature_api::test_support::fixtures::workspace(&other_ws),
+        )
         .await
         .unwrap();
     register_tab(&svc, &other_ws, "elsewhere", "desktop-a", Some("agent-1")).await;

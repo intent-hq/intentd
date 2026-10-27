@@ -33,7 +33,6 @@ use crate::model_catalog::ModelCatalogCache;
 use crate::runtime_config::{ScriptOutputConfig, ScriptParks};
 use crate::WorkspaceSetupStates;
 
-pub use crate::runtime::RuntimeServicesExt;
 pub use crate::{
     daemon_exe_path, default_workspaces_root, is_stale_in_flight_status, known_repo_name,
     publish_event, publish_event_transient, record_setup_running, record_setup_skipped,
@@ -73,6 +72,18 @@ pub mod agent_session {
     pub use crate::agent_session::{derived_default_provider, resolve_provider_id};
 }
 
+/// The discovered-binary search path.
+pub mod auggie_discovery {
+    pub use crate::auggie_discovery::enhanced_path_dirs;
+}
+
+/// Browser-exec request and response shaping.
+pub mod browser_ops {
+    pub use crate::browser_ops::{
+        build_forward_params, shape_agent_result, shape_result, successful_claims, BrowserExecArgs,
+    };
+}
+
 /// Caller gating.
 pub mod capability {
     pub use crate::capability::gated_collaborator_caller;
@@ -105,6 +116,11 @@ pub mod runtime_config {
     pub use crate::runtime_config::HookStoreFault;
 }
 
+/// Per-repository `.intent` configuration.
+pub mod repo_config {
+    pub use crate::repo_config::read_repo_config;
+}
+
 /// The async secret store.
 pub mod settings {
     pub use crate::settings::AsyncSecretStore;
@@ -121,6 +137,11 @@ pub mod execution_call {
 
     #[cfg(any(test, feature = "test-hooks"))]
     pub use crate::execution_call::forge_error_for_test;
+}
+
+/// The event bus.
+pub mod events {
+    pub use crate::events::{EventBus, SubscriptionFilter};
 }
 
 /// Workspace file locations.

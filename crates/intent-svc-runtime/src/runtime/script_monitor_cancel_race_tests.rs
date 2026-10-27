@@ -27,8 +27,10 @@ use tokio::time::timeout;
 
 use crate::runtime::RuntimeStateExt;
 use crate::script_monitor::ScriptMonitorExt;
-use crate::test_support::fixtures::{test_registry_with_default_provider, workspace, TempDb};
-use crate::{publish_event, CompletionClassifyPark, EventBus, Services};
+use intent_services::feature_api::test_support::fixtures::{
+    test_registry_with_default_provider, workspace, TempDb,
+};
+use intent_services::feature_api::{publish_event, CompletionClassifyPark, EventBus, Services};
 
 fn wait() -> Duration {
     intentd_test_support::test_timeout(Duration::from_secs(5))

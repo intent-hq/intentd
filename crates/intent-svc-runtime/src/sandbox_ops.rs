@@ -8,8 +8,8 @@ use intent_core::{AgentId, CheckoutMode, Error, Result, Workspace, WorkspaceId};
 use intent_git::{cow_clone, cow_probe, CowSupport};
 use intent_store::{Sandbox, SandboxStatus, Store};
 
-use crate::nested_repos::{is_dirty, stage_all_skipping_nested};
-use crate::now_iso;
+use intent_core::now_iso;
+use intent_services::feature_api::nested_repos::{is_dirty, stage_all_skipping_nested};
 
 /// Test hook: artificial delay (milliseconds) at the top of
 /// [`provision_sandbox`], standing in for a slow `CoW` clone of a large
@@ -54,7 +54,7 @@ async fn apply_test_provision_hooks() -> Result<()> {
 
 /// The outcome types are declared with the runtime port, which core code
 /// matches on.
-pub use crate::feature_ports::{MergeOutcome, ProvisionOutcome};
+pub use intent_services::feature_api::feature_ports::{MergeOutcome, ProvisionOutcome};
 
 /// Configuration for sandbox provisioning.
 pub(crate) struct ProvisionConfig {
@@ -3379,7 +3379,8 @@ mod tests {
         };
         let ws = workspace_for_repo(&canonical);
         store.insert_workspace(&ws).await.unwrap();
-        let mut session = crate::test_support::fixtures::session(&agent, &ws.id);
+        let mut session =
+            intent_services::feature_api::test_support::fixtures::session(&agent, &ws.id);
         session.sandbox_path = Some(sandbox_path.to_string_lossy().into());
         store.insert_agent_session(&session).await.unwrap();
         store
@@ -3398,10 +3399,10 @@ mod tests {
             })
             .await
             .unwrap();
-        let bus = crate::EventBus::new(store.clone());
+        let bus = intent_services::feature_api::EventBus::new(store.clone());
         // A per-test secrets file: `Services::new` would use the default
         // `~/intent/.secrets.json`.
-        let services = crate::Services::new_repository_fixture(
+        let services = intent_services::feature_api::Services::new_repository_fixture(
             store.clone(),
             intent_core::FileSecretStore::with_path(dir.path().join("secrets.json")),
             None,

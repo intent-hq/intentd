@@ -119,6 +119,8 @@ debug = "line-tables-only"
 debug = "line-tables-only"
 [profile.dev.package.intent-store]
 debug = "line-tables-only"
+[profile.dev.package.intent-svc-runtime]
+debug = "line-tables-only"
 [profile.dev.package.intent-svc-transfer]
 debug = "line-tables-only"
 [profile.dev.package.intent-transport]

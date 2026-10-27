@@ -8,7 +8,8 @@ use intent_core::WorkspaceId;
 
 use crate::runtime::RuntimeStateExt;
 use crate::script_output_store::SweepReport;
-use crate::{Error, Services};
+use intent_core::Error;
+use intent_services::feature_api::Services;
 
 /// Time between expiry sweeps. Retention is configured in hours.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(3600);

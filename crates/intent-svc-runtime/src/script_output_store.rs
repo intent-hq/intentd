@@ -244,7 +244,7 @@ impl ScriptOutputStore {
     }
 
     /// The newest→oldest `{ items, nextToken }` page of a run's log lines —
-    /// identical to [`crate::pagination::paginate_text_lines`] over the whole
+    /// identical to [`intent_services::feature_api::pagination::paginate_text_lines`] over the whole
     /// log, without loading it. A missing log yields an empty page.
     pub(crate) fn paginate(
         &self,
@@ -256,7 +256,9 @@ impl ScriptOutputStore {
     ) -> Result<Value> {
         let path = self.run_path(workspace_id, script_id, run_id)?;
         let Some(file) = open_read(&self.root, &path)? else {
-            return Ok(crate::pagination::paginate_text_lines("", limit, token));
+            return Ok(
+                intent_services::feature_api::pagination::paginate_text_lines("", limit, token),
+            );
         };
         paginate_file(file, limit, token)
             .map(|(page, _)| page)
@@ -832,7 +834,7 @@ fn paginate_file(
         }
         true
     })?;
-    let win = crate::pagination::page_window(kept_len, limit, token);
+    let win = intent_services::feature_api::pagination::page_window(kept_len, limit, token);
     let mut items: Vec<String> = Vec::with_capacity(win.end - win.start);
     let mut peak = 0usize;
     if win.end > win.start {

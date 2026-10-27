@@ -9,8 +9,8 @@ use serde_json::json;
 
 use crate::browser_tabs::BrowserTabOpsExt;
 use crate::browser_tabs::BrowserTabRoutingExt;
-use crate::tests::{workspace, TempDb};
-use crate::{EventBus, Services, Subscription, SubscriptionFilter};
+use intent_services::feature_api::tests::{workspace, TempDb};
+use intent_services::feature_api::{EventBus, Services, Subscription, SubscriptionFilter};
 
 fn input(ws: &WorkspaceId, tab_id: &str) -> BrowserTabInput {
     BrowserTabInput {

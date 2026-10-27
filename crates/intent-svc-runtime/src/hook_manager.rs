@@ -59,11 +59,11 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
 
-use crate::feature_ports::CancelSettlement;
 use crate::runtime::RuntimeStateExt;
+use intent_services::feature_api::feature_ports::CancelSettlement;
 #[cfg(test)]
-use crate::runtime_config::HookStoreFault;
-use crate::{publish_event, system_actor, Services};
+use intent_services::feature_api::runtime_config::HookStoreFault;
+use intent_services::feature_api::{publish_event, system_actor, Services};
 
 /// Minimum inter-run delay (spec decision 5): `delayMs` below this floor is
 /// rejected at schedule time.
@@ -119,7 +119,7 @@ const HOOK_LOG_MAX_BYTES: usize = 8 * 1024;
 /// Owned by the harness (H6) alongside the section wording; re-exposed here
 /// for the byte-exact truncation tests.
 #[cfg(test)]
-const HOOK_WAKE_LOGS_CAP: usize = crate::harness::v1::HOOK_WAKE_LOGS_CAP;
+const HOOK_WAKE_LOGS_CAP: usize = intent_services::feature_api::harness::v1::HOOK_WAKE_LOGS_CAP;
 
 /// Cap (in bytes) on a run's JSON-serialized carry-over state. An oversized
 /// `state` is dropped (the previous state is kept) with a warning line
@@ -759,7 +759,10 @@ fn parse_exec_failures(v: Option<&Value>, total: Option<&Value>) -> Option<Strin
         .map_or(lines.len(), |t| usize::try_from(t).unwrap_or(usize::MAX))
         .max(lines.len());
     let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
-    Some(crate::harness::latest_hook_framing().hook_exec_failures_warning(&lines, total))
+    Some(
+        intent_services::feature_api::harness::latest_hook_framing()
+            .hook_exec_failures_warning(&lines, total),
+    )
 }
 
 /// Interpret a returned `state` field: absent keeps the previous carry-over
@@ -777,7 +780,7 @@ fn parse_state(v: &Value, logs: &mut Option<String>) -> StateUpdate {
     }
     let serialized = state.to_string();
     if serialized.len() > HOOK_STATE_MAX_BYTES {
-        let warning = crate::harness::latest_hook_framing()
+        let warning = intent_services::feature_api::harness::latest_hook_framing()
             .hook_state_dropped_warning(serialized.len(), HOOK_STATE_MAX_BYTES);
         let combined = match logs.take() {
             Some(l) => format!("{l}\n{warning}"),
@@ -808,7 +811,8 @@ fn tail_truncate(s: String, max_bytes: usize) -> String {
 /// log-heavy run cannot flood the owner's queue. No-op when the run logged
 /// nothing. Wording and truncation owned by the harness (H6).
 pub(crate) fn with_wake_logs(message: &str, logs: Option<&str>) -> String {
-    crate::harness::latest_hook_framing().hook_wake_logs_section(message, logs)
+    intent_services::feature_api::harness::latest_hook_framing()
+        .hook_wake_logs_section(message, logs)
 }
 
 /// Bound a dispatch message (or eviction error text) to
@@ -825,11 +829,12 @@ fn bound_wake_text(text: &str) -> String {
         .char_indices()
         .nth(HOOK_DISPATCH_MESSAGE_MAX_CHARS)
         .map_or(text.len(), |(i, _)| i);
-    let marker = crate::harness::latest_hook_framing().hook_wake_message_truncated_marker(
-        total - HOOK_DISPATCH_MESSAGE_MAX_CHARS,
-        total,
-        HOOK_DISPATCH_MESSAGE_MAX_CHARS,
-    );
+    let marker = intent_services::feature_api::harness::latest_hook_framing()
+        .hook_wake_message_truncated_marker(
+            total - HOOK_DISPATCH_MESSAGE_MAX_CHARS,
+            total,
+            HOOK_DISPATCH_MESSAGE_MAX_CHARS,
+        );
     format!("{}{marker}", &text[..end])
 }
 
@@ -1105,7 +1110,7 @@ impl HookServicesExt for Services {
         let (finished, result) = tokio::sync::oneshot::channel();
         self.feature_delivery_tasks()
             .spawn_draining(async move {
-                let outcome = crate::workspace_mutations::boxed(
+                let outcome = intent_services::feature_api::workspace_mutations::boxed(
                     services.commit_hook_validation(hook, kind, outcome),
                 )
                 .await;
@@ -1384,9 +1389,10 @@ impl HookServicesExt for Services {
         }
         // FE-cancel (no agent caller) wakes the owner with a notice;
         // owner-side cancel delivers no wake.
-        let notice = caller
-            .is_none()
-            .then(|| crate::harness::latest_hook_framing().hook_cancelled_from_app_notice());
+        let notice = caller.is_none().then(|| {
+            intent_services::feature_api::harness::latest_hook_framing()
+                .hook_cancelled_from_app_notice()
+        });
         let settlement = match notice.as_deref() {
             Some(notice) => CancelSettlement::Notify(notice),
             None => CancelSettlement::Resettle,
@@ -1441,7 +1447,7 @@ impl HookServicesExt for Services {
     /// DEFERRED ([`CancelSettlement::Deferred`]: no per-item completion
     /// backstop either): the cancelled hooks are returned grouped by owner
     /// as `(name, hook_id)` pairs, and the archive tail
-    /// ([`crate::Services::notify_owners_of_archived_watches`]) folds them
+    /// ([`intent_services::feature_api::Services::notify_owners_of_archived_watches`]) folds them
     /// with the swept PR monitors into ONE consolidated notice per agent and
     /// only THEN runs the backstop — so a completion watch deferred on a
     /// monitoring-idle owner sees the queued notice and stays armed, exactly
@@ -2098,7 +2104,7 @@ impl HookServicesExt for Services {
                 hook.run_count += 1;
                 hook.last_error = Some(error.clone());
                 self.emit_hook_event(HOOK_EVICTED, hook, None).await;
-                let notice = crate::harness::latest_hook_framing()
+                let notice = intent_services::feature_api::harness::latest_hook_framing()
                     .hook_evicted_failed_run_notice(&hook.name, &bound_wake_text(&error));
                 let notice = match logs {
                     RunLogs::Captured(ref l) => with_wake_logs(&notice, l.as_deref()),
@@ -2252,7 +2258,7 @@ impl HookServicesExt for Services {
         hook.next_run_at = None;
         hook.last_error = Some(error.clone());
         self.emit_hook_event(HOOK_EVICTED, hook, None).await;
-        let notice = crate::harness::latest_hook_framing()
+        let notice = intent_services::feature_api::harness::latest_hook_framing()
             .hook_evicted_internal_error_notice(&hook.name, &bound_wake_text(&error));
         self.wake_hook_owner(hook, &notice, "evicted").await;
         // The last active hook settling can demote the derived displayStatus
@@ -2296,13 +2302,14 @@ impl HookServicesExt for Services {
     /// runs AND dispatches instead of "without a dispatch".
     async fn finish_expiry(&self, hook: &Hook) {
         self.emit_hook_event(HOOK_EXPIRED, hook, None).await;
-        let notice = crate::harness::latest_hook_framing().hook_expired_notice(
-            &hook.name,
-            &hook.hook_id.0,
-            hook.perpetual,
-            hook.run_count,
-            hook.dispatch_count,
-        );
+        let notice = intent_services::feature_api::harness::latest_hook_framing()
+            .hook_expired_notice(
+                &hook.name,
+                &hook.hook_id.0,
+                hook.perpetual,
+                hook.run_count,
+                hook.dispatch_count,
+            );
         let notice = with_wake_logs(&notice, hook.last_logs.as_deref());
         self.wake_hook_owner(hook, &notice, "expired").await;
         // The last active hook settling can demote the derived displayStatus
@@ -2321,11 +2328,12 @@ impl HookServicesExt for Services {
     /// caller has already persisted `state = expired`.
     async fn finish_run_at_fire(&self, hook: &Hook) {
         self.emit_hook_event(HOOK_EXPIRED, hook, None).await;
-        let notice = crate::harness::latest_hook_framing().hook_run_at_fired_notice(
-            &hook.name,
-            &hook.hook_id.0,
-            hook.run_at.as_deref().unwrap_or_default(),
-        );
+        let notice = intent_services::feature_api::harness::latest_hook_framing()
+            .hook_run_at_fired_notice(
+                &hook.name,
+                &hook.hook_id.0,
+                hook.run_at.as_deref().unwrap_or_default(),
+            );
         let notice = with_wake_logs(&notice, hook.last_logs.as_deref());
         self.wake_hook_owner(hook, &notice, "expired").await;
         // Same settlement recompute as the expiry tail (§6.5 / §5.1).
@@ -2393,7 +2401,7 @@ impl HookServicesExt for Services {
         if reason == "dispatched" {
             metadata["hookStillActive"] = json!(dispatch_still_active);
         }
-        let harness = crate::harness::latest_hook_framing();
+        let harness = intent_services::feature_api::harness::latest_hook_framing();
         let state_note = match reason {
             "dispatched" if dispatch_still_active => {
                 Some(harness.hook_dispatch_active_note(hook.expires_at.as_deref()))
@@ -2472,7 +2480,7 @@ mod tests {
     use intent_store::Store;
 
     use super::*;
-    use crate::events::EventBus;
+    use intent_services::feature_api::events::EventBus;
 
     struct TempDb {
         path: PathBuf,
@@ -2753,7 +2761,7 @@ mod tests {
             return;
         }
         for mode in ["direct", "indirect"] {
-            let root = crate::test_support::test_tempdir("hook-recursion-");
+            let root = intent_services::feature_api::test_support::test_tempdir("hook-recursion-");
             let log_path = root.path().join("worker.log");
             let log = std::fs::File::create(&log_path).unwrap();
             let mut command = std::process::Command::new(std::env::current_exe().unwrap());
@@ -2933,7 +2941,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_cancels_nested_hook_validation_hot_loop() {
-        use crate::agent_manager::{AgentManager, BusEventSink};
+        use intent_services::feature_api::agent_manager::{AgentManager, BusEventSink};
         let (_db, _root, svc, ws, owner) = setup().await;
         let svc = svc.with_hook_eval_timeout(Duration::from_secs(5));
         let mgr = Arc::new(AgentManager::new(
@@ -4130,13 +4138,13 @@ mod tests {
     }
 
     async fn shutdown_nested_committed_validation(expired_perpetual: bool) {
-        use crate::agent_manager::{AgentManager, BusEventSink};
+        use intent_services::feature_api::agent_manager::{AgentManager, BusEventSink};
         let (_tmp, _root, mut svc, ws, owner) = setup().await;
         if expired_perpetual {
             // Child TTL is ten seconds; the parent's default TTL is a day.
             svc = svc.with_hook_clock_skew(Arc::new(std::sync::atomic::AtomicI64::new(20_000)));
         }
-        let park = Arc::new(crate::CompletionClassifyPark::default());
+        let park = Arc::new(intent_services::feature_api::CompletionClassifyPark::default());
         svc.set_hook_wake_park_for_test(park.clone());
         let mgr = Arc::new(AgentManager::new(
             svc.clone(),
@@ -4250,10 +4258,10 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_committed_hook_dispatch_keeps_one_durable_wake() {
-        use crate::agent_manager::{AgentManager, BusEventSink};
+        use intent_services::feature_api::agent_manager::{AgentManager, BusEventSink};
         use std::sync::Arc;
         let (_tmp, _root, mut svc, ws, owner) = setup().await;
-        let park = Arc::new(crate::CompletionClassifyPark::default());
+        let park = Arc::new(intent_services::feature_api::CompletionClassifyPark::default());
         svc.set_hook_wake_park_for_test(park.clone());
         let mgr = Arc::new(AgentManager::new(
             svc.clone(),
@@ -4361,10 +4369,10 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_cancels_hook_evaluation_and_persists_recovery() {
-        use crate::agent_manager::{AgentManager, BusEventSink};
+        use intent_services::feature_api::agent_manager::{AgentManager, BusEventSink};
         use std::sync::Arc;
         let (_tmp, _root, mut svc, ws, owner) = setup().await;
-        let park = Arc::new(crate::CompletionClassifyPark::default());
+        let park = Arc::new(intent_services::feature_api::CompletionClassifyPark::default());
         svc.set_hook_eval_park_for_test(park.clone());
         let mgr = Arc::new(AgentManager::new(
             svc.clone(),
@@ -5221,7 +5229,8 @@ mod tests {
         let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
         assert!(svc.hook_task_alive(&hook.hook_id));
         // Retire only admits a git worktree checkout: give the row one.
-        let scratch = crate::test_support::test_tempdir("intentd-retire-wt-");
+        let scratch =
+            intent_services::feature_api::test_support::test_tempdir("intentd-retire-wt-");
         let mut row = svc.store().get_workspace(&ws).await.unwrap();
         row.repository_path = Some(scratch.path().join("repo").to_string_lossy().into_owned());
         row.worktree_path = Some(
@@ -6703,7 +6712,9 @@ mod tests {
 
         use intent_acp::EventSink;
 
-        use crate::agent_manager::{AgentManager, BusEventSink, TurnOptions};
+        use intent_services::feature_api::agent_manager::{
+            AgentManager, BusEventSink, TurnOptions,
+        };
 
         let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../intentd/tests/fixtures/mock-acp-agent.mjs")
@@ -6714,7 +6725,7 @@ mod tests {
         let prompt_log =
             std::env::temp_dir().join(format!("itd-hook-bound-{}.jsonl", uuid::Uuid::new_v4()));
         let prompt_log_s = prompt_log.to_string_lossy().into_owned();
-        let _env = crate::agent_manager::tests::EnvGuard::set_all(&[
+        let _env = intent_services::feature_api::agent_manager::tests::EnvGuard::set_all(&[
             ("MOCK_AGENT_SCRIPT_PATH", script.as_str()),
             ("MOCK_AGENT_PROMPT_LOG", prompt_log_s.as_str()),
         ]);
@@ -6806,7 +6817,7 @@ mod tests {
     /// process, so allow well past `poll_deadline()`).
     async fn wait_for_assistant_rows(
         svc: &Services,
-        mgr: &crate::agent_manager::AgentManager,
+        mgr: &intent_services::feature_api::agent_manager::AgentManager,
         owner: &AgentId,
         want: usize,
     ) -> Vec<intent_core::AgentMessage> {
@@ -7139,10 +7150,14 @@ mod tests {
     /// applied, so gates under test read them via `effective_settings()`.
     fn features_registry(
         overrides: &[(&str, bool)],
-    ) -> (tempfile::TempDir, Arc<crate::SettingsRegistry>) {
+    ) -> (
+        tempfile::TempDir,
+        Arc<intent_services::feature_api::SettingsRegistry>,
+    ) {
         let dir = tempfile::tempdir().expect("temp config dir");
         let registry = Arc::new(
-            crate::SettingsRegistry::load(dir.path().join("config.toml")).expect("load registry"),
+            intent_services::feature_api::SettingsRegistry::load(dir.path().join("config.toml"))
+                .expect("load registry"),
         );
         let changes: Vec<(String, Value)> = overrides
             .iter()

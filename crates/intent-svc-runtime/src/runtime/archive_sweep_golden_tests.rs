@@ -6,8 +6,8 @@ use serde_json::json;
 
 use super::test_fixtures::wake_texts_when;
 use crate::hook_manager::HookServicesExt;
-use crate::test_support::goldens::{pr_monitor_row, seed_agent, setup};
-use crate::test_support::goldens::{PREFIX, RE_ARM_HOOKS, RE_ARM_MONITORS};
+use intent_services::feature_api::test_support::goldens::{pr_monitor_row, seed_agent, setup};
+use intent_services::feature_api::test_support::goldens::{PREFIX, RE_ARM_HOOKS, RE_ARM_MONITORS};
 
 /// Regression: archiving a workspace where agent A owns two hooks and one
 /// PR monitor queues exactly ONE wake for A — naming all three items and
@@ -17,7 +17,7 @@ use crate::test_support::goldens::{PREFIX, RE_ARM_HOOKS, RE_ARM_MONITORS};
 #[intent_test_macros::daemon_test]
 async fn archive_sweep_queues_one_consolidated_wake_per_affected_agent() {
     let (_t, svc, ws) = setup().await;
-    let bus = crate::EventBus::new(svc.store().clone());
+    let bus = intent_services::feature_api::EventBus::new(svc.store().clone());
     let svc = svc.with_event_bus(bus);
     let owner = AgentId::from("agent-a");
     let bystander = AgentId::from("agent-b");
@@ -139,7 +139,7 @@ async fn archive_sweep_queues_one_consolidated_wake_per_affected_agent() {
 #[intent_test_macros::daemon_test]
 async fn golden_archive_sweep_consolidated_notice_bytes() {
     let (_t, svc, ws) = setup().await;
-    let bus = crate::EventBus::new(svc.store().clone());
+    let bus = intent_services::feature_api::EventBus::new(svc.store().clone());
     let svc = svc.with_event_bus(bus);
     let owner = AgentId::from("agent-arch");
     seed_agent(&svc, &ws, &owner).await;

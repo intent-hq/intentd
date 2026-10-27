@@ -9,20 +9,22 @@ use serde_json::json;
 
 use super::test_fixtures::host_role::{caller, fixture};
 use crate::host_execution::HostExecutionExt;
-use crate::test_support::fixtures::{workspace, TempDb};
-use crate::Services;
+use intent_services::feature_api::test_support::fixtures::{workspace, TempDb};
+use intent_services::feature_api::Services;
 
 #[tokio::test]
 async fn member_execution_context_event_is_durable_and_survives_store_reopen() {
-    use crate::events::{EventBus, SubscriptionFilter};
     use intent_core::events::HOST_EXECUTION_CONTEXT_CHANGED;
+    use intent_services::feature_api::events::{EventBus, SubscriptionFilter};
     use intent_store::EventQuery;
     use std::{sync::Arc, time::Duration};
 
     let tmp = TempDb::new();
     let (svc, owner, member) = fixture(&tmp).await;
-    let registry =
-        Arc::new(crate::SettingsRegistry::load(tmp.path.with_extension("toml")).unwrap());
+    let registry = Arc::new(
+        intent_services::feature_api::SettingsRegistry::load(tmp.path.with_extension("toml"))
+            .unwrap(),
+    );
     registry
         .apply(&[
             ("sourceControl.github.tokenSource".into(), json!("explicit")),
@@ -120,12 +122,14 @@ async fn member_execution_context_event_is_durable_and_survives_store_reopen() {
 
 #[tokio::test]
 async fn member_execution_context_is_allowlisted_and_uses_host_policy() {
-    use crate::settings::{InMemorySecretStore, SecretStore};
+    use intent_services::feature_api::settings::{InMemorySecretStore, SecretStore};
     use std::sync::Arc;
     let tmp = TempDb::new();
     let (svc, _, member) = fixture(&tmp).await;
-    let registry =
-        Arc::new(crate::SettingsRegistry::load(tmp.path.with_extension("toml")).unwrap());
+    let registry = Arc::new(
+        intent_services::feature_api::SettingsRegistry::load(tmp.path.with_extension("toml"))
+            .unwrap(),
+    );
     registry
         .apply(&[
             ("sourceControl.github.tokenSource".into(), json!("explicit")),
@@ -186,13 +190,14 @@ async fn member_execution_context_is_allowlisted_and_uses_host_policy() {
 
 #[tokio::test]
 async fn member_execution_enablement_events_follow_committed_changes_and_reset() {
-    use crate::events::{EventBus, SubscriptionFilter};
     use intent_core::events::HOST_EXECUTION_CONTEXT_CHANGED;
+    use intent_services::feature_api::events::{EventBus, SubscriptionFilter};
     use std::{sync::Arc, time::Duration};
     let tmp = TempDb::new();
     let (svc, _, member) = fixture(&tmp).await;
     let path = tmp.path.with_extension("toml");
-    let registry = Arc::new(crate::SettingsRegistry::load(path.clone()).unwrap());
+    let registry =
+        Arc::new(intent_services::feature_api::SettingsRegistry::load(path.clone()).unwrap());
     registry
         .apply(&[("sourceControl.github.tokenSource".into(), json!("explicit"))])
         .unwrap();
@@ -255,7 +260,7 @@ async fn member_execution_enablement_events_follow_committed_changes_and_reset()
             .iter()
             .any(|row| row.id == event.id && row.data == event.data));
         let reloaded = Services::new(svc.store().clone()).with_settings_registry(Arc::new(
-            crate::SettingsRegistry::load(path.clone()).unwrap(),
+            intent_services::feature_api::SettingsRegistry::load(path.clone()).unwrap(),
         ));
         assert_eq!(
             with_caller(caller(&member), reloaded.host_execution_context())
@@ -317,12 +322,14 @@ async fn member_execution_enablement_events_follow_committed_changes_and_reset()
 
 #[tokio::test]
 async fn member_execution_enablement_projects_complete_canonical_policy() {
-    use crate::settings::{InMemorySecretStore, SecretStore};
+    use intent_services::feature_api::settings::{InMemorySecretStore, SecretStore};
     use std::sync::Arc;
     let tmp = TempDb::new();
     let (svc, owner, member) = fixture(&tmp).await;
-    let registry =
-        Arc::new(crate::SettingsRegistry::load(tmp.path.with_extension("toml")).unwrap());
+    let registry = Arc::new(
+        intent_services::feature_api::SettingsRegistry::load(tmp.path.with_extension("toml"))
+            .unwrap(),
+    );
     registry
         .apply(&[("sourceControl.github.tokenSource".into(), json!("explicit"))])
         .unwrap();
@@ -525,7 +532,7 @@ async fn member_script_remove_preserves_a_protected_definition_and_runtime() {
     use intent_core::{events::SCRIPT_CHANGED, ScriptCreateParams};
     let tmp = TempDb::new();
     let (svc, _, member) = fixture(&tmp).await;
-    let bus = crate::events::EventBus::new(svc.store().clone());
+    let bus = intent_services::feature_api::events::EventBus::new(svc.store().clone());
     let svc = svc.with_event_bus(bus);
     let target = WorkspaceId::new();
     svc.store()
@@ -767,13 +774,15 @@ async fn script_archive_restore_enforce_workspace_scope_and_guest_authority() {
 
 #[tokio::test]
 async fn member_execution_context_events_cover_policy_setup_and_unchanged_configured_rejection() {
-    use crate::events::{EventBus, SubscriptionFilter};
     use intent_core::events::HOST_EXECUTION_CONTEXT_CHANGED;
+    use intent_services::feature_api::events::{EventBus, SubscriptionFilter};
     use std::{sync::Arc, time::Duration};
     let tmp = TempDb::new();
     let (svc, _, member) = fixture(&tmp).await;
-    let registry =
-        Arc::new(crate::SettingsRegistry::load(tmp.path.with_extension("toml")).unwrap());
+    let registry = Arc::new(
+        intent_services::feature_api::SettingsRegistry::load(tmp.path.with_extension("toml"))
+            .unwrap(),
+    );
     registry
         .apply(&[("sourceControl.github.tokenSource".into(), json!("explicit"))])
         .unwrap();
@@ -790,9 +799,9 @@ async fn member_execution_context_events_cover_policy_setup_and_unchanged_config
     with_caller(
         caller(&member),
         svc.execution_call_for_test(async {
-            let _ = crate::execution_call::forge_error_for_test(intent_sourcecontrol::Error::Auth(
-                "private response".into(),
-            ));
+            let _ = intent_services::feature_api::execution_call::forge_error_for_test(
+                intent_sourcecontrol::Error::Auth("private response".into()),
+            );
             Ok(())
         }),
     )
@@ -851,9 +860,9 @@ async fn member_execution_context_events_cover_policy_setup_and_unchanged_config
 
 #[tokio::test]
 async fn member_pr_status_rejection_publishes_durable_safe_context() {
-    use crate::events::{EventBus, SubscriptionFilter};
-    use crate::test_support::stub_forge::StubForge;
     use intent_core::events::HOST_EXECUTION_CONTEXT_CHANGED;
+    use intent_services::feature_api::events::{EventBus, SubscriptionFilter};
+    use intent_services::feature_api::test_support::stub_forge::StubForge;
     use std::{sync::Arc, time::Duration};
     let tmp = TempDb::new();
     let (svc, _, member) = fixture(&tmp).await;
@@ -869,8 +878,10 @@ async fn member_pr_status_rejection_publishes_durable_safe_context() {
         .with_source_control(Arc::new(StubForge::with_get_pr_error(|| {
             intent_sourcecontrol::Error::Auth("private-response".into())
         })));
-    let registry =
-        Arc::new(crate::SettingsRegistry::load(tmp.path.with_extension("toml")).unwrap());
+    let registry = Arc::new(
+        intent_services::feature_api::SettingsRegistry::load(tmp.path.with_extension("toml"))
+            .unwrap(),
+    );
     registry
         .apply(&[("sourceControl.github.tokenSource".into(), json!("explicit"))])
         .unwrap();

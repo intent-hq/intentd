@@ -6,7 +6,7 @@ use serde_json::json;
 
 use super::test_fixtures::wake_texts_when;
 use crate::hook_manager::HookServicesExt;
-use crate::test_support::goldens::{pr_monitor_row, seed_agent, setup};
+use intent_services::feature_api::test_support::goldens::{pr_monitor_row, seed_agent, setup};
 
 /// FE-cancel notices for hooks and PR monitors: exact wake bytes delivered
 /// to the owning agent. (The archive sweep's consolidated notice is a v2.7
@@ -14,7 +14,7 @@ use crate::test_support::goldens::{pr_monitor_row, seed_agent, setup};
 #[tokio::test]
 async fn golden_hook_and_pr_monitor_cancel_notice_bytes() {
     let (_t, svc, ws) = setup().await;
-    let bus = crate::EventBus::new(svc.store().clone());
+    let bus = intent_services::feature_api::EventBus::new(svc.store().clone());
     let svc = svc.with_event_bus(bus);
     let owner = AgentId::from("agent-cancel");
     seed_agent(&svc, &ws, &owner).await;
@@ -65,7 +65,7 @@ async fn golden_hook_and_pr_monitor_cancel_notice_bytes() {
 #[tokio::test]
 async fn golden_hook_eviction_notice_bytes() {
     let (_t, svc, ws) = setup().await;
-    let bus = crate::EventBus::new(svc.store().clone());
+    let bus = intent_services::feature_api::EventBus::new(svc.store().clone());
     let svc = svc.with_event_bus(bus);
     let owner = AgentId::from("agent-evict");
     seed_agent(&svc, &ws, &owner).await;
@@ -118,7 +118,7 @@ async fn golden_hook_eviction_notice_bytes() {
 #[tokio::test]
 async fn golden_hook_expiry_notice_bytes() {
     let (_t, svc, ws) = setup().await;
-    let bus = crate::EventBus::new(svc.store().clone());
+    let bus = intent_services::feature_api::EventBus::new(svc.store().clone());
     let svc = svc.with_event_bus(bus);
     let owner = AgentId::from("agent-exp");
     seed_agent(&svc, &ws, &owner).await;
@@ -179,7 +179,7 @@ async fn golden_hook_expiry_notice_bytes() {
 #[tokio::test]
 async fn golden_hook_perpetual_dispatch_wake_bytes() {
     let (_t, svc, ws) = setup().await;
-    let bus = crate::EventBus::new(svc.store().clone());
+    let bus = intent_services::feature_api::EventBus::new(svc.store().clone());
     let svc = svc.with_event_bus(bus);
     let owner = AgentId::from("agent-hooks");
     seed_agent(&svc, &ws, &owner).await;
@@ -242,7 +242,7 @@ fn golden_hook_wake_logs_section() {
 #[tokio::test]
 async fn golden_hook_dispatch_wake_bytes() {
     let (_t, svc, ws) = setup().await;
-    let bus = crate::EventBus::new(svc.store().clone());
+    let bus = intent_services::feature_api::EventBus::new(svc.store().clone());
     let svc = svc.with_event_bus(bus);
     let owner = AgentId::from("agent-hooks");
     seed_agent(&svc, &ws, &owner).await;
@@ -277,7 +277,7 @@ async fn golden_hook_dispatch_wake_bytes() {
 #[tokio::test]
 async fn golden_hook_eviction_internal_error_notice_bytes() {
     let (_t, svc, ws) = setup().await;
-    let bus = crate::EventBus::new(svc.store().clone());
+    let bus = intent_services::feature_api::EventBus::new(svc.store().clone());
     let svc = svc.with_event_bus(bus);
     let owner = AgentId::from("agent-evict-2");
     seed_agent(&svc, &ws, &owner).await;

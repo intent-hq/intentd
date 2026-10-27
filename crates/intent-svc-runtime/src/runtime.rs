@@ -23,17 +23,20 @@ use intent_core::{
 
 use crate::browser_tabs::BrowserTabOpsExt;
 use crate::browser_tabs::BrowserTabRoutingExt;
-use crate::feature_ports::{
-    CommandScriptActivity, MergeOutcome, ProvisionOutcome, RuntimePort, ScriptsClosing,
-    SetupScriptRun,
-};
 use crate::hook_manager::HookServicesExt;
 use crate::host_execution::HostExecutionExt;
 use crate::script_monitor::ScriptMonitorExt;
 use crate::script_output_cleanup::ScriptOutputCleanupExt;
 use crate::{
-    browser_ops, browser_tabs, capability, hook_manager, record_setup_running, sandbox_ops,
-    script_ops, script_output_store, setup_runner, terminal_ops, write_private_script, Services,
+    browser_tabs, hook_manager, sandbox_ops, script_ops, script_output_store, setup_runner,
+    terminal_ops,
+};
+use intent_services::feature_api::feature_ports::{
+    CommandScriptActivity, MergeOutcome, ProvisionOutcome, RuntimePort, ScriptsClosing,
+    SetupScriptRun,
+};
+use intent_services::feature_api::{
+    browser_ops, capability, record_setup_running, write_private_script, Services,
     SETUP_TERMINAL_NAME,
 };
 
@@ -64,6 +67,7 @@ pub(crate) struct RuntimeFeature {
 pub(crate) trait RuntimeStateExt {
     fn runtime(&self) -> &RuntimeFeature;
     fn script_output_store(&self) -> script_output_store::ScriptOutputStore;
+    fn script_manager(&self) -> script_ops::ScriptManager;
 }
 
 impl RuntimeStateExt for Services {
@@ -74,25 +78,17 @@ impl RuntimeStateExt for Services {
     }
 
     /// The on-disk script output store, built from the core
-    /// [`ScriptOutputConfig`](crate::runtime_config::ScriptOutputConfig).
+    /// [`ScriptOutputConfig`](intent_services::feature_api::runtime_config::ScriptOutputConfig).
     fn script_output_store(&self) -> script_output_store::ScriptOutputStore {
         script_output_store::ScriptOutputStore::new(
             &self.feature_script_output_config().data_dir,
             self.feature_script_output_config().max_bytes_per_run,
         )
     }
-}
 
-// Stays inherent until the transfer round-trip test that builds a script
-// manager view moves out with the crate split.
-impl Services {
     /// Build a [`ScriptManager`](script_ops::ScriptManager) view over the shared
     /// PTY host, event bus, store, script registry, and bootstrap locks for one `script.*` call.
-    #[expect(
-        clippy::must_use_candidate,
-        reason = "internal doc-hidden feature API, not a public library API"
-    )]
-    pub fn script_manager(&self) -> script_ops::ScriptManager {
+    fn script_manager(&self) -> script_ops::ScriptManager {
         script_ops::ScriptManager::new(
             self.pty(),
             self.feature_event_bus().cloned(),
@@ -139,7 +135,8 @@ impl RuntimeServicesExt for Services {
 }
 
 /// Register the in-crate runtime feature: its state and its port.
-pub(crate) fn register(services: Services) -> Services {
+#[must_use]
+pub fn register(services: Services) -> Services {
     let feature = Arc::new(RuntimeFeature::default());
     services
         .with_feature(Arc::clone(&feature))

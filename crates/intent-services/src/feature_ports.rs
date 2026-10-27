@@ -998,7 +998,7 @@ pub fn monitor_id(metadata: Option<&serde_json::Value>) -> Option<&str> {
         .flatten()
 }
 
-/// How a cancel transition ([`Services::cancel_active_hook`](crate::hook_manager::HookServicesExt::cancel_active_hook),
+/// How a cancel transition (the runtime's `HookServicesExt::cancel_active_hook`,
 /// [`Services::cancel_active_pr_monitor`]) settles the owner's deferred
 /// completion watches. A completion watch on an idle owner defers while the
 /// owner has active hooks / PR monitors, so cancelling the LAST one must

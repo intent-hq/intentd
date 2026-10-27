@@ -1,12 +1,12 @@
 //! Durable script-monitor wake delivery and lifecycle suppression.
-use crate::Services;
+use intent_services::feature_api::Services;
 use std::sync::Arc;
 
 use intent_core::{AgentId, Result, ScriptMonitor, WorkspaceId};
 use serde_json::{json, Value};
 
-use crate::feature_ports::{monitor_id, wake_id};
 use crate::runtime::RuntimeStateExt;
+use intent_services::feature_api::feature_ports::{monitor_id, wake_id};
 
 /// Script-monitor delivery, export deferral and maintenance, on [`Services`].
 pub(crate) trait ScriptMonitorExt {

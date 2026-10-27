@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use intent_core::{Error, WorkspaceApi, WorkspaceStatus};
 
-use crate::test_support::retire_workspace::*;
+use intent_services::feature_api::test_support::retire_workspace::*;
 
 /// Review regression (intentd#2605): the automatic sweep's retire skips
 /// (logs and counts a failure) a workspace whose script close cannot settle
@@ -157,7 +157,8 @@ async fn retired_workspace_refuses_disk_mutations_and_still_deletes() {
 #[intent_test_macros::daemon_test]
 async fn script_create_admitted_before_retire_commits_before_the_flip() {
     let f = fixture().await;
-    let park = std::sync::Arc::new(crate::runtime_config::SupervisePark::default());
+    let park =
+        std::sync::Arc::new(intent_services::feature_api::runtime_config::SupervisePark::default());
     let svc = f.svc.clone().with_script_create_admitted_park(park.clone());
     let ws = create_workspace(&f).await;
     svc.archive_workspace(ws.id.clone(), None)
@@ -278,11 +279,13 @@ async fn script_mutations_after_retire_returns_are_refused_and_write_nothing() {
         .retire_workspace(ws.id.clone(), None)
         .await
         .expect("retire");
-    let mut sub = f.bus.subscribe(crate::SubscriptionFilter {
-        event_types: vec![intent_core::events::SCRIPT_CHANGED.to_string()],
-        workspace_id: Some(ws.id.0.clone()),
-        ..Default::default()
-    });
+    let mut sub = f
+        .bus
+        .subscribe(intent_services::feature_api::SubscriptionFilter {
+            event_types: vec![intent_core::events::SCRIPT_CHANGED.to_string()],
+            workspace_id: Some(ws.id.0.clone()),
+            ..Default::default()
+        });
 
     let retired = |r: &intent_core::Result<serde_json::Value>| {
         matches!(r, Err(Error::WorkspaceRetired { .. }))

@@ -5,9 +5,9 @@ use intent_core::{WorkspaceApi, WorkspaceId};
 use intent_store::Store;
 use serde_json::Value;
 
-use crate::events::{EventBus, Subscription, SubscriptionFilter};
-use crate::test_support::fixtures::{workspace, TempDb};
-use crate::Services;
+use intent_services::feature_api::events::{EventBus, Subscription, SubscriptionFilter};
+use intent_services::feature_api::test_support::fixtures::{workspace, TempDb};
+use intent_services::feature_api::Services;
 
 struct Harness {
     _tmp: TempDb,

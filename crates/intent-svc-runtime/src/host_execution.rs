@@ -10,7 +10,9 @@ use intent_sourcecontrol::token::{self, TokenSource};
 use intent_store::NewEvent;
 use serde_json::Value;
 
-use crate::{events::SubscriptionFilter, publish_event, system_actor, Services};
+use intent_services::feature_api::{
+    events::SubscriptionFilter, publish_event, system_actor, Services,
+};
 
 /// The host execution context snapshot and its change loop, on [`Services`].
 pub(crate) trait HostExecutionExt {
@@ -59,7 +61,7 @@ impl HostExecutionExt for Services {
             };
         let mut repository_connections = vec![RepositoryConnection {
             provider: "github".into(),
-            host: crate::execution_call::github_execution_host(
+            host: intent_services::feature_api::execution_call::github_execution_host(
                 &settings.source_control.github.api_base_url,
             )
             .unwrap_or_else(|| "github.com".into()),
@@ -78,7 +80,9 @@ impl HostExecutionExt for Services {
             enabled_provider_ids,
             repository_connections,
             git_credential_policy: GitCredentialPolicy::github_https(
-                crate::execution_call::expose_git_credential(self.feature_settings_registry()),
+                intent_services::feature_api::execution_call::expose_git_credential(
+                    self.feature_settings_registry(),
+                ),
             ),
         })
     }

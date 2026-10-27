@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 
 use super::browser_client_pin_tests::{setup, FakeRegistry};
 use super::browser_routing_tests::register_tab;
-use crate::Services;
+use intent_services::feature_api::Services;
 
 const ROUTING_FIXTURE: &str =
     include_str!("../../../intent-transport/tests/fixtures/browser-routing.json");
@@ -64,7 +64,9 @@ async fn routing_fixture_every_case_derives_the_expected_target() {
             Some(false) => {
                 let ws = WorkspaceId::new();
                 svc.store()
-                    .insert_workspace(&crate::test_support::fixtures::workspace(&ws))
+                    .insert_workspace(
+                        &intent_services::feature_api::test_support::fixtures::workspace(&ws),
+                    )
                     .await
                     .expect("workspace");
                 ws

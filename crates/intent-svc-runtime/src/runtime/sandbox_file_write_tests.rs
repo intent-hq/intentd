@@ -4,8 +4,8 @@
 use intent_core::{now_iso, WorkspaceApi, WorkspaceId};
 use intent_store::Store;
 
-use crate::test_support::fixtures::{workspace, TempDb};
-use crate::Services;
+use intent_services::feature_api::test_support::fixtures::{workspace, TempDb};
+use intent_services::feature_api::Services;
 
 #[expect(clippy::similar_names)] // deliberate parallel naming across the scenario's instances
 /// Containment integration test: delegate an agent with isolation=cow, perform a

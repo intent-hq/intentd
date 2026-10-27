@@ -74,7 +74,6 @@ mod attachment_upload;
 mod auggie_cli;
 mod auto_commit;
 pub mod browser_ops;
-mod browser_tabs;
 mod bundled_cli;
 mod capability;
 #[cfg(all(test, unix))]
@@ -114,7 +113,6 @@ mod git_status_cache;
 mod git_status_singleflight;
 pub mod host_exec;
 pub mod host_exec_stream;
-mod host_execution;
 mod installed_cli;
 mod workspace_mutations;
 
@@ -208,7 +206,6 @@ mod direct_secret_ops;
 mod fast_mode;
 mod harness;
 mod history_xml;
-mod hook_manager;
 #[cfg(test)]
 mod human_attribution_tests;
 mod image_dimensions;
@@ -254,13 +251,7 @@ mod rate_limit;
 pub mod repo_config;
 pub mod retention;
 mod rtk;
-mod runtime;
 mod runtime_config;
-mod sandbox_ops;
-mod script_monitor;
-mod script_ops;
-mod script_output_cleanup;
-mod script_output_store;
 pub mod worktree_presence;
 pub use feature_ports::CommandScriptActivity;
 mod search_ops;
@@ -271,7 +262,6 @@ mod shell;
 mod stack_frame;
 pub(crate) mod stack_sample;
 mod task_effort;
-mod terminal_ops;
 #[cfg(any(test, feature = "test-hooks"))]
 mod test_seams;
 pub mod tool_block;
@@ -1896,7 +1886,7 @@ impl Services {
             ports: feature_ports::FeaturePorts::default(),
             features: feature_ports::FeatureSet::default(),
         };
-        let services = agent_wake::register(runtime::register(services));
+        let services = agent_wake::register(services);
         services
             .gitlab_credential_gate
             .attach_repository(services.repository_connection_directory(), descriptor)
@@ -35890,7 +35880,7 @@ impl WorkspaceApi for Services {
 impl Services {
     /// Archive tail: queue ONE consolidated wake per agent whose background
     /// hooks and/or PR monitors the archive sweeps
-    /// ([`Services::cancel_workspace_hooks`](crate::hook_manager::HookServicesExt::cancel_workspace_hooks),
+    /// (the runtime's `HookServicesExt::cancel_workspace_hooks`,
     /// [`Services::cancel_workspace_pr_monitors`]) just cancelled — the
     /// [`crate::harness::Harness::workspace_archived_watches_cancelled_notice`]
     /// surface naming every cancelled hook (`name` + id) and monitor

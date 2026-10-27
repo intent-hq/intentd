@@ -188,7 +188,7 @@ async fn expiry_sweep_reads_retention_hours_live_from_settings() {
     let (data, mut h) = output_harness().await;
     let config_path = data.0.join("config.toml");
     std::fs::write(&config_path, "[scripts]\noutputRetentionHours = 0\n").expect("config");
-    let registry = Arc::new(crate::SettingsRegistry::load(&config_path).expect("registry"));
+    let registry = Arc::new(intent_services::feature_api::SettingsRegistry::load(&config_path).expect("registry"));
     h.services = h.services.clone().with_settings_registry(registry.clone());
     let ws = h.ws.as_str().to_string();
     write_log(&h.services, &ws, "s", "r");

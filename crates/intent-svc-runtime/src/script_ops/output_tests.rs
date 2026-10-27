@@ -198,7 +198,7 @@ async fn script_output_cap_is_read_live_at_run_start() {
     let data = WorktreeDir::new();
     let config = data.0.join("config.toml");
     std::fs::write(&config, "").unwrap();
-    let registry = Arc::new(crate::SettingsRegistry::load(&config).expect("settings"));
+    let registry = Arc::new(intent_services::feature_api::SettingsRegistry::load(&config).expect("settings"));
     let mut h = harness().await;
     h.services = h
         .services

@@ -15,8 +15,8 @@ use serde_json::{json, Value};
 
 use super::browser_client_pin_tests::FakeRegistry;
 use super::browser_routing_tests::register_tab;
-use crate::test_support::fixtures::{workspace, TempDb, WorkspacesRoot};
-use crate::Services;
+use intent_services::feature_api::test_support::fixtures::{workspace, TempDb, WorkspacesRoot};
+use intent_services::feature_api::Services;
 
 /// [`FakeRegistry`] plus a connection snapshot: each client has one
 /// connection whose id is its position + 1, and a route names that

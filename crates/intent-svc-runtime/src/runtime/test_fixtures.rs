@@ -11,9 +11,9 @@ use intent_core::AgentId;
 #[cfg(unix)]
 use serde_json::Value;
 
-use crate::Services;
+use intent_services::feature_api::Services;
 #[cfg(unix)]
-use crate::Subscription;
+use intent_services::feature_api::Subscription;
 
 /// Copy of `test_support::goldens::wake_texts_when`.
 ///
@@ -84,8 +84,8 @@ pub(crate) mod host_role {
     use intent_core::{now_iso, Caller, Principal, PrincipalId};
     use intent_store::Store;
 
-    use crate::test_support::fixtures::TempDb;
-    use crate::Services;
+    use intent_services::feature_api::test_support::fixtures::TempDb;
+    use intent_services::feature_api::Services;
 
     pub(crate) async fn fixture(tmp: &TempDb) -> (Services, PrincipalId, PrincipalId) {
         let store = Store::open(&tmp.path).await.unwrap();

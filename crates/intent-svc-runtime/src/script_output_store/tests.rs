@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime};
 use serde_json::Value;
 
 use super::*;
-use crate::pagination::paginate_text_lines;
+use intent_services::feature_api::pagination::paginate_text_lines;
 
 fn store(cap: u64) -> (tempfile::TempDir, ScriptOutputStore) {
     let dir = tempfile::tempdir().expect("tempdir");

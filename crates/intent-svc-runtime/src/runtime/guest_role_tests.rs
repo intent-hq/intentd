@@ -1,8 +1,8 @@
-use crate::test_support::capability_fixtures::{fixture, Role};
-use crate::test_support::fixtures::TempDb;
 use intent_core::{
     AgentCreateExtra, Error, ScriptCreateParams, ScriptMode, WorkspaceApi, WorkspaceRole,
 };
+use intent_services::feature_api::test_support::capability_fixtures::{fixture, Role};
+use intent_services::feature_api::test_support::fixtures::TempDb;
 use serde_json::json;
 
 #[tokio::test]

@@ -86,7 +86,7 @@ impl SetupScriptRunner {
                     )
                 } else {
                     (
-                        crate::SETUP_SCRIPT_WRAPPER.to_string(),
+                        intent_services::feature_api::SETUP_SCRIPT_WRAPPER.to_string(),
                         script_path.to_string_lossy().to_string(),
                     )
                 };
@@ -121,7 +121,7 @@ fn forward_slashes(p: &Path) -> String {
     p.to_string_lossy().replace('\\', "/")
 }
 
-/// [`crate::SETUP_SCRIPT_WRAPPER`] with the inner interpreter templated:
+/// [`intent_services::feature_api::SETUP_SCRIPT_WRAPPER`] with the inner interpreter templated:
 /// identical text except the script runs through the double-quoted `sh`
 /// instead of bare `/bin/sh` (drift-guarded against the const in tests).
 pub(crate) fn wrapper_for_sh(sh: &str) -> String {
@@ -234,14 +234,13 @@ mod tests {
     #[test]
     fn posix_command_is_byte_identical_to_historic_spawn() {
         let runner = select(false, None);
-        let (program, args, extra_env) =
-            runner.command(Path::new("/w/.intent/setup-a.sh"), None);
+        let (program, args, extra_env) = runner.command(Path::new("/w/.intent/setup-a.sh"), None);
         assert_eq!(program, "/bin/sh");
         assert_eq!(
             args,
             vec![
                 "-c".to_string(),
-                crate::SETUP_SCRIPT_WRAPPER.to_string(),
+                intent_services::feature_api::SETUP_SCRIPT_WRAPPER.to_string(),
                 "sh".to_string(),
                 "/w/.intent/setup-a.sh".to_string(),
             ]
@@ -332,7 +331,7 @@ mod tests {
     fn wrapper_for_sh_matches_posix_const() {
         assert_eq!(
             wrapper_for_sh("/bin/sh").replacen("\"/bin/sh\"", "/bin/sh", 1),
-            crate::SETUP_SCRIPT_WRAPPER
+            intent_services::feature_api::SETUP_SCRIPT_WRAPPER
         );
     }
 
@@ -341,9 +340,7 @@ mod tests {
         let w = SETUP_SCRIPT_WRAPPER_CMD;
         assert!(w.starts_with("@echo off\r\n"));
         assert!(w.contains("call \"%INTENT_SETUP_SCRIPT%\"\r\n"));
-        assert!(
-            w.contains("echo.\r\necho Setup script %verb% in %elapsed%s (exit code %code%)")
-        );
+        assert!(w.contains("echo.\r\necho Setup script %verb% in %elapsed%s (exit code %code%)"));
         assert!(w.contains("(set \"verb=completed\")"));
         assert!(w.contains("(set \"verb=failed\")"));
         assert!(w.ends_with("exit /b %code%\r\n"));

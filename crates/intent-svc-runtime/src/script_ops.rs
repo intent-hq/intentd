@@ -35,14 +35,14 @@ mod monitors;
 mod retirement;
 use lifecycle::RunLease;
 
-use crate::events::EventBus;
-use crate::feature_ports::CommandScriptActivity;
-use crate::runtime_config::ScriptParks;
-#[cfg(test)]
-use crate::runtime_config::SupervisePark;
 use crate::script_output_store::ScriptOutputStore;
-use crate::shell::{default_shell, scrubbed_env_vars_except, shell_args};
-use crate::{publish_event, publish_event_transient, system_actor};
+use intent_services::feature_api::events::EventBus;
+use intent_services::feature_api::feature_ports::CommandScriptActivity;
+use intent_services::feature_api::runtime_config::ScriptParks;
+#[cfg(test)]
+use intent_services::feature_api::runtime_config::SupervisePark;
+use intent_services::feature_api::shell::{default_shell, scrubbed_env_vars_except, shell_args};
+use intent_services::feature_api::{publish_event, publish_event_transient, system_actor};
 
 /// Delay before an auto-restart attempt (mirrors `AUTO_RESTART_DELAY_MS`).
 const AUTO_RESTART_DELAY: Duration = Duration::from_secs(1);
@@ -99,7 +99,7 @@ const RUN_RESULT_OUTPUT_BYTES: u64 = 512 * 1024;
 /// In-memory bookkeeping for one managed script (definition + runtime + the live
 /// PTY + supervisor task). Held in the shared registry on [`Services`].
 ///
-/// [`Services`]: crate::Services
+/// [`Services`]: intent_services::feature_api::Services
 pub(crate) struct ManagedScript {
     def: Script,
     state: ScriptRuntimeState,
@@ -325,23 +325,23 @@ impl ScriptLocks {
 /// Cheap to clone (all handles); the supervisor task owns its own clone.
 #[derive(Clone)]
 pub struct ScriptManager {
-    owner_services: Option<crate::Services>,
+    owner_services: Option<intent_services::feature_api::Services>,
     /// The owner's agent-wake port, kept apart from `owner_services` so the
     /// monitor-owner check works on a manager detached from its owner.
-    agent_wake: Arc<dyn crate::feature_ports::AgentWakePort>,
+    agent_wake: Arc<dyn intent_services::feature_api::feature_ports::AgentWakePort>,
     pty: Arc<PtyHost>,
     bus: Option<EventBus>,
     store: Store,
     scripts: ScriptRegistry,
     locks: ScriptLocks,
-    /// The too-fast-exit floor in milliseconds ([`TOO_FAST_MS`](crate::runtime_config::TOO_FAST_MS) in production;
+    /// The too-fast-exit floor in milliseconds ([`TOO_FAST_MS`](intent_services::feature_api::runtime_config::TOO_FAST_MS) in production;
     /// tests inject a larger floor so the decision is load-independent).
     too_fast_ms: u128,
     /// Test park seams for the `script.*` race windows; all `None` in
     /// production wiring.
     parks: ScriptParks,
-    settings: Option<Arc<crate::SettingsRegistry>>,
-    tasks: Arc<crate::delivery_tasks::DeliveryTasks>,
+    settings: Option<Arc<intent_services::feature_api::SettingsRegistry>>,
+    tasks: Arc<intent_services::feature_api::delivery_tasks::DeliveryTasks>,
     output_store: ScriptOutputStore,
 }
 
@@ -447,7 +447,7 @@ impl ScriptManager {
     ) -> Self {
         Self {
             owner_services: None,
-            agent_wake: Arc::new(crate::feature_ports::UnavailableAgentWake),
+            agent_wake: Arc::new(intent_services::feature_api::feature_ports::UnavailableAgentWake),
             pty,
             bus,
             store,
@@ -456,7 +456,7 @@ impl ScriptManager {
             too_fast_ms,
             parks,
             settings: None,
-            tasks: Arc::new(crate::delivery_tasks::DeliveryTasks::default()),
+            tasks: Arc::new(intent_services::feature_api::delivery_tasks::DeliveryTasks::default()),
             output_store: ScriptOutputStore::new(
                 &std::env::temp_dir().join(format!("intentd-{}", uuid::Uuid::new_v4())),
                 intent_core::config::DEFAULT_SCRIPT_OUTPUT_MAX_BYTES_PER_RUN,
@@ -494,13 +494,19 @@ impl ScriptManager {
         self.pty.kill(pty_id).await;
     }
 
-    pub(crate) fn with_owner_services(mut self, services: crate::Services) -> Self {
+    pub(crate) fn with_owner_services(
+        mut self,
+        services: intent_services::feature_api::Services,
+    ) -> Self {
         self.agent_wake = services.feature_agent_wake_port();
         self.owner_services = Some(services);
         self
     }
 
-    pub(crate) fn with_tasks(mut self, tasks: Arc<crate::delivery_tasks::DeliveryTasks>) -> Self {
+    pub(crate) fn with_tasks(
+        mut self,
+        tasks: Arc<intent_services::feature_api::delivery_tasks::DeliveryTasks>,
+    ) -> Self {
         self.tasks = tasks;
         self
     }
@@ -548,7 +554,7 @@ impl ScriptManager {
             .await
             .is_ok_and(|row| row.is_retired())
         {
-            return Err(crate::retire::retired_error(ws));
+            return Err(intent_services::feature_api::retire::retired_error(ws));
         }
         Ok(())
     }
@@ -591,7 +597,10 @@ impl ScriptManager {
         }
     }
 
-    pub(crate) fn with_settings(mut self, settings: Option<Arc<crate::SettingsRegistry>>) -> Self {
+    pub(crate) fn with_settings(
+        mut self,
+        settings: Option<Arc<intent_services::feature_api::SettingsRegistry>>,
+    ) -> Self {
         self.settings = settings;
         self
     }
@@ -1268,7 +1277,9 @@ impl ScriptManager {
                         .filter(|p| !p.is_empty())
                         .map(PathBuf::from)
                     {
-                        let repo_config = crate::repo_config::read_repo_config(&repo_path).await;
+                        let repo_config =
+                            intent_services::feature_api::repo_config::read_repo_config(&repo_path)
+                                .await;
                         if let Some(repo_scripts) = repo_config.scripts {
                             let now = now_iso();
                             let scripts: Vec<Script> = repo_scripts
@@ -1602,7 +1613,7 @@ impl ScriptManager {
         let paginate = paginate || page_token.is_some();
         let Some(run) = run else {
             return Ok(if paginate {
-                crate::pagination::paginate_text_lines(
+                intent_services::feature_api::pagination::paginate_text_lines(
                     "",
                     max_lines,
                     page_token.map(std::string::String::as_str),
@@ -3065,7 +3076,7 @@ impl ScriptManager {
     /// `cwd` relative to it (rejecting absolute paths / `..` traversal).
     async fn resolve_cwd(&self, ws: &WorkspaceId, def: &Script) -> Result<Option<PathBuf>> {
         let workspace = self.store.get_workspace(ws).await?;
-        let Some(root) = crate::git_ops::worktree_path(&workspace) else {
+        let Some(root) = intent_services::feature_api::git_ops::worktree_path(&workspace) else {
             return Ok(None);
         };
         match def.cwd.as_deref().filter(|s| !s.is_empty()) {
@@ -3149,7 +3160,7 @@ fn spawn_env_overlay(
 /// order-preserving dir list (current PATH first, then essential system dirs and
 /// node/version-manager locations). Returns `None` when no dirs resolve.
 fn enhanced_shell_path() -> Option<String> {
-    let dirs = crate::auggie_discovery::enhanced_path_dirs();
+    let dirs = intent_services::feature_api::auggie_discovery::enhanced_path_dirs();
     if dirs.is_empty() {
         return None;
     }
@@ -3338,8 +3349,8 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::*;
-    use crate::events::{EventBus, Subscription, SubscriptionFilter};
-    use crate::Services;
+    use intent_services::feature_api::events::{EventBus, Subscription, SubscriptionFilter};
+    use intent_services::feature_api::Services;
 
     /// Pure-liveness deadline for event-driven waits (monorepo#515): the waits
     /// below return as soon as the awaited event arrives, so this bound only
@@ -3706,7 +3717,7 @@ mod tests {
     /// correctly gap-fills nothing then (intent-hq/monorepo#4191).
     #[test]
     fn spawn_overlay_injects_commit_identity_script_env_wins() {
-        let _env = crate::agent_manager::tests::EnvGuard::apply(&[
+        let _env = intent_services::feature_api::agent_manager::tests::EnvGuard::apply(&[
             ("GIT_AUTHOR_NAME", None),
             ("GIT_AUTHOR_EMAIL", None),
             ("GIT_COMMITTER_NAME", None),
@@ -7007,8 +7018,10 @@ mod tests {
     #[cfg(unix)]
     #[intent_test_macros::daemon_test]
     async fn script_git_log_with_blocking_config_pager_exits_cleanly() {
-        let _env =
-            crate::agent_manager::tests::EnvGuard::apply(&[("GIT_PAGER", None), ("PAGER", None)]);
+        let _env = intent_services::feature_api::agent_manager::tests::EnvGuard::apply(&[
+            ("GIT_PAGER", None),
+            ("PAGER", None),
+        ]);
         let h = harness_with_worktree(true).await;
         let workspace = h
             .services
@@ -7016,7 +7029,8 @@ mod tests {
             .get_workspace(&h.ws)
             .await
             .expect("workspace");
-        let root = crate::git_ops::worktree_path(&workspace).expect("worktree");
+        let root =
+            intent_services::feature_api::git_ops::worktree_path(&workspace).expect("worktree");
         let repo = git2::Repository::init(&root).expect("init repo");
         {
             let sig = git2::Signature::now("Script Test", "script@example.com").expect("sig");

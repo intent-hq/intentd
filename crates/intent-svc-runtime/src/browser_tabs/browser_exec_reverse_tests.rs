@@ -10,8 +10,8 @@ use intent_core::{
 use intent_store::Store;
 use serde_json::{json, Value};
 
-use crate::test_support::fixtures::{workspace, TempDb, WorkspacesRoot};
-use crate::Services;
+use intent_services::feature_api::test_support::fixtures::{workspace, TempDb, WorkspacesRoot};
+use intent_services::feature_api::Services;
 
 #[derive(Default)]
 struct RecordingDispatch {

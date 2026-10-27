@@ -27,7 +27,7 @@ use intent_core::{
 use intent_store::NewEvent;
 use serde_json::{json, Value};
 
-use crate::{publish_event, Services};
+use intent_services::feature_api::{publish_event, Services};
 
 /// The `browser.exec` action the daemon answers itself from the registry.
 pub(crate) const LIST_TABS_ACTION: &str = "listTabs";
@@ -95,7 +95,7 @@ impl BrowserTabRoutingExt for Services {
     /// Browser transport used to be administrator-only. Retain internal callers
     /// while checking the actual resource for every non-administrator wire call.
     async fn require_browser_workspace(&self, workspace: &WorkspaceId) -> Result<()> {
-        if crate::event_ops::is_collaborator_caller() {
+        if intent_services::feature_api::event_ops::is_collaborator_caller() {
             self.require_workspace_manager(workspace, "browser").await?;
         }
         Ok(())

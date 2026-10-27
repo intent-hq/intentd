@@ -29,10 +29,14 @@ use std::time::Duration;
 
 use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 
-use crate::events::EventBus;
-use crate::execution_call::expose_git_credential;
-use crate::shell::{default_shell, scrubbed_env_vars_except, shell_true_invocation};
-use crate::{publish_event, publish_event_transient, system_actor, SettingsRegistry};
+use intent_services::feature_api::events::EventBus;
+use intent_services::feature_api::execution_call::expose_git_credential;
+use intent_services::feature_api::shell::{
+    default_shell, scrubbed_env_vars_except, shell_true_invocation,
+};
+use intent_services::feature_api::{
+    publish_event, publish_event_transient, system_actor, SettingsRegistry,
+};
 
 /// How often the output streamer polls for natural process exit. The broadcast
 /// sender lives in the (still-tracked) session, so a child that exits on its own
@@ -77,7 +81,7 @@ fn resolve(terminal_id: &str) -> Result<PtyId> {
 /// commands and Windows defaults are unchanged.
 #[expect(clippy::too_many_arguments)]
 pub(crate) async fn create_owned(
-    tasks: &crate::delivery_tasks::DeliveryTasks,
+    tasks: &intent_services::feature_api::delivery_tasks::DeliveryTasks,
     pty: Arc<PtyHost>,
     bus: Option<EventBus>,
     store: Option<Store>,
@@ -140,7 +144,7 @@ async fn create(
     env: Option<std::collections::BTreeMap<String, String>>,
 ) -> Result<Value> {
     create_owned(
-        &crate::delivery_tasks::DeliveryTasks::default(),
+        &intent_services::feature_api::delivery_tasks::DeliveryTasks::default(),
         pty,
         bus,
         store,
@@ -213,7 +217,7 @@ async fn default_cwd(
         }
     }
     let workspace = store.get_workspace(workspace_id).await.ok()?;
-    crate::git_ops::worktree_path(&workspace)
+    intent_services::feature_api::git_ops::worktree_path(&workspace)
 }
 
 /// Environment pairs offering the daemon-managed GitHub credential to git
@@ -250,11 +254,14 @@ pub(crate) fn git_credential_env(
         return github;
     };
     let config = settings.snapshot().effective.source_control.gitlab.clone();
-    let Ok(instance) = crate::source_control_auth_ops::repository_owner::logical_instance(&config)
+    let Ok(instance) =
+        intent_services::feature_api::source_control_auth_ops::repository_owner::logical_instance(
+            &config,
+        )
     else {
         return github;
     };
-    let Some(intentd) = crate::daemon_exe_path() else {
+    let Some(intentd) = intent_services::feature_api::daemon_exe_path() else {
         return github;
     };
     let inherited = github
@@ -296,7 +303,7 @@ pub(crate) fn injected_git_env(
 /// entries). The helper path is the running daemon's own binary
 /// (`current_exe`); an unresolvable path yields no pairs (logged at debug).
 fn credential_pairs(cwd: Option<&Path>) -> Vec<(String, String)> {
-    let Some(intentd) = crate::daemon_exe_path() else {
+    let Some(intentd) = intent_services::feature_api::daemon_exe_path() else {
         return Vec::new();
     };
     let inherited = std::env::var(intent_git::auth::GIT_CONFIG_PARAMETERS_ENV).ok();
@@ -456,7 +463,7 @@ fn render_output(
     let raw = String::from_utf8_lossy(&snapshot.bytes);
     let clean = strip_ansi(&raw);
     if paginate || page_token.is_some() {
-        return crate::pagination::paginate_text_lines(
+        return intent_services::feature_api::pagination::paginate_text_lines(
             &clean,
             max_lines,
             page_token.map(std::string::String::as_str),
@@ -567,7 +574,7 @@ fn utf8_len(b: u8) -> usize {
 /// Attach to a freshly created PTY and fan its output onto the bus as
 /// `terminal:data`, emitting a terminal `terminal:exit` when the stream closes.
 pub(crate) fn spawn_output_stream(
-    tasks: &crate::delivery_tasks::DeliveryTasks,
+    tasks: &intent_services::feature_api::delivery_tasks::DeliveryTasks,
     pty: Arc<PtyHost>,
     bus: Option<EventBus>,
     workspace_id: WorkspaceId,
@@ -867,7 +874,7 @@ mod tests {
     use intent_core::{Event, Workspace};
     use intent_store::Store;
 
-    use crate::events::{Subscription, SubscriptionFilter};
+    use intent_services::feature_api::events::{Subscription, SubscriptionFilter};
 
     /// Generous deadline so the real-PTY tests stay green under loaded CI.
     const TIMEOUT: Duration = Duration::from_secs(8);
@@ -1151,7 +1158,7 @@ mod tests {
         let store = Store::open(&dir.path().join("store.db")).await.unwrap();
         let bus = EventBus::new(store.clone());
         let pty = host();
-        let tasks = crate::delivery_tasks::DeliveryTasks::default();
+        let tasks = intent_services::feature_api::delivery_tasks::DeliveryTasks::default();
         let id = pty.spawn(SpawnSpec::new("ws-shutdown", "cat")).unwrap();
         spawn_output_stream(
             &tasks,
@@ -1429,7 +1436,7 @@ mod tests {
     /// for its full root, with credential release gated by the owner policy.
     #[test]
     fn git_credential_env_respects_gate() {
-        let _env = crate::agent_manager::tests::EnvGuard::apply(&[(
+        let _env = intent_services::feature_api::agent_manager::tests::EnvGuard::apply(&[(
             intent_git::auth::GIT_CONFIG_PARAMETERS_ENV,
             None,
         )]);
@@ -1480,7 +1487,7 @@ mod tests {
     /// then (intent-hq/monorepo#4191).
     #[test]
     fn injected_git_env_carries_commit_identity_ungated() {
-        let _env = crate::agent_manager::tests::EnvGuard::apply(&[
+        let _env = intent_services::feature_api::agent_manager::tests::EnvGuard::apply(&[
             ("GIT_AUTHOR_NAME", None),
             ("GIT_AUTHOR_EMAIL", None),
             ("GIT_COMMITTER_NAME", None),
@@ -1678,7 +1685,7 @@ mod tests {
     async fn list_returns_spawn_name_or_default() {
         let pty = host();
         let mut named = SpawnSpec::new("ws-named", "cat");
-        named.name = Some(crate::SETUP_TERMINAL_NAME.to_string());
+        named.name = Some(intent_services::feature_api::SETUP_TERMINAL_NAME.to_string());
         let named_id = pty.spawn(named).unwrap().to_string();
 
         let res = create(
@@ -1734,7 +1741,11 @@ mod tests {
                 std::env::temp_dir().join(format!("intentd-term-wrap-{}.sh", uuid::Uuid::new_v4()));
             std::fs::write(&path, body).expect("write script");
             let out = std::process::Command::new("/bin/sh")
-                .args(["-c", crate::SETUP_SCRIPT_WRAPPER, "sh"])
+                .args([
+                    "-c",
+                    intent_services::feature_api::SETUP_SCRIPT_WRAPPER,
+                    "sh",
+                ])
                 .arg(&path)
                 .output()
                 .expect("run wrapper");
@@ -2471,7 +2482,7 @@ mod tests {
     /// (intent-hq/monorepo#4191).
     #[tokio::test]
     async fn acp_create_without_cwd_falls_back_to_session_cwd_with_identity() {
-        let _env = crate::agent_manager::tests::EnvGuard::apply(&[
+        let _env = intent_services::feature_api::agent_manager::tests::EnvGuard::apply(&[
             ("GIT_AUTHOR_NAME", None),
             ("GIT_AUTHOR_EMAIL", None),
             ("GIT_COMMITTER_NAME", None),

@@ -15,8 +15,8 @@ use intent_core::{
 use intent_store::Store;
 use serde_json::{json, Value};
 
-use crate::test_support::fixtures::{workspace, TempDb, WorkspacesRoot};
-use crate::{EventBus, Services, SubscriptionFilter};
+use intent_services::feature_api::test_support::fixtures::{workspace, TempDb, WorkspacesRoot};
+use intent_services::feature_api::{EventBus, Services, SubscriptionFilter};
 
 /// A dispatcher with a fixed set of live clients: `browser_exec == true`
 /// entries are eligible. `Default` resolves to the first eligible
