@@ -3401,9 +3401,10 @@ mod tests {
         let bus = crate::EventBus::new(store.clone());
         // A per-test secrets file: `Services::new` would use the default
         // `~/intent/.secrets.json`.
-        let services = crate::Services::new_with_file_secrets(
+        let services = crate::Services::new_repository_fixture(
             store.clone(),
             intent_core::FileSecretStore::with_path(dir.path().join("secrets.json")),
+            None,
         )
         .with_event_bus(bus.clone());
 

@@ -164,7 +164,7 @@ async fn member_execution_context_is_allowlisted_and_uses_host_policy() {
         assert!(!context.to_string().contains("/host/provider"));
         assert_eq!(svc.execution_provider_paths().await.unwrap()["codex"], "/host/provider");
         assert!(matches!(svc.settings_get("providers.paths".into()).await, Err(Error::Forbidden(_))));
-        svc.feature_secrets().delete("sourceControl.github.token").await.unwrap();
+        svc.feature_secrets().delete_for_test("sourceControl.github.token").await.unwrap();
         assert_eq!(svc.host_execution_context().await.unwrap()["repositoryConnections"][0]["configured"], false,
             "collaboration credentials must never supply execution");
         registry.apply(&[("sourceControl.github.exposeGitCredentialToChildren".into(), json!(true))]).unwrap();
@@ -244,7 +244,7 @@ async fn member_execution_enablement_events_follow_committed_changes_and_reset()
                 .unwrap()
         );
         let rows = svc
-            .store
+            .store()
             .query_events(&intent_store::EventQuery {
                 event_types: vec![HOST_EXECUTION_CONTEXT_CHANGED.into()],
                 ..Default::default()
@@ -915,7 +915,7 @@ async fn member_pr_status_rejection_publishes_durable_safe_context() {
     );
     assert!(!batch[0].data.to_string().contains("private-response"));
     let stored = svc
-        .store
+        .store()
         .query_events(&intent_store::EventQuery {
             event_types: vec![HOST_EXECUTION_CONTEXT_CHANGED.into()],
             ..Default::default()

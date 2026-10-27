@@ -16,6 +16,7 @@ use serde_json::Value;
 use crate::agent_manager::AgentManager;
 use crate::agent_ops::QueuedMessage;
 use crate::delivery_tasks::DeliveryTasks;
+use crate::settings::AsyncSecretStore;
 use crate::workspace_mutations::WorkspaceMutations;
 use crate::workspace_status::ScriptsRunningPark;
 use crate::{CompletionClassifyPark, Services};
@@ -197,6 +198,14 @@ impl DeliveryTasks {
     /// Test seam: `drain_finite`.
     pub async fn drain_finite_for_test(&self) {
         self.drain_finite().await;
+    }
+}
+
+#[doc(hidden)]
+impl AsyncSecretStore {
+    /// Test seam: `delete`.
+    pub async fn delete_for_test(&self, account: &str) -> Result<()> {
+        self.delete(account).await
     }
 }
 
