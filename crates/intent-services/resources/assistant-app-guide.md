@@ -64,6 +64,9 @@ help. Discuss or test them only when explicitly asked, and confirm the frontend
 supports them. A newer daemon or agent instruction version does not prove support
 in the installed client.
 
+For development testing, run both component branches and create a new agent with
+harness 3.4. Existing agents retain their creation-time prompts.
+
 In a supporting development frontend, an agent can put raw, self-contained
 HTML/CSS/JavaScript in a `ws-block:html` fence to show a local interactive visual
 in chat. Ordinary `html` fences remain source; an incomplete fence never executes.
