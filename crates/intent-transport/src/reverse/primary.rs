@@ -13,8 +13,10 @@
 //!   Guest hellos enter only the device roster. Current members can host
 //!   ordinary workspace browsers; each dispatch rechecks their authority.
 //!   Chief and host reverse requests select only administrator connections.
-//! - [`ReverseTarget::Default`] → the **first-connected** eligible connection
-//!   (unchanged single-desktop behaviour); none → `NoClient`.
+//! - [`ReverseTarget::Default`] → the **first-connected** eligible client,
+//!   via its **newest** eligible connection (unchanged single-desktop
+//!   behaviour; a stale older socket of that client is skipped); none →
+//!   `NoClient`.
 //! - [`ReverseTarget::Client`] / [`ReverseTarget::Pinned`] → the **newest**
 //!   eligible connection of that logical `clientId`; none →
 //!   `ClientOffline { client_id, name, pinned }`.
@@ -405,10 +407,27 @@ fn resolve_entry_matching<'a>(
     allowed: impl Fn(&Entry) -> bool,
 ) -> Result<&'a Entry, ReverseDispatchError> {
     match target {
-        ReverseTarget::Default => entries
-            .iter()
-            .find(|e| e.is_eligible() && allowed(e))
-            .ok_or(ReverseDispatchError::NoClient),
+        // The first-connected eligible *client* stays the sticky primary,
+        // but the request goes to that client's newest eligible connection,
+        // the same rule as `Client` / `Pinned`: an older socket of the same
+        // app that stopped answering must not take every unpinned dispatch
+        // (intent-hq/intent#7902).
+        ReverseTarget::Default => {
+            let first = entries
+                .iter()
+                .find(|e| e.is_eligible() && allowed(e))
+                .ok_or(ReverseDispatchError::NoClient)?;
+            let client_id = &first
+                .identity
+                .as_ref()
+                .expect("an eligible entry always carries an identity")
+                .client_id;
+            Ok(entries
+                .iter()
+                .rev()
+                .find(|e| e.is_eligible() && e.has_client(client_id) && allowed(e))
+                .unwrap_or(first))
+        }
         ReverseTarget::Client(client_id) | ReverseTarget::Pinned(client_id) => entries
             .iter()
             .rev()
@@ -423,6 +442,28 @@ fn resolve_entry_matching<'a>(
                 pinned: matches!(target, ReverseTarget::Pinned(_)),
             }),
     }
+}
+
+/// Name the connection a reverse request went to, for timeout errors:
+/// `browser client "<name>" (<clientId>) on connection <n> over <transport>,
+/// connected <ts>`. Lets a report of a silent client say which one it was.
+fn describe_connection(entry: &Entry) -> String {
+    let client = match &entry.identity {
+        Some(identity) => match &identity.name {
+            Some(name) => format!(
+                "browser client \"{name}\" ({})",
+                identity.client_id.as_str()
+            ),
+            None => format!("browser client {}", identity.client_id.as_str()),
+        },
+        None => "browser client".to_string(),
+    };
+    format!(
+        "{client} on connection {} over {}, connected {}",
+        entry.id,
+        entry.transport.as_str(),
+        entry.connected_at
+    )
 }
 
 impl PrimaryReverseRegistry {
@@ -790,17 +831,26 @@ impl AgentReverseDispatch for PrimaryReverseRegistry {
             && params["workspaceId"]
                 .as_str()
                 .is_some_and(|ws| !ws.is_empty() && !intent_core::WorkspaceId::from(ws).is_chief());
-        let channel = resolve_entry_matching(&self.inner.lock().entries, &target, |entry| {
+        let resolved = resolve_entry_matching(&self.inner.lock().entries, &target, |entry| {
             member_scope || entry.channel.is_administrator()
         })
-        .map(|e| e.channel.clone());
+        .map(|e| (e.channel.clone(), describe_connection(e)));
         Box::pin(async move {
-            let channel = channel?;
+            let (channel, connection) = resolved?;
             let timeout = request_timeout(method, &params);
             channel.request(method, params, timeout).await.map_err(|e| {
+                let message = if e.message == super::timeout_message(method) {
+                    format!(
+                        "{}: {connection} did not answer within {}s",
+                        e.message,
+                        timeout.as_secs()
+                    )
+                } else {
+                    e.message
+                };
                 ReverseDispatchError::Transport {
                     code: e.code,
-                    message: e.message,
+                    message,
                 }
             })
         })

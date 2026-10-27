@@ -50,6 +50,12 @@ pub(crate) fn request_timeout(method: &str, params: &Value) -> Duration {
     }
 }
 
+/// The message a reverse request carries when the client does not reply in
+/// time. Callers that know which connection was asked append it.
+pub(crate) fn timeout_message(method: &str) -> String {
+    format!("reverse request timed out: {method}")
+}
+
 /// A JSON-RPC error returned by the client to a reverse request.
 #[derive(Debug, Clone)]
 pub struct ReverseError {
@@ -272,7 +278,7 @@ impl ReverseChannel {
             Err(_) => Err(ReverseError {
                 data: None,
                 code: 0,
-                message: format!("reverse request timed out: {method}"),
+                message: timeout_message(method),
             }),
         }
     }
