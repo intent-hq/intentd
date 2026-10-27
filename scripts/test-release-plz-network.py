@@ -96,11 +96,16 @@ class ReleasePlzNetwork(unittest.TestCase):
                     allowed.append((name, step.get('id')))
         self.assertEqual(allowed, [('release-plz-pr', 'release_pr')])
 
-    def test_tag_publication_job_stays_online_and_unretried(self):
+    def test_tag_publication_job_runs_once_and_stays_online(self):
         doc = yaml.safe_load(WORKFLOW.read_text())
-        release = yaml.safe_dump(doc['jobs']['release-plz-release'])
-        self.assertNotIn(FETCH_RUN, release)
-        self.assertNotIn('CARGO_NET_OFFLINE', WORKFLOW.read_text())
+        steps = doc['jobs']['release-plz-release']['steps']
+        publishing = [step for step in steps if 'scripts/release-plz' in step.get('run', '')
+                      or 'release-plz release' in step.get('run', '') or step.get('uses', '').startswith(ACTION)]
+        self.assertEqual([step['run'] for step in publishing], ['python3 -S scripts/release-plz-release.py'])
+        self.assertEqual([step.get('if') for step in steps if step.get('if')], [], 'no conditional (retry) steps')
+        self.assertNotIn(FETCH_RUN, yaml.safe_dump(steps))
+        for step in steps:
+            self.assertNotIn('CARGO_NET_OFFLINE', step.get('env') or {})
 
     def test_fetch_script_documents_this_caller(self):
         self.assertIn('release-plz.yml', (ROOT / 'scripts/fetch-locked-crates.py').read_text())
