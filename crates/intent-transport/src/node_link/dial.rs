@@ -16,7 +16,7 @@ use intent_core::node_link::{
 };
 use intent_core::{Error, Result};
 
-use super::link::Timings;
+use super::link::Tuning;
 use super::pin::{self, CertificatePin, PIN_MISMATCH};
 use super::{codes, GitConnection, LeaseToken, LinkEvents, NodeLink, GIT_PATH, LINK_PATH};
 
@@ -59,13 +59,13 @@ type Socket = WebSocketStream<TlsStream<TcpStream>>;
 /// unauthorized, stale generation, other head, wrong node or version
 /// mismatch.
 pub async fn dial_link(endpoint: &NodeEndpoint, hello: LinkHello) -> Result<DialedLink> {
-    dial_link_with(endpoint, hello, Timings::default()).await
+    dial_link_with(endpoint, hello, Tuning::default()).await
 }
 
 pub(super) async fn dial_link_with(
     endpoint: &NodeEndpoint,
     hello: LinkHello,
-    timings: Timings,
+    tuning: Tuning,
 ) -> Result<DialedLink> {
     let binding = hello.binding.clone();
     let (socket, welcome) = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
@@ -80,7 +80,7 @@ pub(super) async fn dial_link_with(
     })
     .await
     .map_err(|_| super::unavailable())??;
-    let (link, events) = NodeLink::start(socket, binding, timings);
+    let (link, events) = NodeLink::start(socket, binding, tuning);
     Ok(DialedLink {
         link,
         events,
@@ -108,11 +108,17 @@ pub async fn dial_git(endpoint: &NodeEndpoint, binding: &LeaseBinding) -> Result
     Ok(GitConnection::start(socket, binding.clone(), None))
 }
 
-async fn read_welcome(socket: &mut Socket, binding: &LeaseBinding) -> Result<LinkWelcome> {
+pub(super) async fn read_welcome<S>(
+    socket: &mut WebSocketStream<S>,
+    binding: &LeaseBinding,
+) -> Result<LinkWelcome>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     loop {
         match socket.next().await {
             Some(Ok(Message::Binary(bytes))) => {
-                let LinkFrame::Welcome(welcome) = LinkFrame::decode(&bytes)? else {
+                let Ok(LinkFrame::Welcome(welcome)) = LinkFrame::decode(&bytes) else {
                     return Err(super::protocol("expected welcome"));
                 };
                 ensure_protocol(welcome.protocol)?;

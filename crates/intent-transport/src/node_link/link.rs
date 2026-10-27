@@ -21,30 +21,38 @@ use intent_core::{AgentId, Error, Result};
 
 use super::codes;
 
-/// Heartbeat cadence and the silence after which a link is declared dead.
+/// Heartbeat cadence, the silence after which a link is declared dead, and
+/// queue sizes.
 #[derive(Debug, Clone, Copy)]
-pub(super) struct Timings {
+pub(super) struct Tuning {
     pub heartbeat: Duration,
     pub dead_after: Duration,
+    pub outbound_queue: usize,
+    pub event_queue: usize,
 }
 
-impl Default for Timings {
+impl Default for Tuning {
     fn default() -> Self {
         Self {
             heartbeat: Duration::from_secs(15),
             dead_after: Duration::from_secs(45),
+            outbound_queue: 256,
+            event_queue: 1024,
         }
     }
 }
 
-const OUTBOUND_QUEUE: usize = 256;
-const EVENT_QUEUE: usize = 1024;
+/// Room for cancellations and dropped-request replies, which skip the
+/// outbound queue. Each pending call or inbound request produces at most
+/// one; overflowing it closes the link rather than losing one.
+const URGENT_QUEUE: usize = 1024;
 /// JSON-RPC internal error, used when a request handler is dropped.
 const DROPPED_CODE: i32 = -32603;
 
 struct Inner {
     binding: LeaseBinding,
     out: mpsc::Sender<Message>,
+    urgent: mpsc::Sender<Message>,
     pending: Mutex<HashMap<LinkId, oneshot::Sender<LinkOutcome>>>,
     inbound: Mutex<HashMap<LinkId, watch::Sender<bool>>>,
     close: watch::Sender<bool>,
@@ -63,6 +71,28 @@ impl Inner {
         }
     }
 
+    /// Queue a cancellation or dropped-request reply ahead of ordinary
+    /// frames. It is never silently lost: if even the urgent queue is full,
+    /// the link closes, which cancels everything on both sides.
+    fn send_urgent(&self, frame: &LinkFrame) {
+        if self.is_closed() {
+            return;
+        }
+        let Ok(bytes) = frame.encode() else {
+            return;
+        };
+        if let Err(mpsc::error::TrySendError::Full(_)) =
+            self.urgent.try_send(Message::Binary(bytes.into()))
+        {
+            tracing::warn!(
+                code = codes::CLOSED,
+                "node link: urgent queue full; closing"
+            );
+            self.shut();
+        }
+    }
+
+    /// Best effort, for heartbeats: a lost one is replaced by the next.
     fn try_send_frame(&self, frame: &LinkFrame) {
         if self.is_closed() {
             return;
@@ -190,7 +220,7 @@ impl Drop for IncomingRequest {
             return;
         }
         lock(&self.inner.inbound).remove(&self.request.request_id);
-        self.inner.try_send_frame(&LinkFrame::Response {
+        self.inner.send_urgent(&LinkFrame::Response {
             request_id: self.request.request_id,
             outcome: LinkOutcome::Err(LinkRpcError {
                 code: DROPPED_CODE,
@@ -215,7 +245,7 @@ impl Drop for CallGuard {
             return;
         }
         if lock(&self.inner.pending).remove(&self.id).is_some() {
-            self.inner.try_send_frame(&LinkFrame::CancelRequest {
+            self.inner.send_urgent(&LinkFrame::CancelRequest {
                 request_id: self.id,
             });
         }
@@ -227,31 +257,33 @@ impl NodeLink {
     pub(super) fn start<S>(
         socket: WebSocketStream<S>,
         binding: LeaseBinding,
-        timings: Timings,
+        tuning: Tuning,
     ) -> (Self, LinkEvents)
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let (out, out_rx) = mpsc::channel(OUTBOUND_QUEUE);
-        let (events_tx, events_rx) = mpsc::channel(EVENT_QUEUE);
+        let (out, out_rx) = mpsc::channel(tuning.outbound_queue);
+        let (urgent, urgent_rx) = mpsc::channel(URGENT_QUEUE);
+        let (events_tx, events_rx) = mpsc::channel(tuning.event_queue);
         let (close, _) = watch::channel(false);
         let inner = Arc::new(Inner {
             binding,
             out,
+            urgent,
             pending: Mutex::new(HashMap::new()),
             inbound: Mutex::new(HashMap::new()),
             close,
         });
         let (sink, stream) = socket.split();
         let last_seen = Arc::new(Mutex::new(Instant::now()));
-        tokio::spawn(write_loop(sink, out_rx, inner.clone()));
+        tokio::spawn(write_loop(sink, out_rx, urgent_rx, inner.clone()));
         tokio::spawn(read_loop(
             stream,
             events_tx,
             inner.clone(),
             last_seen.clone(),
         ));
-        tokio::spawn(heartbeat_loop(inner.clone(), last_seen, timings));
+        tokio::spawn(heartbeat_loop(inner.clone(), last_seen, tuning));
         (Self { inner }, LinkEvents { rx: events_rx })
     }
 
@@ -306,11 +338,14 @@ impl NodeLink {
             return Err(closed_error());
         }
         let bytes = frame.encode()?;
-        self.inner
-            .out
-            .send(Message::Binary(bytes.into()))
-            .await
-            .map_err(|_| closed_error())
+        let mut close = self.inner.close.subscribe();
+        // A stalled writer must not hold a sender past the link's closure.
+        tokio::select! {
+            sent = self.inner.out.send(Message::Binary(bytes.into())) => {
+                sent.map_err(|_| closed_error())
+            }
+            () = super::wait_true(&mut close) => Err(closed_error()),
+        }
     }
 
     /// Call `method` on the peer for `agent_id` and wait up to `timeout`
@@ -348,19 +383,22 @@ impl NodeLink {
             params,
             timeout_ms: u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX),
         });
-        if let Err(error) = self.send_any(&request).await {
-            guard.settled = true;
-            lock(&self.inner.pending).remove(&request_id);
-            return Err(error);
-        }
-        match tokio::time::timeout(timeout, rx).await {
+        // One deadline covers queueing the request and waiting for its
+        // outcome, so a full outbound queue cannot outlast `timeout`.
+        let exchange = async {
+            self.send_any(&request).await?;
+            rx.await.map_err(|_| closed_error())
+        };
+        let result = tokio::time::timeout(timeout, exchange).await;
+        match result {
             Ok(Ok(outcome)) => {
                 guard.settled = true;
                 Ok(outcome)
             }
-            Ok(Err(_)) => {
+            Ok(Err(error)) => {
                 guard.settled = true;
-                Err(closed_error())
+                lock(&self.inner.pending).remove(&request_id);
+                Err(error)
             }
             Err(_) => Err(Error::Internal(codes::TIMEOUT.into())),
         }
@@ -370,6 +408,7 @@ impl NodeLink {
 async fn write_loop<S>(
     mut sink: futures_util::stream::SplitSink<WebSocketStream<S>, Message>,
     mut out: mpsc::Receiver<Message>,
+    mut urgent: mpsc::Receiver<Message>,
     inner: Arc<Inner>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -377,18 +416,39 @@ async fn write_loop<S>(
     let mut close = inner.close.subscribe();
     loop {
         tokio::select! {
-            message = out.recv() => {
+            biased;
+            () = super::wait_true(&mut close) => break,
+            message = urgent.recv() => {
                 let Some(message) = message else { break };
-                if sink.send(message).await.is_err() {
-                    break;
+                tokio::select! {
+                    sent = sink.send(message) => {
+                        if sent.is_err() {
+                            break;
+                        }
+                    }
+                    () = super::wait_true(&mut close) => break,
                 }
             }
-            () = super::wait_true(&mut close) => break,
+            message = out.recv() => {
+                let Some(message) = message else { break };
+                tokio::select! {
+                    sent = sink.send(message) => {
+                        if sent.is_err() {
+                            break;
+                        }
+                    }
+                    () = super::wait_true(&mut close) => break,
+                }
+            }
         }
     }
     inner.shut();
-    let _ = sink.send(Message::Close(None)).await;
-    let _ = sink.close().await;
+    // A peer that stopped reading must not hold this task open.
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        let _ = sink.send(Message::Close(None)).await;
+        let _ = sink.close().await;
+    })
+    .await;
 }
 
 async fn read_loop<S>(
@@ -421,7 +481,13 @@ async fn read_loop<S>(
             );
             break;
         };
-        if !route(frame, &events, &inner).await {
+        // A consumer that stops draining events must not keep a closed link
+        // (and its reader) alive.
+        let keep = tokio::select! {
+            keep = route(frame, &events, &inner) => keep,
+            () = super::wait_true(&mut close) => false,
+        };
+        if !keep {
             break;
         }
     }
@@ -484,9 +550,9 @@ async fn route(frame: LinkFrame, events: &mpsc::Sender<LinkEvent>, inner: &Arc<I
     }
 }
 
-async fn heartbeat_loop(inner: Arc<Inner>, last_seen: Arc<Mutex<Instant>>, timings: Timings) {
+async fn heartbeat_loop(inner: Arc<Inner>, last_seen: Arc<Mutex<Instant>>, tuning: Tuning) {
     let mut close = inner.close.subscribe();
-    let mut tick = tokio::time::interval(timings.heartbeat);
+    let mut tick = tokio::time::interval(tuning.heartbeat);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut nonce = 0_u64;
     loop {
@@ -494,7 +560,7 @@ async fn heartbeat_loop(inner: Arc<Inner>, last_seen: Arc<Mutex<Instant>>, timin
             _ = tick.tick() => {}
             () = super::wait_true(&mut close) => return,
         }
-        if lock(&last_seen).elapsed() > timings.dead_after {
+        if lock(&last_seen).elapsed() > tuning.dead_after {
             tracing::warn!(code = codes::UNAVAILABLE, "node link: peer silent; closing");
             inner.shut();
             return;

@@ -9,8 +9,8 @@ use intent_core::nodes::{NodeArch, NodeCounter, NodeOs};
 use intent_core::placement::AgentPlatform;
 use intent_core::AgentId;
 
-use super::dial::{decode_rejection, dial_link_with};
-use super::link::Timings;
+use super::dial::{decode_rejection, dial_link_with, read_welcome};
+use super::link::Tuning;
 use super::*;
 use crate::protocol::test_capture::Capture;
 use crate::{generate_certificate, TlsCertificate};
@@ -580,11 +580,12 @@ async fn closing_the_link_fails_pending_calls_and_cancels_requests() {
 #[tokio::test]
 async fn heartbeats_keep_an_idle_link_open() {
     let mut node = Node::start(token("t")).await;
-    let timings = Timings {
+    let tuning = Tuning {
         heartbeat: Duration::from_millis(50),
         dead_after: Duration::from_millis(300),
+        ..Tuning::default()
     };
-    let head = dial_link_with(&node.endpoint(), hello(binding(1)), timings)
+    let head = dial_link_with(&node.endpoint(), hello(binding(1)), tuning)
         .await
         .unwrap();
     let (node_link, _events, _) = node.accept_link().await;
@@ -881,7 +882,8 @@ fn wire_trace_is_recognized_for_log_filtering() {
         "tokio_tungstenite::handshake",
     ] {
         assert!(is_wire_trace(target, &Level::TRACE), "{target}");
-        assert!(!is_wire_trace(target, &Level::DEBUG), "{target}");
+        assert!(is_wire_trace(target, &Level::DEBUG), "{target}");
+        assert!(!is_wire_trace(target, &Level::INFO), "{target}");
     }
     for target in ["tungstenite_extra", "intent_transport::node_link", "rustls"] {
         assert!(!is_wire_trace(target, &Level::TRACE), "{target}");
@@ -965,4 +967,236 @@ async fn canary_secret_never_reaches_trace_level_log_outputs() {
     for (_, line) in capture.lines() {
         assert!(!line.contains(canary), "secret leaked: {line}");
     }
+}
+
+/// A peer cannot get text into head's errors through a malformed frame:
+/// serde's decode errors quote the input.
+#[tokio::test]
+async fn malformed_welcome_does_not_echo_peer_text() {
+    use futures_util::SinkExt as _;
+    use tokio_tungstenite::tungstenite::protocol::Role;
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::WebSocketStream;
+
+    for payload in [
+        r#"{"type":"CANARY-peer-text"}"#,
+        r#"{"type":"welcome","protocol":5,"CANARY-peer-text":1}"#,
+        "CANARY-peer-text",
+    ] {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let mut client = WebSocketStream::from_raw_socket(client, Role::Client, None).await;
+        let mut server = WebSocketStream::from_raw_socket(server, Role::Server, None).await;
+        server
+            .send(Message::Binary(payload.as_bytes().to_vec().into()))
+            .await
+            .unwrap();
+        let error = read_welcome(&mut client, &binding(1)).await.unwrap_err();
+        assert_eq!(code(&error), codes::PROTOCOL, "{payload}");
+        assert!(!format!("{error} {error:?}").contains("CANARY"), "{error}");
+    }
+}
+
+/// A node-side git connection whose owner stopped draining it still closes
+/// when a newer bind retires its binding.
+#[tokio::test]
+async fn rebind_closes_a_git_connection_with_a_full_receive_queue() {
+    let mut node = Node::start(token("t")).await;
+    let _old = dial(&node, 1).await;
+    let _ = node.accept_link().await;
+    let head_git = dial_git(&node.endpoint(), &binding(1)).await.unwrap();
+    let node_git = node.accept_git().await;
+    for i in 0..200_u32 {
+        if head_git.send(i.to_be_bytes().to_vec()).await.is_err() {
+            break;
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let _new = dial(&node, 2).await;
+    let _ = node.accept_link().await;
+    tokio::time::timeout(wait(), node_git.closed())
+        .await
+        .unwrap();
+    tokio::time::timeout(wait(), head_git.closed())
+        .await
+        .unwrap();
+}
+
+/// Dropping the listener does not retire established git connections.
+#[tokio::test]
+async fn dropping_the_listener_keeps_git_connections_open() {
+    let mut node = Node::start(token("t")).await;
+    let _link = dial(&node, 1).await;
+    let _ = node.accept_link().await;
+    let mut head_git = dial_git(&node.endpoint(), &binding(1)).await.unwrap();
+    let node_git = node.accept_git().await;
+    drop(node.listener);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!node_git.is_closed());
+    node_git.send(b"still here".to_vec()).await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(wait(), head_git.recv()).await.unwrap(),
+        Some(b"still here".to_vec())
+    );
+}
+
+fn small_queues() -> Tuning {
+    Tuning {
+        outbound_queue: 2,
+        event_queue: 2,
+        ..Tuning::default()
+    }
+}
+
+/// A node with tiny queues and the head link dialed with tiny queues.
+async fn tuned_pair() -> (Node, DialedLink, NodeLink, LinkEvents) {
+    let dir = tempfile::tempdir().unwrap();
+    let certificate = certificate();
+    let token = token("t");
+    let listener = NodeListener::bind_with(
+        "127.0.0.1:0".parse().unwrap(),
+        NodeListenerConfig {
+            node_id: NODE.into(),
+            token: token.clone(),
+            binding_file: BindingFile::new(dir.path().join("binding.json")),
+            certificate: certificate.clone(),
+        },
+        welcome(),
+        small_queues(),
+    )
+    .await
+    .unwrap();
+    let mut node = Node {
+        listener,
+        certificate,
+        token,
+        dir,
+    };
+    let head = dial_link_with(&node.endpoint(), hello(binding(1)), small_queues())
+        .await
+        .unwrap();
+    let (node_link, node_events, _) = node.accept_link().await;
+    (node, head, node_link, node_events)
+}
+
+/// Keep sending large frames on `link` until it closes. With the peer not
+/// draining its events, the peer's reader stops, the socket buffers fill,
+/// and then `link`'s outbound queue.
+fn saturate(link: NodeLink) -> tokio::task::JoinHandle<()> {
+    let frame = LinkFrame::Prompt {
+        agent_id: AgentId::from_string("agent"),
+        turn_id: "turn".into(),
+        prompt: vec![json!("x".repeat(256 * 1024))],
+    };
+    let handle = tokio::spawn(async move { while link.send(&frame).await.is_ok() {} });
+    handle
+}
+
+fn drain(mut events: LinkEvents) {
+    tokio::spawn(async move { while events.recv().await.is_some() {} });
+}
+
+async fn saturated() {
+    tokio::time::sleep(Duration::from_secs(1)).await;
+}
+
+#[tokio::test]
+async fn call_deadline_covers_a_full_outbound_queue() {
+    let (_node, head, _node_link, _node_events) = tuned_pair().await;
+    let _flood = saturate(head.link.clone());
+    saturated().await;
+    let call = head
+        .link
+        .call(AgentId::new(), "x", json!({}), Duration::from_millis(300));
+    let error = tokio::time::timeout(wait(), call)
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(code(&error), codes::TIMEOUT);
+}
+
+#[tokio::test]
+async fn closing_releases_a_call_blocked_on_a_full_outbound_queue() {
+    let (_node, head, _node_link, _node_events) = tuned_pair().await;
+    let _flood = saturate(head.link.clone());
+    saturated().await;
+    let call = {
+        let link = head.link.clone();
+        tokio::spawn(async move {
+            link.call(AgentId::new(), "x", json!({}), Duration::from_secs(600))
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!call.is_finished());
+    head.link.close();
+    let error = tokio::time::timeout(wait(), call)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(code(&error), codes::CLOSED);
+}
+
+#[tokio::test]
+async fn cancellation_is_not_lost_behind_a_full_outbound_queue() {
+    let (_node, head, _node_link, mut node_events) = tuned_pair().await;
+    let call = {
+        let link = head.link.clone();
+        tokio::spawn(async move {
+            link.call(
+                AgentId::new(),
+                "slow",
+                json!({}),
+                Duration::from_millis(1500),
+            )
+            .await
+        })
+    };
+    let Some(LinkEvent::Request(request)) = tokio::time::timeout(wait(), node_events.recv())
+        .await
+        .unwrap()
+    else {
+        panic!("expected a request");
+    };
+    let _flood = saturate(head.link.clone());
+    let error = tokio::time::timeout(wait(), call)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(code(&error), codes::TIMEOUT);
+    assert!(!head.link.is_closed());
+    drain(node_events);
+    tokio::time::timeout(wait(), request.cancelled())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn dropped_request_reply_is_not_lost_behind_a_full_outbound_queue() {
+    let (_node, head, node_link, mut node_events) = tuned_pair().await;
+    let call = {
+        let link = head.link.clone();
+        tokio::spawn(async move { link.call(AgentId::new(), "x", json!({}), wait()).await })
+    };
+    let Some(LinkEvent::Request(request)) = tokio::time::timeout(wait(), node_events.recv())
+        .await
+        .unwrap()
+    else {
+        panic!("expected a request");
+    };
+    let _flood = saturate(node_link.clone());
+    saturated().await;
+    drop(request);
+    assert!(!node_link.is_closed());
+    drain(head.events);
+    let outcome = tokio::time::timeout(wait(), call)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let LinkOutcome::Err(error) = outcome else {
+        panic!("expected an error outcome");
+    };
+    assert_eq!(error.message, "node-link-request-dropped");
 }

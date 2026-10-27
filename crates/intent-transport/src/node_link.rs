@@ -81,10 +81,11 @@ fn config(detail: &'static str) -> Error {
     Error::InvalidParams(format!("{}: {detail}", codes::CONFIG))
 }
 
-/// Whether a log event is the WebSocket library's wire tracing, which prints
-/// whole upgrade requests (including the lease token header) and frames.
-/// Daemon log outputs must drop these so a `trace` filter cannot leak the
-/// token.
+/// Whether a log event is the WebSocket library's wire logging: its trace
+/// output prints whole upgrade requests (including the lease token header)
+/// and frames, and its debug output prints peer-supplied close reasons.
+/// Daemon log outputs must drop these so a `trace` or `debug` filter cannot
+/// leak the token or log peer text.
 #[must_use]
 pub fn is_wire_trace(target: &str, level: &tracing::Level) -> bool {
     let wire = |prefix: &str| {
@@ -93,7 +94,7 @@ pub fn is_wire_trace(target: &str, level: &tracing::Level) -> bool {
                 .strip_prefix(prefix)
                 .is_some_and(|rest| rest.starts_with("::"))
     };
-    *level == tracing::Level::TRACE && (wire("tungstenite") || wire("tokio_tungstenite"))
+    *level >= tracing::Level::DEBUG && (wire("tungstenite") || wire("tokio_tungstenite"))
 }
 
 /// Wait until a watched flag turns `true` (or its sender is gone), without

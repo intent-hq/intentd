@@ -42,38 +42,61 @@ impl GitConnection {
         let (mut sink, mut stream) = socket.split();
         let mut closed = close.subscribe();
         let close_tx = close.clone();
-        tokio::spawn(async move {
-            let mut retire = retire;
-            loop {
-                let retired = async {
-                    match retire.as_mut() {
-                        Some(rx) => super::wait_true(rx).await,
-                        None => std::future::pending().await,
+        if let Some(mut retire) = retire {
+            let close = close.clone();
+            let mut closed = close.subscribe();
+            tokio::spawn(async move {
+                tokio::select! {
+                    retired = retire.wait_for(|retired| *retired) => {
+                        // A dropped listener retires nothing.
+                        if retired.is_ok() {
+                            close.send_replace(true);
+                        }
                     }
-                };
+                    () = super::wait_true(&mut closed) => {}
+                }
+            });
+        }
+        tokio::spawn(async move {
+            loop {
                 tokio::select! {
                     bytes = out_rx.recv() => {
                         let Some(bytes) = bytes else { break };
-                        if sink.send(Message::Binary(bytes.into())).await.is_err() {
-                            break;
+                        tokio::select! {
+                            sent = sink.send(Message::Binary(bytes.into())) => {
+                                if sent.is_err() {
+                                    break;
+                                }
+                            }
+                            () = super::wait_true(&mut closed) => break,
                         }
                     }
                     message = stream.next() => match message {
                         Some(Ok(Message::Binary(bytes))) => {
-                            if in_tx.send(bytes.to_vec()).await.is_err() {
-                                break;
+                            // A full receive queue must not keep a retired
+                            // connection open.
+                            tokio::select! {
+                                sent = in_tx.send(bytes.to_vec()) => {
+                                    if sent.is_err() {
+                                        break;
+                                    }
+                                }
+                                () = super::wait_true(&mut closed) => break,
                             }
                         }
                         Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
                         _ => break,
                     },
                     () = super::wait_true(&mut closed) => break,
-                    () = retired => break,
                 }
             }
             close_tx.send_replace(true);
-            let _ = sink.send(Message::Close(None)).await;
-            let _ = sink.close().await;
+            // A peer that stopped reading must not hold this task open.
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let _ = sink.send(Message::Close(None)).await;
+                let _ = sink.close().await;
+            })
+            .await;
         });
         Self {
             binding,
@@ -97,10 +120,11 @@ impl GitConnection {
         if self.is_closed() {
             return Err(Error::Internal(codes::CLOSED.into()));
         }
-        self.out
-            .send(bytes)
-            .await
-            .map_err(|_| Error::Internal(codes::CLOSED.into()))
+        let mut closed = self.close.subscribe();
+        tokio::select! {
+            sent = self.out.send(bytes) => sent.map_err(|_| Error::Internal(codes::CLOSED.into())),
+            () = super::wait_true(&mut closed) => Err(Error::Internal(codes::CLOSED.into())),
+        }
     }
 
     /// The next message, `None` once the connection has closed.

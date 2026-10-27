@@ -23,7 +23,7 @@ use intent_core::{Error, Result};
 use super::dial::{
     socket_config, HANDSHAKE_TIMEOUT, HEADER_GENERATION, HEADER_HEAD, HEADER_LEASE, HEADER_NODE,
 };
-use super::link::Timings;
+use super::link::Tuning;
 use super::{
     codes, error_code, pin, BindingFile, GitConnection, LeaseToken, LinkEvents, NodeLink, GIT_PATH,
     LINK_PATH,
@@ -71,7 +71,7 @@ struct Shared {
     token: LeaseToken,
     file: BindingFile,
     welcome: WelcomeFn,
-    timings: Timings,
+    tuning: Tuning,
     current: Mutex<Current>,
 }
 
@@ -102,14 +102,14 @@ impl NodeListener {
         config: NodeListenerConfig,
         welcome: WelcomeFn,
     ) -> Result<Self> {
-        Self::bind_with(address, config, welcome, Timings::default()).await
+        Self::bind_with(address, config, welcome, Tuning::default()).await
     }
 
     pub(super) async fn bind_with(
         address: SocketAddr,
         config: NodeListenerConfig,
         welcome: WelcomeFn,
-        timings: Timings,
+        tuning: Tuning,
     ) -> Result<Self> {
         let binding = config.binding_file.load()?;
         let tls = TlsAcceptor::from(Arc::new(pin::server_config(&config.certificate)?));
@@ -124,7 +124,7 @@ impl NodeListener {
             token: config.token,
             file: config.binding_file,
             welcome,
-            timings,
+            tuning,
             current: Mutex::new(Current {
                 binding,
                 link: None,
@@ -296,7 +296,7 @@ async fn admit(
             Some(retire),
         ))),
         Route::Link => bind(&mut socket, shared).await.map(|hello| {
-            let (link, events) = NodeLink::start(socket, hello.binding.clone(), shared.timings);
+            let (link, events) = NodeLink::start(socket, hello.binding.clone(), shared.tuning);
             let mut current = lock(&shared.current);
             if current.binding.as_ref() == Some(&hello.binding) {
                 current.link = Some(link.clone());
@@ -322,8 +322,9 @@ where
 {
     let hello = loop {
         match socket.next().await {
-            Some(Ok(Message::Binary(bytes))) => match LinkFrame::decode(&bytes)? {
-                LinkFrame::Hello(hello) => break hello,
+            // Decode errors quote the peer's bytes; report a fixed code.
+            Some(Ok(Message::Binary(bytes))) => match LinkFrame::decode(&bytes) {
+                Ok(LinkFrame::Hello(hello)) => break hello,
                 _ => return Err(super::protocol("expected hello")),
             },
             Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
