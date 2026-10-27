@@ -6,9 +6,9 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use intent_core::{
-    now_iso, AgentId, AgentSession, AgentStatus, BoxFuture, ContentType, Error, MessageOrigin,
-    Note, NoteAddInput, NoteCreate, NoteEditInput, NoteEditLinesInput, NoteId, NoteMetadata,
-    NoteUpdateInput, NoteVisibility, Workspace, WorkspaceActivity, WorkspaceApi,
+    now_iso, AgentId, AgentSession, AgentStatus, BoxFuture, Error, MessageOrigin,
+    Note, NoteAddInput, NoteCreate, NoteEditInput, NoteEditLinesInput, NoteId,
+    NoteUpdateInput, Workspace, WorkspaceActivity, WorkspaceApi,
     WorkspaceAttention, WorkspaceId, WorkspaceUpdate,
 };
 use intent_store::Store;
@@ -87,6 +87,7 @@ pub(crate) use crate::test_support::fixtures::{
 };
 
 pub(crate) use crate::test_support::fixtures::workspace;
+use crate::test_support::fixtures::note;
 
 pub(super) async fn setup(content: &str) -> (TempDb, Services, WorkspaceId, NoteId) {
     let tmp = TempDb::new();
@@ -34730,19 +34731,17 @@ mod worktree_provisioning {
 /// isolation, no worktree — and `workspace.duplicate` (which never runs a
 /// setup script) completes immediately with `ranScript: false`.
 pub(crate) mod setup_lifecycle_events {
-    use std::path::PathBuf;
-    use std::time::Duration;
-
     use intent_core::{
         WorkspaceApi, WorkspaceCreate, WorkspaceCreateInitialAgent, WorkspaceSetupState,
     };
     use intent_store::Store;
-    #[cfg(unix)]
-    use intentd_test_support::Barrier;
-    use serde_json::{json, Value};
+    use serde_json::json;
 
-    use super::{test_registry_with_default_provider, test_tempdir, TempDb};
-    use crate::{EventBus, Services, Subscription, SubscriptionFilter};
+    use super::{test_registry_with_default_provider, TempDb};
+    use crate::test_support::setup_lifecycle::{
+        assert_quiet, recv_setup, seed_repo, services, subscribe_setup, unique_dir,
+    };
+    use crate::{EventBus, Services, SubscriptionFilter};
 
     /// Worktree provisioned but no effective script anywhere (no explicit
     /// param, no repo config, no legacy row): no `started`, exactly one
@@ -35072,7 +35071,7 @@ mod file_ops_service {
         w.worktree_path = Some(primary.to_string_lossy().into_owned());
         store.insert_workspace(&w).await.unwrap();
         let caller = AgentId::new();
-        let mut session = super::turn_end_unread_gate::session(&caller, &ws);
+        let mut session = crate::test_support::fixtures::session(&caller, &ws);
         session.sandbox_path = Some(sandbox.to_string_lossy().into_owned());
         store.insert_agent_session(&session).await.unwrap();
         let svc = Services::new(store);
@@ -40885,11 +40884,12 @@ mod last_activity_events {
 /// unread. On a session-load error the gate FAILS OPEN (raise anyway).
 #[cfg(test)]
 mod turn_end_unread_gate {
-    use intent_core::{now_iso, AgentId, AgentSession, AgentStatus, WorkspaceId, WorkspaceStatus};
+    use intent_core::{now_iso, AgentId, WorkspaceId, WorkspaceStatus};
     use intent_store::Store;
 
     use super::{workspace, TempDb};
     use crate::agent_manager::should_raise_turn_end_unread;
+    use crate::test_support::fixtures::session;
     use crate::Services;
 
     struct Harness {
@@ -41119,7 +41119,7 @@ mod idle_workspace_archived_stamp {
     use serde_json::{json, Value};
     use tokio::time::timeout;
 
-    use super::turn_end_unread_gate::session;
+    use crate::test_support::fixtures::session;
     use super::{workspace, TempDb};
     use crate::{EventBus, Services, Subscription, SubscriptionFilter};
 
@@ -46073,7 +46073,7 @@ mod agent_summary_excludes_deleted {
     use intent_core::{now_iso, AgentId, AgentStatus, WorkspaceId};
     use intent_store::Store;
 
-    use super::turn_end_unread_gate::session;
+    use crate::test_support::fixtures::session;
     use super::{workspace, TempDb};
     use crate::Services;
 

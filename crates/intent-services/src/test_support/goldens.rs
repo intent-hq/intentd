@@ -1,6 +1,20 @@
+//! Golden-test fixtures shared by core's goldens and the runtime's hook
+//! goldens: services with a configured default provider, a seeded agent
+//! row, the persisted wake texts, and the v2.7 archive-notice fragments.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use intent_core::{now_iso, AgentId, WorkspaceId};
+use intent_store::Store;
+use serde_json::json;
+
+use crate::test_support::fixtures::workspace;
+use crate::Services;
+
 /// `SQLite` db (plus its `.config.toml` sibling) inside an RAII temp dir; the
 /// dir sweep on drop also covers the `-wal`/`-shm` sidecars.
-pub(crate) struct TempDb {
+pub struct TempDb {
     path: PathBuf,
     _dir: tempfile::TempDir,
 }
@@ -13,7 +27,7 @@ impl TempDb {
     }
 }
 
-pub(crate) async fn setup() -> (TempDb, Services, WorkspaceId) {
+pub async fn setup() -> (TempDb, Services, WorkspaceId) {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let ws = WorkspaceId::new();
@@ -36,7 +50,7 @@ pub(crate) async fn setup() -> (TempDb, Services, WorkspaceId) {
     (tmp, services, ws)
 }
 
-pub(crate) fn pr_monitor_row() -> intent_core::PrMonitor {
+pub fn pr_monitor_row() -> intent_core::PrMonitor {
     intent_core::PrMonitor {
         monitor_id: intent_core::PrMonitorId::from("prmon-1"),
         workspace_id: WorkspaceId::from("ws-1"),
@@ -58,7 +72,7 @@ pub(crate) fn pr_monitor_row() -> intent_core::PrMonitor {
 }
 
 /// Seed a bare agent session row owned by `ws` (mirrors the hook tests).
-pub(crate) async fn seed_agent(svc: &Services, ws: &WorkspaceId, id: &AgentId) {
+pub async fn seed_agent(svc: &Services, ws: &WorkspaceId, id: &AgentId) {
     let ts = now_iso();
     let session = intent_core::AgentSession {
         harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
@@ -117,7 +131,8 @@ pub(crate) async fn seed_agent(svc: &Services, ws: &WorkspaceId, id: &AgentId) {
 /// Wake persistence can lag the op return, so poll until at least `expected`
 /// messages are present (generous deadline, monorepo#1358 precedent); on
 /// timeout return whatever was seen and let the caller's assert report it.
-pub(crate) async fn wake_texts_when(svc: &Services, id: &AgentId, expected: usize) -> Vec<String> {
+#[cfg(test)]
+pub async fn wake_texts_when(svc: &Services, id: &AgentId, expected: usize) -> Vec<String> {
     let deadline = std::time::Instant::now()
         + intentd_test_support::test_timeout(std::time::Duration::from_secs(10));
     loop {
@@ -145,10 +160,10 @@ pub(crate) async fn wake_texts_when(svc: &Services, id: &AgentId, expected: usiz
     }
 }
 
-pub(crate) const PREFIX: &str = "[SYSTEM NOTICE] This workspace was archived and has since been \
+pub const PREFIX: &str = "[SYSTEM NOTICE] This workspace was archived and has since been \
     unarchived. While it was archived, ";
 
-pub(crate) const RE_ARM_HOOKS: &str =
+pub const RE_ARM_HOOKS: &str =
     "ws.hook.get(hookId) recovers a hook's script for ws.hook.schedule";
 
-pub(crate) const RE_ARM_MONITORS: &str = "ws.pr.monitor re-registers a PR";
+pub const RE_ARM_MONITORS: &str = "ws.pr.monitor re-registers a PR";

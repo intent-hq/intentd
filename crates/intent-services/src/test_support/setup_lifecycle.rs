@@ -1,13 +1,28 @@
-/// Temp directory tree swept on drop (see [`test_tempdir`]).
-pub(crate) struct TempDir(pub(crate) PathBuf, #[expect(dead_code)] tempfile::TempDir);
+//! Setup-lifecycle event fixtures (§6.5): a seeded repo, services with an
+//! event bus, and the `workspace:setup:*` subscription.
 
-pub(crate) fn unique_dir(prefix: &str) -> TempDir {
+use std::path::PathBuf;
+#[cfg(test)]
+use std::time::Duration;
+
+use intent_store::Store;
+#[cfg(test)]
+use serde_json::Value;
+
+use crate::test_support::fixtures::TempDb;
+use crate::test_support::test_tempdir;
+use crate::{EventBus, Services, Subscription, SubscriptionFilter};
+
+/// Temp directory tree swept on drop (see [`test_tempdir`]).
+pub struct TempDir(pub PathBuf, #[expect(dead_code)] tempfile::TempDir);
+
+pub fn unique_dir(prefix: &str) -> TempDir {
     let guard = test_tempdir(&format!("{prefix}-"));
     TempDir(guard.path().to_path_buf(), guard)
 }
 
 /// Init a git repo with one commit; returns (guard, head branch).
-pub(crate) fn seed_repo(prefix: &str) -> (TempDir, String) {
+pub fn seed_repo(prefix: &str) -> (TempDir, String) {
     let dir = unique_dir(prefix);
     let repo = git2::Repository::init(&dir.0).unwrap();
     {
@@ -29,7 +44,7 @@ pub(crate) fn seed_repo(prefix: &str) -> (TempDir, String) {
     (dir, branch)
 }
 
-pub(crate) async fn services(root: PathBuf) -> (Services, EventBus, TempDb) {
+pub async fn services(root: PathBuf) -> (Services, EventBus, TempDb) {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let bus = EventBus::new(store.clone());
@@ -41,7 +56,7 @@ pub(crate) async fn services(root: PathBuf) -> (Services, EventBus, TempDb) {
 
 /// Subscribe to only the setup lifecycle events (the setup terminal's
 /// `terminal:*` stream and the create's other events stay out of scope).
-pub(crate) fn subscribe_setup(bus: &EventBus) -> Subscription {
+pub fn subscribe_setup(bus: &EventBus) -> Subscription {
     bus.subscribe(SubscriptionFilter {
         event_types: vec!["workspace:setup:*".to_string()],
         ..Default::default()
@@ -50,7 +65,8 @@ pub(crate) fn subscribe_setup(bus: &EventBus) -> Subscription {
 
 /// Receive one setup event (generous timeout: script paths cross a PTY
 /// spawn + reap poll), serialized to wire JSON.
-pub(crate) async fn recv_setup(sub: &mut Subscription) -> Value {
+#[cfg(test)]
+pub async fn recv_setup(sub: &mut Subscription) -> Value {
     let batch = tokio::time::timeout(
         intentd_test_support::test_timeout(Duration::from_secs(20)),
         sub.recv(),
@@ -62,7 +78,8 @@ pub(crate) async fn recv_setup(sub: &mut Subscription) -> Value {
     serde_json::to_value(&batch[0]).expect("serialize event")
 }
 
-pub(crate) async fn assert_quiet(sub: &mut Subscription) {
+#[cfg(test)]
+pub async fn assert_quiet(sub: &mut Subscription) {
     let quiet = tokio::time::timeout(
         intentd_test_support::test_timeout(Duration::from_millis(300)),
         sub.recv(),

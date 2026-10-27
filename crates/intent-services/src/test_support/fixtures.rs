@@ -4,7 +4,10 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use intent_core::{now_iso, Workspace, WorkspaceId};
+use intent_core::{
+    now_iso, AgentId, AgentSession, AgentStatus, ContentType, Note, NoteId, NoteMetadata,
+    NoteVisibility, Workspace, WorkspaceId,
+};
 use serde_json::json;
 
 use super::test_tempdir;
@@ -197,7 +200,7 @@ impl WorkspacesRoot {
     }
 }
 
-fn note(ws: &WorkspaceId, id: &str, content: &str) -> Note {
+pub fn note(ws: &WorkspaceId, id: &str, content: &str) -> Note {
     let ts = now_iso();
     Note {
         id: NoteId::from(id),
@@ -218,7 +221,7 @@ fn note(ws: &WorkspaceId, id: &str, content: &str) -> Note {
     }
 }
 
-pub(crate) fn session(agent_id: &AgentId, ws: &WorkspaceId) -> AgentSession {
+pub fn session(agent_id: &AgentId, ws: &WorkspaceId) -> AgentSession {
     AgentSession {
         harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
         harness_features: None,

@@ -6,14 +6,14 @@
 
 use std::time::Duration;
 
-use intent_core::{
-    Error, WorkspaceApi, WorkspaceCreate, WorkspaceId, WorkspaceListFilter, WorkspaceStatus,
-};
-use intent_store::Store;
+use intent_core::{Error, WorkspaceApi, WorkspaceId, WorkspaceListFilter, WorkspaceStatus};
 
-use super::turn_end_unread_gate::session;
-use super::{note, test_tempdir, TempDb};
-use crate::{EventBus, Services};
+use crate::test_support::test_tempdir;
+use crate::Services;
+
+use crate::test_support::retire_workspace::{
+    create_workspace, days_from_now, fixture, flip_retired, Fixture,
+};
 
 async fn wait_gone(path: &std::path::Path) {
     for _ in 0..100 {

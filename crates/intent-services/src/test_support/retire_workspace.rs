@@ -1,17 +1,28 @@
-pub(crate) struct Fixture {
-    pub(crate) _tmp: TempDb,
-    pub(crate) _repo: tempfile::TempDir,
-    pub(crate) _root: tempfile::TempDir,
-    pub(crate) root: std::path::PathBuf,
-    pub(crate) repo: std::path::PathBuf,
-    pub(crate) store: Store,
-    pub(crate) bus: EventBus,
-    pub(crate) svc: Services,
+//! The `workspace.retire` fixture: a git repo with one commit, services
+//! with a per-test workspaces root and an event bus, and a provisioned
+//! workspace with a note and an agent row.
+
+use intent_core::{WorkspaceApi, WorkspaceCreate, WorkspaceId};
+use intent_store::Store;
+
+use crate::test_support::fixtures::{note, session, TempDb};
+use crate::test_support::test_tempdir;
+use crate::{EventBus, Services};
+
+pub struct Fixture {
+    pub _tmp: TempDb,
+    pub _repo: tempfile::TempDir,
+    pub _root: tempfile::TempDir,
+    pub root: std::path::PathBuf,
+    pub repo: std::path::PathBuf,
+    pub store: Store,
+    pub bus: EventBus,
+    pub svc: Services,
 }
 
 /// A git repo with one commit, plus a `Services` with a per-test workspaces
 /// root and an event bus.
-pub(crate) async fn fixture() -> Fixture {
+pub async fn fixture() -> Fixture {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let repo_dir = test_tempdir("intentd-retire-repo-");
@@ -50,7 +61,7 @@ pub(crate) async fn fixture() -> Fixture {
 
 /// Provision a real worktree workspace off the fixture repo, with one note
 /// and one agent session so "rows are kept" is observable.
-pub(crate) async fn create_workspace(f: &Fixture) -> intent_core::Workspace {
+pub async fn create_workspace(f: &Fixture) -> intent_core::Workspace {
     let ws = f
         .svc
         .create_workspace(
@@ -79,13 +90,13 @@ pub(crate) async fn create_workspace(f: &Fixture) -> intent_core::Workspace {
     ws
 }
 
-pub(crate) fn days_from_now(days: i64) -> time::OffsetDateTime {
+pub fn days_from_now(days: i64) -> time::OffsetDateTime {
     time::OffsetDateTime::now_utc() + time::Duration::days(days)
 }
 
 /// Flip `ws` to Retired in the store only (the window before retire's
 /// teardown, or a terminal that escaped the sweep).
-pub(crate) async fn flip_retired(f: &Fixture, ws: &WorkspaceId) {
+pub async fn flip_retired(f: &Fixture, ws: &WorkspaceId) {
     f.store
         .archive_workspace_detaching_guests(ws, &intent_core::now_iso())
         .await

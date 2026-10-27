@@ -5,7 +5,8 @@ use intent_core::{now_iso, AgentId};
 use serde_json::json;
 
 use crate::hook_manager::HookServicesExt;
-use crate::v1_goldens::{pr_monitor_row, seed_agent, setup, wake_texts_when};
+use super::test_fixtures::wake_texts_when;
+use crate::test_support::goldens::{pr_monitor_row, seed_agent, setup};
 
 /// FE-cancel notices for hooks and PR monitors: exact wake bytes delivered
 /// to the owning agent. (The archive sweep's consolidated notice is a v2.7

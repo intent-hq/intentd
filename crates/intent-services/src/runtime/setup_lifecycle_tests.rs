@@ -1,13 +1,16 @@
 //! Setup-script lifecycle events from a real script run (moved from
 //! `tests.rs` `setup_lifecycle_events`).
 
+use std::time::Duration;
+
 use intent_core::{WorkspaceApi, WorkspaceCreate, WorkspaceSetupState};
 use serde_json::json;
 
 #[cfg(unix)]
 use intentd_test_support::Barrier;
 
-use crate::tests::setup_lifecycle_events::*;
+use super::test_fixtures::{assert_quiet, recv_setup};
+use crate::test_support::setup_lifecycle::*;
 
 /// Script exits non-zero: `completed` still fires once, carrying the
 /// script's real exit code — a failing setup script never fails the

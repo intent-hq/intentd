@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use intent_core::{Error, WorkspaceApi, WorkspaceStatus};
 
-use crate::tests::retire_workspace::*;
+use crate::test_support::retire_workspace::*;
 
 /// Review regression (intentd#2605): the automatic sweep's retire skips
 /// (logs and counts a failure) a workspace whose script close cannot settle

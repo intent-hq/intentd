@@ -14,17 +14,16 @@
 //! `agent_ops::tests::delegate_appends_task_note_preamble_to_first_message`.
 
 use std::fmt::Write as _;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use intent_core::events::{AGENT_DELETED, AGENT_FAILED, AGENT_IDLE, AGENT_RETIRED};
 use intent_core::{
     now_iso, ActorType, AgentId, Event, EventActor, MessageOrigin, Workspace, WorkspaceId,
 };
-use intent_store::Store;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
+pub(crate) use crate::test_support::goldens::{pr_monitor_row, seed_agent, setup, wake_texts_when};
 use crate::Services;
 
 fn sha256_hex(s: &str) -> String {

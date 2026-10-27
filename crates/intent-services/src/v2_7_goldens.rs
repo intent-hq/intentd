@@ -8,6 +8,7 @@
 //! per-item archive goldens; the sweeps emit through `harness::latest()`).
 
 use crate::harness::Harness;
+use crate::test_support::goldens::{PREFIX, RE_ARM_HOOKS, RE_ARM_MONITORS};
 
 fn v2_7() -> &'static dyn Harness {
     let entry = crate::harness::resolve_entry("2.7");

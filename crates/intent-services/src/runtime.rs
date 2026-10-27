@@ -1668,3 +1668,6 @@ mod sandbox_file_write_tests;
 #[cfg(all(test, unix))]
 mod setup_lifecycle_tests;
 
+#[cfg(test)]
+mod test_fixtures;
+
