@@ -35,13 +35,16 @@ pub mod human_author;
 pub mod ids;
 pub mod model;
 pub mod native_review;
+pub mod node_link;
 pub mod nodes;
 pub mod path_utils;
+pub mod placement;
 pub mod process_policy;
 pub mod pull_request_key;
 pub use pull_request_key::pull_request_key;
 #[doc(hidden)]
 pub mod queue_visibility_contract;
+pub mod remote_launch;
 pub mod replay_preview;
 pub mod repo_ref;
 pub mod review_monitor;
