@@ -1,6 +1,7 @@
 //! Unit tests for [`PrimaryReverseRegistry`] (REV-2): capability-gated
 //! eligibility, `ReverseTarget` resolution (`Default` = first-connected
-//! eligible, `Client`/`Pinned` = newest eligible connection of that client),
+//! eligible client via its newest eligible connection, `Client`/`Pinned` =
+//! newest eligible connection of that client),
 //! typed offline errors, logical-client transitions (`bind` / drop, queued in
 //! mutation order), and RAII deregistration. Channel identity is checked
 //! functionally — a
@@ -216,6 +217,158 @@ async fn default_dispatch_routes_to_the_first_connected_eligible_channel() {
             .client_id
             .as_str(),
         "a"
+    );
+}
+
+/// Regression (intent-hq/intent#7902): `Default` keeps the first-connected
+/// *client* but uses that client's newest eligible connection, like
+/// `Client` / `Pinned`. An older connection of the same app that stopped
+/// answering must not keep receiving every unpinned `browser.exec`.
+#[tokio::test]
+async fn default_dispatch_uses_the_newest_connection_of_the_first_connected_client() {
+    let reg = PrimaryReverseRegistry::new();
+    let (stale, mut rx_stale) = idle_channel();
+    let (other, mut rx_other) = idle_channel();
+    let (fresh, mut rx_fresh) = idle_channel();
+    let g_stale = reg.register(stale, ReverseTransport::Uds);
+    g_stale.bind(identity("x", true));
+    let g_other = reg.register(other, ReverseTransport::Wss);
+    g_other.bind(identity("y", true));
+    let g_fresh = reg.register(fresh.clone(), ReverseTransport::Uds);
+    g_fresh.bind(identity("x", true));
+
+    let out = dispatch_and_reply(
+        &reg,
+        ReverseTarget::Default,
+        &fresh,
+        &mut rx_fresh,
+        json!({ "host": "fresh" }),
+    )
+    .await
+    .expect("ok");
+    assert_eq!(out, json!({ "host": "fresh" }));
+    assert!(
+        rx_stale.try_recv().is_err(),
+        "the stale connection is skipped"
+    );
+    assert!(
+        rx_other.try_recv().is_err(),
+        "the first-connected client still wins"
+    );
+    assert_eq!(
+        reg.resolve(&ReverseTarget::Default)
+            .expect("resolves")
+            .client_id
+            .as_str(),
+        "x"
+    );
+}
+
+/// Regression (intent-hq/intent#7902): a reverse `browser.exec` that times
+/// out names the client and connection that never answered, instead of a
+/// bare "reverse request timed out".
+#[tokio::test(start_paused = true)]
+async fn dispatch_timeout_names_the_silent_client_and_connection() {
+    let reg = PrimaryReverseRegistry::new();
+    let (silent, _rx_silent) = idle_channel();
+    let (later, _rx_later) = idle_channel();
+    let g_silent = reg.register(silent, ReverseTransport::Uds);
+    g_silent.bind(identity("a", true));
+    let g_later = reg.register(later, ReverseTransport::Wss);
+    g_later.bind(identity("b", true));
+
+    let err = reg
+        .dispatch(
+            "browser.exec",
+            json!({ "actions": [] }),
+            ReverseTarget::Default,
+        )
+        .await
+        .expect_err("times out");
+    let ReverseDispatchError::Transport { message, .. } = err else {
+        panic!("unexpected error: {err:?}");
+    };
+    assert!(
+        message.starts_with("reverse request timed out: browser.exec"),
+        "keeps the stable prefix: {message}"
+    );
+    assert!(
+        message.contains("\"client a\" (a)"),
+        "names the client: {message}"
+    );
+    assert!(
+        message.contains("answer the request within 30s"),
+        "states the deadline: {message}"
+    );
+    assert!(
+        message.contains("over uds"),
+        "names the transport: {message}"
+    );
+    assert!(
+        message.contains("on connection 0"),
+        "names the connection: {message}"
+    );
+}
+
+/// A client that *answers* with an error whose text happens to match the
+/// daemon's timeout wording is not relabeled as silent, and a hello name with
+/// quotes is escaped in the timeout diagnostic.
+#[tokio::test]
+async fn client_error_replies_are_never_relabeled_as_timeouts() {
+    let reg = PrimaryReverseRegistry::new();
+    let (a, mut rx_a) = idle_channel();
+    let g_a = reg.register(a.clone(), ReverseTransport::Uds);
+    g_a.bind(identity("a", true));
+    let dispatch = tokio::spawn({
+        let reg = reg.clone();
+        async move {
+            reg.dispatch(
+                "browser.exec",
+                json!({ "actions": [] }),
+                ReverseTarget::Default,
+            )
+            .await
+        }
+    });
+    let frame = rx_a.recv().await.expect("frame");
+    let value: serde_json::Value = serde_json::from_str(&frame).expect("json");
+    a.route_response(&json!({
+        "jsonrpc": "2.0",
+        "id": value["id"],
+        "error": { "code": -32603, "message": "reverse request timed out: browser.exec" },
+    }));
+    let err = dispatch.await.expect("join").expect_err("client error");
+    assert_eq!(
+        err,
+        ReverseDispatchError::Transport {
+            code: -32603,
+            message: "reverse request timed out: browser.exec".to_string(),
+        }
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn dispatch_timeout_escapes_the_hello_name() {
+    let reg = PrimaryReverseRegistry::new();
+    let (a, _rx_a) = idle_channel();
+    let g_a = reg.register(a, ReverseTransport::Wss);
+    let mut quoted = identity("a", true);
+    quoted.name = Some("Bob\" (admin) on connection 9".to_string());
+    g_a.bind(quoted);
+    let err = reg
+        .dispatch(
+            "browser.exec",
+            json!({ "actions": [] }),
+            ReverseTarget::Default,
+        )
+        .await
+        .expect_err("times out");
+    let message = err.to_string();
+    assert!(
+        message.contains(
+            r#"browser client "Bob\" (admin) on connection 9" (a) on connection 0 over wss"#
+        ),
+        "escapes the name: {message}"
     );
 }
 
