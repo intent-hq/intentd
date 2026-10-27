@@ -1820,6 +1820,9 @@ pub(crate) fn waiting_on_pr_monitors_entry(m: &PrMonitor) -> Value {
 /// the repo identity when the monitor has no snapshot yet, and status
 /// resolved as snapshot state → draft flag → `completed` ⇒ closed (terminal
 /// covers both merged and closed; don't falsely claim merged) → open.
+/// `updatedAt` deliberately diverges from the FE: it is the snapshot's
+/// forge `prUpdatedAt` when persisted (the FE only sees the monitor row's
+/// time, and uses it solely for a monitor not yet in the daemon pool).
 pub(crate) fn pr_monitor_pr_info(m: &PrMonitorListEntry) -> PullRequestInfo {
     let status = match m.snapshot_state.as_deref() {
         Some("merged") => PullRequestStatus::Merged,

@@ -359,7 +359,8 @@ the merge queue. The **Waiting** filter shows the same workspaces.
 
 The PR badge in list and board views shows a PR in the merge queue first, then
 draft PRs, then open PRs (including conflicted PRs), then merged and closed PRs.
-Within the same state, it shows the PR most recently updated on GitHub. Home's shortened PR list
+Within the same state, it shows the most recently updated PR (for a PR an agent only
+watches, its last update on GitHub as of the watch's latest check). Home's shortened PR list
 keeps unfinished PRs ahead of merged or closed ones; the **+N** count in list view
 includes the other linked PRs, even when their details are not loaded.
 
