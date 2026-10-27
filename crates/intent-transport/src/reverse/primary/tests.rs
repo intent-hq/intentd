@@ -1,6 +1,7 @@
 //! Unit tests for [`PrimaryReverseRegistry`] (REV-2): capability-gated
 //! eligibility, `ReverseTarget` resolution (`Default` = first-connected
-//! eligible, `Client`/`Pinned` = newest eligible connection of that client),
+//! eligible client via its newest eligible connection, `Client`/`Pinned` =
+//! newest eligible connection of that client),
 //! typed offline errors, logical-client transitions (`bind` / drop, queued in
 //! mutation order), and RAII deregistration. Channel identity is checked
 //! functionally — a
@@ -216,6 +217,160 @@ async fn default_dispatch_routes_to_the_first_connected_eligible_channel() {
             .client_id
             .as_str(),
         "a"
+    );
+}
+
+/// Regression (intent-hq/intent#7902): `Default` keeps the first-connected
+/// *client* but uses that client's newest eligible connection, like
+/// `Client` / `Pinned`. An older connection of the same app that stopped
+/// answering must not keep receiving every unpinned `browser.exec`.
+#[tokio::test]
+async fn default_dispatch_uses_the_newest_connection_of_the_first_connected_client() {
+    let reg = PrimaryReverseRegistry::new();
+    let (stale, mut rx_stale) = idle_channel();
+    let (other, mut rx_other) = idle_channel();
+    let (fresh, mut rx_fresh) = idle_channel();
+    let g_stale = reg.register(stale, ReverseTransport::Uds);
+    g_stale.bind(identity("x", true));
+    let g_other = reg.register(other, ReverseTransport::Wss);
+    g_other.bind(identity("y", true));
+    let g_fresh = reg.register(fresh.clone(), ReverseTransport::Uds);
+    g_fresh.bind(identity("x", true));
+
+    let out = dispatch_and_reply(
+        &reg,
+        ReverseTarget::Default,
+        &fresh,
+        &mut rx_fresh,
+        json!({ "host": "fresh" }),
+    )
+    .await
+    .expect("ok");
+    assert_eq!(out, json!({ "host": "fresh" }));
+    assert!(
+        rx_stale.try_recv().is_err(),
+        "the stale connection is skipped"
+    );
+    assert!(
+        rx_other.try_recv().is_err(),
+        "the first-connected client still wins"
+    );
+    assert_eq!(
+        reg.resolve(&ReverseTarget::Default)
+            .expect("resolves")
+            .client_id
+            .as_str(),
+        "x"
+    );
+}
+
+/// Regression (intent-hq/intent#7902): a reverse `browser.exec` that times
+/// out names the client and connection that never answered, instead of a
+/// bare "reverse request timed out".
+#[tokio::test(start_paused = true)]
+async fn dispatch_timeout_names_the_silent_client_and_connection() {
+    let reg = PrimaryReverseRegistry::new();
+    let (silent, _rx_silent) = idle_channel();
+    let (later, _rx_later) = idle_channel();
+    let g_silent = reg.register(silent, ReverseTransport::Uds);
+    g_silent.bind(identity("a", true));
+    let g_later = reg.register(later, ReverseTransport::Wss);
+    g_later.bind(identity("b", true));
+
+    let err = reg
+        .dispatch(
+            "browser.exec",
+            json!({ "actions": [] }),
+            ReverseTarget::Default,
+        )
+        .await
+        .expect_err("times out");
+    let ReverseDispatchError::Transport { message, .. } = err else {
+        panic!("unexpected error: {err:?}");
+    };
+    assert!(
+        message.starts_with("reverse request timed out: browser.exec"),
+        "keeps the stable prefix: {message}"
+    );
+    assert!(
+        message.contains("\"client a\" (a)"),
+        "names the client: {message}"
+    );
+    // `ws.browser.exec` (intent-acp `DAEMON_TIMEOUT_MARKER`) keys its
+    // `ws.browser.clients()` hint on this exact daemon-only phrase.
+    assert!(
+        message.contains(" did not accept or answer the request within 30s"),
+        "states the deadline: {message}"
+    );
+    assert!(
+        message.contains("over uds"),
+        "names the transport: {message}"
+    );
+    assert!(
+        message.contains("on connection 0"),
+        "names the connection: {message}"
+    );
+}
+
+/// A client that *answers* with an error whose text happens to match the
+/// daemon's timeout wording is not relabeled as silent, and a hello name with
+/// quotes is escaped in the timeout diagnostic.
+#[tokio::test]
+async fn client_error_replies_are_never_relabeled_as_timeouts() {
+    let reg = PrimaryReverseRegistry::new();
+    let (a, mut rx_a) = idle_channel();
+    let g_a = reg.register(a.clone(), ReverseTransport::Uds);
+    g_a.bind(identity("a", true));
+    let dispatch = tokio::spawn({
+        let reg = reg.clone();
+        async move {
+            reg.dispatch(
+                "browser.exec",
+                json!({ "actions": [] }),
+                ReverseTarget::Default,
+            )
+            .await
+        }
+    });
+    let frame = rx_a.recv().await.expect("frame");
+    let value: serde_json::Value = serde_json::from_str(&frame).expect("json");
+    a.route_response(&json!({
+        "jsonrpc": "2.0",
+        "id": value["id"],
+        "error": { "code": -32603, "message": "reverse request timed out: browser.exec" },
+    }));
+    let err = dispatch.await.expect("join").expect_err("client error");
+    assert_eq!(
+        err,
+        ReverseDispatchError::Transport {
+            code: -32603,
+            message: "reverse request timed out: browser.exec".to_string(),
+        }
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn dispatch_timeout_escapes_the_hello_name() {
+    let reg = PrimaryReverseRegistry::new();
+    let (a, _rx_a) = idle_channel();
+    let g_a = reg.register(a, ReverseTransport::Wss);
+    let mut quoted = identity("a", true);
+    quoted.name = Some("Bob\" (admin) on connection 9".to_string());
+    g_a.bind(quoted);
+    let err = reg
+        .dispatch(
+            "browser.exec",
+            json!({ "actions": [] }),
+            ReverseTarget::Default,
+        )
+        .await
+        .expect_err("times out");
+    let message = err.to_string();
+    assert!(
+        message.contains(
+            r#"browser client "Bob\" (admin) on connection 9" (a) on connection 0 over wss"#
+        ),
+        "escapes the name: {message}"
     );
 }
 
@@ -1100,4 +1255,183 @@ async fn identity_drift_unauthorized_exact_collision_cannot_capture_reverse_auth
         Err(ReverseDispatchError::ClientOffline { .. })
     ));
     assert!(foreign_rx.try_recv().is_err());
+}
+
+fn workspace(id: &str) -> intent_core::WorkspaceId {
+    intent_core::WorkspaceId::from(id)
+}
+
+/// `ws.browser.clients()` source: every hello'd connection is listed under
+/// its client (oldest first, un-hello'd omitted, browser eligibility per
+/// connection), and both a `Default` and a `Client` route name the newest
+/// eligible connection — the same one `dispatch` uses (#7902).
+#[test]
+fn connection_snapshot_lists_connections_and_names_the_routed_one() {
+    let reg = PrimaryReverseRegistry::new();
+    let (old_desk, _rx_old) = idle_channel();
+    let (unhelloed, _rx_unhelloed) = idle_channel();
+    let (aux, _rx_aux) = idle_channel();
+    let (new_desk, _rx_new) = idle_channel();
+    let g_old = reg.register(old_desk, ReverseTransport::Wss);
+    g_old.bind(identity("desk", true));
+    let _g_unhelloed = reg.register(unhelloed, ReverseTransport::Wss);
+    let g_aux = reg.register(aux, ReverseTransport::Uds);
+    g_aux.bind(identity("desk", false));
+    let g_new = reg.register(new_desk, ReverseTransport::Wss);
+    g_new.bind(identity("desk", true));
+
+    let snapshot = reg.connection_snapshot(
+        &workspace("ws-1"),
+        &[ReverseTarget::Default, client("desk")],
+    );
+    let value = serde_json::to_value(&snapshot).expect("serializes");
+    let connected_at = |n: usize| value["clients"][0]["connections"][n]["connectedAt"].clone();
+    assert_eq!(
+        value,
+        json!({
+            "clients": [{
+                "clientId": "desk",
+                "name": "client desk",
+                "canHostBrowser": true,
+                "connections": [
+                    { "connectionId": 0, "transport": "wss", "connectedAt": connected_at(0), "canHostBrowser": true },
+                    { "connectionId": 2, "transport": "uds", "connectedAt": connected_at(1), "canHostBrowser": false },
+                    { "connectionId": 3, "transport": "wss", "connectedAt": connected_at(2), "canHostBrowser": true },
+                ],
+            }],
+            "routes": [
+                { "clientId": "desk", "name": "client desk", "connectionId": 3 },
+                { "clientId": "desk", "name": "client desk", "connectionId": 3 },
+            ],
+        })
+    );
+    assert!(connected_at(0).is_string());
+
+    drop(g_new);
+    let snapshot = reg.connection_snapshot(&workspace("ws-1"), &[ReverseTarget::Default]);
+    assert_eq!(
+        snapshot.routes[0].connection_id,
+        Some(0),
+        "with the newest gone, the route falls back to the remaining eligible connection"
+    );
+}
+
+/// Several clients keep first-connection order, and a client whose
+/// connections cannot host a browser is still listed.
+#[test]
+fn connection_snapshot_orders_clients_by_first_connection() {
+    let reg = PrimaryReverseRegistry::new();
+    let (a, _rx_a) = idle_channel();
+    let (b, _rx_b) = idle_channel();
+    let (a2, _rx_a2) = idle_channel();
+    let g_b = reg.register(b, ReverseTransport::Uds);
+    g_b.bind(identity("cli", false));
+    let g_a = reg.register(a, ReverseTransport::Wss);
+    g_a.bind(identity("desk", true));
+    let g_a2 = reg.register(a2, ReverseTransport::Wss);
+    g_a2.bind(identity("desk", true));
+
+    let snapshot = reg.connection_snapshot(&workspace("ws-1"), &[ReverseTarget::Default]);
+    let ids: Vec<_> = snapshot
+        .clients
+        .iter()
+        .map(|c| {
+            (
+                c.client_id.as_str().to_string(),
+                c.can_host_browser,
+                c.connections.len(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        ids,
+        vec![("cli".to_string(), false, 1), ("desk".to_string(), true, 2)]
+    );
+    assert_eq!(snapshot.routes[0].connection_id, Some(2));
+}
+
+/// Targets nothing can receive report the dispatch error text, keeping the
+/// named client of a pin.
+#[test]
+fn connection_snapshot_reports_unroutable_targets() {
+    let reg = PrimaryReverseRegistry::new();
+    let snapshot = reg.connection_snapshot(
+        &workspace("ws-1"),
+        &[ReverseTarget::Default, pinned("gone")],
+    );
+    assert!(snapshot.clients.is_empty());
+    assert_eq!(
+        serde_json::to_value(&snapshot.routes).expect("serializes"),
+        json!([
+            { "clientId": null, "connectionId": null, "error": "no client connected" },
+            {
+                "clientId": "gone",
+                "connectionId": null,
+                "error": "pinned browser client gone is not connected",
+            },
+        ])
+    );
+}
+
+struct NoApi;
+impl intent_core::WorkspaceApi for NoApi {}
+
+/// A member connection may host a workspace's browser but not Chief's
+/// (administrator only), so the routes follow `dispatch`'s scope.
+#[test]
+fn connection_snapshot_routes_chief_to_administrator_connections_only() {
+    let reg = PrimaryReverseRegistry::new();
+    let (member_tx, _rx_member) = mpsc::channel::<crate::OutboundFrame>(4);
+    let member = ReverseChannel::new(member_tx).with_member_authority(
+        std::sync::Arc::new(NoApi),
+        Some(&intent_core::Caller::Wire {
+            principal_id: intent_core::PrincipalId::new(),
+            host_role: intent_core::HostRole::Member,
+        }),
+    );
+    member.set_browser_member(true);
+    let g_member = reg.register(member, ReverseTransport::Wss);
+    g_member.bind(identity("member", true));
+
+    let workspace_route = reg.connection_snapshot(&workspace("ws-1"), &[ReverseTarget::Default]);
+    assert_eq!(workspace_route.routes[0].connection_id, Some(0));
+    assert!(workspace_route.clients[0].connections[0].can_host_browser);
+
+    let chief = reg.connection_snapshot(
+        &intent_core::WorkspaceId::chief(),
+        &[ReverseTarget::Default],
+    );
+    assert_eq!(chief.routes[0].connection_id, None);
+    assert!(
+        !chief.clients[0].can_host_browser && !chief.clients[0].connections[0].can_host_browser,
+        "the list applies the same Chief scope as the routes"
+    );
+    assert_eq!(
+        chief.routes[0].error.as_deref(),
+        Some("no client connected")
+    );
+}
+
+/// A route names its client the way the list does (newest hello), even when
+/// the routed connection's own hello carried an older name.
+#[test]
+fn connection_snapshot_route_uses_the_listed_client_name() {
+    let reg = PrimaryReverseRegistry::new();
+    let (desk, _rx_desk) = idle_channel();
+    let (aux, _rx_aux) = idle_channel();
+    let g_desk = reg.register(desk, ReverseTransport::Wss);
+    g_desk.bind(ReverseClientIdentity {
+        name: Some("Old".to_string()),
+        ..identity("desk", true)
+    });
+    let g_aux = reg.register(aux, ReverseTransport::Uds);
+    g_aux.bind(ReverseClientIdentity {
+        name: Some("New".to_string()),
+        ..identity("desk", false)
+    });
+
+    let snapshot = reg.connection_snapshot(&workspace("ws-1"), &[ReverseTarget::Default]);
+    assert_eq!(snapshot.clients[0].name.as_deref(), Some("New"));
+    assert_eq!(snapshot.routes[0].connection_id, Some(0));
+    assert_eq!(snapshot.routes[0].name.as_deref(), Some("New"));
 }

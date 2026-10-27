@@ -31,7 +31,7 @@ use intent_core::transfer::TransferPlan;
 use intent_core::execution::HostExecutionContext;
 use intent_core::{
     AgentId, AgentStatus, BoxFuture, BrowserTab, BrowserTabInput, ClientId, Error, HookId, Result,
-    ReverseTarget, ScriptCreateParams, WorkspaceApi, WorkspaceId,
+    ScriptCreateParams, WorkspaceApi, WorkspaceId,
 };
 
 use crate::Services;
@@ -633,14 +633,6 @@ pub trait RuntimePort: Send + Sync + 'static {
         sandbox_id: AgentId,
     ) -> BoxFuture<'a, Result<serde_json::Value>>;
 
-    /// The [`ReverseTarget`] an agent `browser.exec` for `workspace_id`
-    /// dispatches to: the workspace's driving client (REV-2 Model 10).
-    fn driving_client_target<'a>(
-        &'a self,
-        svc: &'a Services,
-        workspace_id: &'a WorkspaceId,
-    ) -> BoxFuture<'a, Result<ReverseTarget>>;
-
     /// Re-home every claimed browser tab of `workspace_id` to `new_host`,
     /// the workspace's new driving-client pin (REV-2 Model 10).
     fn migrate_claimed_browser_tabs<'a>(
@@ -831,6 +823,21 @@ pub trait RuntimePort: Send + Sync + 'static {
     /// scripts loaded.
     fn hydrate_scripts<'a>(&'a self, svc: &'a Services) -> BoxFuture<'a, Result<usize>>;
 
+    /// After a workspace import commits: recover script monitors, start
+    /// their maintenance loop, and refresh the live definitions of the
+    /// imported `script_ids` of `workspace_id`. Best-effort: failures are
+    /// logged, never returned.
+    fn recover_imported_scripts<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
+        script_ids: &'a [String],
+    ) -> BoxFuture<'a, ()>;
+
+    /// Re-arm the active hooks from the store; resolves to the number of
+    /// hooks resumed.
+    fn rehydrate_hooks<'a>(&'a self, svc: &'a Services) -> BoxFuture<'a, Result<usize>>;
+
     /// Command-mode script runs in flight and the last settlement time.
     fn command_script_activity(&self, svc: &Services) -> CommandScriptActivity;
 
@@ -964,7 +971,11 @@ pub struct CommandScriptActivity {
 
 /// The queued-message id of a script-monitor wake (`script-monitor:<id>`),
 /// if `metadata` describes one. Shared by runtime and agents.
-pub(crate) fn wake_id(metadata: Option<&serde_json::Value>) -> Option<String> {
+#[expect(
+    clippy::must_use_candidate,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn wake_id(metadata: Option<&serde_json::Value>) -> Option<String> {
     let md = metadata?;
     (md["type"] == "script_monitor_wake")
         .then(|| {
@@ -976,14 +987,18 @@ pub(crate) fn wake_id(metadata: Option<&serde_json::Value>) -> Option<String> {
 }
 
 /// The monitor id of a script-monitor wake, if `metadata` describes one.
-pub(crate) fn monitor_id(metadata: Option<&serde_json::Value>) -> Option<&str> {
+#[expect(
+    clippy::must_use_candidate,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn monitor_id(metadata: Option<&serde_json::Value>) -> Option<&str> {
     let md = metadata?;
     (md["type"] == "script_monitor_wake")
         .then(|| md["monitorId"].as_str())
         .flatten()
 }
 
-/// How a cancel transition ([`Services::cancel_active_hook`],
+/// How a cancel transition ([`Services::cancel_active_hook`](crate::hook_manager::HookServicesExt::cancel_active_hook),
 /// [`Services::cancel_active_pr_monitor`]) settles the owner's deferred
 /// completion watches. A completion watch on an idle owner defers while the
 /// owner has active hooks / PR monitors, so cancelling the LAST one must
@@ -991,7 +1006,7 @@ pub(crate) fn monitor_id(metadata: Option<&serde_json::Value>) -> Option<&str> {
 /// ([`Services::redeliver_completion_after_queue_mutation`]) — either
 /// through a wake or directly — or the watch strands forever.
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum CancelSettlement<'a> {
+pub enum CancelSettlement<'a> {
     /// Wake the owner with this notice; the wake runs the backstop itself
     /// after the delivery attempt (FE/app cancel).
     Notify(&'a str),
@@ -1080,7 +1095,7 @@ pub trait AgentQueueDrainer: Send + Sync {
 /// there is no agent to wake. Deliveries and enqueues fail, there is no
 /// drainer, every status is terminal and no provider is disabled.
 #[derive(Default)]
-pub(crate) struct UnavailableAgentWake;
+pub struct UnavailableAgentWake;
 
 fn agent_wake_unavailable() -> Error {
     Error::Internal("agent wake port not registered".into())
@@ -1554,14 +1569,6 @@ impl RuntimePort for UnavailableRuntime {
         DEFAULT_WORKSPACE_API.sandbox_discard(workspace_id, sandbox_id)
     }
 
-    fn driving_client_target<'a>(
-        &'a self,
-        _svc: &'a Services,
-        _workspace_id: &'a WorkspaceId,
-    ) -> BoxFuture<'a, Result<ReverseTarget>> {
-        Box::pin(async { Err(runtime_unavailable()) })
-    }
-
     fn migrate_claimed_browser_tabs<'a>(
         &'a self,
         _svc: &'a Services,
@@ -1742,6 +1749,19 @@ impl RuntimePort for UnavailableRuntime {
     }
 
     fn hydrate_scripts<'a>(&'a self, _svc: &'a Services) -> BoxFuture<'a, Result<usize>> {
+        Box::pin(async { Ok(0) })
+    }
+
+    fn recover_imported_scripts<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _workspace_id: &'a WorkspaceId,
+        _script_ids: &'a [String],
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
+
+    fn rehydrate_hooks<'a>(&'a self, _svc: &'a Services) -> BoxFuture<'a, Result<usize>> {
         Box::pin(async { Ok(0) })
     }
 
@@ -2052,6 +2072,7 @@ impl Services {
 
 #[cfg(test)]
 mod tests {
+    use crate::runtime::RuntimeStateExt;
     use std::sync::Arc;
 
     use intent_core::{Error, WorkspaceApi, WorkspaceId};
@@ -2567,10 +2588,6 @@ mod tests {
             );
         };
         refused(
-            "driving_client_target",
-            format!("{:?}", port.driving_client_target(&svc, &ws).await),
-        );
-        refused(
             "migrate_claimed_browser_tabs",
             format!(
                 "{:?}",
@@ -2611,6 +2628,15 @@ mod tests {
             (false, None),
             "an unregistered runtime runs no setup script"
         );
+        assert_eq!(
+            format!("{:?}", port.rehydrate_hooks(&svc).await),
+            "Ok(0)",
+            "an unregistered runtime resumes no hooks"
+        );
+        // Best-effort and infallible: an unregistered runtime has no
+        // imported scripts to recover.
+        port.recover_imported_scripts(&svc, &ws, &["script".to_owned()])
+            .await;
     }
 
     #[derive(Debug, Default)]

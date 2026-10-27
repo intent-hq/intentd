@@ -9,6 +9,16 @@ pub const RELEASE_HINT: &str = "You are controlling the workspace primary deskto
 pub const PENDING_HINT: &str = "End this turn and wait for the desktop control permission outcome.";
 /// User Stop must never invite automatic acquisition or retries.
 pub const STOP_HINT: &str = "Desktop control permission was rescinded by the user. Respect the interruption; do not automatically restart or retry desktop control.";
+/// A `windowId`-targeted action whose window is not ready for input.
+pub const TARGET_MISMATCH: &str = "desktop-target-mismatch";
+/// Documented `desktop-target-mismatch` reasons, in check order.
+pub const TARGET_REASONS: &[&str] = &[
+    "window_unavailable",
+    "not_frontmost",
+    "outside_window",
+    "obscured",
+    "not_focused",
+];
 /// Desktop failures preserve their stable protocol code and execution outcome.
 pub type DesktopResult<T> = std::result::Result<T, DesktopError>;
 
@@ -19,6 +29,9 @@ pub struct DesktopError {
     pub detail: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub execution: Option<String>,
+    /// Which window-target check failed; only with `desktop-target-mismatch`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 impl DesktopError {
     /// Construct a failure before an execution outcome has been established.
@@ -28,7 +41,23 @@ impl DesktopError {
             code: code.into(),
             detail: detail.into(),
             execution: None,
+            reason: None,
         }
+    }
+    /// Keep `reason` only where the contract defines it: a documented
+    /// `desktop-target-mismatch` reason. Anything else is dropped so native
+    /// replies cannot smuggle free-form text into model-visible errors.
+    #[must_use]
+    pub fn sanitized(mut self) -> Self {
+        if self.code != TARGET_MISMATCH
+            || !self
+                .reason
+                .as_deref()
+                .is_some_and(|reason| TARGET_REASONS.contains(&reason))
+        {
+            self.reason = None;
+        }
+        self
     }
     /// JSON-RPC envelope code for the structured desktop failure.
     #[must_use]
@@ -43,6 +72,7 @@ impl DesktopError {
             | "desktop-stale-layout"
             | "desktop-display-selection-required"
             | "desktop-display-unavailable"
+            | TARGET_MISMATCH
             | "desktop-command-expired" => -32602,
             _ => -32603,
         }
@@ -51,8 +81,13 @@ impl DesktopError {
 impl std::fmt::Display for DesktopError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}: {}", self.code, self.detail)?;
-        if let Some(execution) = &self.execution {
-            write!(f, " (execution: {execution})")?;
+        match (&self.execution, &self.reason) {
+            (Some(execution), Some(reason)) => {
+                write!(f, " (execution: {execution}, reason: {reason})")?;
+            }
+            (Some(execution), None) => write!(f, " (execution: {execution})")?,
+            (None, Some(reason)) => write!(f, " (reason: {reason})")?,
+            (None, None) => {}
         }
         Ok(())
     }
@@ -115,12 +150,29 @@ pub fn validate_action(kind: &str, args: &Value) -> DesktopResult<Value> {
     let allowed: &[&str] = match kind {
         "startControl" | "endControl" | "listDisplay" => &[],
         "screenshot" => &["displayId", "layoutId"],
-        "move" => &["displayId", "layoutId", "x", "y"],
-        "click" => &["displayId", "layoutId", "x", "y", "button", "clickCount"],
-        "type" => &["text"],
-        "keypress" => &["key", "modifiers"],
-        "scroll" => &["displayId", "layoutId", "x", "y", "deltaX", "deltaY"],
-        "drag" => &["displayId", "layoutId", "from", "to"],
+        "move" => &["displayId", "layoutId", "x", "y", "windowId"],
+        "click" => &[
+            "displayId",
+            "layoutId",
+            "x",
+            "y",
+            "button",
+            "clickCount",
+            "windowId",
+        ],
+        "type" => &["text", "windowId"],
+        "keypress" => &["key", "modifiers", "windowId"],
+        "scroll" => &[
+            "displayId",
+            "layoutId",
+            "x",
+            "y",
+            "deltaX",
+            "deltaY",
+            "windowId",
+        ],
+        "drag" => &["displayId", "layoutId", "from", "to", "windowId"],
+        "focusWindow" => &["windowId"],
         _ => return Err(invalid()),
     };
     if object.keys().any(|key| !allowed.contains(&key.as_str())) {
@@ -132,6 +184,11 @@ pub fn validate_action(kind: &str, args: &Value) -> DesktopResult<Value> {
         return Err(invalid());
     }
     if object.contains_key("layoutId") && !nonempty("layoutId") {
+        return Err(invalid());
+    }
+    // An opaque screenshot window ID: never empty, null or non-string, and
+    // forwarded unchanged so the executor can check the target.
+    if (object.contains_key("windowId") || kind == "focusWindow") && !nonempty("windowId") {
         return Err(invalid());
     }
     if matches!(kind, "move" | "click" | "scroll" | "drag") && !nonempty("layoutId") {
@@ -251,6 +308,7 @@ mod tests {
             "keypress",
             "scroll",
             "drag",
+            "focusWindow",
         ] {
             for field in [
                 "agentId",
@@ -316,6 +374,113 @@ mod tests {
             args[field] = json!(1);
             assert!(validate_action("move", &args).is_err(), "{field}");
         }
+    }
+    #[test]
+    fn window_target_is_optional_opaque_and_forwarded_unchanged() {
+        let cases = [
+            ("move", json!({"layoutId":"l","x":1,"y":1})),
+            ("click", json!({"layoutId":"l","x":1,"y":1})),
+            (
+                "scroll",
+                json!({"layoutId":"l","x":1,"y":1,"deltaX":0,"deltaY":120}),
+            ),
+            (
+                "drag",
+                json!({"layoutId":"l","from":{"x":0,"y":0},"to":{"x":1,"y":1}}),
+            ),
+            ("type", json!({"text":"hello"})),
+            ("keypress", json!({"key":"a"})),
+        ];
+        for (kind, args) in cases {
+            assert!(validate_action(kind, &args).is_ok(), "{kind} untargeted");
+            let mut targeted = args.clone();
+            targeted["windowId"] = "win-safari".into();
+            let action = validate_action(kind, &targeted).unwrap();
+            assert_eq!(action["windowId"], "win-safari", "{kind}");
+            assert_eq!(action["kind"], kind);
+            for invalid in [json!(""), json!(null), json!(7), json!({"id":"w"})] {
+                let mut args = args.clone();
+                args["windowId"] = invalid;
+                assert!(validate_action(kind, &args).is_err(), "{kind} {args}");
+            }
+        }
+        for kind in ["startControl", "endControl", "listDisplay", "screenshot"] {
+            assert!(
+                validate_action(kind, &json!({"windowId":"w"})).is_err(),
+                "{kind}"
+            );
+        }
+    }
+    #[test]
+    fn focus_window_requires_only_a_window_id() {
+        assert_eq!(
+            validate_action("focusWindow", &json!({"windowId":"win-slack"})).unwrap(),
+            json!({"kind":"focusWindow","windowId":"win-slack"})
+        );
+        for args in [
+            json!({}),
+            json!({"windowId":""}),
+            json!({"windowId":null}),
+            json!({"windowId":7}),
+        ] {
+            assert!(validate_action("focusWindow", &args).is_err(), "{args}");
+        }
+        for field in [
+            "x",
+            "y",
+            "layoutId",
+            "displayId",
+            "text",
+            "key",
+            "button",
+            "agentId",
+            "clientId",
+            "sessionId",
+        ] {
+            let args = json!({"windowId":"w", field: "1"});
+            assert!(validate_action("focusWindow", &args).is_err(), "{field}");
+        }
+    }
+    #[test]
+    fn target_mismatch_keeps_documented_reasons_only() {
+        let mismatch: DesktopError = serde_json::from_value(json!({
+            "code":"desktop-target-mismatch",
+            "detail":"The target window is not ready for input.",
+            "execution":"not_started",
+            "reason":"not_frontmost"
+        }))
+        .unwrap();
+        let mismatch = mismatch.sanitized();
+        assert_eq!(mismatch.numeric_code(), -32602);
+        assert_eq!(mismatch.reason.as_deref(), Some("not_frontmost"));
+        let rendered = mismatch.to_string();
+        assert!(rendered.contains("desktop-target-mismatch"));
+        assert!(rendered.contains("execution: not_started"));
+        assert!(rendered.contains("reason: not_frontmost"));
+        assert_eq!(
+            serde_json::to_value(&mismatch).unwrap()["reason"],
+            "not_frontmost"
+        );
+        for reason in TARGET_REASONS {
+            let mut e = DesktopError::new(TARGET_MISMATCH, "x");
+            e.reason = Some((*reason).into());
+            assert_eq!(e.sanitized().reason.as_deref(), Some(*reason));
+        }
+        let mut unknown = DesktopError::new(TARGET_MISMATCH, "x");
+        unknown.reason = Some("made up".into());
+        assert_eq!(unknown.sanitized().reason, None);
+        let mut other = DesktopError::new("desktop-execution-failed", "x");
+        other.reason = Some("not_frontmost".into());
+        let other = other.sanitized();
+        assert_eq!(other.reason, None);
+        assert!(serde_json::to_value(&other)
+            .unwrap()
+            .get("reason")
+            .is_none());
+        assert!(serde_json::from_value::<DesktopError>(
+            json!({"code":"x","detail":"y","surprise":true})
+        )
+        .is_err());
     }
     #[test]
     fn validates_input_limits_and_coordinates() {

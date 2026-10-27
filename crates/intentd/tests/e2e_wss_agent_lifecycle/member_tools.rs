@@ -1,5 +1,6 @@
 //! Member execution through a disposable real daemon and mock ACP provider.
 use super::*;
+use intent_app::RuntimeServicesExt as _;
 use intent_core::{now_iso, Principal, PrincipalId, WorkspaceId};
 use intent_store::Store;
 use std::fmt::Write as _;

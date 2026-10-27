@@ -16,7 +16,7 @@ use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 type Gates = Arc<Mutex<HashMap<WorkspaceId, Arc<RwLock<()>>>>>;
 
 #[derive(Clone, Default)]
-pub(crate) struct WorkspaceMutations(Gates);
+pub struct WorkspaceMutations(Gates);
 
 struct Entry {
     gates: Gates,
@@ -45,7 +45,7 @@ struct Permit {
 }
 
 #[derive(Clone)]
-pub(crate) struct Mutation {
+pub struct Mutation {
     _permit: Arc<Permit>,
 }
 
@@ -65,9 +65,7 @@ pub(crate) async fn scope<F: Future>(future: F) -> F::Output {
     ADMITTED.scope(RefCell::new(inherited), future).await
 }
 
-pub(crate) fn boxed<'a, T>(
-    future: impl Future<Output = T> + Send + 'a,
-) -> intent_core::BoxFuture<'a, T> {
+pub fn boxed<'a, T>(future: impl Future<Output = T> + Send + 'a) -> intent_core::BoxFuture<'a, T> {
     Box::pin(scope(future))
 }
 
@@ -92,7 +90,11 @@ impl WorkspaceMutations {
         }
     }
 
-    pub(crate) fn enter(&self, id: &WorkspaceId) -> Result<Mutation> {
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub fn enter(&self, id: &WorkspaceId) -> Result<Mutation> {
         if let Some(permit) = ADMITTED
             .try_with(|held| {
                 held.borrow()

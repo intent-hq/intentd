@@ -221,7 +221,11 @@ pub(crate) fn background_execution<T: Send + 'static>(
     }
 }
 
-pub(crate) fn github_execution_host(api_base_url: &str) -> Option<String> {
+#[expect(
+    clippy::must_use_candidate,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn github_execution_host(api_base_url: &str) -> Option<String> {
     let url = reqwest::Url::parse(api_base_url).ok()?;
     let host = url.host_str()?.to_ascii_lowercase();
     Some(if host == "api.github.com" {
@@ -236,7 +240,11 @@ pub(crate) fn github_execution_host(api_base_url: &str) -> Option<String> {
 /// token resolution; the production composition root always wires the
 /// registry, where the schema default (`true`) applies. Shared with the
 /// `system.gitCredential` UDS RPC (see [`crate::github_git_credential`]).
-pub(crate) fn expose_git_credential(settings: Option<&SettingsRegistry>) -> bool {
+#[expect(
+    clippy::must_use_candidate,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn expose_git_credential(settings: Option<&SettingsRegistry>) -> bool {
     if intent_core::process_policy::ProcessPolicy::current().private_test_profile() {
         return false;
     }

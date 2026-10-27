@@ -34,14 +34,55 @@ commands, change credentials, or manage sharing. Host membership retains its exi
 authority. Role downgrades apply to subsequent operations on open connections.
 
 Only when explicitly asked about workspace discussions: this unreleased Multiplayer
-Labs feature supports reactions 👍 👎 👀 ✅ 🙈. The emoji picker has no tooltips;
+Labs feature supports multiple workspace-wide discussions. Start a discussion by
+sending its first message; everyone with workspace access can read and participate.
+Workspace owners and managers can rename discussions; only workspace owners can
+delete them, including the default discussion. Open the discussion, then use the
+discussion panel's **…** menu for **Rename discussion** or **Delete discussion**.
+These controls require discussion-management support from the connected daemon.
+Archived workspaces whose folder was purged keep discussions read-only; unarchive the
+workspace before renaming or deleting a discussion.
+Existing private history remains
+visible only to its original participants and is read-only; new private discussions
+are unavailable. Discussions support reactions 👍 👎 👀 ✅ 🙈. The emoji picker has no tooltips;
 hover or focus an existing reaction to see who reacted, and click to toggle yours.
 Legacy 🙂 can be removed. Agents can react only
 after explicit addressing in the workspace-wide discussion; reactions never wake
-agents. Private discussions remain human-only. Imported reaction names are historical
+agents. Imported reaction names are historical
 snapshots, not local access.
 
-<!-- Sources: packages/intentd/crates/intent-core/src/discussion.rs; packages/intentd/crates/intent-services/src/discussion_ops.rs; packages/intentd/crates/intent-acp/src/mcp_server/bindings/discussion.rs; packages/cloudlands-fe/src/features/discussions/. -->
+An agent author's name or avatar opens that agent beside the discussion. If the
+agent is unavailable, the app reports that it cannot open the reference. Sending
+in an existing discussion preserves its message row while confirmation arrives; failed messages can be
+retried without consuming a newer draft. Discussion composers currently support
+text and references, not image pasting or file attachments. The discussion and
+agent-chat @ menus have different recipient and delivery rules. Sending a message
+with a selected agent in a workspace-wide discussion explicitly addresses that agent.
+
+With person-mention support from the connected daemon, selecting a person in the
+discussion's @ menu records who is mentioned. Sending can alert that person when
+the discussion is off screen and notifications are enabled. Plain text that looks
+like an @ mention does not identify a recipient. Notification actions open the
+relevant discussion subject to current access. Unread counts appear in discussion
+navigation and inactive tabs. They reflect messages observed by this client and
+clear as focused discussion content is read; they are not durable cross-device
+read receipts. These additions remain part of unreleased Multiplayer Labs.
+
+Only when explicitly asked about the experimental People panel: invitations to
+specific accounts appear as **Invited** for people who can manage sharing. A share
+link without a named recipient does not add a person. Accepted members remain in
+People when they stop viewing the workspace and appear greyed out. Being connected
+to the host elsewhere does not mean they are active here.
+
+In the People panel's Activity list, nearby consecutive actions by the same person
+share an avatar. Each action remains individually selectable. **Load more** looks
+for older activity from people, even when automated events fill the recent feed.
+In agent chat, other people's typing appears as a compact status above the prompt
+without moving the messages or monitor cards.
+
+<!-- Sources: packages/cloudlands-fe/src/features/presence/components/{WorkspacePeopleRoster,WorkspacePeopleActivity,PresenceTypingIndicator}.svelte; packages/cloudlands-fe/src/store/renderer/slices/{presence/presence-selectors,workspace-share/workspace-share-selectors}.ts; packages/cloudlands-fe/src/lib/components/chat/ChatPanel.svelte. -->
+
+<!-- Sources: packages/intentd/crates/intent-core/src/discussion.rs; packages/intentd/crates/intent-services/src/discussion_ops.rs; packages/intentd/crates/intent-transport/src/retired_gate.rs; packages/intentd/crates/intent-store/src/discussion_management_repo.rs; packages/intentd/crates/intent-acp/src/mcp_server/bindings/discussion.rs; packages/cloudlands-fe/src/features/discussions/components/{DiscussionThread,DiscussionMessageView,DiscussionMentionPicker,DiscussionUnreadBadge}.svelte; packages/cloudlands-fe/src/features/discussions/discussion-reference-navigation.ts; packages/cloudlands-fe/src/features/layout/tab-types/DiscussionTabType.svelte; packages/cloudlands-fe/src/store/renderer/slices/notifications/sagas/notifications-saga.ts; packages/cloudlands-fe/src/store/renderer/slices/workspace-discussion/workspace-discussion-selectors.ts. -->
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/settings/MobileSettings.svelte; src/features/devices/{PersonalDevicesPanel.svelte,personal-devices-selectors.ts}; src/store/renderer/slices/principal/principal-selectors.ts; src/store/renderer/slices/websocket-api/sagas/websocket-api-saga.ts; messages/en.json. -->
 
@@ -65,7 +106,9 @@ supports them. A newer daemon or agent instruction version does not prove suppor
 in the installed client.
 
 For development testing, run both component branches and create a new agent with
-harness 3.4. Existing agents retain their creation-time prompts.
+harness 3.5. Existing agents retain their creation-time prompts. If controls do
+not respond in a scaled embedded-browser preview, choose **Fit panel** in its size
+menu and retry.
 
 In a supporting development frontend, an agent can put raw, self-contained
 HTML/CSS/JavaScript in a `ws-block:html` fence to show a local interactive visual
@@ -103,7 +146,7 @@ dark appearance, its content height and console messages. A frontend without tha
 action reports it as unsupported; the agent then says preview is unavailable.
 Asked for an image to share elsewhere, the agent saves a PNG file instead.
 
-<!-- Sources: packages/cloudlands-fe/src/features/inline-html/{InlineHtmlPreview.svelte,inline-html-document.ts,inline-html-runtime.ts,inline-html-styles.ts}; packages/cloudlands-fe/src/features/browser/main/inline-html-preview-service.ts; packages/cloudlands-fe/src/lib/styles/tokens.css; packages/intentd/crates/intent-services/resources/agent-instructions/v3.4/common.md; packages/intentd/crates/intent-acp/src/mcp_server/bindings/browser_docs/overview.md. Visual workflow, layout and theme rules adapted from T3 Code (MIT, see packages/intentd/NOTICE). -->
+<!-- Sources: packages/cloudlands-fe/src/features/inline-html/{InlineHtmlPreview.svelte,inline-html-document.ts,inline-html-runtime.ts,inline-html-styles.ts}; packages/cloudlands-fe/src/features/browser/main/inline-html-preview-service.ts; packages/cloudlands-fe/src/lib/components/browser/BrowserViewportMenu.svelte; packages/cloudlands-fe/src/lib/styles/tokens.css; packages/intentd/crates/intent-services/resources/agent-instructions/v3.5/common.md; packages/intentd/crates/intent-acp/src/mcp_server/bindings/browser_docs/overview.md. Visual workflow, layout and theme rules adapted from T3 Code (MIT, see packages/intentd/NOTICE). -->
 
 ## Finding things
 
@@ -347,7 +390,7 @@ directories. Workspaces already stored in the daemon remain available.
 
 <!-- Sources: packages/intentd/crates/intentd/src/main.rs; packages/cloudlands-fe/src/routes/(app)/settings/+page.svelte. -->
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceBoard,HomeWorkspaceDetail,HomeWorkspacePullBadge}.svelte; src/features/home/home-model.ts; src/features/home/home.css. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceBoard,HomeWorkspaceDetail,HomeWorkspacePullBadge}.svelte; src/features/home/home-model.ts; src/features/home/home.css; src/lib/components/workspace/sidebar/workspace-pr-presentation.ts. -->
 
 In **Home → Workspaces**, list rows and board cards show organization/repository
 labels in views that include multiple repositories. When an organization is selected,
@@ -364,9 +407,10 @@ terminal tab, alone does not count. **Waiting** covers workspaces watching somet
 monitored PR, a background hook, a delegated agent, a script run monitor, or a PR in
 the merge queue. The **Waiting** filter shows the same workspaces.
 
-The PR badge in list and board views prioritizes draft PRs, then open PRs
-(including conflicted or queued PRs), then merged and closed PRs. Within the same
-state, it shows the most recently updated available PR. Home's shortened PR list
+The PR badge in list and board views shows a PR in the merge queue first, then
+draft PRs, then open PRs (including conflicted PRs), then merged and closed PRs.
+Within the same state, it shows the most recently updated PR (for a PR an agent only
+watches, its last update on GitHub as of the watch's latest check). Home's shortened PR list
 keeps unfinished PRs ahead of merged or closed ones; the **+N** count in list view
 includes the other linked PRs, even when their details are not loaded.
 
@@ -583,27 +627,35 @@ The grouping choice is remembered with Home's settings for the current signed-in
 user and connected backend. **Activity** remains the default; existing saved
 grouping choices keep their behavior.
 
-## Retire and restore workspaces
+## Archive, auto-archive and disk cleanup
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{home-workspace-menu.ts,HomeWorkspaceControls.svelte}; src/lib/components/workspace/RetiredWorkspaceBanner.svelte; src/lib/components/settings/GitWorkspaceSettings.svelte; messages/en.json. Daemon: workspace.retire, packages/intentd/crates/intent-services/src/{retire,auto_retire}.rs. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{home-workspace-menu.ts,HomeWorkspaceControls.svelte}; src/lib/components/modals/RetireWorkspaceConfirmDialog.svelte; src/lib/components/settings/GitWorkspaceSettings.svelte; messages/en.json. Daemon: workspace.archive, workspace.retire, packages/intentd/crates/intent-services/src/{auto_archive,retire,auto_retire}.rs. -->
 
-Retiring frees disk space: it deletes the workspace's folder, including uncommitted
-changes and untracked files, but keeps its conversations, notes, tasks, and git
-branch. In **Home → Workspaces**, right-click a workspace and choose **Retire**, then
-confirm. An active workspace is archived first. Workspaces whose folder is the
-repository itself (not a separate checkout) and remote workspaces cannot be retired.
+Archive is the one way to put a workspace away. In **Home → Workspaces**,
+right-click a workspace and choose **Archive**. Archiving stops its agents, hooks
+and PR monitors and keeps its folder. Archived workspaces appear under the
+**Archived** filter. Choose **Unarchive**, or send an agent a message, to continue.
 
-Retired workspaces appear only under the **Retired** filter in Home. Opening one
-shows its history read-only. To keep working, choose **Restore as blank workspace**
-from its menu or banner, or send it a message: Intent recreates it from a fresh
-checkout of the default branch on a new branch. The old branch still holds the
-earlier work.
+Intent archives idle workspaces automatically: a workspace with no messages, note
+edits or agent activity for 7 days is archived, unless an agent, script, hook or PR
+monitor is still running or it is shared with guests. Change or turn this off in
+**Workspace setup → Archive idle workspaces** (`/settings?tab=setup#git-workspace`),
+or set `autoArchiveIdleAfterDays` (`0` = off) under `[workspace]` in `config.toml`.
 
-To retire archived workspaces automatically, turn on **Workspace setup →
-Automatically retire archived workspaces** (`/settings?tab=setup#git-workspace`) and
-set **Retire after (days)** (7 when first turned on). Intent checks about once an
-hour. It is off by default, and it skips remote, shared, and non-retirable
-workspaces.
+To free disk space, right-click an archived workspace and choose **Purge workspace
+folder**, then confirm. This deletes the folder, including uncommitted changes and
+untracked files, but keeps conversations, notes, tasks and the git branch. The
+workspace card's status then reads "Workspace folder purged to free disk space."
+Workspaces whose folder is the repository itself and remote workspaces cannot be
+purged. To purge automatically, turn on **Workspace setup → Free disk space for
+archived workspaces** and set the number of days (7 when first turned on), or set
+`purgeArchivedAfterDays` in `config.toml`. It is off by default, runs about once an
+hour, and skips workspaces with uncommitted changes.
+
+A purged workspace still shows as archived and its history stays readable.
+Unarchiving it, or sending a message, recreates it from a fresh checkout of the
+default branch on a new branch; the old branch still holds the earlier work, and
+the agents are told the folder was purged.
 
 ## Home workspace status icons
 
@@ -837,6 +889,12 @@ A missing-file or access error is different: check the path and access rather th
 assuming the file cannot be previewed.
 
 Assistant chat can show an image from any workspace on the connected computer when its link names that workspace (`intent://local/{workspaceId}/file/{path}`). A workspace agent's chat shows only its own workspace's images; another workspace's image appears as a link or as a placeholder saying it is from another workspace. Open that workspace, or ask the Assistant, to view it.
+
+Agents mention another workspace as a link showing its title rather than its internal ID.
+Clicking a workspace link in an agent chat or a note switches to that workspace; in Assistant
+chat it opens beside the conversation.
+
+<!-- Sources: packages/cloudlands-fe/src/lib/utils/workspaces-link-handler.ts (workspace links outside Assistant chat); packages/intentd/crates/intent-services/resources/agent-instructions/v3.4/common.md. Test-build behavior pending its frontend release. -->
 
 <!-- Sources: packages/cloudlands-fe/src/features/layout/tab-types/FileTabType.svelte; packages/cloudlands-fe/src/lib/components/markdown/{MarkdownViewer,MarkdownDiagram,MermaidRenderer}.svelte; packages/cloudlands-fe/src/lib/components/file-explorer/file-explorer-layout.svelte; packages/cloudlands-fe/src/store/renderer/slices/files/sagas/files-write-saga.ts; packages/cloudlands-fe/src/lib/client/live/live-files-client.ts; packages/cloudlands-fe/src/features/file/services/download-workspace-file.ts; packages/cloudlands-fe/src/lib/utils/workspace-file-image.ts. -->
 

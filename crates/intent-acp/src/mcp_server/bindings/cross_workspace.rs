@@ -3,8 +3,8 @@
 //! Thin wrappers over the [`WorkspaceApi`] cross-workspace surface: sibling
 //! discovery and cross-workspace note reads. The daemon already enforces the
 //! "same repositoryPath" access rule and shapes the returned payload — the
-//! binding only peels arguments and echoes the trait's `serde_json::Value`
-//! result unchanged (reference parity with `buildCrossWorkspaceApi` in
+//! binding peels arguments and echoes the trait's `serde_json::Value`
+//! result, adding only agent-facing workspace links to sibling rows (reference parity with `buildCrossWorkspaceApi` in
 //! `ws-misc-api.ts`).
 
 use std::sync::Arc;
@@ -40,15 +40,22 @@ pub(crate) async fn dispatch(
 }
 
 /// Retired siblings are opt-in: `ws.crossWorkspace.listSiblings({ includeRetired: true })`.
+/// Each row gains `link` / `markdownLink` (agent-facing only; the daemon RPC
+/// row is unchanged) so agents can name a sibling with a clickable link.
 async fn list_siblings(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
     args: &Value,
 ) -> Result<Value, String> {
     let include_retired = super::opt_strict_bool(args, "includeRetired")?.unwrap_or(false);
-    api.cross_workspace_list_siblings(ws.clone(), include_retired)
+    let mut siblings = api
+        .cross_workspace_list_siblings(ws.clone(), include_retired)
         .await
-        .map_err(map_err)
+        .map_err(map_err)?;
+    if let Some(rows) = siblings.as_array_mut() {
+        rows.iter_mut().for_each(super::insert_workspace_links);
+    }
+    Ok(siblings)
 }
 
 async fn read_note(

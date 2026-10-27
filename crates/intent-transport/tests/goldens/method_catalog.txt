@@ -147,9 +147,11 @@ router desktop.respondPermission
 router desktop.revoke
 router desktop.setPermission
 router discussion.conversations
+router discussion.delete
 router discussion.list
 router discussion.react
 router discussion.recipients
+router discussion.rename
 router discussion.retryAgent
 router discussion.send
 router discussion.stopAgent

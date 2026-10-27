@@ -5,6 +5,8 @@ mod cursor_move;
 mod hello_probe;
 #[path = "desktop_control/start_timeout.rs"]
 mod start_timeout;
+#[path = "desktop_control/window_targets.rs"]
+mod window_targets;
 use super::*;
 use intent_core::{AgentId, Caller, HostRole};
 use serde_json::json;
@@ -19,6 +21,11 @@ async fn executor_reply(socket: &mut Socket, request: Value, calls: &mut Vec<Val
     calls.push(p.clone());
     if p["operation"] == "execute" && calls[0]["executeFailure"] == "partial" {
         socket.send(Message::Text(json!({"jsonrpc":"2.0","id":request["id"],"error":{"code":-32603,"message":"Native operation failed after partial execution.","data":{"code":"desktop-execution-failed","detail":"Native operation failed after partial execution.","execution":"partial"}}}).to_string().into())).await.unwrap();
+        return;
+    }
+    if p["operation"] == "execute" && calls[0].get("executeError").is_some() {
+        let data = calls[0]["executeError"].clone();
+        socket.send(Message::Text(json!({"jsonrpc":"2.0","id":request["id"],"error":{"code":-32602,"message":data["detail"],"data":data}}).to_string().into())).await.unwrap();
         return;
     }
     let display_count = calls.iter().find_map(|call| call["displayCount"].as_u64());
@@ -85,7 +92,11 @@ async fn executor_reply(socket: &mut Socket, request: Value, calls: &mut Vec<Val
                     json!({"layoutId":"l","displays":displays})
                 }
                 "screenshot" => {
-                    json!({"capturedAt":"2026-10-02T09:00:00Z","layoutId":"l","displays":[{"displayId":action.get("displayId").cloned().unwrap_or(json!("d")),"width":1920,"height":1080,"originX":0,"originY":0,"scaleFactor":1.0,"assetId":"capture","url":format!("workspace-asset://{}/capture",p["workspaceId"].as_str().unwrap()),"mimeType":"image/png"}]})
+                    let mut shot = json!({"capturedAt":"2026-10-02T09:00:00Z","layoutId":"l","displays":[{"displayId":action.get("displayId").cloned().unwrap_or(json!("d")),"width":1920,"height":1080,"originX":0,"originY":0,"scaleFactor":1.0,"assetId":"capture","url":format!("workspace-asset://{}/capture",p["workspaceId"].as_str().unwrap()),"mimeType":"image/png"}]});
+                    if let Some(extra) = calls[0]["screenshotExtra"].as_object() {
+                        shot.as_object_mut().unwrap().extend(extra.clone());
+                    }
+                    shot
                 }
                 _ => json!({"ok":true}),
             };

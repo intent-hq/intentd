@@ -31,6 +31,8 @@ pub(super) fn message(row: &SqliteRow) -> Result<DiscussionMessage> {
             .map_err(|e| Error::Internal(e.to_string()))?,
         agent_mentions: serde_json::from_str(row.get::<&str, _>("agent_mentions_json"))
             .map_err(|e| Error::Internal(e.to_string()))?,
+        principal_mentions: serde_json::from_str(row.get::<&str, _>("principal_mentions_json"))
+            .map_err(|e| Error::Internal(e.to_string()))?,
         agent_activity: serde_json::from_str(row.get("agent_activity_json"))
             .map_err(|e| Error::Internal(e.to_string()))?,
         author: serde_json::from_str(row.get("author_json"))

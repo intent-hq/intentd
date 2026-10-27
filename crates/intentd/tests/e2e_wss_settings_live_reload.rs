@@ -1268,17 +1268,20 @@ async fn quick_action_effort_persists_emits_changes_and_resets_over_wss() {
     assert_eq!(blank_reloaded[1]["value"], values[1]);
 }
 
-/// `workspace.autoRetireArchivedAfterDays` (§5.12) over WSS: advertised as an
+/// `workspace.purgeArchivedAfterDays` (§5.12) over WSS: advertised as an
 /// optional number with `min: 1` and no `defaultValue`, reads `null` (off)
 /// until set, persists a positive integer to config.toml with a
 /// `settings:changed` event, rejects zero / negative / fractional days with
-/// `-32602`, and `null` turns it off again by removing the key.
+/// `-32602`, and `null` turns it off again by removing the key. Its
+/// deprecated predecessor `workspace.autoRetireArchivedAfterDays` is no
+/// longer advertised, and `workspace.autoArchiveIdleAfterDays` is advertised
+/// with `min: 0` and `defaultValue: 7`.
 #[tokio::test]
-async fn auto_retire_setting_validates_persists_and_clears_over_wss() {
+async fn purge_setting_validates_persists_and_clears_over_wss() {
     let dir = temp_data_dir();
     let (_daemon, mut rpc, mut sub) = boot_with_wss(dir.path()).await;
     await_config_watcher_ready(dir.path()).await;
-    let path = "workspace.autoRetireArchivedAfterDays";
+    let path = "workspace.purgeArchivedAfterDays";
 
     let list = wss_rpc(&mut rpc, 30, "settings.list", json!({})).await;
     let def = list["result"]["settings"]
@@ -1292,6 +1295,22 @@ async fn auto_retire_setting_validates_persists_and_clears_over_wss() {
     assert_eq!(def["min"], json!(1.0), "{def}");
     assert!(def.get("defaultValue").is_none(), "{def}");
     assert_eq!(def["value"], Value::Null, "{def}");
+    let settings = list["result"]["settings"]
+        .as_array()
+        .expect("settings array");
+    assert!(
+        !settings
+            .iter()
+            .any(|d| d["path"] == json!("workspace.autoRetireArchivedAfterDays")),
+        "the deprecated key is not advertised: {list}"
+    );
+    let auto_archive = settings
+        .iter()
+        .find(|d| d["path"] == json!("workspace.autoArchiveIdleAfterDays"))
+        .unwrap_or_else(|| panic!("auto-archive not advertised: {list}"));
+    assert_eq!(auto_archive["type"], json!("number"), "{auto_archive}");
+    assert_eq!(auto_archive["min"], json!(0.0), "{auto_archive}");
+    assert_eq!(auto_archive["defaultValue"], json!(7.0), "{auto_archive}");
 
     let initial = settings_snapshot(&mut rpc, &[path]).await;
     assert_eq!(initial[0]["value"], Value::Null);
@@ -1314,7 +1333,7 @@ async fn auto_retire_setting_validates_persists_and_clears_over_wss() {
     let text = std::fs::read_to_string(dir.path().join("config.toml")).expect("config.toml");
     assert!(
         text.lines()
-            .any(|l| l.trim() == "autoRetireArchivedAfterDays = 7"),
+            .any(|l| l.trim() == "purgeArchivedAfterDays = 7"),
         "{text}"
     );
 
@@ -1348,7 +1367,7 @@ async fn auto_retire_setting_validates_persists_and_clears_over_wss() {
     assert!(
         !text
             .lines()
-            .any(|l| l.trim_start().starts_with("autoRetireArchivedAfterDays")),
+            .any(|l| l.trim_start().starts_with("purgeArchivedAfterDays")),
         "{text}"
     );
 }

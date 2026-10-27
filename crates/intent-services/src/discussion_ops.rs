@@ -1,7 +1,7 @@
 //! Explicitly addressed workspace discussions; all transports share these gates.
 use intent_core::discussion::{
     DiscussionActor, DiscussionAuthor, DiscussionSendResult, DiscussionTarget,
-    DEFAULT_CONVERSATION, DISCUSSION_BODY_MAX_BYTES, DISCUSSION_RECIPIENT_MAX,
+    DEFAULT_CONVERSATION, DISCUSSION_BODY_MAX_BYTES,
 };
 use intent_core::events::{DISCUSSION_MESSAGE, DISCUSSION_REACTION};
 use intent_core::{
@@ -13,6 +13,51 @@ use serde_json::{json, Value};
 use crate::Services;
 
 impl Services {
+    pub(crate) async fn discussion_manage_op(
+        &self,
+        ws: &WorkspaceId,
+        id: &str,
+        name: Option<&str>,
+    ) -> Result<Value> {
+        let principal = self.discussion_access(ws, id).await?;
+        let conversation = self
+            .store
+            .manage_discussion(ws, &principal, id, name)
+            .await?;
+        let event_type = if name.is_none() {
+            intent_core::events::DISCUSSION_DELETED
+        } else {
+            intent_core::events::DISCUSSION_UPDATED
+        };
+        let mut data = json!({"workspaceId":ws,"conversationId":conversation.id});
+        if name.is_some() {
+            data["conversation"] = json!(conversation);
+        }
+        crate::publish_event_transient(
+            self.event_bus.as_ref(),
+            &NewEvent {
+                workspace_id: ws.clone(),
+                timestamp: intent_core::now_iso(),
+                event_type: event_type.into(),
+                actor: EventActor {
+                    actor_type: ActorType::User,
+                    id: Some(principal.0),
+                    ..EventActor::default()
+                },
+                session_id: None,
+                correlation_id: None,
+                parent_event_id: None,
+                metadata: None,
+                data,
+            },
+        );
+        Ok(if name.is_none() {
+            json!({"deleted":true,"conversationId":conversation.id})
+        } else {
+            json!({"conversation":conversation})
+        })
+    }
+
     async fn discussion_human(&self, workspace_id: &WorkspaceId) -> Result<PrincipalId> {
         let Some(Caller::Wire { principal_id, .. }) = current_caller() else {
             return Err(Error::Forbidden(
@@ -65,7 +110,12 @@ impl Services {
         conversation_id: &str,
     ) -> Result<PrincipalId> {
         let principal = self.discussion_human(workspace_id).await?;
-        if conversation_id != DEFAULT_CONVERSATION
+        if self
+            .store
+            .discussion_conversation(workspace_id, conversation_id)
+            .await?
+            .kind
+            != "workspace"
             && !self
                 .store
                 .discussion_is_participant(workspace_id, conversation_id, &principal)
@@ -114,21 +164,10 @@ impl Services {
                     "invalid conversation page bounds".into(),
                 ));
             }
-            let visible = before.is_none()
-                && self
-                    .store
-                    .discussion_agent_access(ws, DEFAULT_CONVERSATION, &agent_id)
-                    .await?;
-            let conversations = if visible {
-                vec![
-                    self.store
-                        .discussion_conversation(ws, DEFAULT_CONVERSATION)
-                        .await?,
-                ]
-            } else {
-                vec![]
-            };
-            return Ok(json!({"conversations":conversations,"hasMore":false}));
+            return self
+                .store
+                .discussion_agent_conversations(ws, &agent_id, before, limit)
+                .await;
         }
         let principal = self.discussion_human(ws).await?;
         self.store
@@ -160,6 +199,19 @@ impl Services {
             Some(Caller::Agent { agent_id }) => Some(agent_id),
             _ => None,
         };
+        if target.create_conversation
+            && (target.conversation_id.is_some()
+                || target.recipient_principal_ids.is_some()
+                || agent_id.is_some())
+        {
+            return Err(Error::InvalidParams(
+                "createConversation requires a human and no conversation or private recipients"
+                    .into(),
+            ));
+        }
+        if agent_id.is_some() && !target.principal_mentions.is_empty() {
+            return Err(Error::Forbidden("only humans may mention people".into()));
+        }
         let principal_id = if let Some(agent) = &agent_id {
             if target.recipient_principal_ids.is_some() {
                 return Err(Error::Forbidden(
@@ -203,22 +255,12 @@ impl Services {
                 "conversationId and recipientPrincipalIds are mutually exclusive".into(),
             ));
         }
-        if let Some(recipients) = &target.recipient_principal_ids {
-            let unique: std::collections::HashSet<_> = recipients.iter().collect();
-            if recipients.is_empty()
-                || recipients.len() > DISCUSSION_RECIPIENT_MAX
-                || unique.len() != recipients.len()
-                || principal_id
-                    .as_ref()
-                    .is_some_and(|id| recipients.contains(id))
-                || recipients.iter().any(|p| p.as_str().is_empty())
-            {
-                return Err(Error::InvalidParams(
-                    "recipientPrincipalIds must contain 1..31 distinct other workspace members"
-                        .into(),
-                ));
-            }
-        } else if agent_id.is_none() {
+        if target.recipient_principal_ids.is_some() {
+            return Err(Error::InvalidParams(
+                "private discussion creation is no longer supported".into(),
+            ));
+        }
+        if agent_id.is_none() && !target.create_conversation {
             self.discussion_access(
                 workspace_id,
                 target
@@ -227,6 +269,24 @@ impl Services {
                     .unwrap_or(DEFAULT_CONVERSATION),
             )
             .await?;
+        }
+        if !target.create_conversation
+            && self
+                .store
+                .discussion_conversation(
+                    workspace_id,
+                    target
+                        .conversation_id
+                        .as_deref()
+                        .unwrap_or(DEFAULT_CONVERSATION),
+                )
+                .await?
+                .kind
+                != "workspace"
+        {
+            return Err(Error::Forbidden(
+                "legacy private discussions are read-only".into(),
+            ));
         }
         let (author, actor) = if let Some(agent) = agent_id {
             let session = self.store.get_agent_session_summary(&agent).await?;
@@ -273,6 +333,22 @@ impl Services {
             .send_discussion_message(workspace_id, message_id, body, &author, target)
             .await?;
         if inserted {
+            if target.create_conversation {
+                crate::publish_event_transient(
+                    self.event_bus.as_ref(),
+                    &NewEvent {
+                        workspace_id: workspace_id.clone(),
+                        timestamp: result.conversation.created_at.clone(),
+                        event_type: intent_core::events::DISCUSSION_CREATED.into(),
+                        actor: actor.clone(),
+                        session_id: None,
+                        correlation_id: None,
+                        parent_event_id: None,
+                        metadata: None,
+                        data: json!({"workspaceId":workspace_id,"conversationId":result.conversation.id,"conversation":result.conversation}),
+                    },
+                );
+            }
             // History is committed above. Broadcast its full snapshot without
             // duplicating human message bodies in the durable event log.
             crate::publish_event_transient(
@@ -343,9 +419,24 @@ impl Services {
         active: bool,
     ) -> Result<intent_core::discussion::DiscussionReactionState> {
         let actor = match current_caller() {
-            Some(Caller::Agent { agent_id }) => DiscussionActor::Agent(agent_id),
+            Some(Caller::Agent { agent_id }) => {
+                self.discussion_agent_access(ws, conversation, &agent_id)
+                    .await?;
+                DiscussionActor::Agent(agent_id)
+            }
             _ => DiscussionActor::Human(self.discussion_access(ws, conversation).await?),
         };
+        if self
+            .store
+            .discussion_conversation(ws, conversation)
+            .await?
+            .kind
+            != "workspace"
+        {
+            return Err(Error::Forbidden(
+                "legacy private discussions are read-only".into(),
+            ));
+        }
         let (state, changed) = self
             .store
             .set_discussion_actor_reaction(ws, conversation, message, &actor, reaction, active)
@@ -387,7 +478,12 @@ impl Services {
                 .get("conversationId")
                 .and_then(Value::as_str)
                 .unwrap_or(DEFAULT_CONVERSATION);
-            let Ok(principal) = self.discussion_access(&event.workspace_id, id).await else {
+            let access = if event.event_type == intent_core::events::DISCUSSION_DELETED {
+                self.discussion_human(&event.workspace_id).await
+            } else {
+                self.discussion_access(&event.workspace_id, id).await
+            };
+            let Ok(principal) = access else {
                 return Ok(None);
             };
             let message_id = if event.event_type == DISCUSSION_REACTION {

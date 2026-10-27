@@ -1,7 +1,9 @@
-use super::tests::{fixture, Role};
-use super::*;
-use crate::tests::TempDb;
-use intent_core::{AgentCreateExtra, ScriptCreateParams, ScriptMode, WorkspaceApi};
+use crate::test_support::capability_fixtures::{fixture, Role};
+use crate::test_support::fixtures::TempDb;
+use intent_core::{
+    AgentCreateExtra, Error, ScriptCreateParams, ScriptMode, WorkspaceApi, WorkspaceRole,
+};
+use serde_json::json;
 
 #[tokio::test]
 async fn guest_roles_are_scoped_live_and_do_not_grant_owner_authority() {
@@ -18,7 +20,7 @@ async fn guest_roles_are_scoped_live_and_do_not_grant_owner_authority() {
     sqlx::query("INSERT INTO host_member(principal_id,added_at) VALUES(?,?)")
         .bind(f.outsider.as_str())
         .bind(intent_core::now_iso())
-        .execute(svc.store.write_pool())
+        .execute(svc.store().write_pool())
         .await
         .unwrap();
     assert!(matches!(
@@ -255,7 +257,7 @@ async fn guest_roles_script_list_cannot_import_repository_commands() {
     sqlx::query("UPDATE workspace SET repository_path=? WHERE id=?")
         .bind(repo.to_str().unwrap())
         .bind(f.ws.as_str())
-        .execute(f.services.store.write_pool())
+        .execute(f.services.store().write_pool())
         .await
         .unwrap();
     f.run(

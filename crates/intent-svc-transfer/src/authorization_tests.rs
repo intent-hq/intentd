@@ -1,7 +1,7 @@
 //! Caller authorization of the transfer RPCs: transfer handles stay owned by
 //! the principal that opened them, and gated callers cannot export.
 
-use intent_core::discussion::DiscussionTarget;
+use intent_core::discussion::{DiscussionAuthor, DiscussionTarget};
 use intent_core::{
     now_iso, with_caller, AgentId, Caller, Error, HostRole, Principal, PrincipalId, WorkspaceApi,
     WorkspaceId, WorkspaceRole,
@@ -187,17 +187,37 @@ async fn member_export_handles_remain_owned_by_the_authenticated_initiator() {
 #[tokio::test]
 async fn discussion_export_cannot_bypass_participant_authorization() {
     let (_tmp, svc, ws, p) = conversation_fixture().await;
-    with_caller(
-        human(&p[1].id),
-        svc.discussion_send(
-            ws.clone(),
-            "private".into(),
-            "private body".into(),
-            recipients(&[p[2].id.clone()]),
-        ),
-    )
-    .await
-    .unwrap();
+    assert!(matches!(
+        with_caller(
+            human(&p[1].id),
+            svc.discussion_send(
+                ws.clone(),
+                "private".into(),
+                "private body".into(),
+                recipients(&[p[2].id.clone()]),
+            ),
+        )
+        .await,
+        Err(Error::InvalidParams(_))
+    ));
+    // Seed historical private data through persistence; new private creation is rejected.
+    let author = DiscussionAuthor {
+        principal_id: Some(p[1].id.clone()),
+        agent_id: None,
+        login: p[1].login.clone(),
+        display_name: p[1].display_name.clone(),
+        avatar_url: p[1].avatar_url.clone(),
+    };
+    svc.store()
+        .send_discussion_message(
+            &ws,
+            "private",
+            "private body",
+            &author,
+            &recipients(&[p[2].id.clone()]),
+        )
+        .await
+        .unwrap();
     for caller in [
         Caller::Wire {
             principal_id: p[0].id.clone(),

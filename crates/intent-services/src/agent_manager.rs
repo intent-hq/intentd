@@ -176,14 +176,18 @@ pub(crate) const AUTO_UNARCHIVE_PROMPT_NOTICE: &str =
 /// Transcript text of the `workspace_revived` system row persisted when a turn
 /// start revives a RETIRED workspace (PROTOCOL §5.1 "Revive").
 pub(crate) const WORKSPACE_REVIVED_NOTICE_TEXT: &str =
-    "Workspace was retired and has been revived as a fresh, blank checkout because a message was sent to this agent. Files, uncommitted changes, and local git state from before were lost; conversations and notes were kept.";
+    "The workspace folder was purged while the workspace was archived. It has been unarchived as a fresh, blank checkout because a message was sent to this agent. Files, uncommitted changes, and local git state from before were lost; conversations and notes were kept.";
 
-/// Trailing prompt block injected into the SAME turn that revived a retired
-/// workspace: all prior on-disk state is gone. Names the kept old branch (its
-/// committed work is still in the repository) and the fresh branch.
+/// Trailing prompt block telling the model a retired ("purged") workspace
+/// was revived: all prior on-disk state is gone. Names the kept old branch
+/// (its committed work is still in the repository) and the fresh branch.
+/// Injected into the SAME turn that revived the workspace, and left pending
+/// ([`intent_core::PENDING_WORKSPACE_PURGE_NOTICE_KEY`]) for every other
+/// agent's next turn.
 pub(crate) fn workspace_revived_prompt_notice(previous_branch: &str, branch: &str) -> String {
     format!(
-        "[SYSTEM NOTICE] This workspace was retired and its folder was deleted. All files, \
+        "[SYSTEM NOTICE] This workspace's folder was purged to free disk space while the \
+         workspace was archived, and the workspace has since been unarchived. All files, \
          uncommitted changes, and local git state from before are gone; you are now in a fresh, \
          blank checkout of the repository's default branch on the new branch `{branch}`. \
          Commits on the previous branch `{previous_branch}` are kept in the repository. \
@@ -5969,8 +5973,35 @@ impl AgentManager {
         // `auto_unarchived` system row stays excluded from history replay
         // like every system row.
         let notice = self.auto_unarchived.lock().unwrap().remove(agent_id);
-        if let Some(notice) = notice {
-            blocks.extend(text_prompt(&notice));
+        // Folder-purged notice left pending by a revive this agent did not
+        // trigger (a manual unarchive, or another agent's turn): taken
+        // exactly once. When this turn already carries its own revive
+        // notice the pending copy is dropped, never sent twice.
+        let pending = match self
+            .services
+            .store
+            .take_agent_session_metadata_key(
+                workspace_id,
+                agent_id,
+                intent_core::PENDING_WORKSPACE_PURGE_NOTICE_KEY,
+            )
+            .await
+        {
+            Ok(pending) => pending,
+            Err(e) => {
+                tracing::warn!(agent = %agent_id, error = %e, "pending purge notice read failed");
+                None
+            }
+        };
+        // A revive notice already carries the purge warning, so a pending copy
+        // is dropped. An ordinary auto-unarchive notice does not (the folder
+        // was purged by an EARLIER revive this agent has not heard about yet),
+        // so the pending notice follows it.
+        let revive_now = notice
+            .as_deref()
+            .is_some_and(|text| text != AUTO_UNARCHIVE_PROMPT_NOTICE);
+        for text in notice.into_iter().chain(pending.filter(|_| !revive_now)) {
+            blocks.extend(text_prompt(&text));
         }
         Ok(blocks)
     }
@@ -23412,6 +23443,30 @@ mod agent_retry_tests {
         (Arc::new(AgentManager::new(services, sink, 8)), db_dir)
     }
 
+    /// [`manager_with_session`] with the runtime test double as the
+    /// manager's runtime port.
+    async fn manager_with_session_fake_runtime(
+        agent_id: &AgentId,
+        ws: &WorkspaceId,
+        status: AgentStatus,
+    ) -> (Arc<AgentManager>, tempfile::TempDir) {
+        let db_dir = crate::tests::test_tempdir("intentd-retry-");
+        let path = db_dir.path().join("store.db");
+        let db = Store::open(&path).await.expect("temp store");
+        db.insert_workspace(&workspace(ws))
+            .await
+            .expect("insert workspace");
+        db.insert_agent_session(&session(agent_id, ws, status))
+            .await
+            .expect("insert session");
+        let bus = EventBus::new(db.clone());
+        let services = crate::test_support::fake_runtime::FakeRuntime::install(
+            Services::new(db).with_event_bus(bus.clone()),
+        );
+        let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus));
+        (Arc::new(AgentManager::new(services, sink, 8)), db_dir)
+    }
+
     #[intent_test_macros::daemon_test]
     async fn monitor_delivery_recovers_each_persistence_boundary_without_duplicate_transcript() {
         for boundary in [
@@ -23422,7 +23477,8 @@ mod agent_retry_tests {
         ] {
             let agent = AgentId::from("recover-monitor-owner");
             let ws = WorkspaceId::from("recover-monitor-workspace");
-            let (mgr, db_dir) = manager_with_session(&agent, &ws, AgentStatus::RuntimeIdle).await;
+            let (mgr, db_dir) =
+                manager_with_session_fake_runtime(&agent, &ws, AgentStatus::RuntimeIdle).await;
             let row: intent_core::ScriptMonitor = serde_json::from_value(json!({
                 "monitorId":"recover", "workspaceId":ws, "agentId":agent,
                 "scriptId":"script", "runId":"run", "scriptName":"Script", "mode":"command",
@@ -23522,7 +23578,9 @@ mod agent_retry_tests {
                 assert!(store.admit_script_notification(&durable).await.unwrap());
             }
             let bus = EventBus::new(store.clone());
-            let services = Services::new(store.clone()).with_event_bus(bus.clone());
+            let services = crate::test_support::fake_runtime::FakeRuntime::install(
+                Services::new(store.clone()).with_event_bus(bus.clone()),
+            );
             let mgr = Arc::new(AgentManager::new(
                 services,
                 Arc::new(BusEventSink::new(bus)),
@@ -23602,7 +23660,8 @@ mod agent_retry_tests {
             for exporting in [false, true] {
                 let agent = AgentId::from("monitor-raced-owner");
                 let ws = WorkspaceId::from("monitor-raced-workspace");
-                let (mgr, _db) = manager_with_session(&agent, &ws, AgentStatus::RuntimeIdle).await;
+                let (mgr, _db) =
+                    manager_with_session_fake_runtime(&agent, &ws, AgentStatus::RuntimeIdle).await;
                 let (head, _) = mgr.services.enqueue_message(
                 &agent, "monitor head".into(), None, None,
                 Some(json!({"type":"script_monitor_wake","monitorId":"raced-monitor","workspaceId":ws})),

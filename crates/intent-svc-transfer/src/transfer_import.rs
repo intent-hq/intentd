@@ -603,22 +603,24 @@ impl TransferImportExt for Services {
         // Boot hydration may have cached the reclaimed orphan definitions.
         // Refresh only imported IDs, after commit so a failed import leaves
         // both the durable rows and their live definitions untouched.
-        // Resolve imported monitor deadlines/results before compact run recovery
-        // manufactures an interruption. No source process is resumed here.
-        if let Err(error) = self.script_manager().recover_monitors().await {
-            tracing::warn!(%error, "post-import script monitor recovery failed");
-        }
-        self.start_script_monitor_maintenance();
-        if let Some((_, scripts)) = outcome.rows.iter().find(|(table, _)| table == "script") {
-            let manager = self.script_manager();
-            for script in scripts {
-                if let Some(id) = script.get("id").and_then(serde_json::Value::as_str) {
-                    if let Err(error) = manager.refresh_imported(&workspace_id, id).await {
-                        tracing::warn!(script = %id, %error, "post-import script refresh failed");
-                    }
-                }
-            }
-        }
+        // The runtime feature resolves imported monitor deadlines/results
+        // before compact run recovery manufactures an interruption. No source
+        // process is resumed here.
+        let imported_script_ids: Vec<String> = outcome
+            .rows
+            .iter()
+            .find(|(table, _)| table == "script")
+            .map(|(_, scripts)| {
+                scripts
+                    .iter()
+                    .filter_map(|script| script.get("id").and_then(serde_json::Value::as_str))
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.feature_runtime()
+            .recover_imported_scripts(self, &workspace_id, &imported_script_ids)
+            .await;
         self.place_imported_assets(&workspace_id, &extracted_dir.join("assets"))
             .await;
 
@@ -848,10 +850,14 @@ impl TransferImportExt for Services {
                 tracing::warn!(error = %e, "post-import event subscription rehydration failed");
                 0
             });
-        let hooks = self.rehydrate_hooks().await.unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "post-import hook rehydration failed");
-            0
-        });
+        let hooks = self
+            .feature_runtime()
+            .rehydrate_hooks(self)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "post-import hook rehydration failed");
+                0
+            });
         let pr_monitors = self.rehydrate_pr_monitors().await.unwrap_or_else(|e| {
             tracing::warn!(error = %e, "post-import PR monitor rehydration failed");
             0
@@ -1380,7 +1386,8 @@ const IN_FLIGHT_STATUSES: &[&str] = &["active", "Processing", "Waiting"];
 /// - **draft**: dropped — drafts FK onto `client`, which never transfers.
 /// - **`workspace_discussion_message`**: keep the immutable author snapshot;
 ///   clear the private retry principal so a destination identity collision
-///   cannot consume an imported message as a new send's retry.
+///   cannot consume an imported message as a new send's retry. Clear selected
+///   principal notification identities while retaining historical body text.
 /// - **`interrupted_agent`**: exported pending rows are kept; synthesized rows
 ///   for newly-interrupted agents are added unless the agent already has one.
 fn transform_rows(
@@ -1410,6 +1417,13 @@ fn transform_rows(
                         .is_some_and(|payload| has_discussion_reference(&payload))
                 });
             }
+            "workspace_discussion_conversation" => {
+                for object in &mut objects {
+                    let map = expect_object(&table, object)?;
+                    map.insert("first_principal_id".into(), serde_json::Value::Null);
+                    map.insert("first_client_message_id".into(), serde_json::Value::Null);
+                }
+            }
             "workspace_discussion_message" | "discussion_participant" | "discussion_reaction" => {
                 for object in &mut objects {
                     let map = expect_object(&table, object)?;
@@ -1419,6 +1433,7 @@ fn transform_rows(
                     }
                     if table == "workspace_discussion_message" {
                         map.insert("agent_activity_json".into(), serde_json::json!("[]"));
+                        map.insert("principal_mentions_json".into(), serde_json::json!("[]"));
                     }
                 }
             }
@@ -1833,6 +1848,21 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn discussion_import_clears_principal_mentions_before_store_insertion() {
+        let mentions =
+            serde_json::json!([{"principalId":"collision","name":"Bob","start":0,"end":4}]);
+        let transformed = transform_rows(vec![("workspace_discussion_message".into(), vec![serde_json::json!({"body":"@Bob","principal_mentions_json":mentions.to_string()})])], &ws(), &root(), "now").unwrap();
+        let message = &transformed
+            .rows
+            .iter()
+            .find(|(name, _)| name == "workspace_discussion_message")
+            .unwrap()
+            .1[0];
+        assert_eq!(message["principal_mentions_json"], "[]");
+        assert_eq!(message["body"], "@Bob");
     }
 
     #[tokio::test]

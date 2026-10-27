@@ -113,11 +113,13 @@ pub use model::LAST_SEEN_MESSAGE_ID_KEY;
 pub use model::MAX_DELEGATION_DEPTH;
 pub use model::PENDING_PROPOSALS_KEY;
 pub use model::PENDING_QUESTIONS_MESSAGE_ID_KEY;
+pub use model::PENDING_WORKSPACE_PURGE_NOTICE_KEY;
 pub use model::PROPOSAL_OUTCOME_APPLIED;
 pub use model::PROPOSAL_OUTCOME_DISMISSED;
 pub use model::PROPOSAL_RESOLUTIONS_KEY;
 pub use model::REPOSITORY_GUIDANCE_HARNESS_VERSIONS;
 pub use model::REPOSITORY_MONITOR_GUIDANCE_HARNESS_VERSIONS;
+pub use model::WORKSPACE_PURGED_STATUS_MESSAGE;
 pub use model::WORKSPACE_STATUS_MESSAGE_MAX_LENGTH;
 pub use model::{
     cap_json_value, fit_agent_list_frame, format_key_bytes_table, last_tool_use_preview,
@@ -208,8 +210,9 @@ pub use settings_file::{
 pub use tilde::{expand_tilde, expand_tilde_string, expand_tilde_with};
 pub use traits::{
     AgentReverseDispatch, BoxFuture, ContextEngine, ContextError, EngineAvailability, PublishEvent,
-    ResolvedClient, RetrieveRequest, RetrieveResult, RetrievedItem, ReverseDispatchError,
-    ReverseLiveClient, ReverseTarget, WorkspaceApi,
+    ResolvedClient, RetrieveRequest, RetrieveResult, RetrievedItem, ReverseClientConnections,
+    ReverseConnectionInfo, ReverseConnectionSnapshot, ReverseDispatchError, ReverseLiveClient,
+    ReverseRoute, ReverseTarget, WorkspaceApi,
 };
 pub use turn_attachments::{
     is_workspace_api_input, new_attachment_id, AttachmentPolicy, TurnAttachment,

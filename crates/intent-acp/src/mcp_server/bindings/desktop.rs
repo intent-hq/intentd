@@ -4,7 +4,7 @@ use serde_json::Value;
 use std::sync::Arc;
 pub(crate) const PRELUDE: &str = r"
     globalThis.ws = globalThis.ws || {};
-    ws.desktop = Object.fromEntries(['startControl','endControl','listDisplay','screenshot','move','click','type','keypress','scroll','drag'].map(method => [method, (...args) => {
+    ws.desktop = Object.fromEntries(['startControl','endControl','listDisplay','screenshot','move','click','type','keypress','scroll','drag','focusWindow'].map(method => [method, (...args) => {
         if (args.length > 1) throw new Error('Desktop methods accept at most one argument');
         return host({method: 'desktop.' + method, args: args.length ? args[0] : {}});
     }]));
@@ -26,6 +26,7 @@ pub(crate) async fn dispatch(
         "keypress" => "keypress",
         "scroll" => "scroll",
         "drag" => "drag",
+        "focusWindow" => "focusWindow",
         other => return Err(format!("Unknown desktop method: {other}")),
     };
     intent_core::desktop::validate_action(method, args).map_err(|e| e.to_string())?;
@@ -45,6 +46,7 @@ mod tests {
             assert!(enabled.contains("'startControl'"));
             assert!(enabled.contains("'listDisplay'"));
             assert!(enabled.contains("'move'"));
+            assert!(enabled.contains("'focusWindow'"));
             let disabled = super::super::prelude_for_bridge(
                 &AgentFeaturesSettings {
                     desktop_control: false,
@@ -55,6 +57,7 @@ mod tests {
             assert!(!disabled.contains("'startControl'"));
             assert!(!disabled.contains("'listDisplay'"));
             assert!(!disabled.contains("'move'"));
+            assert!(!disabled.contains("'focusWindow'"));
             assert!(!disabled.contains("ws.desktop ="));
         }
     }

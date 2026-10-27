@@ -54,10 +54,15 @@ env:
   LINUX_BIGMEM_BURST_THRESHOLD: ${{ vars.CI_LINUX_BIGMEM_SLOTS || '0' }}
 
 # The heavy jobs share two self-hosted Linux slots, so cancel
-# superseded PR runs instead of letting them back up the queue (push-to-main
-# runs are never cancelled).
+# superseded PR runs instead of letting them back up the queue. Each main push
+# run gets a group of its own and concurrency never cancels it: GitHub admits
+# a group's runs in no guaranteed order, so a shared cancelling group could
+# let an older commit's late run cancel the tip's, and a shared queueing group
+# makes the tip wait behind an older run. The `supersede` job retires older
+# push runs by commit ancestry instead. Merge-queue refs are unique per entry
+# and never cancelled here (retire-obsolete-merge-runs.yml retires them).
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}${{ github.event_name == 'push' && format('-{0}', github.run_id) || '' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -91,18 +96,24 @@ jobs:
           XL_THRESHOLD: ${{ env.LINUX_XL_BURST_THRESHOLD }}
           BIGMEM_THRESHOLD: ${{ env.LINUX_BIGMEM_BURST_THRESHOLD }}
           # Pooled jobs that start together once routing finishes; each reads
-          # outputs.slots[key] (see runner-route.yml for the fields). check
-          # and coverage-changed list pull_request only: the merge queue keeps
-          # them on their burst runner, WarpBuild (see the `heavy` step below).
+          # outputs.slots[key] (see runner-route.yml for the fields).
+          # coverage-changed lists pull_request only: the merge queue keeps it
+          # on its burst runner, WarpBuild (on an 8-CPU slot its p90 of 38 min
+          # would outlast coverage-all, which sets the queue's pace).
           # coverage-all, coverage-e2e and the Linux daemon-lifecycle leg run
           # only in the queue and take a free xl or bigmem slot there (longest
           # first, so coverage-all gets the xl slot), or burst to WarpBuild.
           # check asks for gh-linux-16x (WarpBuild measured it at p90 97% of 8
           # CPUs and 19.7 GB), so it takes an xl slot when one is left after
           # coverage-changed, else a bigmem heavy slot (30 GB or more; one of its
-          # rustc processes passed 12 GB), else a 16x burst. Its minutes
-          # stay below coverage-changed's so coverage-changed (15.5 min on xl,
-          # ~33 on heavy) always picks first within a run. Two corners: with
+          # rustc processes passed 12 GB), else a 16x burst. It does the same
+          # in the queue, where it ranks after coverage-all and coverage-e2e:
+          # on a bigmem slot it slows down least (queue check on WarpBuild 16x
+          # p50 15 / p90 18 min; PR timings put it at roughly p50 16 / p90 22
+          # there, against coverage-all's p50 20 / p90 23 on xl), while
+          # coverage-e2e would grow from p90 9 to 23 min. Its minutes
+          # (10, its xl time) stay below coverage-changed's (15.5 min on xl,
+          # ~33 on heavy), so coverage-changed always picks first within a PR run. Two corners: with
           # no xl slot and one bigmem slot free, coverage-changed takes the
           # bigmem slot and check bursts; and the ranking is per run, so a
           # concurrent PR's check can take the last xl slot before this run's
@@ -111,7 +122,7 @@ jobs:
           # (release branches only) and the gate keep the `runners` mapping.
           SLOT_JOBS: >-
             [
-            {"key":"check","label":"gh-linux-16x","rust":true,"minutes":12,"events":["pull_request"]},
+            {"key":"check","label":"gh-linux-16x","rust":true,"minutes":10,"events":["pull_request","merge_group"]},
             {"key":"coverage-changed","label":"gh-linux-16x","rust":true,"minutes":13,"events":["pull_request"]},
             {"key":"release-scripts","label":"ubuntu-24.04","minutes":6},
             {"key":"pr-static","label":"ubuntu-24.04","minutes":1,"events":["pull_request"]},
@@ -156,7 +167,7 @@ jobs:
             const free = ['ubuntu-22.04', 'ubuntu-24.04', 'ubuntu-latest', 'ubuntu-24.04-arm', 'windows-2022', 'windows-2025'];
             // The paid sizes jobs ask for and the WarpBuild runner each bursts to.
             // GitHub's larger runners are off, so a paid size never runs on GitHub
-            // (same cores except Macs, which get 12 because every Mac job is CPU-bound;
+            // (same cores; Macs stay on 6, as 12 cost twice as much for at most 1.25x;
             // Windows stays on Server 2022, macOS 15 keeps signed builds off macOS 26).
             const warp = {
               'gh-linux-8x': 'warp-ubuntu-2404-x64-8x',
@@ -164,8 +175,8 @@ jobs:
               'gh-linux-arm64-8x': 'warp-ubuntu-2404-arm64-8x',
               'gh-windows-8x': 'warp-windows-2022-x64-8x',
               'gh-windows-16x': 'warp-windows-2022-x64-16x',
-              'macos-26-xlarge': 'warp-macos-26-arm64-12x',
-              'macos-15-xlarge': 'warp-macos-15-arm64-12x',
+              'macos-26-xlarge': 'warp-macos-26-arm64-6x',
+              'macos-15-xlarge': 'warp-macos-15-arm64-6x',
             };
             // Fork pull requests never spend WarpBuild minutes: a paid size runs on
             // the free standard runner of its OS instead.
@@ -331,9 +342,9 @@ jobs:
             core.setOutput('windows_labels', JSON.stringify(mapping['gh-windows-16x']));
             core.setOutput('macos_labels', JSON.stringify(mapping['macos-26-xlarge']));
             for (const key of ['windows', 'macos']) core.setOutput(`${key}_burst`, String(burst[key]));
-      # check and coverage-changed (through `slots`, which list pull_request
-      # only) take their burst runner (WarpBuild) in the merge queue.
-      # coverage-all, coverage-e2e and the Linux daemon-lifecycle leg read
+      # coverage-changed (through `slots`, which lists it for pull_request
+      # only) takes its burst runner (WarpBuild) in the merge queue.
+      # check, coverage-all, coverage-e2e and the Linux daemon-lifecycle leg read
       # their own merge_group `slots` entries, so only as many take a slot as
       # are free and the rest burst to WarpBuild (the slot hosts raise
       # fs.inotify.max_user_instances to 32768 for their parallel daemons).
@@ -464,8 +475,11 @@ jobs:
     runs-on: ${{ fromJSON(needs.route.outputs.slots || '{}')['check'] || fromJSON('["warp-ubuntu-2404-x64-16x"]') }}
     # The cold-cache check job exhausted its 20-minute budget after its tests
     # passed in run 37305697722. Allow completion/cache margin without changing
-    # individual test timeouts.
-    timeout-minutes: 25
+    # individual test timeouts. In the merge queue it may now run on an 8-CPU
+    # bigmem slot (PR p90 19 min there, plus the queue-only GitLab feature
+    # build), so it gets the slot budget, still under the queue's 60-minute
+    # check response timeout (coverage-all 55, coverage-e2e 45).
+    timeout-minutes: 40
     env:
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
@@ -823,30 +837,108 @@ jobs:
   # empty so the retained native step guards never bypass queue validation
   # or main release builds. CI Gate is the only required context; the old
   # per-matrix required-context constraint (intentd#868) no longer applies.
+  # Superseded main pushes (push to main only). auto-cut-alpha.yml reads only
+  # the push run on main's live tip, so per-commit Windows proofs cover only
+  # commits that reach the tip (each tip's tree contains every superseded
+  # commit). scripts/supersede-push-runs.py reads main's live tip first and
+  # cancels only live push runs whose commit is strictly behind that tip, so
+  # the tip's run is never cancelled (even by an old re-run or after a reset).
+  # It reports superseded=true when the tip is already strictly ahead of this
+  # commit (an older run admitted late), which skips this run's Windows
+  # post-merge job; any API error reports false so Windows runs. Hosted and independent of `route` so it starts at
+  # once; advisory in CI Gate.
+  supersede:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
+      contents: read
+    outputs:
+      superseded: ${{ steps.scan.outputs.superseded }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Retire superseded main-push runs
+        id: scan
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I -B scripts/supersede-push-runs.py --repo "$GITHUB_REPOSITORY" --sha "$GITHUB_SHA" --run-id "$GITHUB_RUN_ID" >> "$GITHUB_OUTPUT"
+
+  # Cancels a merge-queue run as soon as any job fails. The queue builds one
+  # entry at a time and CI Gate rejects any failure, so the first failed job
+  # already dooms the entry; without this the queue (and paid macOS/Linux
+  # runners) waited a median 16 min for the slowest job before ejecting it.
+  # CI Gate (`always()`) still runs on the cancelled run and fails, so the
+  # queue ejects the entry as before, only sooner. Advisory: hosted and free,
+  # no `needs` so it starts at once, never in CI Gate's `needs`, and the
+  # script exits 0 on every outcome. Only this job and `supersede` hold
+  # actions: write; it checks out just its script and runs no build code.
+  fail-fast:
+    name: Merge queue fail-fast
+    if: github.event_name == 'merge_group'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts/merge-queue-fail-fast.py
+          sparse-checkout-cone-mode: false
+      - name: Cancel this run on the first failed job
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I -B scripts/merge-queue-fail-fast.py --repo "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT"
+
   release-fast-path:
     needs: [route]
     runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
-    # Same-repo release-plz PRs only (fork PRs get no CI — see the
-    # `pull_request` trigger comment). Ordinary PRs skip it at once, so the
-    # `check` / `coverage-changed` dependency costs them no queue time.
-    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'release-plz-')
+    # Same-repo release-plz PRs (fork PRs get no CI — see the `pull_request`
+    # trigger comment) and every main push. Ordinary PRs skip it at once, so
+    # the `check` / `coverage-changed` dependency costs them no queue time.
+    # A main push compares against the previous tip (`github.event.before`):
+    # a release-metadata push (`chore: release vX.Y.Z`) is a tree auto-cut
+    # just required green plus release metadata, so it skips the Windows
+    # post-merge job (`release_push`). Each event gets only its own output,
+    # so a push never trips the `fast_path` guards on the `build` steps and
+    # the macOS release build still runs.
+    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && startsWith(github.head_ref, 'release-plz-'))
     timeout-minutes: 5
     outputs:
-      fast_path: ${{ steps.decide.outputs.fast_path }}
+      fast_path: ${{ github.event_name == 'pull_request' && steps.decide.outputs.fast_path || '' }}
+      release_push: ${{ github.event_name == 'push' && steps.decide.outputs.fast_path || '' }}
     steps:
       - uses: actions/checkout@v7
-      - name: Fetch PR base commit
-        run: git fetch --no-tags --depth=1 origin ${{ github.event.pull_request.base.sha }}
+      # A push needs this commit's parent (`--exact-parent` below); a PR
+      # needs its base commit.
+      - name: Fetch base commit
+        env:
+          BASE_SHA: ${{ github.event_name == 'push' && github.event.before || github.event.pull_request.base.sha }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT" = push ]; then
+            git fetch --no-tags --depth=2 origin "$GITHUB_SHA"
+          else
+            git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          fi
       - name: Evaluate diff shape
         id: decide
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_SHA: ${{ github.event_name == 'push' && github.event.before || github.event.pull_request.base.sha }}
+          EVENT: ${{ github.event_name }}
         run: |
           set -euo pipefail
           # Script contract: prints fast_path=true|false; non-zero exit means
           # no-match. Never fail this step — a broken checker must degrade to
-          # full CI, not block the PR.
-          out=$(./scripts/release-pr-fast-path.sh "$BASE_SHA" HEAD) || {
+          # full CI, not block the PR. A push must be a single commit directly
+          # on the previous tip, so a force push cannot borrow a merge-base diff.
+          mode=()
+          if [ "$EVENT" = push ]; then mode=(--exact-parent); fi
+          out=$(./scripts/release-pr-fast-path.sh ${mode[@]+"${mode[@]}"} "$BASE_SHA" HEAD) || {
             echo "release-pr-fast-path.sh exited non-zero — falling back to full CI"
             out="fast_path=false"
           }
@@ -861,14 +953,18 @@ jobs:
     # `windows` job below. The explicit event allowlist prevents matrix
     # expansion for all PRs, including forks and release-shaped PRs.
     # `!cancelled()` permits skipped release-fast-path and failed route
-    # dependencies: release metadata is PR-only, and the native runner has a
+    # dependencies: the PR `fast_path` output is empty on push and
+    # merge_group (a release push reports only `release_push`, which these
+    # steps ignore, so the macOS release build still runs), and the native runner has a
     # hosted fallback when routing fails. CI Gate still rejects skipped Linux
     # validation on merge_group after a route failure.
     # `route` places the native entry and runs on every event this job runs
     # on. route runs on ubuntu-24.04, so this dependency can never queue
     # behind the self-hosted runners it decides about.
-    needs: [release-fast-path, route]
-    if: ${{ !cancelled() && (github.event_name == 'merge_group' || github.event_name == 'push') }}
+    # On push it is skipped when `supersede` reports this commit superseded
+    # (only the tip's proof is read); CI Gate accepts that skip only then.
+    needs: [release-fast-path, route, supersede]
+    if: ${{ !cancelled() && (github.event_name == 'merge_group' || (github.event_name == 'push' && needs.supersede.outputs.superseded != 'true')) }}
     strategy:
       # Don't let one platform's failure cancel the other's required check.
       fail-fast: false
@@ -881,7 +977,7 @@ jobs:
           # use the latest hosted ARM64 image. Empty route output also falls back to
           # hosted. Keep the check name independent of the runner.
           - target: aarch64-apple-darwin
-            os: ${{ fromJSON(needs.route.outputs.macos_labels || '["warp-macos-26-arm64-12x"]') }}
+            os: ${{ fromJSON(needs.route.outputs.macos_labels || '["warp-macos-26-arm64-6x"]') }}
             name: build (aarch64-apple-darwin)
     # Explicit per-entry names keep check history stable across runner changes.
     name: ${{ matrix.name }}
@@ -963,9 +1059,9 @@ jobs:
       # scripts (libz-sys and friends try-compile C for the target even when
       # pkg-config resolves a system lib), which would require a full
       # darwin / MSVC cross C toolchain on Linux; the native runners need
-      # nothing extra and share this job's warm target dir. release-fast-path
-      # is pull_request-only, so its output is empty on merge_group and the
-      # `!= 'true'` guard lets the step run there.
+      # nothing extra and share this job's warm target dir. release-fast-path's
+      # `fast_path` output is pull_request-only, so it is empty on merge_group
+      # and the `!= 'true'` guard lets the step run there.
       - name: Clippy (target-gated code)
         if: needs.release-fast-path.outputs.fast_path != 'true' && github.event_name == 'merge_group'
         run: cargo clippy --workspace --all-targets --target ${{ matrix.target }} -- -D warnings
@@ -1146,10 +1242,15 @@ jobs:
   # them (the queue runs only `windows-lint` above). A Windows-only runtime
   # failure therefore lands on main; the push CI Gate goes red and
   # auto-cut-alpha.yml refuses to cut an alpha until a fix (or a re-run)
-  # turns it green. Routed like `windows-lint`.
+  # turns it green. Routed like `windows-lint`. It is skipped when this
+  # commit is already superseded (`supersede` reported superseded=true; a
+  # newer push's scan cancels it if it is still running) or is a
+  # release-metadata push (release-fast-path reported release_push=true). CI
+  # Gate accepts the skip only then; a failed or skipped classifier or scan
+  # reports nothing, so the job still runs.
   windows:
-    needs: [route]
-    if: ${{ !cancelled() && github.event_name == 'push' }}
+    needs: [route, release-fast-path, supersede]
+    if: ${{ !cancelled() && github.event_name == 'push' && needs.release-fast-path.outputs.release_push != 'true' && needs.supersede.outputs.superseded != 'true' }}
     strategy:
       matrix:
         include:
@@ -1262,7 +1363,7 @@ jobs:
       matrix:
         include:
           - target: aarch64-apple-darwin
-            os: ${{ fromJSON(needs.route.outputs.macos_labels || '["warp-macos-26-arm64-12x"]') }}
+            os: ${{ fromJSON(needs.route.outputs.macos_labels || '["warp-macos-26-arm64-6x"]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     env:
@@ -1385,7 +1486,7 @@ jobs:
     # would skip it on fork PRs anyway, where route itself is skipped).
     # Nothing here may reference github.event.pull_request — that
     # context does not exist on merge_group. release-fast-path is no longer a
-    # dependency: it is pull_request-only, so its output is empty on
+    # dependency: its `fast_path` output is pull_request-only, so it is empty on
     # merge_group and must not be required; the fast-path skip it used to
     # provide is subsumed by the pull_request skip. Merge groups come from
     # the repo's own ruleset, so no same-repo fork guard applies.
@@ -2150,6 +2251,8 @@ jobs:
           python3 -B scripts/test-release-rust-cache.py
           python3 -I -B scripts/test-optional-intel-release.py
           python3 -B scripts/test-release-host-network.py
+          python3 -B scripts/test-release-plz-network.py
+          python3 -I -B scripts/test-release-plz-rerun.py
           python3 -B scripts/test-setup-sccache.py
           python3 -I -B scripts/test-coverage-storage.py
           python3 -B scripts/test-hosted-runners.py
@@ -2181,7 +2284,10 @@ jobs:
           python3 -I -B scripts/test-retire-obsolete-merge-runs-caller.py
           python3 -I -B scripts/test-retire-obsolete-merge-runs-workflow.py
       - name: Test native CI routing and gate results
-        run: python3 -I -B scripts/test-ci-native-routing.py
+        run: |
+          python3 -I -B scripts/test-ci-native-routing.py
+          python3 -I -B scripts/test-supersede-push-runs.py
+          python3 -I -B scripts/test-merge-queue-fail-fast.py
       - name: Install release cache regression compiler
         shell: bash
         run: |
@@ -2209,6 +2315,8 @@ jobs:
         run: |
           python3 -I -B scripts/test-macos-ci-cleanup.py
           python3 -I -B scripts/test-macos-ci-workflows.py
+      - name: Test the Bash 3.2 cache fill workflow
+        run: python3 -I -B scripts/test-bash3-cache-workflow.py
       - name: Test changed-tests.sh
         run: python3 -S scripts/test-changed-tests-stdin.py
       # A renamed or deleted test module or source file would otherwise leave
@@ -2404,7 +2512,7 @@ jobs:
           - platform: linux
             os: ${{ fromJSON(needs.route.outputs.slots || '{}')['daemon-lifecycle-linux'] || fromJSON('["warp-ubuntu-2404-x64-16x"]') }}
           - platform: macos
-            os: ${{ fromJSON(needs.route.outputs.macos_labels || '["warp-macos-26-arm64-12x"]') }}
+            os: ${{ fromJSON(needs.route.outputs.macos_labels || '["warp-macos-26-arm64-6x"]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     env:
@@ -2455,7 +2563,7 @@ jobs:
     name: CI Gate
     if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
-    needs: [route, pr-static, release-fast-path, cache-smoke, daemon-lifecycle, check, windows-cross-lint, build, windows-lint, windows, macos-services-runtime, coverage-e2e, coverage-all, coverage-changed, pr-title, conflict-markers, monorepo-consumer-checks, deb-packaging, release-scripts, install-ps1, pi-session-paths]
+    needs: [route, pr-static, release-fast-path, supersede, cache-smoke, daemon-lifecycle, check, windows-cross-lint, build, windows-lint, windows, macos-services-runtime, coverage-e2e, coverage-all, coverage-changed, pr-title, conflict-markers, monorepo-consumer-checks, deb-packaging, release-scripts, install-ps1, pi-session-paths]
     steps:
       - name: Check results
         run: |
@@ -2521,15 +2629,27 @@ jobs:
               require pi-session-paths "${{ needs.pi-session-paths.result }}"
               ;;
             push)
+              # Release-metadata and superseded pushes skip the Windows
+              # post-merge job; the skip is accepted only when the reporting
+              # job succeeded (see `release-fast-path` and `supersede`).
+              windows=require
+              if [ "${{ needs.release-fast-path.result }}" = success ] && [ "${{ needs.release-fast-path.outputs.release_push }}" = true ]; then
+                windows=optional
+              fi
+              build=require
+              if [ "${{ needs.supersede.result }}" = success ] && [ "${{ needs.supersede.outputs.superseded }}" = true ]; then
+                windows=optional
+                build=optional
+              fi
               require route "${{ needs.route.result }}"
               optional pr-static "${{ needs.pr-static.result }}"
               optional cache-smoke "${{ needs.cache-smoke.result }}"
               optional daemon-lifecycle "${{ needs.daemon-lifecycle.result }}"
               optional check "${{ needs.check.result }}"
               optional windows-cross-lint "${{ needs.windows-cross-lint.result }}"
-              require build "${{ needs.build.result }}"
+              "$build" build "${{ needs.build.result }}"
               optional windows-lint "${{ needs.windows-lint.result }}"
-              require windows "${{ needs.windows.result }}"
+              "$windows" windows "${{ needs.windows.result }}"
               optional macos-services-runtime "${{ needs.macos-services-runtime.result }}"
               optional coverage-e2e "${{ needs.coverage-e2e.result }}"
               optional coverage-all "${{ needs.coverage-all.result }}"

@@ -56,6 +56,7 @@ pub(crate) mod v2_9;
 pub(crate) mod v3_1;
 pub(crate) mod v3_3;
 pub(crate) mod v3_4;
+pub(crate) mod v3_5;
 
 // Context rendering is admitted separately from the versioned text bundle.
 #[cfg_attr(not(test), expect(dead_code))]
@@ -559,6 +560,7 @@ static REGISTRY: &[&HarnessEntry] = &[
     &V3_2_ENTRY,
     &v3_3::ENTRY,
     &v3_4::ENTRY,
+    &v3_5::ENTRY,
 ];
 
 /// The registry row for [`LATEST_VERSION`]. A unit test pins that the row
@@ -575,6 +577,105 @@ pub(crate) fn latest_entry() -> &'static HarnessEntry {
 /// session's stamp (turn envelope, wakes) use this.
 pub(crate) fn latest() -> &'static dyn Harness {
     latest_entry().harness
+}
+
+/// The hook wake and notice framing of the latest harness, for the runtime
+/// feature crate. It forwards to [`Harness`] without making the trait (and
+/// the agent-side types its other methods name) public; each method is
+/// documented on the trait method of the same name.
+#[derive(Clone, Copy)]
+pub struct HookFraming(&'static dyn Harness);
+
+/// The hook framing of [`latest`].
+#[must_use]
+pub fn latest_hook_framing() -> HookFraming {
+    HookFraming(latest())
+}
+
+impl HookFraming {
+    #[must_use]
+    pub fn hook_wake_logs_section(&self, message: &str, logs: Option<&str>) -> String {
+        self.0.hook_wake_logs_section(message, logs)
+    }
+
+    #[must_use]
+    pub fn hook_state_dropped_warning(&self, state_bytes: usize, cap_bytes: usize) -> String {
+        self.0.hook_state_dropped_warning(state_bytes, cap_bytes)
+    }
+
+    #[must_use]
+    pub fn hook_wake_message_truncated_marker(
+        &self,
+        omitted_chars: usize,
+        total_chars: usize,
+        cap_chars: usize,
+    ) -> String {
+        self.0
+            .hook_wake_message_truncated_marker(omitted_chars, total_chars, cap_chars)
+    }
+
+    #[must_use]
+    pub fn hook_exec_failures_warning(&self, lines: &[&str], total: usize) -> String {
+        self.0.hook_exec_failures_warning(lines, total)
+    }
+
+    #[must_use]
+    pub fn hook_wake_framing(
+        &self,
+        hook_name: &str,
+        message: &str,
+        state_note: Option<&str>,
+    ) -> String {
+        self.0.hook_wake_framing(hook_name, message, state_note)
+    }
+
+    #[must_use]
+    pub fn hook_dispatch_active_note(&self, expires_at: Option<&str>) -> String {
+        self.0.hook_dispatch_active_note(expires_at)
+    }
+
+    #[must_use]
+    pub fn hook_dispatch_retired_note(&self, hook_id: &str) -> String {
+        self.0.hook_dispatch_retired_note(hook_id)
+    }
+
+    #[must_use]
+    pub fn hook_evicted_state_note(&self, hook_id: &str) -> String {
+        self.0.hook_evicted_state_note(hook_id)
+    }
+
+    #[must_use]
+    pub fn hook_evicted_failed_run_notice(&self, hook_name: &str, error: &str) -> String {
+        self.0.hook_evicted_failed_run_notice(hook_name, error)
+    }
+
+    #[must_use]
+    pub fn hook_evicted_internal_error_notice(&self, hook_name: &str, error: &str) -> String {
+        self.0.hook_evicted_internal_error_notice(hook_name, error)
+    }
+
+    #[must_use]
+    pub fn hook_expired_notice(
+        &self,
+        hook_name: &str,
+        hook_id: &str,
+        perpetual: bool,
+        run_count: i64,
+        dispatch_count: i64,
+    ) -> String {
+        self.0
+            .hook_expired_notice(hook_name, hook_id, perpetual, run_count, dispatch_count)
+    }
+
+    #[must_use]
+    pub fn hook_run_at_fired_notice(&self, hook_name: &str, hook_id: &str, run_at: &str) -> String {
+        self.0.hook_run_at_fired_notice(hook_name, hook_id, run_at)
+    }
+
+    #[must_use]
+    pub fn hook_cancelled_from_app_notice(&self) -> String {
+        self.0.hook_cancelled_from_app_notice()
+    }
 }
 
 /// Resolve a session's stamped `harnessVersion` to its registry row. Unknown
@@ -620,23 +721,6 @@ mod tests {
             intent_core::CURRENT_HARNESS_VERSION,
             "the current version is the newest registry row"
         );
-        let released = resolve_entry("3.3");
-        assert_eq!(released.version, "3.3");
-        assert!(std::ptr::eq(
-            released.doctrine.instructions,
-            std::ptr::addr_of!(crate::instructions::V3_3)
-        ));
-        assert!(std::ptr::eq(
-            entry.doctrine.instructions,
-            std::ptr::addr_of!(crate::instructions::V3_4)
-        ));
-        assert!(entry.doctrine.instructions.single_workspace_fallback);
-        assert_eq!(
-            entry.doctrine.instructions.workspace,
-            released.doctrine.instructions.workspace
-        );
-        assert_eq!(data_ptr(entry.harness), data_ptr(released.harness));
-        assert_eq!(entry.doctrine.specialists, released.doctrine.specialists);
         let repository_guidance = resolve_entry("3.0");
         let previous = resolve_entry("2.10");
         assert_eq!(previous.version, "2.10");

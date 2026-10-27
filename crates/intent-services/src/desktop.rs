@@ -19,14 +19,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 #[derive(Default)]
-pub(crate) struct Runtime {
+pub struct Runtime {
     live: Mutex<HashMap<AgentId, Live>>,
     candidates: Mutex<HashMap<String, Vec<Binding>>>,
     original_candidates: Mutex<HashMap<String, Vec<Binding>>>,
     assignment_generations: Mutex<HashMap<WorkspaceId, String>>,
     revoked: Mutex<std::collections::HashSet<String>>,
     outbox_gate: tokio::sync::Mutex<()>,
-    pub(crate) changed: tokio::sync::Notify,
+    pub changed: tokio::sync::Notify,
     watchers: Mutex<HashMap<AgentId, String>>,
     gates: Mutex<HashMap<AgentId, Arc<tokio::sync::Mutex<()>>>>,
     #[cfg(test)]
@@ -138,14 +138,22 @@ impl Runtime {
             .or_insert_with(id)
             .clone()
     }
-    pub(crate) fn assignment_changed(&self, workspace: &WorkspaceId) {
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub fn assignment_changed(&self, workspace: &WorkspaceId) {
         self.assignment_generations
             .lock()
             .expect("desktop assignment generations")
             .insert(workspace.clone(), id());
         self.changed.notify_waiters();
     }
-    pub(crate) fn active_client(&self, workspace: &WorkspaceId) -> Option<intent_core::ClientId> {
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub fn active_client(&self, workspace: &WorkspaceId) -> Option<intent_core::ClientId> {
         self.live
             .lock()
             .expect("desktop state")
@@ -314,6 +322,60 @@ impl Binding {
         json!({"operation":operation,"workspaceId":self.workspace_id,"agentId":self.agent_id,"principalId":self.connection.principal_id,"connectionEpoch":self.connection.connection_epoch,"computerId":self.computer_id})
     }
 }
+/// Browser driving-client resolution: core state (the workspace pin, the
+/// desktop presence and the claimed tabs) that desktop control and the
+/// runtime feature's browser routing both read.
+impl Services {
+    /// The [`ReverseTarget`] every agent `browser.exec` (and every routed
+    /// claimed-tab request) for `workspace_id` dispatches to — the
+    /// workspace's **driving client** (REV-2 Model 10): the explicit pin
+    /// (`Pinned`), else the client actively controlling this workspace's
+    /// desktop (`Client`), else the host of the workspace's existing claimed
+    /// tabs (`Client`), else the first-connected eligible client (`Default`).
+    /// Chief and workspaces the store does not know are unpinned.
+    #[doc(hidden)]
+    pub async fn driving_client_target(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> intent_core::Result<intent_core::ReverseTarget> {
+        Ok(self.driving_client_route(workspace_id).await?.0)
+    }
+
+    /// [`Self::driving_client_target`] plus which rule chose it:
+    /// `"workspace"` (the pin), `"desktop"` (active desktop control),
+    /// `"tabs"` (host of claimed tabs) or `"default"`.
+    pub(crate) async fn driving_client_route(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> intent_core::Result<(intent_core::ReverseTarget, &'static str)> {
+        use intent_core::{Error, ReverseTarget};
+
+        if workspace_id.is_chief() {
+            return Ok((ReverseTarget::Default, "default"));
+        }
+        match self.store().workspace_browser_client(workspace_id).await {
+            Ok(Some(client_id)) => return Ok((ReverseTarget::Pinned(client_id), "workspace")),
+            Ok(None) | Err(Error::NotFound(_)) => {}
+            Err(e) => return Err(e),
+        }
+        if let Some(client) = self.feature_desktop().active_client(workspace_id) {
+            return Ok((ReverseTarget::Client(client), "desktop"));
+        }
+        let claimed_host = self
+            .store()
+            .list_browser_tabs(workspace_id)
+            .await?
+            .into_iter()
+            .find(|tab| tab.owner_agent_id.is_some())
+            .map(|tab| tab.host_client_id);
+        Ok(
+            claimed_host.map_or((ReverseTarget::Default, "default"), |host| {
+                (ReverseTarget::Client(host), "tabs")
+            }),
+        )
+    }
+}
+
 impl Services {
     async fn desktop_validate_live(&self, live: &Live) -> DesktopResult<()> {
         if let Phase::Pending {
@@ -847,8 +909,14 @@ impl Services {
             }
         };
         if let Err(e) = result {
+            // A target mismatch reports exactly what ran (nothing, or the
+            // steps before focus moved), so the session survives it and the
+            // agent can focusWindow, re-screenshot and retry.
+            let known_target_mismatch = e.code == intent_core::desktop::TARGET_MISMATCH
+                && e.execution.as_deref() != Some("unknown");
             if e.code == "desktop-outcome-unknown"
-                || matches!(e.execution.as_deref(), Some("partial" | "unknown"))
+                || e.execution.as_deref() == Some("unknown")
+                || (e.execution.as_deref() == Some("partial") && !known_target_mismatch)
             {
                 self.desktop.remove(agent);
                 let services = self.clone();
@@ -1806,9 +1874,16 @@ fn validate_result(result: &Value, action: &Value, workspace: &WorkspaceId) -> D
             Err(invalid())
         };
     }
-    if result
-        .as_object()
-        .is_none_or(|o| o.len() != if screenshot { 3 } else { 2 })
+    // Screenshots carry window metadata (`windows`, optional `frontmost`);
+    // results from executors that predate it omit both.
+    let expected = if screenshot {
+        3 + usize::from(result.get("windows").is_some())
+            + usize::from(result.get("frontmost").is_some())
+    } else {
+        2
+    };
+    if result.as_object().is_none_or(|o| o.len() != expected)
+        || (result.get("frontmost").is_some() && result.get("windows").is_none())
         || string(result, "layoutId").is_err()
         || (screenshot
             && !result["capturedAt"].as_str().is_some_and(|s| {
@@ -1856,6 +1931,93 @@ fn validate_result(result: &Value, action: &Value, workspace: &WorkspaceId) -> D
                 return Err(invalid());
             }
         }
+    }
+    if screenshot && result.get("windows").is_some() {
+        validate_windows(result, &displays[0]).map_err(|()| invalid())?;
+    }
+    Ok(())
+}
+
+/// Check screenshot window metadata against the documented shape: frames in
+/// image pixels that intersect the captured display, unique IDs, and at most
+/// one focused window, which must be the frontmost application's.
+fn validate_windows(result: &Value, display: &Value) -> Result<(), ()> {
+    let text = |v: &Value, key: &str| v[key].as_str().is_some_and(|s| !s.is_empty());
+    let optional_text = |v: &Value, key: &str| v.get(key).is_none() || text(v, key);
+    let pid = |v: &Value| {
+        v["pid"]
+            .as_u64()
+            .is_some_and(|n| n > 0 && u32::try_from(n).is_ok())
+    };
+    let only = |v: &Value, allowed: &[&str]| {
+        v.as_object()
+            .is_some_and(|o| o.keys().all(|k| allowed.contains(&k.as_str())))
+    };
+    let frontmost = result.get("frontmost");
+    if let Some(app) = frontmost {
+        if !only(app, &["appName", "bundleId", "pid", "windowId"])
+            || !text(app, "appName")
+            || !optional_text(app, "bundleId")
+            || !optional_text(app, "windowId")
+            || !pid(app)
+        {
+            return Err(());
+        }
+    }
+    let windows = result["windows"].as_array().ok_or(())?;
+    let (image_width, image_height) = (
+        display["width"].as_i64().ok_or(())?,
+        display["height"].as_i64().ok_or(())?,
+    );
+    let mut ids = std::collections::HashSet::new();
+    let mut focused = None;
+    for window in windows {
+        let allowed = [
+            "windowId", "appName", "bundleId", "pid", "title", "x", "y", "width", "height",
+            "focused",
+        ];
+        if !only(window, &allowed)
+            || !text(window, "windowId")
+            || !ids.insert(window["windowId"].as_str())
+            || !text(window, "appName")
+            || !optional_text(window, "bundleId")
+            || !optional_text(window, "title")
+            || !pid(window)
+        {
+            return Err(());
+        }
+        let (Some(x), Some(y), Some(width), Some(height)) = (
+            window["x"].as_i64(),
+            window["y"].as_i64(),
+            window["width"].as_i64().filter(|n| *n > 0),
+            window["height"].as_i64().filter(|n| *n > 0),
+        ) else {
+            return Err(());
+        };
+        if x >= image_width
+            || y >= image_height
+            || x.saturating_add(width) <= 0
+            || y.saturating_add(height) <= 0
+        {
+            return Err(());
+        }
+        match window["focused"].as_bool() {
+            Some(true) if focused.is_none() => focused = Some(window),
+            Some(false) => {}
+            _ => return Err(()),
+        }
+    }
+    if let Some(window) = focused {
+        let app = frontmost.ok_or(())?;
+        if app.get("windowId") != Some(&window["windowId"]) || app["pid"] != window["pid"] {
+            return Err(());
+        }
+    } else if frontmost
+        .and_then(|app| app["windowId"].as_str())
+        .is_some_and(|id| ids.contains(&Some(id)))
+    {
+        // A listed frontmost window must be the one marked focused.
+        return Err(());
     }
     Ok(())
 }

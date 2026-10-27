@@ -57,7 +57,9 @@ pub(crate) const RETIRED_GATED_METHODS: &[&str] = &[
     "comment.respond",
     "desktop.respondPermission",
     "desktop.setPermission",
+    "discussion.delete",
     "discussion.react",
+    "discussion.rename",
     "discussion.retryAgent",
     "discussion.send",
     "discussion.stopAgent",
@@ -529,6 +531,8 @@ mod tests {
         let retired = params(&serde_json::json!({ "workspaceId": "ws-retired" }));
         let live = params(&serde_json::json!({ "workspaceId": "ws-live" }));
         for method in [
+            "discussion.delete",
+            "discussion.rename",
             "note.create",
             "task.update",
             "workspace.update",

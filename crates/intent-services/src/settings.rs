@@ -208,7 +208,7 @@ type MutationHook<T> = Arc<Mutex<Option<Box<dyn FnOnce() -> T + Send>>>>;
 /// most one blocking-pool thread total (not one per request). Cache entries are
 /// invalidated on successful writes and expire on TTL.
 #[derive(Clone)]
-pub(crate) struct AsyncSecretStore {
+pub struct AsyncSecretStore {
     paired_gitlab: Option<std::path::PathBuf>,
     repository_gate: Arc<OnceLock<GitlabCredentialGate>>,
     repository_write: Option<Arc<RepositorySettingsWrite>>,
@@ -485,7 +485,12 @@ impl AsyncSecretStore {
     /// `Err` on timeout / backing-error. Concurrent callers for the same `account`
     /// are coalesced into a single `spawn_blocking`; a cached result is served
     /// without touching the backing store until it expires.
-    pub(crate) async fn load(&self, account: &str) -> Result<Option<String>> {
+    #[expect(
+        clippy::missing_errors_doc,
+        clippy::missing_panics_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub async fn load(&self, account: &str) -> Result<Option<String>> {
         let action = {
             let mut state = self.state.lock().unwrap();
             match state.entries.get(account) {
@@ -1297,7 +1302,7 @@ impl SettingDefinition {
                 let Some(n) = value.as_f64() else {
                     return invalid(format!("{}: expected a number", self.path));
                 };
-                if self.path == AUTO_RETIRE_ARCHIVED_AFTER_DAYS_PATH
+                if WHOLE_DAY_PATHS.contains(&self.path)
                     && (n.fract() != 0.0 || n > f64::from(u32::MAX))
                 {
                     return invalid(format!("{}: expected a whole number of days", self.path));
@@ -1838,11 +1843,21 @@ pub(crate) fn definitions() -> Vec<SettingDefinition> {
             "workspace",
             false,
         ),
+        // Whole days; 0 turns the idle auto-archive sweep off.
+        number(
+            AUTO_ARCHIVE_IDLE_AFTER_DAYS_PATH,
+            "Auto-archive idle workspaces (days)",
+            "Archive workspaces with no activity for this many days; archiving stops their agents, hooks and monitors and keeps their folders (0 = off)",
+            "workspace",
+            Some(0.0),
+            None,
+            f64::from(intent_core::settings_file::DEFAULT_AUTO_ARCHIVE_IDLE_AFTER_DAYS),
+        ),
         // Optional positive integer; the absent key (no default) is off.
         SettingDefinition {
-            path: AUTO_RETIRE_ARCHIVED_AFTER_DAYS_PATH,
-            label: "Auto-retire archived workspaces (days)",
-            description: "Retire workspaces archived longer than this many days: their checkout folders are deleted to free disk space while conversations, notes and history are kept (absent = off)",
+            path: PURGE_ARCHIVED_AFTER_DAYS_PATH,
+            label: "Purge archived workspace folders (days)",
+            description: "Delete the folders of workspaces archived longer than this many days to free disk space; conversations, notes, tasks and the git branch are kept, and folders with uncommitted changes are skipped (absent = off)",
             category: "workspace",
             ty: SettingType::Number {
                 min: Some(1.0),
@@ -2758,19 +2773,92 @@ pub fn history_replay_tool_content_chars(settings: &SettingsFile) -> usize {
     settings.agents.history_replay_tool_content_chars as usize
 }
 
-/// Settings path of the auto-retire window (PROTOCOL §5.12).
-pub(crate) const AUTO_RETIRE_ARCHIVED_AFTER_DAYS_PATH: &str =
-    "workspace.autoRetireArchivedAfterDays";
+/// Settings path of the idle auto-archive window (PROTOCOL §5.12).
+pub(crate) const AUTO_ARCHIVE_IDLE_AFTER_DAYS_PATH: &str = "workspace.autoArchiveIdleAfterDays";
 
-/// The effective `workspace.autoRetireArchivedAfterDays` setting: `Some(days)`
-/// when the automatic retire sweep is on, `None` when the key is absent (or a
-/// hand-edited `0`) — read live from the settings snapshot at each sweep.
+/// Settings path of the automatic purge window (PROTOCOL §5.12).
+pub(crate) const PURGE_ARCHIVED_AFTER_DAYS_PATH: &str = "workspace.purgeArchivedAfterDays";
+
+/// The deprecated predecessor of [`PURGE_ARCHIVED_AFTER_DAYS_PATH`]. No
+/// catalog entry remains (older clients hide their toggle); the key still
+/// parses so [`migrate_auto_retire_setting`] can carry it over, and writes
+/// from old clients are tolerated-and-ignored.
+pub(crate) const DEPRECATED_AUTO_RETIRE_PATH: &str = "workspace.autoRetireArchivedAfterDays";
+
+/// Day-count settings that must be whole numbers.
+const WHOLE_DAY_PATHS: [&str; 2] = [
+    AUTO_ARCHIVE_IDLE_AFTER_DAYS_PATH,
+    PURGE_ARCHIVED_AFTER_DAYS_PATH,
+];
+
+/// The effective `workspace.autoArchiveIdleAfterDays` setting: `Some(days)`
+/// when the idle auto-archive sweep is on (the default, 7), `None` when it
+/// is `0` — read live from the settings snapshot at each sweep.
 #[must_use]
-pub fn auto_retire_archived_after_days(settings: &SettingsFile) -> Option<u32> {
+pub fn auto_archive_idle_after_days(settings: &SettingsFile) -> Option<u32> {
+    Some(settings.workspace.auto_archive_idle_after_days).filter(|days| *days > 0)
+}
+
+/// The effective `workspace.purgeArchivedAfterDays` setting: `Some(days)`
+/// when the automatic purge sweep is on, `None` when the key is absent (or a
+/// hand-edited `0`) — read live from the settings snapshot at each sweep.
+/// While the new key is unset, a (hand-edited or not yet migrated) legacy
+/// `autoRetireArchivedAfterDays` still applies.
+#[must_use]
+pub fn purge_archived_after_days(settings: &SettingsFile) -> Option<u32> {
     settings
         .workspace
-        .auto_retire_archived_after_days
+        .purge_archived_after_days
+        .or(settings.workspace.auto_retire_archived_after_days)
         .filter(|days| *days > 0)
+}
+
+/// One-time boot migration of the deprecated
+/// `workspace.autoRetireArchivedAfterDays` to `workspace.purgeArchivedAfterDays`
+/// (same value semantics). When only the legacy key is set its value is
+/// carried over; when both are set the new key wins. Either way the legacy
+/// key is removed from config.toml in the same atomic, comment-preserving
+/// [`SettingsRegistry::apply`] batch. A file without the legacy key is never
+/// rewritten.
+///
+/// # Errors
+///
+/// Never errors today: a failed rewrite is logged and skipped (the file
+/// stays intact and the purge sweep keeps honoring the legacy key, so the
+/// next boot retries). The `Result` keeps parity with the other startup
+/// migrations.
+pub fn migrate_auto_retire_setting(registry: &SettingsRegistry) -> Result<()> {
+    let snapshot = registry.snapshot();
+    let workspace = &snapshot.effective.workspace;
+    let Some(legacy) = workspace.auto_retire_archived_after_days else {
+        return Ok(());
+    };
+    let carried = workspace.purge_archived_after_days.is_none() && legacy > 0;
+    let mut changes: Vec<(String, Value)> = Vec::with_capacity(2);
+    if carried {
+        changes.push((PURGE_ARCHIVED_AFTER_DAYS_PATH.to_string(), json!(legacy)));
+    }
+    changes.push((DEPRECATED_AUTO_RETIRE_PATH.to_string(), Value::Null));
+    if let Err(e) = registry.apply(&changes) {
+        tracing::warn!(
+            error = %e,
+            "failed to migrate workspace.autoRetireArchivedAfterDays to \
+             workspace.purgeArchivedAfterDays; continuing (next boot retries)"
+        );
+        return Ok(());
+    }
+    if carried {
+        tracing::info!(
+            days = legacy,
+            "migrated workspace.autoRetireArchivedAfterDays to workspace.purgeArchivedAfterDays"
+        );
+    } else {
+        tracing::info!(
+            "removed deprecated workspace.autoRetireArchivedAfterDays from config.toml; \
+             the already-set workspace.purgeArchivedAfterDays wins"
+        );
+    }
+    Ok(())
 }
 
 /// The effective `agents.toolPayloadRetentionDays` setting: `Some(days)` when
@@ -3478,6 +3566,7 @@ impl<'a> SettingsService<'a> {
             // hard rejection would fail whole batches from old clients).
             if RETIRED_BACKGROUND_AGENT_PATHS.contains(&path)
                 || path == DEPRECATED_ACTIVE_PROVIDER_PATH
+                || path == DEPRECATED_AUTO_RETIRE_PATH
                 || path == "agents.flushQueuedMessages"
             {
                 tracing::debug!(path, "ignoring settings.update for retired setting");
@@ -7021,19 +7110,19 @@ mod tests {
         }
     }
 
-    /// `workspace.autoRetireArchivedAfterDays` (PROTOCOL §5.12) is a
-    /// TOML-backed optional positive integer: absent (`null`) means off and
-    /// has no implicit default; zero, negative and non-integer values reject.
+    /// `workspace.purgeArchivedAfterDays` (PROTOCOL §5.12) is a TOML-backed
+    /// optional positive integer: absent (`null`) means off and has no
+    /// implicit default; zero, negative and non-integer values reject.
     #[test]
-    fn auto_retire_catalog_entry_is_an_optional_positive_integer() {
-        let def = find_definition("workspace.autoRetireArchivedAfterDays")
-            .expect("workspace.autoRetireArchivedAfterDays missing from catalog");
+    fn purge_catalog_entry_is_an_optional_positive_integer() {
+        let def = find_definition(PURGE_ARCHIVED_AFTER_DAYS_PATH)
+            .expect("workspace.purgeArchivedAfterDays missing from catalog");
         assert!(!def.sensitive);
         assert!(!def.read_only);
         assert_eq!(def.category, "workspace");
         assert!(matches!(def.ty, SettingType::Number { min: Some(1.0), .. }));
         assert_eq!(def.default_value, None, "absent = off; no implicit value");
-        assert!(KNOWN_PATHS.contains(&"workspace.autoRetireArchivedAfterDays"));
+        assert!(KNOWN_PATHS.contains(&PURGE_ARCHIVED_AFTER_DAYS_PATH));
         def.validate(&json!(7)).expect("7 days is legal");
         def.validate(&json!(1)).expect("1 day is legal");
         def.validate(&json!(7.0))
@@ -7045,32 +7134,89 @@ mod tests {
         assert!(def.definition_json().get("defaultValue").is_none());
 
         let mut settings = SettingsFile::default();
-        assert_eq!(auto_retire_archived_after_days(&settings), None);
-        settings.workspace.auto_retire_archived_after_days = Some(7);
-        assert_eq!(auto_retire_archived_after_days(&settings), Some(7));
-        // A hand-edited 0 in config.toml reads as off, never "retire now".
-        settings.workspace.auto_retire_archived_after_days = Some(0);
-        assert_eq!(auto_retire_archived_after_days(&settings), None);
+        assert_eq!(purge_archived_after_days(&settings), None);
+        settings.workspace.purge_archived_after_days = Some(7);
+        assert_eq!(purge_archived_after_days(&settings), Some(7));
+        // A hand-edited 0 in config.toml reads as off, never "purge now".
+        settings.workspace.purge_archived_after_days = Some(0);
+        assert_eq!(purge_archived_after_days(&settings), None);
     }
 
-    /// The auto-retire setting round-trips through the registry-wired
-    /// service: absent reads `null` with `default` origin, `settings.update`
-    /// persists to config.toml, invalid values reject with `-32602` naming
-    /// the key and keep the prior value, `null` turns it off by removing the
-    /// key, and `settings.reset` removes it too.
+    /// The legacy `autoRetireArchivedAfterDays` has no catalog entry (older
+    /// clients hide their toggle) but still drives the purge sweep while
+    /// the new key is unset; the new key always wins.
+    #[test]
+    fn legacy_auto_retire_key_is_uncataloged_but_still_honored() {
+        assert!(find_definition(DEPRECATED_AUTO_RETIRE_PATH).is_none());
+        assert!(KNOWN_PATHS.contains(&DEPRECATED_AUTO_RETIRE_PATH));
+        let mut settings = SettingsFile::default();
+        settings.workspace.auto_retire_archived_after_days = Some(5);
+        assert_eq!(purge_archived_after_days(&settings), Some(5));
+        settings.workspace.purge_archived_after_days = Some(9);
+        assert_eq!(purge_archived_after_days(&settings), Some(9));
+    }
+
+    /// `workspace.autoArchiveIdleAfterDays` (PROTOCOL §5.12) is a whole
+    /// number of days with default 7; `0` turns the sweep off.
+    #[test]
+    fn auto_archive_catalog_entry_defaults_to_seven_and_allows_zero() {
+        let def = find_definition(AUTO_ARCHIVE_IDLE_AFTER_DAYS_PATH)
+            .expect("workspace.autoArchiveIdleAfterDays missing from catalog");
+        assert!(!def.sensitive);
+        assert!(!def.read_only);
+        assert_eq!(def.category, "workspace");
+        assert!(matches!(def.ty, SettingType::Number { min: Some(0.0), .. }));
+        assert_eq!(def.default_value, Some(json!(7.0)));
+        assert!(KNOWN_PATHS.contains(&AUTO_ARCHIVE_IDLE_AFTER_DAYS_PATH));
+        for ok in [json!(0), json!(1), json!(7), json!(30.0)] {
+            def.validate(&ok)
+                .unwrap_or_else(|e| panic!("{ok} must pass: {e}"));
+        }
+        for bad in [json!(-1), json!(1.5), json!("7"), json!(true), Value::Null] {
+            assert!(def.validate(&bad).is_err(), "{bad} must reject");
+        }
+
+        let mut settings = SettingsFile::default();
+        assert_eq!(auto_archive_idle_after_days(&settings), Some(7));
+        settings.workspace.auto_archive_idle_after_days = 0;
+        assert_eq!(auto_archive_idle_after_days(&settings), None);
+        settings.workspace.auto_archive_idle_after_days = 14;
+        assert_eq!(auto_archive_idle_after_days(&settings), Some(14));
+    }
+
+    fn temp_settings_service_paths(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let id = uuid::Uuid::new_v4();
+        (
+            std::env::temp_dir().join(format!("intentd-settings-{tag}-{id}.db")),
+            std::env::temp_dir().join(format!("intentd-settings-{tag}-{id}.toml")),
+        )
+    }
+
+    fn remove_temp_settings_files(db: &std::path::Path, config: &std::path::Path) {
+        let _ = std::fs::remove_file(config);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
+                "{}{suffix}",
+                db.display()
+            )));
+        }
+    }
+
+    /// The purge setting round-trips through the registry-wired service:
+    /// absent reads `null` with `default` origin, `settings.update` persists
+    /// to config.toml, invalid values reject with `-32602` naming the key and
+    /// keep the prior value, `null` turns it off by removing the key, and
+    /// `settings.reset` removes it too.
     #[tokio::test]
-    async fn auto_retire_setting_round_trips_via_registry() {
-        let tag = uuid::Uuid::new_v4();
-        let tmp = std::env::temp_dir().join(format!("intentd-settings-autoretire-{tag}.db"));
+    async fn purge_setting_round_trips_via_registry() {
+        let (tmp, config_path) = temp_settings_service_paths("purge");
         let store = Store::open(&tmp).await.expect("open store");
-        let config_path =
-            std::env::temp_dir().join(format!("intentd-settings-autoretire-{tag}.toml"));
         std::fs::write(&config_path, "").expect("write empty config");
         let registry = SettingsRegistry::load(&config_path).expect("load registry");
         let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
         let secrets = AsyncSecretStore::new(secrets);
         let svc = SettingsService::new(&store, &secrets, Some(&registry));
-        let path = "workspace.autoRetireArchivedAfterDays";
+        let path = PURGE_ARCHIVED_AFTER_DAYS_PATH;
 
         let got = svc.get(path).await.expect("get");
         assert_eq!(got["value"], Value::Null);
@@ -7083,9 +7229,9 @@ mod tests {
         assert_eq!(got["value"], json!(7.0));
         assert_eq!(got["origin"], json!("file"));
         let text = std::fs::read_to_string(&config_path).expect("read config");
-        assert!(text.contains("autoRetireArchivedAfterDays = 7"), "{text}");
+        assert!(text.contains("purgeArchivedAfterDays = 7"), "{text}");
         assert_eq!(
-            auto_retire_archived_after_days(&registry.snapshot().effective),
+            purge_archived_after_days(&registry.snapshot().effective),
             Some(7)
         );
 
@@ -7100,22 +7246,22 @@ mod tests {
             );
         }
         assert_eq!(
-            auto_retire_archived_after_days(&registry.snapshot().effective),
+            purge_archived_after_days(&registry.snapshot().effective),
             Some(7)
         );
 
         svc.update(&json!([{ "path": path, "value": null }]))
             .await
-            .expect("null turns auto-retire off");
+            .expect("null turns purge off");
         assert_eq!(
-            auto_retire_archived_after_days(&registry.snapshot().effective),
+            purge_archived_after_days(&registry.snapshot().effective),
             None
         );
         let text = std::fs::read_to_string(&config_path).expect("read config");
         assert!(
             !text
                 .lines()
-                .any(|l| l.trim_start().starts_with("autoRetireArchivedAfterDays")),
+                .any(|l| l.trim_start().starts_with("purgeArchivedAfterDays")),
             "{text}"
         );
 
@@ -7126,16 +7272,134 @@ mod tests {
         assert_eq!(reset["value"], Value::Null);
         assert_eq!(reset["origin"], json!("default"));
         assert_eq!(
-            auto_retire_archived_after_days(&registry.snapshot().effective),
+            purge_archived_after_days(&registry.snapshot().effective),
             None
         );
 
-        let _ = std::fs::remove_file(&config_path);
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(std::path::PathBuf::from(format!(
-                "{}{suffix}",
-                tmp.display()
-            )));
+        // An old client still writing the legacy key is tolerated and ignored.
+        svc.update(&json!([{ "path": DEPRECATED_AUTO_RETIRE_PATH, "value": 3 }]))
+            .await
+            .expect("legacy write is ignored, not rejected");
+        let text = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(!text.contains("autoRetireArchivedAfterDays"), "{text}");
+
+        remove_temp_settings_files(&tmp, &config_path);
+    }
+
+    /// The auto-archive setting round-trips: absent reads 7 with `default`
+    /// origin, `0` persists and turns it off, negatives and fractions
+    /// reject, and `settings.reset` returns to 7.
+    #[tokio::test]
+    async fn auto_archive_setting_round_trips_via_registry() {
+        let (tmp, config_path) = temp_settings_service_paths("autoarchive");
+        let store = Store::open(&tmp).await.expect("open store");
+        std::fs::write(&config_path, "").expect("write empty config");
+        let registry = SettingsRegistry::load(&config_path).expect("load registry");
+        let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
+        let secrets = AsyncSecretStore::new(secrets);
+        let svc = SettingsService::new(&store, &secrets, Some(&registry));
+        let path = AUTO_ARCHIVE_IDLE_AFTER_DAYS_PATH;
+
+        let got = svc.get(path).await.expect("get");
+        assert_eq!(got["value"], json!(7.0));
+        assert_eq!(got["origin"], json!("default"));
+        assert_eq!(
+            auto_archive_idle_after_days(&registry.snapshot().effective),
+            Some(7)
+        );
+
+        svc.update(&json!([{ "path": path, "value": 0 }]))
+            .await
+            .expect("0 turns auto-archive off");
+        let text = std::fs::read_to_string(&config_path).expect("read config");
+        assert!(text.contains("autoArchiveIdleAfterDays = 0"), "{text}");
+        assert_eq!(
+            auto_archive_idle_after_days(&registry.snapshot().effective),
+            None
+        );
+
+        for value in [json!(-1), json!(2.5), Value::Null] {
+            let err = svc
+                .update(&json!([{ "path": path, "value": value }]))
+                .await
+                .expect_err("invalid value must reject");
+            assert!(
+                matches!(err, Error::InvalidParams(ref msg) if msg.contains(path)),
+                "expected InvalidParams naming {path} for {value}, got {err:?}"
+            );
+        }
+
+        svc.update(&json!([{ "path": path, "value": 14 }]))
+            .await
+            .expect("update");
+        assert_eq!(
+            auto_archive_idle_after_days(&registry.snapshot().effective),
+            Some(14)
+        );
+        let reset = svc.reset(path).await.expect("reset");
+        assert_eq!(reset["origin"], json!("default"));
+        assert_eq!(
+            auto_archive_idle_after_days(&registry.snapshot().effective),
+            Some(7)
+        );
+
+        remove_temp_settings_files(&tmp, &config_path);
+    }
+
+    /// The boot migration renames the legacy key: carried over when only it
+    /// is set, dropped when the new key is already set, and a file without
+    /// it is never rewritten. Comments survive the rewrite.
+    #[test]
+    fn migrate_auto_retire_setting_renames_the_legacy_key() {
+        let cases: [(&str, Option<u32>); 3] = [
+            (
+                "# keep me\n[workspace]\nautoRetireArchivedAfterDays = 5\n",
+                Some(5),
+            ),
+            (
+                "[workspace]\nautoRetireArchivedAfterDays = 5\npurgeArchivedAfterDays = 9\n",
+                Some(9),
+            ),
+            ("[workspace]\npurgeArchivedAfterDays = 4\n", Some(4)),
+        ];
+        for (text, expected) in cases {
+            let (_db, config_path) = temp_settings_service_paths("migrate-retire");
+            std::fs::write(&config_path, text).expect("write config");
+            let before = std::fs::metadata(&config_path)
+                .and_then(|m| m.modified())
+                .ok();
+            let registry = SettingsRegistry::load(&config_path).expect("load registry");
+            migrate_auto_retire_setting(&registry).expect("migrate");
+            let after = std::fs::read_to_string(&config_path).expect("read config");
+            assert!(!after.contains("autoRetireArchivedAfterDays"), "{after}");
+            assert_eq!(
+                registry
+                    .snapshot()
+                    .effective
+                    .workspace
+                    .purge_archived_after_days,
+                expected,
+                "{text}"
+            );
+            assert_eq!(
+                purge_archived_after_days(&registry.snapshot().effective),
+                expected
+            );
+            if text.starts_with("# keep me") {
+                assert!(after.contains("# keep me"), "{after}");
+                assert!(after.contains("purgeArchivedAfterDays = 5"), "{after}");
+            }
+            if !text.contains("autoRetireArchivedAfterDays") {
+                assert_eq!(after, text, "a file without the legacy key is untouched");
+                let unchanged = std::fs::metadata(&config_path)
+                    .and_then(|m| m.modified())
+                    .ok();
+                assert_eq!(before, unchanged);
+            }
+            // Idempotent: a second boot does nothing.
+            migrate_auto_retire_setting(&registry).expect("migrate again");
+            assert_eq!(std::fs::read_to_string(&config_path).unwrap(), after);
+            let _ = std::fs::remove_file(&config_path);
         }
     }
 
