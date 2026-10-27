@@ -1,6 +1,4 @@
 use super::*;
-use crate::runtime::RuntimeStateExt;
-use crate::script_monitor::ScriptMonitorExt;
 
 async fn pending_monitor(
     svc: &Services,
@@ -37,7 +35,7 @@ async fn pending_monitor(
 // transcript and durable queue transitions explicitly, then simulate the
 // successful worker acknowledgement that permits completion to settle.
 async fn deliver_pending_notification(svc: &Services, row: &intent_core::ScriptMonitor) {
-    svc.dispatch_script_monitor(row).await;
+    FakeRuntime::of(svc).dispatch_script_monitor(svc, row).await;
     let Some(job) = svc
         .store
         .script_notification_jobs()
@@ -244,6 +242,7 @@ async fn pending_query_error_recovers_without_pending_row_or_another_event() {
 #[intent_test_macros::daemon_test]
 async fn pending_notifications_allow_other_dispatches_and_settle_exactly_once() {
     let (_tmp, svc, ws) = setup().await;
+    let svc = FakeRuntime::install(svc);
     let child = create_agent(&svc, &ws, "Child").await;
     let parent = watch_child(&svc, &ws, &child).await;
     let other = create_agent(&svc, &ws, "Other").await;
@@ -304,6 +303,7 @@ async fn pending_notifications_allow_other_dispatches_and_settle_exactly_once() 
 #[intent_test_macros::daemon_test]
 async fn pending_notification_settling_before_marker_is_retried() {
     let (_tmp, svc, ws) = setup().await;
+    let svc = FakeRuntime::install(svc);
     let child = create_agent(&svc, &ws, "Child").await;
     let parent = watch_child(&svc, &ws, &child).await;
     let row = pending_monitor(&svc, &ws, &child).await;
@@ -343,6 +343,7 @@ async fn pending_notification_settling_before_marker_is_retried() {
 #[intent_test_macros::daemon_test]
 async fn pending_synthetic_reclassification_keeps_stale_report_provenance() {
     let (_tmp, svc, ws) = setup().await;
+    let svc = FakeRuntime::install(svc);
     let child = create_agent(&svc, &ws, "Child").await;
     let parent = watch_child(&svc, &ws, &child).await;
     let row = pending_monitor(&svc, &ws, &child).await;
@@ -377,6 +378,7 @@ async fn pending_synthetic_reclassification_keeps_stale_report_provenance() {
 #[intent_test_macros::daemon_test]
 async fn pending_advisory_provenance_clears_when_notification_settles() {
     let (_tmp, svc, ws) = setup().await;
+    let svc = FakeRuntime::install(svc);
     let child = create_agent(&svc, &ws, "Child").await;
     let parent = watch_child(&svc, &ws, &child).await;
     seed_active_hook(&svc, &ws, &child, "still monitoring").await;
@@ -478,6 +480,7 @@ async fn removing_queued_monitor_wake_suppresses_durable_restart_delivery() {
 #[intent_test_macros::daemon_test]
 async fn completion_marker_retry_redelivers_deferred_completion_watch() {
     let (_tmp, svc, ws) = setup().await;
+    let svc = FakeRuntime::install(svc);
     let child = create_agent(&svc, &ws, "Child").await;
     let parent = watch_child(&svc, &ws, &child).await;
     let monitor = pending_monitor(&svc, &ws, &child).await;
@@ -505,18 +508,16 @@ async fn completion_marker_retry_redelivers_deferred_completion_watch() {
     svc.handle_completion_event(&event).await;
     assert!(svc.has_interim_skipped_idle(&child));
     sqlx::query("CREATE TRIGGER fail_marker BEFORE UPDATE OF phase ON agent_queue_admission WHEN new.phase='completed' BEGIN SELECT RAISE(ABORT,'marker failure'); END").execute(svc.store.write_pool()).await.unwrap();
-    svc.complete_script_monitor_delivery(&child, &monitor.monitor_id)
+    svc.ports
+        .runtime()
+        .complete_script_monitor_delivery(&svc, &child, &monitor.monitor_id)
         .await;
     assert_eq!(parent_message_count(&svc, &parent).await, 0);
-    assert!(svc
-        .runtime()
-        .script_locks
-        .monitor_completions
-        .lock()
-        .unwrap()
-        .contains(&(child.clone(), monitor.monitor_id.clone())));
+    assert!(FakeRuntime::of(&svc).completion_retry_pending(&child, &monitor.monitor_id));
     assert!(
-        !svc.script_monitor_delivery_allowed(&child, Some(&job.metadata))
+        !svc.ports
+            .runtime()
+            .script_monitor_delivery_allowed(&svc, &child, Some(&job.metadata))
             .await
             .unwrap(),
         "finished work must not reenter while its marker retries"
@@ -525,22 +526,18 @@ async fn completion_marker_retry_redelivers_deferred_completion_watch() {
         .execute(svc.store.write_pool())
         .await
         .unwrap();
-    svc.retry_script_monitor_completion(&child, &monitor.monitor_id)
+    FakeRuntime::of(&svc)
+        .retry_script_monitor_completion(&svc, &child, &monitor.monitor_id)
         .await;
     wait_for_completion(&svc, &parent, &child).await;
-    assert!(svc
-        .runtime()
-        .script_locks
-        .monitor_completions
-        .lock()
-        .unwrap()
-        .is_empty());
+    assert!(!FakeRuntime::of(&svc).completion_retry_pending(&child, &monitor.monitor_id));
     assert!(!svc
         .store
         .script_monitor_pending_for_agent(&child)
         .await
         .unwrap());
-    svc.retry_script_monitor_completion(&child, &monitor.monitor_id)
+    FakeRuntime::of(&svc)
+        .retry_script_monitor_completion(&svc, &child, &monitor.monitor_id)
         .await;
     assert_eq!(parent_message_count(&svc, &parent).await, 1);
     svc.shutdown_agent_deliveries().await;

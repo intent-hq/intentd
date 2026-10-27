@@ -340,7 +340,7 @@ directories. Workspaces already stored in the daemon remain available.
 
 <!-- Sources: packages/intentd/crates/intentd/src/main.rs; packages/cloudlands-fe/src/routes/(app)/settings/+page.svelte. -->
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceBoard,HomeWorkspaceDetail,HomeWorkspacePullBadge}.svelte; src/features/home/home-model.ts; src/features/home/home.css. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceBoard,HomeWorkspaceDetail,HomeWorkspacePullBadge}.svelte; src/features/home/home-model.ts; src/features/home/home.css; src/lib/components/workspace/sidebar/workspace-pr-presentation.ts. -->
 
 In **Home → Workspaces**, list rows and board cards show organization/repository
 labels in views that include multiple repositories. When an organization is selected,
@@ -357,9 +357,10 @@ terminal tab, alone does not count. **Waiting** covers workspaces watching somet
 monitored PR, a background hook, a delegated agent, a script run monitor, or a PR in
 the merge queue. The **Waiting** filter shows the same workspaces.
 
-The PR badge in list and board views prioritizes draft PRs, then open PRs
-(including conflicted or queued PRs), then merged and closed PRs. Within the same
-state, it shows the most recently updated available PR. Home's shortened PR list
+The PR badge in list and board views shows a PR in the merge queue first, then
+draft PRs, then open PRs (including conflicted PRs), then merged and closed PRs.
+Within the same state, it shows the most recently updated PR (for a PR an agent only
+watches, its last update on GitHub as of the watch's latest check). Home's shortened PR list
 keeps unfinished PRs ahead of merged or closed ones; the **+N** count in list view
 includes the other linked PRs, even when their details are not loaded.
 
