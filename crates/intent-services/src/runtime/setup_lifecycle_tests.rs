@@ -121,3 +121,20 @@ async fn script_success_emits_started_then_completed_exit_zero() {
 
     assert_quiet(&mut sub).await;
 }
+
+/// Wait until the setup script has reached its barrier (proving the
+/// spawn succeeded and the script is parked there).
+#[cfg(unix)]
+pub(crate) async fn wait_for_barrier(barrier: &Barrier) {
+    tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(20)),
+        async {
+            while !barrier.entered() {
+                // timing-guard: poll interval for the barrier's arrival file
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        },
+    )
+    .await
+    .expect("setup script reached the barrier");
+}

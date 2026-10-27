@@ -88,27 +88,6 @@ pub(crate) use crate::test_support::fixtures::{
 
 pub(crate) use crate::test_support::fixtures::workspace;
 
-fn note(ws: &WorkspaceId, id: &str, content: &str) -> Note {
-    let ts = now_iso();
-    Note {
-        id: NoteId::from(id),
-        workspace_id: ws.clone(),
-        title: "Title".to_string(),
-        content: content.to_string(),
-        content_type: ContentType::Markdown,
-        tags: vec![],
-        is_pinned: false,
-        is_archived: false,
-        is_default: false,
-        parent_id: None,
-        visibility: NoteVisibility::Workspace,
-        metadata: NoteMetadata::default(),
-        created_at: ts.clone(),
-        rev: 0,
-        updated_at: ts,
-    }
-}
-
 pub(super) async fn setup(content: &str) -> (TempDb, Services, WorkspaceId, NoteId) {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
@@ -34765,96 +34744,6 @@ pub(crate) mod setup_lifecycle_events {
     use super::{test_registry_with_default_provider, test_tempdir, TempDb};
     use crate::{EventBus, Services, Subscription, SubscriptionFilter};
 
-    /// Wait until the setup script has reached its barrier (proving the
-    /// spawn succeeded and the script is parked there).
-    #[cfg(unix)]
-    pub(crate) async fn wait_for_barrier(barrier: &Barrier) {
-        tokio::time::timeout(
-            intentd_test_support::test_timeout(Duration::from_secs(20)),
-            async {
-                while !barrier.entered() {
-                    // timing-guard: poll interval for the barrier's arrival file
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-            },
-        )
-        .await
-        .expect("setup script reached the barrier");
-    }
-
-    /// Temp directory tree swept on drop (see [`test_tempdir`]).
-    pub(crate) struct TempDir(pub(crate) PathBuf, #[expect(dead_code)] tempfile::TempDir);
-
-    pub(crate) fn unique_dir(prefix: &str) -> TempDir {
-        let guard = test_tempdir(&format!("{prefix}-"));
-        TempDir(guard.path().to_path_buf(), guard)
-    }
-
-    /// Init a git repo with one commit; returns (guard, head branch).
-    pub(crate) fn seed_repo(prefix: &str) -> (TempDir, String) {
-        let dir = unique_dir(prefix);
-        let repo = git2::Repository::init(&dir.0).unwrap();
-        {
-            let mut cfg = repo.config().unwrap();
-            cfg.set_str("user.name", "Tester").unwrap();
-            cfg.set_str("user.email", "t@e.dev").unwrap();
-        }
-        std::fs::write(dir.0.join("README.md"), "init\n").unwrap();
-        let mut index = repo.index().unwrap();
-        index
-            .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
-            .unwrap();
-        index.write().unwrap();
-        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
-        let sig = git2::Signature::now("Tester", "t@e.dev").unwrap();
-        repo.commit(Some("HEAD"), &sig, &sig, "chore: init", &tree, &[])
-            .unwrap();
-        let branch = repo.head().unwrap().shorthand().unwrap().to_string();
-        (dir, branch)
-    }
-
-    pub(crate) async fn services(root: PathBuf) -> (Services, EventBus, TempDb) {
-        let tmp = TempDb::new();
-        let store = Store::open(&tmp.path).await.expect("open store");
-        let bus = EventBus::new(store.clone());
-        let svc = Services::new(store)
-            .with_workspaces_root(root)
-            .with_event_bus(bus.clone());
-        (svc, bus, tmp)
-    }
-
-    /// Subscribe to only the setup lifecycle events (the setup terminal's
-    /// `terminal:*` stream and the create's other events stay out of scope).
-    pub(crate) fn subscribe_setup(bus: &EventBus) -> Subscription {
-        bus.subscribe(SubscriptionFilter {
-            event_types: vec!["workspace:setup:*".to_string()],
-            ..Default::default()
-        })
-    }
-
-    /// Receive one setup event (generous timeout: script paths cross a PTY
-    /// spawn + reap poll), serialized to wire JSON.
-    pub(crate) async fn recv_setup(sub: &mut Subscription) -> Value {
-        let batch = tokio::time::timeout(
-            intentd_test_support::test_timeout(Duration::from_secs(20)),
-            sub.recv(),
-        )
-        .await
-        .expect("setup event delivered")
-        .expect("subscription open");
-        assert_eq!(batch.len(), 1, "expected exactly one event per delivery");
-        serde_json::to_value(&batch[0]).expect("serialize event")
-    }
-
-    pub(crate) async fn assert_quiet(sub: &mut Subscription) {
-        let quiet = tokio::time::timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(300)),
-            sub.recv(),
-        )
-        .await;
-        assert!(quiet.is_err(), "no further setup events, got: {quiet:?}");
-    }
-
     /// Worktree provisioned but no effective script anywhere (no explicit
     /// param, no repo config, no legacy row): no `started`, exactly one
     /// `completed` with `ranScript: false` and no `exitCode` key.
@@ -41024,55 +40913,6 @@ mod turn_end_unread_gate {
             store,
             services,
             ws,
-        }
-    }
-
-    pub(crate) fn session(agent_id: &AgentId, ws: &WorkspaceId) -> AgentSession {
-        AgentSession {
-            harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
-            harness_features: None,
-            id: agent_id.clone(),
-            workspace_id: ws.clone(),
-            backend_session_id: None,
-            acp_session_id: None,
-            name: format!("test-{}", agent_id.0),
-            name_explicitly_set: false,
-            model: Some("test-model".into()),
-            reasoning_effort: None,
-            effort_levels: None,
-            provider: Some("test".into()),
-            status: AgentStatus::Idle,
-            is_active: false,
-            system_prompt: None,
-            messages: vec![],
-            created_at: now_iso(),
-            updated_at: now_iso(),
-            parent_agent_id: None,
-            specialist: None,
-            task_note_id: None,
-            skip_auto_commit: false,
-            completion_report: None,
-            completion_report_timestamp: None,
-            attention_request_kind: None,
-            attention_request_reason: None,
-            attention_request_timestamp: None,
-            delegation_depth: None,
-            initial_message: None,
-            context_references: None,
-            image_blocks: None,
-            file_blocks: None,
-            is_background: false,
-            metadata: None,
-            stats: None,
-            sandbox_id: None,
-            sandbox_path: None,
-            sandbox_branch: None,
-            stop_reason: None,
-            stop_reason_timestamp: None,
-            session_corrupted: false,
-            pending_delete_at: None,
-            retired_at: None,
-            notifications_muted: false,
         }
     }
 
