@@ -57,6 +57,9 @@ SUPERSEDED_SKIPS = {"windows", "build"}
 # Advisory gate dependencies: any result is accepted (the gate reads only
 # their outputs), so a failed classifier or scan degrades to full CI.
 ADVISORY = {"release-fast-path", "supersede"}
+# Queue-only watcher outside CI Gate's `needs`: it cancels a doomed run early
+# and never decides the gate (scripts/test-merge-queue-fail-fast.py).
+QUEUE_WATCHERS = {"fail-fast"}
 RELEASE_BRANCH = "release-plz-2026-10-19T04-14-25Z"
 # macOS proofs that run once in the merge queue.
 NATIVE_STEPS = (
@@ -384,6 +387,8 @@ def routing_errors(workflow):
                     expected |= {"release-fast-path"}
                 if fast_path == "true":
                     expected -= FAST_PATH_SKIPS
+            if event == "merge_group":
+                expected |= QUEUE_WATCHERS
             if event == "push":
                 # Every main push classifies its diff against the previous tip
                 # and scans for superseded runs.

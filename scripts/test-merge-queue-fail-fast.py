@@ -219,5 +219,52 @@ class MainTests(unittest.TestCase):
             self.assertIn('check', summary.read())
 
 
+class WorkflowTests(unittest.TestCase):
+    """Pin the ci.yml wiring the script's safety argument depends on."""
+
+    @classmethod
+    def setUpClass(cls):
+        import yaml
+        cls.jobs = yaml.safe_load((Path(__file__).resolve().parents[1] / '.github/workflows/ci.yml').read_text())['jobs']
+        cls.job = cls.jobs['fail-fast']
+
+    def test_runs_only_in_the_merge_queue_on_a_free_hosted_runner(self):
+        self.assertEqual(self.job['if'], "github.event_name == 'merge_group'")
+        self.assertEqual(self.job['runs-on'], 'ubuntu-24.04')
+        self.assertNotIn('needs', self.job, 'must start at once, not behind route')
+
+    def test_job_name_matches_the_script(self):
+        self.assertEqual(self.job['name'], fail_fast.SELF_NAME)
+        self.assertEqual(self.jobs['gate']['name'], fail_fast.GATE_NAME)
+
+    def test_never_gates_and_gate_still_runs_after_a_cancel(self):
+        self.assertNotIn('fail-fast', self.jobs['gate']['needs'])
+        self.assertTrue(self.jobs['gate']['if'].lstrip('${ ').startswith('always()'), self.jobs['gate']['if'])
+
+    def test_least_privilege(self):
+        self.assertEqual(self.job['permissions'], {'actions': 'write', 'contents': 'read'})
+        writers = sorted(name for name, j in self.jobs.items() if (j.get('permissions') or {}).get('actions') == 'write')
+        self.assertEqual(writers, ['fail-fast', 'supersede'])
+
+    def test_checks_out_only_its_script_and_runs_it(self):
+        checkout, step = self.job['steps']
+        self.assertTrue(checkout['uses'].startswith('actions/checkout@'))
+        self.assertIs(checkout['with']['persist-credentials'], False)
+        self.assertEqual(checkout['with']['sparse-checkout'], 'scripts/merge-queue-fail-fast.py')
+        self.assertIs(checkout['with']['sparse-checkout-cone-mode'], False)
+        self.assertEqual(step['env'], {'GH_TOKEN': '${{ github.token }}'})
+        self.assertEqual(step['run'], 'python3 -I -B scripts/merge-queue-fail-fast.py --repo "$GITHUB_REPOSITORY" '
+                                      '--run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT"')
+        self.assertNotIn('--dry-run', step['run'])
+
+    def test_script_deadline_ends_before_the_job_timeout(self):
+        budget = self.job['timeout-minutes'] * 60
+        self.assertLessEqual(fail_fast.DEADLINE_SECONDS + fail_fast.POLL_SECONDS + 4 * 60, budget)
+
+    def test_release_scripts_runs_these_tests(self):
+        commands = '\n'.join(s.get('run', '') for s in self.jobs['release-scripts']['steps'])
+        self.assertIn('python3 -I -B scripts/test-merge-queue-fail-fast.py', commands)
+
+
 if __name__ == '__main__':
     unittest.main()
