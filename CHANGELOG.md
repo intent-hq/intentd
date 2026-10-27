@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.66] - 2026-10-27
+
+### 🔧 Refactor
+
+- *(services)* Move runtime into intent-svc-runtime ([#2767](https://github.com/intent-hq/intentd/pull/2767))
+
+### 📚 Documentation
+
+- Describe Multiplayer as always on in the assistant guide ([#2753](https://github.com/intent-hq/intentd/pull/2753))
+
+
 ## [0.11.65] - 2026-10-27
 
 ### 🧪 Testing
