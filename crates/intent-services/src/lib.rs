@@ -5050,7 +5050,6 @@ impl Services {
         mut route: intent_core::ReverseRoute,
         target: &intent_core::ReverseTarget,
     ) -> Result<serde_json::Value> {
-        use crate::browser_tabs::BrowserTabRoutingExt;
         use intent_core::{ReverseDispatchError, ReverseTarget};
 
         if route.connection_id.is_none() {
@@ -5062,7 +5061,11 @@ impl Services {
                     name: route.name.clone(),
                     pinned: matches!(target, ReverseTarget::Pinned(_)),
                 };
-                route.error = Some(self.browser_dispatch_error_message(error).await);
+                route.error = Some(
+                    self.feature_runtime()
+                        .browser_dispatch_error_message(self, error)
+                        .await,
+                );
             }
         }
         serde_json::to_value(route).map_err(|e| Error::Internal(e.to_string()))

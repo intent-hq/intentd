@@ -715,6 +715,7 @@ impl RuntimePort for FakeRuntime {
         fn browser_remove_tab<'a>(&'a self, svc: &'a Services, host: ClientId, tab_id: String) -> BoxFuture<'a, Result<()>>;
         fn browser_sync_tabs<'a>(&'a self, svc: &'a Services, host: ClientId, tabs: Vec<BrowserTabInput>) -> BoxFuture<'a, Result<Vec<String>>>;
         fn browser_exec<'a>(&'a self, svc: &'a Services, workspace_id: WorkspaceId, actions: Vec<serde_json::Value>, tab_id: Option<String>, agent_id: Option<AgentId>) -> BoxFuture<'a, Result<serde_json::Value>>;
+        fn browser_dispatch_error_message<'a>(&'a self, svc: &'a Services, err: intent_core::ReverseDispatchError) -> BoxFuture<'a, String>;
         fn browser_navigate_tab<'a>(&'a self, svc: &'a Services, tab_id: String, url: String) -> BoxFuture<'a, Result<serde_json::Value>>;
         fn browser_close_tab<'a>(&'a self, svc: &'a Services, tab_id: String, force: bool) -> BoxFuture<'a, Result<serde_json::Value>>;
         fn sandbox_merge<'a>(&'a self, svc: &'a Services, workspace_id: WorkspaceId, sandbox_id: AgentId) -> BoxFuture<'a, Result<serde_json::Value>>;

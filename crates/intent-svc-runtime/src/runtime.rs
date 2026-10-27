@@ -981,6 +981,14 @@ impl RuntimePort for RuntimeFeature {
     /// }` and echo that action's result envelope. The host then reports the
     /// resulting navigation through `browser.upsertTab` and every client
     /// follows the canonical row.
+    fn browser_dispatch_error_message<'a>(
+        &'a self,
+        svc: &'a Services,
+        err: ReverseDispatchError,
+    ) -> BoxFuture<'a, String> {
+        Box::pin(async move { svc.browser_dispatch_error_message(err).await })
+    }
+
     fn browser_navigate_tab<'a>(
         &'a self,
         svc: &'a Services,

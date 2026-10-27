@@ -601,6 +601,15 @@ pub trait RuntimePort: Send + Sync + 'static {
         agent_id: Option<AgentId>,
     ) -> BoxFuture<'a, Result<serde_json::Value>>;
 
+    /// Word a `browser.*` reverse-dispatch error for its caller: an offline
+    /// client is named (falling back to its stored name). Core's
+    /// `ws.browser.clients()` route view uses the runtime's wording.
+    fn browser_dispatch_error_message<'a>(
+        &'a self,
+        svc: &'a Services,
+        err: intent_core::ReverseDispatchError,
+    ) -> BoxFuture<'a, String>;
+
     /// `browser.navigateTab`.
     fn browser_navigate_tab<'a>(
         &'a self,
@@ -1531,6 +1540,14 @@ impl RuntimePort for UnavailableRuntime {
         agent_id: Option<AgentId>,
     ) -> BoxFuture<'a, Result<serde_json::Value>> {
         DEFAULT_WORKSPACE_API.browser_exec(workspace_id, actions, tab_id, agent_id)
+    }
+
+    fn browser_dispatch_error_message<'a>(
+        &'a self,
+        _svc: &'a Services,
+        err: intent_core::ReverseDispatchError,
+    ) -> BoxFuture<'a, String> {
+        Box::pin(async move { err.to_string() })
     }
 
     fn browser_navigate_tab<'a>(
