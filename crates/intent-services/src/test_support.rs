@@ -5,6 +5,8 @@
 //! (provider CLI stubs, fixture timeouts) stay `cfg(test)`.
 
 pub mod capability_fixtures;
+#[cfg(test)]
+pub(crate) mod fake_runtime;
 pub mod fixtures;
 #[cfg(test)]
 pub(crate) mod provider_installed;

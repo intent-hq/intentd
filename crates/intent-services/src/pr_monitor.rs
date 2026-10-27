@@ -5104,7 +5104,7 @@ impl Services {
 
 #[cfg(test)]
 mod tests {
-    use crate::hook_manager::HookServicesExt;
+    use crate::test_support::fake_runtime::{scheduled_hook, FakeRuntime};
     mod ancestry_messages;
     mod ancestry_regression;
     mod compact_required_checks;
@@ -8004,6 +8004,7 @@ mod tests {
     #[tokio::test]
     async fn a_parent_is_refused_while_its_child_is_still_working() {
         let (_db, _root, svc, _forge, ws, parent) = setup().await;
+        let svc = FakeRuntime::install(svc);
         let child = child_agent(&svc, &ws, "agent-child", &parent, AgentStatus::Active).await;
         let first = register(&svc, &ws, &child).await;
         link_task_note(&svc, &ws, &child, intent_core::TaskStatus::InProgress).await;
@@ -8072,19 +8073,9 @@ mod tests {
         svc.set_test_busy(&child, false);
 
         // Idle holding an active hook: the hook is a waiting reason too.
-        let out = svc
-            .hook_schedule_op(
-                &ws,
-                &child,
-                &json!({
-                    "name": "watcher",
-                    "code": "return { dispatch: false };",
-                    "delayMs": 10_000,
-                }),
-            )
-            .await
-            .expect("schedule");
-        let hook_id = intent_core::HookId::from(out["hook"]["hookId"].as_str().expect("hookId"));
+        let hook = scheduled_hook(&ws, &child, "watcher");
+        svc.store().insert_hook(&hook).await.expect("insert hook");
+        let hook_id = hook.hook_id.clone();
         let refused = svc
             .pr_monitor_start_op(&ws, &parent, 42, None)
             .await
@@ -8094,9 +8085,9 @@ mod tests {
             json!(true),
             "hook-holding child: {refused}"
         );
-        svc.hook_cancel_op(&ws, &hook_id, Some(&child))
-            .await
-            .expect("cancel hook");
+        FakeRuntime::of(&svc)
+            .cancel_hook(&svc, &hook_id, Some(&child))
+            .await;
 
         // Task still `in_progress`, but idle with nothing pending: the
         // predicates are OR'd, so the takeover proceeds.

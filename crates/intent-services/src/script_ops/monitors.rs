@@ -395,8 +395,12 @@ impl ScriptManager {
             self.emit_monitor(row, &row.state).await;
             if let Some(services) = self.owner_services.clone() {
                 let row = row.clone();
+                #[cfg(test)]
+                let dispatched = std::sync::Arc::clone(&self.locks.monitor_dispatched);
                 intent_core::spawn_daemon(async move {
                     services.dispatch_script_monitor(&row).await;
+                    #[cfg(test)]
+                    dispatched.notify_one();
                 });
             }
         }

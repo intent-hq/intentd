@@ -13,6 +13,8 @@ intent-svc-transfer = { path = "../intent-svc-transfer", version = "0.11.60" }
 
 [dev-dependencies]
 intent-core = { path = "../intent-core", version = "0.11.60" }
+# Disposable secret stores for the end-to-end tests (`Services::new_repository_fixture`).
+intent-services = { path = "../intent-services", version = "0.11.60", features = ["repository-test-fixtures"] }
 intent-store = { path = "../intent-store", version = "0.11.60" }
 intent-transport = { path = "../intent-transport", version = "0.11.60" }
 serde_json = { workspace = true }
