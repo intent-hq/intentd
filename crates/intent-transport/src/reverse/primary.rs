@@ -21,6 +21,10 @@
 //!   eligible connection of that logical `clientId`; none →
 //!   `ClientOffline { client_id, name, pinned }`.
 //!
+//! The shared REV-2 cases in `tests/fixtures/browser-routing.json` (a copy
+//! of the monorepo's `docs/protocol/fixtures/browser-routing/routing.json`)
+//! run against this registry in `primary/tests.rs`.
+//!
 //! Every accepted UDS or WSS connection registers its per-connection
 //! [`ReverseChannel`] with the shared [`PrimaryReverseRegistry`] and holds the
 //! returned [`PrimaryReverseGuard`] for the life of the connection. A
@@ -407,8 +411,10 @@ fn resolve_entry_matching<'a>(
     allowed: impl Fn(&Entry) -> bool,
 ) -> Result<&'a Entry, ReverseDispatchError> {
     match target {
-        // The first-connected eligible *client* stays the sticky primary,
-        // but the request goes to that client's newest eligible connection,
+        // The client of the oldest live eligible registration is the
+        // primary (re-evaluated per request, so it changes when that
+        // registration drops even if the client has a newer connection),
+        // and the request goes to that client's newest eligible connection,
         // the same rule as `Client` / `Pinned`: an older socket of the same
         // app that stopped answering must not take every unpinned dispatch
         // (intent-hq/intent#7902).

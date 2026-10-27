@@ -818,8 +818,9 @@ impl RuntimePort for RuntimeFeature {
     /// daemon-hosted MCP server, not a client connection), so we route the
     /// batch through the injected [`AgentReverseDispatch`]. The target is
     /// the workspace's **driving client** ([`Services::driving_client_target`],
-    /// REV-2 Model 5 & 10: pin → host of the workspace's claimed tabs →
-    /// first-connected eligible client); a driving client that is offline is
+    /// REV-2 rules 2–5: pin → client of an active desktop session → host of
+    /// the workspace's claimed tabs → first-connected eligible client); a
+    /// driving client that is offline is
     /// a hard `-32603` ("browser client … for this workspace is not
     /// connected"), never a silent fallback. Two rules run before dispatch:
     /// every `tabId` the batch names (envelope or per action) must be an

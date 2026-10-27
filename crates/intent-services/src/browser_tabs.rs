@@ -548,3 +548,6 @@ mod browser_client_pin_tests;
 
 #[cfg(test)]
 mod browser_routing_tests;
+
+#[cfg(test)]
+mod browser_routing_fixture_tests;

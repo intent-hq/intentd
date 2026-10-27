@@ -1,6 +1,7 @@
 // ---------------------------------------------------------------------------
-// REV-2 routing (Model 3–6 & 10): the driving client (pin → claimed-tab host
-// → first-connected), registry-answered `listTabs`, claim / pin migration of
+// REV-2 routing (Model 3–6 & 10): the driving client (pin → desktop session
+// → claimed-tab host → first-connected; every rule also runs as a shared
+// case in browser_routing_fixture_tests.rs), registry-answered `listTabs`, claim / pin migration of
 // tab rows, and the tab-addressed `browser.navigateTab` / `browser.closeTab`.
 // ---------------------------------------------------------------------------
 use crate::browser_tabs::BrowserTabRoutingExt;
@@ -21,7 +22,7 @@ fn agent(id: &str) -> AgentId {
 /// so they are created on demand (`setup` already knows `desktop-a` /
 /// `desktop-b` and the primary workspace). User tabs report
 /// `displayed: true`, agent tabs `false` (hidden).
-async fn register_tab(
+pub(super) async fn register_tab(
     svc: &Services,
     ws: &WorkspaceId,
     tab_id: &str,
