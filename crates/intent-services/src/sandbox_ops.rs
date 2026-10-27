@@ -3336,4 +3336,132 @@ mod tests {
     // The previous Services-level tests have been removed as misleading. Implementing the
     // WSS e2e infrastructure is ~1 session of focused work but is beyond the current P0-2
     // fix scope without explicit coordinator approval.
+
+    /// The real runtime's merge-back keeps the merged bytes in the checkout
+    /// when the sweep's caller is aborted and the daemon then shuts down.
+    /// Reauthored from core's
+    /// `real_runtime_merge_sweep_retains_merged_content_after_caller_abort`
+    /// over public requests only; core's sweep/shutdown ordering (the caller
+    /// aborted inside the marked window, shutdown draining the pending
+    /// cleanup) stays pinned there by
+    /// `merge_sweep_finishes_marked_sandbox_after_caller_abort` against the
+    /// runtime test double.
+    #[intent_test_macros::daemon_test]
+    async fn merge_sweep_keeps_merged_content_through_caller_abort_and_shutdown() {
+        use intent_store::SandboxStatus;
+        use tokio::time::{timeout, Duration};
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("sweep.db");
+        let store = Store::open(&db_path).await.unwrap();
+        let canonical = dir.path().join("canonical");
+        let sandbox_path = dir.path().join("sandbox");
+        init_test_repo(&canonical);
+        let agent = AgentId::from("sweep-shutdown");
+        let branch = format!("sb/{}", agent.0);
+        // A real Git clone and commit exercise merge-back without a native CoW dependency.
+        let base = {
+            let repo = git2::Repository::clone(canonical.to_str().unwrap(), &sandbox_path).unwrap();
+            let parent = repo.head().unwrap().peel_to_commit().unwrap();
+            let base = parent.id().to_string();
+            repo.branch(&branch, &parent, false).unwrap();
+            repo.set_head(&format!("refs/heads/{branch}")).unwrap();
+            fs::write(sandbox_path.join("swept.txt"), "retained merge").unwrap();
+            let mut index = repo.index().unwrap();
+            index.add_path(Path::new("swept.txt")).unwrap();
+            index.write().unwrap();
+            let oid = index.write_tree().unwrap();
+            let tree = repo.find_tree(oid).unwrap();
+            let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, "Retained work", &tree, &[&parent])
+                .unwrap();
+            base
+        };
+        let ws = workspace_for_repo(&canonical);
+        store.insert_workspace(&ws).await.unwrap();
+        let mut session = crate::test_support::fixtures::session(&agent, &ws.id);
+        session.sandbox_path = Some(sandbox_path.to_string_lossy().into());
+        store.insert_agent_session(&session).await.unwrap();
+        store
+            .insert_sandbox(&intent_store::Sandbox {
+                id: "shutdown-sandbox".into(),
+                workspace_id: ws.id.clone(),
+                agent_id: agent.clone(),
+                path: sandbox_path.to_string_lossy().into(),
+                branch,
+                base_commit_sha: base,
+                snapshot_commit_sha: None,
+                status: SandboxStatus::MergePending,
+                retry_count: 0,
+                created_at: now_iso(),
+                updated_at: now_iso(),
+            })
+            .await
+            .unwrap();
+        let bus = crate::EventBus::new(store.clone());
+        // A per-test secrets file: `Services::new` would use the default
+        // `~/intent/.secrets.json`.
+        let services = crate::Services::new_with_file_secrets(
+            store.clone(),
+            intent_core::FileSecretStore::with_path(dir.path().join("secrets.json")),
+        )
+        .with_event_bus(bus.clone());
+
+        let owner = services.clone();
+        let caller =
+            intent_core::spawn_daemon(async move { owner.sweep_merge_pending_sandboxes().await });
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            async {
+                while store
+                    .get_sandbox(&ws.id, &agent)
+                    .await
+                    .unwrap()
+                    .is_some_and(|sb| sb.status == SandboxStatus::MergePending)
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            },
+        )
+        .await
+        .expect("the sweep merged the sandbox");
+        assert_eq!(
+            fs::read_to_string(canonical.join("swept.txt")).unwrap(),
+            "retained merge"
+        );
+        caller.abort();
+        let _ = caller.await;
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(10)),
+            services.shutdown_store_writers(),
+        )
+        .await
+        .expect("shutdown drains the store writers");
+        bus.shutdown().await.unwrap();
+        store.close().await;
+
+        let reopened = Store::open(&db_path).await.unwrap();
+        assert!(reopened
+            .get_sandbox(&ws.id, &agent)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(!sandbox_path.exists());
+        assert_eq!(
+            fs::read_to_string(canonical.join("swept.txt")).unwrap(),
+            "retained merge"
+        );
+        let events = reopened
+            .query_events(&intent_store::EventQuery::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "sandbox:cow:merged")
+                .count(),
+            1
+        );
+        reopened.close().await;
+    }
 }

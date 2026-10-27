@@ -1665,9 +1665,14 @@ mod retire_workspace_tests;
 #[cfg(test)]
 mod sandbox_file_write_tests;
 
+#[cfg(test)]
+mod script_monitor_cancel_race_tests;
+
 #[cfg(all(test, unix))]
 mod setup_lifecycle_tests;
 
 #[cfg(test)]
 mod test_fixtures;
 
+#[cfg(test)]
+mod workspace_delete_tests;

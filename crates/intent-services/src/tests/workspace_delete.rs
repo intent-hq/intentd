@@ -1,8 +1,6 @@
 //! Service-level incremental deletion regressions (intent-hq/intent#5337).
 
 use super::{test_registry_with_default_provider, workspace, TempDb, WorkspacesRoot};
-use crate::browser_tabs::BrowserTabOpsExt;
-use crate::hook_manager::HookServicesExt;
 use crate::{EventBus, Services};
 use intent_core::{AgentId, Error, WorkspaceApi, WorkspaceId};
 use intent_store::Store;
@@ -256,14 +254,6 @@ async fn incremental_delete_refuses_new_producers_after_cleanup_sweeps() {
             None,
         )
         .await;
-    let hook = h
-        .svc
-        .hook_schedule_op(
-            &ws,
-            &agents[2],
-            &json!({"name":"late hook", "delayMs":60000, "code":"return {dispatch:false}"}),
-        )
-        .await;
     let subscription = h
         .svc
         .agent_subscribe(
@@ -283,7 +273,6 @@ async fn incremental_delete_refuses_new_producers_after_cleanup_sweeps() {
         None,
     );
     assert!(note.is_err(), "late history producer admitted: {note:?}");
-    assert!(hook.is_err(), "hook escaped scheduler sweep: {hook:?}");
     assert!(
         subscription.is_err(),
         "subscription escaped sweep: {subscription:?}"
@@ -316,15 +305,13 @@ async fn incremental_delete_refuses_new_producers_after_cleanup_sweeps() {
         panic!("monitor escaped cleanup");
     };
     assert!(error.to_string().contains("being deleted"));
-    let tab: intent_core::BrowserTabInput = serde_json::from_value(json!({
-        "tabId":"late-tab", "workspaceId":ws.0, "url":"http://localhost/"
-    }))
-    .unwrap();
-    let host = intent_core::ClientId::from("test-host");
-    let upsert = h.svc.browser_tab_upsert(host.clone(), tab.clone()).await;
-    let sync = h.svc.browser_tabs_sync(host, vec![tab]).await;
-    assert!(upsert.unwrap_err().to_string().contains("being deleted"));
-    assert!(sync.unwrap_err().to_string().contains("being deleted"));
+    // The runtime's producers (hooks, browser tabs) are admitted through
+    // this same gate; runtime/workspace_delete_tests.rs pins that they
+    // honour it.
+    let Err(gate) = h.svc.feature_workspace_mutations().enter(&ws) else {
+        panic!("a runtime producer would be admitted mid-delete");
+    };
+    assert!(gate.to_string().contains("being deleted"));
     // note.list is a read, but normally recreates Spec. It must not refill
     // a workspace that the incremental note sweep just emptied.
     h.store
