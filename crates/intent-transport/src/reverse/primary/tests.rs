@@ -296,8 +296,10 @@ async fn dispatch_timeout_names_the_silent_client_and_connection() {
         message.contains("\"client a\" (a)"),
         "names the client: {message}"
     );
+    // `ws.browser.exec` (intent-acp `DAEMON_TIMEOUT_MARKER`) keys its
+    // `ws.browser.clients()` hint on this exact daemon-only phrase.
     assert!(
-        message.contains("answer the request within 30s"),
+        message.contains(" did not accept or answer the request within 30s"),
         "states the deadline: {message}"
     );
     assert!(
@@ -1400,8 +1402,36 @@ fn connection_snapshot_routes_chief_to_administrator_connections_only() {
         &[ReverseTarget::Default],
     );
     assert_eq!(chief.routes[0].connection_id, None);
+    assert!(
+        !chief.clients[0].can_host_browser && !chief.clients[0].connections[0].can_host_browser,
+        "the list applies the same Chief scope as the routes"
+    );
     assert_eq!(
         chief.routes[0].error.as_deref(),
         Some("no client connected")
     );
+}
+
+/// A route names its client the way the list does (newest hello), even when
+/// the routed connection's own hello carried an older name.
+#[test]
+fn connection_snapshot_route_uses_the_listed_client_name() {
+    let reg = PrimaryReverseRegistry::new();
+    let (desk, _rx_desk) = idle_channel();
+    let (aux, _rx_aux) = idle_channel();
+    let g_desk = reg.register(desk, ReverseTransport::Wss);
+    g_desk.bind(ReverseClientIdentity {
+        name: Some("Old".to_string()),
+        ..identity("desk", true)
+    });
+    let g_aux = reg.register(aux, ReverseTransport::Uds);
+    g_aux.bind(ReverseClientIdentity {
+        name: Some("New".to_string()),
+        ..identity("desk", false)
+    });
+
+    let snapshot = reg.connection_snapshot(&workspace("ws-1"), &[ReverseTarget::Default]);
+    assert_eq!(snapshot.clients[0].name.as_deref(), Some("New"));
+    assert_eq!(snapshot.routes[0].connection_id, Some(0));
+    assert_eq!(snapshot.routes[0].name.as_deref(), Some("New"));
 }

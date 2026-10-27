@@ -48,7 +48,10 @@ pub(crate) async fn dispatch(
     match method {
         "exec" => exec(api, ws, caller_agent_id, args).await,
         "listTabs" => list_tabs(api, ws, caller_agent_id, args).await,
-        "clients" => api.browser_clients(ws.clone()).await.map_err(map_err),
+        "clients" => api
+            .browser_clients(ws.clone(), caller_agent_id.cloned())
+            .await
+            .map_err(map_err),
         "docs" => docs(args),
         other => Err(format!("host: unknown method `browser.{other}`")),
     }
@@ -79,13 +82,17 @@ async fn exec(
         .map_err(|e| with_timeout_hint(map_err(e)))
 }
 
-/// The transport's wording for a reverse request that got no answer.
-const TIMEOUT_MARKER: &str = "reverse request timed out: browser.exec";
+/// The suffix only a daemon-side deadline adds to a `browser.exec` failure
+/// (`… on connection <n> over <transport>, connected <ts> did not accept or
+/// answer the request within <s>s`, intent-transport `reverse::primary`). An
+/// error the client itself returns never carries it, even when its text
+/// says "timed out".
+const DAEMON_TIMEOUT_MARKER: &str = " did not accept or answer the request within ";
 
-/// Point a timed-out `browser.exec` at the read that shows which connection
-/// received it; other errors pass through unchanged.
+/// Point a `browser.exec` the daemon gave up waiting on at the read that
+/// shows which connection received it; other errors pass through unchanged.
 fn with_timeout_hint(message: String) -> String {
-    if message.contains(TIMEOUT_MARKER) {
+    if message.contains(DAEMON_TIMEOUT_MARKER) {
         format!(
             "{message}. Call ws.browser.clients() to see this client's live connections and \
              which one received the request."

@@ -134,7 +134,10 @@ fn desk_client(id: &str, connection_id: u64, eligible: bool) -> Value {
 async fn browser_clients_unpinned_names_the_default_connection() {
     let reg = SnapshotRegistry::new(&[("desktop-a", Some("Desktop A"), true)]);
     let (_t, _r, svc, ws) = setup(reg.clone()).await;
-    let out = svc.browser_clients(ws.clone()).await.expect("clients");
+    let out = svc
+        .browser_clients(ws.clone(), None)
+        .await
+        .expect("clients");
     assert_eq!(
         out,
         json!({
@@ -155,7 +158,8 @@ async fn browser_clients_unpinned_names_the_default_connection() {
 
 /// A pin routes the workspace to the pinned client while the unpinned
 /// route stays on the first-connected one; a pin that is offline reports
-/// no connection and the dispatch error.
+/// no connection and the error `browser.exec` would give (with the stored
+/// client name, since no live connection supplies one).
 #[intent_test_macros::daemon_test]
 async fn browser_clients_reports_the_pin_and_an_offline_pin() {
     let reg = SnapshotRegistry::new(&[
@@ -178,7 +182,10 @@ async fn browser_clients_reports_the_pin_and_an_offline_pin() {
     svc.set_workspace_browser_client(ws.clone(), Some(ClientId::from_string("desktop-b")))
         .await
         .expect("pin");
-    let out = svc.browser_clients(ws.clone()).await.expect("clients");
+    let out = svc
+        .browser_clients(ws.clone(), None)
+        .await
+        .expect("clients");
     assert_eq!(out["unpinned"]["connectionId"], 1);
     assert_eq!(
         out["workspace"],
@@ -191,12 +198,12 @@ async fn browser_clients_reports_the_pin_and_an_offline_pin() {
     svc.set_workspace_browser_client(ws.clone(), Some(ClientId::from_string("gone")))
         .await
         .expect("pin");
-    let out = svc.browser_clients(ws).await.expect("clients");
+    let out = svc.browser_clients(ws, None).await.expect("clients");
     assert_eq!(
         out["workspace"],
         json!({
             "clientId": "gone", "connectionId": null,
-            "error": "pinned browser client gone is not connected",
+            "error": "browser client \"Gone\" (gone) for this workspace is not connected",
             "source": "workspace",
         })
     );
@@ -211,7 +218,7 @@ async fn browser_clients_reports_the_claimed_tab_host() {
     ]);
     let (_t, _r, svc, ws) = setup(reg).await;
     register_tab(&svc, &ws, "agent-tab", "desktop-b", Some("agent-1")).await;
-    let out = svc.browser_clients(ws).await.expect("clients");
+    let out = svc.browser_clients(ws, None).await.expect("clients");
     assert_eq!(out["unpinned"]["clientId"], "desktop-a");
     assert_eq!(out["workspace"]["clientId"], "desktop-b");
     assert_eq!(out["workspace"]["connectionId"], 2);
@@ -224,7 +231,7 @@ async fn browser_clients_reports_the_claimed_tab_host() {
 async fn browser_clients_without_an_eligible_client_reports_no_client() {
     let reg = SnapshotRegistry::new(&[("cli", None, false)]);
     let (_t, _r, svc, ws) = setup(reg).await;
-    let out = svc.browser_clients(ws).await.expect("clients");
+    let out = svc.browser_clients(ws, None).await.expect("clients");
     let no_client =
         json!({ "clientId": null, "connectionId": null, "error": "no client connected" });
     let mut workspace_route = no_client.clone();
@@ -247,9 +254,52 @@ async fn browser_clients_without_a_dispatcher_lists_nothing() {
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
     let svc = Services::new(store);
-    let out = svc.browser_clients(ws).await.expect("clients");
+    let out = svc.browser_clients(ws, None).await.expect("clients");
     assert_eq!(out["clients"], json!([]));
     assert_eq!(out["unpinned"]["error"], "no client connected");
     assert_eq!(out["workspace"]["error"], "no client connected");
     assert_eq!(out["workspace"]["source"], "default");
+}
+
+/// A dispatcher that answers one route for two targets breaks the contract;
+/// that is an internal error, never a silent "no client connected".
+#[intent_test_macros::daemon_test]
+async fn browser_clients_rejects_a_short_route_list() {
+    struct ShortRegistry;
+    impl AgentReverseDispatch for ShortRegistry {
+        fn is_connected(&self) -> bool {
+            false
+        }
+        fn connection_snapshot(
+            &self,
+            _workspace_id: &WorkspaceId,
+            _targets: &[ReverseTarget],
+        ) -> ReverseConnectionSnapshot {
+            ReverseConnectionSnapshot {
+                clients: Vec::new(),
+                routes: vec![ReverseRoute::failed(&ReverseDispatchError::NoClient)],
+            }
+        }
+        fn dispatch<'a>(
+            &'a self,
+            _method: &'a str,
+            _params: Value,
+            _target: ReverseTarget,
+        ) -> BoxFuture<'a, Result<Value, ReverseDispatchError>> {
+            panic!("browser.clients must never dispatch to a client")
+        }
+    }
+    let tmp = TempDb::new();
+    let store = Store::open(&tmp.path).await.expect("open store");
+    let ws = WorkspaceId::new();
+    store.insert_workspace(&workspace(&ws)).await.expect("ws");
+    let svc = Services::new(store).with_reverse_dispatch(Arc::new(ShortRegistry));
+    let err = svc
+        .browser_clients(ws, None)
+        .await
+        .expect_err("short route list");
+    assert!(
+        matches!(&err, intent_core::Error::Internal(m) if m.contains("one route per target")),
+        "{err:?}"
+    );
 }

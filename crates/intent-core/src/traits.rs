@@ -899,9 +899,14 @@ pub trait WorkspaceApi: Send + Sync {
     /// [{ connectionId, transport, connectedAt, canHostBrowser }] }],
     /// unpinned: Route, workspace: Route & { source } }` where a route is
     /// `{ clientId, name?, connectionId, error? }` (see
-    /// [`ReverseConnectionSnapshot`]). Read-only.
-    fn browser_clients(&self, id: WorkspaceId) -> BoxFuture<'_, Result<serde_json::Value>> {
-        let _ = id;
+    /// [`ReverseConnectionSnapshot`]). Read-only. `agent_id` is the calling
+    /// agent, whose workspace membership is checked as for `browser_exec`.
+    fn browser_clients(
+        &self,
+        id: WorkspaceId,
+        agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (id, agent_id);
         Box::pin(async {
             Err(Error::Internal(
                 "WorkspaceApi::browser_clients not implemented".to_string(),
@@ -9245,8 +9250,9 @@ pub struct ReverseLiveClient {
 /// One live hello'd connection in a [`ReverseConnectionSnapshot`].
 /// `connection_id` is the registry's arrival sequence (the number a
 /// `browser.exec` timeout error names); `transport` is the wire spelling
-/// (`"uds"` / `"wss"`); `can_host_browser` is the routing eligibility
-/// (`browserExec` advertised and browser-hosting authority), the same
+/// (`"uds"` / `"wss"`); `can_host_browser` is whether a `browser.exec` of
+/// the snapshot's workspace may be routed to it (`browserExec` advertised,
+/// browser-hosting authority, and administrator-only for Chief) — the same
 /// predicate `dispatch` selects on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -9272,10 +9278,11 @@ pub struct ReverseClientConnections {
 }
 
 /// Where one [`ReverseTarget`] would be delivered right now. On success
-/// `connection_id` names the receiving connection; otherwise it is `None`
-/// and `error` carries the [`ReverseDispatchError`] text a dispatch would
-/// fail with (`client_id` / `name` still name a pinned or tab-host client
-/// that is offline).
+/// `connection_id` names the receiving connection and `name` is the
+/// client's listed (newest-hello) name; otherwise `connection_id` is `None`
+/// and `error` carries the [`ReverseDispatchError`] text (`client_id` /
+/// `name` still name a pinned or tab-host client that is offline; the
+/// service layer rewords it as `browser.exec` would).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReverseRoute {

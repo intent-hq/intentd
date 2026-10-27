@@ -9970,7 +9970,7 @@ mod wsapi6_bindings_tests {
         browser_exec_fe_envelope: Mutex<Option<Value>>,
         /// When set, `browser_exec` fails with this internal error.
         browser_exec_error: Mutex<Option<String>>,
-        browser_clients_calls: Mutex<Vec<String>>,
+        browser_clients_calls: Mutex<Vec<(String, Option<String>)>>,
     }
 
     impl WorkspaceApi for FakeApi {
@@ -10118,11 +10118,15 @@ mod wsapi6_bindings_tests {
             })
         }
 
-        fn browser_clients(&self, ws: WorkspaceId) -> BoxFuture<'_, Result<Value>> {
-            self.browser_clients_calls
-                .lock()
-                .unwrap()
-                .push(ws.as_str().to_string());
+        fn browser_clients(
+            &self,
+            ws: WorkspaceId,
+            agent_id: Option<AgentId>,
+        ) -> BoxFuture<'_, Result<Value>> {
+            self.browser_clients_calls.lock().unwrap().push((
+                ws.as_str().to_string(),
+                agent_id.map(|a| a.as_str().to_string()),
+            ));
             Box::pin(async {
                 Ok(json!({
                     "clients": [{
@@ -10687,7 +10691,7 @@ mod wsapi6_bindings_tests {
         assert_eq!(v["workspace"]["source"], json!("default"));
         assert_eq!(
             *api.browser_clients_calls.lock().unwrap(),
-            vec!["amber-forest".to_string()]
+            vec![("amber-forest".to_string(), Some("agent-77".to_string()))]
         );
         assert!(api.browser_exec_calls.lock().unwrap().is_empty());
     }
@@ -10715,6 +10719,19 @@ mod wsapi6_bindings_tests {
             message.contains("Call ws.browser.clients() to see this client's live connections"),
             "{message}"
         );
+
+        // An error the client itself returned (no daemon deadline suffix)
+        // gets no hint, even though its text says "timed out".
+        *api.browser_exec_error.lock().unwrap() =
+            Some("browser.exec: reverse request timed out: browser.exec".to_string());
+        let resp = call(
+            &srv,
+            "return await ws.browser.exec([{ action: 'screenshot' }]);",
+        )
+        .await;
+        let message = text(&resp);
+        assert!(message.contains("timed out"), "{message}");
+        assert!(!message.contains("ws.browser.clients()"), "{message}");
 
         *api.browser_exec_error.lock().unwrap() =
             Some("browser.exec: no client connected".to_string());
