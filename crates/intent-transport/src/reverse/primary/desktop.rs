@@ -109,7 +109,10 @@ pub(super) async fn dispatch(
             let mut failure: DesktopError = error
                 .data
                 .and_then(|data| serde_json::from_value(data).ok())
-                .unwrap_or_else(|| DesktopError::new("desktop-outcome-unknown", error.message));
+                .map_or_else(
+                    || DesktopError::new("desktop-outcome-unknown", error.message),
+                    DesktopError::sanitized,
+                );
             // A lost reply cannot establish whether submitted input ran. Keep
             // explicit native classifications, but never default an uncertain
             // execute outcome to the agent boundary's pre-execution status.

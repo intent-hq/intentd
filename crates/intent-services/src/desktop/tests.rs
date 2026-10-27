@@ -684,6 +684,7 @@ async fn activation_failure_diagnostics_survive_outbox_and_conversation() {
             code: "desktop-os-permission-required".into(),
             detail: "Screen Recording permission is required.".into(),
             execution: execution.map(str::to_string),
+            reason: None,
         };
         *h.executor.fail.lock().unwrap() = Some("startControl".into());
         *h.executor.failure.lock().unwrap() = Some(failure.clone());
@@ -1892,4 +1893,267 @@ async fn stop_during_action_validation_never_restores_active_control() {
     assert_eq!(restarted["alreadyGranted"], false);
     assert_ne!(restarted["sessionId"], active["sessionId"]);
     h.agent("endControl", json!({})).await.unwrap();
+}
+
+fn windowed_screenshot() -> Value {
+    json!({
+        "capturedAt":"2026-10-26T12:00:00Z","layoutId":"layout",
+        "displays":[{"displayId":"screen","width":2880,"height":1800,"originX":0,"originY":0,"scaleFactor":2.0,"assetId":"asset","url":"workspace-asset://workspace/asset","mimeType":"image/png"}],
+        "frontmost":{"appName":"Safari","bundleId":"com.apple.Safari","pid":411,"windowId":"win-safari"},
+        "windows":[
+            {"windowId":"win-safari","appName":"Safari","bundleId":"com.apple.Safari","pid":411,"title":"Start Page","x":200,"y":100,"width":1600,"height":1000,"focused":true},
+            {"windowId":"win-slack","appName":"Slack","pid":522,"x":-120,"y":50,"width":1400,"height":900,"focused":false}
+        ]
+    })
+}
+
+type Mutation = Box<dyn Fn(&mut Value)>;
+
+#[test]
+fn screenshot_window_metadata_is_validated_and_passed_through() {
+    let ws = WorkspaceId::from("workspace");
+    let action = json!({"kind":"screenshot"});
+    let result = windowed_screenshot();
+    validate_result(&result, &action, &ws).unwrap();
+    let mut empty = result.clone();
+    empty["windows"] = json!([]);
+    empty["frontmost"]
+        .as_object_mut()
+        .unwrap()
+        .remove("windowId");
+    validate_result(&empty, &action, &ws).unwrap();
+    let mut no_frontmost = empty.clone();
+    no_frontmost.as_object_mut().unwrap().remove("frontmost");
+    validate_result(&no_frontmost, &action, &ws).unwrap();
+    // Older executors that predate window metadata still return a valid image.
+    let mut legacy = result.clone();
+    legacy.as_object_mut().unwrap().remove("frontmost");
+    legacy.as_object_mut().unwrap().remove("windows");
+    validate_result(&legacy, &action, &ws).unwrap();
+    // A focused window on another display may be named only by frontmost.
+    let mut offscreen_focus = result.clone();
+    offscreen_focus["frontmost"]["windowId"] = "win-other-display".into();
+    offscreen_focus["windows"][0]["focused"] = false.into();
+    validate_result(&offscreen_focus, &action, &ws).unwrap();
+
+    let broken: Vec<(&str, Mutation)> = vec![
+        ("windows not array", Box::new(|v| v["windows"] = json!({}))),
+        ("windows null", Box::new(|v| v["windows"] = Value::Null)),
+        ("frontmost null", Box::new(|v| v["frontmost"] = Value::Null)),
+        ("unknown top-level", Box::new(|v| v["extra"] = 1.into())),
+        (
+            "frontmost without windows",
+            Box::new(|v| {
+                v.as_object_mut().unwrap().remove("windows");
+            }),
+        ),
+        (
+            "empty windowId",
+            Box::new(|v| v["windows"][0]["windowId"] = "".into()),
+        ),
+        (
+            "numeric windowId",
+            Box::new(|v| v["windows"][0]["windowId"] = 7.into()),
+        ),
+        (
+            "duplicate windowId",
+            Box::new(|v| v["windows"][1]["windowId"] = "win-safari".into()),
+        ),
+        (
+            "empty appName",
+            Box::new(|v| v["windows"][1]["appName"] = "".into()),
+        ),
+        ("zero pid", Box::new(|v| v["windows"][1]["pid"] = 0.into())),
+        (
+            "string pid",
+            Box::new(|v| v["windows"][1]["pid"] = "522".into()),
+        ),
+        (
+            "fractional x",
+            Box::new(|v| v["windows"][1]["x"] = 1.5.into()),
+        ),
+        (
+            "zero width",
+            Box::new(|v| v["windows"][1]["width"] = 0.into()),
+        ),
+        (
+            "negative height",
+            Box::new(|v| v["windows"][1]["height"] = (-1).into()),
+        ),
+        (
+            "empty title",
+            Box::new(|v| v["windows"][1]["title"] = "".into()),
+        ),
+        (
+            "null title",
+            Box::new(|v| v["windows"][1]["title"] = Value::Null),
+        ),
+        (
+            "null bundleId",
+            Box::new(|v| v["windows"][1]["bundleId"] = Value::Null),
+        ),
+        (
+            "focused not bool",
+            Box::new(|v| v["windows"][1]["focused"] = "false".into()),
+        ),
+        (
+            "unknown window field",
+            Box::new(|v| v["windows"][1]["zOrder"] = 1.into()),
+        ),
+        (
+            "missing focused",
+            Box::new(|v| {
+                v["windows"][1].as_object_mut().unwrap().remove("focused");
+            }),
+        ),
+        (
+            "two focused",
+            Box::new(|v| v["windows"][1]["focused"] = true.into()),
+        ),
+        (
+            "focused differs from frontmost",
+            Box::new(|v| v["frontmost"]["windowId"] = "win-slack".into()),
+        ),
+        (
+            "focused without frontmost window",
+            Box::new(|v| {
+                v["frontmost"].as_object_mut().unwrap().remove("windowId");
+            }),
+        ),
+        (
+            "focused with other pid",
+            Box::new(|v| v["frontmost"]["pid"] = 999.into()),
+        ),
+        (
+            "frontmost empty appName",
+            Box::new(|v| v["frontmost"]["appName"] = "".into()),
+        ),
+        (
+            "frontmost zero pid",
+            Box::new(|v| v["frontmost"]["pid"] = 0.into()),
+        ),
+        (
+            "frontmost empty windowId",
+            Box::new(|v| v["frontmost"]["windowId"] = "".into()),
+        ),
+        (
+            "frontmost unknown field",
+            Box::new(|v| v["frontmost"]["title"] = "x".into()),
+        ),
+        (
+            "listed frontmost window not focused",
+            Box::new(|v| {
+                v["frontmost"]["windowId"] = "win-slack".into();
+                v["windows"][0]["focused"] = false.into();
+            }),
+        ),
+        (
+            "window off display",
+            Box::new(|v| v["windows"][1]["x"] = 2880.into()),
+        ),
+    ];
+    for (name, mutate) in broken {
+        let mut value = result.clone();
+        mutate(&mut value);
+        assert!(validate_result(&value, &action, &ws).is_err(), "{name}");
+    }
+    // Window metadata belongs to screenshots only.
+    let mut listed = json!({"layoutId":"layout","displays":[{"displayId":"screen","width":1,"height":1,"originX":0,"originY":0,"scaleFactor":1.0}]});
+    validate_result(&listed, &json!({"kind":"listDisplay"}), &ws).unwrap();
+    listed["windows"] = json!([]);
+    assert!(validate_result(&listed, &json!({"kind":"listDisplay"}), &ws).is_err());
+}
+
+#[tokio::test]
+async fn window_target_is_forwarded_and_focus_window_returns_ok() {
+    let h = Harness::new().await;
+    h.remember().await;
+    h.agent("startControl", json!({})).await.unwrap();
+    assert_eq!(
+        h.agent("type", json!({"text":"hi","windowId":"win-safari"}))
+            .await
+            .unwrap(),
+        json!({"ok":true})
+    );
+    assert_eq!(
+        h.agent("focusWindow", json!({"windowId":"win-slack"}))
+            .await
+            .unwrap(),
+        json!({"ok":true})
+    );
+    let calls = h.executor.calls.lock().unwrap().clone();
+    let actions: Vec<_> = calls
+        .iter()
+        .filter(|c| c["operation"] == "prepareCommand")
+        .map(|c| c["action"].clone())
+        .collect();
+    assert_eq!(
+        actions,
+        vec![
+            json!({"kind":"type","text":"hi","windowId":"win-safari"}),
+            json!({"kind":"focusWindow","windowId":"win-slack"}),
+        ]
+    );
+    let mut ws_shot = windowed_screenshot();
+    ws_shot["displays"][0]["url"] = format!("workspace-asset://{}/asset", h.workspace).into();
+    *h.executor.result.lock().unwrap() = Some(ws_shot.clone());
+    assert_eq!(h.agent("screenshot", json!({})).await.unwrap(), ws_shot);
+    let before = h.executor.calls.lock().unwrap().len();
+    assert!(h
+        .agent("focusWindow", json!({"windowId":""}))
+        .await
+        .is_err());
+    assert_eq!(h.executor.calls.lock().unwrap().len(), before);
+}
+
+#[tokio::test]
+async fn target_mismatch_reaches_the_agent_and_keeps_control_active() {
+    for execution in ["not_started", "partial"] {
+        let h = Harness::new().await;
+        h.remember().await;
+        h.agent("startControl", json!({})).await.unwrap();
+        let mut failure = DesktopError::new(
+            intent_core::desktop::TARGET_MISMATCH,
+            "The target window is not ready for input. Call ws.desktop.focusWindow({ windowId }) if needed, take a new screenshot to confirm the target, then retry.",
+        );
+        failure.execution = Some(execution.into());
+        failure.reason = Some("not_frontmost".into());
+        *h.executor.fail.lock().unwrap() = Some("execute".into());
+        *h.executor.failure.lock().unwrap() = Some(failure.clone());
+        let e = h
+            .agent("type", json!({"text":"Safari","windowId":"win-safari"}))
+            .await
+            .unwrap_err();
+        assert_eq!(e, failure, "{execution}");
+        assert_eq!(e.numeric_code(), -32602);
+        // The executor knows exactly what ran, so the agent may focusWindow,
+        // take a screenshot and retry within the same session.
+        assert!(
+            matches!(
+                h.services.desktop.state(&h.agent),
+                DesktopState::Active { .. }
+            ),
+            "{execution}"
+        );
+        *h.executor.fail.lock().unwrap() = None;
+        assert_eq!(
+            h.agent("focusWindow", json!({"windowId":"win-safari"}))
+                .await
+                .unwrap(),
+            json!({"ok":true})
+        );
+    }
+    // Uncertain outcomes still invalidate the session, target or not.
+    let h = Harness::new().await;
+    h.remember().await;
+    h.agent("startControl", json!({})).await.unwrap();
+    let mut failure = DesktopError::new(intent_core::desktop::TARGET_MISMATCH, "x");
+    failure.execution = Some("unknown".into());
+    *h.executor.fail.lock().unwrap() = Some("execute".into());
+    *h.executor.failure.lock().unwrap() = Some(failure);
+    assert!(h
+        .agent("type", json!({"text":"x","windowId":"w"}))
+        .await
+        .is_err());
+    assert_eq!(h.services.desktop.state(&h.agent), DesktopState::Inactive);
 }
