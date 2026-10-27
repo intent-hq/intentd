@@ -597,6 +597,29 @@ impl RuntimePort for FakeRuntime {
     }
 
     /// Remove the sandbox folder and row, as the runtime's discard does.
+    /// Mirrors the runtime's claimed-tab migration on a pin change: reassign
+    /// the claimed rows in the store, flag each moved tab's desktop
+    /// assignment, and wake desktop waiters. The runtime's per-tab
+    /// `browser:tab-updated` events are not published here.
+    fn migrate_claimed_browser_tabs<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
+        new_host: &'a ClientId,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let moved = svc
+                .store
+                .reassign_claimed_browser_tabs(workspace_id, new_host)
+                .await?;
+            for (tab, _) in &moved {
+                svc.desktop.assignment_changed(&tab.workspace_id);
+            }
+            svc.desktop.changed.notify_waiters();
+            Ok(())
+        })
+    }
+
     fn discard_sandbox<'a>(
         &'a self,
         svc: &'a Services,
@@ -720,7 +743,6 @@ impl RuntimePort for FakeRuntime {
         fn browser_close_tab<'a>(&'a self, svc: &'a Services, tab_id: String, force: bool) -> BoxFuture<'a, Result<serde_json::Value>>;
         fn sandbox_merge<'a>(&'a self, svc: &'a Services, workspace_id: WorkspaceId, sandbox_id: AgentId) -> BoxFuture<'a, Result<serde_json::Value>>;
         fn sandbox_discard<'a>(&'a self, svc: &'a Services, workspace_id: WorkspaceId, sandbox_id: AgentId) -> BoxFuture<'a, Result<serde_json::Value>>;
-        fn migrate_claimed_browser_tabs<'a>(&'a self, svc: &'a Services, workspace_id: &'a WorkspaceId, new_host: &'a ClientId) -> BoxFuture<'a, Result<()>>;
         fn provision_sandbox<'a>(&'a self, svc: &'a Services, workspace_id: &'a WorkspaceId, agent_id: &'a AgentId, workspaces_root: PathBuf) -> BoxFuture<'a, Result<ProvisionOutcome>>;
         fn run_setup_script(&self, svc: &Services, run: SetupScriptRun) -> BoxFuture<'static, (bool, Option<u32>)>;
         fn script_monitor_lane<'a>(&'a self, svc: &'a Services) -> &'a tokio::sync::Mutex<()>;
