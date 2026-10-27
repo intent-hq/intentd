@@ -309,6 +309,11 @@ impl Runtime {
             },
         });
     }
+    /// Test seam: drop the session [`Self::activate_for_test`] recorded.
+    #[cfg(test)]
+    pub(crate) fn deactivate_for_test(&self) {
+        self.remove(&AgentId::from_string("routing-fixture-agent"));
+    }
     fn put(&self, live: Live) {
         if matches!(live.phase, Phase::Active { .. }) {
             self.assignment_changed(&live.binding.workspace_id);

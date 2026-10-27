@@ -46,19 +46,29 @@ async fn known_client(svc: &Services, id: &str) -> ClientId {
     client
 }
 
+/// Every shared case on one store, each in its own fresh workspace (Chief
+/// only for the Chief case), reporting all failing cases at once.
 #[intent_test_macros::daemon_test]
 async fn routing_fixture_every_case_derives_the_expected_target() {
     let fixture: Value = serde_json::from_str(ROUTING_FIXTURE).expect("routing fixture json");
     assert_eq!(fixture["schema"], "browser-routing/v1");
     let cases = fixture["cases"].as_array().expect("cases");
     assert!(!cases.is_empty(), "the routing fixture has no cases");
+    let (_t, _r, svc, _bus, _primary) = setup(FakeRegistry::new(&[])).await;
+    let mut failures = Vec::new();
     for case in cases {
         let name = case["id"].as_str().expect("case id");
         let state = &case["workspace"];
-        let (_t, _r, svc, _bus, primary) = setup(FakeRegistry::new(&[])).await;
         let ws = match state["chief"].as_bool() {
             Some(true) => WorkspaceId::chief(),
-            Some(false) => primary,
+            Some(false) => {
+                let ws = WorkspaceId::new();
+                svc.store()
+                    .insert_workspace(&crate::test_support::fixtures::workspace(&ws))
+                    .await
+                    .expect("workspace");
+                ws
+            }
             None => panic!("{name}: workspace.chief must be a boolean"),
         };
         if let Some(pin) = state["pin"].as_str() {
@@ -72,7 +82,7 @@ async fn routing_fixture_every_case_derives_the_expected_target() {
             register_tab(
                 &svc,
                 &ws,
-                tab["tabId"].as_str().expect("tabId"),
+                &format!("{name}/{}", tab["tabId"].as_str().expect("tabId")),
                 tab["host"].as_str().expect("host"),
                 tab["owner"].as_str(),
             )
@@ -82,10 +92,16 @@ async fn routing_fixture_every_case_derives_the_expected_target() {
             svc.feature_desktop()
                 .activate_for_test(&ws, ClientId::from_string(client));
         }
-        assert_eq!(
-            svc.driving_client_target(&ws).await.expect(name),
-            expected_target(case),
-            "{name}"
-        );
+        let got = svc.driving_client_target(&ws).await.expect(name);
+        let want = expected_target(case);
+        if got != want {
+            failures.push(format!("{name}: expected {want:?}, got {got:?}"));
+        }
+        svc.feature_desktop().deactivate_for_test();
     }
+    assert!(
+        failures.is_empty(),
+        "routing fixture cases failed:\n{}",
+        failures.join("\n")
+    );
 }

@@ -13,10 +13,11 @@
 //!   Guest hellos enter only the device roster. Current members can host
 //!   ordinary workspace browsers; each dispatch rechecks their authority.
 //!   Chief and host reverse requests select only administrator connections.
-//! - [`ReverseTarget::Default`] → the **first-connected** eligible client,
-//!   via its **newest** eligible connection (unchanged single-desktop
-//!   behaviour; a stale older socket of that client is skipped); none →
-//!   `NoClient`.
+//! - [`ReverseTarget::Default`] → the client of the **oldest live** eligible
+//!   registration, via its **newest** eligible connection (a stale older
+//!   socket of that client is skipped). Re-evaluated per request: when that
+//!   registration drops, the next-oldest registration's client wins even if
+//!   the first client still has a newer connection. None → `NoClient`.
 //! - [`ReverseTarget::Client`] / [`ReverseTarget::Pinned`] → the **newest**
 //!   eligible connection of that logical `clientId`; none →
 //!   `ClientOffline { client_id, name, pinned }`.

@@ -1291,26 +1291,27 @@ fn fixture_target(case: &serde_json::Value) -> ReverseTarget {
     }
 }
 
-fn assert_fixture_error(case: &str, got: &ReverseDispatchError, want: &serde_json::Value) {
-    match (want["kind"].as_str(), got) {
-        (Some("no-client"), ReverseDispatchError::NoClient) => {}
+/// `Ok` when `got` is the error `want` describes; unknown kinds are a fixture
+/// bug and panic.
+fn check_fixture_error(got: &ReverseDispatchError, want: &serde_json::Value) -> Result<(), String> {
+    let matches = match (want["kind"].as_str(), got) {
+        (Some("no-client"), ReverseDispatchError::NoClient) => true,
         (
             Some("client-offline"),
             ReverseDispatchError::ClientOffline {
                 client_id, pinned, ..
             },
         ) => {
-            assert_eq!(
-                Some(client_id.as_str()),
-                want["clientId"].as_str(),
-                "{case}"
-            );
-            assert_eq!(Some(*pinned), want["pinned"].as_bool(), "{case}");
+            Some(client_id.as_str()) == want["clientId"].as_str()
+                && Some(*pinned) == want["pinned"].as_bool()
         }
-        (Some("no-client" | "client-offline"), _) => {
-            panic!("{case}: expected {want}, got {got:?}")
-        }
-        (other, _) => panic!("{case}: unknown error kind {other:?}"),
+        (Some("no-client" | "client-offline"), _) => false,
+        (other, _) => panic!("unknown error kind {other:?} in {want}"),
+    };
+    if matches {
+        Ok(())
+    } else {
+        Err(format!("expected {want}, got {got:?}"))
     }
 }
 
@@ -1324,8 +1325,8 @@ struct FixtureConnection {
 }
 
 /// Build the registry a case describes: register every connection in
-/// arrival order, hello in `helloOrder` (default: arrival order), then
-/// drop the `drops`.
+/// arrival order, hello in `helloOrder` (default: arrival order; it must
+/// list every hello'd connection exactly once), then drop the `drops`.
 fn fixture_registry(case: &serde_json::Value) -> (PrimaryReverseRegistry, Vec<FixtureConnection>) {
     let name = case["id"].as_str().expect("case id");
     let reg = PrimaryReverseRegistry::new();
@@ -1351,6 +1352,11 @@ fn fixture_registry(case: &serde_json::Value) -> (PrimaryReverseRegistry, Vec<Fi
             }
         })
         .collect();
+    let hellod: Vec<String> = conns
+        .iter()
+        .filter(|c| c.client.is_some())
+        .map(|c| c.id.clone())
+        .collect();
     let hello_order: Vec<String> = match case.get("helloOrder") {
         Some(order) => order
             .as_array()
@@ -1358,25 +1364,25 @@ fn fixture_registry(case: &serde_json::Value) -> (PrimaryReverseRegistry, Vec<Fi
             .iter()
             .map(|v| v.as_str().expect("helloOrder id").to_string())
             .collect(),
-        None => conns
-            .iter()
-            .filter(|c| c.client.is_some())
-            .map(|c| c.id.clone())
-            .collect(),
+        None => hellod.clone(),
     };
+    let mut sorted_order = hello_order.clone();
+    sorted_order.sort();
+    let mut sorted_hellod = hellod;
+    sorted_hellod.sort();
+    assert_eq!(
+        sorted_order, sorted_hellod,
+        "{name}: helloOrder must list every hello'd connection exactly once"
+    );
     for id in &hello_order {
         let conn = conns
             .iter()
             .find(|c| &c.id == id)
-            .unwrap_or_else(|| panic!("{name}: helloOrder names unknown connection {id}"));
-        let client = conn
-            .client
-            .as_deref()
-            .unwrap_or_else(|| panic!("{name}: {id} never hello'd"));
-        conn.guard
-            .as_ref()
-            .expect("live guard")
-            .bind(identity(client, conn.browser_exec));
+            .expect("checked against the connections above");
+        conn.guard.as_ref().expect("live guard").bind(identity(
+            conn.client.as_deref().expect("hello'd"),
+            conn.browser_exec,
+        ));
     }
     for drop_id in case["drops"].as_array().expect("drops") {
         let conn = conns
@@ -1414,73 +1420,97 @@ fn routing_fixture_copy_matches_the_protocol_fixture_when_in_the_monorepo() {
     }
 }
 
-/// Every shared case: the registry resolves the case's `expect.target` to
-/// the expected connection (witnessed by a real dispatch landing on that
-/// channel and no other) or to the expected typed error.
-#[tokio::test]
-async fn routing_fixture_every_case_reaches_the_expected_connection() {
-    for case in routing_cases() {
-        let name = case["id"].as_str().expect("case id").to_string();
-        let (reg, mut conns) = fixture_registry(&case);
-        let target = fixture_target(&case);
-        if let Some(want) = case["expect"].get("error") {
-            let err = reg.resolve(&target).expect_err(&name);
-            assert_fixture_error(&name, &err, want);
-            let err = reg
-                .dispatch("browser.exec", json!({ "actions": [] }), target)
-                .await
-                .expect_err(&name);
-            assert_fixture_error(&name, &err, want);
-            continue;
+/// Run one case: the registry resolves its `expect.target` to the expected
+/// connection (witnessed by a real dispatch landing on that channel and no
+/// other) or to the expected typed error. The dispatch carries the case's
+/// `workspaceId`, so ordinary workspaces take the member-scope filter and
+/// Chief the administrator-only one, as in production.
+async fn run_routing_case(case: &serde_json::Value) -> Result<(), String> {
+    let (reg, mut conns) = fixture_registry(case);
+    let target = fixture_target(case);
+    let workspace_id = if case["workspace"]["chief"].as_bool() == Some(true) {
+        intent_core::CHIEF_WORKSPACE_ID
+    } else {
+        "routing-fixture-workspace"
+    };
+    let params = json!({ "workspaceId": workspace_id, "actions": [] });
+    if let Some(want) = case["expect"].get("error") {
+        match reg.resolve(&target) {
+            Err(err) => check_fixture_error(&err, want).map_err(|e| format!("resolve: {e}"))?,
+            Ok(got) => return Err(format!("resolve: expected {want}, got {got:?}")),
         }
-        let want = case["expect"]["connection"].as_str().expect("connection");
-        let idx = conns
-            .iter()
-            .position(|c| c.id == want)
-            .unwrap_or_else(|| panic!("{name}: expect names unknown connection {want}"));
-        assert_eq!(
-            reg.resolve(&target).expect(&name).client_id.as_str(),
-            conns[idx].client.as_deref().expect("hello'd"),
-            "{name}: resolve() picks the expected client"
-        );
-        let dispatch = tokio::spawn({
-            let reg = reg.clone();
-            async move {
-                reg.dispatch("browser.exec", json!({ "actions": [] }), target)
-                    .await
-            }
-        });
-        let frame = tokio::time::timeout(
-            intentd_test_support::test_timeout(Duration::from_millis(500)),
-            conns[idx].rx.recv(),
-        )
-        .await;
-        let Ok(Some(frame)) = frame else {
-            dispatch.abort();
-            let got: Vec<String> = conns
-                .iter_mut()
-                .filter_map(|c| c.rx.try_recv().is_ok().then(|| c.id.clone()))
-                .collect();
-            panic!("{name}: expected the request on {want}, it went to {got:?}");
+        return match reg.dispatch("browser.exec", params, target).await {
+            Err(err) => check_fixture_error(&err, want).map_err(|e| format!("dispatch: {e}")),
+            Ok(got) => Err(format!("dispatch: expected {want}, got {got}")),
         };
-        let frame: serde_json::Value = serde_json::from_str(&frame).expect("json");
-        conns[idx].channel.route_response(&json!({
-            "jsonrpc": "2.0",
-            "id": frame["id"],
-            "result": { "case": name },
-        }));
-        assert_eq!(
-            dispatch.await.expect("join").expect(&name),
-            json!({ "case": name })
-        );
-        for (i, conn) in conns.iter_mut().enumerate() {
-            if i != idx {
-                assert!(
-                    conn.rx.try_recv().is_err(),
-                    "{name}: {} must not receive the request",
-                    conn.id
-                );
-            }
+    }
+    let want = case["expect"]["connection"].as_str().expect("connection");
+    let idx = conns
+        .iter()
+        .position(|c| c.id == want)
+        .unwrap_or_else(|| panic!("expect names unknown connection {want}"));
+    let want_client = conns[idx].client.clone().expect("hello'd");
+    match reg.resolve(&target) {
+        Ok(got) if got.client_id.as_str() == want_client => {}
+        other => {
+            return Err(format!(
+                "resolve: expected client {want_client}, got {other:?}"
+            ))
         }
     }
+    let dispatch = tokio::spawn({
+        let reg = reg.clone();
+        async move { reg.dispatch("browser.exec", params, target).await }
+    });
+    let frame = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(500)),
+        conns[idx].rx.recv(),
+    )
+    .await;
+    let Ok(Some(frame)) = frame else {
+        dispatch.abort();
+        let got: Vec<String> = conns
+            .iter_mut()
+            .filter_map(|c| c.rx.try_recv().is_ok().then(|| c.id.clone()))
+            .collect();
+        return Err(format!(
+            "expected the request on {want}, it went to {got:?}"
+        ));
+    };
+    let frame: serde_json::Value = serde_json::from_str(&frame).expect("json");
+    conns[idx].channel.route_response(&json!({
+        "jsonrpc": "2.0",
+        "id": frame["id"],
+        "result": { "routed": want },
+    }));
+    match dispatch.await.expect("join") {
+        Ok(reply) if reply == json!({ "routed": want }) => {}
+        other => return Err(format!("dispatch reply: {other:?}")),
+    }
+    let extra: Vec<String> = conns
+        .iter_mut()
+        .enumerate()
+        .filter_map(|(i, c)| (i != idx && c.rx.try_recv().is_ok()).then(|| c.id.clone()))
+        .collect();
+    if extra.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("{extra:?} also received the request"))
+    }
+}
+
+/// Every shared case, reporting all failing cases at once.
+#[tokio::test]
+async fn routing_fixture_every_case_reaches_the_expected_connection() {
+    let mut failures = Vec::new();
+    for case in routing_cases() {
+        if let Err(e) = run_routing_case(&case).await {
+            failures.push(format!("{}: {e}", case["id"].as_str().expect("case id")));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "routing fixture cases failed:\n{}",
+        failures.join("\n")
+    );
 }
