@@ -7,8 +7,9 @@
 //!
 //! Core is driven only through public requests: `agent.create`,
 //! `app.agents.waitFor`, `agent.getSubscriptions`, and `agent:idle` events
-//! through the completion delivery loop. The loop handles events in order, so
-//! a sentinel idle for a separately watched agent, once its wake lands,
+//! through the completion delivery loop. The loop handles events in order and
+//! inline, so a sentinel idle for a separately watched agent, once its wake
+//! lands (or, with the claim park armed, once its own terminal delivery parks),
 //! proves every earlier idle was handled. The claim park is the one core
 //! test seam.
 
@@ -98,12 +99,27 @@ impl Harness {
 
     /// Fence the delivery loop: every idle published before this returns has
     /// been handled.
-    async fn settle(&self) {
+    ///
+    /// With the claim park armed, every terminal delivery parks, the
+    /// sentinel's included, so its wake cannot land. The loop delivers inline,
+    /// so the sentinel reaching the park is the fence; it stays parked until
+    /// the caller notifies `park.release` for it.
+    async fn settle(&self, park: Option<&CompletionClassifyPark>) {
         let before = messages(&self.svc, &self.observer).await;
         self.wait_for(&self.observer, &[&self.sentinel], "immediate")
             .await;
         self.idle(&self.sentinel, json!({"agentId": self.sentinel}))
             .await;
+        if let Some(park) = park {
+            timeout(wait(), park.entered.notified())
+                .await
+                .expect("the sentinel idle reached the claim park");
+            return;
+        }
+        self.wait_observer_past(before).await;
+    }
+
+    async fn wait_observer_past(&self, before: usize) {
         timeout(wait(), async {
             while messages(&self.svc, &self.observer).await == before {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -238,11 +254,18 @@ async fn script_monitor_cancel_redelivers_a_watched_childs_completion_once() {
         if grouped {
             h.idle(&parent, json!({"agentId": parent})).await;
         }
-        h.settle().await;
+        let armed = (!grouped).then_some(park.as_ref());
+        let observed = messages(&svc, &h.observer).await;
+        h.settle(armed).await;
         assert_eq!(messages(&svc, &parent).await, 1, "one advisory");
         assert!(messages_text(&svc, &parent).await.contains("Monitor check"));
         assert!(h.watches_child(&parent, &child).await);
         h.wait_persisted_watches(&parent, 1).await;
+        if armed.is_some() {
+            // Only the sentinel is parked: let its wake land before the race.
+            park.release.notify_one();
+            h.wait_observer_past(observed).await;
+        }
 
         let cancellation = tokio::spawn({
             let svc = svc.clone();
@@ -260,9 +283,12 @@ async fn script_monitor_cancel_redelivers_a_watched_childs_completion_once() {
                 .expect("cancellation redelivery claims the watch");
             // The competing idle pass must yield to the claimed delivery.
             h.idle(&child, json!({"agentId": child})).await;
-            h.settle().await;
+            h.settle(armed).await;
             assert!(h.watches_child(&parent, &child).await);
             assert_eq!(messages(&svc, &parent).await, 1);
+            // Release both parked deliveries: the cancellation's claim and
+            // the sentinel's fence.
+            park.release.notify_one();
             park.release.notify_one();
         }
         timeout(wait(), cancellation).await.unwrap().unwrap();
