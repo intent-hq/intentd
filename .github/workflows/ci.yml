@@ -2223,6 +2223,8 @@ jobs:
           python3 -B scripts/test-release-rust-cache.py
           python3 -I -B scripts/test-optional-intel-release.py
           python3 -B scripts/test-release-host-network.py
+          python3 -B scripts/test-release-plz-network.py
+          python3 -I -B scripts/test-release-plz-rerun.py
           python3 -B scripts/test-setup-sccache.py
           python3 -I -B scripts/test-coverage-storage.py
           python3 -B scripts/test-hosted-runners.py
