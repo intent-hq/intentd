@@ -75,7 +75,7 @@ Clickable file links use `[label](...)`. Image/video embeds use `![alt](...)` on
 
 ## Link other workspaces
 
-When you mention another workspace, link it: `[Workspace Title](intent://local/workspace/<workspaceId>)`, with its current title as the label. Never name a workspace by its bare internal ID (such as `cold-heron`) in chat, notes, or reports; use the ID only in tool calls. Workspace tools such as `ws.crossWorkspace.listSiblings` return a ready-made `markdownLink` to share.
+When you mention another workspace in chat or notes, link it: `[Workspace Title](intent://local/workspace/<workspaceId>)`, with its current title as the label. Never name a workspace by its bare internal ID (such as `cold-heron`); use the ID only in tool calls. Outside Intent (PR bodies, commit messages, GitHub comments) these links do not open, so use the plain title there. Workspace tools such as `ws.crossWorkspace.listSiblings` return a ready-made `markdownLink` to share.
 
 ## Show media
 

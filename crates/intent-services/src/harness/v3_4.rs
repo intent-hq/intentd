@@ -28,13 +28,15 @@ mod tests {
     const RULE_HEADING: &str = "## Link other workspaces\n";
     const LINK_EXAMPLE: &str = "`[Workspace Title](intent://local/workspace/<workspaceId>)`";
 
+    /// The workspace link section: its heading through the text before the
+    /// next `## ` heading.
     fn workspace_links_section() -> &'static str {
         let common = super::ENTRY.doctrine.instructions.common;
         let start = common.find(RULE_HEADING).expect("workspace link section");
-        let end = common[start..]
-            .find("## Show media\n")
-            .expect("next section")
-            + start;
+        let body = start + RULE_HEADING.len();
+        let end = common[body..]
+            .find("\n## ")
+            .map_or(common.len(), |i| body + i + 1);
         &common[start..end]
     }
 
@@ -60,6 +62,7 @@ mod tests {
             "Never name a workspace by its bare internal ID",
             "use the ID only in tool calls",
             "`markdownLink`",
+            "Outside Intent",
         ] {
             assert!(workspace_links_section().contains(guidance), "{guidance}");
         }
@@ -67,6 +70,13 @@ mod tests {
         assert_eq!(a.workspace_agent, b.workspace_agent);
         assert_eq!(a.assistant, b.assistant);
         assert_eq!(a.single_workspace_fallback, b.single_workspace_fallback);
+        let data_ptr = |h: &'static dyn crate::harness::Harness| {
+            std::ptr::from_ref::<dyn crate::harness::Harness>(h).cast::<()>()
+        };
+        assert!(
+            std::ptr::eq(data_ptr(current.harness), data_ptr(previous.harness)),
+            "3.4 keeps 3.3's text surfaces"
+        );
         assert_eq!(current.doctrine.specialists, previous.doctrine.specialists);
         assert_eq!((current.default_features)(), (previous.default_features)());
         assert_eq!(current.feature_labels, previous.feature_labels);

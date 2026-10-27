@@ -9395,6 +9395,19 @@ mod wsapi3_bindings_tests {
         assert!(text(&resp).contains("Note not found"));
     }
 
+    /// A bracketed title stays one Markdown link (shared escaping with the
+    /// workspace links).
+    #[tokio::test]
+    async fn note_create_markdown_link_escapes_brackets_in_the_title() {
+        let (srv, _api) = server();
+        let resp = call(&srv, "return await ws.note.create('Fix [beta]', 'x');").await;
+        let v = body(&resp);
+        assert_eq!(
+            v["markdownLink"],
+            json!(r"[Fix \[beta\]](intent://local/amber-forest/note/n-new)")
+        );
+    }
+
     #[tokio::test]
     async fn note_create_returns_link_and_markdown_link() {
         let (srv, api) = server();

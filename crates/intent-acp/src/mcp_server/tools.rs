@@ -338,7 +338,7 @@ API:
   ws.mcp.listTools(serverId) → { tools: [...] }  // Forward `tools/list` to one enabled external MCP server; the raw MCP result. Errors when the server is disabled (globally or for this workspace) or not running.
   ws.mcp.callTool(serverId, toolName, args?, timeoutMs?) → result  // Forward `tools/call` to one enabled external MCP server and return the raw MCP result. `args` defaults to `{}`; `timeoutMs` is a per-call override the daemon caps at its own bound.
 
-  ws.crossWorkspace.listSiblings({ includeRetired? }?) → [workspaces]  // Other workspaces sharing the same repository (repo-scoped; retired only via includeRetired). Rows are `{ id, title, branch, status, createdAt, updatedAt, link, markdownLink }`; share `markdownLink` when you mention that workspace.
+  ws.crossWorkspace.listSiblings({ includeRetired? }?) → [workspaces]  // Other workspaces sharing the same repository (repo-scoped; retired only via includeRetired). Rows include `link` and `markdownLink`; share `markdownLink` when you mention that workspace.
   ws.crossWorkspace.readNote(targetWorkspaceId, noteId) → note  // Read a note from another sibling workspace in the same repository. Use `listSiblings()` first to discover valid workspace IDs; use noteId=`spec` for its spec.
   ws.crossWorkspace.listNotes(targetWorkspaceId) → [notes]  // List notes in another sibling workspace. Use this before `readNote()` if you do not know which note IDs exist there.
 
@@ -644,7 +644,7 @@ API:
   ws.mcp.listTools(serverId) → { tools: [...] }  // Forward `tools/list` to one enabled external MCP server; the raw MCP result. Errors when the server is disabled (globally or for this workspace) or not running.
   ws.mcp.callTool(serverId, toolName, args?, timeoutMs?) → result  // Forward `tools/call` to one enabled external MCP server and return the raw MCP result. `args` defaults to `{}`; `timeoutMs` is a per-call override the daemon caps at its own bound.
 
-  ws.crossWorkspace.listSiblings({ includeRetired? }?) → [workspaces]  // Other workspaces sharing the same repository (repo-scoped; retired only via includeRetired). Rows are `{ id, title, branch, status, createdAt, updatedAt, link, markdownLink }`; share `markdownLink` when you mention that workspace.
+  ws.crossWorkspace.listSiblings({ includeRetired? }?) → [workspaces]  // Other workspaces sharing the same repository (repo-scoped; retired only via includeRetired). Rows include `link` and `markdownLink`; share `markdownLink` when you mention that workspace.
   ws.crossWorkspace.readNote(targetWorkspaceId, noteId) → note  // Read a note from another sibling workspace in the same repository. Use `listSiblings()` first to discover valid workspace IDs; use noteId=`spec` for its spec.
   ws.crossWorkspace.listNotes(targetWorkspaceId) → [notes]  // List notes in another sibling workspace. Use this before `readNote()` if you do not know which note IDs exist there.
 

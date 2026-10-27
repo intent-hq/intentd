@@ -101,8 +101,10 @@ async fn app_file_links_in_assembled_prompts_are_session_pinned() {
             }
             if agent_type != "interactive" {
                 // 3.4 adds only the workspace-link section to the common body.
-                let start = prompts[1].find("## Link other workspaces\n").unwrap();
-                let end = prompts[1][start..].find("## Show media\n").unwrap() + start;
+                let heading = "## Link other workspaces\n";
+                let start = prompts[1].find(heading).unwrap();
+                let body = start + heading.len();
+                let end = prompts[1][body..].find("\n## ").unwrap() + body + 1;
                 let without_workspace_links =
                     format!("{}{}", &prompts[1][..start], &prompts[1][end..]);
                 assert_eq!(

@@ -497,21 +497,35 @@ pub(crate) fn map_err(e: intent_core::Error) -> String {
     e.to_string()
 }
 
+/// A Markdown link `[label](url)` whose label has `[`, `]` and `\\` escaped,
+/// so a title like `Fix [beta] login` still forms one link.
+pub(crate) fn markdown_link(label: &str, url: &str) -> String {
+    let mut out = String::with_capacity(label.len() + url.len() + 4);
+    out.push('[');
+    for c in label.chars() {
+        if matches!(c, '[' | ']' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push_str("](");
+    out.push_str(url);
+    out.push(')');
+    out
+}
+
 /// The app link that opens workspace `id`, plus a Markdown link labelled with
-/// its title: `(intent://local/workspace/{id}, [Title](intent://local/workspace/{id}))`.
-/// Returned beside workspace IDs so agents share a clickable workspace instead
-/// of its internal ID. Brackets and backslashes in the title are escaped so a
-/// title like `Fix [beta] login` still forms one link.
+/// its title (`Untitled` when blank): `(intent://local/workspace/{id},
+/// [Title](intent://local/workspace/{id}))`. Returned beside workspace IDs so
+/// agents share a clickable workspace instead of its internal ID.
 pub(crate) fn workspace_links(id: &str, title: &str) -> (String, String) {
     let link = format!("intent://local/workspace/{id}");
-    let label: String = title
-        .chars()
-        .flat_map(|c| match c {
-            '[' | ']' | '\\' => vec!['\\', c],
-            _ => vec![c],
-        })
-        .collect();
-    let markdown_link = format!("[{label}]({link})");
+    let label = if title.trim().is_empty() {
+        "Untitled"
+    } else {
+        title
+    };
+    let markdown_link = markdown_link(label, &link);
     (link, markdown_link)
 }
 
@@ -557,6 +571,10 @@ mod workspace_link_tests {
         assert_eq!(
             workspace_links("w", r"Fix [beta] a\b").1,
             r"[Fix \[beta\] a\\b](intent://local/workspace/w)"
+        );
+        assert_eq!(
+            workspace_links("w", "  ").1,
+            "[Untitled](intent://local/workspace/w)"
         );
     }
 
