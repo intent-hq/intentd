@@ -890,11 +890,13 @@ mod tests {
             .await
             .unwrap();
         let bus = EventBus::new(store.clone());
-        let services = Services::new_with_file_secrets(
-            store.clone(),
-            intent_core::FileSecretStore::with_path(db.dir.path().join("secrets.json")),
-        )
-        .with_event_bus(bus.clone());
+        let services = crate::test_support::fake_runtime::FakeRuntime::install(
+            Services::new_with_file_secrets(
+                store.clone(),
+                intent_core::FileSecretStore::with_path(db.dir.path().join("secrets.json")),
+            )
+            .with_event_bus(bus.clone()),
+        );
         let (release, released) = tokio::sync::oneshot::channel();
         *services.sandbox_merge_finish.lock().unwrap() = Some(released);
         let owner = services.clone();
@@ -915,10 +917,8 @@ mod tests {
                 .status,
             SandboxStatus::Merged
         );
-        assert_eq!(
-            fs::read_to_string(canonical.join("swept.txt")).unwrap(),
-            "retained merge"
-        );
+        // The git merge-back itself is runtime behaviour (sandbox_ops tests);
+        // the fake runtime reports a clean merge without touching the checkout.
         caller.abort();
         assert!(caller.await.unwrap_err().is_cancelled());
         let (entered, entering) = tokio::sync::oneshot::channel();
@@ -957,10 +957,6 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(!sandbox_path.exists());
-        assert_eq!(
-            fs::read_to_string(canonical.join("swept.txt")).unwrap(),
-            "retained merge"
-        );
         let events = reopened
             .query_events(&intent_store::EventQuery::default())
             .await

@@ -2,8 +2,6 @@
 //! projection (digest/lastResponse), conversation truncation, the queue
 //! lifecycle, send/force semantics, summary, model catalog, and subscriptions.
 
-use crate::hook_manager::HookServicesExt;
-use crate::script_monitor::ScriptMonitorExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -37,6 +35,7 @@ use crate::agent_ops::{
     parse_session_stats_output, resolve_auggie_bin_with,
 };
 use crate::agent_subscriptions::GroupPersistOp;
+use crate::test_support::fake_runtime::FakeRuntime;
 use crate::Services;
 use intent_core::MAX_DELEGATION_DEPTH;
 
@@ -3796,6 +3795,7 @@ async fn rearmed_watch_dedups_empty_report_completion() {
 #[tokio::test]
 async fn gap_b_settlement_records_marker_so_rearm_skips_stale_report() {
     let (_t, svc, ws) = setup().await;
+    let svc = FakeRuntime::install(svc);
     let parent = create_agent(&svc, &ws, "Parent").await;
     let child = create_agent(&svc, &ws, "Child").await;
     let hook = seed_active_hook(&svc, &ws, &child, "pr-watch").await;
@@ -10393,6 +10393,7 @@ async fn agent_list_row_stays_within_row_budget() {
         AGENT_LIST_PATH_CAP_BYTES, AGENT_LIST_PREVIEW_BUDGET_BYTES, AGENT_LIST_ROW_BUDGET_BYTES,
     };
     let (_t, svc, ws) = setup().await;
+    let svc = FakeRuntime::install(svc);
     let (_id, row) = worst_case_agent_list_row(&svc, &ws).await;
 
     assert_eq!(
@@ -10479,6 +10480,7 @@ async fn agent_list_row_keys_match_allowlist_golden() {
         AGENT_LIST_ROW_METADATA_KEYS,
     };
     let (_t, svc, ws) = setup().await;
+    let svc = FakeRuntime::install(svc);
     let (_id, row) = worst_case_agent_list_row(&svc, &ws).await;
     let wire = serde_json::to_value(&row).unwrap();
 
@@ -21522,7 +21524,7 @@ async fn get_subscriptions_bundles_slim_participants() {
 
 #[intent_test_macros::daemon_test]
 async fn get_subscriptions_preserves_chief_identity_and_runtime_overlays() {
-    let (_t, svc, manager, _bus, ws) = setup_with_manager().await;
+    let (_t, svc, manager, _bus, ws) = setup_with_manager_fake_runtime().await;
     let chief = WorkspaceId::chief();
     let parent = create_agent(&svc, &chief, "Chief").await;
     let child = create_agent(&svc, &ws, "Remote participant").await;
@@ -24775,6 +24777,7 @@ async fn seed_active_pr_monitor(
 #[tokio::test]
 async fn hook_waiting_idle_delivers_advisory_then_armed_watch_completes() {
     let (_t, svc, ws) = setup().await;
+    let svc = FakeRuntime::install(svc);
     let parent = create_agent(&svc, &ws, "Parent").await;
     let child = create_agent(&svc, &ws, "Child").await;
     let hook = seed_active_hook(&svc, &ws, &child, "pr-watch").await;
@@ -24895,7 +24898,7 @@ async fn hook_waiting_idle_delivers_advisory_then_armed_watch_completes() {
 /// is unchanged: a second idle before any turn stays silent.
 #[tokio::test]
 async fn turn_start_opens_new_waiting_period_for_armed_watch() {
-    let (_t, svc, manager, _bus, ws) = setup_with_manager().await;
+    let (_t, svc, manager, _bus, ws) = setup_with_manager_fake_runtime().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
     let child = create_agent(&svc, &ws, "Child").await;
     seed_active_hook(&svc, &ws, &child, "pr-watch").await;
@@ -25002,7 +25005,7 @@ async fn turn_start_opens_new_waiting_period_for_armed_watch() {
 /// the first even though the marker cleared.
 #[tokio::test]
 async fn turn_start_opens_new_waiting_period_for_grouped_watch() {
-    let (_t, svc, manager, _bus, ws) = setup_with_manager().await;
+    let (_t, svc, manager, _bus, ws) = setup_with_manager_fake_runtime().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
     let child = create_agent(&svc, &ws, "Child").await;
     seed_active_hook(&svc, &ws, &child, "pr-watch").await;
@@ -25096,6 +25099,7 @@ async fn turn_start_opens_new_waiting_period_for_grouped_watch() {
 #[tokio::test]
 async fn monitoring_idle_advisory_metadata_flags() {
     let (_t, svc, ws) = setup().await;
+    let svc = FakeRuntime::install(svc);
     let parent = create_agent(&svc, &ws, "Parent").await;
     let child = create_agent(&svc, &ws, "Child").await;
     seed_active_hook(&svc, &ws, &child, "ci-poll").await;
@@ -25413,6 +25417,7 @@ async fn queue_interim_monitoring_idle_gets_no_advisory() {
 #[tokio::test]
 async fn busy_suppressed_monitoring_idle_advisory_heals_on_worker_exit() {
     let (_t, svc, ws) = setup().await;
+    let svc = FakeRuntime::install(svc);
     let parent = create_agent(&svc, &ws, "Parent").await;
     let child = create_agent(&svc, &ws, "Child").await;
     seed_active_hook(&svc, &ws, &child, "pr-watch").await;
@@ -25492,6 +25497,7 @@ async fn busy_suppressed_monitoring_idle_advisory_heals_on_worker_exit() {
 #[tokio::test]
 async fn failed_advisory_wake_retries_without_another_event() {
     let (_t, svc, ws) = setup().await;
+    let svc = FakeRuntime::install(svc);
     let parent = create_agent(&svc, &ws, "Parent").await;
     let child = create_agent(&svc, &ws, "Child").await;
     seed_active_hook(&svc, &ws, &child, "pr-watch").await;
@@ -25590,6 +25596,7 @@ async fn failed_advisory_wake_retries_without_another_event() {
 #[tokio::test]
 async fn sustained_marker_write_failure_advises_once_per_period() {
     let (_t, svc, ws) = setup().await;
+    let svc = FakeRuntime::install(svc);
     let parent = create_agent(&svc, &ws, "Parent").await;
     let child = create_agent(&svc, &ws, "Child").await;
     seed_active_hook(&svc, &ws, &child, "pr-watch").await;
@@ -25713,6 +25720,7 @@ async fn sustained_marker_write_failure_advises_once_per_period() {
 #[tokio::test]
 async fn ask_then_watch_adoption_receives_monitoring_idle_advisory() {
     let (_t, svc, ws) = setup().await;
+    let svc = FakeRuntime::install(svc);
     let parent = create_agent(&svc, &ws, "Parent").await;
     let child = create_agent(&svc, &ws, "Child").await;
     seed_active_hook(&svc, &ws, &child, "pr-watch").await;
@@ -25787,6 +25795,7 @@ async fn ask_then_watch_adoption_receives_monitoring_idle_advisory() {
 #[tokio::test]
 async fn completion_only_watch_skips_monitoring_idle_advisory() {
     let (_t, svc, ws) = setup().await;
+    let svc = FakeRuntime::install(svc);
     let parent = create_agent(&svc, &ws, "Parent").await;
     let child = create_agent(&svc, &ws, "Child").await;
     let hook = seed_active_hook(&svc, &ws, &child, "pr-watch").await;
@@ -25858,6 +25867,7 @@ async fn completion_only_watch_skips_monitoring_idle_advisory() {
 #[tokio::test]
 async fn advisory_marker_clears_at_settlement_without_armed_watch() {
     let (_t, svc, ws) = setup().await;
+    let svc = FakeRuntime::install(svc);
     let parent = create_agent(&svc, &ws, "Parent").await;
     let child = create_agent(&svc, &ws, "Child").await;
     let hook = seed_active_hook(&svc, &ws, &child, "first-watch").await;
@@ -26048,6 +26058,7 @@ async fn agent_waiting_monitoring_idle_gets_no_advisory() {
 #[tokio::test]
 async fn grouped_monitoring_idle_delivers_one_advisory_and_group_settles_later() {
     let (_t, svc, ws) = setup().await;
+    let svc = FakeRuntime::install(svc);
     let parent = create_agent(&svc, &ws, "Parent").await;
     let child = create_agent(&svc, &ws, "Child").await;
     let hook = seed_active_hook(&svc, &ws, &child, "pr-watch").await;
@@ -26228,6 +26239,7 @@ async fn completion_wake_without_hooks_stays_plain() {
 #[tokio::test]
 async fn after_all_group_waits_for_hook_waiting_child() {
     let (_t, svc, ws) = setup().await;
+    let svc = FakeRuntime::install(svc);
     let parent = create_agent(&svc, &ws, "Parent").await;
     let child = create_agent(&svc, &ws, "Child").await;
     let hook = seed_active_hook(&svc, &ws, &child, "ci-poll").await;
@@ -26246,7 +26258,10 @@ async fn after_all_group_waits_for_hook_waiting_child() {
 
     // Child idles while its hook is active: NOT recorded as settled.
     let mut data = json!({ "agentId": child.0 });
-    svc.annotate_waiting_on_hooks(&child, &mut data).await;
+    svc.ports
+        .runtime()
+        .annotate_waiting_on_hooks(&svc, &child, &mut data)
+        .await;
     assert!(data.get("waitingOnHooks").is_some(), "stamped: {data}");
     svc.handle_completion_event(&completion_event(&ws, AGENT_IDLE, &child, data))
         .await;
@@ -26590,6 +26605,7 @@ async fn after_all_group_waits_for_pr_monitor_waiting_child() {
 #[tokio::test]
 async fn external_hook_cancel_settles_deferred_watch() {
     let (_t, svc, ws) = setup().await;
+    let svc = FakeRuntime::install(svc);
     let parent = create_agent(&svc, &ws, "Parent").await;
     let child = create_agent(&svc, &ws, "Child").await;
     let hook = seed_active_hook(&svc, &ws, &child, "pr-watch").await;
@@ -26624,9 +26640,9 @@ async fn external_hook_cancel_settles_deferred_watch() {
     // owner wake persists directly (no runtime turn), so the terminal-
     // transition backstop synthesizes the child's completion and the
     // deferred watch fires.
-    svc.hook_cancel_op(&ws, &hook.hook_id, None)
-        .await
-        .expect("cancel hook");
+    FakeRuntime::of(&svc)
+        .cancel_hook(&svc, &hook.hook_id, None)
+        .await;
     assert!(
         svc.find_watches_for_child(&child).is_empty(),
         "deferred watch fires when the last active hook is cancelled"
@@ -26648,7 +26664,7 @@ async fn rehydrated_watch_on_hook_waiting_idle_child_does_not_refire() {
     let (parent, child) = {
         let store = Store::open(&tmp.path).await.expect("open store");
         store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        let svc = Services::new(store);
+        let svc = FakeRuntime::install(Services::new(store));
         let parent = create_agent(&svc, &ws, "Parent").await;
         let child = create_agent(&svc, &ws, "Child").await;
         seed_active_hook(&svc, &ws, &child, "pr-watch").await;
@@ -26680,7 +26696,7 @@ async fn rehydrated_watch_on_hook_waiting_idle_child_does_not_refire() {
     }; // simulated daemon restart
 
     let store = Store::open(&tmp.path).await.expect("reopen store");
-    let restarted = Services::new(store);
+    let restarted = FakeRuntime::install(Services::new(store));
     let loaded = restarted
         .heal_completion_watches_on_startup()
         .await
@@ -28109,6 +28125,7 @@ async fn pre_publish_group_record_skips_agent_waiting_child() {
 #[tokio::test]
 async fn status_list_and_diagnostics_surface_waiting_on_hooks() {
     let (_t, svc, ws) = setup().await;
+    let svc = FakeRuntime::install(svc);
     let hooked = create_agent(&svc, &ws, "Hooked").await;
     let bare = create_agent(&svc, &ws, "Bare").await;
     let hook = seed_active_hook(&svc, &ws, &hooked, "inbox-poll").await;
@@ -28183,6 +28200,7 @@ async fn assert_waiting_hooks_read_cost(batched: bool) {
     use intent_core::{HookId, HookState};
 
     let (_t, svc, ws) = setup().await;
+    let svc = FakeRuntime::install(svc);
     let owner = create_agent(&svc, &ws, "Owner").await;
     let peer = create_agent(&svc, &ws, "Peer").await;
     let bare = create_agent(&svc, &ws, "Bare").await;
@@ -28279,8 +28297,18 @@ async fn assert_waiting_hooks_read_cost(batched: bool) {
     assert!(cost_failures.is_empty(), "{}", cost_failures.join("\n"));
     // Visibility remains best-effort if the store read fails.
     svc.store().read_pool().close().await;
-    assert!(svc.active_hooks_for_agent(&owner).await.is_empty());
-    assert!(svc.active_hooks_by_agent(&ws).await.is_empty());
+    assert!(svc
+        .ports
+        .runtime()
+        .active_hooks_for_agent(&svc, &owner)
+        .await
+        .is_empty());
+    assert!(svc
+        .ports
+        .runtime()
+        .active_hooks_by_agent(&svc, &ws)
+        .await
+        .is_empty());
 }
 
 #[tokio::test]
@@ -28926,6 +28954,7 @@ async fn hook_owning_parent_idle_seals_group_and_wake_delivers() {
 #[intent_test_macros::daemon_test]
 async fn hook_waiting_child_settlement_still_deferred_after_seal() {
     let (_t, svc, ws) = setup().await;
+    let svc = FakeRuntime::install(svc);
     let parent = create_agent(&svc, &ws, "Parent").await;
     let child = delegate_after_all(&svc, &ws, &parent).await;
     let hook = seed_active_hook(&svc, &ws, &child, "ci-poll").await;
@@ -29185,6 +29214,7 @@ async fn completion_report_idle_settles_group_despite_active_pr_monitor() {
 #[intent_test_macros::daemon_test]
 async fn completion_report_idle_settles_group_despite_active_hook() {
     let (_t, svc, ws) = setup().await;
+    let svc = FakeRuntime::install(svc);
     let parent = create_agent(&svc, &ws, "Parent").await;
     let child = delegate_after_all(&svc, &ws, &parent).await;
     seed_active_hook(&svc, &ws, &child, "late-comment-watch").await;
@@ -29207,7 +29237,10 @@ async fn completion_report_idle_settles_group_despite_active_hook() {
         "completionReport": report,
         "report": report,
     });
-    svc.annotate_waiting_on_hooks(&child, &mut data).await;
+    svc.ports
+        .runtime()
+        .annotate_waiting_on_hooks(&svc, &child, &mut data)
+        .await;
     assert!(data.get("waitingOnHooks").is_some(), "stamped: {data}");
     svc.handle_completion_event(&completion_event(&ws, AGENT_IDLE, &child, data))
         .await;
@@ -29221,7 +29254,11 @@ async fn completion_report_idle_settles_group_despite_active_hook() {
     assert!(text.contains("task done"), "{text}");
     assert!(svc.delegation_group_for_parent(&parent).is_none());
     assert_eq!(
-        svc.active_hooks_for_agent(&child).await.len(),
+        svc.ports
+            .runtime()
+            .active_hooks_for_agent(&svc, &child)
+            .await
+            .len(),
         1,
         "settlement leaves the hook armed"
     );
@@ -29284,6 +29321,7 @@ async fn completion_report_idle_fires_ungrouped_watch_despite_active_monitor() {
 #[tokio::test]
 async fn pre_publish_group_record_bypasses_external_wait_deferrals_with_report() {
     let (_t, svc, ws) = setup().await;
+    let svc = FakeRuntime::install(svc);
     let p = create_agent(&svc, &ws, "P").await;
     let b = create_agent(&svc, &ws, "B").await;
     let gid = svc.get_or_create_delegation_group(&ws, &p);
@@ -29307,7 +29345,10 @@ async fn pre_publish_group_record_bypasses_external_wait_deferrals_with_report()
         .expect("persist report");
 
     let mut data = json!({ "agentId": b.0, "completionReport": "done", "report": "done" });
-    svc.annotate_waiting_on_hooks(&b, &mut data).await;
+    svc.ports
+        .runtime()
+        .annotate_waiting_on_hooks(&svc, &b, &mut data)
+        .await;
     svc.annotate_waiting_on_pr_monitors(&b, &mut data).await;
     svc.record_group_completion_pre_publish(&ws, &b, &data)
         .await;
@@ -29317,7 +29358,14 @@ async fn pre_publish_group_record_bypasses_external_wait_deferrals_with_report()
         group.completed_agent_ids.contains(&b),
         "report-carrying idle records despite hook + monitor deferrals"
     );
-    assert_eq!(svc.active_hooks_for_agent(&b).await.len(), 1);
+    assert_eq!(
+        svc.ports
+            .runtime()
+            .active_hooks_for_agent(&svc, &b)
+            .await
+            .len(),
+        1
+    );
     assert_eq!(svc.active_pr_monitors_for_agent(&b).await.len(), 1);
 }
 
@@ -29550,6 +29598,7 @@ async fn watch_after_progress_adopts_armed_watch_and_fires_terminal_idle() {
 #[tokio::test]
 async fn registration_reconcile_defers_on_reported_idle_child_with_active_hook() {
     let (_t, svc, ws) = setup().await;
+    let svc = FakeRuntime::install(svc);
     let watcher = create_agent(&svc, &ws, "Watcher").await;
     let child = create_agent(&svc, &ws, "Child").await;
     let hook = seed_active_hook(&svc, &ws, &child, "pr-watch").await;
@@ -30345,6 +30394,7 @@ async fn sender_auto_subscribe_after_report_rearms_watch_and_fires_next_idle() {
 #[tokio::test]
 async fn registration_deferral_survives_non_last_hook_terminal_transition() {
     let (_t, svc, ws) = setup().await;
+    let svc = FakeRuntime::install(svc);
     let watcher = create_agent(&svc, &ws, "Watcher").await;
     let child = create_agent(&svc, &ws, "Child").await;
     let hook_a = seed_active_hook(&svc, &ws, &child, "ci-poll").await;
@@ -33928,15 +33978,41 @@ async fn setup_with_manager() -> (
     EventBus,
     WorkspaceId,
 ) {
+    setup_with_manager_on(|services| services).await
+}
+
+/// [`setup_with_manager`] with the runtime test double installed before the
+/// manager takes its `Services` clone.
+async fn setup_with_manager_fake_runtime() -> (
+    TempDb,
+    Services,
+    Arc<crate::agent_manager::AgentManager>,
+    EventBus,
+    WorkspaceId,
+) {
+    setup_with_manager_on(FakeRuntime::install).await
+}
+
+async fn setup_with_manager_on(
+    configure: impl FnOnce(Services) -> Services,
+) -> (
+    TempDb,
+    Services,
+    Arc<crate::agent_manager::AgentManager>,
+    EventBus,
+    WorkspaceId,
+) {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
     let bus = EventBus::new(store.clone());
     let registry = test_registry_with_default_provider(&tmp);
-    let services = Services::new(store)
-        .with_settings_registry(registry)
-        .with_event_bus(bus.clone());
+    let services = configure(
+        Services::new(store)
+            .with_settings_registry(registry)
+            .with_event_bus(bus.clone()),
+    );
     let sink: Arc<dyn intent_acp::EventSink> = Arc::new(crate::BusEventSink::new(bus.clone()));
     let manager = Arc::new(crate::agent_manager::AgentManager::new(
         services.clone(),
@@ -43382,6 +43458,7 @@ async fn agent_watch_resolved_when_target_is_cascade_retired() {
 #[tokio::test]
 async fn retire_settles_hook_deferred_watch_with_retired_notice() {
     let (_t, svc, ws, bus) = setup_with_bus().await;
+    let svc = FakeRuntime::install(svc);
     let _worker = svc.spawn_completion_delivery_loop();
     wait_for_subscriber(&bus).await;
     let watcher = create_agent(&svc, &ws, "Watcher").await;
@@ -43435,6 +43512,12 @@ async fn retire_settles_hook_deferred_watch_with_retired_notice() {
         1,
         "exactly one wake for the retire"
     );
+    assert!(
+        FakeRuntime::of(&svc)
+            .calls()
+            .contains(&"cancel_agent_hooks"),
+        "retire asks the runtime to cancel the retired agent's hooks"
+    );
 }
 
 /// Which archive-swept watches the monitoring-idle child owns in
@@ -43460,7 +43543,7 @@ enum ArchivedWatches {
 async fn archive_keeps_deferred_watch_armed_until_the_childs_real_turn_ends(
     watches: ArchivedWatches,
 ) {
-    let (_t, svc, manager, _bus, ws) = setup_with_manager().await;
+    let (_t, svc, manager, _bus, ws) = setup_with_manager_fake_runtime().await;
     let parent = create_agent(&svc, &ws, "Parent").await;
     let child = create_agent(&svc, &ws, "Child").await;
     let hook = match watches {
@@ -43633,6 +43716,7 @@ async fn archive_keeps_mixed_deferred_watch_armed_until_real_turn_ends() {
 #[tokio::test]
 async fn retire_cascade_reaches_cross_workspace_descendants() {
     let (_t, svc, ws, bus) = setup_with_bus().await;
+    let svc = FakeRuntime::install(svc);
     let _worker = svc.spawn_completion_delivery_loop();
     wait_for_subscriber(&bus).await;
     let other_ws = WorkspaceId::new();
@@ -48769,7 +48853,7 @@ async fn completion_startup_reconciliation_does_not_consume_new_watches() {
         let store = Store::open(&tmp.path).await.unwrap();
         let ws = WorkspaceId::new();
         store.insert_workspace(&workspace(&ws)).await.unwrap();
-        let svc = Services::new(store);
+        let svc = FakeRuntime::install(Services::new(store));
         let original = create_agent(&svc, &ws, "Original").await;
         let newcomer = create_agent(&svc, &ws, "Newcomer").await;
         let child = create_agent(&svc, &ws, "Child").await;
@@ -48793,7 +48877,7 @@ async fn completion_startup_reconciliation_does_not_consume_new_watches() {
             .update_agent_session(&ws, &session)
             .await
             .unwrap();
-        let restarted = Services::new(Store::open(&tmp.path).await.unwrap());
+        let restarted = FakeRuntime::install(Services::new(Store::open(&tmp.path).await.unwrap()));
         let recovery = restarted.prepare_startup_completion_recovery().await;
         restarted
             .agent_watch_op(ws.clone(), newcomer.clone(), child.clone())
@@ -49383,6 +49467,7 @@ async fn send_queued_message_now_store_only_processing_requires_successful_persi
 async fn script_monitor_waiting_advisory_and_after_all_retire_on_silent_cancel() {
     for grouped in [false, true] {
         let (_t, svc, ws) = setup().await;
+        let svc = FakeRuntime::install(svc);
         let park = Arc::new(crate::CompletionClassifyPark::default());
         let svc = if grouped {
             svc
@@ -49391,27 +49476,11 @@ async fn script_monitor_waiting_advisory_and_after_all_retire_on_silent_cancel()
         };
         let parent = create_agent(&svc, &ws, "Parent").await;
         let child = create_agent(&svc, &ws, "Child").await;
-        let script = svc
-            .script_create(
-                ws.clone(),
-                intent_core::ScriptCreateParams {
-                    name: "Monitor check".into(),
-                    command: "true".into(),
-                    mode: intent_core::ScriptMode::Command,
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        let sid = script["id"].as_str().unwrap().to_owned();
-        svc.store
-            .admit_script_run(&ws, &sid, "accepted-reservation")
-            .await
-            .unwrap();
-        let monitor = svc
-            .script_monitor(ws.clone(), child.clone(), sid, json!({"ttlMs":60000}))
-            .await
-            .unwrap();
+        // Fake runtime: seed the active monitor row the runtime's
+        // `script.monitor` would have written; its lookups read it back.
+        let monitor =
+            crate::test_support::fake_runtime::active_script_monitor(&ws, &child, "Monitor check");
+        svc.store.insert_script_monitor(&monitor).await.unwrap();
         let gid = grouped.then(|| {
             let gid = svc.get_or_create_delegation_group(&ws, &parent);
             svc.enroll_child_in_group(&gid, &child);
@@ -49430,7 +49499,7 @@ async fn script_monitor_waiting_advisory_and_after_all_retire_on_silent_cancel()
         svc.annotate_waiting_on_pr_monitors(&child, &mut data).await;
         assert_eq!(
             data["waitingOnScriptMonitors"][0]["monitorId"],
-            monitor["monitor"]["monitorId"]
+            json!(monitor.monitor_id)
         );
         svc.handle_completion_event(&completion_event(&ws, AGENT_IDLE, &child, data.clone()))
             .await;
@@ -49456,7 +49525,9 @@ async fn script_monitor_waiting_advisory_and_after_all_retire_on_silent_cancel()
             let ws = ws.clone();
             let child = child.clone();
             async move {
-                svc.cancel_script_monitors(&ws, Some(&child), "owner-retired")
+                svc.ports
+                    .runtime()
+                    .cancel_script_monitors(&svc, &ws, Some(&child), "owner-retired")
                     .await
                     .unwrap();
             }
@@ -49506,7 +49577,9 @@ async fn script_monitor_waiting_advisory_and_after_all_retire_on_silent_cancel()
         assert!(svc.find_watches_for_child(&child).is_empty());
         assert_eq!(parent_message_count(&svc, &parent).await, 2);
         assert!(svc
-            .active_script_monitors_for_agent(&child)
+            .ports
+            .runtime()
+            .active_script_monitors_for_agent(&svc, &child)
             .await
             .is_empty());
     }
