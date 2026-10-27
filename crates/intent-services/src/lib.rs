@@ -5023,8 +5023,8 @@ impl Services {
     /// The `workspace.getBrowserClient` payload for `id`: the persisted pin
     /// (`clientId` + `source: "workspace"`, else `source: "default"`) and
     /// `resolved` — the driving client an agent `browser.exec` would reach
-    /// right now ([`Self::driving_client_target`]: pin → client controlling
-    /// the workspace's desktop → host of the workspace's claimed tabs →
+    /// right now ([`Self::driving_client_target`]: pin → client of an active
+    /// desktop session → host of the workspace's claimed tabs →
     /// first-connected eligible client), `null`
     /// when that client is offline or no eligible client is connected. Chief
     /// has no row and always reports the default.

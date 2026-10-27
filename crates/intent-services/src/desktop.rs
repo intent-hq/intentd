@@ -286,6 +286,34 @@ impl Runtime {
         *sequence += 1;
         Ok((session_id.clone(), *sequence))
     }
+    /// Test seam: record an active desktop session of `workspace` running on
+    /// `client`, the state `driving_client_target` reads for its desktop step.
+    #[cfg(test)]
+    pub(crate) fn activate_for_test(&self, workspace: &WorkspaceId, client: intent_core::ClientId) {
+        self.put(Live {
+            binding: Binding {
+                workspace_id: workspace.clone(),
+                agent_id: AgentId::from_string("routing-fixture-agent"),
+                agent_name: "routing fixture".into(),
+                connection: DesktopConnection {
+                    client_id: client,
+                    principal_id: PrincipalId::new(),
+                    connection_epoch: "routing-fixture".into(),
+                },
+                computer_id: "routing-fixture".into(),
+                computer_name: "Routing fixture".into(),
+            },
+            phase: Phase::Active {
+                session_id: id(),
+                sequence: 0,
+            },
+        });
+    }
+    /// Test seam: drop the session [`Self::activate_for_test`] recorded.
+    #[cfg(test)]
+    pub(crate) fn deactivate_for_test(&self) {
+        self.remove(&AgentId::from_string("routing-fixture-agent"));
+    }
     fn put(&self, live: Live) {
         if matches!(live.phase, Phase::Active { .. }) {
             self.assignment_changed(&live.binding.workspace_id);
@@ -328,11 +356,14 @@ impl Binding {
 impl Services {
     /// The [`ReverseTarget`] every agent `browser.exec` (and every routed
     /// claimed-tab request) for `workspace_id` dispatches to — the
-    /// workspace's **driving client** (REV-2 Model 10): the explicit pin
-    /// (`Pinned`), else the client actively controlling this workspace's
-    /// desktop (`Client`), else the host of the workspace's existing claimed
-    /// tabs (`Client`), else the first-connected eligible client (`Default`).
-    /// Chief and workspaces the store does not know are unpinned.
+    /// workspace's **driving client** (REV-2 rules 2–5): the explicit pin
+    /// (`Pinned`), else the client of the workspace's active desktop
+    /// session (`Client`), else the host of its oldest claimed tab
+    /// (`Client`), else the first-connected eligible client (`Default`).
+    /// Chief always resolves to `Default`; a workspace the store does not
+    /// know is unpinned. The shared cases in
+    /// `docs/protocol/fixtures/browser-routing/routing.json` pin this order
+    /// (`browser_tabs/browser_routing_fixture_tests.rs`).
     #[doc(hidden)]
     pub async fn driving_client_target(
         &self,
