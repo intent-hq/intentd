@@ -5,6 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
+use std::time::Duration;
 
 use intent_core::{BoxFuture, Error, Result};
 use intent_git::node_git::{AgentRemote, GitService};
@@ -167,6 +168,130 @@ async fn head_caps_concurrent_sessions() {
     })
     .await
     .unwrap();
+}
+
+/// Give `repository` a commit and `count` refs under agent-1's prefix, so
+/// its upload-pack advertisement spans many messages.
+fn many_agent_refs(repository: &Path, count: usize) {
+    let git = |args: &[&str]| {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(repository)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    };
+    git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "--quiet",
+        "--allow-empty",
+        "-m",
+        "base",
+    ]);
+    let head = Command::new("git")
+        .arg("-C")
+        .arg(repository)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    let head = String::from_utf8(head.stdout).unwrap();
+    let mut input = String::new();
+    for n in 0..count {
+        input.push_str(&format!(
+            "create refs/intent/ws/ws-1/agents/agent-1/r{n} {}\n",
+            head.trim()
+        ));
+    }
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(repository)
+        .args(["update-ref", "--stdin"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write as _;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+    }
+    assert!(child.wait().unwrap().success());
+}
+
+#[tokio::test]
+async fn replacing_an_idle_connection_closes_it() {
+    let (node, _link, sessions, serving) = connected().await;
+    let mut node = node;
+    let _second_head = dial_git(&node.endpoint(), &binding(1)).await.unwrap();
+    sessions.attach(node.accept_git().await);
+    // Head's server for the first connection ends: the node closed it.
+    tokio::time::timeout(wait(), serving)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(sessions.is_connected());
+}
+
+#[tokio::test]
+async fn replacing_a_connection_ends_a_session_with_a_full_event_queue() {
+    let (node, _link, sessions, serving) = connected().await;
+    let mut node = node;
+    many_agent_refs(&node.dir.path().join("head"), 20_000);
+    // Never read: head's advertisement fills this session's event queue and
+    // blocks the first connection's reader.
+    let mut stalled = tokio::time::timeout(
+        wait(),
+        sessions.open(GitService::UploadPack, &remote("agent-1")),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    // Wait until the shared reader is stuck on the stalled session's full
+    // queue: it then can't deliver another session's acceptance.
+    tokio::time::timeout(wait(), async {
+        loop {
+            let probe = tokio::time::timeout(
+                intentd_test_support::test_timeout(Duration::from_millis(300)),
+                sessions.open(GitService::UploadPack, &remote("agent-1")),
+            )
+            .await;
+            if probe.is_err() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let _second_head = dial_git(&node.endpoint(), &binding(1)).await.unwrap();
+    sessions.attach(node.accept_git().await);
+    tokio::time::timeout(wait(), serving)
+        .await
+        .unwrap()
+        .unwrap();
+    let error = tokio::time::timeout(wait(), async {
+        loop {
+            match stalled.recv().await {
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("the replaced session must not end cleanly"),
+                Err(error) => break error,
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        session_code(&error).contains(git_codes::UNAVAILABLE),
+        "{error}"
+    );
 }
 
 #[tokio::test]

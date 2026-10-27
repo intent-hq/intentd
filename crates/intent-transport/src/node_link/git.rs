@@ -154,8 +154,8 @@ impl GitConnection {
 /// Sends on a [`GitConnection`]; see [`GitConnection::sender`].
 #[derive(Debug, Clone)]
 pub struct GitSender {
-    out: mpsc::Sender<Vec<u8>>,
-    close: watch::Sender<bool>,
+    pub(super) out: mpsc::Sender<Vec<u8>>,
+    pub(super) close: watch::Sender<bool>,
 }
 
 impl GitSender {
@@ -175,12 +175,26 @@ impl GitSender {
         }
     }
 
-    /// Queue one message without waiting; dropped when the queue is full or
-    /// the connection is gone.
-    pub fn try_send(&self, bytes: Vec<u8>) {
-        if !*self.close.borrow() {
-            let _ = self.out.try_send(bytes);
+    /// Queue one message without waiting. Returns it back when the queue is
+    /// full; drops it when the connection is gone.
+    ///
+    /// # Errors
+    ///
+    /// The message, when the queue is full.
+    pub fn try_send(&self, bytes: Vec<u8>) -> std::result::Result<(), Vec<u8>> {
+        if *self.close.borrow() {
+            return Ok(());
         }
+        match self.out.try_send(bytes) {
+            Err(mpsc::error::TrySendError::Full(bytes)) => Err(bytes),
+            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => Ok(()),
+        }
+    }
+
+    /// Resolves once the connection has closed.
+    pub async fn closed(&self) {
+        let mut rx = self.close.subscribe();
+        super::wait_true(&mut rx).await;
     }
 
     /// Close the connection.

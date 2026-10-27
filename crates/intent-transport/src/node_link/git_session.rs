@@ -333,13 +333,20 @@ impl NodeGitSessions {
     /// Use `connection` for new sessions. Sessions on the previous
     /// connection end as unavailable.
     pub fn attach(&self, mut connection: GitConnection) {
-        let epoch = {
+        let sender = connection.sender();
+        let (epoch, previous) = {
             let mut state = lock(&self.state);
             state.epoch += 1;
-            state.connection = Some((state.epoch, connection.sender()));
+            let epoch = state.epoch;
+            let previous = state.connection.replace((epoch, sender.clone()));
             state.sessions.clear();
-            state.epoch
+            (state.epoch, previous)
         };
+        // The previous connection's head sessions end when it closes, and
+        // its reader stops even if it was waiting on a full session queue.
+        if let Some((_, previous)) = previous {
+            previous.close();
+        }
         let state = self.state.clone();
         tokio::spawn(async move {
             while let Some((kind, id, payload)) = connection.recv().await.and_then(decode) {
@@ -360,7 +367,10 @@ impl NodeGitSessions {
                     state.sessions.get(&id).cloned()
                 };
                 if let Some(session) = session {
-                    let _ = session.send(event).await;
+                    tokio::select! {
+                        _ = session.send(event) => {}
+                        () = sender.closed() => break,
+                    }
                 }
             }
             connection.close();
@@ -506,8 +516,22 @@ impl Drop for GitSession {
             state.sessions.remove(&self.id);
         }
         drop(state);
-        if !self.closed {
-            self.sender.try_send(encode(CLOSE, self.id, &[]));
+        if self.closed {
+            return;
+        }
+        // Head must learn of the cancellation, or its service and session
+        // slot stay live: wait for queue space, or close the connection
+        // when there is no runtime to wait on.
+        if let Err(close) = self.sender.try_send(encode(CLOSE, self.id, &[])) {
+            match tokio::runtime::Handle::try_current() {
+                Ok(runtime) => {
+                    let sender = self.sender.clone();
+                    runtime.spawn(async move {
+                        let _ = sender.send(close).await;
+                    });
+                }
+                Err(_) => self.sender.close(),
+            }
         }
     }
 }
@@ -587,3 +611,6 @@ async fn serve_helper(stream: tokio::net::UnixStream, sessions: &NodeGitSessions
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
