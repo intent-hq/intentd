@@ -628,13 +628,13 @@ async fn boot_with_source_control(sc: Option<Arc<dyn SourceControl>>) -> Fixture
         .expect("seed agent");
 
     let forge = StubForge::default();
-    let services = Arc::new(
+    let services = Arc::new(intent_app::compose(
         Services::new(store)
             .with_workspaces_root(workspaces_root)
             .with_event_bus(bus.clone())
             .with_source_control(sc.unwrap_or_else(|| Arc::new(forge.clone())))
             .with_pr_monitor_debounce_seconds(3600),
-    );
+    ));
     let api: Arc<dyn WorkspaceApi> = services.clone();
     let tls = ensure_tls_certificate(&dir).expect("cert");
     let token_store_inner = Arc::new(MemTokenStore::default());

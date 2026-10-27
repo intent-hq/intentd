@@ -4,9 +4,10 @@
 use intent_core::{AgentId, HookState, PrMonitorState, WorkspaceApi};
 use serde_json::json;
 
+use super::test_fixtures::wake_texts_when;
 use crate::hook_manager::HookServicesExt;
-use crate::v1_goldens::{pr_monitor_row, seed_agent, setup, wake_texts_when};
-use crate::v2_7_goldens::{PREFIX, RE_ARM_HOOKS, RE_ARM_MONITORS};
+use crate::test_support::goldens::{pr_monitor_row, seed_agent, setup};
+use crate::test_support::goldens::{PREFIX, RE_ARM_HOOKS, RE_ARM_MONITORS};
 
 /// Regression: archiving a workspace where agent A owns two hooks and one
 /// PR monitor queues exactly ONE wake for A — naming all three items and

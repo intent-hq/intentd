@@ -63,7 +63,7 @@ async fn monitor_failed_settlement() -> (Harness, ScriptManager, intent_core::Sc
         mgr.run(&h.ws, &id, None, Some(5)).await.unwrap()["exitCode"],
         7
     );
-    tokio::time::timeout(LIVENESS, mgr.tasks.drain_finite())
+    tokio::time::timeout(LIVENESS, mgr.tasks.drain_finite_for_test())
         .await
         .unwrap();
     mgr.tasks = Arc::default();
@@ -1453,12 +1453,12 @@ async fn monitor_export_defers_delivery_and_queue_drain_until_abort() {
     assert!(h
         .services
         .defer_script_monitor_for_export(&owner, "wake", Some(&metadata)));
-    assert!(!h.services.has_ready_to_send(&owner));
+    assert!(!h.services.has_ready_to_send_for_test(&owner));
     assert!(h.services.dequeue_message(&owner).is_none());
     h.services
         .feature_transfer_port()
         .remove_export_for_test("export-test");
-    assert!(h.services.has_ready_to_send(&owner));
+    assert!(h.services.has_ready_to_send_for_test(&owner));
     let queued = h.services.dequeue_message(&owner).unwrap();
     assert_eq!(queued.id, format!("script-monitor:{}", row.monitor_id));
     h.services.dispatch_script_monitor(&row).await;

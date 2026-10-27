@@ -1163,7 +1163,7 @@ mod tests {
         );
         let held = store.write_pool().acquire().await.unwrap();
         pty.kill_all().await;
-        let drain = tasks.drain_finite();
+        let drain = tasks.drain_finite_for_test();
         tokio::pin!(drain);
         tokio::select! {
             biased;

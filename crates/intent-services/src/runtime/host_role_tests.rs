@@ -7,8 +7,8 @@ use intent_core::{
 use intent_store::Store;
 use serde_json::json;
 
+use super::test_fixtures::host_role::{caller, fixture};
 use crate::host_execution::HostExecutionExt;
-use crate::test_support::capability_fixtures::host_role::{caller, fixture};
 use crate::test_support::fixtures::{workspace, TempDb};
 use crate::Services;
 
@@ -164,7 +164,7 @@ async fn member_execution_context_is_allowlisted_and_uses_host_policy() {
         assert!(!context.to_string().contains("/host/provider"));
         assert_eq!(svc.execution_provider_paths().await.unwrap()["codex"], "/host/provider");
         assert!(matches!(svc.settings_get("providers.paths".into()).await, Err(Error::Forbidden(_))));
-        svc.feature_secrets().delete("sourceControl.github.token").await.unwrap();
+        svc.feature_secrets().delete_for_test("sourceControl.github.token").await.unwrap();
         assert_eq!(svc.host_execution_context().await.unwrap()["repositoryConnections"][0]["configured"], false,
             "collaboration credentials must never supply execution");
         registry.apply(&[("sourceControl.github.exposeGitCredentialToChildren".into(), json!(true))]).unwrap();
@@ -244,7 +244,7 @@ async fn member_execution_enablement_events_follow_committed_changes_and_reset()
                 .unwrap()
         );
         let rows = svc
-            .store
+            .store()
             .query_events(&intent_store::EventQuery {
                 event_types: vec![HOST_EXECUTION_CONTEXT_CHANGED.into()],
                 ..Default::default()
@@ -763,4 +763,166 @@ async fn script_archive_restore_enforce_workspace_scope_and_guest_authority() {
         ));
     })
     .await;
+}
+
+#[tokio::test]
+async fn member_execution_context_events_cover_policy_setup_and_unchanged_configured_rejection() {
+    use crate::events::{EventBus, SubscriptionFilter};
+    use intent_core::events::HOST_EXECUTION_CONTEXT_CHANGED;
+    use std::{sync::Arc, time::Duration};
+    let tmp = TempDb::new();
+    let (svc, _, member) = fixture(&tmp).await;
+    let registry =
+        Arc::new(crate::SettingsRegistry::load(tmp.path.with_extension("toml")).unwrap());
+    registry
+        .apply(&[("sourceControl.github.tokenSource".into(), json!("explicit"))])
+        .unwrap();
+    let bus = EventBus::new(svc.store().clone());
+    let svc = svc
+        .with_settings_registry(registry)
+        .with_event_bus(bus.clone());
+    let worker = svc.spawn_execution_context_loop();
+    let mut events = bus.subscribe(SubscriptionFilter {
+        event_types: vec![HOST_EXECUTION_CONTEXT_CHANGED.into()],
+        ..Default::default()
+    });
+    let before = svc.execution_context_snapshot().await.unwrap();
+    with_caller(
+        caller(&member),
+        svc.execution_call_for_test(async {
+            let _ = crate::execution_call::forge_error_for_test(intent_sourcecontrol::Error::Auth(
+                "private response".into(),
+            ));
+            Ok(())
+        }),
+    )
+    .await
+    .unwrap();
+    let batch = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        events.recv(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        batch[0].data,
+        json!(before),
+        "rejection invalidates despite unchanged configured flags"
+    );
+    with_caller(
+        Caller::Daemon,
+        svc.settings_update(
+            json!([{"path":"sourceControl.github.exposeGitCredentialToChildren","value":false}]),
+        ),
+    )
+    .await
+    .unwrap();
+    let batch = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        events.recv(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        batch.last().unwrap().data["gitCredentialPolicy"]["managedHelperEnabled"],
+        false
+    );
+    with_caller(
+        caller(&member),
+        svc.observe_execution_readiness(
+            json!({"providers":[{"id":"codex","authenticated":false,"secret":"no-leak"}]}),
+        ),
+    )
+    .await
+    .unwrap();
+    let batch = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(5)),
+        events.recv(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(!batch[0].data.to_string().contains("no-leak"));
+    worker.abort();
+    let _ = worker.await;
+}
+
+#[tokio::test]
+async fn member_pr_status_rejection_publishes_durable_safe_context() {
+    use crate::events::{EventBus, SubscriptionFilter};
+    use crate::test_support::stub_forge::StubForge;
+    use intent_core::events::HOST_EXECUTION_CONTEXT_CHANGED;
+    use std::{sync::Arc, time::Duration};
+    let tmp = TempDb::new();
+    let (svc, _, member) = fixture(&tmp).await;
+    let ws = WorkspaceId::new();
+    let mut row = workspace(&ws);
+    row.repository_owner = Some("o".into());
+    row.repository_name = Some("r".into());
+    row.pr_number = Some(42);
+    svc.store().insert_workspace(&row).await.unwrap();
+    let bus = EventBus::new(svc.store().clone());
+    let svc = svc
+        .with_event_bus(bus.clone())
+        .with_source_control(Arc::new(StubForge::with_get_pr_error(|| {
+            intent_sourcecontrol::Error::Auth("private-response".into())
+        })));
+    let registry =
+        Arc::new(crate::SettingsRegistry::load(tmp.path.with_extension("toml")).unwrap());
+    registry
+        .apply(&[("sourceControl.github.tokenSource".into(), json!("explicit"))])
+        .unwrap();
+    let svc = svc.with_settings_registry(registry);
+    let mut events = bus.subscribe(SubscriptionFilter {
+        event_types: vec![HOST_EXECUTION_CONTEXT_CHANGED.into()],
+        ..Default::default()
+    });
+    let worker = svc.spawn_execution_context_loop();
+    let before = svc.execution_context_snapshot().await.unwrap();
+    let _error = with_caller(caller(&member), svc.pr_status(ws))
+        .await
+        .unwrap_err();
+    let received = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_secs(2)),
+        events.recv(),
+    )
+    .await;
+    worker.abort();
+    let _ = worker.await;
+    let batch = received
+        .expect("classified PR rejection must invalidate readiness")
+        .unwrap();
+    assert_eq!(batch[0].data, json!(before));
+    assert_eq!(
+        batch[0]
+            .data
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>(),
+        [
+            "defaultModelId",
+            "defaultProviderId",
+            "enabledProviderIds",
+            "gitCredentialPolicy",
+            "repositoryConnections"
+        ]
+        .into_iter()
+        .collect()
+    );
+    assert!(!batch[0].data.to_string().contains("private-response"));
+    let stored = svc
+        .store()
+        .query_events(&intent_store::EventQuery {
+            event_types: vec![HOST_EXECUTION_CONTEXT_CHANGED.into()],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(stored
+        .iter()
+        .any(|e| e.id == batch[0].id && e.data == batch[0].data));
 }

@@ -118,6 +118,9 @@ pub mod event_ops {
 /// The task-local execution scope and its credential policy.
 pub mod execution_call {
     pub use crate::execution_call::{expose_git_credential, github_execution_host};
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub use crate::execution_call::forge_error_for_test;
 }
 
 /// Workspace file locations.

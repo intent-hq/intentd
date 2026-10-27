@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use intent_core::{Error, WorkspaceApi, WorkspaceStatus};
 
-use crate::tests::retire_workspace::*;
+use crate::test_support::retire_workspace::*;
 
 /// Review regression (intentd#2605): the automatic sweep's retire skips
 /// (logs and counts a failure) a workspace whose script close cannot settle
@@ -17,7 +17,7 @@ async fn auto_retire_skips_a_workspace_whose_script_result_cannot_be_settled() {
 
     let out = f
         .svc
-        .auto_retire_workspace_op(ws.id.clone(), days_from_now(8))
+        .auto_retire_workspace_op_for_test(ws.id.clone(), days_from_now(8))
         .await;
     assert!(matches!(out, Err(Error::Internal(_))), "{out:?}");
     assert_still_archived_and_unsettled(&f, &ws, &id).await;
@@ -419,4 +419,64 @@ async fn terminal_id_mutations_refused_on_a_retired_workspace() {
     let err = f.svc.terminal_kill(terminal_id.clone()).await.unwrap_err();
     assert!(is_retired(&err), "kill: {err:?}");
     assert_eq!(f.svc.pty().list_scope(ws.id.as_str()).len(), 1);
+}
+
+/// An archived workspace whose command finished but whose result could not
+/// be persisted (a trigger refuses the `last_run` write), so the script still
+/// holds an unsettled admitted run.
+pub(crate) async fn archived_with_unsettled_run(f: &Fixture) -> (intent_core::Workspace, String) {
+    let ws = create_workspace(f).await;
+    let v = f
+        .svc
+        .script_create(
+            ws.id.clone(),
+            intent_core::ScriptCreateParams {
+                name: "done".to_string(),
+                command: "printf done".to_string(),
+                mode: intent_core::ScriptMode::Command,
+                purpose: Some(intent_core::ScriptPurpose::Saved),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create");
+    let id = v["id"].as_str().expect("script id").to_string();
+    sqlx::query(
+        "CREATE TRIGGER refuse_result BEFORE UPDATE OF last_run ON script \
+         BEGIN SELECT RAISE(FAIL,'result refused'); END",
+    )
+    .execute(f.store.write_pool())
+    .await
+    .unwrap();
+    let out = f
+        .svc
+        .script_run(ws.id.clone(), id.clone(), None, Some(10))
+        .await
+        .expect("run");
+    assert_eq!(out["exitCode"], 0, "{out}");
+    f.svc
+        .archive_workspace(ws.id.clone(), None)
+        .await
+        .expect("archive");
+    (ws, id)
+}
+
+/// The retire flip waits for the scripts to be fully stopped AND settled:
+/// asserts the row stays Archived (not Retired), the checkout is kept and
+/// the run's result is still unsettled.
+pub(crate) async fn assert_still_archived_and_unsettled(
+    f: &Fixture,
+    ws: &intent_core::Workspace,
+    id: &str,
+) {
+    let row = f.store.get_workspace(&ws.id).await.unwrap();
+    assert!(row.archived && !row.is_retired(), "{row:?}");
+    assert!(std::path::Path::new(ws.worktree_path.as_deref().unwrap()).is_dir());
+    let def = f
+        .store
+        .get_script_in_workspace(&ws.id, id)
+        .await
+        .unwrap()
+        .expect("script row");
+    assert!(def.last_run.is_none(), "result still unsettled: {def:?}");
 }

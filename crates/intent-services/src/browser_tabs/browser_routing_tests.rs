@@ -347,7 +347,7 @@ async fn successful_claim_migrates_the_tab_to_the_driving_client() {
     // success marker — so nothing counts as a confirmed claim and the
     // row is untouched.
     let row = svc
-        .store
+        .store()
         .get_browser_tab("user-tab")
         .await
         .unwrap()
@@ -371,7 +371,7 @@ async fn successful_claim_migrates_the_tab_to_the_driving_client() {
     .await
     .expect("migrate");
     let row = svc
-        .store
+        .store()
         .get_browser_tab("user-tab")
         .await
         .unwrap()
@@ -410,7 +410,7 @@ async fn successful_claim_migrates_the_tab_to_the_driving_client() {
     .await
     .unwrap();
     assert!(svc
-        .store
+        .store()
         .list_browser_tabs(&ws)
         .await
         .unwrap()
@@ -435,7 +435,7 @@ async fn successful_claim_migrates_the_tab_to_the_driving_client() {
     .await
     .expect("same-host claim");
     let row = svc
-        .store
+        .store()
         .get_browser_tab("local-tab")
         .await
         .unwrap()
@@ -537,7 +537,7 @@ async fn claim_reply_with_tab_id_migrates_through_browser_exec() {
         [ReverseTarget::Default]
     );
     let row = svc
-        .store
+        .store()
         .get_browser_tab("user-tab")
         .await
         .unwrap()

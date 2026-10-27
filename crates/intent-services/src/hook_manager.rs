@@ -2608,13 +2608,12 @@ mod tests {
             .update_agent_session(&ws, &session)
             .await
             .unwrap();
-        svc.enqueue_message(
+        svc.enqueue_message_for_test(
             &owner,
             "PENDING-SECRET-content".into(),
             Some(json!([{"type":"image", "data":"PENDING-SECRET-image"}])),
             Some(json!([{"type":"resource", "uri":"PENDING-SECRET-file"}])),
             Some(json!({"extra":"PENDING-SECRET-metadata"})),
-            None,
             false,
             intent_core::MessageOrigin::Automatic,
         );
@@ -2622,7 +2621,7 @@ mod tests {
             let mut queues = svc.feature_agent_queues().lock().unwrap();
             queues.get_mut(&owner).unwrap()[0].queued_at = "2020-01-01T00:00:00Z".into();
         }
-        let before = svc.queue_snapshot(&owner);
+        let before = svc.queue_snapshot_for_test(&owner);
         let out = svc.hook_schedule_op(&ws, &owner, &json!({
             "name":"stale self queue", "delayMs":600_000,
             "code": r"
@@ -2644,7 +2643,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            svc.queue_snapshot(&owner),
+            svc.queue_snapshot_for_test(&owner),
             before,
             "hook reads never consume"
         );
@@ -4219,7 +4218,7 @@ mod tests {
         mgr.shutdown().await;
         let restarted = Services::new(svc.store().clone());
         restarted.rehydrate_agent_queues().await.unwrap();
-        let queue = restarted.queue_snapshot(&owner);
+        let queue = restarted.queue_snapshot_for_test(&owner);
         assert_eq!(
             queue.len(),
             if expired_perpetual { 2 } else { 1 },
@@ -4230,7 +4229,7 @@ mod tests {
             .unwrap()
             .contains("preserve nested committed wake"));
         restarted.rehydrate_agent_queues().await.unwrap();
-        assert_eq!(restarted.queue_snapshot(&owner).len(), queue.len());
+        assert_eq!(restarted.queue_snapshot_for_test(&owner).len(), queue.len());
         assert_eq!(
             queue
                 .iter()
@@ -4288,26 +4287,25 @@ mod tests {
             svc.store().get_hook(&hook.hook_id).await.unwrap().state,
             HookState::Dispatched
         );
-        assert!(mgr.try_begin_turn(&owner, &ws).await.is_some());
+        assert!(mgr.try_begin_turn_for_test(&owner, &ws).await.is_some());
         svc.set_live_turn(
             &owner,
             "committed-hook-partial",
             vec![json!({"type":"text","text":"save before waiting"})],
         );
-        svc.enqueue_message_with_id(
+        svc.enqueue_message_with_id_for_test(
             &owner,
             Some("committed-hook-popped".into()),
             "popped payload".into(),
             None,
             None,
             None,
-            None,
             false,
             intent_core::MessageOrigin::User,
         );
-        svc.persist_queue_snapshot(&owner).await;
-        let (_entry, draining) = svc.dequeue_message_draining(&owner).unwrap();
-        svc.persist_queue_snapshot(&owner).await;
+        svc.persist_queue_snapshot_for_test(&owner).await;
+        let (_entry, draining) = svc.dequeue_message_draining_for_test(&owner).unwrap();
+        svc.persist_queue_snapshot_for_test(&owner).await;
         mgr.begin_shutdown();
         // A committed tail may still be waiting on event publication. Recovery
         // must already be durable before shutdown awaits that tail.
@@ -4343,7 +4341,7 @@ mod tests {
         drop(draining);
         let restarted = Services::new(svc.store().clone());
         restarted.rehydrate_agent_queues().await.unwrap();
-        let queue = restarted.queue_snapshot(&owner);
+        let queue = restarted.queue_snapshot_for_test(&owner);
         assert_eq!(
             queue.len(),
             2,
@@ -4389,26 +4387,25 @@ mod tests {
         tokio::time::timeout(poll_deadline(), park.entered.notified())
             .await
             .unwrap();
-        assert!(mgr.try_begin_turn(&owner, &ws).await.is_some());
+        assert!(mgr.try_begin_turn_for_test(&owner, &ws).await.is_some());
         svc.set_live_turn(
             &owner,
             "hook-shutdown-partial",
             vec![json!({"type":"text","text":"partial output"})],
         );
-        svc.enqueue_message_with_id(
+        svc.enqueue_message_with_id_for_test(
             &owner,
             Some("hook-shutdown-queue".into()),
             "keep payload".into(),
             None,
             None,
             None,
-            None,
             false,
             intent_core::MessageOrigin::User,
         );
-        svc.persist_queue_snapshot(&owner).await;
-        let (_entry, draining) = svc.dequeue_message_draining(&owner).unwrap();
-        svc.persist_queue_snapshot(&owner).await;
+        svc.persist_queue_snapshot_for_test(&owner).await;
+        let (_entry, draining) = svc.dequeue_message_draining_for_test(&owner).unwrap();
+        svc.persist_queue_snapshot_for_test(&owner).await;
         let shutdown_mgr = mgr.clone();
         let mut shutdown = tokio::spawn(async move {
             shutdown_mgr.shutdown().await;
@@ -4435,7 +4432,7 @@ mod tests {
         let restarted = Services::new(svc.store().clone());
         restarted.rehydrate_agent_queues().await.unwrap();
         assert_eq!(
-            restarted.queue_snapshot(&owner)[0]["id"],
+            restarted.queue_snapshot_for_test(&owner)[0]["id"],
             "hook-shutdown-queue"
         );
         assert!(svc
@@ -5312,7 +5309,7 @@ mod tests {
         let bystander_hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
 
         let res = svc
-            .agent_retire_op(owner.clone(), None, None)
+            .agent_retire_op_for_test(owner.clone(), None, None)
             .await
             .expect("retire");
         assert_eq!(res["success"], json!(true));
@@ -5342,7 +5339,7 @@ mod tests {
         // Restore does NOT resurrect: the row stays cancelled and boot
         // rehydration resumes nothing new (the bystander's live task is
         // skipped by idempotence).
-        svc.agent_restore_op(owner.clone(), None)
+        svc.agent_restore_op_for_test(owner.clone(), None)
             .await
             .expect("restore");
         assert_eq!(svc.rehydrate_hooks().await.unwrap(), 0);
@@ -5583,7 +5580,10 @@ mod tests {
     #[tokio::test]
     async fn active_hook_sets_waiting_without_promoting_display_status() {
         let (_tmp, _root, svc, ws, owner) = setup().await;
-        assert!(!svc.workspace_has_active_hooks_or_script_monitors(&ws).await);
+        assert!(
+            !svc.workspace_has_active_hooks_or_script_monitors_for_test(&ws)
+                .await
+        );
         let out = svc
             .hook_schedule_op(
                 &ws,
@@ -5597,7 +5597,10 @@ mod tests {
             .await
             .expect("schedule");
         let hook: Hook = serde_json::from_value(out["hook"].clone()).unwrap();
-        assert!(svc.workspace_has_active_hooks_or_script_monitors(&ws).await);
+        assert!(
+            svc.workspace_has_active_hooks_or_script_monitors_for_test(&ws)
+                .await
+        );
         let mut row = svc.store().get_workspace(&ws).await.unwrap();
         svc.enrich_workspace_aggregates(&mut row).await;
         assert!(
@@ -5614,7 +5617,10 @@ mod tests {
         svc.hook_cancel_op(&ws, &hook.hook_id, Some(&owner))
             .await
             .expect("cancel");
-        assert!(!svc.workspace_has_active_hooks_or_script_monitors(&ws).await);
+        assert!(
+            !svc.workspace_has_active_hooks_or_script_monitors_for_test(&ws)
+                .await
+        );
         let mut row = svc.store().get_workspace(&ws).await.unwrap();
         svc.enrich_workspace_aggregates(&mut row).await;
         assert!(!row.waiting, "terminal hooks never read waiting");
@@ -5729,7 +5735,7 @@ mod tests {
         // displayStatus transition.
         let deadline = std::time::Instant::now() + poll_deadline();
         loop {
-            if !svc.workspace_is_waiting(&ws).await {
+            if !svc.workspace_is_waiting_for_test(&ws).await {
                 break;
             }
             assert!(
@@ -6813,13 +6819,13 @@ mod tests {
                 .await
                 .expect("messages");
             let have = messages.iter().filter(|m| m.role == "assistant").count();
-            if have >= want && !mgr.is_busy(owner) {
+            if have >= want && !mgr.is_busy_for_test(owner) {
                 return messages;
             }
             assert!(
                 std::time::Instant::now() < deadline,
                 "turn never completed: {have}/{want} assistant rows, busy={}",
-                mgr.is_busy(owner)
+                mgr.is_busy_for_test(owner)
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }

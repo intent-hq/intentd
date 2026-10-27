@@ -4,7 +4,10 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use intent_core::{now_iso, Workspace, WorkspaceId};
+use intent_core::{
+    now_iso, AgentId, AgentSession, AgentStatus, ContentType, Note, NoteId, NoteMetadata,
+    NoteVisibility, Workspace, WorkspaceId,
+};
 use serde_json::json;
 
 use super::test_tempdir;
@@ -194,5 +197,77 @@ impl WorkspacesRoot {
     #[must_use]
     pub fn path(&self) -> &std::path::Path {
         self.0.path()
+    }
+}
+
+#[must_use]
+pub fn note(ws: &WorkspaceId, id: &str, content: &str) -> Note {
+    let ts = now_iso();
+    Note {
+        id: NoteId::from(id),
+        workspace_id: ws.clone(),
+        title: "Title".to_string(),
+        content: content.to_string(),
+        content_type: ContentType::Markdown,
+        tags: vec![],
+        is_pinned: false,
+        is_archived: false,
+        is_default: false,
+        parent_id: None,
+        visibility: NoteVisibility::Workspace,
+        metadata: NoteMetadata::default(),
+        created_at: ts.clone(),
+        rev: 0,
+        updated_at: ts,
+    }
+}
+
+#[must_use]
+pub fn session(agent_id: &AgentId, ws: &WorkspaceId) -> AgentSession {
+    AgentSession {
+        harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),
+        harness_features: None,
+        id: agent_id.clone(),
+        workspace_id: ws.clone(),
+        backend_session_id: None,
+        acp_session_id: None,
+        name: format!("test-{}", agent_id.0),
+        name_explicitly_set: false,
+        model: Some("test-model".into()),
+        reasoning_effort: None,
+        effort_levels: None,
+        provider: Some("test".into()),
+        status: AgentStatus::Idle,
+        is_active: false,
+        system_prompt: None,
+        messages: vec![],
+        created_at: now_iso(),
+        updated_at: now_iso(),
+        parent_agent_id: None,
+        specialist: None,
+        task_note_id: None,
+        skip_auto_commit: false,
+        completion_report: None,
+        completion_report_timestamp: None,
+        attention_request_kind: None,
+        attention_request_reason: None,
+        attention_request_timestamp: None,
+        delegation_depth: None,
+        initial_message: None,
+        context_references: None,
+        image_blocks: None,
+        file_blocks: None,
+        is_background: false,
+        metadata: None,
+        stats: None,
+        sandbox_id: None,
+        sandbox_path: None,
+        sandbox_branch: None,
+        stop_reason: None,
+        stop_reason_timestamp: None,
+        session_corrupted: false,
+        pending_delete_at: None,
+        retired_at: None,
+        notifications_muted: false,
     }
 }
