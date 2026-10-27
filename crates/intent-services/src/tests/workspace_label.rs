@@ -206,6 +206,50 @@ async fn label_survives_archive_and_unarchive() {
     assert_eq!(got.label.as_deref(), Some("For Later"));
 }
 
+/// A full-row write from a snapshot read before a label change (e.g. PR
+/// creation finishing, or a concurrent title-only update) must not revert
+/// the newer label: only the scoped label write touches the column.
+#[intent_test_macros::daemon_test]
+async fn stale_full_row_write_keeps_newer_label() {
+    let h = harness().await;
+    let stale = h.services.store.get_workspace(&h.ws).await.expect("read");
+    assert_eq!(stale.label, None);
+    update_label(&h, &json!("For Later")).await.expect("set");
+    h.services
+        .store
+        .update_workspace(&stale)
+        .await
+        .expect("stale unrelated write");
+    let got = h.services.get_workspace(h.ws.clone()).await.expect("get");
+    assert_eq!(got.label.as_deref(), Some("For Later"), "set survives");
+
+    let stale = h.services.store.get_workspace(&h.ws).await.expect("read");
+    update_label(&h, &Value::Null).await.expect("clear");
+    h.services
+        .store
+        .update_workspace(&stale)
+        .await
+        .expect("stale unrelated write");
+    let got = h.services.get_workspace(h.ws.clone()).await.expect("get");
+    assert_eq!(got.label, None, "clear survives");
+
+    update_label(&h, &json!("Keep")).await.expect("set");
+    let title_only: WorkspaceUpdate =
+        serde_json::from_value(json!({ "title": "Renamed" })).expect("update");
+    let ws = h
+        .services
+        .update_workspace(h.ws.clone(), title_only)
+        .await
+        .expect("title-only update");
+    assert_eq!(ws.label.as_deref(), Some("Keep"));
+    let got = h.services.get_workspace(h.ws.clone()).await.expect("get");
+    assert_eq!(
+        got.label.as_deref(),
+        Some("Keep"),
+        "missing label untouched"
+    );
+}
+
 /// Label writes are owner-only: a collaborator's set or clear is
 /// `Forbidden` (-32003) and leaves the row alone, while the owner may set
 /// it and the collaborator keeps its card-metadata rights.

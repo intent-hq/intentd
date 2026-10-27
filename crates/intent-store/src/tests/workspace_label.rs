@@ -44,8 +44,10 @@ async fn label_round_trips_through_insert_update_and_list() {
         Some("pinned")
     );
 
-    ws.label = Some("For Later".to_string());
-    store.update_workspace(&ws).await.expect("replace");
+    store
+        .set_workspace_label(&id, Some("For Later"))
+        .await
+        .expect("replace");
     assert_eq!(
         store
             .get_workspace(&id)
@@ -62,7 +64,30 @@ async fn label_round_trips_through_insert_update_and_list() {
     let row = listed.iter().find(|w| w.id == id).expect("listed");
     assert_eq!(row.label.as_deref(), Some("For Later"));
 
-    ws.label = None;
-    store.update_workspace(&ws).await.expect("clear");
+    // A full-row write from the stale `ws` snapshot (label "pinned") does
+    // not touch the column: only the scoped setter writes it.
+    store
+        .update_workspace(&ws)
+        .await
+        .expect("stale full-row write");
+    assert_eq!(
+        store
+            .get_workspace(&id)
+            .await
+            .expect("get")
+            .label
+            .as_deref(),
+        Some("For Later")
+    );
+
+    store.set_workspace_label(&id, None).await.expect("clear");
     assert_eq!(store.get_workspace(&id).await.expect("get").label, None);
+    let missing = store
+        .set_workspace_label(&WorkspaceId::new(), Some("x"))
+        .await
+        .expect_err("unknown workspace");
+    assert!(
+        matches!(missing, intent_core::Error::NotFound(_)),
+        "{missing:?}"
+    );
 }

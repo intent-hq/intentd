@@ -23901,6 +23901,11 @@ impl WorkspaceApi for Services {
                 ws.branch = store
                     .update_workspace_with_branch(&ws, branch_update.as_deref())
                     .await?;
+                // The full-row write leaves `label` alone so a stale snapshot
+                // elsewhere cannot revert it; persist an explicit change here.
+                if let Some(label) = normalised.label.as_ref() {
+                    store.set_workspace_label(&ws.id, label.as_deref()).await?;
+                }
                 if let Some(archived) = want_archived {
                     // Delegate the lifecycle flip to the fenced path: it
                     // returns the derived record (`lastActivity` /

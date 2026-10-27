@@ -367,6 +367,9 @@ impl Store {
     /// workspace behind the archive's guest sweep (the `workspace.archive`
     /// fence relies on this — see `ArchiveFence` in `intent-services`).
     ///
+    /// `label` is never written here either: it moves only through
+    /// [`Self::set_workspace_label`], so a stale snapshot cannot revert it.
+    ///
     /// # Errors
     ///
     /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
@@ -408,7 +411,7 @@ impl Store {
              last_activity=CASE WHEN julianday(?) IS NOT NULL \
                AND (last_activity IS NULL OR julianday(last_activity) IS NULL \
                OR julianday(last_activity) < julianday(?)) THEN ? ELSE last_activity END, \
-             token_usage=?, setup_script=?, checkout_mode=?, label=? WHERE id=? RETURNING branch",
+             token_usage=?, setup_script=?, checkout_mode=? WHERE id=? RETURNING branch",
         )
         .bind(&ws.title)
         .bind(branch)
@@ -444,7 +447,6 @@ impl Store {
         .bind(token_usage_to_db(ws)?)
         .bind(setup_script_to_db(ws)?)
         .bind(checkout_mode_to_db(ws)?)
-        .bind(&ws.label)
         .bind(&ws.id.0)
         .fetch_optional(self.write_pool())
         .await
@@ -1400,6 +1402,27 @@ impl Store {
             .execute(self.write_pool())
             .await
             .map_err(|e| Error::Internal(format!("set auto_commit_enabled failed: {e}")))?;
+        if res.rows_affected() == 0 {
+            return Err(Error::NotFound(format!("workspace {id}")));
+        }
+        Ok(())
+    }
+
+    /// Scoped write of the Home workspace label (`workspace.update { label }`):
+    /// `None` clears it. After insert this is the only writer of the column —
+    /// `update_workspace` never touches it — so a stale [`Workspace`]
+    /// snapshot passed to a full-row update cannot revert a newer label.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
+    pub async fn set_workspace_label(&self, id: &WorkspaceId, label: Option<&str>) -> Result<()> {
+        let res = sqlx::query("UPDATE workspace SET label = ? WHERE id = ?")
+            .bind(label)
+            .bind(&id.0)
+            .execute(self.write_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("set workspace label failed: {e}")))?;
         if res.rows_affected() == 0 {
             return Err(Error::NotFound(format!("workspace {id}")));
         }
