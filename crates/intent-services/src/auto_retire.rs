@@ -1,14 +1,20 @@
-//! Automatic retire (PROTOCOL §5.1 "Automatic retire", §5.12
+//! Automatic purge (PROTOCOL §5.1 "Automatic purge", §5.12
+//! `workspace.purgeArchivedAfterDays`, formerly
 //! `workspace.autoRetireArchivedAfterDays`): a periodic sweep that retires
-//! every workspace archived longer than the configured number of days,
-//! through the same path and `workspace:updated` delta as `workspace.retire`.
+//! (purges the folder of) every workspace archived longer than the
+//! configured number of days, through the same path and `workspace:updated`
+//! delta as `workspace.retire`.
 //!
 //! The setting is read live at every sweep (absent = off). Remote,
 //! guest-shared and retire-unsupported workspaces are skipped, and so is a
-//! workspace with a pending grace-window delete. Each workspace is retired
+//! workspace with a pending grace-window delete, and one whose folder holds
+//! work the purge would destroy ([`purge_blocker`]): uncommitted changes in
+//! any root, unpushed commits in a secondary root inside the folder, or a
+//! root that could not be evaluated. Each workspace is retired
 //! independently: a failure is logged and counted, never aborts the sweep.
 //! Retired rows are not archived-and-due any more, so a sweep is idempotent.
 
+use std::path::Path;
 use std::time::Duration;
 
 use intent_core::{Workspace, WorkspaceListFilter};
@@ -30,7 +36,8 @@ pub struct AutoRetireReport {
     pub retired: usize,
     /// Overdue-looking archived workspaces skipped (remote, guest-shared,
     /// retire-unsupported — including a refused retire attempt — pending
-    /// delete, or no readable `archivedAt`).
+    /// delete, uncommitted or unpushed local work, or no readable
+    /// `archivedAt`).
     pub skipped: usize,
     /// Workspaces whose retire attempt failed with any other error (logged
     /// as a warning; retried next sweep).
@@ -47,6 +54,52 @@ enum Attempt {
     Failed,
 }
 
+/// Why the folder of `folder`'s workspace must not be purged, given its
+/// `workspace.localChanges` evaluation: uncommitted changes in any root, a
+/// secondary root inside the folder with unpushed commits (it lives only in
+/// the folder; the primary branch is kept), or a relevant root that could
+/// not be evaluated. Secondary roots outside the folder survive the purge
+/// and never block it. `None` = safe to purge.
+pub(crate) fn purge_blocker(
+    local_changes: &serde_json::Value,
+    folder: Option<&Path>,
+) -> Option<&'static str> {
+    let Some(roots) = local_changes
+        .get("roots")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Some("local changes unreadable");
+    };
+    for root in roots {
+        let primary = root.get("kind").and_then(serde_json::Value::as_str) == Some("primary");
+        let inside = primary
+            || root
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|path| {
+                    folder.is_some_and(|folder| Path::new(path).starts_with(folder))
+                });
+        if !inside {
+            continue;
+        }
+        if root.get("error").is_some_and(|e| !e.is_null()) {
+            return Some("local changes could not be evaluated");
+        }
+        let count = |key: &str| {
+            root.get(key)
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+        };
+        if count("uncommittedCount") > 0 {
+            return Some("uncommitted changes");
+        }
+        if !primary && count("unpushedCount") > 0 {
+            return Some("unpushed commits in a nested repository");
+        }
+    }
+    None
+}
+
 /// `Ok(None)` is the automatic op declining because the workspace is no
 /// longer due (unarchived, re-archived or retired since the sweep listed it).
 fn classify<T>(result: &intent_core::Result<Option<T>>) -> Attempt {
@@ -58,10 +111,11 @@ fn classify<T>(result: &intent_core::Result<Option<T>>) -> Attempt {
 }
 
 impl Services {
-    /// One sweep at `now`, reading `workspace.autoRetireArchivedAfterDays`
-    /// from the live settings snapshot. A no-op when the setting is off.
+    /// One sweep at `now`, reading `workspace.purgeArchivedAfterDays` (or
+    /// its legacy predecessor) from the live settings snapshot. A no-op when
+    /// the setting is off.
     pub(crate) async fn sweep_auto_retire_at(&self, now: OffsetDateTime) -> AutoRetireReport {
-        let days = crate::settings::auto_retire_archived_after_days(&self.effective_settings());
+        let days = crate::settings::purge_archived_after_days(&self.effective_settings());
         self.sweep_auto_retire_after(days, now).await
     }
 
@@ -110,6 +164,11 @@ impl Services {
                 continue;
             }
             if !self.auto_retire_eligible(&ws).await {
+                report.skipped += 1;
+                continue;
+            }
+            if let Some(reason) = self.purge_blocked_by_local_work(&ws).await {
+                tracing::debug!(workspace = %ws.id, reason, "auto-retire: local work in the folder, skipped");
                 report.skipped += 1;
                 continue;
             }
@@ -176,6 +235,19 @@ impl Services {
         )
     }
 
+    /// The [`purge_blocker`] verdict for `ws`'s folder; a failed evaluation
+    /// blocks (retried next sweep).
+    async fn purge_blocked_by_local_work(&self, ws: &Workspace) -> Option<&'static str> {
+        let folder = crate::git_ops::worktree_path(ws);
+        match self.workspace_local_changes_op(ws.id.clone()).await {
+            Ok(changes) => purge_blocker(&changes, folder.as_deref()),
+            Err(e) => {
+                tracing::warn!(workspace = %ws.id, error = %e, "auto-retire: local changes lookup failed");
+                Some("local changes lookup failed")
+            }
+        }
+    }
+
     /// Spawn the auto-retire loop: a first sweep shortly after startup, then
     /// one every hour, each reading the setting live (so turning it on from
     /// Settings applies within the hour, without a restart). Stops when the
@@ -211,8 +283,63 @@ impl Services {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify, Attempt};
+    use super::{classify, purge_blocker, Attempt};
     use intent_core::Error;
+    use serde_json::json;
+    use std::path::Path;
+
+    fn row(kind: &str, path: &str, uncommitted: u64, unpushed: u64) -> serde_json::Value {
+        json!({ "kind": kind, "path": path, "uncommittedCount": uncommitted, "unpushedCount": unpushed, "hasRemoteRefs": true })
+    }
+
+    /// Purge is blocked by uncommitted work anywhere in the folder, by
+    /// unpushed commits in a nested (secondary) repository inside it, and by
+    /// a root that could not be read; unpushed commits on the primary branch
+    /// (kept by the purge) and anything in a repository outside the folder
+    /// never block it.
+    #[test]
+    fn purge_blocker_protects_work_that_lives_only_in_the_folder() {
+        let folder = Some(Path::new("/ws/one"));
+        let clean = json!({ "roots": [row("primary", "/ws/one", 0, 3)] });
+        assert_eq!(
+            purge_blocker(&clean, folder),
+            None,
+            "primary unpushed commits survive on the branch"
+        );
+        assert_eq!(purge_blocker(&json!({ "roots": [] }), folder), None);
+
+        let dirty = json!({ "roots": [row("primary", "/ws/one", 2, 0)] });
+        assert_eq!(purge_blocker(&dirty, folder), Some("uncommitted changes"));
+
+        let nested_unpushed = json!({ "roots": [row("primary", "/ws/one", 0, 0), row("secondary", "/ws/one/packages/sub", 0, 1)] });
+        assert_eq!(
+            purge_blocker(&nested_unpushed, folder),
+            Some("unpushed commits in a nested repository")
+        );
+        let nested_dirty = json!({ "roots": [row("secondary", "/ws/one/packages/sub", 1, 0)] });
+        assert_eq!(
+            purge_blocker(&nested_dirty, folder),
+            Some("uncommitted changes")
+        );
+
+        let outside = json!({ "roots": [row("primary", "/ws/one", 0, 0), row("secondary", "/elsewhere/clone", 4, 4)] });
+        assert_eq!(
+            purge_blocker(&outside, folder),
+            None,
+            "a repository outside the folder survives the purge"
+        );
+
+        let mut errored = row("primary", "/ws/one", 0, 0);
+        errored["error"] = json!("not a git repository");
+        assert_eq!(
+            purge_blocker(&json!({ "roots": [errored] }), folder),
+            Some("local changes could not be evaluated")
+        );
+        assert_eq!(
+            purge_blocker(&json!({}), folder),
+            Some("local changes unreadable")
+        );
+    }
 
     /// A retire-unsupported refusal is skipped (debug only, it would repeat
     /// every sweep); any other error is a failure; success is a retire.

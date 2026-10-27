@@ -60,6 +60,7 @@ mod agent_session;
 mod agent_subscriptions;
 mod agent_wake;
 mod agent_workers;
+mod auto_archive;
 mod auto_retire;
 mod retire;
 /// The §5.5b wire-ID rule, shared by the transport's request validation.
@@ -315,15 +316,16 @@ mod v2_5_goldens;
 mod v2_7_goldens;
 
 pub use acp_adapter::{adapter_slot_limit, init_adapter_slots, live_adapters};
+pub use auto_archive::AutoArchiveReport;
 pub use auto_retire::AutoRetireReport;
 pub use config_watcher::{ConfigWatcher, PreparedReloadAdmission};
 pub(crate) use mcp_servers::McpHub;
 pub use settings::{
     agent_memory_budget_bytes, cleanup_retired_settings, history_replay_tool_content_chars,
     host_total_memory_bytes, import_legacy_settings, max_concurrent_adapters,
-    max_concurrent_agents, migrate_active_provider_setting, migrate_default_vocabulary,
-    migrate_quick_action_settings, report_to_parent_debounce_seconds, tool_payload_retention_days,
-    InMemorySecretStore, SecretStore,
+    max_concurrent_agents, migrate_active_provider_setting, migrate_auto_retire_setting,
+    migrate_default_vocabulary, migrate_quick_action_settings, report_to_parent_debounce_seconds,
+    tool_payload_retention_days, InMemorySecretStore, SecretStore,
 };
 pub use settings_registry::{SettingOrigin, SettingsRegistry, SettingsSnapshot, WsApiPortPolicy};
 pub(crate) use settings_registry::{SettingsChanged, KNOWN_PATHS};
@@ -36026,7 +36028,17 @@ impl Services {
             };
             let current = store.get_workspace(&id).await?;
             if current.is_retired() {
-                let revived = self.revive_retired_checkout(&current).await?;
+                // The agent whose turn triggered the revive gets its notice in
+                // that turn; every other agent's notice is written with the
+                // flip (see `revive_retired_checkout`).
+                let trigger = auto_unarchive
+                    .as_ref()
+                    .and_then(|stamp| stamp.get("agentId"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(AgentId::from);
+                let revived = self
+                    .revive_retired_checkout(&current, trigger.as_ref())
+                    .await?;
                 (revived.is_some(), revived)
             } else {
                 let flipped = store
@@ -36116,6 +36128,9 @@ impl Services {
             changes["baseCommitSha"] = serde_json::json!(revived.base_commit_sha);
             changes["revived"] =
                 auto_unarchive.unwrap_or_else(|| serde_json::json!({ "reason": "manual" }));
+            if revived.cleared_purge_status && ws.status_message.is_none() {
+                changes["statusMessage"] = serde_json::Value::Null;
+            }
         } else if let Some(stamp) = auto_unarchive {
             changes["autoUnarchive"] = stamp;
         }
