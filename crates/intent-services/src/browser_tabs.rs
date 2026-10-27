@@ -551,3 +551,6 @@ mod browser_routing_tests;
 
 #[cfg(test)]
 mod browser_routing_fixture_tests;
+
+#[cfg(test)]
+mod browser_clients_tests;

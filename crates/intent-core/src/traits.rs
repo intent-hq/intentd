@@ -892,6 +892,28 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// `ws.browser.clients()` (agent binding only, no wire method): every
+    /// connected client with its live connections, plus where an unpinned
+    /// `browser.exec` and this workspace's `browser.exec` would go right
+    /// now — `{ clients: [{ clientId, name?, canHostBrowser, connections:
+    /// [{ connectionId, transport, connectedAt, canHostBrowser }] }],
+    /// unpinned: Route, workspace: Route & { source } }` where a route is
+    /// `{ clientId, name?, connectionId, error? }` (see
+    /// [`ReverseConnectionSnapshot`]). Read-only. `agent_id` is the calling
+    /// agent, whose workspace membership is checked as for `browser_exec`.
+    fn browser_clients(
+        &self,
+        id: WorkspaceId,
+        agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (id, agent_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "WorkspaceApi::browser_clients not implemented".to_string(),
+            ))
+        })
+    }
+
     /// `workspace.setBrowserClient` (REV-2): persist (`Some`) or clear
     /// (`None`) the per-workspace browser-client pin, emit
     /// `workspace:updated { changes: { browserClientId } }`, and echo the
@@ -9225,6 +9247,84 @@ pub struct ReverseLiveClient {
     pub connected_at: String,
 }
 
+/// One live hello'd connection in a [`ReverseConnectionSnapshot`].
+/// `connection_id` is the registry's arrival sequence (the number a
+/// `browser.exec` timeout error names); `transport` is the wire spelling
+/// (`"uds"` / `"wss"`); `can_host_browser` is whether a `browser.exec` of
+/// the snapshot's workspace may be routed to it (`browserExec` advertised,
+/// browser-hosting authority, and administrator-only for Chief) — the same
+/// predicate `dispatch` selects on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReverseConnectionInfo {
+    pub connection_id: u64,
+    pub transport: String,
+    pub connected_at: String,
+    pub can_host_browser: bool,
+}
+
+/// One logical client in a [`ReverseConnectionSnapshot`]: its live hello'd
+/// connections, oldest first. `name` comes from the newest hello (as for
+/// [`ReverseLiveClient`]); `can_host_browser` is true when any connection
+/// can.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReverseClientConnections {
+    pub client_id: ClientId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub can_host_browser: bool,
+    pub connections: Vec<ReverseConnectionInfo>,
+}
+
+/// Where one [`ReverseTarget`] would be delivered right now. On success
+/// `connection_id` names the receiving connection and `name` is the
+/// client's listed (newest-hello) name; otherwise `connection_id` is `None`
+/// and `error` carries the [`ReverseDispatchError`] text (`client_id` /
+/// `name` still name a pinned or tab-host client that is offline; the
+/// service layer rewords it as `browser.exec` would).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReverseRoute {
+    pub client_id: Option<ClientId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub connection_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl ReverseRoute {
+    /// The route of a target that resolved to no connection.
+    #[must_use]
+    pub fn failed(error: &ReverseDispatchError) -> Self {
+        let (client_id, name) = match error {
+            ReverseDispatchError::ClientOffline {
+                client_id, name, ..
+            } => (Some(client_id.clone()), name.clone()),
+            _ => (None, None),
+        };
+        Self {
+            client_id,
+            name,
+            connection_id: None,
+            error: Some(error.to_string()),
+        }
+    }
+}
+
+/// Read-only view of the live connections behind each client plus the
+/// route of each requested target, taken under one registry lock so the
+/// two agree ([`AgentReverseDispatch::connection_snapshot`], the source of
+/// `ws.browser.clients()`). Clients are in first-connection order; `routes`
+/// follows the order of the requested targets.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReverseConnectionSnapshot {
+    pub clients: Vec<ReverseClientConnections>,
+    pub routes: Vec<ReverseRoute>,
+}
+
 /// Agent-initiated daemon→client reverse-RPC seam (REV-1/REV-2, PROTOCOL
 /// §5.14/§12.4).
 ///
@@ -9319,6 +9419,35 @@ pub trait AgentReverseDispatch: Send + Sync {
     /// projection). The default reports no clients.
     fn live_clients(&self) -> Vec<ReverseLiveClient> {
         Vec::new()
+    }
+
+    /// Every live hello'd connection grouped by client, plus where each of
+    /// `targets` would be delivered for a `browser.exec` scoped to
+    /// `workspace_id` (Chief selects administrator connections only, as in
+    /// `dispatch`). Read-only: nothing is sent to any client. The default
+    /// lists no clients and reports each target through [`Self::resolve`]
+    /// (no connection id).
+    fn connection_snapshot(
+        &self,
+        workspace_id: &crate::ids::WorkspaceId,
+        targets: &[ReverseTarget],
+    ) -> ReverseConnectionSnapshot {
+        let _ = workspace_id;
+        ReverseConnectionSnapshot {
+            clients: Vec::new(),
+            routes: targets
+                .iter()
+                .map(|target| match self.resolve(target) {
+                    Ok(resolved) => ReverseRoute {
+                        client_id: Some(resolved.client_id),
+                        name: resolved.name,
+                        connection_id: None,
+                        error: None,
+                    },
+                    Err(error) => ReverseRoute::failed(&error),
+                })
+                .collect(),
+        }
     }
 
     /// All hello'd devices, including guests that cannot host a browser.
