@@ -203,12 +203,28 @@ fn collect_san() -> Vec<String> {
 /// Generate a new self-signed certificate, persist it (cert `0644`, key
 /// `0600`), and return it with its fingerprint.
 fn generate_new_cert(data_dir: &Path) -> Result<TlsCertificate> {
+    let generated = generate_certificate(collect_san())?;
+    std::fs::create_dir_all(data_dir).map_err(internal)?;
+    let (cert_path, key_path) = cert_paths(data_dir);
+    write_with_mode(&cert_path, generated.cert.as_bytes(), 0o644)?;
+    write_with_mode(&key_path, generated.key.as_bytes(), 0o600)?;
+    Ok(generated)
+}
+
+/// Generate a self-signed certificate for `names` in memory, without
+/// persisting or caching it. Execution nodes use it for their link listener;
+/// head pins its SHA-256 fingerprint.
+///
+/// # Errors
+///
+/// Returns an error if certificate generation fails.
+pub fn generate_certificate(names: Vec<String>) -> Result<TlsCertificate> {
     let now = OffsetDateTime::now_utc();
     let not_after = now
         .replace_year(now.year() + VALIDITY_YEARS)
         .unwrap_or_else(|_| now + Duration::days(365 * i64::from(VALIDITY_YEARS)));
 
-    let mut params = CertificateParams::new(collect_san()).map_err(internal)?;
+    let mut params = CertificateParams::new(names).map_err(internal)?;
     params.not_before = now;
     params.not_after = not_after;
     params.is_ca = IsCa::NoCa;
@@ -226,11 +242,6 @@ fn generate_new_cert(data_dir: &Path) -> Result<TlsCertificate> {
     let cert_pem = cert.pem();
     let key_pem = key_pair.serialize_pem();
     let fingerprint256 = compute_fingerprint(cert.der().as_ref());
-
-    std::fs::create_dir_all(data_dir).map_err(internal)?;
-    let (cert_path, key_path) = cert_paths(data_dir);
-    write_with_mode(&cert_path, cert_pem.as_bytes(), 0o644)?;
-    write_with_mode(&key_path, key_pem.as_bytes(), 0o600)?;
 
     Ok(TlsCertificate {
         cert: cert_pem,

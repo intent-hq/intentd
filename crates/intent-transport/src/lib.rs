@@ -34,7 +34,9 @@ pub use server::{
     advertised_hosts, collect_bind_interfaces, collect_local_ips, collect_local_ipv6s,
     PairingSnapshot, ServerPairingInfo,
 };
-pub use tls::{ensure_tls_certificate, inspect_cert, CertStatus, TlsCertificate};
+pub use tls::{
+    ensure_tls_certificate, generate_certificate, inspect_cert, CertStatus, TlsCertificate,
+};
 pub use ws::{
     GuestConnectionLimits, SharedGuestLimits, WsApiServer, WsOptions, GUEST_CAP_RETRY_AFTER_SECS,
 };
@@ -71,6 +73,7 @@ mod host_ops;
 mod invite;
 pub mod lifecycle;
 pub mod listener;
+pub mod node_link;
 pub mod pairing;
 mod panic_guard;
 mod presence;
