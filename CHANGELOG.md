@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.64] - 2026-10-27
+
+### 🚀 Features
+
+- Teach agents to link other workspaces instead of naming their IDs ([#2754](https://github.com/intent-hq/intentd/pull/2754))
+- Auto-archive idle workspaces and purge archived folders ([#2756](https://github.com/intent-hq/intentd/pull/2756))
+
+### 🧪 Testing
+
+- *(transport)* Run the shared browser-routing cases against the router ([#2752](https://github.com/intent-hq/intentd/pull/2752))
+
+
 ## [0.11.63] - 2026-10-27
 
 ### 🚀 Features
