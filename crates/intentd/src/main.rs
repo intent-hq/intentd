@@ -39,6 +39,8 @@ mod command_evidence;
 mod doctor_codex;
 mod exact_update;
 mod git_credential;
+#[cfg(unix)]
+mod git_remote_intent;
 mod provider;
 mod rpc_profile;
 mod shutdown;
@@ -273,6 +275,10 @@ enum Command {
 }
 
 fn main() -> ExitCode {
+    #[cfg(unix)]
+    if let Some(code) = git_remote_intent::dispatch_argv0() {
+        return code;
+    }
     // Freeze process restrictions before runtime/configuration consumers.
     // Ordinary settings cannot relax an opted-in private test profile.
     intent_core::process_policy::ProcessPolicy::current();
