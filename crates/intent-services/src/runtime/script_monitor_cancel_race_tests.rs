@@ -129,8 +129,11 @@ impl Harness {
         .expect("the sentinel idle was delivered");
     }
 
-    async fn watches_child(&self, parent: &AgentId, child: &AgentId) -> bool {
-        let subscriptions = with_caller(
+    /// The parent's live (in-memory) watches on `child`, counted from the
+    /// public `agent.getSubscriptions` watch entries whose `actorIds` is
+    /// exactly `[child]`.
+    async fn child_watch_count(&self, parent: &AgentId, child: &AgentId) -> usize {
+        let response = with_caller(
             Caller::Agent {
                 agent_id: parent.clone(),
             },
@@ -139,7 +142,12 @@ impl Harness {
         )
         .await
         .expect("agent.getSubscriptions");
-        subscriptions.to_string().contains(child.as_str())
+        response["subscriptions"]
+            .as_array()
+            .expect("subscriptions array")
+            .iter()
+            .filter(|entry| entry["actorIds"] == json!([child.as_str()]))
+            .count()
     }
 
     async fn persisted_watches(&self, parent: &AgentId) -> usize {
@@ -259,7 +267,7 @@ async fn script_monitor_cancel_redelivers_a_watched_childs_completion_once() {
         h.settle(armed).await;
         assert_eq!(messages(&svc, &parent).await, 1, "one advisory");
         assert!(messages_text(&svc, &parent).await.contains("Monitor check"));
-        assert!(h.watches_child(&parent, &child).await);
+        assert_eq!(h.child_watch_count(&parent, &child).await, 1);
         h.wait_persisted_watches(&parent, 1).await;
         if armed.is_some() {
             // Only the sentinel is parked: let its wake land before the race.
@@ -284,7 +292,7 @@ async fn script_monitor_cancel_redelivers_a_watched_childs_completion_once() {
             // The competing idle pass must yield to the claimed delivery.
             h.idle(&child, json!({"agentId": child})).await;
             h.settle(armed).await;
-            assert!(h.watches_child(&parent, &child).await);
+            assert_eq!(h.child_watch_count(&parent, &child).await, 1);
             assert_eq!(messages(&svc, &parent).await, 1);
             // Release both parked deliveries: the cancellation's claim and
             // the sentinel's fence.
@@ -303,12 +311,13 @@ async fn script_monitor_cancel_redelivers_a_watched_childs_completion_once() {
         // The winner commits durable retirement before removing the
         // in-memory watch: await both.
         timeout(wait(), async {
-            while h.watches_child(&parent, &child).await {
+            while h.child_watch_count(&parent, &child).await != 0 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
         .expect("cancellation redelivery retires the watch");
+        assert_eq!(h.child_watch_count(&parent, &child).await, 0);
         h.wait_persisted_watches(&parent, 0).await;
         assert_eq!(messages(&svc, &parent).await, 2, "advisory + completion");
         assert!(svc
