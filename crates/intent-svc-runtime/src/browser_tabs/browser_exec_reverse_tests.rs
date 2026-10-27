@@ -79,7 +79,7 @@ async fn services_with(
         )
         .await
         .expect("client");
-    let svc = Services::new(store)
+    let svc = crate::test_runtime::with_runtime(Services::new(store))
         .with_workspaces_root(root.path().to_path_buf())
         .with_reverse_dispatch(dispatch);
     (tmp, root, svc)
@@ -106,7 +106,8 @@ async fn browser_exec_without_dispatch_returns_no_client_error() {
     let tmp = TempDb::new();
     let root = WorkspacesRoot::new();
     let store = Store::open(&tmp.path).await.expect("open store");
-    let svc = Services::new(store).with_workspaces_root(root.path().to_path_buf());
+    let svc = crate::test_runtime::with_runtime(Services::new(store))
+        .with_workspaces_root(root.path().to_path_buf());
     let err = svc
         .browser_exec(
             WorkspaceId::from("ws-1"),

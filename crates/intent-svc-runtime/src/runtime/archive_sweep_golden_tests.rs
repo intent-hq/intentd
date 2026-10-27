@@ -6,7 +6,8 @@ use serde_json::json;
 
 use super::test_fixtures::wake_texts_when;
 use crate::hook_manager::HookServicesExt;
-use intent_services::feature_api::test_support::goldens::{pr_monitor_row, seed_agent, setup};
+use crate::test_runtime::goldens_setup as setup;
+use intent_services::feature_api::test_support::goldens::{pr_monitor_row, seed_agent};
 use intent_services::feature_api::test_support::goldens::{PREFIX, RE_ARM_HOOKS, RE_ARM_MONITORS};
 
 /// Regression: archiving a workspace where agent A owns two hooks and one

@@ -73,7 +73,8 @@ async fn workspace_change_is_rejected_without_events_or_row_changes() {
         .await
         .expect("client");
     let bus = EventBus::new(store.clone());
-    let services = Services::new(store.clone()).with_event_bus(bus.clone());
+    let services =
+        crate::test_runtime::with_runtime(Services::new(store.clone())).with_event_bus(bus.clone());
     let subscribe = |ws: &WorkspaceId| {
         bus.subscribe(SubscriptionFilter {
             workspace_id: Some(ws.0.clone()),
@@ -179,7 +180,8 @@ async fn remove_racing_sync_never_publishes_a_stale_opened_after_closed() {
         .await
         .expect("client");
     let bus = EventBus::new(store.clone());
-    let services = Services::new(store.clone()).with_event_bus(bus.clone());
+    let services =
+        crate::test_runtime::with_runtime(Services::new(store.clone())).with_event_bus(bus.clone());
     let mut sub = bus.subscribe(SubscriptionFilter {
         workspace_id: Some(ws.0.clone()),
         event_types: vec!["browser:*".to_string()],
@@ -282,7 +284,7 @@ async fn identity_drift_preserves_legacy_pins_tab_hosts_and_client_scoped_drafts
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.unwrap();
     let agent = AgentId::from_string("draft-agent");
-    let services = Services::new(store.clone());
+    let services = crate::test_runtime::with_runtime(Services::new(store.clone()));
     for (index, old) in ["desktop", "alice:desktop"].into_iter().enumerate() {
         let old = ClientId::from_string(old);
         let drifted = ClientId::from_string(format!("bob:{}", old.as_str()));

@@ -138,7 +138,7 @@ pub(super) async fn setup(
             .expect("client");
     }
     let bus = EventBus::new(store.clone());
-    let svc = Services::new(store)
+    let svc = crate::test_runtime::with_runtime(Services::new(store))
         .with_workspaces_root(root.path().to_path_buf())
         .with_event_bus(bus.clone())
         .with_reverse_dispatch(registry);
@@ -179,7 +179,7 @@ async fn client_list_projects_live_clients() {
 async fn client_list_is_empty_without_a_dispatcher() {
     let tmp = TempDb::new();
     let store = Store::open(&tmp.path).await.expect("open store");
-    let svc = Services::new(store);
+    let svc = crate::test_runtime::with_runtime(Services::new(store));
     assert!(svc.client_list().await.expect("list").is_empty());
 }
 

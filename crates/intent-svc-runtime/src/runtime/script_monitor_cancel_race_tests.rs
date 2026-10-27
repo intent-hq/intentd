@@ -200,11 +200,11 @@ async fn script_monitor_cancel_redelivers_a_watched_childs_completion_once() {
         let park = Arc::new(CompletionClassifyPark::default());
         // A per-test secrets file: `Services::new` would use the default
         // `~/intent/.secrets.json`.
-        let svc = Services::new_repository_fixture(
+        let svc = crate::test_runtime::with_runtime(Services::new_repository_fixture(
             store,
             intent_core::FileSecretStore::with_path(tmp.path.with_extension("secrets")),
             None,
-        )
+        ))
         .with_settings_registry(test_registry_with_default_provider(&tmp))
         .with_event_bus(bus.clone());
         let svc = if grouped {

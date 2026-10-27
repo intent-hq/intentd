@@ -2089,7 +2089,6 @@ impl Services {
 
 #[cfg(test)]
 mod tests {
-    use crate::runtime::RuntimeStateExt;
     use std::sync::Arc;
 
     use intent_core::{Error, WorkspaceApi, WorkspaceId};
@@ -2170,12 +2169,12 @@ mod tests {
         );
         assert_eq!(
             svc.unregistered_feature_ports(),
-            ["transfer"],
-            "Services::new registers the in-crate runtime and agent-wake features"
+            ["transfer", "runtime"],
+            "Services::new registers only the in-crate agent-wake feature"
         );
         assert!(matches!(
             svc.ensure_feature_ports_registered(),
-            Err(Error::Internal(m)) if m == "feature ports not registered: transfer"
+            Err(Error::Internal(m)) if m == "feature ports not registered: transfer, runtime"
         ));
     }
 
@@ -2197,20 +2196,6 @@ mod tests {
                 .export_in_progress(ws.as_str()),
             "the forwarders and clones reach the registered object"
         );
-    }
-
-    #[tokio::test]
-    async fn services_new_registers_one_runtime_feature_shared_by_clones() {
-        let tmp = TempDb::new();
-        let svc = bare_services(&tmp).await;
-        assert!(!svc.unregistered_feature_ports().contains(&"runtime"));
-        let clone = svc.clone();
-        assert!(std::ptr::eq(svc.runtime(), clone.runtime()));
-        assert!(std::ptr::eq(
-            svc.runtime(),
-            svc.feature::<crate::runtime::RuntimeFeature>()
-                .expect("registered")
-        ));
     }
 
     #[tokio::test]

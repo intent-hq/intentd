@@ -3402,10 +3402,12 @@ mod tests {
         let bus = intent_services::feature_api::EventBus::new(store.clone());
         // A per-test secrets file: `Services::new` would use the default
         // `~/intent/.secrets.json`.
-        let services = intent_services::feature_api::Services::new_repository_fixture(
-            store.clone(),
-            intent_core::FileSecretStore::with_path(dir.path().join("secrets.json")),
-            None,
+        let services = crate::test_runtime::with_runtime(
+            intent_services::feature_api::Services::new_repository_fixture(
+                store.clone(),
+                intent_core::FileSecretStore::with_path(dir.path().join("secrets.json")),
+                None,
+            ),
         )
         .with_event_bus(bus.clone());
 

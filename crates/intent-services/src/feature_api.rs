@@ -43,6 +43,8 @@ pub use crate::{
 
 #[cfg(any(test, feature = "test-hooks"))]
 pub use crate::test_support;
+#[cfg(any(test, feature = "test-hooks"))]
+pub use crate::Subscription;
 
 /// Agent turn and recovery helpers.
 pub mod agent_ops {
@@ -58,7 +60,7 @@ pub mod agent_manager {
     pub use crate::agent_manager::{AgentManager, TeardownFence};
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub use crate::agent_manager::imported_spawn_selection_for_test;
+    pub use crate::agent_manager::{imported_spawn_selection_for_test, BusEventSink, TurnOptions};
 
     /// Test fixtures the agent manager tests share.
     #[cfg(any(test, feature = "test-hooks"))]
@@ -124,6 +126,9 @@ pub mod repo_config {
 /// The async secret store.
 pub mod settings {
     pub use crate::settings::AsyncSecretStore;
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub use crate::settings::{InMemorySecretStore, SecretStore};
 }
 
 /// Caller classification for event-producing operations.
@@ -142,6 +147,9 @@ pub mod execution_call {
 /// The event bus.
 pub mod events {
     pub use crate::events::{EventBus, SubscriptionFilter};
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub use crate::events::Subscription;
 }
 
 /// Workspace file locations.

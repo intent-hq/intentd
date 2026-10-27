@@ -35,7 +35,7 @@ libc = { workspace = true }
 nix = { workspace = true, features = ["signal", "process", "fs"] }
 
 [dev-dependencies]
-intent-services = { path = "../intent-services", version = "0.11.65", features = ["test-hooks"] }
+intent-services = { path = "../intent-services", version = "0.11.65", features = ["test-hooks", "repository-test-fixtures"] }
 intent-providers = { path = "../intent-providers", version = "0.11.65", features = ["test-support"] }
 intent-store = { path = "../intent-store", version = "0.11.65", features = ["test-support"] }
 intent-acp = { path = "../intent-acp", version = "0.11.65", features = ["test-hooks"] }

@@ -70,7 +70,7 @@ async fn archive_round_trip_preserves_output_scope_and_hydrates() {
             .len(),
         1
     );
-    let restarted = Services::new(Store::open(&h.tmp.path).await.unwrap());
+    let restarted = crate::test_runtime::with_runtime(Services::new(Store::open(&h.tmp.path).await.unwrap()));
     assert_eq!(restarted.script_manager().hydrate().await.unwrap(), 1);
     assert!(!restarted
         .script_manager()
@@ -729,7 +729,7 @@ async fn new_command_defaults_to_one_off_but_upserts_and_reload_preserve_purpose
         .unwrap();
     // Reload archived definitions from SQLite, then upsert: classification
     // survives both paths even though the replacement returns to active.
-    let restarted = Services::new(Store::open(&h.tmp.path).await.unwrap());
+    let restarted = crate::test_runtime::with_runtime(Services::new(Store::open(&h.tmp.path).await.unwrap()));
     restarted.hydrate_scripts().await.unwrap();
     for (id, expected) in [("new-command", "oneOff"), ("saved-command", "saved")] {
         let updated = restarted
@@ -841,7 +841,7 @@ async fn omitted_purpose_upserts_preserve_unhydrated_store_definitions() {
         .await;
         // Boot continues after failed hydration. The durable row remains an
         // update, even when it has no corresponding in-memory definition.
-        let unhydrated = Services::new(h.services.store().clone());
+        let unhydrated = crate::test_runtime::with_runtime(Services::new(h.services.store().clone()));
         let result = unhydrated
             .script_create(
                 h.ws.clone(),
@@ -894,7 +894,7 @@ async fn archived_script_remove_by_known_id_after_restart() {
             .await
             .unwrap();
         h.services.store().close().await;
-        let restarted = Services::new(Store::open(&h.tmp.path).await.unwrap());
+        let restarted = crate::test_runtime::with_runtime(Services::new(Store::open(&h.tmp.path).await.unwrap()));
         restarted.hydrate_scripts().await.unwrap();
         assert!(restarted
             .script_manager()

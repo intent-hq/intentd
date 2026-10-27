@@ -109,7 +109,7 @@ async fn setup(registry: Arc<SnapshotRegistry>) -> (TempDb, WorkspacesRoot, Serv
     let store = Store::open(&tmp.path).await.expect("open store");
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
-    let svc = Services::new(store)
+    let svc = crate::test_runtime::with_runtime(Services::new(store))
         .with_workspaces_root(root.path().to_path_buf())
         .with_reverse_dispatch(registry);
     (tmp, root, svc, ws)
@@ -253,7 +253,7 @@ async fn browser_clients_without_a_dispatcher_lists_nothing() {
     let store = Store::open(&tmp.path).await.expect("open store");
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
-    let svc = Services::new(store);
+    let svc = crate::test_runtime::with_runtime(Services::new(store));
     let out = svc.browser_clients(ws, None).await.expect("clients");
     assert_eq!(out["clients"], json!([]));
     assert_eq!(out["unpinned"]["error"], "no client connected");
@@ -293,7 +293,8 @@ async fn browser_clients_rejects_a_short_route_list() {
     let store = Store::open(&tmp.path).await.expect("open store");
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
-    let svc = Services::new(store).with_reverse_dispatch(Arc::new(ShortRegistry));
+    let svc = crate::test_runtime::with_runtime(Services::new(store))
+        .with_reverse_dispatch(Arc::new(ShortRegistry));
     let err = svc
         .browser_clients(ws, None)
         .await

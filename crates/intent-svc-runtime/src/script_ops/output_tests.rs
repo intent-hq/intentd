@@ -140,7 +140,7 @@ async fn script_output_is_read_from_disk_after_restart() {
     run_to_exit(&h.services, &h.ws, &id).await;
 
     // Simulated daemon restart: a fresh Services over the same store and data dir.
-    let svc2 = Services::new(h.services.store().clone()).with_script_output_dir(&data.0);
+    let svc2 = crate::test_runtime::with_runtime(Services::new(h.services.store().clone())).with_script_output_dir(&data.0);
     svc2.hydrate_scripts().await.expect("hydrate");
     let text = output_text(&svc2, &h.ws, &id, None).await;
     assert!(
@@ -148,7 +148,7 @@ async fn script_output_is_read_from_disk_after_restart() {
         "{text:?}"
     );
     // Lazily loaded (known-id) access works too, without hydration.
-    let svc3 = Services::new(h.services.store().clone()).with_script_output_dir(&data.0);
+    let svc3 = crate::test_runtime::with_runtime(Services::new(h.services.store().clone())).with_script_output_dir(&data.0);
     let text = output_text(&svc3, &h.ws, &id, Some(2)).await;
     assert!(text.contains("restart-two"), "{text:?}");
 }

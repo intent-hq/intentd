@@ -10,6 +10,7 @@ use serde_json::json;
 use intentd_test_support::Barrier;
 
 use super::test_fixtures::{assert_quiet, recv_setup};
+use crate::test_runtime::setup_lifecycle_services as services;
 use intent_services::feature_api::test_support::setup_lifecycle::*;
 
 /// Script exits non-zero: `completed` still fires once, carrying the

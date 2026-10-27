@@ -8,7 +8,8 @@ use serde_json::json;
 
 use crate::browser_tabs::BrowserTabOpsExt;
 use crate::hook_manager::HookServicesExt;
-use intent_services::feature_api::test_support::goldens::{seed_agent, setup};
+use crate::test_runtime::goldens_setup as setup;
+use intent_services::feature_api::test_support::goldens::seed_agent;
 
 #[tokio::test]
 async fn hooks_and_browser_tabs_are_refused_while_the_workspace_is_being_deleted() {

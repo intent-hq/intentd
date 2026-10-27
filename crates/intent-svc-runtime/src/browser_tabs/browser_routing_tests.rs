@@ -516,7 +516,7 @@ async fn claim_reply_with_tab_id_migrates_through_browser_exec() {
         .unwrap();
     let bus = EventBus::new(store.clone());
     let dispatch = Arc::new(ClaimOk(Mutex::new(Vec::new())));
-    let svc = Services::new(store)
+    let svc = crate::test_runtime::with_runtime(Services::new(store))
         .with_workspaces_root(root.path().to_path_buf())
         .with_event_bus(bus.clone())
         .with_reverse_dispatch(dispatch.clone());
@@ -642,7 +642,7 @@ async fn claim_completing_after_a_pin_switch_commits_to_the_new_driving_client()
         targets: Mutex::new(Vec::new()),
     });
     let svc = Arc::new(
-        Services::new(store)
+        crate::test_runtime::with_runtime(Services::new(store))
             .with_workspaces_root(root.path().to_path_buf())
             .with_event_bus(bus.clone())
             .with_reverse_dispatch(dispatch.clone()),

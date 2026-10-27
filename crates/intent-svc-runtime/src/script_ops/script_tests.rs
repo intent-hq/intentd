@@ -35,7 +35,8 @@ async fn harness() -> Harness {
     let ws = WorkspaceId::new();
     store.insert_workspace(&workspace(&ws)).await.expect("ws");
     let bus = EventBus::new(store.clone());
-    let services = Services::new(store.clone()).with_event_bus(bus.clone());
+    let services =
+        crate::test_runtime::with_runtime(Services::new(store.clone())).with_event_bus(bus.clone());
     Harness {
         _tmp: tmp,
         services,

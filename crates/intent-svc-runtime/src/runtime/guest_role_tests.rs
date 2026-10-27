@@ -1,7 +1,8 @@
+use crate::test_runtime::capability_fixture as fixture;
 use intent_core::{
     AgentCreateExtra, Error, ScriptCreateParams, ScriptMode, WorkspaceApi, WorkspaceRole,
 };
-use intent_services::feature_api::test_support::capability_fixtures::{fixture, Role};
+use intent_services::feature_api::test_support::capability_fixtures::Role;
 use intent_services::feature_api::test_support::fixtures::TempDb;
 use serde_json::json;
 

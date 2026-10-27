@@ -1,10 +1,12 @@
 //! `workspace.retire` against running scripts and terminals (moved from
 //! `tests/retire_workspace.rs`).
 
+use crate::runtime::RuntimeStateExt;
 use std::time::Duration;
 
 use intent_core::{Error, WorkspaceApi, WorkspaceStatus};
 
+use crate::test_runtime::retire_fixture as fixture;
 use intent_services::feature_api::test_support::retire_workspace::*;
 
 /// Review regression (intentd#2605): the automatic sweep's retire skips
