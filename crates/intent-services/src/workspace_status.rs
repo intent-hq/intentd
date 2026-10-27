@@ -74,7 +74,7 @@ pub(crate) type WaitingStatusCache = LastObservedCache<bool>;
 pub(crate) struct ScriptsRunningState {
     scripts: RunningFlagGate,
     background_tasks: RunningFlagGate,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     park: Mutex<Option<Arc<ScriptsRunningPark>>>,
 }
 
@@ -141,11 +141,14 @@ impl RunningFlagGate {
 /// Test seam: parks the next `scriptsRunning` recompute that observed a
 /// transition, after its first registry read and before its store await, so
 /// a test can interleave a newer script start (one-shot).
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
 #[derive(Default)]
-pub(crate) struct ScriptsRunningPark {
-    pub(crate) entered: tokio::sync::Notify,
-    pub(crate) release: tokio::sync::Notify,
+pub struct ScriptsRunningPark {
+    /// Signaled by the parked recompute on entering the window.
+    pub entered: tokio::sync::Notify,
+    /// Held by the parked recompute until the test releases it.
+    pub release: tokio::sync::Notify,
 }
 
 struct CacheInner<T> {
@@ -768,7 +771,7 @@ impl Services {
             state.cache.seed(workspace_id, running, generation);
             return;
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-hooks"))]
         if flag == RunningFlag::Scripts {
             self.park_scripts_running_recompute().await;
         }
@@ -794,7 +797,7 @@ impl Services {
     }
 
     /// Arm [`ScriptsRunningPark`]: the next transitioning recompute parks.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn arm_scripts_running_park(&self) -> Arc<ScriptsRunningPark> {
         let park = Arc::new(ScriptsRunningPark::default());
         *self
@@ -805,7 +808,7 @@ impl Services {
         park
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     async fn park_scripts_running_recompute(&self) {
         let park = self
             .scripts_running_state

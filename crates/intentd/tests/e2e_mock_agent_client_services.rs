@@ -64,10 +64,12 @@ async fn setup_manager(
 
     let store = Store::open(&db).await.expect("open store");
     let bus = EventBus::new(store.clone());
-    let services = Services::new(store.clone())
-        .with_workspaces_root(tmp.path().to_path_buf())
-        .with_settings_registry(common::registry_with_default_provider(&ws_root))
-        .with_event_bus(bus.clone());
+    let services = intent_app::compose(
+        Services::new(store.clone())
+            .with_workspaces_root(tmp.path().to_path_buf())
+            .with_settings_registry(common::registry_with_default_provider(&ws_root))
+            .with_event_bus(bus.clone()),
+    );
 
     let ws = WorkspaceId::new();
     store

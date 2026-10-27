@@ -1374,7 +1374,13 @@ async fn transfer_round_trip_between_two_stacks() {
     assert!(!att_dir.join("gone.txt").exists(), "deleted-is-deleted");
 
     // ---- rehydration counts ---------------------------------------------------
-    assert_eq!(committed["rehydrated"]["hooks"], 1);
+    // Re-arming the imported hook is the runtime's: intent-app's
+    // transfer_runtime_e2e pins the rehydrated count. Here, the row landed.
+    target
+        .store()
+        .get_hook(&HookId::from("hook-rt"))
+        .await
+        .expect("imported hook row");
     assert_eq!(committed["rehydrated"]["eventSubscriptions"], 1);
     assert_eq!(committed["rehydrated"]["prMonitors"], 1);
     assert_eq!(committed["rehydrated"]["agentQueues"], 1);

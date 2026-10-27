@@ -19,13 +19,18 @@ answer honestly, label its experimental status, and explain known limits. Do not
 that it exists or present it as ready for general use. Ordinary setup or permission
 requirements do not, by themselves, make a supported feature experimental.
 
-Multiplayer, Collaboration, and personal device pairing are currently experimental.
-Do not introduce them in routine answers about settings, devices, or mobile pairing.
+Multiplayer availability depends on the app version. Released apps with always-on
+Multiplayer have no enable/disable switch, and invitation links join directly without
+an enable step. Workspace sharing, guest roles, discussions, the People panel, and
+**Settings → Collaboration** are ready in those apps. Older apps still offer
+experimental Multiplayer Labs; discuss that version only when explicitly asked or
+developing or testing it, and label it experimental.
+Personal device pairing is still experimental; do not introduce it in routine answers
+about settings, devices, or mobile pairing.
 
-<!-- Sources: packages/intentd/crates/intent-services/src/capability.rs; packages/cloudlands-fe/src/lib/components/modals/ShareWorkspaceDialog.svelte. -->
+<!-- Sources: packages/intentd/crates/intent-services/src/capability.rs; packages/cloudlands-fe/src/lib/components/modals/ShareWorkspaceDialog.svelte; packages/cloudlands-fe/src/store/renderer/slices/user-preferences/user-preferences-slice.ts; packages/cloudlands-fe/src/features/invite-progress/invite-progress-service.ts. -->
 
-Only when explicitly asked about workspace guest roles: this unreleased Multiplayer
-Labs feature labels the default collaborator role Participant. The workspace owner
+Workspace guest roles: the default collaborator role is Participant. The workspace owner
 can change a direct guest between Participant and Manager in Share. Managers can
 create agents, choose models/providers and reasoning effort, and run, start, stop,
 restart or inspect existing
@@ -33,10 +38,9 @@ saved scripts. They cannot edit script commands, control raw terminals, run host
 commands, change credentials, or manage sharing. Host membership retains its existing
 authority. Role downgrades apply to subsequent operations on open connections.
 
-Only when explicitly asked about workspace discussions: this unreleased Multiplayer
-Labs feature supports multiple workspace-wide discussions in matching app and
-daemon versions. Older apps may not offer the management or mention controls
-described below. Start a discussion by
+With matching app and connected-daemon discussion support, workspaces support
+multiple workspace-wide discussions. Older apps may not offer the management or
+mention controls described below. Start a discussion by
 sending its first message; everyone with workspace access can read and participate.
 Workspace owners and managers can rename discussions; only workspace owners can
 delete them, including the default discussion. Open the discussion, then use the
@@ -68,10 +72,9 @@ like an @ mention does not identify a recipient. Notification actions open the
 relevant discussion subject to current access. Unread counts appear in discussion
 navigation and inactive tabs. They reflect messages observed by this client and
 clear as focused discussion content is read; they are not durable cross-device
-read receipts. These additions remain part of unreleased Multiplayer Labs.
+read receipts.
 
-Only when explicitly asked about the experimental People panel: invitations to
-specific accounts appear as **Invited** for people who can manage sharing. A share
+In the People panel, invitations to specific accounts appear as **Invited** for people who can manage sharing. A share
 link without a named recipient does not add a person. Accepted members remain in
 People when they stop viewing the workspace and appear greyed out. Being connected
 to the host elsewhere does not mean they are active here.
@@ -95,8 +98,8 @@ substitute or unrelated alternative. If the user asks where to test personal
 pairing, use **Settings → Mobile → Intent Mobile → Show QR Code** on the intended
 connection. Older instructions may call it **Pair another device as me**; that is
 not the current button label. Personal pairing requires a current signed-in identity
-and the connection's personal-pairing capability. The restricted-access panel also
-requires Multiplayer and a refreshed identity; the remote-owner panel needs Remote
+and the connection's personal-pairing capability. The restricted-access panel needs
+a refreshed identity; older apps also require Multiplayer Labs. The remote-owner panel needs Remote
 Access enabled. Connected-device list support is independent. Do not invent a
 readiness date or advise enabling the experiment for ordinary mobile setup.
 
@@ -479,7 +482,7 @@ terminal being open. If setup stays running, inspect its last output before
 retrying. Include that output, the Intent version, and the operating system when
 reporting the problem.
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/terminal/QuakeTerminalOverlay.svelte; src/features/layout/tab-types/TerminalTabType.svelte; src/features/scripts/confirm-script-deletion.ts; src/store/renderer/slices/scripts/scripts-selectors.ts; src/lib/components/chat/EventSubscriptionsCard.svelte; messages/en.json. Backend sources: packages/intentd/crates/intent-services/src/script_monitor.rs; packages/intentd/crates/intentd/src/main.rs (staged update restart watcher). -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/terminal/QuakeTerminalOverlay.svelte; src/features/layout/tab-types/TerminalTabType.svelte; src/features/scripts/confirm-script-deletion.ts; src/store/renderer/slices/scripts/scripts-selectors.ts; src/lib/components/chat/EventSubscriptionsCard.svelte; messages/en.json. Backend sources: packages/intentd/crates/intent-svc-runtime/src/script_monitor.rs; packages/intentd/crates/intentd/src/main.rs (staged update restart watcher). -->
 
 Script lists show unarchived scripts; use **Load more** when offered to see the
 next page. Open a script to view available output; use **Edit command** to inspect

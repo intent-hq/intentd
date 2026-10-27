@@ -5,9 +5,8 @@
 
 use intent_core::{WorkspaceApi, WorkspaceStatus};
 
-use super::retire_workspace::{
-    create_workspace, days_from_now, drain_changes, fixture, subscribe_updates,
-};
+use super::retire_workspace::{drain_changes, subscribe_updates};
+use crate::test_support::retire_workspace::{create_workspace, days_from_now, fixture};
 
 /// On by default: with no setting, a workspace idle past 7 days is archived
 /// on the next sweep with the ordinary archive delta; one idle 6 days is

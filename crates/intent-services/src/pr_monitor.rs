@@ -3321,7 +3321,7 @@ impl Services {
 
     /// Core cancel transition shared by [`Services::pr_monitor_cancel`] and
     /// the archive sweep ([`Services::cancel_workspace_pr_monitors`]),
-    /// mirroring [`Services::cancel_active_hook`](crate::hook_manager::HookServicesExt::cancel_active_hook): guarded CAS write to
+    /// mirroring the runtime's `HookServicesExt::cancel_active_hook`: guarded CAS write to
     /// `cancelled`, catch-up-marker removal, `prMonitor:cancelled` emit. How
     /// the owner's deferred completion watches settle is the caller's
     /// [`CancelSettlement`] choice. Ends with the transition-only
@@ -3373,7 +3373,7 @@ impl Services {
     /// Archive sweep (`workspace.archive`): cancel every ACTIVE PR monitor
     /// in the workspace through the shared cancel transition
     /// ([`Services::cancel_active_pr_monitor`]), mirroring the hook sweep
-    /// ([`Services::cancel_workspace_hooks`](crate::hook_manager::HookServicesExt::cancel_workspace_hooks)) — state persisted to
+    /// (the runtime's `HookServicesExt::cancel_workspace_hooks`) — state persisted to
     /// `cancelled`, `prMonitor:cancelled` emitted, waiting recomputed
     /// (§5.1). Each cancel is SILENT (no per-monitor wake) and DEFERRED
     /// ([`CancelSettlement::Deferred`]: no per-item completion backstop
@@ -3438,7 +3438,7 @@ impl Services {
     /// Retire sweep (`ws.agent.retire`): cancel every ACTIVE PR monitor
     /// owned by the retiring agent through the shared cancel transition
     /// ([`Services::cancel_active_pr_monitor`]), mirroring the hook sweep
-    /// ([`Services::cancel_agent_hooks`](crate::hook_manager::HookServicesExt::cancel_agent_hooks)) — state persisted to `cancelled`,
+    /// (the runtime's `HookServicesExt::cancel_agent_hooks`) — state persisted to `cancelled`,
     /// `prMonitor:cancelled` emitted, waiting recomputed (§5.1). NO wake
     /// notice: the owner retired itself and is inert, so parking a notice
     /// in its queue is noise (the backstop in `cancel_active_pr_monitor`
@@ -4662,7 +4662,7 @@ impl Services {
     }
 
     /// Idle-visibility deferral backstop (mirrors
-    /// [`Services::resettle_owner_after_hook_terminal`](crate::hook_manager::HookServicesExt::resettle_owner_after_hook_terminal)):
+    /// the runtime's `HookServicesExt::resettle_owner_after_hook_terminal`):
     /// after a PR monitor reaches a terminal state, re-run the
     /// deferred-completion redelivery for the owner. A completion watch on
     /// an idle owner defers while it owns active PR monitors; the
@@ -4915,7 +4915,7 @@ impl Services {
     }
 
     /// Idle-visibility deferral (mirrors
-    /// [`Services::active_hooks_for_agent`](crate::hook_manager::HookServicesExt::active_hooks_for_agent)):
+    /// the runtime's `HookServicesExt::active_hooks_for_agent`):
     /// the caller's ACTIVE PR monitors, oldest first. Empty when the agent
     /// owns no active monitor; a store failure is logged and reads as empty
     /// (visibility is best-effort and must never block an idle emit or wake
@@ -4955,7 +4955,7 @@ impl Services {
     /// owning agent id as light `waitingOnPrMonitors` entries (agents with no
     /// active monitor are absent). A store failure is logged and reads as
     /// empty, mirroring
-    /// [`Services::active_hooks_by_agent`](crate::hook_manager::HookServicesExt::active_hooks_by_agent).
+    /// the runtime's `HookServicesExt::active_hooks_by_agent`.
     pub(crate) async fn active_pr_monitors_by_agent(
         &self,
         workspace_id: &WorkspaceId,
@@ -4996,7 +4996,7 @@ impl Services {
     /// is omitted — never `[]` — otherwise, and an existing stamp is left
     /// untouched). Returns the stamped list (empty when nothing was stamped
     /// and no stamp was present). Mirrors
-    /// [`Services::annotate_waiting_on_hooks`](crate::hook_manager::HookServicesExt::annotate_waiting_on_hooks).
+    /// the runtime's `HookServicesExt::annotate_waiting_on_hooks`.
     pub(crate) async fn annotate_waiting_on_pr_monitors(
         &self,
         agent_id: &AgentId,
