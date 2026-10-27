@@ -1503,9 +1503,12 @@ fn init_tracing(serving: bool) {
 
     // Store::close is also used by offline CLI commands. Keep all lifecycle
     // timing output scoped to serve, independently of the user's RUST_LOG.
+    // The WebSocket library's trace output prints node-link upgrade requests
+    // with their lease token, so it never reaches an output.
     let timing_filter = || {
         tracing_subscriber::filter::filter_fn(move |meta| {
-            serving || !shutdown::is_timing_target(meta.target())
+            (serving || !shutdown::is_timing_target(meta.target()))
+                && !intent_transport::node_link::is_wire_trace(meta.target(), meta.level())
         })
     };
 
