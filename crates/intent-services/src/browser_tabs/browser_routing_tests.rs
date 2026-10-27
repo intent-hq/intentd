@@ -1,6 +1,7 @@
 // ---------------------------------------------------------------------------
-// REV-2 routing (Model 3–6 & 10): the driving client (pin → claimed-tab host
-// → first-connected), registry-answered `listTabs`, claim / pin migration of
+// REV-2 routing (Model 3–6 & 10): the driving client (pin → desktop session
+// → claimed-tab host → first-connected; every rule also runs as a shared
+// case in browser_routing_fixture_tests.rs), registry-answered `listTabs`, claim / pin migration of
 // tab rows, and the tab-addressed `browser.navigateTab` / `browser.closeTab`.
 // ---------------------------------------------------------------------------
 use crate::browser_tabs::BrowserTabRoutingExt;

@@ -1257,6 +1257,266 @@ async fn identity_drift_unauthorized_exact_collision_cannot_capture_reverse_auth
     assert!(foreign_rx.try_recv().is_err());
 }
 
+// ---------------------------------------------------------------------------
+// The shared REV-2 routing cases. `tests/fixtures/browser-routing.json` mirrors
+// `docs/protocol/fixtures/browser-routing/routing.json` (monorepo); every case
+// runs here against the real registry, and the docs contract test checks the
+// same cases against the protocol text, so a rule change that skips either
+// side fails. intent-services runs the workspace half (`expect.target`).
+// ---------------------------------------------------------------------------
+
+const ROUTING_FIXTURE: &str = include_str!("../../../tests/fixtures/browser-routing.json");
+
+fn routing_cases() -> Vec<serde_json::Value> {
+    let fixture: serde_json::Value =
+        serde_json::from_str(ROUTING_FIXTURE).expect("routing fixture json");
+    assert_eq!(fixture["schema"], "browser-routing/v1");
+    let cases = fixture["cases"].as_array().expect("cases").clone();
+    assert!(!cases.is_empty(), "the routing fixture has no cases");
+    cases
+}
+
+fn fixture_target(case: &serde_json::Value) -> ReverseTarget {
+    let target = &case["expect"]["target"];
+    let client_id = || {
+        ClientId::from_string(
+            target["clientId"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{}: target without clientId", case["id"])),
+        )
+    };
+    match target["kind"].as_str() {
+        Some("default") => ReverseTarget::Default,
+        Some("client") => ReverseTarget::Client(client_id()),
+        Some("pinned") => ReverseTarget::Pinned(client_id()),
+        other => panic!("{}: unknown target kind {other:?}", case["id"]),
+    }
+}
+
+/// `Ok` when `got` is the error `want` describes; unknown kinds are a fixture
+/// bug and panic.
+fn check_fixture_error(got: &ReverseDispatchError, want: &serde_json::Value) -> Result<(), String> {
+    let matches = match (want["kind"].as_str(), got) {
+        (Some("no-client"), ReverseDispatchError::NoClient) => true,
+        (
+            Some("client-offline"),
+            ReverseDispatchError::ClientOffline {
+                client_id, pinned, ..
+            },
+        ) => {
+            Some(client_id.as_str()) == want["clientId"].as_str()
+                && Some(*pinned) == want["pinned"].as_bool()
+        }
+        (Some("no-client" | "client-offline"), _) => false,
+        (other, _) => panic!("unknown error kind {other:?} in {want}"),
+    };
+    if matches {
+        Ok(())
+    } else {
+        Err(format!("expected {want}, got {got:?}"))
+    }
+}
+
+struct FixtureConnection {
+    id: String,
+    client: Option<String>,
+    browser_exec: bool,
+    channel: ReverseChannel,
+    rx: mpsc::Receiver<crate::OutboundFrame>,
+    guard: Option<super::PrimaryReverseGuard>,
+}
+
+/// Build the registry a case describes: register every connection in
+/// arrival order, hello in `helloOrder` (default: arrival order; it must
+/// list every hello'd connection exactly once), then drop the `drops`.
+fn fixture_registry(case: &serde_json::Value) -> (PrimaryReverseRegistry, Vec<FixtureConnection>) {
+    let name = case["id"].as_str().expect("case id");
+    let reg = PrimaryReverseRegistry::new();
+    let mut conns: Vec<FixtureConnection> = case["connections"]
+        .as_array()
+        .expect("connections")
+        .iter()
+        .map(|c| {
+            let (channel, rx) = idle_channel();
+            let guard = reg.register(channel.clone(), ReverseTransport::Uds);
+            assert_eq!(
+                c["hello"].as_bool(),
+                Some(c["client"].is_string()),
+                "{name}: a connection has a client iff it hello'd"
+            );
+            FixtureConnection {
+                id: c["id"].as_str().expect("connection id").to_string(),
+                client: c["client"].as_str().map(str::to_string),
+                browser_exec: c["browserExec"].as_bool().expect("browserExec"),
+                channel,
+                rx,
+                guard: Some(guard),
+            }
+        })
+        .collect();
+    let hellod: Vec<String> = conns
+        .iter()
+        .filter(|c| c.client.is_some())
+        .map(|c| c.id.clone())
+        .collect();
+    let hello_order: Vec<String> = match case.get("helloOrder") {
+        Some(order) => order
+            .as_array()
+            .expect("helloOrder")
+            .iter()
+            .map(|v| v.as_str().expect("helloOrder id").to_string())
+            .collect(),
+        None => hellod.clone(),
+    };
+    let mut sorted_order = hello_order.clone();
+    sorted_order.sort();
+    let mut sorted_hellod = hellod;
+    sorted_hellod.sort();
+    assert_eq!(
+        sorted_order, sorted_hellod,
+        "{name}: helloOrder must list every hello'd connection exactly once"
+    );
+    for id in &hello_order {
+        let conn = conns
+            .iter()
+            .find(|c| &c.id == id)
+            .expect("checked against the connections above");
+        conn.guard.as_ref().expect("live guard").bind(identity(
+            conn.client.as_deref().expect("hello'd"),
+            conn.browser_exec,
+        ));
+    }
+    for drop_id in case["drops"].as_array().expect("drops") {
+        let conn = conns
+            .iter_mut()
+            .find(|c| c.id == drop_id.as_str().expect("drop id"))
+            .unwrap_or_else(|| panic!("{name}: drops names unknown connection {drop_id}"));
+        drop(conn.guard.take());
+    }
+    (reg, conns)
+}
+
+#[test]
+fn routing_fixture_copy_matches_the_protocol_fixture_when_in_the_monorepo() {
+    let protocol = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../../docs/protocol/fixtures/browser-routing/routing.json");
+    if let Ok(text) = std::fs::read_to_string(&protocol) {
+        let parsed: serde_json::Value = serde_json::from_str(&text).expect("protocol fixture json");
+        let copy: serde_json::Value = serde_json::from_str(ROUTING_FIXTURE).expect("copy json");
+        let revision = |v: &serde_json::Value| v["revision"].as_u64().expect("integer revision");
+        // Docs lead: the protocol file may be ahead of this copy, never behind,
+        // and the same revision must mean the same cases.
+        assert!(
+            revision(&copy) <= revision(&parsed),
+            "tests/fixtures/browser-routing.json is ahead of {}; land the docs change first",
+            protocol.display()
+        );
+        if revision(&copy) == revision(&parsed) {
+            assert_eq!(
+                parsed,
+                copy,
+                "tests/fixtures/browser-routing.json differs from {} at the same revision",
+                protocol.display()
+            );
+        }
+    }
+}
+
+/// Run one case: the registry resolves its `expect.target` to the expected
+/// connection (witnessed by a real dispatch landing on that channel and no
+/// other) or to the expected typed error. The dispatch carries the case's
+/// `workspaceId`, so ordinary workspaces take the member-scope filter and
+/// Chief the administrator-only one, as in production.
+async fn run_routing_case(case: &serde_json::Value) -> Result<(), String> {
+    let (reg, mut conns) = fixture_registry(case);
+    let target = fixture_target(case);
+    let workspace_id = if case["workspace"]["chief"].as_bool() == Some(true) {
+        intent_core::CHIEF_WORKSPACE_ID
+    } else {
+        "routing-fixture-workspace"
+    };
+    let params = json!({ "workspaceId": workspace_id, "actions": [] });
+    if let Some(want) = case["expect"].get("error") {
+        match reg.resolve(&target) {
+            Err(err) => check_fixture_error(&err, want).map_err(|e| format!("resolve: {e}"))?,
+            Ok(got) => return Err(format!("resolve: expected {want}, got {got:?}")),
+        }
+        return match reg.dispatch("browser.exec", params, target).await {
+            Err(err) => check_fixture_error(&err, want).map_err(|e| format!("dispatch: {e}")),
+            Ok(got) => Err(format!("dispatch: expected {want}, got {got}")),
+        };
+    }
+    let want = case["expect"]["connection"].as_str().expect("connection");
+    let idx = conns
+        .iter()
+        .position(|c| c.id == want)
+        .unwrap_or_else(|| panic!("expect names unknown connection {want}"));
+    let want_client = conns[idx].client.clone().expect("hello'd");
+    match reg.resolve(&target) {
+        Ok(got) if got.client_id.as_str() == want_client => {}
+        other => {
+            return Err(format!(
+                "resolve: expected client {want_client}, got {other:?}"
+            ))
+        }
+    }
+    let dispatch = tokio::spawn({
+        let reg = reg.clone();
+        async move { reg.dispatch("browser.exec", params, target).await }
+    });
+    let frame = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(500)),
+        conns[idx].rx.recv(),
+    )
+    .await;
+    let Ok(Some(frame)) = frame else {
+        dispatch.abort();
+        let got: Vec<String> = conns
+            .iter_mut()
+            .filter_map(|c| c.rx.try_recv().is_ok().then(|| c.id.clone()))
+            .collect();
+        return Err(format!(
+            "expected the request on {want}, it went to {got:?}"
+        ));
+    };
+    let frame: serde_json::Value = serde_json::from_str(&frame).expect("json");
+    conns[idx].channel.route_response(&json!({
+        "jsonrpc": "2.0",
+        "id": frame["id"],
+        "result": { "routed": want },
+    }));
+    match dispatch.await.expect("join") {
+        Ok(reply) if reply == json!({ "routed": want }) => {}
+        other => return Err(format!("dispatch reply: {other:?}")),
+    }
+    let extra: Vec<String> = conns
+        .iter_mut()
+        .enumerate()
+        .filter_map(|(i, c)| (i != idx && c.rx.try_recv().is_ok()).then(|| c.id.clone()))
+        .collect();
+    if extra.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("{extra:?} also received the request"))
+    }
+}
+
+/// Every shared case, reporting all failing cases at once.
+#[tokio::test]
+async fn routing_fixture_every_case_reaches_the_expected_connection() {
+    let mut failures = Vec::new();
+    for case in routing_cases() {
+        if let Err(e) = run_routing_case(&case).await {
+            failures.push(format!("{}: {e}", case["id"].as_str().expect("case id")));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "routing fixture cases failed:\n{}",
+        failures.join("\n")
+    );
+}
+
 fn workspace(id: &str) -> intent_core::WorkspaceId {
     intent_core::WorkspaceId::from(id)
 }

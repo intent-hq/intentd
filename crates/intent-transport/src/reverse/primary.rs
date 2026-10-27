@@ -13,13 +13,18 @@
 //!   Guest hellos enter only the device roster. Current members can host
 //!   ordinary workspace browsers; each dispatch rechecks their authority.
 //!   Chief and host reverse requests select only administrator connections.
-//! - [`ReverseTarget::Default`] → the **first-connected** eligible client,
-//!   via its **newest** eligible connection (unchanged single-desktop
-//!   behaviour; a stale older socket of that client is skipped); none →
-//!   `NoClient`.
+//! - [`ReverseTarget::Default`] → the client of the **oldest live** eligible
+//!   registration, via its **newest** eligible connection (a stale older
+//!   socket of that client is skipped). Re-evaluated per request: when that
+//!   registration drops, the next-oldest registration's client wins even if
+//!   the first client still has a newer connection. None → `NoClient`.
 //! - [`ReverseTarget::Client`] / [`ReverseTarget::Pinned`] → the **newest**
 //!   eligible connection of that logical `clientId`; none →
 //!   `ClientOffline { client_id, name, pinned }`.
+//!
+//! The shared REV-2 cases in `tests/fixtures/browser-routing.json` (a copy
+//! of the monorepo's `docs/protocol/fixtures/browser-routing/routing.json`)
+//! run against this registry in `primary/tests.rs`.
 //!
 //! Every accepted UDS or WSS connection registers its per-connection
 //! [`ReverseChannel`] with the shared [`PrimaryReverseRegistry`] and holds the
@@ -408,8 +413,10 @@ fn resolve_entry_matching<'a>(
     allowed: impl Fn(&Entry) -> bool,
 ) -> Result<&'a Entry, ReverseDispatchError> {
     match target {
-        // The first-connected eligible *client* stays the sticky primary,
-        // but the request goes to that client's newest eligible connection,
+        // The client of the oldest live eligible registration is the
+        // primary (re-evaluated per request, so it changes when that
+        // registration drops even if the client has a newer connection),
+        // and the request goes to that client's newest eligible connection,
         // the same rule as `Client` / `Pinned`: an older socket of the same
         // app that stopped answering must not take every unpinned dispatch
         // (intent-hq/intent#7902).
