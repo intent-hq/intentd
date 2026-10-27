@@ -8985,6 +8985,7 @@ mod tests {
             }]),
             required_check_names: Some(BTreeSet::from([pick(b, "build", "lint").into()])),
             observed_at: Some(pick(b, "2026-10-24T12:00:00Z", "2026-10-25T12:00:00Z").into()),
+            pr_updated_at: Some(pick(b, "2026-10-24T11:00:00Z", "2026-10-25T11:00:00Z").into()),
             checks_not_started_delivered: Some(head.into()),
             latest_reviews_carried: !b,
         }
@@ -9387,6 +9388,10 @@ mod tests {
         ("/statusChecks", "frozen legacy evidence, internal"),
         ("/requiredCheckNames", "internal required-flag evidence"),
         ("/observedAt", "freshness anchor; never diffed"),
+        (
+            "/prUpdatedAt",
+            "forge recency for pool ordering; never diffed",
+        ),
         (
             "/checksNotStartedDelivered",
             "internal stall-wake bookkeeping",
