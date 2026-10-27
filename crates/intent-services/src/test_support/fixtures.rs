@@ -200,6 +200,7 @@ impl WorkspacesRoot {
     }
 }
 
+#[must_use]
 pub fn note(ws: &WorkspaceId, id: &str, content: &str) -> Note {
     let ts = now_iso();
     Note {
@@ -221,6 +222,7 @@ pub fn note(ws: &WorkspaceId, id: &str, content: &str) -> Note {
     }
 }
 
+#[must_use]
 pub fn session(agent_id: &AgentId, ws: &WorkspaceId) -> AgentSession {
     AgentSession {
         harness_version: intent_core::CURRENT_HARNESS_VERSION.to_string(),

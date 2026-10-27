@@ -9,6 +9,7 @@
 //! `transfer_round_trip_between_two_stacks`; those keep the transfer-side
 //! assertions (rows, files, fences) and build no runtime.
 
+use std::fmt::Write as _;
 use std::future::Future;
 use std::io::Write as _;
 
@@ -25,6 +26,10 @@ use sha2::Digest as _;
 const T: &str = "2026-08-11T00:00:00Z";
 
 struct Fixture {
+    #[cfg_attr(
+        not(unix),
+        expect(dead_code, reason = "only the unix script run reads the checkout")
+    )]
     dir: tempfile::TempDir,
     services: Services,
     owner: PrincipalId,
@@ -77,8 +82,10 @@ impl Fixture {
     async fn import(&self, archive: &[u8], ws: &str) -> (String, intent_core::Result<Value>) {
         let sha = sha2::Sha256::digest(archive)
             .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>();
+            .fold(String::new(), |mut hex, b| {
+                let _ = write!(hex, "{b:02x}");
+                hex
+            });
         let begun = self
             .as_app(self.services.workspace_import_begin(
                 serde_json::to_value(manifest(ws)).expect("manifest json"),
@@ -212,34 +219,27 @@ async fn import_commit_rehydrates_hooks_and_refreshes_the_script_cache() {
     for fail_late in [false, true] {
         let f = Fixture::new().await;
         let ws = "ws-reimport";
-        // The workspace's stale rows, plus scripts the archive does not
-        // list and another workspace's script.
+        // The workspace's stale script row (no workspace row: the import
+        // creates it), plus a script the archive does not list and another
+        // workspace's script.
         let mut stale = rows(ws)
             .into_iter()
-            .filter(|(table, _)| matches!(*table, "workspace" | "script"))
+            .filter(|(table, _)| *table == "script")
             .map(|(table, rows)| (table.to_string(), rows))
             .collect::<Vec<_>>();
-        for (table, rows) in &mut stale {
-            if table == "script" {
-                rows[0]["command"] = json!("echo stale");
-                rows[0]["cwd"] = json!("old-cwd");
-                rows.push(json!({
-                    "id": "script-unlisted", "workspace_id": ws, "name": "Unlisted",
-                    "command": "echo unlisted", "mode": "command", "source": "user",
-                    "created_at": "t0"
-                }));
-                rows.push(json!({
-                    "id": "script-keeper", "workspace_id": "keeper", "name": "Keep",
-                    "command": "echo keep", "mode": "command", "source": "user",
-                    "created_at": "t0"
-                }));
-            } else {
-                rows.push(json!({
-                    "id": "keeper", "title": "Keeper", "branch": "main", "status": "Active",
-                    "created_at": T, "updated_at": T
-                }));
-            }
-        }
+        let scripts = &mut stale[0].1;
+        scripts[0]["command"] = json!("echo stale");
+        scripts[0]["cwd"] = json!("old-cwd");
+        scripts.push(json!({
+            "id": "script-unlisted", "workspace_id": ws, "name": "Unlisted",
+            "command": "echo unlisted", "mode": "command", "source": "user",
+            "created_at": "t0"
+        }));
+        scripts.push(json!({
+            "id": "script-keeper", "workspace_id": "keeper", "name": "Keep",
+            "command": "echo keep", "mode": "command", "source": "user",
+            "created_at": "t0"
+        }));
         f.services
             .store()
             .transfer_import_rows(&stale)

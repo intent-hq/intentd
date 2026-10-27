@@ -50,6 +50,7 @@ pub async fn setup() -> (TempDb, Services, WorkspaceId) {
     (tmp, services, ws)
 }
 
+#[must_use]
 pub fn pr_monitor_row() -> intent_core::PrMonitor {
     intent_core::PrMonitor {
         monitor_id: intent_core::PrMonitorId::from("prmon-1"),

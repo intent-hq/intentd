@@ -183,6 +183,7 @@ impl StubForge {
     /// A forge whose `check_auth` reports `authenticated: false` and
     /// whose `get_user` rejects the credential (`Auth`), as the real
     /// client does on a 401.
+    #[must_use]
     pub fn unauthenticated() -> Self {
         Self {
             unauthenticated: true,
@@ -203,6 +204,7 @@ impl StubForge {
 /// `extra_repos` is non-empty: one hit per scoped repo (the addressed
 /// `repo` first, then the extras), each hit's URL naming ITS OWN repo,
 /// newest-updated first, with a continuation cursor.
+#[must_use]
 pub fn multi_repo_hits(repo: &RepoRef, extra_repos: &[RepoRef]) -> Vec<(u64, String, String)> {
     std::iter::once(repo)
         .chain(extra_repos.iter())
@@ -218,6 +220,7 @@ pub fn multi_repo_hits(repo: &RepoRef, extra_repos: &[RepoRef]) -> Vec<(u64, Str
         .collect()
 }
 
+#[must_use]
 pub fn sample_pr() -> PullRequest {
     PullRequest {
         number: 42,
@@ -845,6 +848,7 @@ impl SourceControl for StubForge {
     }
 }
 
+#[must_use]
 pub fn stub_issue() -> Issue {
     Issue {
         number: 11,

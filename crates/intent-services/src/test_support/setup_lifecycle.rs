@@ -16,12 +16,14 @@ use crate::{EventBus, Services, Subscription, SubscriptionFilter};
 /// Temp directory tree swept on drop (see [`test_tempdir`]).
 pub struct TempDir(pub PathBuf, #[expect(dead_code)] tempfile::TempDir);
 
+#[must_use]
 pub fn unique_dir(prefix: &str) -> TempDir {
     let guard = test_tempdir(&format!("{prefix}-"));
     TempDir(guard.path().to_path_buf(), guard)
 }
 
 /// Init a git repo with one commit; returns (guard, head branch).
+#[must_use]
 pub fn seed_repo(prefix: &str) -> (TempDir, String) {
     let dir = unique_dir(prefix);
     let repo = git2::Repository::init(&dir.0).unwrap();
@@ -56,6 +58,7 @@ pub async fn services(root: PathBuf) -> (Services, EventBus, TempDb) {
 
 /// Subscribe to only the setup lifecycle events (the setup terminal's
 /// `terminal:*` stream and the create's other events stay out of scope).
+#[must_use]
 pub fn subscribe_setup(bus: &EventBus) -> Subscription {
     bus.subscribe(SubscriptionFilter {
         event_types: vec!["workspace:setup:*".to_string()],

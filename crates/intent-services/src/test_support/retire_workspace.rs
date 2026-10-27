@@ -10,9 +10,9 @@ use crate::test_support::test_tempdir;
 use crate::{EventBus, Services};
 
 pub struct Fixture {
-    pub _tmp: TempDb,
-    pub _repo: tempfile::TempDir,
-    pub _root: tempfile::TempDir,
+    _tmp: TempDb,
+    _repo: tempfile::TempDir,
+    _root: tempfile::TempDir,
     pub root: std::path::PathBuf,
     pub repo: std::path::PathBuf,
     pub store: Store,
@@ -90,6 +90,7 @@ pub async fn create_workspace(f: &Fixture) -> intent_core::Workspace {
     ws
 }
 
+#[must_use]
 pub fn days_from_now(days: i64) -> time::OffsetDateTime {
     time::OffsetDateTime::now_utc() + time::Duration::days(days)
 }

@@ -52,6 +52,7 @@ impl Services {
     }
 
     /// Test seam: `dequeue_message_draining`; the draining guard is opaque.
+    #[must_use]
     pub fn dequeue_message_draining_for_test(
         &self,
         agent_id: &AgentId,
@@ -64,6 +65,10 @@ impl Services {
     #[expect(
         clippy::too_many_arguments,
         reason = "mirrors enqueue_message's argument list"
+    )]
+    #[expect(
+        clippy::must_use_candidate,
+        reason = "callers enqueue for the side effect, as with the forwarded fn"
     )]
     pub fn enqueue_message_for_test(
         &self,
@@ -92,6 +97,10 @@ impl Services {
     #[expect(
         clippy::too_many_arguments,
         reason = "mirrors enqueue_message_with_id's argument list"
+    )]
+    #[expect(
+        clippy::must_use_candidate,
+        reason = "callers enqueue for the side effect, as with the forwarded fn"
     )]
     pub fn enqueue_message_with_id_for_test(
         &self,
@@ -131,6 +140,7 @@ impl Services {
     /// Test seam: `queue_snapshot`.
     #[must_use]
     pub fn queue_snapshot_for_test(&self, agent_id: &AgentId) -> Vec<Value> {
+        // queue-egress: allow — test seam: hands the snapshot to a feature-crate test; no entry leaves the daemon
         self.queue_snapshot(agent_id)
     }
 

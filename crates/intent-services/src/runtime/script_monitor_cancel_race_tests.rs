@@ -2,7 +2,7 @@
 //! completion exactly once, racing both a competing idle pass and the
 //! detached `commit_monitor` → `dispatch_script_monitor` callback. Reauthored
 //! from core's `real_runtime_script_monitor_cancel_redelivery_retires_watch_once`
-//! (agent_ops tests; the same scenario against the runtime test double stays
+//! (`agent_ops` tests; the same scenario against the runtime test double stays
 //! there as `script_monitor_waiting_advisory_and_after_all_retire_on_silent_cancel`).
 //!
 //! Core is driven only through public requests: `agent.create`,

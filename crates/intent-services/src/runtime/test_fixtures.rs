@@ -4,12 +4,16 @@
 //! seeding), which core's `test-hooks` build cannot use. Keep each copy in
 //! step with the original it names.
 
+#[cfg(unix)]
 use std::time::Duration;
 
 use intent_core::AgentId;
+#[cfg(unix)]
 use serde_json::Value;
 
-use crate::{Services, Subscription};
+use crate::Services;
+#[cfg(unix)]
+use crate::Subscription;
 
 /// Copy of `test_support::goldens::wake_texts_when`.
 ///
@@ -46,6 +50,7 @@ pub(crate) async fn wake_texts_when(svc: &Services, id: &AgentId, expected: usiz
     }
 }
 
+#[cfg(unix)]
 /// Copy of `test_support::setup_lifecycle::recv_setup`.
 ///
 /// Receive one setup event (generous timeout: script paths cross a PTY
@@ -62,6 +67,7 @@ pub(crate) async fn recv_setup(sub: &mut Subscription) -> Value {
     serde_json::to_value(&batch[0]).expect("serialize event")
 }
 
+#[cfg(unix)]
 /// Copy of `test_support::setup_lifecycle::assert_quiet`.
 pub(crate) async fn assert_quiet(sub: &mut Subscription) {
     let quiet = tokio::time::timeout(
