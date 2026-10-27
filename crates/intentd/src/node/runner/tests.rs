@@ -356,6 +356,90 @@ async fn node_runner_answers_a_prompt_for_an_exited_agent() {
     assert_eq!(records(&h.runner).await.len(), before);
 }
 
+#[tokio::test]
+async fn node_runner_tags_every_chunk_of_a_turn_even_when_the_journal_lags() {
+    let Some(h) = harness(1, &[]) else { return };
+    h.runner.launch(launch("a1"));
+    // 201 notifications arrive faster than they are fsync'd; the turn ends
+    // (and the next one starts) while most are still queued.
+    h.runner
+        .prompt(&AgentId::from("a1"), "t1".into(), text("many"));
+    wait_for(&h.runner, "first turn end", turn_ended("a1", "t1")).await;
+    h.runner
+        .prompt(&AgentId::from("a1"), "t2".into(), text("next"));
+    let all = wait_for(&h.runner, "second turn end", turn_ended("a1", "t2")).await;
+    let tag = |r: &JournalRecord| match &r.body {
+        JournalBody::Notification { notification } => {
+            let text = notification.to_string();
+            if text.contains("chunk ") || text.contains("echo: many") {
+                Some(("t1", r.turn_id.clone()))
+            } else if text.contains("echo: next") {
+                Some(("t2", r.turn_id.clone()))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    let tags: Vec<_> = all.iter().filter_map(tag).collect();
+    assert_eq!(tags.len(), 202, "{tags:?}");
+    for (expected, actual) in &tags {
+        assert_eq!(actual.as_deref(), Some(*expected), "{tags:?}");
+    }
+    // Each turn's output precedes its end.
+    let last_t1 = all
+        .iter()
+        .rposition(|r| {
+            r.turn_id.as_deref() == Some("t1") && matches!(r.body, JournalBody::Notification { .. })
+        })
+        .unwrap();
+    assert!(last_t1 < all.iter().position(turn_ended("a1", "t1")).unwrap());
+    h.runner.shutdown().await;
+}
+
+#[tokio::test]
+async fn node_runner_kills_leftover_children_when_the_provider_exits_by_itself() {
+    let Some(h) = harness(1, &[]) else { return };
+    h.runner.launch(launch("a1"));
+    let (agent, child) = agent_pids(&h.storage, "a1").await;
+    h.runner
+        .prompt(&AgentId::from("a1"), "t1".into(), text("exit"));
+    let all = wait_for(&h.runner, "exit", exited("a1")).await;
+    match &find(&all, exited("a1")).body {
+        JournalBody::Exited { exit_code, error } => {
+            assert_eq!((*exit_code, error.as_deref()), (Some(0), None));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_gone(agent).await;
+    assert_gone(child).await;
+    assert!(h.runner.running().is_empty());
+}
+
+#[tokio::test]
+async fn node_runner_shutdown_waits_until_queued_output_and_exit_are_journaled() {
+    let Some(h) = harness(1, &[]) else { return };
+    h.runner.launch(launch("a1"));
+    h.runner
+        .prompt(&AgentId::from("a1"), "t1".into(), text("many"));
+    // Stop as soon as the burst starts arriving, with most of it queued.
+    wait_for(&h.runner, "first output", |r| {
+        matches!(r.body, JournalBody::Notification { .. })
+    })
+    .await;
+    h.runner.shutdown().await;
+    let all = records(&h.runner).await;
+    assert_eq!(
+        all.iter().filter(|r| exited("a1")(r)).count(),
+        1,
+        "the exit is journaled before shutdown returns: {all:#?}"
+    );
+    // Nothing is appended after shutdown returned.
+    let count = all.len();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(records(&h.runner).await.len(), count);
+}
+
 #[test]
 fn node_test_agent_fixture_exists() {
     assert!(Path::new(concat!(

@@ -8,8 +8,9 @@
 // On start it writes `agent.pid` (its pid and a same-group `sleep` child's
 // pid) into its working directory, so tests can check that stop kills the
 // whole process tree. A prompt whose text contains "block" parks until
-// session/cancel; "slow" waits 300 ms; every turn first streams one
-// agent_message_chunk "echo: <text>".
+// session/cancel; "slow" waits 300 ms; "many" streams 200 extra chunks;
+// "exit" answers and then exits with code 0, leaving its `sleep` child
+// running; every turn first streams one agent_message_chunk "echo: <text>".
 import readline from 'node:readline';
 import fs from 'node:fs';
 import { spawn } from 'node:child_process';
@@ -63,6 +64,22 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
           update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `echo: ${text}` } },
         },
       });
+      if (text.includes('many')) {
+        for (let i = 0; i < 200; i++) {
+          send({
+            method: 'session/update',
+            params: {
+              sessionId: SESSION,
+              update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `chunk ${i}` } },
+            },
+          });
+        }
+      }
+      if (text.includes('exit')) {
+        send({ id: msg.id, result: { stopReason: 'end_turn' } });
+        setTimeout(() => process.exit(0), 50);
+        return;
+      }
       if (text.includes('block')) {
         parked.push(msg.id);
         return;

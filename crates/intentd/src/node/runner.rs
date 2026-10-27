@@ -22,7 +22,7 @@ use intent_acp::{
     IncomingNotification, IncomingRequest, PermissionPolicy, PermissionRegistry, SinkEvent,
     SpawnOptions,
 };
-use intent_core::node_link::{JournalBody, JournalRecord, LaunchCommand};
+use intent_core::node_link::{JournalBody, JournalRecord, LaunchCommand, LeaseBinding};
 use intent_core::nodes::NodeCounter;
 use intent_core::{AgentId, BoxFuture, WorkspaceId};
 use intent_nodes::journal::{Journal, JournalEntry};
@@ -48,8 +48,9 @@ pub(super) mod codes {
 
 /// How long a stopped provider gets to exit after SIGTERM before SIGKILL.
 const TERM_GRACE: Duration = Duration::from_secs(2);
-/// How long shutdown waits for stopped agents to be cleaned up.
-const SHUTDOWN_WAIT: Duration = Duration::from_secs(10);
+/// How long shutdown waits for stopped agents to be cleaned up and their
+/// queued records (each one fsync'd) to be journaled.
+const SHUTDOWN_WAIT: Duration = Duration::from_secs(30);
 
 /// A provider the node may launch: its registry entry (with any configured
 /// argument override) and the configured executable.
@@ -82,6 +83,13 @@ struct Inner {
     journal: Arc<Mutex<Journal>>,
     appended: watch::Sender<NodeCounter>,
     state: Mutex<State>,
+    /// Each agent's journal pump; shutdown waits for them so an agent's
+    /// queued output and exit are durable before the node exits.
+    pumps: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// The binding of the newest link session. Link sessions take it around
+    /// adoption and every side effect, so a replaced session can act on
+    /// nothing (see `session.rs`).
+    link_gate: tokio::sync::Mutex<Option<LeaseBinding>>,
 }
 
 #[derive(Default)]
@@ -98,9 +106,8 @@ struct Agent {
     workspace_id: WorkspaceId,
     stop: Mutex<Option<oneshot::Sender<()>>>,
     ready: watch::Receiver<Option<Arc<Ready>>>,
-    /// The running turn, if any; shared with the pump, which tags
-    /// notifications with it.
-    turn: Arc<Mutex<Option<String>>>,
+    /// Whether a turn is running; refuses a second one.
+    busy: Mutex<bool>,
     marks: mpsc::UnboundedSender<Mark>,
     activity: ActivityTracker,
 }
@@ -111,9 +118,15 @@ struct Ready {
     session_id: String,
 }
 
-/// Records the agent's pump journals after every notification already
+/// What the agent's pump handles after every notification already
 /// received.
 enum Mark {
+    /// Tag notifications with `turn_id` from now on; acknowledged once every
+    /// earlier notification is journaled, before the prompt is sent.
+    TurnStarted {
+        turn_id: String,
+        ack: oneshot::Sender<()>,
+    },
     TurnEnded {
         turn_id: String,
         stop_reason: String,
@@ -154,6 +167,8 @@ impl Runner {
                 journal: Arc::new(Mutex::new(config.journal)),
                 appended: watch::channel(last).0,
                 state: Mutex::new(State::default()),
+                pumps: Mutex::new(Vec::new()),
+                link_gate: tokio::sync::Mutex::new(None),
             }),
         }
     }
@@ -167,6 +182,11 @@ impl Runner {
         let mut ids: Vec<AgentId> = lock(&self.inner.state).agents.keys().cloned().collect();
         ids.sort_by(|a, b| a.0.cmp(&b.0));
         ids
+    }
+
+    /// The binding of the newest link session; see `session.rs`.
+    pub(super) fn link_gate(&self) -> &tokio::sync::Mutex<Option<LeaseBinding>> {
+        &self.inner.link_gate
     }
 
     /// Changes whenever a record is appended.
@@ -270,7 +290,7 @@ impl Runner {
             workspace_id: workspace_id.clone(),
             stop: Mutex::new(Some(stop_tx)),
             ready: ready_rx,
-            turn: Arc::new(Mutex::new(None)),
+            busy: Mutex::new(false),
             marks: marks_tx,
             activity: ActivityTracker::new(),
         });
@@ -278,13 +298,17 @@ impl Runner {
         state.workspaces.insert(agent_id, workspace_id);
         drop(state);
         // caller-binding: allow — node-local journal pump; the node has no service layer
-        tokio::spawn(self.clone().pump(
+        let pump = tokio::spawn(self.clone().pump(
             (agent.id.clone(), agent.workspace_id.clone()),
-            agent.turn.clone(),
             agent.activity.clone(),
             notes_rx,
             marks_rx,
         ));
+        {
+            let mut pumps = lock(&self.inner.pumps);
+            pumps.retain(|pump| !pump.is_finished());
+            pumps.push(pump);
+        }
         // caller-binding: allow — node-local provider process; the node has no service layer
         tokio::spawn(
             self.clone()
@@ -294,17 +318,20 @@ impl Runner {
 
     /// Journal the agent's notifications and marks in arrival order. A mark
     /// is taken only once every notification already queued is journaled,
-    /// so a turn end never precedes that turn's output. The pump ends once
-    /// the provider connection and every holder of the agent are gone, so a
-    /// turn that ends after the process exited is still journaled.
+    /// so a turn end never precedes that turn's output, and the pump alone
+    /// decides which turn a notification belongs to: the turn it was
+    /// received during, not whichever turn is current when it is written.
+    /// The pump ends once the provider connection and every holder of the
+    /// agent are gone, so a turn that ends after the process exited is
+    /// still journaled.
     async fn pump(
         self,
         (agent_id, workspace_id): (AgentId, WorkspaceId),
-        turn: Arc<Mutex<Option<String>>>,
         activity: ActivityTracker,
         mut notes: mpsc::UnboundedReceiver<IncomingNotification>,
         mut marks: mpsc::UnboundedReceiver<Mark>,
     ) {
+        let mut turn: Option<String> = None;
         loop {
             let (turn_id, body) = tokio::select! {
                 biased;
@@ -313,11 +340,16 @@ impl Runner {
                     if note.method != "session/update" {
                         continue;
                     }
-                    let turn = lock(&turn).clone();
-                    (turn, JournalBody::Notification { notification: note.params })
+                    (turn.clone(), JournalBody::Notification { notification: note.params })
                 }
                 Some(mark) = marks.recv() => match mark {
+                    Mark::TurnStarted { turn_id, ack } => {
+                        turn = Some(turn_id);
+                        let _ = ack.send(());
+                        continue;
+                    }
                     Mark::TurnEnded { turn_id, stop_reason, error } => {
+                        turn = None;
                         (Some(turn_id), JournalBody::TurnEnded { stop_reason, error })
                     }
                     Mark::Exited { exit_code, error } => {
@@ -352,17 +384,19 @@ impl Runner {
         let (exit_code, error) = match self.start(&agent, &launch, model.as_deref(), notes) {
             Err(error) => (None, Some(format!("{}: {error}", codes::START))),
             Ok((mut child, connection, serve, cwd)) => {
+                // Read before waiting: a reaped child no longer reports it,
+                // and its process group can outlive it.
+                let pid = child.id();
                 let outcome = self
                     .supervise(&launch, &connection, &mut child, &mut stop, &ready, &cwd)
                     .await;
+                // Whatever the provider left in its process group goes too,
+                // also when it exited by itself.
+                kill_tree(child, pid).await;
                 let result = match outcome {
                     Outcome::Exited(code) => (code, None),
-                    Outcome::Stopped => {
-                        kill_tree(child).await;
-                        (None, None)
-                    }
+                    Outcome::Stopped => (None, None),
                     Outcome::StartFailed(error) => {
-                        kill_tree(child).await;
                         (None, Some(format!("{}: {error}", codes::START)))
                     }
                 };
@@ -494,9 +528,9 @@ impl Runner {
             return;
         };
         {
-            let mut turn = lock(&agent.turn);
-            if turn.is_some() {
-                drop(turn);
+            let mut busy = lock(&agent.busy);
+            if *busy {
+                drop(busy);
                 self.record_detached(refuse(
                     agent.workspace_id.clone(),
                     codes::BUSY,
@@ -504,17 +538,17 @@ impl Runner {
                 ));
                 return;
             }
-            *turn = Some(turn_id.clone());
+            *busy = true;
         }
         // caller-binding: allow — node-local ACP turn; the node has no service layer
         tokio::spawn(async move {
-            let (stop_reason, error) = run_turn(&agent, prompt).await;
+            let (stop_reason, error) = run_turn(&agent, &turn_id, prompt).await;
             let _ = agent.marks.send(Mark::TurnEnded {
                 turn_id,
                 stop_reason,
                 error,
             });
-            *lock(&agent.turn) = None;
+            *lock(&agent.busy) = false;
         });
     }
 
@@ -543,14 +577,21 @@ impl Runner {
         }
     }
 
-    /// Stop every agent and wait (bounded) for their cleanup.
+    /// Stop every agent and wait (bounded) until each one's queued output
+    /// and exit are journaled.
     pub(super) async fn shutdown(&self) {
         for id in self.running() {
             self.stop(&id);
         }
-        let deadline = tokio::time::Instant::now() + SHUTDOWN_WAIT;
-        while !lock(&self.inner.state).agents.is_empty() && tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(50)).await;
+        let pumps = std::mem::take(&mut *lock(&self.inner.pumps));
+        let drained = tokio::time::timeout(SHUTDOWN_WAIT, async {
+            for pump in pumps {
+                let _ = pump.await;
+            }
+        })
+        .await;
+        if drained.is_err() {
+            tracing::warn!("node: shutdown gave up waiting for agent records to be journaled");
         }
     }
 }
@@ -563,7 +604,7 @@ enum Outcome {
 
 /// Wait for the session, then run one ACP prompt and report its stop reason
 /// and any error.
-async fn run_turn(agent: &Agent, prompt: Vec<Value>) -> (String, Option<String>) {
+async fn run_turn(agent: &Agent, turn_id: &str, prompt: Vec<Value>) -> (String, Option<String>) {
     let failed = |detail: String| ("refusal".to_owned(), Some(detail));
     let Ok(blocks) = prompt
         .into_iter()
@@ -580,6 +621,16 @@ async fn run_turn(agent: &Agent, prompt: Vec<Value>) -> (String, Option<String>)
     let Some(session) = session else {
         return failed(format!("{}: the agent has exited", codes::NOT_RUNNING));
     };
+    // Switch the pump to this turn before anything the prompt causes can
+    // arrive.
+    let (ack, switched) = oneshot::channel();
+    let started = Mark::TurnStarted {
+        turn_id: turn_id.to_owned(),
+        ack,
+    };
+    if agent.marks.send(started).is_err() || switched.await.is_err() {
+        return failed(format!("{}: the agent has exited", codes::NOT_RUNNING));
+    }
     agent.activity.touch();
     match intent_acp::session::prompt(
         &session.connection,
@@ -603,10 +654,13 @@ async fn run_turn(agent: &Agent, prompt: Vec<Value>) -> (String, Option<String>)
 /// Stop a provider process tree the way the local agent manager does:
 /// SIGTERM its process group, SIGKILL whatever is left after a grace period,
 /// then sweep descendants that moved to their own process groups.
-async fn kill_tree(mut child: Child) {
+/// `spawn_pid` is the pid read at spawn: once the child has been reaped it
+/// no longer reports one, but members of its process group may remain (the
+/// group id cannot be reused while any member is alive).
+async fn kill_tree(mut child: Child, spawn_pid: Option<u32>) {
     use nix::sys::signal::{killpg, Signal};
     use nix::unistd::Pid;
-    let Some(pid) = child.id() else {
+    let Some(pid) = child.id().or(spawn_pid) else {
         let _ = child.start_kill();
         let _ = child.wait().await;
         return;
