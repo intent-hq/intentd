@@ -44,6 +44,8 @@ pub(super) mod codes {
     pub const BUSY: &str = "node-agent-busy";
     /// The turn failed.
     pub const TURN: &str = "node-turn-failed";
+    /// The node is shutting down and starts no more agents.
+    pub const SHUTTING_DOWN: &str = "node-shutting-down";
 }
 
 /// How long a stopped provider gets to exit after SIGTERM before SIGKILL.
@@ -98,6 +100,8 @@ struct Inner {
 
 #[derive(Default)]
 struct State {
+    /// Shutdown began: no more agents start.
+    closing: bool,
     /// Running (or starting) agents; their count is the capacity in use.
     agents: HashMap<AgentId, Arc<Agent>>,
     /// The workspace of every agent launched since start, so a prompt for an
@@ -262,6 +266,13 @@ impl Runner {
             },
         };
         let mut state = lock(&self.inner.state);
+        if state.closing {
+            drop(state);
+            return Some(exited(format!(
+                "{}: the node is shutting down",
+                codes::SHUTTING_DOWN
+            )));
+        }
         if state.agents.contains_key(&agent_id) {
             // The running agent's own records are what head should see; a
             // duplicate launch is not journaled as its exit.
@@ -623,13 +634,32 @@ impl Runner {
     /// Stop every agent and wait (bounded) until each one's queued output
     /// and exit are journaled.
     pub(super) async fn shutdown(&self) {
-        for id in self.running() {
+        // Close admission first, under the same lock launches are admitted
+        // under, so no agent can start after the stop below.
+        let running: Vec<AgentId> = {
+            let mut state = lock(&self.inner.state);
+            state.closing = true;
+            state.agents.keys().cloned().collect()
+        };
+        for id in running {
             self.stop(&id);
         }
-        let pumps = std::mem::take(&mut *lock(&self.inner.pumps));
         let drained = tokio::time::timeout(SHUTDOWN_WAIT, async {
-            for pump in pumps {
-                let _ = pump.await;
+            // A launch admitted just before closing may register its pump
+            // after a take, so keep draining until nothing is left.
+            loop {
+                let pumps = std::mem::take(&mut *lock(&self.inner.pumps));
+                let idle = lock(&self.inner.state).agents.is_empty();
+                if pumps.is_empty() {
+                    if idle {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    continue;
+                }
+                for pump in pumps {
+                    let _ = pump.await;
+                }
             }
         })
         .await;

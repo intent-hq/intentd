@@ -143,13 +143,15 @@ impl Node {
             }
         };
         drop(self.listener);
-        self.runner.shutdown().await;
-        // Closing the links ends their sessions, which hold the runner and
-        // with it the storage lock.
+        // Stop taking commands first: once its link is closed a session
+        // applies none of its queued frames, and joining the sessions
+        // settles any frame being applied. Only then stop the agents, so
+        // none can be launched behind the shutdown.
         for link in &links {
             link.close();
         }
         while sessions.join_next().await.is_some() {}
+        self.runner.shutdown().await;
         result
     }
 }

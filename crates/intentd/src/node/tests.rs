@@ -52,7 +52,11 @@ struct Running {
 
 impl Running {
     async fn start(root: &std::path::Path, max_agents: u32) -> Self {
-        let node = Node::start(&config(max_agents), root).await.unwrap();
+        Self::start_with(root, &config(max_agents)).await
+    }
+
+    async fn start_with(root: &std::path::Path, config: &Config) -> Self {
+        let node = Node::start(config, root).await.unwrap();
         let endpoint = NodeEndpoint {
             url: format!("wss://{}", node.listener.local_addr()),
             pin: CertificatePin::parse(&node.certificate_sha256).unwrap(),
@@ -283,6 +287,116 @@ async fn node_answers_head_requests_as_unsupported() {
         "{outcome:?}"
     );
     node.stop().await;
+}
+
+/// Launches that keep arriving on a live link while the node shuts down
+/// are either stopped by that shutdown or refused: every agent that left a
+/// record has its exit journaled, and no provider process survives.
+#[tokio::test]
+async fn node_shutdown_settles_launches_arriving_on_a_live_link() {
+    let Some(node_bin) = intent_providers::resolve_on_path("node") else {
+        eprintln!("skipping: node not on PATH");
+        return;
+    };
+    let fixture = format!(
+        "{}/tests/fixtures/node-test-agent.mjs",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let mut config = config(8);
+    config.providers = BTreeMap::from([(
+        "mock".to_owned(),
+        ProviderEntry {
+            binary: node_bin,
+            args: Some(vec![fixture]),
+        },
+    )]);
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("node");
+    let mut node = Running::start_with(&root, &config).await;
+    let mut dialed = dial_link(&node.endpoint, hello(1, "lease-1", 0))
+        .await
+        .unwrap();
+    replay_complete(&mut dialed).await;
+    let launch = |id: String| {
+        LinkFrame::Launch(LaunchCommand {
+            agent_id: AgentId::from(id),
+            workspace_id: WorkspaceId::from("ws-1"),
+            provider: "mock".into(),
+            model: None,
+        })
+    };
+    dialed.link.send(&launch("a0".into())).await.unwrap();
+    dialed
+        .link
+        .send(&LinkFrame::Prompt {
+            agent_id: AgentId::from("a0"),
+            turn_id: "t1".into(),
+            prompt: vec![serde_json::json!({ "type": "text", "text": "many" })],
+        })
+        .await
+        .unwrap();
+    // Shut down while a0's burst is being journaled.
+    assert!(matches!(
+        next_record(&mut dialed).await.body,
+        JournalBody::Notification { .. }
+    ));
+    let _ = node.stop.take().unwrap().send(());
+    for i in 1..=20 {
+        if dialed.link.send(&launch(format!("late{i}"))).await.is_err() {
+            break;
+        }
+    }
+    node.task.await.unwrap().unwrap();
+
+    let journal = Journal::open(&root.join("journal")).unwrap();
+    let records = journal.records_after(NodeCounter(0)).unwrap();
+    let mut agents: Vec<&str> = records.iter().map(|r| r.agent_id.0.as_str()).collect();
+    agents.sort_unstable();
+    agents.dedup();
+    assert!(agents.contains(&"a0"), "{records:#?}");
+    for agent in agents {
+        let exits = records
+            .iter()
+            .filter(|r| r.agent_id.0 == agent && matches!(r.body, JournalBody::Exited { .. }))
+            .count();
+        assert_eq!(exits, 1, "{agent}: {records:#?}");
+    }
+    for entry in std::fs::read_dir(root.join("agents")).unwrap() {
+        let pid_file = entry.unwrap().path().join("work").join("agent.pid");
+        let Ok(bytes) = std::fs::read(&pid_file) else {
+            continue;
+        };
+        let pids: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        for key in ["agent", "child"] {
+            let pid = i32::try_from(pids[key].as_i64().unwrap()).unwrap();
+            let deadline = tokio::time::Instant::now() + wait();
+            while !process_gone(pid) {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "{} {key} {pid} survived shutdown",
+                    pid_file.display()
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
+}
+
+/// Whether `pid` has exited (a zombie awaiting its reaper counts).
+fn process_gone(pid: i32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Err(_) => true,
+            Ok(stat) => stat
+                .rsplit_once(") ")
+                .is_some_and(|(_, rest)| rest.starts_with('Z')),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err()
+    }
 }
 
 #[test]

@@ -457,6 +457,26 @@ async fn node_runner_kills_a_helper_in_its_own_process_group_after_a_natural_exi
 }
 
 #[tokio::test]
+async fn node_runner_refuses_launches_once_shutdown_began() {
+    let Some(h) = harness(2, &[]) else { return };
+    h.runner.launch(launch("a1")).await;
+    h.runner.shutdown().await;
+    h.runner.launch(launch("a2")).await;
+    let all = wait_for(&h.runner, "refusal", exited("a2")).await;
+    let error = exit_error(find(&all, exited("a2"))).unwrap();
+    assert!(error.starts_with(codes::SHUTTING_DOWN), "{error}");
+    assert!(h.runner.running().is_empty());
+    assert!(
+        !h.storage
+            .agent_dir(&AgentId::from("a2"))
+            .unwrap()
+            .join("agent.pid")
+            .exists(),
+        "no provider was started"
+    );
+}
+
+#[tokio::test]
 async fn node_runner_shutdown_waits_until_queued_output_and_exit_are_journaled() {
     let Some(h) = harness(1, &[]) else { return };
     h.runner.launch(launch("a1")).await;
