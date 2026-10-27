@@ -8,7 +8,7 @@
 //! watch waiting, and a script monitor delivering its result to its owner.
 //! Fixture rows (the workspace and the agent sessions) are seeded through
 //! the public store API, because creating an agent through `agent.create`
-//! needs a configured provider.
+//! needs a configured provider; secrets live in a per-test file.
 
 use std::future::Future;
 use std::time::Duration;
@@ -106,8 +106,11 @@ async fn fixture_with(agent_manager: bool, settings: &[(&str, Value)]) -> Fixtur
             .collect();
         registry.apply(&updates).expect("apply settings");
     }
+    // Repository and collaboration credentials stay in this TempDir: the
+    // default `FileSecretStore` would use the developer's own secrets file.
+    let secrets = intent_core::FileSecretStore::with_path(dir.path().join("secrets.json"));
     let services = intent_app::compose(
-        Services::new(store)
+        Services::new_repository_fixture(store, secrets, None)
             .with_workspaces_root(dir.path().join("workspaces"))
             .with_settings_registry(registry)
             .with_event_bus(bus.clone()),
