@@ -288,8 +288,9 @@ impl Runtime {
     }
     /// Test seam: record an active desktop session of `workspace` running on
     /// `client`, the state `driving_client_target` reads for its desktop step.
-    #[cfg(test)]
-    pub(crate) fn activate_for_test(&self, workspace: &WorkspaceId, client: intent_core::ClientId) {
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn activate_for_test(&self, workspace: &WorkspaceId, client: intent_core::ClientId) {
         self.put(Live {
             binding: Binding {
                 workspace_id: workspace.clone(),
@@ -310,8 +311,9 @@ impl Runtime {
         });
     }
     /// Test seam: drop the session [`Self::activate_for_test`] recorded.
-    #[cfg(test)]
-    pub(crate) fn deactivate_for_test(&self) {
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn deactivate_for_test(&self) {
         self.remove(&AgentId::from_string("routing-fixture-agent"));
     }
     fn put(&self, live: Live) {
