@@ -1662,5 +1662,9 @@ mod host_role_tests;
 #[cfg(test)]
 mod retire_workspace_tests;
 
+#[cfg(test)]
+mod sandbox_file_write_tests;
+
 #[cfg(all(test, unix))]
 mod setup_lifecycle_tests;
+
