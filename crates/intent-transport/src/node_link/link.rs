@@ -3,6 +3,7 @@
 //! task that closes a silent link.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -46,12 +47,27 @@ impl Default for Tuning {
 /// outbound queue. Each pending call or inbound request produces at most
 /// one; overflowing it closes the link rather than losing one.
 const URGENT_QUEUE: usize = 1024;
+
+/// Where an outgoing request is. The writer moves it from `QUEUED` to
+/// `WRITTEN` just before sending; a caller that gives up moves it from
+/// `QUEUED` to `ABANDONED`, and the writer then drops it unsent. A
+/// cancellation is sent only for a written request, so it can never
+/// overtake its own request.
+const QUEUED: u8 = 0;
+const WRITTEN: u8 = 1;
+const ABANDONED: u8 = 2;
+
+/// An ordinary outbound message; a request carries its delivery state.
+struct Outbound {
+    message: Message,
+    request: Option<Arc<AtomicU8>>,
+}
 /// JSON-RPC internal error, used when a request handler is dropped.
 const DROPPED_CODE: i32 = -32603;
 
 struct Inner {
     binding: LeaseBinding,
-    out: mpsc::Sender<Message>,
+    out: mpsc::Sender<Outbound>,
     urgent: mpsc::Sender<Message>,
     pending: Mutex<HashMap<LinkId, oneshot::Sender<LinkOutcome>>>,
     inbound: Mutex<HashMap<LinkId, watch::Sender<bool>>>,
@@ -98,7 +114,10 @@ impl Inner {
             return;
         }
         if let Ok(bytes) = frame.encode() {
-            let _ = self.out.try_send(Message::Binary(bytes.into()));
+            let _ = self.out.try_send(Outbound {
+                message: Message::Binary(bytes.into()),
+                request: None,
+            });
         }
     }
 }
@@ -209,7 +228,7 @@ impl IncomingRequest {
         NodeLink {
             inner: self.inner.clone(),
         }
-        .send_any(&frame)
+        .send_any(&frame, None)
         .await
     }
 }
@@ -236,6 +255,7 @@ impl Drop for IncomingRequest {
 struct CallGuard {
     inner: Arc<Inner>,
     id: LinkId,
+    state: Arc<AtomicU8>,
     settled: bool,
 }
 
@@ -244,7 +264,12 @@ impl Drop for CallGuard {
         if self.settled {
             return;
         }
-        if lock(&self.inner.pending).remove(&self.id).is_some() {
+        let was_pending = lock(&self.inner.pending).remove(&self.id).is_some();
+        let unsent = self
+            .state
+            .compare_exchange(QUEUED, ABANDONED, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+        if was_pending && !unsent {
             self.inner.send_urgent(&LinkFrame::CancelRequest {
                 request_id: self.id,
             });
@@ -330,10 +355,10 @@ impl NodeLink {
         ) {
             return Err(super::protocol("frame is not sent directly"));
         }
-        self.send_any(frame).await
+        self.send_any(frame, None).await
     }
 
-    async fn send_any(&self, frame: &LinkFrame) -> Result<()> {
+    async fn send_any(&self, frame: &LinkFrame, request: Option<Arc<AtomicU8>>) -> Result<()> {
         if self.is_closed() {
             return Err(closed_error());
         }
@@ -341,7 +366,7 @@ impl NodeLink {
         let mut close = self.inner.close.subscribe();
         // A stalled writer must not hold a sender past the link's closure.
         tokio::select! {
-            sent = self.inner.out.send(Message::Binary(bytes.into())) => {
+            sent = self.inner.out.send(Outbound { message: Message::Binary(bytes.into()), request }) => {
                 sent.map_err(|_| closed_error())
             }
             () = super::wait_true(&mut close) => Err(closed_error()),
@@ -366,9 +391,11 @@ impl NodeLink {
         let request_id = uuid::Uuid::new_v4();
         let (tx, rx) = oneshot::channel();
         lock(&self.inner.pending).insert(request_id, tx);
+        let state = Arc::new(AtomicU8::new(QUEUED));
         let mut guard = CallGuard {
             inner: self.inner.clone(),
             id: request_id,
+            state: state.clone(),
             settled: false,
         };
         if self.is_closed() {
@@ -386,7 +413,7 @@ impl NodeLink {
         // One deadline covers queueing the request and waiting for its
         // outcome, so a full outbound queue cannot outlast `timeout`.
         let exchange = async {
-            self.send_any(&request).await?;
+            self.send_any(&request, Some(state)).await?;
             rx.await.map_err(|_| closed_error())
         };
         let result = tokio::time::timeout(timeout, exchange).await;
@@ -407,7 +434,7 @@ impl NodeLink {
 
 async fn write_loop<S>(
     mut sink: futures_util::stream::SplitSink<WebSocketStream<S>, Message>,
-    mut out: mpsc::Receiver<Message>,
+    mut out: mpsc::Receiver<Outbound>,
     mut urgent: mpsc::Receiver<Message>,
     inner: Arc<Inner>,
 ) where
@@ -429,8 +456,16 @@ async fn write_loop<S>(
                     () = super::wait_true(&mut close) => break,
                 }
             }
-            message = out.recv() => {
-                let Some(message) = message else { break };
+            outbound = out.recv() => {
+                let Some(Outbound { message, request }) = outbound else { break };
+                let abandoned = request.is_some_and(|state| {
+                    state
+                        .compare_exchange(QUEUED, WRITTEN, Ordering::AcqRel, Ordering::Acquire)
+                        .is_err()
+                });
+                if abandoned {
+                    continue;
+                }
                 tokio::select! {
                     sent = sink.send(message) => {
                         if sent.is_err() {

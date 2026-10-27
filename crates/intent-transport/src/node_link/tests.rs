@@ -1200,3 +1200,72 @@ async fn dropped_request_reply_is_not_lost_behind_a_full_outbound_queue() {
     };
     assert_eq!(error.message, "node-link-request-dropped");
 }
+
+/// A request still queued behind a stalled writer when its call gives up
+/// is never transmitted, so the peer never sees an abandoned request
+/// without its cancellation, nor a cancellation ahead of its request.
+#[tokio::test]
+async fn abandoned_queued_request_is_never_sent_uncancelled() {
+    use futures_util::StreamExt as _;
+    use tokio_tungstenite::tungstenite::protocol::Role;
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::WebSocketStream;
+
+    let (near, far) = tokio::io::duplex(64);
+    let near = WebSocketStream::from_raw_socket(near, Role::Client, None).await;
+    let mut peer = WebSocketStream::from_raw_socket(far, Role::Server, None).await;
+    let (link, _events) = NodeLink::start(
+        near,
+        binding(1),
+        Tuning {
+            outbound_queue: 2,
+            ..Tuning::default()
+        },
+    );
+    link.send(&LinkFrame::Prompt {
+        agent_id: AgentId::new(),
+        turn_id: "turn".into(),
+        prompt: vec![json!("x".repeat(4096))],
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let error = link
+        .call(AgentId::new(), "slow", json!({}), Duration::from_millis(50))
+        .await
+        .unwrap_err();
+    assert_eq!(code(&error), codes::TIMEOUT);
+
+    let mut seen = Vec::new();
+    while let Ok(Some(Ok(message))) = tokio::time::timeout(
+        intentd_test_support::test_timeout(Duration::from_millis(500)),
+        peer.next(),
+    )
+    .await
+    {
+        if let Message::Binary(bytes) = message {
+            seen.push(LinkFrame::decode(&bytes).unwrap());
+        }
+    }
+    assert!(
+        matches!(seen.first(), Some(LinkFrame::Prompt { .. })),
+        "the stalled prompt is delivered: {seen:?}"
+    );
+    let requests: Vec<_> = seen
+        .iter()
+        .filter_map(|f| match f {
+            LinkFrame::Request(r) => Some(r.request_id),
+            _ => None,
+        })
+        .collect();
+    let cancels: Vec<_> = seen
+        .iter()
+        .filter_map(|f| match f {
+            LinkFrame::CancelRequest { request_id } => Some(*request_id),
+            _ => None,
+        })
+        .collect();
+    assert!(requests.is_empty(), "abandoned request was sent: {seen:?}");
+    assert!(cancels.is_empty(), "cancel for an unsent request: {seen:?}");
+    link.close();
+}
