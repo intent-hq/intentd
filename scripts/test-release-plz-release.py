@@ -234,7 +234,12 @@ class WorkflowTests(unittest.TestCase):
         workflow = (ROOT / ".github/workflows/release-plz.yml").read_text()
         release, pr = workflow.split("  release-plz-pr:\n", 1)
         self.assertIn("python3 -S scripts/release-plz-release.py", release)
-        self.assertNotIn("continue-on-error:", workflow)
+        # Tag publication never swallows a failure; the planning job's first
+        # release-pr attempt is the one exception (its retry owns the failure,
+        # scripts/test-release-plz-network.py).
+        self.assertNotIn("continue-on-error:", release)
+        self.assertEqual(pr.count("continue-on-error:"), 1)
+        self.assertIn("        id: release_pr\n", pr.split("continue-on-error:", 1)[0].rsplit("      - name:", 1)[1])
         self.assertIn("    needs: [release-plz-release, runner-route]\n", pr)
         self.assertIn("if: ${{ github.repository_owner == 'intent-hq' }}", pr)
         self.assertEqual(sum(line.strip() == "cancel-in-progress: false"
