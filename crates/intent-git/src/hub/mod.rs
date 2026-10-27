@@ -84,8 +84,10 @@ pub struct HubAssignment {
 }
 
 /// Agent-owned mutable aliases. Index and checkpoint anchors are head-only.
+/// `Base` is the commit head starts a remote agent from.
 #[derive(Clone, Copy, Debug)]
 pub enum AgentRef {
+    Base,
     Head,
     Wip,
 }
@@ -114,6 +116,7 @@ pub fn agent_ref(workspace: &str, agent: &str, kind: AgentRef) -> Result<String>
     component(workspace)?;
     component(agent)?;
     let suffix = match kind {
+        AgentRef::Base => "base",
         AgentRef::Head => "head",
         AgentRef::Wip => "wip",
     };
@@ -147,7 +150,7 @@ pub fn publish_ref(branch: &str) -> Result<String> {
     Ok(name)
 }
 
-fn component(value: &str) -> Result<()> {
+pub(crate) fn component(value: &str) -> Result<()> {
     if value.is_empty()
         || value.starts_with(['.', '-'])
         || !value

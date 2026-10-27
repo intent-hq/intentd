@@ -2516,6 +2516,7 @@ dependencies = [
  "httparse",
  "if-addrs",
  "intent-core",
+ "intent-git",
  "intent-services",
  "intent-store",
  "intentd-test-support",

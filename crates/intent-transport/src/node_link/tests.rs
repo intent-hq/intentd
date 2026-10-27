@@ -1269,3 +1269,5 @@ async fn abandoned_queued_request_is_never_sent_uncancelled() {
     assert!(cancels.is_empty(), "cancel for an unsent request: {seen:?}");
     link.close();
 }
+
+mod git_sessions;

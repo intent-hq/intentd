@@ -117,13 +117,16 @@ impl GitConnection {
     ///
     /// `node-link-closed` when the connection is gone.
     pub async fn send(&self, bytes: Vec<u8>) -> Result<()> {
-        if self.is_closed() {
-            return Err(Error::Internal(codes::CLOSED.into()));
-        }
-        let mut closed = self.close.subscribe();
-        tokio::select! {
-            sent = self.out.send(bytes) => sent.map_err(|_| Error::Internal(codes::CLOSED.into())),
-            () = super::wait_true(&mut closed) => Err(Error::Internal(codes::CLOSED.into())),
+        self.sender().send(bytes).await
+    }
+
+    /// A cloneable handle that sends on this connection, so one task can
+    /// receive while others send.
+    #[must_use]
+    pub fn sender(&self) -> GitSender {
+        GitSender {
+            out: self.out.clone(),
+            close: self.close.clone(),
         }
     }
 
@@ -145,6 +148,58 @@ impl GitConnection {
     pub async fn closed(&self) {
         let mut rx = self.close.subscribe();
         super::wait_true(&mut rx).await;
+    }
+}
+
+/// Sends on a [`GitConnection`]; see [`GitConnection::sender`].
+#[derive(Debug, Clone)]
+pub struct GitSender {
+    pub(super) out: mpsc::Sender<Vec<u8>>,
+    pub(super) close: watch::Sender<bool>,
+}
+
+impl GitSender {
+    /// Send one message.
+    ///
+    /// # Errors
+    ///
+    /// `node-link-closed` when the connection is gone.
+    pub async fn send(&self, bytes: Vec<u8>) -> Result<()> {
+        if *self.close.borrow() {
+            return Err(Error::Internal(codes::CLOSED.into()));
+        }
+        let mut closed = self.close.subscribe();
+        tokio::select! {
+            sent = self.out.send(bytes) => sent.map_err(|_| Error::Internal(codes::CLOSED.into())),
+            () = super::wait_true(&mut closed) => Err(Error::Internal(codes::CLOSED.into())),
+        }
+    }
+
+    /// Queue one message without waiting. Returns it back when the queue is
+    /// full; drops it when the connection is gone.
+    ///
+    /// # Errors
+    ///
+    /// The message, when the queue is full.
+    pub fn try_send(&self, bytes: Vec<u8>) -> std::result::Result<(), Vec<u8>> {
+        if *self.close.borrow() {
+            return Ok(());
+        }
+        match self.out.try_send(bytes) {
+            Err(mpsc::error::TrySendError::Full(bytes)) => Err(bytes),
+            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => Ok(()),
+        }
+    }
+
+    /// Resolves once the connection has closed.
+    pub async fn closed(&self) {
+        let mut rx = self.close.subscribe();
+        super::wait_true(&mut rx).await;
+    }
+
+    /// Close the connection.
+    pub fn close(&self) {
+        self.close.send_replace(true);
     }
 }
 

@@ -15,6 +15,7 @@ repository-test-fixtures = []
 [dependencies]
 intent-core = { path = "../intent-core", version = "0.11.62" }
 intent-services = { path = "../intent-services", version = "0.11.62" }
+intent-git = { path = "../intent-git", version = "0.11.62" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

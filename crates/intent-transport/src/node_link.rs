@@ -17,6 +17,9 @@
 mod binding_file;
 mod dial;
 mod git;
+#[cfg(unix)]
+mod git_helper;
+mod git_session;
 mod link;
 mod listener;
 mod pin;
@@ -25,7 +28,15 @@ mod secret;
 
 pub use binding_file::BindingFile;
 pub use dial::{dial_git, dial_link, DialedLink, NodeEndpoint};
-pub use git::GitConnection;
+pub use git::{GitConnection, GitSender};
+#[cfg(unix)]
+pub use git_helper::run_git_remote_helper;
+#[cfg(unix)]
+pub use git_session::serve_helpers;
+pub use git_session::{
+    codes as git_codes, serve_git, CloseStatus, GitSession, NodeGitAccess, NodeGitSessions,
+    OpenRequest, MAX_SESSIONS,
+};
 pub use intent_core::node_link::*;
 pub use link::{IncomingRequest, LinkEvent, LinkEvents, NodeLink};
 pub use listener::{NodeConnection, NodeListener, NodeListenerConfig, WelcomeFn};
