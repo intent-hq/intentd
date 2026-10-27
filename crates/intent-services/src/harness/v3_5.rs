@@ -46,7 +46,8 @@ mod tests {
             current.doctrine.instructions.single_workspace_fallback,
             previous.doctrine.instructions.single_workspace_fallback
         );
-        assert!(std::ptr::eq(current.harness, previous.harness));
+        // Trait-object vtables can be duplicated across codegen units.
+        assert!(std::ptr::addr_eq(current.harness, previous.harness));
         assert_eq!(current.doctrine.specialists, previous.doctrine.specialists);
         assert_eq!((current.default_features)(), (previous.default_features)());
         assert_eq!(current.feature_labels, previous.feature_labels);
