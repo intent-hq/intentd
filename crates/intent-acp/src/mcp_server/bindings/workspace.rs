@@ -684,6 +684,7 @@ async fn apply_proposal(
             "path": created.workspace.effective_path(),
         },
     });
+    super::insert_workspace_links(&mut out["workspace"]);
     if let Some(mut agent) = created.initial_agent {
         strip_agent_hidden_fields(&mut agent);
         out["initialAgent"] = agent;

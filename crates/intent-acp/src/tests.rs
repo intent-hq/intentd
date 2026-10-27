@@ -10165,6 +10165,20 @@ mod wsapi6_bindings_tests {
         assert_eq!(*api.cross_list_siblings_calls.lock().unwrap(), 1);
     }
 
+    /// Each sibling row carries a ready-made workspace link so agents can
+    /// reference the workspace by a clickable title instead of its bare ID.
+    #[tokio::test]
+    async fn cross_workspace_list_siblings_rows_carry_workspace_links() {
+        let (srv, _api) = server();
+        let resp = call(&srv, "return await ws.crossWorkspace.listSiblings();").await;
+        let v = body(&resp);
+        assert_eq!(v[0]["link"], json!("intent://local/workspace/sibling-1"));
+        assert_eq!(
+            v[0]["markdownLink"],
+            json!("[Sib One](intent://local/workspace/sibling-1)")
+        );
+    }
+
     /// `includeRetired` is strictly boolean: omission and explicit `false`
     /// list live siblings, `true` opts in, and any other value (`"true"`,
     /// `null`, a number, an object) is an invalid-params error that never
@@ -14487,6 +14501,11 @@ mod workspace_apply_proposal_tests {
         assert_eq!(out["workspace"]["title"], "Follow up");
         assert_eq!(out["workspace"]["branch"], "ws-new-branch");
         assert_eq!(out["workspace"]["path"], "/checkouts/ws-new");
+        assert_eq!(out["workspace"]["link"], "intent://local/workspace/ws-new");
+        assert_eq!(
+            out["workspace"]["markdownLink"],
+            "[Follow up](intent://local/workspace/ws-new)"
+        );
         assert_eq!(out["initialAgent"]["id"], "agent-new");
         assert!(
             out["initialAgent"].get("notificationsMuted").is_none(),
