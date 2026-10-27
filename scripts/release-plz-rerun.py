@@ -160,6 +160,33 @@ def decide(head, run, jobs, log=None, max_attempts=MAX_ATTEMPTS):
                    f'(attempt {attempt} of {max_attempts}); re-running its failed jobs.')
 
 
+def attempt_jobs(api, run, attempt):
+    data = api(f'repos/{REPO}/actions/runs/{run["id"]}/attempts/{attempt}/jobs?per_page=100')
+    return data.get('jobs') if isinstance(data, dict) else None
+
+
+def with_publication(api, run):
+    """The current attempt's jobs, plus the tag job's latest result if this attempt omits it.
+
+    rerun-failed-jobs does not re-execute a successful "Release-plz release";
+    GitHub currently lists a copy of it in the new attempt (run 40430078531
+    attempt 2), but should a rerun attempt omit it, its latest earlier result
+    stands in, so a second automatic rerun stays possible. A failed or missing
+    earlier result still blocks the rerun.
+    """
+    jobs = attempt_jobs(api, run, run['run_attempt'])
+    if not isinstance(jobs, list) or any(isinstance(j, dict) and j.get('name') == RELEASE_JOB for j in jobs):
+        return jobs
+    for attempt in range(run['run_attempt'] - 1, 0, -1):
+        earlier = attempt_jobs(api, run, attempt)
+        if not isinstance(earlier, list):
+            raise ApiError('unreadable job listing')
+        release = [j for j in earlier if isinstance(j, dict) and j.get('name') == RELEASE_JOB]
+        if release:
+            return jobs + release
+    return jobs
+
+
 def assess(api=gh_api):
     ref = api(f'repos/{REPO}/git/ref/heads/main')
     head = (ref or {}).get('object', {}).get('sha') if isinstance(ref, dict) else None
@@ -171,8 +198,7 @@ def assess(api=gh_api):
     run = latest_run(runs, head)
     jobs = log = None
     if run is not None and run.get('status') == 'completed' and run.get('conclusion') in {'failure', 'timed_out'}:
-        data = api(f'repos/{REPO}/actions/runs/{run["id"]}/attempts/{run["run_attempt"]}/jobs?per_page=100')
-        jobs = data.get('jobs') if isinstance(data, dict) else None
+        jobs = with_publication(api, run)
         job = planning_job(jobs)
         if job is not None and job.get('conclusion') != 'timed_out':
             log = api(f'repos/{REPO}/actions/jobs/{job["id"]}/logs', raw=True)

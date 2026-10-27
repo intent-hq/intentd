@@ -66,7 +66,10 @@ class FakeApi:
         if '/actions/workflows/release-plz.yml/runs' in endpoint:
             return {'total_count': len(self.runs), 'workflow_runs': self.runs}
         if '/jobs' in endpoint:
-            return {'jobs': self.job_rows}
+            rows = self.job_rows
+            if isinstance(rows, dict):
+                rows = rows[int(endpoint.split('/attempts/')[1].split('/')[0])]
+            return {'jobs': rows}
         raise AssertionError(endpoint)
 
     def posts(self):
@@ -243,6 +246,30 @@ class Main(unittest.TestCase):
         code, lines, _ = self.main(api)
         self.assertEqual((code, api.posts()), (1, []))
         self.assertIn('Could not check', lines[-1])
+
+    def test_rerun_attempt_without_copied_publication_row_uses_the_earlier_attempt(self):
+        # GitHub copies successful jobs into a rerun attempt (run 40430078531
+        # attempt 2 lists "Release-plz release" with attempt 1's timestamps),
+        # but the proof must not depend on it: look back for the tag job.
+        planning_only = [row for row in jobs() if row['name'] != 'Release-plz release']
+        api = FakeApi([run(attempt=2)], {2: planning_only, 1: jobs()})
+        code, lines, _ = self.main(api)
+        self.assertEqual((code, api.posts()), (0, [f'repos/{REPO}/actions/runs/1010/rerun-failed-jobs']))
+        self.assertIn(f'repos/{REPO}/actions/runs/1010/attempts/1/jobs?per_page=100', [c[1] for c in api.calls])
+        self.assertIn('attempt 2 of 3', lines[-1])
+
+    def test_earlier_publication_failure_is_never_masked(self):
+        planning_only = [row for row in jobs() if row['name'] != 'Release-plz release']
+        for earlier in (jobs(release='failure'), planning_only):
+            with self.subTest(earlier=earlier):
+                api = FakeApi([run(attempt=2)], {2: planning_only, 1: earlier})
+                code, _, _ = self.main(api)
+                self.assertEqual((code, api.posts()), (1, []))
+
+    def test_copied_publication_row_needs_no_extra_lookup(self):
+        api = FakeApi([run(attempt=2)], {2: jobs()})
+        self.assertEqual(self.main(api, '--dry-run')[0], 0)
+        self.assertFalse(any('/attempts/1/' in c[1] for c in api.calls))
 
     def test_dry_run_never_posts(self):
         api = FakeApi([run(attempt=1)], jobs())
