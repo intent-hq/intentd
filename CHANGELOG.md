@@ -2,6 +2,69 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.61] - 2026-10-27
+
+### 🧪 Testing
+
+- *(services)* Run core agent/watch tests against a runtime test double ([#2736](https://github.com/intent-hq/intentd/pull/2736))
+
+
+## [0.11.60] - 2026-10-27
+
+### 🚀 Features
+
+- *(desktop)* Accept windowId targets and add focusWindow ([#2734](https://github.com/intent-hq/intentd/pull/2734))
+
+### 🐛 Bug Fixes
+
+- Bump Codex ACP fallback to v2.3.0 ([#2739](https://github.com/intent-hq/intentd/pull/2739))
+- *(transport)* Route unpinned browser.exec to the client's newest connection ([#2733](https://github.com/intent-hq/intentd/pull/2733))
+
+### 🧪 Testing
+
+- *(pr-monitor)* Check every optional saved field survives an upgrade ([#2735](https://github.com/intent-hq/intentd/pull/2735))
+
+
+## [0.11.59] - 2026-10-27
+
+### 🧪 Testing
+
+- *(core)* Lint against hard-coded current harness version literals ([#2726](https://github.com/intent-hq/intentd/pull/2726))
+
+
+## [0.11.58] - 2026-10-26
+
+### 🚀 Features
+
+- *(discussions)* Add workspace-wide creation and role management ([#2616](https://github.com/intent-hq/intentd/pull/2616))
+
+
+## [0.11.57] - 2026-10-26
+
+### 🔧 Refactor
+
+- *(services)* Gather runtime-dependent core tests beside the runtime ([#2730](https://github.com/intent-hq/intentd/pull/2730))
+
+
+## [0.11.56] - 2026-10-26
+
+### 🔧 Refactor
+
+- *(services)* Route remaining runtime calls through ports before the crate move ([#2728](https://github.com/intent-hq/intentd/pull/2728))
+
+
+## [0.11.55] - 2026-10-26
+
+### 🔧 Refactor
+
+- *(services)* Route runtime through public core accessors ([#2719](https://github.com/intent-hq/intentd/pull/2719))
+- *(core)* Define harness guidance version sets in intent-core ([#2717](https://github.com/intent-hq/intentd/pull/2717))
+
+### 📚 Documentation
+
+- *(guide)* Describe the pinned Default profile in Settings → Providers ([#2718](https://github.com/intent-hq/intentd/pull/2718))
+
+
 ## [0.11.54] - 2026-10-26
 
 ### 🐛 Bug Fixes

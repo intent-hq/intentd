@@ -388,11 +388,11 @@ pub fn is_stale_in_flight_status(status: intent_core::AgentStatus) -> bool {
 /// test can land a concurrent watch removal deterministically inside that
 /// window. Same shape as [`runtime_config::SupervisePark`].
 #[derive(Default)]
-pub(crate) struct CompletionClassifyPark {
+pub struct CompletionClassifyPark {
     /// Signaled by the parked delivery on entering the window.
-    pub(crate) entered: tokio::sync::Notify,
+    pub entered: tokio::sync::Notify,
     /// Held by the parked delivery inside the window until the test releases it.
-    pub(crate) release: tokio::sync::Notify,
+    pub release: tokio::sync::Notify,
 }
 
 /// Provenance retained when a synthetic completion has to defer again.
@@ -944,9 +944,9 @@ pub struct Services {
     /// deterministic. `None` in production wiring; tests inject via the
     /// `#[cfg(test)]`-only `with_completion_classify_park`.
     completion_classify_park: Option<Arc<CompletionClassifyPark>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     hook_wake_park: Option<Arc<CompletionClassifyPark>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     hook_eval_park: Option<Arc<CompletionClassifyPark>>,
     /// Test park seam (intent-hq/intent#4367) for the completion-delivery
     /// claim→send window: parks the ungrouped terminal delivery right after
@@ -1414,7 +1414,7 @@ pub struct Services {
     /// Test-only fault injector consulted before every hook-run persistence
     /// step (intent-hq/intent#5035): `Some(err)` fails that attempt without
     /// touching the store. `None` in production wiring.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     hook_store_fault: Option<runtime_config::HookStoreFault>,
     /// Host suspend-overlap query used by [`Services::run_prompt_turn`] to
     /// recognize a sleep-induced turn failure and enroll it as interrupted for
@@ -1735,9 +1735,9 @@ impl Services {
             script_too_fast_ms: runtime_config::TOO_FAST_MS,
             script_parks: runtime_config::ScriptParks::default(),
             completion_classify_park: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             hook_wake_park: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             hook_eval_park: None,
             completion_claim_park: None,
             completion_flip_take_park: None,
@@ -1849,7 +1849,7 @@ impl Services {
             hook_eval_timeout: runtime_config::HOOK_EVAL_TIMEOUT,
             hook_clock_skew: None,
             hook_store_retry_base: runtime_config::HOOK_STORE_RETRY_BASE,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             hook_store_fault: None,
             suspend_tracker: None,
             pr_monitor_catch_up: Arc::new(Mutex::new(HashMap::new())),
@@ -2007,8 +2007,10 @@ impl Services {
 
     /// Test-only: compress the hook script eval budget so timeout-eviction
     /// coverage completes in milliseconds.
-    #[cfg(test)]
-    pub(crate) fn with_hook_eval_timeout(mut self, timeout: std::time::Duration) -> Self {
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_hook_eval_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.hook_eval_timeout = timeout;
         self
     }
@@ -2016,19 +2018,20 @@ impl Services {
     /// Test-only: inject a shared clock skew (milliseconds) into the hook
     /// TTL expiry math so a test can move a deadline deterministically
     /// instead of racing wall clock.
-    #[cfg(test)]
-    pub(crate) fn with_hook_clock_skew(
-        mut self,
-        skew_ms: Arc<std::sync::atomic::AtomicI64>,
-    ) -> Self {
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_hook_clock_skew(mut self, skew_ms: Arc<std::sync::atomic::AtomicI64>) -> Self {
         self.hook_clock_skew = Some(skew_ms);
         self
     }
 
     /// Test-only: compress the backoff between hook persistence retries so
     /// store-failure coverage completes in milliseconds.
-    #[cfg(test)]
-    pub(crate) fn with_hook_store_retry_base(mut self, base: std::time::Duration) -> Self {
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_hook_store_retry_base(mut self, base: std::time::Duration) -> Self {
         self.hook_store_retry_base = base;
         self
     }
@@ -2036,15 +2039,21 @@ impl Services {
     /// Test-only: inject a fault into hook-run persistence steps. The
     /// injector is called with the step name before every attempt and fails
     /// the attempt when it returns `Some(err)`.
-    #[cfg(test)]
-    pub(crate) fn with_hook_store_fault(mut self, fault: runtime_config::HookStoreFault) -> Self {
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_hook_store_fault(mut self, fault: runtime_config::HookStoreFault) -> Self {
         self.hook_store_fault = Some(fault);
         self
     }
 
     /// The current hook-expiry clock skew in milliseconds (0 when no test
     /// skew is injected).
-    pub(crate) fn hook_clock_skew_ms(&self) -> i64 {
+    #[expect(
+        clippy::must_use_candidate,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub fn hook_clock_skew_ms(&self) -> i64 {
         self.hook_clock_skew
             .as_ref()
             .map_or(0, |s| s.load(std::sync::atomic::Ordering::SeqCst))
@@ -2539,8 +2548,10 @@ impl Services {
     /// Test seam: raise the `script.*` too-fast-exit floor so the no-restart
     /// decision is independent of scheduler load (monorepo#514). Production
     /// wiring keeps the [`runtime_config::TOO_FAST_MS`] default.
-    #[cfg(test)]
-    pub(crate) fn with_script_too_fast_ms(mut self, ms: u128) -> Self {
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_script_too_fast_ms(mut self, ms: u128) -> Self {
         self.script_too_fast_ms = ms;
         self
     }
@@ -2548,19 +2559,20 @@ impl Services {
     /// Test seam (monorepo#1180): park `script.*` supervisors in their
     /// pre-registration window so teardown-vs-registration races are
     /// deterministic. Production wiring keeps `None` (no parking).
-    #[cfg(test)]
-    pub(crate) fn with_script_supervise_park(
-        mut self,
-        park: Arc<runtime_config::SupervisePark>,
-    ) -> Self {
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_script_supervise_park(mut self, park: Arc<runtime_config::SupervisePark>) -> Self {
         self.script_parks.supervise = Some(park);
         self
     }
 
     /// Test seam: park every script launch before its PTY spawns and its
     /// output log opens (including service auto-restarts).
-    #[cfg(test)]
-    pub(crate) fn with_script_before_spawn_park(
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_script_before_spawn_park(
         mut self,
         park: Arc<runtime_config::SupervisePark>,
     ) -> Self {
@@ -2570,8 +2582,10 @@ impl Services {
 
     /// Test seam: park workspace deletion after its scripts stop, before the
     /// script output folder is deleted.
-    #[cfg(test)]
-    pub(crate) fn with_script_workspace_closed_park(
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_script_workspace_closed_park(
         mut self,
         park: Arc<runtime_config::SupervisePark>,
     ) -> Self {
@@ -2581,8 +2595,10 @@ impl Services {
 
     /// Test seam: park `script.create` after its retired/closing checks,
     /// before the definition is persisted.
-    #[cfg(test)]
-    pub(crate) fn with_script_create_admitted_park(
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_script_create_admitted_park(
         mut self,
         park: Arc<runtime_config::SupervisePark>,
     ) -> Self {
@@ -2594,8 +2610,10 @@ impl Services {
     /// check, before the `was_running` marker write and the in-memory flip to
     /// `running`, so persist-before-observable ordering is testable.
     /// Production wiring keeps `None` (no parking).
-    #[cfg(test)]
-    pub(crate) fn with_script_mark_running_park(
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_script_mark_running_park(
         mut self,
         park: Arc<runtime_config::SupervisePark>,
     ) -> Self {
@@ -3347,8 +3365,9 @@ impl Services {
     /// [`Self::enrich_workspace_aggregates_with_unread`] (the list path
     /// threads its batch unread set, `workspace.get` its pre-read external
     /// PR inputs); this no-argument form remains for tests.
-    #[cfg(test)]
-    pub(crate) async fn enrich_workspace_aggregates(&self, ws: &mut Workspace) {
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub async fn enrich_workspace_aggregates(&self, ws: &mut Workspace) {
         self.enrich_workspace_aggregates_with_unread(ws, None, None)
             .await;
     }
@@ -5012,7 +5031,7 @@ impl Services {
         } else {
             self.store.workspace_browser_client(id).await?
         };
-        let target = self.ports.runtime().driving_client_target(self, id).await?;
+        let target = self.driving_client_target(id).await?;
         let resolved = self
             .reverse_dispatch
             .as_ref()
@@ -7876,7 +7895,7 @@ impl Services {
     /// (queue empty, no worker in flight), so after re-running watch delivery
     /// this also seals the agent's open `after_all` group — the mutation
     /// removed the redrive whose terminal idle would otherwise have sealed it.
-    pub(crate) async fn redeliver_completion_after_queue_mutation(&self, child_id: &AgentId) {
+    pub async fn redeliver_completion_after_queue_mutation(&self, child_id: &AgentId) {
         if !self.has_interim_skipped_idle(child_id) {
             return;
         }
@@ -7939,10 +7958,17 @@ impl Services {
         // through and run the advisory-ALLOWED delivery variant instead.
         let advisory_pending = self.has_advisory_pending_interim_skip(child_id);
         if !advisory_pending
-            && (!self.active_hooks_for_agent(child_id).await.is_empty()
+            && (!self
+                .ports
+                .runtime()
+                .active_hooks_for_agent(self, child_id)
+                .await
+                .is_empty()
                 || (!self.active_pr_monitors_for_agent(child_id).await.is_empty()
                     || !self
-                        .active_script_monitors_for_agent(child_id)
+                        .ports
+                        .runtime()
+                        .active_script_monitors_for_agent(self, child_id)
                         .await
                         .is_empty()))
         {
@@ -8026,7 +8052,10 @@ impl Services {
         // (omitted) here unless the monorepo#1945 report bypass passed the
         // active-hooks guard above (or a hook was scheduled in the window),
         // matching the live emit sites' shape.
-        self.annotate_waiting_on_hooks(child_id, &mut data).await;
+        self.ports
+            .runtime()
+            .annotate_waiting_on_hooks(self, child_id, &mut data)
+            .await;
         // Idle-visibility (unified external-wait): same `waitingOnPrMonitors`
         // shape-parity stamp — empty (omitted) here unless the report bypass
         // passed the active-pr-monitors guard above.
@@ -8629,12 +8658,18 @@ impl Services {
         // kept: the advisory wake below names them.
         let active_hooks: Vec<serde_json::Value> =
             if event.event_type == AGENT_IDLE && !completion_reported {
-                self.active_hooks_for_agent(child_id).await
+                self.ports
+                    .runtime()
+                    .active_hooks_for_agent(self, child_id)
+                    .await
             } else {
                 Vec::new()
             };
         let active_script_monitors = if event.event_type == AGENT_IDLE && !completion_reported {
-            self.active_script_monitors_for_agent(child_id).await
+            self.ports
+                .runtime()
+                .active_script_monitors_for_agent(self, child_id)
+                .await
         } else {
             Vec::new()
         };
@@ -9704,7 +9739,11 @@ impl Services {
             grouped,
             child_of_recipient,
         );
-        let script_waits = self.active_script_monitors_for_agent(child_id).await;
+        let script_waits = self
+            .ports
+            .runtime()
+            .active_script_monitors_for_agent(self, child_id)
+            .await;
         if !script_waits.is_empty() {
             use std::fmt::Write as _;
             wake.push_str("\nActive script monitors:");
@@ -9719,7 +9758,9 @@ impl Services {
         let mut metadata = build_event_notification_metadata(&[event]);
         metadata["watchStillArmed"] = serde_json::json!(true);
         metadata["childExternallyWaiting"] = serde_json::json!(true);
-        self.annotate_waiting_on_script_monitors(child_id, &mut metadata)
+        self.ports
+            .runtime()
+            .annotate_waiting_on_script_monitors(self, child_id, &mut metadata)
             .await;
         if !active_hooks.is_empty() {
             metadata["waitingOnHooks"] = serde_json::Value::Array(active_hooks.to_vec());
@@ -10303,7 +10344,14 @@ impl Services {
     /// the sandbox directory + record, emit `sandbox:cow:merged`, and clear the
     /// retry count. All store failures are logged and swallowed — the merge
     /// itself already landed in canonical.
-    pub(crate) async fn finalize_sandbox_merged(
+    #[cfg_attr(
+        test,
+        expect(
+            clippy::missing_panics_doc,
+            reason = "internal doc-hidden feature API, not a public library API"
+        )
+    )]
+    pub async fn finalize_sandbox_merged(
         &self,
         workspace_id: &WorkspaceId,
         agent_id: &AgentId,
@@ -14905,7 +14953,7 @@ pub fn record_setup_skipped(states: &WorkspaceSetupStates, workspace_id: &Worksp
 /// observable without its terminal; until then the record stays `pending`
 /// (the `workspace:setup:started` publish precedes the spawn attempt and is
 /// not tied to this transition).
-pub(crate) fn record_setup_running(
+pub fn record_setup_running(
     states: &WorkspaceSetupStates,
     workspace_id: &WorkspaceId,
     terminal_id: &str,
@@ -15571,7 +15619,7 @@ pub async fn github_git_credential(
 /// (logged at debug) — a lossy conversion would point the helper at a
 /// nonexistent binary, so the spawn simply proceeds without the helper,
 /// never failing on it.
-pub(crate) fn daemon_exe_path() -> Option<String> {
+pub fn daemon_exe_path() -> Option<String> {
     match std::env::current_exe() {
         Ok(path) => match path.into_os_string().into_string() {
             Ok(path) => Some(path),
@@ -15953,7 +16001,11 @@ impl Services {
 /// Publish a transient (broadcast-only, never persisted) event onto the bus
 /// when one is wired. Used for high-volume ephemeral events like
 /// `chat:stream:delta` that do not need durable storage.
-pub(crate) fn publish_event_transient(bus: Option<&EventBus>, event: &NewEvent) -> Option<Event> {
+#[expect(
+    clippy::must_use_candidate,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub fn publish_event_transient(bus: Option<&EventBus>, event: &NewEvent) -> Option<Event> {
     bus.map(|b| b.publish_transient(event))
 }
 
@@ -16092,7 +16144,7 @@ impl<K: std::hash::Hash + Eq> Drop for KeyedInflightSlot<'_, K> {
 /// so the archive tail — a detached task — can carry the hold across its
 /// spawn; an entry is pruned once nobody holds or awaits it.
 #[derive(Default)]
-pub(crate) struct ArchiveFence {
+pub struct ArchiveFence {
     locks: Mutex<HashMap<WorkspaceId, Arc<tokio::sync::Mutex<()>>>>,
 }
 
@@ -16100,7 +16152,11 @@ impl ArchiveFence {
     /// Take `workspace_id`'s fence (FIFO among waiters: tokio's mutex is
     /// fair, so an unarchive queued behind an archive tail acquires before
     /// the tail's own re-acquire).
-    async fn acquire(self: &Arc<Self>, workspace_id: &WorkspaceId) -> ArchiveFenceGuard {
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub async fn acquire(self: &Arc<Self>, workspace_id: &WorkspaceId) -> ArchiveFenceGuard {
         let lock = self
             .locks
             .lock()
@@ -16119,7 +16175,7 @@ impl ArchiveFence {
 
 /// One hold on an [`ArchiveFence`] entry; releases the lock and prunes the
 /// entry on drop once no other caller holds or awaits it.
-pub(crate) struct ArchiveFenceGuard {
+pub struct ArchiveFenceGuard {
     fence: Arc<ArchiveFence>,
     key: WorkspaceId,
     guard: Option<tokio::sync::OwnedMutexGuard<()>>,
@@ -18238,7 +18294,9 @@ impl Services {
             // Keep the permit through cleanup and terminal event publication.
             let _deletion = services.workspace_mutations.delete(&id).await;
             services
-                .cancel_script_monitors(&id, None, "workspace-deleted")
+                .ports
+                .runtime()
+                .cancel_script_monitors(&services, &id, None, "workspace-deleted")
                 .await?;
             // Refuse new script launches, auto-restarts and output logs, and
             // stop the running scripts, so nothing writes a log after the
@@ -19183,6 +19241,8 @@ impl WorkspaceApi for Services {
             caps.insert("workspaceGuestRoles".into(), serde_json::json!(1));
             caps.insert("discussionAgentMessaging".into(), serde_json::json!(1));
             caps.insert("discussionAgentActivity".into(), serde_json::json!(1));
+            caps.insert("discussionPrincipalMentions".into(), serde_json::json!(1));
+            caps.insert("discussionManagement".into(), serde_json::json!(1));
             if let Some(cow_supported) = self.compute_cow_supported().await {
                 caps.insert("cowSupported".to_string(), serde_json::json!(cow_supported));
             }
@@ -23987,7 +24047,9 @@ impl WorkspaceApi for Services {
             // failure fails the RPC with the row still active: access
             // revocation is never best-effort. Unarchive does NOT restore
             // either; a guest rejoins by a fresh invite.
-            this.cancel_script_monitors(&id, None, "workspace-archived")
+            this.ports
+                .runtime()
+                .cancel_script_monitors(&this, &id, None, "workspace-archived")
                 .await?;
             let guest_sweep = store.archive_workspace_detaching_guests(&id, &now).await?;
             ws.status = WorkspaceStatus::Archived;
@@ -34414,6 +34476,29 @@ impl WorkspaceApi for Services {
             .await
         })
     }
+    fn discussion_rename(
+        &self,
+        workspace_id: WorkspaceId,
+        conversation_id: String,
+        name: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.discussion_manage_op(&workspace_id, &conversation_id, Some(&name))
+                .await
+        })
+    }
+
+    fn discussion_delete(
+        &self,
+        workspace_id: WorkspaceId,
+        conversation_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            self.discussion_manage_op(&workspace_id, &conversation_id, None)
+                .await
+        })
+    }
+
     fn discussion_conversations(
         &self,
         workspace_id: WorkspaceId,
@@ -35814,7 +35899,7 @@ impl WorkspaceApi for Services {
 impl Services {
     /// Archive tail: queue ONE consolidated wake per agent whose background
     /// hooks and/or PR monitors the archive sweeps
-    /// ([`Services::cancel_workspace_hooks`],
+    /// ([`Services::cancel_workspace_hooks`](crate::hook_manager::HookServicesExt::cancel_workspace_hooks),
     /// [`Services::cancel_workspace_pr_monitors`]) just cancelled — the
     /// [`crate::harness::Harness::workspace_archived_watches_cancelled_notice`]
     /// surface naming every cancelled hook (`name` + id) and monitor
@@ -38471,7 +38556,7 @@ fn parse_npx_version_ok(version_str: &str) -> bool {
 
 /// Display name of the workspace setup script terminal (`SpawnSpec::name`,
 /// surfaced through `terminal.list`).
-pub(crate) const SETUP_TERMINAL_NAME: &str = "Setup Script";
+pub const SETUP_TERMINAL_NAME: &str = "Setup Script";
 
 /// `/bin/sh` timing wrapper the setup script terminal runs via `/bin/sh -c`
 /// (`$1` is the script path): records the start epoch, runs the script through
@@ -38482,13 +38567,17 @@ pub(crate) const SETUP_TERMINAL_NAME: &str = "Setup Script";
 /// script's output ends with a newline (the common case). Assumes `date +%s`
 /// (epoch seconds; not in POSIX before Issue 8 but supported by macOS, GNU
 /// coreutils, and `BusyBox` — all platforms intentd targets).
-pub(crate) const SETUP_SCRIPT_WRAPPER: &str = r#"start=$(date +%s); /bin/sh "$1"; code=$?; elapsed=$(( $(date +%s) - start )); if [ "$code" -eq 0 ]; then printf '\nSetup script completed in %ss (exit code %s)\n' "$elapsed" "$code"; else printf '\nSetup script failed in %ss (exit code %s)\n' "$elapsed" "$code"; fi; exit "$code""#;
+pub const SETUP_SCRIPT_WRAPPER: &str = r#"start=$(date +%s); /bin/sh "$1"; code=$?; elapsed=$(( $(date +%s) - start )); if [ "$code" -eq 0 ]; then printf '\nSetup script completed in %ss (exit code %s)\n' "$elapsed" "$code"; else printf '\nSetup script failed in %ss (exit code %s)\n' "$elapsed" "$code"; fi; exit "$code""#;
 
 /// Write `contents` to a fresh file created with mode `0600` on unix (plain
 /// write elsewhere), so the script file is never exposed with world-readable
 /// permissions (parallel to secrets.rs `write_private`).
 #[cfg(unix)]
-async fn write_private_script(path: &Path, contents: &str) -> std::io::Result<()> {
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub async fn write_private_script(path: &Path, contents: &str) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt;
     let mut f = tokio::fs::OpenOptions::new()
         .write(true)
@@ -38501,7 +38590,11 @@ async fn write_private_script(path: &Path, contents: &str) -> std::io::Result<()
 }
 
 #[cfg(not(unix))]
-async fn write_private_script(path: &Path, contents: &str) -> std::io::Result<()> {
+#[expect(
+    clippy::missing_errors_doc,
+    reason = "internal doc-hidden feature API, not a public library API"
+)]
+pub async fn write_private_script(path: &Path, contents: &str) -> std::io::Result<()> {
     tokio::fs::write(path, contents).await
 }
 

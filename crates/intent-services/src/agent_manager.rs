@@ -23412,6 +23412,30 @@ mod agent_retry_tests {
         (Arc::new(AgentManager::new(services, sink, 8)), db_dir)
     }
 
+    /// [`manager_with_session`] with the runtime test double as the
+    /// manager's runtime port.
+    async fn manager_with_session_fake_runtime(
+        agent_id: &AgentId,
+        ws: &WorkspaceId,
+        status: AgentStatus,
+    ) -> (Arc<AgentManager>, tempfile::TempDir) {
+        let db_dir = crate::tests::test_tempdir("intentd-retry-");
+        let path = db_dir.path().join("store.db");
+        let db = Store::open(&path).await.expect("temp store");
+        db.insert_workspace(&workspace(ws))
+            .await
+            .expect("insert workspace");
+        db.insert_agent_session(&session(agent_id, ws, status))
+            .await
+            .expect("insert session");
+        let bus = EventBus::new(db.clone());
+        let services = crate::test_support::fake_runtime::FakeRuntime::install(
+            Services::new(db).with_event_bus(bus.clone()),
+        );
+        let sink: Arc<dyn EventSink> = Arc::new(BusEventSink::new(bus));
+        (Arc::new(AgentManager::new(services, sink, 8)), db_dir)
+    }
+
     #[intent_test_macros::daemon_test]
     async fn monitor_delivery_recovers_each_persistence_boundary_without_duplicate_transcript() {
         for boundary in [
@@ -23422,7 +23446,8 @@ mod agent_retry_tests {
         ] {
             let agent = AgentId::from("recover-monitor-owner");
             let ws = WorkspaceId::from("recover-monitor-workspace");
-            let (mgr, db_dir) = manager_with_session(&agent, &ws, AgentStatus::RuntimeIdle).await;
+            let (mgr, db_dir) =
+                manager_with_session_fake_runtime(&agent, &ws, AgentStatus::RuntimeIdle).await;
             let row: intent_core::ScriptMonitor = serde_json::from_value(json!({
                 "monitorId":"recover", "workspaceId":ws, "agentId":agent,
                 "scriptId":"script", "runId":"run", "scriptName":"Script", "mode":"command",
@@ -23522,7 +23547,9 @@ mod agent_retry_tests {
                 assert!(store.admit_script_notification(&durable).await.unwrap());
             }
             let bus = EventBus::new(store.clone());
-            let services = Services::new(store.clone()).with_event_bus(bus.clone());
+            let services = crate::test_support::fake_runtime::FakeRuntime::install(
+                Services::new(store.clone()).with_event_bus(bus.clone()),
+            );
             let mgr = Arc::new(AgentManager::new(
                 services,
                 Arc::new(BusEventSink::new(bus)),
@@ -23602,7 +23629,8 @@ mod agent_retry_tests {
             for exporting in [false, true] {
                 let agent = AgentId::from("monitor-raced-owner");
                 let ws = WorkspaceId::from("monitor-raced-workspace");
-                let (mgr, _db) = manager_with_session(&agent, &ws, AgentStatus::RuntimeIdle).await;
+                let (mgr, _db) =
+                    manager_with_session_fake_runtime(&agent, &ws, AgentStatus::RuntimeIdle).await;
                 let (head, _) = mgr.services.enqueue_message(
                 &agent, "monitor head".into(), None, None,
                 Some(json!({"type":"script_monitor_wake","monitorId":"raced-monitor","workspaceId":ws})),

@@ -4,26 +4,33 @@
 //! and the shared script/hook registries the feature owns.
 //!
 //! Core reaches the feature only through the port (the `WorkspaceApi`
-//! forwarders) and through [`Services::runtime`] for the registries that
+//! forwarders) and through [`Services::runtime`](crate::runtime::RuntimeStateExt::runtime) for the registries that
 //! core-resident code (the script manager view, script monitors, hook
 //! scheduling, shutdown) still reads. [`Services::new`] registers it; the
 //! later move into its own crate turns that registration into the
 //! composition root's.
 
 use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use intent_core::execution::HostExecutionContext;
 use intent_core::{
     now_iso, AgentId, BoxFuture, BrowserTab, BrowserTabInput, ClientId, Error, HookId, Result,
-    ReverseDispatchError, ReverseTarget, ScriptCreateParams, WorkspaceApi, WorkspaceId,
+    ReverseDispatchError, ScriptCreateParams, WorkspaceApi, WorkspaceId,
 };
 
+use crate::browser_tabs::BrowserTabOpsExt;
+use crate::browser_tabs::BrowserTabRoutingExt;
 use crate::feature_ports::{
     CommandScriptActivity, MergeOutcome, ProvisionOutcome, RuntimePort, ScriptsClosing,
     SetupScriptRun,
 };
+use crate::hook_manager::HookServicesExt;
+use crate::host_execution::HostExecutionExt;
+use crate::script_monitor::ScriptMonitorExt;
+use crate::script_output_cleanup::ScriptOutputCleanupExt;
 use crate::{
     browser_ops, browser_tabs, capability, hook_manager, record_setup_running, sandbox_ops,
     script_ops, script_output_store, setup_runner, terminal_ops, write_private_script, Services,
@@ -49,17 +56,36 @@ pub(crate) struct RuntimeFeature {
     /// Live per-hook scheduler tasks for the background hook service
     /// (`hook.*`). Shared across clones so the RPC/MCP front doors and the
     /// tasks themselves observe the same set; rehydrated from the `hook`
-    /// table at boot via [`Services::rehydrate_hooks`].
+    /// table at boot via [`Services::rehydrate_hooks`](crate::hook_manager::HookServicesExt::rehydrate_hooks).
     pub(crate) hook_tasks: hook_manager::HookTasks,
 }
 
-impl Services {
+/// The runtime feature state and script output store, on [`Services`].
+pub(crate) trait RuntimeStateExt {
+    fn runtime(&self) -> &RuntimeFeature;
+    fn script_output_store(&self) -> script_output_store::ScriptOutputStore;
+}
+
+impl RuntimeStateExt for Services {
     /// The runtime feature registered by [`Services::new`].
-    pub(crate) fn runtime(&self) -> &RuntimeFeature {
+    fn runtime(&self) -> &RuntimeFeature {
         self.feature::<RuntimeFeature>()
             .expect("the in-crate runtime feature is registered")
     }
 
+    /// The on-disk script output store, built from the core
+    /// [`ScriptOutputConfig`](crate::runtime_config::ScriptOutputConfig).
+    fn script_output_store(&self) -> script_output_store::ScriptOutputStore {
+        script_output_store::ScriptOutputStore::new(
+            &self.feature_script_output_config().data_dir,
+            self.feature_script_output_config().max_bytes_per_run,
+        )
+    }
+}
+
+// Stays inherent until the transfer round-trip test that builds a script
+// manager view moves out with the crate split.
+impl Services {
     /// Build a [`ScriptManager`](script_ops::ScriptManager) view over the shared
     /// PTY host, event bus, store, script registry, and bootstrap locks for one `script.*` call.
     #[expect(
@@ -68,27 +94,47 @@ impl Services {
     )]
     pub fn script_manager(&self) -> script_ops::ScriptManager {
         script_ops::ScriptManager::new(
-            self.pty.clone(),
-            self.event_bus.clone(),
-            self.store.clone(),
+            self.pty(),
+            self.feature_event_bus().cloned(),
+            self.store().clone(),
             self.runtime().scripts.clone(),
             self.runtime().script_locks.clone(),
-            self.script_too_fast_ms,
-            self.script_parks.clone(),
+            self.feature_script_too_fast_ms(),
+            self.feature_script_parks().clone(),
         )
-        .with_settings(self.settings_registry.clone())
+        .with_settings(self.settings_registry())
         .with_output_store(self.script_output_store())
-        .with_tasks(self.store_tasks.clone())
+        .with_tasks(self.feature_store_tasks().clone())
         .with_owner_services(self.clone())
     }
+}
 
-    /// The on-disk script output store, built from the core
-    /// [`ScriptOutputConfig`](crate::runtime_config::ScriptOutputConfig).
-    pub(crate) fn script_output_store(&self) -> script_output_store::ScriptOutputStore {
-        script_output_store::ScriptOutputStore::new(
-            &self.script_output_config.data_dir,
-            self.script_output_config.max_bytes_per_run,
-        )
+/// Runtime entry points the daemon calls on [`Services`] directly, through
+/// the composition root's `StartupExt`.
+pub trait RuntimeServicesExt {
+    /// Re-arm the active hooks from the store at boot; resolves to the
+    /// number of hooks resumed.
+    fn rehydrate_hooks(&self) -> impl Future<Output = Result<usize>> + Send;
+
+    /// Start the periodic script output retention sweep.
+    fn spawn_script_output_sweep_loop(&self) -> tokio::task::JoinHandle<()>;
+
+    /// Start the loop that republishes the host execution context when its
+    /// inputs change.
+    fn spawn_execution_context_loop(&self) -> tokio::task::JoinHandle<()>;
+}
+
+impl RuntimeServicesExt for Services {
+    fn rehydrate_hooks(&self) -> impl Future<Output = Result<usize>> + Send {
+        HookServicesExt::rehydrate_hooks(self)
+    }
+
+    fn spawn_script_output_sweep_loop(&self) -> tokio::task::JoinHandle<()> {
+        ScriptOutputCleanupExt::spawn_script_output_sweep_loop(self)
+    }
+
+    fn spawn_execution_context_loop(&self) -> tokio::task::JoinHandle<()> {
+        HostExecutionExt::spawn_execution_context_loop(self)
     }
 }
 
@@ -174,7 +220,7 @@ impl RuntimePort for RuntimeFeature {
             svc.require_member(&workspace_id).await?;
             let options = intent_core::script_lists::ScriptListOptions::parse(&options, true)?;
             if options.summary {
-                svc.store
+                svc.store()
                     .script_summary_page(&workspace_id, agent_id.as_ref(), true, &options)
                     .await
             } else {
@@ -192,7 +238,10 @@ impl RuntimePort for RuntimeFeature {
     ) -> BoxFuture<'a, Result<serde_json::Value>> {
         Box::pin(async move {
             svc.require_member(&workspace_id).await?;
-            let row = svc.store.script_monitor(&workspace_id, &monitor_id).await?;
+            let row = svc
+                .store()
+                .script_monitor(&workspace_id, &monitor_id)
+                .await?;
             if owner.is_some_and(|id| id != row.agent_id) {
                 return Err(Error::InvalidParams("unknown monitor ID".into()));
             }
@@ -246,7 +295,7 @@ impl RuntimePort for RuntimeFeature {
             if capability::gated_collaborator_caller("script.create")?.is_some() {
                 if let Some(id) = params.script_id.as_deref() {
                     if svc
-                        .store
+                        .store()
                         .script_workspace(id)
                         .await?
                         .is_some_and(|actual| actual != workspace_id)
@@ -287,10 +336,10 @@ impl RuntimePort for RuntimeFeature {
         options: serde_json::Value,
     ) -> BoxFuture<'a, Result<serde_json::Value>> {
         Box::pin(async move {
-            let _admission = svc.workspace_mutations.enter(&workspace_id)?;
+            let _admission = svc.feature_workspace_mutations().enter(&workspace_id)?;
             svc.require_member(&workspace_id).await?;
-            let _archive = svc.archive_fence.acquire(&workspace_id).await;
-            let retirement = svc.ports.agent_wake().retirement_gate(svc, &agent_id);
+            let _archive = svc.feature_archive_fence().acquire(&workspace_id).await;
+            let retirement = svc.feature_agent_wake().retirement_gate(svc, &agent_id);
             let _retirement = retirement.lock().await;
             let key = (workspace_id.clone(), script_id.clone());
             let auto = self.auto_start_monitors.lock().unwrap().get(&key).cloned();
@@ -327,7 +376,7 @@ impl RuntimePort for RuntimeFeature {
         Box::pin(async move {
             svc.require_member(&workspace_id).await?;
             Ok(
-                serde_json::json!({"monitors":svc.store.script_monitors(&workspace_id,agent_id.as_ref()).await?}),
+                serde_json::json!({"monitors":svc.store().script_monitors(&workspace_id,agent_id.as_ref()).await?}),
             )
         })
     }
@@ -374,7 +423,7 @@ impl RuntimePort for RuntimeFeature {
     ) -> BoxFuture<'a, Result<serde_json::Value>> {
         Box::pin(async move {
             match svc
-                .store
+                .store()
                 .get_script_in_workspace(&workspace_id, &script_id)
                 .await?
             {
@@ -588,10 +637,10 @@ impl RuntimePort for RuntimeFeature {
         command: Option<String>,
         env: Option<std::collections::BTreeMap<String, String>>,
     ) -> BoxFuture<'a, Result<serde_json::Value>> {
-        let pty = svc.pty.clone();
-        let bus = svc.event_bus.clone();
-        let store = svc.store.clone();
-        let settings = svc.settings_registry.clone();
+        let pty = svc.pty();
+        let bus = svc.feature_event_bus().cloned();
+        let store = svc.store().clone();
+        let settings = svc.settings_registry();
         Box::pin(async move {
             // Workspace terminals use the host owner's execution setup.
             svc.require_workspace_manager(&workspace_id, "terminal.create")
@@ -603,10 +652,10 @@ impl RuntimePort for RuntimeFeature {
             // the row and sweeps the workspace's PTYs under the same fence,
             // so a create admitted before the flip finishes spawning before
             // the sweep lists terminals, and one after it is refused.
-            let _archive = svc.archive_fence.acquire(&workspace_id).await;
+            let _archive = svc.feature_archive_fence().acquire(&workspace_id).await;
             svc.refuse_if_retired(&workspace_id).await?;
             terminal_ops::create_owned(
-                &svc.terminal_tasks,
+                svc.feature_terminal_tasks(),
                 pty,
                 bus,
                 Some(store),
@@ -628,7 +677,7 @@ impl RuntimePort for RuntimeFeature {
         terminal_id: String,
         data: String,
     ) -> BoxFuture<'a, Result<serde_json::Value>> {
-        let pty = svc.pty.clone();
+        let pty = svc.pty();
         Box::pin(async move {
             // Resolve the terminal's actual workspace before authorizing it.
             svc.require_terminal_manager(&terminal_id, "terminal.write")
@@ -645,7 +694,7 @@ impl RuntimePort for RuntimeFeature {
         cols: u16,
         rows: u16,
     ) -> BoxFuture<'a, Result<serde_json::Value>> {
-        let pty = svc.pty.clone();
+        let pty = svc.pty();
         Box::pin(async move {
             svc.require_terminal_manager(&terminal_id, "terminal.resize")
                 .await?;
@@ -659,7 +708,7 @@ impl RuntimePort for RuntimeFeature {
         svc: &'a Services,
         terminal_id: String,
     ) -> BoxFuture<'a, Result<serde_json::Value>> {
-        let pty = svc.pty.clone();
+        let pty = svc.pty();
         Box::pin(async move {
             svc.require_terminal_manager(&terminal_id, "terminal.kill")
                 .await?;
@@ -674,7 +723,7 @@ impl RuntimePort for RuntimeFeature {
         terminal_id: String,
         max_bytes: Option<i64>,
     ) -> BoxFuture<'a, Result<serde_json::Value>> {
-        let pty = svc.pty.clone();
+        let pty = svc.pty();
         Box::pin(async move {
             svc.require_terminal_manager(&terminal_id, "terminal.getBuffer")
                 .await?;
@@ -687,7 +736,7 @@ impl RuntimePort for RuntimeFeature {
         svc: &'a Services,
         workspace_id: WorkspaceId,
     ) -> BoxFuture<'a, Result<serde_json::Value>> {
-        let pty = svc.pty.clone();
+        let pty = svc.pty();
         let boot_id = pty.daemon_boot_id().to_string();
         Box::pin(async move {
             svc.require_workspace_manager(&workspace_id, "terminal.list")
@@ -705,7 +754,7 @@ impl RuntimePort for RuntimeFeature {
         paginate: Option<bool>,
         page_token: Option<String>,
     ) -> BoxFuture<'a, Result<serde_json::Value>> {
-        let pty = svc.pty.clone();
+        let pty = svc.pty();
         Box::pin(async move {
             svc.require_workspace_manager(&workspace_id, "terminal.readOutput")
                 .await?;
@@ -781,7 +830,7 @@ impl RuntimePort for RuntimeFeature {
     /// `claimTab` that succeeded re-homes the row to the driving client as
     /// re-resolved at commit time (`browser:tab-updated { changes: {
     /// hostClientId, ownerAgentId } }`, see
-    /// [`Services::browser_tab_claim_migrate`]).
+    /// [`Services::browser_tab_claim_migrate`](crate::browser_tabs::BrowserTabRoutingExt::browser_tab_claim_migrate)).
     /// Attribution fields (`workspaceId`, `agentId`,
     /// `tabId`) are threaded into the forwarded params so the FE sees the
     /// same envelope shape the client-triggered path already emits. Result
@@ -829,7 +878,7 @@ impl RuntimePort for RuntimeFeature {
             named_tabs.dedup();
             for id in &named_tabs {
                 let known = svc
-                    .store
+                    .store()
                     .get_browser_tab(id)
                     .await?
                     .is_some_and(|tab| tab.workspace_id == workspace_id);
@@ -874,7 +923,7 @@ impl RuntimePort for RuntimeFeature {
                     serde_json::json!({ "results": results })
                 });
             }
-            let Some(dispatch) = svc.reverse_dispatch.clone() else {
+            let Some(dispatch) = svc.feature_reverse_dispatch().cloned() else {
                 return Err(Error::Internal(
                     "browser.exec: no client connected".to_string(),
                 ));
@@ -975,8 +1024,7 @@ impl RuntimePort for RuntimeFeature {
             if force {
                 let target = svc.browser_tab_route_target(&tab).await?;
                 let reachable = svc
-                    .reverse_dispatch
-                    .as_ref()
+                    .feature_reverse_dispatch()
                     .is_some_and(|d| d.resolve(&target).is_ok());
                 if reachable {
                     // The host is told directly; failures fall through to
@@ -1002,7 +1050,7 @@ impl RuntimePort for RuntimeFeature {
         workspace_id: WorkspaceId,
         sandbox_id: AgentId,
     ) -> BoxFuture<'a, Result<serde_json::Value>> {
-        let store = svc.store.clone();
+        let store = svc.store().clone();
         Box::pin(async move {
             use crate::sandbox_ops::{merge_sandbox, MergeOutcome};
             use intent_store::SandboxStatus;
@@ -1127,20 +1175,12 @@ impl RuntimePort for RuntimeFeature {
         workspace_id: WorkspaceId,
         sandbox_id: AgentId,
     ) -> BoxFuture<'a, Result<serde_json::Value>> {
-        let store = svc.store.clone();
+        let store = svc.store().clone();
         Box::pin(async move {
             svc.require_agent_member(&sandbox_id).await?;
             crate::sandbox_ops::discard_sandbox(&store, &workspace_id, &sandbox_id).await?;
             Ok(serde_json::json!({ "ok": true }))
         })
-    }
-
-    fn driving_client_target<'a>(
-        &'a self,
-        svc: &'a Services,
-        workspace_id: &'a WorkspaceId,
-    ) -> BoxFuture<'a, Result<ReverseTarget>> {
-        Box::pin(svc.driving_client_target(workspace_id))
     }
 
     fn migrate_claimed_browser_tabs<'a>(
@@ -1161,7 +1201,7 @@ impl RuntimePort for RuntimeFeature {
     ) -> BoxFuture<'a, Result<ProvisionOutcome>> {
         Box::pin(async move {
             let config = sandbox_ops::ProvisionConfig { workspaces_root };
-            sandbox_ops::provision_sandbox(&svc.store, workspace_id, agent_id, &config).await
+            sandbox_ops::provision_sandbox(svc.store(), workspace_id, agent_id, &config).await
         })
     }
 
@@ -1172,7 +1212,7 @@ impl RuntimePort for RuntimeFeature {
         agent_id: &'a AgentId,
     ) -> BoxFuture<'a, Result<MergeOutcome>> {
         Box::pin(sandbox_ops::merge_sandbox(
-            &svc.store,
+            svc.store(),
             workspace_id,
             agent_id,
         ))
@@ -1185,7 +1225,7 @@ impl RuntimePort for RuntimeFeature {
         agent_id: &'a AgentId,
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(sandbox_ops::discard_sandbox(
-            &svc.store,
+            svc.store(),
             workspace_id,
             agent_id,
         ))
@@ -1205,10 +1245,10 @@ impl RuntimePort for RuntimeFeature {
             source_branch,
         } = run;
         let worktree_path = worktree_for_read.to_string_lossy().to_string();
-        let pty_for_setup = svc.pty.clone();
-        let bus_for_setup = svc.event_bus.clone();
-        let setup_states = svc.workspace_setup_states.clone();
-        let terminal_tasks = svc.terminal_tasks.clone();
+        let pty_for_setup = svc.pty();
+        let bus_for_setup = svc.feature_event_bus().cloned();
+        let setup_states = svc.feature_workspace_setup_states().clone();
+        let terminal_tasks = svc.feature_terminal_tasks().clone();
         Box::pin(async move {
             'setup: {
                 // Write script to a private file under worktree .intent/ directory
@@ -1509,6 +1549,35 @@ impl RuntimePort for RuntimeFeature {
         })
     }
 
+    fn recover_imported_scripts<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
+        script_ids: &'a [String],
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            // Resolve imported monitor deadlines/results before compact run
+            // recovery manufactures an interruption. No source process is
+            // resumed here.
+            if let Err(error) = svc.script_manager().recover_monitors().await {
+                tracing::warn!(%error, "post-import script monitor recovery failed");
+            }
+            svc.start_script_monitor_maintenance();
+            if !script_ids.is_empty() {
+                let manager = svc.script_manager();
+                for id in script_ids {
+                    if let Err(error) = manager.refresh_imported(workspace_id, id).await {
+                        tracing::warn!(script = %id, %error, "post-import script refresh failed");
+                    }
+                }
+            }
+        })
+    }
+
+    fn rehydrate_hooks<'a>(&'a self, svc: &'a Services) -> BoxFuture<'a, Result<usize>> {
+        Box::pin(HookServicesExt::rehydrate_hooks(svc))
+    }
+
     fn command_script_activity(&self, svc: &Services) -> CommandScriptActivity {
         script_ops::command_activity(&svc.runtime().scripts, &svc.runtime().script_locks)
     }
@@ -1576,3 +1645,21 @@ impl ScriptsClosing for script_ops::WorkspaceClosing {
         script_ops::WorkspaceClosing::unsettled(self)
     }
 }
+
+#[cfg(test)]
+mod archive_sweep_golden_tests;
+
+#[cfg(test)]
+mod guest_role_tests;
+
+#[cfg(test)]
+mod hook_golden_tests;
+
+#[cfg(test)]
+mod host_role_tests;
+
+#[cfg(test)]
+mod retire_workspace_tests;
+
+#[cfg(all(test, unix))]
+mod setup_lifecycle_tests;

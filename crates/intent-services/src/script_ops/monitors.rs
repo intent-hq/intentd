@@ -5,6 +5,7 @@ use super::{
     json, now_iso, publish_event, script_event, Error, Ordering, PtyId, Result, ScriptManager,
     SpawnSpec, Value, WorkspaceId, LOST_AT_DAEMON_STOP_ERROR,
 };
+use crate::script_monitor::ScriptMonitorExt;
 use intent_core::script_output::LineDecoder;
 use intent_core::{AgentId, ScriptLastRun, ScriptMonitor, ScriptMonitorTrigger, ScriptRunOutcome};
 use intent_pty::OutputChunk;
@@ -394,8 +395,12 @@ impl ScriptManager {
             self.emit_monitor(row, &row.state).await;
             if let Some(services) = self.owner_services.clone() {
                 let row = row.clone();
+                #[cfg(test)]
+                let dispatched = std::sync::Arc::clone(&self.locks.monitor_dispatched);
                 intent_core::spawn_daemon(async move {
                     services.dispatch_script_monitor(&row).await;
+                    #[cfg(test)]
+                    dispatched.notify_one();
                 });
             }
         }

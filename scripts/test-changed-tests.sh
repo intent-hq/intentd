@@ -14,6 +14,7 @@ set -euo pipefail
 unset BASE DRY_RUN BUILD_JOBS TEST_THREADS NEXTEST_SHOW_PROGRESS CARGO_TERM_PROGRESS_WHEN
 unset NEXTEST_RUNNER INTENTD_TEST_TIMEOUT_MULTIPLIER
 unset RUN_STDIN INTENTD_ASSERT_BOUND_CALLER COVERAGE_STORAGE_DIR
+unset CARGO_LOCALE_LOG RUNNER_LOCALE_LOG RUN_LOCALE
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 script="$here/changed-tests.sh"
@@ -40,9 +41,33 @@ fail() {
   exit 1
 }
 
-for command in bash dirname grep mktemp rm sort python3; do
+for command in bash dirname env grep mktemp rm sort python3; do
   ln -s "$(command -v "$command")" "$bin_dir/$command"
 done
+
+# glibc's en_US.UTF-8 collation ignores '-' and '_' (intentd sorts before
+# intent-services, ab before a_z), which is what the locale cases below run
+# the script under. A host that has no compiled en_US.UTF-8 gets a private build in the
+# temp dir, reached through LOCPATH, when localedef and the en_US source
+# exist (glibc ignores an empty LOCPATH). Without either (macOS collates
+# by code point), those cases are skipped with a notice. RUN_LOCALE=<name>
+# run_script hands the locale to the script alone, through env: a prefix
+# LC_ALL on the function would switch this shell too, which cannot see
+# LOCPATH and warns.
+real_env=$(command -v env)
+ignores_punctuation() {
+  [[ "$(printf 'intent-services\nintentd\na_z\nab\n' | LOCPATH="$1" LC_ALL=en_US.UTF-8 sort 2>/dev/null)" == $'ab\na_z\nintentd\nintent-services' ]]
+}
+en_us_locpath=""
+en_us=1
+if ! ignores_punctuation ""; then
+  en_us_locpath="$temp_dir/locale"
+  mkdir -p "$en_us_locpath"
+  localedef -i en_US -f UTF-8 "$en_us_locpath/en_US.UTF-8" >/dev/null 2>&1 || true
+  ignores_punctuation "$en_us_locpath" || en_us=""
+fi
+[[ -n "$en_us" ]] ||
+  echo "changed-tests tests: no en_US.UTF-8 locale that ignores '-' and '_' (glibc's) is available; en_US.UTF-8 cases skipped"
 
 # git wrapper: the subcommand named by GIT_STUB_FAIL fails like a broken
 # checkout would; everything else reaches the real git.
@@ -58,25 +83,29 @@ SH
 chmod +x "$bin_dir/git"
 
 # Stub cargo: every invocation is appended to CARGO_TEST_LOG as
-# "<cwd>: [INTENTD_TEST_TIMEOUT_MULTIPLIER=N ]<argv>" and exits with
+# "<cwd>: [INTENTD_TEST_TIMEOUT_MULTIPLIER=N ]<argv>", the LC_ALL it got
+# ("<unset>" when none) to CARGO_LOCALE_LOG, and it exits with
 # CARGO_STUB_EXIT (default 0). It drains stdin like a real nextest child
 # could, so the script must not feed it the remaining plans.
 cat >"$bin_dir/cargo" <<'SH'
 #!/usr/bin/env bash
 [[ "${INTENTD_ASSERT_BOUND_CALLER-}" == 1 ]] || { echo "cargo: caller policy is not armed" >&2; exit 91; }
 printf '%s: %s%s\n' "$PWD" "${INTENTD_TEST_TIMEOUT_MULTIPLIER:+INTENTD_TEST_TIMEOUT_MULTIPLIER=$INTENTD_TEST_TIMEOUT_MULTIPLIER }" "$*" >>"$CARGO_TEST_LOG"
+printf '%s\n' "${LC_ALL-<unset>}" >>"$CARGO_LOCALE_LOG"
 while IFS= read -r line; do printf '%s\n' "$line" >>"$CARGO_STDIN_LOG"; done
 exit "${CARGO_STUB_EXIT:-0}"
 SH
 chmod +x "$bin_dir/cargo"
 
 # Stub runner: appends "call:" plus one line per argv word to RUNNER_TEST_LOG,
-# its cwd to RUNNER_CWD_LOG, and exits with RUNNER_STUB_EXIT (default 0).
+# its cwd to RUNNER_CWD_LOG, the LC_ALL it got to RUNNER_LOCALE_LOG, and exits
+# with RUNNER_STUB_EXIT (default 0).
 cat >"$bin_dir/runner" <<'SH'
 #!/usr/bin/env bash
 [[ "${INTENTD_ASSERT_BOUND_CALLER-}" == 1 ]] || { echo "runner: caller policy is not armed" >&2; exit 91; }
 { echo "call:"; printf '%s\n' "$@"; } >>"$RUNNER_TEST_LOG"
 printf '%s\n' "$PWD" >>"$RUNNER_CWD_LOG"
+printf '%s\n' "${LC_ALL-<unset>}" >>"$RUNNER_LOCALE_LOG"
 exit "${RUNNER_STUB_EXIT:-0}"
 SH
 chmod +x "$bin_dir/runner"
@@ -174,13 +203,17 @@ base_sha=$(g rev-parse HEAD)
 g update-ref refs/remotes/origin/main HEAD
 g checkout -q -b feature
 
+clear_logs() {
+  local log
+  for log in cargo cargo-stdin cargo-locale runner runner-cwd runner-locale; do
+    : >"$temp_dir/$log.log"
+  done
+}
+
 reset_repo() {
   g reset -q --hard refs/remotes/origin/main
   g clean -fdq
-  : >"$temp_dir/cargo.log"
-  : >"$temp_dir/cargo-stdin.log"
-  : >"$temp_dir/runner.log"
-  : >"$temp_dir/runner-cwd.log"
+  clear_logs
 }
 
 edit() {
@@ -197,17 +230,24 @@ commit_all() {
 # leak into the expected argv. The script runs from RUN_CWD (default: the
 # fixture checkout); it must find its repo root on its own. Ordinary calls
 # get EOF, even when this suite inherits an open terminal. Only the explicit
-# stdin-drain control supplies finite input through RUN_STDIN.
+# stdin-drain control supplies finite input through RUN_STDIN, and
+# RUN_LOCALE=en_US.UTF-8 runs it under that locale (see ignores_punctuation).
 run_script() {
   set +e
   (
+    if [[ -n "${RUN_LOCALE-}" ]]; then
+      set -- "$real_env" LOCPATH="$en_us_locpath" LC_ALL="$RUN_LOCALE" "$script_bash" "$script" "$@"
+    else
+      set -- "$script_bash" "$script" "$@"
+    fi
     cd "${RUN_CWD:-$repo}" &&
       PATH="$bin_dir" BASE="${BASE-}" BUILD_JOBS="${BUILD_JOBS-}" TEST_THREADS="${TEST_THREADS-}" \
         DRY_RUN="${DRY_RUN-}" NEXTEST_RUNNER="${NEXTEST_RUNNER-}" \
         CARGO_TEST_LOG="$temp_dir/cargo.log" CARGO_STDIN_LOG="$temp_dir/cargo-stdin.log" \
         RUNNER_TEST_LOG="$temp_dir/runner.log" \
         RUNNER_CWD_LOG="$temp_dir/runner-cwd.log" \
-        "$script_bash" "$script" "$@"
+        CARGO_LOCALE_LOG="$temp_dir/cargo-locale.log" RUNNER_LOCALE_LOG="$temp_dir/runner-locale.log" \
+        "$@"
   ) <"${RUN_STDIN:-/dev/null}" >"$temp_dir/stdout" 2>"$temp_dir/stderr"
   status=$?
   set -e
@@ -215,6 +255,8 @@ run_script() {
   stderr=$(<"$temp_dir/stderr")
   cargo_log=$(<"$temp_dir/cargo.log")
   runner_log=$(<"$temp_dir/runner.log")
+  cargo_locale_log=$(<"$temp_dir/cargo-locale.log")
+  runner_locale_log=$(<"$temp_dir/runner-locale.log")
 }
 
 expect_cargo() {
@@ -512,17 +554,67 @@ expect_ok
 [[ "$stdout" == "$fixture_edges" ]] || fail "$case_name: edges were"$'\n'"$stdout"$'\n'"expected"$'\n'"$fixture_edges"
 [[ -z "$cargo_log" ]] || fail "$case_name: cargo ran: $cargo_log"
 
-# Byte order whatever the locale: glibc's en_US.UTF-8 collation ignores '-'
-# and would put intentd before intent-services.
-if locale -a 2>/dev/null | grep -qix 'en_US.utf-\{0,1\}8'; then
+# Byte order whatever the locale (see ignores_punctuation).
+if [[ -n "$en_us" ]]; then
   case_name="--print-edges / --print-rdeps sort in byte order under en_US.UTF-8"
   reset_repo
-  LC_ALL=en_US.UTF-8 run_script --print-edges
+  RUN_LOCALE=en_US.UTF-8 run_script --print-edges
   expect_ok
   [[ "$stdout" == "$fixture_edges" ]] || fail "$case_name: edges were"$'\n'"$stdout"
-  LC_ALL=en_US.UTF-8 run_script --print-rdeps
+  RUN_LOCALE=en_US.UTF-8 run_script --print-rdeps
   expect_ok
   [[ "$stdout" == "$fixture_rdeps" ]] || fail "$case_name: rdeps were '$stdout'"
+fi
+
+# The selection itself sorts in byte order whatever the locale: the crate
+# list and its reverse-dependency note, a crate's --test targets and a suite's
+# changed modules are the same under en_US.UTF-8 as under C.
+# expect_same_under_en_us runs the script on the current tree under C, then
+# under en_US.UTF-8, and requires byte-identical stdout, stderr and cargo argv;
+# the en_US.UTF-8 results (equal to C's) stay in stdout / cargo_log after it.
+expect_same_under_en_us() {
+  local c_status c_stdout c_stderr c_cargo
+  clear_logs
+  LC_ALL=C run_script "$@"
+  c_status=$status c_stdout=$stdout c_stderr=$stderr c_cargo=$cargo_log
+  clear_logs
+  RUN_LOCALE=en_US.UTF-8 run_script "$@"
+  [[ "$status" -eq "$c_status" ]] || fail "$case_name: exited $status under en_US.UTF-8, $c_status under C: $stderr"
+  [[ "$stdout" == "$c_stdout" ]] ||
+    fail "$case_name: stdout under en_US.UTF-8 was"$'\n'"$stdout"$'\n'"under C"$'\n'"$c_stdout"
+  [[ "$stderr" == "$c_stderr" ]] ||
+    fail "$case_name: stderr under en_US.UTF-8 was"$'\n'"$stderr"$'\n'"under C"$'\n'"$c_stderr"
+  [[ "$cargo_log" == "$c_cargo" ]] ||
+    fail "$case_name: cargo argv under en_US.UTF-8 was"$'\n'"$cargo_log"$'\n'"under C"$'\n'"$c_cargo"
+}
+
+if [[ -n "$en_us" ]]; then
+  case_name="intent-core reverse dependencies are listed in byte order under en_US.UTF-8"
+  reset_repo
+  edit crates/intent-core/src/lib.rs
+  commit_all
+  expect_same_under_en_us
+  expect_ok
+  expect_cargo "$core_rdeps_lib" "-p intentd --bins --tests"
+  [[ "$stdout" == *"$core_rdeps_note"* ]] || fail "$case_name: no reverse-dependency note: $stdout"
+
+  # '_' sorts before letters in byte order; en_US.UTF-8 ignores it, which
+  # would put ab before a_z.
+  case_name="--test targets and suite modules are listed in byte order under en_US.UTF-8"
+  reset_repo
+  write crates/alpha/tests/a_z.rs
+  write crates/alpha/tests/ab.rs
+  write crates/intentd/tests/suite_e2e.rs $'//! fixture suite\nmod common;\n\nmod auggie_context_e2e;\nmod e2e_core;\nmod e2e_shared;\nmod m_z;\nmod mb;'
+  write crates/intentd/tests/m_z.rs
+  write crates/intentd/tests/mb.rs
+  commit_all "underscore names"
+  edit crates/alpha/tests/ab.rs
+  edit crates/alpha/tests/a_z.rs
+  edit crates/intentd/tests/mb.rs
+  edit crates/intentd/tests/m_z.rs
+  expect_same_under_en_us --base HEAD
+  expect_ok
+  expect_cargo "-p alpha --test a_z --test ab" "-p intentd --test suite_e2e -E (binary_id(=intentd::suite_e2e)&test(/^(m_z|mb)::/))"
 fi
 
 case_name="--print-rdeps prints intent-core's transitive dependents"
@@ -724,6 +816,42 @@ for inherited_policy in '' 0 false 1; do
   expect_ok
   expect_runner --plan "-p alpha --test one" --base origin/main --label test-changed
 done
+
+# The byte-order pin is the script's own: cargo and the runner run the tests
+# under the caller's LC_ALL, or none when the caller set none, as make test
+# and the merge queue do.
+case_name="cargo and the runner get the caller's LC_ALL"
+reset_repo
+edit crates/alpha/tests/one.rs
+LC_ALL=POSIX run_script
+expect_ok
+expect_cargo "-p alpha --test one"
+[[ "$cargo_locale_log" == POSIX ]] || fail "$case_name: cargo got LC_ALL '$cargo_locale_log'"
+clear_logs
+LC_ALL=POSIX run_script --instrumented
+expect_ok
+[[ "$cargo_locale_log" == POSIX ]] || fail "$case_name: instrumented cargo got LC_ALL '$cargo_locale_log'"
+clear_logs
+LC_ALL=POSIX NEXTEST_RUNNER="$bin_dir/runner" run_script
+expect_ok
+expect_runner --plan "-p alpha --test one" --base origin/main --label test-changed
+[[ "$runner_locale_log" == POSIX ]] || fail "$case_name: runner got LC_ALL '$runner_locale_log'"
+
+# A subshell, so this suite's own LC_ALL is untouched afterwards.
+case_name="cargo and the runner get no LC_ALL when the caller set none"
+(
+  unset LC_ALL
+  reset_repo
+  edit crates/alpha/tests/one.rs
+  run_script
+  expect_ok
+  expect_cargo "-p alpha --test one"
+  [[ "$cargo_locale_log" == "<unset>" ]] || fail "$case_name: cargo got LC_ALL '$cargo_locale_log'"
+  clear_logs
+  NEXTEST_RUNNER="$bin_dir/runner" run_script
+  expect_ok
+  [[ "$runner_locale_log" == "<unset>" ]] || fail "$case_name: runner got LC_ALL '$runner_locale_log'"
+)
 
 case_name="runner receives every plan in one invocation"
 reset_repo
@@ -963,9 +1091,10 @@ out, root = map(pathlib.Path, sys.argv[1:])
     ['workspace', 'target', 'profiles', 'temporary', 'home']}))
 PYTHON
 printf 'payload\n' > "$temp_dir/storage-input"
-COVERAGE_STORAGE_DIR="$storage_dir" RUN_STDIN="$temp_dir/storage-input" run_script --instrumented
+LC_ALL=POSIX COVERAGE_STORAGE_DIR="$storage_dir" RUN_STDIN="$temp_dir/storage-input" run_script --instrumented
 expect_ok
 expect_cov "-p alpha --test one" "-p gamma --test smoke"
+[[ "$cargo_locale_log" == $'POSIX\nPOSIX' ]] || fail "$case_name: cargo got LC_ALL '$cargo_locale_log'"
 [[ "$(cat "$temp_dir/cargo-stdin.log")" == payload ]] || fail "$case_name: caller input was changed"
 python3 - "$storage_dir/resources.jsonl" <<'PYTHON'
 import json, sys
@@ -1508,10 +1637,19 @@ gate_sample miss '# mapfile is unavailable on Bash 3'
 gate_hits=$(gate_matches "$script" "$here/with-test-policy.sh" "${BASH_SOURCE[0]}")
 [[ -z "$gate_hits" ]] || fail "Bash 4+ constructs found (stock macOS bash is 3.2):"$'\n'"$gate_hits"
 
+# Lookup order, kept in step with the monorepo's scripts/find-bash3.sh (this
+# repo stands alone, so it carries its own copy): BASH3_BIN, the `make bash3`
+# cache (BASH3_CACHE_DIR, default ${XDG_CACHE_HOME:-~/.cache}/intent-bash3), a
+# bash3 on PATH, Homebrew bash@3, then a 3.x /bin/bash.
+bash3_cache_dir() {
+  printf '%s\n' "${BASH3_CACHE_DIR:-${XDG_CACHE_HOME:-${HOME:-}/.cache}/intent-bash3}"
+}
+
 find_bash3() {
-  local candidate resolved brew_prefix
+  local candidate resolved brew_prefix cache_bash
   brew_prefix=$(brew --prefix bash@3 2>/dev/null) || brew_prefix=""
-  for candidate in "${BASH3_BIN:-}" bash3 "${brew_prefix:+$brew_prefix/bin/bash}" \
+  cache_bash="$(bash3_cache_dir)/bash"
+  for candidate in "${BASH3_BIN:-}" "$cache_bash" bash3 "${brew_prefix:+$brew_prefix/bin/bash}" \
     /opt/homebrew/opt/bash@3/bin/bash /usr/local/opt/bash@3/bin/bash /bin/bash; do
     [[ -n "$candidate" ]] || continue
     resolved=$(command -v "$candidate" 2>/dev/null) || continue
@@ -1523,10 +1661,71 @@ find_bash3() {
   return 1
 }
 
+# How to get an interpreter, for the skip notice and the REQUIRE_BASH3 failure
+# (the monorepo's bash3_missing_hint wording).
+bash3_missing_hint() {
+  printf '%s\n' "run 'make bash3' from the monorepo to build one into $(bash3_cache_dir), or point BASH3_BIN at one"
+}
+
+# No Bash 3 found: a skip notice by default; a non-empty REQUIRE_BASH3 (CI)
+# makes it a failure instead.
+report_missing_bash3() {
+  if [[ -n "${REQUIRE_BASH3:-}" ]]; then
+    fail "no Bash 3 interpreter found and REQUIRE_BASH3 is set ($(bash3_missing_hint); or unset REQUIRE_BASH3 to skip the real 3.2 run)"
+  fi
+  echo "changed-tests tests: no Bash 3 interpreter found ($(bash3_missing_hint)); real 3.2 run skipped, static gate only"
+}
+
+# The lookup finds the `make bash3` cache on its own, in the monorepo's
+# scripts/find-bash3.sh order. PATH is an empty dir so a bash3 or brew on the
+# host cannot answer instead of the stubs.
+lookup_dir="$temp_dir/bash3-lookup"
+mkdir -p "$lookup_dir/empty-path" "$lookup_dir/xdg/intent-bash3" "$lookup_dir/home/.cache/intent-bash3" \
+  "$lookup_dir/moved"
+for stub in "$lookup_dir/xdg/intent-bash3/bash" "$lookup_dir/home/.cache/intent-bash3/bash" \
+  "$lookup_dir/moved/bash" "$lookup_dir/explicit-bash"; do
+  printf '#!/bin/sh\nexit 0\n' >"$stub"
+  chmod 755 "$stub"
+done
+run_lookup() {
+  (
+    unset BASH3_BIN BASH3_CACHE_DIR XDG_CACHE_HOME
+    # shellcheck disable=SC2123 # an empty search path is the point
+    PATH="$lookup_dir/empty-path"
+    for assignment in "$@"; do export "${assignment?}"; done
+    find_bash3
+  ) || true
+}
+[[ "$(run_lookup XDG_CACHE_HOME="$lookup_dir/xdg")" == "$lookup_dir/xdg/intent-bash3/bash" ]] ||
+  fail "find_bash3 does not find the make bash3 cache under XDG_CACHE_HOME"
+[[ "$(run_lookup HOME="$lookup_dir/home")" == "$lookup_dir/home/.cache/intent-bash3/bash" ]] ||
+  fail "find_bash3 does not find the make bash3 cache under ~/.cache"
+[[ "$(run_lookup BASH3_CACHE_DIR="$lookup_dir/moved" XDG_CACHE_HOME="$lookup_dir/xdg")" == "$lookup_dir/moved/bash" ]] ||
+  fail "find_bash3 does not honor BASH3_CACHE_DIR"
+[[ "$(run_lookup BASH3_BIN="$lookup_dir/explicit-bash" XDG_CACHE_HOME="$lookup_dir/xdg")" == "$lookup_dir/explicit-bash" ]] ||
+  fail "find_bash3 does not prefer BASH3_BIN over the cache"
+# A rejected cache falls through: to nothing, or to a stock 3.x /bin/bash
+# (macOS), the only candidate an empty PATH leaves.
+printf '#!/bin/sh\nexit 1\n' >"$lookup_dir/moved/bash"
+fallthrough=$(run_lookup BASH3_CACHE_DIR="$lookup_dir/moved")
+[[ -z "$fallthrough" || "$fallthrough" == /bin/bash ]] ||
+  fail "find_bash3 does not fall through past a cached binary that is not Bash 3: got $fallthrough"
+# Without an interpreter, the notice names `make bash3` and REQUIRE_BASH3 turns
+# the skip into a failure.
+missing=$(BASH3_CACHE_DIR="$lookup_dir/none" REQUIRE_BASH3='' report_missing_bash3) ||
+  fail "the Bash 3 skip notice exits non-zero without REQUIRE_BASH3"
+[[ "$missing" == *"run 'make bash3'"*"$lookup_dir/none"*"real 3.2 run skipped"* ]] ||
+  fail "the Bash 3 skip notice does not name make bash3 and the cache: $missing"
+if missing=$( (BASH3_CACHE_DIR="$lookup_dir/none" REQUIRE_BASH3=1 report_missing_bash3) 2>&1); then
+  fail "REQUIRE_BASH3=1 does not fail when no Bash 3 is found"
+fi
+[[ "$missing" == *"REQUIRE_BASH3 is set"*"run 'make bash3'"* ]] ||
+  fail "the REQUIRE_BASH3 failure does not name make bash3: $missing"
+
 if [[ "${BASH_VERSINFO[0]}" -eq 3 ]]; then
   : # the fixtures above already ran under Bash 3
 elif bash3=$(find_bash3); then
   CHANGED_TESTS_TEST_BASH="$bash3" "$bash3" "${BASH_SOURCE[0]}"
 else
-  echo "changed-tests tests: no Bash 3 interpreter found (set BASH3_BIN); real 3.2 run skipped, static gate only"
+  report_missing_bash3
 fi

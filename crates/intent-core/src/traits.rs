@@ -5467,7 +5467,36 @@ pub trait WorkspaceApi: Send + Sync {
         let _ = (workspace_id, conversation_id, message_id, reaction, active);
         Box::pin(async { Err(Error::Internal("discussion.react not implemented".into())) })
     }
-    /// Bounded participant-only discovery.
+    /// Rename a workspace-wide discussion as its owner or manager.
+    fn discussion_rename(
+        &self,
+        workspace_id: WorkspaceId,
+        conversation_id: String,
+        name: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, conversation_id, name);
+        Box::pin(async {
+            Err(Error::Internal(
+                "discussion management not implemented".into(),
+            ))
+        })
+    }
+
+    /// Delete a workspace-wide discussion as its owner.
+    fn discussion_delete(
+        &self,
+        workspace_id: WorkspaceId,
+        conversation_id: String,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        let _ = (workspace_id, conversation_id);
+        Box::pin(async {
+            Err(Error::Internal(
+                "discussion management not implemented".into(),
+            ))
+        })
+    }
+
+    /// Bounded discovery, with legacy private history filtered by original participation.
     fn discussion_conversations(
         &self,
         workspace_id: WorkspaceId,
@@ -9085,8 +9114,9 @@ pub trait ContextEngine: Send + Sync {
 ///   [`ReverseDispatchError::ClientOffline`] (with `pinned` set for `Pinned`).
 ///   `Client` is what tab-host routing uses, `Pinned` what the per-workspace
 ///   browser-client pin uses — same lookup, distinct error wording.
-/// - [`Default`](Self::Default): the **first-connected** eligible connection;
-///   none ⇒ [`ReverseDispatchError::NoClient`].
+/// - [`Default`](Self::Default): the **first-connected** eligible client,
+///   via its **newest** eligible connection (the same per-client rule as
+///   `Client` / `Pinned`); none ⇒ [`ReverseDispatchError::NoClient`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReverseTarget {
     /// A specific logical client (e.g. the host of a browser tab).

@@ -3860,10 +3860,124 @@ pub fn lift_from_principal_id(metadata: Option<&serde_json::Value>) -> Option<Pr
 /// (migration 0096).
 pub const CURRENT_HARNESS_VERSION: &str = "3.3";
 
+/// Harness versions that receive repository guidance, oldest first. The single
+/// source for every admission gate and boundary test: bumping
+/// [`CURRENT_HARNESS_VERSION`] means appending the new version here (and to
+/// [`REPOSITORY_MONITOR_GUIDANCE_HARNESS_VERSIONS`]), and the compile-time
+/// check below fails the build until that is done. Exact strings only, so
+/// malformed or unknown stamps are never admitted.
+pub const REPOSITORY_GUIDANCE_HARNESS_VERSIONS: &[&str] = &["3.0", "3.1", "3.2", "3.3"];
+
+/// Harness versions that receive monitor-style repository guidance and the
+/// repository-callback prompt envelope, oldest first. Always the newest part
+/// of [`REPOSITORY_GUIDANCE_HARNESS_VERSIONS`] (checked at compile time).
+pub const REPOSITORY_MONITOR_GUIDANCE_HARNESS_VERSIONS: &[&str] = &["3.2", "3.3"];
+
+const fn const_str_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+const fn ends_with_current(versions: &[&str]) -> bool {
+    !versions.is_empty() && const_str_eq(versions[versions.len() - 1], CURRENT_HARNESS_VERSION)
+}
+
+const fn is_suffix_of(suffix: &[&str], list: &[&str]) -> bool {
+    if suffix.len() > list.len() {
+        return false;
+    }
+    let offset = list.len() - suffix.len();
+    let mut i = 0;
+    while i < suffix.len() {
+        if !const_str_eq(suffix[i], list[offset + i]) {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+const fn is_major_minor(version: &str) -> bool {
+    let bytes = version.as_bytes();
+    let (mut i, mut dots, mut digits_in_part) = (0, 0, 0);
+    while i < bytes.len() {
+        match bytes[i] {
+            b'0'..=b'9' => digits_in_part += 1,
+            b'.' if digits_in_part > 0 => {
+                dots += 1;
+                digits_in_part = 0;
+            }
+            _ => return false,
+        }
+        i += 1;
+    }
+    dots == 1 && digits_in_part > 0
+}
+
+const _: () = {
+    assert!(
+        is_major_minor(CURRENT_HARNESS_VERSION),
+        "CURRENT_HARNESS_VERSION must be MAJOR.MINOR (e.g. \"3.3\")"
+    );
+    assert!(
+        ends_with_current(REPOSITORY_GUIDANCE_HARNESS_VERSIONS),
+        "CURRENT_HARNESS_VERSION changed: append it to REPOSITORY_GUIDANCE_HARNESS_VERSIONS"
+    );
+    assert!(
+        ends_with_current(REPOSITORY_MONITOR_GUIDANCE_HARNESS_VERSIONS),
+        "CURRENT_HARNESS_VERSION changed: append it to REPOSITORY_MONITOR_GUIDANCE_HARNESS_VERSIONS"
+    );
+    assert!(
+        is_suffix_of(
+            REPOSITORY_MONITOR_GUIDANCE_HARNESS_VERSIONS,
+            REPOSITORY_GUIDANCE_HARNESS_VERSIONS
+        ),
+        "REPOSITORY_MONITOR_GUIDANCE_HARNESS_VERSIONS must be the newest part of REPOSITORY_GUIDANCE_HARNESS_VERSIONS"
+    );
+};
+
 /// Explicit admission preserves repository guidance without admitting unknown versions.
 #[must_use]
 pub fn harness_supports_repository_guidance(version: &str) -> bool {
-    matches!(version, "3.0" | "3.1" | "3.2" | "3.3")
+    REPOSITORY_GUIDANCE_HARNESS_VERSIONS.contains(&version)
+}
+
+/// Whether a session stamped with `version` gets monitor-style repository
+/// guidance and the repository-callback prompt envelope. Exact match against
+/// [`REPOSITORY_MONITOR_GUIDANCE_HARNESS_VERSIONS`].
+#[must_use]
+pub fn harness_uses_repository_monitor_guidance(version: &str) -> bool {
+    REPOSITORY_MONITOR_GUIDANCE_HARNESS_VERSIONS.contains(&version)
+}
+
+/// Test support: the next minor and next major harness version after
+/// [`CURRENT_HARNESS_VERSION`] (for "3.3": `["3.4", "4.0"]`). Boundary tests
+/// use these as "not yet admitted" stamps instead of hard-coding a version
+/// that a bump would silently admit.
+#[doc(hidden)]
+#[must_use]
+pub fn harness_versions_after_current() -> [String; 2] {
+    harness_versions_after(CURRENT_HARNESS_VERSION)
+        .expect("CURRENT_HARNESS_VERSION is MAJOR.MINOR (checked at compile time)")
+}
+
+fn harness_versions_after(version: &str) -> Option<[String; 2]> {
+    let (major, minor) = version.split_once('.')?;
+    let (major, minor): (u32, u32) = (major.parse().ok()?, minor.parse().ok()?);
+    Some([
+        format!("{major}.{}", minor.checked_add(1)?),
+        format!("{}.0", major.checked_add(1)?),
+    ])
 }
 
 /// Serde default for [`AgentSession::harness_version`]: payloads persisted or
@@ -8900,6 +9014,115 @@ mod tests {
             assert!(v["metadata"].get(CHIEF_PROMPT_VERSION_KEY).is_none());
         }
         assert!(legacy["metadata"].get(CHIEF_PROMPT_VERSION_KEY).is_none());
+    }
+
+    #[test]
+    fn harness_guidance_version_sets_admit_exact_listed_versions() {
+        for version in REPOSITORY_GUIDANCE_HARNESS_VERSIONS {
+            assert!(harness_supports_repository_guidance(version), "{version}");
+        }
+        for version in REPOSITORY_MONITOR_GUIDANCE_HARNESS_VERSIONS {
+            assert!(
+                harness_uses_repository_monitor_guidance(version),
+                "{version}"
+            );
+            assert!(REPOSITORY_GUIDANCE_HARNESS_VERSIONS.contains(version));
+        }
+        assert!(harness_supports_repository_guidance(
+            CURRENT_HARNESS_VERSION
+        ));
+        assert!(harness_uses_repository_monitor_guidance(
+            CURRENT_HARNESS_VERSION
+        ));
+        let first_monitor = REPOSITORY_MONITOR_GUIDANCE_HARNESS_VERSIONS[0];
+        for version in REPOSITORY_GUIDANCE_HARNESS_VERSIONS
+            .iter()
+            .take_while(|v| **v != first_monitor)
+        {
+            assert!(
+                !harness_uses_repository_monitor_guidance(version),
+                "{version}"
+            );
+        }
+    }
+
+    #[test]
+    fn harness_guidance_version_sets_reject_unknown_and_malformed_stamps() {
+        let after = harness_versions_after_current();
+        let malformed = [
+            "", "1.0", "2.9", "2.10", "3", "3.0.0", " 3.0", "3.0 ", "v3.0", "03.0", "unknown",
+        ];
+        for version in after.iter().map(String::as_str).chain(malformed) {
+            assert!(
+                !harness_supports_repository_guidance(version),
+                "{version:?}"
+            );
+            assert!(
+                !harness_uses_repository_monitor_guidance(version),
+                "{version:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn harness_versions_after_are_next_minor_and_major() {
+        let after = |v: &str| harness_versions_after(v).map(|[a, b]| (a, b));
+        assert_eq!(after("3.3"), Some(("3.4".into(), "4.0".into())));
+        assert_eq!(after("3.9"), Some(("3.10".into(), "4.0".into())));
+        assert_eq!(after("12.0"), Some(("12.1".into(), "13.0".into())));
+        for malformed in ["", "3", "3.", ".3", "3.3.1", "v3.3", "3.x"] {
+            assert_eq!(after(malformed), None, "{malformed:?}");
+        }
+        assert_eq!(
+            harness_versions_after_current(),
+            harness_versions_after(CURRENT_HARNESS_VERSION).unwrap()
+        );
+        for version in harness_versions_after_current() {
+            assert!(!REPOSITORY_GUIDANCE_HARNESS_VERSIONS.contains(&version.as_str()));
+        }
+    }
+
+    /// Versions that already shipped with guidance keep it for life: sessions
+    /// stamped with them persist. These literals are history, not the
+    /// current version, so a bump only appends to the lists and never
+    /// edits this test; dropping an entry fails it.
+    #[test]
+    fn harness_guidance_never_drops_shipped_versions() {
+        for version in ["3.0", "3.1", "3.2", "3.3"] {
+            assert!(harness_supports_repository_guidance(version), "{version}");
+        }
+        for version in ["3.2", "3.3"] {
+            assert!(
+                harness_uses_repository_monitor_guidance(version),
+                "{version}"
+            );
+        }
+        for version in ["3.0", "3.1"] {
+            assert!(
+                !harness_uses_repository_monitor_guidance(version),
+                "{version}"
+            );
+        }
+    }
+
+    #[test]
+    fn harness_version_set_const_helpers_compare_exactly() {
+        assert!(const_str_eq("3.3", "3.3"));
+        assert!(!const_str_eq("3.3", "3.30"));
+        assert!(!const_str_eq("3.3", "3.4"));
+        assert!(ends_with_current(&["2.9", CURRENT_HARNESS_VERSION]));
+        assert!(!ends_with_current(&[]));
+        assert!(!ends_with_current(&[CURRENT_HARNESS_VERSION, "9.9"]));
+        assert!(is_suffix_of(&["b", "c"], &["a", "b", "c"]));
+        assert!(is_suffix_of(&[], &["a"]));
+        assert!(!is_suffix_of(&["a", "b"], &["a", "b", "c"]));
+        assert!(!is_suffix_of(&["a", "b", "c", "d"], &["b", "c", "d"][..]));
+        for valid in ["3.3", "10.0", "3.10"] {
+            assert!(is_major_minor(valid), "{valid}");
+        }
+        for invalid in ["", "3", "3.", ".3", "3.3.1", "v3.3", "3.x", " 3.3"] {
+            assert!(!is_major_minor(invalid), "{invalid:?}");
+        }
     }
 
     #[test]

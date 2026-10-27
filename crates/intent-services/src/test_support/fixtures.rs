@@ -144,3 +144,55 @@ pub fn legacy_metadata_values() -> Vec<Option<serde_json::Value>> {
         ),
     ]
 }
+
+/// A settings registry (backed by a config file next to the temp db, swept
+/// with [`TempDb`]'s dir) seeding `model.defaultProvider = "auggie"`: since
+/// monorepo#3044 there is no positional provider fallback, so tests that
+/// create/delegate agents without an explicit provider or model need a
+/// configured default to resolve to. The `providers.paths` override points
+/// auggie at a deterministic executable so availability checks
+/// (`agent.delegate`) pass without the real binary on the test host
+/// (monorepo#3162).
+#[must_use]
+pub fn test_registry_with_default_provider(
+    tmp: &TempDb,
+) -> std::sync::Arc<crate::SettingsRegistry> {
+    let cfg = PathBuf::from(format!("{}.config.toml", tmp.path.display()));
+    let registry = std::sync::Arc::new(crate::SettingsRegistry::load(cfg).expect("load registry"));
+    registry
+        .apply(&[
+            (
+                "model.defaultProvider".to_string(),
+                serde_json::json!("auggie"),
+            ),
+            (
+                "providers.paths".to_string(),
+                serde_json::json!({ "auggie": "/bin/sh" }),
+            ),
+        ])
+        .expect("seed default provider");
+    registry
+}
+
+/// Drop-cleanup wrapper around a per-test workspaces root, paired with the
+/// intent-services hermetic-tests guard (see `default_workspaces_root`). Every
+/// test that constructs a `Services` reachable from workspace provisioning
+/// **must** attach one via `.with_workspaces_root(root.path().to_path_buf())`;
+/// otherwise the guard panics rather than writing under `~/intent/workspaces`.
+pub struct WorkspacesRoot(tempfile::TempDir);
+
+impl WorkspacesRoot {
+    #[expect(
+        clippy::must_use_candidate,
+        clippy::new_without_default,
+        reason = "test fixture for feature-crate tests, not a public library API"
+    )]
+    pub fn new() -> Self {
+        Self(test_tempdir("intentd-wss-"))
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &std::path::Path {
+        self.0.path()
+    }
+}

@@ -171,7 +171,11 @@ impl Services {
 
     /// Member+ gate for a workspace-scoped read / steer / edit. A
     /// collaborator who is not a member gets `NotFound`.
-    pub(crate) async fn require_member(&self, workspace_id: &WorkspaceId) -> Result<()> {
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub async fn require_member(&self, workspace_id: &WorkspaceId) -> Result<()> {
         if let Some(principal_id) = gated_collaborator_caller("member")? {
             match self.store.get_host_role(&principal_id).await {
                 Ok(HostRole::Owner) => return Ok(()),
@@ -249,7 +253,11 @@ impl Services {
     /// Scoped authority for agent creation and operating saved scripts. Never
     /// use for terminal access, arbitrary execution, sharing or workspace CRUD.
     /// Returns whether this is a restricted Manager guest (for field checks).
-    pub(crate) async fn require_workspace_operator(
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub async fn require_workspace_operator(
         &self,
         workspace_id: &WorkspaceId,
         what: &str,
@@ -276,7 +284,11 @@ impl Services {
         Ok(false)
     }
 
-    pub(crate) async fn require_saved_script_operator(
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub async fn require_saved_script_operator(
         &self,
         workspace_id: &WorkspaceId,
         script_id: &str,
@@ -361,7 +373,11 @@ impl Services {
     /// Member+ gate keyed by agent: resolves the agent's workspace (one point
     /// read, collaborator callers only) and requires membership there. An
     /// unknown agent is `NotFound` either way.
-    pub(crate) async fn require_agent_member(&self, agent_id: &AgentId) -> Result<()> {
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub async fn require_agent_member(&self, agent_id: &AgentId) -> Result<()> {
         if gated_collaborator_caller("member")?.is_none() {
             return Ok(());
         }
@@ -404,11 +420,11 @@ impl Services {
 
     /// PTY ids are host-global. Resolve their workspace before admitting a
     /// member; an ACP session-scoped PTY is not a workspace terminal.
-    pub(crate) async fn require_terminal_manager(
-        &self,
-        terminal_id: &str,
-        what: &str,
-    ) -> Result<()> {
+    #[expect(
+        clippy::missing_errors_doc,
+        reason = "internal doc-hidden feature API, not a public library API"
+    )]
+    pub async fn require_terminal_manager(&self, terminal_id: &str, what: &str) -> Result<()> {
         if gated_collaborator_caller(what)?.is_none() {
             return Ok(());
         }
@@ -871,28 +887,15 @@ impl Services {
 }
 
 #[cfg(test)]
-mod guest_role_tests;
-#[cfg(test)]
 mod sharing_tests;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    pub(super) use crate::test_support::capability_fixtures::{fixture, Role};
     use crate::tests::{workspace, TempDb};
-    use intent_core::{now_iso, with_caller, Principal, WorkspaceApi};
+    use intent_core::{with_caller, WorkspaceApi};
     use intent_store::Store;
-    use std::future::Future;
-
-    /// The caller roles of the matrix, one column each.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub(super) enum Role {
-        Administrator,
-        Owner,
-        Collaborator,
-        NonMember,
-        Agent,
-        Daemon,
-    }
 
     const ROLES: [Role; 6] = [
         Role::Administrator,
@@ -902,105 +905,6 @@ mod tests {
         Role::Agent,
         Role::Daemon,
     ];
-
-    /// One workspace with a non-administrator **owner** (the primary is
-    /// demoted so the one-owner index admits the promotion), a collaborator
-    /// member, and a principal with no membership.
-    pub(super) struct Fixture {
-        pub(super) services: Services,
-        pub(super) ws: WorkspaceId,
-        pub(super) other_ws: WorkspaceId,
-        pub(super) primary: PrincipalId,
-        pub(super) owner: PrincipalId,
-        pub(super) collaborator: PrincipalId,
-        pub(super) outsider: PrincipalId,
-    }
-
-    fn principal(login: &str) -> Principal {
-        Principal {
-            id: PrincipalId::new(),
-            identity: None,
-            github_user_id: None,
-            login: Some(login.to_string()),
-            display_name: Some(format!("{login} name")),
-            avatar_url: None,
-            is_primary: false,
-            created_at: now_iso(),
-            updated_at: now_iso(),
-        }
-    }
-
-    pub(super) async fn fixture(tmp: &TempDb) -> Fixture {
-        let store = Store::open(&tmp.path).await.expect("open store");
-        let ws = WorkspaceId::new();
-        store.insert_workspace(&workspace(&ws)).await.expect("ws");
-        let other_ws = WorkspaceId::new();
-        store
-            .insert_workspace(&workspace(&other_ws))
-            .await
-            .expect("other ws");
-        let primary = store.get_primary_principal().await.expect("primary").id;
-        let (owner, collaborator, outsider) = (
-            principal("owner"),
-            principal("collab"),
-            principal("outsider"),
-        );
-        for p in [&owner, &collaborator, &outsider] {
-            store.upsert_principal(p).await.expect("principal");
-        }
-        store
-            .set_workspace_member_role(&ws, &primary, WorkspaceRole::Collaborator)
-            .await
-            .expect("demote primary");
-        store
-            .add_workspace_member(&ws, &owner.id, WorkspaceRole::Owner)
-            .await
-            .expect("owner");
-        store
-            .add_workspace_member(&ws, &collaborator.id, WorkspaceRole::Collaborator)
-            .await
-            .expect("collaborator");
-        let workspaces_root = tmp.path.parent().expect("temp db dir").join("workspaces");
-        Fixture {
-            services: Services::new(store).with_workspaces_root(workspaces_root),
-            ws,
-            other_ws,
-            primary,
-            owner: owner.id,
-            collaborator: collaborator.id,
-            outsider: outsider.id,
-        }
-    }
-
-    impl Fixture {
-        fn caller(&self, role: Role) -> Caller {
-            let wire = |principal_id: &PrincipalId, is_administrator| Caller::Wire {
-                principal_id: principal_id.clone(),
-                host_role: if is_administrator {
-                    intent_core::HostRole::Owner
-                } else {
-                    intent_core::HostRole::Guest
-                },
-            };
-            match role {
-                Role::Administrator => wire(&self.primary, true),
-                Role::Owner => wire(&self.owner, false),
-                Role::Collaborator => wire(&self.collaborator, false),
-                Role::NonMember => wire(&self.outsider, false),
-                Role::Agent => Caller::Agent {
-                    agent_id: AgentId::new(),
-                },
-                Role::Daemon => Caller::Daemon,
-            }
-        }
-
-        pub(super) async fn run<T, F>(&self, role: Role, f: F) -> Result<T>
-        where
-            F: Future<Output = Result<T>>,
-        {
-            with_caller(self.caller(role), f).await
-        }
-    }
 
     /// Collapse a guarded call's outcome to the matrix cell it should land
     /// on: `ok`, `forbidden` (`-32003`) or `not-found` (membership hidden).

@@ -33,6 +33,7 @@ mod diffs_repo;
 mod discussion_activity_repo;
 mod discussion_agent_repo;
 mod discussion_conversation_repo;
+mod discussion_management_repo;
 mod discussion_reaction_repo;
 mod discussion_repo;
 mod draft_repo;

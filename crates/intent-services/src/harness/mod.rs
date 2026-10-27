@@ -34,9 +34,9 @@
 //! Each version also owns a [`Doctrine`] — its bundled instruction/specialist
 //! markdown set under `resources/agent-instructions/<ver>/` and
 //! `resources/specialists/<ver>/` — and the [`REGISTRY`] maps the stamped
-//! session `harnessVersion` (`"1.0"` through `"3.3"`) to the pair, so a session
-//! keeps assembling the exact doctrine
-//! it was created with even after the binary ships a newer set. All past
+//! session `harnessVersion` (`"1.0"` through `CURRENT_HARNESS_VERSION`) to
+//! the pair, so a session keeps assembling the exact doctrine it was created
+//! with even after the binary ships a newer set. All past
 //! versions stay bundled.
 
 pub(crate) mod review_wake;
@@ -575,6 +575,105 @@ pub(crate) fn latest() -> &'static dyn Harness {
     latest_entry().harness
 }
 
+/// The hook wake and notice framing of the latest harness, for the runtime
+/// feature crate. It forwards to [`Harness`] without making the trait (and
+/// the agent-side types its other methods name) public; each method is
+/// documented on the trait method of the same name.
+#[derive(Clone, Copy)]
+pub struct HookFraming(&'static dyn Harness);
+
+/// The hook framing of [`latest`].
+#[must_use]
+pub fn latest_hook_framing() -> HookFraming {
+    HookFraming(latest())
+}
+
+impl HookFraming {
+    #[must_use]
+    pub fn hook_wake_logs_section(&self, message: &str, logs: Option<&str>) -> String {
+        self.0.hook_wake_logs_section(message, logs)
+    }
+
+    #[must_use]
+    pub fn hook_state_dropped_warning(&self, state_bytes: usize, cap_bytes: usize) -> String {
+        self.0.hook_state_dropped_warning(state_bytes, cap_bytes)
+    }
+
+    #[must_use]
+    pub fn hook_wake_message_truncated_marker(
+        &self,
+        omitted_chars: usize,
+        total_chars: usize,
+        cap_chars: usize,
+    ) -> String {
+        self.0
+            .hook_wake_message_truncated_marker(omitted_chars, total_chars, cap_chars)
+    }
+
+    #[must_use]
+    pub fn hook_exec_failures_warning(&self, lines: &[&str], total: usize) -> String {
+        self.0.hook_exec_failures_warning(lines, total)
+    }
+
+    #[must_use]
+    pub fn hook_wake_framing(
+        &self,
+        hook_name: &str,
+        message: &str,
+        state_note: Option<&str>,
+    ) -> String {
+        self.0.hook_wake_framing(hook_name, message, state_note)
+    }
+
+    #[must_use]
+    pub fn hook_dispatch_active_note(&self, expires_at: Option<&str>) -> String {
+        self.0.hook_dispatch_active_note(expires_at)
+    }
+
+    #[must_use]
+    pub fn hook_dispatch_retired_note(&self, hook_id: &str) -> String {
+        self.0.hook_dispatch_retired_note(hook_id)
+    }
+
+    #[must_use]
+    pub fn hook_evicted_state_note(&self, hook_id: &str) -> String {
+        self.0.hook_evicted_state_note(hook_id)
+    }
+
+    #[must_use]
+    pub fn hook_evicted_failed_run_notice(&self, hook_name: &str, error: &str) -> String {
+        self.0.hook_evicted_failed_run_notice(hook_name, error)
+    }
+
+    #[must_use]
+    pub fn hook_evicted_internal_error_notice(&self, hook_name: &str, error: &str) -> String {
+        self.0.hook_evicted_internal_error_notice(hook_name, error)
+    }
+
+    #[must_use]
+    pub fn hook_expired_notice(
+        &self,
+        hook_name: &str,
+        hook_id: &str,
+        perpetual: bool,
+        run_count: i64,
+        dispatch_count: i64,
+    ) -> String {
+        self.0
+            .hook_expired_notice(hook_name, hook_id, perpetual, run_count, dispatch_count)
+    }
+
+    #[must_use]
+    pub fn hook_run_at_fired_notice(&self, hook_name: &str, hook_id: &str, run_at: &str) -> String {
+        self.0.hook_run_at_fired_notice(hook_name, hook_id, run_at)
+    }
+
+    #[must_use]
+    pub fn hook_cancelled_from_app_notice(&self) -> String {
+        self.0.hook_cancelled_from_app_notice()
+    }
+}
+
 /// Resolve a session's stamped `harnessVersion` to its registry row. Unknown
 /// versions fall back to the latest with a WARN (never fail a turn over a
 /// stale or corrupt stamp).
@@ -613,7 +712,11 @@ mod tests {
     fn registry_resolves_stamped_current_version() {
         let entry = resolve_entry(intent_core::CURRENT_HARNESS_VERSION);
         assert_eq!(entry.version, intent_core::CURRENT_HARNESS_VERSION);
-        assert_eq!(entry.version, "3.3");
+        assert_eq!(
+            REGISTRY[REGISTRY.len() - 1].version,
+            intent_core::CURRENT_HARNESS_VERSION,
+            "the current version is the newest registry row"
+        );
         let repository_guidance = resolve_entry("3.0");
         let previous = resolve_entry("2.10");
         assert_eq!(previous.version, "2.10");
@@ -640,7 +743,8 @@ mod tests {
 
     /// 3.3 changes only the unknown/default-agent composition flag; text
     /// surfaces, specialists, feature defaults and every instruction body stay
-    /// those of 3.2 (intent-hq/intent#5835).
+    /// those of 3.2 (intent-hq/intent#5835). Pinned to 3.3 on purpose: it
+    /// describes that release, not whichever version is current.
     #[test]
     fn registry_v3_3_only_flips_single_workspace_fallback() {
         let current = resolve_entry("3.3");
@@ -663,7 +767,11 @@ mod tests {
         assert_eq!(a.common, b.common);
         assert_eq!(a.workspace, b.workspace);
         assert_eq!(a.workspace_agent, b.workspace_agent);
-        for entry in REGISTRY.iter().filter(|e| e.version != "3.3") {
+        let introduced = REGISTRY
+            .iter()
+            .position(|e| e.version == "3.3")
+            .expect("3.3 registry row");
+        for entry in &REGISTRY[..introduced] {
             assert!(
                 !entry.doctrine.instructions.single_workspace_fallback,
                 "{} must keep its creation-time composition",
@@ -758,6 +866,19 @@ mod tests {
             assert!(!entry.doctrine.instructions.common.is_empty());
             assert!(!entry.feature_labels.is_empty());
             let _ = (entry.default_features)();
+        }
+    }
+
+    /// Every version intent-core admits to repository guidance has its own
+    /// registry row, so an admitted session never runs on the unknown-version
+    /// fallback doctrine.
+    #[test]
+    fn guidance_admitted_versions_have_exact_registry_rows() {
+        for version in intent_core::REPOSITORY_GUIDANCE_HARNESS_VERSIONS {
+            assert!(
+                REGISTRY.iter().any(|e| e.version == *version),
+                "no harness registry row for admitted version {version}"
+            );
         }
     }
 

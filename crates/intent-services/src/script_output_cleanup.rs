@@ -6,17 +6,29 @@ use std::time::Duration;
 
 use intent_core::WorkspaceId;
 
+use crate::runtime::RuntimeStateExt;
 use crate::script_output_store::SweepReport;
 use crate::{Error, Services};
 
 /// Time between expiry sweeps. Retention is configured in hours.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(3600);
 
-impl Services {
+/// Script output retention sweeps, on [`Services`].
+pub(crate) trait ScriptOutputCleanupExt {
+    fn script_output_retention(&self) -> Duration;
+    async fn sweep_expired_script_output(&self) -> SweepReport;
+    async fn sweep_script_output_older_than(&self, max_age: Duration) -> SweepReport;
+    async fn sweep_orphaned_script_output(&self) -> usize;
+    async fn delete_workspace_script_output(&self, ws: &WorkspaceId) -> bool;
+    #[must_use]
+    fn spawn_script_output_sweep_loop(&self) -> tokio::task::JoinHandle<()>;
+}
+
+impl ScriptOutputCleanupExt for Services {
     /// The live `scripts.outputRetentionHours` window; zero disables the
     /// expiry sweep.
     fn script_output_retention(&self) -> Duration {
-        let hours = self.settings_registry.as_ref().map_or(
+        let hours = self.feature_settings_registry().map_or(
             intent_core::config::DEFAULT_SCRIPT_OUTPUT_RETENTION_HOURS,
             |r| intent_core::config::script_output_retention_hours(&r.snapshot().effective),
         );
@@ -24,7 +36,7 @@ impl Services {
     }
 
     /// Delete script run logs older than the live retention window.
-    pub(crate) async fn sweep_expired_script_output(&self) -> SweepReport {
+    async fn sweep_expired_script_output(&self) -> SweepReport {
         self.sweep_script_output_older_than(self.script_output_retention())
             .await
     }
@@ -33,7 +45,7 @@ impl Services {
     /// the current run of a script that is still running (a service
     /// auto-restart keeps appending to that run's log). Zero deletes no logs;
     /// stale compaction temp files are deleted either way.
-    pub(crate) async fn sweep_script_output_older_than(&self, max_age: Duration) -> SweepReport {
+    async fn sweep_script_output_older_than(&self, max_age: Duration) -> SweepReport {
         let store = self.script_output_store();
         let mgr = self.script_manager();
         tokio::task::spawn_blocking(move || {
@@ -51,7 +63,7 @@ impl Services {
     /// Delete the output folders of workspaces that no longer exist.
     /// Returns how many folders were deleted. A lookup error keeps the
     /// folder (it is retried on the next startup).
-    pub(crate) async fn sweep_orphaned_script_output(&self) -> usize {
+    async fn sweep_orphaned_script_output(&self) -> usize {
         let store = self.script_output_store();
         let ids = match tokio::task::spawn_blocking(move || store.workspace_ids()).await {
             Ok(ids) => ids,
@@ -66,7 +78,7 @@ impl Services {
             if ws.is_chief() {
                 continue;
             }
-            match self.store.get_workspace(&ws).await {
+            match self.store().get_workspace(&ws).await {
                 Err(Error::NotFound(_)) => {
                     if self.delete_workspace_script_output(&ws).await {
                         removed += 1;
@@ -83,7 +95,7 @@ impl Services {
 
     /// Delete every on-disk log of one workspace. Best-effort: returns
     /// whether the folder is gone, logging any failure.
-    pub(crate) async fn delete_workspace_script_output(&self, ws: &WorkspaceId) -> bool {
+    async fn delete_workspace_script_output(&self, ws: &WorkspaceId) -> bool {
         let store = self.script_output_store();
         let id = ws.as_str().to_owned();
         match tokio::task::spawn_blocking(move || store.delete_workspace(&id)).await {
@@ -103,8 +115,7 @@ impl Services {
     /// workspaces that no longer exist, then sweeps expired logs right away
     /// and every hour after. Stops when the settings task group closes; the
     /// composition root also aborts it on shutdown.
-    #[must_use]
-    pub fn spawn_script_output_sweep_loop(&self) -> tokio::task::JoinHandle<()> {
+    fn spawn_script_output_sweep_loop(&self) -> tokio::task::JoinHandle<()> {
         let services = self.clone();
         intent_core::spawn_daemon(async move {
             let orphans = services.sweep_orphaned_script_output().await;
@@ -127,7 +138,7 @@ impl Services {
                 }
                 tokio::select! {
                     biased;
-                    () = services.settings_tasks.closed() => break,
+                    () = services.feature_settings_tasks().closed() => break,
                     () = tokio::time::sleep(SWEEP_INTERVAL) => {}
                 }
             }

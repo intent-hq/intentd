@@ -1331,7 +1331,7 @@ impl crate::Services {
     /// bound instance only). What `invite.prove` and the pin lookup send so
     /// an instance that restricts anonymous reads still answers the host
     /// that is connected to it. Read under the [`GitlabCredentialGate`].
-    pub(crate) async fn own_gitlab_token(&self, host: &GitlabHost) -> Option<String> {
+    pub async fn own_gitlab_token(&self, host: &GitlabHost) -> Option<String> {
         let gate = self.gitlab_credential_gate.lock().await;
         if !self.gitlab_host_is_bound(host) {
             return None;

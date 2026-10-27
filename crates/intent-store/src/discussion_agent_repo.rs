@@ -1,6 +1,6 @@
 //! Local addressing grants and transactional delivery into the ordinary queue.
 use crate::{AgentQueueRow, Store};
-use intent_core::discussion::{DiscussionMessage, DEFAULT_CONVERSATION};
+use intent_core::discussion::DiscussionMessage;
 use intent_core::{AgentId, Error, Result, WorkspaceId};
 use sqlx::{Row, SqliteConnection};
 
@@ -23,8 +23,10 @@ pub(super) async fn agent_access_in(
     conversation: &str,
     agent: &AgentId,
 ) -> Result<bool> {
-    if conversation != DEFAULT_CONVERSATION {
-        return Ok(false);
+    match super::discussion_conversation_repo::read_conversation(conn, ws, conversation).await {
+        Ok(c) if c.kind == "workspace" => {}
+        Ok(_) | Err(Error::NotFound(_)) => return Ok(false),
+        Err(error) => return Err(error),
     }
     sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM discussion_agent_grant g JOIN agent_session a ON a.id=g.agent_id AND a.workspace_id=g.workspace_id WHERE g.workspace_id=? AND g.conversation_id=? AND g.agent_id=? AND a.retired_at IS NULL AND a.status<>'deleted')")
         .bind(ws.as_str()).bind(conversation).bind(agent.as_str()).fetch_one(conn).await.map_err(|e| db(&e))
@@ -40,6 +42,26 @@ pub struct DiscussionDelivery {
 }
 
 impl Store {
+    /// Bounded discovery of workspace conversations explicitly granted to this agent.
+    /// # Errors
+    /// Returns database or conversation decoding errors.
+    pub async fn discussion_agent_conversations(
+        &self,
+        ws: &WorkspaceId,
+        agent: &AgentId,
+        before: Option<&str>,
+        limit: u32,
+    ) -> Result<serde_json::Value> {
+        let ids: Vec<String> = sqlx::query_scalar("SELECT g.conversation_id FROM discussion_agent_grant g JOIN agent_session a ON a.id=g.agent_id AND a.workspace_id=g.workspace_id WHERE g.workspace_id=? AND g.agent_id=? AND a.retired_at IS NULL AND a.status<>'deleted' AND g.conversation_id<? ORDER BY g.conversation_id DESC LIMIT ?")
+            .bind(ws.as_str()).bind(agent.as_str()).bind(before.unwrap_or("~")).bind(i64::from(limit)+1).fetch_all(self.read_pool()).await.map_err(|e|db(&e))?;
+        let has_more = ids.len() > limit as usize;
+        let mut conversations = vec![];
+        for id in ids.into_iter().take(limit as usize) {
+            conversations.push(self.discussion_conversation(ws, &id).await?);
+        }
+        Ok(serde_json::json!({"conversations":conversations,"hasMore":has_more}))
+    }
+
     /// Check the current agent and local explicit-address grant.
     /// # Errors
     /// Returns database errors.
@@ -103,14 +125,15 @@ impl Store {
             return Ok(false);
         };
         let active: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM discussion_agent_activity WHERE turn_id=? AND state='queued')").bind(&row.turn_id).fetch_one(&mut *tx).await.map_err(|e| db(&e))?;
+        let conversation: String = sqlx::query_scalar(
+            "SELECT conversation_id FROM workspace_discussion_message WHERE id=?",
+        )
+        .bind(message)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| db(&e))?;
         let eligible = active
-            && agent_access_in(
-                &mut tx,
-                &WorkspaceId(ws),
-                DEFAULT_CONVERSATION,
-                &row.agent_id,
-            )
-            .await?;
+            && agent_access_in(&mut tx, &WorkspaceId(ws), &conversation, &row.agent_id).await?;
         if eligible {
             sqlx::query("INSERT INTO agent_queue(id,agent_id,position,payload,created_at,turn_id) VALUES(?,?,(SELECT coalesce(max(position),-1)+1 FROM agent_queue WHERE agent_id=?),?,?,?)")
                 .bind(&row.id).bind(row.agent_id.as_str()).bind(row.agent_id.as_str()).bind(row.payload.to_string()).bind(&row.created_at).bind(&row.turn_id)

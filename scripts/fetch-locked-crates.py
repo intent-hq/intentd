@@ -6,6 +6,9 @@ Callers then run cargo-dist with CARGO_NET_OFFLINE=true, so its internal
 `build-global-artifacts` and `host` jobs (v0.11.31 publication failed twice
 on crates.io HTTP2/TLS errors in run 39880269962, intent-hq/intent#7639) and
 by scripts/test-optional-intel-dist.py (runs 39394522385 and 39355882408).
+release-plz.yml's planning job also runs it before `release-plz release-pr`
+(online: `cargo package` re-resolves; run 40430078531), so crate downloads
+are cached with retries; scripts/test-release-plz-network.py keeps it there.
 scripts/test-optional-intel-dist-network.py covers the retry handling offline.
 
 Run: python3 -I -B scripts/fetch-locked-crates.py

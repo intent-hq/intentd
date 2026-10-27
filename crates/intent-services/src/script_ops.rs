@@ -223,6 +223,12 @@ pub(crate) struct ScriptLocks {
     /// rather than on the entry so removing or recreating a finished script
     /// cannot erase it (and so skip the idle update grace).
     command_settled_at: Arc<Mutex<Option<Instant>>>,
+    /// Test seam: signalled each time the detached dispatch a committed
+    /// monitor spawns (`commit_monitor` → `dispatch_script_monitor`) has
+    /// finished, so a test can wait for that callback instead of assuming it
+    /// ran before the caller returned.
+    #[cfg(test)]
+    pub(crate) monitor_dispatched: Arc<tokio::sync::Notify>,
 }
 
 impl ScriptLocks {
@@ -489,7 +495,7 @@ impl ScriptManager {
     }
 
     pub(crate) fn with_owner_services(mut self, services: crate::Services) -> Self {
-        self.agent_wake = services.ports.agent_wake_port();
+        self.agent_wake = services.feature_agent_wake_port();
         self.owner_services = Some(services);
         self
     }
@@ -4186,7 +4192,7 @@ mod tests {
                 let id = create_simple(&h, "saved", "true", ScriptMode::Command).await;
                 let entered = Arc::new(tokio::sync::Notify::new());
                 let mut services = h.services.clone();
-                services.script_parks.admission_wait = Some(entered.clone());
+                services.script_parks_mut_for_test().admission_wait = Some(entered.clone());
                 let manager = services.script_manager();
                 let lock = manager.locks.definition_lock(&id);
                 let guard = lock.lock().await;
@@ -5470,9 +5476,15 @@ mod tests {
 
         // Model another request claiming the durable id after the service's
         // preflight. Invoke the scoped manager directly to test its final fence.
-        let mut claimed = h.services.store.list_all_scripts().await.unwrap().remove(0);
+        let mut claimed = h
+            .services
+            .store()
+            .list_all_scripts()
+            .await
+            .unwrap()
+            .remove(0);
         claimed.workspace_id = WorkspaceId::chief().to_string();
-        h.services.store.upsert_script(&claimed).await.unwrap();
+        h.services.store().upsert_script(&claimed).await.unwrap();
         let result = h
             .services
             .script_manager()
@@ -5501,7 +5513,7 @@ mod tests {
         assert_eq!(state["status"], "running");
         assert_eq!(state["pid"], pid);
         assert_eq!(
-            h.services.store.script_workspace(&id).await.unwrap(),
+            h.services.store().script_workspace(&id).await.unwrap(),
             Some(WorkspaceId::chief())
         );
         h.services.script_stop(h.ws.clone(), id).await.unwrap();
@@ -7666,7 +7678,7 @@ mod tests {
             .unwrap();
         let persisted = h
             .services
-            .store
+            .store()
             .list_all_scripts()
             .await
             .unwrap()
@@ -7736,14 +7748,14 @@ mod tests {
         use intent_core::{Caller, HostRole, PrincipalId};
         let h = harness().await;
         let p = start_parked_service(&h).await;
-        let mut member = h.services.store.get_primary_principal().await.unwrap();
+        let mut member = h.services.store().get_primary_principal().await.unwrap();
         member.id = PrincipalId::new();
         member.is_primary = false;
-        h.services.store.upsert_principal(&member).await.unwrap();
+        h.services.store().upsert_principal(&member).await.unwrap();
         sqlx::query("INSERT INTO host_member(principal_id,added_at) VALUES (?,?)")
             .bind(member.id.as_str())
             .bind(now_iso())
-            .execute(h.services.store.write_pool())
+            .execute(h.services.store().write_pool())
             .await
             .unwrap();
         let caller = |is_member| {
@@ -7801,7 +7813,7 @@ mod tests {
         assert_reaped(p.pid, "after overlapping create and remove").await;
         second.unwrap().unwrap();
         let live = h.services.script_list(h.ws.clone()).await.unwrap();
-        let persisted = h.services.store.list_all_scripts().await.unwrap();
+        let persisted = h.services.store().list_all_scripts().await.unwrap();
         let restarted = Services::new(h.services.store().clone());
         restarted.hydrate_scripts().await.unwrap();
         let restored = restarted.script_list(h.ws.clone()).await.unwrap();
@@ -7940,3 +7952,10 @@ mod tests {
         assert_eq!(st["error"], err);
     }
 }
+
+#[cfg(test)]
+/// `script.*` reconciled onto the same PTY host (§5.8, §12.2): command one-shot
+/// `script.run`, service auto-restart/backoff, dev-server URL detection on
+/// `script:state`, and a terminal attaching to a running script's PTY.
+#[cfg(unix)]
+mod script_tests;

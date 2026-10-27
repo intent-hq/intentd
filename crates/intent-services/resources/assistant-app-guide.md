@@ -34,14 +34,57 @@ commands, change credentials, or manage sharing. Host membership retains its exi
 authority. Role downgrades apply to subsequent operations on open connections.
 
 Only when explicitly asked about workspace discussions: this unreleased Multiplayer
-Labs feature supports reactions 👍 👎 👀 ✅ 🙈. The emoji picker has no tooltips;
+Labs feature supports multiple workspace-wide discussions in matching app and
+daemon versions. Older apps may not offer the management or mention controls
+described below. Start a discussion by
+sending its first message; everyone with workspace access can read and participate.
+Workspace owners and managers can rename discussions; only workspace owners can
+delete them, including the default discussion. Open the discussion, then use the
+discussion panel's **…** menu for **Rename discussion** or **Delete discussion**.
+These controls require discussion-management support from the connected daemon.
+Retired workspaces keep discussions read-only; restore the workspace before renaming
+or deleting a discussion.
+Existing private history remains
+visible only to its original participants and is read-only; new private discussions
+are unavailable. Discussions support reactions 👍 👎 👀 ✅ 🙈. The emoji picker has no tooltips;
 hover or focus an existing reaction to see who reacted, and click to toggle yours.
 Legacy 🙂 can be removed. Agents can react only
 after explicit addressing in the workspace-wide discussion; reactions never wake
-agents. Private discussions remain human-only. Imported reaction names are historical
+agents. Imported reaction names are historical
 snapshots, not local access.
 
-<!-- Sources: packages/intentd/crates/intent-core/src/discussion.rs; packages/intentd/crates/intent-services/src/discussion_ops.rs; packages/intentd/crates/intent-acp/src/mcp_server/bindings/discussion.rs; packages/cloudlands-fe/src/features/discussions/. -->
+An agent author's name or avatar opens that agent beside the discussion. If the
+agent is unavailable, the app reports that it cannot open the reference. Sending
+in an existing discussion preserves its message row while confirmation arrives; failed messages can be
+retried without consuming a newer draft. Discussion composers currently support
+text and references, not image pasting or file attachments. The discussion and
+agent-chat @ menus have different recipient and delivery rules. Sending a message
+with a selected agent in a workspace-wide discussion explicitly addresses that agent.
+
+With matching app and connected-daemon person-mention support, selecting a person in the
+discussion's @ menu records who is mentioned. Sending can alert that person when
+the discussion is off screen and notifications are enabled. Plain text that looks
+like an @ mention does not identify a recipient. Notification actions open the
+relevant discussion subject to current access. Unread counts appear in discussion
+navigation and inactive tabs. They reflect messages observed by this client and
+clear as focused discussion content is read; they are not durable cross-device
+read receipts. These additions remain part of unreleased Multiplayer Labs.
+
+Only when explicitly asked about the experimental People panel: invitations to
+specific accounts appear as **Invited** for people who can manage sharing. A share
+link without a named recipient does not add a person. Accepted members remain in
+People when they stop viewing the workspace and appear greyed out. Being connected
+to the host elsewhere does not mean they are active here.
+
+In the People panel's Activity list, nearby consecutive actions by the same person
+share an avatar. Each action remains individually selectable. **Load more** looks
+for older activity from people, even when automated events fill the recent feed.
+In agent chat, other people's typing appears as a compact status above the prompt
+without moving the messages or monitor cards.
+
+<!-- Sources: packages/cloudlands-fe/src/features/presence/components/{WorkspacePeopleRoster,WorkspacePeopleActivity,PresenceTypingIndicator}.svelte; packages/cloudlands-fe/src/store/renderer/slices/{presence/presence-selectors,workspace-share/workspace-share-selectors}.ts; packages/cloudlands-fe/src/lib/components/chat/ChatPanel.svelte. -->
+
+<!-- Sources: packages/intentd/crates/intent-core/src/discussion.rs; packages/intentd/crates/intent-services/src/discussion_ops.rs; packages/intentd/crates/intent-transport/src/retired_gate.rs; packages/intentd/crates/intent-store/src/discussion_management_repo.rs; packages/intentd/crates/intent-acp/src/mcp_server/bindings/discussion.rs; packages/cloudlands-fe/src/features/discussions/components/{DiscussionThread,DiscussionMessageView,DiscussionMentionPicker,DiscussionUnreadBadge}.svelte; packages/cloudlands-fe/src/features/discussions/discussion-reference-navigation.ts; packages/cloudlands-fe/src/features/layout/tab-types/DiscussionTabType.svelte; packages/cloudlands-fe/src/store/renderer/slices/notifications/sagas/notifications-saga.ts; packages/cloudlands-fe/src/store/renderer/slices/workspace-discussion/workspace-discussion-selectors.ts. -->
 
 <!-- Sources (paths relative to packages/cloudlands-fe): src/features/settings/MobileSettings.svelte; src/features/devices/{PersonalDevicesPanel.svelte,personal-devices-selectors.ts}; src/store/renderer/slices/principal/principal-selectors.ts; src/store/renderer/slices/websocket-api/sagas/websocket-api-saga.ts; messages/en.json. -->
 
@@ -326,7 +369,7 @@ anything. A dismissed reminder shows **Running** if work is running, otherwise
 
 <!-- Daemon sources: crates/intent-services/src/workspace_attention_reminders.rs; crates/intent-services/src/workspace_status.rs; crates/intent-transport/src/router.rs. -->
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceBoard,HomeWorkspaceDetail,HomeWorkspacePullBadge}.svelte; src/features/home/home-model.ts; src/features/home/home.css. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceBoard,HomeWorkspaceDetail,HomeWorkspacePullBadge}.svelte; src/features/home/home-model.ts; src/features/home/home.css; src/lib/components/workspace/sidebar/workspace-pr-presentation.ts. -->
 
 In **Home → Workspaces**, list rows and board cards show organization/repository
 labels in views that include multiple repositories. When an organization is selected,
@@ -345,9 +388,12 @@ other service script, or an open terminal tab, alone does not count.
 hook, a delegated agent, a script run monitor, or a PR in the merge queue. The
 **Waiting** filter shows the same workspaces; older apps may not offer that filter.
 
-The PR badge in list and board views prioritizes draft PRs, then open PRs
-(including conflicted or queued PRs), then merged and closed PRs. Within the same
-state, it shows the most recently updated available PR. Home's shortened PR list
+The PR badge's priority in list and board views depends on the app version. Apps
+that prioritize queued PRs show a PR in the merge queue first, then drafts, other
+open PRs (including conflicted PRs), then merged and closed PRs. Older apps show
+drafts before open PRs, including queued or conflicted PRs, then merged and closed PRs.
+Within the same state, it shows the most recently updated PR (for a PR an agent only
+watches, its last update on GitHub as of the watch's latest check). Home's shortened PR list
 keeps unfinished PRs ahead of merged or closed ones; the **+N** count in list view
 includes the other linked PRs, even when their details are not loaded.
 

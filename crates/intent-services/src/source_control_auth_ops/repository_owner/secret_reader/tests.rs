@@ -1,4 +1,5 @@
 use super::*;
+use crate::host_execution::HostExecutionExt;
 use crate::repository_credentials::authority::{
     RepositoryAuthority, RepositoryAuthorityFence, RepositoryAuthorityRequest,
     RepositoryCredentialTransport,

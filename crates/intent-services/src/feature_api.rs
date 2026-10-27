@@ -19,20 +19,27 @@
 //! `test-hooks`; scripts/check-test-hooks-feature.sh keeps it out of the
 //! production build.
 
+use std::collections::HashMap;
 use std::path::Path;
-#[cfg(any(test, feature = "test-hooks"))]
 use std::sync::Arc;
 
+use intent_core::{AgentId, AgentReverseDispatch};
+use intent_sourcecontrol::SourceControl;
+
 use crate::delivery_tasks::DeliveryTasks;
-use crate::feature_ports::TransferPort;
+use crate::feature_ports::{AgentWakePort, RuntimePort, TransferPort};
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::model_catalog::ModelCatalogCache;
+use crate::runtime_config::{ScriptOutputConfig, ScriptParks};
 use crate::WorkspaceSetupStates;
 
+pub use crate::runtime::RuntimeServicesExt;
 pub use crate::{
-    default_workspaces_root, is_stale_in_flight_status, known_repo_name, publish_event,
-    record_setup_skipped, system_actor, workspace_created_event, workspace_setup_completed_event,
-    worktree_folder_slug, EventBus, Services, SettingsRegistry, SubscriptionFilter,
+    daemon_exe_path, default_workspaces_root, is_stale_in_flight_status, known_repo_name,
+    publish_event, publish_event_transient, record_setup_running, record_setup_skipped,
+    system_actor, workspace_created_event, workspace_setup_completed_event, worktree_folder_slug,
+    write_private_script, ArchiveFence, ArchiveFenceGuard, CompletionClassifyPark, EventBus,
+    Services, SettingsRegistry, SubscriptionFilter, SETUP_SCRIPT_WRAPPER, SETUP_TERMINAL_NAME,
 };
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -78,7 +85,39 @@ pub mod delivery_tasks {
 
 /// The feature ports core calls features through.
 pub mod feature_ports {
-    pub use crate::feature_ports::{TransferPort, IMPORT_MAX_CHUNK_BYTES};
+    pub use crate::feature_ports::{
+        monitor_id, wake_id, AgentWakePort, CancelSettlement, CommandScriptActivity, MergeOutcome,
+        ProvisionOutcome, RuntimePort, ScriptsClosing, SetupScriptRun, TransferPort,
+        UnavailableAgentWake, IMPORT_MAX_CHUNK_BYTES,
+    };
+}
+
+/// The desktop-client presence and browser assignment runtime.
+pub mod desktop {
+    pub use crate::desktop::Runtime;
+}
+
+/// Script output configuration and test parks that core owns.
+pub mod runtime_config {
+    pub use crate::runtime_config::{ScriptOutputConfig, ScriptParks, SupervisePark};
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub use crate::runtime_config::HookStoreFault;
+}
+
+/// The async secret store.
+pub mod settings {
+    pub use crate::settings::AsyncSecretStore;
+}
+
+/// Caller classification for event-producing operations.
+pub mod event_ops {
+    pub use crate::event_ops::is_collaborator_caller;
+}
+
+/// The task-local execution scope and its credential policy.
+pub mod execution_call {
+    pub use crate::execution_call::{expose_git_credential, github_execution_host};
 }
 
 /// Workspace file locations.
@@ -89,6 +128,16 @@ pub mod file_ops {
 /// Workspace git locations.
 pub mod git_ops {
     pub use crate::git_ops::worktree_path;
+}
+
+/// The hook wake and notice framing of the latest harness.
+pub mod harness {
+    pub use crate::harness::{latest_hook_framing, HookFraming};
+
+    /// Harness v1 constants.
+    pub mod v1 {
+        pub use crate::harness::v1::HOOK_WAKE_LOGS_CAP;
+    }
 }
 
 /// The cached model catalog.
@@ -117,6 +166,36 @@ pub mod human_attribution_tests {
 #[cfg(any(test, feature = "test-hooks"))]
 pub mod tests {
     pub use crate::test_support::fixtures::{workspace, TempDb};
+}
+
+/// Cursor pagination over lists and text.
+pub mod pagination {
+    pub use crate::pagination::{page_window, paginate_text_lines};
+}
+
+/// The refusal for operations on a retired workspace.
+pub mod retire {
+    pub use crate::retire::retired_error;
+}
+
+/// Shell selection and environment scrubbing.
+pub mod shell {
+    pub use crate::shell::{
+        default_shell, scrubbed_env_vars_except, shell_args, shell_true_invocation,
+    };
+}
+
+/// Source-control credential identity.
+pub mod source_control_auth_ops {
+    /// Repository-owned credential settings.
+    pub mod repository_owner {
+        pub use crate::source_control_auth_ops::repository_owner::logical_instance;
+    }
+}
+
+/// Per-workspace mutation admission.
+pub mod workspace_mutations {
+    pub use crate::workspace_mutations::{boxed, Mutation, WorkspaceMutations};
 }
 
 /// Nested repository discovery and staging.
@@ -152,7 +231,7 @@ impl Services {
     /// Background tasks that drain on shutdown.
     #[doc(hidden)]
     #[must_use]
-    pub fn feature_store_tasks(&self) -> &DeliveryTasks {
+    pub fn feature_store_tasks(&self) -> &Arc<DeliveryTasks> {
         &self.store_tasks
     }
 
@@ -170,6 +249,122 @@ impl Services {
         &self.workspace_setup_states
     }
 
+    /// Background tasks spawned by delivery paths; drained on shutdown.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn feature_delivery_tasks(&self) -> &DeliveryTasks {
+        &self.delivery_tasks
+    }
+
+    /// Background tasks owned by settings watchers.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn feature_settings_tasks(&self) -> &DeliveryTasks {
+        &self.settings_tasks
+    }
+
+    /// Background tasks owned by terminal sessions.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn feature_terminal_tasks(&self) -> &Arc<DeliveryTasks> {
+        &self.terminal_tasks
+    }
+
+    /// The desktop-client presence and browser assignment runtime.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn feature_desktop(&self) -> &crate::desktop::Runtime {
+        &self.desktop
+    }
+
+    /// The reverse dispatcher to connected clients, when one is attached.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn feature_reverse_dispatch(&self) -> Option<&Arc<dyn AgentReverseDispatch>> {
+        self.reverse_dispatch.as_ref()
+    }
+
+    /// The lane that serializes browser-tab mutations.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn feature_browser_tab_gate(&self) -> &tokio::sync::Mutex<()> {
+        &self.browser_tab_gate
+    }
+
+    /// The wired settings registry, if any, borrowed.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn feature_settings_registry(&self) -> Option<&SettingsRegistry> {
+        self.settings_registry.as_deref()
+    }
+
+    /// The secret store.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn feature_secrets(&self) -> &crate::settings::AsyncSecretStore {
+        &self.secrets
+    }
+
+    /// The configured source-control provider, if any.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn feature_source_control(&self) -> Option<&Arc<dyn SourceControl>> {
+        self.source_control.as_ref()
+    }
+
+    /// The in-memory per-agent message queues.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn feature_agent_queues(
+        &self,
+    ) -> &std::sync::Mutex<HashMap<AgentId, Vec<crate::agent_ops::QueuedMessage>>> {
+        &self.agent_queues
+    }
+
+    /// The per-workspace archive fence.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn feature_archive_fence(&self) -> &Arc<crate::ArchiveFence> {
+        &self.archive_fence
+    }
+
+    /// The minimum run time below which a script exit counts as too fast.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn feature_script_too_fast_ms(&self) -> u128 {
+        self.script_too_fast_ms
+    }
+
+    /// Script lifecycle test parks (all unset in production).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn feature_script_parks(&self) -> &ScriptParks {
+        &self.script_parks
+    }
+
+    /// Where script output is kept and how much each run may write.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn feature_script_output_config(&self) -> &ScriptOutputConfig {
+        &self.script_output_config
+    }
+
+    /// The hook-evaluation test park (unset in production).
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn feature_hook_eval_park(&self) -> Option<&Arc<crate::CompletionClassifyPark>> {
+        self.hook_eval_park.as_ref()
+    }
+
+    /// The hook-wake test park (unset in production).
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn feature_hook_wake_park(&self) -> Option<&Arc<crate::CompletionClassifyPark>> {
+        self.hook_wake_park.as_ref()
+    }
+
     /// The registered transfer feature.
     #[doc(hidden)]
     #[must_use]
@@ -183,6 +378,92 @@ impl Services {
     #[must_use]
     pub fn models_catalog_for_test(&self) -> &Arc<ModelCatalogCache> {
         &self.models_catalog
+    }
+
+    /// The registered runtime feature.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn feature_runtime(&self) -> &dyn RuntimePort {
+        self.ports.runtime()
+    }
+
+    /// The registered agent-wake feature.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn feature_agent_wake(&self) -> &dyn AgentWakePort {
+        self.ports.agent_wake()
+    }
+
+    /// A shared handle on the agent-wake port, for holders that outlive the
+    /// borrow of `Services`.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn feature_agent_wake_port(&self) -> Arc<dyn AgentWakePort> {
+        self.ports.agent_wake_port()
+    }
+
+    /// The per-workspace mutation admission gates.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn feature_workspace_mutations(&self) -> &crate::workspace_mutations::WorkspaceMutations {
+        &self.workspace_mutations
+    }
+
+    /// The per-agent cap on active hooks.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn feature_hooks_max_per_agent(&self) -> u32 {
+        self.hooks_max_per_agent
+    }
+
+    /// The hook evaluation timeout.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn feature_hook_eval_timeout(&self) -> std::time::Duration {
+        self.hook_eval_timeout
+    }
+
+    /// The base backoff for hook-run persistence retries.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn feature_hook_store_retry_base(&self) -> std::time::Duration {
+        self.hook_store_retry_base
+    }
+
+    /// Notified when cached execution contexts must be recomputed.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn feature_execution_invalidation(&self) -> &tokio::sync::Notify {
+        &self.execution_invalidation
+    }
+
+    /// The hook-run persistence fault injector (test wiring only).
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn feature_hook_store_fault(&self) -> Option<&crate::runtime_config::HookStoreFault> {
+        self.hook_store_fault.as_ref()
+    }
+
+    /// Test seam: park hook wakes inside their classify window.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn set_hook_wake_park_for_test(&mut self, park: Arc<crate::CompletionClassifyPark>) {
+        self.hook_wake_park = Some(park);
+    }
+
+    /// Test seam: park hook evaluations inside their window.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn set_hook_eval_park_for_test(&mut self, park: Arc<crate::CompletionClassifyPark>) {
+        self.hook_eval_park = Some(park);
+    }
+
+    /// Test seam: the script lifecycle parks, for arming one.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn script_parks_mut_for_test(&mut self) -> &mut ScriptParks {
+        &mut self.script_parks
     }
 
     /// Test seam: replace the model catalog cache.

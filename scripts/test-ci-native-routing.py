@@ -46,9 +46,20 @@ PR_METADATA = {"pr-title", "conflict-markers"}
 # Release-metadata PRs (release-fast-path reports fast_path=true) skip these
 # slow jobs; the queue still requires them (intentd#2493).
 FAST_PATH_SKIPS = {"check", "windows-cross-lint", "coverage-changed"}
+# Main pushes skip the Windows post-merge job when release-fast-path reports
+# release_push=true (a tree auto-cut-alpha just required green plus release
+# metadata) or `supersede` reports superseded=true (main's live tip is already
+# strictly ahead of this commit). Every other push job still runs.
+RELEASE_PUSH_SKIPS = {"windows"}
+# A superseded commit also skips its paid macOS build (only the tip's proof is
+# read); a release push keeps it (see test_release_push_keeps_macos_release_build).
+SUPERSEDED_SKIPS = {"windows", "build"}
 # Advisory gate dependencies: any result is accepted (the gate reads only
-# their outputs), so a failed classifier degrades to full CI.
-ADVISORY = {"release-fast-path"}
+# their outputs), so a failed classifier or scan degrades to full CI.
+ADVISORY = {"release-fast-path", "supersede"}
+# Queue-only watcher outside CI Gate's `needs`: it cancels a doomed run early
+# and never decides the gate (scripts/test-merge-queue-fail-fast.py).
+QUEUE_WATCHERS = {"fail-fast"}
 RELEASE_BRANCH = "release-plz-2026-10-19T04-14-25Z"
 # macOS proofs that run once in the merge queue.
 NATIVE_STEPS = (
@@ -116,18 +127,127 @@ def condition(value, context, *, success=True, cancelled=False):
     return (has_status or success) and bool(eval(compile(tree, "<condition>", "eval"), {"__builtins__": {}}))
 
 
-def context(event, *, fork=False, fast_path="", platform="macOS", head_ref="feature"):
+def template_value(value, values):
+    """Evaluate a `${{ }}` template (the concurrency group / cancel flag).
+
+    Supports the condition subset plus `format('literal', context)`; an
+    unknown context key raises, so a new input cannot be silently ignored.
+    A lone expression keeps its type; mixed text concatenates strings.
+    """
+    def evaluate(expression):
+        # Title-case bare true/false only, never inside quoted literals.
+        expression = re.sub(r"'[^']*'|\btrue\b|\bfalse\b",
+                            lambda m: m[0] if m[0].startswith("'") else m[0].title(), expression)
+        expression = re.sub(r"format\('([^']*)', ([\w.]+)\)",
+                            lambda m: repr(m[1].replace("{0}", str(values[m[2]]))), expression)
+        expression = re.sub(r"\b(?:github|steps)\.[\w.-]+", lambda m: repr(values[m[0]]), expression)
+        expression = expression.replace("&&", " and ").replace("||", " or ")
+        expression = re.sub(r"!(?!=)", " not ", expression).strip()
+        tree = ast.parse(expression, mode="eval")
+        allowed = (ast.Expression, ast.BoolOp, ast.UnaryOp, ast.Compare, ast.Constant,
+                   ast.And, ast.Or, ast.Not, ast.Eq, ast.NotEq)
+        if any(not isinstance(node, allowed) for node in ast.walk(tree)):
+            raise ValueError(f"unsupported Actions expression: {value}")
+        return eval(compile(tree, "<template>", "eval"), {"__builtins__": {}})
+    if isinstance(value, bool):
+        return value
+    parts = re.split(r"\$\{\{(.*?)\}\}", str(value))
+    if len(parts) == 3 and not parts[0] and not parts[2]:
+        return evaluate(parts[1])
+    return "".join(part if i % 2 == 0 else str(evaluate(part)) for i, part in enumerate(parts))
+
+
+def run_concurrency(workflow, event, *, sha, run_id, attempt="1"):
+    """(group, cancel-in-progress) the workflow-level concurrency gives one run."""
+    ref = {"push": "refs/heads/main", "pull_request": "refs/pull/7/merge",
+           "merge_group": f"refs/heads/gh-readonly-queue/main/pr-7-{sha}"}[event]
+    values = {"github.workflow": "CI", "github.ref": ref, "github.event_name": event,
+              "github.sha": sha, "github.run_id": run_id, "github.run_attempt": attempt}
+    block = workflow.get("concurrency") or {}
+    return template_value(block.get("group", ""), values), template_value(block.get("cancel-in-progress", False), values)
+
+
+def concurrency_errors(workflow):
+    """Concurrency never cancels or serializes main-push runs.
+
+    GitHub admits runs of one concurrency group in no guaranteed order, so a
+    shared cancelling group could let an older commit's late run cancel the
+    tip's, and a shared queueing group makes the tip wait behind an older run.
+    Each push run gets a group of its own; the `supersede` job retires older
+    runs by commit ancestry instead.
+    """
+    errors = []
+    older, older_cancel = run_concurrency(workflow, "push", sha="a" * 40, run_id="10")
+    tip, tip_cancel = run_concurrency(workflow, "push", sha="b" * 40, run_id="11")
+    rerun, _ = run_concurrency(workflow, "push", sha="a" * 40, run_id="10", attempt="2")
+    if older == tip:
+        errors.append("push: runs must not share a concurrency group (admission order is not push order)")
+    if older_cancel is not False or tip_cancel is not False:
+        errors.append("push: concurrency must never cancel a push run")
+    if rerun == tip:
+        errors.append("push: a re-run must not share the tip's group")
+    for event in ("pull_request", "merge_group"):
+        group, _ = run_concurrency(workflow, event, sha="c" * 40, run_id="12")
+        if group in (older, tip):
+            errors.append(f"{event}: must not share a main push group")
+    if run_concurrency(workflow, "pull_request", sha="c" * 40, run_id="12")[1] is not True:
+        errors.append("pull_request: superseded PR runs must stay cancelled")
+    if run_concurrency(workflow, "merge_group", sha="c" * 40, run_id="12")[1] is not False:
+        errors.append("merge_group: queue runs must never be cancelled by concurrency")
+    for name, job in workflow["jobs"].items():
+        if "concurrency" in job:
+            errors.append(f"{name}: job-level concurrency could cancel the tip's run")
+    return errors
+
+
+def supersede_job_errors(workflow):
+    """The ancestry scan: push-to-main only, hosted, independent, least privilege."""
+    errors = []
+    job = workflow["jobs"].get("supersede")
+    if not job:
+        return ["supersede: missing push job"]
+    for event in REQUIRED:
+        for ref in ("refs/heads/main", "refs/heads/other"):
+            values = {**context(event), "github.ref": ref}
+            if condition(job.get("if", True), values) != (event == "push" and ref == "refs/heads/main"):
+                errors.append(f"supersede: wrong selection for {event}/{ref}")
+    if job.get("needs"):
+        errors.append("supersede: must start at once, independent of route")
+    if job.get("runs-on") != "ubuntu-24.04":
+        errors.append("supersede: must run on the free hosted runner")
+    if job.get("permissions") != {"actions": "write", "contents": "read"}:
+        errors.append("supersede: permissions must be exactly actions: write, contents: read")
+    scan = next((step for step in job.get("steps", []) if step.get("id") == "scan"), {})
+    if "scripts/supersede-push-runs.py" not in str(scan.get("run", "")) or scan.get("continue-on-error"):
+        errors.append("supersede: scan step must run scripts/supersede-push-runs.py")
+    if job.get("outputs", {}).get("superseded") != "${{ steps.scan.outputs.superseded }}":
+        errors.append("supersede: must export the scan's superseded output")
+    for name in SUPERSEDED_SKIPS:
+        if "supersede" not in (workflow["jobs"][name].get("needs") or []):
+            errors.append(f"{name}: must read the supersede scan")
+    tests = workflow["jobs"]["release-scripts"]["steps"]
+    if not any(re.search(r"^python3 -I -B scripts/test-supersede-push-runs\.py$", str(step.get("run", "")), re.M)
+               and not step.get("if") and not step.get("continue-on-error") for step in tests):
+        errors.append("supersede: its offline suite must run in release-scripts")
+    return errors
+
+
+def context(event, *, fork=False, fast_path="", platform="macOS", head_ref="feature", release_push="", superseded=""):
     return {
         "github.event_name": event,
         "github.head_ref": head_ref if event == "pull_request" else "",
         "github.repository": "intent-hq/intentd",
         "github.event.pull_request.head.repo.full_name": "outside/intentd" if fork else "intent-hq/intentd",
         "needs.release-fast-path.outputs.fast_path": fast_path,
+        "needs.release-fast-path.outputs.release_push": release_push,
+        "needs.supersede.outputs.superseded": superseded,
+        "github.ref": "refs/heads/main" if event == "push" else "",
         "runner.os": platform,
     }
 
 
-def scheduled(workflow, event, *, fork=False, fast_path="", route="success", cancelled=False, head_ref="feature"):
+def scheduled(workflow, event, *, fork=False, fast_path="", route="success", cancelled=False, head_ref="feature",
+              release_push="", classifier=None, superseded="", scan=None):
     results = {}
     pending = dict(workflow["jobs"])
     while pending:
@@ -142,17 +262,21 @@ def scheduled(workflow, event, *, fork=False, fast_path="", route="success", can
         needs = job.get("needs", [])
         if isinstance(needs, str):
             needs = [needs]
-        values = context(event, fork=fork, fast_path=fast_path, head_ref=head_ref)
+        values = context(event, fork=fork, fast_path=fast_path, head_ref=head_ref, release_push=release_push,
+                         superseded=superseded)
         values.update({f"needs.{key}.result": value for key, value in results.items()})
         runs = condition(job.get("if", True), values,
                          success=all(results[n] == "success" for n in needs), cancelled=cancelled)
-        results[name] = (route if name == "route" else "success") if runs else "skipped"
+        outcome = {"route": route, "release-fast-path": classifier or "success", "supersede": scan or "success"}.get(name, "success")
+        results[name] = outcome if runs else "skipped"
     return results
 
 
-def gate_passes(workflow, event, results, fast_path=""):
+def gate_passes(workflow, event, results, fast_path="", release_push="", superseded=""):
     body = next(s["run"] for s in workflow["jobs"]["gate"]["steps"] if s.get("name") == "Check results")
     values = {"github.event_name": event, "needs.release-fast-path.outputs.fast_path": fast_path,
+              "needs.release-fast-path.outputs.release_push": release_push,
+              "needs.supersede.outputs.superseded": superseded,
               **{f"needs.{k}.result": v for k, v in results.items()}}
     body = re.sub(r"\$\{\{\s*(.*?)\s*\}\}", lambda m: values[m[1]], body)
     result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", body], capture_output=True, text=True, timeout=5)
@@ -180,6 +304,65 @@ def gate_errors(workflow):
                 if gate_passes(workflow, event, {**baseline, name: result}) != accepted:
                     errors.append(f"{event}: {name}={result}")
     errors.extend(fast_path_gate_errors(workflow, expected))
+    errors.extend(release_push_gate_errors(workflow, expected))
+    return errors
+
+
+def queue_fail_fast_errors(workflow):
+    """The fail-fast watcher cancels on any failed merge_group job, which is
+    safe only while every such job's failure already fails CI Gate."""
+    errors = []
+    jobs = scheduled(workflow, "merge_group")
+    ran = {name for name, result in jobs.items() if result == "success"} - {"gate"}
+    needs = set(workflow["jobs"]["gate"]["needs"])
+    if ran - needs != QUEUE_WATCHERS:
+        errors.append(f"merge_group jobs outside CI Gate's needs must be exactly the watchers: {sorted(ran - needs)}")
+    baseline = {name: jobs.get(name, "skipped") for name in needs}
+    if not gate_passes(workflow, "merge_group", baseline):
+        errors.append("merge_group: baseline rejected")
+    for name in sorted(ran & needs):
+        if workflow["jobs"][name].get("continue-on-error"):
+            errors.append(f"{name}: a continue-on-error job's failure would cancel a passing run")
+        if gate_passes(workflow, "merge_group", {**baseline, name: "failure"}):
+            errors.append(f"{name}: CI Gate accepts its failure, so the watcher would eject a passing entry")
+    return errors
+
+
+def release_push_gate_errors(workflow, expected):
+    """The push gate accepts a skipped Windows job only on a reported skip.
+
+    A skip is reported when release-fast-path succeeded with release_push=true
+    or supersede succeeded with superseded=true. Anything else fails closed: a
+    failed or cancelled Windows job, a skip without the reporting job's
+    success, and a skip of any other push job.
+    """
+    errors = []
+    required = REQUIRED["push"]
+    # The skip flags take all three values; cancelled is covered by the
+    # per-job results below and by gate_errors' generic table.
+    flags, outcomes = ("", "false", "true"), ("success", "skipped", "failure")
+    for release_push in flags:
+        for classifier in outcomes:
+            for superseded in flags:
+                for scan in outcomes:
+                    release = release_push == "true" and classifier == "success"
+                    stale = superseded == "true" and scan == "success"
+                    skips = (RELEASE_PUSH_SKIPS if release else set()) | (SUPERSEDED_SKIPS if stale else set())
+                    baseline = {name: "success" if name in required else "skipped" for name in expected}
+                    baseline["release-fast-path"] = classifier
+                    baseline["supersede"] = scan
+                    for name in skips:
+                        baseline[name] = "skipped"
+                    label = (f"push/release_push={release_push or '-'}/release-fast-path={classifier}"
+                             f"/superseded={superseded or '-'}/supersede={scan}")
+                    flags_in = {"release_push": release_push, "superseded": superseded}
+                    if not gate_passes(workflow, "push", baseline, **flags_in):
+                        errors.append(f"{label}: baseline")
+                    for name in required:
+                        for result in ("skipped", "failure", "cancelled"):
+                            accepted = result == "skipped" and name in skips
+                            if gate_passes(workflow, "push", {**baseline, name: result}, **flags_in) != accepted:
+                                errors.append(f"{label}: {name}={result}")
     return errors
 
 
@@ -208,9 +391,15 @@ def fast_path_gate_errors(workflow, expected):
 def routing_errors(workflow):
     errors = []
     for event in REQUIRED:
-        cases = [("feature", "")] + [(RELEASE_BRANCH, f) for f in ("", "false", "true")] if event == "pull_request" else [("", "")]
-        for head_ref, fast_path in cases:
-            jobs = scheduled(workflow, event, fast_path=fast_path, head_ref=head_ref)
+        if event == "pull_request":
+            cases = [("feature", "", "")] + [(RELEASE_BRANCH, f, "") for f in ("", "false", "true")]
+        elif event == "push":
+            cases = [("", "", r, x) for r in ("", "false", "true") for x in ("", "false", "true")]
+        else:
+            cases = [("", "", "", "")]
+        for head_ref, fast_path, release_push, superseded in [c if len(c) == 4 else (*c, "") for c in cases]:
+            jobs = scheduled(workflow, event, fast_path=fast_path, head_ref=head_ref, release_push=release_push,
+                             superseded=superseded)
             expected = REQUIRED[event] | {"route", "gate"}
             if event == "pull_request":
                 expected |= PR_METADATA
@@ -218,9 +407,26 @@ def routing_errors(workflow):
                     expected |= {"release-fast-path"}
                 if fast_path == "true":
                     expected -= FAST_PATH_SKIPS
+            if event == "merge_group":
+                expected |= QUEUE_WATCHERS
+            if event == "push":
+                # Every main push classifies its diff against the previous tip
+                # and scans for superseded runs.
+                expected |= {"release-fast-path", "supersede"}
+                if release_push == "true":
+                    expected -= RELEASE_PUSH_SKIPS
+                if superseded == "true":
+                    expected -= SUPERSEDED_SKIPS
             actual = {name for name, result in jobs.items() if result == "success"}
             if actual != expected:
-                errors.append(f"{event}/{head_ref}/{fast_path}: wrong jobs {actual ^ expected}")
+                errors.append(f"{event}/{head_ref}/{fast_path}/{release_push}/{superseded}: wrong jobs {actual ^ expected}")
+    # A failed or cancelled classifier or scan reports nothing: Windows still runs.
+    for result in ("failure", "cancelled"):
+        if scheduled(workflow, "push", classifier=result)["windows"] != "success":
+            errors.append(f"push: Windows skipped after release-fast-path={result}")
+        for job in SUPERSEDED_SKIPS:
+            if scheduled(workflow, "push", scan=result)[job] != "success":
+                errors.append(f"push: {job} skipped after supersede={result}")
     if any(value != "skipped" for value in scheduled(workflow, "pull_request", fork=True).values()):
         errors.append("fork PR allocated runners")
     for event in REQUIRED:
@@ -570,7 +776,7 @@ class RunnerAvailabilityTests(unittest.TestCase):
         result = run_route(self.workflow, **fixture)
         outputs = route_outputs(self.workflow, result["outputs"])
         self.assertEqual(json.loads(outputs.get("macos_labels", "null")), expected)
-        self.assertEqual(outputs.get("macos_burst"), str(expected == ["warp-macos-26-arm64-12x"]).lower())
+        self.assertEqual(outputs.get("macos_burst"), str(expected == ["warp-macos-26-arm64-6x"]).lower())
         for job_id, field, value in (("build", "target", "aarch64-apple-darwin"),
                                      ("daemon-lifecycle", "platform", "macos")):
             job = self.workflow["jobs"][job_id]
@@ -590,7 +796,7 @@ class RunnerAvailabilityTests(unittest.TestCase):
                       [{**runner(), "labels": [{"name": "macOS"}, {"name": "ARM64"}]}],
                       [runner(busy=True), runner(status="offline"), runner(arch="X64")]):
             with self.subTest(fleet=fleet):
-                self.assert_mac_route({"org": fleet}, ["warp-macos-26-arm64-12x"])
+                self.assert_mac_route({"org": fleet}, ["warp-macos-26-arm64-6x"])
         for fleet in ([runner()], [runner(platform="MACos", arch="arm64")],
                       [{**runner(), "labels": [{"name": n} for n in ("SELF-HOSTED", "macos", "arm64")]}],
                       [runner(busy=True), runner(status="offline"), runner(), runner(arch="X64")]):
@@ -598,15 +804,15 @@ class RunnerAvailabilityTests(unittest.TestCase):
                 self.assert_mac_route({"org": fleet}, ["self-hosted", "macOS", "ARM64"])
 
     def test_org_lookup_and_repo_fallback_are_shared_and_fail_to_hosted(self):
-        cases = [({}, ["warp-macos-26-arm64-12x"], ["org"]),
+        cases = [({}, ["warp-macos-26-arm64-6x"], ["org"]),
                  ({"orgError": "403 missing permission", "repo": [runner()]},
                   ["self-hosted", "macOS", "ARM64"], ["org", "repo"]),
-                 ({"orgError": "403", "repo": [runner(busy=True)]}, ["warp-macos-26-arm64-12x"], ["org", "repo"]),
-                 ({"orgError": "403", "repo": []}, ["warp-macos-26-arm64-12x"], ["org", "repo"]),
-                 ({"orgError": "403", "repoError": "403 missing permission"}, ["warp-macos-26-arm64-12x"], ["org", "repo"]),
-                 ({"orgError": "network timeout", "repoError": "503 unavailable"}, ["warp-macos-26-arm64-12x"], ["org", "repo"]),
-                 ({"org": {"unexpected": "response"}}, ["warp-macos-26-arm64-12x"], ["org"]),
-                 ({"org": [], "repo": [runner()]}, ["warp-macos-26-arm64-12x"], ["org"])]
+                 ({"orgError": "403", "repo": [runner(busy=True)]}, ["warp-macos-26-arm64-6x"], ["org", "repo"]),
+                 ({"orgError": "403", "repo": []}, ["warp-macos-26-arm64-6x"], ["org", "repo"]),
+                 ({"orgError": "403", "repoError": "403 missing permission"}, ["warp-macos-26-arm64-6x"], ["org", "repo"]),
+                 ({"orgError": "network timeout", "repoError": "503 unavailable"}, ["warp-macos-26-arm64-6x"], ["org", "repo"]),
+                 ({"org": {"unexpected": "response"}}, ["warp-macos-26-arm64-6x"], ["org"]),
+                 ({"org": [], "repo": [runner()]}, ["warp-macos-26-arm64-6x"], ["org"])]
         for fixture, expected, endpoints in cases:
             with self.subTest(fixture=fixture):
                 result = self.assert_mac_route(fixture, expected)
@@ -626,7 +832,7 @@ class RunnerAvailabilityTests(unittest.TestCase):
                 # Jobs still asking for the generic self-hosted Linux fleet never occupy a slot.
                 jobs += [{"status": "in_progress", "labels": ["self-hosted", "Linux", "X64"]}] * 5
                 result = self.assert_mac_route({"org": fleet, "jobs": jobs, "queueErrors": queue_errors},
-                                              ["warp-macos-26-arm64-12x"] if queue_errors else ["self-hosted", "macOS", "ARM64"])
+                                              ["warp-macos-26-arm64-6x"] if queue_errors else ["self-hosted", "macOS", "ARM64"])
                 outputs = result["outputs"]
                 # Both slots are busy, so 16-core work has no idle bigmem runner and bursts;
                 # 8-core work keeps the heavy pool's queue semantics.
@@ -646,10 +852,12 @@ class RunnerAvailabilityTests(unittest.TestCase):
                 self.assertEqual(outputs["linux_burst"], "true")
                 self.assertEqual(outputs["windows_burst"], "true")
 
-    def test_merge_queue_keeps_heavy_linux_jobs_on_github_hosted(self):
-        # The queue starts ~4 heavy 16-CPU Rust jobs at once, more than the two
-        # 8-CPU intent-cache slots absorb in the queue's time budget. Light
-        # jobs, PRs and pushes keep the probe's choice.
+    def test_merge_queue_heavy_jobs_read_their_own_slots(self):
+        # The queue's heavy 16-CPU Rust jobs take only the slots their own
+        # merge_group entries win; the shared linux_labels mapping bursts there.
+        # Here the one bigmem slot goes to coverage-all, so check bursts too
+        # (test_merge_queue_check_takes_a_slot_after_the_coverage_suites covers
+        # check on a slot). Light jobs, PRs and pushes keep the probe's choice.
         same_repo = {"pull_request": {"head": {"repo": {"full_name": "intent-hq/intentd"}}}}
         for idle in (True, False):
             fleet = [slot(), small_slot(), runner("Windows", "X64"), runner()] if idle else []
@@ -661,7 +869,7 @@ class RunnerAvailabilityTests(unittest.TestCase):
                     hosted = event == "merge_group" or not idle
                     slots = json.loads(outputs["slots"])
                     # The one free heavy slot goes to `coverage-changed` on a PR (it ranks
-                    # above check); the queue lists no heavy job. check bursts to its 16x WarpBuild runner.
+                    # above check) and to coverage-all in the queue. check bursts to its 16x WarpBuild runner.
                     self.assertEqual(slots["check"], ["warp-ubuntu-2404-x64-16x"])
                     self.assertEqual(slots["coverage-changed"], BIG if event == "pull_request" and idle else ["warp-ubuntu-2404-x64-16x"])
                     # Free standard labels never take a self-hosted slot, even an idle one.
@@ -713,7 +921,7 @@ class RunnerAvailabilityTests(unittest.TestCase):
     def test_bursts_go_to_warpbuild(self):
         same_repo = {"pull_request": {"head": {"repo": {"full_name": "intent-hq/intentd"}}}}
         warp = {"linux_labels": ["warp-ubuntu-2404-x64-16x"], "check_labels": ["warp-ubuntu-2404-x64-8x"],
-                "windows_labels": ["warp-windows-2022-x64-16x"], "macos_labels": ["warp-macos-26-arm64-12x"]}
+                "windows_labels": ["warp-windows-2022-x64-16x"], "macos_labels": ["warp-macos-26-arm64-6x"]}
         for event in ("pull_request", "push", "merge_group"):
             with self.subTest(event=event):
                 result = run_route(self.workflow, org=[], eventName=event, warpbuildDisabled="",
@@ -795,9 +1003,37 @@ class RunnerAvailabilityTests(unittest.TestCase):
                                    jobs=jobs, xlThreshold="2")
                 slots = json.loads(result["outputs"]["slots"])
                 self.assertEqual((slots["coverage-changed"], slots["check"]), (coverage, check))
-        # In the merge queue check is unlisted for the event and bursts at 16x.
+        # In the merge queue check also takes a free slot (see the next test).
         result = run_route(self.workflow, org=fleet, eventName="merge_group", xlThreshold="2")
-        self.assertEqual(json.loads(result["outputs"]["slots"])["check"], ["warp-ubuntu-2404-x64-16x"])
+        self.assertEqual(json.loads(result["outputs"]["slots"])["check"], BIG)
+
+    def test_merge_queue_check_takes_a_slot_after_the_coverage_suites(self):
+        # The queue builds one entry at a time and coverage-all on xl (~20 min)
+        # sets its pace. check takes a free xl or bigmem slot after coverage-all
+        # and coverage-e2e (it slows down least on 8 CPUs), else bursts at 16x.
+        # coverage-changed stays on WarpBuild in the queue.
+        fleet = [xl_slot(), xl_slot(), slot(), slot()]
+        warp16 = ["warp-ubuntu-2404-x64-16x"]
+        def busy(labels):
+            return {"status": "in_progress", "labels": labels, "created_at": "2099-01-01T00:00:00Z"}
+        for xl_free, big_free, expected in (
+                (2, 2, {"coverage-all": XL, "coverage-e2e": XL, "check": BIG, "daemon-lifecycle-linux": BIG}),
+                (1, 2, {"coverage-all": XL, "coverage-e2e": BIG, "check": BIG, "daemon-lifecycle-linux": warp16}),
+                (0, 2, {"coverage-all": BIG, "coverage-e2e": BIG, "check": warp16, "daemon-lifecycle-linux": warp16}),
+                (2, 0, {"coverage-all": XL, "coverage-e2e": XL, "check": warp16, "daemon-lifecycle-linux": warp16}),
+                (0, 0, {"coverage-all": warp16, "coverage-e2e": warp16, "check": warp16, "daemon-lifecycle-linux": warp16})):
+            with self.subTest(xl_free=xl_free, big_free=big_free):
+                jobs = [busy(XL)] * (2 - xl_free) + [busy(BIG)] * (2 - big_free)
+                result = run_route(self.workflow, org=fleet, eventName="merge_group", jobs=jobs, xlThreshold="2")
+                slots = json.loads(result["outputs"]["slots"])
+                self.assertEqual({key: slots[key] for key in expected}, expected)
+                self.assertEqual(slots["coverage-changed"], warp16)
+        # A queue run with only 12 GB heavy slots free never puts check there.
+        result = run_route(self.workflow, org=[small_heavy_slot(), small_heavy_slot()], eventName="merge_group")
+        self.assertEqual(json.loads(result["outputs"]["slots"])["check"], warp16)
+        # The kill switch sends it back to WarpBuild with every other listed job.
+        result = run_route(self.workflow, org=fleet, eventName="merge_group", xlThreshold="2", linuxDisabled="true")
+        self.assertEqual(json.loads(result["outputs"]["slots"])["check"], warp16)
 
     def test_16_core_jobs_never_overflow_to_small_heavy_slots(self):
         # intent-ci3's 12 GB heavy slots OOM-killed check and coverage-changed
@@ -874,7 +1110,7 @@ class RunnerAvailabilityTests(unittest.TestCase):
             with self.subTest(disabled=disabled):
                 outputs = run_route(self.workflow, org=fleet, macosDisabled=disabled)["outputs"]
                 self.assertEqual(json.loads(outputs["macos_labels"]),
-                                 ["warp-macos-26-arm64-12x"] if disabled == "true" else ["self-hosted", "macOS", "ARM64"])
+                                 ["warp-macos-26-arm64-6x"] if disabled == "true" else ["self-hosted", "macOS", "ARM64"])
                 self.assertEqual(outputs["macos_burst"], str(disabled == "true").lower())
                 self.assertEqual(json.loads(outputs["linux_labels"]), BIG)
                 self.assertEqual(json.loads(outputs["windows_labels"]), ["self-hosted", "Windows", "X64"])
@@ -884,7 +1120,7 @@ class RunnerAvailabilityTests(unittest.TestCase):
     def test_empty_outputs_use_hosted_macos_in_both_matrices(self):
         for job_id in ("build", "windows", "daemon-lifecycle", "macos-services-runtime"):
             for row in self.workflow["jobs"][job_id]["strategy"]["matrix"]["include"]:
-                expected = ["warp-macos-26-arm64-12x"] if row.get("target") == "aarch64-apple-darwin" or row.get("platform") == "macos" else (
+                expected = ["warp-macos-26-arm64-6x"] if row.get("target") == "aarch64-apple-darwin" or row.get("platform") == "macos" else (
                     ["warp-ubuntu-2404-x64-16x"] if row.get("platform") == "linux" else ["warp-windows-2022-x64-16x"])
                 for outputs in ({}, {"macos_labels": "", "windows_labels": "", "linux_labels": ""}):
                     with self.subTest(job=job_id, row=row, outputs=outputs):
@@ -895,7 +1131,7 @@ class RunnerAvailabilityTests(unittest.TestCase):
 
     def test_hosted_macos_skips_persistent_cleanup_and_uses_cache(self):
         steps = {s.get("name"): s for s in self.workflow["jobs"]["build"]["steps"]}
-        for labels in (["warp-macos-26-arm64-12x"], ["self-hosted", "macOS", "ARM64"]):
+        for labels in (["warp-macos-26-arm64-6x"], ["self-hosted", "macOS", "ARM64"]):
             for fast_path in ("", "true"):
                 values = {**context("merge_group", fast_path=fast_path), "matrix.os": labels}
                 for name in ("Ensure macOS CI disk headroom", "Point CARGO_TARGET_DIR outside the work dir (self-hosted)"):
@@ -1029,8 +1265,86 @@ class NativeRoutingTests(unittest.TestCase):
     def setUpClass(cls):
         cls.workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
 
+    def test_every_queue_job_failure_already_fails_the_gate(self):
+        self.assertEqual(queue_fail_fast_errors(self.workflow), [])
+        workflow = copy.deepcopy(self.workflow)
+        body = next(st for st in workflow["jobs"]["gate"]["steps"] if st.get("name") == "Check results")
+        # A gate that stops reading a queue job would accept its failure.
+        merge_group = body["run"].index("merge_group)")
+        line = 'require deb-packaging "${{ needs.deb-packaging.result }}"\n'
+        at = body["run"].index(line, merge_group)
+        body["run"] = body["run"][:at] + body["run"][at + len(line):]
+        self.assertTrue(any(e.startswith("deb-packaging:") for e in queue_fail_fast_errors(workflow)))
+
     def test_job_selection_and_route_failures(self):
         self.assertEqual(routing_errors(self.workflow), [])
+
+    def test_concurrency_never_cancels_or_serializes_main_pushes(self):
+        self.assertEqual(concurrency_errors(self.workflow), [])
+
+    def test_concurrency_mutations_are_caught(self):
+        cases = {
+            "shared-cancelling-group": lambda c: c.update({
+                "group": "${{ github.workflow }}-${{ github.ref }}",
+                "cancel-in-progress": "${{ github.event_name == 'pull_request' || github.event_name == 'push' }}"}),
+            "shared-queueing-group": lambda c: c.__setitem__("group", "${{ github.workflow }}-${{ github.ref }}"),
+            "per-commit-cancelling": lambda c: c.__setitem__("cancel-in-progress", "${{ github.event_name != 'merge_group' }}"),
+            "queue-cancelled": lambda c: c.__setitem__("cancel-in-progress", True),
+        }
+        for label, mutate in cases.items():
+            with self.subTest(mutation=label):
+                workflow = copy.deepcopy(self.workflow)
+                mutate(workflow["concurrency"])
+                self.assertTrue(concurrency_errors(workflow))
+        workflow = copy.deepcopy(self.workflow)
+        workflow["jobs"]["windows"]["concurrency"] = {"group": "windows", "cancel-in-progress": True}
+        self.assertIn("windows: job-level concurrency could cancel the tip's run", concurrency_errors(workflow))
+
+    def test_supersede_job_contract(self):
+        self.assertEqual(supersede_job_errors(self.workflow), [])
+        cases = {
+            "pr": lambda j: j.__setitem__("if", "github.event_name != 'merge_group'"),
+            "any-branch": lambda j: j.__setitem__("if", "github.event_name == 'push'"),
+            "routed": lambda j: j.__setitem__("needs", ["route"]),
+            "broad-token": lambda j: j["permissions"].__setitem__("contents", "write"),
+            "optional": lambda j: next(s for s in j["steps"] if s.get("id") == "scan").__setitem__("continue-on-error", True),
+        }
+        for label, mutate in cases.items():
+            with self.subTest(mutation=label):
+                workflow = copy.deepcopy(self.workflow)
+                mutate(workflow["jobs"]["supersede"])
+                self.assertTrue(supersede_job_errors(workflow))
+
+    def test_release_push_keeps_macos_release_build(self):
+        # The push macOS release build is the only mandatory per-tip macOS
+        # workspace release build (release-profile code such as
+        # cfg(not(debug_assertions)) is never compiled in the queue;
+        # release-cache.yml builds only on matching paths or dispatch), so a
+        # release-metadata push skips only Windows.
+        steps = {step.get("name"): step for step in self.workflow["jobs"]["build"]["steps"]}
+        for name in ("Build (release)", "Warm merge queue check cache"):
+            self.assertTrue(condition(steps[name]["if"], context("push", release_push="true")), name)
+        self.assertEqual(scheduled(self.workflow, "push", release_push="true")["build"], "success")
+
+    def test_release_push_classifier_compares_against_the_previous_tip(self):
+        job = self.workflow["jobs"]["release-fast-path"]
+        self.assertTrue(condition(job["if"], context("push")))
+        decide = next(step for step in job["steps"] if step.get("id") == "decide")
+        # A push classifies only a single commit on the previous tip, so a
+        # force push or multi-commit push cannot borrow a merge-base diff.
+        fetch = next(step for step in job["steps"] if "git fetch" in str(step.get("run", "")))
+        self.assertIn("--exact-parent", decide["run"])
+        self.assertIn("--depth=2", fetch["run"])
+        for event, base in (("push", "github.event.before"), ("pull_request", "github.event.pull_request.base.sha")):
+            values = {"github.event_name": event, "github.event.before": "before",
+                      "github.event.pull_request.base.sha": "pr-base"}
+            self.assertEqual(template_value(decide["env"]["BASE_SHA"], values), values[base], event)
+        # Each event reads only its own output, so a release push can never
+        # trip the PR fast-path guards on the `build` job's steps.
+        for event, own, other in (("push", "release_push", "fast_path"), ("pull_request", "fast_path", "release_push")):
+            values = {"github.event_name": event, "steps.decide.outputs.fast_path": "true"}
+            self.assertEqual(template_value(job["outputs"][own], values), "true", own)
+            self.assertEqual(template_value(job["outputs"][other], values), "", other)
 
     def test_gate_result_truth_tables(self):
         self.assertEqual(gate_errors(self.workflow), [])

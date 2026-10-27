@@ -13,8 +13,10 @@
 //!   Guest hellos enter only the device roster. Current members can host
 //!   ordinary workspace browsers; each dispatch rechecks their authority.
 //!   Chief and host reverse requests select only administrator connections.
-//! - [`ReverseTarget::Default`] → the **first-connected** eligible connection
-//!   (unchanged single-desktop behaviour); none → `NoClient`.
+//! - [`ReverseTarget::Default`] → the **first-connected** eligible client,
+//!   via its **newest** eligible connection (unchanged single-desktop
+//!   behaviour; a stale older socket of that client is skipped); none →
+//!   `NoClient`.
 //! - [`ReverseTarget::Client`] / [`ReverseTarget::Pinned`] → the **newest**
 //!   eligible connection of that logical `clientId`; none →
 //!   `ClientOffline { client_id, name, pinned }`.
@@ -405,23 +407,92 @@ fn resolve_entry_matching<'a>(
     allowed: impl Fn(&Entry) -> bool,
 ) -> Result<&'a Entry, ReverseDispatchError> {
     match target {
-        ReverseTarget::Default => entries
-            .iter()
-            .find(|e| e.is_eligible() && allowed(e))
-            .ok_or(ReverseDispatchError::NoClient),
-        ReverseTarget::Client(client_id) | ReverseTarget::Pinned(client_id) => entries
-            .iter()
-            .rev()
-            .find(|e| e.is_eligible() && e.has_client(client_id) && allowed(e))
-            .ok_or_else(|| ReverseDispatchError::ClientOffline {
-                client_id: client_id.clone(),
-                name: entries
-                    .iter()
-                    .rev()
-                    .filter(|e| e.has_client(client_id))
-                    .find_map(|e| e.identity.as_ref().and_then(|i| i.name.clone())),
-                pinned: matches!(target, ReverseTarget::Pinned(_)),
-            }),
+        // The first-connected eligible *client* stays the sticky primary,
+        // but the request goes to that client's newest eligible connection,
+        // the same rule as `Client` / `Pinned`: an older socket of the same
+        // app that stopped answering must not take every unpinned dispatch
+        // (intent-hq/intent#7902).
+        ReverseTarget::Default => {
+            let first = entries
+                .iter()
+                .find(|e| e.is_eligible() && allowed(e))
+                .ok_or(ReverseDispatchError::NoClient)?;
+            let client_id = &first
+                .identity
+                .as_ref()
+                .expect("an eligible entry always carries an identity")
+                .client_id;
+            // `first` itself matches, so the newest match always exists.
+            Ok(newest_eligible_of(entries, client_id, &allowed).unwrap_or(first))
+        }
+        ReverseTarget::Client(client_id) | ReverseTarget::Pinned(client_id) => {
+            newest_eligible_of(entries, client_id, &allowed).ok_or_else(|| {
+                ReverseDispatchError::ClientOffline {
+                    client_id: client_id.clone(),
+                    name: entries
+                        .iter()
+                        .rev()
+                        .filter(|e| e.has_client(client_id))
+                        .find_map(|e| e.identity.as_ref().and_then(|i| i.name.clone())),
+                    pinned: matches!(target, ReverseTarget::Pinned(_)),
+                }
+            })
+        }
+    }
+}
+
+/// The newest eligible, `allowed` connection of logical client `client_id`.
+fn newest_eligible_of<'a>(
+    entries: &'a VecDeque<Entry>,
+    client_id: &ClientId,
+    allowed: &impl Fn(&Entry) -> bool,
+) -> Option<&'a Entry> {
+    entries
+        .iter()
+        .rev()
+        .find(|e| e.is_eligible() && e.has_client(client_id) && allowed(e))
+}
+
+/// The connection a reverse request went to, captured cheaply under the
+/// registry lock and formatted only if the request times out.
+struct ConnectionLabel {
+    id: u64,
+    transport: ReverseTransport,
+    connected_at: String,
+    client: Option<(ClientId, Option<String>)>,
+}
+
+impl ConnectionLabel {
+    fn of(entry: &Entry) -> Self {
+        Self {
+            id: entry.id,
+            transport: entry.transport,
+            connected_at: entry.connected_at.clone(),
+            client: entry
+                .identity
+                .as_ref()
+                .map(|i| (i.client_id.clone(), i.name.clone())),
+        }
+    }
+}
+
+/// `browser client "<name>" (<clientId>) on connection <n> over <transport>,
+/// connected <ts>`, so a report of a silent client says which one it was.
+/// The hello-supplied name is Debug-escaped.
+impl std::fmt::Display for ConnectionLabel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.client {
+            Some((id, Some(name))) => write!(f, "browser client {name:?} ({})", id.as_str())?,
+            Some((id, None)) => write!(f, "browser client {}", id.as_str())?,
+            None => f.write_str("browser client")?,
+        }
+        write!(
+            f,
+            " on connection {} over {}, connected {}",
+            self.id,
+            self.transport.as_str(),
+            self.connected_at
+        )
     }
 }
 
@@ -472,7 +543,8 @@ impl PrimaryReverseRegistry {
     }
 
     /// The channel a [`ReverseTarget::Default`] dispatch would use right now
-    /// (the first-connected eligible connection), or `None` when no eligible
+    /// (the first-connected eligible client's newest eligible connection),
+    /// or `None` when no eligible
     /// client is connected. A cheap clone of the entry's channel; the entry
     /// stays registered.
     ///
@@ -790,17 +862,26 @@ impl AgentReverseDispatch for PrimaryReverseRegistry {
             && params["workspaceId"]
                 .as_str()
                 .is_some_and(|ws| !ws.is_empty() && !intent_core::WorkspaceId::from(ws).is_chief());
-        let channel = resolve_entry_matching(&self.inner.lock().entries, &target, |entry| {
+        let resolved = resolve_entry_matching(&self.inner.lock().entries, &target, |entry| {
             member_scope || entry.channel.is_administrator()
         })
-        .map(|e| e.channel.clone());
+        .map(|e| (e.channel.clone(), ConnectionLabel::of(e)));
         Box::pin(async move {
-            let channel = channel?;
+            let (channel, connection) = resolved?;
             let timeout = request_timeout(method, &params);
             channel.request(method, params, timeout).await.map_err(|e| {
+                let message = if e.timed_out {
+                    format!(
+                        "{}: {connection} did not accept or answer the request within {}s",
+                        e.message,
+                        timeout.as_secs()
+                    )
+                } else {
+                    e.message
+                };
                 ReverseDispatchError::Transport {
                     code: e.code,
-                    message: e.message,
+                    message,
                 }
             })
         })
