@@ -5993,8 +5993,15 @@ impl AgentManager {
                 None
             }
         };
-        if let Some(notice) = notice.or(pending) {
-            blocks.extend(text_prompt(&notice));
+        // A revive notice already carries the purge warning, so a pending copy
+        // is dropped. An ordinary auto-unarchive notice does not (the folder
+        // was purged by an EARLIER revive this agent has not heard about yet),
+        // so the pending notice follows it.
+        let revive_now = notice
+            .as_deref()
+            .is_some_and(|text| text != AUTO_UNARCHIVE_PROMPT_NOTICE);
+        for text in notice.into_iter().chain(pending.filter(|_| !revive_now)) {
+            blocks.extend(text_prompt(&text));
         }
         Ok(blocks)
     }

@@ -35946,7 +35946,17 @@ impl Services {
             };
             let current = store.get_workspace(&id).await?;
             if current.is_retired() {
-                let revived = self.revive_retired_checkout(&current).await?;
+                // The agent whose turn triggered the revive gets its notice in
+                // that turn; every other agent's notice is written with the
+                // flip (see `revive_retired_checkout`).
+                let trigger = auto_unarchive
+                    .as_ref()
+                    .and_then(|stamp| stamp.get("agentId"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(AgentId::from);
+                let revived = self
+                    .revive_retired_checkout(&current, trigger.as_ref())
+                    .await?;
                 (revived.is_some(), revived)
             } else {
                 let flipped = store
@@ -35967,17 +35977,6 @@ impl Services {
             None if flipped => Some(UnarchiveOutcome::Unarchived),
             None => None,
         };
-        // A revive leaves the folder-purged notice pending for every agent
-        // except the one whose turn triggered it (that turn carries its own
-        // copy), BEFORE the drain kicks below start any parked turn.
-        if let Some(r) = &revived {
-            let trigger = auto_unarchive
-                .as_ref()
-                .and_then(|stamp| stamp.get("agentId"))
-                .and_then(serde_json::Value::as_str);
-            self.record_pending_purge_notices(&id, &r.previous_branch, &r.branch, trigger)
-                .await;
-        }
         // The losing racer on the auto path stops here: the winner (a
         // concurrent turn start or a manual unarchive) already kicked the
         // parked drains and emitted its delta, so re-running the tail would

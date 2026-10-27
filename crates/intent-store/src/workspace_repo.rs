@@ -1600,6 +1600,29 @@ impl Store {
         base_commit_sha: Option<&str>,
         updated_at: &str,
     ) -> Result<bool> {
+        self.revive_workspace_if_retired_with_notice(id, branch, base_commit_sha, updated_at, None)
+            .await
+    }
+
+    /// [`Self::revive_workspace_if_retired`] that also leaves a one-time
+    /// prompt notice pending on the workspace's agent sessions **in the same
+    /// `BEGIN IMMEDIATE` transaction** as the flip: no reader can observe the
+    /// revived (Active) row without the notices, and a crash can never commit
+    /// one without the other. `notice` is `(metadata key, text, excluded
+    /// session)`; every session of the workspace except the excluded one
+    /// gets the key set. Nothing is written when the row is not retired.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
+    pub async fn revive_workspace_if_retired_with_notice(
+        &self,
+        id: &WorkspaceId,
+        branch: &str,
+        base_commit_sha: Option<&str>,
+        updated_at: &str,
+        notice: Option<(&str, &str, Option<&AgentId>)>,
+    ) -> Result<bool> {
         let retired = enum_to_db(&WorkspaceStatus::Retired)?;
         let mut lifecycle = self.repository_lifecycle_write().await?;
         let status: Option<String> = sqlx::query_scalar("SELECT status FROM workspace WHERE id=?")
@@ -1615,24 +1638,65 @@ impl Store {
             return Ok(false);
         }
         lifecycle.begin(&[crate::RepositoryLifecycleKey::Workspace(id.clone())])?;
-        let res = sqlx::query(
-            "UPDATE workspace SET status=?, archived=0, archived_at=NULL, retired_at=NULL, \
-             branch=?, base_commit_sha=?, updated_at=?, \
-             status_message=CASE WHEN status_message=? THEN NULL ELSE status_message END \
-             WHERE id=? AND status=?",
-        )
-        .bind(enum_to_db(&WorkspaceStatus::Active)?)
-        .bind(branch)
-        .bind(base_commit_sha)
-        .bind(updated_at)
-        .bind(intent_core::WORKSPACE_PURGED_STATUS_MESSAGE)
-        .bind(&id.0)
-        .bind(&retired)
-        .execute(self.write_pool())
-        .await
-        .map_err(|e| Error::Internal(format!("conditional revive failed: {e}")))?;
-        lifecycle.settle_after_retirement().await?;
-        Ok(res.rows_affected() > 0)
+        let mut conn = self
+            .write_pool()
+            .acquire()
+            .await
+            .map_err(|e| Error::Internal(format!("revive workspace acquire failed: {e}")))?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("revive workspace begin failed: {e}")))?;
+        let body: Result<bool> = async {
+            let res = sqlx::query(
+                "UPDATE workspace SET status=?, archived=0, archived_at=NULL, retired_at=NULL, \
+                 branch=?, base_commit_sha=?, updated_at=?, \
+                 status_message=CASE WHEN status_message=? THEN NULL ELSE status_message END \
+                 WHERE id=? AND status=?",
+            )
+            .bind(enum_to_db(&WorkspaceStatus::Active)?)
+            .bind(branch)
+            .bind(base_commit_sha)
+            .bind(updated_at)
+            .bind(intent_core::WORKSPACE_PURGED_STATUS_MESSAGE)
+            .bind(&id.0)
+            .bind(&retired)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("conditional revive failed: {e}")))?;
+            if res.rows_affected() == 0 {
+                return Ok(false);
+            }
+            if let Some((key, text, excluded)) = notice {
+                sqlx::query(
+                    "UPDATE agent_session SET \
+                     metadata = json_set(\
+                         CASE \
+                             WHEN metadata IS NULL THEN '{}' \
+                             WHEN json_type(metadata) = 'object' THEN metadata \
+                             ELSE json_object('priorNonObjectMetadata', json(metadata)) \
+                         END, \
+                         '$.' || ?, ?) \
+                     WHERE workspace_id = ? AND (? IS NULL OR id <> ?)",
+                )
+                .bind(key)
+                .bind(text)
+                .bind(&id.0)
+                .bind(excluded.map(|a| a.0.as_str()))
+                .bind(excluded.map(|a| a.0.as_str()))
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| Error::Internal(format!("revive pending notice write failed: {e}")))?;
+            }
+            Ok(true)
+        }
+        .await;
+        let result =
+            crate::commit_with_rollback_guard(conn, body, "revive workspace commit failed").await;
+        let settled = lifecycle.settle_after_retirement().await;
+        let flipped = result?;
+        settled?;
+        Ok(flipped)
     }
 
     /// Ordinary workspace keys for inherited host access, without hydrating

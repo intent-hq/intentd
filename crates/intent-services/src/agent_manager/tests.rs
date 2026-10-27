@@ -3912,6 +3912,42 @@ async fn manual_unarchive_of_a_purged_workspace_leaves_the_notice_pending_for_ev
     );
 }
 
+/// Review regression (intentd#2756): a pending folder-purged notice survives
+/// an ORDINARY unarchive. After a manual revive, the workspace is archived
+/// again before agent `b` ever ran; `b`'s next message auto-unarchives it and
+/// that turn carries both the auto-unarchive notice and the purge warning.
+#[intent_test_macros::daemon_test]
+async fn pending_purge_notice_survives_a_later_ordinary_unarchive() {
+    let root = test_tempdir("intentd-purge-rearchive-root-");
+    let repo = test_tempdir("intentd-purge-rearchive-repo-");
+    let (_tmp, mgr, _bus) = manager_with_bus_in(Some(root.path())).await;
+    let ws = WorkspaceId::from("ws-purge-rearchive");
+    let (a, b) = (AgentId::from("a-reviver"), AgentId::from("a-idle"));
+    retired_workspace_with_two_agents(&mgr, root.path(), repo.path(), &ws, &a, &b).await;
+
+    intent_core::WorkspaceApi::unarchive_workspace(&mgr.services, ws.clone())
+        .await
+        .expect("manual revive");
+    intent_core::WorkspaceApi::archive_workspace(&mgr.services, ws.clone(), None)
+        .await
+        .expect("archive again");
+
+    assert!(mgr.try_begin(&b, &ws).await, "b's message auto-unarchives");
+    let prompt = mgr
+        .build_turn_prompt(&b, &ws, "hello", &super::TurnOptions::default())
+        .await
+        .unwrap();
+    mgr.end_turn(&b).await;
+    let text = serde_json::to_string(&prompt).unwrap();
+    assert!(text.contains("automatically unarchived"), "{text}");
+    assert_eq!(text.matches(PURGE_NOTICE_PREFIX).count(), 1, "{text}");
+    assert_eq!(
+        purge_notices_in_next_prompt(&mgr, &b, &ws).await,
+        0,
+        "one-shot"
+    );
+}
+
 /// A turn start that races a retirement teardown must not be lost
 /// (verifier finding on intentd#2605): retire holds the archive fence from
 /// its Retired flip through `stop_many`, which releases in-flight slots. The
