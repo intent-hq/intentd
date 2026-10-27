@@ -34,6 +34,20 @@ fn hang_guard(base: Duration) -> Duration {
     base.mul_f64(multiplier)
 }
 
+/// Every string value under `value`, one per line: message text and
+/// metadata as the agent reads them, with no JSON escaping.
+fn collect_strings(value: &Value, out: &mut String) {
+    match value {
+        Value::String(s) => {
+            out.push_str(s);
+            out.push('\n');
+        }
+        Value::Array(items) => items.iter().for_each(|v| collect_strings(v, out)),
+        Value::Object(map) => map.values().for_each(|v| collect_strings(v, out)),
+        _ => {}
+    }
+}
+
 struct Fixture {
     _dir: tempfile::TempDir,
     services: Services,
@@ -44,17 +58,17 @@ struct Fixture {
 }
 
 async fn fixture() -> Fixture {
-    fixture_with(false).await
+    fixture_with(false, &[]).await
 }
 
 /// The fixture with the daemon's agent manager attached, as intentd wires
 /// it: queued agent wakes are drained by the manager.
 #[cfg(unix)]
 async fn fixture_with_agent_manager() -> Fixture {
-    fixture_with(true).await
+    fixture_with(true, &[]).await
 }
 
-async fn fixture_with(agent_manager: bool) -> Fixture {
+async fn fixture_with(agent_manager: bool, settings: &[(&str, Value)]) -> Fixture {
     let dir = tempfile::tempdir().expect("tempdir");
     let store = Store::open(&dir.path().join("e2e.db"))
         .await
@@ -81,9 +95,21 @@ async fn fixture_with(agent_manager: bool) -> Fixture {
         .expect("primary principal")
         .id;
     let bus = intent_services::EventBus::new(store.clone());
+    let registry = std::sync::Arc::new(
+        intent_services::SettingsRegistry::load(dir.path().join("config.toml"))
+            .expect("settings registry"),
+    );
+    if !settings.is_empty() {
+        let updates: Vec<(String, Value)> = settings
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), value.clone()))
+            .collect();
+        registry.apply(&updates).expect("apply settings");
+    }
     let services = intent_app::compose(
         Services::new(store)
             .with_workspaces_root(dir.path().join("workspaces"))
+            .with_settings_registry(registry)
             .with_event_bus(bus.clone()),
     );
     let agent_manager = agent_manager.then(|| {
@@ -191,7 +217,10 @@ impl Fixture {
             )
             .await
             .expect("agent.getQueue");
-        format!("{conversation}\n{queue}")
+        let mut text = String::new();
+        collect_strings(&conversation, &mut text);
+        collect_strings(&queue, &mut text);
+        text
     }
 
     /// Wait until `agent` has received a message containing `needle`.
@@ -454,11 +483,121 @@ async fn script_monitor_delivers_the_run_result_to_its_owner() {
     let monitor = f
         .as_agent(
             &owner,
-            f.services
-                .script_start_monitor(f.workspace.clone(), owner.clone(), script_id, run_id),
+            f.services.script_start_monitor(
+                f.workspace.clone(),
+                owner.clone(),
+                script_id,
+                run_id.clone(),
+            ),
         )
         .await
         .expect("arm the start monitor");
     assert_eq!(monitor["ok"], json!(true), "{monitor}");
-    f.wait_received(&owner, "E2E monitored").await;
+    let text = f
+        .wait_received(&owner, &format!("run {run_id}: finished"))
+        .await;
+    assert!(
+        text.contains(r#""outcome":"succeeded""#) && text.contains(r#""exitCode":0"#),
+        "the wake carries the settled run result: {text}"
+    );
+}
+
+/// A loopback GitLab answering the PAT validation `identity.connect` makes.
+async fn mock_gitlab() -> (String, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock gitlab");
+    let origin = format!("http://{}", listener.local_addr().expect("mock addr"));
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut reader = BufReader::new(stream);
+            let mut request = String::new();
+            if reader.read_line(&mut request).await.is_err() {
+                continue;
+            }
+            let mut header = String::new();
+            while reader.read_line(&mut header).await.is_ok_and(|n| n > 0) && header != "\r\n" {
+                header.clear();
+            }
+            let body = if request.contains("/api/v4/personal_access_tokens/self") {
+                json!({ "id": 7, "scopes": ["api"] })
+            } else if request.contains("/api/v4/user") {
+                json!({ "id": 42, "username": "e2e-user", "name": "E2E User" })
+            } else {
+                json!({})
+            }
+            .to_string();
+            let _ = reader
+                .get_mut()
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await;
+        }
+    });
+    (origin, server)
+}
+
+/// A collaboration credential connected through `identity.connect` (stored in
+/// the scoped collaboration store) never reaches the host execution context:
+/// execution reads only repository-purpose credentials.
+#[tokio::test]
+async fn execution_context_ignores_a_connected_collaboration_credential() {
+    const SECRET: &str = "glpat-e2e-collaboration-secret";
+    const HOST: &str = "gitlab.e2e.test";
+    let (origin, server) = mock_gitlab().await;
+    let f = fixture_with(
+        false,
+        &[
+            // Only stored credentials count, not the test host's gh CLI or env.
+            ("sourceControl.github.tokenSource", json!("explicit")),
+            ("sourceControl.gitlab.host", json!(HOST)),
+            ("sourceControl.gitlab.apiBaseUrl", json!(origin)),
+        ],
+    )
+    .await;
+    f.as_app(f.services.identity_connect(
+        "gitlab".into(),
+        Some(HOST.into()),
+        Some("pat".into()),
+        Some(SECRET.into()),
+    ))
+    .await
+    .expect("identity.connect");
+    let status = f
+        .as_app(
+            f.services
+                .identity_auth_status("gitlab".into(), Some(HOST.into())),
+        )
+        .await
+        .expect("identity.authStatus");
+    assert!(
+        status.to_string().contains("e2e-user"),
+        "the collaboration identity is connected: {status}"
+    );
+
+    let context = f
+        .as_app(f.services.host_execution_context())
+        .await
+        .expect("host.executionContext");
+    let connections = context["repositoryConnections"]
+        .as_array()
+        .unwrap_or_else(|| panic!("repository connections: {context}"));
+    assert!(!connections.is_empty(), "{context}");
+    for connection in connections {
+        assert_eq!(connection["configured"], json!(false), "{context}");
+    }
+    assert!(
+        !context.to_string().contains(SECRET),
+        "the collaboration secret never appears: {context}"
+    );
+    server.abort();
 }

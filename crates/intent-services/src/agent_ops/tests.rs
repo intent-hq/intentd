@@ -49585,6 +49585,157 @@ async fn script_monitor_waiting_advisory_and_after_all_retire_on_silent_cancel()
     }
 }
 
+/// The real runtime's cancel path for a script-monitor-waiting child: the same
+/// scenario as [`script_monitor_waiting_advisory_and_after_all_retire_on_silent_cancel`]
+/// (which runs against the runtime test double), on the in-crate runtime, with
+/// a real script, run reservation and `script.monitor` registration. The cancel
+/// and the detached `commit_monitor` → `dispatch_script_monitor` callback both
+/// redeliver; the claimed watch retires exactly once.
+#[intent_test_macros::daemon_test]
+async fn real_runtime_script_monitor_cancel_redelivery_retires_watch_once() {
+    use crate::runtime::RuntimeStateExt;
+    use crate::script_monitor::ScriptMonitorExt;
+
+    for grouped in [false, true] {
+        let (_t, svc, ws) = setup().await;
+        let park = Arc::new(crate::CompletionClassifyPark::default());
+        let svc = if grouped {
+            svc
+        } else {
+            svc.with_completion_claim_park(park.clone())
+        };
+        let parent = create_agent(&svc, &ws, "Parent").await;
+        let child = create_agent(&svc, &ws, "Child").await;
+        let script = svc
+            .script_create(
+                ws.clone(),
+                intent_core::ScriptCreateParams {
+                    name: "Monitor check".into(),
+                    command: "true".into(),
+                    mode: intent_core::ScriptMode::Command,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let sid = script["id"].as_str().unwrap().to_owned();
+        svc.store
+            .admit_script_run(&ws, &sid, "accepted-reservation")
+            .await
+            .unwrap();
+        let monitor = svc
+            .script_monitor(ws.clone(), child.clone(), sid, json!({"ttlMs":60000}))
+            .await
+            .unwrap();
+        let gid = grouped.then(|| {
+            let gid = svc.get_or_create_delegation_group(&ws, &parent);
+            svc.enroll_child_in_group(&gid, &child);
+            gid
+        });
+        svc.register_completion_watch(
+            &ws,
+            &ws,
+            parent.clone(),
+            "Parent".into(),
+            child.clone(),
+            gid,
+        )
+        .unwrap();
+        let mut data = json!({"agentId":child});
+        svc.annotate_waiting_on_pr_monitors(&child, &mut data).await;
+        assert_eq!(
+            data["waitingOnScriptMonitors"][0]["monitorId"],
+            monitor["monitor"]["monitorId"]
+        );
+        svc.handle_completion_event(&completion_event(&ws, AGENT_IDLE, &child, data.clone()))
+            .await;
+        svc.handle_completion_event(&completion_event(&ws, AGENT_IDLE, &child, data))
+            .await;
+        assert_eq!(parent_message_count(&svc, &parent).await, 1);
+        assert!(parent_messages_text(&svc, &parent)
+            .await
+            .contains("Monitor check"));
+        assert_eq!(svc.find_watches_for_child(&child).len(), 1);
+        if grouped {
+            svc.handle_completion_event(&completion_event(
+                &ws,
+                AGENT_IDLE,
+                &parent,
+                json!({"agentId":parent}),
+            ))
+            .await;
+        }
+        wait_for_persisted_watches(&svc, 1).await;
+        let cancellation = tokio::spawn({
+            let svc = svc.clone();
+            let ws = ws.clone();
+            let child = child.clone();
+            async move {
+                svc.cancel_script_monitors(&ws, Some(&child), "owner-retired")
+                    .await
+                    .unwrap();
+            }
+        });
+        if !grouped {
+            timeout(
+                intentd_test_support::test_timeout(Duration::from_secs(5)),
+                park.entered.notified(),
+            )
+            .await
+            .expect("cancellation redelivery claims the watch");
+            // The competing idle pass must yield to the existing delivery;
+            // its return does not promise that the winner has retired yet.
+            svc.handle_completion_event(&completion_event(
+                &ws,
+                AGENT_IDLE,
+                &child,
+                json!({"agentId":child}),
+            ))
+            .await;
+            assert_eq!(svc.find_watches_for_child(&child).len(), 1);
+            assert_eq!(parent_message_count(&svc, &parent).await, 1);
+            park.release.notify_one();
+        }
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            cancellation,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        // The cancel's ScriptManager cleanup committed the monitor, which
+        // spawned a detached dispatch_script_monitor; wait for that callback
+        // too rather than assuming it finished when the cancel returned.
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            svc.runtime().script_locks.monitor_dispatched.notified(),
+        )
+        .await
+        .expect("commit_monitor's dispatch callback finished");
+        // Cancellation and commit_monitor's spawned redelivery race for the
+        // same claim. The winner commits durable retirement before removing
+        // the in-memory watch, so observing the database alone is not a fence
+        // for both states. Await memory cleanup and then durable retirement.
+        timeout(
+            intentd_test_support::test_timeout(Duration::from_secs(5)),
+            async {
+                while !svc.find_watches_for_child(&child).is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            },
+        )
+        .await
+        .expect("cancellation redelivery retires the in-memory watch");
+        wait_for_persisted_watches(&svc, 0).await;
+        assert!(svc.find_watches_for_child(&child).is_empty());
+        assert_eq!(parent_message_count(&svc, &parent).await, 2);
+        assert!(svc
+            .active_script_monitors_for_agent(&child)
+            .await
+            .is_empty());
+    }
+}
+
 #[intent_test_macros::daemon_test]
 async fn task_push_assignment_cleanup_publishes_complete_metadata() {
     let (_tmp, svc, ws) = setup().await;
