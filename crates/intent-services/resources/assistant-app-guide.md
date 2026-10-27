@@ -552,7 +552,7 @@ until Intent sees them again.
 
 ## Home Workspaces
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceSettings,HomeWorkspaceBoard}.svelte; src/features/home/{home-workspace-opening,home-workspace-status-groups,home-workspaces-persistence}.ts. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceSettings,HomeWorkspaceBoard}.svelte; src/features/home/{home-workspace-opening,home-workspace-status-groups,home-workspaces-persistence,home-workspace-menu}.ts. Daemon: workspace.update `label`, packages/intentd/crates/intent-core/src/model.rs (normalize_workspace_label). -->
 
 In **Home → Workspaces**, click a list row or board card to select it and show its
 preview. Double-click it, or Cmd-click (Ctrl-click on Windows and Linux), to open the
@@ -569,9 +569,20 @@ groups. In list view, **Status** groups workspace statuses in this order:
 The board uses **Activity** while the list is grouped by **Status**. Switching back
 to the list restores its detailed groups.
 
-Pinned board cards show a pin icon. Right-click a card and choose **Pin** or
-**Unpin**. Pinned cards stay ahead of unpinned cards; **Done & idle** shows newest
-activity first within the pinned and unpinned groups.
+Right-click a workspace and choose **Pin** or **Unpin**, or open **Label** to give
+it a label. The **Label** submenu lists the labels already in use (A–Z), **New
+label…** to name a new one (1–64 characters, not a duplicate and not "Pinned"), and
+**Remove label** when the workspace has one. Each workspace has one label; Pinned is
+the built-in label, so labeling a pinned workspace unpins it and pinning a labeled
+workspace removes its label. A label disappears once no workspace holds it. Labels
+are saved by the daemon, so they sync to every client connected to it; shared
+workspace members who are not owners cannot change them.
+
+In the list, pinned workspaces come first with a pin icon, then one collapsible
+group per label (A–Z), then the usual groups without those workspaces. Grouped by
+**None**, and on the board, pinned workspaces show a pin icon and stay ahead of the
+rest without label groups; **Done & idle** shows newest activity first within the
+pinned and unpinned groups.
 
 The grouping choice is remembered with Home's settings for the current signed-in
 user and connected backend. **Activity** remains the default; existing saved

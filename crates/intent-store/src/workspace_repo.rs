@@ -27,7 +27,7 @@ const WORKSPACE_COLUMNS: &str = "id, title, branch, base_ref, base_commit_sha, s
     repository_name, worktree_path, scope, skip_worktree, is_remote, default_model, pr_number, \
     pr_url, pr_status, active_pull_request, pull_requests, context_links, archived, archived_at, \
     tags, created_at, updated_at, last_activity, token_usage, setup_script, checkout_mode, \
-    browser_client_id, last_content_activity, retired_at";
+    browser_client_id, last_content_activity, retired_at, label";
 
 // Shared with deletion query-cost regressions so they exercise the exact
 // production statements, including their candidate-selection work.
@@ -263,7 +263,7 @@ impl Store {
         }
         let sql = format!(
             "INSERT INTO workspace ({WORKSPACE_COLUMNS}, auto_commit_enabled) VALUES \
-             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
         let query = sqlx::query(&sql)
             .bind(&ws.id.0)
@@ -302,6 +302,7 @@ impl Store {
             .bind(ws.browser_client_id.as_ref().map(|c| c.0.clone()))
             .bind(&ws.last_content_activity)
             .bind(&ws.retired_at)
+            .bind(&ws.label)
             .bind(auto_commit.map(i64::from));
         lifecycle.begin(&[crate::RepositoryLifecycleKey::Workspace(ws.id.clone())])?;
         if let Some(admission) = admission {
@@ -407,7 +408,7 @@ impl Store {
              last_activity=CASE WHEN julianday(?) IS NOT NULL \
                AND (last_activity IS NULL OR julianday(last_activity) IS NULL \
                OR julianday(last_activity) < julianday(?)) THEN ? ELSE last_activity END, \
-             token_usage=?, setup_script=?, checkout_mode=? WHERE id=? RETURNING branch",
+             token_usage=?, setup_script=?, checkout_mode=?, label=? WHERE id=? RETURNING branch",
         )
         .bind(&ws.title)
         .bind(branch)
@@ -443,6 +444,7 @@ impl Store {
         .bind(token_usage_to_db(ws)?)
         .bind(setup_script_to_db(ws)?)
         .bind(checkout_mode_to_db(ws)?)
+        .bind(&ws.label)
         .bind(&ws.id.0)
         .fetch_optional(self.write_pool())
         .await
@@ -1977,6 +1979,7 @@ fn map_workspace_row(row: &SqliteRow) -> Result<Workspace> {
         token_usage,
         checkout_mode,
         browser_client_id: col::<Option<String>>(row, "browser_client_id")?.map(ClientId),
+        label: col(row, "label")?,
         // The remaining fields are never persisted: `activity` is derived
         // (§9.9), the emit-only fields (card aggregates, `displayStatus`, the
         // wait/script/background flags, `cowSupported`, `diskUsage`,

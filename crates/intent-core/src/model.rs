@@ -336,6 +336,14 @@ pub struct Workspace {
     /// Omitted (not `null`) until an agent sets one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_image_asset_id: Option<String>,
+    /// The workspace's single Home grouping label (§9.1): the reserved value
+    /// [`WORKSPACE_LABEL_PINNED`] for the built-in Pinned label, or a
+    /// trimmed free-form name of 1–[`WORKSPACE_LABEL_MAX_CHARS`] characters.
+    /// Set / cleared via `workspace.update { label }` (owner-only); there is
+    /// no label registry — the labels that exist are the distinct values
+    /// workspaces hold. Omitted (not `null`) when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
     /// Derived, read-only; never persisted (§9.9).
     pub activity: WorkspaceActivity,
     pub attention: WorkspaceAttention,
@@ -593,6 +601,33 @@ pub const WORKSPACE_LIST_ROW_BUDGET_BYTES: usize = 7_680;
 /// `pullRequestsTotal`. `workspace.get` serves the full pool.
 pub const WORKSPACE_LIST_PR_CAP: usize = 5;
 
+/// Reserved [`Workspace::label`] value for the built-in Pinned label.
+pub const WORKSPACE_LABEL_PINNED: &str = "pinned";
+
+/// Maximum length, in characters, of a trimmed [`Workspace::label`].
+pub const WORKSPACE_LABEL_MAX_CHARS: usize = 64;
+
+/// Normalise a `workspace.update { label }` value: trim surrounding
+/// whitespace and require 1–[`WORKSPACE_LABEL_MAX_CHARS`] characters.
+///
+/// # Errors
+/// [`crate::Error::InvalidParams`] when the trimmed label is empty or too
+/// long.
+pub fn normalize_workspace_label(raw: &str) -> crate::Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(crate::Error::InvalidParams(
+            "workspace.update: `label` must not be empty (pass null to clear it)".to_string(),
+        ));
+    }
+    if trimmed.chars().count() > WORKSPACE_LABEL_MAX_CHARS {
+        return Err(crate::Error::InvalidParams(format!(
+            "workspace.update: `label` must be at most {WORKSPACE_LABEL_MAX_CHARS} characters"
+        )));
+    }
+    Ok(trimmed.to_string())
+}
+
 /// Key allowlist golden for a serialized `workspace.list` row: the
 /// top-level keys a list row may carry after [`Workspace::slim_for_list`].
 /// The row-budget golden test compares every key of a worst-case row
@@ -618,6 +653,7 @@ pub const WORKSPACE_LIST_ROW_KEYS: &[&str] = &[
     "status",
     "statusMessage",
     "statusImageAssetId",
+    "label",
     "activity",
     "attention",
     "createdAt",
@@ -1550,6 +1586,16 @@ pub struct WorkspaceUpdate {
         deserialize_with = "deserialize_optional_field"
     )]
     pub status_image_asset_id: Option<Option<String>>,
+    /// Clearable Home label (§9.1 `Workspace.label`): a wire `null`
+    /// (`Some(None)`) clears it, `Some(Some(label))` sets it (trimmed and
+    /// validated by the service), missing (`None`) leaves it untouched.
+    /// Owner-only — not in the collaborator-editable allowlist.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_field"
+    )]
+    pub label: Option<Option<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -19261,6 +19261,7 @@ impl WorkspaceApi for Services {
             caps.insert("discussionAgentActivity".into(), serde_json::json!(1));
             caps.insert("discussionPrincipalMentions".into(), serde_json::json!(1));
             caps.insert("discussionManagement".into(), serde_json::json!(1));
+            caps.insert("workspaceLabels".into(), serde_json::json!(1));
             if let Some(cow_supported) = self.compute_cow_supported().await {
                 caps.insert("cowSupported".to_string(), serde_json::json!(cow_supported));
             }
@@ -23706,8 +23707,23 @@ impl WorkspaceApi for Services {
                 normalised.status_image_asset_id = Some(None);
             }
         }
+        // A set `label` persists trimmed, so the delta carries the trimmed
+        // value; an invalid one is refused below before any write.
+        let label_error = match normalised.label.as_mut() {
+            Some(Some(raw)) => match intent_core::normalize_workspace_label(raw) {
+                Ok(trimmed) => {
+                    *raw = trimmed;
+                    None
+                }
+                Err(e) => Some(e),
+            },
+            _ => None,
+        };
         let mut changes = serde_json::to_value(&normalised).unwrap_or(serde_json::Value::Null);
         Box::pin(async move {
+            if let Some(e) = label_error {
+                return Err(e);
+            }
             // `Retired` is entered only through `workspace.retire` / the
             // automatic sweep (ownership proof, teardown, folder removal):
             // a generic status write must never produce it.
@@ -23781,6 +23797,11 @@ impl WorkspaceApi for Services {
             // PR fields below.
             if let Some(v) = update.status_image_asset_id {
                 ws.status_image_asset_id = v.filter(|s| !s.trim().is_empty());
+            }
+            // Home label (§9.1): `null` clears, a string sets the trimmed
+            // value validated above, missing leaves it untouched.
+            if let Some(v) = normalised.label.clone() {
+                ws.label = v;
             }
             if let Some(v) = update.branch {
                 ws.branch = v;

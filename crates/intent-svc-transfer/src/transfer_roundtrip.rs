@@ -626,6 +626,7 @@ async fn seed_source(
     let mut ws = intent_services::feature_api::tests::workspace(id);
     ws.repository_path = Some(repo.to_string_lossy().into_owned());
     ws.repository_name = Some("test-repo".to_string());
+    ws.label = Some("For Later".to_string());
     svc.store().insert_workspace(&ws).await.expect("workspace");
 
     svc.store()
@@ -1307,6 +1308,11 @@ async fn transfer_round_trip_between_two_stacks() {
     );
     assert_eq!(imported.worktree_path, None);
     assert_eq!(imported.branch, "main");
+    assert_eq!(
+        imported.label.as_deref(),
+        Some("For Later"),
+        "the workspace label rides the transfer"
+    );
     // Worktree: right tip, dirty state restored (WIP snapshot unwound).
     assert_eq!(repo_head(&checkout), seeded.main_tip);
     assert_eq!(
