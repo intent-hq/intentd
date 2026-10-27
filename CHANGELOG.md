@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.61] - 2026-10-27
+
+### 🧪 Testing
+
+- *(services)* Run core agent/watch tests against a runtime test double ([#2736](https://github.com/intent-hq/intentd/pull/2736))
+
+
+## [0.11.60] - 2026-10-27
+
+### 🚀 Features
+
+- *(desktop)* Accept windowId targets and add focusWindow ([#2734](https://github.com/intent-hq/intentd/pull/2734))
+
+### 🐛 Bug Fixes
+
+- Bump Codex ACP fallback to v2.3.0 ([#2739](https://github.com/intent-hq/intentd/pull/2739))
+- *(transport)* Route unpinned browser.exec to the client's newest connection ([#2733](https://github.com/intent-hq/intentd/pull/2733))
+
+### 🧪 Testing
+
+- *(pr-monitor)* Check every optional saved field survives an upgrade ([#2735](https://github.com/intent-hq/intentd/pull/2735))
+
+
 ## [0.11.59] - 2026-10-27
 
 ### 🧪 Testing

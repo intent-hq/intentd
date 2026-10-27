@@ -223,6 +223,12 @@ pub(crate) struct ScriptLocks {
     /// rather than on the entry so removing or recreating a finished script
     /// cannot erase it (and so skip the idle update grace).
     command_settled_at: Arc<Mutex<Option<Instant>>>,
+    /// Test seam: signalled each time the detached dispatch a committed
+    /// monitor spawns (`commit_monitor` → `dispatch_script_monitor`) has
+    /// finished, so a test can wait for that callback instead of assuming it
+    /// ran before the caller returned.
+    #[cfg(test)]
+    pub(crate) monitor_dispatched: Arc<tokio::sync::Notify>,
 }
 
 impl ScriptLocks {

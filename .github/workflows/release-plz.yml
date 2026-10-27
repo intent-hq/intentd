@@ -207,8 +207,23 @@ jobs:
       # never committed or supplied to the publication job above.
       - name: Prepare release planning baseline
         run: python3 -S scripts/release-plz-baseline.py --output "$RUNNER_TEMP/release-plz-planning.toml"
+      # crates.io resilience (scripts/test-release-plz-network.py). Run
+      # 40430078531 failed in release-pr's `cargo package` on "curl failed:
+      # [16] Error in the HTTP2 framing layer"; without the no-op marker the
+      # frontend alpha cut deferred for six hours. `cargo package` re-resolves
+      # against the index, so it cannot run offline: fetch the locked crates
+      # with retries, turn off HTTP/2 multiplexing, raise cargo's retries, and
+      # run release-pr once more if the first attempt fails. release-pr is
+      # idempotent (it recomputes the Release PR from repo state), as the
+      # manual `gh run rerun --failed` recovery relied on. Both attempts
+      # failing still fails the job; release-plz-rerun.yml then re-runs it.
+      - name: Fetch locked crates (retrying)
+        run: python3 -I -B scripts/fetch-locked-crates.py
       - name: Run release-plz release-pr
         id: release_pr
+        # The only continue-on-error in this workflow: the retry below owns
+        # the failure, and the tag-publishing job above never swallows one.
+        continue-on-error: true
         uses: release-plz/action@aec534bbd8631793b9b3b8f1ee6cd886c322e17f # v0.5.133
         with:
           command: release-pr
@@ -216,15 +231,34 @@ jobs:
           config: ${{ runner.temp }}/release-plz-planning.toml
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+          CARGO_HTTP_MULTIPLEXING: "false"
+          CARGO_NET_RETRY: "10"
+      - name: Back off before retrying release-pr
+        if: ${{ steps.release_pr.outcome == 'failure' }}
+        run: |
+          echo "::warning::release-plz release-pr failed; retrying once in 60s (crates.io network errors are usually transient)."
+          sleep 60
+      - name: Retry release-plz release-pr
+        id: release_pr_retry
+        if: ${{ steps.release_pr.outcome == 'failure' }}
+        uses: release-plz/action@aec534bbd8631793b9b3b8f1ee6cd886c322e17f # v0.5.133
+        with:
+          command: release-pr
+          version: 0.3.162 # Keep tag-selection semantics and actual-tool fixtures aligned.
+          config: ${{ runner.temp }}/release-plz-planning.toml
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+          CARGO_HTTP_MULTIPLEXING: "false"
+          CARGO_NET_RETRY: "10"
       - name: Remove temporary planning configuration
         if: ${{ always() }}
         run: rm -f "$RUNNER_TEMP/release-plz-planning.toml"
       - name: Validate release-plz no-op baseline
         id: no_release
-        if: ${{ success() && steps.release_pr.outcome == 'success' }}
+        if: ${{ success() && (steps.release_pr.outcome == 'success' || steps.release_pr_retry.outcome == 'success') }}
         env:
-          RELEASE_PLZ_OUTCOME: ${{ steps.release_pr.outcome }}
-          RELEASE_PLZ_PRS: ${{ steps.release_pr.outputs.prs }}
+          RELEASE_PLZ_OUTCOME: ${{ steps.release_pr.outcome == 'success' && 'success' || steps.release_pr_retry.outcome }}
+          RELEASE_PLZ_PRS: ${{ steps.release_pr.outcome == 'success' && steps.release_pr.outputs.prs || steps.release_pr_retry.outputs.prs }}
         run: python3 -S scripts/release-plz-noop.py >> "$GITHUB_OUTPUT"
       # Surface cache hit rates in the log; `always()` keeps them visible
       # when release-pr fails. Skips cleanly when sccache was never

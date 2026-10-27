@@ -866,6 +866,34 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: python3 -I -B scripts/supersede-push-runs.py --repo "$GITHUB_REPOSITORY" --sha "$GITHUB_SHA" --run-id "$GITHUB_RUN_ID" >> "$GITHUB_OUTPUT"
 
+  # Cancels a merge-queue run as soon as any job fails. The queue builds one
+  # entry at a time and CI Gate rejects any failure, so the first failed job
+  # already dooms the entry; without this the queue (and paid macOS/Linux
+  # runners) waited a median 16 min for the slowest job before ejecting it.
+  # CI Gate (`always()`) still runs on the cancelled run and fails, so the
+  # queue ejects the entry as before, only sooner. Advisory: hosted and free,
+  # no `needs` so it starts at once, never in CI Gate's `needs`, and the
+  # script exits 0 on every outcome. Only this job and `supersede` hold
+  # actions: write; it checks out just its script and runs no build code.
+  fail-fast:
+    name: Merge queue fail-fast
+    if: github.event_name == 'merge_group'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts/merge-queue-fail-fast.py
+          sparse-checkout-cone-mode: false
+      - name: Cancel this run on the first failed job
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -I -B scripts/merge-queue-fail-fast.py --repo "$GITHUB_REPOSITORY" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT"
+
   release-fast-path:
     needs: [route]
     runs-on: ${{ fromJSON(needs.route.outputs.runners || '{}')['ubuntu-24.04'] || fromJSON('["ubuntu-24.04"]') }}
@@ -2223,6 +2251,8 @@ jobs:
           python3 -B scripts/test-release-rust-cache.py
           python3 -I -B scripts/test-optional-intel-release.py
           python3 -B scripts/test-release-host-network.py
+          python3 -B scripts/test-release-plz-network.py
+          python3 -I -B scripts/test-release-plz-rerun.py
           python3 -B scripts/test-setup-sccache.py
           python3 -I -B scripts/test-coverage-storage.py
           python3 -B scripts/test-hosted-runners.py
@@ -2257,6 +2287,7 @@ jobs:
         run: |
           python3 -I -B scripts/test-ci-native-routing.py
           python3 -I -B scripts/test-supersede-push-runs.py
+          python3 -I -B scripts/test-merge-queue-fail-fast.py
       - name: Install release cache regression compiler
         shell: bash
         run: |
