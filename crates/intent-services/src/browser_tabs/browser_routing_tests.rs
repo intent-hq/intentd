@@ -21,7 +21,7 @@ fn agent(id: &str) -> AgentId {
 /// so they are created on demand (`setup` already knows `desktop-a` /
 /// `desktop-b` and the primary workspace). User tabs report
 /// `displayed: true`, agent tabs `false` (hidden).
-async fn register_tab(
+pub(super) async fn register_tab(
     svc: &Services,
     ws: &WorkspaceId,
     tab_id: &str,

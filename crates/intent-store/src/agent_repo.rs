@@ -3893,6 +3893,56 @@ impl Store {
         Ok(true)
     }
 
+    /// Atomically read and remove one string-valued session metadata key:
+    /// `Ok(Some(value))` for exactly one caller per stored value (the removal
+    /// is CAS-guarded on the value just read, so two racing takers never both
+    /// get it), `Ok(None)` when the key is absent, not a string, or was taken
+    /// concurrently, or the session does not exist. `updated_at` is left
+    /// untouched (bookkeeping, not activity). `key` must be a trusted
+    /// compile-time constant.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Internal` if the database operation fails.
+    pub async fn take_agent_session_metadata_key(
+        &self,
+        workspace_id: &WorkspaceId,
+        id: &AgentId,
+        key: &str,
+    ) -> Result<Option<String>> {
+        let value: Option<String> = sqlx::query_scalar(
+            "SELECT json_extract(metadata, '$.' || ?) FROM agent_session \
+             WHERE id = ? AND workspace_id = ? AND json_valid(metadata) \
+               AND json_type(metadata, '$.' || ?) = 'text'",
+        )
+        .bind(key)
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .bind(key)
+        .fetch_optional(self.read_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("read agent session metadata key failed: {e}")))?
+        .flatten();
+        let Some(value) = value else {
+            return Ok(None);
+        };
+        let rows = sqlx::query(
+            "UPDATE agent_session SET metadata = json_remove(metadata, '$.' || ?) \
+             WHERE id = ? AND workspace_id = ? AND json_valid(metadata) \
+               AND json_extract(metadata, '$.' || ?) = ?",
+        )
+        .bind(key)
+        .bind(&id.0)
+        .bind(&workspace_id.0)
+        .bind(key)
+        .bind(&value)
+        .execute(self.write_pool())
+        .await
+        .map_err(|e| Error::Internal(format!("take agent session metadata key failed: {e}")))?
+        .rows_affected();
+        Ok((rows > 0).then_some(value))
+    }
+
     /// [`Store::set_agent_session_metadata_key`] for a JSON-typed value:
     /// `value` is a serialized JSON document (array/object/scalar) stored
     /// through `SQLite`'s `json(?)` so it lands as real JSON under the key —

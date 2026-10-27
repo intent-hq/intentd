@@ -60,6 +60,7 @@ mod agent_session;
 mod agent_subscriptions;
 mod agent_wake;
 mod agent_workers;
+mod auto_archive;
 mod auto_retire;
 mod retire;
 /// The §5.5b wire-ID rule, shared by the transport's request validation.
@@ -316,15 +317,16 @@ mod v2_5_goldens;
 mod v2_7_goldens;
 
 pub use acp_adapter::{adapter_slot_limit, init_adapter_slots, live_adapters};
+pub use auto_archive::AutoArchiveReport;
 pub use auto_retire::AutoRetireReport;
 pub use config_watcher::{ConfigWatcher, PreparedReloadAdmission};
 pub(crate) use mcp_servers::McpHub;
 pub use settings::{
     agent_memory_budget_bytes, cleanup_retired_settings, history_replay_tool_content_chars,
     host_total_memory_bytes, import_legacy_settings, max_concurrent_adapters,
-    max_concurrent_agents, migrate_active_provider_setting, migrate_default_vocabulary,
-    migrate_quick_action_settings, report_to_parent_debounce_seconds, tool_payload_retention_days,
-    InMemorySecretStore, SecretStore,
+    max_concurrent_agents, migrate_active_provider_setting, migrate_auto_retire_setting,
+    migrate_default_vocabulary, migrate_quick_action_settings, report_to_parent_debounce_seconds,
+    tool_payload_retention_days, InMemorySecretStore, SecretStore,
 };
 pub use settings_registry::{SettingOrigin, SettingsRegistry, SettingsSnapshot, WsApiPortPolicy};
 pub(crate) use settings_registry::{SettingsChanged, KNOWN_PATHS};
@@ -5021,8 +5023,9 @@ impl Services {
     /// The `workspace.getBrowserClient` payload for `id`: the persisted pin
     /// (`clientId` + `source: "workspace"`, else `source: "default"`) and
     /// `resolved` — the driving client an agent `browser.exec` would reach
-    /// right now ([`Self::driving_client_target`]: pin → host of the
-    /// workspace's claimed tabs → first-connected eligible client), `null`
+    /// right now ([`Self::driving_client_target`]: pin → client controlling
+    /// the workspace's desktop → host of the workspace's claimed tabs →
+    /// first-connected eligible client), `null`
     /// when that client is offline or no eligible client is connected. Chief
     /// has no row and always reports the default.
     async fn browser_client_state(&self, id: &WorkspaceId) -> Result<serde_json::Value> {
@@ -5051,6 +5054,73 @@ impl Services {
         }
         out.insert("resolved".into(), resolved);
         Ok(serde_json::Value::Object(out))
+    }
+
+    /// The `ws.browser.clients()` payload for `id` (see
+    /// [`WorkspaceApi::browser_clients`]): one registry snapshot carrying
+    /// every client's live connections, the unpinned (`Default`) route and
+    /// this workspace's driving-client route with its `source`. A route
+    /// to an offline client carries the error `browser.exec` would report.
+    /// Without a dispatcher no client is listed and both routes report `no
+    /// client connected`.
+    async fn browser_clients_state(&self, id: &WorkspaceId) -> Result<serde_json::Value> {
+        use intent_core::{ReverseConnectionSnapshot, ReverseDispatchError, ReverseRoute};
+
+        let (target, source) = self.driving_client_route(id).await?;
+        let targets = [intent_core::ReverseTarget::Default, target];
+        let snapshot = self.reverse_dispatch.as_ref().map_or_else(
+            || ReverseConnectionSnapshot {
+                clients: Vec::new(),
+                routes: targets
+                    .iter()
+                    .map(|_| ReverseRoute::failed(&ReverseDispatchError::NoClient))
+                    .collect(),
+            },
+            |d| d.connection_snapshot(id, &targets),
+        );
+        let Ok([unpinned, workspace]) = <[ReverseRoute; 2]>::try_from(snapshot.routes) else {
+            return Err(Error::Internal(
+                "browser.clients: the dispatcher did not report one route per target".to_string(),
+            ));
+        };
+        let mut routes = Vec::with_capacity(2);
+        for (route, target) in [unpinned, workspace].into_iter().zip(&targets) {
+            routes.push(self.browser_route_value(route, target).await?);
+        }
+        let mut workspace = routes.pop().expect("two routes");
+        let unpinned = routes.pop().expect("two routes");
+        workspace["source"] = source.into();
+        Ok(serde_json::json!({
+            "clients": snapshot.clients,
+            "unpinned": unpinned,
+            "workspace": workspace,
+        }))
+    }
+
+    /// One `ws.browser.clients()` route as JSON. An offline named client's
+    /// error is reworded exactly as `browser.exec` reports it (with the
+    /// stored client name when no live connection supplies one).
+    async fn browser_route_value(
+        &self,
+        mut route: intent_core::ReverseRoute,
+        target: &intent_core::ReverseTarget,
+    ) -> Result<serde_json::Value> {
+        use crate::browser_tabs::BrowserTabRoutingExt;
+        use intent_core::{ReverseDispatchError, ReverseTarget};
+
+        if route.connection_id.is_none() {
+            if let (Some(client_id), ReverseTarget::Client(_) | ReverseTarget::Pinned(_)) =
+                (route.client_id.clone(), target)
+            {
+                let error = ReverseDispatchError::ClientOffline {
+                    client_id,
+                    name: route.name.clone(),
+                    pinned: matches!(target, ReverseTarget::Pinned(_)),
+                };
+                route.error = Some(self.browser_dispatch_error_message(error).await);
+            }
+        }
+        serde_json::to_value(route).map_err(|e| Error::Internal(e.to_string()))
     }
 
     /// Attach the runtime [`ServerControl`] so `settings.update` can start/stop
@@ -25285,6 +25355,20 @@ impl WorkspaceApi for Services {
         })
     }
 
+    fn browser_clients(
+        &self,
+        id: WorkspaceId,
+        agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            if let Some(agent) = agent_id.as_ref() {
+                self.require_agent_member(agent).await?;
+            }
+            self.require_member(&id).await?;
+            self.browser_clients_state(&id).await
+        })
+    }
+
     fn set_workspace_browser_client(
         &self,
         id: WorkspaceId,
@@ -36039,7 +36123,17 @@ impl Services {
             };
             let current = store.get_workspace(&id).await?;
             if current.is_retired() {
-                let revived = self.revive_retired_checkout(&current).await?;
+                // The agent whose turn triggered the revive gets its notice in
+                // that turn; every other agent's notice is written with the
+                // flip (see `revive_retired_checkout`).
+                let trigger = auto_unarchive
+                    .as_ref()
+                    .and_then(|stamp| stamp.get("agentId"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(AgentId::from);
+                let revived = self
+                    .revive_retired_checkout(&current, trigger.as_ref())
+                    .await?;
                 (revived.is_some(), revived)
             } else {
                 let flipped = store
@@ -36129,6 +36223,9 @@ impl Services {
             changes["baseCommitSha"] = serde_json::json!(revived.base_commit_sha);
             changes["revived"] =
                 auto_unarchive.unwrap_or_else(|| serde_json::json!({ "reason": "manual" }));
+            if revived.cleared_purge_status && ws.status_message.is_none() {
+                changes["statusMessage"] = serde_json::Value::Null;
+            }
         } else if let Some(stamp) = auto_unarchive {
             changes["autoUnarchive"] = stamp;
         }

@@ -397,7 +397,7 @@ async fn retire_refuses_unregistered_folder_and_keeps_it() {
 // blank checkout of the default branch on a NEW branch, at the same path.
 // ---------------------------------------------------------------------------
 
-fn subscribe_updates(f: &Fixture, ws: &WorkspaceId) -> crate::Subscription {
+pub(crate) fn subscribe_updates(f: &Fixture, ws: &WorkspaceId) -> crate::Subscription {
     f.bus.subscribe(crate::SubscriptionFilter {
         event_types: vec!["workspace:updated".to_string()],
         workspace_id: Some(ws.0.clone()),
@@ -407,7 +407,7 @@ fn subscribe_updates(f: &Fixture, ws: &WorkspaceId) -> crate::Subscription {
 
 /// Collect the `changes` of every `workspace:updated` delta that arrives
 /// within a short quiet window.
-async fn drain_changes(sub: &mut crate::Subscription) -> Vec<serde_json::Value> {
+pub(crate) async fn drain_changes(sub: &mut crate::Subscription) -> Vec<serde_json::Value> {
     let mut changes = Vec::new();
     while let Ok(Some(batch)) = tokio::time::timeout(
         intentd_test_support::test_timeout(Duration::from_millis(500)),
@@ -502,7 +502,12 @@ async fn manual_unarchive_revives_retired_workspace_as_fresh_checkout() {
             "branch": revived.branch,
             "baseCommitSha": revived.base_commit_sha,
             "revived": { "reason": "manual" },
+            "statusMessage": null,
         })
+    );
+    assert!(
+        revived.status_message.is_none(),
+        "the unchanged purge status message is cleared on revive"
     );
 
     let row = f.store.get_workspace(&ws.id).await.unwrap();
@@ -754,7 +759,8 @@ async fn retire_and_revive_racing_leave_a_consistent_workspace() {
 }
 
 // ---------------------------------------------------------------------------
-// Automatic retire (PROTOCOL §5.1 "Automatic retire", §5.12
+// Automatic purge (PROTOCOL §5.1 "Automatic purge", §5.12
+// `workspace.purgeArchivedAfterDays`, formerly
 // `workspace.autoRetireArchivedAfterDays`): a periodic sweep retires
 // workspaces archived longer than the configured number of days.
 // ---------------------------------------------------------------------------
@@ -763,7 +769,7 @@ pub(crate) fn days_from_now(days: i64) -> time::OffsetDateTime {
     time::OffsetDateTime::now_utc() + time::Duration::days(days)
 }
 
-/// Off by default: with no `workspace.autoRetireArchivedAfterDays`, the
+/// Off by default: with no `workspace.purgeArchivedAfterDays`, the
 /// sweep retires nothing, however long a workspace has been archived.
 #[intent_test_macros::daemon_test]
 async fn auto_retire_is_off_by_default() {
@@ -1484,4 +1490,160 @@ async fn place_attachment_racing_retire_places_nothing() {
     .unwrap_err();
     assert!(matches!(err, Error::WorkspaceRetired { .. }), "{err:?}");
     assert!(f.store.list_attachments(&ws.id).await.unwrap().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Purge status message (PROTOCOL §5.1 Retired workspaces): a retire sets the
+// workspace `statusMessage` so the card shows the folder is gone; a revive
+// clears it only while it is unchanged.
+// ---------------------------------------------------------------------------
+
+/// A manual retire replaces the status message with the purge text in the
+/// same row write and the single retire delta.
+#[intent_test_macros::daemon_test]
+async fn retire_sets_the_purge_status_message_in_its_single_delta() {
+    let f = fixture().await;
+    let ws = create_workspace(&f).await;
+    f.svc
+        .update_workspace(
+            ws.id.clone(),
+            intent_core::WorkspaceUpdate {
+                status_message: Some("PR #12 merged".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("set status");
+    f.svc
+        .archive_workspace(ws.id.clone(), None)
+        .await
+        .expect("archive");
+    let mut sub = subscribe_updates(&f, &ws.id);
+    let retired = f
+        .svc
+        .retire_workspace(ws.id.clone(), None)
+        .await
+        .expect("retire");
+    assert_eq!(
+        retired.status_message.as_deref(),
+        Some(intent_core::WORKSPACE_PURGED_STATUS_MESSAGE)
+    );
+    let changes = drain_changes(&mut sub).await;
+    let retire_deltas: Vec<_> = changes
+        .iter()
+        .filter(|c| c["status"] == "Retired")
+        .collect();
+    assert_eq!(retire_deltas.len(), 1, "{changes:?}");
+    assert_eq!(
+        retire_deltas[0]["statusMessage"],
+        serde_json::json!(intent_core::WORKSPACE_PURGED_STATUS_MESSAGE)
+    );
+}
+
+/// The automatic purge sets the same status message.
+#[intent_test_macros::daemon_test]
+async fn auto_purge_sets_the_purge_status_message() {
+    let f = fixture().await;
+    let ws = create_workspace(&f).await;
+    f.svc
+        .archive_workspace(ws.id.clone(), None)
+        .await
+        .expect("archive");
+    let report = f
+        .svc
+        .sweep_auto_retire_after(Some(7), days_from_now(8))
+        .await;
+    assert_eq!(report.retired, 1, "{report:?}");
+    let row = f.store.get_workspace(&ws.id).await.unwrap();
+    assert_eq!(
+        row.status_message.as_deref(),
+        Some(intent_core::WORKSPACE_PURGED_STATUS_MESSAGE)
+    );
+}
+
+/// A message written into the row after the purge (here directly, standing
+/// in for an agent or the daemon's own status writers) survives the revive;
+/// only the unchanged purge text is cleared.
+#[intent_test_macros::daemon_test]
+async fn revive_keeps_a_status_message_changed_since_the_purge() {
+    let f = fixture().await;
+    let ws = create_workspace(&f).await;
+    f.svc
+        .retire_workspace(ws.id.clone(), None)
+        .await
+        .expect("retire");
+    let mut row = f.store.get_workspace(&ws.id).await.unwrap();
+    row.status_message = Some("Waiting on review".to_string());
+    f.store.update_workspace(&row).await.expect("write message");
+    let mut sub = subscribe_updates(&f, &ws.id);
+    let revived = f
+        .svc
+        .unarchive_workspace(ws.id.clone())
+        .await
+        .expect("revive");
+    assert_eq!(revived.status_message.as_deref(), Some("Waiting on review"));
+    let changes = drain_changes(&mut sub).await;
+    assert_eq!(changes.len(), 1, "{changes:?}");
+    assert!(changes[0].get("statusMessage").is_none(), "{changes:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Automatic purge safety: folders holding work the purge would destroy are
+// skipped and retried on the next sweep.
+// ---------------------------------------------------------------------------
+
+/// An archived workspace with uncommitted changes is skipped (folder kept,
+/// still Archived); once the changes are committed the next sweep purges it.
+#[intent_test_macros::daemon_test]
+async fn auto_purge_skips_a_folder_with_uncommitted_changes_until_it_is_clean() {
+    let f = fixture().await;
+    let ws = create_workspace(&f).await;
+    let wt = std::path::PathBuf::from(ws.worktree_path.clone().unwrap());
+    std::fs::write(wt.join("draft.txt"), "unsaved work").unwrap();
+    f.svc
+        .archive_workspace(ws.id.clone(), None)
+        .await
+        .expect("archive");
+
+    let report = f
+        .svc
+        .sweep_auto_retire_after(Some(7), days_from_now(8))
+        .await;
+    assert_eq!(report.retired, 0, "{report:?}");
+    assert_eq!(report.skipped, 1, "{report:?}");
+    assert_eq!(report.failed, 0, "{report:?}");
+    assert!(wt.join("draft.txt").is_file(), "unsaved work kept");
+    assert!(!f.store.get_workspace(&ws.id).await.unwrap().is_retired());
+
+    std::fs::remove_file(wt.join("draft.txt")).unwrap();
+    let report = f
+        .svc
+        .sweep_auto_retire_after(Some(7), days_from_now(8))
+        .await;
+    assert_eq!(report.retired, 1, "{report:?}");
+    assert!(f.store.get_workspace(&ws.id).await.unwrap().is_retired());
+}
+
+/// The sweep reads the renamed setting live: `workspace.purgeArchivedAfterDays
+/// = 7` turns it on without a restart.
+#[intent_test_macros::daemon_test]
+async fn auto_purge_reads_the_live_purge_setting() {
+    let f = fixture().await;
+    let cfg = f.root.join("auto-purge.config.toml");
+    let registry = std::sync::Arc::new(crate::SettingsRegistry::load(cfg).expect("registry"));
+    let svc = f.svc.clone().with_settings_registry(registry.clone());
+    let ws = create_workspace(&f).await;
+    svc.archive_workspace(ws.id.clone(), None)
+        .await
+        .expect("archive");
+
+    assert_eq!(svc.sweep_auto_retire_at(days_from_now(8)).await.retired, 0);
+    registry
+        .apply(&[(
+            "workspace.purgeArchivedAfterDays".to_string(),
+            serde_json::json!(7),
+        )])
+        .expect("set");
+    assert_eq!(svc.sweep_auto_retire_at(days_from_now(8)).await.retired, 1);
+    assert!(f.store.get_workspace(&ws.id).await.unwrap().is_retired());
 }

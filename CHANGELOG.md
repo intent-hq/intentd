@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.63] - 2026-10-27
+
+### 🚀 Features
+
+- *(browser)* Add ws.browser.clients() to show live client connections and routes ([#2749](https://github.com/intent-hq/intentd/pull/2749))
+
+
+## [0.11.62] - 2026-10-27
+
+### 🐛 Bug Fixes
+
+- *(pr-monitor)* Report GitHub's updatedAt for monitor-only PR pool entries ([#2745](https://github.com/intent-hq/intentd/pull/2745))
+
+
 ## [0.11.61] - 2026-10-27
 
 ### 🧪 Testing
