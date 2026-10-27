@@ -2219,6 +2219,7 @@ dependencies = [
  "intent-core",
  "intent-services",
  "intent-store",
+ "intent-svc-runtime",
  "intent-svc-transfer",
  "intent-transport",
  "serde_json",
@@ -2377,7 +2378,6 @@ dependencies = [
  "async-trait",
  "base64 0.23.1",
  "chrono",
- "croner",
  "ctor",
  "git2",
  "ignore",
@@ -2469,6 +2469,38 @@ dependencies = [
  "tokio",
  "tracing",
  "trybuild",
+ "uuid",
+]
+
+[[package]]
+name = "intent-svc-runtime"
+version = "0.11.65"
+dependencies = [
+ "base64 0.23.1",
+ "chrono",
+ "croner",
+ "git2",
+ "intent-acp",
+ "intent-core",
+ "intent-git",
+ "intent-js",
+ "intent-providers",
+ "intent-pty",
+ "intent-services",
+ "intent-sourcecontrol",
+ "intent-store",
+ "intent-test-macros",
+ "intentd-test-support",
+ "libc",
+ "nix 0.31.3",
+ "regex",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "time",
+ "tokio",
+ "toml_edit",
+ "tracing",
  "uuid",
 ]
 

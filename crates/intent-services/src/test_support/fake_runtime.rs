@@ -597,6 +597,29 @@ impl RuntimePort for FakeRuntime {
     }
 
     /// Remove the sandbox folder and row, as the runtime's discard does.
+    /// Mirrors the runtime's claimed-tab migration on a pin change: reassign
+    /// the claimed rows in the store, flag each moved tab's desktop
+    /// assignment, and wake desktop waiters. The runtime's per-tab
+    /// `browser:tab-updated` events are not published here.
+    fn migrate_claimed_browser_tabs<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
+        new_host: &'a ClientId,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let moved = svc
+                .store
+                .reassign_claimed_browser_tabs(workspace_id, new_host)
+                .await?;
+            for (tab, _) in &moved {
+                svc.desktop.assignment_changed(&tab.workspace_id);
+            }
+            svc.desktop.changed.notify_waiters();
+            Ok(())
+        })
+    }
+
     fn discard_sandbox<'a>(
         &'a self,
         svc: &'a Services,
@@ -715,11 +738,11 @@ impl RuntimePort for FakeRuntime {
         fn browser_remove_tab<'a>(&'a self, svc: &'a Services, host: ClientId, tab_id: String) -> BoxFuture<'a, Result<()>>;
         fn browser_sync_tabs<'a>(&'a self, svc: &'a Services, host: ClientId, tabs: Vec<BrowserTabInput>) -> BoxFuture<'a, Result<Vec<String>>>;
         fn browser_exec<'a>(&'a self, svc: &'a Services, workspace_id: WorkspaceId, actions: Vec<serde_json::Value>, tab_id: Option<String>, agent_id: Option<AgentId>) -> BoxFuture<'a, Result<serde_json::Value>>;
+        fn browser_dispatch_error_message<'a>(&'a self, svc: &'a Services, err: intent_core::ReverseDispatchError) -> BoxFuture<'a, String>;
         fn browser_navigate_tab<'a>(&'a self, svc: &'a Services, tab_id: String, url: String) -> BoxFuture<'a, Result<serde_json::Value>>;
         fn browser_close_tab<'a>(&'a self, svc: &'a Services, tab_id: String, force: bool) -> BoxFuture<'a, Result<serde_json::Value>>;
         fn sandbox_merge<'a>(&'a self, svc: &'a Services, workspace_id: WorkspaceId, sandbox_id: AgentId) -> BoxFuture<'a, Result<serde_json::Value>>;
         fn sandbox_discard<'a>(&'a self, svc: &'a Services, workspace_id: WorkspaceId, sandbox_id: AgentId) -> BoxFuture<'a, Result<serde_json::Value>>;
-        fn migrate_claimed_browser_tabs<'a>(&'a self, svc: &'a Services, workspace_id: &'a WorkspaceId, new_host: &'a ClientId) -> BoxFuture<'a, Result<()>>;
         fn provision_sandbox<'a>(&'a self, svc: &'a Services, workspace_id: &'a WorkspaceId, agent_id: &'a AgentId, workspaces_root: PathBuf) -> BoxFuture<'a, Result<ProvisionOutcome>>;
         fn run_setup_script(&self, svc: &Services, run: SetupScriptRun) -> BoxFuture<'static, (bool, Option<u32>)>;
         fn script_monitor_lane<'a>(&'a self, svc: &'a Services) -> &'a tokio::sync::Mutex<()>;
