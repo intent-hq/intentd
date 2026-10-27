@@ -16,6 +16,7 @@ pub(crate) mod quota_script;
 pub mod retire_workspace;
 mod scratch;
 pub mod setup_lifecycle;
+pub mod stub_forge;
 pub mod submodule_fixture;
 pub use scratch::{test_tempdir, test_tempdir_in};
 
