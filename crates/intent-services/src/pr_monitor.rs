@@ -8772,15 +8772,15 @@ mod tests {
                     passed: pick(b, 1, 0),
                     failed: pick(b, 0, 1),
                     pending: pick(b, 0, 1),
-                    skipped: pick(b, 0, 1),
+                    skipped: pick(b, 1, 0),
                     items: vec![pr_ops::MergeRequirementCheck {
                         name: "build".into(),
                         status: pick(b, "passed", "failed").into(),
                         required: !b,
                         url: Some(pick(b, "https://ci/1", "https://ci/2").into()),
                     }],
-                    failing_required: pick(b, vec![], vec!["build".into()]),
-                    pending_required: pick(b, vec![], vec!["lint".into()]),
+                    failing_required: vec![pick(b, "lint", "build").into()],
+                    pending_required: vec![pick(b, "docs", "lint").into()],
                     required_known: !b,
                 },
                 approvals: pr_ops::MergeRequirementsApprovals {
@@ -8830,8 +8830,8 @@ mod tests {
             },
             ejection_tracked: !b,
             skipped_tracked: !b,
-            checks_unobserved: b,
-            checks_seed_pending: b,
+            checks_unobserved: !b,
+            checks_seed_pending: !b,
             status_checks: Some(vec![pr_ops::MergeRequirementCheck {
                 name: pick(b, "legacy", "legacy-2").into(),
                 status: "passed".into(),
@@ -8845,34 +8845,31 @@ mod tests {
         }
     }
 
-    /// The JSON pointer of every field a value's `Serialize` impl visits
-    /// (array items as `*`), split into the fields it wrote and the ones it
-    /// left out (`skip_serializing_if`) or wrote as `null`. Read from the
+    /// The JSON pointers of every field a value's `Serialize` impl leaves
+    /// out (`skip_serializing_if`) or writes as `null`, and of every empty
+    /// list or map (whose item fields would go unvisited). Read from the
     /// TYPE's own serializer, so it covers fields a sample forgot to fill.
+    /// Limit: `#[serde(flatten)]` fields serialize as map entries, so a
+    /// skipped field inside one is not seen (none of the snapshot's types
+    /// flatten today).
     mod field_paths {
         use std::cell::RefCell;
         use std::collections::BTreeSet;
 
         use serde::ser::{self, Serialize};
 
-        #[derive(Default)]
-        pub struct Fields {
-            pub written: BTreeSet<String>,
-            pub empty: BTreeSet<String>,
-        }
-
-        pub fn of<T: Serialize>(value: &T) -> Fields {
+        pub fn empty<T: Serialize>(value: &T) -> BTreeSet<String> {
             let rec = Rec {
                 path: RefCell::new(Vec::new()),
-                fields: RefCell::new(Fields::default()),
+                empty: RefCell::new(BTreeSet::new()),
             };
             value.serialize(&rec).expect("record fields");
-            rec.fields.into_inner()
+            rec.empty.into_inner()
         }
 
         struct Rec {
             path: RefCell<Vec<String>>,
-            fields: RefCell<Fields>,
+            empty: RefCell<BTreeSet<String>>,
         }
 
         impl Rec {
@@ -8883,16 +8880,22 @@ mod tests {
                 format!("/{}", segments.join("/"))
             }
             fn field<T: ?Sized + Serialize>(&self, key: &str, value: &T) -> Result<(), Error> {
-                let pointer = self.pointer(key);
-                let empty = value.serialize(Probe).is_err_and(|e| e.0 == NULL);
-                let mut fields = self.fields.borrow_mut();
-                if empty {
-                    fields.empty.insert(pointer);
-                } else {
-                    fields.written.insert(pointer);
+                if value.serialize(Probe).is_err_and(|e| e.0 == NULL) {
+                    self.skip(key);
                 }
-                drop(fields);
                 self.nested(key, value)
+            }
+            fn empty_here(&self, len: Option<usize>) {
+                if len == Some(0) {
+                    let pointer: String = self
+                        .path
+                        .borrow()
+                        .iter()
+                        .map(|s| format!("/{s}"))
+                        .collect::<Vec<_>>()
+                        .concat();
+                    self.empty.borrow_mut().insert(pointer);
+                }
             }
             fn nested<T: ?Sized + Serialize>(&self, key: &str, value: &T) -> Result<(), Error> {
                 self.path.borrow_mut().push(key.to_owned());
@@ -8902,7 +8905,7 @@ mod tests {
             }
             fn skip(&self, key: &str) {
                 let pointer = self.pointer(key);
-                self.fields.borrow_mut().empty.insert(pointer);
+                self.empty.borrow_mut().insert(pointer);
             }
         }
 
@@ -8922,9 +8925,9 @@ mod tests {
 
         const NULL: &str = "null";
 
-        /// Errs with [`NULL`] only on a top-level `null`, telling an empty
-        /// `Option` apart. Compound values err otherwise (no recursion
-        /// needed: an empty list is still data) and count as written.
+        /// Errs with [`NULL`] only on a top-level `null` (looking through
+        /// newtypes), telling an empty `Option` apart. Compound values err
+        /// otherwise and count as written; [`Rec`] checks their contents.
         struct Probe;
 
         macro_rules! leaves {
@@ -8970,9 +8973,9 @@ mod tests {
             fn serialize_newtype_struct<T: ?Sized + Serialize>(
                 self,
                 _: &'static str,
-                _: &T,
+                v: &T,
             ) -> Result<(), Error> {
-                Ok(())
+                v.serialize(self)
             }
             fn serialize_newtype_variant<T: ?Sized + Serialize>(
                 self,
@@ -9076,7 +9079,8 @@ mod tests {
             ) -> Result<(), Error> {
                 self.field(variant, v)
             }
-            fn serialize_seq(self, _: Option<usize>) -> Result<Self, Error> {
+            fn serialize_seq(self, len: Option<usize>) -> Result<Self, Error> {
+                self.empty_here(len);
                 Ok(self)
             }
             fn serialize_tuple(self, _: usize) -> Result<Self, Error> {
@@ -9094,7 +9098,8 @@ mod tests {
             ) -> Result<Self, Error> {
                 Ok(self)
             }
-            fn serialize_map(self, _: Option<usize>) -> Result<Self, Error> {
+            fn serialize_map(self, len: Option<usize>) -> Result<Self, Error> {
+                self.empty_here(len);
                 Ok(self)
             }
             fn serialize_struct(self, _: &'static str, _: usize) -> Result<Self, Error> {
@@ -9276,6 +9281,16 @@ mod tests {
         ("/requirements/isInMergeQueue", "unknown queue membership"),
     ];
 
+    /// Fields shipped together with a persistence flag that reads `false`
+    /// on state saved before them. Removed alone, such a field reads as a
+    /// genuine "tracked, nothing yet" state whose next event IS news, so it
+    /// is tested removed together with its flags, as older state has it.
+    const UPGRADE_FIELDS_WITH_FLAGS: &[(&str, &[&str], &str)] = &[(
+        "/requirements/mergeQueueEjection",
+        &["/ejectionTracked"],
+        "ejection tracking (intentd#1519)",
+    )];
+
     fn upgrade_field_listed(list: &[(&str, &str)], field: &str) -> bool {
         list.iter().any(|(prefix, _)| {
             field == *prefix
@@ -9294,7 +9309,9 @@ mod tests {
     /// runs the same backfill and diff as two polls of an upgraded monitor
     /// and compares the change lines with a monitor that always had it.
     /// The field list is read from the types, so a new field is covered
-    /// as soon as the samples above compile.
+    /// as soon as the samples above compile. Not covered: an upgrade that
+    /// re-encodes an existing value instead of adding a field (intentd#2623
+    /// stored skipped checks as `passed`); its own test guards that.
     #[test]
     fn every_optional_field_dropped_from_an_upgraded_baseline_still_reports_changes() {
         let (a, b) = (upgrade_sample(false), upgrade_sample(true));
@@ -9305,12 +9322,11 @@ mod tests {
         // `a` is the saved state the fields are removed from, so it must
         // write every field the types declare; `b` only supplies new values
         // (a flag that is omitted while false is a valid one).
-        let fields = field_paths::of(&a);
+        let empty = field_paths::empty(&a);
         assert!(
-            fields.empty.is_empty(),
-            "upgrade_sample(false) leaves {:?} empty: give every field a value so the upgrade \
-             test covers it",
-            fields.empty
+            empty.is_empty(),
+            "upgrade_sample(false) leaves {empty:?} empty: give every field (and every list) a \
+             value so the upgrade test covers it"
         );
         let generic = |p: &str| {
             p.split('/')
@@ -9332,82 +9348,87 @@ mod tests {
             .into_iter()
             .filter(|p| strip(&[p]).is_some())
             .collect();
-        // Optional top-level flags (`ejectionTracked`, `skippedTracked`, ...)
-        // read `false` when absent. A field is checked twice: removed alone
-        // (shipped without a flag) and removed with every flag (shipped with
-        // one, so older state lacks both). It passes if either variant is
-        // clean: removed alone, a flagged field reads as a genuine "tracked,
-        // nothing yet" state whose next event IS news. An unhandled field
-        // fails both.
-        let flags: Vec<&String> = optional
-            .iter()
-            .filter(|p| {
-                p.matches('/').count() == 1 && a_json.pointer(p).is_some_and(Value::is_boolean)
-            })
-            .collect();
         let mut failures = Vec::new();
+        let mut unknown_used = BTreeSet::new();
         for pointer in &optional {
             let field = generic(pointer);
-            let mut variant_failures = Vec::new();
-            let mut with_flags = vec![pointer];
-            with_flags.extend(flags.iter().copied().filter(|f| *f != pointer));
-            for (removed, label) in [
-                (&with_flags[..1], ""),
-                (&with_flags[..], " (and every flag)"),
-            ] {
-                let old = strip(removed).unwrap_or_else(|| {
-                    panic!("{pointer}{label}: the stripped snapshot does not load")
-                });
-
-                // Upgrade poll: the PR still reads as `a`. Nothing changed, so
-                // nothing may be pending against the backfilled baseline.
-                let mut base = old.clone();
-                backfill_upgraded_anchor(&mut base, &a, Some(&old));
-                let false_wake = diff_snapshots(&base, &a);
-                if !false_wake.is_empty() {
-                    if !upgrade_field_listed(UPGRADE_FIELDS_UNKNOWN_WHEN_ABSENT, &field) {
-                        variant_failures.push(format!(
-                            "{pointer}{label}: the upgrade poll itself reports {false_wake:?}. \
-                             Adopt the field silently in backfill_upgraded_anchor"
-                        ));
-                        continue;
-                    }
-                    // That wake is delivered: the baseline advances to the read.
-                    base = a.clone();
-                }
-
-                // Change poll: the field now reads as in `b`.
-                let mut changed_json = a_json.clone();
-                match b_json.pointer(pointer) {
-                    Some(v) => *changed_json.pointer_mut(pointer).unwrap() = v.clone(),
-                    None => remove_json_key(&mut changed_json, pointer),
-                }
-                let changed: PrMonitorSnapshot = serde_json::from_value(changed_json)
-                    .unwrap_or_else(|e| panic!("{pointer}: b's value does not load: {e}"));
-                let mut reference = a.clone();
-                backfill_upgraded_anchor(&mut reference, &changed, Some(&a));
-                let expected = diff_snapshots(&reference, &changed);
-                backfill_upgraded_anchor(&mut base, &changed, Some(&a));
-                let reported = diff_snapshots(&base, &changed);
-
-                let exempt = upgrade_field_listed(UPGRADE_FIELDS_WITHOUT_CHANGE_LINES, &field);
-                if expected.is_empty() && !exempt {
-                    variant_failures.push(format!(
-                        "{pointer}: changing it from upgrade_sample(false) to \
-                         upgrade_sample(true) reports nothing even without an upgrade. Give the \
-                         samples values the diff reports, or list the field in \
-                         UPGRADE_FIELDS_WITHOUT_CHANGE_LINES with a reason"
-                    ));
-                } else if reported != expected {
-                    variant_failures.push(format!(
-                        "{pointer}{label}: an upgraded monitor reports {reported:?}, one that \
-                         always had the field reports {expected:?}. Adopt the field in \
-                         backfill_upgraded_anchor"
-                    ));
-                }
+            if strip(&[pointer]).as_ref() == Some(&a) {
+                failures.push(format!(
+                    "{pointer}: removing it changes nothing, so the upgrade is not exercised. \
+                     Give it a non-default value in upgrade_sample(false)"
+                ));
+                continue;
             }
-            if variant_failures.len() == 2 {
-                failures.extend(variant_failures);
+            let flags = UPGRADE_FIELDS_WITH_FLAGS
+                .iter()
+                .find(|(f, _, _)| *f == field)
+                .map_or(&[][..], |(_, flags, _)| *flags);
+            let mut removed = vec![pointer.clone()];
+            removed.extend(flags.iter().map(|f| (*f).to_owned()));
+            let old = strip(&removed.iter().collect::<Vec<_>>())
+                .unwrap_or_else(|| panic!("{removed:?}: the stripped snapshot does not load"));
+
+            // Upgrade poll: the PR still reads as `a`. Nothing changed, so
+            // nothing may be pending against the backfilled baseline.
+            let mut base = old.clone();
+            backfill_upgraded_anchor(&mut base, &a, Some(&old));
+            let false_wake = diff_snapshots(&base, &a);
+            if !false_wake.is_empty() {
+                if !upgrade_field_listed(UPGRADE_FIELDS_UNKNOWN_WHEN_ABSENT, &field) {
+                    failures.push(format!(
+                        "{pointer}: the upgrade poll itself reports {false_wake:?}. Adopt the \
+                         field silently in backfill_upgraded_anchor (if it ships with a \
+                         persistence flag, list both in UPGRADE_FIELDS_WITH_FLAGS)"
+                    ));
+                    continue;
+                }
+                if false_wake.len() != 1 {
+                    failures.push(format!(
+                        "{pointer}: an unknown → known field may cost one wake line, the \
+                         upgrade poll reports {false_wake:?}"
+                    ));
+                    continue;
+                }
+                unknown_used.insert(field.clone());
+                // That wake is delivered: the baseline advances to the read.
+                base = a.clone();
+            }
+
+            // Change poll: the field now reads as in `b`.
+            let mut changed_json = a_json.clone();
+            match b_json.pointer(pointer) {
+                Some(v) => *changed_json.pointer_mut(pointer).unwrap() = v.clone(),
+                None => remove_json_key(&mut changed_json, pointer),
+            }
+            let changed: PrMonitorSnapshot = serde_json::from_value(changed_json)
+                .unwrap_or_else(|e| panic!("{pointer}: b's value does not load: {e}"));
+            let mut reference = a.clone();
+            backfill_upgraded_anchor(&mut reference, &changed, Some(&a));
+            let expected = diff_snapshots(&reference, &changed);
+            backfill_upgraded_anchor(&mut base, &changed, Some(&a));
+            let reported = diff_snapshots(&base, &changed);
+
+            let silent = upgrade_field_listed(UPGRADE_FIELDS_WITHOUT_CHANGE_LINES, &field);
+            if expected.is_empty() != silent {
+                failures.push(if silent {
+                    format!(
+                        "{pointer} is in UPGRADE_FIELDS_WITHOUT_CHANGE_LINES but a change \
+                         reports {expected:?}: remove it from the list"
+                    )
+                } else {
+                    format!(
+                        "{pointer}: changing it from upgrade_sample(false) to \
+                         upgrade_sample(true) reports nothing even without an upgrade. Give \
+                         the samples values the diff reports, or list the field in \
+                         UPGRADE_FIELDS_WITHOUT_CHANGE_LINES with a reason"
+                    )
+                });
+            } else if reported != expected {
+                failures.push(format!(
+                    "{pointer}: an upgraded monitor reports {reported:?}, one that always had \
+                     the field reports {expected:?}. Adopt the field in \
+                     backfill_upgraded_anchor"
+                ));
             }
         }
         assert!(
@@ -9416,16 +9437,49 @@ mod tests {
                 .any(|p| p == "/requirements/approvals/latestReviews"),
             "enumeration found {optional:?}"
         );
+        // Every list entry must still name an optional field and still be
+        // needed, so an exemption cannot outlive its reason.
         let fields: Vec<String> = optional.iter().map(|p| generic(p)).collect();
-        for (prefix, _) in UPGRADE_FIELDS_WITHOUT_CHANGE_LINES
+        let listed = UPGRADE_FIELDS_WITHOUT_CHANGE_LINES
             .iter()
             .chain(UPGRADE_FIELDS_UNKNOWN_WHEN_ABSENT)
-        {
+            .map(|(f, _)| *f)
+            .chain(
+                UPGRADE_FIELDS_WITH_FLAGS
+                    .iter()
+                    .flat_map(|(f, flags, _)| std::iter::once(*f).chain(flags.iter().copied())),
+            );
+        for prefix in listed {
             if !fields
                 .iter()
                 .any(|f| upgrade_field_listed(&[(prefix, "")], f))
             {
                 failures.push(format!("{prefix} is listed but is no optional field"));
+            }
+        }
+        for (prefix, _) in UPGRADE_FIELDS_UNKNOWN_WHEN_ABSENT {
+            if !unknown_used
+                .iter()
+                .any(|f| upgrade_field_listed(&[(prefix, "")], f))
+            {
+                failures.push(format!(
+                    "{prefix} is in UPGRADE_FIELDS_UNKNOWN_WHEN_ABSENT but its upgrade no \
+                     longer wakes: remove it from the list"
+                ));
+            }
+        }
+        for (field, _, _) in UPGRADE_FIELDS_WITH_FLAGS {
+            let pointer = (*field).to_owned();
+            let Some(alone) = strip(&[&pointer]) else {
+                continue;
+            };
+            let mut base = alone.clone();
+            backfill_upgraded_anchor(&mut base, &a, Some(&alone));
+            if diff_snapshots(&base, &a).is_empty() {
+                failures.push(format!(
+                    "{field} is in UPGRADE_FIELDS_WITH_FLAGS but upgrades cleanly without its \
+                     flags: remove it from the list"
+                ));
             }
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
