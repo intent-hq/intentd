@@ -44,8 +44,9 @@ use std::sync::{Arc, Mutex};
 
 pub use intent_core::ResolvedClient;
 use intent_core::{
-    now_iso, AgentReverseDispatch, BoxFuture, ClientHostInfo, ClientId, ReverseDispatchError,
-    ReverseLiveClient, ReverseTarget, WorkspaceApi, WorkspaceId,
+    now_iso, AgentReverseDispatch, BoxFuture, ClientHostInfo, ClientId, ReverseClientConnections,
+    ReverseConnectionInfo, ReverseConnectionSnapshot, ReverseDispatchError, ReverseLiveClient,
+    ReverseRoute, ReverseTarget, WorkspaceApi, WorkspaceId,
 };
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -453,6 +454,54 @@ fn newest_eligible_of<'a>(
         .find(|e| e.is_eligible() && e.has_client(client_id) && allowed(e))
 }
 
+/// One logical client's live hello'd connections, oldest first, and the
+/// identity of its newest hello (by hello sequence, not registration
+/// order), which supplies the display fields.
+struct ClientGroup<'a> {
+    newest: &'a ReverseClientIdentity,
+    newest_hello: u64,
+    entries: Vec<&'a Entry>,
+}
+
+/// Hello'd `entries` grouped by `clientId`, in first-connection order;
+/// un-hello'd connections are omitted. Shared by `client.list`
+/// ([`PrimaryReverseRegistry::live_clients`]) and `ws.browser.clients()`
+/// ([`PrimaryReverseRegistry::connection_snapshot`]) so both name a client
+/// the same way.
+fn group_by_client(entries: &VecDeque<Entry>) -> Vec<ClientGroup<'_>> {
+    let mut groups: Vec<ClientGroup<'_>> = Vec::new();
+    for entry in entries {
+        let Some(identity) = &entry.identity else {
+            continue;
+        };
+        match groups
+            .iter_mut()
+            .find(|g| g.newest.client_id == identity.client_id)
+        {
+            Some(group) => {
+                group.entries.push(entry);
+                if entry.hello_seq > group.newest_hello {
+                    group.newest_hello = entry.hello_seq;
+                    group.newest = identity;
+                }
+            }
+            None => groups.push(ClientGroup {
+                newest: identity,
+                newest_hello: entry.hello_seq,
+                entries: vec![entry],
+            }),
+        }
+    }
+    groups
+}
+
+/// Whether a `browser.exec` scoped to `workspace_id` may go to member
+/// connections; Chief (and an unscoped request) selects administrator
+/// connections only.
+fn member_scoped(workspace_id: &str) -> bool {
+    !workspace_id.is_empty() && !WorkspaceId::from(workspace_id).is_chief()
+}
+
 /// The connection a reverse request went to, captured cheaply under the
 /// registry lock and formatted only if the request times out.
 struct ConnectionLabel {
@@ -596,55 +645,100 @@ impl PrimaryReverseRegistry {
     #[must_use]
     pub fn live_clients(&self) -> Vec<LiveClient> {
         let state = self.inner.lock();
-        let mut clients: Vec<(LiveClient, u64)> = Vec::new();
-        for entry in &state.entries {
-            let Some(identity) = &entry.identity else {
-                continue;
-            };
-            match clients
-                .iter_mut()
-                .find(|(c, _)| c.client_id == identity.client_id)
-            {
-                Some((client, newest_hello)) => {
-                    client.connections += 1;
-                    client.transports.push(entry.transport);
-                    client.browser_exec |= identity.browser_exec();
-                    // Newest hello wins for the display fields — by hello
-                    // sequence, not by which connection registered first.
-                    if entry.hello_seq > *newest_hello {
-                        *newest_hello = entry.hello_seq;
-                        client.name.clone_from(&identity.name);
-                        client.capabilities.clone_from(&identity.capabilities);
-                        client.host.clone_from(&identity.host);
-                    }
+        group_by_client(&state.entries)
+            .into_iter()
+            .map(|group| {
+                let browser_exec = group.entries.iter().any(|e| {
+                    e.identity
+                        .as_ref()
+                        .is_some_and(ReverseClientIdentity::browser_exec)
+                });
+                let mut capabilities = match &group.newest.capabilities {
+                    Value::Object(map) => map.clone(),
+                    _ => serde_json::Map::new(),
+                };
+                capabilities.insert("browserExec".into(), Value::Bool(browser_exec));
+                LiveClient {
+                    client_id: group.newest.client_id.clone(),
+                    name: group.newest.name.clone(),
+                    capabilities: Value::Object(capabilities),
+                    host: group.newest.host.clone(),
+                    browser_exec,
+                    connections: group.entries.len(),
+                    transports: group.entries.iter().map(|e| e.transport).collect(),
+                    connected_at: group.entries[0].connected_at.clone(),
                 }
-                None => clients.push((
-                    LiveClient {
-                        client_id: identity.client_id.clone(),
-                        name: identity.name.clone(),
-                        capabilities: identity.capabilities.clone(),
-                        host: identity.host.clone(),
-                        browser_exec: identity.browser_exec(),
-                        connections: 1,
-                        transports: vec![entry.transport],
+            })
+            .collect()
+    }
+
+    /// Every live hello'd connection grouped by `clientId` (the grouping and
+    /// newest-hello `name` of [`Self::live_clients`]) plus where each of
+    /// `targets` would be delivered for a `browser.exec` scoped to
+    /// `workspace_id` — the same eligibility, scope and newest-connection
+    /// rules as `dispatch`. A connection's `can_host_browser` applies that
+    /// same scope (Chief: administrator connections only). One lock
+    /// acquisition, so the routes always name a listed connection, under
+    /// the listed client name. Read-only: nothing is sent to any client.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
+    #[must_use]
+    pub fn connection_snapshot(
+        &self,
+        workspace_id: &WorkspaceId,
+        targets: &[ReverseTarget],
+    ) -> ReverseConnectionSnapshot {
+        let member_scope = member_scoped(workspace_id.as_str());
+        let in_scope = |entry: &Entry| member_scope || entry.channel.is_administrator();
+        let state = self.inner.lock();
+        let clients: Vec<ReverseClientConnections> = group_by_client(&state.entries)
+            .into_iter()
+            .map(|group| {
+                let connections: Vec<ReverseConnectionInfo> = group
+                    .entries
+                    .iter()
+                    .map(|entry| ReverseConnectionInfo {
+                        connection_id: entry.id,
+                        transport: entry.transport.as_str().to_string(),
                         connected_at: entry.connected_at.clone(),
-                    },
-                    entry.hello_seq,
-                )),
-            }
-        }
-        let mut clients: Vec<LiveClient> = clients.into_iter().map(|(c, _)| c).collect();
-        for client in &mut clients {
-            let bag = match &mut client.capabilities {
-                Value::Object(map) => map,
-                other => {
-                    *other = Value::Object(serde_json::Map::new());
-                    other.as_object_mut().expect("just set an object")
+                        can_host_browser: entry.is_eligible() && in_scope(entry),
+                    })
+                    .collect();
+                ReverseClientConnections {
+                    client_id: group.newest.client_id.clone(),
+                    name: group.newest.name.clone(),
+                    can_host_browser: connections.iter().any(|c| c.can_host_browser),
+                    connections,
                 }
-            };
-            bag.insert("browserExec".into(), Value::Bool(client.browser_exec));
-        }
-        clients
+            })
+            .collect();
+        let routes = targets
+            .iter()
+            .map(
+                |target| match resolve_entry_matching(&state.entries, target, in_scope) {
+                    Ok(entry) => {
+                        let client_id = &entry
+                            .identity
+                            .as_ref()
+                            .expect("an eligible entry always carries an identity")
+                            .client_id;
+                        ReverseRoute {
+                            client_id: Some(client_id.clone()),
+                            name: clients
+                                .iter()
+                                .find(|c| &c.client_id == client_id)
+                                .and_then(|c| c.name.clone()),
+                            connection_id: Some(entry.id),
+                            error: None,
+                        }
+                    }
+                    Err(error) => ReverseRoute::failed(&error),
+                },
+            )
+            .collect();
+        ReverseConnectionSnapshot { clients, routes }
     }
 
     /// Presence of the given logical clients: one O(1) index lookup per
@@ -819,6 +913,14 @@ impl AgentReverseDispatch for PrimaryReverseRegistry {
             .collect()
     }
 
+    fn connection_snapshot(
+        &self,
+        workspace_id: &WorkspaceId,
+        targets: &[ReverseTarget],
+    ) -> ReverseConnectionSnapshot {
+        PrimaryReverseRegistry::connection_snapshot(self, workspace_id, targets)
+    }
+
     fn authenticated_clients(&self) -> Vec<ReverseLiveClient> {
         self.inner.lock().devices.clone()
     }
@@ -858,10 +960,8 @@ impl AgentReverseDispatch for PrimaryReverseRegistry {
         params: Value,
         target: ReverseTarget,
     ) -> BoxFuture<'a, Result<Value, ReverseDispatchError>> {
-        let member_scope = method == "browser.exec"
-            && params["workspaceId"]
-                .as_str()
-                .is_some_and(|ws| !ws.is_empty() && !intent_core::WorkspaceId::from(ws).is_chief());
+        let member_scope =
+            method == "browser.exec" && params["workspaceId"].as_str().is_some_and(member_scoped);
         let resolved = resolve_entry_matching(&self.inner.lock().entries, &target, |entry| {
             member_scope || entry.channel.is_administrator()
         })

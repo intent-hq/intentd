@@ -4974,8 +4974,9 @@ impl Services {
     /// The `workspace.getBrowserClient` payload for `id`: the persisted pin
     /// (`clientId` + `source: "workspace"`, else `source: "default"`) and
     /// `resolved` — the driving client an agent `browser.exec` would reach
-    /// right now ([`Self::driving_client_target`]: pin → host of the
-    /// workspace's claimed tabs → first-connected eligible client), `null`
+    /// right now ([`Self::driving_client_target`]: pin → client controlling
+    /// the workspace's desktop → host of the workspace's claimed tabs →
+    /// first-connected eligible client), `null`
     /// when that client is offline or no eligible client is connected. Chief
     /// has no row and always reports the default.
     async fn browser_client_state(&self, id: &WorkspaceId) -> Result<serde_json::Value> {
@@ -5004,6 +5005,73 @@ impl Services {
         }
         out.insert("resolved".into(), resolved);
         Ok(serde_json::Value::Object(out))
+    }
+
+    /// The `ws.browser.clients()` payload for `id` (see
+    /// [`WorkspaceApi::browser_clients`]): one registry snapshot carrying
+    /// every client's live connections, the unpinned (`Default`) route and
+    /// this workspace's driving-client route with its `source`. A route
+    /// to an offline client carries the error `browser.exec` would report.
+    /// Without a dispatcher no client is listed and both routes report `no
+    /// client connected`.
+    async fn browser_clients_state(&self, id: &WorkspaceId) -> Result<serde_json::Value> {
+        use intent_core::{ReverseConnectionSnapshot, ReverseDispatchError, ReverseRoute};
+
+        let (target, source) = self.driving_client_route(id).await?;
+        let targets = [intent_core::ReverseTarget::Default, target];
+        let snapshot = self.reverse_dispatch.as_ref().map_or_else(
+            || ReverseConnectionSnapshot {
+                clients: Vec::new(),
+                routes: targets
+                    .iter()
+                    .map(|_| ReverseRoute::failed(&ReverseDispatchError::NoClient))
+                    .collect(),
+            },
+            |d| d.connection_snapshot(id, &targets),
+        );
+        let Ok([unpinned, workspace]) = <[ReverseRoute; 2]>::try_from(snapshot.routes) else {
+            return Err(Error::Internal(
+                "browser.clients: the dispatcher did not report one route per target".to_string(),
+            ));
+        };
+        let mut routes = Vec::with_capacity(2);
+        for (route, target) in [unpinned, workspace].into_iter().zip(&targets) {
+            routes.push(self.browser_route_value(route, target).await?);
+        }
+        let mut workspace = routes.pop().expect("two routes");
+        let unpinned = routes.pop().expect("two routes");
+        workspace["source"] = source.into();
+        Ok(serde_json::json!({
+            "clients": snapshot.clients,
+            "unpinned": unpinned,
+            "workspace": workspace,
+        }))
+    }
+
+    /// One `ws.browser.clients()` route as JSON. An offline named client's
+    /// error is reworded exactly as `browser.exec` reports it (with the
+    /// stored client name when no live connection supplies one).
+    async fn browser_route_value(
+        &self,
+        mut route: intent_core::ReverseRoute,
+        target: &intent_core::ReverseTarget,
+    ) -> Result<serde_json::Value> {
+        use crate::browser_tabs::BrowserTabRoutingExt;
+        use intent_core::{ReverseDispatchError, ReverseTarget};
+
+        if route.connection_id.is_none() {
+            if let (Some(client_id), ReverseTarget::Client(_) | ReverseTarget::Pinned(_)) =
+                (route.client_id.clone(), target)
+            {
+                let error = ReverseDispatchError::ClientOffline {
+                    client_id,
+                    name: route.name.clone(),
+                    pinned: matches!(target, ReverseTarget::Pinned(_)),
+                };
+                route.error = Some(self.browser_dispatch_error_message(error).await);
+            }
+        }
+        serde_json::to_value(route).map_err(|e| Error::Internal(e.to_string()))
     }
 
     /// Attach the runtime [`ServerControl`] so `settings.update` can start/stop
@@ -25187,6 +25255,20 @@ impl WorkspaceApi for Services {
         Box::pin(async move {
             self.require_member(&id).await?;
             self.browser_client_state(&id).await
+        })
+    }
+
+    fn browser_clients(
+        &self,
+        id: WorkspaceId,
+        agent_id: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<serde_json::Value>> {
+        Box::pin(async move {
+            if let Some(agent) = agent_id.as_ref() {
+                self.require_agent_member(agent).await?;
+            }
+            self.require_member(&id).await?;
+            self.browser_clients_state(&id).await
         })
     }
 
