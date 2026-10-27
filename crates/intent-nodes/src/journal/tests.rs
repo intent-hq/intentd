@@ -167,15 +167,16 @@ fn open_refuses_a_gap_or_a_corrupt_state() {
 #[test]
 fn journal_files_are_private() {
     use std::os::unix::fs::PermissionsExt as _;
-    let dir = tempfile::tempdir().unwrap();
-    let mut journal = Journal::open(dir.path()).unwrap();
+    let parent = tempfile::tempdir().unwrap();
+    let dir = parent.path().join("journal");
+    let mut journal = Journal::open(&dir).unwrap();
     journal.use_lease("lease-1").unwrap();
     journal.append(entry("secret output")).unwrap();
+    let mode = fs::metadata(&dir).unwrap().permissions().mode();
+    assert_eq!(mode & 0o077, 0, "journal directory mode {mode:o}");
+    let dir = dir.as_path();
     for name in [STATE.to_owned(), record_name(1)] {
-        let mode = fs::metadata(dir.path().join(&name))
-            .unwrap()
-            .permissions()
-            .mode();
+        let mode = fs::metadata(dir.join(&name)).unwrap().permissions().mode();
         assert_eq!(mode & 0o077, 0, "{name} mode {mode:o}");
     }
 }

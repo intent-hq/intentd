@@ -95,7 +95,13 @@ impl Journal {
     /// `node-journal-corrupt` for an unreadable state file, a malformed
     /// record name or a gap; `node-journal` on IO failure.
     pub fn open(dir: &Path) -> Result<Self> {
-        fs::create_dir_all(dir).map_err(|e| io_error("create directory", &e))?;
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder
+            .create(dir)
+            .map_err(|e| io_error("create directory", &e))?;
         let state_path = dir.join(STATE);
         let state = match fs::read(&state_path) {
             Ok(bytes) => serde_json::from_slice(&bytes).map_err(|_| corrupt("state"))?,
