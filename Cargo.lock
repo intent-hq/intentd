@@ -2215,14 +2215,17 @@ dependencies = [
 name = "intent-app"
 version = "0.11.64"
 dependencies = [
+ "base64 0.23.1",
  "intent-core",
  "intent-services",
  "intent-store",
  "intent-svc-transfer",
  "intent-transport",
  "serde_json",
+ "sha2 0.11.0",
  "tempfile",
  "tokio",
+ "zip",
 ]
 
 [[package]]

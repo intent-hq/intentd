@@ -12,14 +12,17 @@ intent-services = { path = "../intent-services", version = "0.11.64" }
 intent-svc-transfer = { path = "../intent-svc-transfer", version = "0.11.64" }
 
 [dev-dependencies]
+base64 = { workspace = true }
 intent-core = { path = "../intent-core", version = "0.11.64" }
 # Disposable secret stores for the end-to-end tests (`Services::new_repository_fixture`).
 intent-services = { path = "../intent-services", version = "0.11.64", features = ["repository-test-fixtures"] }
 intent-store = { path = "../intent-store", version = "0.11.64" }
 intent-transport = { path = "../intent-transport", version = "0.11.64" }
 serde_json = { workspace = true }
+sha2 = "0.11"
 tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 [lints]
 workspace = true
