@@ -49597,7 +49597,18 @@ async fn real_runtime_script_monitor_cancel_redelivery_retires_watch_once() {
     use crate::script_monitor::ScriptMonitorExt;
 
     for grouped in [false, true] {
-        let (_t, svc, ws) = setup().await;
+        // Same fixture as `setup()`, but over a per-test secrets file:
+        // `Services::new` would use the default `~/intent/.secrets.json`.
+        let tmp = TempDb::new();
+        let store = Store::open(&tmp.path).await.expect("open store");
+        let ws = WorkspaceId::new();
+        store.insert_workspace(&workspace(&ws)).await.expect("ws");
+        let registry = test_registry_with_default_provider(&tmp);
+        let svc = Services::new_with_file_secrets(
+            store,
+            intent_core::FileSecretStore::with_path(tmp.path.with_extension("secrets")),
+        )
+        .with_settings_registry(registry);
         let park = Arc::new(crate::CompletionClassifyPark::default());
         let svc = if grouped {
             svc
