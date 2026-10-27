@@ -105,6 +105,7 @@
 # selects every test target of <c>); an empty selection exits 0.
 
 set -euo pipefail
+host_kind=$(uname -s); : "$host_kind"
 
 # Byte order for every sort, glob and comparison below, whatever the caller's
 # locale: glibc's en_US.UTF-8 collation ignores '-' and '_', which put intentd
