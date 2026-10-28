@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.70] - 2026-10-28
+
+### 🧪 Testing
+
+- Verify four protocol fixture copies with the shared lock tool ([#2774](https://github.com/intent-hq/intentd/pull/2774))
+
+
 ## [0.11.69] - 2026-10-28
 
 ### 🚀 Features
