@@ -3892,7 +3892,8 @@ mod desktop_feature_tests {
 mod script_recipe_tests {
     use super::SCRIPT_RUN_MONITOR_RECIPE;
     use serde_json::json;
-    // Mirrored from intent docs/protocol/fixtures/scripts/compact.json at 6f6ecc27.
+    // Copy of intent docs/protocol/fixtures/scripts/compact.json; its lock
+    // tests/fixtures/scripts-compact.lock.json names the monorepo commit.
     const COMPACT: &str = include_str!("../../tests/fixtures/scripts-compact.json");
     #[tokio::test]
     async fn quick_exit_recipe_waits_only_for_active_success_and_checks_both_run_identities() {
