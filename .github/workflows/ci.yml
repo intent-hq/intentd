@@ -430,6 +430,7 @@ jobs:
           sparse-checkout-cone-mode: false
           sparse-checkout: |
             /scripts/suggested-prompts-contract.mjs
+            /scripts/lib/fixture-copy.mjs
             /docs/protocol/fixtures/suggested-prompts/v1/
       - name: Verify suggested-prompts case provenance
         env:

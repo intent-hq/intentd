@@ -788,6 +788,18 @@ selected, the action is available once its connection, browser capability and
 your access are ready. Do not promise automatic failover or change the primary
 client without the user's instruction.
 
+## iOS workspace browser
+
+<!-- Sources: packages/ios/Intent/Views/Workspaces/{WorkspaceBrowserView,WorkspaceBrowserPage}.swift; packages/ios/Intent/Services/BrowserTunnelURL.swift; packages/ios/Intent/Info.plist. -->
+
+In the iOS workspace browser, enter an explicit `http://` or `https://` address
+to open a server reachable from the device, including LAN and Tailscale hosts.
+Allow Intent's local network access if prompted; if previously denied, enable
+it in iOS Settings under **Privacy & Security → Local Network**. Tailscale
+addresses require a working route from the device. `daemon.localhost` and
+loopback addresses instead open servers on the connected daemon through its
+authenticated tunnel.
+
 ## Add context, run a task, and find results
 
 <!-- Sources: packages/cloudlands-fe/src/lib/components/workspace/MultiSelectTabbedSidebar.svelte; sidebar/{AddContextSection,ContextPanel,NotesPanel}.svelte; NoteMetadataBar.svelte (sidebar/ and NoteMetadataBar paths relative to the same workspace component directory); messages/en.json. -->
