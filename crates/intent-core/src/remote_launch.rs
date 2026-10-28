@@ -29,3 +29,16 @@ pub struct RemoteLaunchStarted {
     pub lease_id: String,
     pub platform: AgentPlatform,
 }
+
+/// One agent head runs on an execution node, under `lease_id`. Head claims
+/// these agents when it binds a link; the node stops agents it runs that
+/// head does not claim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentRecord {
+    pub agent_id: AgentId,
+    pub workspace_id: WorkspaceId,
+    pub node_id: String,
+    pub lease_id: String,
+    pub created_at: String,
+}

@@ -2218,6 +2218,7 @@ dependencies = [
  "intent-core",
  "intent-services",
  "intent-store",
+ "intent-svc-remote",
  "intent-svc-transfer",
  "intent-transport",
  "serde_json",
@@ -2469,6 +2470,26 @@ dependencies = [
  "tokio",
  "tracing",
  "trybuild",
+ "uuid",
+]
+
+[[package]]
+name = "intent-svc-remote"
+version = "0.11.62"
+dependencies = [
+ "intent-acp",
+ "intent-core",
+ "intent-services",
+ "intent-store",
+ "intent-transport",
+ "intentd-test-support",
+ "libc",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "tracing",
  "uuid",
 ]
 
