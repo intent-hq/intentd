@@ -11689,6 +11689,18 @@ impl Services {
         // Delegated agents are background agents (the TS `DelegateTaskTool`
         // always sets `metadata.isBackground: true`; G-A1/P3-1.2c).
         extra_metadata.insert("isBackground".to_string(), json!(true));
+        // A placed (remote) child's instructions are assembled from its
+        // session on head, so an explicit `behaviorPrompt` must be stored
+        // there (it overrides the specialist body, as on `agent.create`).
+        if input.placement.is_some() {
+            if let Some(bp) = input
+                .behavior_prompt
+                .as_deref()
+                .filter(|bp| !bp.trim().is_empty())
+            {
+                extra_metadata.insert("behaviorPrompt".to_string(), json!(bp));
+            }
+        }
         let extra = AgentCreateExtra {
             remember_specialist: false,
             provider: delegate_provider,

@@ -11999,17 +11999,18 @@ impl AgentManager {
         if self.contains(agent_id) {
             boxed_await(|| self.kill_child_only(agent_id)).await;
         }
+        // The node opens the provider session with no prompt injection, so
+        // the agent's instructions (base prompt, specialist body or explicit
+        // `behaviorPrompt`, rules) ride its first prompt as the
+        // `FirstTurnPrepend` `<system>` block, as for local providers without
+        // native injection. Prepared before the node starts anything: a
+        // failure fails this turn, and the next one prepares again.
+        boxed_await(|| self.prepare_remote_system_prompt(agent_id, workspace_id, session)).await?;
         let runtime = self
             .services
             .feature_remote_launch_port()
             .runtime(&self.services, agent_id)
             .await?;
-        // The node opens the provider session with no prompt injection, so
-        // the agent's instructions (base prompt, specialist body or explicit
-        // `behaviorPrompt`, rules) ride its first prompt as the
-        // `FirstTurnPrepend` `<system>` block, as for local providers without
-        // native injection.
-        boxed_await(|| self.prepare_remote_system_prompt(agent_id, workspace_id, session)).await;
         let origin = RepositoryOrigin::unavailable();
         let provider = session.provider.clone().unwrap_or_default();
         let handle = AgentHandle {
@@ -12077,14 +12078,18 @@ impl AgentManager {
     /// Assemble a remote agent's system prompt the way `create_agent` does
     /// for a local one (no workspace tool reference: remote agents have no
     /// workspace tools yet), persist it on the session, and arm the
-    /// first-turn prepend that delivers it with the next prompt. A failed
-    /// write leaves the prompt undelivered rather than failing the turn.
+    /// first-turn prepend that delivers it with the next prompt.
+    ///
+    /// # Errors
+    ///
+    /// When the prompt cannot be stored: the turn fails rather than start a
+    /// run without its instructions.
     async fn prepare_remote_system_prompt(
         &self,
         agent_id: &AgentId,
         workspace_id: &WorkspaceId,
         session: &AgentSession,
-    ) {
+    ) -> Result<()> {
         let workspace = self.services.store.get_workspace(workspace_id).await.ok();
         let cwd = workspace.as_ref().and_then(crate::git_ops::worktree_path);
         let specialist = self
@@ -12111,21 +12116,22 @@ impl AgentManager {
         )
         .await
         else {
-            return;
+            return Ok(());
         };
-        if let Err(e) = self
-            .services
+        self.services
             .store
             .set_agent_session_system_prompt(workspace_id, agent_id, &prompt)
             .await
-        {
-            tracing::warn!(agent = %agent_id, error = %e, "remote agent: could not persist its system prompt");
-            return;
-        }
+            .map_err(|e| {
+                Error::Internal(format!(
+                    "remote agent: could not store its instructions before starting it: {e}"
+                ))
+            })?;
         self.prepend_pending
             .lock()
             .unwrap()
             .insert(agent_id.clone());
+        Ok(())
     }
 
     /// Close admission before the composition root performs any teardown await.

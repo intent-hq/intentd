@@ -348,7 +348,7 @@ impl crate::feature_ports::RemoteLaunchPort for RemoteRuntimes {
         _workspace_id: &'a WorkspaceId,
         _placement: &'a intent_core::placement::AgentPlacement,
     ) -> BoxFuture<'a, intent_core::Result<intent_core::remote_launch::RemotePlacementView>> {
-        Box::pin(async { Err(Error::Internal("not used".into())) })
+        Box::pin(async { Ok(remote_view()) })
     }
     fn launch<'a>(
         &'a self,
@@ -415,6 +415,18 @@ async fn remote_manager(
     (tmp, mgr)
 }
 
+fn remote_view() -> intent_core::remote_launch::RemotePlacementView {
+    intent_core::remote_launch::RemotePlacementView {
+        node_id: "node-1".into(),
+        lease_id: "lease-1".into(),
+        node_name: "Mac".into(),
+        placement: intent_core::placement::AgentPlacement::default(),
+        effective_isolation: intent_core::remote_launch::EffectiveIsolation::Pending,
+        placement_error: None,
+        base_commit: "base".into(),
+    }
+}
+
 /// A placed agent's turns run on the runtime the remote-launch port hands
 /// out (asked once, then reused), never on a local process; transcripts
 /// are written as for a local agent.
@@ -453,7 +465,7 @@ async fn a_placed_agent_runs_its_turns_on_the_remote_runtime() {
         .lock()
         .unwrap()
         .iter()
-        .all(|(session, _)| session == "remote:agent-remote-turns"));
+        .all(|(session, _)| *session == format!("remote:{id}")));
     assert!(mgr.agent_root_pids().is_empty(), "no local process");
     let messages = mgr
         .services
@@ -593,4 +605,81 @@ async fn a_remote_agents_instructions_ride_its_first_prompt() {
         let persisted = store.get_agent_session(&id).await.unwrap().system_prompt;
         assert!(persisted.is_some_and(|p| p.contains(marker)));
     }
+}
+
+/// Review of intentd#2779: an explicit `behaviorPrompt` on a remote
+/// delegation reaches the child's first prompt through the real delegate
+/// path.
+#[tokio::test]
+async fn a_remote_delegations_behavior_prompt_rides_its_first_prompt() {
+    let script = mock_agent_script();
+    let _env = EnvGuard::set_all(&[("MOCK_AGENT_SCRIPT_PATH", &script)]);
+    let ws = WorkspaceId::from("ws-remote-delegate");
+    let parent = AgentId::from("agent-remote-delegate-parent");
+    let fake = FakeRuntime::new();
+    let port = Arc::new(RemoteRuntimes {
+        runtime: Some(fake.clone()),
+        asked: AtomicUsize::new(0),
+    });
+    let (_tmp, mgr) = remote_manager(port.clone(), &parent, &ws).await;
+    let delegated = mgr
+        .services
+        .agent_delegate_op(
+            ws.clone(),
+            intent_core::AgentDelegateInput {
+                task_text: Some("Do the remote thing".into()),
+                provider: Some("mock".into()),
+                behavior_prompt: Some("CUSTOM-INSTRUCTION".into()),
+                placement: Some(serde_json::from_value(json!({"target": "remote"})).unwrap()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let child = AgentId::from(delegated["agentId"].as_str().unwrap());
+    fake.wait_prompts(1).await;
+    fake.finish.add_permits(1);
+    wait_idle(&mgr, &child).await;
+    let first = serde_json::to_string(&fake.prompts.lock().unwrap()[0].1).unwrap();
+    assert!(first.contains("<system>"), "{first}");
+    assert!(first.contains("CUSTOM-INSTRUCTION"), "{first}");
+}
+
+/// Review of intentd#2779: when the instructions cannot be stored, the turn
+/// fails before the node starts anything, and the next turn prepares again.
+#[tokio::test]
+async fn a_remote_run_never_starts_without_its_instructions() {
+    let ws = WorkspaceId::from("ws-remote-prepare");
+    let id = AgentId::from("agent-remote-prepare");
+    let fake = FakeRuntime::new();
+    let port = Arc::new(RemoteRuntimes {
+        runtime: Some(fake.clone()),
+        asked: AtomicUsize::new(0),
+    });
+    let (_tmp, mgr) = remote_manager(port.clone(), &id, &ws).await;
+    let pool = mgr.services.store.write_pool();
+    sqlx::query("CREATE TRIGGER fail_system_prompt BEFORE UPDATE OF system_prompt ON agent_session BEGIN SELECT RAISE(FAIL, 'injected'); END")
+        .execute(pool)
+        .await
+        .unwrap();
+    let failed = mgr.ensure_started(&id, &ws).await;
+    assert!(
+        matches!(&failed, Err(Error::Internal(m)) if m.contains("could not store its instructions")),
+        "{failed:?}"
+    );
+    assert_eq!(
+        port.asked.load(Ordering::SeqCst),
+        0,
+        "nothing started on the node"
+    );
+    assert!(!mgr.contains(&id));
+
+    sqlx::query("DROP TRIGGER fail_system_prompt")
+        .execute(pool)
+        .await
+        .unwrap();
+    mgr.ensure_started(&id, &ws).await.unwrap();
+    assert_eq!(port.asked.load(Ordering::SeqCst), 1);
+    assert!(mgr.prepend_pending.lock().unwrap().contains(&id));
 }
