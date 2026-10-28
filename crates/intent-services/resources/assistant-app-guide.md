@@ -837,16 +837,18 @@ the workspace sidebar's menu, choose **Set primary client**, and confirm **Set a
 Primary**.
 
 Newer or test builds may instead offer a **Primary client** submenu. Where present,
-it shows the current primary client and **Offline** when disconnected; choose
-**This app**, then confirm **Set as Primary**. The submenu replaces the separate
-warning indicator, so use the menu for this information in those builds.
+it shows the current primary client and **Offline** when disconnected; the menu
+button may also show a red dot. Choose **This app**, then confirm **Set as Primary**.
+If that choice is unavailable, a line below it explains missing access or browser
+support. The submenu replaces the separate warning indicator in those builds.
 
 Switching ends active desktop control and moves agent-owned browser tabs to that
 client without preserving page state; tabs you opened yourself stay where they
 are. The action depends on the current client's connection, browser capability
 and your access. A checkmark means the saved primary selection matches the
-confirmed current client; it does not guarantee browser availability. After
-reconnecting, wait for the current client and workspace browser state to refresh.
+confirmed current client; it does not guarantee browser availability. The
+selection updates when the primary changes. After reconnecting, wait for the
+current client and workspace browser state to refresh.
 When the saved selection is known and this client is not selected, the action
 is available once those prerequisites are ready. Do not promise automatic
 failover or change the primary client without the user's instruction.

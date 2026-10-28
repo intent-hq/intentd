@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.71] - 2026-10-28
+
+### 📚 Documentation
+
+- *(assistant-guide)* Describe the primary client in the workspace menu ([#2778](https://github.com/intent-hq/intentd/pull/2778))
+
+
+## [0.11.70] - 2026-10-28
+
+### 🧪 Testing
+
+- Verify four protocol fixture copies with the shared lock tool ([#2774](https://github.com/intent-hq/intentd/pull/2774))
+
+
+## [0.11.69] - 2026-10-28
+
+### 🚀 Features
+
+- Persist and serve Workspace.label ([#2760](https://github.com/intent-hq/intentd/pull/2760))
+
+
 ## [0.11.68] - 2026-10-28
 
 ### 📚 Documentation

@@ -1,0 +1,7 @@
+{
+  "lockVersion": 1,
+  "sourceRepository": "intent-hq/intent",
+  "sourcePath": "docs/protocol/fixtures/checkout-repo-config.json",
+  "sourceCommit": "5edc385ea032d1a2d58f636a6e124cec2f8b59cc",
+  "fileSha256": "557dfa24768fb3ce79b3db45176b789899fc2530769fff04e3305307c3596a43"
+}

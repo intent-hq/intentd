@@ -407,40 +407,65 @@ jobs:
           node-version: '24'
       - name: Check CI routing and gate failures
         run: python3 -I -B scripts/test-ci-native-routing.py
-      # The suggested-prompts cases are an exact-byte copy of the monorepo
-      # contract (docs/protocol/suggested-prompts.md); an edited copy fails here.
-      - name: Read pinned suggested-prompts case revision
-        id: suggested-prompts-cases
-        run: |
-          node --input-type=module <<'NODE'
-          import { readFileSync, appendFileSync } from 'node:fs';
-          const lock = JSON.parse(readFileSync('crates/intent-services/tests/fixtures/suggested-prompts.lock.json', 'utf8'));
-          if (lock.sourceRepository !== 'intent-hq/intent' || !/^[0-9a-f]{40}$/.test(lock.sourceCommit)) {
-            throw new Error('suggested-prompts case lock must pin a full intent-hq/intent commit');
-          }
-          appendFileSync(process.env.GITHUB_OUTPUT, `source-commit=${lock.sourceCommit}\n`);
-          NODE
-      - name: Checkout exact canonical suggested-prompts cases
-        uses: actions/checkout@v7
-        with:
-          repository: intent-hq/intent
-          ref: ${{ steps.suggested-prompts-cases.outputs.source-commit }}
-          path: .suggested-prompts-contract-source
-          persist-credentials: false
-          sparse-checkout-cone-mode: false
-          sparse-checkout: |
-            /scripts/suggested-prompts-contract.mjs
-            /scripts/lib/fixture-copy.mjs
-            /docs/protocol/fixtures/suggested-prompts/v1/
-      - name: Verify suggested-prompts case provenance
-        env:
-          SOURCE_COMMIT: ${{ steps.suggested-prompts-cases.outputs.source-commit }}
+      # Copies of monorepo protocol fixtures (docs/protocol/README.md "Copied
+      # fixtures") carry a lock naming the intent-hq/intent commit they were
+      # exported from; an edited copy fails here. Every tracked *.lock.json for
+      # intent-hq/intent is verified: only its commit is fetched, the commit
+      # must be on intent-hq/intent main, and the contract script owning the
+      # lock is found at that commit. Re-export a copy, never edit it:
+      #   node <monorepo>/scripts/<name>-contract.mjs export --source-root <monorepo> \
+      #     --source-commit <merged sha> --component intentd --component-root .
+      - name: Test fixture lock discovery
+        run: python3 -I -B scripts/test-fixture-lock-discovery.py
+      - name: Verify protocol fixture copy provenance
         run: |
           set -euo pipefail
-          node .suggested-prompts-contract-source/scripts/suggested-prompts-contract.mjs verify \
-            --source-root "$GITHUB_WORKSPACE/.suggested-prompts-contract-source" \
-            --source-commit "$SOURCE_COMMIT" --component intentd --component-root "$GITHUB_WORKSPACE" \
-            | tee -a "$GITHUB_STEP_SUMMARY"
+          # A command substitution in an assignment fails the step (set -e,
+          # pipefail) when discovery throws; `mapfile < <(...)` would not.
+          discovered=$(git ls-files -z -- '*.lock.json' | node -e '
+            const fs = require("node:fs");
+            for (const file of fs.readFileSync(0, "utf8").split("\0").filter(Boolean)) {
+              const lock = JSON.parse(fs.readFileSync(file, "utf8"));
+              if (lock.sourceRepository !== "intent-hq/intent") continue;
+              if (!/^[0-9a-f]{40}$/.test(lock.sourceCommit) || typeof lock.sourcePath !== "string"
+                || !lock.sourcePath.startsWith("docs/protocol/fixtures/") || lock.sourcePath.split("/").includes("..")) {
+                throw new Error(`${file} must pin a full intent-hq/intent commit and a docs/protocol/fixtures path`);
+              }
+              console.log(`${file} ${lock.sourceCommit} ${lock.sourcePath}`);
+            }')
+          mapfile -t locks <<<"$discovered"
+          # Guard the discovery itself: five copies are adopted today.
+          if [ "${#locks[@]}" -lt 5 ]; then
+            echo "::error::expected at least 5 intent-hq/intent fixture locks, found ${#locks[@]}"
+            exit 1
+          fi
+          source_root="$RUNNER_TEMP/fixture-copy-source"
+          git init -q "$source_root"
+          git -C "$source_root" remote add origin https://github.com/intent-hq/intent.git
+          # main's commits only (no trees or blobs), for the ancestry checks;
+          # they run before any shallow fetch can cut that history.
+          git -C "$source_root" fetch -q --filter=tree:0 origin main:refs/remotes/origin/main </dev/null
+          for entry in "${locks[@]}"; do
+            read -r lock commit _ <<<"$entry"
+            if ! git -C "$source_root" merge-base --is-ancestor "$commit" origin/main </dev/null 2>/dev/null; then
+              echo "::error file=$lock::lock commit $commit is not on intent-hq/intent main; export from a merged commit"
+              exit 1
+            fi
+          done
+          for entry in "${locks[@]}"; do
+            read -r lock commit source_path <<<"$entry"
+            git -C "$source_root" fetch -q --depth=1 --filter=blob:none origin "$commit" </dev/null
+            git -C "$source_root" sparse-checkout set --no-cone /scripts/lib/fixture-copy.mjs '/scripts/*-contract.mjs' "/$source_path" </dev/null
+            git -C "$source_root" checkout -q --detach "$commit" </dev/null
+            mapfile -t scripts < <(git -C "$source_root" grep -l -F "$lock" "$commit" -- 'scripts/*-contract.mjs' </dev/null | sed "s/^$commit://")
+            if [ "${#scripts[@]}" -ne 1 ]; then
+              echo "::error file=$lock::expected one contract script naming $lock at intent-hq/intent@$commit, found ${#scripts[@]}"
+              exit 1
+            fi
+            node "$source_root/${scripts[0]}" verify --source-root "$source_root" \
+              --source-commit "$commit" --component intentd --component-root "$GITHUB_WORKSPACE" </dev/null \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+          done
       # Release PRs run this job too: a release that would split the intentd
       # version_group (intent-hq/intentd#2461) fails here before it merges.
       - name: Check release-plz version groups stay in lockstep
