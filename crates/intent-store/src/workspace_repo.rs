@@ -27,7 +27,7 @@ const WORKSPACE_COLUMNS: &str = "id, title, branch, base_ref, base_commit_sha, s
     repository_name, worktree_path, scope, skip_worktree, is_remote, default_model, pr_number, \
     pr_url, pr_status, active_pull_request, pull_requests, context_links, archived, archived_at, \
     tags, created_at, updated_at, last_activity, token_usage, setup_script, checkout_mode, \
-    browser_client_id, last_content_activity, retired_at";
+    browser_client_id, last_content_activity, retired_at, label";
 
 // Shared with deletion query-cost regressions so they exercise the exact
 // production statements, including their candidate-selection work.
@@ -263,7 +263,7 @@ impl Store {
         }
         let sql = format!(
             "INSERT INTO workspace ({WORKSPACE_COLUMNS}, auto_commit_enabled) VALUES \
-             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+             (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
         );
         let query = sqlx::query(&sql)
             .bind(&ws.id.0)
@@ -302,6 +302,7 @@ impl Store {
             .bind(ws.browser_client_id.as_ref().map(|c| c.0.clone()))
             .bind(&ws.last_content_activity)
             .bind(&ws.retired_at)
+            .bind(&ws.label)
             .bind(auto_commit.map(i64::from));
         lifecycle.begin(&[crate::RepositoryLifecycleKey::Workspace(ws.id.clone())])?;
         if let Some(admission) = admission {
@@ -365,6 +366,9 @@ impl Store {
     /// snapshot read before a concurrent archive can never resurrect the
     /// workspace behind the archive's guest sweep (the `workspace.archive`
     /// fence relies on this — see `ArchiveFence` in `intent-services`).
+    ///
+    /// `label` is never written here either: it moves only through
+    /// [`Self::set_workspace_label`], so a stale snapshot cannot revert it.
     ///
     /// # Errors
     ///
@@ -1404,6 +1408,27 @@ impl Store {
         Ok(())
     }
 
+    /// Scoped write of the Home workspace label (`workspace.update { label }`):
+    /// `None` clears it. After insert this is the only writer of the column —
+    /// `update_workspace` never touches it — so a stale [`Workspace`]
+    /// snapshot passed to a full-row update cannot revert a newer label.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::NotFound` if the workspace does not exist; `Error::Internal` if the database operation fails.
+    pub async fn set_workspace_label(&self, id: &WorkspaceId, label: Option<&str>) -> Result<()> {
+        let res = sqlx::query("UPDATE workspace SET label = ? WHERE id = ?")
+            .bind(label)
+            .bind(&id.0)
+            .execute(self.write_pool())
+            .await
+            .map_err(|e| Error::Internal(format!("set workspace label failed: {e}")))?;
+        if res.rows_affected() == 0 {
+            return Err(Error::NotFound(format!("workspace {id}")));
+        }
+        Ok(())
+    }
+
     /// The persisted per-workspace auto-commit override. `Ok(None)` for
     /// pre-migration rows (NULL column) — the caller resolves NULL against
     /// the global `git.autoCommit` setting. `NotFound` when the workspace
@@ -1977,6 +2002,7 @@ fn map_workspace_row(row: &SqliteRow) -> Result<Workspace> {
         token_usage,
         checkout_mode,
         browser_client_id: col::<Option<String>>(row, "browser_client_id")?.map(ClientId),
+        label: col(row, "label")?,
         // The remaining fields are never persisted: `activity` is derived
         // (§9.9), the emit-only fields (card aggregates, `displayStatus`, the
         // wait/script/background flags, `cowSupported`, `diskUsage`,

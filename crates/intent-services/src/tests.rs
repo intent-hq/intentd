@@ -23,6 +23,7 @@ mod skill_list;
 mod task_list_latency;
 mod task_push;
 pub(crate) mod workspace_delete;
+mod workspace_label;
 
 /// Runs before `main()` — and therefore before any test threads exist, making
 /// `set_var` race-free. Node children spawned by lib tests (e.g. the real
@@ -771,6 +772,7 @@ async fn worst_case_workspace_list_row() -> Workspace {
             .to_string(),
     );
     row.status_image_asset_id = Some(format!("asset-{}", uuid::Uuid::new_v4()));
+    row.label = Some("Customer escalations for later".to_string());
     row.last_activity = Some(now_iso());
     row.tags = vec!["frontend".to_string(), "regression".to_string()];
     row.path = Some(format!(
@@ -32270,6 +32272,11 @@ mod worktree_provisioning {
             obj.get("cowSupported").and_then(serde_json::Value::as_bool),
             svc.compute_cow_supported().await,
             "capability mirrors the shared workspaces-root probe"
+        );
+        assert_eq!(
+            obj.get("workspaceLabels"),
+            Some(&serde_json::json!(1)),
+            "workspace labels are advertised as exact integer 1: {caps}"
         );
     }
 

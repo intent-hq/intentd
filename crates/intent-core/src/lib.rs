@@ -136,6 +136,7 @@ pub use model::{chief_prompt_version, CHIEF_PROMPT_VERSION_KEY};
 pub use model::{chief_workspace, CHIEF_WORKSPACE_TIMESTAMP};
 pub use model::{lift_app_message_id, USER_APP_MESSAGE_ID_KEY};
 pub use model::{lift_from_principal_id, FROM_PRINCIPAL_ID_KEY};
+pub use model::{normalize_workspace_label, WORKSPACE_LABEL_MAX_CHARS, WORKSPACE_LABEL_PINNED};
 pub use model::{
     ActorType, AgentActivity, AgentCreateExtra, AgentDelegateInput, AgentLite, AgentMessage,
     AgentMetadata, AgentSession, AgentStatus, AgentWakeCreateOptions, AgentWakeOrCreateInput,
