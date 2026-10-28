@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.69] - 2026-10-28
+
+### 🚀 Features
+
+- Persist and serve Workspace.label ([#2760](https://github.com/intent-hq/intentd/pull/2760))
+
+
 ## [0.11.68] - 2026-10-28
 
 ### 📚 Documentation
