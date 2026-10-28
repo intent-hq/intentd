@@ -379,6 +379,7 @@ async fn remote_agent_launches_streams_stops_and_leaves_its_wip_ref() {
             tokio::time::Instant::now() < deadline,
             "node never bound: {response}"
         );
+        // timing-guard: poll interval while the separate node process binds to head (no event exposes it)
         tokio::time::sleep(Duration::from_millis(200)).await;
     };
     let agent = &created["agent"];
@@ -459,6 +460,7 @@ async fn remote_agent_launches_streams_stops_and_leaves_its_wip_ref() {
             if let Some(wip) = try_rev(&repo, &format!("{refs}/wip")) {
                 return wip;
             }
+            // timing-guard: poll interval for the node process's git push to land the ref (no event exposes it)
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     })
