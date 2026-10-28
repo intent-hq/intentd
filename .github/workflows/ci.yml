@@ -415,10 +415,14 @@ jobs:
       # lock is found at that commit. Re-export a copy, never edit it:
       #   node <monorepo>/scripts/<name>-contract.mjs export --source-root <monorepo> \
       #     --source-commit <merged sha> --component intentd --component-root .
+      - name: Test fixture lock discovery
+        run: python3 -I -B scripts/test-fixture-lock-discovery.py
       - name: Verify protocol fixture copy provenance
         run: |
           set -euo pipefail
-          mapfile -t locks < <(git ls-files -z -- '*.lock.json' | node -e '
+          # A command substitution in an assignment fails the step (set -e,
+          # pipefail) when discovery throws; `mapfile < <(...)` would not.
+          discovered=$(git ls-files -z -- '*.lock.json' | node -e '
             const fs = require("node:fs");
             for (const file of fs.readFileSync(0, "utf8").split("\0").filter(Boolean)) {
               const lock = JSON.parse(fs.readFileSync(file, "utf8"));
@@ -429,6 +433,7 @@ jobs:
               }
               console.log(`${file} ${lock.sourceCommit} ${lock.sourcePath}`);
             }')
+          mapfile -t locks <<<"$discovered"
           # Guard the discovery itself: five copies are adopted today.
           if [ "${#locks[@]}" -lt 5 ]; then
             echo "::error::expected at least 5 intent-hq/intent fixture locks, found ${#locks[@]}"
