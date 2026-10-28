@@ -421,7 +421,7 @@ impl Runner {
                         loop {
                             tick.tick().await;
                             let found = intent_acp::descendant_pids(pid).await;
-                            *lock(&descendants) = found;
+                            remember(&descendants, &found);
                         }
                     })
                 });
@@ -551,7 +551,7 @@ impl Runner {
         // groups are no longer its descendants.
         if let Some(pid) = pid {
             let found = intent_acp::descendant_pids(pid).await;
-            *lock(descendants) = found;
+            remember(descendants, &found);
         }
         ready.send_replace(Some(Arc::new(Ready {
             connection: connection.clone(),
@@ -756,6 +756,36 @@ async fn run_turn(agent: &Agent, turn_id: &str, prompt: Vec<Value>) -> (String, 
     }
 }
 
+/// Merge a descendant snapshot into the known set. Snapshots are taken
+/// concurrently (setup and the periodic tracker) and may complete out of
+/// order, so a result only adds pids: a helper captured once stays known
+/// after it is reparented, until it exits. Pids that are gone, or now in
+/// the node's own process group (recycled), are dropped.
+fn merge_snapshot(known: &[i32], found: &[i32], alive: impl Fn(i32) -> bool) -> Vec<i32> {
+    let mut merged: Vec<i32> = known
+        .iter()
+        .chain(found)
+        .copied()
+        .filter(|&pid| alive(pid))
+        .collect();
+    merged.sort_unstable();
+    merged.dedup();
+    merged
+}
+
+/// Whether `pid` is a live process outside the node's own process group,
+/// the same guard `intent_acp::sweep_escaped_descendants` applies.
+fn alive_outside_own_group(pid: i32) -> bool {
+    use nix::unistd::{getpgid, Pid};
+    pid > 1
+        && getpgid(Some(Pid::from_raw(pid))).is_ok_and(|group| Some(group) != getpgid(None).ok())
+}
+
+fn remember(descendants: &Mutex<Vec<i32>>, found: &[i32]) {
+    let mut known = lock(descendants);
+    *known = merge_snapshot(&known, found, alive_outside_own_group);
+}
+
 /// The pids of processes whose environment carries `RUN_MARKER_ENV=marker`.
 /// Linux only (`/proc/<pid>/environ`, readable for the node's own user's
 /// processes); elsewhere, and for a helper that clears its environment,
@@ -797,7 +827,8 @@ async fn marked_processes(marker: &str) -> Vec<i32> {
 /// descendants seen while it ran: after it exits, helpers in their own
 /// process groups are no longer its descendants, so they and their own
 /// descendants are swept from that snapshot (and, on Linux, from the run
-/// marker). Remaining gap, outside Linux or for a helper that clears its
+/// marker). Snapshots only add to the known set (see [`merge_snapshot`]).
+/// Remaining gap, outside Linux or for a helper that clears its
 /// environment: a helper that leaves the provider's process group after the
 /// last snapshot of a provider that then exits by itself is missed.
 async fn kill_tree(mut child: Child, spawn_pid: Option<u32>, known: &[i32]) {

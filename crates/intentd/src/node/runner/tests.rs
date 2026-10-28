@@ -545,6 +545,21 @@ async fn node_runner_shutdown_waits_until_queued_output_and_exit_are_journaled()
 }
 
 #[test]
+fn descendant_snapshots_merge_so_a_stale_result_cannot_erase_a_known_helper() {
+    let alive = |pid: i32| pid != 30;
+    // The setup snapshot (taken later) finds the helper first ...
+    let known = merge_snapshot(&[], &[10, 20], alive);
+    assert_eq!(known, vec![10, 20]);
+    // ... then an older periodic snapshot, taken before the helper existed,
+    // completes and must not erase it.
+    let known = merge_snapshot(&known, &[10], alive);
+    assert_eq!(known, vec![10, 20]);
+    // Pids that are gone are dropped; new ones are added once.
+    let known = merge_snapshot(&[10, 20, 30], &[40, 20], alive);
+    assert_eq!(known, vec![10, 20, 40]);
+}
+
+#[test]
 fn node_test_agent_fixture_exists() {
     assert!(Path::new(concat!(
         env!("CARGO_MANIFEST_DIR"),
