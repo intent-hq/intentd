@@ -456,6 +456,49 @@ async fn node_runner_kills_a_helper_in_its_own_process_group_after_a_natural_exi
     assert_gone(helper).await;
 }
 
+/// The provider starts a helper in its own process group during startup and
+/// exits on its first prompt, before any periodic snapshot can have run.
+/// Nothing here waits on the tracker.
+#[tokio::test]
+async fn node_runner_kills_a_startup_helper_when_the_provider_exits_on_its_first_prompt() {
+    let Some(h) = harness(1, &["--detached-helper"]) else {
+        return;
+    };
+    h.runner.launch(launch("a1")).await;
+    h.runner
+        .prompt(&AgentId::from("a1"), "t1".into(), text("exit"))
+        .await;
+    let (agent, helper) = agent_pids(&h.storage, "a1").await;
+    wait_for(&h.runner, "exit", exited("a1")).await;
+    assert_gone(agent).await;
+    assert_gone(helper).await;
+}
+
+/// A helper started in its own process group in the middle of a session,
+/// immediately before the provider exits, is seen by no snapshot; on Linux
+/// the run marker in its inherited environment still identifies it.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn node_runner_kills_a_helper_started_just_before_the_provider_exits() {
+    let Some(h) = harness(1, &[]) else { return };
+    h.runner.launch(launch("a1")).await;
+    h.runner
+        .prompt(&AgentId::from("a1"), "t1".into(), text("spawn-exit"))
+        .await;
+    wait_for(&h.runner, "exit", exited("a1")).await;
+    let path = h
+        .storage
+        .agent_dir(&AgentId::from("a1"))
+        .unwrap()
+        .join("late-helper.pid");
+    let pid: i32 = std::fs::read_to_string(&path)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_gone(pid).await;
+}
+
 #[tokio::test]
 async fn node_runner_refuses_launches_once_shutdown_began() {
     let Some(h) = harness(2, &[]) else { return };

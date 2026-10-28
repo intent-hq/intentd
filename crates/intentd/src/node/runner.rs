@@ -54,6 +54,10 @@ const TERM_GRACE: Duration = Duration::from_secs(2);
 /// that left its process group can still be found after it exits (its
 /// children are reparented the moment it exits).
 const TRACK_INTERVAL: Duration = Duration::from_secs(1);
+/// Set in every provider's environment to a value unique to that run, so
+/// its helpers (which inherit it) can be found after the provider exits,
+/// wherever they were reparented to.
+const RUN_MARKER_ENV: &str = "INTENT_NODE_RUN";
 /// How long shutdown waits for stopped agents to be cleaned up and their
 /// queued records (each one fsync'd) to be journaled.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(30);
@@ -120,6 +124,8 @@ struct Agent {
     activity: ActivityTracker,
     /// The provider's descendants at the last snapshot.
     descendants: Arc<Mutex<Vec<i32>>>,
+    /// This run's [`RUN_MARKER_ENV`] value.
+    run_marker: String,
 }
 
 /// A provider session that finished its ACP setup.
@@ -308,6 +314,7 @@ impl Runner {
             ready: ready_rx,
             busy: Mutex::new(false),
             descendants: Arc::new(Mutex::new(Vec::new())),
+            run_marker: intent_core::node_link::LinkId::new_v4().to_string(),
             marks: marks_tx,
             activity: ActivityTracker::new(),
         });
@@ -419,15 +426,25 @@ impl Runner {
                     })
                 });
                 let outcome = self
-                    .supervise(&launch, &connection, &mut child, &mut stop, &ready, &cwd)
+                    .supervise(
+                        &launch,
+                        &connection,
+                        &mut child,
+                        &mut stop,
+                        &ready,
+                        &cwd,
+                        (pid, &agent.descendants),
+                    )
                     .await;
                 if let Some(tracker) = tracker {
                     tracker.abort();
                 }
                 // Whatever the provider left behind goes too, also when it
-                // exited by itself: its process group, and the helpers last
-                // seen as its descendants (and theirs).
-                let known = lock(&agent.descendants).clone();
+                // exited by itself: its process group, the helpers last seen
+                // as its descendants (and theirs), and on Linux every process
+                // still carrying this run's marker.
+                let mut known = lock(&agent.descendants).clone();
+                known.extend(marked_processes(&agent.run_marker).await);
                 kill_tree(child, pid, &known).await;
                 let result = match outcome {
                     Outcome::Exited(code) => (code, None),
@@ -474,6 +491,9 @@ impl Runner {
         options.cwd = Some(&cwd);
         options.provider_binary = Some(&launch.binary);
         options.model = model;
+        options
+            .extra_env
+            .insert(RUN_MARKER_ENV.to_owned(), agent.run_marker.clone());
         let spawned = intent_acp::spawn_provider(&options, hooks)?;
         // A configured binary launches directly, never through npx, so there
         // is no npx launch directory to keep alive.
@@ -500,6 +520,10 @@ impl Runner {
         Ok((child, connection, serve, cwd))
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "private step of run_agent over its locals"
+    )]
     async fn supervise(
         &self,
         launch: &ProviderLaunch,
@@ -508,6 +532,7 @@ impl Runner {
         stop: &mut oneshot::Receiver<()>,
         ready: &watch::Sender<Option<Arc<Ready>>>,
         cwd: &std::path::Path,
+        (pid, descendants): (Option<u32>, &Mutex<Vec<i32>>),
     ) -> Outcome {
         let setup = async {
             intent_acp::handshake(connection, &launch.config).await?;
@@ -521,6 +546,13 @@ impl Runner {
             status = child.wait() => return Outcome::Exited(status.ok().and_then(|s| s.code())),
             _ = &mut *stop => return Outcome::Stopped,
         };
+        // Record what the provider started during setup before any prompt
+        // can make it exit: once it has exited, helpers in their own process
+        // groups are no longer its descendants.
+        if let Some(pid) = pid {
+            let found = intent_acp::descendant_pids(pid).await;
+            *lock(descendants) = found;
+        }
         ready.send_replace(Some(Arc::new(Ready {
             connection: connection.clone(),
             session_id: session.session_id.to_string(),
@@ -724,6 +756,38 @@ async fn run_turn(agent: &Agent, turn_id: &str, prompt: Vec<Value>) -> (String, 
     }
 }
 
+/// The pids of processes whose environment carries `RUN_MARKER_ENV=marker`.
+/// Linux only (`/proc/<pid>/environ`, readable for the node's own user's
+/// processes); elsewhere, and for a helper that clears its environment,
+/// only the descendant snapshots find escaped helpers. A recycled pid
+/// cannot carry the marker of an earlier run.
+async fn marked_processes(marker: &str) -> Vec<i32> {
+    #[cfg(target_os = "linux")]
+    {
+        let needle = format!("{RUN_MARKER_ENV}={marker}").into_bytes();
+        tokio::task::spawn_blocking(move || {
+            let Ok(entries) = std::fs::read_dir("/proc") else {
+                return Vec::new();
+            };
+            entries
+                .filter_map(Result::ok)
+                .filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
+                .filter(|pid| {
+                    std::fs::read(format!("/proc/{pid}/environ"))
+                        .is_ok_and(|env| env.split(|b| *b == 0).any(|var| var == needle))
+                })
+                .collect()
+        })
+        .await
+        .unwrap_or_default()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = marker;
+        Vec::new()
+    }
+}
+
 /// Stop a provider process tree the way the local agent manager does:
 /// SIGTERM its process group, SIGKILL whatever is left after a grace period,
 /// then sweep descendants that moved to their own process groups.
@@ -732,9 +796,10 @@ async fn run_turn(agent: &Agent, turn_id: &str, prompt: Vec<Value>) -> (String, 
 /// group id cannot be reused while any member is alive). `known` are
 /// descendants seen while it ran: after it exits, helpers in their own
 /// process groups are no longer its descendants, so they and their own
-/// descendants are swept from that snapshot. Like every pid-based sweep
-/// this is best effort: a helper started after the last snapshot of a
-/// provider that exits by itself is missed.
+/// descendants are swept from that snapshot (and, on Linux, from the run
+/// marker). Remaining gap, outside Linux or for a helper that clears its
+/// environment: a helper that leaves the provider's process group after the
+/// last snapshot of a provider that then exits by itself is missed.
 async fn kill_tree(mut child: Child, spawn_pid: Option<u32>, known: &[i32]) {
     use nix::sys::signal::{killpg, Signal};
     use nix::unistd::Pid;

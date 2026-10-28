@@ -11,7 +11,9 @@
 // whole process tree. A prompt whose text contains "block" parks until
 // session/cancel; "slow" waits 300 ms; "many" streams 200 extra chunks;
 // "exit" answers and then exits with code 0, leaving its `sleep` child
-// running; every turn first streams one agent_message_chunk "echo: <text>".
+// running; "spawn-exit" starts another `sleep` in its own process group,
+// writes its pid to `late-helper.pid`, answers and exits at once; every turn
+// first streams one agent_message_chunk "echo: <text>".
 import readline from 'node:readline';
 import fs from 'node:fs';
 import { spawn } from 'node:child_process';
@@ -76,6 +78,12 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
             },
           });
         }
+      }
+      if (text.includes('spawn-exit')) {
+        const late = spawn('sleep', ['300'], { stdio: 'ignore', detached: true });
+        fs.writeFileSync('late-helper.pid', String(late.pid));
+        send({ id: msg.id, result: { stopReason: 'end_turn' } });
+        process.exit(0);
       }
       if (text.includes('exit')) {
         send({ id: msg.id, result: { stopReason: 'end_turn' } });
