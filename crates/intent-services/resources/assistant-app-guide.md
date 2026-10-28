@@ -780,7 +780,8 @@ To switch, open the workspace in the client you want to use, open the workspace
 sidebar's menu, choose **Primary client** → **This app**, and confirm **Set as
 Primary**. This moves agent-owned tabs to that client without preserving page
 state; tabs you opened yourself stay where they are. **This app** depends on the
-current client's connection, browser capability and your access. A checkmark marks
+current client's connection, browser capability and your access; when a guest role or
+missing browser support blocks it, a line below it says why. A checkmark marks
 the current primary client; it does not guarantee browser availability. The
 selection updates when the primary changes; after reconnecting, wait for the
 current client and workspace browser state to refresh. Do not promise automatic
