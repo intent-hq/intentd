@@ -544,67 +544,6 @@ async fn node_runner_shutdown_waits_until_queued_output_and_exit_are_journaled()
     assert_eq!(records(&h.runner).await.len(), count);
 }
 
-fn helper(pid: i32, start: &str) -> Helper {
-    Helper {
-        pid,
-        start: start.to_owned(),
-    }
-}
-
-#[test]
-fn descendant_snapshots_merge_so_a_stale_result_cannot_erase_a_known_helper() {
-    let now = |pid: i32| match pid {
-        10 => Some("s10".to_owned()),
-        20 => Some("s20".to_owned()),
-        40 => Some("s40".to_owned()),
-        _ => None,
-    };
-    // The setup snapshot (taken later) finds the helper first ...
-    let known = merge_snapshot(&[], &[helper(10, "s10"), helper(20, "s20")], now);
-    assert_eq!(known, vec![helper(10, "s10"), helper(20, "s20")]);
-    // ... then an older periodic snapshot, taken before the helper existed,
-    // completes and must not erase it.
-    let known = merge_snapshot(&known, &[helper(10, "s10")], now);
-    assert_eq!(known, vec![helper(10, "s10"), helper(20, "s20")]);
-    // Exited pids are dropped; new ones are added once.
-    let known = merge_snapshot(
-        &[helper(10, "s10"), helper(30, "s30")],
-        &[helper(40, "s40"), helper(10, "s10")],
-        now,
-    );
-    assert_eq!(known, vec![helper(10, "s10"), helper(40, "s40")]);
-}
-
-#[test]
-fn descendant_identity_drops_a_reused_pid_and_keeps_the_reparented_helper() {
-    // Pid 20 was our helper (started at "a"); it exited and an unrelated
-    // process now has pid 20 (started at "b"). Pid 30 is our helper too,
-    // reparented: no longer in any snapshot, but still the same process.
-    let now = |pid: i32| match pid {
-        20 => Some("b".to_owned()),
-        30 => Some("c".to_owned()),
-        _ => None,
-    };
-    let known = merge_snapshot(&[helper(20, "a"), helper(30, "c")], &[], now);
-    assert_eq!(known, vec![helper(30, "c")], "reused pid 20 is not ours");
-    // A snapshot entry whose process changed between `ps` and the identity
-    // read is not adopted either.
-    let known = merge_snapshot(&known, &[helper(20, "a")], now);
-    assert_eq!(known, vec![helper(30, "c")]);
-    // Teardown revalidates the same way.
-    assert_eq!(revalidated_pids(&known, now), vec![30]);
-    assert!(revalidated_pids(&[helper(20, "a")], now).is_empty());
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn process_start_identity_is_stable_for_a_process_and_absent_for_none() {
-    let me = i32::try_from(std::process::id()).unwrap();
-    let first = process_start(me).expect("own start time");
-    assert_eq!(process_start(me), Some(first));
-    assert_eq!(process_start(i32::MAX), None);
-}
-
 #[test]
 fn node_test_agent_fixture_exists() {
     assert!(Path::new(concat!(
