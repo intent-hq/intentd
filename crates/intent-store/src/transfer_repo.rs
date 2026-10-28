@@ -181,6 +181,11 @@ pub(crate) const TRANSFER_EXCLUDED_TABLES: &[(&str, &str)] = &[
          rows alone would create dangling recovery pointers and cannot transfer ownership",
     ),
     (
+        "remote_agent",
+        "binds agents to a source-head node lease; the target head has its own node and lease, \
+         and an imported agent does not run on the source head's node",
+    ),
+    (
         "client",
         "connected FE clients are per-daemon; imported draft rows referencing them \
          are dropped by the import transform layer",

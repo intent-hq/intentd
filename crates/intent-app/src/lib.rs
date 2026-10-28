@@ -20,6 +20,10 @@ use intent_services::Services;
 /// its integration tests.
 pub use intent_svc_transfer as transfer;
 
+/// Remote agents on a configured execution node, re-exported for the daemon
+/// and its integration tests.
+pub use intent_svc_remote as remote;
+
 /// Runtime (scripts, hooks, terminals, browser tabs, sandboxes) entry points
 /// the daemon calls on [`Services`] at startup.
 pub use intent_services::feature_api::RuntimeServicesExt;
@@ -37,8 +41,9 @@ pub use intent_services::feature_api::RuntimeServicesExt;
 #[must_use]
 pub fn compose(services: Services) -> Services {
     let services = intent_svc_transfer::register(services);
-    // No daemon runs agents on an execution node yet: every remote launch
-    // fails as `placement-unavailable` until the remote feature registers.
+    let services = intent_svc_remote::register(services);
+    // The remote feature does not launch agents yet: every remote launch
+    // fails as `placement-unavailable` until it registers its port.
     let services = services.with_remote_launch_port(std::sync::Arc::new(
         intent_services::feature_api::feature_ports::UnavailableRemoteLaunch,
     ));
@@ -66,10 +71,24 @@ pub trait StartupExt {
     /// Delete export staging directories left behind by a previous daemon
     /// run. Called once at boot.
     fn sweep_stale_export_staging(&self) -> impl Future<Output = ()> + Send;
+
+    /// Start the connector to the execution node configured in `data_dir`
+    /// (`remote-node.json`). Returns `false` when no node is configured.
+    fn start_remote_node(
+        &self,
+        data_dir: &std::path::Path,
+    ) -> impl Future<Output = intent_services::Result<bool>> + Send;
 }
 
 impl StartupExt for Services {
     fn sweep_stale_export_staging(&self) -> impl Future<Output = ()> + Send {
         intent_svc_transfer::TransferServicesExt::sweep_stale_export_staging(self)
+    }
+
+    fn start_remote_node(
+        &self,
+        data_dir: &std::path::Path,
+    ) -> impl Future<Output = intent_services::Result<bool>> + Send {
+        intent_svc_remote::RemoteServicesExt::start_remote_node(self, data_dir)
     }
 }

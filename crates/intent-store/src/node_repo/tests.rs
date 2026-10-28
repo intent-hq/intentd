@@ -610,3 +610,160 @@ async fn reassignment_cannot_replace_the_original_merge_target() {
         NodeCounter(2)
     );
 }
+
+#[tokio::test]
+async fn the_journal_ack_only_moves_forward_and_survives_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("nodes.db");
+    let store = Store::open(&path).await.unwrap();
+    let (node, lease) = records();
+    store.enroll_node(&node, &lease).await.unwrap();
+    let owner = &lease.owner;
+    assert_eq!(
+        store
+            .advance_node_lease_ack(owner, NodeCounter(5))
+            .await
+            .unwrap(),
+        NodeCounter(5)
+    );
+    assert_eq!(
+        store
+            .advance_node_lease_ack(owner, NodeCounter(3))
+            .await
+            .unwrap(),
+        NodeCounter(5),
+        "a lower ack never regresses the persisted one"
+    );
+    store.close().await;
+    let store = Store::open(&path).await.unwrap();
+    assert_eq!(
+        store.get_node_lease(owner).await.unwrap().ack_seq,
+        NodeCounter(5)
+    );
+    let mut stale = owner.clone();
+    stale.incarnation = uuid::Uuid::new_v4().to_string();
+    assert!(matches!(
+        store.advance_node_lease_ack(&stale, NodeCounter(9)).await,
+        Err(Error::NotFound(_))
+    ));
+}
+
+#[tokio::test]
+async fn a_welcome_records_the_platform_and_readies_the_lease() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("nodes.db")).await.unwrap();
+    assert_eq!(store.node_head_id().await.unwrap(), None);
+    let (mut node, lease) = records();
+    node.state = NodeState::Offline;
+    store.enroll_node(&node, &lease).await.unwrap();
+    assert_eq!(
+        store.node_head_id().await.unwrap().as_deref(),
+        Some("head-test")
+    );
+    assert_eq!(
+        store.find_execution_node(&node.id).await.unwrap(),
+        Some(node.clone())
+    );
+    assert_eq!(store.find_execution_node("other").await.unwrap(), None);
+
+    let readied = store
+        .record_node_welcome(&lease.owner, NodeOs::Macos, NodeArch::Aarch64, 3, "9.9.9")
+        .await
+        .unwrap();
+    assert_eq!(readied.state, LeaseState::Ready);
+    assert!(readied.last_seen_at.is_some());
+    let host = store.get_node(&node.id, &node.head_id).await.unwrap();
+    assert_eq!(
+        (host.os, host.arch, host.capacity.max_agents, host.state),
+        (NodeOs::Macos, NodeArch::Aarch64, 3, NodeState::Ready)
+    );
+    assert_eq!(host.version, "9.9.9");
+    // A busy lease keeps its state on the next welcome.
+    store
+        .transition_node_lease(&lease.owner, LeaseState::Busy)
+        .await
+        .unwrap();
+    let again = store
+        .record_node_welcome(&lease.owner, NodeOs::Macos, NodeArch::Aarch64, 3, "9.9.9")
+        .await
+        .unwrap();
+    assert_eq!(again.state, LeaseState::Busy);
+}
+
+#[tokio::test]
+async fn remote_agents_are_recorded_per_lease_and_cascade_with_the_agent() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("nodes.db")).await.unwrap();
+    let (node, lease) = records();
+    store.enroll_node(&node, &lease).await.unwrap();
+    seed_agent(&store, "agent-a", "workspace").await;
+    seed_agent(&store, "agent-b", "workspace").await;
+    let record = |agent: &str, created_at: &str| RemoteAgentRecord {
+        agent_id: agent.into(),
+        workspace_id: "workspace".into(),
+        node_id: node.id.clone(),
+        lease_id: lease.owner.lease_id.clone(),
+        created_at: created_at.into(),
+    };
+    store
+        .record_remote_agent(&record("agent-b", "2026-01-02T00:00:00Z"))
+        .await
+        .unwrap();
+    store
+        .record_remote_agent(&record("agent-a", "2026-01-01T00:00:00Z"))
+        .await
+        .unwrap();
+    store
+        .record_remote_agent(&record("agent-a", "2026-01-01T00:00:00Z"))
+        .await
+        .expect("recording the same placement again is a no-op");
+    let listed = store
+        .list_remote_agents(&lease.owner.lease_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        listed
+            .iter()
+            .map(|r| r.agent_id.as_str())
+            .collect::<Vec<_>>(),
+        ["agent-a", "agent-b"]
+    );
+
+    let mut elsewhere = record("agent-a", "2026-01-03T00:00:00Z");
+    elsewhere.node_id = "other-node".into();
+    assert!(matches!(
+        store.record_remote_agent(&elsewhere).await,
+        Err(Error::InvalidParams(_))
+    ));
+    let mut unknown = record("agent-a", "2026-01-03T00:00:00Z");
+    unknown.lease_id = "no-such-lease".into();
+    assert!(matches!(
+        store.record_remote_agent(&unknown).await,
+        Err(Error::NotFound(_))
+    ));
+    assert!(
+        store
+            .record_remote_agent(&record("agent-missing", "2026-01-03T00:00:00Z"))
+            .await
+            .is_err(),
+        "the agent must exist"
+    );
+
+    sqlx::query("DELETE FROM agent_session WHERE id = 'agent-b'")
+        .execute(store.write_pool())
+        .await
+        .unwrap();
+    assert!(store
+        .remove_remote_agent(&AgentId::from("agent-a"))
+        .await
+        .unwrap());
+    assert!(!store
+        .remove_remote_agent(&AgentId::from("agent-a"))
+        .await
+        .unwrap());
+    assert!(store
+        .list_remote_agents(&lease.owner.lease_id)
+        .await
+        .unwrap()
+        .is_empty());
+}
