@@ -49,6 +49,9 @@ pub(crate) struct Tuning {
     /// before trying again, in case the operator fixed the node.
     pub permanent_retry: Duration,
     pub backoff: Backoff,
+    /// Test seam: fail every ack write while set.
+    #[cfg(test)]
+    pub fail_ack_writes: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Default for Tuning {
@@ -60,6 +63,8 @@ impl Default for Tuning {
             turn_poll: Duration::from_secs(1),
             permanent_retry: Duration::from_secs(60),
             backoff: Backoff::default(),
+            #[cfg(test)]
+            fail_ack_writes: Arc::default(),
         }
     }
 }
@@ -193,6 +198,8 @@ impl RemoteNode {
         tuning: Tuning,
     ) -> Result<Self> {
         let lease = HeadLease::open(store, &config).await?;
+        #[cfg(test)]
+        let lease = lease.failing_ack_writes_when(tuning.fail_ack_writes.clone());
         let acked = lease.acked().await?;
         let status = NodeStatus {
             node_id: config.node_id.clone(),
@@ -273,12 +280,12 @@ async fn run(shared: Arc<Shared>, endpoint: NodeEndpoint, lease: HeadLease, mut 
     let mut backoff = shared.tuning.backoff.clone();
     let mut shutdown = shared.shutdown.subscribe();
     loop {
-        let acked = ingest.ingested();
+        let ingested = ingest.ingested();
         let dialed = link::dial_with_backoff(
             &endpoint,
             || {
                 let lease = lease.clone();
-                async move { lease.next_hello(acked).await }
+                async move { lease.next_hello(ingested).await }
             },
             &mut backoff,
             shutdown.clone(),
@@ -314,7 +321,7 @@ async fn run(shared: Arc<Shared>, endpoint: NodeEndpoint, lease: HeadLease, mut 
         shared.link.send_replace(Some(link.clone()));
         tracing::info!(
             generation = link.binding().generation.0,
-            acked = acked.0,
+            ingested = ingested.0,
             "remote node: link bound"
         );
         shared.flush_stops().await;

@@ -17,6 +17,9 @@ use crate::config::HeadNodeConfig;
 pub(crate) struct HeadLease {
     store: Store,
     owner: LeaseOwner,
+    /// Test seam: fail every ack write while set.
+    #[cfg(test)]
+    fail_ack_writes: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl HeadLease {
@@ -39,6 +42,8 @@ impl HeadLease {
             return Ok(Self {
                 store,
                 owner: lease.owner,
+                #[cfg(test)]
+                fail_ack_writes: std::sync::Arc::default(),
             });
         }
         let head_id = match store.node_head_id().await? {
@@ -87,7 +92,22 @@ impl HeadLease {
             fence: None,
         };
         store.enroll_node(&record, &lease).await?;
-        Ok(Self { store, owner })
+        Ok(Self {
+            store,
+            owner,
+            #[cfg(test)]
+            fail_ack_writes: std::sync::Arc::default(),
+        })
+    }
+
+    /// Test seam: fail ack writes while `flag` is set.
+    #[cfg(test)]
+    pub(crate) fn failing_ack_writes_when(
+        mut self,
+        flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        self.fail_ack_writes = flag;
+        self
     }
 
     pub(crate) fn owner(&self) -> &LeaseOwner {
@@ -100,7 +120,19 @@ impl HeadLease {
     }
 
     /// Durably advance the generation, then build the hello offering it.
-    pub(crate) async fn next_hello(&self, acked: NodeCounter) -> Result<LinkHello> {
+    /// The hello acks only what is persisted: the node deletes the records
+    /// it acks, so offering `ingested` before it is saved could lose records
+    /// a restarted head still needs. Head first tries to persist `ingested`;
+    /// if that fails it offers the older durable ack and its in-memory
+    /// sequence skips the replayed duplicates.
+    pub(crate) async fn next_hello(&self, ingested: NodeCounter) -> Result<LinkHello> {
+        let acked = match self.persist_ack(ingested).await {
+            Ok(acked) => acked,
+            Err(error) => {
+                tracing::warn!(%error, seq = ingested.0, "remote node: could not persist the journal ack; offering the saved one");
+                self.acked().await?
+            }
+        };
         let generation = self.store.next_node_link_generation(&self.owner).await?;
         Ok(LinkHello {
             protocol: NODE_LINK_PROTOCOL,
@@ -131,6 +163,13 @@ impl HeadLease {
 
     /// Persist that every record up to `seq` is ingested.
     pub(crate) async fn persist_ack(&self, seq: NodeCounter) -> Result<NodeCounter> {
+        #[cfg(test)]
+        if self
+            .fail_ack_writes
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(Error::Internal("injected ack write failure".into()));
+        }
         self.store.advance_node_lease_ack(&self.owner, seq).await
     }
 }

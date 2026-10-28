@@ -42,6 +42,7 @@ fn tuning() -> Tuning {
         turn_poll: Duration::from_millis(20),
         permanent_retry: Duration::from_millis(50),
         backoff: Backoff::new(Duration::from_millis(10), Duration::from_millis(50)),
+        fail_ack_writes: Arc::default(),
     }
 }
 
@@ -927,5 +928,54 @@ async fn a_prompt_waiting_for_the_link_is_not_sent_after_a_stop() {
         _ => None,
     })
     .await;
+    node.shutdown();
+}
+
+#[tokio::test]
+async fn a_rebind_never_acks_more_than_head_persisted() {
+    let mut fake = FakeNode::start().await;
+    let head = Head::new().await;
+    let flaky = tuning();
+    let fail = flaky.fail_ack_writes.clone();
+    let node = RemoteNode::start_with(head.store.clone(), fake.config(), flaky)
+        .await
+        .unwrap();
+    let agent = AgentId::new();
+    let runtime = node.attach(&agent, &workspace());
+
+    let first = fake.accept().await;
+    fail.store(true, std::sync::atomic::Ordering::SeqCst);
+    first.replay_complete(0).await;
+    first.journal(note(1, &agent, "one")).await;
+    first.journal(note(2, &agent, "two")).await;
+    assert_eq!(texts(&runtime, 2).await, ["one", "two"]);
+    tokio::time::timeout(wait(), async {
+        while node.ingested() < NodeCounter(2) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    first.link.close();
+
+    // The writes still fail: the rebind offers only the saved ack, so the
+    // node keeps records 1 and 2.
+    let mut second = fake.accept().await;
+    assert_eq!(second.hello.acked_seq, NodeCounter(0));
+    assert!(second.hello.binding.generation > first.hello.binding.generation);
+    assert_eq!(head.persisted_ack(&node).await, NodeCounter(0));
+
+    // Persistence recovers: the replay is deduplicated and the ack advances.
+    fail.store(false, std::sync::atomic::Ordering::SeqCst);
+    for (seq, text) in [(1, "one"), (2, "two"), (3, "three")] {
+        second.journal(note(seq, &agent, text)).await;
+    }
+    second.replay_complete(3).await;
+    second.acked(3).await;
+    assert_eq!(texts(&runtime, 1).await, ["three"]);
+    assert_eq!(head.persisted_ack(&node).await, NodeCounter(3));
+    second.link.close();
+    let third = fake.accept().await;
+    assert_eq!(third.hello.acked_seq, NodeCounter(3));
     node.shutdown();
 }
