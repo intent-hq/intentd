@@ -201,6 +201,7 @@
         "browserClientId",
         "defaultModel",
         "isRemote",
+        "label",
         "lastActivity",
         "mcpServerToggled",
         "members",

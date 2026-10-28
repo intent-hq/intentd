@@ -588,7 +588,7 @@ until Intent sees them again.
 
 ## Home Workspaces
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceSettings,HomeWorkspaceBoard}.svelte; src/features/home/{home-workspace-opening,home-workspace-status-groups,home-workspaces-persistence,home-workspace-menu}.ts; src/features/home/home-retired-workspaces.svelte.ts; src/lib/components/settings/GitWorkspaceSettings.svelte; src/shared/utils/workspace-attention-reminder.ts; messages/en.json. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{HomePage,HomeWorkspaceSettings,HomeWorkspaceBoard}.svelte; src/features/home/{home-workspace-opening,home-workspace-status-groups,home-workspaces-persistence,home-workspace-menu,home-workspace-labels}.ts; src/features/home/home-retired-workspaces.svelte.ts; src/lib/components/settings/GitWorkspaceSettings.svelte; src/shared/utils/workspace-attention-reminder.ts; messages/en.json. Daemon: workspace.update `label`, packages/intentd/crates/intent-core/src/model.rs (normalize_workspace_label). -->
 
 In **Home → Workspaces**, click a list row or board card to select it and show its
 preview. Double-click it, or Cmd-click (Ctrl-click on Windows and Linux), to open the
@@ -610,9 +610,22 @@ groups workspace statuses in this order:
 The board uses **Activity** while the list is grouped by **Status**. Switching back
 to the list restores its detailed groups.
 
-Pinned board cards show a pin icon. Right-click a card and choose **Pin** or
-**Unpin**. Pinned cards stay ahead of unpinned cards; **Done & idle** shows newest
-activity first within the pinned and unpinned groups.
+In app and daemon versions that support workspace labels, right-click a workspace
+and choose **Pin** or **Unpin**, or open **Label** to give it a label. The **Label**
+submenu lists the labels already in use (A–Z), **New label…** to name a new one (1–64 characters, not a duplicate and not "Pinned"), and
+**Remove label** when the workspace has one. Each workspace has one label; Pinned is
+the built-in label, so labeling a pinned workspace unpins it and pinning a labeled
+workspace removes its label. A label disappears once no workspace holds it. Labels
+are saved by the daemon, so they sync to every client connected to it. Only the
+workspace owner sees **Pin**, **Unpin** and **Label**; shared members cannot change them.
+
+In those apps, the list puts pinned workspaces first with a pin icon, then one collapsible
+group per label (A–Z), then the usual groups without those workspaces. Grouped by
+**None**, and on the board, pinned workspaces show a pin icon and stay ahead of the
+rest without label groups; **Done & idle** shows newest activity first within the
+pinned and unpinned groups. Older apps without **Label** keep their existing
+**Pin**/**Unpin** behavior; their pins are local Home preferences rather than synced
+daemon labels.
 
 The grouping choice is remembered with Home's settings for the current signed-in
 user and connected backend. **Activity** remains the default; existing saved
@@ -831,6 +844,18 @@ state to refresh. When the saved selection is known and this client is not
 selected, the action is available once its connection, browser capability and
 your access are ready. Do not promise automatic failover or change the primary
 client without the user's instruction.
+
+## iOS workspace browser
+
+<!-- Sources: packages/ios/Intent/Views/Workspaces/{WorkspaceBrowserView,WorkspaceBrowserPage}.swift; packages/ios/Intent/Services/BrowserTunnelURL.swift; packages/ios/Intent/Info.plist. -->
+
+In the iOS workspace browser, enter an explicit `http://` or `https://` address
+to open a server reachable from the device, including LAN and Tailscale hosts.
+Allow Intent's local network access if prompted; if previously denied, enable
+it in iOS Settings under **Privacy & Security → Local Network**. Tailscale
+addresses require a working route from the device. `daemon.localhost` and
+loopback addresses instead open servers on the connected daemon through its
+authenticated tunnel.
 
 ## Add context, run a task, and find results
 
