@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.68] - 2026-10-28
+
+### 📚 Documentation
+
+- Explain local HTTP browsing on iOS ([#2691](https://github.com/intent-hq/intentd/pull/2691))
+
+
 ## [0.11.67] - 2026-10-28
 
 ### ⚙️ Miscellaneous Tasks
