@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.67] - 2026-10-28
+
+### ⚙️ Miscellaneous Tasks
+
+- *(acp)* Win back room in the condensed ws.* prompt reference ([#2770](https://github.com/intent-hq/intentd/pull/2770))
+
+
 ## [0.11.66] - 2026-10-27
 
 ### 🔧 Refactor
