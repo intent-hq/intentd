@@ -25,7 +25,6 @@ libc = { workspace = true }
 [dev-dependencies]
 intent-services = { path = "../intent-services", version = "0.11.62", features = ["test-hooks"] }
 intentd-test-support = { path = "../intentd-test-support" }
-sqlx.workspace = true
 tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }
 

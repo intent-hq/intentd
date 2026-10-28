@@ -2486,7 +2486,6 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
- "sqlx",
  "tempfile",
  "tokio",
  "tracing",
