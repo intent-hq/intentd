@@ -799,8 +799,11 @@ pub const PROVIDER_RETURN_METADATA_KEY: &str = "providerReturn";
 /// [`Store::update_agent_session_metadata`]) never set or clear them, so a
 /// caller's stale snapshot cannot erase a newer value or bring back an old
 /// one (PROTOCOL §5.54 shared quota state).
-const DAEMON_OWNED_METADATA_KEYS: [&str; 2] =
-    [MANUAL_CHOICE_METADATA_KEY, PROVIDER_RETURN_METADATA_KEY];
+const DAEMON_OWNED_METADATA_KEYS: [&str; 3] = [
+    MANUAL_CHOICE_METADATA_KEY,
+    PROVIDER_RETURN_METADATA_KEY,
+    intent_core::remote_launch::REMOTE_PLACEMENT_METADATA_KEY,
+];
 
 /// The two binds a whole-document `metadata` write needs (see
 /// [`daemon_owned_preserving_metadata`]): the caller's document without the
@@ -844,16 +847,18 @@ fn daemon_owned_preserving_metadata(
     raw_doc: &str,
     keep_choice_if: &str,
 ) -> String {
-    let [choice, ret] = DAEMON_OWNED_METADATA_KEYS;
+    let [choice, ret, remote] = DAEMON_OWNED_METADATA_KEYS;
     format!(
         "CASE WHEN metadata IS NOT NULL AND json_valid(metadata) \
               AND json_type(metadata) = 'object' \
               AND (json_type(metadata, '$.{choice}') IS NOT NULL \
-                   OR json_type(metadata, '$.{ret}') IS NOT NULL) \
+                   OR json_type(metadata, '$.{ret}') IS NOT NULL \
+                   OR json_type(metadata, '$.{remote}') IS NOT NULL) \
              THEN json_patch({object_doc}, json_object(\
                  '{choice}', CASE WHEN ({keep_choice_if}) \
                                   THEN json(metadata -> '$.{choice}') END, \
-                 '{ret}', json(metadata -> '$.{ret}'))) \
+                 '{ret}', json(metadata -> '$.{ret}'), \
+                 '{remote}', json(metadata -> '$.{remote}'))) \
          ELSE {raw_doc} END"
     )
 }
@@ -14383,6 +14388,68 @@ mod tests {
         assert!(metadata.get(MANUAL_CHOICE_METADATA_KEY).is_none());
         assert_eq!(metadata["providerReturn"]["home"], "claude-code");
         assert_eq!(metadata["keep"], 1);
+    }
+
+    /// Remote launch: the `remotePlacement` projection mirror is daemon-owned.
+    /// A whole-document metadata write (`agent.update` and friends) can
+    /// neither erase it nor forge one.
+    #[tokio::test]
+    async fn whole_document_writes_cannot_set_or_clear_remote_placement() {
+        use intent_core::now_iso;
+        use intent_core::remote_launch::REMOTE_PLACEMENT_METADATA_KEY;
+        let tmp = TempDb::new("test-agent-repo");
+        let store = Store::open(&tmp).await.expect("create test store");
+        let ts = now_iso();
+        let ws_id = WorkspaceId("ws-remote-placement".to_string());
+        store
+            .insert_workspace(&baseline_test_workspace(&ws_id, &ts))
+            .await
+            .expect("insert workspace");
+        let placed = AgentId("agent-placed".to_string());
+        let local = AgentId("agent-local".to_string());
+        for id in [&placed, &local] {
+            store
+                .insert_agent_session(&baseline_test_session(id, &ws_id, &ts, None))
+                .await
+                .expect("insert");
+        }
+        store
+            .set_agent_session_metadata_key_json(
+                &ws_id,
+                &placed,
+                REMOTE_PLACEMENT_METADATA_KEY,
+                r#"{"nodeId":"node-1"}"#,
+                &now_iso(),
+            )
+            .await
+            .expect("set view");
+        let forged =
+            serde_json::json!({ "keep": 1, REMOTE_PLACEMENT_METADATA_KEY: { "nodeId": "forged" } });
+        for id in [&placed, &local] {
+            store
+                .update_agent_session_metadata(&ws_id, id, Some(&forged), &now_iso())
+                .await
+                .expect("whole write");
+        }
+        let placed_meta = store
+            .get_agent_session(&placed)
+            .await
+            .unwrap()
+            .metadata
+            .unwrap();
+        assert_eq!(
+            placed_meta[REMOTE_PLACEMENT_METADATA_KEY]["nodeId"],
+            "node-1"
+        );
+        assert_eq!(placed_meta["keep"], 1);
+        let local_meta = store
+            .get_agent_session(&local)
+            .await
+            .unwrap()
+            .metadata
+            .unwrap();
+        assert!(local_meta.get(REMOTE_PLACEMENT_METADATA_KEY).is_none());
+        assert_eq!(local_meta["keep"], 1);
     }
 
     /// Review of intentd#2624: whole-document writes keep the daemon-owned

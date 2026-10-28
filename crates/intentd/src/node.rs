@@ -16,14 +16,19 @@ use anyhow::bail;
 use intent_core::node_link::LinkWelcome;
 use intent_core::nodes::{NodeArch, NodeOs};
 use intent_core::placement::AgentPlatform;
+use intent_git::node_git::{CheckoutCache, NodeGit};
 use intent_nodes::journal::Journal;
-use intent_transport::node_link::{NodeConnection, NodeListener, NodeListenerConfig, WelcomeFn};
+use intent_transport::node_link::{
+    serve_helpers, NodeConnection, NodeGitSessions, NodeListener, NodeListenerConfig, WelcomeFn,
+};
 
+mod checkout;
 mod config;
 mod runner;
 mod session;
 mod storage;
 
+use checkout::GitCheckouts;
 use config::{Config, ProviderEntry};
 use runner::{ProviderLaunch, Runner, RunnerConfig};
 use storage::Storage;
@@ -64,23 +69,62 @@ pub(super) async fn run(args: Args) -> anyhow::Result<()> {
 struct Node {
     listener: NodeListener,
     runner: Runner,
+    /// Head's git connection, used by the agents' fetches and WIP pushes.
+    git_sessions: NodeGitSessions,
+    helpers: tokio::task::JoinHandle<()>,
     certificate_sha256: String,
     platform: AgentPlatform,
     _storage: Arc<Storage>,
 }
 
+/// Builds the runner's checkouts from the storage root and the git cache.
+type MakeCheckouts = fn(Arc<Storage>, CheckoutCache) -> Arc<dyn checkout::Checkouts>;
+
 impl Node {
     async fn start(config: &Config, root: &std::path::Path) -> anyhow::Result<Self> {
+        Self::start_with_checkouts(config, root, |storage, cache| {
+            Arc::new(GitCheckouts::new(cache, storage))
+        })
+        .await
+    }
+
+    async fn start_with_checkouts(
+        config: &Config,
+        root: &std::path::Path,
+        make_checkouts: MakeCheckouts,
+    ) -> anyhow::Result<Self> {
         let platform = host_platform()?;
         let storage = Arc::new(Storage::open(root)?);
         let certificate = storage.tls_certificate()?;
         let journal_dir = storage.journal_dir();
         let journal = tokio::task::spawn_blocking(move || Journal::open(&journal_dir)).await??;
+        // Agents' git commands reach head through `git-remote-intent` (this
+        // executable under that name) and the local session socket.
+        let helper_dir = storage.helper_dir();
+        let executable = std::env::current_exe()
+            .map_err(|e| anyhow::anyhow!("locate the intentd executable: {e}"))?;
+        NodeGit::install_helper(&helper_dir, &executable)
+            .map_err(|e| anyhow::anyhow!("install the git-remote-intent helper: {e}"))?;
+        let socket = storage.git_socket();
+        match std::fs::remove_file(&socket) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => bail!("remove the stale git socket {}: {e}", socket.display()),
+        }
+        let git_listener = tokio::net::UnixListener::bind(&socket)
+            .map_err(|e| anyhow::anyhow!("bind the git socket {}: {e}", socket.display()))?;
+        let git_sessions = NodeGitSessions::new();
+        // caller-binding: allow — node-local git helper socket; the node has no service layer
+        let helpers = tokio::spawn(serve_helpers(git_listener, git_sessions.clone()));
+        let checkouts = make_checkouts(
+            storage.clone(),
+            CheckoutCache::new(storage.cache_dir(), NodeGit::new(helper_dir, socket)),
+        );
         let runner = Runner::new(RunnerConfig {
             max_agents: config.max_agents,
             policy: config.permission.policy(),
             providers: provider_launches(&config.providers),
-            storage: storage.clone(),
+            checkouts,
             journal,
         });
         let welcome: WelcomeFn = {
@@ -109,6 +153,8 @@ impl Node {
         Ok(Self {
             listener,
             runner,
+            git_sessions,
+            helpers,
             certificate_sha256: certificate.fingerprint256,
             platform,
             _storage: storage,
@@ -135,8 +181,8 @@ impl Node {
                         sessions.spawn(session::serve_link(self.runner.clone(), link, events, hello));
                     }
                     Some(NodeConnection::Git(git)) => {
-                        tracing::info!("node: git connections are not served yet; closing");
-                        drop(git);
+                        tracing::info!("node: head's git connection bound");
+                        self.git_sessions.attach(git);
                     }
                     None => break Ok(()),
                 },
@@ -152,6 +198,7 @@ impl Node {
         }
         while sessions.join_next().await.is_some() {}
         self.runner.shutdown().await;
+        self.helpers.abort();
         result
     }
 }

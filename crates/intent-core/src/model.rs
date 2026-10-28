@@ -3676,6 +3676,15 @@ pub const AGENT_LIST_ROW_KEYS: &[&str] = &[
     "retiredAt",
     "notificationsMuted",
     "harnessVersion",
+    // Placed (remote) agent projection, `methods/nodes.md`: small and
+    // computed on write (rung 1) into the session's daemon-owned
+    // `remotePlacement` metadata; omitted for local agents.
+    "nodeId",
+    "leaseId",
+    "nodeName",
+    "placement",
+    "effectiveIsolation",
+    "placementError",
     "metadata",
 ];
 
@@ -4831,6 +4840,26 @@ pub struct AgentLite {
     /// from `agent.list` rows by [`Self::strip_detail_only_fields`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness_features: Option<serde_json::Value>,
+    /// Execution node of a remote agent (PROTOCOL `methods/nodes.md`
+    /// placed-agent projection). Omitted for local agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
+    /// Lease the remote agent runs under. Omitted for local agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_id: Option<String>,
+    /// The configured display name of the remote agent's node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_name: Option<String>,
+    /// The resolved `placement` of a remote agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<crate::placement::AgentPlacement>,
+    /// `pending` until the remote agent's isolated checkout is ready, then
+    /// `isolated`. Omitted for local agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_isolation: Option<crate::remote_launch::EffectiveIsolation>,
+    /// Why the remote agent could not start on its node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement_error: Option<crate::remote_launch::PlacementError>,
     pub metadata: AgentMetadata,
 }
 
@@ -4860,6 +4889,8 @@ impl AgentLite {
         let is_initial_agent = session.is_initial_agent().then_some(true);
         let sponsor_agent_id = session.sponsor_agent_id().map(str::to_string);
         let chief_prompt_version = session.metadata.as_ref().and_then(chief_prompt_version);
+        let remote =
+            crate::remote_launch::RemotePlacementView::from_metadata(session.metadata.as_ref());
         let metadata = AgentMetadata {
             attention_request_reason_truncated: false,
             completion_report_truncated: false,
@@ -4939,6 +4970,12 @@ impl AgentLite {
             notifications_muted: session.notifications_muted,
             harness_version: session.harness_version,
             harness_features: session.harness_features,
+            node_id: remote.as_ref().map(|r| r.node_id.clone()),
+            lease_id: remote.as_ref().map(|r| r.lease_id.clone()),
+            node_name: remote.as_ref().map(|r| r.node_name.clone()),
+            placement: remote.as_ref().map(|r| r.placement.clone()),
+            effective_isolation: remote.as_ref().map(|r| r.effective_isolation),
+            placement_error: remote.and_then(|r| r.placement_error),
             metadata,
         }
     }
@@ -5156,6 +5193,11 @@ pub struct AgentCreateExtra {
     /// like send/queue.
     pub file_blocks: Option<serde_json::Value>,
     pub is_background: Option<bool>,
+    /// The documented `placement` object (PROTOCOL `model-platform-routing`):
+    /// present only when the caller chose one, so an omitted placement keeps
+    /// today's local launch. `null` is rejected rather than read as omitted.
+    #[serde(deserialize_with = "crate::placement::present")]
+    pub placement: Option<crate::placement::AgentPlacement>,
     /// Internal override for the created session's `nameExplicitlySet` flag.
     /// Not accepted from the wire (`#[serde(skip)]`): `agent_delegate_op`
     /// sets `Some(false)` so a delegated child keeps its task-derived name
@@ -5202,6 +5244,11 @@ pub struct AgentDelegateInput {
     /// rejects a second delegation unless `force: true` is passed to
     /// intentionally add another agent.
     pub force: Option<bool>,
+    /// The documented `placement` object for the delegated child; single
+    /// delegation only (a batch with a placement is rejected). `null` is
+    /// rejected rather than read as omitted.
+    #[serde(deserialize_with = "crate::placement::present")]
+    pub placement: Option<crate::placement::AgentPlacement>,
     /// Batch form (PROTOCOL §5.5): a list of tasks to classify and start
     /// together — each entry either a bare task-note id or a
     /// [`BatchTaskEntry::Options`] object carrying per-task
@@ -5300,6 +5347,10 @@ pub struct AgentWakeCreateOptions {
     pub context_references: Option<serde_json::Value>,
     pub metadata: Option<serde_json::Value>,
     pub skip_auto_commit: Option<bool>,
+    /// The documented `placement` object, used only when a new agent is
+    /// created; an existing assigned agent keeps where it runs.
+    #[serde(deserialize_with = "crate::placement::present")]
+    pub placement: Option<crate::placement::AgentPlacement>,
 }
 
 /// Wire input for `agent.wakeOrCreate` (PROTOCOL §5.5, widened by C1d-10a).

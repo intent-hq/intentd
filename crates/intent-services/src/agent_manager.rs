@@ -3537,6 +3537,13 @@ impl AgentManager {
             .services
             .specialist_model_options_for_workspace(&workspace_id)
             .await;
+        // Platform discovery for remote placement; `None` (the default
+        // description) unless an execution node is configured.
+        let remote_placement_help = self
+            .services
+            .feature_remote_launch_port()
+            .placement_help(&self.services)
+            .await;
         let server_blueprint = {
             let workspace_id = workspace_id.clone();
             let agent_id = agent_id.clone();
@@ -3544,6 +3551,7 @@ impl AgentManager {
             let attachments = self.services.turn_attachments();
             let features = agent_features.clone();
             let compact = opts.provider.truncates_tool_descriptions;
+            let remote_placement_help = remote_placement_help.clone();
             ServerBlueprint::new(read_owner, move || {
                 WorkspaceMcpServer::for_agent_type(api.clone(), workspace_id.clone(), &agent_type)
                     .with_caller_agent_id(Some(agent_id.clone()))
@@ -3570,6 +3578,7 @@ impl AgentManager {
                             .collect(),
                     )
                     .with_compact_tool_descriptions(compact)
+                    .with_remote_placement_help(remote_placement_help.clone())
             })
             .with_original_services(original_services, session.clone())
         };
@@ -11497,6 +11506,15 @@ impl AgentManager {
         // the common case for every turn after the first.
         boxed_await(|| self.services.await_sandbox_provisioning(agent_id)).await;
         let mut session = boxed_await(|| self.services.require_agent_session(agent_id)).await?;
+        // A remote agent runs on its execution node, never here: an agent
+        // created with a remote placement carries the daemon-owned
+        // `remotePlacement` view, and its turns use the node's runtime.
+        if intent_core::remote_launch::RemotePlacementView::from_metadata(session.metadata.as_ref())
+            .is_some()
+        {
+            return boxed_await(|| self.ensure_remote_started(agent_id, workspace_id, &session))
+                .await;
+        }
         // Lazy legacy feature freeze (intent-hq/monorepo#2459): a pre-0096
         // row still carrying harness_features = NULL gets its snapshot
         // materialized at this activation choke point — every turn (first
@@ -11945,6 +11963,96 @@ impl AgentManager {
         .await?;
         self.spawn_attempt_provider.lock().unwrap().remove(agent_id);
         Ok(acp_session_id)
+    }
+
+    /// [`Self::ensure_started_owned`] for a remote agent: reuse its live
+    /// runtime, or ask the remote-launch feature for one (which starts the
+    /// agent on its node when it is not running there) and install it like
+    /// a local agent's. There is no local process, MCP bridge or ACP session
+    /// on head; the session id is a stable placeholder the runtime ignores.
+    async fn ensure_remote_started(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        session: &AgentSession,
+    ) -> Result<StartedSession> {
+        let session_id = format!("remote:{agent_id}");
+        if self.handle_is_live(agent_id) {
+            return Ok(StartedSession {
+                session_id,
+                turn: self.capture_turn(agent_id)?,
+            });
+        }
+        if self.contains(agent_id) {
+            boxed_await(|| self.kill_child_only(agent_id)).await;
+        }
+        let runtime = self
+            .services
+            .feature_remote_launch_port()
+            .runtime(&self.services, agent_id)
+            .await?;
+        let origin = RepositoryOrigin::unavailable();
+        let provider = session.provider.clone().unwrap_or_default();
+        let handle = AgentHandle {
+            execution: RuntimeHandle::custom(runtime),
+            repository_origin: origin.clone(),
+            antigravity_profile: None,
+            session_mcp_servers: Vec::new(),
+            spawned_model: session.model.clone(),
+            session_open_filled_model: None,
+            spawned_provider: provider.clone(),
+            spawned_selection: provider,
+            _activation: None,
+            thought_level: None,
+            config_options: None,
+            confirmed_effort: None,
+            wake_gate: Arc::new(AtomicUsize::new(0)),
+            wake_listener: None,
+        };
+        // Same teardown fence as a local install: a stop or workspace
+        // teardown that armed first wins, and the runtime is stopped.
+        let refused = {
+            let closed = self.admission_closed.lock().unwrap();
+            let retired = self.retired.lock().unwrap();
+            let stopping = self.stopping.lock().unwrap();
+            if *closed || retired.contains(agent_id) || stopping.contains(agent_id) {
+                Some(handle)
+            } else {
+                let mut slots = self.handles.lock().unwrap();
+                if let std::collections::hash_map::Entry::Vacant(entry) =
+                    slots.entry(agent_id.clone())
+                {
+                    entry.insert(handle);
+                    self.registry.register(
+                        agent_id.clone(),
+                        self.make_original_kill(agent_id.clone(), Arc::downgrade(&origin)),
+                    );
+                    None
+                } else {
+                    Some(handle)
+                }
+            }
+        };
+        if let Some(mut handle) = refused {
+            handle.repository_origin.retire();
+            if let Some(teardown) = RuntimeTeardown::take(&mut handle) {
+                teardown.kill_tree().await;
+            }
+            return Err(Error::NotFound(format!(
+                "agent session {agent_id} is being deleted"
+            )));
+        }
+        // Output the node streams between turns becomes implicit turns, as
+        // for a local agent.
+        let listener = self.spawn_wake_listener(agent_id.clone(), workspace_id.clone());
+        match self.handles.lock().unwrap().get_mut(agent_id) {
+            Some(h) => h.wake_listener = Some(listener),
+            None => listener.abort(),
+        }
+        Ok(StartedSession {
+            session_id,
+            turn: self.capture_turn(agent_id)?,
+        })
     }
 
     /// Close admission before the composition root performs any teardown await.

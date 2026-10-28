@@ -213,6 +213,44 @@ pub fn service_command(service: GitService, repository: &Path, remote: &AgentRem
     command
 }
 
+/// The commit `repository`'s `HEAD` points at: where a remote agent of the
+/// workspace starts.
+///
+/// # Errors
+///
+/// When the repository can't be opened or has no commit yet.
+pub fn head_commit(repository: &Path) -> Result<String> {
+    let repo = git2::Repository::open(repository).map_err(crate::map_git_err)?;
+    let commit = repo
+        .head()
+        .and_then(|head| head.peel_to_commit())
+        .map_err(|_| Error::InvalidParams("the workspace repository has no commit yet".into()))?;
+    Ok(commit.id().to_string())
+}
+
+/// The node's checkout-cache name for `repository`: stable for every
+/// worktree of one repository (it hashes the common git directory), and
+/// revealing nothing about head's paths.
+///
+/// # Errors
+///
+/// When the repository can't be opened.
+pub fn repo_key(repository: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+    let repo = git2::Repository::open(repository).map_err(crate::map_git_err)?;
+    let common = repo
+        .commondir()
+        .canonicalize()
+        .map_err(|e| Error::Internal(format!("node git: resolve the repository: {e}")))?;
+    let digest = Sha256::digest(common.as_os_str().as_encoded_bytes());
+    let mut key = String::from("repo-");
+    for byte in &digest[..16] {
+        write!(key, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    Ok(key)
+}
+
 /// Point head's `base` ref for `remote` at `commit` in `repository`.
 ///
 /// # Errors

@@ -7,16 +7,19 @@
 //! then sends it, at most every [`Tuning::ack_interval`] or
 //! [`Tuning::ack_batch`] records, and right after the node's replay.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::watch;
 use tokio::time::Instant;
 
-use intent_core::node_link::{LinkFrame, LinkOutcome, LinkRpcError, LinkWelcome};
+use intent_core::node_link::{
+    JournalBody, LaunchCommand, LinkFrame, LinkOutcome, LinkRpcError, LinkWelcome,
+};
 use intent_core::nodes::NodeCounter;
-use intent_core::placement::AgentPlatform;
+use intent_core::placement::{AgentPlatform, PlatformAvailability};
+use intent_core::remote_launch::{EffectiveIsolation, PlacementError};
 use intent_core::{AgentId, Error, Result, WorkspaceId};
 use intent_store::Store;
 use intent_transport::node_link::{
@@ -89,6 +92,11 @@ pub struct NodeStatus {
 pub(crate) struct Shared {
     pub agents: Agents,
     pub tuning: Tuning,
+    pub store: Store,
+    /// Runtimes of agents the node was already running when head bound it
+    /// (after a head restart), kept so their records keep flowing until the
+    /// agent manager takes them.
+    parked: Mutex<HashMap<AgentId, Arc<RemoteAgentRuntime>>>,
     link: watch::Sender<Option<NodeLink>>,
     status: Mutex<NodeStatus>,
     /// Agents whose stop has not been sent yet.
@@ -170,6 +178,17 @@ impl Shared {
     fn disconnected(&self) {
         lock(&self.status).connected = false;
     }
+
+    /// The node's platforms: supported once it has said what it runs, and
+    /// available while it is connected with a free agent slot.
+    pub(crate) fn availability(&self) -> PlatformAvailability {
+        let status = lock(&self.status).clone();
+        let supported: Vec<AgentPlatform> = status.platform.into_iter().collect();
+        let free = status.connected
+            && self.agents.live_count() < usize::try_from(status.max_agents).unwrap_or(usize::MAX);
+        let available = if free { supported.clone() } else { Vec::new() };
+        PlatformAvailability::new(supported, available, intent_core::now_iso())
+    }
 }
 
 /// A running connector to the configured node. Clones share it.
@@ -201,6 +220,7 @@ impl RemoteNode {
         #[cfg(test)]
         let lease = lease.failing_ack_writes_when(tuning.fail_ack_writes.clone());
         let acked = lease.acked().await?;
+        let store = lease.store().clone();
         let status = NodeStatus {
             node_id: config.node_id.clone(),
             node_name: config.name.clone(),
@@ -214,6 +234,8 @@ impl RemoteNode {
         let shared = Arc::new(Shared {
             agents: Agents::default(),
             tuning,
+            store,
+            parked: Mutex::new(HashMap::new()),
             link: watch::channel(None).0,
             status: Mutex::new(status),
             pending_stops: Mutex::new(BTreeSet::new()),
@@ -227,6 +249,11 @@ impl RemoteNode {
             Ingest::new(acked),
         ));
         Ok(Self { shared })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shared(&self) -> Arc<Shared> {
+        self.shared.clone()
     }
 
     /// What head knows about the node now.
@@ -265,6 +292,46 @@ impl RemoteNode {
     /// `node-link-unavailable` when no link is up; the link's send error.
     pub async fn send(&self, frame: &LinkFrame) -> Result<()> {
         self.shared.send(frame).await
+    }
+
+    /// Agents head counts as running on the node.
+    #[must_use]
+    pub fn running(&self) -> usize {
+        self.shared.agents.live_count()
+    }
+
+    /// The node's supported and currently available platforms.
+    #[must_use]
+    pub fn availability(&self) -> PlatformAvailability {
+        self.shared.availability()
+    }
+
+    /// The runtime of `command`'s agent: the one kept for it when the node
+    /// was already running it at bind, or a new one, attached before the
+    /// launch is sent (waiting up to the link-loss grace for a link). A
+    /// launch for an agent the node already runs is ignored by the node.
+    ///
+    /// # Errors
+    ///
+    /// `node-link-unavailable` when no link comes up within the grace.
+    pub async fn launch(&self, command: LaunchCommand) -> Result<Arc<RemoteAgentRuntime>> {
+        let parked = lock(&self.shared.parked).remove(&command.agent_id);
+        if let Some(runtime) = parked.filter(|runtime| runtime.is_running()) {
+            return Ok(runtime);
+        }
+        let runtime = self.attach(&command.agent_id, &command.workspace_id);
+        let link = self
+            .shared
+            .link_within(self.shared.tuning.link_loss_grace)
+            .await
+            .ok_or_else(|| {
+                Error::Internal(format!(
+                    "{}: the execution node is not connected",
+                    link::codes::UNAVAILABLE
+                ))
+            })?;
+        link.send(&LinkFrame::Launch(command)).await?;
+        Ok(runtime)
     }
 
     /// Stop dialing and close the link.
@@ -324,8 +391,13 @@ async fn run(shared: Arc<Shared>, endpoint: NodeEndpoint, lease: HeadLease, mut 
             ingested = ingested.0,
             "remote node: link bound"
         );
+        claim(&shared, &welcome, &link).await;
         shared.flush_stops().await;
+        let git = serve_git(&shared, &endpoint, &link).await;
         serve(&shared, &lease, &mut ingest, &link, events, &mut shutdown).await;
+        if let Some(git) = git {
+            git.abort();
+        }
         link.close();
         shared.link.send_if_modified(|current| {
             let ours = current
@@ -365,13 +437,17 @@ async fn serve(
                     LinkEvent::Frame(LinkFrame::Journal(record)) => {
                         let seq = record.seq;
                         match ingest.accept(seq) {
-                            Step::Ingest => shared.agents.deliver(record),
+                            Step::Ingest => {
+                                record_placement(shared, &record).await;
+                                shared.agents.deliver(record);
+                            }
                             Step::IngestAfterLoss { lost } => {
                                 tracing::warn!(
                                     from = lost.0 .0,
                                     through = lost.1 .0,
                                     "remote node: journal records were lost on the node"
                                 );
+                                record_placement(shared, &record).await;
                                 shared.agents.deliver(record);
                             }
                             Step::Skip => {}
@@ -446,6 +522,112 @@ impl Acks {
         if !link.is_closed() {
             let _ = link.send(&LinkFrame::Ack { seq }).await;
         }
+    }
+}
+
+/// Claim the node's running agents at bind: an agent head has no record of
+/// on this lease (a head crash mid-launch, a deleted agent) is stopped; one
+/// head knows but has not attached since it started gets a runtime, kept
+/// until the agent manager takes it, so its output is not dropped.
+async fn claim(shared: &Arc<Shared>, welcome: &LinkWelcome, link: &NodeLink) {
+    if welcome.running_agents.is_empty() {
+        return;
+    }
+    let lease_id = lock(&shared.status).lease_id.clone();
+    let claimed = match shared.store.list_remote_agents(&lease_id).await {
+        Ok(claimed) => claimed,
+        Err(error) => {
+            // Without the records head cannot tell which agents are its
+            // own; stopping them all could end live work, so wait for the
+            // next bind.
+            tracing::warn!(%error, "remote node: could not read this lease's agents; claiming nothing");
+            return;
+        }
+    };
+    let workspaces: HashMap<&AgentId, &WorkspaceId> = claimed
+        .iter()
+        .map(|record| (&record.agent_id, &record.workspace_id))
+        .collect();
+    for agent_id in &welcome.running_agents {
+        match workspaces.get(agent_id) {
+            None => {
+                tracing::info!(agent = %agent_id, "remote node: stopping an agent head does not claim");
+                let stop = LinkFrame::Stop {
+                    agent_id: agent_id.clone(),
+                };
+                if link.send(&stop).await.is_err() {
+                    return;
+                }
+            }
+            Some(workspace_id) if !shared.agents.is_attached(agent_id) => {
+                let sink = shared.agents.attach(agent_id, (*workspace_id).clone());
+                let runtime = Arc::new(RemoteAgentRuntime::new(
+                    agent_id.clone(),
+                    sink,
+                    shared.clone(),
+                ));
+                lock(&shared.parked).insert(agent_id.clone(), runtime);
+            }
+            Some(_) => {}
+        }
+    }
+}
+
+/// Dial the git connection for `link`'s binding and serve the node's git
+/// sessions on it. A failure is logged: agents then cannot fetch their base,
+/// and their launches fail with that error.
+async fn serve_git(
+    shared: &Arc<Shared>,
+    endpoint: &NodeEndpoint,
+    link: &NodeLink,
+) -> Option<tokio::task::JoinHandle<()>> {
+    match link::dial_git(endpoint, link.binding()).await {
+        Ok(connection) => {
+            let access = Arc::new(crate::git::HeadGitAccess::new(shared.clone()));
+            // caller-binding: allow — serves node git sessions; access is checked per session against the store
+            Some(tokio::spawn(link::serve_git(connection, access)))
+        }
+        Err(error) => {
+            tracing::warn!(
+                code = link::error_code(&error).unwrap_or("other"),
+                "remote node: git connection not bound; remote agents cannot fetch or push"
+            );
+            None
+        }
+    }
+}
+
+/// Keep a remote agent's projected placement current: `isolated` once the
+/// node reports its checkout and session ready, and the start error of an
+/// agent that never got there.
+async fn record_placement(shared: &Shared, record: &intent_core::node_link::JournalRecord) {
+    let update: Box<dyn FnOnce(&mut intent_core::remote_launch::RemotePlacementView) + Send> =
+        match &record.body {
+            JournalBody::Started { .. } => Box::new(|view| {
+                view.effective_isolation = EffectiveIsolation::Isolated;
+                view.placement_error = None;
+            }),
+            JournalBody::Exited {
+                error: Some(error), ..
+            } => {
+                let error = PlacementError::from_node_error(error);
+                Box::new(move |view| {
+                    if view.effective_isolation == EffectiveIsolation::Pending {
+                        view.placement_error = Some(error);
+                    }
+                })
+            }
+            _ => return,
+        };
+    if let Err(error) = crate::view::update(
+        &shared.store,
+        &record.workspace_id,
+        &record.agent_id,
+        update,
+    )
+    .await
+    {
+        tracing::warn!(agent = %record.agent_id, %error, "remote node: could not record the agent's placement state");
     }
 }
 

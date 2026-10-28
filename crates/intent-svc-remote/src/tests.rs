@@ -51,7 +51,12 @@ fn token() -> LeaseToken {
 }
 
 fn welcome() -> WelcomeFn {
-    Arc::new(|_| LinkWelcome {
+    welcome_running(Vec::new())
+}
+
+/// A welcome reporting `running` as the node's running agents.
+fn welcome_running(running: Vec<AgentId>) -> WelcomeFn {
+    Arc::new(move |_| LinkWelcome {
         protocol: 0,
         intentd_version: "node-test".into(),
         node_id: String::new(),
@@ -60,7 +65,7 @@ fn welcome() -> WelcomeFn {
             arch: NodeArch::Aarch64,
         },
         max_agents: 2,
-        running_agents: vec![],
+        running_agents: running.clone(),
     })
 }
 
@@ -68,6 +73,7 @@ fn welcome() -> WelcomeFn {
 struct FakeNode {
     listener: NodeListener,
     certificate: TlsCertificate,
+    git: Vec<intent_transport::node_link::GitConnection>,
     _dir: tempfile::TempDir,
 }
 
@@ -77,13 +83,18 @@ impl FakeNode {
     }
 
     async fn start_at(address: SocketAddr) -> Self {
+        Self::start_with(address, welcome()).await
+    }
+
+    async fn start_with(address: SocketAddr, welcome: WelcomeFn) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let certificate =
             generate_certificate(vec!["localhost".into(), "127.0.0.1".into()]).unwrap();
-        let listener = Self::listen(&dir, &certificate, address).await;
+        let listener = Self::listen_with(&dir, &certificate, address, welcome).await;
         Self {
             listener,
             certificate,
+            git: Vec::new(),
             _dir: dir,
         }
     }
@@ -93,6 +104,15 @@ impl FakeNode {
         certificate: &TlsCertificate,
         address: SocketAddr,
     ) -> NodeListener {
+        Self::listen_with(dir, certificate, address, welcome()).await
+    }
+
+    async fn listen_with(
+        dir: &tempfile::TempDir,
+        certificate: &TlsCertificate,
+        address: SocketAddr,
+        welcome: WelcomeFn,
+    ) -> NodeListener {
         NodeListener::bind(
             address,
             NodeListenerConfig {
@@ -101,7 +121,7 @@ impl FakeNode {
                 binding_file: BindingFile::new(dir.path().join("binding.json")),
                 certificate: certificate.clone(),
             },
-            welcome(),
+            welcome,
         )
         .await
         .unwrap()
@@ -111,18 +131,25 @@ impl FakeNode {
         config_for(self.listener.local_addr(), &self.certificate)
     }
 
+    /// The next link. Head's git connections, dialed right after each
+    /// bind, are kept in `git` (the fake serves no git).
     async fn accept(&mut self) -> NodeEnd {
-        match tokio::time::timeout(wait(), self.listener.accept()).await {
-            Ok(Some(NodeConnection::Link {
-                link,
-                events,
-                hello,
-            })) => NodeEnd {
-                link,
-                events,
-                hello,
-            },
-            other => panic!("expected a link, got {other:?}"),
+        loop {
+            match tokio::time::timeout(wait(), self.listener.accept()).await {
+                Ok(Some(NodeConnection::Link {
+                    link,
+                    events,
+                    hello,
+                })) => {
+                    return NodeEnd {
+                        link,
+                        events,
+                        hello,
+                    }
+                }
+                Ok(Some(NodeConnection::Git(git))) => self.git.push(git),
+                other => panic!("expected a link, got {other:?}"),
+            }
         }
     }
 }
@@ -639,6 +666,7 @@ async fn a_stop_is_sent_once_now_or_after_the_next_bind() {
     let mut fake = FakeNode {
         listener,
         certificate,
+        git: Vec::new(),
         _dir: dir,
     };
     let mut link = fake.accept().await;
@@ -813,9 +841,23 @@ mod services {
         let path = data.path().join(crate::CONFIG_FILE);
         std::fs::write(&path, config.to_string()).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        assert!(services.start_remote_node(data.path()).await.unwrap());
+        assert!(
+            !crate::experimental_enabled(),
+            "tests run without {}",
+            crate::EXPERIMENTAL_ENV
+        );
         assert!(
             !services.start_remote_node(data.path()).await.unwrap(),
+            "remote agents stay off without the experimental switch"
+        );
+        assert!(services.remote_node().is_none());
+        assert!(crate::start_configured(&services, data.path())
+            .await
+            .unwrap());
+        assert!(
+            !crate::start_configured(&services, data.path())
+                .await
+                .unwrap(),
             "one connector at a time"
         );
         let link = fake.accept().await;
@@ -919,6 +961,7 @@ async fn a_prompt_waiting_for_the_link_is_not_sent_after_a_stop() {
     let mut fake = FakeNode {
         listener,
         certificate,
+        git: Vec::new(),
         _dir: dir,
     };
     let mut link = fake.accept().await;
@@ -978,4 +1021,424 @@ async fn a_rebind_never_acks_more_than_head_persisted() {
     let third = fake.accept().await;
     assert_eq!(third.hello.acked_seq, NodeCounter(3));
     node.shutdown();
+}
+
+/// The remote-launch port against a fake node: admission, placing an agent,
+/// its first-turn launch, the projected placement, and bind-time claims.
+mod launch {
+    use std::path::Path;
+    use std::process::Command;
+
+    use intent_core::placement::{AgentPlacement, PlacementUnavailableReason};
+    use intent_core::remote_launch::{
+        EffectiveIsolation, RemoteLaunchRequest, RemotePlacementView, REMOTE_PLACEMENT_METADATA_KEY,
+    };
+    use intent_core::{Error, Workspace};
+    use intent_git::node_git::{self, AgentRemote, GitService};
+    use intent_services::feature_api::feature_ports::RemoteLaunchPort;
+    use intent_services::feature_api::Services;
+    use intent_transport::node_link::NodeGitAccess;
+
+    use super::*;
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    /// Head services with the remote feature, a workspace on a one-commit
+    /// repository, and the connector bound to `fake`.
+    struct Fixture {
+        services: Services,
+        node: RemoteNode,
+        repo: tempfile::TempDir,
+        base: String,
+        _tmp: TempDb,
+    }
+
+    impl Fixture {
+        async fn start(fake: &mut FakeNode) -> (Self, NodeEnd) {
+            let tmp = TempDb::new();
+            let store = Store::open(&tmp.path).await.unwrap();
+            let services = crate::register(Services::new(store.clone()));
+            let repo = tempfile::tempdir().unwrap();
+            git(repo.path(), &["init", "--quiet"]);
+            std::fs::write(repo.path().join("README.md"), "base\n").unwrap();
+            git(repo.path(), &["add", "README.md"]);
+            git(repo.path(), &["commit", "--quiet", "-m", "base"]);
+            let base = git(repo.path(), &["rev-parse", "HEAD"]);
+            let now = intent_core::now_iso();
+            store
+                .insert_workspace(&Workspace {
+                    id: workspace(),
+                    title: "Remote".into(),
+                    branch: "main".into(),
+                    repository_path: Some(repo.path().to_string_lossy().into_owned()),
+                    created_at: now.clone(),
+                    updated_at: now,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let node = RemoteNode::start_with(store, fake.config(), tuning())
+                .await
+                .unwrap();
+            crate::install_node(&services, node.clone());
+            let link = fake.accept().await;
+            link.replay_complete(0).await;
+            let fixture = Self {
+                services,
+                node,
+                repo,
+                base,
+                _tmp: tmp,
+            };
+            fixture.connected().await;
+            (fixture, link)
+        }
+
+        async fn connected(&self) {
+            tokio::time::timeout(wait(), async {
+                while !self.node.status().connected {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the link binds");
+        }
+
+        fn port(&self) -> &dyn RemoteLaunchPort {
+            self.services.feature_remote_launch_port()
+        }
+
+        /// A created agent, placed on the node with `view`.
+        async fn agent(&self, view: &RemotePlacementView) -> AgentId {
+            let agent = AgentId::new();
+            let now = intent_core::now_iso();
+            sqlx::query("INSERT INTO agent_session (id, workspace_id, name, status, provider, created_at, updated_at) VALUES (?, ?, 'remote', 'idle', 'mock', ?, ?)")
+                .bind(agent.as_str())
+                .bind(workspace().as_str())
+                .bind(&now)
+                .bind(&now)
+                .execute(self.services.store().write_pool())
+                .await
+                .unwrap();
+            self.services
+                .store()
+                .set_agent_session_metadata_key_json(
+                    &workspace(),
+                    &agent,
+                    REMOTE_PLACEMENT_METADATA_KEY,
+                    &serde_json::to_string(view).unwrap(),
+                    &now,
+                )
+                .await
+                .unwrap();
+            agent
+        }
+
+        async fn view(&self, agent: &AgentId) -> RemotePlacementView {
+            let session = self
+                .services
+                .store()
+                .get_agent_session(agent)
+                .await
+                .unwrap();
+            RemotePlacementView::from_metadata(session.metadata.as_ref()).unwrap()
+        }
+
+        async fn admit(&self, placement: &str) -> intent_core::Result<RemotePlacementView> {
+            let placement: AgentPlacement = serde_json::from_str(placement).unwrap();
+            self.port()
+                .admit(&self.services, &workspace(), &placement)
+                .await
+        }
+
+        async fn placed(&self) -> (AgentId, RemotePlacementView) {
+            let view = self.admit(r#"{"target":"remote"}"#).await.unwrap();
+            let agent = self.agent(&view).await;
+            self.port()
+                .launch(
+                    &self.services,
+                    RemoteLaunchRequest {
+                        workspace_id: workspace(),
+                        agent_id: agent.clone(),
+                        view: view.clone(),
+                    },
+                )
+                .await
+                .unwrap();
+            (agent, view)
+        }
+    }
+
+    fn unavailable(
+        result: intent_core::Result<RemotePlacementView>,
+    ) -> intent_core::placement::PlacementUnavailable {
+        match result {
+            Err(Error::PlacementUnavailable(failure)) => *failure,
+            other => panic!("expected placement-unavailable, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn admission_matches_the_nodes_platform_and_capacity() {
+        let mut fake = FakeNode::start().await;
+        let (f, _link) = Fixture::start(&mut fake).await;
+
+        let view = f
+            .admit(r#"{"target":"remote","os":"macos","arch":"aarch64"}"#)
+            .await
+            .unwrap();
+        assert_eq!(view.node_id, NODE);
+        assert_eq!(view.node_name, "Test node");
+        assert_eq!(view.lease_id, f.node.status().lease_id);
+        assert_eq!(view.base_commit, f.base);
+        assert_eq!(view.effective_isolation, EffectiveIsolation::Pending);
+        assert_eq!(
+            serde_json::to_value(&view.placement).unwrap(),
+            json!({"target":"remote","checkout":"isolated","os":"macos","arch":"aarch64","nodeId":NODE})
+        );
+
+        let linux = unavailable(f.admit(r#"{"os":"linux"}"#).await);
+        assert_eq!(
+            linux.reason,
+            PlacementUnavailableReason::UnsupportedPlatform
+        );
+        assert_eq!(
+            linux.message(),
+            "Unsupported linux; available: macos/aarch64; supported: macos/aarch64"
+        );
+        let elsewhere = unavailable(f.admit(r#"{"nodeId":"other-node"}"#).await);
+        assert_eq!(
+            elsewhere.reason,
+            PlacementUnavailableReason::UnsupportedPlatform
+        );
+
+        // Both of the node's slots taken: retryable no-capacity.
+        let _one = f.node.attach(&AgentId::new(), &workspace());
+        let _two = f.node.attach(&AgentId::new(), &workspace());
+        let full = unavailable(f.admit(r#"{"target":"remote"}"#).await);
+        assert_eq!(full.reason, PlacementUnavailableReason::NoCapacity);
+        assert_eq!(full.data()["retryable"], true);
+        assert_eq!(
+            full.data()["supportedPlatforms"],
+            json!([{"os":"macos","arch":"aarch64"}])
+        );
+
+        let help = f.port().placement_help(&f.services).await.unwrap();
+        assert!(help.contains("\"Test node\""), "{help}");
+        assert!(help.contains("platforms: macos/aarch64"), "{help}");
+        assert!(
+            help.contains("available now: none (2 of 2 agents running)"),
+            "{help}"
+        );
+        assert!(
+            help.contains("uncommitted changes are not carried"),
+            "{help}"
+        );
+        f.node.shutdown();
+    }
+
+    #[tokio::test]
+    async fn an_offline_node_admits_nothing() {
+        let mut fake = FakeNode::start().await;
+        let (f, link) = Fixture::start(&mut fake).await;
+        f.node.shutdown();
+        drop(link);
+        tokio::time::timeout(wait(), async {
+            while f.node.status().connected {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let offline = unavailable(f.admit(r#"{"target":"remote"}"#).await);
+        assert_eq!(offline.reason, PlacementUnavailableReason::NoCapacity);
+        assert!(offline.availability.available_platforms.is_empty());
+    }
+
+    /// Placing an agent records it on the lease and writes its base ref; its
+    /// first runtime sends the launch with that commit and the repository's
+    /// cache key; `Started` then marks its checkout isolated.
+    #[tokio::test]
+    async fn a_placed_agent_launches_on_its_first_runtime() {
+        let mut fake = FakeNode::start().await;
+        let (f, mut link) = Fixture::start(&mut fake).await;
+        let (agent, view) = f.placed().await;
+        let record = f
+            .services
+            .store()
+            .get_remote_agent(&agent)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.lease_id, view.lease_id);
+        let base_ref = AgentRemote::new(workspace().as_str(), agent.as_str())
+            .unwrap()
+            .ref_name(intent_git::hub::AgentRef::Base);
+        assert_eq!(git(f.repo.path(), &["rev-parse", &base_ref]), f.base);
+
+        let runtime = f.port().runtime(&f.services, &agent).await.unwrap();
+        let launch = link
+            .expect(|frame| match frame {
+                LinkFrame::Launch(command) => Some(command),
+                _ => None,
+            })
+            .await;
+        assert_eq!(launch.agent_id, agent);
+        assert_eq!(launch.provider, "mock");
+        assert_eq!(launch.base_commit, f.base);
+        assert_eq!(launch.repo_key, node_git::repo_key(f.repo.path()).unwrap());
+        assert!(runtime.is_alive());
+
+        link.journal(JournalRecord {
+            seq: NodeCounter(1),
+            agent_id: agent.clone(),
+            workspace_id: workspace(),
+            turn_id: None,
+            recorded_at: intent_core::now_iso(),
+            body: JournalBody::Started {
+                base_commit: f.base.clone(),
+            },
+        })
+        .await;
+        link.acked(1).await;
+        let placed = f.view(&agent).await;
+        assert_eq!(placed.effective_isolation, EffectiveIsolation::Isolated);
+        assert_eq!(placed.placement_error, None);
+        f.node.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_start_failure_is_the_agents_placement_error() {
+        let mut fake = FakeNode::start().await;
+        let (f, mut link) = Fixture::start(&mut fake).await;
+        let (agent, _) = f.placed().await;
+        let runtime = f.port().runtime(&f.services, &agent).await.unwrap();
+        link.journal(JournalRecord {
+            seq: NodeCounter(1),
+            agent_id: agent.clone(),
+            workspace_id: workspace(),
+            turn_id: None,
+            recorded_at: intent_core::now_iso(),
+            body: JournalBody::Exited {
+                exit_code: None,
+                error: Some("node-provider-unavailable: provider \"mock\" is not configured on this node (configured: codex)".into()),
+            },
+        })
+        .await;
+        link.acked(1).await;
+        let view = f.view(&agent).await;
+        assert_eq!(view.effective_isolation, EffectiveIsolation::Pending);
+        let error = view.placement_error.unwrap();
+        assert_eq!(error.code, "node-provider-unavailable");
+        assert!(
+            error.detail.contains("not configured on this node"),
+            "{}",
+            error.detail
+        );
+        assert!(!runtime.is_alive());
+        f.node.shutdown();
+    }
+
+    #[tokio::test]
+    async fn an_agent_never_placed_has_no_remote_runtime() {
+        let mut fake = FakeNode::start().await;
+        let (f, _link) = Fixture::start(&mut fake).await;
+        let view = f.admit(r#"{"target":"remote"}"#).await.unwrap();
+        let unplaced = f.agent(&view).await;
+        let result = f.port().runtime(&f.services, &unplaced).await;
+        assert!(
+            matches!(&result, Err(Error::InvalidParams(m)) if m.starts_with("node-agent-unplaced")),
+            "{:?}",
+            result.err()
+        );
+        f.node.shutdown();
+    }
+
+    /// At bind, an agent the node runs that head has no record of is
+    /// stopped; one head placed keeps running, and its output reaches the
+    /// runtime head later takes for it, with no second launch.
+    #[tokio::test]
+    async fn binding_stops_unclaimed_agents_and_keeps_claimed_ones() {
+        let mut first = FakeNode::start().await;
+        let (f, link) = Fixture::start(&mut first).await;
+        let (claimed, _) = f.placed().await;
+        let config = f.node.status();
+        f.node.shutdown();
+        drop(link);
+        drop(first);
+
+        // A head restart: a new connector on the same store.
+        let stray = AgentId::new();
+        let mut fake = FakeNode::start_with(
+            "127.0.0.1:0".parse().unwrap(),
+            welcome_running(vec![claimed.clone(), stray.clone()]),
+        )
+        .await;
+        let node = RemoteNode::start_with(f.services.store().clone(), fake.config(), tuning())
+            .await
+            .unwrap();
+        assert_eq!(node.status().lease_id, config.lease_id);
+        crate::install_node(&f.services, node.clone());
+        let mut link = fake.accept().await;
+        let stopped = link
+            .expect(|frame| match frame {
+                LinkFrame::Stop { agent_id } => Some(agent_id),
+                _ => None,
+            })
+            .await;
+        assert_eq!(stopped, stray);
+        link.replay_complete(0).await;
+        link.journal(note(1, &claimed, "still working")).await;
+        link.acked(1).await;
+        let runtime = f.port().runtime(&f.services, &claimed).await.unwrap();
+        let notes = runtime.notifications();
+        let note = tokio::time::timeout(wait(), async { notes.lock().await.recv().await })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(note.params["update"]["content"]["text"], "still working");
+        node.shutdown();
+    }
+
+    /// Head serves an agent's refs only on the current binding and only for
+    /// an agent recorded on that binding's lease.
+    #[tokio::test]
+    async fn git_sessions_are_confined_to_the_leases_agents() {
+        let mut fake = FakeNode::start().await;
+        let (f, link) = Fixture::start(&mut fake).await;
+        let (agent, _) = f.placed().await;
+        let view = f.admit(r#"{"target":"remote"}"#).await.unwrap();
+        let unplaced = f.agent(&view).await;
+        let access = crate::git::HeadGitAccess::new(f.node.shared());
+        let binding = link.hello.binding.clone();
+        let remote =
+            |agent: &AgentId| AgentRemote::new(workspace().as_str(), agent.as_str()).unwrap();
+
+        let path = access.repository(&binding, &remote(&agent)).await.unwrap();
+        assert_eq!(path, f.repo.path());
+        assert!(matches!(
+            access.repository(&binding, &remote(&unplaced)).await,
+            Err(Error::Forbidden(_))
+        ));
+        let other_workspace = AgentRemote::new("ws-other", agent.as_str()).unwrap();
+        assert!(matches!(
+            access.repository(&binding, &other_workspace).await,
+            Err(Error::Forbidden(_))
+        ));
+        let mut stale = binding.clone();
+        stale.generation = NodeCounter(binding.generation.0 - 1);
+        assert!(access.repository(&stale, &remote(&agent)).await.is_err());
+        let _ = GitService::UploadPack;
+        f.node.shutdown();
+    }
 }

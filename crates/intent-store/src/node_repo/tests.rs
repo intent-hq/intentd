@@ -717,6 +717,21 @@ async fn remote_agents_are_recorded_per_lease_and_cascade_with_the_agent() {
         .record_remote_agent(&record("agent-a", "2026-01-01T00:00:00Z"))
         .await
         .expect("recording the same placement again is a no-op");
+    assert_eq!(
+        store
+            .get_remote_agent(&AgentId::from("agent-a"))
+            .await
+            .unwrap(),
+        Some(record("agent-a", "2026-01-01T00:00:00Z"))
+    );
+    assert_eq!(
+        store
+            .get_remote_agent(&AgentId::from("agent-local"))
+            .await
+            .unwrap(),
+        None,
+        "an agent never placed on a node is local"
+    );
     let listed = store
         .list_remote_agents(&lease.owner.lease_id)
         .await

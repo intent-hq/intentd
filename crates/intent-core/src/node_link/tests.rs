@@ -133,6 +133,8 @@ fn every_frame() -> Vec<LinkFrame> {
             workspace_id: WorkspaceId::new(),
             provider: "claude".into(),
             model: Some("opus".into()),
+            base_commit: "base".into(),
+            repo_key: "repo".into(),
         }),
         LinkFrame::Prompt {
             agent_id: agent_id.clone(),

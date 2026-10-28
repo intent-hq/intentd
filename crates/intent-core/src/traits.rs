@@ -2305,6 +2305,15 @@ pub trait WorkspaceApi: Send + Sync {
         })
     }
 
+    /// Remote-placement discovery for agents in `workspace_id` (the
+    /// `ws.help("agent")` and tool-description text): the configured
+    /// execution node, its platforms and how to place an agent on it.
+    /// `None` when the daemon has no execution node.
+    fn agent_placement_help(&self, workspace_id: WorkspaceId) -> BoxFuture<'_, Option<String>> {
+        let _ = workspace_id;
+        Box::pin(async { None })
+    }
+
     /// Read the workspace's last explicitly remembered manual specialist.
     fn agent_get_creation_preferences(
         &self,

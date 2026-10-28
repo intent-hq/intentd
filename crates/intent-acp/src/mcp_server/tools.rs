@@ -1310,6 +1310,47 @@ fn inject_model_options(base: &str, model_options: &[SpecialistModelOptions]) ->
     Some(out)
 }
 
+/// Splice `help` (the remote-placement discovery text, one or more lines)
+/// into `base` as continuation lines of the `ws.agent.create` doc entry, so
+/// a bridge whose daemon has a configured execution node advertises its
+/// platforms. Lines are indented 4 so `[agentFeatures]` pruning and the
+/// condensed rendering treat them as part of that entry. Returns `base`
+/// unchanged when the anchor is absent.
+pub(crate) fn inject_remote_placement_help(base: &str, help: &str) -> String {
+    let block: String = help
+        .lines()
+        .map(|line| format!("    {}\n", line.trim()))
+        .collect();
+    let mut out = String::with_capacity(base.len() + block.len());
+    let mut in_create = false;
+    let mut inserted = false;
+    for line in base.lines() {
+        let trimmed = line.trim_start();
+        let indent = line.len() - trimmed.len();
+        let is_continuation = indent >= 4 && !trimmed.is_empty();
+        if in_create && !is_continuation && !inserted {
+            out.push_str(&block);
+            inserted = true;
+        }
+        if indent == 2 && trimmed.starts_with("ws.") {
+            in_create = trimmed.starts_with("ws.agent.create(");
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if in_create && !inserted {
+        out.push_str(&block);
+        inserted = true;
+    }
+    if !inserted {
+        return base.to_owned();
+    }
+    if !base.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
 /// Render the injected continuation block: one header line plus one line per
 /// specialist naming its resolved default (`` default `<model>` ``, or
 /// `default: provider default` when resolution yields the provider CLI
@@ -3790,5 +3831,45 @@ mod script_recipe_tests {
                     .is_err()
             );
         }
+    }
+
+    /// Remote-placement discovery joins the `ws.agent.create` entry as
+    /// continuation lines in both renderings; without it the description is
+    /// unchanged.
+    #[test]
+    fn remote_placement_help_extends_the_create_docs() {
+        let features = intent_core::settings_file::AgentFeaturesSettings::default();
+        let base = crate::mcp_server::tools::workspace_api_description(false, &features);
+        let help = "Remote placement (experimental): node \"Mac\" is connected.\nPass `placement`.";
+        let full = crate::mcp_server::tools::inject_remote_placement_help(&base, help);
+        let create = full
+            .lines()
+            .position(|l| l.starts_with("  ws.agent.create("))
+            .unwrap();
+        let lines: Vec<&str> = full.lines().collect();
+        let injected = lines
+            .iter()
+            .position(|l| {
+                l.trim_start()
+                    .starts_with("Remote placement (experimental)")
+            })
+            .unwrap();
+        assert!(injected > create);
+        assert!(lines[create + 1..injected]
+            .iter()
+            .all(|l| l.starts_with("    ")));
+        assert!(lines[injected].starts_with("    "));
+        assert!(lines[injected + 1].starts_with("    Pass `placement`."));
+        assert!(
+            lines[injected + 2].starts_with("  ws."),
+            "the next entry follows"
+        );
+        assert_eq!(full.len(), base.len() + help.len() + 1 + 2 * 4);
+
+        let condensed =
+            crate::mcp_server::tools::condensed_workspace_api_description(false, &features, &[]);
+        let condensed_full =
+            crate::mcp_server::tools::inject_remote_placement_help(&condensed, help);
+        assert!(condensed_full.contains("    Remote placement (experimental)"));
     }
 }

@@ -26,8 +26,10 @@ use std::sync::Arc;
 #[cfg(any(test, feature = "test-hooks"))]
 use std::sync::Mutex;
 
+use intent_core::agent_runtime::AgentRuntime;
+use intent_core::placement::AgentPlacement;
 use intent_core::placement::PlatformAvailability;
-use intent_core::remote_launch::{RemoteLaunchRequest, RemoteLaunchStarted};
+use intent_core::remote_launch::{RemoteLaunchRequest, RemotePlacementView};
 use intent_core::transfer::TransferPlan;
 
 use intent_core::execution::HostExecutionContext;
@@ -1155,56 +1157,127 @@ impl AgentWakePort for UnavailableAgentWake {
     }
 }
 
-/// The remote-launch feature: start agents on a configured execution node.
-/// `placements` is the platform discovery behind tool help and
-/// `placement-unavailable` errors; `launch` starts an already created agent
-/// on the node; `stop` stops a remote agent's process.
+/// The agent-manager runtime of a remote agent: the same contract a local
+/// agent's runtime implements, so turn orchestration, queueing and
+/// transcripts are shared.
+pub type RemoteRuntime = dyn AgentRuntime<
+    Prompt = Vec<intent_acp::session::ContentBlock>,
+    PromptOutcome = intent_acp::session::PromptOutcome,
+    Activity = intent_acp::session::ActivityTracker,
+    Error = intent_acp::AcpError,
+    Notifications = Arc<
+        tokio::sync::Mutex<
+            tokio::sync::mpsc::UnboundedReceiver<intent_acp::transport::IncomingNotification>,
+        >,
+    >,
+>;
+
+/// The remote-launch feature: run agents on a configured execution node.
+///
+/// A create with a placement first asks [`RemoteLaunchPort::admit`] (no
+/// effects), persists the agent with the returned view, then
+/// [`RemoteLaunchPort::launch`] places it on the node. Its provider process
+/// starts on its first turn, when the agent manager asks for its
+/// [`RemoteLaunchPort::runtime`].
 pub trait RemoteLaunchPort: Send + Sync + 'static {
     /// The configured node's supported platforms, and those that can take
     /// an agent now. Nothing when no node is configured.
     fn placements<'a>(&'a self, svc: &'a Services) -> BoxFuture<'a, Result<PlatformAvailability>>;
 
-    /// Launch `request.agent_id` on a node matching `request.placement`.
+    /// Platform discovery for `ws.help("agent")` and the tool description:
+    /// the configured node, its platforms and how to place an agent on it.
+    /// `None` when no node is configured.
+    fn placement_help<'a>(&'a self, svc: &'a Services) -> BoxFuture<'a, Option<String>>;
+
+    /// Check that an agent with `placement` can start in `workspace_id` now,
+    /// before anything is created, and resolve where it would run.
     ///
     /// # Errors
     ///
-    /// [`Error::PlacementUnavailable`] when no node can run the placement.
+    /// [`Error::PlacementUnavailable`] when no node matches the platform or
+    /// has capacity (or no node is configured); [`Error::InvalidParams`] for
+    /// an unsupported placement or a workspace without a commit to start
+    /// from.
+    fn admit<'a>(
+        &'a self,
+        svc: &'a Services,
+        workspace_id: &'a WorkspaceId,
+        placement: &'a AgentPlacement,
+    ) -> BoxFuture<'a, Result<RemotePlacementView>>;
+
+    /// Place the created agent on the node: record it on the lease and
+    /// write its `base` ref.
+    ///
+    /// # Errors
+    ///
+    /// When the record or the ref cannot be written.
     fn launch<'a>(
         &'a self,
         svc: &'a Services,
         request: RemoteLaunchRequest,
-    ) -> BoxFuture<'a, Result<RemoteLaunchStarted>>;
+    ) -> BoxFuture<'a, Result<()>>;
 
-    /// Stop the remote agent `agent_id`.
-    fn stop<'a>(&'a self, svc: &'a Services, agent_id: &'a AgentId) -> BoxFuture<'a, Result<()>>;
+    /// The runtime driving remote agent `agent_id`, starting its provider on
+    /// the node when it is not running there.
+    ///
+    /// # Errors
+    ///
+    /// When the agent is not placed on a node, or no node is configured.
+    fn runtime<'a>(
+        &'a self,
+        svc: &'a Services,
+        agent_id: &'a AgentId,
+    ) -> BoxFuture<'a, Result<Arc<RemoteRuntime>>>;
 }
 
 /// The remote-launch port of a daemon with no execution node: nothing is
-/// supported, every launch fails as `placement-unavailable`
+/// supported, every admission fails as `placement-unavailable`
 /// (`unsupported-platform`, no alternatives) and no agent runs remotely.
-/// The composition root registers it until the remote feature exists.
 #[derive(Default)]
 pub struct UnavailableRemoteLaunch;
+
+fn no_execution_node() -> Error {
+    Error::InvalidParams(
+        "node-unavailable: this daemon has no execution node configured for remote agents".into(),
+    )
+}
 
 impl RemoteLaunchPort for UnavailableRemoteLaunch {
     fn placements<'a>(&'a self, _svc: &'a Services) -> BoxFuture<'a, Result<PlatformAvailability>> {
         Box::pin(async { Ok(PlatformAvailability::none(intent_core::now_iso())) })
     }
 
-    fn launch<'a>(
+    fn placement_help<'a>(&'a self, _svc: &'a Services) -> BoxFuture<'a, Option<String>> {
+        Box::pin(async { None })
+    }
+
+    fn admit<'a>(
         &'a self,
         _svc: &'a Services,
-        request: RemoteLaunchRequest,
-    ) -> BoxFuture<'a, Result<RemoteLaunchStarted>> {
+        _workspace_id: &'a WorkspaceId,
+        placement: &'a AgentPlacement,
+    ) -> BoxFuture<'a, Result<RemotePlacementView>> {
         Box::pin(async move {
             let failure =
-                PlatformAvailability::none(intent_core::now_iso()).unavailable(request.placement);
+                PlatformAvailability::none(intent_core::now_iso()).unavailable(placement.clone());
             Err(Error::PlacementUnavailable(Box::new(failure)))
         })
     }
 
-    fn stop<'a>(&'a self, _svc: &'a Services, agent_id: &'a AgentId) -> BoxFuture<'a, Result<()>> {
-        Box::pin(async move { Err(Error::NotFound(format!("remote agent {agent_id}"))) })
+    fn launch<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _request: RemoteLaunchRequest,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async { Err(no_execution_node()) })
+    }
+
+    fn runtime<'a>(
+        &'a self,
+        _svc: &'a Services,
+        _agent_id: &'a AgentId,
+    ) -> BoxFuture<'a, Result<Arc<RemoteRuntime>>> {
+        Box::pin(async { Err(no_execution_node()) })
     }
 }
 
@@ -2266,7 +2339,6 @@ mod tests {
     #[tokio::test]
     async fn the_unavailable_remote_launch_port_supports_no_platform() {
         use intent_core::placement::{AgentPlacement, PlacementUnavailableReason};
-        use intent_core::remote_launch::RemoteLaunchRequest;
         let tmp = TempDb::new();
         let svc = bare_services(&tmp).await;
         let port = svc.feature_remote_launch_port();
@@ -2275,24 +2347,13 @@ mod tests {
         assert!(placements.supported_platforms.is_empty());
         assert!(placements.available_platforms.is_empty());
         assert!(placements.available_os.is_empty());
+        assert_eq!(port.placement_help(&svc).await, None);
 
         let placement: AgentPlacement =
             serde_json::from_str(r#"{"target":"remote","os":"linux"}"#).unwrap();
-        let agent = intent_core::AgentId::new();
-        let launched = port
-            .launch(
-                &svc,
-                RemoteLaunchRequest {
-                    workspace_id: WorkspaceId::new(),
-                    agent_id: agent.clone(),
-                    placement: placement.clone(),
-                    provider: "claude".into(),
-                    model: None,
-                },
-            )
-            .await;
-        let Err(Error::PlacementUnavailable(failure)) = launched else {
-            panic!("expected placement-unavailable, got {launched:?}");
+        let admitted = port.admit(&svc, &WorkspaceId::new(), &placement).await;
+        let Err(Error::PlacementUnavailable(failure)) = admitted else {
+            panic!("expected placement-unavailable, got {admitted:?}");
         };
         assert_eq!(failure.requested, placement);
         assert_eq!(
@@ -2305,10 +2366,12 @@ mod tests {
         );
         assert_eq!(failure.data()["retryable"], false);
 
-        let stopped = port.stop(&svc, &agent).await;
+        let agent = intent_core::AgentId::new();
+        let runtime = port.runtime(&svc, &agent).await;
         assert!(
-            matches!(&stopped, Err(Error::NotFound(m)) if m.contains(agent.as_str())),
-            "{stopped:?}"
+            matches!(&runtime, Err(Error::InvalidParams(m)) if m.starts_with("node-unavailable")),
+            "a remote agent never runs without a node: {:?}",
+            runtime.err()
         );
     }
 
