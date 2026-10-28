@@ -337,3 +337,63 @@ async fn the_placement_wire_shape_is_closed() {
         .placement
         .is_some());
 }
+
+/// Review of intentd#2779: caller metadata that is not an object must not
+/// drop the placement (the agent would then run locally).
+#[tokio::test]
+async fn a_placed_create_keeps_its_placement_with_non_object_metadata() {
+    let (_t, svc, ws) = setup().await;
+    let svc = svc.with_remote_launch_port(Arc::new(FakeRemote::default()));
+    for metadata in [json!([1, 2]), json!("legacy"), json!(7)] {
+        let created = create(
+            &svc,
+            &ws,
+            AgentCreateExtra {
+                placement: Some(placement(json!({"target": "remote"}))),
+                metadata: Some(metadata.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            created["agent"]["nodeId"], "node-1",
+            "{metadata}: {created}"
+        );
+        let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+        let session = svc.store.get_agent_session(&id).await.unwrap();
+        assert!(RemotePlacementView::from_metadata(session.metadata.as_ref()).is_some());
+        assert_eq!(
+            session.metadata.unwrap()["priorNonObjectMetadata"],
+            metadata
+        );
+    }
+}
+
+/// Review of intentd#2779: a remote agent's model cannot be switched (the
+/// node keeps running the launched identity), so the switch is refused.
+#[tokio::test]
+async fn a_remote_agents_model_change_is_refused() {
+    let (_t, svc, ws) = setup().await;
+    let svc = svc.with_remote_launch_port(Arc::new(FakeRemote::default()));
+    let created = create(
+        &svc,
+        &ws,
+        AgentCreateExtra {
+            placement: Some(placement(json!({"target": "remote"}))),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+    let result = svc
+        .agent_set_model_op(id.clone(), "opus".into(), None)
+        .await;
+    assert!(
+        matches!(&result, Err(Error::InvalidParams(m)) if m.starts_with("remote-model-change-unsupported")),
+        "{result:?}"
+    );
+    let session = svc.store.get_agent_session(&id).await.unwrap();
+    assert_eq!(session.model.as_deref(), Some("sonnet4.5"));
+}

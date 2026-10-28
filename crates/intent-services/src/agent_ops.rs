@@ -5777,13 +5777,23 @@ impl Services {
                     "{method}: encode remote placement failed: {e}"
                 ))
             })?;
-            let meta_value = metadata.get_or_insert_with(|| Value::Object(serde_json::Map::new()));
-            if let Some(obj) = meta_value.as_object_mut() {
-                obj.insert(
-                    intent_core::remote_launch::REMOTE_PLACEMENT_METADATA_KEY.to_string(),
-                    view,
-                );
-            }
+            // The placement must land whatever the caller's metadata is: a
+            // non-object document is kept under `priorNonObjectMetadata`
+            // (the single-key writers' convention), never left without it.
+            let mut obj = match metadata.take() {
+                Some(Value::Object(obj)) => obj,
+                None | Some(Value::Null) => serde_json::Map::new(),
+                Some(other) => {
+                    let mut obj = serde_json::Map::new();
+                    obj.insert("priorNonObjectMetadata".to_string(), other);
+                    obj
+                }
+            };
+            obj.insert(
+                intent_core::remote_launch::REMOTE_PLACEMENT_METADATA_KEY.to_string(),
+                view,
+            );
+            metadata = Some(Value::Object(obj));
         }
         if let Some(spec_id) = specialist.as_deref() {
             // Both snapshot resolutions below walk the specialist tier
@@ -6026,6 +6036,16 @@ impl Services {
         provider_id: Option<String>,
     ) -> Result<Value> {
         let session = self.load_session_internal(&agent_id).await?;
+        // A remote agent's provider process runs on its node with the
+        // identity it was launched with; switching it there is not supported
+        // yet, so refuse rather than report a switch that never happens.
+        if intent_core::remote_launch::RemotePlacementView::from_metadata(session.metadata.as_ref())
+            .is_some()
+        {
+            return Err(Error::InvalidParams(
+                "remote-model-change-unsupported: a remote agent keeps the provider and model it was launched with; create a new agent to use another".into(),
+            ));
+        }
         // An explicit providerId must be a registered provider before any
         // mutation (persisting an unknown one would make the next spawn
         // silently fall back to the default binary, -32602).

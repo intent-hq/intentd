@@ -492,3 +492,34 @@ async fn a_placed_agent_never_starts_locally() {
     assert!(!mgr.contains(&id));
     assert!(mgr.agent_root_pids().is_empty());
 }
+
+/// Review of intentd#2779: a live remote run is not reused once the
+/// session's identity changed; it is stopped and the turn is refused.
+#[tokio::test]
+async fn a_live_remote_run_is_not_reused_after_an_identity_change() {
+    let ws = WorkspaceId::from("ws-remote-identity");
+    let id = AgentId::from("agent-remote-identity");
+    let fake = FakeRuntime::new();
+    let port = Arc::new(RemoteRuntimes {
+        runtime: Some(fake.clone()),
+        asked: AtomicUsize::new(0),
+    });
+    let (_tmp, mgr) = remote_manager(port.clone(), &id, &ws).await;
+    mgr.ensure_started(&id, &ws).await.unwrap();
+    assert!(mgr.contains(&id));
+    let mut session = mgr.services.store.get_agent_session(&id).await.unwrap();
+    session.model = Some("another-model".into());
+    mgr.services
+        .store
+        .update_agent_session(&ws, &session)
+        .await
+        .unwrap();
+    let result = mgr.ensure_started(&id, &ws).await;
+    assert!(
+        matches!(&result, Err(Error::InvalidParams(m)) if m.starts_with("remote-model-change-unsupported")),
+        "{result:?}"
+    );
+    assert!(!mgr.contains(&id), "the old run is not kept");
+    assert_eq!(fake.stops.load(Ordering::SeqCst), 1);
+    assert_eq!(port.asked.load(Ordering::SeqCst), 1);
+}

@@ -11977,6 +11977,19 @@ impl AgentManager {
         session: &AgentSession,
     ) -> Result<StartedSession> {
         let session_id = format!("remote:{agent_id}");
+        // The node runs the identity the agent was launched with. A changed
+        // provider or model is refused at `agent.setModel`; should one still
+        // reach here, stop the old run rather than keep using it silently.
+        let identity_changed = self.handles.lock().unwrap().get(agent_id).is_some_and(|h| {
+            Some(h.spawned_provider.as_str()) != session.provider.as_deref()
+                || h.spawned_model != session.model
+        });
+        if identity_changed {
+            boxed_await(|| self.kill_child_only(agent_id)).await;
+            return Err(Error::InvalidParams(
+                "remote-model-change-unsupported: the remote agent's provider or model changed after launch; create a new agent to use another".into(),
+            ));
+        }
         if self.handle_is_live(agent_id) {
             return Ok(StartedSession {
                 session_id,
