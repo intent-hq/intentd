@@ -105,6 +105,8 @@ impl RemoteAgentRuntime {
             return None;
         }
         self.shared.agents.detach(&self.agent_id, &self.sink);
+        // Fail prompts already waiting; they would never see a turn end.
+        self.sink.close();
         self.shared.request_stop(&self.agent_id)
     }
 
@@ -136,11 +138,21 @@ impl RemoteAgentRuntime {
         // A prompt during a reconnect waits for the link, up to the grace.
         let undelivered =
             || transport("node-link-unavailable: the prompt was not delivered to the node");
-        let link = self
-            .shared
-            .link_within(self.shared.tuning.link_loss_grace)
-            .await
-            .ok_or_else(undelivered)?;
+        // A stop or an exit drops the turn's waiter, which ends the wait.
+        let link = tokio::select! {
+            link = self.shared.link_within(self.shared.tuning.link_loss_grace) => {
+                link.ok_or_else(undelivered)?
+            }
+            _ = &mut ended => {
+                return Err(self
+                    .not_running()
+                    .unwrap_or_else(|| transport("node-agent-not-running")));
+            }
+        };
+        // The agent may have been stopped just as the link came up.
+        if let Some(error) = self.not_running() {
+            return Err(error);
+        }
         link.send(&LinkFrame::Prompt {
             agent_id: self.agent_id.clone(),
             turn_id: turn_id.clone(),

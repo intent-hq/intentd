@@ -844,3 +844,89 @@ fn the_remote_runtime_is_an_agent_manager_runtime() {
     fn accepts(_: Option<Arc<ManagerRuntime>>) {}
     accepts(None::<Arc<crate::RemoteAgentRuntime>>.map(|r| r as Arc<ManagerRuntime>));
 }
+
+#[tokio::test]
+async fn stopping_the_agent_fails_a_waiting_prompt() {
+    let mut fake = FakeNode::start().await;
+    let head = Head::new().await;
+    let node = head.start(fake.config()).await;
+    let agent = AgentId::new();
+    let runtime = node.attach(&agent, &workspace());
+    let mut link = fake.accept().await;
+    let prompt = {
+        let runtime = runtime.clone();
+        tokio::spawn(async move {
+            let activity = ActivityTracker::new();
+            runtime.prompt("s", text_prompt("go"), &activity).await
+        })
+    };
+    link.expect(|frame| matches!(frame, LinkFrame::Prompt { .. }).then_some(()))
+        .await;
+    runtime.stop().await;
+    match tokio::time::timeout(wait(), prompt).await.unwrap().unwrap() {
+        Err(AcpError::Transport(message)) => {
+            assert!(message.contains("stopped"), "{message}");
+        }
+        other => panic!("expected a stopped error, got {other:?}"),
+    }
+    link.expect(|frame| match frame {
+        LinkFrame::Stop { agent_id } if agent_id == agent => Some(()),
+        _ => None,
+    })
+    .await;
+    node.shutdown();
+}
+
+#[tokio::test]
+async fn a_prompt_waiting_for_the_link_is_not_sent_after_a_stop() {
+    let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = reserved.local_addr().unwrap();
+    drop(reserved);
+    let certificate = generate_certificate(vec!["localhost".into(), "127.0.0.1".into()]).unwrap();
+    let head = Head::new().await;
+    let mut slow = tuning();
+    slow.link_loss_grace = wait();
+    let node = RemoteNode::start_with(head.store.clone(), config_for(address, &certificate), slow)
+        .await
+        .unwrap();
+    let agent = AgentId::new();
+    let runtime = node.attach(&agent, &workspace());
+    let prompt = {
+        let runtime = runtime.clone();
+        tokio::spawn(async move {
+            let activity = ActivityTracker::new();
+            runtime.prompt("s", text_prompt("go"), &activity).await
+        })
+    };
+    // The prompt has started and is waiting for the link.
+    tokio::time::timeout(wait(), async {
+        while runtime.client_request_seq() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the prompt starts");
+    runtime.stop().await;
+    match tokio::time::timeout(wait(), prompt).await.unwrap().unwrap() {
+        Err(AcpError::Transport(message)) => {
+            assert!(message.contains("stopped"), "{message}");
+        }
+        other => panic!("expected a stopped error, got {other:?}"),
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let listener = FakeNode::listen(&dir, &certificate, address).await;
+    let mut fake = FakeNode {
+        listener,
+        certificate,
+        dir,
+    };
+    let mut link = fake.accept().await;
+    link.expect(|frame| match frame {
+        LinkFrame::Stop { agent_id } if agent_id == agent => Some(()),
+        LinkFrame::Prompt { .. } => panic!("a stopped agent's prompt is never sent"),
+        _ => None,
+    })
+    .await;
+    node.shutdown();
+}

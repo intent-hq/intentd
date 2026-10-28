@@ -35,6 +35,8 @@ struct SinkState {
     /// Turns a prompt is waiting on, by turn id.
     turns: HashMap<String, oneshot::Sender<TurnEnd>>,
     exit: Option<Exit>,
+    /// Head stopped the agent: no new turn waits, none still waiting.
+    closed: bool,
 }
 
 /// One remote agent's inbox.
@@ -67,7 +69,7 @@ impl AgentSink {
     /// `None` when it already exited.
     pub(crate) fn expect_turn(&self, turn_id: &str) -> Option<oneshot::Receiver<TurnEnd>> {
         let mut state = lock(&self.state);
-        if state.exit.is_some() {
+        if state.exit.is_some() || state.closed {
             return None;
         }
         let (tx, rx) = oneshot::channel();
@@ -78,6 +80,14 @@ impl AgentSink {
     /// Stop waiting for `turn_id` (its prompt was dropped or gave up).
     pub(crate) fn forget_turn(&self, turn_id: &str) {
         lock(&self.state).turns.remove(turn_id);
+    }
+
+    /// Head stopped the agent: fail every waiting prompt and refuse new
+    /// turns.
+    pub(crate) fn close(&self) {
+        let mut state = lock(&self.state);
+        state.closed = true;
+        state.turns.clear();
     }
 
     pub(crate) fn exit(&self) -> Option<Exit> {
