@@ -60,11 +60,22 @@ async fn uds_rpc(socket: &Path, id: i64, method: &str, params: Value) -> Value {
     write_half.flush().await.unwrap();
     let mut reader = BufReader::new(read_half);
     let mut buf = String::new();
-    timeout(common::rpc_read_timeout(), reader.read_line(&mut buf))
-        .await
-        .unwrap_or_else(|_| panic!("UDS RPC {method} (id {id}) timed out waiting for response"))
-        .expect("read uds response");
-    serde_json::from_str(buf.trim_end()).expect("invalid JSON frame")
+    timeout(common::rpc_read_timeout(), async {
+        loop {
+            buf.clear();
+            let read = reader.read_line(&mut buf).await.expect("read uds response");
+            assert_ne!(
+                read, 0,
+                "UDS RPC {method} (id {id}) reached EOF before response"
+            );
+            let response: Value = serde_json::from_str(buf.trim_end()).expect("invalid JSON frame");
+            if response["id"] == json!(id) {
+                return response;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("UDS RPC {method} (id {id}) timed out waiting for response"))
 }
 
 #[derive(Debug)]
@@ -397,7 +408,11 @@ async fn shutdown_reaps_terminal_and_script_pty_sessions() {
     // Graceful shutdown via the UDS-only control fast-path (PROTOCOL §5.7).
     let started_at = Instant::now();
     let shutdown = uds_rpc(&socket, 5, "system.shutdown", json!({})).await;
-    assert_eq!(shutdown["result"].get("ok"), Some(&json!(true)));
+    assert_eq!(
+        shutdown["result"].get("ok"),
+        Some(&json!(true)),
+        "system.shutdown response: {shutdown}"
+    );
 
     // Both stragglers must be gone within the bounded sweep: scripts are
     // flagged user-stopped synchronously, then one concurrent kill-all covers
