@@ -1317,10 +1317,12 @@ fn inject_model_options(base: &str, model_options: &[SpecialistModelOptions]) ->
 /// condensed rendering treat them as part of that entry. Returns `base`
 /// unchanged when the anchor is absent.
 pub(crate) fn inject_remote_placement_help(base: &str, help: &str) -> String {
-    let block: String = help
-        .lines()
-        .map(|line| format!("    {}\n", line.trim()))
-        .collect();
+    let mut block = String::with_capacity(help.len() + 64);
+    for line in help.lines() {
+        block.push_str("    ");
+        block.push_str(line.trim());
+        block.push('\n');
+    }
     let mut out = String::with_capacity(base.len() + block.len());
     let mut in_create = false;
     let mut inserted = false;

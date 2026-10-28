@@ -1402,11 +1402,14 @@ mod launch {
         link.acked(1).await;
         let runtime = f.port().runtime(&f.services, &claimed).await.unwrap();
         let notes = runtime.notifications();
-        let note = tokio::time::timeout(wait(), async { notes.lock().await.recv().await })
+        let received = tokio::time::timeout(wait(), async { notes.lock().await.recv().await })
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(note.params["update"]["content"]["text"], "still working");
+        assert_eq!(
+            received.params["update"]["content"]["text"],
+            "still working"
+        );
         node.shutdown();
     }
 
