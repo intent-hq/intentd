@@ -825,25 +825,31 @@ where available or reconnect, and check the app and daemon versions.
 
 ## Restore workspace browser use
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/{DrivingClientIndicator,SetPrimaryClientConfirmDialog}.svelte; src/lib/components/workspace/sidebar/WorkspaceProgressCard.svelte; src/features/events/daemon-events-bridge.client.ts; src/store/renderer/slices/browser-clients/{browser-clients-selectors,browser-clients-slice}.ts; src/store/renderer/slices/browser-clients/sagas/browser-clients-saga.ts; messages/en.json. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/lib/components/workspace/{driving-indicator.ts,SetPrimaryClientConfirmDialog.svelte}; src/features/workspace/components/WorkspaceActionItems.svelte; src/lib/components/workspace/sidebar/WorkspaceProgressCard.svelte; src/features/events/daemon-events-bridge.client.ts; src/store/renderer/slices/browser-clients/{browser-clients-selectors,browser-clients-slice}.ts; src/store/renderer/slices/browser-clients/sagas/browser-clients-saga.ts; messages/en.json. -->
 
-The workspace sidebar warns when its primary browser client is offline, even if
-the workspace has no browser tabs yet. Hover over the warning for recovery help:
-agent browser tabs and tunnels fail until that client reconnects or another
-connected, browser-capable client is set as primary.
+Agent browser tabs and tunnels require the workspace's primary browser client to
+be connected and browser-capable. If it is offline, reconnect it or, when asked,
+select another eligible client.
 
-To switch, open the workspace in the client you want to use, open the workspace
-sidebar's menu, choose **Set Current Client as Primary**, and confirm **Set as
-Primary**. This moves agent-owned tabs to that client without preserving page
-state; tabs you opened yourself stay where they are. The action depends on the
-current client's connection, browser capability and your access. A checkmark
-means the saved primary selection matches the confirmed current client; it does
-not guarantee browser availability. The selection updates when the primary
-changes; after reconnecting, wait for the current client and workspace browser
-state to refresh. When the saved selection is known and this client is not
-selected, the action is available once its connection, browser capability and
-your access are ready. Do not promise automatic failover or change the primary
-client without the user's instruction.
+In released app versions with the offline sidebar warning, hover over it for
+recovery help. To switch, open the workspace in the client you want to use, open
+the workspace sidebar's menu, choose **Set primary client**, and confirm **Set as
+Primary**.
+
+Newer or test builds may instead offer a **Primary client** submenu. Where present,
+it shows the current primary client and **Offline** when disconnected; choose
+**This app**, then confirm **Set as Primary**. The submenu replaces the separate
+warning indicator, so use the menu for this information in those builds.
+
+Switching ends active desktop control and moves agent-owned browser tabs to that
+client without preserving page state; tabs you opened yourself stay where they
+are. The action depends on the current client's connection, browser capability
+and your access. A checkmark means the saved primary selection matches the
+confirmed current client; it does not guarantee browser availability. After
+reconnecting, wait for the current client and workspace browser state to refresh.
+When the saved selection is known and this client is not selected, the action
+is available once those prerequisites are ready. Do not promise automatic
+failover or change the primary client without the user's instruction.
 
 ## iOS workspace browser
 
