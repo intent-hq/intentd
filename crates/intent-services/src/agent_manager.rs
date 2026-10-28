@@ -12004,6 +12004,12 @@ impl AgentManager {
             .feature_remote_launch_port()
             .runtime(&self.services, agent_id)
             .await?;
+        // The node opens the provider session with no prompt injection, so
+        // the agent's instructions (base prompt, specialist body or explicit
+        // `behaviorPrompt`, rules) ride its first prompt as the
+        // `FirstTurnPrepend` `<system>` block, as for local providers without
+        // native injection.
+        boxed_await(|| self.prepare_remote_system_prompt(agent_id, workspace_id, session)).await;
         let origin = RepositoryOrigin::unavailable();
         let provider = session.provider.clone().unwrap_or_default();
         let handle = AgentHandle {
@@ -12066,6 +12072,60 @@ impl AgentManager {
             session_id,
             turn: self.capture_turn(agent_id)?,
         })
+    }
+
+    /// Assemble a remote agent's system prompt the way `create_agent` does
+    /// for a local one (no workspace tool reference: remote agents have no
+    /// workspace tools yet), persist it on the session, and arm the
+    /// first-turn prepend that delivers it with the next prompt. A failed
+    /// write leaves the prompt undelivered rather than failing the turn.
+    async fn prepare_remote_system_prompt(
+        &self,
+        agent_id: &AgentId,
+        workspace_id: &WorkspaceId,
+        session: &AgentSession,
+    ) {
+        let workspace = self.services.store.get_workspace(workspace_id).await.ok();
+        let cwd = workspace.as_ref().and_then(crate::git_ops::worktree_path);
+        let specialist = self
+            .services
+            .agent_specialist_injection(agent_id, cwd.as_deref())
+            .await;
+        let agent_type = derive_agent_type(&self.services, session, workspace.as_ref());
+        let is_sub_agent = session.parent_agent_id.is_some() || session.is_background;
+        let settings = self.services.effective_settings();
+        let auto_commit_enabled = self.services.effective_auto_commit(workspace_id).await;
+        let agent_features = self.services.session_agent_features(session);
+        let Some(prompt) = crate::rules::assemble_system_prompt(
+            &self.services.store,
+            cwd.as_deref(),
+            &agent_type,
+            specialist.as_ref(),
+            is_sub_agent,
+            auto_commit_enabled,
+            settings.rtk.enabled,
+            &agent_features,
+            workspace.as_ref(),
+            Some(session),
+            None,
+        )
+        .await
+        else {
+            return;
+        };
+        if let Err(e) = self
+            .services
+            .store
+            .set_agent_session_system_prompt(workspace_id, agent_id, &prompt)
+            .await
+        {
+            tracing::warn!(agent = %agent_id, error = %e, "remote agent: could not persist its system prompt");
+            return;
+        }
+        self.prepend_pending
+            .lock()
+            .unwrap()
+            .insert(agent_id.clone());
     }
 
     /// Close admission before the composition root performs any teardown await.

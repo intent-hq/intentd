@@ -153,9 +153,11 @@ async fn a_placed_create_persists_its_node_and_reports_what_it_starts_from() {
         .unwrap();
     assert_eq!(got.node_name.as_deref(), Some("Mac Studio"));
     assert_eq!(got.effective_isolation, Some(EffectiveIsolation::Pending));
+    // Detail-only: list rows stay within their budget without them.
     let listed = svc.agent_list_op(ws.clone()).await.unwrap();
     let row = listed.iter().find(|a| a.id == id).unwrap();
-    assert_eq!(row.node_id.as_deref(), Some("node-1"));
+    assert_eq!(row.node_id, None);
+    assert_eq!(row.placement, None);
 }
 
 #[tokio::test]

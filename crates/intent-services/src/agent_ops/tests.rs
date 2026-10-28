@@ -10246,6 +10246,33 @@ async fn worst_case_agent_list_row(
         .set_agent_notifications_muted(ws, &id, true)
         .await
         .expect("mute");
+    // A remote agent at its caps: 128-byte node id and name, the longest
+    // placement error detail.
+    let node = "n".repeat(128);
+    let view = intent_core::remote_launch::RemotePlacementView {
+        node_id: node.clone(),
+        lease_id: uuid::Uuid::new_v4().to_string(),
+        node_name: "N".repeat(128),
+        placement: serde_json::from_value(json!({
+            "target": "remote", "checkout": "isolated", "os": "macos", "arch": "aarch64", "nodeId": node,
+        }))
+        .unwrap(),
+        effective_isolation: intent_core::remote_launch::EffectiveIsolation::Pending,
+        placement_error: Some(intent_core::remote_launch::PlacementError::from_node_error(
+            &format!("node-checkout-failed: {}", "e".repeat(4096)),
+        )),
+        base_commit: "0".repeat(40),
+    };
+    svc.store()
+        .set_agent_session_metadata_key_json(
+            ws,
+            &id,
+            intent_core::remote_launch::REMOTE_PLACEMENT_METADATA_KEY,
+            &serde_json::to_string(&view).unwrap(),
+            &ts,
+        )
+        .await
+        .expect("remote placement");
 
     seed_active_hook(svc, ws, &id, "Wait for CI on intentd PR").await;
     seed_active_hook(svc, ws, &id, "Wait for shipped alpha").await;

@@ -523,3 +523,74 @@ async fn a_live_remote_run_is_not_reused_after_an_identity_change() {
     assert_eq!(fake.stops.load(Ordering::SeqCst), 1);
     assert_eq!(port.asked.load(Ordering::SeqCst), 1);
 }
+
+/// Review of intentd#2779: a remote agent's instructions (an explicit
+/// `behaviorPrompt`, or a specialist's frozen body and role) reach the node
+/// with its first prompt, as a `<system>` prepend, and only once.
+#[tokio::test]
+async fn a_remote_agents_instructions_ride_its_first_prompt() {
+    for specialist in [false, true] {
+        let ws = WorkspaceId::from(format!("ws-remote-prompt-{specialist}").as_str());
+        let id = AgentId::from(format!("agent-remote-prompt-{specialist}").as_str());
+        let fake = FakeRuntime::new();
+        let port = Arc::new(RemoteRuntimes {
+            runtime: Some(fake.clone()),
+            asked: AtomicUsize::new(0),
+        });
+        let (_tmp, mgr) = remote_manager(port, &id, &ws).await;
+        let marker = if specialist {
+            "SPECIALIST-BODY-MARKER"
+        } else {
+            "BEHAVIOR-PROMPT-MARKER"
+        };
+        let store = &mgr.services.store;
+        store
+            .set_agent_session_metadata_key(&ws, &id, "behaviorPrompt", marker, None, None)
+            .await
+            .unwrap();
+        if specialist {
+            let mut session = store.get_agent_session(&id).await.unwrap();
+            session.specialist = Some("implementor".into());
+            store.update_agent_session(&ws, &session).await.unwrap();
+            store
+                .set_agent_session_metadata_key(
+                    &ws,
+                    &id,
+                    "specialistName",
+                    "Implementor",
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        for (turn, text) in [(1, "first"), (2, "second")] {
+            mgr.send_message(
+                id.clone(),
+                ws.clone(),
+                text.into(),
+                None,
+                super::super::TurnOptions::default(),
+            )
+            .await
+            .unwrap();
+            fake.wait_prompts(turn).await;
+            fake.finish.add_permits(1);
+            wait_idle(&mgr, &id).await;
+        }
+        let prompts = fake.prompts.lock().unwrap().clone();
+        let first = serde_json::to_string(&prompts[0].1).unwrap();
+        let second = serde_json::to_string(&prompts[1].1).unwrap();
+        assert!(first.contains("<system>"), "{first}");
+        assert!(first.contains(marker), "{first}");
+        if specialist {
+            assert!(first.contains("Implementor"), "{first}");
+        }
+        assert!(
+            !second.contains(marker),
+            "the instructions are sent once: {second}"
+        );
+        let persisted = store.get_agent_session(&id).await.unwrap().system_prompt;
+        assert!(persisted.is_some_and(|p| p.contains(marker)));
+    }
+}

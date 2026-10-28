@@ -3676,15 +3676,6 @@ pub const AGENT_LIST_ROW_KEYS: &[&str] = &[
     "retiredAt",
     "notificationsMuted",
     "harnessVersion",
-    // Placed (remote) agent projection, `methods/nodes.md`: small and
-    // computed on write (rung 1) into the session's daemon-owned
-    // `remotePlacement` metadata; omitted for local agents.
-    "nodeId",
-    "leaseId",
-    "nodeName",
-    "placement",
-    "effectiveIsolation",
-    "placementError",
     "metadata",
 ];
 
@@ -4982,7 +4973,9 @@ impl AgentLite {
 
     /// List-path detail-field strip (intent-hq/intent#5383): drop the fields
     /// that only the open-agent (detail) UI reads — `harnessFeatures`,
-    /// `effortLevels`, `contextReferences`, `fileBlocks`, `stats`,
+    /// `effortLevels`, `contextReferences`, `fileBlocks`, `stats`, the
+    /// placed-agent fields (`nodeId`, `leaseId`, `nodeName`, `placement`,
+    /// `effectiveIsolation`, `placementError`),
     /// `metadata.pendingProposals`, `metadata.proposalResolutions` — so an
     /// `agent.list` row carries only what list contexts render. Every one of
     /// these is presence-detected on the wire (`skip_serializing_if`), so a
@@ -4994,6 +4987,14 @@ impl AgentLite {
     /// [`AGENT_LIST_ROW_METADATA_KEYS`] pin the resulting shape.
     pub fn strip_detail_only_fields(&mut self) {
         self.harness_features = None;
+        // Placed-agent fields (rung 3: no list UI reads them yet; served on
+        // agent.get / agent.getSession and create results).
+        self.node_id = None;
+        self.lease_id = None;
+        self.node_name = None;
+        self.placement = None;
+        self.effective_isolation = None;
+        self.placement_error = None;
         self.effort_levels = None;
         self.context_references = None;
         self.file_blocks = None;

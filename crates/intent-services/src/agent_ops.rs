@@ -5409,10 +5409,10 @@ impl Services {
             )
             .await;
         if let Err(error) = launched {
-            view.placement_error = Some(intent_core::remote_launch::PlacementError {
-                code: "remote-launch-failed".into(),
-                detail: error.to_string(),
-            });
+            view.placement_error = Some(intent_core::remote_launch::PlacementError::new(
+                "remote-launch-failed",
+                &error.to_string(),
+            ));
             if let Ok(encoded) = serde_json::to_string(&view) {
                 if let Err(e) = self
                     .store

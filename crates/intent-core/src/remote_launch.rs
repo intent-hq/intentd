@@ -56,7 +56,35 @@ pub struct PlacementError {
     pub detail: String,
 }
 
+/// Longest `placementError.detail` kept, in UTF-8 bytes: the field rides
+/// every `agent.list` row, and node errors can quote command output.
+pub const PLACEMENT_ERROR_DETAIL_MAX_BYTES: usize = 512;
+
+/// Longest `placementError.code` kept, in bytes.
+const PLACEMENT_ERROR_CODE_MAX_BYTES: usize = 64;
+
+fn cap(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_owned();
+    }
+    let mut end = max.saturating_sub('…'.len_utf8());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
+}
+
 impl PlacementError {
+    /// A placement error with `code` and `detail` capped to their list-row
+    /// budgets.
+    #[must_use]
+    pub fn new(code: &str, detail: &str) -> Self {
+        Self {
+            code: cap(code, PLACEMENT_ERROR_CODE_MAX_BYTES),
+            detail: cap(detail, PLACEMENT_ERROR_DETAIL_MAX_BYTES),
+        }
+    }
+
     /// Split a node error (`"<code>: <detail>"`) into its code and detail;
     /// an error without a code is `node-agent-start-failed`.
     #[must_use]
@@ -68,15 +96,9 @@ impl PlacementError {
                         .bytes()
                         .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-') =>
             {
-                Self {
-                    code: code.to_owned(),
-                    detail: detail.to_owned(),
-                }
+                Self::new(code, detail)
             }
-            _ => Self {
-                code: "node-agent-start-failed".to_owned(),
-                detail: error.to_owned(),
-            },
+            _ => Self::new("node-agent-start-failed", error),
         }
     }
 }
@@ -115,4 +137,24 @@ pub fn launch_notice(node_name: &str, base_commit: &str) -> String {
     format!(
         "The agent runs on execution node \"{node_name}\" and starts from commit {short} (the workspace's last commit). Uncommitted changes in the workspace are not carried to the remote agent; commit them first if it needs them."
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn placement_errors_split_the_node_code_and_cap_the_detail() {
+        let error =
+            PlacementError::from_node_error("node-capacity: this node is running 2 of 2 agents");
+        assert_eq!(error.code, "node-capacity");
+        assert_eq!(error.detail, "this node is running 2 of 2 agents");
+        let plain = PlacementError::from_node_error("Something: broke");
+        assert_eq!(plain.code, "node-agent-start-failed");
+        assert_eq!(plain.detail, "Something: broke");
+        let long =
+            PlacementError::from_node_error(&format!("node-checkout-failed: {}", "é".repeat(1000)));
+        assert!(long.detail.len() <= PLACEMENT_ERROR_DETAIL_MAX_BYTES);
+        assert!(long.detail.ends_with('…'));
+    }
 }

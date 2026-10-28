@@ -445,6 +445,23 @@ async fn remote_agent_launches_streams_stops_and_leaves_its_wip_ref() {
     let reply = got["lastAgentResponse"].as_str().unwrap_or_default();
     assert!(reply.contains("echo:"), "{got}");
     assert!(reply.contains("hello remote"), "{got}");
+    // The agent's instructions went with its first prompt, persisted as its
+    // system prompt.
+    let session = ok(
+        &mut rpc_ws,
+        94,
+        "agent.getSession",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    let system_prompt = session["systemPrompt"]
+        .as_str()
+        .or_else(|| session["session"]["systemPrompt"].as_str())
+        .unwrap_or_default();
+    assert!(
+        !system_prompt.trim().is_empty(),
+        "the remote agent's system prompt is assembled and stored: {session}"
+    );
     assert_eq!(got["effectiveIsolation"], "isolated", "{got}");
 
     // Stop: the node pushes the agent's work before it exits.
