@@ -122,8 +122,9 @@ struct Agent {
     busy: Mutex<bool>,
     marks: mpsc::UnboundedSender<Mark>,
     activity: ActivityTracker,
-    /// The provider's descendants at the last snapshot.
-    descendants: Arc<Mutex<Vec<i32>>>,
+    /// The provider's descendants seen so far that are still the same
+    /// processes (see [`merge_snapshot`]).
+    descendants: Arc<Mutex<Vec<Helper>>>,
     /// This run's [`RUN_MARKER_ENV`] value.
     run_marker: String,
 }
@@ -421,7 +422,7 @@ impl Runner {
                         loop {
                             tick.tick().await;
                             let found = intent_acp::descendant_pids(pid).await;
-                            remember(&descendants, &found);
+                            remember(&descendants, found).await;
                         }
                     })
                 });
@@ -443,9 +444,21 @@ impl Runner {
                 // exited by itself: its process group, the helpers last seen
                 // as its descendants (and theirs), and on Linux every process
                 // still carrying this run's marker.
-                let mut known = lock(&agent.descendants).clone();
-                known.extend(marked_processes(&agent.run_marker).await);
-                kill_tree(child, pid, &known).await;
+                // Every remembered or marked pid is revalidated against its
+                // start time right before the sweep, so a pid reused by an
+                // unrelated process is never signalled.
+                let known = lock(&agent.descendants).clone();
+                let marked = marked_processes(&agent.run_marker).await;
+                let owned = tokio::task::spawn_blocking(move || {
+                    let marked = identify(&marked);
+                    revalidated_pids(
+                        &merge_snapshot(&known, &marked, current_identity),
+                        current_identity,
+                    )
+                })
+                .await
+                .unwrap_or_default();
+                kill_tree(child, pid, &owned).await;
                 let result = match outcome {
                     Outcome::Exited(code) => (code, None),
                     Outcome::Stopped => (None, None),
@@ -532,7 +545,7 @@ impl Runner {
         stop: &mut oneshot::Receiver<()>,
         ready: &watch::Sender<Option<Arc<Ready>>>,
         cwd: &std::path::Path,
-        (pid, descendants): (Option<u32>, &Mutex<Vec<i32>>),
+        (pid, descendants): (Option<u32>, &Arc<Mutex<Vec<Helper>>>),
     ) -> Outcome {
         let setup = async {
             intent_acp::handshake(connection, &launch.config).await?;
@@ -551,7 +564,7 @@ impl Runner {
         // groups are no longer its descendants.
         if let Some(pid) = pid {
             let found = intent_acp::descendant_pids(pid).await;
-            remember(descendants, &found);
+            remember(descendants, found).await;
         }
         ready.send_replace(Some(Arc::new(Ready {
             connection: connection.clone(),
@@ -649,7 +662,7 @@ impl Runner {
         lock(&self.inner.state)
             .agents
             .get(agent_id)
-            .map(|agent| lock(&agent.descendants).clone())
+            .map(|agent| lock(&agent.descendants).iter().map(|h| h.pid).collect())
             .unwrap_or_default()
     }
 
@@ -756,34 +769,101 @@ async fn run_turn(agent: &Agent, turn_id: &str, prompt: Vec<Value>) -> (String, 
     }
 }
 
+/// A remembered provider helper: its pid and the start time that tells it
+/// apart from a later process reusing the pid.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct Helper {
+    pid: i32,
+    start: String,
+}
+
 /// Merge a descendant snapshot into the known set. Snapshots are taken
 /// concurrently (setup and the periodic tracker) and may complete out of
-/// order, so a result only adds pids: a helper captured once stays known
-/// after it is reparented, until it exits. Pids that are gone, or now in
-/// the node's own process group (recycled), are dropped.
-fn merge_snapshot(known: &[i32], found: &[i32], alive: impl Fn(i32) -> bool) -> Vec<i32> {
-    let mut merged: Vec<i32> = known
+/// order, so a result only adds helpers: one captured once stays known after
+/// it is reparented, for as long as it is the same process. Every entry is
+/// kept only while `identity` (the pid's current start time, `None` when it
+/// is gone or in the node's own process group) still matches, so a pid that
+/// was reused by an unrelated process is dropped.
+fn merge_snapshot(
+    known: &[Helper],
+    found: &[Helper],
+    identity: impl Fn(i32) -> Option<String>,
+) -> Vec<Helper> {
+    let mut merged: Vec<Helper> = known
         .iter()
         .chain(found)
-        .copied()
-        .filter(|&pid| alive(pid))
+        .filter(|helper| identity(helper.pid).as_deref() == Some(helper.start.as_str()))
+        .cloned()
         .collect();
-    merged.sort_unstable();
+    merged.sort();
     merged.dedup();
     merged
 }
 
-/// Whether `pid` is a live process outside the node's own process group,
-/// the same guard `intent_acp::sweep_escaped_descendants` applies.
-fn alive_outside_own_group(pid: i32) -> bool {
-    use nix::unistd::{getpgid, Pid};
-    pid > 1
-        && getpgid(Some(Pid::from_raw(pid))).is_ok_and(|group| Some(group) != getpgid(None).ok())
+/// The pids of `known` helpers that are still the same processes.
+fn revalidated_pids(known: &[Helper], identity: impl Fn(i32) -> Option<String>) -> Vec<i32> {
+    let mut pids: Vec<i32> = merge_snapshot(known, &[], identity)
+        .into_iter()
+        .map(|helper| helper.pid)
+        .collect();
+    pids.dedup();
+    pids
 }
 
-fn remember(descendants: &Mutex<Vec<i32>>, found: &[i32]) {
-    let mut known = lock(descendants);
-    *known = merge_snapshot(&known, found, alive_outside_own_group);
+/// `pid`'s current start time if it is alive outside the node's own process
+/// group (the guard `intent_acp::sweep_escaped_descendants` also applies).
+fn current_identity(pid: i32) -> Option<String> {
+    use nix::unistd::{getpgid, Pid};
+    let outside = pid > 1
+        && getpgid(Some(Pid::from_raw(pid))).is_ok_and(|group| Some(group) != getpgid(None).ok());
+    if outside {
+        process_start(pid)
+    } else {
+        None
+    }
+}
+
+/// When `pid` started: `/proc/<pid>/stat` field 22 (clock ticks since boot)
+/// on Linux, `ps -o lstart=` elsewhere. `None` when there is no such
+/// process.
+fn process_start(pid: i32) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        // Fields after the parenthesized command name start at field 3.
+        let (_, rest) = stat.rsplit_once(") ")?;
+        rest.split_whitespace().nth(19).map(str::to_owned)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let output = std::process::Command::new("ps")
+            .args(["-o", "lstart=", "-p", &pid.to_string()])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        let start = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        (output.status.success() && !start.is_empty()).then_some(start)
+    }
+}
+
+/// The current identities of `pids` that are alive outside the node's
+/// process group. Blocking.
+fn identify(pids: &[i32]) -> Vec<Helper> {
+    pids.iter()
+        .filter_map(|&pid| current_identity(pid).map(|start| Helper { pid, start }))
+        .collect()
+}
+
+/// Merge the snapshot `found` into `descendants`.
+async fn remember(descendants: &Arc<Mutex<Vec<Helper>>>, found: Vec<i32>) {
+    let descendants = descendants.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        let found = identify(&found);
+        let mut known = lock(&descendants);
+        *known = merge_snapshot(&known, &found, current_identity);
+    })
+    .await;
 }
 
 /// The pids of processes whose environment carries `RUN_MARKER_ENV=marker`.
@@ -827,7 +907,8 @@ async fn marked_processes(marker: &str) -> Vec<i32> {
 /// descendants seen while it ran: after it exits, helpers in their own
 /// process groups are no longer its descendants, so they and their own
 /// descendants are swept from that snapshot (and, on Linux, from the run
-/// marker). Snapshots only add to the known set (see [`merge_snapshot`]).
+/// marker). Snapshots only add to the known set, and every entry is
+/// revalidated by start time before the sweep (see [`merge_snapshot`]).
 /// Remaining gap, outside Linux or for a helper that clears its
 /// environment: a helper that leaves the provider's process group after the
 /// last snapshot of a provider that then exits by itself is missed.
