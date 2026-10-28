@@ -441,6 +441,52 @@ jobs:
             --source-root "$GITHUB_WORKSPACE/.suggested-prompts-contract-source" \
             --source-commit "$SOURCE_COMMIT" --component intentd --component-root "$GITHUB_WORKSPACE" \
             | tee -a "$GITHUB_STEP_SUMMARY"
+      # Four more exact single-file copies of monorepo fixtures, each with a
+      # lock naming the intent-hq/intent commit it was exported from
+      # (docs/protocol/README.md "Copied fixtures"). Re-export, never edit:
+      #   node <monorepo>/scripts/<name>-contract.mjs export --source-root <monorepo> \
+      #     --source-commit <merged sha> --component intentd --component-root .
+      - name: Checkout canonical single-file fixture copies
+        uses: actions/checkout@v7
+        with:
+          repository: intent-hq/intent
+          path: .fixture-copy-source
+          persist-credentials: false
+          # Each lock may name a different commit; trees only until checkout.
+          fetch-depth: 0
+          filter: blob:none
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /scripts/lib/fixture-copy.mjs
+            /scripts/scripts-compact-contract.mjs
+            /scripts/note-truncated-read-contract.mjs
+            /scripts/checkout-repo-config-contract.mjs
+            /scripts/event-stream-recovery-contract.mjs
+            /docs/protocol/fixtures/scripts/compact.json
+            /docs/protocol/fixtures/notes/truncated-read.json
+            /docs/protocol/fixtures/checkout-repo-config.json
+            /docs/protocol/fixtures/event-stream-recovery/contract.json
+      - name: Verify single-file fixture copy provenance
+        run: |
+          set -euo pipefail
+          source_root="$GITHUB_WORKSPACE/.fixture-copy-source"
+          while read -r name lock; do
+            commit=$(node -e '
+              const lock = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"));
+              if (lock.sourceRepository !== "intent-hq/intent" || !/^[0-9a-f]{40}$/.test(lock.sourceCommit)) {
+                throw new Error(`${process.argv[1]} must pin a full intent-hq/intent commit`);
+              }
+              console.log(lock.sourceCommit);' "$lock")
+            git -C "$source_root" checkout -q --detach "$commit"
+            node "$source_root/scripts/$name-contract.mjs" verify --source-root "$source_root" \
+              --source-commit "$commit" --component intentd --component-root "$GITHUB_WORKSPACE" \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+          done <<'COPIES'
+          scripts-compact crates/intent-acp/tests/fixtures/scripts-compact.lock.json
+          note-truncated-read crates/intent-core/tests/fixtures/truncated-read.lock.json
+          checkout-repo-config crates/intent-core/tests/goldens/checkout_repo_config.lock.json
+          event-stream-recovery crates/intent-transport/src/events/fixtures/event-stream-recovery.lock.json
+          COPIES
       # Release PRs run this job too: a release that would split the intentd
       # version_group (intent-hq/intentd#2461) fails here before it merges.
       - name: Check release-plz version groups stay in lockstep
