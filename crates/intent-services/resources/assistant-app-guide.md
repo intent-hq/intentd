@@ -839,8 +839,10 @@ Primary**.
 Newer or test builds may instead offer a **Primary client** submenu. Where present,
 it shows the current primary client and **Offline** when disconnected; the menu
 button may also show a red dot. Choose **This app**, then confirm **Set as Primary**.
-If that choice is unavailable, a line below it explains missing access or browser
-support. The submenu replaces the separate warning indicator in those builds.
+When missing access or browser support blocks the choice, a line below explains
+why. It can also be unavailable while client or connection information refreshes,
+or when this app is already selected. The submenu replaces the separate warning
+indicator in those builds.
 
 Switching ends active desktop control and moves agent-owned browser tabs to that
 client without preserving page state; tabs you opened yourself stay where they
