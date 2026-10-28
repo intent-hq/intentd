@@ -67,7 +67,7 @@ fn welcome() -> WelcomeFn {
 struct FakeNode {
     listener: NodeListener,
     certificate: TlsCertificate,
-    dir: tempfile::TempDir,
+    _dir: tempfile::TempDir,
 }
 
 impl FakeNode {
@@ -83,7 +83,7 @@ impl FakeNode {
         Self {
             listener,
             certificate,
-            dir,
+            _dir: dir,
         }
     }
 
@@ -638,7 +638,7 @@ async fn a_stop_is_sent_once_now_or_after_the_next_bind() {
     let mut fake = FakeNode {
         listener,
         certificate,
-        dir,
+        _dir: dir,
     };
     let mut link = fake.accept().await;
     link.expect(|frame| match frame {
@@ -786,12 +786,12 @@ mod config {
     }
 }
 
+#[cfg(unix)]
 mod services {
     use super::*;
     use crate::RemoteServicesExt as _;
     use intent_services::feature_api::Services;
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn the_connector_starts_only_with_a_configuration() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -822,7 +822,6 @@ mod services {
         let node = services.remote_node().expect("connector registered");
         assert_eq!(node.status().node_name, NODE);
         node.shutdown();
-        drop(fake.dir);
     }
 }
 
@@ -919,7 +918,7 @@ async fn a_prompt_waiting_for_the_link_is_not_sent_after_a_stop() {
     let mut fake = FakeNode {
         listener,
         certificate,
-        dir,
+        _dir: dir,
     };
     let mut link = fake.accept().await;
     link.expect(|frame| match frame {
