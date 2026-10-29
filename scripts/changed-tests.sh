@@ -26,9 +26,12 @@
 # queue's coverage-e2e / coverage-all jobs use, with the same env and the same
 # auggie_context_e2e exclusion (see scripts/coverage-e2e.sh):
 #   INTENTD_TEST_TIMEOUT_MULTIPLIER=3 cargo llvm-cov --no-report nextest <plan>
-#       [--build-jobs N] [--test-threads N] -E 'not test(/^auggie_context_e2e::/)'
+#       [--build-jobs N] [--test-threads N] --no-tests=warn
+#       -E 'not test(/^auggie_context_e2e::/)'
 # (a plan that carries its own -E has the exclusion ANDed into it, since
-# nextest ORs repeated -E flags).
+# nextest ORs repeated -E flags). --no-tests=warn: a changed test file whose
+# every test is #[ignore] selects zero runnable tests, which nextest otherwise
+# fails as "no tests to run" (exit 4; coverage-changed on intentd#2787).
 # No `cargo llvm-cov clean`, no report: the point is executing the changed
 # tests under instrumentation (intent-hq/intentd#1947), not a coverage number.
 # --instrumented cannot be combined with --runner (usage error).
@@ -920,9 +923,12 @@ extra=""
 [[ -n "$test_threads" ]] && extra+=" --test-threads $test_threads"
 
 # The instrumented form mirrors scripts/coverage-e2e.sh: same env, same
-# auggie_context_e2e exclusion (it needs a real auggie binary).
+# auggie_context_e2e exclusion (it needs a real auggie binary). A plan whose
+# selected tests are all #[ignore] runs zero tests; that warns instead of
+# failing the coverage-changed job (intentd#2787).
 cov_env="INTENTD_TEST_TIMEOUT_MULTIPLIER=3"
 cov_filter="not test(/^auggie_context_e2e::/)"
+cov_no_tests="--no-tests=warn"
 
 # Splits plan $1 (flags assembled above: no quoting, no glob characters) into
 # plan_args and its filterset plan_expr. Under --instrumented plan_expr also
@@ -955,7 +961,7 @@ describe() {
   local tail=""
   [[ -z "$plan_expr" ]] || tail=" -E '$plan_expr'"
   if [[ -n "$instrumented" ]]; then
-    echo "$cov_env cargo llvm-cov --no-report nextest ${plan_args[*]}$extra$tail"
+    echo "$cov_env cargo llvm-cov --no-report nextest ${plan_args[*]}$extra $cov_no_tests$tail"
   else
     echo "cargo nextest run ${plan_args[*]}$extra$tail"
   fi
@@ -993,6 +999,7 @@ while IFS= read -r -u 3 plan; do
   plan_words "$plan"
   # shellcheck disable=SC2086
   set -- "${plan_args[@]}" $extra
+  [[ -z "$instrumented" ]] || set -- "$@" "$cov_no_tests"
   [[ -z "$plan_expr" ]] || set -- "$@" -E "$plan_expr"
   scope_index=$((scope_index + 1))
   set +e
