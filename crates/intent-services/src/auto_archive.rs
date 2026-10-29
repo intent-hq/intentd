@@ -11,7 +11,7 @@
 //! workspaces (archiving would remove the guests), and any workspace with
 //! work in flight — a running agent turn, a running script or background
 //! worker, an active hook or an active PR monitor — and any workspace whose
-//! git roots hold uncommitted changes or unpushed commits
+//! folder's git roots hold uncommitted changes or unpushed commits
 //! ([`crate::local_work::LocalWorkRule::Archive`]). Each workspace is
 //! archived independently: a failure is logged and counted, never aborts the
 //! sweep. Archived rows are not due any more, so a sweep is idempotent.
@@ -36,8 +36,8 @@ const FIRST_SWEEP_DELAY: Duration = Duration::from_secs(180);
 pub struct AutoArchiveReport {
     /// Workspaces archived by this sweep.
     pub archived: usize,
-    /// Idle workspaces skipped (remote, guest-shared, pending delete, or
-    /// work in flight).
+    /// Idle workspaces skipped (guest-shared, pending delete, work in
+    /// flight, or uncommitted / unpushed git work in the folder).
     pub skipped: usize,
     /// Workspaces whose archive attempt failed (logged as a warning;
     /// retried next sweep).
@@ -118,14 +118,24 @@ impl Services {
             }
             // The listed row may be stale: re-read right before archiving so
             // a message or a manual archive since the listing wins.
-            match self.store.get_workspace(&ws.id).await {
-                Ok(fresh) if auto_archive_due(&fresh, cutoff) => {}
+            let fresh = match self.store.get_workspace(&ws.id).await {
+                Ok(fresh) if auto_archive_due(&fresh, cutoff) => fresh,
                 Ok(_) => continue,
                 Err(e) => {
                     tracing::warn!(workspace = %ws.id, error = %e, "auto-archive: re-read failed");
                     report.failed += 1;
                     continue;
                 }
+            };
+            // The only check that runs git: after the cheap checks and the
+            // re-read, as close to the archive as possible.
+            if let Some(reason) = self
+                .blocked_by_local_work(&fresh, crate::local_work::LocalWorkRule::Archive)
+                .await
+            {
+                tracing::debug!(workspace = %ws.id, reason, "auto-archive: local git work, skipped");
+                report.skipped += 1;
+                continue;
             }
             if self.workspace_activity(&ws.id) == WorkspaceActivity::AgentRunning {
                 report.skipped += 1;
@@ -188,9 +198,7 @@ impl Services {
             Ok(_) => return Some("active PR monitor"),
             Err(_) => return Some("PR monitor lookup failed"),
         }
-        // Last: the only check that runs git.
-        self.blocked_by_local_work(ws, crate::local_work::LocalWorkRule::Archive)
-            .await
+        None
     }
 
     /// Spawn the auto-archive loop: a first sweep shortly after startup,

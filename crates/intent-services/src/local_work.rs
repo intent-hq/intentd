@@ -2,21 +2,23 @@
 //! "Automatic archive" and "Automatic purge"), read from one
 //! `workspace.localChanges` evaluation.
 //!
-//! Both sweeps share the evaluation and the per-root walk; they differ in
-//! which work counts:
+//! Both sweeps share the evaluation and the per-root walk, and both look
+//! only at the workspace's own folder: the primary worktree and secondary
+//! roots inside it. A secondary root outside the folder (e.g. the user's own
+//! checkout, possibly registered by many workspaces) is not this workspace's
+//! work and never blocks either sweep. They differ in which work counts:
 //!
 //! - [`LocalWorkRule::Archive`] — the workspace is still in progress while
-//!   any of its roots (primary or secondary, wherever it lives) has
-//!   uncommitted changes or commits on no remote-tracking ref. A repository
-//!   with no remote refs at all has nothing to push, so only its
-//!   uncommitted changes count.
+//!   any of those roots has uncommitted changes or commits on no
+//!   remote-tracking ref. A repository with no remote refs at all has
+//!   nothing to push, so only its uncommitted changes count.
 //! - [`LocalWorkRule::Purge`] — only work the purge would destroy counts:
-//!   uncommitted changes in any root inside the folder, and unpushed commits
-//!   in a secondary root inside it (the primary branch is kept). Roots
-//!   outside the folder survive the purge and never block it.
+//!   uncommitted changes in any of those roots, and unpushed commits in a
+//!   nested secondary root (the primary branch is kept).
 //!
-//! Under either rule a relevant root that could not be evaluated blocks, so
-//! the sweep retries on its next run instead of guessing.
+//! Under either rule a relevant root that could not be evaluated, or a row
+//! missing a field the rule needs, blocks, so the sweep retries on its next
+//! run instead of guessing.
 
 use std::path::Path;
 
@@ -55,7 +57,7 @@ pub(crate) fn local_work_blocker(
                 .is_some_and(|path| {
                     folder.is_some_and(|folder| Path::new(path).starts_with(folder))
                 });
-        if rule == LocalWorkRule::Purge && !inside {
+        if !inside {
             continue;
         }
         if root.get("error").is_some_and(|e| !e.is_null()) {
@@ -74,12 +76,13 @@ pub(crate) fn local_work_blocker(
         }
         match rule {
             LocalWorkRule::Archive => {
-                let has_remote = root
+                match root
                     .get("hasRemoteRefs")
                     .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false);
-                if has_remote {
-                    return Some("unpushed commits");
+                {
+                    Some(false) => {}
+                    Some(true) => return Some("unpushed commits"),
+                    None => return Some("local changes could not be evaluated"),
                 }
             }
             LocalWorkRule::Purge => {
@@ -179,9 +182,10 @@ mod tests {
     }
 
     /// Auto-archive is blocked by uncommitted changes or unpushed commits in
-    /// any root — the primary branch and repositories outside the folder
-    /// included — and by an unreadable root. A repository with no remote
-    /// refs has nothing to push, so only its uncommitted changes count.
+    /// the folder's roots — the primary branch included — and by an
+    /// unreadable root or a row without `hasRemoteRefs`. A repository with
+    /// no remote refs has nothing to push, so only its uncommitted changes
+    /// count. Repositories outside the folder never block it.
     #[test]
     fn archive_blocker_keeps_any_unsaved_or_unpushed_work_active() {
         let folder = Some(Path::new("/ws/one"));
@@ -199,16 +203,29 @@ mod tests {
             "unlike purge, the primary branch's unpushed commits block"
         );
 
-        let outside = json!({ "roots": [row("primary", "/ws/one", 0, 0), row("secondary", "/elsewhere/clone", 0, 1)] });
+        let nested = json!({ "roots": [row("primary", "/ws/one", 0, 0), row("secondary", "/ws/one/packages/sub", 0, 1)] });
+        assert_eq!(archive_blocker(&nested, folder), Some("unpushed commits"));
+        let nested_dirty = json!({ "roots": [row("secondary", "/ws/one/packages/sub", 3, 0)] });
+        assert_eq!(
+            archive_blocker(&nested_dirty, folder),
+            Some("uncommitted changes")
+        );
+
+        let mut outside_errored = row("secondary", "/elsewhere/clone", 0, 0);
+        outside_errored["error"] = json!("not a git repository");
+        let outside = json!({ "roots": [row("primary", "/ws/one", 0, 0), row("secondary", "/elsewhere/clone", 3, 4), outside_errored] });
         assert_eq!(
             archive_blocker(&outside, folder),
-            Some("unpushed commits"),
-            "a repository outside the folder still holds the workspace's work"
+            None,
+            "a shared or moved repository outside the folder is not this workspace's work"
         );
-        let outside_dirty = json!({ "roots": [row("secondary", "/elsewhere/clone", 3, 0)] });
+
+        let mut no_flag = row("primary", "/ws/one", 0, 1);
+        no_flag.as_object_mut().unwrap().remove("hasRemoteRefs");
         assert_eq!(
-            archive_blocker(&outside_dirty, folder),
-            Some("uncommitted changes")
+            archive_blocker(&json!({ "roots": [no_flag] }), folder),
+            Some("local changes could not be evaluated"),
+            "a row missing hasRemoteRefs fails safe"
         );
 
         let mut no_remote = row("primary", "/ws/one", 0, 1000);
@@ -224,7 +241,7 @@ mod tests {
             Some("uncommitted changes")
         );
 
-        let mut errored = row("secondary", "/elsewhere/clone", 0, 0);
+        let mut errored = row("secondary", "/ws/one/packages/sub", 0, 0);
         errored["error"] = json!("not a git repository");
         assert_eq!(
             archive_blocker(&json!({ "roots": [errored] }), folder),
