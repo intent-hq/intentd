@@ -14,6 +14,11 @@
 //! outcomes, so turn orchestration, queueing and transcripts stay those of a
 //! local agent.
 //!
+//! The node's agents run their `workspace_api` code on the node and forward
+//! the control-plane calls (notes, tasks, agents, PRs, comments, events) to
+//! head over the link; head answers each one only for an agent on the
+//! link's lease, as that agent.
+//!
 //! [`RemoteLaunch`] is the feature's remote-launch port: admission against
 //! the node, placing a created agent on it, and the runtime that starts the
 //! agent there on its first turn.
@@ -40,6 +45,7 @@ mod git;
 mod ingest;
 mod launch;
 mod lease;
+mod rpc;
 mod runtime;
 mod view;
 
@@ -151,7 +157,8 @@ pub(crate) async fn start_configured(services: &Services, data_dir: &Path) -> Re
     if feature.node().is_some() {
         return Ok(false);
     }
-    let node = RemoteNode::start(services.store().clone(), config).await?;
+    let calls = rpc::HeadCalls::new(services.clone());
+    let node = RemoteNode::start(services.store().clone(), config, Some(calls)).await?;
     let mut slot = lock(&feature.node);
     if slot.is_some() {
         node.shutdown();

@@ -1682,3 +1682,68 @@ async fn script_monitor_helpers_refuse_anonymous_and_do_not_escape_chief_scope()
         CHIEF_WORKSPACE_ID
     );
 }
+
+// ============================================================================
+// Frame router (remote agents)
+// ============================================================================
+
+/// Answers `note.*` itself, refuses `script.*`, and leaves the rest to the
+/// bridge's `WorkspaceApi`; records every frame it saw.
+#[derive(Default)]
+struct RecordingRouter {
+    seen: Mutex<Vec<(String, Value)>>,
+}
+
+impl crate::HostFrameRouter for RecordingRouter {
+    fn route(
+        &self,
+        method: &str,
+        args: &Value,
+    ) -> Option<BoxFuture<'static, std::result::Result<Value, String>>> {
+        self.seen
+            .lock()
+            .unwrap()
+            .push((method.to_owned(), args.clone()));
+        if method.starts_with("note.") {
+            let echoed = json!({ "routed": method, "args": args });
+            return Some(Box::pin(async move { Ok(echoed) }));
+        }
+        if method.starts_with("script.") {
+            return Some(Box::pin(async { Err("refused by the router".to_owned()) }));
+        }
+        None
+    }
+}
+
+#[tokio::test]
+async fn frame_router_answers_the_frames_it_claims_and_the_api_answers_the_rest() {
+    let api = Arc::new(FakeApi::default());
+    let router = Arc::new(RecordingRouter::default());
+    let srv = WorkspaceMcpServer::new(api.clone(), WorkspaceId::from_string("ws-1"))
+        .with_caller_agent_id(Some(AgentId::from_string("agent-1")))
+        .with_frame_router(router.clone());
+
+    let routed = call(&srv, r#"return await ws.note.read("n-1");"#).await;
+    assert_eq!(routed["result"]["isError"], json!(false), "{routed}");
+    let routed = body(&routed);
+    assert_eq!(routed["routed"], json!("note.read"));
+    assert_eq!(routed["args"]["id"], json!("n-1"));
+
+    let refused = call(&srv, "return await ws.script.list();").await;
+    assert_eq!(refused["result"]["isError"], json!(true), "{refused}");
+    assert!(text(&refused).contains("refused by the router"), "{refused}");
+    assert_eq!(*api.script_list_calls.lock().unwrap(), 0);
+
+    let local = call(&srv, r#"return await ws.file.read("a.txt");"#).await;
+    assert_eq!(local["result"]["isError"], json!(false), "{local}");
+    assert_eq!(*api.file_read_calls.lock().unwrap(), vec!["a.txt".to_owned()]);
+
+    let seen: Vec<String> = router
+        .seen
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(method, _)| method.clone())
+        .collect();
+    assert_eq!(seen, ["note.read", "script.list", "file.read"]);
+}

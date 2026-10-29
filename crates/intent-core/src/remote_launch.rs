@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use crate::placement::AgentPlacement;
 use crate::{AgentId, WorkspaceId};
 
+pub mod workspace_api;
+
 /// Place the just-created agent `agent_id` on the node its admission
 /// resolved (`view`): record it on the node's lease and point its `base`
 /// ref at `view.base_commit`. Its provider process starts on its first turn.

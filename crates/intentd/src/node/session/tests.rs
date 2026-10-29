@@ -32,6 +32,7 @@ fn harness() -> Harness {
         providers: BTreeMap::new(),
         checkouts: crate::node::checkout::PlainCheckouts::new(storage),
         journal,
+        mcp_bridge_exe: std::env::current_exe().unwrap(),
     });
     Harness { runner, _dir: dir }
 }

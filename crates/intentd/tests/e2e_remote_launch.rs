@@ -247,6 +247,37 @@ fn start_node(dir: &Path, node_bin: &Path) -> (GuardedChild, String, String) {
     )
 }
 
+/// Send `content` to the agent, wait for its turn to end, and return its
+/// reply. `id` and `id + 1` are the RPC ids used.
+async fn turn(
+    rpc_ws: &mut common::TlsWs,
+    events: &mut common::TlsWs,
+    (ws_id, agent_id): (&str, &str),
+    content: &str,
+    id: i64,
+) -> String {
+    ok(
+        rpc_ws,
+        id,
+        "agent.sendMessage",
+        json!({ "workspaceId": ws_id, "agentId": agent_id, "content": content }),
+    )
+    .await;
+    let end = event(events, "agent:stream:end").await;
+    assert_eq!(end["data"]["agentId"], agent_id, "{end}");
+    let got = ok(
+        rpc_ws,
+        id + 1,
+        "agent.get",
+        json!({ "workspaceId": ws_id, "agentId": agent_id }),
+    )
+    .await;
+    got["agent"]["lastAgentResponse"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned()
+}
+
 async fn seed_workspace(data_dir: &Path, repo: &Path) -> String {
     use intent_core::{now_iso, Workspace, WorkspaceId};
     let store = intent_store::Store::open(&data_dir.join("intentd.db"))
@@ -464,6 +495,37 @@ async fn remote_agent_launches_streams_stops_and_leaves_its_wip_ref() {
     );
     assert_eq!(got["effectiveIsolation"], "isolated", "{got}");
 
+    // workspace_api on the node: a note goes to head as the agent, a file
+    // write lands in the node's worktree (and comes back in the wip ref),
+    // and a namespace the node cannot serve fails by name.
+    let wsapi = r#"wsapi const note = await ws.note.create("From the node", "remote body"); await ws.file.write("remote.txt", "node work"); return JSON.stringify({ note: note.id });"#;
+    let reply = turn(&mut rpc_ws, &mut events, (&ws_id, &agent_id), wsapi, 95).await;
+    assert!(reply.starts_with("wsapi: "), "{reply}");
+    let notes = ok(
+        &mut rpc_ws,
+        97,
+        "note.list",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    assert!(
+        notes.to_string().contains("From the node"),
+        "the forwarded note is on head: {notes}"
+    );
+    let refused = turn(
+        &mut rpc_ws,
+        &mut events,
+        (&ws_id, &agent_id),
+        "wsapi return await ws.script.list();",
+        98,
+    )
+    .await;
+    assert!(
+        refused.starts_with("wsapi-error: ")
+            && refused.contains("is not supported on remote agents yet"),
+        "{refused}"
+    );
+
     // Stop: the node pushes the agent's work before it exits.
     ok(
         &mut rpc_ws,
@@ -488,6 +550,20 @@ async fn remote_agent_launches_streams_stops_and_leaves_its_wip_ref() {
     // The node's worktree started from the commit, not head's dirty tree:
     // its README is the committed one.
     assert_eq!(git(&repo, &["show", &format!("{wip}:README.md")]), "base");
+    assert_eq!(
+        git(&repo, &["show", &format!("{wip}:remote.txt")]),
+        "node work"
+    );
+    // The provider reached the node's workspace API the way a real one
+    // does: through the node's own `intentd mcp-bridge`.
+    let bridge: Value =
+        serde_json::from_str(&git(&repo, &["show", &format!("{wip}:mcp-bridge.json")])).unwrap();
+    assert!(
+        bridge["command"].as_str().unwrap().ends_with("intentd"),
+        "{bridge}"
+    );
+    assert_eq!(bridge["args"][0], "mcp-bridge", "{bridge}");
+    assert_eq!(bridge["args"][1], "--connect", "{bridge}");
     let wip_files = git(&repo, &["ls-tree", "--name-only", &wip]);
     assert!(wip_files.lines().any(|f| f == "agent.pid"), "{wip_files}");
     assert_eq!(

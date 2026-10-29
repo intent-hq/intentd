@@ -121,6 +121,22 @@ pub struct WorkspaceMcpServer {
     repository_guidance: Option<GuidanceBinding>,
     /// Original endpoint context; no runtime construction path installs it yet.
     request_context: Option<Arc<dyn McpRequestContext>>,
+    /// Sees every `host({method, args})` frame before the local dispatch;
+    /// `None` (every head-side bridge) dispatches all frames locally.
+    frame_router: Option<Arc<dyn HostFrameRouter>>,
+}
+
+/// Decides, per `host({method, args})` frame, whether the bridge handles it
+/// itself. A remote agent's node uses it to forward control-plane calls to
+/// head and refuse the namespaces a node cannot serve.
+pub trait HostFrameRouter: Send + Sync {
+    /// The frame's result when the router handles it; `None` dispatches the
+    /// frame to the bridge's `WorkspaceApi` as usual.
+    fn route(
+        &self,
+        method: &str,
+        args: &Value,
+    ) -> Option<intent_core::BoxFuture<'static, std::result::Result<Value, String>>>;
 }
 
 impl WorkspaceMcpServer {
@@ -144,6 +160,7 @@ impl WorkspaceMcpServer {
             compact_tool_descriptions: false,
             repository_guidance: None,
             request_context: None,
+            frame_router: None,
         }
     }
 
@@ -188,6 +205,14 @@ impl WorkspaceMcpServer {
     #[must_use]
     pub fn with_request_context(mut self, context: Arc<dyn McpRequestContext>) -> Self {
         self.request_context = Some(context);
+        self
+    }
+
+    /// Route `host` frames through `router` before the local dispatch (the
+    /// remote node's wiring point).
+    #[must_use]
+    pub fn with_frame_router(mut self, router: Arc<dyn HostFrameRouter>) -> Self {
+        self.frame_router = Some(router);
         self
     }
 
