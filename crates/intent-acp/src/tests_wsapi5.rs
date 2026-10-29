@@ -1726,7 +1726,7 @@ async fn frame_router_answers_the_frames_it_claims_and_the_api_answers_the_rest(
     let answered = call(&srv, r#"return await ws.note.read("n-1");"#).await;
     assert_eq!(answered["result"]["isError"], json!(false), "{answered}");
     let answered = body(&answered);
-    assert_eq!(answered["answered"], json!("note.read"));
+    assert_eq!(answered["routed"], json!("note.read"));
     assert_eq!(answered["args"]["id"], json!("n-1"));
 
     let refused = call(&srv, "return await ws.script.list();").await;
