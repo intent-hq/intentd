@@ -689,7 +689,7 @@ fn enabled_gate_rejects_explicitly_disabled_providers() {
             .expect_err("disabled provider must be rejected");
         assert!(
             matches!(&err, intent_core::Error::InvalidParams(m)
-                if m.contains("not enabled") && m.contains("Settings > Agents")),
+                if m.contains("not enabled") && m.contains("Settings > Providers")),
             "distinct not-enabled rejection for {id}: {err:?}"
         );
     }

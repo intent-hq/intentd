@@ -508,6 +508,42 @@ async fn quick_actions_on_a_missing_profile_require_replacement() {
 }
 
 #[intent_test_macros::daemon_test]
+async fn disabling_default_profile_preserves_selection_and_requires_replacement() {
+    let fx = Fixture::new().await;
+    let work = fx.profile("codex", "Work").await;
+    fx.svc
+        .settings_update_checking_profiles(json!([
+            { "path": "model.defaultProvider", "value": work },
+            { "path": "model.providerDefaults", "value": { work.clone(): "gpt-5" } },
+            { "path": "quickActions.defaultModel", "value": "gpt-5" }
+        ]))
+        .await
+        .unwrap();
+    fx.svc
+        .settings_update_checking_profiles(json!([
+            { "path": "providers.enabled", "value": { "codex": false } }
+        ]))
+        .await
+        .expect("a saved default/profile model must not veto disabling its provider");
+    let settings = fx.svc.effective_settings();
+    assert_eq!(
+        settings.model.default_provider.as_deref(),
+        Some(work.as_str())
+    );
+    assert_eq!(settings.model.provider_defaults[&work], "gpt-5");
+    assert_eq!(
+        settings.quick_actions.default_model.as_deref(),
+        Some("gpt-5")
+    );
+    let err = fx
+        .svc
+        .agent_complete_once_op("hi".into(), None, None, None, None, None, None)
+        .await
+        .unwrap_err();
+    assert_eq!(replacement(&err), (work, "provider-disabled".into()));
+}
+
+#[intent_test_macros::daemon_test]
 async fn models_list_for_a_reference_requires_a_saved_profile() {
     let fx = Fixture::new().await;
     let err = fx

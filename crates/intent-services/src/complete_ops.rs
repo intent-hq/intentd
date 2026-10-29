@@ -459,6 +459,18 @@ impl Services {
             },
         };
 
+        // Keep named-profile replacement errors intact; a bare selection uses
+        // the existing one-shot unavailable result. Check the resolved route,
+        // since a legacy quick-action override can name a different provider.
+        self.ensure_provider_ref_selectable_in(&run_provider, &settings.providers)?;
+        if let Err(error) = crate::agent_ops::ensure_provider_enabled(
+            "agent.completeOnce",
+            &run_provider,
+            settings.providers.enabled.as_ref(),
+        ) {
+            return Ok(unavailable(error));
+        }
+
         let effort = resolve_quick_action_effort(
             &settings,
             quick_action_type.as_deref(),
@@ -900,6 +912,63 @@ mod tests {
             services
         };
         (tmp, services)
+    }
+
+    #[tokio::test]
+    async fn complete_once_disabled_provider_never_launches_default_or_override() {
+        for provider in ["auggie", "codex", "claude-code", "pi"] {
+            for explicit_model in [None, Some("default".to_string())] {
+                let (_tmp, services) = services_with_settings(&[
+                    ("model.defaultProvider", json!(provider)),
+                    ("providers.enabled", json!({ provider: false })),
+                ])
+                .await;
+                let result = services
+                    .agent_complete_once_op(
+                        "hi".into(),
+                        None,
+                        explicit_model,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(result["available"], false, "{provider}: {result}");
+                let reason = result["reason"].as_str().unwrap();
+                assert!(reason.contains("is not enabled"), "{result}");
+                assert!(reason.contains("Settings > Providers"), "{result}");
+            }
+        }
+
+        // The override's route is disabled even though the app default is not.
+        let (_tmp, services) = services_with_settings(&[
+            ("model.defaultProvider", json!("codex")),
+            (
+                "quickActions.typeOverrides",
+                json!({ "commit": "auggie:sonnet4.5" }),
+            ),
+            ("providers.enabled", json!({ "auggie": false })),
+        ])
+        .await;
+        let result = services
+            .agent_complete_once_op(
+                "hi".into(),
+                None,
+                None,
+                Some("commit".into()),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["available"], false);
+        assert!(
+            result["reason"].as_str().unwrap().contains("\"auggie\""),
+            "{result}"
+        );
     }
 
     /// Executable stand-in for a provider's ACP adapter: a shell wrapper that

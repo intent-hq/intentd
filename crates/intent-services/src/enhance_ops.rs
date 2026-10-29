@@ -291,13 +291,21 @@ impl Services {
         // settings, which resolve the gate closed rather than falling through to
         // the first registered provider — return a typed unavailable response so
         // the FE can hide the affordance gracefully without an error crash.
-        let effective_provider =
-            crate::agent_session::derived_default_provider(&self.effective_settings());
+        let settings = self.effective_settings();
+        let effective_provider = crate::agent_session::derived_default_provider(&settings);
         if effective_provider.as_deref() != Some("auggie") {
             return Ok(json!({
                 "available": false,
                 "reason": "enhance-prompt requires auggie as the effective default provider"
             }));
+        }
+
+        if let Err(error) = crate::agent_ops::ensure_provider_enabled(
+            "agent.enhancePrompt",
+            "auggie",
+            settings.providers.enabled.as_ref(),
+        ) {
+            return Ok(json!({ "available": false, "reason": error.to_string() }));
         }
 
         // Optional cwd pin: unknown workspace surfaces as -32602 (NotFound);
