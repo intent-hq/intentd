@@ -206,6 +206,26 @@ async fn active_desktop_session_is_reported_as_target() {
     );
 }
 
+/// A desktop session whose client has no eligible connection is still
+/// reported as the routed `target`, with `resolved: null`.
+#[intent_test_macros::daemon_test]
+async fn offline_desktop_session_client_is_reported_as_target() {
+    let reg = two_clients();
+    let (_t, _r, svc, _bus, ws) = setup(reg).await;
+    svc.feature_desktop()
+        .activate_for_test(&ws, ClientId::from_string("gone-desk"));
+    let state = svc.get_workspace_browser_client(ws.clone()).await.unwrap();
+    svc.feature_desktop().deactivate_for_test();
+    assert_eq!(
+        state,
+        json!({
+            "source": "default",
+            "resolved": null,
+            "target": { "clientId": "gone-desk", "via": "desktop" }
+        })
+    );
+}
+
 /// Model 5: an agent `listTabs` is answered from the registry — every
 /// host aggregated, no reverse call — with the FE field names plus the
 /// host fields, filtered by `scope`.
