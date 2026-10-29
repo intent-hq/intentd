@@ -265,6 +265,16 @@ existing specialist to edit its behavior. Global defaults and a specialist's
 instructions are different scopes. Some agent feature changes apply only to newly
 created sessions; do not promise they alter running conversations.
 
+**Built-in coding specialists.** Developer handles implementation directly and can
+delegate focused work when useful. Coordinator plans and delegates implementation
+to Implementors; a Verifier provides a separate review when the work needs one.
+These defaults keep planning and checks proportional to the change, reuse relevant
+test evidence, and preserve required repository checks. A new harness version
+applies to new sessions; existing sessions keep their captured behavior, and
+custom specialist instructions can override the defaults.
+
+<!-- Sources: packages/intentd/crates/intent-services/resources/specialists/v3.6/; packages/intentd/crates/intent-services/src/{specialists.rs,harness/v3_6.rs}. -->
+
 **Provider profiles (Codex and Claude Code only).** A profile runs the installed
 CLI with its own environment variables, for example a work and a personal account
 or a different endpoint. In **Settings → Providers**, open the ⋯ menu on Codex or

@@ -216,7 +216,7 @@ pub(crate) const EMBEDDED_BUNDLED_V2_5: &[(&str, &str)] = &[
 /// default — the LATEST version's set (the file tiers above it are
 /// user-owned and unversioned). Session-scoped resolution swaps in the
 /// session's pinned bundle via [`SpecialistsService::with_embedded`] (H2).
-const EMBEDDED_BUNDLED: &[(&str, &str)] = EMBEDDED_BUNDLED_V3_1;
+const EMBEDDED_BUNDLED: &[(&str, &str)] = EMBEDDED_BUNDLED_V3_6;
 
 pub(crate) const EMBEDDED_BUNDLED_V3_1: &[(&str, &str)] = &[
     (
@@ -231,6 +231,30 @@ pub(crate) const EMBEDDED_BUNDLED_V3_1: &[(&str, &str)] = &[
     EMBEDDED_BUNDLED_V2_5[6],
     EMBEDDED_BUNDLED_V2_5[7],
     EMBEDDED_BUNDLED_V2_5[8],
+];
+
+pub(crate) const EMBEDDED_BUNDLED_V3_6: &[(&str, &str)] = &[
+    EMBEDDED_BUNDLED_V3_1[0],
+    (
+        "developer",
+        include_str!("../resources/specialists/v3.6/developer.md"),
+    ),
+    (
+        "implementor",
+        include_str!("../resources/specialists/v3.6/implementor.md"),
+    ),
+    EMBEDDED_BUNDLED_V3_1[3],
+    EMBEDDED_BUNDLED_V3_1[4],
+    (
+        "spec-writer",
+        include_str!("../resources/specialists/v3.6/spec-writer.md"),
+    ),
+    EMBEDDED_BUNDLED_V3_1[6],
+    (
+        "verifier",
+        include_str!("../resources/specialists/v3.6/verifier.md"),
+    ),
+    EMBEDDED_BUNDLED_V3_1[8],
 ];
 
 /// The empty embedded floor used when [`REPLACEMENT_DIR_ENV`] replaces the
