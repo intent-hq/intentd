@@ -4075,6 +4075,7 @@ impl Services {
     /// cannot decode). Respawns read this instead of the live settings so a
     /// settings change never alters an existing session's tools/prompt —
     /// matching what `harnessFeatures` reports on the wire.
+    #[must_use]
     pub fn session_agent_features(
         &self,
         session: &AgentSession,

@@ -1723,11 +1723,11 @@ async fn frame_router_answers_the_frames_it_claims_and_the_api_answers_the_rest(
         .with_caller_agent_id(Some(AgentId::from_string("agent-1")))
         .with_frame_router(router.clone());
 
-    let routed = call(&srv, r#"return await ws.note.read("n-1");"#).await;
-    assert_eq!(routed["result"]["isError"], json!(false), "{routed}");
-    let routed = body(&routed);
-    assert_eq!(routed["routed"], json!("note.read"));
-    assert_eq!(routed["args"]["id"], json!("n-1"));
+    let answered = call(&srv, r#"return await ws.note.read("n-1");"#).await;
+    assert_eq!(answered["result"]["isError"], json!(false), "{answered}");
+    let answered = body(&answered);
+    assert_eq!(answered["answered"], json!("note.read"));
+    assert_eq!(answered["args"]["id"], json!("n-1"));
 
     let refused = call(&srv, "return await ws.script.list();").await;
     assert_eq!(refused["result"]["isError"], json!(true), "{refused}");

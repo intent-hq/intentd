@@ -197,7 +197,7 @@ async fn namespaces_a_node_cannot_serve_are_refused_by_name() {
         "return await ws.terminal.list();",
         "return await ws.hook.list();",
         "return await ws.desktop.listDisplay();",
-        r#"return await ws.browser.listTabs();"#,
+        "return await ws.browser.listTabs();",
         "return await ws.workspace.info();",
         r#"return await ws.file.getAttachment("att-1");"#,
         r#"return await ws.git.registerRoot("sub");"#,

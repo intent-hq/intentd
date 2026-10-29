@@ -878,13 +878,13 @@ fn make_workspace_host_with_pending(
             seq
         });
         Box::pin(async move {
-            let routed = router.as_ref().and_then(|router| {
+            let claimed = router.as_ref().and_then(|router| {
                 let method = arg.get("method").and_then(Value::as_str)?;
                 let args = arg.get("args").cloned().unwrap_or(Value::Null);
                 router.route(method, &args)
             });
-            let result = match routed {
-                Some(routed) => routed.await,
+            let result = match claimed {
+                Some(claimed) => claimed.await,
                 None => {
                     workspace_host_dispatch(
                         api,

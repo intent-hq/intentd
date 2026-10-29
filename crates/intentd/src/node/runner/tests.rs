@@ -635,7 +635,7 @@ async fn node_runner_reports_a_failed_checkout_as_the_agents_exit() {
     assert!(h.checkouts.pushes.lock().unwrap().is_empty());
 }
 
-/// The text of the turn's `wsapi` line (the fixture's workspace_api result).
+/// The text of the turn's `wsapi` line (the fixture's `workspace_api` result).
 fn wsapi_line(all: &[JournalRecord], turn: &str) -> String {
     all.iter()
         .filter(|r| r.turn_id.as_deref() == Some(turn))
