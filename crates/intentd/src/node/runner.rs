@@ -198,8 +198,14 @@ impl Redactor {
         })
     }
 
-    /// Mask secrets anywhere in arbitrary provider data (tool input and
-    /// output, metadata, prose): every string and every object key.
+    /// Fields whose content is free-form provider data, not ACP schema:
+    /// their object keys are data too and are masked.
+    const FREE_FORM: [&'static str; 3] = ["rawInput", "rawOutput", "_meta"];
+
+    /// Mask secrets in provider data: every string value. Object keys are
+    /// kept, since outside [`Self::FREE_FORM`] they are ACP field names
+    /// (an embedded resource's `text`, a location's `path`) that head needs
+    /// to parse the update; inside a free-form field the keys are masked too.
     fn value(&self, value: &mut Value) {
         if self.secrets.is_empty() {
             return;
@@ -208,11 +214,33 @@ impl Redactor {
             Value::String(text) => *text = self.text(std::mem::take(text)),
             Value::Array(items) => items.iter_mut().for_each(|item| self.value(item)),
             Value::Object(map) => {
+                for (key, item) in map.iter_mut() {
+                    if Self::FREE_FORM.contains(&key.as_str()) {
+                        self.data(item);
+                    } else {
+                        self.value(item);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Mask secrets in free-form data (a tool's raw input or output, `_meta`):
+    /// every string and every object key.
+    fn data(&self, value: &mut Value) {
+        if self.secrets.is_empty() {
+            return;
+        }
+        match value {
+            Value::String(text) => *text = self.text(std::mem::take(text)),
+            Value::Array(items) => items.iter_mut().for_each(|item| self.data(item)),
+            Value::Object(map) => {
                 let entries = std::mem::take(map);
                 *map = entries
                     .into_iter()
                     .map(|(key, mut item)| {
-                        self.value(&mut item);
+                        self.data(&mut item);
                         (self.text(key), item)
                     })
                     .collect();
@@ -226,8 +254,14 @@ impl Redactor {
     /// the update's variant tag, tool kind/status/id, content block and
     /// tool-content tags, plan entry status/priority) are kept as sent, so
     /// head can still parse the update even when a short secret equals a
-    /// protocol word; everything else, including tool `rawInput` /
-    /// `rawOutput` at any depth, is masked with [`Self::value`].
+    /// protocol word; every other string is masked with [`Self::value`], and
+    /// tool `rawInput` / `rawOutput` / `_meta` with [`Self::data`] (keys too).
+    ///
+    /// Accepted v1 limit: a secret identical to an ACP enum word not listed
+    /// here (for example an annotation audience `user`) is masked in that
+    /// position, so head cannot parse that one update and drops it. This
+    /// fails closed (nothing leaks), and real provider credentials are long
+    /// random strings, so it is not expected in practice.
     fn notification(&self, params: &mut Value) {
         if self.secrets.is_empty() {
             return;
@@ -287,6 +321,9 @@ impl Redactor {
             match field(key, item) {
                 Keep::Id if item.is_string() => {}
                 Keep::Walk(walk) => walk(self, item),
+                Keep::Id | Keep::Mask if Self::FREE_FORM.contains(&key.as_str()) => {
+                    self.data(item);
+                }
                 Keep::Id | Keep::Mask => self.value(item),
             }
         }

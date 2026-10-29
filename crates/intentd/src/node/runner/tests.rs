@@ -915,9 +915,20 @@ fn the_redactor_masks_credentials_and_long_values_but_not_short_settings_or_acco
         redactor.text("a abcdef-secret-long b secret-long 1 pw1 /home/node/.codex-work".into()),
         "a [redacted] b [redacted] 1 [redacted] /home/node/.codex-work"
     );
-    let mut value = json!({ "k": ["x secret-long"], "secret-long": 1 });
+    let mut value = json!({
+        "k": ["x secret-long"],
+        "secret-long": 1,
+        "rawOutput": { "secret-long": "secret-long" },
+    });
     redactor.value(&mut value);
-    assert_eq!(value, json!({ "k": ["x [redacted]"], "[redacted]": 1 }));
+    assert_eq!(
+        value,
+        json!({
+            "k": ["x [redacted]"],
+            "secret-long": 1,
+            "rawOutput": { "[redacted]": "[redacted]" },
+        })
+    );
     let none = Redactor::new(None);
     assert_eq!(none.text("secret-long".into()), "secret-long");
 }
@@ -1021,5 +1032,75 @@ fn the_redactor_masks_tool_payloads_but_keeps_schema_identifiers() {
             params: params.clone(),
         });
         assert!(mapped.is_some(), "{secret}: unparseable update {params}");
+    }
+}
+
+/// Outside a tool's free-form `rawInput` / `rawOutput` / `_meta`, field names
+/// are never rewritten: an embedded resource and a tool call's locations
+/// keep their required keys, and the update still parses, even when the
+/// credential is the field name itself.
+#[test]
+fn the_redactor_keeps_resource_and_location_keys() {
+    for secret in ["text", "path", "uri"] {
+        let profile = ProfileEnv::new(
+            "codex@work",
+            "f1",
+            vec![("CODEX_ACCESS_TOKEN".into(), Some(secret.into()))],
+        );
+        let redactor = Redactor::new(Some(&profile));
+        let mut resource = json!({
+            "sessionId": "s1",
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {
+                    "type": "resource",
+                    "resource": {
+                        "uri": "file:///notes.md",
+                        "mimeType": "text/markdown",
+                        "text": format!("leaked {secret}"),
+                    },
+                },
+            },
+        });
+        redactor.notification(&mut resource);
+        let embedded = &resource["update"]["content"]["resource"];
+        assert_eq!(
+            embedded["text"], "leaked [redacted]",
+            "{secret}: {resource}"
+        );
+        assert!(embedded.get("uri").is_some(), "{secret}: {resource}");
+        let mut tool = json!({
+            "sessionId": "s1",
+            "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call-1",
+                "title": "edit",
+                "kind": "edit",
+                "status": "pending",
+                "locations": [{ "path": format!("/work/{secret}.md"), "line": 3 }],
+                "rawInput": { secret: format!("value {secret}") },
+                "_meta": { secret: 1 },
+            },
+        });
+        redactor.notification(&mut tool);
+        let update = &tool["update"];
+        assert_eq!(update["locations"][0]["path"], "/work/[redacted].md");
+        assert_eq!(
+            update["rawInput"],
+            json!({ "[redacted]": "value [redacted]" })
+        );
+        assert_eq!(update["_meta"], json!({ "[redacted]": 1 }));
+        for (what, params) in [("resource", &resource), ("tool", &tool)] {
+            let mapped = intent_acp::session::map_notification(&intent_acp::IncomingNotification {
+                method: "session/update".into(),
+                params: params.clone(),
+            });
+            assert!(mapped.is_some(), "{secret}: unparseable {what} {params}");
+        }
+        assert_eq!(
+            tool["update"]["locations"].as_array().map(Vec::len),
+            Some(1),
+            "{secret}"
+        );
     }
 }
