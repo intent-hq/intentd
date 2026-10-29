@@ -19,8 +19,8 @@ use tokio::sync::{mpsc, oneshot, watch};
 use intent_acp::session::ActivityTracker;
 use intent_acp::{
     ClientRequestHandler, Connection, ConnectionHooks, EventSink, FileService,
-    IncomingNotification, IncomingRequest, PermissionPolicy, PermissionRegistry, SinkEvent,
-    SpawnOptions,
+    IncomingNotification, IncomingRequest, PermissionPolicy, PermissionRegistry, ProfileEnv,
+    SinkEvent, SpawnOptions,
 };
 use intent_core::node_link::{JournalBody, JournalRecord, LaunchCommand, LeaseBinding};
 use intent_core::nodes::NodeCounter;
@@ -39,6 +39,10 @@ pub(super) mod codes {
     pub const PROVIDER: &str = "node-provider-unavailable";
     /// The provider process could not be started or set up.
     pub const START: &str = "node-agent-start-failed";
+    /// The selected provider profile cannot be used on this node (a missing
+    /// account folder, or an overlay the node cannot read). Nothing falls
+    /// back to the node's own login.
+    pub const PROFILE: &str = "node-profile-unavailable";
     /// The agent's checkout of its base commit could not be prepared.
     pub const CHECKOUT: &str = "node-checkout-failed";
     /// The agent is not running on this node.
@@ -80,6 +84,9 @@ pub(super) struct RunnerConfig {
     pub providers: BTreeMap<String, ProviderLaunch>,
     pub checkouts: Arc<dyn Checkouts>,
     pub journal: Journal,
+    /// The node user's home: a leading `~` in a profile's account directory
+    /// expands against it.
+    pub home: Option<PathBuf>,
     /// The executable providers run as `mcp-bridge` to reach an agent's
     /// workspace MCP server.
     pub mcp_bridge_exe: PathBuf,
@@ -96,6 +103,7 @@ struct Inner {
     policy: PermissionPolicy,
     providers: BTreeMap<String, ProviderLaunch>,
     checkouts: Arc<dyn Checkouts>,
+    home: Option<PathBuf>,
     mcp_bridge_exe: PathBuf,
     /// The newest bound link; agents forward control-plane calls on it.
     head: HeadLink,
@@ -145,6 +153,201 @@ struct Agent {
     descendants: Arc<Mutex<Vec<i32>>>,
     /// This run's [`RUN_MARKER_ENV`] value.
     run_marker: String,
+    /// Scrubs the profile's secret values from what the agent journals.
+    redactor: Arc<Redactor>,
+}
+
+/// Replaces a launch profile's secret values with [`Redactor::MASK`] in the
+/// provider-originated text the node journals or logs (session updates and
+/// provider error messages, which can echo a rejected credential). Every
+/// value of a credential-named variable (`*_API_KEY`, `*_TOKEN`, `*SECRET*`,
+/// `*PASSWORD*`, ...; [`intent_acp::is_likely_secret_env_key`]) is masked
+/// whatever its length; another variable's value is masked from
+/// [`Redactor::MIN_LEN`] bytes, so a short setting such as `1` does not
+/// scrub ordinary text. Account-folder paths are not secrets.
+#[derive(Default)]
+struct Redactor {
+    /// Longest first, so a secret containing another is masked whole.
+    secrets: Vec<String>,
+}
+
+impl Redactor {
+    const MASK: &'static str = "[redacted]";
+    const MIN_LEN: usize = 8;
+
+    fn new(profile: Option<&ProfileEnv>) -> Self {
+        let mut secrets: Vec<String> = profile
+            .into_iter()
+            .flat_map(ProfileEnv::entries)
+            .filter(|(key, _)| {
+                !intent_acp::profile_env::ACCOUNT_DIR_KEYS
+                    .iter()
+                    .any(|dir| dir.eq_ignore_ascii_case(key))
+            })
+            .filter_map(|(key, value)| {
+                let value = value.filter(|value| !value.is_empty())?;
+                (intent_acp::is_likely_secret_env_key(key) || value.len() >= Self::MIN_LEN)
+                    .then(|| value.to_owned())
+            })
+            .collect();
+        secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+        secrets.dedup();
+        Self { secrets }
+    }
+
+    fn text(&self, text: String) -> String {
+        if !self
+            .secrets
+            .iter()
+            .any(|secret| text.contains(secret.as_str()))
+        {
+            return text;
+        }
+        self.secrets.iter().fold(text, |text, secret| {
+            text.replace(secret.as_str(), Self::MASK)
+        })
+    }
+
+    /// Fields whose content is free-form provider data, not ACP schema:
+    /// their object keys are data too and are masked.
+    const FREE_FORM: [&'static str; 3] = ["rawInput", "rawOutput", "_meta"];
+
+    /// Mask secrets in provider data: every string value. Object keys are
+    /// kept, since outside [`Self::FREE_FORM`] they are ACP field names
+    /// (an embedded resource's `text`, a location's `path`) that head needs
+    /// to parse the update; inside a free-form field the keys are masked too.
+    fn value(&self, value: &mut Value) {
+        if self.secrets.is_empty() {
+            return;
+        }
+        match value {
+            Value::String(text) => *text = self.text(std::mem::take(text)),
+            Value::Array(items) => items.iter_mut().for_each(|item| self.value(item)),
+            Value::Object(map) => {
+                for (key, item) in map.iter_mut() {
+                    if Self::FREE_FORM.contains(&key.as_str()) {
+                        self.data(item);
+                    } else {
+                        self.value(item);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Mask secrets in free-form data (a tool's raw input or output, `_meta`):
+    /// every string and every object key.
+    fn data(&self, value: &mut Value) {
+        if self.secrets.is_empty() {
+            return;
+        }
+        match value {
+            Value::String(text) => *text = self.text(std::mem::take(text)),
+            Value::Array(items) => items.iter_mut().for_each(|item| self.data(item)),
+            Value::Object(map) => {
+                let entries = std::mem::take(map);
+                *map = entries
+                    .into_iter()
+                    .map(|(key, mut item)| {
+                        self.data(&mut item);
+                        (self.text(key), item)
+                    })
+                    .collect();
+            }
+            _ => {}
+        }
+    }
+
+    /// Mask a `session/update` notification's params. Field names and the
+    /// string identifiers at their ACP schema positions (the session id,
+    /// the update's variant tag, tool kind/status/id, content block and
+    /// tool-content tags, plan entry status/priority) are kept as sent, so
+    /// head can still parse the update even when a short secret equals a
+    /// protocol word; every other string is masked with [`Self::value`], and
+    /// tool `rawInput` / `rawOutput` / `_meta` with [`Self::data`] (keys too).
+    ///
+    /// Accepted v1 limit: a secret identical to an ACP enum word not listed
+    /// here (for example an annotation audience `user`) is masked in that
+    /// position, so head cannot parse that one update and drops it. This
+    /// fails closed (nothing leaks), and real provider credentials are long
+    /// random strings, so it is not expected in practice.
+    fn notification(&self, params: &mut Value) {
+        if self.secrets.is_empty() {
+            return;
+        }
+        self.schema(params, &|key, _| match key {
+            "sessionId" => Keep::Id,
+            "update" => Keep::Walk(Self::update),
+            _ => Keep::Mask,
+        });
+    }
+
+    fn update(&self, update: &mut Value) {
+        self.schema(update, &|key, _| match key {
+            "sessionUpdate" | "kind" | "status" | "toolCallId" => Keep::Id,
+            "content" => Keep::Walk(Self::content),
+            "entries" => Keep::Walk(Self::plan_entries),
+            _ => Keep::Mask,
+        });
+    }
+
+    /// A content block, a tool call's content list, or a tool content item
+    /// (`{ type, content: <block> }`).
+    fn content(&self, content: &mut Value) {
+        if let Value::Array(items) = content {
+            for item in items {
+                self.content(item);
+            }
+            return;
+        }
+        self.schema(content, &|key, _| match key {
+            "type" | "mimeType" => Keep::Id,
+            "content" => Keep::Walk(Self::content),
+            _ => Keep::Mask,
+        });
+    }
+
+    fn plan_entries(&self, entries: &mut Value) {
+        let Value::Array(items) = entries else {
+            return self.value(entries);
+        };
+        for item in items {
+            self.schema(item, &|key, _| match key {
+                "status" | "priority" => Keep::Id,
+                _ => Keep::Mask,
+            });
+        }
+    }
+
+    /// Walk one schema object: keys stay, and each field is kept (a string
+    /// identifier only), walked with its own schema, or masked as data. A
+    /// value that is not an object is masked as data.
+    fn schema(&self, value: &mut Value, field: &dyn Fn(&str, &Value) -> Keep) {
+        let Value::Object(map) = value else {
+            return self.value(value);
+        };
+        for (key, item) in map.iter_mut() {
+            match field(key, item) {
+                Keep::Id if item.is_string() => {}
+                Keep::Walk(walk) => walk(self, item),
+                Keep::Id | Keep::Mask if Self::FREE_FORM.contains(&key.as_str()) => {
+                    self.data(item);
+                }
+                Keep::Id | Keep::Mask => self.value(item),
+            }
+        }
+    }
+}
+
+/// What [`Redactor::schema`] does with one field.
+enum Keep {
+    /// A protocol identifier: kept as sent when it is a string.
+    Id,
+    /// A nested schema object.
+    Walk(fn(&Redactor, &mut Value)),
+    /// Arbitrary data: masked.
+    Mask,
 }
 
 /// A provider session that finished its ACP setup.
@@ -201,6 +404,7 @@ impl Runner {
                 policy: config.policy,
                 providers: config.providers,
                 checkouts: config.checkouts,
+                home: config.home,
                 mcp_bridge_exe: config.mcp_bridge_exe,
                 head: HeadLink::default(),
                 journal: Arc::new(Mutex::new(config.journal)),
@@ -291,6 +495,7 @@ impl Runner {
             model,
             base_commit,
             repo_key,
+            profile_env,
             agent_features,
             is_sub_agent,
         } = command;
@@ -336,6 +541,16 @@ impl Runner {
                 configured.join(", ")
             )));
         };
+        let profile = match profile_env
+            .map(|wire| self.node_profile(&wire.0))
+            .transpose()
+        {
+            Ok(profile) => profile,
+            Err(error) => {
+                drop(state);
+                return Some(exited(format!("{}: {error}", codes::PROFILE)));
+            }
+        };
         let (stop_tx, stop_rx) = oneshot::channel();
         let (ready_tx, ready_rx) = watch::channel(None);
         let (marks_tx, marks_rx) = mpsc::unbounded_channel();
@@ -358,6 +573,7 @@ impl Runner {
             run_marker: intent_core::node_link::LinkId::new_v4().to_string(),
             marks: marks_tx,
             activity: ActivityTracker::new(),
+            redactor: Arc::new(Redactor::new(profile.as_ref())),
         });
         state.agents.insert(agent_id.clone(), agent.clone());
         state.workspaces.insert(agent_id, workspace_id);
@@ -365,7 +581,7 @@ impl Runner {
         // caller-binding: allow — node-local journal pump; the node has no service layer
         let pump = tokio::spawn(self.clone().pump(
             (agent.id.clone(), agent.workspace_id.clone()),
-            agent.activity.clone(),
+            (agent.activity.clone(), agent.redactor.clone()),
             notes_rx,
             marks_rx,
         ));
@@ -375,10 +591,14 @@ impl Runner {
             pumps.push(pump);
         }
         // caller-binding: allow — node-local provider process; the node has no service layer
-        tokio::spawn(
-            self.clone()
-                .run_agent(agent, launch, model, notes_tx, ready_tx, stop_rx),
-        );
+        tokio::spawn(self.clone().run_agent(
+            agent,
+            (launch, profile),
+            model,
+            notes_tx,
+            ready_tx,
+            stop_rx,
+        ));
         None
     }
 
@@ -393,7 +613,7 @@ impl Runner {
     async fn pump(
         self,
         (agent_id, workspace_id): (AgentId, WorkspaceId),
-        activity: ActivityTracker,
+        (activity, redactor): (ActivityTracker, Arc<Redactor>),
         mut notes: mpsc::UnboundedReceiver<IncomingNotification>,
         mut marks: mpsc::UnboundedReceiver<Mark>,
     ) {
@@ -406,7 +626,9 @@ impl Runner {
                     if note.method != "session/update" {
                         continue;
                     }
-                    (turn.clone(), JournalBody::Notification { notification: note.params })
+                    let mut notification = note.params;
+                    redactor.notification(&mut notification);
+                    (turn.clone(), JournalBody::Notification { notification })
                 }
                 Some(mark) = marks.recv() => match mark {
                     Mark::Started { base_commit } => {
@@ -419,9 +641,11 @@ impl Runner {
                     }
                     Mark::TurnEnded { turn_id, stop_reason, error } => {
                         turn = None;
+                        let error = error.map(|error| redactor.text(error));
                         (Some(turn_id), JournalBody::TurnEnded { stop_reason, error })
                     }
                     Mark::Exited { exit_code, error } => {
+                        let error = error.map(|error| redactor.text(error));
                         (None, JournalBody::Exited { exit_code, error })
                     }
                 },
@@ -444,7 +668,7 @@ impl Runner {
     async fn run_agent(
         self,
         agent: Arc<Agent>,
-        launch: ProviderLaunch,
+        (launch, profile): (ProviderLaunch, Option<ProfileEnv>),
         model: Option<String>,
         notes: mpsc::UnboundedSender<IncomingNotification>,
         ready: watch::Sender<Option<Arc<Ready>>>,
@@ -479,7 +703,13 @@ impl Runner {
                         codes::START
                     ))),
                     Ok((bridge, mcp)) => self
-                        .start(&agent, &launch, model.as_deref(), notes, cwd)
+                        .start(
+                            &agent,
+                            (&launch, profile.as_ref()),
+                            model.as_deref(),
+                            notes,
+                            cwd,
+                        )
                         .map(|started| (started, bridge, mcp))
                         .map_err(|error| Some(format!("{}: {error}", codes::START))),
                 }
@@ -559,7 +789,7 @@ impl Runner {
     fn start(
         &self,
         agent: &Agent,
-        launch: &ProviderLaunch,
+        (launch, profile): (&ProviderLaunch, Option<&ProfileEnv>),
         model: Option<&str>,
         notes: mpsc::UnboundedSender<IncomingNotification>,
         cwd: PathBuf,
@@ -575,6 +805,7 @@ impl Runner {
         options.cwd = Some(&cwd);
         options.provider_binary = Some(&launch.binary);
         options.model = model;
+        options.profile_env = profile;
         options
             .extra_env
             .insert(RUN_MARKER_ENV.to_owned(), agent.run_marker.clone());
@@ -651,6 +882,20 @@ impl Runner {
             status = child.wait() => Outcome::Exited(status.ok().and_then(|s| s.code())),
             _ = &mut *stop => Outcome::Stopped,
         }
+    }
+
+    /// The overlay a launch's profile runs with on this node: parsed
+    /// strictly, then each account directory's leading `~` expanded against
+    /// the node's home and required to exist. The error never renders a
+    /// value.
+    fn node_profile(&self, wire: &Value) -> Result<ProfileEnv, String> {
+        let profile = ProfileEnv::from_node_wire(wire).ok_or_else(|| {
+            "the selected provider profile's environment could not be read; no other account was used"
+                .to_owned()
+        })?;
+        profile
+            .for_node(self.inner.home.as_deref())
+            .map_err(|missing| missing.to_string())
     }
 
     /// Run a turn. Its output streams as notifications; its end (or why it
@@ -740,14 +985,14 @@ impl Runner {
 
     /// Ask the agent's provider to cancel its running turn.
     pub(super) async fn cancel(&self, agent_id: &AgentId) {
-        let ready = lock(&self.inner.state)
-            .agents
-            .get(agent_id)
-            .and_then(|agent| agent.ready.borrow().clone());
+        let agent = lock(&self.inner.state).agents.get(agent_id).cloned();
+        let Some(agent) = agent else { return };
+        let ready = agent.ready.borrow().clone();
         if let Some(ready) = ready {
             if let Err(error) =
                 intent_acp::session::cancel(&ready.connection, &ready.session_id).await
             {
+                let error = agent.redactor.text(error.to_string());
                 tracing::info!(agent = %agent_id, %error, "node: cancel was not delivered");
             }
         }

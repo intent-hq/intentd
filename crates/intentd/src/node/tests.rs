@@ -110,6 +110,7 @@ fn refused_launch(id: &str) -> LinkFrame {
         model: None,
         base_commit: "base".into(),
         repo_key: "repo".into(),
+        profile_env: None,
         agent_features: serde_json::json!({}),
         is_sub_agent: false,
     })
@@ -335,6 +336,7 @@ async fn node_shutdown_settles_launches_arriving_on_a_live_link() {
             model: None,
             base_commit: "base".into(),
             repo_key: "repo".into(),
+            profile_env: None,
             agent_features: serde_json::json!({}),
             is_sub_agent: false,
         })

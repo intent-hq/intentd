@@ -1,7 +1,7 @@
 //! Runner behavior against real provider processes: the `node-test-agent.mjs`
 //! fixture speaking ACP over stdio. Skips when `node` is not on PATH.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde_json::json;
@@ -19,6 +19,8 @@ struct Harness {
     runner: Runner,
     storage: Arc<Storage>,
     checkouts: Arc<crate::node::checkout::PlainCheckouts>,
+    /// The node user's home a profile's `~` expands against.
+    home: PathBuf,
     _dir: tempfile::TempDir,
 }
 
@@ -59,11 +61,14 @@ fn harness(max_agents: u32, args: &[&str]) -> Option<Harness> {
         checkouts: checkouts.clone(),
         journal,
         mcp_bridge_exe: std::env::current_exe().unwrap(),
+        home: Some(dir.path().join("home")),
     });
+    let home = dir.path().join("home");
     Some(Harness {
         runner,
         storage,
         checkouts,
+        home,
         _dir: dir,
     })
 }
@@ -77,6 +82,7 @@ fn launch(id: &str) -> LaunchCommand {
         base_commit: "base".into(),
         repo_key: "repo".into(),
         agent_features: serde_json::json!({}),
+        profile_env: None,
         is_sub_agent: false,
     }
 }
@@ -691,4 +697,469 @@ async fn node_runner_gives_each_agent_its_workspace_api_on_the_node() {
     );
     h.runner.stop(&id);
     wait_for(&h.runner, "exit", exited("w1")).await;
+}
+
+const CANARY: &str = "canary-profile-secret-5b1e";
+/// A seven-byte credential: masked because of its variable's name.
+const SHORT_SECRET: &str = "s3cr3t!";
+
+/// A launch with the selected profile's overlay, as head sends it.
+fn launch_with_profile(id: &str, env: &Value) -> LaunchCommand {
+    LaunchCommand {
+        profile_env: Some(intent_core::node_link::LaunchProfileEnv(json!({
+            "providerRef": "codex@work",
+            "fingerprint": "f1",
+            "env": env,
+        }))),
+        ..launch(id)
+    }
+}
+
+/// The fixture's environment, once it has started with `--dump-env`.
+async fn agent_env(storage: &Storage, id: &str) -> serde_json::Map<String, Value> {
+    let path = storage
+        .agent_dir(&AgentId::from(id))
+        .unwrap()
+        .join("agent.env.json");
+    let deadline = tokio::time::Instant::now() + wait();
+    loop {
+        if let Ok(bytes) = std::fs::read(&path) {
+            if let Ok(Value::Object(env)) = serde_json::from_slice::<Value>(&bytes) {
+                return env;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "agent never started"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Every log line written while the returned guard is held (this thread's
+/// runtime only: run the test on a current-thread runtime).
+fn capture_logs() -> (Arc<Mutex<Vec<u8>>>, tracing::subscriber::DefaultGuard) {
+    #[derive(Clone)]
+    struct Sink(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            lock(&self.0).extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let logs = Arc::new(Mutex::new(Vec::new()));
+    let sink = Sink(logs.clone());
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_ansi(false)
+        .with_writer(move || sink.clone())
+        .finish();
+    (logs, tracing::subscriber::set_default(subscriber))
+}
+
+#[tokio::test]
+async fn node_runner_applies_the_profile_with_local_launch_precedence_and_node_home() {
+    let Some(h) = harness(1, &["--dump-env"]) else {
+        return;
+    };
+    let home = &h.home;
+    std::fs::create_dir_all(home.join(".codex-work")).unwrap();
+    let inherited = std::env::vars()
+        .map(|(key, _)| key)
+        .find(|key| key != "PATH" && key != "HOME")
+        .expect("an inherited variable");
+    h.runner
+        .launch(launch_with_profile(
+            "a1",
+            &json!([
+                { "key": "CODEX_HOME", "value": "~/.codex-work" },
+                { "key": "CODEX_ACCESS_TOKEN", "value": CANARY },
+                { "key": "EMPTY_VALUE", "value": "" },
+                { "key": inherited, "value": null },
+                { "key": RUN_MARKER_ENV, "value": "profile-cannot-override-wiring" },
+                { "key": "PATH", "value": "/profile/bin" },
+            ]),
+        ))
+        .await;
+    let env = agent_env(&h.storage, "a1").await;
+    // `~` is the node's home, never head's.
+    assert_eq!(
+        env["CODEX_HOME"],
+        home.join(".codex-work").to_string_lossy().as_ref()
+    );
+    // The profile's values replace inherited ones, empty values are real
+    // values, and `unset` removes an inherited variable.
+    assert_eq!(env["CODEX_ACCESS_TOKEN"], CANARY);
+    assert_eq!(env["EMPTY_VALUE"], "");
+    assert!(!env.contains_key(&inherited), "{inherited} kept");
+    // Intent's own wiring wins over the profile, as in a local launch.
+    assert_ne!(env[RUN_MARKER_ENV], "profile-cannot-override-wiring");
+    assert_ne!(env["PATH"], "/profile/bin");
+    h.runner.stop(&AgentId::from("a1"));
+    wait_for(&h.runner, "exit", exited("a1")).await;
+}
+
+#[tokio::test]
+async fn node_runner_without_a_profile_keeps_the_node_login_environment() {
+    let Some(h) = harness(1, &["--dump-env"]) else {
+        return;
+    };
+    h.runner.launch(launch("a1")).await;
+    let env = agent_env(&h.storage, "a1").await;
+    for (key, value) in std::env::vars() {
+        if key != "PATH" && !key.starts_with("NODE_") && key != RUN_MARKER_ENV {
+            assert_eq!(
+                env.get(&key).and_then(Value::as_str),
+                Some(value.as_str()),
+                "{key}"
+            );
+        }
+    }
+    h.runner.stop(&AgentId::from("a1"));
+    wait_for(&h.runner, "exit", exited("a1")).await;
+}
+
+#[tokio::test]
+async fn node_runner_fails_a_launch_whose_profile_folder_is_missing_without_leaking_it() {
+    let Some(h) = harness(1, &["--dump-env"]) else {
+        return;
+    };
+    let (logs, _guard) = capture_logs();
+    for (id, key) in [("a1", "CODEX_HOME"), ("a2", "CLAUDE_CONFIG_DIR")] {
+        h.runner
+            .launch(launch_with_profile(
+                id,
+                &json!([
+                    { "key": key, "value": "~/.missing-account" },
+                    { "key": "CODEX_ACCESS_TOKEN", "value": CANARY },
+                ]),
+            ))
+            .await;
+        let all = wait_for(&h.runner, "profile refusal", exited(id)).await;
+        let error = exit_error(find(&all, exited(id))).unwrap();
+        assert!(error.starts_with(codes::PROFILE), "{error}");
+        assert!(error.contains(key), "{error}");
+        assert!(error.contains("this node"), "{error}");
+        assert!(error.contains("no other account was used"), "{error}");
+        assert!(!error.contains(".missing-account"), "{error}");
+    }
+    // Never started: no provider ran on the node's own login instead.
+    assert!(h.runner.running().is_empty());
+    for id in ["a1", "a2"] {
+        let dir = h.storage.agent_dir(&AgentId::from(id)).unwrap();
+        assert!(!dir.join("agent.env.json").exists(), "{id} started");
+    }
+    let journal = serde_json::to_string(&records(&h.runner).await).unwrap();
+    assert!(!journal.contains(CANARY), "{journal}");
+    let logs = String::from_utf8(lock(&logs).clone()).unwrap();
+    assert!(!logs.contains(CANARY), "{logs}");
+}
+
+#[tokio::test]
+async fn node_runner_refuses_a_malformed_profile_overlay() {
+    let Some(h) = harness(1, &["--dump-env"]) else {
+        return;
+    };
+    let mut command = launch_with_profile("a1", &json!([]));
+    command.profile_env = Some(intent_core::node_link::LaunchProfileEnv(json!({
+        "providerRef": "codex@work",
+        "env": [{ "key": "CODEX_ACCESS_TOKEN", "value": CANARY }],
+    })));
+    h.runner.launch(command).await;
+    let all = wait_for(&h.runner, "profile refusal", exited("a1")).await;
+    let error = exit_error(find(&all, exited("a1"))).unwrap();
+    assert!(error.starts_with(codes::PROFILE), "{error}");
+    assert!(!error.contains(CANARY), "{error}");
+    assert!(h.runner.running().is_empty());
+}
+
+#[tokio::test]
+async fn node_runner_keeps_profile_secrets_out_of_logs_and_the_journal() {
+    let Some(h) = harness(1, &["--dump-env"]) else {
+        return;
+    };
+    let (logs, _guard) = capture_logs();
+    h.runner
+        .launch(launch_with_profile(
+            "a1",
+            &json!([{ "key": "CODEX_ACCESS_TOKEN", "value": CANARY }]),
+        ))
+        .await;
+    h.runner
+        .prompt(&AgentId::from("a1"), "t1".into(), text("hello"))
+        .await;
+    wait_for(&h.runner, "turn end", turn_ended("a1", "t1")).await;
+    assert_eq!(
+        agent_env(&h.storage, "a1").await["CODEX_ACCESS_TOKEN"],
+        CANARY
+    );
+    h.runner.stop(&AgentId::from("a1"));
+    wait_for(&h.runner, "exit", exited("a1")).await;
+    let journal = serde_json::to_string(&records(&h.runner).await).unwrap();
+    assert!(!journal.contains(CANARY), "{journal}");
+    let logs = String::from_utf8(lock(&logs).clone()).unwrap();
+    assert!(!logs.contains(CANARY), "{logs}");
+}
+
+/// A provider that echoes a profile credential in its setup error, its
+/// streamed output and its turn error: the journal carries none of it, and
+/// short values and account folders are left alone.
+#[tokio::test]
+async fn node_runner_redacts_profile_secrets_a_provider_echoes() {
+    for secret in [CANARY, SHORT_SECRET] {
+        for (args, prompt) in [
+            (&["--fail-setup-echo", "CODEX_ACCESS_TOKEN"][..], None),
+            (&[][..], Some("echo-env CODEX_ACCESS_TOKEN")),
+        ] {
+            let Some(h) = harness(1, args) else {
+                return;
+            };
+            let (logs, _guard) = capture_logs();
+            h.runner
+                .launch(launch_with_profile(
+                    "a1",
+                    &json!([
+                        { "key": "CODEX_ACCESS_TOKEN", "value": secret },
+                        { "key": "SHORT_FLAG", "value": "1" },
+                    ]),
+                ))
+                .await;
+            if let Some(prompt) = prompt {
+                h.runner
+                    .prompt(&AgentId::from("a1"), "t1".into(), text(prompt))
+                    .await;
+                let all = wait_for(&h.runner, "turn end", turn_ended("a1", "t1")).await;
+                let (_, error) = turn_end(find(&all, turn_ended("a1", "t1")));
+                let error = error.expect("the turn failed");
+                assert!(error.contains("rejected credential [redacted]"), "{error}");
+                h.runner.stop(&AgentId::from("a1"));
+            }
+            let all = wait_for(&h.runner, "exit", exited("a1")).await;
+            let journal = serde_json::to_string(&all).unwrap();
+            if prompt.is_none() {
+                let error = exit_error(find(&all, exited("a1"))).expect("setup failed");
+                assert!(error.contains("[redacted]"), "{error}");
+            } else {
+                assert!(journal.contains("token [redacted]"), "{journal}");
+            }
+            assert!(!journal.contains(secret), "{secret}: {journal}");
+            let logs = String::from_utf8(lock(&logs).clone()).unwrap();
+            assert!(!logs.contains(secret), "{secret}: {logs}");
+        }
+    }
+}
+
+#[test]
+fn the_redactor_masks_credentials_and_long_values_but_not_short_settings_or_account_folders() {
+    let profile = ProfileEnv::new(
+        "codex@work",
+        "f1",
+        vec![
+            (
+                "CODEX_ACCESS_TOKEN".into(),
+                Some("abcdef-secret-long".into()),
+            ),
+            ("INNER".into(), Some("secret-long".into())),
+            ("SHORT_FLAG".into(), Some("1".into())),
+            ("SERVICE_PASSWORD".into(), Some("pw1".into())),
+            ("CODEX_HOME".into(), Some("/home/node/.codex-work".into())),
+            ("REMOVED".into(), None),
+        ],
+    );
+    let redactor = Redactor::new(Some(&profile));
+    assert_eq!(
+        redactor.text("a abcdef-secret-long b secret-long 1 pw1 /home/node/.codex-work".into()),
+        "a [redacted] b [redacted] 1 [redacted] /home/node/.codex-work"
+    );
+    let mut value = json!({
+        "k": ["x secret-long"],
+        "secret-long": 1,
+        "rawOutput": { "secret-long": "secret-long" },
+    });
+    redactor.value(&mut value);
+    assert_eq!(
+        value,
+        json!({
+            "k": ["x [redacted]"],
+            "secret-long": 1,
+            "rawOutput": { "[redacted]": "[redacted]" },
+        })
+    );
+    let none = Redactor::new(None);
+    assert_eq!(none.text("secret-long".into()), "secret-long");
+}
+
+/// A short credential that collides with ACP vocabulary (`text`) masks the
+/// provider's prose but never its field names or variant tags, so head can
+/// still parse every update.
+#[tokio::test]
+async fn node_runner_masking_a_schema_word_keeps_updates_parseable() {
+    let Some(h) = harness(1, &[]) else {
+        return;
+    };
+    h.runner
+        .launch(launch_with_profile(
+            "a1",
+            &json!([{ "key": "CODEX_ACCESS_TOKEN", "value": "text" }]),
+        ))
+        .await;
+    h.runner
+        .prompt(&AgentId::from("a1"), "t1".into(), text("hello text"))
+        .await;
+    let all = wait_for(&h.runner, "turn end", turn_ended("a1", "t1")).await;
+    let notifications: Vec<&Value> = all
+        .iter()
+        .filter_map(|r| match &r.body {
+            JournalBody::Notification { notification } => Some(notification),
+            _ => None,
+        })
+        .collect();
+    assert!(!notifications.is_empty(), "{all:#?}");
+    for notification in notifications {
+        let mapped = intent_acp::session::map_notification(&intent_acp::IncomingNotification {
+            method: "session/update".into(),
+            params: notification.clone(),
+        });
+        assert!(mapped.is_some(), "unparseable update: {notification}");
+        assert_eq!(
+            notification["update"]["content"],
+            json!({ "type": "text", "text": "echo: hello [redacted]" })
+        );
+    }
+    h.runner.stop(&AgentId::from("a1"));
+    wait_for(&h.runner, "exit", exited("a1")).await;
+}
+
+/// Identifiers stay only at their ACP schema positions: a `status` or `type`
+/// inside a tool's raw input or output is data and is masked, while the
+/// update itself still parses on head.
+#[test]
+fn the_redactor_masks_tool_payloads_but_keeps_schema_identifiers() {
+    for secret in ["s3cr3t!", "completed", "text"] {
+        let profile = ProfileEnv::new(
+            "codex@work",
+            "f1",
+            vec![("CODEX_ACCESS_TOKEN".into(), Some(secret.into()))],
+        );
+        let redactor = Redactor::new(Some(&profile));
+        let mut params = json!({
+            "sessionId": "s1",
+            "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call-1",
+                "status": "completed",
+                "kind": "execute",
+                "title": format!("login {secret}"),
+                "content": [{
+                    "type": "content",
+                    "content": { "type": "text", "text": format!("rejected credential {secret}") },
+                }],
+                "rawInput": { "status": format!("token {secret}"), "type": secret },
+                "rawOutput": {
+                    "status": format!("rejected credential {secret}"),
+                    "nested": [{ "type": secret, secret: 1 }],
+                },
+            },
+        });
+        redactor.notification(&mut params);
+        let update = &params["update"];
+        assert_eq!(update["sessionUpdate"], "tool_call_update", "{secret}");
+        assert_eq!(update["status"], "completed", "{secret}");
+        assert_eq!(update["content"][0]["type"], "content", "{secret}");
+        assert_eq!(update["content"][0]["content"]["type"], "text", "{secret}");
+        assert_eq!(
+            update["content"][0]["content"]["text"],
+            "rejected credential [redacted]"
+        );
+        assert_eq!(update["title"], "login [redacted]");
+        assert_eq!(
+            update["rawInput"],
+            json!({ "status": "token [redacted]", "type": "[redacted]" })
+        );
+        assert_eq!(
+            update["rawOutput"],
+            json!({
+                "status": "rejected credential [redacted]",
+                "nested": [{ "type": "[redacted]", "[redacted]": 1 }],
+            })
+        );
+        let mapped = intent_acp::session::map_notification(&intent_acp::IncomingNotification {
+            method: "session/update".into(),
+            params: params.clone(),
+        });
+        assert!(mapped.is_some(), "{secret}: unparseable update {params}");
+    }
+}
+
+/// Outside a tool's free-form `rawInput` / `rawOutput` / `_meta`, field names
+/// are never rewritten: an embedded resource and a tool call's locations
+/// keep their required keys, and the update still parses, even when the
+/// credential is the field name itself.
+#[test]
+fn the_redactor_keeps_resource_and_location_keys() {
+    for secret in ["text", "path", "uri"] {
+        let profile = ProfileEnv::new(
+            "codex@work",
+            "f1",
+            vec![("CODEX_ACCESS_TOKEN".into(), Some(secret.into()))],
+        );
+        let redactor = Redactor::new(Some(&profile));
+        let mut resource = json!({
+            "sessionId": "s1",
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {
+                    "type": "resource",
+                    "resource": {
+                        "uri": "file:///notes.md",
+                        "mimeType": "text/markdown",
+                        "text": format!("leaked {secret}"),
+                    },
+                },
+            },
+        });
+        redactor.notification(&mut resource);
+        let embedded = &resource["update"]["content"]["resource"];
+        assert_eq!(
+            embedded["text"], "leaked [redacted]",
+            "{secret}: {resource}"
+        );
+        assert!(embedded.get("uri").is_some(), "{secret}: {resource}");
+        let mut tool = json!({
+            "sessionId": "s1",
+            "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call-1",
+                "title": "edit",
+                "kind": "edit",
+                "status": "pending",
+                "locations": [{ "path": format!("/work/{secret}.md"), "line": 3 }],
+                "rawInput": { secret: format!("value {secret}") },
+                "_meta": { secret: 1 },
+            },
+        });
+        redactor.notification(&mut tool);
+        let update = &tool["update"];
+        assert_eq!(update["locations"][0]["path"], "/work/[redacted].md");
+        assert_eq!(
+            update["rawInput"],
+            json!({ "[redacted]": "value [redacted]" })
+        );
+        assert_eq!(update["_meta"], json!({ "[redacted]": 1 }));
+        for (what, params) in [("resource", &resource), ("tool", &tool)] {
+            let mapped = intent_acp::session::map_notification(&intent_acp::IncomingNotification {
+                method: "session/update".into(),
+                params: params.clone(),
+            });
+            assert!(mapped.is_some(), "{secret}: unparseable {what} {params}");
+        }
+        assert_eq!(
+            tool["update"]["locations"].as_array().map(Vec::len),
+            Some(1),
+            "{secret}"
+        );
+    }
 }

@@ -2484,6 +2484,7 @@ dependencies = [
  "intent-acp",
  "intent-core",
  "intent-git",
+ "intent-providers",
  "intent-services",
  "intent-store",
  "intent-transport",

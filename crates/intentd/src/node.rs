@@ -127,6 +127,7 @@ impl Node {
             providers: provider_launches(&config.providers),
             checkouts,
             journal,
+            home: node_home(),
             mcp_bridge_exe: executable.clone(),
         });
         let welcome: WelcomeFn = {
@@ -234,6 +235,15 @@ fn provider_launches(
 }
 
 /// The platform this node runs on, as head's placement sees it.
+/// The node user's home directory, which a leading `~` in a provider
+/// profile's account directory refers to.
+fn node_home() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .filter(|home| !home.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
 fn host_platform() -> anyhow::Result<AgentPlatform> {
     platform_of(std::env::consts::OS, std::env::consts::ARCH)
 }

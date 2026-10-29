@@ -232,8 +232,8 @@ async fn unsupported_placements_are_refused_before_any_effect() {
             "{result:?}"
         );
     }
-    // A saved provider profile cannot be sent to a node: refused, never run
-    // on the node's own login instead.
+    // A selected profile that does not resolve fails admission, never
+    // running on the node's own login instead.
     let result = svc
         .admit_remote_agent(
             &ws,
@@ -242,10 +242,36 @@ async fn unsupported_placements_are_refused_before_any_effect() {
         )
         .await;
     assert!(
-        matches!(&result, Err(Error::InvalidParams(m)) if m.starts_with("remote-auth-unsupported")),
+        matches!(&result, Err(Error::ProviderProfile(f))
+            if f.data["code"] == "provider-profile-replacement-required"),
         "{result:?}"
     );
     assert!(remote.launched.lock().unwrap().is_empty());
+}
+
+/// A create that selects a saved provider profile is admitted (its
+/// environment is sent when the agent starts on the node).
+#[tokio::test]
+async fn a_saved_profile_is_admitted_for_a_remote_agent() {
+    let (_t, svc, ws) = setup().await;
+    let remote = Arc::new(FakeRemote::default());
+    let svc = svc.with_remote_launch_port(remote.clone());
+    let created = intent_core::caller::with_caller(
+        intent_core::caller::Caller::Daemon,
+        svc.provider_profiles_create_impl(json!({
+            "baseProviderId": "codex",
+            "name": "Work",
+            "env": [{ "key": "CODEX_HOME", "kind": "set", "value": "~/.codex-work" }],
+        })),
+    )
+    .await
+    .expect("create profile");
+    let reference = created["profile"]["providerRef"].as_str().unwrap();
+    let view = svc
+        .admit_remote_agent(&ws, reference, &placement(json!({"target": "remote"})))
+        .await
+        .expect("a resolvable profile is admitted");
+    assert_eq!(view.node_id, "node-1");
 }
 
 /// A launch that fails after the agent exists leaves it placed (so it can

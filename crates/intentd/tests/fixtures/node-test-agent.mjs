@@ -5,6 +5,12 @@
 //   --exit-on-start <code>  exit immediately with <code>
 //   --hang-setup            never answer session/new
 //   --detached-helper       start the `sleep` child in its own process group
+//   --dump-env              write its environment to `agent.env.json` in its
+//                           working directory (profile-overlay tests)
+//   --fail-setup-echo <VAR> fail session/new with an error quoting $VAR
+//
+// A prompt "echo-env <VAR>" streams $VAR as a chunk and then fails the turn
+// with an error quoting it (credential echo tests).
 //
 // On start it writes `agent.pid` (its pid and a same-group `sleep` child's
 // pid) into its working directory, so tests can check that stop kills the
@@ -27,7 +33,10 @@ const argv = process.argv.slice(2);
 const exitAt = argv.indexOf('--exit-on-start');
 if (exitAt >= 0) process.exit(Number(argv[exitAt + 1] ?? 1));
 const hangSetup = argv.includes('--hang-setup');
+const failSetupAt = argv.indexOf('--fail-setup-echo');
+const failSetupVar = failSetupAt >= 0 ? argv[failSetupAt + 1] : undefined;
 const detachedHelper = argv.includes('--detached-helper');
+if (argv.includes('--dump-env')) fs.writeFileSync('agent.env.json', JSON.stringify(process.env));
 
 const sleeper = spawn('sleep', ['300'], { stdio: 'ignore', detached: detachedHelper });
 fs.writeFileSync('agent.pid', JSON.stringify({ agent: process.pid, child: sleeper.pid }));
@@ -119,6 +128,13 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
     case 'session/new':
       if (hangSetup) return;
       mcpServers = msg.params?.mcpServers ?? [];
+      if (failSetupVar) {
+        const value = process.env[failSetupVar];
+        return send({
+          id: msg.id,
+          error: { code: -32000, message: `rejected credential ${value}`, data: { credential: value } },
+        });
+      }
       return send({ id: msg.id, result: { sessionId: SESSION } });
     case 'session/prompt': {
       const text = promptText(msg.params);
@@ -147,6 +163,18 @@ readline.createInterface({ input: process.stdin }).on('line', async (line) => {
           update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `echo: ${text}` } },
         },
       });
+      const echo = text.match(/^echo-env (\S+)$/);
+      if (echo) {
+        const value = process.env[echo[1]];
+        send({
+          method: 'session/update',
+          params: {
+            sessionId: SESSION,
+            update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: `token ${value}` } },
+          },
+        });
+        return send({ id: msg.id, error: { code: -32000, message: `rejected credential ${value}`, data: { credential: value } } });
+      }
       if (text.includes('many')) {
         for (let i = 0; i < 200; i++) {
           send({

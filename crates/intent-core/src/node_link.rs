@@ -150,6 +150,26 @@ pub struct LaunchCommand {
     /// Whether the agent is a sub-agent (delegated or background), for the
     /// same top-level-only gates a local bridge applies.
     pub is_sub_agent: bool,
+    /// The selected provider profile's environment overlay, or absent when
+    /// no profile is selected and the node uses its own provider login.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_env: Option<LaunchProfileEnv>,
+}
+
+/// The environment overlay of the provider profile a launch runs with:
+/// `{ providerRef, fingerprint, env: [{ key, value | null }] }`, where a
+/// `null` value unsets the variable. Account directories (`CLAUDE_CONFIG_DIR`,
+/// `CODEX_HOME`) are sent as typed; the node expands a leading `~` against
+/// its own home. Values are secrets: `Debug` never renders them, and the
+/// node parses the overlay strictly before applying it.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct LaunchProfileEnv(pub Value);
+
+impl std::fmt::Debug for LaunchProfileEnv {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LaunchProfileEnv(<redacted>)")
+    }
 }
 
 /// A request over the link: node to head for forwarded workspace API calls.

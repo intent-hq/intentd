@@ -54,6 +54,7 @@ pub use mcp_config::{
     to_acp_session_mcp_servers, to_auggie_mcp_config, to_opencode_mcp_config, NormalizedMcpServer,
     NormalizedMcpServers,
 };
+pub use mcp_env::is_likely_secret_env_key;
 pub use mcp_env::{build_baseline_mcp_env_from_process, EnvMap};
 pub use mcp_server::bindings_prelude_for_bridge;
 pub use mcp_server::bindings_prelude_for_workspace;
@@ -64,7 +65,7 @@ pub use mcp_server::{
 pub use permission::{
     PermissionOutcome, PermissionPolicy, PermissionRegistry, PermissionRequestData,
 };
-pub use profile_env::ProfileEnv;
+pub use profile_env::{NodeAccountDirMissing, ProfileEnv};
 pub use session::{MappedToolCall, MappedUpdate};
 pub use spawn::{spawn_provider, AgentPriority, LaunchMode, NpxLaunchDir, SpawnOptions};
 pub use terminal::{TerminalCreateParams, TerminalExitInfo, TerminalHost, TerminalOutputInfo};
