@@ -567,3 +567,42 @@ async fn bounded_read_rejects_invalid_values_before_loading_the_note() {
     assert!(!is_error, "{text}");
     assert_eq!(text, "\"b\"");
 }
+
+/// Boxed numbers serialize like their primitive (`new Number(NaN)` → `null`)
+/// and functions / symbols vanish from `JSON.stringify`, so each would become
+/// an absent option and an unbounded read. Only nullish, primitive strings and
+/// primitive safe positive integers may reach the host.
+#[tokio::test]
+async fn bounded_read_rejects_non_primitive_options_without_loading_the_note() {
+    let (srv, api) = server(numbered_lines(1_500_000));
+    for key in ["startLine", "maxLines"] {
+        for value in [
+            "new Number(NaN)",
+            "new Number(Infinity)",
+            "new Number(5)",
+            "new String('2')",
+            "() => 1",
+            "Symbol('x')",
+            "5n",
+        ] {
+            let opts = format!("{{ startLine: 1, maxLines: 5, {key}: {value} }}");
+            let (is_error, text) =
+                call(&srv, &format!("return await ws.note.read('big', {opts});")).await;
+            assert!(
+                is_error,
+                "{opts} must be rejected, got: {}",
+                &text[..text.len().min(200)]
+            );
+            assert!(
+                text.contains(&format!("{key} must be a positive integer")),
+                "{opts}: {}",
+                &text[..text.len().min(200)]
+            );
+        }
+    }
+    assert_eq!(
+        api.reads.load(Ordering::SeqCst),
+        0,
+        "a rejected read must not load the note"
+    );
+}

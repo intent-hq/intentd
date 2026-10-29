@@ -24,7 +24,9 @@ pub(crate) const PRELUDE: &str = r"
             const args = { ...(options || {}), id };
             for (const key of ['startLine', 'maxLines']) {
                 const value = args[key];
-                if (typeof value === 'number' && !(Number.isSafeInteger(value) && value >= 1)) {
+                const ok = value === undefined || value === null || typeof value === 'string'
+                    || (typeof value === 'number' && Number.isSafeInteger(value) && value >= 1);
+                if (!ok) {
                     throw new Error(`${key} must be a positive integer`);
                 }
             }
@@ -115,9 +117,10 @@ struct LineWindow {
 }
 
 /// Parse an optional positive line option; `null` / absent is `None`.
-/// `NaN` / `±Infinity` serialize to `null`, so the JS wrapper rejects
-/// non-integer numbers before the host call; this check stays authoritative
-/// for every other value.
+/// `NaN` / `±Infinity` (boxed or not) serialize to `null` and functions /
+/// symbols vanish, so the JS wrapper lets through only nullish values,
+/// primitive strings and primitive safe positive integers; this check stays
+/// authoritative for the string contents.
 /// Numeric strings are tolerated for parity with `editLines`' `req_i64`.
 fn opt_positive_line(args: &Value, key: &str) -> Result<Option<usize>, String> {
     let invalid = || format!("{key} must be a positive integer");
