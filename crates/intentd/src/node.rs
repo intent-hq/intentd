@@ -27,6 +27,7 @@ mod config;
 mod runner;
 mod session;
 mod storage;
+mod workspace_api;
 
 use checkout::GitCheckouts;
 use config::{Config, ProviderEntry};
@@ -126,6 +127,7 @@ impl Node {
             providers: provider_launches(&config.providers),
             checkouts,
             journal,
+            mcp_bridge_exe: executable.clone(),
         });
         let welcome: WelcomeFn = {
             let runner = runner.clone();

@@ -399,3 +399,42 @@ async fn a_remote_agents_model_change_is_refused() {
     let session = svc.store.get_agent_session(&id).await.unwrap();
     assert_eq!(session.model.as_deref(), Some("sonnet4.5"));
 }
+
+/// Attachments live on head and a remote agent's provider runs on its node,
+/// so a message carrying any is refused before it is stored or queued; the
+/// same message without attachments is accepted.
+#[tokio::test]
+async fn a_message_with_attachments_to_a_remote_agent_is_refused() {
+    let (_t, svc, ws) = setup().await;
+    let svc = svc.with_remote_launch_port(Arc::new(FakeRemote::default()));
+    let created = create(
+        &svc,
+        &ws,
+        AgentCreateExtra {
+            placement: Some(placement(json!({"target": "remote"}))),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let id = AgentId::from(created["agent"]["id"].as_str().unwrap());
+    let before = svc.store.get_agent_messages(&id, None).await.unwrap().len();
+    let images = json!([{ "data": "aGVsbG8=", "mimeType": "image/png" }]);
+    let files = json!([{ "attachmentId": "att-1", "fileName": "notes.txt" }]);
+    for (images, files) in [(Some(images.clone()), None), (None, Some(files.clone()))] {
+        let result = svc
+            .agent_send_message_op(id.clone(), "look".into(), None, images, files, None)
+            .await;
+        assert!(
+            matches!(&result, Err(Error::InvalidParams(m)) if m.starts_with("remote-agent-unsupported: attachments")),
+            "{result:?}"
+        );
+    }
+    assert_eq!(
+        svc.store.get_agent_messages(&id, None).await.unwrap().len(),
+        before
+    );
+    svc.agent_send_message_op(id.clone(), "look".into(), None, Some(json!([])), None, None)
+        .await
+        .unwrap();
+}

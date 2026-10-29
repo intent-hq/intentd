@@ -8422,6 +8422,11 @@ impl AgentManager {
         // a truncated/mistyped id must not claim the slot or queue a phantom
         // message that never drains (the sender then waits forever).
         let session = self.services.require_agent_session(&agent_id).await?;
+        crate::agent_ops::reject_remote_attachments(
+            &session,
+            options.image_blocks.as_ref(),
+            options.file_blocks.as_ref(),
+        )?;
         // Bind the delivery to the target's OWN session workspace
         // (intent-hq/intent#5017): a cross-workspace `ws.agent.send` arrives
         // with the SENDER's bridge workspace, and every scope-sensitive step

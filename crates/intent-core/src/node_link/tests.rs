@@ -135,6 +135,8 @@ fn every_frame() -> Vec<LinkFrame> {
             model: Some("opus".into()),
             base_commit: "base".into(),
             repo_key: "repo".into(),
+            agent_features: serde_json::json!({}),
+            is_sub_agent: false,
         }),
         LinkFrame::Prompt {
             agent_id: agent_id.clone(),

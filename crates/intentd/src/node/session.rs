@@ -133,7 +133,7 @@ pub(super) async fn serve_link(
     let binding = hello.binding;
     let acked = hello.acked_seq;
     match adopt(&runner, &binding, acked, || link.is_closed()).await {
-        Adopted::Ready => {}
+        Adopted::Ready => runner.head_link().set(link.clone()),
         Adopted::Replaced => {
             tracing::info!("node: link replaced before it was adopted");
             link.close();

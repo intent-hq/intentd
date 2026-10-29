@@ -683,3 +683,44 @@ async fn a_remote_run_never_starts_without_its_instructions() {
     assert_eq!(port.asked.load(Ordering::SeqCst), 1);
     assert!(mgr.prepend_pending.lock().unwrap().contains(&id));
 }
+
+/// A message with attachments to a remote agent is refused by the runtime
+/// front door before it is stored, queued or prompted.
+#[tokio::test]
+async fn a_remote_agent_refuses_a_message_with_attachments() {
+    let ws = WorkspaceId::from("ws-remote-attachments");
+    let id = AgentId::from("agent-remote-attachments");
+    let fake = FakeRuntime::new();
+    let port = Arc::new(RemoteRuntimes {
+        runtime: Some(fake.clone()),
+        asked: AtomicUsize::new(0),
+    });
+    let (_tmp, mgr) = remote_manager(port.clone(), &id, &ws).await;
+    let result = mgr
+        .send_message(
+            id.clone(),
+            ws.clone(),
+            "look".into(),
+            None,
+            super::super::TurnOptions {
+                file_blocks: Some(serde_json::json!([
+                    { "attachmentId": "att-1", "fileName": "notes.txt" }
+                ])),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(
+        matches!(&result, Err(Error::InvalidParams(m)) if m.starts_with("remote-agent-unsupported: attachments")),
+        "{result:?}"
+    );
+    assert!(fake.prompts.lock().unwrap().is_empty());
+    assert_eq!(port.asked.load(Ordering::SeqCst), 0);
+    assert!(mgr
+        .services
+        .store
+        .get_agent_messages(&id, None)
+        .await
+        .unwrap()
+        .is_empty());
+}

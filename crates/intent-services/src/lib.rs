@@ -2164,7 +2164,7 @@ impl Services {
     /// excluded from reads and never seeded with an override) and lookup
     /// failures fall back to the global value so the gate never hard-fails on
     /// resolution.
-    pub(crate) async fn effective_auto_commit(&self, workspace_id: &WorkspaceId) -> bool {
+    pub async fn effective_auto_commit(&self, workspace_id: &WorkspaceId) -> bool {
         match self.store.workspace_auto_commit(workspace_id).await {
             Ok(Some(enabled)) => enabled,
             Ok(None) => self.effective_settings().git.auto_commit,
