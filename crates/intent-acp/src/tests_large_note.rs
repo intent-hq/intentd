@@ -8,8 +8,9 @@
 use std::sync::{Arc, Mutex};
 
 use intent_core::{
-    AgentId, BoxFuture, Error, Note, NoteAddInput, NoteAddResult, NoteEditInput, NoteEditResult,
-    NoteId, NoteMetadata, Result, WorkspaceApi, WorkspaceId,
+    AgentId, BoxFuture, Error, Note, NoteAddInput, NoteAddResult, NoteEditInput,
+    NoteEditLinesInput, NoteEditLinesResult, NoteEditResult, NoteId, NoteMetadata, Result,
+    WorkspaceApi, WorkspaceId,
 };
 use serde_json::{json, Value};
 
@@ -120,6 +121,44 @@ impl WorkspaceApi for StoreApi {
                 old_text_length: input.old.len(),
                 new_text_length: input.new.len(),
                 match_position: i64::try_from(pos).unwrap(),
+                old_content,
+                new_content,
+                converted_count: 0,
+                created_task_note_ids: Vec::new(),
+                created_tasks: Vec::new(),
+                warnings: Vec::new(),
+            })
+        })
+    }
+
+    /// Same 1-based inclusive `split('\n')` numbering as the service's
+    /// `apply_edit_lines`, so a bounded read can be checked against it.
+    fn edit_note_lines(
+        &self,
+        _ws: WorkspaceId,
+        note_id: NoteId,
+        input: NoteEditLinesInput,
+        _caller: Option<AgentId>,
+    ) -> BoxFuture<'_, Result<NoteEditLinesResult>> {
+        let mut guard = self.content.lock().unwrap();
+        let old_content = guard.clone();
+        let mut lines: Vec<&str> = old_content.split('\n').collect();
+        let total_lines_before = lines.len();
+        let start = usize::try_from(input.start).unwrap();
+        let end = usize::try_from(input.end).unwrap();
+        lines.splice(start - 1..end, std::iter::once(input.content.as_str()));
+        let new_content = lines.join("\n");
+        let total_lines_after = new_content.split('\n').count();
+        guard.clone_from(&new_content);
+        drop(guard);
+        Box::pin(async move {
+            Ok(NoteEditLinesResult {
+                ok: true,
+                note_id,
+                start_line: input.start,
+                end_line: input.end,
+                total_lines_before,
+                total_lines_after,
                 old_content,
                 new_content,
                 converted_count: 0,
@@ -260,4 +299,200 @@ async fn small_note_mutations_keep_the_content_echo() {
     assert_eq!(body["oldContent"], json!("alpha\nbeta"));
     assert_eq!(body["newContent"], json!("alpha\ngamma"));
     assert!(body.get("contentOmitted").is_none());
+}
+
+/// `L1\nL2\n…\nL{lines}` — every line names its own 1-based number.
+fn numbered_lines(lines: usize) -> String {
+    let mut s = String::with_capacity(lines * 9);
+    for i in 1..=lines {
+        if i > 1 {
+            s.push('\n');
+        }
+        s.push('L');
+        s.push_str(&i.to_string());
+    }
+    s
+}
+
+/// A line-bounded read of a huge note returns only the requested lines, so
+/// the script never materializes the whole note.
+#[tokio::test]
+async fn bounded_read_of_huge_note_returns_only_the_requested_lines() {
+    let (srv, _api) = server(numbered_lines(1_500_000));
+    let (is_error, text) = call(
+        &srv,
+        "return await ws.note.read('big', { startLine: 1000, maxLines: 3 });",
+    )
+    .await;
+    assert!(!is_error, "{}", &text[..text.len().min(200)]);
+    assert!(
+        text.len() < 4096,
+        "bounded read must not carry the whole note, got {} bytes",
+        text.len()
+    );
+    let body: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(body["rawContent"], json!("L1000\nL1001\nL1002"));
+    assert_eq!(
+        body["content"],
+        json!("1000 | L1000\n1001 | L1001\n1002 | L1002")
+    );
+    assert_eq!(body["totalLines"], json!(1_500_000));
+    assert_eq!(body["startLine"], json!(1000));
+    assert_eq!(body["endLine"], json!(1002));
+    assert_eq!(body["truncated"], json!(true));
+    assert_eq!(body["rev"], json!(1));
+    assert_eq!(body["updatedAt"], json!("2026-01-01T00:00:00Z"));
+    assert_eq!(body["id"], json!("big"));
+    assert_eq!(body["title"], json!("big"));
+}
+
+/// The last page of a huge note: `maxLines` past the end stops at the last line.
+#[tokio::test]
+async fn bounded_read_of_huge_note_tail_stops_at_the_last_line() {
+    let (srv, _api) = server(numbered_lines(1_500_000));
+    let (is_error, text) = call(
+        &srv,
+        "const n = await ws.note.read('big', { startLine: 1499999, maxLines: 50 }); \
+         return { raw: n.rawContent, start: n.startLine, end: n.endLine, truncated: n.truncated };",
+    )
+    .await;
+    assert!(!is_error, "{text}");
+    let body: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(body["raw"], json!("L1499999\nL1500000"));
+    assert_eq!(body["start"], json!(1_499_999));
+    assert_eq!(body["end"], json!(1_500_000));
+    assert_eq!(body["truncated"], json!(true));
+}
+
+#[tokio::test]
+async fn bounded_read_covering_the_whole_note_is_not_truncated() {
+    let (srv, _api) = server("a\nb\nc".to_string());
+    for opts in [
+        "{ startLine: 1, maxLines: 10 }",
+        "{ maxLines: 3 }",
+        "{ startLine: 1 }",
+    ] {
+        let (is_error, text) =
+            call(&srv, &format!("return await ws.note.read('big', {opts});")).await;
+        assert!(!is_error, "{opts}: {text}");
+        let body: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(body["rawContent"], json!("a\nb\nc"), "{opts}");
+        assert_eq!(
+            body["content"],
+            json!("   1 | a\n   2 | b\n   3 | c"),
+            "{opts}"
+        );
+        assert_eq!(body["totalLines"], json!(3), "{opts}");
+        assert_eq!(body["startLine"], json!(1), "{opts}");
+        assert_eq!(body["endLine"], json!(3), "{opts}");
+        assert_eq!(body["truncated"], json!(false), "{opts}");
+    }
+    let (is_error, text) = call(&srv, "return await ws.note.read('big', { startLine: 2 });").await;
+    assert!(!is_error, "{text}");
+    let body: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(body["rawContent"], json!("b\nc"));
+    assert_eq!(body["startLine"], json!(2));
+    assert_eq!(body["endLine"], json!(3));
+    assert_eq!(body["truncated"], json!(true));
+}
+
+/// Without options (or with an empty / nullish options object) the result
+/// keeps its existing shape: no paging fields.
+#[tokio::test]
+async fn unbounded_read_keeps_its_existing_shape() {
+    let (srv, _api) = server("a\nb".to_string());
+    for call_expr in [
+        "ws.note.read('big')",
+        "ws.note.read('big', {})",
+        "ws.note.read('big', { startLine: null, maxLines: undefined })",
+    ] {
+        let (is_error, text) = call(&srv, &format!("return await {call_expr};")).await;
+        assert!(!is_error, "{call_expr}: {text}");
+        let body: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            body,
+            json!({
+                "id": "big",
+                "title": "big",
+                "tags": [],
+                "content": "   1 | a\n   2 | b",
+                "rawContent": "a\nb",
+                "totalLines": 2,
+                "imageCount": 0,
+                "images": [],
+            }),
+            "{call_expr}"
+        );
+    }
+}
+
+/// A page's line numbers address the same lines `ws.note.editLines` edits.
+#[tokio::test]
+async fn bounded_read_line_numbers_line_up_with_edit_lines() {
+    let (srv, api) = server("a\nb\nc\nd".to_string());
+    let (is_error, text) = call(
+        &srv,
+        "const n = await ws.note.read('big', { startLine: 3, maxLines: 1 }); \
+         await ws.note.editLines('big', { start: n.startLine, end: n.endLine, content: n.rawContent.toUpperCase() }); \
+         return n.rawContent;",
+    )
+    .await;
+    assert!(!is_error, "{text}");
+    assert_eq!(text, "\"c\"");
+    assert_eq!(api.content(), "a\nb\nC\nd");
+}
+
+#[tokio::test]
+async fn bounded_read_of_empty_note_returns_an_empty_page() {
+    let (srv, _api) = server(String::new());
+    let (is_error, text) = call(
+        &srv,
+        "return await ws.note.read('big', { startLine: 1, maxLines: 5 });",
+    )
+    .await;
+    assert!(!is_error, "{text}");
+    let body: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(body["rawContent"], json!(""));
+    assert_eq!(body["content"], json!(""));
+    assert_eq!(body["totalLines"], json!(0));
+    assert_eq!(body["startLine"], json!(1));
+    assert_eq!(body["endLine"], json!(0));
+    assert_eq!(body["truncated"], json!(false));
+}
+
+#[tokio::test]
+async fn bounded_read_rejects_invalid_options() {
+    let (srv, _api) = server("a\nb\nc".to_string());
+    for (opts, expected) in [
+        ("{ startLine: 0 }", "startLine must be a positive integer"),
+        ("{ startLine: -2 }", "startLine must be a positive integer"),
+        ("{ startLine: 1.5 }", "startLine must be a positive integer"),
+        ("{ startLine: 'x' }", "startLine must be a positive integer"),
+        (
+            "{ startLine: true }",
+            "startLine must be a positive integer",
+        ),
+        ("{ maxLines: 0 }", "maxLines must be a positive integer"),
+        ("{ maxLines: -1 }", "maxLines must be a positive integer"),
+        ("{ maxLines: 2.5 }", "maxLines must be a positive integer"),
+        (
+            "{ startLine: 4 }",
+            "startLine (4) exceeds total lines in note (3)",
+        ),
+    ] {
+        let (is_error, text) =
+            call(&srv, &format!("return await ws.note.read('big', {opts});")).await;
+        assert!(is_error, "{opts} must be rejected, got: {text}");
+        assert!(text.contains(expected), "{opts}: {text}");
+    }
+    let (srv, _api) = server(String::new());
+    let (is_error, text) = call(&srv, "return await ws.note.read('big', { startLine: 2 });").await;
+    assert!(
+        is_error,
+        "startLine past an empty note must be rejected: {text}"
+    );
+    assert!(
+        text.contains("startLine (2) exceeds total lines in note (0)"),
+        "{text}"
+    );
 }

@@ -20,7 +20,7 @@ use super::{map_err, opt_str, opt_vec_str, req_i64, req_str};
 pub(crate) const PRELUDE: &str = r"
     globalThis.ws = globalThis.ws || {};
     ws.note = {
-        read: (id) => host({ method: 'note.read', args: { id } }),
+        read: (id, options) => host({ method: 'note.read', args: { ...(options || {}), id } }),
         create: (title, content, tags) =>
             host({ method: 'note.create', args: { title, content, tags } }),
         list: (tag) => host({ method: 'note.list', args: { tag } }),
@@ -97,31 +97,116 @@ pub(crate) async fn dispatch(
     }
 }
 
+/// Requested line window of a bounded `ws.note.read` (intent-hq/intent#7688).
+/// Lines are 1-based and split on `\n`, the numbering of the rendered
+/// `content` and of `ws.note.editLines`.
+struct LineWindow {
+    start: usize,
+    max: Option<usize>,
+}
+
+/// Parse an optional positive line option; `null` / absent is `None`.
+/// Numeric strings are tolerated for parity with `editLines`' `req_i64`.
+fn opt_positive_line(args: &Value, key: &str) -> Result<Option<usize>, String> {
+    let invalid = || format!("{key} must be a positive integer");
+    let parsed = match args.get(key) {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::Number(n)) => n.as_i64(),
+        Some(Value::String(s)) => s.trim().parse::<i64>().ok(),
+        Some(_) => None,
+    };
+    match parsed {
+        Some(v) if v >= 1 => usize::try_from(v).map(Some).map_err(|_| invalid()),
+        _ => Err(invalid()),
+    }
+}
+
+/// `Some` iff the caller passed `startLine` or `maxLines`; with neither the
+/// read keeps its unbounded result shape.
+fn line_window(args: &Value) -> Result<Option<LineWindow>, String> {
+    let start = opt_positive_line(args, "startLine")?;
+    let max = opt_positive_line(args, "maxLines")?;
+    if start.is_none() && max.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(LineWindow {
+        start: start.unwrap_or(1),
+        max,
+    }))
+}
+
+/// Append `   N | text` display lines, newline-separated.
+fn push_numbered<'a>(rendered: &mut String, lines: impl Iterator<Item = (usize, &'a str)>) {
+    for (i, (number, line)) in lines.enumerate() {
+        if i > 0 {
+            rendered.push('\n');
+        }
+        let _ = write!(rendered, "{number:>4} | {line}");
+    }
+}
+
 async fn read(
     api: &Arc<dyn WorkspaceApi>,
     ws: &WorkspaceId,
     args: &Value,
 ) -> Result<Value, String> {
     let id = req_str(args, "id").map_err(|_| "Note ID is required".to_string())?;
+    let window = line_window(args)?;
     let note = api
         .get_note(ws.clone(), NoteId::from_string(&id))
         .await
         .map_err(map_err)?;
-    let raw_content = note.content.clone();
-    let total_lines = if raw_content.is_empty() {
+    let total_lines = if note.content.is_empty() {
         0
     } else {
-        raw_content.split('\n').count()
+        note.content.split('\n').count()
     };
+    // `(startLine, endLine)` of a bounded read. Only the requested lines are
+    // copied out of the note, so a huge note never reaches the script whole.
+    let mut page: Option<(usize, usize)> = None;
     let mut rendered = String::new();
-    if !raw_content.is_empty() {
-        for (idx, line) in raw_content.split('\n').enumerate() {
-            if idx > 0 {
-                rendered.push('\n');
-            }
-            let _ = write!(rendered, "{:>4} | {line}", idx + 1);
+    let raw_content = if let Some(window) = &window {
+        if window.start > total_lines.max(1) {
+            return Err(format!(
+                "startLine ({}) exceeds total lines in note ({total_lines})",
+                window.start
+            ));
         }
-    }
+        let take = window.max.unwrap_or(usize::MAX);
+        let numbered = || {
+            note.content
+                .split('\n')
+                .enumerate()
+                .skip(window.start - 1)
+                .take(take)
+                .map(|(idx, line)| (idx + 1, line))
+        };
+        let mut raw = String::new();
+        let mut end = window.start - 1;
+        if total_lines > 0 {
+            for (number, line) in numbered() {
+                if number > window.start {
+                    raw.push('\n');
+                }
+                raw.push_str(line);
+                end = number;
+            }
+            push_numbered(&mut rendered, numbered());
+        }
+        page = Some((window.start, end));
+        raw
+    } else {
+        if total_lines > 0 {
+            push_numbered(
+                &mut rendered,
+                note.content
+                    .split('\n')
+                    .enumerate()
+                    .map(|(idx, line)| (idx + 1, line)),
+            );
+        }
+        note.content.clone()
+    };
     if let Some(task) = note.metadata.task.as_ref() {
         rendered.push_str("\n\n--- Task Metadata ---\n");
         let _ = write!(
@@ -163,6 +248,17 @@ async fn read(
         "imageCount": 0,
         "images": Vec::<Value>::new(),
     });
+    if let Some((start_line, end_line)) = page {
+        let obj = out.as_object_mut().unwrap();
+        obj.insert("startLine".to_string(), json!(start_line));
+        obj.insert("endLine".to_string(), json!(end_line));
+        obj.insert(
+            "truncated".to_string(),
+            Value::Bool(start_line > 1 || end_line < total_lines),
+        );
+        obj.insert("rev".to_string(), json!(note.rev));
+        obj.insert("updatedAt".to_string(), json!(note.updated_at));
+    }
     if let Some(task) = note.metadata.task.as_ref() {
         let task_status = serde_json::to_value(task.status)
             .map_err(|e| format!("engine: serialize taskStatus failed: {e}"))?;
