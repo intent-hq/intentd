@@ -47,7 +47,7 @@ async fn connect_after_shutdown_fence(drain_writers: bool) {
         reader.get_mut().write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}", body.len(), body).as_bytes()).await.unwrap();
     });
     let services = Arc::new(
-        crate::Services::new(store)
+        crate::Services::new_isolated(store)
             .with_secret_store(Arc::new(raw.clone()))
             .with_github_login_base_uri(&base),
     );
@@ -126,9 +126,14 @@ pub(crate) async fn authorize(
             reader.get_mut().write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}", body.len(), body).as_bytes()).await.unwrap();
         }
     });
-    let (_, flow) = intent_sourcecontrol::device_flow::start_at(&base, "client", &["repo"])
-        .await
-        .unwrap();
+    let (_, flow) = intent_sourcecontrol::device_flow::start_at_with_store(
+        &base,
+        "client",
+        &["repo"],
+        services.gitlab_secret_store.clone(),
+    )
+    .await
+    .unwrap();
     let flow_id = next_flow_id();
     let deadline = Instant::now() + intentd_test_support::test_timeout(Duration::from_secs(30));
     let state = services.github_auth_flow.clone();
@@ -181,7 +186,7 @@ async fn github_poll_retains_engine_result_after_write_wait_budget() {
         .await
         .unwrap();
     let raw = intent_core::FileSecretStore::with_path(dir.path().join("secrets.json"));
-    let services = crate::Services::new(store).with_secret_store(Arc::new(raw.clone()));
+    let services = crate::Services::new_isolated(store).with_secret_store(Arc::new(raw.clone()));
     let entered = Arc::new(tokio::sync::Notify::new());
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     let release = Arc::new(std::sync::Mutex::new(Some(release_rx)));
@@ -253,7 +258,7 @@ async fn revoke_or_cancel_before_publication(cancel: bool) {
         ],
         ..Default::default()
     });
-    let services = crate::Services::new(store)
+    let services = crate::Services::new_isolated(store)
         .with_secret_store(Arc::new(raw.clone()))
         .with_event_bus(bus)
         .with_github_login_base_uri("http://127.0.0.1:1");
@@ -356,7 +361,7 @@ async fn finalizer_ownership_timeout(replace_flow: bool) {
         ],
         ..Default::default()
     });
-    let mut services = crate::Services::new(store).with_event_bus(bus);
+    let mut services = crate::Services::new_isolated(store).with_event_bus(bus);
     services.secrets = Arc::new(
         crate::settings::AsyncSecretStore::new(Arc::new(raw.clone()))
             .with_settle_timeout(Duration::from_millis(100)),

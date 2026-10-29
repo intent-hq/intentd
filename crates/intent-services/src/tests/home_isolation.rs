@@ -110,20 +110,54 @@ async fn home_isolation_setup_fixture_leaves_home_untouched() {
     assert_eq!(home.snapshot(), before, "sentinel home must stay untouched");
 }
 
-/// The production default constructor refuses to resolve the real home's
-/// secrets store under the test harness instead of silently migrating it.
+/// The production default constructor never resolves the real home's
+/// secrets store under the test harness: it is redirected to an empty
+/// scratch store, so the real tokens are unreadable and writes land outside
+/// the home. The same redirect covers the module-level token loaders.
 #[tokio::test]
-async fn home_isolation_default_services_refuse_forbidden_home() {
+async fn home_isolation_default_services_redirect_away_from_forbidden_home() {
     let home = SentinelHome::new();
+    std::fs::write(
+        home.dir.path().join("intent").join(".secrets.json"),
+        r#"{"real":"user-secret","sourceControl.github.token":"real-gh-token"}"#,
+    )
+    .expect("real dotfile secrets");
     let before = home.snapshot();
     let db = TempDb::new();
     let store = Store::open(&db.path).await.expect("open store");
 
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Services::new(store)));
-
+    let services = Services::new(store);
     assert!(
-        outcome.is_err(),
-        "Services::new must refuse the forbidden home's secrets store"
+        !services
+            .gitlab_secret_store
+            .path()
+            .starts_with(home.dir.path()),
+        "default Services must not use the forbidden home's store"
     );
+    assert_eq!(
+        services.secrets.load("real").await.expect("load"),
+        None,
+        "the real secrets must not be readable"
+    );
+    services
+        .secrets
+        .store("home-isolation.probe", "redirected")
+        .await
+        .expect("store probe secret");
+    assert_eq!(
+        intent_sourcecontrol::token::resolve(&intent_sourcecontrol::TokenSource::Explicit).await,
+        None,
+        "the GitHub token loader must not read the forbidden home"
+    );
+    let scratch = services
+        .gitlab_secret_store
+        .path()
+        .parent()
+        .map(Path::to_path_buf);
+    drop(services);
+    if let Some(dir) = scratch {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     assert_eq!(home.snapshot(), before, "sentinel home must stay untouched");
 }
