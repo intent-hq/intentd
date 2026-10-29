@@ -3252,6 +3252,7 @@ mod tests {
                                 intent_services::feature_api::model_catalog::ModelFetchResult {
                                     models: None,
                                     warning: Some("temporary authentication probe failure".into()),
+                                    warning_kind: None,
                                 }
                             })
                         },

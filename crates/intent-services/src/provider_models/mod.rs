@@ -79,6 +79,50 @@ pub(crate) struct ProviderModelsFetch {
     pub models: Option<Vec<Value>>,
     /// Machine-readable reason when `models` is `None`.
     pub warning: Option<String>,
+    /// Structured cause of the failure, when known (PROTOCOL §5.30
+    /// `warningKind`).
+    pub warning_kind: Option<crate::model_catalog::ModelWarningKind>,
+}
+
+/// Why an installed-CLI catalog command could not be prepared: the
+/// human-readable `reason` (served verbatim as `warning`) plus the
+/// structured cause when it is one a client can act on.
+#[derive(Debug, Clone)]
+pub(crate) struct CatalogUnavailable {
+    pub reason: String,
+    pub kind: Option<crate::model_catalog::ModelWarningKind>,
+}
+
+impl From<String> for CatalogUnavailable {
+    fn from(reason: String) -> Self {
+        Self { reason, kind: None }
+    }
+}
+
+impl From<&str> for CatalogUnavailable {
+    fn from(reason: &str) -> Self {
+        reason.to_owned().into()
+    }
+}
+
+impl From<crate::installed_cli::DiscoveryError> for CatalogUnavailable {
+    fn from(err: crate::installed_cli::DiscoveryError) -> Self {
+        Self {
+            kind: err
+                .cli_missing
+                .then_some(crate::model_catalog::ModelWarningKind::CliMissing),
+            reason: err.message,
+        }
+    }
+}
+
+/// The failure when no adapter launch can be built for `provider_id`: the
+/// pinned adapter runs through `npx`, so Node.js with `npx` is missing.
+pub(crate) fn adapter_unavailable(provider_id: &str) -> CatalogUnavailable {
+    CatalogUnavailable {
+        reason: crate::complete_ops::missing_one_shot_adapter_message(provider_id),
+        kind: Some(crate::model_catalog::ModelWarningKind::PrerequisiteMissing),
+    }
 }
 
 impl ProviderModelsFetch {
@@ -86,6 +130,7 @@ impl ProviderModelsFetch {
         Self {
             models: Some(models),
             warning: None,
+            warning_kind: None,
         }
     }
 
@@ -93,6 +138,15 @@ impl ProviderModelsFetch {
         Self {
             models: None,
             warning: Some(format!("{provider_id}: {reason}")),
+            warning_kind: None,
+        }
+    }
+
+    /// [`Self::unavailable`] keeping the failure's structured cause.
+    pub(crate) fn from_unavailable(provider_id: &str, err: CatalogUnavailable) -> Self {
+        Self {
+            warning_kind: err.kind,
+            ..Self::unavailable(provider_id, err.reason)
         }
     }
 }
@@ -216,7 +270,7 @@ pub(crate) async fn fetch_claude_code_models() -> ProviderModelsFetch {
 pub(crate) async fn installed_model_command(
     provider_id: &str,
     profile: Option<std::sync::Arc<intent_acp::ProfileEnv>>,
-) -> Result<AcpProbeCommand, String> {
+) -> Result<AcpProbeCommand, CatalogUnavailable> {
     let provider = intent_providers::find_provider(provider_id).ok_or("unknown provider")?;
     let codex = provider_id == "codex";
     let npx = tokio::task::spawn_blocking(move || {
@@ -229,15 +283,18 @@ pub(crate) async fn installed_model_command(
     .await
     .map_err(|_| "adapter discovery failed")?;
     let cmd = crate::complete_ops::one_shot_launch(provider, None, npx, None)
-        .ok_or_else(|| crate::complete_ops::missing_one_shot_adapter_message(provider_id))?;
+        .ok_or_else(|| adapter_unavailable(provider_id))?;
     cmd.check_npx_version().await.map_err(|e| e.to_string())?;
-    cmd.with_profile(profile).prepare_installed_catalog().await
+    Ok(cmd
+        .with_profile(profile)
+        .prepare_installed_catalog()
+        .await?)
 }
 
 async fn fetch_installed_models(provider_id: &str) -> ProviderModelsFetch {
     match installed_model_command(provider_id, None).await {
         Ok(cmd) => fetch_installed_models_at(provider_id, cmd).await,
-        Err(reason) => ProviderModelsFetch::unavailable(provider_id, reason),
+        Err(err) => ProviderModelsFetch::from_unavailable(provider_id, err),
     }
 }
 
@@ -728,6 +785,7 @@ fn unsloth_fetch_outcome(body: &str, total_ram_bytes: Option<u64>) -> ProviderMo
             warning: Some(format!(
                 "unsloth: {hidden} repo(s) hidden (estimated to exceed available memory, or size unknown)"
             )),
+            warning_kind: None,
         }
     } else {
         ProviderModelsFetch::ok(rows)
