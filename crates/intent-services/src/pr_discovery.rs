@@ -14,7 +14,7 @@ use std::time::Duration;
 use intent_sourcecontrol::request_budget::with_admission_tracking;
 use intent_sourcecontrol::traffic::{record_reuse, Operation, Reuse};
 use intent_sourcecontrol::{
-    cache_scope::CacheScope, Error, PrQuery, PrState, PullRequest, RepoRef, Result, SourceControl,
+    cache_scope::CacheScope, Error, PrState, PullRequest, RepoRef, Result, SourceControl,
 };
 use tokio::time::Instant;
 
@@ -622,17 +622,9 @@ impl Discovery {
                 let mut seen = HashSet::new();
                 let mut numbers = HashSet::new();
                 for _ in 0..MAX_PAGES {
-                    let page = sc
-                        .list_prs(
-                            &key.repo,
-                            PrQuery {
-                                state: Some(PrState::Open),
-                                limit: Some(100),
-                                cursor: cursor.clone(),
-                                ..PrQuery::default()
-                            },
-                        )
-                        .await?;
+                    // Only the repository owner's heads: another fork's
+                    // same-name branch is not this workspace's (#8010).
+                    let page = sc.list_own_open_prs(&key.repo, cursor.clone()).await?;
                     if page.items.len() > 100 {
                         return Err(unknown("oversized open PR page"));
                     }

@@ -619,6 +619,46 @@ async fn shared_discovery_head_query_matches_a_pr_authored_by_someone_else() {
     assert_eq!((found.number, found.author.as_str()), (1300, "maintainer"));
 }
 
+/// intent-hq/intent#8010 on the repository-wide listing (at most 1,000 open
+/// PRs, i.e. most repositories): another fork's same-name head, even a newer
+/// one, never matches; the owner's head matches whoever authored it; a head
+/// whose fork was deleted matches nothing.
+#[tokio::test]
+async fn shared_discovery_listing_ignores_other_forks_with_the_same_branch() {
+    let mut authored = fork_pull(4, "authored", "o");
+    authored["user"] = json!({"login":"maintainer"});
+    let mut deleted = pull(5, "gone");
+    deleted["head"]["repo"] = serde_json::Value::Null;
+    let api = Api::new(vec![
+        fork_pull(1, "feature", "o"),
+        fork_pull(2, "feature", "contributor"),
+        fork_pull(3, "fork-only", "contributor"),
+        authored,
+        deleted,
+    ])
+    .await;
+    let (_t, svc, _) = refresh_setup(StubForge::default(), "main", None, false).await;
+    let sc = api.sc();
+    let repo = RepoRef::new("o", "r");
+    let found = |branch: &'static str| {
+        let (svc, sc, repo) = (&svc, sc.clone(), repo.clone());
+        async move {
+            svc.discover_shared_pr(sc.as_ref(), &repo, branch, None, None)
+                .await
+                .unwrap()
+                .map(|pr| (pr.number, pr.author))
+        }
+    };
+    assert_eq!(found("feature").await, Some((1, "o".into())));
+    assert_eq!(found("fork-only").await, None, "another fork's PR");
+    assert_eq!(
+        found("authored").await,
+        Some((4, "maintainer".into())),
+        "head owner, not author, scopes the match"
+    );
+    assert_eq!(found("gone").await, None, "a deleted fork's head");
+}
+
 /// A head query that observes a PR open supersedes an older cached record of
 /// it, as the repository-wide listing does (intent-hq/intent#7187).
 #[tokio::test]

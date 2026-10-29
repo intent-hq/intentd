@@ -215,6 +215,28 @@ pub trait SourceControl: Send + Sync {
         Err(Error::Unsupported("complete review discussions".into()))
     }
 
+    /// One page (up to 100) of the repository's open PRs whose head lives in
+    /// the repository owner's account: shared PR discovery's repository-wide
+    /// listing, which must not attach another fork's same-name branch
+    /// (intent-hq/intent#8010). The default lists every open PR, for forges
+    /// that report no head owner.
+    async fn list_own_open_prs(
+        &self,
+        repo: &RepoRef,
+        cursor: Option<String>,
+    ) -> Result<Page<PullRequest>> {
+        self.list_prs(
+            repo,
+            PrQuery {
+                state: Some(PrState::Open),
+                limit: Some(100),
+                cursor,
+                ..PrQuery::default()
+            },
+        )
+        .await
+    }
+
     /// Open PRs whose head branch is `head_ref` in the workspace's own head
     /// repository, in one bounded read. More matches than one page is an
     /// error rather than a truncated answer. The default suits forges whose
