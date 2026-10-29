@@ -12,6 +12,8 @@ use intent_store::Store;
 
 const FORBIDDEN_HOME: &str = "INTENTD_TEST_FORBIDDEN_HOME";
 const SECRETS_FILE: &str = "INTENTD_SECRETS_FILE";
+const WORKSPACES_DIR: &str = "INTENTD_WORKSPACES_DIR";
+const ASSERT_HERMETIC_ROOT: &str = "INTENTD_ASSERT_HERMETIC_ROOT";
 
 /// Points `HOME` and the forbidden-home marker at a sentinel directory and
 /// restores both on drop. Nextest runs each test in its own process, and the
@@ -34,13 +36,22 @@ impl SentinelHome {
         std::fs::create_dir_all(&intent).expect("sentinel intent dir");
         std::fs::write(intent.join("secrets.json"), r#"{"real":"user-secret"}"#)
             .expect("legacy secrets");
-        let saved = ["HOME", "USERPROFILE", SECRETS_FILE, FORBIDDEN_HOME]
-            .into_iter()
-            .map(|k| (k, std::env::var_os(k)))
-            .collect();
+        let saved = [
+            "HOME",
+            "USERPROFILE",
+            SECRETS_FILE,
+            FORBIDDEN_HOME,
+            WORKSPACES_DIR,
+            ASSERT_HERMETIC_ROOT,
+        ]
+        .into_iter()
+        .map(|k| (k, std::env::var_os(k)))
+        .collect();
         std::env::set_var("HOME", dir.path());
         std::env::set_var("USERPROFILE", dir.path());
         std::env::remove_var(SECRETS_FILE);
+        std::env::remove_var(WORKSPACES_DIR);
+        std::env::remove_var(ASSERT_HERMETIC_ROOT);
         std::env::set_var(FORBIDDEN_HOME, dir.path());
         Self {
             dir,
@@ -158,6 +169,29 @@ async fn home_isolation_default_services_redirect_away_from_forbidden_home() {
     if let Some(dir) = scratch {
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    assert_eq!(home.snapshot(), before, "sentinel home must stay untouched");
+}
+
+/// The machine-level CoW probe resolves the workspaces root through the
+/// non-panicking `try_default_workspaces_root`; with no injected root it must
+/// not create `~/intent/workspaces` in the real home (caught by the CI
+/// backstop: `created workspaces` under the runner's home).
+#[tokio::test]
+async fn home_isolation_cow_probe_never_creates_the_default_workspaces_root() {
+    let home = SentinelHome::new();
+    let before = home.snapshot();
+
+    assert_eq!(
+        crate::try_default_workspaces_root(),
+        None,
+        "the default workspaces root must be unavailable inside the forbidden home"
+    );
+    let (_db, services, _ws, _note) = setup("body").await;
+    services.prewarm_cow_supported();
+    let _ = services.compute_cow_supported().await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    drop(services);
 
     assert_eq!(home.snapshot(), before, "sentinel home must stay untouched");
 }

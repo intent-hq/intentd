@@ -13216,7 +13216,8 @@ pub fn default_workspaces_root() -> PathBuf {
 /// not fire the hermetic guard (e.g. the `system.status` workspaces-disk
 /// sampler in the composition root): `None` when `INTENTD_ASSERT_HERMETIC_ROOT`
 /// is set with no `INTENTD_WORKSPACES_DIR` — the posture where resolving the
-/// `$HOME` default would panic — else the same root the service layer uses.
+/// `$HOME` default would panic — or, under the test harness, when the default
+/// lands in the real home; else the same root the service layer uses.
 pub(crate) fn try_default_workspaces_root() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("INTENTD_WORKSPACES_DIR") {
         return Some(PathBuf::from(dir));
@@ -13224,12 +13225,17 @@ pub(crate) fn try_default_workspaces_root() -> Option<PathBuf> {
     if std::env::var_os("INTENTD_ASSERT_HERMETIC_ROOT").is_some() {
         return None;
     }
-    Some(
-        std::env::var_os("HOME")
-            .map_or_else(std::env::temp_dir, PathBuf::from)
-            .join("intent")
-            .join("workspaces"),
-    )
+    let root = std::env::var_os("HOME")
+        .map_or_else(std::env::temp_dir, PathBuf::from)
+        .join("intent")
+        .join("workspaces");
+    // Under the test harness the real home's root is unavailable, exactly
+    // like the hermetic posture above: the CoW probe would otherwise create
+    // `~/intent/workspaces` (see `intent_core::test_isolation`).
+    if intent_core::test_isolation::is_in_forbidden_home(&root) {
+        return None;
+    }
+    Some(root)
 }
 
 /// Non-panicking, side-effect-free mirror of [`resolve_workspaces_parent`] for
