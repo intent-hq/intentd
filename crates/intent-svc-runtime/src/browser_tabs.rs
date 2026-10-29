@@ -342,8 +342,13 @@ impl BrowserTabRoutingExt for Services {
     ///
     /// Guards, each failing closed:
     /// - **Liveness.** A superseded id with a live hello'd connection keeps
-    ///   its tabs — it is still an active host. Without a reverse registry
-    ///   liveness is unknown, so nothing moves.
+    ///   its tabs — it is still an active host. Liveness is read while holding
+    ///   the tab gate; without a reverse registry it is unknown, so nothing
+    ///   moves.
+    /// - **Workspace access.** A collaborator caller moves a host only when it
+    ///   may manage the browser in every workspace that host has open tabs in
+    ///   (the transport has already required current host execution
+    ///   authority).
     /// - **No change of who may act as the host.** Besides the
     ///   administrator, only principal `P` may hello as `P:…`. An id's
     ///   *namespace owner* is its head segment when that names a principal of
@@ -362,18 +367,7 @@ impl BrowserTabRoutingExt for Services {
         let Some(dispatch) = self.feature_reverse_dispatch() else {
             return Ok(0);
         };
-        let live: HashSet<ClientId> = dispatch
-            .live_clients()
-            .into_iter()
-            .map(|c| c.client_id)
-            .collect();
-        let mut candidates: Vec<ClientId> = superseded
-            .into_iter()
-            .filter(|id| !live.contains(id))
-            .collect();
-        if candidates.is_empty() {
-            return Ok(0);
-        }
+        let mut candidates = superseded;
         let head = |id: &ClientId| id.as_str().split_once(':').map(|(h, _)| h.to_string());
         let heads: Vec<PrincipalId> = std::iter::once(client_id)
             .chain(candidates.iter())
@@ -394,6 +388,33 @@ impl BrowserTabRoutingExt for Services {
             return Ok(0);
         }
         let _gate = self.feature_browser_tab_gate().lock().await;
+        // Liveness is read under the gate every host report takes, so an old
+        // host that reconnected while this request waited keeps its tabs.
+        let live: HashSet<ClientId> = dispatch
+            .live_clients()
+            .into_iter()
+            .map(|c| c.client_id)
+            .collect();
+        candidates.retain(|id| !live.contains(id));
+        if intent_services::feature_api::event_ops::is_collaborator_caller() {
+            let mut allowed = Vec::with_capacity(candidates.len());
+            'host: for host in candidates {
+                for tab in self.store().list_browser_tabs_by_host(&host).await? {
+                    if self
+                        .require_browser_workspace(&tab.workspace_id)
+                        .await
+                        .is_err()
+                    {
+                        continue 'host;
+                    }
+                }
+                allowed.push(host);
+            }
+            candidates = allowed;
+        }
+        if candidates.is_empty() {
+            return Ok(0);
+        }
         let moved = self
             .store()
             .reassign_browser_tabs_from_hosts(client_id, &candidates)

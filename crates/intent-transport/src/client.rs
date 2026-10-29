@@ -282,7 +282,10 @@ pub(crate) async fn handle(
         };
     }
     let superseded = superseded_client_ids(&resolved);
-    if !superseded.is_empty() {
+    // Rehoming tabs is browser management: it needs the same current host
+    // execution authority as the browser RPCs, not just namespace ownership
+    // (a member demoted to guest keeps its namespace but loses the browser).
+    if !superseded.is_empty() && crate::context::may_manage_workspaces(api).await {
         if let Err(e) = api
             .rehome_superseded_browser_tabs(resolved.clone(), superseded)
             .await

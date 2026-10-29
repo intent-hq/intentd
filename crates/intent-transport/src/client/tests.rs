@@ -547,6 +547,8 @@ fn monitor_test_host_support_requires_explicit_opt_in() {
 struct RehomeApi {
     calls: Mutex<Vec<(String, Vec<String>)>>,
     fail: bool,
+    /// The durable host role `principal_host_role` reports (`None` ⇒ error).
+    role: Option<intent_core::HostRole>,
 }
 
 impl WorkspaceApi for RehomeApi {
@@ -558,6 +560,16 @@ impl WorkspaceApi for RehomeApi {
         _host: ClientHostInfo,
     ) -> BoxFuture<'_, Result<()>> {
         Box::pin(async { Ok(()) })
+    }
+
+    fn principal_host_role(
+        &self,
+        _principal_id: PrincipalId,
+    ) -> BoxFuture<'_, Result<intent_core::HostRole>> {
+        let role = self.role;
+        Box::pin(
+            async move { role.ok_or_else(|| intent_core::Error::NotFound("principal".into())) },
+        )
     }
 
     fn rehome_superseded_browser_tabs(
@@ -726,4 +738,63 @@ async fn failed_rehome_does_not_fail_the_hello() {
     assert_eq!(out["result"]["clientId"], json!("4d61d017:60420340"));
     assert_eq!(binding.unwrap().as_str(), "4d61d017:60420340");
     assert_eq!(api.calls.lock().unwrap().len(), 1);
+}
+
+/// Rehoming is browser management: a collaborator whose connection still
+/// carries a member snapshot but who has since been demoted to guest keeps
+/// its namespace, yet its hello offers nothing for rehome (and still
+/// succeeds); with current member authority its own namespaced earlier id
+/// is offered.
+#[tokio::test]
+async fn demoted_collaborator_hello_rehomes_nothing_but_still_succeeds() {
+    let member_snapshot = Caller::Wire {
+        principal_id: PrincipalId::from_string("p-mem"),
+        host_role: intent_core::HostRole::Member,
+    };
+    let demoted = RehomeApi {
+        role: Some(intent_core::HostRole::Guest),
+        ..RehomeApi::default()
+    };
+    let mut binding = None;
+    let out = parsed(
+        with_request_context(
+            true,
+            Some(member_snapshot.clone()),
+            handle(
+                hello_as("p-mem:x:p-mem:dev"),
+                &demoted,
+                &mut binding,
+                true,
+                TEST_DAEMON_VERSION,
+            ),
+        )
+        .await,
+    );
+    assert_eq!(out["result"]["clientId"], json!("p-mem:x:p-mem:dev"));
+    assert!(demoted.calls.lock().unwrap().is_empty());
+
+    let member = RehomeApi {
+        role: Some(intent_core::HostRole::Member),
+        ..RehomeApi::default()
+    };
+    let mut binding = None;
+    let _ = with_request_context(
+        true,
+        Some(member_snapshot),
+        handle(
+            hello_as("p-mem:x:p-mem:dev"),
+            &member,
+            &mut binding,
+            true,
+            TEST_DAEMON_VERSION,
+        ),
+    )
+    .await;
+    assert_eq!(
+        *member.calls.lock().unwrap(),
+        vec![(
+            "p-mem:x:p-mem:dev".to_string(),
+            vec!["p-mem:dev".to_string()]
+        )]
+    );
 }
