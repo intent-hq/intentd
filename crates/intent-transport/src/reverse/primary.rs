@@ -248,6 +248,12 @@ struct State {
     bound: HashMap<u64, ClientId>,
     /// Maintained on mutation, so roster reads clone only the returned rows.
     devices: Vec<ReverseLiveClient>,
+    /// `clientId`s with a `client.hello` in flight (reserved before the hello
+    /// persists its client row, released after the bind), counted per id.
+    /// Read by [`PrimaryReverseRegistry::client_active`] so the superseded-id
+    /// tab rehome (intent-hq/intent#8045) never moves a host that is about to
+    /// bind.
+    binding: HashMap<ClientId, usize>,
 }
 
 impl State {
@@ -760,6 +766,21 @@ impl PrimaryReverseRegistry {
     ///
     /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
     #[must_use]
+    /// Whether `client_id` has a live hello'd connection or a `client.hello`
+    /// in flight ([`PrimaryReverseGuard::reserve_binding`]). A hello reserves
+    /// its id before it persists the client row, and the store serializes that
+    /// write with the rehome's transaction, so a host this reports inactive
+    /// inside the rehome's write transaction can only bind after the commit.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
+    #[must_use]
+    pub fn client_active(&self, client_id: &ClientId) -> bool {
+        let state = self.inner.lock();
+        state.presence.contains_key(client_id) || state.binding.contains_key(client_id)
+    }
+
     pub fn host_presence(&self, hosts: &HashSet<&ClientId>) -> HashMap<ClientId, ClientPresence> {
         let state = self.inner.lock();
         hosts
@@ -913,6 +934,10 @@ impl AgentReverseDispatch for PrimaryReverseRegistry {
         PrimaryReverseRegistry::resolve(self, target)
     }
 
+    fn client_active(&self, client_id: &ClientId) -> bool {
+        PrimaryReverseRegistry::client_active(self, client_id)
+    }
+
     fn live_clients(&self) -> Vec<ReverseLiveClient> {
         PrimaryReverseRegistry::live_clients(self)
             .iter()
@@ -1020,7 +1045,44 @@ async fn publish_client_event(api: &dyn WorkspaceApi, transition: &ClientTransit
     }
 }
 
+/// A `client.hello` in flight for one `clientId`
+/// ([`PrimaryReverseGuard::reserve_binding`]); released on drop.
+pub struct BindingReservation {
+    inner: Arc<Inner>,
+    client_id: ClientId,
+}
+
+impl Drop for BindingReservation {
+    fn drop(&mut self) {
+        let mut state = self.inner.lock();
+        if let Some(count) = state.binding.get_mut(&self.client_id) {
+            *count -= 1;
+            if *count == 0 {
+                state.binding.remove(&self.client_id);
+            }
+        }
+    }
+}
+
 impl PrimaryReverseGuard {
+    /// Reserve `client_id` for this connection's in-flight `client.hello`:
+    /// take it before the hello persists its client row and hold it until the
+    /// bind, so [`PrimaryReverseRegistry::client_active`] reports the id
+    /// throughout. `None` for a detached guard.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
+    #[must_use]
+    pub fn reserve_binding(&self, client_id: ClientId) -> Option<BindingReservation> {
+        let inner = self.registry.as_ref()?;
+        *inner.lock().binding.entry(client_id.clone()).or_insert(0) += 1;
+        Some(BindingReservation {
+            inner: Arc::clone(inner),
+            client_id,
+        })
+    }
+
     pub(crate) fn desktop_connection(&self) -> Option<intent_core::desktop::DesktopConnection> {
         let inner = self.registry.as_ref()?;
         let state = inner.lock();

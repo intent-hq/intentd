@@ -938,3 +938,54 @@ async fn reassign_browser_tabs_from_hosts_moves_only_open_rows_of_old_hosts() {
         .unwrap();
     assert!(none.is_empty());
 }
+
+/// The rehome's final per-host decision runs while the transaction holds the
+/// store's only write connection (intent-hq/intent#8045): a concurrent
+/// `client.hello` cannot persist its client row — and so cannot bind — until
+/// the move commits. Hosts the predicate rejects are never written.
+#[tokio::test]
+async fn reassign_browser_tabs_from_hosts_decides_while_holding_the_write_connection() {
+    let f = fixture().await;
+    let new_host = ClientId("scope:client-a".to_string());
+    f.store
+        .upsert_client(
+            &new_host,
+            Some("Desktop A"),
+            None,
+            &ClientHostInfo::default(),
+        )
+        .await
+        .unwrap();
+    f.store
+        .upsert_browser_tab(&f.host_a, input(&f.ws, "a-tab", "https://a.test/"))
+        .await
+        .unwrap();
+    f.store
+        .upsert_browser_tab(&f.host_b, input(&f.ws, "b-tab", "https://b.test/"))
+        .await
+        .unwrap();
+    let pool = f.store.write_pool().clone();
+    let held = std::sync::atomic::AtomicBool::new(true);
+    let decide = |host: &ClientId| {
+        if pool.try_acquire().is_some() {
+            held.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+        *host == f.host_a
+    };
+    let moved = f
+        .store
+        .reassign_browser_tabs_from_hosts(&new_host, &[f.host_a.clone(), f.host_b.clone()], &decide)
+        .await
+        .unwrap();
+    assert!(
+        held.load(std::sync::atomic::Ordering::SeqCst),
+        "the write connection is held while deciding"
+    );
+    let ids: Vec<&str> = moved.iter().map(|(t, _)| t.tab_id.as_str()).collect();
+    assert_eq!(ids, ["a-tab"]);
+    let b = f.store.get_browser_tab("b-tab").await.unwrap().unwrap();
+    assert_eq!(
+        b.host_client_id, f.host_b,
+        "a rejected host is never written"
+    );
+}

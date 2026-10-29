@@ -937,6 +937,13 @@ async fn process_captured_frame(
                     == Some(1);
             // A new hello revokes the previous connection-local operation.
             subs.setup = crate::provider_setup::Connection::default();
+            // Mark the presented id as binding before the hello persists its
+            // client row, until the bind below (intent-hq/intent#8045): a
+            // concurrent superseded-id rehome then never moves this host.
+            let binding = req.client_id.as_ref().and_then(|id| {
+                reverse_guard
+                    .reserve_binding(client::scope_to_caller(ClientId::from_string(id.clone())))
+            });
             let mut bound = None;
             let frame = panic_guard::guard_frame(&method, rpc_id.clone(), async {
                 let outcome = client::handle(
@@ -980,6 +987,7 @@ async fn process_captured_frame(
                 subs.hello_identity = Some(identity.clone());
                 reverse_guard.bind(identity);
             }
+            drop(binding);
             // Multiplayer w5: a hello'd connection is online for its
             // principal. Best-effort — a refusal (no wire caller) only
             // means this connection never counts as present.

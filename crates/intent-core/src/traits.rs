@@ -9437,6 +9437,16 @@ pub trait AgentReverseDispatch: Send + Sync {
         Vec::new()
     }
 
+    /// Whether `client_id` is live or about to be: a hello'd connection, or a
+    /// `client.hello` in flight that has not bound yet. The superseded-id tab
+    /// rehome (intent-hq/intent#8045) never moves such a host. The default
+    /// consults [`Self::live_clients`] only.
+    fn client_active(&self, client_id: &ClientId) -> bool {
+        self.live_clients()
+            .iter()
+            .any(|client| &client.client_id == client_id)
+    }
+
     /// Every live hello'd connection grouped by client, plus where each of
     /// `targets` would be delivered for a `browser.exec` scoped to
     /// `workspace_id` (Chief selects administrator connections only, as in

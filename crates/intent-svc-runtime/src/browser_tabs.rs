@@ -407,25 +407,17 @@ impl BrowserTabRoutingExt for Services {
         }
         // Liveness is read under the gate every host report takes, so an old
         // host that reconnected while this request waited keeps its tabs.
-        let live_now = || -> HashSet<ClientId> {
-            dispatch
-                .live_clients()
-                .into_iter()
-                .map(|c| c.client_id)
-                .collect()
-        };
-        let live = live_now();
-        candidates.retain(|id| !live.contains(id));
+        candidates.retain(|id| !dispatch.client_active(id));
         if candidates.is_empty() {
             return Ok(0);
         }
         // Binding a connection does not take the gate, so an old host can come
-        // online after the snapshot above. The final liveness read happens
-        // inside the write transaction, right before the rows move: a host
-        // bound by then is never written (nothing speculative is committed or
-        // visible to readers), and a bind after it is ordered after the move.
-        let still_offline =
-            |host: &ClientId| !dispatch.live_clients().iter().any(|c| c.client_id == *host);
+        // online after the check above. The final check runs inside the write
+        // transaction, right before the rows move. A hello reserves its id
+        // before it persists its client row, and that write waits for this
+        // transaction, so a host inactive here can only bind after the commit:
+        // nothing speculative is committed or visible to readers.
+        let still_offline = |host: &ClientId| !dispatch.client_active(host);
         let moved = self
             .store()
             .reassign_browser_tabs_from_hosts(client_id, &candidates, &still_offline)
