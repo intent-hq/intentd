@@ -754,18 +754,6 @@ impl PrimaryReverseRegistry {
         ReverseConnectionSnapshot { clients, routes }
     }
 
-    /// Presence of the given logical clients: one O(1) index lookup per
-    /// distinct id under a single lock acquisition, independent of how many
-    /// connections the daemon holds. Absent keys are offline. This is the
-    /// `browser.listTabs` `hostName` / `hostConnected` decoration source —
-    /// the index is maintained by registry mutations (rung 1 of the derived
-    /// field ladder), so a list of N tabs costs O(N) regardless of client
-    /// count.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
-    #[must_use]
     /// Whether `client_id` has a live hello'd connection or a `client.hello`
     /// in flight ([`PrimaryReverseGuard::reserve_binding`]). A hello reserves
     /// its id before it persists the client row, and the store serializes that
@@ -781,6 +769,18 @@ impl PrimaryReverseRegistry {
         state.presence.contains_key(client_id) || state.binding.contains_key(client_id)
     }
 
+    /// Presence of the given logical clients: one O(1) index lookup per
+    /// distinct id under a single lock acquisition, independent of how many
+    /// connections the daemon holds. Absent keys are offline. This is the
+    /// `browser.listTabs` `hostName` / `hostConnected` decoration source —
+    /// the index is maintained by registry mutations (rung 1 of the derived
+    /// field ladder), so a list of N tabs costs O(N) regardless of client
+    /// count.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (a prior panic while holding the lock).
+    #[must_use]
     pub fn host_presence(&self, hosts: &HashSet<&ClientId>) -> HashMap<ClientId, ClientPresence> {
         let state = self.inner.lock();
         hosts
