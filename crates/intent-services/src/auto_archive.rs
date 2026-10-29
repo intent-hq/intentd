@@ -3,14 +3,16 @@
 //! every workspace idle longer than the configured number of days, through
 //! the same path and `workspace:updated` delta as `workspace.archive`.
 //!
-//! The setting is read live at every sweep (absent = 7, `0` = off). A
+//! The setting is read live at every sweep (absent or `0` = off). A
 //! workspace is idle when the newest of `lastContentActivity`,
 //! `lastActivity` and `createdAt` is older than the cutoff. Skipped: the
 //! Chief workspace, remote workspaces, workspaces that are already archived,
 //! retired or deleted, a pending grace-window delete, guest-shared
 //! workspaces (archiving would remove the guests), and any workspace with
 //! work in flight — a running agent turn, a running script or background
-//! worker, an active hook or an active PR monitor. Each workspace is
+//! worker, an active hook or an active PR monitor — and any workspace whose
+//! git roots hold uncommitted changes or unpushed commits
+//! ([`crate::local_work::LocalWorkRule::Archive`]). Each workspace is
 //! archived independently: a failure is logged and counted, never aborts the
 //! sweep. Archived rows are not due any more, so a sweep is idempotent.
 
@@ -186,7 +188,9 @@ impl Services {
             Ok(_) => return Some("active PR monitor"),
             Err(_) => return Some("PR monitor lookup failed"),
         }
-        None
+        // Last: the only check that runs git.
+        self.blocked_by_local_work(ws, crate::local_work::LocalWorkRule::Archive)
+            .await
     }
 
     /// Spawn the auto-archive loop: a first sweep shortly after startup,

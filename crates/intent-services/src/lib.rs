@@ -213,6 +213,7 @@ mod invite_ops;
 mod issue_cache;
 mod line_attribution;
 mod linear_ops;
+mod local_work;
 mod member_removal;
 mod model_catalog;
 mod model_preference;

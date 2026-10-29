@@ -590,18 +590,20 @@ grouping choices keep their behavior.
 
 ## Archive, auto-archive and disk cleanup
 
-<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{home-workspace-menu.ts,HomeWorkspaceControls.svelte}; src/lib/components/modals/RetireWorkspaceConfirmDialog.svelte; src/lib/components/settings/GitWorkspaceSettings.svelte; messages/en.json. Daemon: workspace.archive, workspace.retire, packages/intentd/crates/intent-services/src/{auto_archive,retire,auto_retire}.rs. -->
+<!-- Sources (paths relative to packages/cloudlands-fe): src/features/home/{home-workspace-menu.ts,HomeWorkspaceControls.svelte}; src/lib/components/modals/RetireWorkspaceConfirmDialog.svelte; src/lib/components/settings/GitWorkspaceSettings.svelte; messages/en.json. Daemon: workspace.archive, workspace.retire, packages/intentd/crates/intent-services/src/{auto_archive,retire,auto_retire,local_work}.rs. -->
 
 Archive is the one way to put a workspace away. In **Home → Workspaces**,
 right-click a workspace and choose **Archive**. Archiving stops its agents, hooks
 and PR monitors and keeps its folder. Archived workspaces appear under the
 **Archived** filter. Choose **Unarchive**, or send an agent a message, to continue.
 
-Intent archives idle workspaces automatically: a workspace with no messages, note
-edits or agent activity for 7 days is archived, unless an agent, script, hook or PR
-monitor is still running or it is shared with guests. Change or turn this off in
-**Workspace setup → Archive idle workspaces** (`/settings?tab=setup#git-workspace`),
-or set `autoArchiveIdleAfterDays` (`0` = off) under `[workspace]` in `config.toml`.
+Intent can archive idle workspaces automatically. It is off by default; turn on
+**Workspace setup → Archive idle workspaces** (`/settings?tab=setup#git-workspace`)
+and set the number of days (7 when first turned on), or set `autoArchiveIdleAfterDays`
+(`0` = off) under `[workspace]` in `config.toml`. A workspace with no messages, note
+edits or agent activity for that long is archived, unless an agent, script, hook or
+PR monitor is still running, it is shared with guests, or it has uncommitted changes
+or unpushed commits.
 
 To free disk space, right-click an archived workspace and choose **Purge workspace
 folder**, then confirm. This deletes the folder, including uncommitted changes and

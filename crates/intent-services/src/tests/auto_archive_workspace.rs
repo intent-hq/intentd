@@ -8,20 +8,39 @@ use intent_core::{WorkspaceApi, WorkspaceStatus};
 use super::retire_workspace::{drain_changes, subscribe_updates};
 use crate::test_support::retire_workspace::{create_workspace, days_from_now, fixture};
 
-/// On by default: with no setting, a workspace idle past 7 days is archived
-/// on the next sweep with the ordinary archive delta; one idle 6 days is
-/// not; a second sweep is a no-op.
+/// Off by default: with no setting, even a workspace idle for years is
+/// left alone.
 #[intent_test_macros::daemon_test]
-async fn auto_archive_is_on_by_default_after_seven_idle_days() {
+async fn auto_archive_is_off_by_default() {
+    let f = fixture().await;
+    let ws = create_workspace(&f).await;
+    assert_eq!(
+        f.svc.sweep_auto_archive_at(days_from_now(3650)).await,
+        crate::AutoArchiveReport::default()
+    );
+    assert!(!f.store.get_workspace(&ws.id).await.unwrap().archived);
+}
+
+/// With a 7-day window, a workspace idle past 7 days is archived on the next
+/// sweep with the ordinary archive delta; one idle 6 days is not; a second
+/// sweep is a no-op.
+#[intent_test_macros::daemon_test]
+async fn auto_archive_archives_after_the_configured_idle_days() {
     let f = fixture().await;
     let ws = create_workspace(&f).await;
 
-    let early = f.svc.sweep_auto_archive_at(days_from_now(6)).await;
+    let early = f
+        .svc
+        .sweep_auto_archive_after(Some(7), days_from_now(6))
+        .await;
     assert_eq!(early, crate::AutoArchiveReport::default());
     assert!(!f.store.get_workspace(&ws.id).await.unwrap().archived);
 
     let mut sub = subscribe_updates(&f, &ws.id);
-    let report = f.svc.sweep_auto_archive_at(days_from_now(8)).await;
+    let report = f
+        .svc
+        .sweep_auto_archive_after(Some(7), days_from_now(8))
+        .await;
     assert_eq!(report.archived, 1, "{report:?}");
     assert_eq!(report.failed, 0, "{report:?}");
     let row = f.store.get_workspace(&ws.id).await.unwrap();
@@ -39,7 +58,10 @@ async fn auto_archive_is_on_by_default_after_seven_idle_days() {
         "archive delta published: {changes:?}"
     );
 
-    let again = f.svc.sweep_auto_archive_at(days_from_now(30)).await;
+    let again = f
+        .svc
+        .sweep_auto_archive_after(Some(7), days_from_now(30))
+        .await;
     assert_eq!(again, crate::AutoArchiveReport::default());
 }
 
@@ -223,4 +245,78 @@ async fn auto_archived_workspace_unarchives_normally() {
         .expect("unarchive");
     assert_eq!(back.status, WorkspaceStatus::Active);
     assert!(std::path::Path::new(ws.worktree_path.as_deref().unwrap()).is_dir());
+}
+
+/// An idle workspace with uncommitted changes is skipped (still Active) and
+/// archived by the first sweep after the changes are gone.
+#[intent_test_macros::daemon_test]
+async fn auto_archive_skips_a_workspace_with_uncommitted_changes() {
+    let f = fixture().await;
+    let ws = create_workspace(&f).await;
+    let wt = std::path::PathBuf::from(ws.worktree_path.clone().unwrap());
+    std::fs::write(wt.join("draft.txt"), "unsaved work").unwrap();
+
+    let report = f
+        .svc
+        .sweep_auto_archive_after(Some(7), days_from_now(8))
+        .await;
+    assert_eq!(report.archived, 0, "{report:?}");
+    assert_eq!(report.skipped, 1, "{report:?}");
+    assert_eq!(report.failed, 0, "{report:?}");
+    assert!(!f.store.get_workspace(&ws.id).await.unwrap().archived);
+
+    std::fs::remove_file(wt.join("draft.txt")).unwrap();
+    let report = f
+        .svc
+        .sweep_auto_archive_after(Some(7), days_from_now(8))
+        .await;
+    assert_eq!(report.archived, 1, "{report:?}");
+    assert!(f.store.get_workspace(&ws.id).await.unwrap().archived);
+}
+
+/// An idle workspace whose branch has commits on no remote-tracking ref is
+/// skipped; once a remote ref covers them it is archived. (The fixture repo
+/// starts with no remote refs, where history alone never blocks.)
+#[intent_test_macros::daemon_test]
+async fn auto_archive_skips_a_workspace_with_unpushed_commits() {
+    let f = fixture().await;
+    let ws = create_workspace(&f).await;
+    let wt = std::path::PathBuf::from(ws.worktree_path.clone().unwrap());
+    let repo = git2::Repository::open(&wt).expect("open worktree");
+    let base = repo.head().unwrap().peel_to_commit().unwrap();
+    repo.reference("refs/remotes/origin/main", base.id(), true, "test remote")
+        .expect("remote ref");
+    std::fs::write(wt.join("feature.txt"), "work\n").unwrap();
+    let mut index = repo.index().unwrap();
+    index.add_path(std::path::Path::new("feature.txt")).unwrap();
+    index.write().unwrap();
+    let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+    let sig = git2::Signature::now("Tester", "t@e.dev").unwrap();
+    let head = repo
+        .commit(
+            Some("HEAD"),
+            &sig,
+            &sig,
+            "feat: local only",
+            &tree,
+            &[&base],
+        )
+        .unwrap();
+
+    let report = f
+        .svc
+        .sweep_auto_archive_after(Some(7), days_from_now(8))
+        .await;
+    assert_eq!(report.archived, 0, "{report:?}");
+    assert_eq!(report.skipped, 1, "{report:?}");
+    assert!(!f.store.get_workspace(&ws.id).await.unwrap().archived);
+
+    repo.reference("refs/remotes/origin/feature", head, true, "pushed")
+        .expect("pushed ref");
+    let report = f
+        .svc
+        .sweep_auto_archive_after(Some(7), days_from_now(8))
+        .await;
+    assert_eq!(report.archived, 1, "{report:?}");
+    assert!(f.store.get_workspace(&ws.id).await.unwrap().archived);
 }

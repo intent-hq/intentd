@@ -1275,7 +1275,7 @@ async fn quick_action_effort_persists_emits_changes_and_resets_over_wss() {
 /// `-32602`, and `null` turns it off again by removing the key. Its
 /// deprecated predecessor `workspace.autoRetireArchivedAfterDays` is no
 /// longer advertised, and `workspace.autoArchiveIdleAfterDays` is advertised
-/// with `min: 0` and `defaultValue: 7`.
+/// with `min: 0` and `defaultValue: 0` (off by default).
 #[tokio::test]
 async fn purge_setting_validates_persists_and_clears_over_wss() {
     let dir = temp_data_dir();
@@ -1310,7 +1310,12 @@ async fn purge_setting_validates_persists_and_clears_over_wss() {
         .unwrap_or_else(|| panic!("auto-archive not advertised: {list}"));
     assert_eq!(auto_archive["type"], json!("number"), "{auto_archive}");
     assert_eq!(auto_archive["min"], json!(0.0), "{auto_archive}");
-    assert_eq!(auto_archive["defaultValue"], json!(7.0), "{auto_archive}");
+    assert_eq!(auto_archive["defaultValue"], json!(0.0), "{auto_archive}");
+    assert_eq!(
+        auto_archive["value"],
+        json!(0.0),
+        "off by default: {auto_archive}"
+    );
 
     let initial = settings_snapshot(&mut rpc, &[path]).await;
     assert_eq!(initial[0]["value"], Value::Null);
