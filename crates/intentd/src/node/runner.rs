@@ -143,6 +143,76 @@ struct Agent {
     descendants: Arc<Mutex<Vec<i32>>>,
     /// This run's [`RUN_MARKER_ENV`] value.
     run_marker: String,
+    /// Scrubs the profile's secret values from what the agent journals.
+    redactor: Arc<Redactor>,
+}
+
+/// Replaces a launch profile's secret values with [`Redactor::MASK`] in the
+/// provider-originated text the node journals or logs (session updates and
+/// provider error messages, which can echo a rejected credential). Values
+/// shorter than [`Redactor::MIN_LEN`] and account-folder paths are not
+/// treated as secrets, so ordinary text such as `1` is never scrubbed.
+#[derive(Default)]
+struct Redactor {
+    /// Longest first, so a secret containing another is masked whole.
+    secrets: Vec<String>,
+}
+
+impl Redactor {
+    const MASK: &'static str = "[redacted]";
+    const MIN_LEN: usize = 8;
+
+    fn new(profile: Option<&ProfileEnv>) -> Self {
+        let mut secrets: Vec<String> = profile
+            .into_iter()
+            .flat_map(ProfileEnv::entries)
+            .filter(|(key, _)| {
+                !intent_acp::profile_env::ACCOUNT_DIR_KEYS
+                    .iter()
+                    .any(|dir| dir.eq_ignore_ascii_case(key))
+            })
+            .filter_map(|(_, value)| value)
+            .filter(|value| value.len() >= Self::MIN_LEN)
+            .map(str::to_owned)
+            .collect();
+        secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+        secrets.dedup();
+        Self { secrets }
+    }
+
+    fn text(&self, text: String) -> String {
+        if !self
+            .secrets
+            .iter()
+            .any(|secret| text.contains(secret.as_str()))
+        {
+            return text;
+        }
+        self.secrets.iter().fold(text, |text, secret| {
+            text.replace(secret.as_str(), Self::MASK)
+        })
+    }
+
+    fn value(&self, value: &mut Value) {
+        if self.secrets.is_empty() {
+            return;
+        }
+        match value {
+            Value::String(text) => *text = self.text(std::mem::take(text)),
+            Value::Array(items) => items.iter_mut().for_each(|item| self.value(item)),
+            Value::Object(map) => {
+                let entries = std::mem::take(map);
+                *map = entries
+                    .into_iter()
+                    .map(|(key, mut item)| {
+                        self.value(&mut item);
+                        (self.text(key), item)
+                    })
+                    .collect();
+            }
+            _ => {}
+        }
+    }
 }
 
 /// A provider session that finished its ACP setup.
@@ -354,6 +424,7 @@ impl Runner {
             run_marker: intent_core::node_link::LinkId::new_v4().to_string(),
             marks: marks_tx,
             activity: ActivityTracker::new(),
+            redactor: Arc::new(Redactor::new(profile.as_ref())),
         });
         state.agents.insert(agent_id.clone(), agent.clone());
         state.workspaces.insert(agent_id, workspace_id);
@@ -361,7 +432,7 @@ impl Runner {
         // caller-binding: allow — node-local journal pump; the node has no service layer
         let pump = tokio::spawn(self.clone().pump(
             (agent.id.clone(), agent.workspace_id.clone()),
-            agent.activity.clone(),
+            (agent.activity.clone(), agent.redactor.clone()),
             notes_rx,
             marks_rx,
         ));
@@ -393,7 +464,7 @@ impl Runner {
     async fn pump(
         self,
         (agent_id, workspace_id): (AgentId, WorkspaceId),
-        activity: ActivityTracker,
+        (activity, redactor): (ActivityTracker, Arc<Redactor>),
         mut notes: mpsc::UnboundedReceiver<IncomingNotification>,
         mut marks: mpsc::UnboundedReceiver<Mark>,
     ) {
@@ -406,7 +477,9 @@ impl Runner {
                     if note.method != "session/update" {
                         continue;
                     }
-                    (turn.clone(), JournalBody::Notification { notification: note.params })
+                    let mut notification = note.params;
+                    redactor.value(&mut notification);
+                    (turn.clone(), JournalBody::Notification { notification })
                 }
                 Some(mark) = marks.recv() => match mark {
                     Mark::Started { base_commit } => {
@@ -419,9 +492,11 @@ impl Runner {
                     }
                     Mark::TurnEnded { turn_id, stop_reason, error } => {
                         turn = None;
+                        let error = error.map(|error| redactor.text(error));
                         (Some(turn_id), JournalBody::TurnEnded { stop_reason, error })
                     }
                     Mark::Exited { exit_code, error } => {
+                        let error = error.map(|error| redactor.text(error));
                         (None, JournalBody::Exited { exit_code, error })
                     }
                 },
@@ -740,14 +815,14 @@ impl Runner {
 
     /// Ask the agent's provider to cancel its running turn.
     pub(super) async fn cancel(&self, agent_id: &AgentId) {
-        let ready = lock(&self.inner.state)
-            .agents
-            .get(agent_id)
-            .and_then(|agent| agent.ready.borrow().clone());
+        let agent = lock(&self.inner.state).agents.get(agent_id).cloned();
+        let Some(agent) = agent else { return };
+        let ready = agent.ready.borrow().clone();
         if let Some(ready) = ready {
             if let Err(error) =
                 intent_acp::session::cancel(&ready.connection, &ready.session_id).await
             {
+                let error = agent.redactor.text(error.to_string());
                 tracing::info!(agent = %agent_id, %error, "node: cancel was not delivered");
             }
         }

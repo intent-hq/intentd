@@ -842,3 +842,78 @@ async fn node_runner_keeps_profile_secrets_out_of_logs_and_the_journal() {
     let logs = String::from_utf8(lock(&logs).clone()).unwrap();
     assert!(!logs.contains(CANARY), "{logs}");
 }
+
+/// A provider that echoes a profile credential in its setup error, its
+/// streamed output and its turn error: the journal carries none of it, and
+/// short values and account folders are left alone.
+#[tokio::test]
+async fn node_runner_redacts_profile_secrets_a_provider_echoes() {
+    for (args, prompt) in [
+        (&["--fail-setup-echo", "CODEX_ACCESS_TOKEN"][..], None),
+        (&[][..], Some("echo-env CODEX_ACCESS_TOKEN")),
+    ] {
+        let Some(h) = harness(1, args) else {
+            return;
+        };
+        let (logs, _guard) = capture_logs();
+        h.runner
+            .launch(launch_with_profile(
+                "a1",
+                &json!([
+                    { "key": "CODEX_ACCESS_TOKEN", "value": CANARY },
+                    { "key": "SHORT_FLAG", "value": "1" },
+                ]),
+            ))
+            .await;
+        if let Some(prompt) = prompt {
+            h.runner
+                .prompt(&AgentId::from("a1"), "t1".into(), text(prompt))
+                .await;
+            let all = wait_for(&h.runner, "turn end", turn_ended("a1", "t1")).await;
+            let (_, error) = turn_end(find(&all, turn_ended("a1", "t1")));
+            let error = error.expect("the turn failed");
+            assert!(error.contains("rejected credential [redacted]"), "{error}");
+            h.runner.stop(&AgentId::from("a1"));
+        }
+        let all = wait_for(&h.runner, "exit", exited("a1")).await;
+        if prompt.is_none() {
+            let error = exit_error(find(&all, exited("a1"))).expect("setup failed");
+            assert!(error.contains("[redacted]"), "{error}");
+        } else {
+            let journal = serde_json::to_string(&all).unwrap();
+            assert!(journal.contains("token [redacted]"), "{journal}");
+        }
+        let journal = serde_json::to_string(&all).unwrap();
+        assert!(!journal.contains(CANARY), "{journal}");
+        let logs = String::from_utf8(lock(&logs).clone()).unwrap();
+        assert!(!logs.contains(CANARY), "{logs}");
+    }
+}
+
+#[test]
+fn the_redactor_masks_secrets_but_not_short_values_or_account_folders() {
+    let profile = ProfileEnv::new(
+        "codex@work",
+        "f1",
+        vec![
+            (
+                "CODEX_ACCESS_TOKEN".into(),
+                Some("abcdef-secret-long".into()),
+            ),
+            ("INNER".into(), Some("secret-long".into())),
+            ("SHORT_FLAG".into(), Some("1".into())),
+            ("CODEX_HOME".into(), Some("/home/node/.codex-work".into())),
+            ("REMOVED".into(), None),
+        ],
+    );
+    let redactor = Redactor::new(Some(&profile));
+    assert_eq!(
+        redactor.text("a abcdef-secret-long b secret-long 1 /home/node/.codex-work".into()),
+        "a [redacted] b [redacted] 1 /home/node/.codex-work"
+    );
+    let mut value = json!({ "k": ["x secret-long"], "secret-long": 1 });
+    redactor.value(&mut value);
+    assert_eq!(value, json!({ "k": ["x [redacted]"], "[redacted]": 1 }));
+    let none = Redactor::new(None);
+    assert_eq!(none.text("secret-long".into()), "secret-long");
+}
