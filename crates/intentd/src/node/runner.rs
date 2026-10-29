@@ -198,6 +198,25 @@ impl Redactor {
         })
     }
 
+    /// ACP fields whose string values are protocol identifiers (variant
+    /// tags, enums, ids), never provider prose: masking them would make the
+    /// update unparseable on head and drop it, so they are kept as sent.
+    const SCHEMA_FIELDS: [&'static str; 10] = [
+        "type",
+        "sessionUpdate",
+        "sessionId",
+        "kind",
+        "status",
+        "toolCallId",
+        "role",
+        "mimeType",
+        "priority",
+        "stopReason",
+    ];
+
+    /// Mask secrets in a provider JSON value: string values anywhere except
+    /// [`Self::SCHEMA_FIELDS`]; object keys are protocol field names and are
+    /// never rewritten.
     fn value(&self, value: &mut Value) {
         if self.secrets.is_empty() {
             return;
@@ -206,14 +225,11 @@ impl Redactor {
             Value::String(text) => *text = self.text(std::mem::take(text)),
             Value::Array(items) => items.iter_mut().for_each(|item| self.value(item)),
             Value::Object(map) => {
-                let entries = std::mem::take(map);
-                *map = entries
-                    .into_iter()
-                    .map(|(key, mut item)| {
-                        self.value(&mut item);
-                        (self.text(key), item)
-                    })
-                    .collect();
+                for (key, item) in map.iter_mut() {
+                    if !(item.is_string() && Self::SCHEMA_FIELDS.contains(&key.as_str())) {
+                        self.value(item);
+                    }
+                }
             }
             _ => {}
         }

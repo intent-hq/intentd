@@ -917,7 +917,48 @@ fn the_redactor_masks_credentials_and_long_values_but_not_short_settings_or_acco
     );
     let mut value = json!({ "k": ["x secret-long"], "secret-long": 1 });
     redactor.value(&mut value);
-    assert_eq!(value, json!({ "k": ["x [redacted]"], "[redacted]": 1 }));
+    assert_eq!(value, json!({ "k": ["x [redacted]"], "secret-long": 1 }));
     let none = Redactor::new(None);
     assert_eq!(none.text("secret-long".into()), "secret-long");
+}
+
+/// A short credential that collides with ACP vocabulary (`text`) masks the
+/// provider's prose but never its field names or variant tags, so head can
+/// still parse every update.
+#[tokio::test]
+async fn node_runner_masking_a_schema_word_keeps_updates_parseable() {
+    let Some(h) = harness(1, &[]) else {
+        return;
+    };
+    h.runner
+        .launch(launch_with_profile(
+            "a1",
+            &json!([{ "key": "CODEX_ACCESS_TOKEN", "value": "text" }]),
+        ))
+        .await;
+    h.runner
+        .prompt(&AgentId::from("a1"), "t1".into(), text("hello text"))
+        .await;
+    let all = wait_for(&h.runner, "turn end", turn_ended("a1", "t1")).await;
+    let notifications: Vec<&Value> = all
+        .iter()
+        .filter_map(|r| match &r.body {
+            JournalBody::Notification { notification } => Some(notification),
+            _ => None,
+        })
+        .collect();
+    assert!(!notifications.is_empty(), "{all:#?}");
+    for notification in notifications {
+        let mapped = intent_acp::session::map_notification(&intent_acp::IncomingNotification {
+            method: "session/update".into(),
+            params: notification.clone(),
+        });
+        assert!(mapped.is_some(), "unparseable update: {notification}");
+        assert_eq!(
+            notification["update"]["content"],
+            json!({ "type": "text", "text": "echo: hello [redacted]" })
+        );
+    }
+    h.runner.stop(&AgentId::from("a1"));
+    wait_for(&h.runner, "exit", exited("a1")).await;
 }
