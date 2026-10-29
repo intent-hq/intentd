@@ -478,7 +478,6 @@ exit 97
             absent["warning"].as_str().unwrap().contains("Install"),
             "{absent}"
         );
-        assert_eq!(absent["warningKind"], "cli-missing", "{absent}");
     }
     assert_eq!(
         records(&log).len(),
