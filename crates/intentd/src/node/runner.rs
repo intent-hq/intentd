@@ -198,25 +198,8 @@ impl Redactor {
         })
     }
 
-    /// ACP fields whose string values are protocol identifiers (variant
-    /// tags, enums, ids), never provider prose: masking them would make the
-    /// update unparseable on head and drop it, so they are kept as sent.
-    const SCHEMA_FIELDS: [&'static str; 10] = [
-        "type",
-        "sessionUpdate",
-        "sessionId",
-        "kind",
-        "status",
-        "toolCallId",
-        "role",
-        "mimeType",
-        "priority",
-        "stopReason",
-    ];
-
-    /// Mask secrets in a provider JSON value: string values anywhere except
-    /// [`Self::SCHEMA_FIELDS`]; object keys are protocol field names and are
-    /// never rewritten.
+    /// Mask secrets anywhere in arbitrary provider data (tool input and
+    /// output, metadata, prose): every string and every object key.
     fn value(&self, value: &mut Value) {
         if self.secrets.is_empty() {
             return;
@@ -225,15 +208,99 @@ impl Redactor {
             Value::String(text) => *text = self.text(std::mem::take(text)),
             Value::Array(items) => items.iter_mut().for_each(|item| self.value(item)),
             Value::Object(map) => {
-                for (key, item) in map.iter_mut() {
-                    if !(item.is_string() && Self::SCHEMA_FIELDS.contains(&key.as_str())) {
-                        self.value(item);
-                    }
-                }
+                let entries = std::mem::take(map);
+                *map = entries
+                    .into_iter()
+                    .map(|(key, mut item)| {
+                        self.value(&mut item);
+                        (self.text(key), item)
+                    })
+                    .collect();
             }
             _ => {}
         }
     }
+
+    /// Mask a `session/update` notification's params. Field names and the
+    /// string identifiers at their ACP schema positions (the session id,
+    /// the update's variant tag, tool kind/status/id, content block and
+    /// tool-content tags, plan entry status/priority) are kept as sent, so
+    /// head can still parse the update even when a short secret equals a
+    /// protocol word; everything else, including tool `rawInput` /
+    /// `rawOutput` at any depth, is masked with [`Self::value`].
+    fn notification(&self, params: &mut Value) {
+        if self.secrets.is_empty() {
+            return;
+        }
+        self.schema(params, &|key, _| match key {
+            "sessionId" => Keep::Id,
+            "update" => Keep::Walk(Self::update),
+            _ => Keep::Mask,
+        });
+    }
+
+    fn update(&self, update: &mut Value) {
+        self.schema(update, &|key, _| match key {
+            "sessionUpdate" | "kind" | "status" | "toolCallId" => Keep::Id,
+            "content" => Keep::Walk(Self::content),
+            "entries" => Keep::Walk(Self::plan_entries),
+            _ => Keep::Mask,
+        });
+    }
+
+    /// A content block, a tool call's content list, or a tool content item
+    /// (`{ type, content: <block> }`).
+    fn content(&self, content: &mut Value) {
+        if let Value::Array(items) = content {
+            for item in items {
+                self.content(item);
+            }
+            return;
+        }
+        self.schema(content, &|key, _| match key {
+            "type" | "mimeType" => Keep::Id,
+            "content" => Keep::Walk(Self::content),
+            _ => Keep::Mask,
+        });
+    }
+
+    fn plan_entries(&self, entries: &mut Value) {
+        let Value::Array(items) = entries else {
+            return self.value(entries);
+        };
+        for item in items {
+            self.schema(item, &|key, _| match key {
+                "status" | "priority" => Keep::Id,
+                _ => Keep::Mask,
+            });
+        }
+    }
+
+    /// Walk one schema object: keys stay, and each field is kept (a string
+    /// identifier only), walked with its own schema, or masked as data. A
+    /// value that is not an object is masked as data.
+    fn schema(&self, value: &mut Value, field: &dyn Fn(&str, &Value) -> Keep) {
+        let Value::Object(map) = value else {
+            return self.value(value);
+        };
+        for (key, item) in map.iter_mut() {
+            match field(key, item) {
+                Keep::Id if item.is_string() => {}
+                Keep::Walk(walk) => walk(self, item),
+                Keep::Id | Keep::Mask => self.value(item),
+            }
+        }
+    }
+}
+
+/// What [`Redactor::schema`] does with one field.
+enum Keep {
+    /// A protocol identifier: kept as sent when it is a string.
+    Id,
+    /// A nested schema object.
+    Walk(fn(&Redactor, &mut Value)),
+    /// Arbitrary data: masked.
+    Mask,
 }
 
 /// A provider session that finished its ACP setup.
@@ -499,7 +566,7 @@ impl Runner {
                         continue;
                     }
                     let mut notification = note.params;
-                    redactor.value(&mut notification);
+                    redactor.notification(&mut notification);
                     (turn.clone(), JournalBody::Notification { notification })
                 }
                 Some(mark) = marks.recv() => match mark {

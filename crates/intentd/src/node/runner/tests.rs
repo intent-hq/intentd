@@ -917,7 +917,7 @@ fn the_redactor_masks_credentials_and_long_values_but_not_short_settings_or_acco
     );
     let mut value = json!({ "k": ["x secret-long"], "secret-long": 1 });
     redactor.value(&mut value);
-    assert_eq!(value, json!({ "k": ["x [redacted]"], "secret-long": 1 }));
+    assert_eq!(value, json!({ "k": ["x [redacted]"], "[redacted]": 1 }));
     let none = Redactor::new(None);
     assert_eq!(none.text("secret-long".into()), "secret-long");
 }
@@ -961,4 +961,65 @@ async fn node_runner_masking_a_schema_word_keeps_updates_parseable() {
     }
     h.runner.stop(&AgentId::from("a1"));
     wait_for(&h.runner, "exit", exited("a1")).await;
+}
+
+/// Identifiers stay only at their ACP schema positions: a `status` or `type`
+/// inside a tool's raw input or output is data and is masked, while the
+/// update itself still parses on head.
+#[test]
+fn the_redactor_masks_tool_payloads_but_keeps_schema_identifiers() {
+    for secret in ["s3cr3t!", "completed", "text"] {
+        let profile = ProfileEnv::new(
+            "codex@work",
+            "f1",
+            vec![("CODEX_ACCESS_TOKEN".into(), Some(secret.into()))],
+        );
+        let redactor = Redactor::new(Some(&profile));
+        let mut params = json!({
+            "sessionId": "s1",
+            "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call-1",
+                "status": "completed",
+                "kind": "execute",
+                "title": format!("login {secret}"),
+                "content": [{
+                    "type": "content",
+                    "content": { "type": "text", "text": format!("rejected credential {secret}") },
+                }],
+                "rawInput": { "status": format!("token {secret}"), "type": secret },
+                "rawOutput": {
+                    "status": format!("rejected credential {secret}"),
+                    "nested": [{ "type": secret, secret: 1 }],
+                },
+            },
+        });
+        redactor.notification(&mut params);
+        let update = &params["update"];
+        assert_eq!(update["sessionUpdate"], "tool_call_update", "{secret}");
+        assert_eq!(update["status"], "completed", "{secret}");
+        assert_eq!(update["content"][0]["type"], "content", "{secret}");
+        assert_eq!(update["content"][0]["content"]["type"], "text", "{secret}");
+        assert_eq!(
+            update["content"][0]["content"]["text"],
+            "rejected credential [redacted]"
+        );
+        assert_eq!(update["title"], "login [redacted]");
+        assert_eq!(
+            update["rawInput"],
+            json!({ "status": "token [redacted]", "type": "[redacted]" })
+        );
+        assert_eq!(
+            update["rawOutput"],
+            json!({
+                "status": "rejected credential [redacted]",
+                "nested": [{ "type": "[redacted]", "[redacted]": 1 }],
+            })
+        );
+        let mapped = intent_acp::session::map_notification(&intent_acp::IncomingNotification {
+            method: "session/update".into(),
+            params: params.clone(),
+        });
+        assert!(mapped.is_some(), "{secret}: unparseable update {params}");
+    }
 }
