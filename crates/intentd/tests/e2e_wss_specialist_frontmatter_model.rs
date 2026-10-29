@@ -424,12 +424,7 @@ async fn specialist_provider_and_frontmatter_model_resolved_over_wss() {
     drop(daemon);
 }
 
-/// WSS e2e for specialist aliases (PROTOCOL §5.11): the bundled v1.1
-/// `spec-writer` carries `aliases: ["coordinator"]`, so `agent.create` with
-/// `specialistId: "coordinator"` persists the CANONICAL id (`spec-writer`)
-/// on the session — surfaced as `metadata.specialist` — and resolves the
-/// specialist's display name; `specialist.get` on the alias serves the
-/// canonical resolved view.
+/// Specialist aliases resolve and persist the canonical identity over WSS.
 #[tokio::test]
 async fn specialist_alias_resolves_and_persists_canonical_id_over_wss() {
     let data_dir_guard = temp_data_dir();
@@ -478,7 +473,7 @@ async fn specialist_alias_resolves_and_persists_canonical_id_over_wss() {
         got["specialist"]["id"], "spec-writer",
         "alias resolves to the canonical def over WSS"
     );
-    assert_eq!(got["specialist"]["aliases"], json!(["coordinator"]));
+    assert_eq!(got["specialist"]["aliases"], json!(["coordinator", "lead"]));
 
     // agent.create with the alias persists the canonical specialist id and
     // derives the display name from the canonical specialist. The explicit
