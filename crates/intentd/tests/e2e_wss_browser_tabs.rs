@@ -711,3 +711,91 @@ async fn browser_tab_registry_round_trip_over_wss() {
     assert_eq!(tabs[0]["hostConnected"], false);
     assert!(tabs[0].get("hostName").is_none(), "{res}");
 }
+
+/// `workspace.getBrowserClient` over the real transport reports an unpinned
+/// workspace's routed claimed-tab host as `target` even after that host
+/// disconnects (`resolved: null`); a set omits `target` and a clear reports
+/// the recomputed route (PROTOCOL §5.1 "Routed client (`target`)").
+#[tokio::test]
+async fn browser_client_target_names_an_offline_claimed_tab_host_over_wss() {
+    let fx = boot().await;
+    let mut viewer = connect(&fx).await;
+    let created = wss_rpc(
+        &mut viewer,
+        1,
+        "workspace.create",
+        json!({ "title": "Routed", "branch": "main", "skipWorktree": true }),
+    )
+    .await;
+    let ws_id = created["result"]["workspace"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("workspace id: {created}"))
+        .to_string();
+    let _ = wss_rpc(&mut viewer, 2, "client.hello", hello("desktop-b")).await;
+    let mut host = connect(&fx).await;
+    let _ = wss_rpc(&mut host, 1, "client.hello", hello("desktop-a")).await;
+
+    let mut claimed = tab("tab-claimed", "https://a.test/agent");
+    claimed["ownerAgentId"] = json!("agent-1");
+    let res = wss_rpc(
+        &mut host,
+        2,
+        "browser.upsertTab",
+        json!({ "workspaceId": ws_id, "tab": claimed }),
+    )
+    .await;
+    assert_eq!(res["result"]["tab"]["ownerAgentId"], "agent-1", "{res}");
+    close_ws(host).await;
+    let _ = await_host_offline(&mut viewer, 3, &ws_id).await;
+
+    let res = wss_rpc(
+        &mut viewer,
+        100,
+        "workspace.getBrowserClient",
+        json!({ "workspaceId": ws_id }),
+    )
+    .await;
+    assert_eq!(
+        res["result"],
+        json!({ "browserClient": {
+            "source": "default",
+            "resolved": null,
+            "target": { "clientId": "desktop-a", "via": "tabs" }
+        } }),
+        "{res}"
+    );
+
+    let res = wss_rpc(
+        &mut viewer,
+        101,
+        "workspace.setBrowserClient",
+        json!({ "workspaceId": ws_id, "clientId": "desktop-b" }),
+    )
+    .await;
+    assert_eq!(
+        res["result"],
+        json!({ "browserClient": {
+            "clientId": "desktop-b",
+            "source": "workspace",
+            "resolved": { "clientId": "desktop-b", "name": "Intent Desktop @ desktop-b" }
+        } }),
+        "a set carries no target: {res}"
+    );
+
+    let res = wss_rpc(
+        &mut viewer,
+        102,
+        "workspace.setBrowserClient",
+        json!({ "workspaceId": ws_id, "clientId": null }),
+    )
+    .await;
+    assert_eq!(
+        res["result"],
+        json!({ "browserClient": {
+            "source": "default",
+            "resolved": { "clientId": "desktop-b", "name": "Intent Desktop @ desktop-b" },
+            "target": { "clientId": "desktop-b", "via": "tabs" }
+        } }),
+        "a clear reports the re-homed claimed-tab route: {res}"
+    );
+}

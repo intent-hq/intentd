@@ -114,7 +114,8 @@ async fn claimed_tab_host_is_the_driving_client_when_unpinned() {
         state,
         json!({
             "source": "default",
-            "resolved": { "clientId": "desktop-b", "name": "Desktop B" }
+            "resolved": { "clientId": "desktop-b", "name": "Desktop B" },
+            "target": { "clientId": "desktop-b", "via": "tabs" }
         })
     );
     let out = svc
@@ -130,6 +131,98 @@ async fn claimed_tab_host_is_the_driving_client_when_unpinned() {
     assert_eq!(
         reg.calls.lock().unwrap()[0].2,
         ReverseTarget::Client(ClientId::from_string("desktop-b"))
+    );
+}
+
+/// An unpinned workspace whose oldest claimed tab sits on a client that is
+/// not connected reports that host as `target` with `resolved: null`, so a
+/// client can tell "routed to an offline client" from "no eligible client".
+#[intent_test_macros::daemon_test]
+async fn offline_claimed_tab_host_is_reported_as_target() {
+    let reg = two_clients();
+    let (_t, _r, svc, _bus, ws) = setup(reg).await;
+    register_tab(&svc, &ws, "stale-tab", "legacy-host", Some("agent-1")).await;
+
+    assert_eq!(
+        svc.get_workspace_browser_client(ws.clone()).await.unwrap(),
+        json!({
+            "source": "default",
+            "resolved": null,
+            "target": { "clientId": "legacy-host", "via": "tabs" }
+        })
+    );
+}
+
+/// `target` names only a client the desktop-session or claimed-tab rule
+/// chose: user tabs never route, and a pin already names its client.
+#[intent_test_macros::daemon_test]
+async fn target_is_omitted_for_user_tabs_and_pins() {
+    let reg = two_clients();
+    let (_t, _r, svc, _bus, ws) = setup(reg).await;
+    register_tab(&svc, &ws, "user-tab", "legacy-host", None).await;
+    assert_eq!(
+        svc.get_workspace_browser_client(ws.clone()).await.unwrap(),
+        json!({
+            "source": "default",
+            "resolved": { "clientId": "desktop-a", "name": "Desktop A" }
+        }),
+        "a user tab does not choose the driving client"
+    );
+
+    register_tab(&svc, &ws, "agent-tab", "desktop-b", Some("agent-1")).await;
+    let pinned = svc
+        .set_workspace_browser_client(ws.clone(), Some(ClientId::from_string("desktop-a")))
+        .await
+        .expect("pin");
+    assert_eq!(
+        pinned,
+        json!({
+            "clientId": "desktop-a",
+            "source": "workspace",
+            "resolved": { "clientId": "desktop-a", "name": "Desktop A" }
+        }),
+        "a pinned workspace carries no target"
+    );
+}
+
+/// An active desktop-control session chooses the driving client ahead of
+/// claimed tabs and is reported as `via: "desktop"`.
+#[intent_test_macros::daemon_test]
+async fn active_desktop_session_is_reported_as_target() {
+    let reg = two_clients();
+    let (_t, _r, svc, _bus, ws) = setup(reg).await;
+    register_tab(&svc, &ws, "agent-tab", "desktop-a", Some("agent-1")).await;
+    svc.feature_desktop()
+        .activate_for_test(&ws, ClientId::from_string("desktop-b"));
+    let state = svc.get_workspace_browser_client(ws.clone()).await.unwrap();
+    svc.feature_desktop().deactivate_for_test();
+    assert_eq!(
+        state,
+        json!({
+            "source": "default",
+            "resolved": { "clientId": "desktop-b", "name": "Desktop B" },
+            "target": { "clientId": "desktop-b", "via": "desktop" }
+        })
+    );
+}
+
+/// A desktop session whose client has no eligible connection is still
+/// reported as the routed `target`, with `resolved: null`.
+#[intent_test_macros::daemon_test]
+async fn offline_desktop_session_client_is_reported_as_target() {
+    let reg = two_clients();
+    let (_t, _r, svc, _bus, ws) = setup(reg).await;
+    svc.feature_desktop()
+        .activate_for_test(&ws, ClientId::from_string("gone-desk"));
+    let state = svc.get_workspace_browser_client(ws.clone()).await.unwrap();
+    svc.feature_desktop().deactivate_for_test();
+    assert_eq!(
+        state,
+        json!({
+            "source": "default",
+            "resolved": null,
+            "target": { "clientId": "gone-desk", "via": "desktop" }
+        })
     );
 }
 

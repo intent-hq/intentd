@@ -5003,15 +5003,18 @@ impl Services {
     /// right now ([`Self::driving_client_target`]: pin → client of an active
     /// desktop session → host of the workspace's claimed tabs →
     /// first-connected eligible client), `null`
-    /// when that client is offline or no eligible client is connected. Chief
-    /// has no row and always reports the default.
+    /// when that client is offline or no eligible client is connected — and,
+    /// for an unpinned workspace the desktop-session or claimed-tab rule
+    /// routed, `target: { clientId, via }` naming that client even while it
+    /// is offline. Chief has no row and always reports the default.
     async fn browser_client_state(&self, id: &WorkspaceId) -> Result<serde_json::Value> {
-        let pinned = if id.is_chief() {
-            None
-        } else {
-            self.store.workspace_browser_client(id).await?
-        };
-        let target = self.driving_client_target(id).await?;
+        // Existence check only (`-32602` for an unknown workspace; the route
+        // read treats a missing row as unpinned). The pin itself comes from
+        // the route below, so a racing clear cannot pair a pin with `target`.
+        if !id.is_chief() {
+            self.store.workspace_browser_client(id).await?;
+        }
+        let (target, via) = self.driving_client_route(id).await?;
         let resolved = self
             .reverse_dispatch
             .as_ref()
@@ -5020,16 +5023,23 @@ impl Services {
                 serde_json::to_value(r).unwrap_or(serde_json::Value::Null)
             });
         let mut out = serde_json::Map::new();
-        match pinned {
-            Some(client_id) => {
+        match &target {
+            intent_core::ReverseTarget::Pinned(client_id) => {
                 out.insert("clientId".into(), client_id.as_str().into());
                 out.insert("source".into(), "workspace".into());
             }
-            None => {
+            _ => {
                 out.insert("source".into(), "default".into());
             }
         }
         out.insert("resolved".into(), resolved);
+        // Every specific-client rule other than the pin reports its client.
+        if let intent_core::ReverseTarget::Client(client_id) = &target {
+            out.insert(
+                "target".into(),
+                serde_json::json!({ "clientId": client_id.as_str(), "via": via }),
+            );
+        }
         Ok(serde_json::Value::Object(out))
     }
 
